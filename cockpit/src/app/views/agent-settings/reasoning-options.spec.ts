@@ -121,6 +121,18 @@ describe('getSelectableReasoningOptions (no Default sentinel)', () => {
 });
 
 describe('defaultSelectableReasoning', () => {
+  it('exposes mandatory Muse reasoning from minimal through max, defaulting to medium', () => {
+    const cap = {
+      method: 'effort_enum',
+      default: 'medium',
+      options: ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'],
+    };
+    expect(getSelectableReasoningOptions(cap).map((option) => option.label)).toEqual([
+      'Minimal', 'Low', 'Medium', 'High', 'X-High', 'Max',
+    ]);
+    expect(defaultSelectableReasoning(cap)).toBe('medium');
+  });
+
   it('resolves to the family default when selectable', () => {
     expect(
       defaultSelectableReasoning({method: 'binary_toggle', default: 'on', options: ['on', 'off']}),

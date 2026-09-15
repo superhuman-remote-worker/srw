@@ -63,6 +63,7 @@ _FAMILY_MODELS = {
     "glm": "glm-5.1",
     "glm-5.3": "glm-5.3",
     "glm-5.3-flash": "glm-5.3-flash",
+    "muse-spark-1.3": "meta/muse-spark-1.3",
     "gpt-5": "gpt-5.5",
     "codex-spark": "gpt-5.3-codex-spark",
     "gpt-oss": "gpt-oss-120b",
@@ -140,7 +141,7 @@ def test_every_shipped_worker_template_is_phase_agnostic():
         for p in (_CONFIG / "prompts").glob("systemprompt*.txt")
         if "interactive" not in p.name and "subagent" not in p.name
     )
-    assert len(templates) == 10, templates
+    assert len(templates) == 11, templates
     for path in templates:
         raw = path.read_text(encoding="utf-8")
         assert not is_legacy_phase_template(raw), path.name
@@ -350,7 +351,7 @@ def test_every_worker_template_states_the_per_call_gate_once():
         for f in sorted(_CONFIG.glob("prompts/systemprompt*.txt"))
         if "interactive" not in f.name and "subagent" not in f.name
     ]
-    assert len(templates) == 10, [f.name for f in templates]
+    assert len(templates) == 11, [f.name for f in templates]
     for template in templates:
         text = template.read_text(encoding="utf-8")
         assert text.count(_PER_CALL_GATE_SENTENCE) == 1, template.name

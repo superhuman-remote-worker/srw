@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Optional
 
@@ -362,6 +363,9 @@ def family_of(model_id: str, default: str = "default") -> str:
         return "glm-5.3"
     if "glm" in name:
         return "glm"
+    # Version-specific: older Muse releases must not inherit 1.3 capabilities.
+    if re.search(r"(?:^|/)muse-spark-1\.3(?:$|[-:])", name):
+        return "muse-spark-1.3"
     if name.startswith(
         (
             "mistral",
