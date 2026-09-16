@@ -30,6 +30,10 @@ from orchestrator.services.manifest_runtime_ownership import (
     require_srw_runtime,
     uses_srw_runtime,
 )
+from orchestrator.services.vm_workspace_recovery_store import (
+    acquire_vm_cleanup_permit,
+    complete_vm_cleanup_permit,
+)
 from shared.runtime.core.tool_policy import ToolPolicyError
 from shared.workspace_contract import resolve_workspace_contract
 
@@ -184,7 +188,42 @@ class JobControlOperations:
                 status_code=503,
                 detail="VM provisioning not available (no NATS or K8s)",
             )
-        if not await self.dependencies.vm_provisioner.delete_vm(job_id):
+        try:
+            identity = (
+                await self.dependencies.vm_provisioner.capture_vm_teardown_identity(
+                    job_id, entity_type="job"
+                )
+            )
+            permit = await acquire_vm_cleanup_permit(
+                self.dependencies.recovery_store,
+                owner_kind="job",
+                owner_id=job_id,
+                identity=identity,
+                source="public_vm_delete",
+            )
+        except Exception as exc:
+            raise HTTPException(
+                status_code=409,
+                detail="VM cleanup authority is temporarily unavailable",
+            ) from exc
+        if not permit.allowed:
+            raise HTTPException(
+                status_code=409,
+                detail="VM cleanup is held for workspace recovery",
+            )
+        outcome = await self.dependencies.vm_provisioner.release_vm_captured(
+            job_id,
+            identity,
+            entity_type="job",
+            capture_snapshot=False,
+        )
+        if outcome.disposition in {"completed", "identity_superseded"}:
+            await complete_vm_cleanup_permit(
+                self.dependencies.recovery_store,
+                permit,
+                outcome=outcome.disposition,
+            )
+        if outcome.disposition != "completed":
             raise HTTPException(status_code=500, detail="Failed to delete VM")
         return {"status": "deleting", "job_id": job_id}
 

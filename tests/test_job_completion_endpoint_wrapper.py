@@ -50,12 +50,27 @@ def _isolate_workspace_cleanup_authority(monkeypatch: pytest.MonkeyPatch) -> Non
     """Keep legacy completion tests focused on their existing collaborators."""
 
     original = orchestrator.main._completion_effect_dependencies
+    legacy_original = orchestrator.main._legacy_completion_dependencies
 
     def dependencies():
         return dataclasses.replace(original(), recovery_store=_AllowCleanupStore())
 
     monkeypatch.setattr(
         orchestrator.main, "_completion_effect_dependencies", dependencies
+    )
+
+    def legacy_dependencies():
+        resolved = legacy_original()
+        return dataclasses.replace(
+            resolved,
+            workspace=dataclasses.replace(
+                resolved.workspace,
+                recovery_store=_AllowCleanupStore(),
+            ),
+        )
+
+    monkeypatch.setattr(
+        orchestrator.main, "_legacy_completion_dependencies", legacy_dependencies
     )
 
 
@@ -2556,6 +2571,24 @@ async def test_hybrid_vm_and_kubernetes_s36_captures_and_releases_both(
     }
     runner = _RecordingRunner()
     release_order: list[str] = []
+    cleanup_requests: list[UUID] = []
+    active_cleanup: UUID | None = None
+
+    class SequentialCleanupStore:
+        async def acquire_cleanup_permit(self, **kwargs):
+            nonlocal active_cleanup
+            request_id = kwargs["request_id"]
+            assert active_cleanup is None, "distinct resources must settle sequentially"
+            active_cleanup = request_id
+            cleanup_requests.append(request_id)
+            return SimpleNamespace(allowed=True, admission_id=request_id)
+
+        async def complete_cleanup_permit(self, admission_id, *, outcome):
+            nonlocal active_cleanup
+            assert admission_id == active_cleanup
+            assert outcome == "completed"
+            active_cleanup = None
+            return True
 
     async def release_vm(*_args, **_kwargs):
         release_order.append("vm")
@@ -2566,6 +2599,14 @@ async def test_hybrid_vm_and_kubernetes_s36_captures_and_releases_both(
         return True
 
     monkeypatch.setattr(orchestrator.main, "postgres_db", _RouteDB(job))
+    original_dependencies = orchestrator.main._completion_effect_dependencies
+    monkeypatch.setattr(
+        orchestrator.main,
+        "_completion_effect_dependencies",
+        lambda: dataclasses.replace(
+            original_dependencies(), recovery_store=SequentialCleanupStore()
+        ),
+    )
     monkeypatch.setattr(
         orchestrator.main.container_provisioner,
         "capture_terminal_workspace_identity",
@@ -2625,6 +2666,9 @@ async def test_hybrid_vm_and_kubernetes_s36_captures_and_releases_both(
         "snapshot_created_at": intent["kubernetes"]["snapshot_created_at"],
     }
     assert release_order == ["vm", "kubernetes"]
+    assert len(cleanup_requests) == 2
+    assert cleanup_requests[0] != cleanup_requests[1]
+    assert active_cleanup is None
     assert runner.callback_counts["workspace_archive_teardown"] == 1
     legacy_cleanup.assert_not_awaited()
 

@@ -4539,22 +4539,76 @@ class PostgresDB:
             else ""
         )
         async with self.acquire() as conn:
-            result = await conn.execute(
-                f"""
-                UPDATE jobs
-                SET status = 'cancelled',
-                    assigned_agent_id = NULL,
-                    updated_at = CURRENT_TIMESTAMP
-                WHERE id = $1
-                  AND execution_lane = 'pinned'
-                  AND status::text = $2::text
-                  AND status NOT IN ('completed', 'cancelled')
-                  {control_guard}
-                """,
-                uuid_val,
-                expected_status,
-            )
+            async with conn.transaction():
+                result = await conn.execute(
+                    f"""
+                    UPDATE jobs
+                    SET status = 'cancelled',
+                        assigned_agent_id = NULL,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE id = $1
+                      AND execution_lane = 'pinned'
+                      AND status::text = $2::text
+                      AND status NOT IN ('completed', 'cancelled')
+                      {control_guard}
+                    """,
+                    uuid_val,
+                    expected_status,
+                )
+                if result == "UPDATE 1":
+                    await self._resolve_workspace_recovery_cancel_participant(
+                        conn, uuid_val
+                    )
         return result == "UPDATE 1"
+
+    @staticmethod
+    async def _resolve_workspace_recovery_cancel_participant(
+        conn: Any, job_uuid: UUID
+    ) -> None:
+        """Resolve only one cancelled participant and release a final operation."""
+
+        participant = await conn.fetchrow(
+            "SELECT recovery_id FROM vm_workspace_recovery_jobs "
+            "WHERE job_id=$1 AND resolved_at IS NULL FOR UPDATE",
+            job_uuid,
+        )
+        if participant is None:
+            return
+        recovery_id = participant["recovery_id"]
+        await conn.execute(
+            "UPDATE vm_workspace_recovery_jobs "
+            "SET participation='cancelled',resolved_at=clock_timestamp(),"
+            "outcome=COALESCE(outcome,'{}'::jsonb) || "
+            '\'{"control":"cancelled"}\'::jsonb '
+            "WHERE recovery_id=$1 AND job_id=$2 AND resolved_at IS NULL",
+            recovery_id,
+            job_uuid,
+        )
+        await conn.execute(
+            "UPDATE jobs SET freeze_data=NULL WHERE id=$1 "
+            "AND freeze_data->>'freeze_type'='workspace_recovery' "
+            "AND freeze_data->>'recovery_id'=$2",
+            job_uuid,
+            str(recovery_id),
+        )
+        remaining = await conn.fetchval(
+            "SELECT EXISTS (SELECT 1 FROM vm_workspace_recovery_jobs "
+            "WHERE recovery_id=$1 AND resolved_at IS NULL)",
+            recovery_id,
+        )
+        if remaining is False:
+            await conn.execute(
+                "UPDATE vm_workspace_recoveries SET phase='cancelled',"
+                "resolved_at=clock_timestamp(),claimed_by=NULL,claimed_until=NULL,"
+                "version=version+1 WHERE id=$1 AND resolved_at IS NULL",
+                recovery_id,
+            )
+            await conn.execute(
+                "UPDATE vm_workspace_recovery_retention_pins "
+                "SET released_at=clock_timestamp() "
+                "WHERE recovery_id=$1 AND released_at IS NULL",
+                recovery_id,
+            )
 
     async def cancel_stateless_job(
         self,
@@ -4628,47 +4682,9 @@ class PostgresDB:
                     )
                     if row is None:
                         raise _CancelCASLostError
-                    participant = await conn.fetchrow(
-                        "SELECT recovery_id FROM vm_workspace_recovery_jobs "
-                        "WHERE job_id=$1 AND resolved_at IS NULL FOR UPDATE",
-                        job_uuid,
+                    await self._resolve_workspace_recovery_cancel_participant(
+                        conn, job_uuid
                     )
-                    if participant is not None:
-                        recovery_id = participant["recovery_id"]
-                        await conn.execute(
-                            "UPDATE vm_workspace_recovery_jobs "
-                            "SET participation='cancelled',resolved_at=clock_timestamp(),"
-                            "outcome=COALESCE(outcome,'{}'::jsonb) || "
-                            '\'{"control":"cancelled"}\'::jsonb '
-                            "WHERE recovery_id=$1 AND job_id=$2 AND resolved_at IS NULL",
-                            recovery_id,
-                            job_uuid,
-                        )
-                        await conn.execute(
-                            "UPDATE jobs SET freeze_data=NULL WHERE id=$1 "
-                            "AND freeze_data->>'freeze_type'='workspace_recovery' "
-                            "AND freeze_data->>'recovery_id'=$2",
-                            job_uuid,
-                            str(recovery_id),
-                        )
-                        remaining = await conn.fetchval(
-                            "SELECT EXISTS (SELECT 1 FROM vm_workspace_recovery_jobs "
-                            "WHERE recovery_id=$1 AND resolved_at IS NULL)",
-                            recovery_id,
-                        )
-                        if remaining is False:
-                            await conn.execute(
-                                "UPDATE vm_workspace_recoveries SET phase='cancelled',"
-                                "resolved_at=clock_timestamp(),claimed_by=NULL,claimed_until=NULL,"
-                                "version=version+1 WHERE id=$1 AND resolved_at IS NULL",
-                                recovery_id,
-                            )
-                            await conn.execute(
-                                "UPDATE vm_workspace_recovery_retention_pins "
-                                "SET released_at=clock_timestamp() "
-                                "WHERE recovery_id=$1 AND released_at IS NULL",
-                                recovery_id,
-                            )
         except _CancelCASLostError:
             return False, False
 

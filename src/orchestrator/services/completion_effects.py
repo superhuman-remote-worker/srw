@@ -117,14 +117,14 @@ async def run_completion_workspace_teardown(
     recovery_store = dependencies.recovery_store
 
     async def _archive_and_teardown_workspace() -> dict[str, Any]:
-        cleanup_admission: Any | None = None
         try:
-            cleanup_request_id = UUID(str(effect_runner.command_id))
+            cleanup_request_namespace = UUID(str(effect_runner.command_id))
         except (AttributeError, TypeError, ValueError):
-            cleanup_request_id = uuid5(NAMESPACE_URL, f"completion-cleanup:{job_id}")
+            cleanup_request_namespace = uuid5(
+                NAMESPACE_URL, f"completion-cleanup:{job_id}"
+            )
 
-        async def _admit_destructive_cleanup(pvc_uid: Any) -> None:
-            nonlocal cleanup_admission
+        async def _admit_destructive_cleanup(pvc_uid: Any, *, resource: str) -> Any:
             try:
                 parsed_pvc_uid = UUID(str(pvc_uid)) if pvc_uid is not None else None
             except (TypeError, ValueError, AttributeError):
@@ -133,17 +133,20 @@ async def run_completion_workspace_teardown(
                 owner_kind="job",
                 owner_id=UUID(job_id),
                 pvc_uid=parsed_pvc_uid,
-                request_id=cleanup_request_id,
+                request_id=uuid5(
+                    cleanup_request_namespace,
+                    f"{resource}:{parsed_pvc_uid or 'none'}",
+                ),
                 source="completion_workspace_teardown",
             )
             if not permit.allowed:
                 raise RuntimeError(
                     "workspace teardown held for unresolved workspace recovery"
                 )
-            cleanup_admission = permit
+            return permit
 
-        async def _complete_destructive_cleanup(outcome: str) -> None:
-            admission_id = getattr(cleanup_admission, "admission_id", None)
+        async def _complete_destructive_cleanup(permit: Any, outcome: str) -> None:
+            admission_id = getattr(permit, "admission_id", None)
             if admission_id is not None:
                 await recovery_store.complete_cleanup_permit(
                     admission_id, outcome=outcome
@@ -190,8 +193,8 @@ async def run_completion_workspace_teardown(
                 or any(character.isspace() for character in ssh_host_key_fingerprint)
             ):
                 raise RuntimeError("VM teardown intent has invalid SSH host key")
-            await _admit_destructive_cleanup(rootdisk_uid)
-            return await vm_provisioner.release_vm_captured(
+            cleanup = await _admit_destructive_cleanup(rootdisk_uid, resource="vm")
+            outcome = await vm_provisioner.release_vm_captured(
                 job_id,
                 VMTeardownIdentity(
                     provision_generation=generation,
@@ -204,6 +207,9 @@ async def run_completion_workspace_teardown(
                 ssh_host=ssh_host,
                 ssh_port=ssh_port,
             )
+            if outcome.disposition in {"completed", "identity_superseded"}:
+                await _complete_destructive_cleanup(cleanup, outcome.disposition)
+            return outcome
 
         async def _capture_kubernetes_teardown_detail() -> dict[str, Any]:
             captured = await container_provisioner.capture_terminal_workspace_identity(
@@ -261,7 +267,7 @@ async def run_completion_workspace_teardown(
                 ssh_host_key_fingerprint=host_key,
                 ssh_port=ssh_port,
             )
-            await _admit_destructive_cleanup(pvc_uid)
+            cleanup = await _admit_destructive_cleanup(pvc_uid, resource="kubernetes")
             released = await container_provisioner.release_workspace(
                 WorkspaceOwner.job(job_id),
                 teardown_identity=teardown_identity,
@@ -277,11 +283,17 @@ async def run_completion_workspace_teardown(
                 ),
             )
             if released:
+                await _complete_destructive_cleanup(cleanup, "completed")
                 return "completed"
-            return await container_provisioner.classify_workspace_teardown_identity(
-                WorkspaceOwner.job(job_id),
-                teardown_identity,
+            disposition = (
+                await container_provisioner.classify_workspace_teardown_identity(
+                    WorkspaceOwner.job(job_id),
+                    teardown_identity,
+                )
             )
+            if disposition == "identity_superseded":
+                await _complete_destructive_cleanup(cleanup, disposition)
+            return disposition
 
         try:
             if effect_runner is not None:
@@ -463,7 +475,6 @@ async def run_completion_workspace_teardown(
             if retry_reasons:
                 raise RuntimeError("; ".join(retry_reasons))
             if "identity_superseded" in teardown_dispositions:
-                await _complete_destructive_cleanup("identity_superseded")
                 return {
                     "actions": cleanup_actions,
                     "teardown_disposition": "identity_superseded",
@@ -472,8 +483,11 @@ async def run_completion_workspace_teardown(
             if not (
                 use_identity_fenced_vm_teardown or use_uid_fenced_kubernetes_teardown
             ):
-                await _admit_destructive_cleanup(None)
+                cleanup = await _admit_destructive_cleanup(
+                    None, resource="legacy_workspace"
+                )
                 cleanup_actions = await _archive_and_cleanup_workspace(job_id)
+                await _complete_destructive_cleanup(cleanup, "completed")
         except Exception as exc:
             logger.warning(
                 "Workspace cleanup failed for job %s (non-blocking): %s",
@@ -485,7 +499,6 @@ async def run_completion_workspace_teardown(
                 "error": str(exc),
                 "teardown_disposition": "retry_pending",
             }
-        await _complete_destructive_cleanup("completed")
         return {
             "actions": list(cleanup_actions),
             "teardown_disposition": "completed",

@@ -43,6 +43,11 @@ from orchestrator.services.vm_provisioner import (
 )
 from orchestrator.services.workspace_binding import CANVAS_WORKSPACE_GENERATION_KEY
 from orchestrator.services.vm_workspace_config import vm_provisioning_options
+from orchestrator.services.vm_workspace_recovery_store import (
+    VMWorkspaceRecoveryStore,
+    acquire_vm_cleanup_permit,
+    complete_vm_cleanup_permit,
+)
 from orchestrator.services.workspace_lifecycle import WorkspaceOwner
 
 logger = logging.getLogger(__name__)
@@ -391,6 +396,7 @@ class WorkspaceSuspensionService:
         self._docker_provisioner: Optional[Any] = None
         self._vm_provisioner: Optional[Any] = None
         self._agent_provisioner: Optional[Any] = None
+        self._workspace_recovery_store: Optional[Any] = None
 
     def connect(
         self,
@@ -402,6 +408,7 @@ class WorkspaceSuspensionService:
         agent_provisioner: Any = None,
     ) -> None:
         self._db = db
+        self._workspace_recovery_store = VMWorkspaceRecoveryStore(db)
         self._snapshot_service = snapshot_service
         self._container_provisioner = container_provisioner
         self._docker_provisioner = docker_provisioner
@@ -971,6 +978,15 @@ class WorkspaceSuspensionService:
             }
 
             if self._vm_provisioner and self._vm_provisioner.is_available:
+                cleanup = await acquire_vm_cleanup_permit(
+                    self._workspace_recovery_store,
+                    owner_kind="job",
+                    owner_id=job_id,
+                    identity=vm_identity,
+                    source="job_workspace_suspension",
+                )
+                if not cleanup.allowed:
+                    raise RuntimeError("VM suspension held for workspace recovery")
                 outcome = await self._vm_provisioner.release_vm_captured(
                     job_id,
                     vm_identity,
@@ -978,6 +994,12 @@ class WorkspaceSuspensionService:
                     capture_snapshot=False,
                     entity_type="job",
                 )
+                if outcome.disposition in {"completed", "identity_superseded"}:
+                    await complete_vm_cleanup_permit(
+                        self._workspace_recovery_store,
+                        cleanup,
+                        outcome=outcome.disposition,
+                    )
                 if (
                     not isinstance(outcome, VMTeardownResult)
                     or outcome.disposition != "completed"
@@ -1996,6 +2018,17 @@ class WorkspaceSuspensionService:
             suspended_ctx["_suspend_remote_io_closed"] = str(vm_lease.receipt["id"])
 
             if self._vm_provisioner and self._vm_provisioner.is_available:
+                cleanup = await acquire_vm_cleanup_permit(
+                    self._workspace_recovery_store,
+                    owner_kind="thread",
+                    owner_id=thread_id,
+                    identity=vm_identity,
+                    source="thread_workspace_suspension",
+                )
+                if not cleanup.allowed:
+                    raise RuntimeError(
+                        "thread VM suspension held for workspace recovery"
+                    )
                 outcome = await self._vm_provisioner.release_vm_captured(
                     thread_id,
                     vm_identity,
@@ -2007,6 +2040,12 @@ class WorkspaceSuspensionService:
                     purge_disk=False,
                     capture_snapshot=False,
                 )
+                if outcome.disposition in {"completed", "identity_superseded"}:
+                    await complete_vm_cleanup_permit(
+                        self._workspace_recovery_store,
+                        cleanup,
+                        outcome=outcome.disposition,
+                    )
                 if (
                     not isinstance(outcome, VMTeardownResult)
                     or outcome.disposition != "completed"

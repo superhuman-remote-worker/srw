@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 import json
 import logging
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from fastapi import FastAPI, HTTPException
@@ -339,6 +340,74 @@ async def test_generic_resume_routes_unresolved_workspace_recovery_without_unpar
     recovery_store.retry_paused.assert_awaited_once()
     operations.dependencies.completion_control.guard.assert_not_awaited()
     operations.dependencies.prepare_job_workspace_runtime.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_public_vm_delete_stands_down_before_recovery_owned_cleanup(
+    tmp_path: Path,
+) -> None:
+    operations = _operations(tmp_path)
+    provisioner = operations.dependencies.vm_provisioner
+    provisioner.lifecycle_available = True
+    provisioner.capture_vm_teardown_identity = AsyncMock(
+        return_value=SimpleNamespace(
+            provision_generation="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            vm_uid="bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            rootdisk_pvc_uid="cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+        )
+    )
+    provisioner.release_vm_captured = AsyncMock()
+    provisioner.delete_vm = AsyncMock(return_value=True)
+    operations.dependencies.recovery_store.acquire_cleanup_permit = AsyncMock(
+        return_value=SimpleNamespace(
+            allowed=False,
+            reason="workspace_recovery_unresolved",
+        )
+    )
+
+    with pytest.raises(HTTPException) as refused:
+        await operations.delete_vm(JOB_ID)
+
+    assert refused.value.status_code == 409
+    provisioner.capture_vm_teardown_identity.assert_awaited_once_with(
+        JOB_ID, entity_type="job"
+    )
+    operations.dependencies.recovery_store.acquire_cleanup_permit.assert_awaited_once()
+    provisioner.release_vm_captured.assert_not_awaited()
+    provisioner.delete_vm.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_public_vm_delete_retains_cleanup_permit_on_ambiguous_outcome(
+    tmp_path: Path,
+) -> None:
+    operations = _operations(tmp_path)
+    provisioner = operations.dependencies.vm_provisioner
+    provisioner.lifecycle_available = True
+    identity = SimpleNamespace(
+        provision_generation="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        vm_uid="bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+        rootdisk_pvc_uid="cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+    )
+    provisioner.capture_vm_teardown_identity = AsyncMock(return_value=identity)
+    provisioner.release_vm_captured = AsyncMock(
+        return_value=SimpleNamespace(disposition="retry_pending")
+    )
+    recovery_store = operations.dependencies.recovery_store
+    recovery_store.acquire_cleanup_permit = AsyncMock(
+        return_value=SimpleNamespace(
+            allowed=True,
+            admission_id="dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+        )
+    )
+    recovery_store.complete_cleanup_permit = AsyncMock()
+
+    with pytest.raises(HTTPException) as pending:
+        await operations.delete_vm(JOB_ID)
+
+    assert pending.value.status_code == 500
+    provisioner.release_vm_captured.assert_awaited_once()
+    recovery_store.complete_cleanup_permit.assert_not_awaited()
 
 
 @pytest.mark.asyncio

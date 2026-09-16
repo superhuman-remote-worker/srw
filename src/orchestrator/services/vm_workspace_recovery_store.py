@@ -72,6 +72,60 @@ class WorkspaceRecoveryControlConflict(RuntimeError):
         self.message = message
 
 
+def _cleanup_uuid(value: Any, *, namespace: str) -> UUID:
+    try:
+        return UUID(str(value))
+    except (TypeError, ValueError, AttributeError):
+        return uuid5(NAMESPACE_URL, f"{namespace}:{value}")
+
+
+async def acquire_vm_cleanup_permit(
+    recovery_store: Any,
+    *,
+    owner_kind: str,
+    owner_id: str | UUID,
+    identity: Any,
+    source: str,
+) -> CleanupPermit:
+    """Admit one exact VM/PVC cleanup intent through recovery authority."""
+
+    canonical_owner = _cleanup_uuid(owner_id, namespace=f"{owner_kind}-owner")
+    raw_pvc_uid = getattr(identity, "rootdisk_pvc_uid", None)
+    pvc_uid = (
+        _cleanup_uuid(raw_pvc_uid, namespace="rootdisk-pvc")
+        if raw_pvc_uid is not None
+        else None
+    )
+    intent = ":".join(
+        (
+            source,
+            owner_kind,
+            str(canonical_owner),
+            str(getattr(identity, "provision_generation", "")),
+            str(getattr(identity, "vm_uid", "")),
+            str(pvc_uid or ""),
+        )
+    )
+    return await recovery_store.acquire_cleanup_permit(
+        owner_kind=owner_kind,
+        owner_id=canonical_owner,
+        pvc_uid=pvc_uid,
+        request_id=uuid5(NAMESPACE_URL, f"vm-workspace-cleanup:{intent}"),
+        source=source,
+    )
+
+
+async def complete_vm_cleanup_permit(
+    recovery_store: Any,
+    permit: CleanupPermit | Any,
+    *,
+    outcome: str,
+) -> None:
+    admission_id = getattr(permit, "admission_id", None)
+    if admission_id is not None:
+        await recovery_store.complete_cleanup_permit(admission_id, outcome=outcome)
+
+
 class VMWorkspaceRecoveryStore:
     def __init__(self, db: Any, *, worker_id: str | None = None) -> None:
         self.db = db
@@ -206,20 +260,6 @@ class VMWorkspaceRecoveryStore:
                         "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
                         f"workspace-recovery-pvc:{root_pvc_uid}",
                     )
-                cleanup = await conn.fetchrow(
-                    "SELECT id FROM vm_workspace_cleanup_admissions "
-                    "WHERE ((owner_kind=$1 AND owner_id=$2) "
-                    "OR ($3::uuid IS NOT NULL AND pvc_uid=$3)) "
-                    "AND completed_at IS NULL FOR UPDATE",
-                    owner_kind,
-                    owner_id,
-                    root_pvc_uid,
-                )
-                if cleanup is not None:
-                    raise WorkspaceRecoveryControlConflict(
-                        "workspace_cleanup_already_admitted",
-                        "Workspace cleanup crossed its admission boundary before recovery.",
-                    )
                 membership = await conn.fetchrow(
                     "SELECT parent_job_id, context FROM jobs WHERE id=$1", job_id
                 )
@@ -227,10 +267,10 @@ class VMWorkspaceRecoveryStore:
                     job_id, membership
                 )
                 if ("job", current_owner) not in owner_locks:
-                    # An uncoordinated parent-id writer changed the snapshot.
-                    # Fence the reporter as attention; never acquire a new
-                    # advisory owner out of canonical order or auto-recover.
-                    current_owner, owner_ambiguous = job_id, True
+                    raise WorkspaceRecoveryControlConflict(
+                        "workspace_owner_changed",
+                        "Canonical workspace ownership changed during recovery admission.",
+                    )
                 elif current_owner != job_id:
                     parent = await conn.fetchrow(
                         "SELECT parent_job_id, context FROM jobs WHERE id=$1",
@@ -245,6 +285,20 @@ class VMWorkspaceRecoveryStore:
                     current_owner,
                 )
                 owner_kind, owner_id = "job", current_owner
+                cleanup = await conn.fetchrow(
+                    "SELECT id FROM vm_workspace_cleanup_admissions "
+                    "WHERE ((owner_kind=$1 AND owner_id=$2) "
+                    "OR ($3::uuid IS NOT NULL AND pvc_uid=$3)) "
+                    "AND completed_at IS NULL FOR UPDATE",
+                    owner_kind,
+                    owner_id,
+                    root_pvc_uid,
+                )
+                if cleanup is not None:
+                    raise WorkspaceRecoveryControlConflict(
+                        "workspace_cleanup_already_admitted",
+                        "Workspace cleanup crossed its admission boundary before recovery.",
+                    )
                 prior = await self._accepted_request(
                     conn,
                     job_id=job_id,
@@ -704,23 +758,57 @@ class VMWorkspaceRecoveryStore:
 
         async with self.db.acquire() as conn:
             async with conn.transaction():
-                await conn.execute(
-                    "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
-                    f"workspace-recovery:{owner_kind}:{owner_id}",
-                )
+                owner_locks = {(owner_kind, owner_id)}
+                if owner_kind == "job":
+                    membership = await conn.fetchrow(
+                        "SELECT parent_job_id,context FROM jobs WHERE id=$1",
+                        owner_id,
+                    )
+                    owner_locks.add(("job", owner_id))
+                    if (
+                        membership is not None
+                        and membership["parent_job_id"] is not None
+                    ):
+                        owner_locks.add(("job", membership["parent_job_id"]))
+                for kind, identifier in sorted(owner_locks):
+                    await conn.execute(
+                        "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+                        f"workspace-recovery:{kind}:{identifier}",
+                    )
                 if pvc_uid is not None:
                     await conn.execute(
                         "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
                         f"workspace-recovery-pvc:{pvc_uid}",
                     )
+                if owner_kind == "job":
+                    membership = await conn.fetchrow(
+                        "SELECT parent_job_id,context FROM jobs WHERE id=$1",
+                        owner_id,
+                    )
+                    if membership is not None:
+                        canonical_owner, ambiguous = _job_workspace_owner(
+                            owner_id, membership
+                        )
+                        if ambiguous or ("job", canonical_owner) not in owner_locks:
+                            raise WorkspaceRecoveryControlConflict(
+                                "workspace_owner_changed",
+                                "Canonical workspace ownership changed during cleanup admission.",
+                            )
+                        owner_id = canonical_owner
                 prior = await conn.fetchrow(
-                    "SELECT id,completed_at FROM vm_workspace_cleanup_admissions "
+                    "SELECT id,completed_at,pvc_uid,source "
+                    "FROM vm_workspace_cleanup_admissions "
                     "WHERE owner_kind=$1 AND owner_id=$2 AND request_id=$3 FOR UPDATE",
                     owner_kind,
                     owner_id,
                     request_id,
                 )
                 if prior is not None:
+                    if prior["pvc_uid"] != pvc_uid or prior["source"] != source:
+                        raise WorkspaceRecoveryControlConflict(
+                            "cleanup_request_id_reused",
+                            "Cleanup request ID was already used with different resource intent.",
+                        )
                     return CleanupPermit(
                         allowed=prior["completed_at"] is None,
                         admission_id=prior["id"],
@@ -829,6 +917,19 @@ class VMWorkspaceRecoveryStore:
                     "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
                     f"workspace-recovery:{observed['owner_kind']}:{observed['owner_id']}",
                 )
+                prior = await conn.fetchrow(
+                    "SELECT intent_digest,accepted_result FROM vm_workspace_recovery_requests "
+                    "WHERE scope_kind='recovery' AND scope_id=$1 AND request_id=$2",
+                    operation_id,
+                    request_id,
+                )
+                if prior is not None:
+                    if prior["intent_digest"] != digest:
+                        raise WorkspaceRecoveryControlConflict(
+                            "request_id_reused",
+                            "Recovery request ID was already used with different intent.",
+                        )
+                    return dict(_json(prior["accepted_result"]))
                 roster = await conn.fetch(
                     "SELECT job_id FROM vm_workspace_recovery_jobs "
                     "WHERE recovery_id=$1 AND resolved_at IS NULL ORDER BY job_id",
@@ -1356,4 +1457,6 @@ __all__ = [
     "RecoveryClaim",
     "VMWorkspaceRecoveryStore",
     "WorkspaceRecoveryControlConflict",
+    "acquire_vm_cleanup_permit",
+    "complete_vm_cleanup_permit",
 ]

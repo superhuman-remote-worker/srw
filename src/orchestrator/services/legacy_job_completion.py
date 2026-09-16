@@ -28,6 +28,10 @@ from orchestrator.services.container_provisioner import (
     WorkspaceCleanupOutcome,
 )
 from orchestrator.services.workspace_lifecycle import WorkspaceOwner
+from orchestrator.services.vm_workspace_recovery_store import (
+    acquire_vm_cleanup_permit,
+    complete_vm_cleanup_permit,
+)
 
 
 CompletionCallback = Callable[..., Any]
@@ -44,6 +48,7 @@ class LegacyPersistenceDependencies:
 class LegacyWorkspaceDependencies:
     container_provisioner: Any
     vm_provisioner: Any
+    recovery_store: Any
     cloud_router: Any
     sudo_gate: Any
     get_container_context: CompletionCallback
@@ -996,6 +1001,17 @@ async def complete_job_legacy(
                             job_id,
                             entity_type="job",
                         )
+                        cleanup = await acquire_vm_cleanup_permit(
+                            dependencies.workspace.recovery_store,
+                            owner_kind="job",
+                            owner_id=job_id,
+                            identity=identity,
+                            source="legacy_vm_recovery_release",
+                        )
+                        if not cleanup.allowed:
+                            raise RuntimeError(
+                                "legacy VM recovery held for workspace recovery"
+                            )
                         release = await vm_provisioner.release_vm_captured(
                             job_id,
                             identity,
@@ -1003,6 +1019,15 @@ async def complete_job_legacy(
                             entity_type="job",
                             capture_snapshot=False,
                         )
+                        if release.disposition in {
+                            "completed",
+                            "identity_superseded",
+                        }:
+                            await complete_vm_cleanup_permit(
+                                dependencies.workspace.recovery_store,
+                                cleanup,
+                                outcome=release.disposition,
+                            )
                         vm_deleted = release.disposition == "completed"
                     except Exception:
                         vm_deleted = False

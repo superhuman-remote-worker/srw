@@ -78,6 +78,10 @@ def _deps(**over: Any) -> tcu.ThreadConfigUpdateDependencies:
     )
     for key, value in store_over.items():
         setattr(store, key, value)
+    recovery_store = MagicMock()
+    recovery_store.acquire_cleanup_permit = AsyncMock(
+        return_value=SimpleNamespace(allowed=True, admission_id=None)
+    )
     fields: dict[str, Any] = dict(
         store=store,
         vm_provisioner=SimpleNamespace(
@@ -86,12 +90,23 @@ def _deps(**over: Any) -> tcu.ThreadConfigUpdateDependencies:
             mode="same-cluster",
             create_thread_vm=AsyncMock(return_value=True),
             delete_thread_vm=AsyncMock(return_value=True),
+            capture_vm_teardown_identity=AsyncMock(
+                return_value=SimpleNamespace(
+                    provision_generation="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                    vm_uid="bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+                    rootdisk_pvc_uid="cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+                )
+            ),
+            release_vm_captured=AsyncMock(
+                return_value=SimpleNamespace(disposition="completed")
+            ),
         ),
         container_provisioner=SimpleNamespace(
             is_available=True,
             in_cluster=True,
             create_pinned_thread_workspace=AsyncMock(return_value=True),
         ),
+        recovery_store=recovery_store,
         apply_thread_config_update_locked=AsyncMock(
             return_value=({"llm": {"model": "m"}}, ["d1"])
         ),
@@ -334,9 +349,39 @@ class TestUpgradeToVm:
 
 class TestAbortVmUpgrade:
     @pytest.mark.asyncio
+    async def test_workspace_recovery_blocks_abort_vm_external_delete(self):
+        recovery_store = MagicMock()
+        recovery_store.acquire_cleanup_permit = AsyncMock(
+            return_value=SimpleNamespace(
+                allowed=False,
+                reason="workspace_recovery_unresolved",
+            )
+        )
+        deps = _deps(recovery_store=recovery_store)
+        deps.vm_provisioner.capture_vm_teardown_identity = AsyncMock(
+            return_value=SimpleNamespace(
+                provision_generation="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                vm_uid="bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+                rootdisk_pvc_uid="cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+            )
+        )
+        deps.vm_provisioner.release_vm_captured = AsyncMock()
+
+        with pytest.raises(HTTPException) as exc:
+            await tcu.agent_abort_thread_vm_upgrade(
+                MagicMock(), THREAD, dependencies=deps
+            )
+
+        assert exc.value.status_code == 503
+        recovery_store.acquire_cleanup_permit.assert_awaited_once()
+        deps.vm_provisioner.release_vm_captured.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_unproven_teardown_is_503_and_never_stamps_aborted(self):
         deps = _deps()
-        deps.vm_provisioner.delete_thread_vm = AsyncMock(return_value=False)
+        deps.vm_provisioner.release_vm_captured = AsyncMock(
+            return_value=SimpleNamespace(disposition="process_zero_unproven")
+        )
         with pytest.raises(HTTPException) as exc:
             await tcu.agent_abort_thread_vm_upgrade(
                 MagicMock(), THREAD, dependencies=deps
@@ -351,7 +396,9 @@ class TestAbortVmUpgrade:
     @pytest.mark.asyncio
     async def test_a_raising_delete_is_also_unproven(self):
         deps = _deps()
-        deps.vm_provisioner.delete_thread_vm = AsyncMock(side_effect=RuntimeError("x"))
+        deps.vm_provisioner.release_vm_captured = AsyncMock(
+            side_effect=RuntimeError("x")
+        )
         with pytest.raises(HTTPException) as exc:
             await tcu.agent_abort_thread_vm_upgrade(
                 MagicMock(), THREAD, dependencies=deps

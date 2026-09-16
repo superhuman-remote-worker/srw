@@ -24,6 +24,14 @@ import pytest
 import orchestrator.main as orch_main
 
 
+def _allow_cleanup_store():
+    return SimpleNamespace(
+        acquire_cleanup_permit=AsyncMock(
+            return_value=SimpleNamespace(allowed=True, admission_id=None)
+        )
+    )
+
+
 def _thread_with_vm(status):
     metadata = (
         {"vm": {"status": status, "ssh_host": "vm-thread", "ssh_port": 30022}}
@@ -53,6 +61,11 @@ async def _cleanup_thread(status):
         patch.object(orch_main, "vm_provisioner", vm_provisioner),
         patch.object(
             orch_main, "container_provisioner", SimpleNamespace(is_available=False)
+        ),
+        patch.object(
+            orch_main,
+            "VMWorkspaceRecoveryStore",
+            return_value=_allow_cleanup_store(),
         ),
     ):
         await control_seams.archive_and_cleanup_workspace("t1", entity_type="threads")
@@ -127,6 +140,11 @@ class TestThreadVmReleasedOnTeardown:
             patch.object(
                 orch_main, "container_provisioner", SimpleNamespace(is_available=False)
             ),
+            patch.object(
+                orch_main,
+                "VMWorkspaceRecoveryStore",
+                return_value=_allow_cleanup_store(),
+            ),
         ):
             with pytest.raises(RuntimeError, match="retry_pending"):
                 await control_seams.archive_and_cleanup_workspace(
@@ -161,6 +179,11 @@ async def _cleanup_job(status):
         patch.object(orch_main, "vm_provisioner", vm_provisioner),
         patch.object(
             orch_main, "container_provisioner", SimpleNamespace(is_available=False)
+        ),
+        patch.object(
+            orch_main,
+            "VMWorkspaceRecoveryStore",
+            return_value=_allow_cleanup_store(),
         ),
     ):
         await control_seams.archive_and_cleanup_workspace("j1")

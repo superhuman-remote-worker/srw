@@ -217,7 +217,11 @@ from orchestrator.services import (  # noqa: E402
     run_queue_admin as run_queue_admin_service,
     unit_claim_bundle as unit_claim_bundle_service,
 )
-from orchestrator.services.vm_workspace_recovery_store import VMWorkspaceRecoveryStore  # noqa: E402
+from orchestrator.services.vm_workspace_recovery_store import (  # noqa: E402
+    VMWorkspaceRecoveryStore,
+    acquire_vm_cleanup_permit,
+    complete_vm_cleanup_permit,
+)
 from orchestrator.services import (  # noqa: E402
     commissioned_officer_provisioning as commissioned_officer_provisioning_service,
     pinned_session_mutation_target as pinned_session_mutation_target_service,
@@ -1093,6 +1097,7 @@ def _pinned_retirement_operations() -> PinnedRetirementOperations:
             container_provisioner=container_provisioner,
             docker_provisioner=docker_provisioner,
             vm_provisioner=vm_provisioner,
+            recovery_store=VMWorkspaceRecoveryStore(postgres_db),
             session_router=session_router,
             resolve_protected_reader_backend=functools.partial(
                 protected_cloud_engage._resolve_protected_reader_backend,
@@ -4029,7 +4034,42 @@ async def _try_dispatch_pending_jobs() -> None:
                             max_provision_attempts,
                         )
                         try:
-                            await vm_provisioner.delete_vm(job_id)
+                            identity = (
+                                await vm_provisioner.capture_vm_teardown_identity(
+                                    job_id, entity_type="job"
+                                )
+                            )
+                            recovery_store = VMWorkspaceRecoveryStore(postgres_db)
+                            cleanup = await acquire_vm_cleanup_permit(
+                                recovery_store,
+                                owner_kind="job",
+                                owner_id=job_id,
+                                identity=identity,
+                                source="dispatcher_vm_recycle",
+                            )
+                            if not cleanup.allowed:
+                                logger.warning(
+                                    "Dispatcher: timed-out VM cleanup held for "
+                                    "workspace recovery on job %s",
+                                    job_id,
+                                )
+                                continue
+                            outcome = await vm_provisioner.release_vm_captured(
+                                job_id,
+                                identity,
+                                entity_type="job",
+                                purge_disk=False,
+                                capture_snapshot=False,
+                            )
+                            if outcome.disposition in {
+                                "completed",
+                                "identity_superseded",
+                            }:
+                                await complete_vm_cleanup_permit(
+                                    recovery_store,
+                                    cleanup,
+                                    outcome=outcome.disposition,
+                                )
                         except Exception:
                             logger.exception(
                                 "Dispatcher: failed to delete timed-out VM for job %s",
@@ -6868,6 +6908,7 @@ def _thread_config_update_dependencies() -> (
         store=postgres_db,
         vm_provisioner=vm_provisioner,
         container_provisioner=container_provisioner,
+        recovery_store=VMWorkspaceRecoveryStore(postgres_db),
         apply_thread_config_update_locked=_apply_thread_config_update_locked,
         enforce_workspace_upgrade_grants=(
             lambda *args, **kwargs: (
@@ -7656,6 +7697,7 @@ def _legacy_completion_dependencies() -> (
         workspace=legacy_job_completion_operations.LegacyWorkspaceDependencies(
             container_provisioner=container_provisioner,
             vm_provisioner=vm_provisioner,
+            recovery_store=VMWorkspaceRecoveryStore(postgres_db),
             cloud_router=main_cloud_router,
             sudo_gate=sudo_gate,
             get_container_context=_get_container_context,
@@ -8095,6 +8137,7 @@ def _thread_retirement_operations() -> (
             persistent_provisioner=persistent_provisioner,
             container_provisioner=container_provisioner,
             vm_provisioner=vm_provisioner,
+            recovery_store=VMWorkspaceRecoveryStore(postgres_db),
             docker_provisioner=docker_provisioner,
             workspace_suspension_service=workspace_suspension_service,
             snapshot_service=snapshot_service,
