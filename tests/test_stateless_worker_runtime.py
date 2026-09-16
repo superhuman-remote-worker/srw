@@ -417,6 +417,219 @@ async def test_enabled_vm_recovery_preserves_sandbox_exhaustion_behavior(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ["sandbox", "vm"])
+@pytest.mark.parametrize("admission_enabled", [False, True])
+async def test_disposition_lookup_timeout_does_not_reclassify_ordinary_exhaustion(
+    worker_runtime, monkeypatch, backend, admission_enabled
+):
+    monkeypatch.setenv("VM_WORKSPACE_RECOVERY_ENABLED", str(admission_enabled))
+    claim = _claim(attempts=5)
+    executor, agent, client, _, _, complete, release = _install(
+        monkeypatch,
+        claim,
+        {
+            "should_stop": True,
+            "error": {"type": "llm_unavailable", "recoverable": True},
+        },
+    )
+    client.backend = backend
+    client.get_workspace_recovery_disposition.side_effect = TimeoutError(
+        "lookup offline"
+    )
+    await executor._serve_worker_claim(claim)
+    client.report_completion.assert_awaited_once()
+    assert (
+        client.report_completion.await_args.args[1]["error"]["type"]
+        == "worker_retry_exhausted"
+    )
+    complete.assert_awaited_once()
+    release.assert_not_awaited()
+    assert executor._worker_workspace_recovery is None
+
+
+@pytest.mark.asyncio
+async def test_vm_workspace_failure_keeps_recovery_when_disposition_lookup_times_out(
+    worker_runtime, monkeypatch
+):
+    monkeypatch.setenv("VM_WORKSPACE_RECOVERY_ENABLED", "true")
+    claim = _claim(attempts=5)
+    executor, agent, client, _, _, complete, release = _install(
+        monkeypatch,
+        claim,
+        {"should_stop": True, "error": {"type": "workspace_unavailable"}},
+    )
+    client.backend = "vm"
+    client.get_workspace_recovery_disposition.side_effect = TimeoutError(
+        "lookup offline"
+    )
+    client.report_workspace_recovery.return_value = _recovery_receipt(claim)
+    await executor._serve_worker_claim(claim)
+    client.report_workspace_recovery.assert_awaited_once()
+    client.report_completion.assert_not_awaited()
+    complete.assert_not_awaited()
+    release.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("retirement_fails", [False, True])
+async def test_heartbeat_recovery_during_cleanup_retains_evidence_until_quiesced(
+    worker_runtime, monkeypatch, retirement_fails
+):
+    monkeypatch.setenv("VM_WORKSPACE_RECOVERY_ENABLED", "true")
+    monkeypatch.setattr(turn_executor, "HEARTBEAT_INTERVAL_SECONDS", 0.001)
+    claim = _claim(attempts=5)
+    writer = _FakeAuditWriter()
+    executor, fake, client, renew, rotate, complete, release = _install(
+        monkeypatch,
+        claim,
+        {"should_stop": True, "freeze_data": {"freeze_type": "batch_boundary"}},
+        audit_writer=writer,
+    )
+    client.backend = "vm"
+    backend = RemoteBackend(
+        host="workspace.invalid", key_path="/unused/test-key", job_id=str(claim.unit_id)
+    )
+    agent = UniversalAgent.__new__(UniversalAgent)
+    agent.postgres_conn = fake.postgres_conn
+    agent.process_job = fake.process_job
+    agent._current_job_id = str(claim.unit_id)
+    agent._worker_lease_token = claim.lease_token
+    agent._workspace_manager = SimpleNamespace(backend=backend)
+    agent._shell_manager = None
+    agent._tool_context = None
+    agent._doc_registration_task = None
+    agent._checkpoint_conn = None
+    agent._checkpointer = None
+    agent._worker_env_restore = {}
+    agent._graph = graph = object()
+    pa._agent = agent
+    started = threading.Event()
+    permit_retirement = threading.Event()
+    received = asyncio.Event()
+    original_retire = backend.retire
+
+    def retire():
+        started.set()
+        assert permit_retirement.wait(2)
+        if retirement_fails:
+            raise RuntimeError("resource retirement failed")
+        original_retire()
+
+    backend.retire = retire
+    receipt = _recovery_receipt(claim)
+
+    async def renewal(*args, **kwargs):
+        if started.is_set():
+            return None
+        return _renewal()
+
+    async def lookup(*args, **kwargs):
+        if started.is_set():
+            received.set()
+            return receipt
+        return None
+
+    renew.side_effect = renewal
+    client.get_workspace_recovery_disposition.side_effect = lookup
+    task = asyncio.create_task(executor._serve_worker_claim(claim))
+    try:
+        assert await asyncio.to_thread(started.wait, 1)
+        await asyncio.wait_for(received.wait(), 1)
+        assert not task.done()
+        assert agent._graph is graph
+        assert agent._workspace_manager.backend is backend
+    finally:
+        permit_retirement.set()
+        await task
+    assert _claim_timing_payload(writer)["outcome"] == (
+        "quarantined:workspace_recovery" if retirement_fails else "workspace_recovery"
+    )
+    assert executor._worker_quarantined is retirement_fails
+    assert executor._stop.is_set() is retirement_fails
+    if retirement_fails:
+        assert agent._workspace_manager.backend is backend
+        assert agent._graph is graph
+    else:
+        assert agent._workspace_manager is None
+    rotate.assert_not_awaited()
+    client.report_completion.assert_not_awaited()
+    complete.assert_not_awaited()
+    release.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_recovery_during_rotation_finishes_strict_handoff(
+    worker_runtime, monkeypatch
+):
+    monkeypatch.setenv("VM_WORKSPACE_RECOVERY_ENABLED", "true")
+    monkeypatch.setattr(turn_executor, "HEARTBEAT_INTERVAL_SECONDS", 0.001)
+    claim = _claim(attempts=5)
+    writer = _FakeAuditWriter()
+    executor, agent, client, renew, rotate, complete, release = _install(
+        monkeypatch,
+        claim,
+        {"should_stop": True, "freeze_data": {"freeze_type": "batch_boundary"}},
+        audit_writer=writer,
+    )
+    client.backend = "vm"
+    rotating = asyncio.Event()
+    receipt_observed = asyncio.Event()
+    receipt = _recovery_receipt(claim)
+
+    async def rotation(*args, **kwargs):
+        rotating.set()
+        await receipt_observed.wait()
+        await asyncio.sleep(0)
+        return None
+
+    async def renewal(*args, **kwargs):
+        return None if rotating.is_set() else _renewal()
+
+    async def lookup(*args, **kwargs):
+        if rotating.is_set():
+            receipt_observed.set()
+            return receipt
+        return None
+
+    rotate.side_effect = rotation
+    renew.side_effect = renewal
+    client.get_workspace_recovery_disposition.side_effect = lookup
+    await asyncio.wait_for(executor._serve_worker_claim(claim), 1)
+    assert _claim_timing_payload(writer)["outcome"] == "workspace_recovery"
+    assert agent.cleanup_calls == [True]
+    assert not executor._worker_quarantined
+    client.report_completion.assert_not_awaited()
+    complete.assert_not_awaited()
+    release.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("missing_gate", ["shell", "backend", "unwrap"])
+async def test_strict_vm_retirement_cannot_scrub_unproven_backend(missing_gate):
+    agent = UniversalAgent.__new__(UniversalAgent)
+    backend = SimpleNamespace(retire_shell_owner=MagicMock(), retire=MagicMock())
+    agent._workspace_manager = SimpleNamespace(backend=backend)
+    agent._shell_manager = None
+    agent._tool_context = None
+    agent._scrub_worker_claim_locals = AsyncMock()
+    if missing_gate == "shell":
+        backend.retire_shell_owner = None
+    elif missing_gate == "backend":
+        backend.retire = None
+    else:
+
+        class UnreadableManager:
+            @property
+            def backend(self):
+                raise RuntimeError("backend cannot be resolved")
+
+        agent._workspace_manager = UnreadableManager()
+    with pytest.raises((SubagentQuiescenceError, RuntimeError)):
+        await agent.hold_worker_finalization(strict=True)
+    agent._scrub_worker_claim_locals.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("http_result", [False, True])
 async def test_recovery_accepted_during_completion_response_uses_strict_handoff(
     worker_runtime, monkeypatch, http_result
@@ -683,7 +896,7 @@ class _FakeAgent:
     async def quiesce_worker_workspace_recovery(self):
         await self.cleanup_worker_claim(preserve_shell=True)
 
-    async def hold_worker_finalization(self):
+    async def hold_worker_finalization(self, *, strict=False):
         self.hold_calls += 1
         self.hold_event.set()
 

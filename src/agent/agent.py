@@ -1994,7 +1994,7 @@ class UniversalAgent:
             except Exception:
                 logger.debug("Worker embedding singleton scrub failed", exc_info=True)
 
-    def _worker_workspace_backend(self) -> Any | None:
+    def _worker_workspace_backend(self, *, strict: bool = False) -> Any | None:
         """Return the exact backend retained for this worker disposition."""
 
         retained = getattr(self, "_worker_finalization_backend", None)
@@ -2008,15 +2008,23 @@ class UniversalAgent:
 
             return unwrap_backend(workspace_manager.backend)
         except Exception:
+            if strict:
+                raise
             logger.debug("Could not unwrap worker workspace backend", exc_info=True)
             return None
 
-    def _retire_worker_shell_admission(self, backend: Any | None) -> None:
+    def _retire_worker_shell_admission(
+        self, backend: Any | None, *, strict: bool = False
+    ) -> None:
         """Close local tmux admission once, retaining terminal cleanup power."""
 
-        if backend is None or getattr(self, "_worker_shell_admission_retired", False):
+        if backend is None:
             return
         retire_shell_owner = getattr(backend, "retire_shell_owner", None)
+        if strict and not callable(retire_shell_owner):
+            raise SubagentQuiescenceError("worker backend has no shell admission gate")
+        if getattr(self, "_worker_shell_admission_retired", False):
+            return
         if retire_shell_owner is None:
             self._worker_shell_admission_retired = True
             return
@@ -2027,6 +2035,8 @@ class UniversalAgent:
             # local admission bit is retired.
             retire_shell_owner()
         except Exception:
+            if strict:
+                raise
             logger.warning("Worker shell admission retirement failed", exc_info=True)
         else:
             self._worker_shell_admission_retired = True
@@ -2185,7 +2195,7 @@ class UniversalAgent:
         self._worker_checkpoint_post_commit = None
         self._defer_job_cleanup = False
 
-    async def hold_worker_finalization(self) -> None:
+    async def hold_worker_finalization(self, *, strict: bool = False) -> None:
         """Enter the inert, bounded hold after durable completion acceptance.
 
         This is deliberately not ``cleanup_worker_claim(preserve_shell=True)``:
@@ -2193,16 +2203,30 @@ class UniversalAgent:
         retires the original backend plus all tenant state, retaining only a
         cleanup-only clone with the exact immutable runtime fence.  A later
         :meth:`cleanup_worker_claim` performs the one final disposition.
+
+        Strict mode also prepares ordinary VM retirement, which can race a
+        recovery receipt. No handle is scrubbed until local quiescence is proven.
         """
 
         if getattr(self, "_worker_finalization_held", False):
+            if strict:
+                await asyncio.to_thread(
+                    self._retire_worker_shell_admission,
+                    self._worker_workspace_backend(strict=True),
+                    strict=True,
+                )
             return
         # Child terminal evidence must be committed while parent authority and
         # its transport are still live.  Never retire the shell/backend first.
         await self._quiesce_subagent_runtime("worker finalization hold")
-        backend = self._worker_workspace_backend()
+        backend = self._worker_workspace_backend(strict=strict)
         self._worker_finalization_backend = backend
-        self._retire_worker_shell_admission(backend)
+        if strict:
+            await asyncio.to_thread(
+                self._retire_worker_shell_admission, backend, strict=True
+            )
+        else:
+            self._retire_worker_shell_admission(backend)
 
         # Retain only a cleanup-only clone carrying immutable workspace/job/
         # runtime/token authority.  The original backend is then fully retired,
@@ -2218,6 +2242,8 @@ class UniversalAgent:
                 )
             self._worker_terminal_shell_cleanup = make_cleanup()
         retire = getattr(backend, "retire", None) if backend else None
+        if strict and backend is not None and not callable(retire):
+            raise SubagentQuiescenceError("worker backend has no retirement gate")
         if retire is not None:
             await asyncio.to_thread(retire)
         await self._scrub_worker_claim_locals()
