@@ -132,9 +132,16 @@ def workspace_recovery_enabled() -> bool:
     }
 
 
+def workspace_replacement_recovery_enabled() -> bool:
+    return os.getenv(
+        "VM_WORKSPACE_REPLACEMENT_RECOVERY_ENABLED", "false"
+    ).strip().lower() in {"1", "true", "yes", "on"}
+
+
 __all__ = [
     "RecoveryAttemptDisposition",
     "WorkspaceRecoveryCode",
     "WorkspaceRecoveryDisposition",
     "workspace_recovery_enabled",
+    "workspace_replacement_recovery_enabled",
 ]

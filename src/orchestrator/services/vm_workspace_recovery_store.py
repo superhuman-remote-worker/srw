@@ -177,6 +177,19 @@ class CleanupPermit:
     completed_outcome: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class RetentionPinCommand:
+    recovery_id: UUID
+    pvc_uid: UUID
+    provision_generation: UUID
+    desired_state: str
+    owner_kind: str
+    owner_id: UUID
+    namespace: str
+    controller_pin_uid: str | None = None
+    controller_pin_resource_version: str | None = None
+
+
 class WorkspaceRecoveryControlConflict(RuntimeError):
     def __init__(self, code: str, message: str) -> None:
         super().__init__(message)
@@ -1472,6 +1485,358 @@ class VMWorkspaceRecoveryStore:
             authority_digest=authority_digest,
         )
 
+    async def list_retention_pin_commands(
+        self, *, limit: int = 32
+    ) -> list[RetentionPinCommand]:
+        """Return durable controller pin work without claiming it as completed."""
+
+        async with self.db.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT pin.recovery_id,pin.pvc_uid,pin.provision_generation,
+                       pin.released_at,pin.controller_pinned_at,
+                       pin.controller_pin_uid,pin.controller_pin_resource_version,
+                       recovery.owner_kind,recovery.owner_id,recovery.namespace
+                  FROM vm_workspace_recovery_retention_pins pin
+                  JOIN vm_workspace_recoveries recovery ON recovery.id=pin.recovery_id
+                 WHERE pin.controller_sync_after <= clock_timestamp()
+                   AND ((pin.released_at IS NULL
+                         AND pin.controller_pinned_at IS NULL)
+                        OR (pin.released_at IS NOT NULL
+                            AND pin.controller_pinned_at IS NOT NULL
+                            AND pin.controller_released_at IS NULL))
+                 ORDER BY pin.controller_sync_after,pin.pinned_at
+                 LIMIT $1
+                """,
+                max(1, limit),
+            )
+        return [
+            RetentionPinCommand(
+                recovery_id=row["recovery_id"],
+                pvc_uid=row["pvc_uid"],
+                provision_generation=row["provision_generation"],
+                desired_state="released" if row["released_at"] else "active",
+                owner_kind=row["owner_kind"],
+                owner_id=row["owner_id"],
+                namespace=row["namespace"],
+                controller_pin_uid=row["controller_pin_uid"],
+                controller_pin_resource_version=row["controller_pin_resource_version"],
+            )
+            for row in rows
+        ]
+
+    async def retention_pin_command(
+        self, claim: RecoveryClaim
+    ) -> RetentionPinCommand | None:
+        """Return the exact active-pin command for one current recovery claim."""
+
+        async with self.db.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                SELECT pin.recovery_id,pin.pvc_uid,pin.provision_generation,
+                       pin.controller_pinned_at,pin.controller_pin_uid,
+                       pin.controller_pin_resource_version,
+                       recovery.owner_kind,recovery.owner_id,recovery.namespace
+                  FROM vm_workspace_recovery_retention_pins pin
+                  JOIN vm_workspace_recoveries recovery ON recovery.id=pin.recovery_id
+                  JOIN vm_workspace_recovery_probe_slots slot
+                    ON slot.recovery_id=recovery.id
+                   AND slot.claim_token=recovery.claim_token
+                 WHERE recovery.id=$1 AND recovery.version=$2
+                   AND recovery.claim_token=$3 AND recovery.claimed_by=$4
+                   AND recovery.claimed_until > clock_timestamp()
+                   AND slot.leased_until > clock_timestamp()
+                   AND recovery.resolved_at IS NULL
+                   AND pin.released_at IS NULL
+                   AND pin.pvc_uid=$5 AND pin.provision_generation=$6
+                """,
+                claim.operation_id,
+                claim.version,
+                claim.claim_token,
+                self.worker_id,
+                claim.captured_identity.get("root_pvc_uid"),
+                claim.captured_identity.get("provision_generation"),
+            )
+        if row is None:
+            return None
+        return RetentionPinCommand(
+            recovery_id=row["recovery_id"],
+            pvc_uid=row["pvc_uid"],
+            provision_generation=row["provision_generation"],
+            desired_state="active",
+            owner_kind=row["owner_kind"],
+            owner_id=row["owner_id"],
+            namespace=row["namespace"],
+            controller_pin_uid=row["controller_pin_uid"],
+            controller_pin_resource_version=row["controller_pin_resource_version"],
+        )
+
+    async def acknowledge_retention_pin(
+        self, command: RetentionPinCommand, result: Mapping[str, Any]
+    ) -> bool:
+        """Persist only an exact controller acknowledgement of the desired state."""
+
+        if result.get("state") != command.desired_state:
+            return False
+        if str(result.get("recovery_id") or "") != str(command.recovery_id):
+            return False
+        if str(result.get("pvc_uid") or "") != str(command.pvc_uid):
+            return False
+        if str(result.get("provision_generation") or "") != str(
+            command.provision_generation
+        ):
+            return False
+        pin_uid = result.get("pin_uid")
+        resource_version = result.get("resource_version")
+        if not isinstance(pin_uid, str) or not pin_uid:
+            return False
+        if not isinstance(resource_version, str) or not resource_version:
+            return False
+        async with self.db.acquire() as conn:
+            if command.desired_state == "active":
+                changed = await conn.fetchval(
+                    """
+                    UPDATE vm_workspace_recovery_retention_pins
+                       SET controller_pinned_at=COALESCE(controller_pinned_at,
+                                                        clock_timestamp()),
+                           controller_pin_uid=$4,
+                           controller_pin_resource_version=$5,
+                           controller_sync_attempts=controller_sync_attempts+1,
+                           controller_sync_error=NULL,
+                           controller_sync_after=clock_timestamp()
+                     WHERE recovery_id=$1 AND pvc_uid=$2
+                       AND provision_generation=$3 AND released_at IS NULL
+                    RETURNING 1
+                    """,
+                    command.recovery_id,
+                    command.pvc_uid,
+                    command.provision_generation,
+                    pin_uid,
+                    resource_version,
+                )
+            else:
+                changed = await conn.fetchval(
+                    """
+                    UPDATE vm_workspace_recovery_retention_pins
+                       SET controller_release_requested_at=COALESCE(
+                               controller_release_requested_at,clock_timestamp()),
+                           controller_released_at=clock_timestamp(),
+                           controller_sync_attempts=controller_sync_attempts+1,
+                           controller_sync_error=NULL,
+                           controller_sync_after=clock_timestamp()
+                     WHERE recovery_id=$1 AND pvc_uid=$2
+                       AND provision_generation=$3 AND released_at IS NOT NULL
+                       AND controller_released_at IS NULL
+                       AND controller_pin_uid=$4
+                    RETURNING 1
+                    """,
+                    command.recovery_id,
+                    command.pvc_uid,
+                    command.provision_generation,
+                    pin_uid,
+                )
+        return changed is not None
+
+    async def defer_retention_pin_command(
+        self, command: RetentionPinCommand, *, error: str
+    ) -> None:
+        async with self.db.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE vm_workspace_recovery_retention_pins
+                   SET controller_sync_attempts=controller_sync_attempts+1,
+                       controller_sync_error=$4,
+                       controller_sync_after=clock_timestamp()+interval '10 seconds'
+                 WHERE recovery_id=$1 AND pvc_uid=$2 AND provision_generation=$3
+                   AND controller_released_at IS NULL
+                """,
+                command.recovery_id,
+                command.pvc_uid,
+                command.provision_generation,
+                error[:500],
+            )
+
+    async def retention_pin_is_acknowledged(self, claim: RecoveryClaim) -> bool:
+        async with self.db.acquire() as conn:
+            return bool(
+                await conn.fetchval(
+                    """
+                    SELECT EXISTS(
+                        SELECT 1
+                          FROM vm_workspace_recovery_retention_pins pin
+                          JOIN vm_workspace_recoveries recovery
+                            ON recovery.id=pin.recovery_id
+                          JOIN vm_workspace_recovery_probe_slots slot
+                            ON slot.recovery_id=recovery.id
+                           AND slot.claim_token=recovery.claim_token
+                         WHERE recovery.id=$1 AND recovery.version=$2
+                           AND recovery.claim_token=$3
+                           AND recovery.claimed_by=$4
+                           AND recovery.claimed_until > clock_timestamp()
+                           AND slot.leased_until > clock_timestamp()
+                           AND recovery.resolved_at IS NULL
+                           AND pin.pvc_uid=$5 AND pin.provision_generation=$6
+                           AND pin.released_at IS NULL
+                           AND pin.controller_pinned_at IS NOT NULL
+                           AND pin.controller_released_at IS NULL
+                    )
+                    """,
+                    claim.operation_id,
+                    claim.version,
+                    claim.claim_token,
+                    self.worker_id,
+                    claim.captured_identity.get("root_pvc_uid"),
+                    claim.captured_identity.get("provision_generation"),
+                )
+            )
+
+    async def accept_stop_evidence(
+        self, claim: RecoveryClaim, evidence: Mapping[str, Any]
+    ) -> str | None:
+        """Append exact controller evidence while the accepting term is live."""
+
+        required = (
+            "vm_uid",
+            "vmi_uid",
+            "launcher_uid",
+            "container_id",
+            "root_pvc_uid",
+            "controller_identity",
+            "observed_at",
+        )
+        if evidence.get("protocol_version") != 1 or any(
+            not isinstance(evidence.get(key), str) or not evidence.get(key)
+            for key in required
+        ):
+            return None
+        if any(
+            str(evidence.get(key)) != str(claim.captured_identity.get(captured))
+            for key, captured in (
+                ("vm_uid", "vm_uid"),
+                ("vmi_uid", "prior_vmi_uid"),
+                ("launcher_uid", "prior_launcher_uid"),
+                ("root_pvc_uid", "root_pvc_uid"),
+            )
+        ):
+            return None
+        canonical = dict(evidence)
+        supplied_digest = canonical.pop("evidence_digest", None)
+        digest = (
+            "sha256:"
+            + hashlib.sha256(
+                json.dumps(
+                    canonical, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+                ).encode("utf-8")
+            ).hexdigest()
+        )
+        if supplied_digest not in {None, digest}:
+            return None
+        try:
+            observed_at = datetime.fromisoformat(
+                str(evidence["observed_at"]).replace("Z", "+00:00")
+            )
+        except ValueError:
+            return None
+        async with self.db.acquire() as conn:
+            inserted = await conn.fetchval(
+                """
+                INSERT INTO vm_workspace_recovery_stop_receipts (
+                    recovery_id,accepted_claim_token,vm_uid,vmi_uid,launcher_uid,
+                    container_id,root_pvc_uid,controller_identity,observed_at,
+                    evidence,evidence_digest
+                )
+                SELECT recovery.id,$3,recovery.vm_uid,recovery.prior_vmi_uid,
+                       recovery.prior_launcher_uid,$5,recovery.root_pvc_uid,$6,$7,
+                       $8::jsonb,$9
+                  FROM vm_workspace_recoveries recovery
+                  JOIN vm_workspace_recovery_probe_slots slot
+                    ON slot.recovery_id=recovery.id
+                   AND slot.claim_token=recovery.claim_token
+                 WHERE recovery.id=$1 AND recovery.version=$2
+                   AND recovery.claim_token=$3 AND recovery.claimed_by=$4
+                   AND recovery.claimed_until > clock_timestamp()
+                   AND slot.leased_until > clock_timestamp()
+                   AND recovery.resolved_at IS NULL
+                   AND recovery.vm_uid=$10 AND recovery.prior_vmi_uid=$11
+                   AND recovery.prior_launcher_uid=$12
+                   AND recovery.root_pvc_uid=$13
+                ON CONFLICT (recovery_id,evidence_digest) DO NOTHING
+                RETURNING evidence_digest
+                """,
+                claim.operation_id,
+                claim.version,
+                claim.claim_token,
+                self.worker_id,
+                evidence["container_id"],
+                evidence["controller_identity"],
+                observed_at,
+                json.dumps(canonical),
+                digest,
+                claim.captured_identity.get("vm_uid"),
+                claim.captured_identity.get("prior_vmi_uid"),
+                claim.captured_identity.get("prior_launcher_uid"),
+                claim.captured_identity.get("root_pvc_uid"),
+            )
+            if inserted is not None:
+                return str(inserted)
+            return await conn.fetchval(
+                """
+                SELECT receipt.evidence_digest
+                  FROM vm_workspace_recovery_stop_receipts receipt
+                  JOIN vm_workspace_recoveries recovery
+                    ON recovery.id=receipt.recovery_id
+                  JOIN vm_workspace_recovery_probe_slots slot
+                    ON slot.recovery_id=recovery.id
+                   AND slot.claim_token=recovery.claim_token
+                 WHERE recovery.id=$1 AND recovery.version=$3
+                   AND recovery.claim_token=$4 AND recovery.claimed_by=$5
+                   AND recovery.claimed_until > clock_timestamp()
+                   AND slot.leased_until > clock_timestamp()
+                   AND recovery.resolved_at IS NULL
+                   AND receipt.evidence_digest=$2
+                   AND receipt.vm_uid=recovery.vm_uid
+                   AND receipt.vmi_uid=recovery.prior_vmi_uid
+                   AND receipt.launcher_uid=recovery.prior_launcher_uid
+                   AND receipt.root_pvc_uid=recovery.root_pvc_uid
+                """,
+                claim.operation_id,
+                digest,
+                claim.version,
+                claim.claim_token,
+                self.worker_id,
+            )
+
+    async def trusted_stop_receipt(self, claim: RecoveryClaim) -> str | None:
+        """Read historical positive evidence for the exact captured incarnation."""
+
+        async with self.db.acquire() as conn:
+            return await conn.fetchval(
+                """
+                SELECT receipt.evidence_digest
+                  FROM vm_workspace_recovery_stop_receipts receipt
+                  JOIN vm_workspace_recoveries recovery
+                    ON recovery.id=receipt.recovery_id
+                  JOIN vm_workspace_recovery_probe_slots slot
+                    ON slot.recovery_id=recovery.id
+                   AND slot.claim_token=recovery.claim_token
+                 WHERE recovery.id=$1 AND recovery.version=$2
+                   AND recovery.claim_token=$3 AND recovery.claimed_by=$4
+                   AND recovery.claimed_until > clock_timestamp()
+                   AND slot.leased_until > clock_timestamp()
+                   AND recovery.resolved_at IS NULL
+                   AND receipt.vm_uid=recovery.vm_uid
+                   AND receipt.vmi_uid=recovery.prior_vmi_uid
+                   AND receipt.launcher_uid=recovery.prior_launcher_uid
+                   AND receipt.root_pvc_uid=recovery.root_pvc_uid
+                 ORDER BY receipt.accepted_at
+                 LIMIT 1
+                """,
+                claim.operation_id,
+                claim.version,
+                claim.claim_token,
+                self.worker_id,
+            )
+
     async def claim_due(
         self,
         operation_id: UUID,
@@ -2218,7 +2583,7 @@ class VMWorkspaceRecoveryStore:
                         """
                         SELECT EXISTS(
                             SELECT 1 FROM vm_workspace_recovery_stop_receipts
-                             WHERE recovery_id=$1 AND accepted_claim_token=$2
+                             WHERE recovery_id=$1 AND accepted_claim_token <= $2
                                AND vm_uid=$3 AND vmi_uid=$4
                                AND launcher_uid=$5 AND root_pvc_uid=$6
                                AND evidence_digest=$7
@@ -2505,6 +2870,7 @@ class VMWorkspaceRecoveryStore:
 __all__ = [
     "CleanupPermit",
     "RecoveryClaim",
+    "RetentionPinCommand",
     "VMWorkspaceRecoveryStore",
     "WorkspaceRecoveryControlConflict",
     "acquire_vm_cleanup_permit",

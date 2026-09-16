@@ -6,7 +6,7 @@ import asyncio
 import json
 import os
 from contextlib import asynccontextmanager
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import UUID, uuid4
 from urllib.parse import urlsplit
@@ -1357,6 +1357,156 @@ async def test_stop_receipts_are_append_only_and_bind_exact_identity(app_pg) -> 
                 "DELETE FROM vm_workspace_recovery_stop_receipts WHERE id=$1",
                 receipt_id,
             )
+
+
+@pytest.mark.asyncio
+async def test_historical_stop_receipt_is_accepted_once_and_reused_by_new_term(
+    app_pg,
+) -> None:
+    recovery_id = await insert_recovery(app_pg)
+    store = VMWorkspaceRecoveryStore(app_pg, worker_id="receipt-controller")
+    first = await store.claim_due(recovery_id)
+    assert first is not None
+    evidence = {
+        "protocol_version": 1,
+        "vm_uid": str(first.captured_identity["vm_uid"]),
+        "vmi_uid": str(first.captured_identity["prior_vmi_uid"]),
+        "launcher_uid": str(first.captured_identity["prior_launcher_uid"]),
+        "container_id": "containerd://old-compute",
+        "root_pvc_uid": str(first.captured_identity["root_pvc_uid"]),
+        "controller_identity": "controller/pod-1",
+        "observed_at": datetime.now(timezone.utc).isoformat(),
+        "containers": [
+            {
+                "name": "compute",
+                "container_id": "containerd://old-compute",
+                "restart_count": 0,
+                "finished_at": datetime.now(timezone.utc).isoformat(),
+            }
+        ],
+    }
+    digest = await store.accept_stop_evidence(first, evidence)
+    assert digest and digest.startswith("sha256:")
+    assert await store.accept_stop_evidence(first, evidence) == digest
+    assert await store.defer_claim(
+        operation_id=first.operation_id,
+        version=first.version,
+        claim_token=first.claim_token,
+        phase="verifying_stop",
+        next_check_seconds=0,
+    )
+    second = await store.claim_due(recovery_id)
+    assert second is not None and second.claim_token > first.claim_token
+    assert await store.trusted_stop_receipt(second) == digest
+
+
+@pytest.mark.asyncio
+async def test_controller_pin_desired_and_ack_state_survive_store_restart(
+    app_pg,
+) -> None:
+    recovery_id = await insert_recovery(app_pg)
+    async with app_pg.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT provision_generation,root_pvc_uid FROM vm_workspace_recoveries "
+            "WHERE id=$1",
+            recovery_id,
+        )
+        await conn.execute(
+            "INSERT INTO vm_workspace_recovery_retention_pins "
+            "(recovery_id,pvc_uid,provision_generation) VALUES ($1,$2,$3)",
+            recovery_id,
+            row["root_pvc_uid"],
+            row["provision_generation"],
+        )
+    first_store = VMWorkspaceRecoveryStore(app_pg, worker_id="controller-sync-a")
+    commands = await first_store.list_retention_pin_commands()
+    assert len(commands) == 1 and commands[0].desired_state == "active"
+    command = commands[0]
+    assert await first_store.acknowledge_retention_pin(
+        command,
+        {
+            "state": "active",
+            "recovery_id": str(recovery_id),
+            "pvc_uid": str(row["root_pvc_uid"]),
+            "provision_generation": str(row["provision_generation"]),
+            "pin_uid": "controller-pin-uid",
+            "resource_version": "11",
+        },
+    )
+
+    restarted = VMWorkspaceRecoveryStore(app_pg, worker_id="controller-sync-b")
+    assert await restarted.list_retention_pin_commands() == []
+    async with app_pg.acquire() as conn:
+        persisted = await conn.fetchrow(
+            "SELECT controller_pinned_at,controller_pin_uid,"
+            "controller_pin_resource_version FROM "
+            "vm_workspace_recovery_retention_pins WHERE recovery_id=$1",
+            recovery_id,
+        )
+    assert persisted["controller_pinned_at"] is not None
+    assert persisted["controller_pin_uid"] == "controller-pin-uid"
+    assert persisted["controller_pin_resource_version"] == "11"
+
+
+@pytest.mark.asyncio
+async def test_controller_pin_release_is_exact_and_failed_sync_stays_durable(
+    app_pg,
+) -> None:
+    recovery_id = await insert_recovery(app_pg)
+    async with app_pg.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT provision_generation,root_pvc_uid FROM vm_workspace_recoveries "
+            "WHERE id=$1",
+            recovery_id,
+        )
+        await conn.execute(
+            "INSERT INTO vm_workspace_recovery_retention_pins "
+            "(recovery_id,pvc_uid,provision_generation,controller_pinned_at,"
+            "controller_pin_uid,controller_pin_resource_version,released_at) "
+            "VALUES ($1,$2,$3,clock_timestamp(),'pin-current','4',clock_timestamp())",
+            recovery_id,
+            row["root_pvc_uid"],
+            row["provision_generation"],
+        )
+    store = VMWorkspaceRecoveryStore(app_pg, worker_id="controller-sync")
+    command = (await store.list_retention_pin_commands())[0]
+    await store.defer_retention_pin_command(command, error="controller unavailable")
+    async with app_pg.acquire() as conn:
+        persisted = await conn.fetchrow(
+            "SELECT controller_released_at,controller_sync_error FROM "
+            "vm_workspace_recovery_retention_pins WHERE recovery_id=$1",
+            recovery_id,
+        )
+        await conn.execute(
+            "UPDATE vm_workspace_recovery_retention_pins "
+            "SET controller_sync_after=clock_timestamp() WHERE recovery_id=$1",
+            recovery_id,
+        )
+    assert persisted["controller_released_at"] is None
+    assert persisted["controller_sync_error"] == "controller unavailable"
+    command = (await store.list_retention_pin_commands())[0]
+    assert not await store.acknowledge_retention_pin(
+        command,
+        {
+            "state": "released",
+            "recovery_id": str(recovery_id),
+            "pvc_uid": str(row["root_pvc_uid"]),
+            "provision_generation": str(row["provision_generation"]),
+            "pin_uid": "pin-stale",
+            "resource_version": "4",
+        },
+    )
+    assert await store.acknowledge_retention_pin(
+        command,
+        {
+            "state": "released",
+            "recovery_id": str(recovery_id),
+            "pvc_uid": str(row["root_pvc_uid"]),
+            "provision_generation": str(row["provision_generation"]),
+            "pin_uid": "pin-current",
+            "resource_version": "4",
+        },
+    )
 
 
 @pytest.mark.asyncio

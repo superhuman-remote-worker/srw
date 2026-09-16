@@ -16,6 +16,7 @@ from orchestrator.services.vm_workspace_recovery import (
     recovery_retry_delay,
 )
 from orchestrator.services.vm_workspace_recovery_store import RecoveryClaim
+from orchestrator.services.vm_workspace_recovery_store import RetentionPinCommand
 from shared.workspace_recovery import WorkspaceRecoveryCode
 
 
@@ -88,6 +89,17 @@ class FakeStore:
         self.released: list[dict[str, object]] = []
         self.disabled_pauses = 0
         self.renewed: list[RecoveryClaim] = []
+        self.pin_deferred: list[str] = []
+        self.pin_acknowledged = True
+        self.pin_command = RetentionPinCommand(
+            recovery_id=OPERATION_ID,
+            pvc_uid=PVC_UID,
+            provision_generation=GENERATION,
+            desired_state="active",
+            owner_kind="job",
+            owner_id=OWNER_ID,
+            namespace="agent-vms",
+        )
 
     async def claim_due(self, operation_id, *, ttl_seconds=30):
         assert operation_id == OPERATION_ID
@@ -125,6 +137,58 @@ class FakeStore:
         self.disabled_pauses += 1
         return 1
 
+    async def list_retention_pin_commands(self, *, limit=32):
+        assert limit == 32
+        return []
+
+    async def retention_pin_command(self, recovery_claim):
+        return self.pin_command
+
+    async def retention_pin_is_acknowledged(self, recovery_claim):
+        return self.pin_acknowledged
+
+    async def acknowledge_retention_pin(self, command, result):
+        self.pin_acknowledged = result.get("state") == "active"
+        return self.pin_acknowledged
+
+    async def defer_retention_pin_command(self, command, *, error):
+        self.pin_deferred.append(error)
+
+    async def accept_stop_evidence(self, recovery_claim, evidence):
+        return evidence.get("evidence_digest")
+
+    async def trusted_stop_receipt(self, recovery_claim):
+        return "sha256:trusted-stop"
+
+
+class PinStore(FakeStore):
+    def __init__(self, *, acknowledged: bool = False) -> None:
+        super().__init__()
+        self.acknowledged = acknowledged
+        self.pin_acknowledged = acknowledged
+        self.command = RetentionPinCommand(
+            recovery_id=OPERATION_ID,
+            pvc_uid=PVC_UID,
+            provision_generation=GENERATION,
+            desired_state="active",
+            owner_kind="job",
+            owner_id=OWNER_ID,
+            namespace="agent-vms",
+        )
+
+    async def retention_pin_command(self, recovery_claim):
+        return self.command
+
+    async def retention_pin_is_acknowledged(self, recovery_claim):
+        return self.acknowledged
+
+    async def acknowledge_retention_pin(self, command, result):
+        self.acknowledged = result.get("state") == "active"
+        return self.acknowledged
+
+    async def defer_retention_pin_command(self, command, *, error):
+        self.pin_deferred.append(error)
+
 
 class Observer:
     def __init__(self, observations: list[dict[str, object]]) -> None:
@@ -145,6 +209,53 @@ def service(store: FakeStore, observer: object) -> VMWorkspaceRecoveryService:
         jitter=lambda: 1.0,
         claim_poll_seconds=0.001,
     )
+
+
+@pytest.mark.asyncio
+async def test_observation_waits_for_exact_controller_pin_ack() -> None:
+    recovery_store = PinStore()
+    observer = Observer([ready_observation()])
+
+    await service(recovery_store, observer).reconcile_once(OPERATION_ID)
+
+    assert observer.calls == 0
+    assert recovery_store.deferred[-1]["diagnostic"]["reason"] == (
+        "controller_retention_pin_unacknowledged"
+    )
+    assert recovery_store.pin_deferred
+
+
+@pytest.mark.asyncio
+async def test_pin_response_loss_retries_before_observation() -> None:
+    recovery_store = PinStore()
+    observation = ready_observation()
+
+    class PinObserver(Observer):
+        def __init__(self):
+            super().__init__([observation, observation.copy()])
+            self.pin_attempts = 0
+
+        async def reconcile_workspace_recovery_pin(self, command):
+            self.pin_attempts += 1
+            if self.pin_attempts == 1:
+                raise TimeoutError("response lost")
+            return {
+                "state": "active",
+                "recovery_id": str(command.recovery_id),
+                "pvc_uid": str(command.pvc_uid),
+                "provision_generation": str(command.provision_generation),
+                "pin_uid": "pin-uid",
+                "resource_version": "2",
+            }
+
+    observer = PinObserver()
+    recovery = service(recovery_store, observer)
+    await recovery.reconcile_once(OPERATION_ID)
+    await recovery.reconcile_once(OPERATION_ID)
+
+    assert observer.pin_attempts == 2
+    assert observer.calls == 2
+    assert recovery_store.released
 
 
 def test_recovery_retry_delay_is_jittered_and_capped() -> None:
@@ -196,7 +307,6 @@ async def test_changed_final_attestation_retains_hold_for_attention() -> None:
     "mutation",
     [
         lambda value: value.__setitem__("ambiguous", True),
-        lambda value: value.__setitem__("prior_runtime", "unknown"),
         lambda value: value["successor"].pop("node_uid"),
         lambda value: value["successor"].pop("ssh_registration_id"),
         lambda value: value.__setitem__("continuation", "unknown"),

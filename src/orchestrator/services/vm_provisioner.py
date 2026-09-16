@@ -4,6 +4,7 @@ import base64
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import hashlib
 import ipaddress
 import json
 import logging
@@ -1948,6 +1949,149 @@ class VMProvisioner:
                 return None
             result.pop("_identity_authenticated", None)
         return result
+
+    async def reconcile_workspace_recovery_pin(self, command: Any) -> Mapping[str, Any]:
+        """Project one durable DB pin into the controller's Lease registry."""
+
+        if not self._http_available or self._http_client is None:
+            raise RuntimeError("same-cluster recovery pin transport is unavailable")
+        payload = {
+            "recovery_id": str(command.recovery_id),
+            "pvc_uid": str(command.pvc_uid),
+            "provision_generation": str(command.provision_generation),
+            "state": command.desired_state,
+            "owner_kind": command.owner_kind,
+            "owner_id": str(command.owner_id),
+            "namespace": command.namespace,
+        }
+        if command.controller_pin_uid is not None:
+            payload["pin_uid"] = command.controller_pin_uid
+        if command.controller_pin_resource_version is not None:
+            payload["resource_version"] = command.controller_pin_resource_version
+        signed = sign_payload(
+            payload,
+            direction="request",
+            operation="recovery-pin",
+            secret=self._lifecycle_hmac_secret,
+        )
+        auth = signed.get(AUTH_FIELD)
+        request_id = auth.get("request_id") if isinstance(auth, Mapping) else None
+        response = await self._http_client.post(
+            "/workspace-recovery/pins", json=signed, timeout=self._http_timeout
+        )
+        data = response.json()
+        if not isinstance(data, Mapping) or not verify_payload(
+            data,
+            direction="response",
+            operation="recovery-pin",
+            secret=self._lifecycle_hmac_secret,
+            expected_correlation_id=request_id,
+        ):
+            raise RuntimeError("workspace recovery pin response is unauthenticated")
+        response.raise_for_status()
+        return unsigned_payload(data)
+
+    async def observe_workspace_recovery(
+        self, captured_identity: Mapping[str, Any]
+    ) -> Mapping[str, Any]:
+        """Observe recovery authority without calling status persistence."""
+
+        if not self._http_available or self._http_client is None:
+            raise RuntimeError("same-cluster recovery observation is unavailable")
+        payload = {key: str(value) for key, value in captured_identity.items()}
+        signed = sign_payload(
+            payload,
+            direction="request",
+            operation="recovery-observe",
+            secret=self._lifecycle_hmac_secret,
+        )
+        auth = signed.get(AUTH_FIELD)
+        request_id = auth.get("request_id") if isinstance(auth, Mapping) else None
+        response = await self._http_client.post(
+            "/workspace-recovery/observe", json=signed, timeout=self._http_timeout
+        )
+        data = response.json()
+        if not isinstance(data, Mapping) or not verify_payload(
+            data,
+            direction="response",
+            operation="recovery-observe",
+            secret=self._lifecycle_hmac_secret,
+            expected_correlation_id=request_id,
+        ):
+            raise RuntimeError("workspace recovery observation is unauthenticated")
+        response.raise_for_status()
+        observation = dict(unsigned_payload(data))
+        owner_kind = str(captured_identity.get("owner_kind") or "")
+        owner_id = str(captured_identity.get("owner_id") or "")
+        try:
+            row = (
+                await self._db.get_thread(owner_id)
+                if owner_kind == "thread"
+                else await self._db.get_job(owner_id)
+            )
+        except Exception as exc:
+            raise RuntimeError("workspace recovery owner read failed") from exc
+        if not isinstance(row, Mapping):
+            raise RuntimeError("workspace recovery owner is unavailable")
+        context = (
+            _extract_thread_vm_context(row)
+            if owner_kind == "thread"
+            else _extract_vm_context(dict(row))
+        )
+        if any(
+            str(context.get(context_key) or "")
+            != str(captured_identity.get(captured_key) or "")
+            for context_key, captured_key in (
+                ("provision_generation", "provision_generation"),
+                ("vm_uid", "vm_uid"),
+                ("rootdisk_pvc_uid", "root_pvc_uid"),
+            )
+        ):
+            observation["ambiguous"] = True
+            return observation
+        successor = observation.get("successor")
+        if observation.get("ready") is not True or not isinstance(successor, Mapping):
+            return observation
+        fingerprint = _safe_ssh_host_key_fingerprint(
+            context.get("ssh_host_key_fingerprint")
+        )
+        if fingerprint is None:
+            return observation
+        from orchestrator.services.vm_readiness import qualify_recovery_successor
+
+        qualified = await qualify_recovery_successor(
+            successor,
+            host_key_fingerprint=fingerprint,
+        )
+        if qualified is None:
+            return observation
+        successor = {**dict(successor), **qualified}
+        registration_seed = ":".join(
+            (
+                str(captured_identity.get("provision_generation") or ""),
+                str(successor.get("vmi_uid") or ""),
+                str(successor.get("launcher_uid") or ""),
+            )
+        )
+        successor["ssh_registration_id"] = (
+            "recovery-"
+            + hashlib.sha256(registration_seed.encode("utf-8")).hexdigest()[:32]
+        )
+        observation.update(
+            {
+                "authenticated": True,
+                "successor": successor,
+                "network_qualification": {
+                    **dict(observation.get("network_qualification") or {}),
+                    **dict(qualified.get("guest_network") or {}),
+                    "address": successor.get("pod_ip"),
+                    "cloud_init_cache": "untouched",
+                    "legacy_cloud_init_cache_cleaned": False,
+                    "qualified": True,
+                },
+            }
+        )
+        return observation
 
     async def list_vms(
         self, *, include_teardown_identity: bool = False

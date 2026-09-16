@@ -226,7 +226,10 @@ from orchestrator.services.vm_workspace_recovery_store import (  # noqa: E402
 from orchestrator.services.vm_workspace_recovery import (  # noqa: E402
     VMWorkspaceRecoveryService,
 )
-from shared.workspace_recovery import workspace_recovery_enabled  # noqa: E402
+from shared.workspace_recovery import (  # noqa: E402
+    workspace_recovery_enabled,
+    workspace_replacement_recovery_enabled,
+)
 from orchestrator.services import (  # noqa: E402
     commissioned_officer_provisioning as commissioned_officer_provisioning_service,
     pinned_session_mutation_target as pinned_session_mutation_target_service,
@@ -5774,6 +5777,7 @@ async def lifespan(app: FastAPI):
                 VMWorkspaceRecoveryStore(postgres_db),
                 vm_provisioner,
                 automatic_enabled=workspace_recovery_enabled(),
+                replacement_enabled=workspace_replacement_recovery_enabled(),
             ).run,
             _shutdown_event,
         ),

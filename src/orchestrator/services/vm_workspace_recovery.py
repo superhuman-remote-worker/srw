@@ -11,6 +11,7 @@ from uuid import UUID
 
 from orchestrator.services.vm_workspace_recovery_store import (
     RecoveryClaim,
+    RetentionPinCommand,
     VMWorkspaceRecoveryStore,
 )
 from shared.workspace_recovery import WorkspaceRecoveryCode
@@ -90,6 +91,7 @@ class VMWorkspaceRecoveryService:
         observer: Any,
         *,
         automatic_enabled: bool = True,
+        replacement_enabled: bool = True,
         probe_timeout_seconds: float = 10.0,
         claim_ttl_seconds: float = 30.0,
         claim_poll_seconds: float = 0.25,
@@ -99,6 +101,7 @@ class VMWorkspaceRecoveryService:
         self.store = store
         self.observer = observer
         self.automatic_enabled = automatic_enabled
+        self.replacement_enabled = replacement_enabled
         self.probe_timeout_seconds = max(0.1, probe_timeout_seconds)
         self.claim_ttl_seconds = max(self.probe_timeout_seconds + 1, claim_ttl_seconds)
         self.claim_poll_seconds = max(0.001, claim_poll_seconds)
@@ -113,11 +116,25 @@ class VMWorkspaceRecoveryService:
                     "Paused %d VM workspace recoveries because automation is disabled",
                     paused,
                 )
-            await shutdown_event.wait()
+            # Hold protection remains active while automation is disabled.
+            # Continue reconciling durable controller pin activation/release,
+            # but never observe or replace a runtime.
+            while not shutdown_event.is_set():
+                try:
+                    await self._reconcile_retention_pins()
+                except Exception:
+                    logger.exception("VM workspace recovery pin sync failed")
+                try:
+                    await asyncio.wait_for(
+                        shutdown_event.wait(), timeout=self.scan_interval_seconds
+                    )
+                except asyncio.TimeoutError:
+                    pass
             return
         logger.info("VM workspace recovery reconciler started")
         while not shutdown_event.is_set():
             try:
+                await self._reconcile_retention_pins()
                 operation_ids = await self.store.list_due_operation_ids(limit=32)
                 results = await asyncio.gather(
                     *(
@@ -184,6 +201,71 @@ class VMWorkspaceRecoveryService:
             remaining_seconds=claim.remaining_seconds,
             jitter=self.jitter,
         )
+
+    async def _sync_retention_pin(self, command: RetentionPinCommand) -> bool:
+        reconcile = getattr(self.observer, "reconcile_workspace_recovery_pin", None)
+        if not callable(reconcile):
+            await self.store.defer_retention_pin_command(
+                command, error="controller recovery pin transport is unavailable"
+            )
+            return False
+        try:
+            result = await asyncio.wait_for(
+                reconcile(command), timeout=self.probe_timeout_seconds
+            )
+            if not isinstance(
+                result, Mapping
+            ) or not await self.store.acknowledge_retention_pin(command, result):
+                raise RuntimeError("controller recovery pin acknowledgement changed")
+            return True
+        except Exception as exc:
+            await self.store.defer_retention_pin_command(command, error=str(exc))
+            return False
+
+    async def _reconcile_retention_pins(self) -> None:
+        commands = await self.store.list_retention_pin_commands(limit=32)
+        if commands:
+            await asyncio.gather(
+                *(self._sync_retention_pin(command) for command in commands)
+            )
+
+    async def _require_retention_pin(self, claim: RecoveryClaim) -> bool:
+        command = await self.store.retention_pin_command(claim)
+        if command is None:
+            return False
+        if not await self.store.retention_pin_is_acknowledged(
+            claim
+        ) and not await self._sync_retention_pin(command):
+            return False
+        return bool(await self.store.retention_pin_is_acknowledged(claim))
+
+    async def _attach_stop_receipt(
+        self, claim: RecoveryClaim, observation: Mapping[str, Any]
+    ) -> Mapping[str, Any] | None:
+        """Persist positive controller evidence and consume only exact receipts."""
+
+        result = dict(observation)
+        # The controller response is not itself a receipt. Only a digest
+        # returned by the append-only store boundary is trusted downstream.
+        result.pop("stop_receipt_digest", None)
+        evidence = result.get("stop_evidence")
+        digest = None
+        if isinstance(evidence, Mapping):
+            digest = await self.store.accept_stop_evidence(claim, evidence)
+            if digest is None:
+                await self._pause(
+                    claim,
+                    code=WorkspaceRecoveryCode.PRIOR_RUNTIME_UNFENCED,
+                    reason="controller_stop_evidence_rejected",
+                    observation=observation,
+                )
+                return None
+        if digest is None:
+            digest = await self.store.trusted_stop_receipt(claim)
+        if isinstance(digest, str) and digest:
+            result["prior_runtime"] = "stopped"
+            result["stop_receipt_digest"] = digest
+        return result
 
     async def _defer(
         self,
@@ -339,6 +421,14 @@ class VMWorkspaceRecoveryService:
             successor.get("launcher_uid"),
             claim.captured_identity.get("prior_launcher_uid"),
         )
+        if replacing and not self.replacement_enabled:
+            await self._pause(
+                claim,
+                code=WorkspaceRecoveryCode.PRIOR_RUNTIME_UNFENCED,
+                reason="automatic_replacement_recovery_disabled",
+                observation=observation,
+            )
+            return True
         if replacing and (
             prior_runtime != "stopped"
             or not isinstance(observation.get("stop_receipt_digest"), str)
@@ -374,6 +464,23 @@ class VMWorkspaceRecoveryService:
         if claim is None:
             return
         try:
+            pin_acknowledged = await self._require_retention_pin(claim)
+        except Exception as exc:
+            pin_acknowledged = False
+            pin_error = str(exc)[:500]
+        else:
+            pin_error = "controller pin is not acknowledged"
+        if not pin_acknowledged:
+            await self._defer(
+                claim,
+                phase="observing",
+                diagnostic={
+                    "reason": "controller_retention_pin_unacknowledged",
+                    "detail": pin_error,
+                },
+            )
+            return
+        try:
             observation = await self._observe(claim)
         except Exception as exc:
             await self._defer(
@@ -387,6 +494,9 @@ class VMWorkspaceRecoveryService:
             return
         if observation is None:
             # A lost durable claim deliberately produces no follow-up write.
+            return
+        observation = await self._attach_stop_receipt(claim, observation)
+        if observation is None:
             return
         attached = await self._read_preconditions(claim, observation)
         if attached is None:
@@ -422,6 +532,9 @@ class VMWorkspaceRecoveryService:
             return
         if final_observation is None:
             return
+        final_observation = await self._attach_stop_receipt(staged, final_observation)
+        if final_observation is None:
+            return
         attached_final = await self._read_preconditions(staged, final_observation)
         if attached_final is None:
             return
@@ -436,7 +549,7 @@ class VMWorkspaceRecoveryService:
                 observation=final_observation,
             )
             return
-        await self.store.release_recovered(
+        released = await self.store.release_recovered(
             operation_id=staged.operation_id,
             version=staged.version,
             claim_token=staged.claim_token,
@@ -449,6 +562,10 @@ class VMWorkspaceRecoveryService:
                 "stop_receipt_digest": final_observation.get("stop_receipt_digest"),
             },
         )
+        if released:
+            # Release is durable in PostgreSQL first. A controller failure keeps
+            # the Lease active and the background sync retries the safe leak.
+            await self._reconcile_retention_pins()
 
 
 __all__ = [

@@ -26,6 +26,19 @@ class RetainedStorage:
         self.namespace = namespace
         self.lock = asyncio.Lock()
 
+    async def _assert_not_recovery_pinned(self, binding) -> None:
+        """Require authoritative absence of an exact controller retention pin."""
+
+        pvc_uid = binding.get("pvc_uid")
+        if not pvc_uid:
+            return
+        read_pins = getattr(self.controller, "_active_recovery_pins", None)
+        if not callable(read_pins):
+            raise RuntimeError("Workspace recovery pin authority is unavailable.")
+        pins = await read_pins()
+        if any(pin.get("pvc_uid") == pvc_uid for pin in pins):
+            raise RuntimeError("Retained workspace is pinned for recovery.")
+
     @staticmethod
     def verify_vm(vm, binding, job_id):
         labels = vm.get("metadata", {}).get("labels", {})
@@ -102,6 +115,7 @@ class RetainedStorage:
 
     async def claim(self, binding, job_id):
         binding = storage_binding(binding)
+        await self._assert_not_recovery_pinned(binding)
         lease = await self._lease(binding)
         labels = storage_labels(binding, job_id)
         if lease is not None:
@@ -198,6 +212,7 @@ class RetainedStorage:
     async def ensure(self, manifest, binding, job_id):
         from vm_controller.controller import CDI_GROUP, CDI_VERSION, CDI_PLURAL
 
+        await self._assert_not_recovery_pinned(binding)
         await self.claim(binding, job_id)
         name = storage_name(binding)
         templates = manifest["spec"].pop("dataVolumeTemplates", [])
@@ -260,6 +275,7 @@ class RetainedStorage:
     async def detach(self, binding):
         """Durably fence late creates before publishing a reusable instance."""
         binding = storage_binding(binding)
+        await self._assert_not_recovery_pinned(binding)
         async with self.lock:
             lease = await self._lease(binding)
             if not lease or (lease.metadata.labels or {}).get(GENERATION_LABEL) != str(
@@ -296,6 +312,7 @@ class RetainedStorage:
     async def delete(self, binding):
         """Tombstone before deleting exact, unattached storage; replay is safe."""
         binding = storage_binding(binding)
+        await self._assert_not_recovery_pinned(binding)
         async with self.lock:
             lease = await self._lease(binding)
             if not await self.unused(binding):

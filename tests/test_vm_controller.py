@@ -3270,6 +3270,50 @@ class TestGcRootdisks:
         )
 
     @pytest.mark.asyncio
+    async def test_exact_recovery_pin_prevents_orphan_gc(self, controller):
+        self._wire(controller, [self._dv("agent-vm-j1-rootdisk", 100)], [])
+        controller.coordination_api.list_namespaced_lease.return_value = {
+            "items": [
+                {
+                    "metadata": {
+                        "uid": "pin-uid",
+                        "resourceVersion": "1",
+                        "labels": {
+                            "srw.io/vm-workspace-recovery-pin": "true",
+                            "srw.io/recovery-id": (
+                                "00000000-0000-4000-8000-000000000741"
+                            ),
+                            "srw.io/recovery-pvc-uid": "root-pvc-uid-j1",
+                            "srw.io/recovery-generation": PROVISION_GENERATION,
+                        },
+                    }
+                }
+            ]
+        }
+        with patch("vm_controller.controller.VM_ROOTDISK_ORPHAN_HOURS", 72):
+            await controller._gc_rootdisks()
+
+        assert not _calls_for(
+            controller.k8s_client.delete_namespaced_custom_object, CDI_PLURAL
+        )
+
+    @pytest.mark.asyncio
+    async def test_pin_authority_failure_aborts_orphan_gc(self, controller):
+        self._wire(controller, [self._dv("agent-vm-j1-rootdisk", 100)], [])
+        controller.coordination_api.list_namespaced_lease.side_effect = RuntimeError(
+            "API down"
+        )
+        with (
+            patch("vm_controller.controller.VM_ROOTDISK_ORPHAN_HOURS", 72),
+            pytest.raises(RuntimeError, match="API down"),
+        ):
+            await controller._gc_rootdisks()
+
+        assert not _calls_for(
+            controller.k8s_client.delete_namespaced_custom_object, CDI_PLURAL
+        )
+
+    @pytest.mark.asyncio
     async def test_create_does_not_run_it_when_disabled(self, controller):
         controller._gc_rootdisks_safe = AsyncMock()
         controller.k8s_client.get_namespaced_custom_object.side_effect = _dv_phase(None)
@@ -3767,6 +3811,310 @@ class TestLifecycleIdentityGeneration:
 
         controller.k8s_client.delete_namespaced_custom_object.assert_not_called()
 
+
+class TestWorkspaceRecoveryControllerEvidence:
+    VM_UID = "00000000-0000-4000-8000-000000000701"
+    OLD_VMI_UID = "00000000-0000-4000-8000-000000000702"
+    OLD_POD_UID = "00000000-0000-4000-8000-000000000703"
+    PVC_UID = "00000000-0000-4000-8000-000000000704"
+    NODE_UID = "00000000-0000-4000-8000-000000000705"
+
+    def identity(self):
+        return {
+            "owner_kind": "job",
+            "owner_id": SAMPLE_JOB_CONFIG["job_id"],
+            "provision_generation": PROVISION_GENERATION,
+            "cluster_name": "test",
+            "namespace": VM_NAMESPACE,
+            "vm_uid": self.VM_UID,
+            "prior_vmi_uid": self.OLD_VMI_UID,
+            "prior_launcher_uid": self.OLD_POD_UID,
+            "root_pvc_uid": self.PVC_UID,
+        }
+
+    def wire(self, controller, *, terminal=False, replacement=False, migration=False):
+        current_vmi = (
+            "00000000-0000-4000-8000-000000000712" if replacement else self.OLD_VMI_UID
+        )
+        current_pod = (
+            "00000000-0000-4000-8000-000000000713" if replacement else self.OLD_POD_UID
+        )
+        vm = {
+            "metadata": {
+                "name": f"agent-vm-{SAMPLE_JOB_CONFIG['job_id']}",
+                "uid": self.VM_UID,
+                "labels": {
+                    "srw.io/owner-kind": "job",
+                    "srw.io/owner-id": SAMPLE_JOB_CONFIG["job_id"],
+                },
+                "annotations": {"srw.io/provision-generation": PROVISION_GENERATION},
+            },
+            "status": {
+                "conditions": [{"type": "Ready", "status": "True"}],
+            },
+        }
+        vmi = {
+            "metadata": {
+                "name": f"agent-vm-{SAMPLE_JOB_CONFIG['job_id']}",
+                "uid": current_vmi,
+                "ownerReferences": [
+                    {
+                        "kind": "VirtualMachine",
+                        "uid": self.VM_UID,
+                        "controller": True,
+                    }
+                ],
+            },
+            "status": {
+                "phase": "Running" if not terminal else "Failed",
+                "interfaces": [
+                    {
+                        "ipAddress": "10.42.0.90",
+                        "mac": "02:00:00:00:07:01",
+                    }
+                ],
+                **({"migrationState": {"migrationUid": "moving"}} if migration else {}),
+            },
+        }
+
+        def get_object(**kwargs):
+            return vm if kwargs["plural"] == KUBEVIRT_PLURAL else vmi
+
+        controller.k8s_client.get_namespaced_custom_object.side_effect = get_object
+        controller.core_api.list_namespaced_persistent_volume_claim.return_value = (
+            types.SimpleNamespace(
+                items=[
+                    types.SimpleNamespace(
+                        metadata=types.SimpleNamespace(
+                            uid=self.PVC_UID,
+                            deletion_timestamp=None,
+                            labels={
+                                "srw.io/owner-kind": "job",
+                                "srw.io/owner-id": SAMPLE_JOB_CONFIG["job_id"],
+                            },
+                        )
+                    )
+                ]
+            )
+        )
+        terminated = {"terminated": {"finishedAt": "2026-09-16T12:00:00Z"}}
+        pod = {
+            "metadata": {
+                "uid": current_pod,
+                "ownerReferences": [
+                    {
+                        "kind": "VirtualMachineInstance",
+                        "uid": current_vmi,
+                        "controller": True,
+                    }
+                ],
+            },
+            "spec": {"nodeName": "node8", "restartPolicy": "Never"},
+            "status": {
+                "phase": "Succeeded" if terminal else "Running",
+                "podIP": "10.42.0.90",
+                "containerStatuses": [
+                    {
+                        "name": "compute",
+                        "containerID": "containerd://compute-old",
+                        "restartCount": 0,
+                        "state": terminated if terminal else {"running": {}},
+                    },
+                    {
+                        "name": "guest-console-log",
+                        "containerID": "containerd://console-old",
+                        "restartCount": 0,
+                        "state": terminated if terminal else {"running": {}},
+                    },
+                ],
+            },
+        }
+        controller.core_api.list_namespaced_pod.return_value = types.SimpleNamespace(
+            items=[pod]
+        )
+        controller.core_api.read_node.return_value = types.SimpleNamespace(
+            metadata=types.SimpleNamespace(uid=self.NODE_UID)
+        )
+        return pod
+
+    @pytest.mark.asyncio
+    async def test_exact_current_terminated_states_mint_stop_evidence(self, controller):
+        self.wire(controller, terminal=True)
+
+        observed = await controller._do_observe_workspace_recovery(self.identity())
+
+        assert observed["prior_runtime"] == "stopped"
+        evidence = observed["stop_evidence"]
+        assert evidence["vmi_uid"] == self.OLD_VMI_UID
+        assert evidence["launcher_uid"] == self.OLD_POD_UID
+        assert [item["name"] for item in evidence["containers"]] == [
+            "compute",
+            "guest-console-log",
+        ]
+        controller.k8s_client.create_namespaced_custom_object.assert_not_called()
+        controller.k8s_client.delete_namespaced_custom_object.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("unsafe", ["last_state", "restarted"])
+    async def test_last_state_or_restarted_container_is_not_stop_proof(
+        self, controller, unsafe
+    ):
+        pod = self.wire(controller, terminal=True)
+        status = pod["status"]["containerStatuses"][0]
+        if unsafe == "last_state":
+            status["lastState"] = status.pop("state")
+        else:
+            status["restartCount"] = 1
+
+        observed = await controller._do_observe_workspace_recovery(self.identity())
+
+        assert observed["prior_runtime"] != "stopped"
+        assert observed["stop_evidence"] == "unknown"
+
+    @pytest.mark.asyncio
+    async def test_missing_old_launcher_is_not_stop_proof(self, controller):
+        self.wire(controller, replacement=True)
+
+        observed = await controller._do_observe_workspace_recovery(self.identity())
+
+        assert observed["prior_runtime"] == "unknown"
+        assert observed["stop_evidence"] == "unknown"
+        assert observed["successor"]["launcher_uid"] != self.OLD_POD_UID
+
+    @pytest.mark.asyncio
+    async def test_migration_or_multiple_launchers_is_ambiguous(self, controller):
+        self.wire(controller, migration=True)
+
+        observed = await controller._do_observe_workspace_recovery(self.identity())
+
+        assert observed["ambiguous"] is True
+        assert observed["migration_ambiguous"] is True
+
+
+class TestWorkspaceRecoveryControllerPins:
+    @pytest.mark.asyncio
+    async def test_recovery_pin_prevents_failed_datavolume_recreation(self, controller):
+        controller.k8s_client.get_namespaced_custom_object.side_effect = _dv_phase(
+            "Failed"
+        )
+        controller._active_recovery_pins = AsyncMock(
+            return_value=({"pvc_uid": (f"root-pvc-uid-{SAMPLE_JOB_CONFIG['job_id']}")},)
+        )
+
+        with (
+            patch("vm_controller.controller.VM_PERSISTENT_ROOTDISK", True),
+            pytest.raises(RuntimeError, match="pinned"),
+        ):
+            await controller._do_create(SAMPLE_JOB_CONFIG)
+
+        assert not _calls_for(
+            controller.k8s_client.delete_namespaced_custom_object, CDI_PLURAL
+        )
+        assert not _calls_for(
+            controller.k8s_client.create_namespaced_custom_object, CDI_PLURAL
+        )
+
+    @pytest.mark.asyncio
+    async def test_pin_create_replay_and_exact_release_survive_restart(
+        self, controller
+    ):
+        recovery_id = "00000000-0000-4000-8000-000000000721"
+        pvc_uid = "00000000-0000-4000-8000-000000000722"
+        lease = types.SimpleNamespace(
+            metadata=types.SimpleNamespace(
+                uid="pin-uid-1",
+                resource_version="7",
+                labels={
+                    "srw.io/vm-workspace-recovery-pin": "true",
+                    "srw.io/recovery-id": recovery_id,
+                    "srw.io/recovery-pvc-uid": pvc_uid,
+                    "srw.io/recovery-generation": PROVISION_GENERATION,
+                    "srw.io/owner-kind": "job",
+                    "srw.io/owner-id": SAMPLE_JOB_CONFIG["job_id"],
+                },
+            )
+        )
+        controller.core_api.list_namespaced_persistent_volume_claim.return_value = (
+            types.SimpleNamespace(
+                items=[
+                    types.SimpleNamespace(
+                        metadata=types.SimpleNamespace(
+                            uid=pvc_uid,
+                            deletion_timestamp=None,
+                            labels={
+                                "srw.io/owner-kind": "job",
+                                "srw.io/owner-id": SAMPLE_JOB_CONFIG["job_id"],
+                            },
+                        )
+                    )
+                ]
+            )
+        )
+        controller.coordination_api.read_namespaced_lease.side_effect = [
+            _FakeApiException(status=404),
+            lease,
+            lease,
+        ]
+        controller.coordination_api.create_namespaced_lease.return_value = lease
+        command = {
+            "recovery_id": recovery_id,
+            "pvc_uid": pvc_uid,
+            "provision_generation": PROVISION_GENERATION,
+            "state": "active",
+            "owner_kind": "job",
+            "owner_id": SAMPLE_JOB_CONFIG["job_id"],
+            "namespace": VM_NAMESPACE,
+        }
+
+        first = await controller._do_reconcile_workspace_recovery_pin(command)
+        replay = await controller._do_reconcile_workspace_recovery_pin(command)
+        released = await controller._do_reconcile_workspace_recovery_pin(
+            {**command, "state": "released", "pin_uid": "pin-uid-1"}
+        )
+
+        assert first == replay
+        assert released["state"] == "released"
+        controller.coordination_api.create_namespaced_lease.assert_called_once()
+        controller.coordination_api.delete_namespaced_lease.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_stale_pin_release_is_refused(self, controller):
+        recovery_id = "00000000-0000-4000-8000-000000000731"
+        pvc_uid = "00000000-0000-4000-8000-000000000732"
+        controller.coordination_api.read_namespaced_lease.return_value = (
+            types.SimpleNamespace(
+                metadata=types.SimpleNamespace(
+                    uid="current-pin",
+                    resource_version="9",
+                    labels={
+                        "srw.io/vm-workspace-recovery-pin": "true",
+                        "srw.io/recovery-id": recovery_id,
+                        "srw.io/recovery-pvc-uid": pvc_uid,
+                        "srw.io/recovery-generation": PROVISION_GENERATION,
+                        "srw.io/owner-kind": "job",
+                        "srw.io/owner-id": SAMPLE_JOB_CONFIG["job_id"],
+                    },
+                )
+            )
+        )
+
+        with pytest.raises(RuntimeError, match="stale"):
+            await controller._do_reconcile_workspace_recovery_pin(
+                {
+                    "recovery_id": recovery_id,
+                    "pvc_uid": pvc_uid,
+                    "provision_generation": PROVISION_GENERATION,
+                    "state": "released",
+                    "owner_kind": "job",
+                    "owner_id": SAMPLE_JOB_CONFIG["job_id"],
+                    "namespace": VM_NAMESPACE,
+                    "pin_uid": "stale-pin",
+                }
+            )
+        controller.coordination_api.delete_namespaced_lease.assert_not_called()
+
+
+class TestLifecycleIdentityGenerationContinuation:
     @pytest.mark.asyncio
     async def test_captured_delete_response_loss_converges_when_vm_and_disk_absent(
         self, controller

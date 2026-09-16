@@ -20973,7 +20973,19 @@ CREATE TABLE public.vm_workspace_recovery_retention_pins (
     pvc_uid uuid NOT NULL,
     provision_generation uuid NOT NULL,
     pinned_at timestamp with time zone DEFAULT clock_timestamp() NOT NULL,
-    released_at timestamp with time zone
+    released_at timestamp with time zone,
+    controller_pinned_at timestamp with time zone,
+    controller_pin_uid text,
+    controller_pin_resource_version text,
+    controller_release_requested_at timestamp with time zone,
+    controller_released_at timestamp with time zone,
+    controller_sync_attempts integer DEFAULT 0 NOT NULL,
+    controller_sync_error text,
+    controller_sync_after timestamp with time zone DEFAULT clock_timestamp() NOT NULL,
+    CONSTRAINT vm_workspace_recovery_controller_pin_ack_shape CHECK ((((controller_pinned_at IS NULL) AND (controller_pin_uid IS NULL) AND (controller_pin_resource_version IS NULL)) OR ((controller_pinned_at IS NOT NULL) AND (controller_pin_uid IS NOT NULL) AND (controller_pin_resource_version IS NOT NULL)))),
+    CONSTRAINT vm_workspace_recovery_controller_pin_uid_nonempty CHECK (((controller_pin_uid IS NULL) OR (controller_pin_uid <> ''::text))),
+    CONSTRAINT vm_workspace_recovery_controller_pin_version_nonempty CHECK (((controller_pin_resource_version IS NULL) OR (controller_pin_resource_version <> ''::text))),
+    CONSTRAINT vm_workspace_recovery_controller_release_ack_shape CHECK (((controller_released_at IS NULL) OR ((released_at IS NOT NULL) AND (controller_pinned_at IS NOT NULL))))
 );
 
 
@@ -25495,6 +25507,13 @@ CREATE UNIQUE INDEX vm_workspace_recoveries_one_open_owner ON public.vm_workspac
 --
 
 CREATE UNIQUE INDEX vm_workspace_recovery_jobs_one_open_job ON public.vm_workspace_recovery_jobs USING btree (job_id) WHERE (resolved_at IS NULL);
+
+
+--
+-- Name: vm_workspace_recovery_retention_pin_sync_due_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX vm_workspace_recovery_retention_pin_sync_due_idx ON public.vm_workspace_recovery_retention_pins USING btree (controller_sync_after) WHERE (controller_released_at IS NULL);
 
 
 --

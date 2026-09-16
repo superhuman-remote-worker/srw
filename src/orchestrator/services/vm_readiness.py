@@ -20,6 +20,11 @@ from orchestrator.services.ide_settings import (
     seed_ide_profile,
 )
 from orchestrator.services.ssh_helpers import wait_for_agent_ssh
+from orchestrator.services.ssh_helpers import pinned_agent_ssh_command
+from orchestrator.services.subprocess_effect import (
+    communicate_bounded,
+    create_owned_subprocess_exec,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +44,62 @@ def _generation(value: object) -> str | None:
     except (TypeError, ValueError):
         return None
     return str(parsed) if str(parsed) == value else None
+
+
+async def qualify_recovery_successor(
+    successor: Mapping[str, Any], *, host_key_fingerprint: str
+) -> dict[str, Any] | None:
+    """Read-only pinned-SSH qualification for a controller-observed successor."""
+
+    pod_ip = successor.get("pod_ip")
+    if not isinstance(pod_ip, str) or not pod_ip or pod_ip != pod_ip.strip():
+        return None
+    if (
+        _generation(successor.get("vmi_uid")) is None
+        or _generation(successor.get("launcher_uid")) is None
+    ):
+        return None
+    ready, _attempts, _error = await wait_for_agent_ssh(
+        pod_ip,
+        22,
+        key_path=resolve_ssh_key_path(),
+        deadline_s=10.0,
+        connect_timeout_s=10,
+        interval_s=0.5,
+        expected_host_key_fingerprint=host_key_fingerprint,
+    )
+    if not ready:
+        return None
+    try:
+        async with pinned_agent_ssh_command(
+            pod_ip,
+            22,
+            "/usr/local/bin/srw-network-qualification",
+            expected_host_key_fingerprint=host_key_fingerprint,
+            key_path=resolve_ssh_key_path(),
+            connect_timeout_s=10,
+            batch_mode=True,
+        ) as command:
+            process = await create_owned_subprocess_exec(
+                *command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _stderr = await communicate_bounded(
+                process,
+                timeout=15,
+                stdout_limit=128 * 1024,
+                stderr_limit=16 * 1024,
+            )
+        network = json.loads(stdout) if process.returncode == 0 else None
+    except Exception:
+        return None
+    if (
+        not isinstance(network, Mapping)
+        or network.get("cloud_init_cache_cleaned") is not False
+    ):
+        return None
+    return {"pod_ip": pod_ip, "guest_network": dict(network)}
 
 
 class VMReadinessService:
@@ -601,9 +662,7 @@ class VMReadinessService:
         if entity_type == "job":
             self._trigger_dispatch()
 
-    async def _recovery_owns_authority(
-        self, entity_type: str, entity_id: str
-    ) -> bool:
+    async def _recovery_owns_authority(self, entity_type: str, entity_id: str) -> bool:
         check = getattr(self._db, "vm_workspace_recovery_owns_authority", None)
         if not callable(check):
             return False
