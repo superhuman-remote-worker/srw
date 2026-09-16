@@ -35,6 +35,62 @@ from shared.run_queue import ClaimedUnit
 
 
 @pytest.mark.asyncio
+async def test_recovery_receipt_for_another_attempt_cannot_handoff_current_claim(
+    monkeypatch,
+):
+    from shared.worker_queue import WorkerClaim
+    from shared.workspace_recovery import (
+        WorkspaceRecoveryCode,
+        WorkspaceRecoveryDisposition,
+    )
+
+    monkeypatch.delenv("VM_WORKSPACE_RECOVERY_ENABLED", raising=False)
+    claim = WorkerClaim(
+        unit=make_claim(token=7), prior_job_status="processing", resume=True
+    )
+    executor = te.StatelessTurnExecutor(pod_name="worker", audit_writer=None)
+    other = WorkspaceRecoveryDisposition.hold_committed(
+        code=WorkspaceRecoveryCode.RUNTIME_NOT_READY,
+        operation_id=uuid4(),
+        accepted_lease_token=6,
+        hold_lease_token=7,
+    )
+    assert not await executor._resolve_workspace_recovery(
+        claim, error=ClaimBundleError(409, recovery=other)
+    )
+    assert executor._worker_workspace_recovery is None
+
+
+@pytest.mark.asyncio
+async def test_cancelled_local_join_quarantines_instead_of_reusing_slot():
+    executor = te.StatelessTurnExecutor(pod_name="worker", audit_writer=None)
+    finished = asyncio.Event()
+    local_task = asyncio.create_task(finished.wait())
+    join_task = asyncio.create_task(executor._join_worker_local_task(local_task))
+    await asyncio.sleep(0)
+    join_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await join_task
+    try:
+        assert executor._worker_quarantined and executor._stop.is_set()
+        assert not local_task.done()
+        with pytest.raises(te._ClaimQuiescenceError):
+            executor.start()
+    finally:
+        finished.set()
+        await local_task
+
+
+@pytest.mark.asyncio
+async def test_singleton_start_cannot_replace_a_quarantined_executor(monkeypatch):
+    executor = te.StatelessTurnExecutor(pod_name="worker", audit_writer=None)
+    executor._worker_quarantined = True
+    monkeypatch.setattr(te, "_executor", executor)
+    with pytest.raises(te._ClaimQuiescenceError, match="quarantined"):
+        await te.start_stateless_executor()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("known", [True, False])
 async def test_client_claim_bundle_parses_only_known_exact_recovery(known):
     import httpx

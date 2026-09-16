@@ -20858,7 +20858,7 @@ CREATE TABLE public.vm_workspace_recoveries (
     CONSTRAINT vm_workspace_recoveries_check2 CHECK ((((resolved_at IS NULL) AND (phase = ANY (ARRAY['recovering'::text, 'paused_attention'::text]))) OR ((resolved_at IS NOT NULL) AND (phase = ANY (ARRAY['recovered'::text, 'cancelled'::text]))))),
     CONSTRAINT vm_workspace_recoveries_claim_token_check CHECK ((claim_token >= 0)),
     CONSTRAINT vm_workspace_recoveries_cluster_name_check CHECK ((cluster_name <> ''::text)),
-    CONSTRAINT vm_workspace_recoveries_exact_runtime_identity CHECK ((((prior_vmi_uid IS NOT NULL) AND (prior_launcher_uid IS NOT NULL) AND (provision_generation IS NOT NULL) AND (namespace IS NOT NULL) AND (vm_uid IS NOT NULL) AND (root_pvc_uid IS NOT NULL)) OR ((phase = 'paused_attention'::text) AND (reason_code = 'workspace_identity_conflict'::text)))),
+    CONSTRAINT vm_workspace_recoveries_exact_runtime_identity CHECK ((((prior_vmi_uid IS NOT NULL) AND (prior_launcher_uid IS NOT NULL) AND (provision_generation IS NOT NULL) AND (namespace IS NOT NULL) AND (vm_uid IS NOT NULL) AND (root_pvc_uid IS NOT NULL)) OR (phase = 'paused_attention'::text))),
     CONSTRAINT vm_workspace_recoveries_namespace_check CHECK ((namespace <> ''::text)),
     CONSTRAINT vm_workspace_recoveries_original_cause_check CHECK ((jsonb_typeof(original_cause) = 'object'::text)),
     CONSTRAINT vm_workspace_recoveries_owner_kind_check CHECK ((owner_kind = ANY (ARRAY['job'::text, 'thread'::text]))),

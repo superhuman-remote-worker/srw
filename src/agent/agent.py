@@ -2225,6 +2225,46 @@ class UniversalAgent:
         self._shell_manager = None
         self._worker_finalization_held = True
 
+    async def quiesce_worker_workspace_recovery(self) -> None:
+        """Strict local retirement; no remote process-stop claim is implied.
+
+        Preserve the original handles if any join fails so a quarantined
+        executor cannot scrub away the only evidence of live local work.
+        """
+        from agent.core.virtual_dirs import unwrap_backend
+
+        manager = getattr(self, "_workspace_manager", None)
+        backend = getattr(self, "_worker_finalization_backend", None)
+        if backend is None and manager is not None:
+            backend = unwrap_backend(manager.backend)
+        # Closing shell admission may wait for synchronous shell I/O. Keep it
+        # off the event loop so the driver can quarantine on its join deadline.
+        if backend is not None:
+            close_admission = getattr(backend, "retire_shell_owner", None)
+            if callable(close_admission):
+                await asyncio.to_thread(close_admission)
+        await self.abandon_worker_subagents("workspace recovery handoff")
+        if backend is not None:
+            retire = getattr(backend, "retire", None)
+            if not callable(retire):
+                raise SubagentQuiescenceError(
+                    "workspace backend has no retirement gate"
+                )
+            # Includes resource/SFTP joins. A failure MUST escape this path.
+            await asyncio.to_thread(retire)
+        await self._scrub_worker_claim_locals()
+        self._shell_manager = None
+        self._workspace_manager = None
+        self._current_job_id = None
+        self._worker_lease_token = None
+        self._worker_finalization_held = False
+        self._worker_finalization_backend = None
+        self._worker_terminal_shell_cleanup = None
+        self._worker_shell_admission_retired = False
+        self._subagent_recovered_runtime = None
+        self._subagent_quiesced_runtime = None
+        self._subagent_abandoned_runtime = None
+
     async def cleanup_worker_claim(self, *, preserve_shell: bool) -> None:
         """Retire all claim-local runtime state under the driver's disposition.
 

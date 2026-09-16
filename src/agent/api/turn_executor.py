@@ -65,9 +65,10 @@ import random
 import re
 import socket
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from agent.api.lease_context import LeaseHandle, LeaseLostError, current_lease
 from agent.api.models import JobStartRequest
@@ -107,6 +108,12 @@ from shared.cloud_push_tasks import (
     fail_bg_task,
 )
 from shared.subagent_lifecycle import SubagentLifecycleError
+from shared.runtime.core.workspace_backend import WorkspaceUnavailableError
+from shared.workspace_recovery import (
+    WorkspaceRecoveryCode,
+    WorkspaceRecoveryDisposition,
+    workspace_recovery_enabled,
+)
 from shared.worker_queue import (
     WorkerClaim,
     WorkerCompletionAcceptance,
@@ -154,6 +161,18 @@ COMPLETE_RETRY_ATTEMPTS = 3
 SHUTDOWN_COMPLETE_TIMEOUT_SECONDS = 5.0
 PENDING_ROWS_LIMIT = 50
 WORKER_FINALIZATION_POLL_SECONDS = 1.0
+WORKER_RECOVERY_QUIESCE_SECONDS = 15.0
+
+
+@dataclass(frozen=True)
+class WorkspaceRecoveryHandoff:
+    """Exact durable receipt, or a report whose commit remains unknown.
+
+    This signal revokes local admission. It never proves a remote command
+    stopped; the durable recovery controller retains that obligation.
+    """
+
+    disposition: WorkspaceRecoveryDisposition | None
 
 
 class _ClaimQuiescenceError(RuntimeError):
@@ -605,6 +624,10 @@ class StatelessTurnExecutor:
         self._worker_preempt_status: Optional[str] = None
         self._worker_terminal_report_generation: tuple[str, int] | None = None
         self._worker_completion_accepted_generation: tuple[str, int] | None = None
+        self._worker_workspace_recovery: WorkspaceRecoveryHandoff | None = None
+        self._worker_workspace_recovery_code: WorkspaceRecoveryCode | None = None
+        self._worker_workspace_backend: str | None = None
+        self._worker_quarantined = False
         self._claim_audit_unavailable_logged = False
         if audit_writer is _AUDIT_WRITER_UNSET:
             try:
@@ -683,6 +706,8 @@ class StatelessTurnExecutor:
         return self._task is not None and not self._task.done()
 
     def start(self) -> None:
+        if self._worker_quarantined:
+            raise _ClaimQuiescenceError("quarantined executor cannot restart")
         if self.running:
             raise RuntimeError("stateless executor already running")
         self._stop = asyncio.Event()
@@ -1087,7 +1112,7 @@ class StatelessTurnExecutor:
                     await self._serve_worker_claim(worker_claim)
                 except asyncio.CancelledError:
                     raise
-                except SubagentLifecycleError:
+                except (SubagentLifecycleError, _ClaimQuiescenceError):
                     # Publishing this claim could overlap the old ToolContext
                     # and child generation.  Leave the exact lease unresolved
                     # for expiry/operator recovery and stop taking new work.
@@ -1260,6 +1285,8 @@ class StatelessTurnExecutor:
         reserved for genuine terminal/human-facing graph stops.
         """
 
+        if self._worker_quarantined:
+            raise _ClaimQuiescenceError("quarantined executor cannot accept a claim")
         unit = claim.unit
         unit_id = str(unit.unit_id)
         token = unit.lease_token
@@ -1280,6 +1307,9 @@ class StatelessTurnExecutor:
         self._worker_preempt_status = None
         self._worker_terminal_report_generation = None
         self._worker_completion_accepted_generation = None
+        self._worker_workspace_recovery = None
+        self._worker_workspace_recovery_code = None
+        self._worker_workspace_backend = None
         heartbeat_task: asyncio.Task | None = None
         try:
             heartbeat_task = asyncio.create_task(
@@ -1307,9 +1337,21 @@ class StatelessTurnExecutor:
             # release is intentionally left to the outer shutdown/reaper path if
             # cancellation prevents the DB call from completing.
             with contextlib.suppress(asyncio.CancelledError, Exception):
-                await self._cleanup_worker_runtime(preserve_shell=True)
+                if not self._worker_quarantined:
+                    if await self._resolve_workspace_recovery(claim):
+                        await self._handoff_workspace_recovery(claim=claim)
+                    else:
+                        await self._cleanup_worker_runtime(preserve_shell=True)
             raise
+        except _ClaimQuiescenceError:
+            self._worker_quarantined = True
+            self.request_stop()
+            timing["outcome"] = "quarantined:workspace_recovery"
+            return
         except SubagentLifecycleError as exc:
+            if await self._resolve_workspace_recovery(claim, error=exc):
+                timing["outcome"] = await self._handoff_workspace_recovery(claim=claim)
+                return
             # Retry the lifecycle gate exactly once through the normal cleanup
             # belt.  Only a fully successful cleanup permits retry publication;
             # a second failure escapes to run(), which stops without release.
@@ -1340,6 +1382,13 @@ class StatelessTurnExecutor:
             timing["outcome"] = "released:child_lifecycle_failed"
             return
         except Exception as exc:
+            if self._worker_quarantined:
+                self.request_stop()
+                timing["outcome"] = "quarantined:workspace_recovery"
+                return
+            if await self._resolve_workspace_recovery(claim, error=exc):
+                timing["outcome"] = await self._handoff_workspace_recovery(claim=claim)
+                return
             logger.exception(
                 "worker_batch failed before a disposition: unit=%s token=%d",
                 unit_id,
@@ -1486,6 +1535,9 @@ class StatelessTurnExecutor:
         finally:
             timing["bundle"] = max(0.0, time.perf_counter() - started_at)
         request, batch = self._parse_worker_bundle(bundle, claim)
+        self._worker_workspace_backend = (request.workspace_runtime or {}).get(
+            "assigned_backend"
+        )
         timing["mcp_attached"] = self._worker_mcp_attached(request)
         metadata = self._worker_job_metadata(request)
         context = request.context or {}
@@ -1507,6 +1559,8 @@ class StatelessTurnExecutor:
         finally:
             timing["preflight"] = max(0.0, time.perf_counter() - started_at)
         if renewal is None:
+            if await self._resolve_workspace_recovery(claim):
+                return await self._handoff_workspace_recovery(claim=claim)
             self._lease.mark_lost()
             logger.warning(
                 "lease lost: worker unit=%s token=%d before graph start",
@@ -1566,8 +1620,12 @@ class StatelessTurnExecutor:
                     0.0, time.perf_counter() - agent_start_started_at
                 )
             if streaming_gen is not None:
-                with contextlib.suppress(asyncio.CancelledError, Exception):
-                    await streaming_gen.aclose()
+                await self._join_worker_local_task(
+                    asyncio.create_task(streaming_gen.aclose())
+                )
+
+        if await self._resolve_workspace_recovery(claim, final_state=final_state):
+            return await self._handoff_workspace_recovery(claim=claim)
 
         if outcome == "lease_lost":
             logger.warning(
@@ -1709,6 +1767,9 @@ class StatelessTurnExecutor:
     ) -> str:
         """Report one genuine/give-up stop, then fence the queue disposition."""
 
+        if await self._resolve_workspace_recovery(claim, final_state=final_state):
+            return await self._handoff_workspace_recovery(claim=claim)
+
         unit = claim.unit
         job_id = str(unit.unit_id)
         token = unit.lease_token
@@ -1786,6 +1847,8 @@ class StatelessTurnExecutor:
             return f"released:{exc.code}"
         finally:
             self._add_worker_finish_timing(timing, started_at)
+        if await self._resolve_workspace_recovery(claim):
+            return await self._handoff_workspace_recovery(claim=claim)
         if not reported:
             # A pause/cancel may win after the handler's thin entry fence.  The
             # handler's jobs-row disposition CAS then rejects the report. Read
@@ -1802,6 +1865,8 @@ class StatelessTurnExecutor:
                     lease_token=token,
                 )
                 if renewal is None:
+                    if await self._resolve_workspace_recovery(claim):
+                        return await self._handoff_workspace_recovery(claim=claim)
                     accepted_completion = await self._accepted_worker_completion(claim)
                     if accepted_completion is None:
                         self._lease.mark_lost()
@@ -1864,6 +1929,8 @@ class StatelessTurnExecutor:
                 lease_token=token,
             )
             if renewal is None:
+                if await self._resolve_workspace_recovery(claim):
+                    return await self._handoff_workspace_recovery(claim=claim)
                 accepted_completion = await self._accepted_worker_completion(claim)
                 if accepted_completion is None:
                     self._lease.mark_lost()
@@ -2086,6 +2153,129 @@ class StatelessTurnExecutor:
                 metadata[key] = value
         return metadata
 
+    async def _resolve_workspace_recovery(
+        self,
+        claim: WorkerClaim,
+        *,
+        error: BaseException | None = None,
+        final_state: dict[str, Any] | None = None,
+    ) -> bool:
+        """Resolve only typed workspace causes and exact accepted receipts."""
+        if self._worker_workspace_recovery is not None:
+            return True
+        receipt = error.recovery if isinstance(error, ClaimBundleError) else None
+        if isinstance(receipt, WorkspaceRecoveryDisposition):
+            if receipt.accepted_lease_token == claim.lease_token:
+                self._worker_workspace_recovery = WorkspaceRecoveryHandoff(receipt)
+                return True
+        client = _pa()._orchestrator_client
+        lookup = getattr(client, "get_workspace_recovery_disposition", None)
+        if not callable(lookup):
+            return False
+        try:
+            receipt = await lookup(str(claim.unit_id), claim.lease_token)
+        except Exception:
+            # A lost bundle/hold response must never become exhaustion while
+            # its authoritative disposition cannot be read.
+            self._worker_workspace_recovery = WorkspaceRecoveryHandoff(None)
+            return True
+        if isinstance(receipt, WorkspaceRecoveryDisposition):
+            if receipt.accepted_lease_token == claim.lease_token:
+                self._worker_workspace_recovery = WorkspaceRecoveryHandoff(receipt)
+                return True
+        if not workspace_recovery_enabled():
+            return False
+        code = (
+            error.code
+            if isinstance(error, ClaimBundleError)
+            else self._worker_workspace_recovery_code
+        )
+        if isinstance(error, WorkspaceUnavailableError):
+            code = WorkspaceRecoveryCode.TRANSPORT_UNAVAILABLE
+        state_error = (final_state or {}).get("error")
+        if isinstance(state_error, dict):
+            if state_error.get("type") == "workspace_unavailable":
+                code = WorkspaceRecoveryCode.TRANSPORT_UNAVAILABLE
+            else:
+                with contextlib.suppress(ValueError, TypeError):
+                    code = WorkspaceRecoveryCode(state_error.get("type"))
+        if not isinstance(code, WorkspaceRecoveryCode):
+            return False
+        if self._worker_workspace_backend not in {None, "vm"}:
+            return False
+        # Publish pending before awaiting: heartbeat observes the same local
+        # admission fence and cannot issue a duplicate recovery request.
+        self._worker_workspace_recovery = WorkspaceRecoveryHandoff(None)
+        try:
+            receipt = await client.report_workspace_recovery(
+                str(claim.unit_id), claim.lease_token, code=code, request_id=uuid4()
+            )
+        except Exception:
+            try:
+                receipt = await lookup(str(claim.unit_id), claim.lease_token)
+            except Exception:
+                receipt = None
+        if (
+            isinstance(receipt, WorkspaceRecoveryDisposition)
+            and receipt.accepted_lease_token == claim.lease_token
+        ):
+            self._worker_workspace_recovery = WorkspaceRecoveryHandoff(receipt)
+        return True
+
+    async def _join_worker_local_task(self, task: asyncio.Task) -> None:
+        """Bound local retirement without mistaking cancellation for a join."""
+        try:
+            done, _ = await asyncio.wait(
+                {task}, timeout=WORKER_RECOVERY_QUIESCE_SECONDS
+            )
+        except asyncio.CancelledError:
+            self._worker_quarantined = True
+            self.request_stop()
+            task.add_done_callback(
+                lambda completed: completed.exception()
+                if not completed.cancelled()
+                else None
+            )
+            raise
+        if task not in done:
+            self._worker_quarantined = True
+            self.request_stop()
+            # Do not cancel a to_thread retirement: its synchronous call is
+            # still live. Keep the executor unusable until process replacement.
+            task.add_done_callback(
+                lambda completed: completed.exception()
+                if not completed.cancelled()
+                else None
+            )
+            raise _ClaimQuiescenceError("worker local retirement did not quiesce")
+        await task
+
+    async def _handoff_workspace_recovery(self, *, claim: WorkerClaim) -> str:
+        """Retire local consumers, preserving tmux and the shared saver pool."""
+        self._lease.mark_lost()
+        runtime = _pa()._agent
+        try:
+            if runtime is not None:
+                retire = getattr(runtime, "quiesce_worker_workspace_recovery", None)
+                if not callable(retire):
+                    raise _ClaimQuiescenceError(
+                        "worker runtime has no recovery quiescence gate"
+                    )
+                await self._join_worker_local_task(asyncio.create_task(retire()))
+        except (Exception, asyncio.CancelledError):
+            self._worker_quarantined = True
+            self.request_stop()
+            logger.error(
+                "workspace recovery local quiescence failed: unit=%s token=%d",
+                claim.unit_id,
+                claim.lease_token,
+                exc_info=True,
+            )
+            return "quarantined:workspace_recovery"
+        # No release/complete/refund: the accepted hold owns the queue. When
+        # response loss remains ambiguous, the exact lease expires to reaper.
+        return "workspace_recovery"
+
     async def _consume_worker_stream(
         self,
         stream: AsyncIterator[Dict[str, Any]],
@@ -2111,7 +2301,7 @@ class StatelessTurnExecutor:
                     if self._lease.lost.is_set():
                         next_state.cancel()
                         with contextlib.suppress(asyncio.CancelledError, Exception):
-                            await next_state
+                            await self._join_worker_local_task(next_state)
                         return "lease_lost", final_state
                     if self._worker_preempted.is_set():
                         next_state.cancel()
@@ -2129,11 +2319,29 @@ class StatelessTurnExecutor:
                         )
                     if isinstance(state, dict):
                         final_state = state
+                        error = state.get("error")
+                        if isinstance(error, dict):
+                            if error.get("type") == "workspace_unavailable":
+                                self._worker_workspace_recovery_code = (
+                                    WorkspaceRecoveryCode.TRANSPORT_UNAVAILABLE
+                                )
+                            else:
+                                with contextlib.suppress(ValueError, TypeError):
+                                    self._worker_workspace_recovery_code = (
+                                        WorkspaceRecoveryCode(error.get("type"))
+                                    )
+                        if self._worker_workspace_recovery_code is not None:
+                            if (
+                                workspace_recovery_enabled()
+                                and self._worker_workspace_backend == "vm"
+                            ):
+                                self._lease.mark_lost()
+                                return "workspace_recovery", final_state
                 finally:
                     if not next_state.done():
                         next_state.cancel()
-                        with contextlib.suppress(asyncio.CancelledError, Exception):
-                            await next_state
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await self._join_worker_local_task(next_state)
         finally:
             finished_at = time.perf_counter()
             if timing["agent_start"] is None:
@@ -2164,6 +2372,9 @@ class StatelessTurnExecutor:
             except asyncio.CancelledError:
                 raise
             except Exception as e:
+                if await self._resolve_workspace_recovery(claim, error=e):
+                    self._lease.mark_lost()
+                    return
                 logger.warning(
                     "worker lease heartbeat failed for unit %s (transient): %s",
                     job_id,
@@ -2171,6 +2382,9 @@ class StatelessTurnExecutor:
                 )
                 continue
             if renewal is None:
+                if await self._resolve_workspace_recovery(claim):
+                    self._lease.mark_lost()
+                    return
                 accepted_completion = await self._accepted_worker_completion(claim)
                 if accepted_completion is not None:
                     logger.info(
@@ -4648,6 +4862,10 @@ _executor: Optional[StatelessTurnExecutor] = None
 async def start_stateless_executor() -> StatelessTurnExecutor:
     """Create + start the singleton executor (idempotent)."""
     global _executor
+    if _executor is not None and _executor._worker_quarantined:
+        raise _ClaimQuiescenceError(
+            "quarantined worker runtime requires process replacement"
+        )
     if _executor is not None and _executor.running:
         return _executor
     executor = StatelessTurnExecutor()

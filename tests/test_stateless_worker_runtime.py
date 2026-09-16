@@ -19,7 +19,14 @@ from typing_extensions import TypedDict
 
 import agent.api.persistent_app as pa
 import agent.api.turn_executor as turn_executor
-from agent.api.orchestrator_client import CompletionNonTerminalReportError
+from agent.api.orchestrator_client import (
+    ClaimBundleError,
+    CompletionNonTerminalReportError,
+)
+from shared.workspace_recovery import (
+    WorkspaceRecoveryCode,
+    WorkspaceRecoveryDisposition,
+)
 from agent.agent import UniversalAgent, _stateless_worker_remote_authority
 from shared.runtime.core.workspace_backend import WorkspaceUnavailableError
 from shared.runtime.core.backends.remote import RemoteBackend
@@ -100,6 +107,376 @@ def _renewal(status="processing") -> WorkerRenewal:
         pending_guidance=(),
         queued_replies=(),
     )
+
+
+def _recovery_receipt(claim):
+    return WorkspaceRecoveryDisposition.hold_committed(
+        code=WorkspaceRecoveryCode.TRANSPORT_UNAVAILABLE,
+        operation_id=uuid4(),
+        accepted_lease_token=claim.lease_token,
+        hold_lease_token=claim.lease_token + 1,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("attempt", [1, 5])
+@pytest.mark.parametrize(
+    "seam",
+    [
+        "bundle",
+        "bundle_response_lost",
+        "preflight",
+        "graph",
+        "shutdown_tail",
+        "heartbeat",
+        "heartbeat_error",
+    ],
+)
+async def test_workspace_refusal_hands_off_without_terminal_report(
+    worker_runtime, monkeypatch, attempt, seam
+):
+    monkeypatch.setenv("VM_WORKSPACE_RECOVERY_ENABLED", "true")
+    claim = _claim(attempts=attempt)
+    final = {"should_stop": True, "goal_achieved": True, "error": None}
+    executor, agent, client, renew, rotate, complete, release = _install(
+        monkeypatch, claim, final
+    )
+    client.backend = "vm"
+    receipt = _recovery_receipt(claim)
+    client.report_workspace_recovery.return_value = receipt
+    if seam == "bundle":
+        client.get_claim_bundle = AsyncMock(
+            side_effect=ClaimBundleError(409, recovery=receipt)
+        )
+    elif seam == "bundle_response_lost":
+        client.get_claim_bundle = AsyncMock(
+            side_effect=TimeoutError("response lost after commit")
+        )
+        client.get_workspace_recovery_disposition.return_value = receipt
+    elif seam == "preflight":
+        renew.return_value = None
+        client.get_workspace_recovery_disposition.return_value = receipt
+    else:
+
+        async def stream():
+            if seam in {"heartbeat", "heartbeat_error"}:
+                await asyncio.Event().wait()
+            if seam == "graph":
+                raise WorkspaceUnavailableError("transport disconnected")
+            yield final
+            if seam == "shutdown_tail":
+                raise WorkspaceUnavailableError("tail transport disconnected")
+
+        agent.process_job = AsyncMock(return_value=stream())
+        if seam in {"heartbeat", "heartbeat_error"}:
+            monkeypatch.setattr(turn_executor, "HEARTBEAT_INTERVAL_SECONDS", 0.001)
+            renew.side_effect = [
+                _renewal(),
+                None if seam == "heartbeat" else OSError("renewal response lost"),
+            ]
+            client.get_workspace_recovery_disposition.return_value = receipt
+
+    await asyncio.wait_for(executor._serve_worker_claim(claim), 1)
+
+    client.report_completion.assert_not_awaited()
+    complete.assert_not_awaited()
+    rotate.assert_not_awaited()
+    release.assert_not_awaited()
+    assert agent.cleanup_calls == [True]
+    assert not executor._stop.is_set()
+    if seam in {"graph", "shutdown_tail"}:
+        client.report_workspace_recovery.assert_awaited_once()
+    if seam in {"preflight", "heartbeat", "heartbeat_error", "bundle_response_lost"}:
+        client.get_workspace_recovery_disposition.assert_awaited()
+
+
+@pytest.mark.asyncio
+async def test_recovery_report_response_loss_replays_exact_disposition(
+    worker_runtime, monkeypatch
+):
+    monkeypatch.setenv("VM_WORKSPACE_RECOVERY_ENABLED", "true")
+    claim = _claim(attempts=5)
+    final = {
+        "should_stop": True,
+        "error": {"type": "workspace_unavailable", "recoverable": True},
+    }
+    executor, agent, client, _, _, complete, release = _install(
+        monkeypatch, claim, final
+    )
+    client.backend = "vm"
+    receipt = _recovery_receipt(claim)
+    client.report_workspace_recovery.side_effect = TimeoutError(
+        "committed response lost"
+    )
+    client.get_workspace_recovery_disposition.side_effect = [None, receipt]
+    await executor._serve_worker_claim(claim)
+    client.report_completion.assert_not_awaited()
+    release.assert_not_awaited()
+    complete.assert_not_awaited()
+    assert agent.cleanup_calls == [True]
+
+
+@pytest.mark.asyncio
+async def test_recovery_quiescence_failure_quarantines_executor(
+    worker_runtime, monkeypatch
+):
+    claim = _claim(attempts=5)
+    executor, agent, client, _, _, complete, release = _install(monkeypatch, claim, {})
+    client.get_claim_bundle = AsyncMock(
+        side_effect=ClaimBundleError(409, recovery=_recovery_receipt(claim))
+    )
+    agent.cleanup_worker_claim = AsyncMock(
+        side_effect=RuntimeError("resource calls still active")
+    )
+    await executor._serve_worker_claim(claim)
+    assert executor._stop.is_set()
+    assert executor._worker_quarantined is True
+    client.report_completion.assert_not_awaited()
+    release.assert_not_awaited()
+    complete.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_bundle_recovery_still_quarantines_failed_cleanup(
+    worker_runtime, monkeypatch
+):
+    claim = _claim(attempts=5)
+    executor, agent, client, _, _, complete, release = _install(monkeypatch, claim, {})
+    client.get_claim_bundle = AsyncMock(side_effect=asyncio.CancelledError)
+    client.get_workspace_recovery_disposition.return_value = _recovery_receipt(claim)
+    agent.cleanup_worker_claim = AsyncMock(side_effect=RuntimeError("still active"))
+    with pytest.raises(asyncio.CancelledError):
+        await executor._serve_worker_claim(claim)
+    assert executor._worker_quarantined and executor._stop.is_set()
+    client.report_completion.assert_not_awaited()
+    complete.assert_not_awaited()
+    release.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_recovery_without_strict_runtime_gate_quarantines_executor(
+    worker_runtime, monkeypatch
+):
+    claim = _claim(attempts=5)
+    executor, agent, client, _, _, complete, release = _install(monkeypatch, claim, {})
+    client.get_claim_bundle = AsyncMock(
+        side_effect=ClaimBundleError(409, recovery=_recovery_receipt(claim))
+    )
+    agent.quiesce_worker_workspace_recovery = None
+    await executor._serve_worker_claim(claim)
+    assert executor._worker_quarantined and executor._stop.is_set()
+    assert agent.cleanup_calls == []
+    client.report_completion.assert_not_awaited()
+    complete.assert_not_awaited()
+    release.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_recovery_unknown_response_leaves_exact_claim_for_reaper(
+    worker_runtime, monkeypatch
+):
+    monkeypatch.setenv("VM_WORKSPACE_RECOVERY_ENABLED", "true")
+    claim = _claim(attempts=5)
+    executor, agent, client, _, _, complete, release = _install(
+        monkeypatch,
+        claim,
+        {
+            "should_stop": True,
+            "error": {"type": "workspace_unavailable"},
+        },
+    )
+    client.report_workspace_recovery.side_effect = TimeoutError("response lost")
+    client.backend = "vm"
+    client.get_workspace_recovery_disposition.return_value = None
+    await executor._serve_worker_claim(claim)
+    client.report_completion.assert_not_awaited()
+    release.assert_not_awaited()
+    complete.assert_not_awaited()
+    assert agent.cleanup_calls == [True]
+
+
+@pytest.mark.asyncio
+async def test_agent_recovery_cleanup_does_not_swallow_transport_retirement_failure():
+    agent = UniversalAgent.__new__(UniversalAgent)
+    backend = SimpleNamespace(
+        retire=MagicMock(side_effect=RuntimeError("still active"))
+    )
+    agent._workspace_manager = SimpleNamespace(backend=backend)
+    agent._tool_context = None
+    agent._retire_worker_shell_admission = MagicMock()
+    agent._scrub_worker_claim_locals = AsyncMock()
+    with pytest.raises(RuntimeError, match="still active"):
+        await agent.quiesce_worker_workspace_recovery()
+    assert agent._workspace_manager.backend is backend
+    agent._scrub_worker_claim_locals.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_workspace_error_survives_child_failure_in_graph_shutdown_tail(
+    worker_runtime, monkeypatch
+):
+    monkeypatch.setenv("VM_WORKSPACE_RECOVERY_ENABLED", "true")
+    claim = _claim(attempts=5)
+    executor, agent, client, _, _, complete, release = _install(monkeypatch, claim, {})
+    client.backend = "vm"
+    client.report_workspace_recovery.return_value = _recovery_receipt(claim)
+
+    async def stream():
+        yield {"should_stop": True, "error": {"type": "workspace_unavailable"}}
+        raise SubagentQuiescenceError("child finalizer failed after workspace loss")
+
+    agent.process_job = AsyncMock(return_value=stream())
+    await executor._serve_worker_claim(claim)
+    client.report_workspace_recovery.assert_awaited_once()
+    client.report_completion.assert_not_awaited()
+    release.assert_not_awaited()
+    complete.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_agent_recovery_cleanup_does_not_swallow_shell_admission_failure():
+    agent = UniversalAgent.__new__(UniversalAgent)
+    backend = SimpleNamespace(
+        retire_shell_owner=MagicMock(side_effect=RuntimeError("shell still admitted")),
+        retire=MagicMock(),
+    )
+    agent._workspace_manager = SimpleNamespace(backend=backend)
+    agent._tool_context = None
+    agent._scrub_worker_claim_locals = AsyncMock()
+    with pytest.raises(RuntimeError, match="shell still admitted"):
+        await agent.quiesce_worker_workspace_recovery()
+    backend.retire.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_recovery_cleanup_timeout_quarantines_and_refuses_next_claim(
+    worker_runtime, monkeypatch
+):
+    claim = _claim(attempts=5)
+    executor, agent, client, _, _, _, release = _install(monkeypatch, claim, {})
+    client.get_claim_bundle = AsyncMock(
+        side_effect=ClaimBundleError(409, recovery=_recovery_receipt(claim))
+    )
+    admitted = asyncio.Event()
+    retire = asyncio.Event()
+
+    async def cleanup(*, preserve_shell):
+        admitted.set()
+        await retire.wait()
+
+    agent.cleanup_worker_claim = cleanup
+    monkeypatch.setattr(turn_executor, "WORKER_RECOVERY_QUIESCE_SECONDS", 0.01)
+    try:
+        await executor._serve_worker_claim(claim)
+        assert admitted.is_set()
+        assert executor._worker_quarantined and executor._stop.is_set()
+        with pytest.raises(turn_executor._ClaimQuiescenceError):
+            await executor._serve_worker_claim(_claim())
+        client.report_completion.assert_not_awaited()
+        release.assert_not_awaited()
+    finally:
+        retire.set()
+        await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_disabled_recovery_admission_still_consumes_accepted_receipt(
+    worker_runtime, monkeypatch
+):
+    monkeypatch.setenv("VM_WORKSPACE_RECOVERY_ENABLED", "false")
+    claim = _claim(attempts=5)
+    executor, agent, client, _, _, complete, release = _install(monkeypatch, claim, {})
+    client.get_claim_bundle = AsyncMock(side_effect=TimeoutError("hold response lost"))
+    client.get_workspace_recovery_disposition.return_value = _recovery_receipt(claim)
+    await executor._serve_worker_claim(claim)
+    client.report_completion.assert_not_awaited()
+    release.assert_not_awaited()
+    complete.assert_not_awaited()
+    assert agent.cleanup_calls == [True]
+
+
+@pytest.mark.asyncio
+async def test_enabled_vm_recovery_preserves_sandbox_exhaustion_behavior(
+    worker_runtime, monkeypatch
+):
+    monkeypatch.setenv("VM_WORKSPACE_RECOVERY_ENABLED", "true")
+    claim = _claim(attempts=5)
+    executor, agent, client, _, _, complete, release = _install(
+        monkeypatch,
+        claim,
+        {
+            "should_stop": True,
+            "error": {"type": "workspace_unavailable", "recoverable": True},
+        },
+    )
+    await executor._serve_worker_claim(claim)
+    client.report_workspace_recovery.assert_not_awaited()
+    client.report_completion.assert_awaited_once()
+    complete.assert_awaited_once()
+    release.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("http_result", [False, True])
+async def test_recovery_accepted_during_completion_response_uses_strict_handoff(
+    worker_runtime, monkeypatch, http_result
+):
+    monkeypatch.setenv("VM_WORKSPACE_RECOVERY_ENABLED", "true")
+    claim = _claim(attempts=5)
+    executor, agent, client, renew, _, complete, release = _install(
+        monkeypatch,
+        claim,
+        {
+            "should_stop": True,
+            "goal_achieved": True,
+        },
+    )
+    receipt = _recovery_receipt(claim)
+
+    async def report(*args, **kwargs):
+        client.get_workspace_recovery_disposition.return_value = receipt
+        renew.return_value = None
+        return http_result
+
+    client.report_completion.side_effect = report
+    await executor._serve_worker_claim(claim)
+    assert executor._worker_workspace_recovery.disposition == receipt
+    assert agent.cleanup_calls == [True]
+    complete.assert_not_awaited()
+    release.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error_type",
+    [
+        "workspace_unavailable",
+        "workspace_transport_unavailable",
+        "workspace_identity_conflict",
+    ],
+)
+async def test_workspace_error_closes_graph_before_another_step(
+    worker_runtime, monkeypatch, error_type
+):
+    monkeypatch.setenv("VM_WORKSPACE_RECOVERY_ENABLED", "true")
+    claim = _claim(attempts=5)
+    executor, agent, client, _, _, _, release = _install(monkeypatch, claim, {})
+    client.backend = "vm"
+    client.report_workspace_recovery.return_value = _recovery_receipt(claim)
+    events = []
+
+    async def stream():
+        try:
+            yield {"should_stop": True, "error": {"type": error_type}}
+            events.append("another_step")
+        finally:
+            events.append(("closed", executor._lease.lost.is_set()))
+
+    agent.process_job = AsyncMock(return_value=stream())
+    await executor._serve_worker_claim(claim)
+    assert events == [("closed", True)]
+    client.report_completion.assert_not_awaited()
+    release.assert_not_awaited()
 
 
 def _acceptance(
@@ -303,6 +680,9 @@ class _FakeAgent:
     async def cleanup_worker_claim(self, *, preserve_shell):
         self.cleanup_calls.append(preserve_shell)
 
+    async def quiesce_worker_workspace_recovery(self):
+        await self.cleanup_worker_claim(preserve_shell=True)
+
     async def hold_worker_finalization(self):
         self.hold_calls += 1
         self.hold_event.set()
@@ -313,13 +693,20 @@ class _FakeClient:
         self.claim = claim
         self.report_result = report_result
         self.report_completion = AsyncMock(return_value=report_result)
+        self.get_workspace_recovery_disposition = AsyncMock(return_value=None)
+        self.report_workspace_recovery = AsyncMock()
+        self.backend = "sandbox"
 
     async def get_claim_bundle(self, unit_id, lease_token):
         assert (unit_id, lease_token) == (
             str(self.claim.unit_id),
             self.claim.lease_token,
         )
-        return _bundle(self.claim)
+        bundle = _bundle(self.claim)
+        bundle["job"]["config_override"]["workspace"]["backend"] = self.backend
+        for name in ("requested_backend", "assigned_backend", "effective_backend"):
+            bundle["job"]["workspace_runtime"][name] = self.backend
+        return bundle
 
 
 class _FakeAuditWriter:
@@ -960,10 +1347,12 @@ async def test_coded_nonterminal_422_cleanup_fault_at_cap_never_rereports(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("report_result", [True, False])
+@pytest.mark.parametrize("workspace_recovery", [False, True])
 async def test_command_accept_queue_closure_is_not_misclassified_as_lease_loss(
     worker_runtime,
     monkeypatch,
     report_result,
+    workspace_recovery,
 ):
     """B4 closes the queue inside accept, before the HTTP response returns."""
 
@@ -989,8 +1378,21 @@ async def test_command_accept_queue_closure_is_not_misclassified_as_lease_loss(
         "get_worker_completion_acceptance",
         accepted_lookup,
     )
+    if workspace_recovery:
+        monkeypatch.setenv("VM_WORKSPACE_RECOVERY_ENABLED", "true")
+        client.get_workspace_recovery_disposition.return_value = _recovery_receipt(
+            claim
+        )
 
     await executor._serve_worker_claim(claim)
+
+    if workspace_recovery:
+        client.report_completion.assert_not_awaited()
+        accepted_lookup.assert_not_awaited()
+        release.assert_not_awaited()
+        complete.assert_not_awaited()
+        assert agent.cleanup_calls == [True]
+        return
 
     client.report_completion.assert_awaited_once()
     accepted_lookup.assert_awaited_once_with(
@@ -1452,7 +1854,11 @@ async def test_agent_finalization_hold_retires_admission_then_disposes_shell_onc
 
 
 @pytest.mark.asyncio
-async def test_agent_hold_drains_admitted_resource_io_and_retires_original_backend():
+@pytest.mark.parametrize("workspace_recovery", [False, True])
+@pytest.mark.parametrize("io_kind", ["resource", "sftp"])
+async def test_agent_hold_drains_admitted_resource_io_and_retires_original_backend(
+    workspace_recovery, io_kind
+):
     job_id = str(uuid4())
     workspace_generation = str(uuid4())
     runtime_incarnation = str(uuid4())
@@ -1496,12 +1902,27 @@ async def test_agent_hold_drains_admitted_resource_io_and_retires_original_backe
     agent._graph = object()
     agent._worker_checkpoint_post_commit = None
     agent._defer_job_cleanup = True
+    child = SimpleNamespace(abandon=AsyncMock())
+    if workspace_recovery:
+        agent._tool_context = SimpleNamespace(subagent_runtime=child)
+    shared_pool = SimpleNamespace(close=AsyncMock())
+    agent._checkpointer = SimpleNamespace(conn=shared_pool)
+
+    def sftp_call():
+        with backend._sftp_lock:
+            return admitted_exec()[0]
 
     resource_task = asyncio.create_task(
-        asyncio.to_thread(backend.exec_claim_resource, ":")
+        asyncio.to_thread(
+            sftp_call if io_kind == "sftp" else lambda: backend.exec_claim_resource(":")
+        )
     )
     assert await asyncio.to_thread(admitted.wait, 1)
-    hold_task = asyncio.create_task(agent.hold_worker_finalization())
+    hold_task = asyncio.create_task(
+        agent.quiesce_worker_workspace_recovery()
+        if workspace_recovery
+        else agent.hold_worker_finalization()
+    )
     await asyncio.sleep(0.02)
 
     # retire() cannot publish the hold until the admitted resource mutation
@@ -1517,6 +1938,14 @@ async def test_agent_hold_drains_admitted_resource_io_and_retires_original_backe
         backend.exec_claim_resource(":")
     with pytest.raises(WorkspaceUnavailableError):
         backend.write_file("late.txt", "must fail")
+    shared_pool.close.assert_not_awaited()
+    assert agent._graph is None and agent._checkpointer is None
+    if workspace_recovery:
+        assert agent._subagent_abandoned_runtime is None
+        assert agent._workspace_manager is None
+        assert agent._shell_manager is None
+        assert not getattr(agent, "_worker_terminal_shell_cleanup", None)
+        return
     capability = agent._worker_terminal_shell_cleanup
     assert callable(capability)
     assert not hasattr(capability, "exec_command")
@@ -1613,8 +2042,9 @@ async def test_recoverable_end_releases_without_reporting(worker_runtime, monkey
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("workspace_recovery", [False, True])
 async def test_last_recoverable_attempt_reports_visible_terminal_give_up(
-    worker_runtime, monkeypatch
+    worker_runtime, monkeypatch, workspace_recovery
 ):
     claim = _claim(input_seq=4, prior="processing", attempts=5, max_attempts=5)
     final = {
@@ -1628,8 +2058,21 @@ async def test_last_recoverable_attempt_reports_visible_terminal_give_up(
     executor, agent, client, _, rotate, complete, release = _install(
         monkeypatch, claim, final
     )
+    if workspace_recovery:
+        monkeypatch.setenv("VM_WORKSPACE_RECOVERY_ENABLED", "true")
+        final["error"]["type"] = "workspace_unavailable"
+        client.backend = "vm"
+        client.report_workspace_recovery.return_value = _recovery_receipt(claim)
 
     await executor._serve_worker_claim(claim)
+
+    if workspace_recovery:
+        client.report_completion.assert_not_awaited()
+        client.report_workspace_recovery.assert_awaited_once()
+        release.assert_not_awaited()
+        complete.assert_not_awaited()
+        assert agent.cleanup_calls == [True]
+        return
 
     client.report_completion.assert_awaited_once()
     reported = client.report_completion.await_args.args[1]
@@ -1644,8 +2087,9 @@ async def test_last_recoverable_attempt_reports_visible_terminal_give_up(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("workspace_recovery", [False, True])
 async def test_last_pregraph_driver_failure_reports_visible_terminal_give_up(
-    worker_runtime, monkeypatch
+    worker_runtime, monkeypatch, workspace_recovery
 ):
     claim = _claim(input_seq=4, prior="processing", attempts=5, max_attempts=5)
     executor, agent, client, _, rotate, complete, release = _install(
@@ -1659,8 +2103,21 @@ async def test_last_pregraph_driver_failure_reports_visible_terminal_give_up(
     client.get_claim_bundle = AsyncMock(
         side_effect=RuntimeError("bundle credentials were revoked")
     )
+    if workspace_recovery:
+        client.get_claim_bundle.side_effect = ClaimBundleError(
+            409,
+            recovery=_recovery_receipt(claim),
+            code=WorkspaceRecoveryCode.RUNTIME_NOT_READY,
+        )
 
     await executor._serve_worker_claim(claim)
+
+    if workspace_recovery:
+        client.report_completion.assert_not_awaited()
+        complete.assert_not_awaited()
+        release.assert_not_awaited()
+        assert agent.cleanup_calls == [True]
+        return
 
     client.report_completion.assert_awaited_once()
     reported = client.report_completion.await_args.args[1]

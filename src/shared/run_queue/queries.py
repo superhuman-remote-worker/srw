@@ -1311,6 +1311,7 @@ async def reap_expired(
     backoff_base_seconds: float = 5.0,
     jitter: float = 0.2,
     session_steal: Callable[..., Awaitable[StolenUnit | None]] | None = None,
+    worker_steal: Callable[..., Awaitable[StolenUnit | None]] | None = None,
 ) -> list[StolenUnit]:
     """Steal expired leases, per-row (§5.2 reaper) — never one bulk UPDATE.
 
@@ -1333,12 +1334,13 @@ async def reap_expired(
     Each steal commits independently (run this OUTSIDE any transaction): a
     crash mid-pass keeps the steals already made.
 
-    ``session_steal`` is the one deliberate layering seam.  When supplied for
-    a session candidate it owns the exact per-row steal and returns the same
-    :class:`StolenUnit` result.  The orchestrator uses it to lock
+    ``session_steal`` and ``worker_steal`` are optional layering seams. Each
+    owns the exact per-row transition for its unit kind and returns a
+    :class:`StolenUnit` or None. The orchestrator uses the session hook to lock
     ``threads -> run_queue`` and record old-claim I/O-quiescence provenance in
-    the *same transaction* as the token bump; generic worker/background rows
-    keep the queue-only statement below.
+    the same transaction as the token bump. The worker hook reconciles durable
+    disposition before retry/exhaustion. Without a matching hook, the existing
+    queue-only statement below remains authoritative.
 
     Layering: without that callback this module touches only ``run_queue``. The CALLER (the
     leader-gated reaper loop — advisory lock ``RUN_QUEUE_REAPER_ID`` in
@@ -1354,8 +1356,15 @@ async def reap_expired(
     for cand in candidates:
         attempts = cand["attempts_since_completion"]
         backoff = backoff_base_seconds * attempts * (1.0 + random.uniform(0.0, jitter))
-        if cand["unit_kind"] == UNIT_KIND_SESSION_TURN and session_steal is not None:
-            unit = await session_steal(
+        steal = (
+            session_steal
+            if cand["unit_kind"] == UNIT_KIND_SESSION_TURN
+            else worker_steal
+            if cand["unit_kind"] == UNIT_KIND_WORKER_BATCH
+            else None
+        )
+        if steal is not None:
+            unit = await steal(
                 conn,
                 candidate=cand,
                 backoff_seconds=backoff,

@@ -43,6 +43,9 @@ from enum import Enum
 from typing import Any
 
 from orchestrator.database.lock_ids import RUN_QUEUE_REAPER_ID
+from orchestrator.services.vm_workspace_recovery_store import VMWorkspaceRecoveryStore
+from shared.workspace_recovery import workspace_recovery_enabled
+from shared.run_queue.queries import _REAP_STEAL_SQL
 from shared.event_journal import append_system_frame, bump_epoch
 from shared.run_queue import (
     REAPER_GRACE_SECONDS,
@@ -1374,6 +1377,54 @@ async def reconcile_claim_loss_holds(
     return settled
 
 
+async def _try_steal_worker_with_recovery(
+    conn: Any, *, candidate: Any, backoff_seconds: float, grace_seconds: float
+) -> StolenUnit | None:
+    """Let exact recovery evidence decide before the ordinary exhaustion CAS."""
+    try:
+        store = VMWorkspaceRecoveryStore(conn)
+        disposition = await store.get_attempt_disposition(
+            conn, job_id=candidate["unit_id"], lease_token=candidate["lease_token"]
+        )
+        # Admission owns canonical workspace -> queue -> job locking and
+        # revalidates both expiry and attempt evidence after those locks.
+        if await store.admit_hold_from_reaper(
+            conn,
+            disposition=disposition,
+            job_id=candidate["unit_id"],
+            lease_token=candidate["lease_token"],
+            grace_seconds=grace_seconds,
+        ):
+            return None
+        # Non-VM workers retain the queue-only steal and exhaustion behavior.
+        row = await conn.fetchrow(
+            _REAP_STEAL_SQL,
+            candidate["unit_id"],
+            candidate["lease_token"],
+            backoff_seconds,
+            grace_seconds,
+        )
+        if row is None:
+            return None
+        return StolenUnit(
+            unit_id=row["unit_id"],
+            unit_kind=row["unit_kind"],
+            state=row["state"],
+            attempts_since_completion=row["attempts_since_completion"],
+            leased_by=candidate["leased_by"],
+            lease_token=row["lease_token"],
+            previous_lease_token=candidate["lease_token"],
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception(
+            "run_queue reaper: worker recovery reconciliation failed for %s (exact lease left unchanged)",
+            candidate["unit_id"],
+        )
+        return None
+
+
 async def reap_cycle(
     conn: Any,
     *,
@@ -1387,10 +1438,16 @@ async def reap_cycle(
     opens its own transaction. Per-row errors are contained so one bad unit
     never blocks the rest of the pass.
     """
+    recovery_options = (
+        {"worker_steal": _try_steal_worker_with_recovery}
+        if workspace_recovery_enabled()
+        else {}
+    )
     stolen = await reap_expired(
         conn,
         grace_seconds=grace_seconds,
         session_steal=_try_steal_session_with_claim_loss,
+        **recovery_options,
     )
     for unit in stolen:
         # Greppable ops line — one per steal (M6 fault-injection anchors on it).

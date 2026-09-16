@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Mapping
-from uuid import UUID, uuid4
+from uuid import UUID, uuid4, uuid5, NAMESPACE_URL
 
 from shared.worker_queue import (
     get_worker_attempt_disposition,
@@ -59,6 +61,14 @@ class VMWorkspaceRecoveryStore:
     def __init__(self, db: Any, *, worker_id: str | None = None) -> None:
         self.db = db
         self.worker_id = worker_id or os.getenv("HOSTNAME", "vm-workspace-recovery")
+
+    @asynccontextmanager
+    async def _connection(self, conn: Any | None):
+        if conn is not None:
+            yield conn
+        else:
+            async with self.db.acquire() as acquired:
+                yield acquired
 
     @staticmethod
     async def _accepted_request(
@@ -145,10 +155,12 @@ class VMWorkspaceRecoveryStore:
         original_cause: Mapping[str, Any] | None = None,
         checkpoint_id: str | None = None,
         checkpoint_namespace: str | None = None,
+        _conn: Any | None = None,
+        expired_grace_seconds: float | None = None,
     ) -> WorkspaceRecoveryDisposition:
         """Fence the reporter and all current members under the workspace lock."""
 
-        async with self.db.acquire() as conn:
+        async with self._connection(_conn) as conn:
             async with conn.transaction():
                 prior = await self._accepted_request(
                     conn,
@@ -254,6 +266,26 @@ class VMWorkspaceRecoveryStore:
                 job = jobs.get(job_id)
                 if job is None:
                     raise RuntimeError("recovery job does not exist")
+                if expired_grace_seconds is not None:
+                    expired = await conn.fetchval(
+                        "SELECT leased_until < clock_timestamp() - "
+                        "make_interval(secs => $3::float8) FROM run_queue "
+                        "WHERE unit_id=$1 AND lease_token=$2 AND state='leased'",
+                        job_id,
+                        accepted_lease_token,
+                        expired_grace_seconds,
+                    )
+                    if expired is not True:
+                        raise RuntimeError(
+                            "worker lease renewed before recovery admission"
+                        )
+                    # Initial scans are hints; authorization can commit while
+                    # this transaction waits for the workspace/queue locks.
+                    exact = await self.get_attempt_disposition(
+                        conn, job_id=job_id, lease_token=accepted_lease_token
+                    )
+                    if exact is None or exact.bundle_authorized:
+                        code = WorkspaceRecoveryCode.TOOL_OUTCOME_UNKNOWN
                 locked_owner, locked_ambiguous = _job_workspace_owner(job_id, job)
                 owner_conflict |= locked_ambiguous or locked_owner != owner_id
                 attempts: dict[UUID, Any] = {}
@@ -360,6 +392,13 @@ class VMWorkspaceRecoveryStore:
                     if attention_required and not reported_attention
                     else code
                 )
+                if (
+                    expired_grace_seconds is not None
+                    and code == WorkspaceRecoveryCode.TOOL_OUTCOME_UNKNOWN
+                ):
+                    # Missing identity remains diagnostic debt, but it must
+                    # not hide the reaper's stronger unknown-execution hold.
+                    disposition_code = WorkspaceRecoveryCode.TOOL_OUTCOME_UNKNOWN
                 phase = "paused_attention" if attention_required else "recovering"
                 diagnostic = (
                     {
@@ -402,6 +441,28 @@ class VMWorkspaceRecoveryStore:
                     diagnostic = {
                         **(diagnostic or {}),
                         "missing_identity_fields": missing_identity_fields,
+                    }
+                if (
+                    expired_grace_seconds is not None
+                    and code == WorkspaceRecoveryCode.TOOL_OUTCOME_UNKNOWN
+                ):
+                    recovery_codes = [WorkspaceRecoveryCode.TOOL_OUTCOME_UNKNOWN.value]
+                    if owner_conflict or missing_runtime_identity:
+                        recovery_codes.append(
+                            WorkspaceRecoveryCode.IDENTITY_CONFLICT.value
+                        )
+                    if unsupported_writers:
+                        recovery_codes.append(
+                            WorkspaceRecoveryCode.SHARED_WRITERS_UNFENCED.value
+                        )
+                    diagnostic = {
+                        **(diagnostic or {}),
+                        "recovery_codes": recovery_codes,
+                        "attempt_ledger_present": exact is not None,
+                        "bundle_authorized": exact.bundle_authorized if exact else None,
+                        "unsupported_writer_job_ids": unsupported_writers,
+                        "unresolved_member_job_ids": uncertain_members,
+                        "control_blocked_job_ids": frozen_members,
                     }
 
                 recovery_id = uuid4()
@@ -576,6 +637,83 @@ class VMWorkspaceRecoveryStore:
                     json.dumps(receipt),
                 )
                 return disposition
+
+    async def admit_hold_from_reaper(
+        self,
+        conn: Any,
+        *,
+        disposition: RecoveryAttemptDisposition | None,
+        job_id: UUID,
+        lease_token: int,
+        grace_seconds: float,
+    ) -> bool:
+        """Contain expired VM claims before generic retry/exhaustion.
+
+        No missing/post-authorization receipt establishes replay safety.
+        Local death or lease expiry also says nothing about remote commands.
+        """
+        if disposition is not None:
+            if disposition.job_id != job_id or disposition.lease_token != lease_token:
+                raise RuntimeError("reaper attempt identity mismatch")
+            if disposition.requires_recovery_hold:
+                return True
+        from shared.workspace_contract import resolve_workspace_contract
+
+        job = await conn.fetchrow("SELECT * FROM jobs WHERE id=$1", job_id)
+        if job is None or job["execution_lane"] != "stateless":
+            return False
+        contract = resolve_workspace_contract(dict(job))
+        if contract.assigned_backend != "vm":
+            return False
+        owner_id, _ = _job_workspace_owner(job_id, job)
+        owner = (
+            job
+            if owner_id == job_id
+            else await conn.fetchrow("SELECT * FROM jobs WHERE id=$1", owner_id)
+        )
+        context = _json(owner["context"]) if owner else {}
+        vm = context.get("vm", {}) if isinstance(context, dict) else {}
+        if not isinstance(vm, dict):
+            vm = {}
+
+        def identifier(key: str) -> UUID | None:
+            try:
+                return UUID(str(vm.get(key)))
+            except (ValueError, TypeError):
+                return None
+
+        request_id = uuid5(NAMESPACE_URL, f"workspace-reaper:{job_id}:{lease_token}")
+        digest = hashlib.sha256(
+            json.dumps(
+                contract.to_context(), sort_keys=True, separators=(",", ":")
+            ).encode()
+        ).hexdigest()
+        await self.admit_hold(
+            job_id=job_id,
+            accepted_lease_token=lease_token,
+            owner_kind="job",
+            owner_id=owner_id,
+            workspace_contract_digest=digest,
+            provision_generation=identifier("provision_generation"),
+            cluster_name=os.getenv("VM_CLUSTER_NAME", "local").strip() or "local",
+            namespace=vm.get("namespace"),
+            vm_uid=identifier("vm_uid"),
+            prior_vmi_uid=identifier("vmi_uid"),
+            prior_launcher_uid=identifier("active_pod_uid"),
+            root_pvc_uid=identifier("rootdisk_pvc_uid"),
+            code=(
+                WorkspaceRecoveryCode.TOOL_OUTCOME_UNKNOWN
+                if disposition is None or disposition.bundle_authorized
+                else WorkspaceRecoveryCode.RUNTIME_NOT_READY
+            ),
+            request_id=request_id,
+            actor_kind="reaper",
+            actor_id=self.worker_id,
+            intent_digest=str(request_id),
+            _conn=conn,
+            expired_grace_seconds=grace_seconds,
+        )
+        return True
 
     async def get_attempt_disposition(
         self, conn: Any, *, job_id: UUID, lease_token: int
