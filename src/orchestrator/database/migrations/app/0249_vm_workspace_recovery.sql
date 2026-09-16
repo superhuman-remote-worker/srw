@@ -14,13 +14,13 @@ CREATE TABLE vm_workspace_recoveries (
     owner_kind text NOT NULL CHECK (owner_kind IN ('job', 'thread')),
     owner_id uuid NOT NULL,
     workspace_contract_digest text NOT NULL CHECK (workspace_contract_digest <> ''),
-    provision_generation uuid NOT NULL,
+    provision_generation uuid,
     cluster_name text NOT NULL CHECK (cluster_name <> ''),
-    namespace text NOT NULL CHECK (namespace <> ''),
-    vm_uid uuid NOT NULL,
-    prior_vmi_uid uuid NOT NULL,
-    prior_launcher_uid uuid NOT NULL,
-    root_pvc_uid uuid NOT NULL,
+    namespace text CHECK (namespace <> ''),
+    vm_uid uuid,
+    prior_vmi_uid uuid,
+    prior_launcher_uid uuid,
+    root_pvc_uid uuid,
     phase text NOT NULL DEFAULT 'recovering'
         CHECK (phase IN ('recovering', 'paused_attention', 'recovered', 'cancelled')),
     first_observed_at timestamptz NOT NULL DEFAULT transaction_timestamp(),
@@ -49,6 +49,12 @@ CREATE TABLE vm_workspace_recoveries (
     claimed_by text,
     claimed_until timestamptz,
     resolved_at timestamptz,
+    CONSTRAINT vm_workspace_recoveries_exact_runtime_identity CHECK (
+        (prior_vmi_uid IS NOT NULL AND prior_launcher_uid IS NOT NULL
+         AND provision_generation IS NOT NULL AND namespace IS NOT NULL
+         AND vm_uid IS NOT NULL AND root_pvc_uid IS NOT NULL)
+        OR (phase = 'paused_attention' AND reason_code = 'workspace_identity_conflict')
+    ),
     CHECK (deadline_at = first_observed_at + interval '15 minutes'),
     CHECK ((claimed_by IS NULL AND claimed_until IS NULL)
         OR (claimed_by IS NOT NULL AND claimed_by <> ''

@@ -23,6 +23,10 @@ from shared.runtime_actor import (
     RUNTIME_ACTOR_REFRESH_HEADER,
     RuntimeActorContext,
 )
+from shared.workspace_recovery import (
+    WorkspaceRecoveryCode,
+    WorkspaceRecoveryDisposition,
+)
 from shared.subagent_parent_authority import (
     ParentExecutionAuthority,
     ParentExecutionAuthorityRefused,
@@ -106,10 +110,47 @@ class ClaimBundleError(Exception):
     exceptions and the executor releases with backoff.
     """
 
-    def __init__(self, status_code: int, detail: str = "") -> None:
+    def __init__(
+        self,
+        status_code: int,
+        detail: str = "",
+        *,
+        code: WorkspaceRecoveryCode | None = None,
+        recovery: WorkspaceRecoveryDisposition | None = None,
+    ) -> None:
         self.status_code = status_code
         self.detail = detail
+        self.code = code
+        self.recovery = recovery
         super().__init__(f"claim-bundle {status_code}: {detail[:200]}")
+
+
+def _workspace_recovery_receipt(
+    response: httpx.Response, lease_token: int
+) -> WorkspaceRecoveryDisposition | None:
+    """Recognize only versioned, exact-attempt receipts; unknown 409s stay generic."""
+    try:
+        body = response.json()
+        recovery = body["recovery"]
+        if (
+            type(recovery["version"]) is not int
+            or recovery["version"] != 1
+            or recovery["action"]
+            not in {"hold_committed", "paused_attention", "recovered"}
+            or type(recovery["accepted_lease_token"]) is not int
+            or recovery["accepted_lease_token"] != lease_token
+            or type(recovery["hold_lease_token"]) is not int
+        ):
+            return None
+        return WorkspaceRecoveryDisposition(
+            code=WorkspaceRecoveryCode(body["code"]),
+            action=recovery["action"],
+            operation_id=UUID(recovery["operation_id"]),
+            accepted_lease_token=recovery["accepted_lease_token"],
+            hold_lease_token=recovery["hold_lease_token"],
+        )
+    except (ValueError, TypeError, KeyError, AttributeError):
+        return None
 
 
 class CompletionNonTerminalReportError(Exception):
@@ -1658,7 +1699,65 @@ class OrchestratorClient:
             detail = response.text or ""
         except Exception:
             pass
-        raise ClaimBundleError(response.status_code, detail)
+        recovery = (
+            _workspace_recovery_receipt(response, lease_token)
+            if response.status_code == 409
+            else None
+        )
+        raise ClaimBundleError(
+            response.status_code,
+            detail,
+            code=recovery.code if recovery else None,
+            recovery=recovery,
+        )
+
+    async def report_workspace_recovery(
+        self,
+        unit_id: str,
+        lease_token: int,
+        *,
+        code: WorkspaceRecoveryCode,
+        request_id: UUID | str,
+    ) -> WorkspaceRecoveryDisposition:
+        """Report an observation using a caller-retained idempotency identity."""
+        if not self._client:
+            await self.connect()
+        response = await self._client.post(
+            f"{self.orchestrator_url}/internal/units/{unit_id}/workspace-recovery",
+            json={
+                "lease_token": int(lease_token),
+                "request_id": str(request_id),
+                "code": code.value,
+                "pod_name": os.environ.get("POD_NAME")
+                or os.environ.get("HOSTNAME", ""),
+                "pod_uid": os.environ.get("POD_UID", ""),
+            },
+            timeout=15.0,
+        )
+        receipt = _workspace_recovery_receipt(response, lease_token)
+        if response.status_code != 200 or receipt is None:
+            raise ClaimBundleError(response.status_code, response.text)
+        return receipt
+
+    async def get_workspace_recovery_disposition(
+        self,
+        unit_id: str,
+        lease_token: int,
+    ) -> WorkspaceRecoveryDisposition | None:
+        """Read the exact non-executable receipt after an ambiguous response."""
+        if not self._client:
+            await self.connect()
+        response = await self._client.get(
+            f"{self.orchestrator_url}/internal/units/{unit_id}/workspace-recovery-disposition",
+            params={"lease_token": int(lease_token)},
+            timeout=15.0,
+        )
+        if response.status_code == 404:
+            return None
+        receipt = _workspace_recovery_receipt(response, lease_token)
+        if response.status_code != 200 or receipt is None:
+            raise ClaimBundleError(response.status_code, response.text)
+        return receipt
 
     async def get_thread_canvas(self, thread_id: str) -> dict[str, Any] | None:
         """Fetch the delegated user's logical ``main`` Canvas state.

@@ -34,6 +34,96 @@ from agent.api.orchestrator_client import ClaimBundleError
 from shared.run_queue import ClaimedUnit
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("known", [True, False])
+async def test_client_claim_bundle_parses_only_known_exact_recovery(known):
+    import httpx
+    from agent.api.orchestrator_client import OrchestratorClient
+    from shared.workspace_recovery import WorkspaceRecoveryCode
+
+    payload = {
+        "detail": "unavailable",
+        "code": "workspace_runtime_not_ready" if known else "future_error",
+        "recovery": {
+            "version": 1,
+            "action": "hold_committed",
+            "operation_id": "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+            "accepted_lease_token": 7,
+            "hold_lease_token": 8,
+        },
+    }
+    client = OrchestratorClient("http://test", "127.0.0.1", 8000, "worker", "default")
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda req: httpx.Response(409, json=payload))
+    ) as transport:
+        client._client = transport
+        with pytest.raises(ClaimBundleError) as caught:
+            await client.get_claim_bundle("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", 7)
+        assert caught.value.code == (
+            WorkspaceRecoveryCode.RUNTIME_NOT_READY if known else None
+        )
+        if known:
+            assert caught.value.recovery.accepted_lease_token == 7
+            assert caught.value.recovery.hold_lease_token == 8
+        else:
+            assert caught.value.recovery is None
+
+
+@pytest.mark.asyncio
+async def test_client_recovery_methods_preserve_identity_and_bounded_timeout(
+    monkeypatch,
+):
+    import httpx
+    import json
+    from agent.api.orchestrator_client import OrchestratorClient
+    from shared.workspace_recovery import WorkspaceRecoveryCode
+
+    monkeypatch.setenv("POD_NAME", "worker-a")
+    monkeypatch.setenv("POD_UID", "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+    request_id = uuid4()
+    requests = []
+    payload = {
+        "detail": "unavailable",
+        "code": "workspace_transport_unavailable",
+        "recovery": {
+            "version": 1,
+            "action": "hold_committed",
+            "operation_id": "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+            "accepted_lease_token": 7,
+            "hold_lease_token": 8,
+        },
+    }
+
+    def respond(request):
+        requests.append(request)
+        return httpx.Response(200, json=payload)
+
+    client = OrchestratorClient("http://test", "127.0.0.1", 8000, "worker", "default")
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as transport:
+        client._client = transport
+        result = await client.report_workspace_recovery(
+            "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+            7,
+            code=WorkspaceRecoveryCode.TRANSPORT_UNAVAILABLE,
+            request_id=request_id,
+        )
+        replay = await client.get_workspace_recovery_disposition(
+            "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", 7
+        )
+    assert result == replay
+    assert result.accepted_lease_token == 7
+    body = json.loads(requests[0].content)
+    assert body == {
+        "lease_token": 7,
+        "code": "workspace_transport_unavailable",
+        "request_id": str(request_id),
+        "pod_name": "worker-a",
+        "pod_uid": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    }
+    assert requests[1].url.params["lease_token"] == "7"
+    assert all(0 < r.extensions["timeout"]["read"] <= 30 for r in requests)
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------

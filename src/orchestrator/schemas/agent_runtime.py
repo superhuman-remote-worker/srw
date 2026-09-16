@@ -1,12 +1,31 @@
 """Agent registration and heartbeat wire contracts."""
 
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID
 from pydantic import BaseModel, Field, field_validator
 from shared.runtime.core.product_capabilities import (
     ComponentProvenance,
     ProvenanceStatus,
 )
+
+
+class WorkspaceRecoveryReport(BaseModel):
+    """Worker observations only: no stop proof or successor authority."""
+
+    model_config = {"extra": "forbid"}
+
+    lease_token: int = Field(gt=0, strict=True)
+    pod_name: str = Field(min_length=1, max_length=253, pattern=r"^\S+$")
+    pod_uid: UUID
+    request_id: UUID
+    code: Literal[
+        "workspace_runtime_not_ready",
+        "workspace_transport_unavailable",
+        "workspace_replacement_observed",
+        "workspace_identity_conflict",
+        "tool_outcome_unknown",
+        "checkpoint_unavailable",
+    ]
 
 
 class AgentRegistration(BaseModel):

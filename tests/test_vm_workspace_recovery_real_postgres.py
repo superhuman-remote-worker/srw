@@ -211,6 +211,121 @@ def admission_kwargs(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "missing",
+    [
+        "prior_vmi_uid",
+        "prior_launcher_uid",
+        "vm_uid",
+        "root_pvc_uid",
+        "provision_generation",
+        "namespace",
+    ],
+)
+async def test_missing_captured_vmi_identity_commits_attention_hold(app_pg, missing):
+    job_id, token = await insert_leased_job(app_pg)
+    store = VMWorkspaceRecoveryStore(app_pg)
+    admitted = await store.admit_hold(
+        **(admission_kwargs(job_id, token) | {missing: None})
+    )
+    assert admitted.action == "paused_attention"
+    assert admitted.code == WorkspaceRecoveryCode.IDENTITY_CONFLICT
+    async with app_pg.acquire() as conn:
+        assert (
+            await conn.fetchval("SELECT state FROM run_queue WHERE unit_id=$1", job_id)
+            == "parked"
+        )
+        operation = await conn.fetchrow(
+            "SELECT * FROM vm_workspace_recoveries WHERE id=$1", admitted.operation_id
+        )
+        assert operation[missing] is None
+        assert (
+            missing
+            in json.loads(operation["latest_diagnostic"])["missing_identity_fields"]
+        )
+        with pytest.raises(asyncpg.CheckViolationError):
+            await conn.execute(
+                "UPDATE vm_workspace_recoveries SET phase='recovering' WHERE id=$1",
+                admitted.operation_id,
+            )
+    assert await store.claim_due(admitted.operation_id) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("missing_attempt", [False, True])
+async def test_reporter_and_active_sibling_replay_exact_committed_hold(
+    app_pg, missing_attempt
+):
+    from types import SimpleNamespace
+    from orchestrator.services.unit_claim_bundle import (
+        get_workspace_recovery_disposition,
+    )
+
+    parent_id, token = await insert_leased_job(
+        app_pg, include_attempt=not missing_attempt
+    )
+    child_id, child_token = await insert_leased_job(
+        app_pg, include_attempt=not missing_attempt
+    )
+    async with app_pg.acquire() as conn:
+        await conn.execute(
+            "UPDATE jobs SET parent_job_id=$2, context='{"
+            + '"inherits_parent_workspace":true'
+            + "}'::jsonb WHERE id=$1",
+            child_id,
+            parent_id,
+        )
+    store = VMWorkspaceRecoveryStore(app_pg)
+    admitted = await store.admit_hold(**admission_kwargs(parent_id, token))
+    dependencies = SimpleNamespace(db=app_pg, recovery_store=store)
+    for job_id, accepted_token in ((parent_id, token), (child_id, child_token)):
+        result = await get_workspace_recovery_disposition(
+            unit_id=str(job_id), lease_token=accepted_token, dependencies=dependencies
+        )
+        assert result is not None
+        assert result.operation_id == admitted.operation_id
+        assert result.accepted_lease_token == accepted_token
+        assert result.hold_lease_token == accepted_token + 1
+        assert result.action == (
+            "paused_attention" if missing_attempt else "hold_committed"
+        )
+    async with app_pg.acquire() as conn:
+        attempt = await store.get_attempt_disposition(
+            conn, job_id=child_id, lease_token=child_token
+        )
+        if not missing_attempt:
+            assert attempt.disposition["action"] == "hold_committed"
+        else:
+            assert attempt is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "code",
+    [
+        WorkspaceRecoveryCode.IDENTITY_CONFLICT,
+        WorkspaceRecoveryCode.TOOL_OUTCOME_UNKNOWN,
+        WorkspaceRecoveryCode.CHECKPOINT_UNAVAILABLE,
+    ],
+)
+async def test_worker_uncertainty_codes_require_attention(app_pg, code):
+    job_id, token = await insert_leased_job(app_pg)
+    store = VMWorkspaceRecoveryStore(app_pg)
+    result = await store.admit_hold(
+        **(admission_kwargs(job_id, token) | {"code": code})
+    )
+    assert result.action == "paused_attention"
+    assert result.code == code
+    async with app_pg.acquire() as conn:
+        diagnostic = await conn.fetchval(
+            "SELECT latest_diagnostic FROM vm_workspace_recoveries WHERE id=$1",
+            result.operation_id,
+        )
+        assert json.loads(diagnostic)["reason"] == code.value
+    assert await store.claim_due(result.operation_id) is None
+
+
+@pytest.mark.asyncio
 async def test_schema_allows_only_one_unresolved_recovery_per_owner(app_pg) -> None:
     first = await insert_recovery(app_pg)
     with pytest.raises(asyncpg.UniqueViolationError):

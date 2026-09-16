@@ -27,15 +27,22 @@ router's, not this module's.
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import logging
 import os
 import time
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable
-from uuid import UUID
+from uuid import UUID, NAMESPACE_URL, uuid5
 
 from fastapi import HTTPException
+from orchestrator.schemas.agent_runtime import WorkspaceRecoveryReport
+from shared.workspace_recovery import (
+    WorkspaceRecoveryCode,
+    WorkspaceRecoveryDisposition,
+    workspace_recovery_enabled,
+)
 
 from orchestrator.security.access import vm_workspaces_on_pod_network
 from orchestrator.services import (
@@ -94,9 +101,234 @@ class UnitClaimBundleDependencies:
     job_workspace_authority_dependencies: Callable[[], Any]
     job_start_bundle_dependencies: Callable[[], Any]
     dispatch_credential_dependencies: Callable[[], Any]
+    recovery_store: Any = None
+
+
+class _WorkspaceRecoveryRefusal(HTTPException):
+    def __init__(
+        self,
+        detail: str,
+        code: WorkspaceRecoveryCode = WorkspaceRecoveryCode.RUNTIME_NOT_READY,
+    ):
+        super().__init__(409, detail)
+        self.code = code
+
+
+def _digest(value: Any) -> str:
+    return (
+        "sha256:"
+        + hashlib.sha256(
+            json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+    )
+
+
+async def get_workspace_recovery_disposition(
+    *,
+    unit_id: str,
+    lease_token: int,
+    dependencies: UnitClaimBundleDependencies,
+) -> WorkspaceRecoveryDisposition | None:
+    if dependencies.recovery_store is None:
+        return None
+    async with dependencies.db.acquire() as conn:
+        attempt = await dependencies.recovery_store.get_attempt_disposition(
+            conn,
+            job_id=UUID(unit_id),
+            lease_token=lease_token,
+        )
+        receipt = attempt.disposition if attempt else None
+        if not receipt:
+            # Legacy attempts can be absent; this reads committed receipts
+            # only and makes no inference about execution or refund rights.
+            row = await conn.fetchrow(
+                "SELECT accepted_result AS receipt FROM vm_workspace_recovery_requests "
+                "WHERE scope_kind='job' AND scope_id=$1 "
+                "AND accepted_result->>'accepted_lease_token'=$2 "
+                "UNION ALL SELECT outcome->'disposition' AS receipt "
+                "FROM vm_workspace_recovery_jobs WHERE job_id=$1 "
+                "AND accepted_lease_token=$3 AND outcome ? 'disposition' LIMIT 1",
+                UUID(unit_id),
+                str(lease_token),
+                lease_token,
+            )
+            receipt = row["receipt"] if row else None
+            if isinstance(receipt, str):
+                receipt = json.loads(receipt)
+    if not receipt:
+        return None
+    return WorkspaceRecoveryDisposition(
+        code=WorkspaceRecoveryCode(receipt["code"]),
+        action=receipt["action"],
+        operation_id=UUID(receipt["operation_id"]),
+        accepted_lease_token=receipt["accepted_lease_token"],
+        hold_lease_token=receipt["hold_lease_token"],
+    )
+
+
+async def _validate_worker_identity(
+    conn: Any, *, unit_id: str, lease_token: int, pod_name: str, pod_uid: str
+) -> None:
+    try:
+        UUID(pod_uid)
+    except (ValueError, TypeError, AttributeError):
+        raise HTTPException(403, "Lease validation failed") from None
+    row = await conn.fetchrow(
+        "SELECT state, lease_token, leased_by FROM run_queue WHERE unit_id=$1::uuid",
+        unit_id,
+    )
+    if not (
+        row
+        and row["state"] == "leased"
+        and row["lease_token"] == lease_token
+        and pod_name
+        and pod_uid
+        and row["leased_by"] == pod_name
+    ):
+        raise HTTPException(403, "Lease validation failed")
+    if not await conn.fetchval(
+        "SELECT EXISTS (SELECT 1 FROM agents WHERE hostname=$1 AND pod_uid=$2)",
+        pod_name,
+        pod_uid,
+    ):
+        raise HTTPException(403, "Lease validation failed")
+
+
+async def report_workspace_recovery(
+    *,
+    unit_id: str,
+    report: WorkspaceRecoveryReport,
+    dependencies: UnitClaimBundleDependencies,
+) -> WorkspaceRecoveryDisposition:
+    store = dependencies.recovery_store
+    if store is None:
+        raise HTTPException(409, "Workspace recovery is unavailable")
+    intent_digest = _digest({"unit_id": unit_id, **report.model_dump(mode="json")})
+    # The accepted request is checked before current authority: admission
+    # rotates the token and the response can be lost after that commit.
+    async with dependencies.db.acquire() as conn:
+        try:
+            prior = await store._accepted_request(
+                conn,
+                job_id=UUID(unit_id),
+                request_id=report.request_id,
+                intent_digest=intent_digest,
+            )
+        except RuntimeError as exc:
+            raise HTTPException(409, "Recovery request identity conflict") from exc
+        if prior is not None:
+            return prior
+        if not workspace_recovery_enabled():
+            raise HTTPException(409, "Workspace recovery is unavailable")
+        await _validate_worker_identity(
+            conn,
+            unit_id=unit_id,
+            lease_token=report.lease_token,
+            pod_name=report.pod_name,
+            pod_uid=str(report.pod_uid),
+        )
+    job = await dependencies.db.get_job(unit_id)
+    try:
+        contract = resolve_workspace_contract(job) if job else None
+    except WorkspaceContractError:
+        contract = None
+    if not (
+        job
+        and job.get("execution_lane") == "stateless"
+        and contract
+        and contract.assigned_backend == "vm"
+        and vm_workspaces_on_pod_network()
+    ):
+        raise HTTPException(409, "Workspace recovery is unavailable")
+    owner = stateless_worker_workspace_owner(job)
+    owner_job = job if owner.id == unit_id else await dependencies.db.get_job(owner.id)
+    vm = get_vm_context(owner_job or {})
+
+    def optional_uuid(key: str) -> UUID | None:
+        try:
+            return UUID(str(vm.get(key)))
+        except (ValueError, TypeError):
+            return None
+
+    cluster = os.getenv("VM_CLUSTER_NAME", "local").strip()
+    if not cluster:
+        raise HTTPException(409, "Workspace recovery cluster is unavailable")
+    namespace = vm.get("namespace")
+    if not isinstance(namespace, str) or not namespace.strip():
+        namespace = None
+    try:
+        return await store.admit_hold(
+            job_id=UUID(unit_id),
+            accepted_lease_token=report.lease_token,
+            owner_kind=owner.kind,
+            owner_id=UUID(owner.id),
+            workspace_contract_digest=_digest(contract.to_context()),
+            provision_generation=optional_uuid("provision_generation"),
+            cluster_name=cluster,
+            namespace=namespace,
+            vm_uid=optional_uuid("vm_uid"),
+            prior_vmi_uid=optional_uuid("vmi_uid"),
+            prior_launcher_uid=optional_uuid("active_pod_uid"),
+            root_pvc_uid=optional_uuid("rootdisk_pvc_uid"),
+            code=WorkspaceRecoveryCode(report.code),
+            request_id=report.request_id,
+            actor_kind="worker",
+            actor_id=f"{report.pod_name}/{report.pod_uid}",
+            intent_digest=intent_digest,
+            original_cause={"code": report.code},
+        )
+    except RuntimeError as exc:
+        # Admission does its own locked lease CAS. Never claim acceptance if
+        # that transaction lost authority or refused the request identity.
+        raise HTTPException(409, "Workspace recovery admission refused") from exc
+
+
+async def _attest_recoverable_vm(owner: Any, *, dependencies: Any) -> Any:
+    try:
+        return await job_workspace_authority.attest_stateless_worker_vm_workspace(
+            owner, dependencies=dependencies
+        )
+    except HTTPException as exc:
+        if exc.status_code == 409:
+            raise _WorkspaceRecoveryRefusal(exc.detail) from exc
+        raise
 
 
 async def claim_bundle_for_unit(
+    unit_id: str,
+    *,
+    lease_token: int,
+    pod_name: str,
+    pod_uid: str,
+    dependencies: UnitClaimBundleDependencies,
+) -> dict[str, Any]:
+    try:
+        return await _assemble_claim_bundle(
+            unit_id,
+            lease_token=lease_token,
+            pod_name=pod_name,
+            pod_uid=pod_uid,
+            dependencies=dependencies,
+        )
+    except _WorkspaceRecoveryRefusal as exc:
+        if not workspace_recovery_enabled() or dependencies.recovery_store is None:
+            raise
+        report = WorkspaceRecoveryReport(
+            lease_token=lease_token,
+            pod_name=pod_name,
+            pod_uid=pod_uid,
+            code=exc.code.value,
+            request_id=uuid5(
+                NAMESPACE_URL, f"workspace-bundle:{unit_id}:{lease_token}"
+            ),
+        )
+        receipt = await report_workspace_recovery(
+            unit_id=unit_id, report=report, dependencies=dependencies
+        )
+        raise HTTPException(409, receipt.as_error_detail()) from None
+
+
+async def _assemble_claim_bundle(
     unit_id: str,
     *,
     lease_token: int,
@@ -150,6 +382,17 @@ async def claim_bundle_for_unit(
         )
     if row is None:
         raise HTTPException(status_code=404, detail="Unknown unit")
+    if (
+        row["unit_kind"] == UNIT_KIND_WORKER_BATCH
+        and dependencies.recovery_store is not None
+    ):
+        prior = await get_workspace_recovery_disposition(
+            unit_id=unit_id,
+            lease_token=lease_token,
+            dependencies=dependencies,
+        )
+        if prior is not None:
+            raise HTTPException(409, prior.as_error_detail())
     if row["state"] != "leased" or int(row["lease_token"]) != int(lease_token):
         # ONE generic detail for both cases — stale token and not-leased are
         # deliberately indistinguishable to the caller.
@@ -174,6 +417,15 @@ async def claim_bundle_for_unit(
                 status_code=403, detail="Lease validation failed"
             ) from None
     if row["unit_kind"] == UNIT_KIND_WORKER_BATCH:
+        if workspace_recovery_enabled():
+            async with dependencies.db.acquire() as conn:
+                await _validate_worker_identity(
+                    conn,
+                    unit_id=unit_id,
+                    lease_token=lease_token,
+                    pod_name=pod_name,
+                    pod_uid=pod_uid,
+                )
         job = await dependencies.db.get_job(unit_id)
         if not job or job.get("execution_lane") != LANE_STATELESS:
             raise HTTPException(
@@ -188,10 +440,17 @@ async def claim_bundle_for_unit(
             dependencies=dependencies.job_workspace_authority_dependencies(),
         )
         if workspace_action != "proceed":
-            raise HTTPException(
-                status_code=409,
-                detail="Job workspace authority is not ready",
-            )
+            try:
+                vm_contract = resolve_workspace_contract(job)
+            except WorkspaceContractError:
+                vm_contract = None
+            if (
+                vm_contract
+                and vm_contract.assigned_backend == "vm"
+                and vm_workspaces_on_pod_network()
+            ):
+                raise _WorkspaceRecoveryRefusal("Job workspace authority is not ready")
+            raise HTTPException(409, "Job workspace authority is not ready")
         workspace_decision = resolve_workspace_runtime(job, vm_mode=vm_provisioner.mode)
         assigned_backend = (
             workspace_decision.contract.assigned_backend
@@ -211,6 +470,8 @@ async def claim_bundle_for_unit(
             job, vm_mode=vm_provisioner.mode
         )
         if initial_runtime_digest is None:
+            if assigned_backend == "vm":
+                raise _WorkspaceRecoveryRefusal("Job workspace authority is not ready")
             raise HTTPException(
                 status_code=409,
                 detail="Job workspace authority is not ready",
@@ -227,6 +488,10 @@ async def claim_bundle_for_unit(
             job, dependencies=dependencies.job_workspace_authority_dependencies()
         )
         if inherit_action != "proceed":
+            if assigned_backend == "vm":
+                raise _WorkspaceRecoveryRefusal(
+                    "Stateless worker parent workspace is not ready"
+                )
             raise HTTPException(
                 status_code=409,
                 detail="Stateless worker parent workspace is not ready",
@@ -270,15 +535,12 @@ async def claim_bundle_for_unit(
                 and bool(vm_ctx.get("ssh_host") or vm_ctx.get("pod_ip"))
                 and bool(vm_ctx.get("ssh_host_key_fingerprint"))
             ):
-                raise HTTPException(
-                    status_code=409,
-                    detail="Stateless worker VM workspace is not Kubernetes-ready",
+                raise _WorkspaceRecoveryRefusal(
+                    "Stateless worker VM workspace is not Kubernetes-ready"
                 )
-            initial_attestation = (
-                await job_workspace_authority.attest_stateless_worker_vm_workspace(
-                    workspace_owner,
-                    dependencies=dependencies.job_workspace_authority_dependencies(),
-                )
+            initial_attestation = await _attest_recoverable_vm(
+                workspace_owner,
+                dependencies=dependencies.job_workspace_authority_dependencies(),
             )
             exact_vm_ctx = copy.deepcopy(vm_ctx)
             exact_vm_ctx.update(
@@ -362,11 +624,9 @@ async def claim_bundle_for_unit(
         # during that window never crosses the response boundary under stale
         # workspace authority.
         if assigned_backend == "vm":
-            confirmed_attestation = (
-                await job_workspace_authority.attest_stateless_worker_vm_workspace(
-                    workspace_owner,
-                    dependencies=dependencies.job_workspace_authority_dependencies(),
-                )
+            confirmed_attestation = await _attest_recoverable_vm(
+                workspace_owner,
+                dependencies=dependencies.job_workspace_authority_dependencies(),
             )
         else:
             confirmed_attestation = (
@@ -381,6 +641,11 @@ async def claim_bundle_for_unit(
                 "assembly for job %s",
                 unit_id,
             )
+            if assigned_backend == "vm":
+                raise _WorkspaceRecoveryRefusal(
+                    "Stateless worker workspace authority unavailable",
+                    WorkspaceRecoveryCode.REPLACEMENT_OBSERVED,
+                )
             raise HTTPException(
                 status_code=409,
                 detail="Stateless worker workspace authority unavailable",
@@ -485,6 +750,26 @@ async def claim_bundle_for_unit(
         if iteration_cap is not None and iteration_cap <= 0:
             iteration_cap = None
 
+        if workspace_recovery_enabled():
+            async with dependencies.db.acquire() as conn:
+                async with conn.transaction():
+                    await _validate_worker_identity(
+                        conn,
+                        unit_id=unit_id,
+                        lease_token=lease_token,
+                        pod_name=pod_name,
+                        pod_uid=pod_uid,
+                    )
+                    authorized = (
+                        await dependencies.recovery_store.record_bundle_authorized(
+                            conn,
+                            job_id=UUID(unit_id),
+                            lease_token=lease_token,
+                            authority_digest=initial_runtime_digest,
+                        )
+                    )
+                    if not authorized:
+                        raise HTTPException(403, "Lease validation failed")
         return {
             "unit_id": unit_id,
             "job_id": unit_id,

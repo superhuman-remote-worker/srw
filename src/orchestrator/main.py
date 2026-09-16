@@ -217,6 +217,7 @@ from orchestrator.services import (  # noqa: E402
     run_queue_admin as run_queue_admin_service,
     unit_claim_bundle as unit_claim_bundle_service,
 )
+from orchestrator.services.vm_workspace_recovery_store import VMWorkspaceRecoveryStore  # noqa: E402
 from orchestrator.services import (  # noqa: E402
     commissioned_officer_provisioning as commissioned_officer_provisioning_service,
     pinned_session_mutation_target as pinned_session_mutation_target_service,
@@ -7057,6 +7058,7 @@ def _unit_claim_bundle_dependencies() -> (
         job_workspace_authority_dependencies=_job_workspace_authority_dependencies,
         job_start_bundle_dependencies=_job_start_bundle_dependencies,
         dispatch_credential_dependencies=_dispatch_credential_dependencies,
+        recovery_store=VMWorkspaceRecoveryStore(postgres_db),
     )
 
 

@@ -130,13 +130,13 @@ class VMWorkspaceRecoveryStore:
         owner_kind: str,
         owner_id: UUID,
         workspace_contract_digest: str,
-        provision_generation: UUID,
+        provision_generation: UUID | None,
         cluster_name: str,
-        namespace: str,
-        vm_uid: UUID,
-        prior_vmi_uid: UUID,
-        prior_launcher_uid: UUID,
-        root_pvc_uid: UUID,
+        namespace: str | None,
+        vm_uid: UUID | None,
+        prior_vmi_uid: UUID | None,
+        prior_launcher_uid: UUID | None,
+        root_pvc_uid: UUID | None,
         code: WorkspaceRecoveryCode,
         request_id: UUID,
         actor_kind: str,
@@ -309,7 +309,6 @@ class VMWorkspaceRecoveryStore:
                         # A queued/parked row does not prove execution safety.
                         # Missing rows/history or an operator park retain debt.
                         uncertain_members.append(str(member_id))
-                attempt = attempts.get(job_id)
                 attention_required = bool(uncertain_members) or any(
                     value is None for value in attempts.values()
                 )
@@ -327,16 +326,38 @@ class VMWorkspaceRecoveryStore:
                     for member_id, member_job in jobs.items()
                     if member_job["execution_lane"] != "stateless"
                 ]
+                missing_identity_fields = [
+                    key
+                    for key, value in {
+                        "prior_vmi_uid": prior_vmi_uid,
+                        "prior_launcher_uid": prior_launcher_uid,
+                        "provision_generation": provision_generation,
+                        "namespace": namespace,
+                        "vm_uid": vm_uid,
+                        "root_pvc_uid": root_pvc_uid,
+                    }.items()
+                    if value is None
+                ]
+                missing_runtime_identity = bool(missing_identity_fields)
+                reported_attention = code in {
+                    WorkspaceRecoveryCode.IDENTITY_CONFLICT,
+                    WorkspaceRecoveryCode.TOOL_OUTCOME_UNKNOWN,
+                    WorkspaceRecoveryCode.CHECKPOINT_UNAVAILABLE,
+                }
                 attention_required = (
-                    attention_required or bool(unsupported_writers) or owner_conflict
+                    attention_required
+                    or bool(unsupported_writers)
+                    or owner_conflict
+                    or missing_runtime_identity
+                    or reported_attention
                 )
                 disposition_code = (
                     WorkspaceRecoveryCode.IDENTITY_CONFLICT
-                    if owner_conflict
+                    if owner_conflict or missing_runtime_identity
                     else WorkspaceRecoveryCode.SHARED_WRITERS_UNFENCED
                     if unsupported_writers
                     else WorkspaceRecoveryCode.TOOL_OUTCOME_UNKNOWN
-                    if attention_required
+                    if attention_required and not reported_attention
                     else code
                 )
                 phase = "paused_attention" if attention_required else "recovering"
@@ -352,6 +373,11 @@ class VMWorkspaceRecoveryStore:
                     }
                     if owner_conflict
                     else {
+                        "reason": "captured_runtime_identity_incomplete",
+                        "missing_identity_fields": missing_identity_fields,
+                    }
+                    if missing_runtime_identity
+                    else {
                         "reason": "shared_workspace_writers_unfenced",
                         "job_ids": unsupported_writers,
                     }
@@ -366,10 +392,17 @@ class VMWorkspaceRecoveryStore:
                         "job_ids": frozen_members,
                     }
                     if frozen_members
+                    else {"reason": code.value}
+                    if reported_attention
                     else {"reason": "worker_batch_attempt_missing"}
                     if attention_required
                     else None
                 )
+                if missing_runtime_identity:
+                    diagnostic = {
+                        **(diagnostic or {}),
+                        "missing_identity_fields": missing_identity_fields,
+                    }
 
                 recovery_id = uuid4()
                 await conn.execute(
@@ -496,16 +529,33 @@ class VMWorkspaceRecoveryStore:
                     "accepted_lease_token": disposition.accepted_lease_token,
                     "hold_lease_token": disposition.hold_lease_token,
                 }
-                if attempt is not None:
+                # Every active participant needs its own immutable accepted
+                # token receipt when renewal is fenced, including a sibling
+                # that never made the reporting request itself.
+                for member_id, member_attempt in attempts.items():
+                    member_receipt = {
+                        **receipt,
+                        "accepted_lease_token": queues[member_id]["lease_token"],
+                        "hold_lease_token": hold_tokens[member_id],
+                    }
+                    await conn.execute(
+                        "UPDATE vm_workspace_recovery_jobs SET outcome=$3::jsonb "
+                        "WHERE recovery_id=$1 AND job_id=$2",
+                        recovery_id,
+                        member_id,
+                        json.dumps({"disposition": member_receipt}),
+                    )
+                    if member_attempt is None:
+                        continue
                     updated = await conn.execute(
                         """
                         UPDATE worker_batch_attempts
                            SET disposition=$3::jsonb, recovery_id=$4
                          WHERE job_id=$1 AND lease_token=$2
                         """,
-                        job_id,
-                        accepted_lease_token,
-                        json.dumps(receipt),
+                        member_id,
+                        queues[member_id]["lease_token"],
+                        json.dumps(member_receipt),
                         recovery_id,
                     )
                     if updated != "UPDATE 1":
