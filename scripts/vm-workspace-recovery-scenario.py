@@ -2,8 +2,9 @@
 """Invoke the in-release VM recovery acceptance adapter on a gate-owned cluster.
 
 This source-controlled driver is intentionally a narrow adapter rather than a
-second implementation of recovery. The disposable release must provide the
-ConfigMap ``srw-vm-workspace-recovery-gate-adapter`` with this exact data:
+second implementation of recovery. The disposable release must provide exactly
+one ConfigMap labeled ``srw.io/vm-workspace-recovery-gate-adapter=true`` with
+this exact data:
 
 ``protocolVersion``
     ``1``.
@@ -23,9 +24,9 @@ The command is invoked with a unique run id, an explicit destructive
 confirmation phrase, and an output path. It must use the live application API,
 PostgreSQL, and Kubernetes API and return their aggregate evidence under the
 v1 contract validated by ``vm-workspace-recovery-k3d-gate.py``. This driver
-always invokes cleanup after an attempted execution. If the release does not
-advertise the adapter ConfigMap, it writes an honest structured SKIP result;
-the outer gate never converts that into PASS.
+always invokes cleanup after an attempted execution. Because the outer runner
+enables the adapter in Helm, a missing or ambiguous ConfigMap is a deployment
+failure rather than an unavailable host capability.
 """
 
 from __future__ import annotations
@@ -40,7 +41,7 @@ import sys
 from typing import Any, Sequence
 
 
-ADAPTER_CONFIGMAP = "srw-vm-workspace-recovery-gate-adapter"
+ADAPTER_LABEL = "srw.io/vm-workspace-recovery-gate-adapter=true"
 PROTOCOL_VERSION = 1
 CONFIRMATION = "disposable-vm-workspace-recovery-gate-v1"
 REQUIRED_SCENARIOS = [
@@ -111,6 +112,31 @@ def parse_adapter(resource: dict[str, Any]) -> tuple[str, str, list[str]]:
     return target, container, command
 
 
+def discover_adapter(context: str, namespace: str) -> dict[str, Any]:
+    """Discover the unique adapter without assuming a Helm release fullname."""
+
+    result = _run(
+        _kubectl(
+            context,
+            namespace,
+            "get",
+            "configmaps",
+            "-l",
+            ADAPTER_LABEL,
+            "-o",
+            "json",
+        )
+    )
+    try:
+        document = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise ScenarioFailure("adapter ConfigMap list is invalid JSON") from exc
+    items = document.get("items") if isinstance(document, dict) else None
+    if not isinstance(items, list) or len(items) != 1 or not isinstance(items[0], dict):
+        raise ScenarioFailure("expected exactly one enabled recovery adapter ConfigMap")
+    return items[0]
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--kube-context", required=True)
@@ -123,33 +149,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if not _CONTEXT.fullmatch(args.kube_context):
         raise ScenarioFailure("refusing a cluster not created by the outer gate")
-    lookup = _run(
-        _kubectl(
-            args.kube_context,
-            args.namespace,
-            "get",
-            "configmap",
-            ADAPTER_CONFIGMAP,
-            "-o",
-            "json",
-        ),
-        check=False,
-    )
-    if lookup.returncode:
-        _write(
-            args.output,
-            {
-                "gate_status": "skipped",
-                "missing_capability": "cluster:vm-workspace-recovery-scenario-adapter-v1",
-            },
-        )
-        return 0
-    try:
-        resource = json.loads(lookup.stdout)
-    except json.JSONDecodeError as exc:
-        raise ScenarioFailure("adapter ConfigMap response is invalid JSON") from exc
-    if not isinstance(resource, dict):
-        raise ScenarioFailure("adapter ConfigMap response is not an object")
+    resource = discover_adapter(args.kube_context, args.namespace)
     target, container, command = parse_adapter(resource)
     run_id = "vm-recovery-" + secrets.token_hex(6)
     evidence_path = f"/tmp/srw-vm-workspace-recovery-gate/{run_id}.json"

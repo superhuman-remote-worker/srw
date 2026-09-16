@@ -239,14 +239,15 @@ def validate_acceptance_evidence(evidence: dict[str, Any]) -> None:
 
     overlap = _section(evidence, "leader_overlap")
     require(
-        overlap.get("fault_injection") == "concurrent_store_callers",
-        "leader-overlap fault was not injected with concurrent store callers",
+        overlap.get("fault_injection") == "controlled_leader_handoff",
+        "leader-overlap fault did not transfer a live reconciler claim",
     )
     require(
         overlap.get("active_operations") == 1, "leader overlap duplicated operation"
     )
     require(
-        overlap.get("accepted_retry_results") == 1, "retry receipt was not idempotent"
+        overlap.get("leader_instances") == 2,
+        "leader overlap did not exercise two reconciler instances",
     )
     require(
         overlap.get("deadline_preserved") is True, "leader overlap extended deadline"
@@ -269,6 +270,18 @@ def validate_acceptance_evidence(evidence: dict[str, Any]) -> None:
         and overlap["max_node_probes"] <= overlap["configured_node_probe_limit"],
         "per-node probe budget exceeded",
     )
+    require(
+        overlap.get("stale_probe_finished_after_handoff") is True,
+        "stale leader probe did not finish after the handoff",
+    )
+    require(
+        overlap.get("stale_result_rejected") is True,
+        "stale leader probe result was not rejected",
+    )
+    require(
+        overlap.get("successor_dispatches") == 1,
+        "leader handoff did not produce exactly one successor dispatch",
+    )
 
     slow = _section(evidence, "slow_boot")
     require(slow.get("state") == "recovered", "slow boot did not recover")
@@ -287,13 +300,33 @@ def validate_acceptance_evidence(evidence: dict[str, Any]) -> None:
 
     deadline = _section(evidence, "deadline")
     require(
-        deadline.get("fault_injection") == "expired_deadline_test_hook",
-        "deadline fault did not use the explicit test hook",
+        deadline.get("fault_injection") == "live_claim_deadline_barrier",
+        "deadline fault did not block a live claimed observation",
     )
     require(deadline.get("state") == "paused_attention", "deadline did not pause")
     require(
         deadline.get("reason_code") == "workspace_recovery_deadline_exceeded",
         "deadline pause has the wrong reason",
+    )
+    require(
+        deadline.get("probe_started_before_deadline") is True,
+        "deadline probe did not start before the immutable deadline",
+    )
+    require(
+        deadline.get("probe_finished_after_deadline") is True,
+        "deadline probe did not finish after the immutable deadline",
+    )
+    require(
+        deadline.get("deadline_cas_rejected") is True,
+        "deadline-crossing observation was not rejected by the durable CAS",
+    )
+    require(
+        deadline.get("final_release_succeeded") is False,
+        "deadline-crossing probe released participants",
+    )
+    require(
+        deadline.get("queue_still_parked") is True,
+        "deadline-crossing probe removed the queue hold",
     )
     require(deadline.get("disk_retained") is True, "deadline deleted retained disk")
     require(
@@ -952,6 +985,12 @@ def deploy_application(
             "orchestrator.vmWorkspaceRecovery.enabled=true",
             "--set",
             "orchestrator.vmWorkspaceRecovery.replacementEnabled=true",
+            "--set",
+            "orchestrator.vmWorkspaceRecovery.claimTtlSeconds=90",
+            "--set",
+            "orchestrator.vmWorkspaceRecovery.permitTtlSeconds=90",
+            "--set",
+            "orchestrator.vmWorkspaceRecovery.externalCallTimeoutSeconds=60",
             "--set",
             "orchestrator.vmWorkspaceRecoveryAcceptanceGate.enabled=true",
             "--set-string",

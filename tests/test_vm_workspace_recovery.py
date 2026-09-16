@@ -489,6 +489,28 @@ async def test_lost_claim_cancels_local_probe_and_discards_result() -> None:
 
 
 @pytest.mark.asyncio
+async def test_acceptance_hook_can_finish_a_real_probe_after_the_db_deadline() -> None:
+    recovery_store = FakeStore()
+
+    class DelayedObserver:
+        async def observe_workspace_recovery(self, _identity):
+            await asyncio.sleep(0.04)
+            return {"state": "ready"}
+
+    recovery_service = VMWorkspaceRecoveryService(
+        recovery_store,
+        DelayedObserver(),
+        probe_timeout_seconds=0.2,
+        claim_poll_seconds=0.002,
+        allow_observation_past_deadline_for_acceptance=True,
+    )
+
+    result = await recovery_service._observe(replace(claim(), remaining_seconds=0.01))
+
+    assert result == {"state": "ready"}
+
+
+@pytest.mark.asyncio
 async def test_automation_disabled_visibly_pauses_due_work() -> None:
     recovery_store = FakeStore()
     shutdown = asyncio.Event()

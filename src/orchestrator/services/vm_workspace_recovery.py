@@ -146,6 +146,7 @@ class VMWorkspaceRecoveryService:
         scan_interval_seconds: float = 3.0,
         jitter: Callable[[], float] | None = None,
         telemetry: VMWorkspaceRecoveryTelemetry | Any | None = None,
+        allow_observation_past_deadline_for_acceptance: bool = False,
     ) -> None:
         self.store = store
         self.observer = observer
@@ -165,6 +166,9 @@ class VMWorkspaceRecoveryService:
         self.scan_interval_seconds = max(0.01, scan_interval_seconds)
         self.jitter = jitter
         self.telemetry = telemetry or workspace_recovery_telemetry
+        self.allow_observation_past_deadline_for_acceptance = bool(
+            allow_observation_past_deadline_for_acceptance
+        )
 
     @classmethod
     def from_settings(
@@ -318,7 +322,9 @@ class VMWorkspaceRecoveryService:
         if not callable(observe):
             raise RuntimeError("controller recovery observation is unavailable")
         probe = asyncio.create_task(observe(claim.captured_identity))
-        deadline = min(self.probe_timeout_seconds, claim.remaining_seconds)
+        deadline = self.probe_timeout_seconds
+        if not self.allow_observation_past_deadline_for_acceptance:
+            deadline = min(deadline, claim.remaining_seconds)
         loop = asyncio.get_running_loop()
         stop_at = loop.time() + max(0.0, deadline)
         try:

@@ -48,8 +48,9 @@ was substituted.
     retention-pin acknowledgement, queue occupancy, network, SSH host-key,
     API, PostgreSQL, Kubernetes, and Longhorn evidence;
   - pause-only checks for absent stop evidence and forced VMI deletion;
-  - explicit fault labels for committed-response replay, concurrent store
-    callers, slow VM boot, and the expired-deadline test hook.
+  - explicit fault labels for committed-response replay, a controlled
+    two-reconciler leader handoff, slow VM boot, and a live claimed observation
+    held across the immutable deadline.
 - Updated the older stateless resilience gate and Helm documentation so a Pod
   replacement cannot be mistaken for retained-VM recovery evidence.
 - Added the two reviewed `qualify_recovery_successor` SSH call sites to the
@@ -216,3 +217,68 @@ a capable disposable host produces complete live evidence.
   sole explicit retention path.
 - Confirmed the unrelated `srw-public-preview-desktop.png` and nested
   knowledge-base modifications are not part of this task.
+
+## Review Fix Round 1
+
+The first scoped review found four acceptance-proof gaps. All four now fail
+closed:
+
+- The outer driver discovers exactly one Helm-rendered adapter by its dedicated
+  label. It no longer assumes the release name. Ordinary `srw` and
+  `fullnameOverride` renders are covered, and a missing or ambiguous adapter
+  after the gate was enabled is a deployment failure rather than a capability
+  skip.
+- The deadline case starts a real production controller observation while its
+  PostgreSQL claim is live, blocks it until database time crosses the original
+  900-second deadline, then lets the controller call finish. A default-off
+  acceptance hook extends only the local wait; the production PostgreSQL CAS
+  remains unchanged. The evidence records that the deadline CAS returned no
+  staged claim, no final release occurred, the queue stayed parked, and the
+  disk and checkpoint survived. The scenario does not rewrite
+  `first_observed_at` or `deadline_at`.
+- The overlap case runs two `VMWorkspaceRecoveryService` instances with
+  distinct durable worker identities. The first owns a live probe while the
+  gate performs an exact claim/permit handoff; the second claims and completes
+  the operation before the first external observation returns. Live DB
+  evidence proves one operation, one dispatch, bounded global/node permits, an
+  unchanged deadline, a higher winning claim token, and rejection of the stale
+  result.
+- Marker and checkpoint I/O now uses `pinned_agent_ssh_command` with the
+  captured SSH host-key fingerprint and bounded subprocess I/O. The regression
+  suite proves a wrong host key is rejected before any command can run.
+
+The review tests were written RED before each implementation step. The first
+focused run reported `7 failed, 23 passed`; the deadline barrier contract then
+reported `2 failed`; the gate-only timeout assertion, late-observation hook,
+and durable-CAS evidence each failed individually before their implementations.
+Final focused GREEN:
+
+```text
+PYTHONPATH=src python -m pytest \
+  tests/test_vm_workspace_recovery.py \
+  tests/test_vm_workspace_recovery_acceptance.py \
+  tests/test_vm_workspace_recovery_gate.py \
+  tests/test_helm_vm_workspace_recovery.py -q --tb=short
+
+58 passed in 14.49s
+```
+
+Because the deterministic gate hook changes the recovery service, the complete
+required backend gate was rerun after the final edit:
+
+```text
+1055 passed, 11 skipped, 18 warnings in 122.71s
+```
+
+The schema drift check replayed all 220 transactional migrations and reported
+`OK: schema artifacts are up to date.` Ruff passed for all changed Python
+files, `git diff --check` and the runtime-coordinate inventory passed, and the
+changed-file selector returned `ALL`. `--help` passed. The final read-only
+preflight returned before cluster mutation with:
+
+```text
+SKIPPED: missing capability: binary:longhornctl, container-engine:k3d-docker-required, socket:/run/iscsid/socket, module:iscsi_tcp, file:disposable-values, image:guest-digest
+```
+
+No destructive cluster run was attempted on this incapable host, so this round
+adds executable live proof logic but does not claim a completed live matrix.

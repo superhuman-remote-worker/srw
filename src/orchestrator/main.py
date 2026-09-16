@@ -228,6 +228,7 @@ from orchestrator.services.vm_workspace_recovery import (  # noqa: E402
 )
 from orchestrator.services.vm_workspace_recovery_config import (  # noqa: E402
     VMWorkspaceRecoverySettings,
+    automatic_reconciler_enabled,
 )
 from orchestrator.services import (  # noqa: E402
     commissioned_officer_provisioning as commissioned_officer_provisioning_service,
@@ -5772,16 +5773,20 @@ async def lifespan(app: FastAPI):
     )
     vm_workspace_recovery_settings = VMWorkspaceRecoverySettings.from_env()
     vm_workspace_recovery_store = VMWorkspaceRecoveryStore(postgres_db)
-    vm_workspace_recovery_task = asyncio.create_task(
-        run_when_leader(
-            VMWorkspaceRecoveryService.from_settings(
-                vm_workspace_recovery_store,
-                vm_provisioner,
-                settings=vm_workspace_recovery_settings,
-            ).run,
-            _shutdown_event,
-        ),
-        name="vm-workspace-recovery",
+    vm_workspace_recovery_task = (
+        asyncio.create_task(
+            run_when_leader(
+                VMWorkspaceRecoveryService.from_settings(
+                    vm_workspace_recovery_store,
+                    vm_provisioner,
+                    settings=vm_workspace_recovery_settings,
+                ).run,
+                _shutdown_event,
+            ),
+            name="vm-workspace-recovery",
+        )
+        if automatic_reconciler_enabled()
+        else None
     )
     sudo_sweeper_task = asyncio.create_task(sudo_expiration_sweeper(_shutdown_event))
     thread_events_prune_task = asyncio.create_task(
@@ -6272,7 +6277,8 @@ async def lifespan(app: FastAPI):
     await dispatcher_task
     if vm_readiness_task is not None:
         await vm_readiness_task
-    await vm_workspace_recovery_task
+    if vm_workspace_recovery_task is not None:
+        await vm_workspace_recovery_task
     await sudo_sweeper_task
     await thread_events_prune_task
     await run_queue_reaper_task

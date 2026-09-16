@@ -15,6 +15,12 @@ SPEC = importlib.util.spec_from_file_location("vm_workspace_recovery_gate", SCRI
 assert SPEC and SPEC.loader
 gate = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(gate)
+DRIVER_SPEC = importlib.util.spec_from_file_location(
+    "vm_workspace_recovery_scenario", DRIVER
+)
+assert DRIVER_SPEC and DRIVER_SPEC.loader
+driver = importlib.util.module_from_spec(DRIVER_SPEC)
+DRIVER_SPEC.loader.exec_module(driver)
 
 
 def _passing_evidence() -> dict:
@@ -59,14 +65,17 @@ def _passing_evidence() -> dict:
             "queue_token_after": 28,
         },
         "leader_overlap": {
-            "fault_injection": "concurrent_store_callers",
+            "fault_injection": "controlled_leader_handoff",
             "active_operations": 1,
-            "accepted_retry_results": 1,
+            "leader_instances": 2,
             "max_global_probes": 4,
             "max_node_probes": 1,
             "configured_global_probe_limit": 4,
             "configured_node_probe_limit": 1,
             "deadline_preserved": True,
+            "stale_probe_finished_after_handoff": True,
+            "stale_result_rejected": True,
+            "successor_dispatches": 1,
         },
         "slow_boot": {
             "state": "recovered",
@@ -76,9 +85,14 @@ def _passing_evidence() -> dict:
             "attested": True,
         },
         "deadline": {
-            "fault_injection": "expired_deadline_test_hook",
+            "fault_injection": "live_claim_deadline_barrier",
             "state": "paused_attention",
             "reason_code": "workspace_recovery_deadline_exceeded",
+            "probe_started_before_deadline": True,
+            "probe_finished_after_deadline": True,
+            "deadline_cas_rejected": True,
+            "final_release_succeeded": False,
+            "queue_still_parked": True,
             "disk_retained": True,
             "checkpoint_retained": True,
             "late_probe_released": False,
@@ -146,7 +160,16 @@ def test_pass_requires_real_substrate_and_every_api_db_evidence_gate() -> None:
         ("substrate", "longhorn_rwo_retain_test", False),
         ("response_loss", "terminal_reports", 1),
         ("leader_overlap", "active_operations", 2),
+        ("leader_overlap", "leader_instances", 1),
+        ("leader_overlap", "stale_probe_finished_after_handoff", False),
+        ("leader_overlap", "stale_result_rejected", False),
+        ("leader_overlap", "successor_dispatches", 2),
         ("slow_boot", "executor_occupied_while_waiting", True),
+        ("deadline", "probe_started_before_deadline", False),
+        ("deadline", "probe_finished_after_deadline", False),
+        ("deadline", "deadline_cas_rejected", False),
+        ("deadline", "final_release_succeeded", True),
+        ("deadline", "queue_still_parked", False),
         ("deadline", "late_probe_released", True),
         ("missing_stop_evidence", "successor_dispatched", True),
         ("forced_deletion", "state", "recovered"),
@@ -210,6 +233,44 @@ def test_default_scenario_driver_is_source_controlled_and_executable() -> None:
     assert 'evidence["driver"] =' not in DRIVER.read_text(encoding="utf-8")
 
 
+def test_scenario_driver_discovers_the_unique_rendered_adapter(monkeypatch) -> None:
+    calls: list[list[str]] = []
+
+    def run(args, **_kwargs):
+        calls.append(list(args))
+        return type(
+            "Result",
+            (),
+            {
+                "returncode": 0,
+                "stdout": '{"items":[{"metadata":{"name":"custom-stack-vm-workspace-recovery-gate-adapter"},"data":{}}]}',
+            },
+        )()
+
+    monkeypatch.setattr(driver, "_run", run)
+
+    resource = driver.discover_adapter("k3d-srw-vm-recovery-gate-a1b2c3", "srw")
+
+    assert resource["metadata"]["name"] == (
+        "custom-stack-vm-workspace-recovery-gate-adapter"
+    )
+    assert "srw.io/vm-workspace-recovery-gate-adapter=true" in calls[0]
+    assert "srw-vm-workspace-recovery-gate-adapter" not in calls[0]
+
+
+def test_enabled_chart_missing_adapter_is_a_failure(monkeypatch) -> None:
+    monkeypatch.setattr(
+        driver,
+        "_run",
+        lambda *_args, **_kwargs: type(
+            "Result", (), {"returncode": 0, "stdout": '{"items":[]}'}
+        )(),
+    )
+
+    with pytest.raises(driver.ScenarioFailure, match="exactly one"):
+        driver.discover_adapter("k3d-srw-vm-recovery-gate-a1b2c3", "srw")
+
+
 def test_preflight_uses_the_in_repo_driver_by_default(tmp_path) -> None:
     values = tmp_path / "values.yaml"
     values.write_text("license:\n  acceptTerms: true\n", encoding="utf-8")
@@ -271,3 +332,36 @@ def test_deployed_image_id_must_match_imported_config_digest() -> None:
     assert not gate.image_id_matches_config_digest(
         "containerd://sha256:" + "b" * 64, digest
     )
+
+
+def test_live_deadline_gate_helm_install_keeps_claim_alive_past_probe_timeout(
+    tmp_path,
+) -> None:
+    class FakeShell:
+        def __init__(self) -> None:
+            self.calls: list[list[str]] = []
+
+        def run(self, args, **_kwargs):
+            self.calls.append(list(args))
+            if "create" in args and "secret" in args:
+                return '{"apiVersion":"v1","kind":"Secret"}'
+            return ""
+
+    shell = FakeShell()
+    gate.deploy_application(
+        shell,
+        context="k3d-gate",
+        namespace="srw",
+        values_file=tmp_path / "values.yaml",
+        images={
+            "orchestrator": "localhost/srw-orchestrator:gate",
+            "agent": "localhost/srw-agent:gate",
+            "vm_controller": "localhost/srw-vm-controller:gate",
+        },
+        guest_image="registry.example/guest@sha256:" + "a" * 64,
+    )
+
+    helm = next(call for call in shell.calls if call[:2] == ["helm", "upgrade"])
+    assert "orchestrator.vmWorkspaceRecovery.claimTtlSeconds=90" in helm
+    assert "orchestrator.vmWorkspaceRecovery.permitTtlSeconds=90" in helm
+    assert "orchestrator.vmWorkspaceRecovery.externalCallTimeoutSeconds=60" in helm

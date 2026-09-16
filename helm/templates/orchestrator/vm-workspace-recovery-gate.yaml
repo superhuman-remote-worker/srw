@@ -10,6 +10,7 @@ metadata:
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "srw.componentLabels" (dict "context" . "component" "orchestrator") | nindent 4 }}
+    srw.io/vm-workspace-recovery-gate-adapter: "true"
 data:
   protocolVersion: "1"
   target: {{ printf "deploy/%s-orchestrator" (include "srw.fullname" .) | quote }}

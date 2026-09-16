@@ -2,8 +2,15 @@
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
+import asyncio
+import inspect
+from unittest.mock import ANY
+
 import pytest
 
+from orchestrator.services import vm_workspace_recovery_config as recovery_config
+from orchestrator.services.ssh_helpers import SSHHostKeyVerificationError
 from orchestrator.operator_cli.vm_workspace_recovery_acceptance import (
     CONFIRMATION,
     LiveScenario,
@@ -11,6 +18,7 @@ from orchestrator.operator_cli.vm_workspace_recovery_acceptance import (
     REQUIRED_SCENARIOS,
     require_execution_guard,
 )
+from orchestrator.operator_cli import vm_workspace_recovery_acceptance as acceptance
 
 
 def test_acceptance_command_carries_the_complete_live_scenario_matrix() -> None:
@@ -47,6 +55,98 @@ def test_acceptance_command_requires_chart_gate_and_exact_confirmation() -> None
         confirmation=CONFIRMATION,
         protocol_version=1,
     )
+
+
+def test_acceptance_gate_process_owns_the_reconciler() -> None:
+    assert (
+        recovery_config.automatic_reconciler_enabled(
+            {
+                "VM_WORKSPACE_RECOVERY_ENABLED": "true",
+                "VM_WORKSPACE_RECOVERY_ACCEPTANCE_GATE_ENABLED": "true",
+            }
+        )
+        is False
+    )
+    assert (
+        recovery_config.automatic_reconciler_enabled(
+            {
+                "VM_WORKSPACE_RECOVERY_ENABLED": "true",
+                "VM_WORKSPACE_RECOVERY_ACCEPTANCE_GATE_ENABLED": "false",
+            }
+        )
+        is True
+    )
+
+
+@pytest.mark.asyncio
+async def test_acceptance_marker_io_rejects_the_wrong_pinned_host_key(
+    monkeypatch,
+) -> None:
+    calls: list[dict[str, object]] = []
+
+    @asynccontextmanager
+    async def reject(*_args, **kwargs):
+        calls.append(kwargs)
+        raise SSHHostKeyVerificationError("host key mismatch")
+        yield []
+
+    monkeypatch.setattr(
+        "orchestrator.services.ssh_helpers.pinned_agent_ssh_command", reject
+    )
+    scenario = object.__new__(LiveScenario)
+
+    with pytest.raises(SSHHostKeyVerificationError, match="host key mismatch"):
+        await scenario._ssh_file(
+            {
+                "pod_ip": "10.42.0.91",
+                "ssh_host_key_fingerprint": "SHA256:" + "A" * 43,
+            },
+            "/home/agent-host/.srw-recovery-gate/marker",
+            None,
+        )
+
+    assert calls == [
+        {
+            "expected_host_key_fingerprint": "SHA256:" + "A" * 43,
+            "key_path": ANY,
+            "connect_timeout_s": 10,
+            "batch_mode": True,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_stale_observation_barrier_finishes_only_after_claim_handoff() -> None:
+    class Observer:
+        async def observe_workspace_recovery(self, identity):
+            return {"owner_id": identity["owner_id"]}
+
+    barrier = acceptance.RecoveryObservationBarrier(
+        Observer(), finish_after_cancellation=True
+    )
+    task = asyncio.create_task(
+        barrier.observe_workspace_recovery({"owner_id": "job-1"})
+    )
+    await barrier.started.wait()
+    task.cancel()
+    await barrier.cancelled.wait()
+
+    assert task.done() is False
+    assert barrier.finished.is_set() is False
+
+    barrier.release.set()
+    assert await task == {"owner_id": "job-1"}
+    assert barrier.finished.is_set() is True
+
+
+def test_deadline_gate_does_not_rewrite_the_immutable_deadline() -> None:
+    source = inspect.getsource(LiveScenario.execute)
+    assert "first_observed_at=clock_timestamp()-interval" not in source
+    assert "deadline_at=clock_timestamp()-interval" not in source
+
+    deadline_source = inspect.getsource(LiveScenario._deadline_barrier_scenario)
+    assert "finish_after_cancellation=True" in deadline_source
+    assert "allow_observation_past_deadline_for_acceptance=True" in deadline_source
 
 
 @pytest.mark.asyncio

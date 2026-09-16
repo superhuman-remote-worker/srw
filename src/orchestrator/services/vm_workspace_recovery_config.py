@@ -29,6 +29,15 @@ def _integer(environ: Mapping[str, str], key: str, default: int) -> int:
         raise ValueError(f"{key} must be an integer") from exc
 
 
+def automatic_reconciler_enabled(
+    environ: Mapping[str, str] | None = None,
+) -> bool:
+    """Let the opt-in acceptance command own deterministic reconciliation."""
+
+    source = os.environ if environ is None else environ
+    return not _boolean(source, "VM_WORKSPACE_RECOVERY_ACCEPTANCE_GATE_ENABLED", False)
+
+
 @dataclass(frozen=True, slots=True)
 class VMWorkspaceRecoverySettings:
     """One process-wide view of the recovery protocol's rollout envelope."""

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -12,6 +13,24 @@ from tests.test_manifest_hosting_helm import render
 
 
 pytestmark = pytest.mark.skipif(shutil.which("helm") is None, reason="Helm is absent")
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def _render_release(release: str, *settings: str) -> list[dict]:
+    command = [
+        "helm",
+        "template",
+        release,
+        str(ROOT / "helm"),
+        "-n",
+        "control-plane",
+        "-f",
+        str(ROOT / "helm/ci/test-values.yaml"),
+    ]
+    for setting in settings:
+        command.extend(["--set", setting])
+    result = subprocess.run(command, capture_output=True, text=True, check=True)
+    return [document for document in yaml.safe_load_all(result.stdout) if document]
 
 
 def _orchestrator(documents: list[dict]) -> dict:
@@ -147,7 +166,8 @@ def test_workspace_recovery_rejects_unsafe_rollout_settings(setting: str) -> Non
 
 
 def test_disposable_acceptance_adapter_is_explicit_and_in_image() -> None:
-    documents = render(
+    documents = _render_release(
+        "srw",
         "orchestrator.vmWorkspaceRecovery.enabled=true",
         "orchestrator.vmWorkspaceRecovery.replacementEnabled=true",
         "orchestrator.vmWorkspaceRecoveryAcceptanceGate.enabled=true",
@@ -166,6 +186,13 @@ def test_disposable_acceptance_adapter_is_explicit_and_in_image() -> None:
         "orchestrator.operator_cli.vm_workspace_recovery_acceptance",
     ]
     assert adapter["data"]["protocolVersion"] == "1"
+    assert adapter["metadata"]["name"] == (
+        "srw-superhuman-remote-worker-vm-workspace-recovery-gate-adapter"
+    )
+    assert (
+        adapter["metadata"]["labels"]["srw.io/vm-workspace-recovery-gate-adapter"]
+        == "true"
+    )
     env = _env(documents, _orchestrator(documents))
     assert env["VM_WORKSPACE_RECOVERY_ACCEPTANCE_GATE_ENABLED"] == "true"
     assert any(
@@ -185,6 +212,30 @@ def test_disposable_acceptance_adapter_is_explicit_and_in_image() -> None:
         and "get" in rule.get("verbs", [])
         for rule in role["rules"]
     )
+
+
+def test_acceptance_adapter_name_follows_fullname_override() -> None:
+    documents = _render_release(
+        "srw",
+        "fullnameOverride=custom-stack",
+        "orchestrator.vmWorkspaceRecovery.enabled=true",
+        "orchestrator.vmWorkspaceRecovery.replacementEnabled=true",
+        "orchestrator.vmWorkspaceRecoveryAcceptanceGate.enabled=true",
+    )
+
+    adapters = [
+        document
+        for document in documents
+        if document.get("kind") == "ConfigMap"
+        and document.get("metadata", {})
+        .get("labels", {})
+        .get("srw.io/vm-workspace-recovery-gate-adapter")
+        == "true"
+    ]
+
+    assert [item["metadata"]["name"] for item in adapters] == [
+        "custom-stack-vm-workspace-recovery-gate-adapter"
+    ]
 
 
 def test_acceptance_adapter_requires_both_automatic_recovery_gates() -> None:
