@@ -212,6 +212,10 @@ export interface OutboxItem {
   threadId: string;
   /** Flush attempts so far (diagnostic; there is deliberately no auto-retry). */
   attempts: number;
+  /** Transcript revision captured when the user committed this send. */
+  expectedConversationRevision?: number;
+  /** Rewind moved the transcript past this send's captured revision. */
+  requiresReview?: boolean;
 }
 
 /** Info about a tool call within an assistant message. */
@@ -419,6 +423,65 @@ export interface CompactionProgressState {
  *  live_settings_silently_dropped_on_stateless_sessions). */
 export type ControlTransport = 'websocket' | 'rest' | 'unavailable';
 type ControlCapabilityMap = Record<string, 'websocket' | 'rest'>;
+type ControlOptionsMap = Record<
+  string,
+  { version: number; modes?: string[]; requires_idle?: boolean }
+>;
+
+interface RewindExpected {
+  session_runtime_generation: string;
+  conversation_revision: number;
+  events_epoch: number;
+  transcript_tail_seq: string;
+  input_seq: string | null;
+  consumed_seq: string | null;
+}
+
+export interface StatelessRewindPreview {
+  message_id: string;
+  mode: 'conversation';
+  prompt: string;
+  eligible: boolean;
+  refusal_code: string | null;
+  swept_count: number;
+  expected: RewindExpected | null;
+}
+
+interface StatelessRewindResult {
+  state: 'applied';
+  rewind_id: string;
+  client_request_id: string;
+  message_id: string;
+  mode: 'conversation';
+  prompt: string;
+  swept_count: number;
+  surviving_turn: number;
+  conversation_revision: number;
+  events_epoch: number;
+  event_seq: string;
+  duplicate?: boolean;
+}
+
+interface RewindOperationMarker {
+  threadId: string;
+  clientRequestId: string;
+  body: {
+    client_request_id: string;
+    message_id: string;
+    mode: 'conversation';
+    expected: RewindExpected;
+  };
+  draftSnapshot: string;
+  draftRevision: number;
+  prefillConsumed: boolean;
+}
+
+export interface RewindPrefill {
+  prompt: string;
+  draftSnapshot: string;
+  draftRevision: number;
+  clientRequestId: string;
+}
 
 /** Verbs that have a REST transport on a socketless session under the legacy
  *  (pre-`controls`) contract: the three durable-inbox verbs, plus
@@ -481,6 +544,8 @@ type ConnectionPayload =
       pinned_runtime_generation_contract: 1;
       session_runtime_generation: string;
       controls?: ControlCapabilityMap;
+      control_options?: ControlOptionsMap;
+      conversation_revision?: number;
       queue?: SessionQueueState | null;
     }
   | {
@@ -492,6 +557,8 @@ type ConnectionPayload =
       pinned_runtime_generation_contract: 1;
       session_runtime_generation: string;
       controls?: ControlCapabilityMap;
+      control_options?: ControlOptionsMap;
+      conversation_revision?: number;
       queue?: SessionQueueState | null;
     };
 
@@ -529,6 +596,7 @@ interface SessionStateSnapshot extends Record<string, unknown> {
   event_cursor: { epoch: number; seq: number };
   /** Exclusive journal floor that reconstructs the latest logical turn. */
   replay_cursor: { epoch: number; seq: number };
+  conversation_revision?: number;
   snapshot_source: 'durable_journal';
 }
 
@@ -593,6 +661,29 @@ export class PersistentChatService {
         datasourceDefaultsAvailable = available;
         if (this.isDraftSession()) void this.retryDraftDefaults();
       });
+    effect(() => {
+      const epochSignal = (
+        this.cache as IndexedDbService & {
+          threadHistoryEpochChanged?: () => {
+            threadId: string;
+            eventsEpoch: number;
+            conversationRevision: number;
+          } | null;
+        }
+      ).threadHistoryEpochChanged;
+      if (typeof epochSignal !== 'function') return;
+      const change = epochSignal();
+      const threadId = untracked(() => this.threadId());
+      if (!change || !threadId || change.threadId !== threadId) return;
+      const key = `${change.threadId}:${change.eventsEpoch}:${change.conversationRevision}`;
+      if (key === this.observedHistoryEpoch) return;
+      this.observedHistoryEpoch = key;
+      this.conversationRevision.update((current) =>
+        Math.max(current, change.conversationRevision),
+      );
+      const generation = this.connectGeneration;
+      void this.loadHistory(threadId, generation);
+    });
     // PersistentChatService remains the sole SSE/WebSocket lifecycle owner.
     // Canvas receives decoded invalidations through this narrow bridge and
     // may send only its typed control vocabulary back through the current
@@ -1305,8 +1396,12 @@ export class PersistentChatService {
   // --- Rewind (knowledge-base/knowledge/features/session_rewind.md) ---
   /** Prompt text handed back by rewind.ack — the component moves it into
    *  the composer (edit-and-resend) and clears the signal. */
-  readonly rewindPrefill = signal<string | null>(null);
+  readonly rewindPrefill = signal<RewindPrefill | null>(null);
   readonly rewindInFlight = signal<boolean>(false);
+  readonly rewindPreview = signal<StatelessRewindPreview | null>(null);
+  readonly rewindPreviewLoading = signal(false);
+  readonly rewindOutcomeUnknown = signal(false);
+  readonly conversationRevision = signal(0);
 
   // --- Cloud sync degraded (initial cloud->workspace seed failed) ---
   /**
@@ -1389,6 +1484,11 @@ export class PersistentChatService {
   // unrelated in-flight error (e.g. a concurrent config.update denial)
   // must not prematurely re-enable the rewind UI.
   private pendingRewindRequestId: string | null = null;
+  private pendingRewindDraftSnapshot = '';
+  private pendingRewindDraftRevision = 0;
+  private historyLoadGeneration = 0;
+  private rewindRefresh: Promise<void> | null = null;
+  private observedHistoryEpoch = '';
   // One-shot send-liveness kickstart: force a reopen if a send is accepted
   // but no SSE data frame follows (see SEND_KICKSTART_TIMEOUT_MS). Armed in
   // _postInput, cleared in disconnect().
@@ -1462,8 +1562,11 @@ export class PersistentChatService {
    *  describes so a stale map can never answer for the next session
    *  (singleton-state rule: stamp, don't just reset). null = not resolved
    *  yet, or an older orchestrator that omits `controls`. */
-  private controlCapabilities: { threadId: string; controls: ControlCapabilityMap } | null =
-    null;
+  private readonly controlCapabilities = signal<{
+    threadId: string;
+    controls: ControlCapabilityMap;
+    options: ControlOptionsMap;
+  } | null>(null);
   /** Socket-sent config updates awaiting their `config.changed` ack (or a
    *  matching error frame), keyed by request_id. Settled by the frame
    *  reducer, by the ack timeout, or by disconnect(). */
@@ -2084,6 +2187,10 @@ export class PersistentChatService {
       this.undoAvailable.set(false);
       this.rewindInFlight.set(false);
       this.rewindPrefill.set(null);
+      this.rewindPreview.set(null);
+      this.rewindPreviewLoading.set(false);
+      this.rewindOutcomeUnknown.set(false);
+      this.conversationRevision.set(0);
       this.pendingRewindRequestId = null;
       this._clearRewindAckFallback();
       this.isSessionPaused.set(false);
@@ -2442,11 +2549,16 @@ export class PersistentChatService {
   }
 
   private async loadHistory(threadId: string, generation?: number): Promise<void> {
+    const historyGeneration = ++this.historyLoadGeneration;
     try {
       // 1. Cache-first: paint the cached conversation immediately (zero
       //    latency on reopen). Empty when this thread isn't cached yet.
       const cached = await this.cache.getThreadMessages(threadId);
-      if (!this._isCurrentThreadRequest(threadId, generation)) return;
+      if (
+        !this._isCurrentThreadRequest(threadId, generation) ||
+        historyGeneration !== this.historyLoadGeneration
+      )
+        return;
       if (cached.length) {
         this.dispatch({ type: 'load_history', threadId, turns: historyToTurns(cached) });
         this.resetWindow();
@@ -2456,21 +2568,94 @@ export class PersistentChatService {
 
       // 2. Refresh from the server. With a cache, fetch only what's newer
       //    (?after=<newest cached>, inclusive); otherwise the full thread.
-      const newest = cached.length ? cached[cached.length - 1].created_at : null;
+      const cacheWithEpoch = this.cache as IndexedDbService & {
+        getThreadCacheEpoch?: (id: string) => Promise<{
+          eventsEpoch: number;
+          conversationRevision: number;
+        } | null>;
+        applyThreadHistoryPage?: (
+          id: string,
+          epoch: number,
+          revision: number,
+          rows: Array<HistoryMessage & { threadId: string }>,
+        ) => Promise<{
+          accepted: boolean;
+          replaced: boolean;
+          messages: Array<HistoryMessage & { threadId: string }>;
+        }>;
+      };
+      const cacheEpoch = cacheWithEpoch.getThreadCacheEpoch
+        ? await cacheWithEpoch.getThreadCacheEpoch(threadId)
+        : null;
+      if (
+        !this._isCurrentThreadRequest(threadId, generation) ||
+        historyGeneration !== this.historyLoadGeneration
+      )
+        return;
+      // Versioned history is fetched as a complete snapshot. If its epoch
+      // advanced, an `after=` request based on the old epoch could return an
+      // empty suffix and incorrectly replace the cache with no transcript.
+      const newest = !cacheEpoch && cached.length ? cached[cached.length - 1].created_at : null;
       const url = newest
         ? `${environment.apiUrl}/persistent/threads/${threadId}/messages` +
           `?after=${encodeURIComponent(newest)}`
         : `${environment.apiUrl}/persistent/threads/${threadId}/messages`;
       const resp = await firstValueFrom(
-        this.http.get<{ messages: HistoryMessage[]; total: number }>(url),
+        this.http.get<{
+          messages: HistoryMessage[];
+          total: number;
+          events_epoch?: number;
+          conversation_revision?: number;
+        }>(url),
       );
-      if (!this._isCurrentThreadRequest(threadId, generation)) return;
+      if (
+        !this._isCurrentThreadRequest(threadId, generation) ||
+        historyGeneration !== this.historyLoadGeneration
+      )
+        return;
       const fetched = resp.messages ?? [];
+
+      const versioned =
+        Number.isInteger(resp.events_epoch) && Number.isInteger(resp.conversation_revision);
+      if (versioned && cacheWithEpoch.applyThreadHistoryPage) {
+        const applied = await cacheWithEpoch.applyThreadHistoryPage(
+          threadId,
+          resp.events_epoch as number,
+          resp.conversation_revision as number,
+          fetched.map((m) => ({ ...m, threadId })),
+        );
+        if (
+          !this._isCurrentThreadRequest(threadId, generation) ||
+          historyGeneration !== this.historyLoadGeneration
+        )
+          return;
+        this.conversationRevision.update((current) =>
+          Math.max(current, resp.conversation_revision as number),
+        );
+        this.dispatch({
+          type: 'load_history',
+          threadId,
+          turns: historyToTurns(applied.messages),
+          preserveLive: !applied.replaced,
+        });
+        this.resetWindow();
+        this._recordDurableMessages(threadId, applied.messages.length);
+        this.historyLoaded.set(true);
+        this._redispatchOutboxBubbles(true);
+        return;
+      }
+
+      // Once a versioned floor exists, an older rolling-deploy response may
+      // render the already-cached rows but may not merge into or downgrade v2.
+      if (cacheEpoch) {
+        this.historyLoaded.set(true);
+        return;
+      }
 
       // 3. Append to the cache by id (never full-replace — that loses
       //    history). Best-effort: a no-op when IndexedDB is unavailable.
       if (fetched.length) {
-        void this.cache.upsertThreadMessages(fetched.map((m) => ({ ...m, threadId })));
+        await this.cache.upsertThreadMessages(fetched.map((m) => ({ ...m, threadId })));
       }
 
       // 4. Render the merged set. Merge in memory (dedup by id) rather than
@@ -3127,13 +3312,36 @@ export class PersistentChatService {
   /** Full transcript repaint after a rewind: drop the (append-only)
    *  cache + cursor, then reload from the server's filtered history. */
   private async _reloadAfterRewind(): Promise<void> {
+    if (this.rewindRefresh) return this.rewindRefresh;
+    this.rewindRefresh = this._performRewindRefresh();
+    try {
+      await this.rewindRefresh;
+    } finally {
+      this.rewindRefresh = null;
+    }
+  }
+
+  private async _performRewindRefresh(): Promise<void> {
     const tid = this.threadId();
     if (!tid) return;
     const generation = this.connectGeneration;
+    const hadSse = this.sse !== null;
+    this.historyLoadGeneration++;
     await this.cache.clearThreadMessages(tid);
     await this.cache.deleteThreadCursor(tid);
     if (!this._isCurrentConnect(tid, generation)) return;
     await this.loadHistory(tid, generation);
+    if (!this._isCurrentConnect(tid, generation)) return;
+    this._redispatchOutboxBubbles(true);
+    await this.loadThreadMeta(tid, generation);
+    if (!this._isCurrentConnect(tid, generation)) return;
+    await this._loadSessionState(tid, generation);
+    if (!this._isCurrentConnect(tid, generation)) return;
+    if (this.sse) {
+      this.sse.close();
+      this.sse = null;
+    }
+    if (hadSse) await this._openSse(tid);
   }
 
   /** Epoch of the frame currently being dispatched, parsed from the SSE
@@ -3418,10 +3626,28 @@ export class PersistentChatService {
     this.sessionRuntimeGeneration = exactRuntimeContract
       ? this._canonicalRuntimeGeneration(connection.session_runtime_generation)
       : null;
-    this.controlCapabilities =
+    this.controlCapabilities.set(
       connection?.controls && typeof connection.controls === 'object'
-        ? { threadId, controls: { ...connection.controls } }
-        : null;
+        ? {
+            threadId,
+            controls: { ...connection.controls },
+            options:
+              connection.control_options && typeof connection.control_options === 'object'
+                ? { ...connection.control_options }
+                : {},
+          }
+        : null,
+    );
+    if (Number.isInteger(connection.conversation_revision)) {
+      this.conversationRevision.update((current) =>
+        Math.max(current, connection.conversation_revision as number),
+      );
+    }
+    const marker = this._readRewindMarker(threadId);
+    if (marker && !marker.prefillConsumed && !this.rewindInFlight()) {
+      // Receipt reads remain available even after new admission is disabled.
+      void this._lookupRewindReceipt(marker, true);
+    }
     if (!this._connectionHasWebSocket(connection)) {
       this.controlSocket = 'none';
       this.controlWsReconnectAttempt = 0;
@@ -3450,7 +3676,7 @@ export class PersistentChatService {
    *  known (see `_installControlTransport`). */
   controlTransport(verb: string): ControlTransport {
     const threadId = this.threadId();
-    const declared = this.controlCapabilities;
+    const declared = this.controlCapabilities();
     if (declared && threadId && declared.threadId === threadId) {
       return declared.controls[verb] ?? 'unavailable';
     }
@@ -3462,6 +3688,20 @@ export class PersistentChatService {
     // pinned owner PATCH is refused while an agent is bound.
     if (verb === 'mode.set' || verb === 'narration.set') return 'rest';
     return 'websocket';
+  }
+
+  /** Whether the currently declared session supports this rewind mode. */
+  rewindModeAvailable(mode: 'both' | 'conversation' | 'code'): boolean {
+    const transport = this.controlTransport('rewind');
+    if (transport === 'unavailable') return false;
+    if (transport === 'websocket') return true;
+    const declared = this.controlCapabilities();
+    const modes = declared?.options['rewind']?.modes;
+    return mode === 'conversation' && (!modes || modes.includes(mode));
+  }
+
+  summarizeAvailable(): boolean {
+    return this.controlTransport('compact') === 'websocket';
   }
 
   /** Drop every control frame queued for `threadId` and tell the user. Runs
@@ -3980,6 +4220,29 @@ export class PersistentChatService {
     return true;
   }
 
+  /** Send a destructive control only on the socket that is open right now. */
+  private _sendImmediateControl(data: Record<string, unknown>): boolean {
+    const threadId = this.threadId();
+    if (!threadId || !this._controlPlaneAllowed(threadId)) return false;
+    const verb = typeof data['method'] === 'string' ? String(data['method']) : '';
+    if (this.controlTransport(verb) !== 'websocket') {
+      this.error.set(this.transloco.translate('chat.control.unavailable'));
+      return false;
+    }
+    const ws = this.controlWs;
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+      this.error.set(this.transloco.translate('chat.rewind.connectionDown'));
+      return false;
+    }
+    try {
+      ws.send(JSON.stringify(data));
+      return true;
+    } catch {
+      this.error.set(this.transloco.translate('chat.rewind.connectionDown'));
+      return false;
+    }
+  }
+
   /** Drain frames queued for `threadId` over a freshly-opened socket.
    *
    * Frames tagged for any other thread are dropped rather than carried: a
@@ -4161,7 +4424,7 @@ export class PersistentChatService {
     // (onclose → _scheduleControlWsReconnect) never routes through
     // disconnect(), so an ordinary drop-and-reconnect still delivers.
     this.controlOutbox = [];
-    this.controlCapabilities = null;
+    this.controlCapabilities.set(null);
     // A config update still awaiting its socket ack belongs to the thread
     // being left; settle it as not-applied so the pane can roll back rather
     // than wait on a frame that will now never arrive here.
@@ -4233,6 +4496,7 @@ export class PersistentChatService {
     this.undoAvailable.set(false);
     this.rewindInFlight.set(false);
     this.rewindPrefill.set(null);
+    this.rewindOutcomeUnknown.set(false);
     this.pendingRewindRequestId = null;
     this._clearRewindAckFallback();
     this.isSessionPaused.set(false);
@@ -4644,6 +4908,7 @@ export class PersistentChatService {
         // pins it to the real id before the first upload.
         threadId: this.threadId() ?? '',
         attempts: 0,
+        expectedConversationRevision: this.conversationRevision(),
       },
     ]);
     this.clearAttachments();
@@ -4764,6 +5029,17 @@ export class PersistentChatService {
         // — the exact failure the outbox's no-auto-retry rule exists to
         // prevent. Refuse before committing, never after.
         if (!item) return;
+        const expectedRevision = item.expectedConversationRevision ?? 0;
+        if (expectedRevision !== this.conversationRevision()) {
+          this.outbox.update((queue) =>
+            queue.map((queued) =>
+              queued.localId === item.localId ? { ...queued, requiresReview: true } : queued,
+            ),
+          );
+          this.outboxStalled.set(true);
+          this.error.set(this.transloco.translate('chat.rewind.staleOutbox'));
+          return;
+        }
         const names = (item.attachments ?? []).filter((a) => a.path).map((a) => a.name);
         const content = composeAgentContent(head.displayContent, names);
         // Record what we're about to POST on the item itself, so the
@@ -4776,9 +5052,9 @@ export class PersistentChatService {
           );
         }
         this.postingLocalIds.add(head.localId);
-        let result: { ok: boolean; status: number };
+        let result: { ok: boolean; status: number; stale?: boolean };
         try {
-          result = await this._postInput(content);
+          result = await this._postInput(content, expectedRevision);
         } finally {
           this.postingLocalIds.delete(head.localId);
         }
@@ -4812,6 +5088,13 @@ export class PersistentChatService {
           this.outboxStalled.set(false);
           this._drainOutboxWithRollback();
           return;
+        }
+        if (result.stale) {
+          this.outbox.update((queue) =>
+            queue.map((queued) =>
+              queued.localId === item.localId ? { ...queued, requiresReview: true } : queued,
+            ),
+          );
         }
         // Any other failure: stop, keep the item + bubble queued. The
         // banner (_postInput set it) explains; next trigger retries.
@@ -5063,6 +5346,17 @@ export class PersistentChatService {
     }
   }
 
+  /** Return a rewind-stale queued message to the composer for explicit review. */
+  takeQueuedSendForReview(localId: string): string | null {
+    const item = this.outboxItem(localId);
+    if (!item?.requiresReview) return null;
+    if (this.postingLocalIds.has(localId) || this.uploadingLocalIds.has(localId)) return null;
+    this._removeFromOutbox(localId);
+    this.dispatch({ type: 'remove_turn', id: localId });
+    if (this.outbox().length === 0) this.outboxStalled.set(false);
+    return item.displayContent;
+  }
+
   /** Drop the whole outbox and remove its optimistic bubbles (thread gone). */
   private _drainOutboxWithRollback(): void {
     const items = this.outbox();
@@ -5079,10 +5373,12 @@ export class PersistentChatService {
    * currently in flight (its row may already be in the reloaded history).
    */
   private _redispatchOutboxBubbles(skipInFlight = false): void {
+    const visibleIds = new Set(this.conversation().turns.map((turn) => turn.id));
     for (const item of this.outbox()) {
       // POST-only: a mid-upload item has never been POSTed, so it cannot
       // be in the reloaded history and skipping it would lose its bubble.
       if (skipInFlight && this.postingLocalIds.has(item.localId)) continue;
+      if (visibleIds.has(item.localId)) continue;
       this.dispatch({
         type: 'user_message',
         id: item.localId,
@@ -5100,18 +5396,31 @@ export class PersistentChatService {
    *  to distinguish a terminal 404/410
    *  (drain) from a retriable failure (keep queued). Sets the error banner on
    *  a hard failure. */
-  private async _postInput(content: string): Promise<{ ok: boolean; status: number }> {
+  private async _postInput(
+    content: string,
+    expectedConversationRevision: number,
+  ): Promise<{ ok: boolean; status: number; stale?: boolean }> {
     const tid = this.threadId();
     if (!tid) return { ok: false, status: 0 };
     const sentGeneration = this.sessionRuntimeGeneration;
     const sentControlEpoch = this.controlWsOpeningGeneration;
     try {
       const accepted = await firstValueFrom(
-        this.http.post<{ accepted: boolean; turn_id: number; queue?: SessionQueueState | null }>(
+        this.http.post<{
+          accepted: boolean;
+          turn_id: number;
+          conversation_revision?: number;
+          queue?: SessionQueueState | null;
+        }>(
           `${environment.apiUrl}/persistent/threads/${tid}/input`,
-          { content },
+          { content, expected_conversation_revision: expectedConversationRevision },
         ),
       );
+      if (Number.isInteger(accepted?.conversation_revision)) {
+        this.conversationRevision.update((current) =>
+          Math.max(current, accepted.conversation_revision as number),
+        );
+      }
       // The accept carries the unit's durable state: a `parked` unit took the
       // input but nothing can claim it — render that, never "waiting".
       this._applyQueueState(tid, accepted?.queue ?? null);
@@ -5123,6 +5432,14 @@ export class PersistentChatService {
     } catch (err: any) {
       const status = err?.status ?? 0;
       if (status === 409) {
+        if (err?.error?.detail?.code === 'session_view_stale') {
+          const currentRevision = err?.error?.detail?.conversation_revision;
+          if (Number.isInteger(currentRevision)) {
+            this.conversationRevision.update((current) => Math.max(current, currentRevision));
+          }
+          this.error.set(this.transloco.translate('chat.rewind.staleOutbox'));
+          return { ok: false, status, stale: true };
+        }
         // A sibling tab may have started a *different* turn. Treating that
         // turn_in_flight as our duplicate used to remove this bubble even
         // though its text never ran. Retirement conflicts additionally carry
@@ -5738,36 +6055,290 @@ export class PersistentChatService {
     }
   }
 
-  /** Rewind the session to just before an earlier user message.
-   *  Returns the request_id echoed on the rewind.ack / error frame.
-   *
-   *  Unlike other control verbs, rewind must never ride _sendControl's
-   *  queue-and-replay fallback: that path exists so a click made while the
-   *  socket is reconnecting still lands once it's back — fine for
-   *  idempotent-ish verbs, wrong for a destructive one. A queued rewind
-   *  frame could replay against a session the user resumed much later for
-   *  an unrelated reason. So the control WS must already be OPEN, or this
-   *  refuses outright instead of deferring. */
-  rewind(messageId: string, mode: 'both' | 'conversation' | 'code'): string {
+  /** Resolve the exact boundary the REST rewind confirmation will submit. */
+  async prepareRewind(messageId: string): Promise<StatelessRewindPreview | null> {
+    this.rewindPreview.set(null);
+    if (this.controlTransport('rewind') !== 'rest') return null;
+    const threadId = this.threadId();
+    if (!threadId || !this.rewindModeAvailable('conversation')) {
+      this.error.set(this.transloco.translate('chat.rewind.unavailable'));
+      return null;
+    }
+    this.rewindPreviewLoading.set(true);
+    try {
+      const preview = await firstValueFrom(
+        this.http.get<StatelessRewindPreview>(
+          `${environment.apiUrl}/persistent/threads/${threadId}/rewinds/preview` +
+            `?message_id=${encodeURIComponent(messageId)}`,
+        ),
+      );
+      if (this.threadId() !== threadId || preview.message_id !== messageId) return null;
+      this.rewindPreview.set(preview);
+      if (!preview.eligible) this._setRewindRefusal(preview.refusal_code);
+      return preview;
+    } catch (err: any) {
+      if (this.threadId() === threadId) this._setRewindRequestError(err);
+      return null;
+    } finally {
+      if (this.threadId() === threadId) this.rewindPreviewLoading.set(false);
+    }
+  }
+
+  /** Rewind to an earlier user message using the declared transport. */
+  rewind(
+    messageId: string,
+    mode: 'both' | 'conversation' | 'code',
+    draftSnapshot = '',
+    draftRevision = 0,
+  ): string {
     const requestId = crypto.randomUUID();
-    if (this.controlWs?.readyState !== WebSocket.OPEN) {
-      this.error.set('Session connection is down — reconnect before rewinding');
-      this.rewindInFlight.set(false);
+    const transport = this.controlTransport('rewind');
+    if (!this.rewindModeAvailable(mode)) {
+      this.error.set(this.transloco.translate('chat.rewind.unavailable'));
       return requestId;
     }
-    // Arm the fallback only once we know the frame is actually going out
-    // now (not queued for later) — nothing to disarm on the refusal path
-    // above since it's never armed there.
-    this.rewindInFlight.set(true);
-    this.pendingRewindRequestId = requestId;
-    this._armRewindAckFallback();
-    this._sendControl({
+    if (transport === 'rest') {
+      const preview = this.rewindPreview();
+      if (
+        mode !== 'conversation' ||
+        !preview ||
+        preview.message_id !== messageId ||
+        !preview.eligible ||
+        !preview.expected
+      ) {
+        this.error.set(this.transloco.translate('chat.rewind.previewRequired'));
+        return requestId;
+      }
+      const threadId = this.threadId();
+      if (!threadId) return requestId;
+      const marker: RewindOperationMarker = {
+        threadId,
+        clientRequestId: requestId,
+        body: {
+          client_request_id: requestId,
+          message_id: messageId,
+          mode: 'conversation',
+          expected: preview.expected,
+        },
+        draftSnapshot,
+        draftRevision,
+        prefillConsumed: false,
+      };
+      this._writeRewindMarker(marker);
+      this.rewindInFlight.set(true);
+      this.pendingRewindRequestId = requestId;
+      void this._submitRestRewind(marker);
+      return requestId;
+    }
+
+    const sent = this._sendImmediateControl({
       method: 'rewind',
       message_id: messageId,
       mode,
       request_id: requestId,
     });
+    if (!sent) {
+      this.rewindInFlight.set(false);
+      return requestId;
+    }
+    this.pendingRewindDraftSnapshot = draftSnapshot;
+    this.pendingRewindDraftRevision = draftRevision;
+    this.rewindInFlight.set(true);
+    this.pendingRewindRequestId = requestId;
+    this._armRewindAckFallback();
     return requestId;
+  }
+
+  /** Explicitly retry the exact stored body after an unknown REST outcome. */
+  retryPendingRewind(): void {
+    const threadId = this.threadId();
+    const marker = threadId ? this._readRewindMarker(threadId) : null;
+    if (!marker || this.rewindInFlight()) return;
+    this.rewindOutcomeUnknown.set(false);
+    this.rewindInFlight.set(true);
+    this.pendingRewindRequestId = marker.clientRequestId;
+    void this._submitRestRewind(marker);
+  }
+
+  refreshPendingRewindReceipt(): void {
+    const threadId = this.threadId();
+    const marker = threadId ? this._readRewindMarker(threadId) : null;
+    if (!marker || this.rewindInFlight()) return;
+    this.rewindInFlight.set(true);
+    void this._lookupRewindReceipt(marker, true).then((found) => {
+      if (this.threadId() !== marker.threadId) return;
+      this.rewindInFlight.set(false);
+      this.rewindOutcomeUnknown.set(!found);
+      if (!found) this.error.set(this.transloco.translate('chat.rewind.outcomeUnknown'));
+    });
+  }
+
+  /** Mark a returned prompt consumed after the component inserts it. */
+  consumeRewindPrefill(clientRequestId: string): void {
+    const threadId = this.threadId();
+    const marker = threadId ? this._readRewindMarker(threadId) : null;
+    if (marker?.clientRequestId === clientRequestId) {
+      marker.prefillConsumed = true;
+      this._writeRewindMarker(marker);
+    }
+    if (this.rewindPrefill()?.clientRequestId === clientRequestId) {
+      this.rewindPrefill.set(null);
+    }
+  }
+
+  private async _submitRestRewind(marker: RewindOperationMarker): Promise<void> {
+    try {
+      const result = await firstValueFrom(
+        this.http.post<StatelessRewindResult>(
+          `${environment.apiUrl}/persistent/threads/${marker.threadId}/rewinds`,
+          marker.body,
+        ).pipe(timeout(15_000)),
+      );
+      await this._applyRestRewindResult(marker, result);
+    } catch (err: any) {
+      if (this.threadId() !== marker.threadId) return;
+      const status = Number(err?.status ?? 0);
+      if (status === 0 || status === 408 || status >= 500) {
+        const recovered = await this._lookupRewindReceipt(marker, false);
+        if (!recovered) {
+          this.rewindOutcomeUnknown.set(true);
+          this.error.set(this.transloco.translate('chat.rewind.outcomeUnknown'));
+        }
+      } else {
+        this._setRewindRequestError(err);
+        this._removeRewindMarker(marker);
+      }
+    } finally {
+      if (this.pendingRewindRequestId === marker.clientRequestId) {
+        this.pendingRewindRequestId = null;
+        this.rewindInFlight.set(false);
+      }
+    }
+  }
+
+  private async _lookupRewindReceipt(
+    marker: RewindOperationMarker,
+    quiet404: boolean,
+  ): Promise<boolean> {
+    try {
+      const result = await firstValueFrom(
+        this.http.get<StatelessRewindResult>(
+          `${environment.apiUrl}/persistent/threads/${marker.threadId}/rewinds/` +
+            `by-client-request/${marker.clientRequestId}`,
+        ),
+      );
+      await this._applyRestRewindResult(marker, result);
+      return true;
+    } catch (err: any) {
+      if (!quiet404 || err?.status !== 404) this._setRewindRequestError(err);
+      return false;
+    }
+  }
+
+  private async _applyRestRewindResult(
+    marker: RewindOperationMarker,
+    result: StatelessRewindResult,
+  ): Promise<void> {
+    if (
+      this.threadId() !== marker.threadId ||
+      result.client_request_id !== marker.clientRequestId
+    )
+      return;
+    this.conversationRevision.update((current) =>
+      Math.max(current, result.conversation_revision),
+    );
+    this.rewindOutcomeUnknown.set(false);
+    this.outbox.update((queue) =>
+      queue.map((item) =>
+        (item.expectedConversationRevision ?? 0) < result.conversation_revision
+          ? { ...item, requiresReview: true }
+          : item,
+      ),
+    );
+    if (this.outbox().some((item) => item.requiresReview)) {
+      this.outboxStalled.set(true);
+    }
+    this.rewindPreview.set(null);
+    await this._reloadAfterRewind();
+    const currentMarker = this._readRewindMarker(marker.threadId);
+    if (
+      !currentMarker ||
+      currentMarker.clientRequestId !== marker.clientRequestId ||
+      currentMarker.prefillConsumed ||
+      result.conversation_revision !== this.conversationRevision()
+    )
+      return;
+    this.rewindPrefill.set({
+      prompt: result.prompt,
+      draftSnapshot: currentMarker.draftSnapshot,
+      draftRevision: currentMarker.draftRevision,
+      clientRequestId: currentMarker.clientRequestId,
+    });
+  }
+
+  private _rewindMarkerKey(threadId: string): string {
+    return `srw.rewind.operation.${threadId}`;
+  }
+
+  private _writeRewindMarker(marker: RewindOperationMarker): void {
+    try {
+      sessionStorage.setItem(this._rewindMarkerKey(marker.threadId), JSON.stringify(marker));
+    } catch {
+      // Private-mode storage failures do not invalidate the server operation.
+    }
+  }
+
+  private _readRewindMarker(threadId: string): RewindOperationMarker | null {
+    try {
+      const raw = sessionStorage.getItem(this._rewindMarkerKey(threadId));
+      if (!raw) return null;
+      const marker = JSON.parse(raw) as RewindOperationMarker;
+      return marker.threadId === threadId && marker.clientRequestId ? marker : null;
+    } catch {
+      return null;
+    }
+  }
+
+  private _removeRewindMarker(marker: RewindOperationMarker): void {
+    try {
+      const current = this._readRewindMarker(marker.threadId);
+      if (current?.clientRequestId === marker.clientRequestId) {
+        sessionStorage.removeItem(this._rewindMarkerKey(marker.threadId));
+      }
+    } catch {
+      // Best effort only.
+    }
+  }
+
+  private _setRewindRefusal(reason: string | null): void {
+    const known = new Set([
+      'feature_disabled',
+      'queue_not_idle',
+      'queue_leased',
+      'input_pending',
+      'control_pending',
+      'pending_input_delivery',
+      'pending_scheduled_wake',
+      'pending_child',
+      'pending_job_wake',
+      'active_job',
+      'pending_final_memory',
+      'target_invalid',
+    ]);
+    const key = reason && known.has(reason) ? reason : 'unavailable';
+    this.error.set(this.transloco.translate(`chat.rewind.refusal.${key}`));
+  }
+
+  private _setRewindRequestError(err: any): void {
+    const detail = err?.error?.detail;
+    const reason = typeof detail === 'object' && detail ? detail.reason : null;
+    if (reason === 'preview_changed') {
+      this.error.set(this.transloco.translate('chat.rewind.stalePreview'));
+    } else if (reason) {
+      this._setRewindRefusal(String(reason));
+    } else {
+      this.error.set(this.transloco.translate('chat.rewind.unavailable'));
+    }
   }
 
   /** "Summarize up to here" — manual compaction bounded at a message. */
@@ -5895,6 +6466,11 @@ export class PersistentChatService {
     switch (data.method) {
       case 'session.state': {
         const durableSnapshot = params['snapshot_source'] === 'durable_journal';
+        if (Number.isInteger(params['conversation_revision'])) {
+          this.conversationRevision.update((current) =>
+            Math.max(current, params['conversation_revision'] as number),
+          );
+        }
         if (!durableSnapshot) {
           // A pinned agent's exact in-memory welcome frame heals a
           // failed durable read during coexistence. It also proves
@@ -6809,10 +7385,18 @@ export class PersistentChatService {
 
       case 'rewind.ack': {
         this._clearRewindAckFallback();
+        const requestId = this.pendingRewindRequestId ?? String(params['request_id'] ?? '');
         this.pendingRewindRequestId = null;
         this.rewindInFlight.set(false);
         const prompt = params['prompt'] as string | undefined;
-        if (prompt) this.rewindPrefill.set(prompt);
+        if (prompt) {
+          this.rewindPrefill.set({
+            prompt,
+            draftSnapshot: this.pendingRewindDraftSnapshot,
+            draftRevision: this.pendingRewindDraftRevision,
+            clientRequestId: requestId,
+          });
+        }
         // Truncate-then-reload: the IndexedDB cache is append-only
         // (loadHistory merges ?after=), so tombstoned rows must be
         // dropped explicitly or they re-render forever.
@@ -6824,6 +7408,15 @@ export class PersistentChatService {
         // Journaled all-viewer signal (arrives via SSE in the new
         // epoch). Idempotent with the initiator's ack-driven reload.
         void this._reloadAfterRewind();
+        const threadId = this.threadId();
+        const marker = threadId ? this._readRewindMarker(threadId) : null;
+        if (
+          marker &&
+          !marker.prefillConsumed &&
+          params['client_request_id'] === marker.clientRequestId
+        ) {
+          void this._lookupRewindReceipt(marker, true);
+        }
         break;
       }
 

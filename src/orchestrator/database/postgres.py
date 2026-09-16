@@ -32330,7 +32330,8 @@ class PostgresDB:
                     existing_delivery = await conn.fetchrow(
                         """
                         SELECT delivery.*, message.thread_id AS message_thread_id,
-                               message.role, message.content, message.turn_number
+                               message.role, message.content, message.turn_number,
+                               message.rewound_at
                           FROM thread_input_deliveries AS delivery
                           JOIN thread_messages AS message
                             ON message.id = delivery.message_id
@@ -32385,6 +32386,16 @@ class PostgresDB:
                             allow_stateless_subagent_event=(foreground_orphan_recovery),
                             supersedes_input_seq=supersedes_input_seq,
                         )
+                if delivery is not None and not delivery.get("execution_disposition"):
+                    delivery = dict(delivery)
+                    delivery["execution_disposition"] = (
+                        "historical"
+                        if delivery.get("rewound_at") is not None
+                        and str(delivery.get("state") or "") in {"admitted", "settled"}
+                        else "superseded"
+                        if delivery.get("rewound_at") is not None
+                        else "current"
+                    )
                 result = {
                     "result": (
                         "idempotent"
@@ -32399,6 +32410,11 @@ class PostgresDB:
                         if delivery is not None
                         else None
                     ),
+                    "execution_disposition": (
+                        str(delivery.get("execution_disposition") or "current")
+                        if delivery is not None
+                        else None
+                    ),
                     "supersedes_input_seq": supersedes_input_seq,
                 }
                 if delivery is not None:
@@ -32408,6 +32424,18 @@ class PostgresDB:
                         "role": "event",
                         "message_id": str(delivery.get("message_id") or ""),
                         "state": str(delivery.get("state") or ""),
+                        "execution_disposition": str(
+                            delivery.get("execution_disposition")
+                            or (
+                                "historical"
+                                if delivery.get("rewound_at") is not None
+                                and str(delivery.get("state") or "")
+                                in {"admitted", "settled"}
+                                else "superseded"
+                                if delivery.get("rewound_at") is not None
+                                else "current"
+                            )
+                        ),
                     }
                 if foreground_orphan_recovery:
                     await conn.execute(
@@ -40783,8 +40811,19 @@ class PostgresDB:
         nullable and were added in migration 0019.
         """
         async with self.acquire() as conn:
-            row = await conn.fetchrow(
-                """
+            async with conn.transaction():
+                thread = await conn.fetchrow(
+                    "SELECT execution_lane FROM threads WHERE id=$1 FOR UPDATE",
+                    thread_id,
+                )
+                if thread is None:
+                    raise ValueError("session thread no longer exists")
+                if str(thread.get("execution_lane") or "pinned") == "stateless":
+                    raise RuntimeError(
+                        "legacy message writer is unavailable for stateless threads"
+                    )
+                row = await conn.fetchrow(
+                    """
                 INSERT INTO thread_messages
                     (thread_id, role, content, tool_calls, turn_number,
                      metrics, tool_call_id, thinking,
@@ -40793,36 +40832,36 @@ class PostgresDB:
                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
                 RETURNING id
                 """,
-                thread_id,
-                role,
-                content,
-                json.dumps(tool_calls) if tool_calls is not None else None,
-                turn_number,
-                json.dumps(metrics) if metrics is not None else None,
-                tool_call_id,
-                thinking,
-                json.dumps(reasoning) if reasoning is not None else None,
-                json.dumps(tool_results) if tool_results is not None else None,
-                provider,
-                json.dumps(provider_raw) if provider_raw is not None else None,
-                json.dumps(additional_kwargs)
-                if additional_kwargs is not None
-                else None,
-                json.dumps(response_metadata)
-                if response_metadata is not None
-                else None,
-            )
-            # Update thread activity + turn count
-            await conn.execute(
-                """
-                UPDATE threads
-                SET last_activity = CURRENT_TIMESTAMP,
-                    total_turns   = GREATEST(total_turns, COALESCE($2, 0))
-                WHERE id = $1
-                """,
-                thread_id,
-                turn_number,
-            )
+                    thread_id,
+                    role,
+                    content,
+                    json.dumps(tool_calls) if tool_calls is not None else None,
+                    turn_number,
+                    json.dumps(metrics) if metrics is not None else None,
+                    tool_call_id,
+                    thinking,
+                    json.dumps(reasoning) if reasoning is not None else None,
+                    json.dumps(tool_results) if tool_results is not None else None,
+                    provider,
+                    json.dumps(provider_raw) if provider_raw is not None else None,
+                    json.dumps(additional_kwargs)
+                    if additional_kwargs is not None
+                    else None,
+                    json.dumps(response_metadata)
+                    if response_metadata is not None
+                    else None,
+                )
+                # Update thread activity + turn count
+                await conn.execute(
+                    """
+                    UPDATE threads
+                    SET last_activity = CURRENT_TIMESTAMP,
+                        total_turns   = GREATEST(total_turns, COALESCE($2, 0))
+                    WHERE id = $1
+                    """,
+                    thread_id,
+                    turn_number,
+                )
         return str(row["id"])
 
     async def persist_thread_input_delivery(
@@ -40879,6 +40918,8 @@ class PostgresDB:
         thread_id: str,
         limit: Optional[int] = None,
         offset: int = 0,
+        *,
+        conn: Any | None = None,
     ) -> List[Dict[str, Any]]:
         """Load thread message history for the cockpit display path, ascending.
 
@@ -40908,7 +40949,10 @@ class PostgresDB:
             query += f" LIMIT ${len(params)}"
             params.append(offset)
             query += f" OFFSET ${len(params)}"
-        async with self.acquire() as conn:
+        if conn is None:
+            async with self.acquire() as acquired:
+                rows = await acquired.fetch(query, *params)
+        else:
             rows = await conn.fetch(query, *params)
         return [self._thread_message_to_dict(r) for r in rows]
 
@@ -41043,6 +41087,8 @@ class PostgresDB:
         before: Optional[datetime] = None,
         after: Optional[datetime] = None,
         limit: Optional[int] = None,
+        *,
+        conn: Any | None = None,
     ) -> Tuple[List[Dict[str, Any]], bool]:
         """Cursor-paged thread message read for the cockpit display (Phase 2).
 
@@ -41086,7 +41132,10 @@ class PostgresDB:
             params.append(limit + 1)  # probe one extra row to detect has_more
             query += f" LIMIT ${len(params)}"
 
-        async with self.acquire() as conn:
+        if conn is None:
+            async with self.acquire() as acquired:
+                rows = list(await acquired.fetch(query, *params))
+        else:
             rows = list(await conn.fetch(query, *params))
 
         has_more = False
@@ -41097,14 +41146,22 @@ class PostgresDB:
             rows.reverse()  # normalize to ascending for display
         return [self._thread_message_to_dict(r) for r in rows], has_more
 
-    async def get_thread_message_count(self, thread_id: str) -> int:
+    async def get_thread_message_count(
+        self, thread_id: str, *, conn: Any | None = None
+    ) -> int:
         """Get total message count for a thread."""
-        async with self.acquire() as conn:
-            return await conn.fetchval(
-                "SELECT COUNT(*) FROM thread_messages "
-                "WHERE thread_id = $1 AND rewound_at IS NULL",
-                thread_id,
-            )
+        if conn is None:
+            async with self.acquire() as acquired:
+                return await acquired.fetchval(
+                    "SELECT COUNT(*) FROM thread_messages "
+                    "WHERE thread_id = $1 AND rewound_at IS NULL",
+                    thread_id,
+                )
+        return await conn.fetchval(
+            "SELECT COUNT(*) FROM thread_messages "
+            "WHERE thread_id = $1 AND rewound_at IS NULL",
+            thread_id,
+        )
 
     async def update_thread_tokens(self, thread_id: str, tokens: int) -> None:
         """Increment total token usage for a thread."""

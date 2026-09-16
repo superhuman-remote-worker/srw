@@ -1544,6 +1544,8 @@ def test_connection_reports_stateless_ready_without_a_socket(monkeypatch):
             "mode.set": "rest",
             "narration.set": "rest",
         },
+        "control_options": {},
+        "conversation_revision": 0,
         # The run-queue lifecycle block rides the connection payload so a
         # reload can re-derive a queued or parked turn.  This fake serves no
         # connection, so the read degrades to None -- which is exactly the
@@ -1553,6 +1555,54 @@ def test_connection_reports_stateless_ready_without_a_socket(monkeypatch):
         "queue": None,
     }
     fake_db.get_pinned_session_binding.assert_not_awaited()
+
+
+def test_connection_advertises_idle_conversation_rewind_when_enabled(monkeypatch):
+    from orchestrator.routers import sessions as sessions_mod
+
+    class _Conn:
+        async def fetchval(self, *_args, **_kwargs):
+            return False
+
+        async def fetchrow(self, *_args, **_kwargs):
+            return None
+
+    class _Acquire:
+        async def __aenter__(self):
+            return _Conn()
+
+        async def __aexit__(self, *_args):
+            return False
+
+    fastapi_app = FastAPI()
+    _install_fake_auth(monkeypatch)
+    monkeypatch.setenv("SESSION_REWIND_IDLE_CONVERSATION_ENABLED", "true")
+    fake_db = AsyncMock()
+    fake_db.get_thread.return_value = {
+        **_connection_thread(lane="stateless", agent_id=None),
+        "kind": "session",
+        "parent_job_id": None,
+        "parent_thread_id": None,
+        "conversation_revision": 4,
+    }
+    fake_db.acquire = lambda: _Acquire()
+    fake_main = _fake_main(fake_db)
+    fastapi_app.state.sessions_dependencies_factory = lambda: fake_main.dependencies
+    fastapi_app.include_router(sessions_mod.router)
+
+    response = TestClient(fastapi_app).get(
+        f"/api/sessions/{CONNECTION_THREAD_ID}/connection"
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["controls"]["rewind"] == "rest"
+    assert payload["control_options"]["rewind"] == {
+        "version": 1,
+        "modes": ["conversation"],
+        "requires_idle": True,
+    }
+    assert payload["conversation_revision"] == 4
 
 
 def test_stateless_controls_never_advertise_a_socket_verb():

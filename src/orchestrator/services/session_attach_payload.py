@@ -503,6 +503,13 @@ async def assemble_session_attach_payload(
             if final_runtime_authority is not None
             else None
         ),
+        # Transcript identity is distinct from the workspace/runtime
+        # generation. A conversation-only rewind keeps the latter stable while
+        # forcing every warm executor to discard its old model context.
+        "conversation_revision": int(
+            (final_thread or {}).get("conversation_revision") or 0
+        ),
+        "events_epoch": int((final_thread or {}).get("events_epoch") or 0),
         # Non-secret physical identity used by the dual agent's monotonic
         # pre-setup claim. If actor binding fails before workspace setup, it
         # can echo this exact tuple while proving that setup never began.

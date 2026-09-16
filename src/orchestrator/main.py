@@ -338,6 +338,7 @@ from orchestrator.routers import job_completion as job_completion_routes  # noqa
 from orchestrator.routers import job_controls as job_control_routes  # noqa: E402
 from orchestrator.routers import job_lifecycle as job_lifecycle_routes  # noqa: E402
 from orchestrator.routers import thread_lifecycle as thread_lifecycle_routes  # noqa: E402
+from orchestrator.routers import thread_rewind as thread_rewind_routes  # noqa: E402
 from orchestrator.routers import verification as verification_routes  # noqa: E402
 from orchestrator.services import (  # noqa: E402
     completion_effects as completion_effect_operations,
@@ -353,6 +354,7 @@ from orchestrator.services import (  # noqa: E402
 )
 from orchestrator.services import (  # noqa: E402
     thread_resume as thread_resume_operations,
+    thread_rewind as thread_rewind_operations,
     thread_retirement as thread_retirement_operations,
 )
 from orchestrator.schemas.job_controls import (  # noqa: E402,F401
@@ -2658,6 +2660,10 @@ from orchestrator.services.deployment_gates import (  # noqa: E402
 
 from orchestrator.services.deployment_gates import (  # noqa: E402
     require_pinned_status_identity as _require_pinned_status_identity,
+)
+
+from orchestrator.services.deployment_gates import (  # noqa: E402
+    stateless_idle_conversation_rewind_enabled as _stateless_idle_conversation_rewind_enabled,
 )
 
 
@@ -8195,6 +8201,17 @@ def _thread_lifecycle_dependencies() -> (
     )
 
 
+def _thread_rewind_dependencies() -> thread_rewind_routes.ThreadRewindDependencies:
+    return thread_rewind_routes.ThreadRewindDependencies(
+        store=postgres_db,
+        service=thread_rewind_operations.ThreadRewindService(
+            postgres_db,
+            _stateless_idle_conversation_rewind_enabled,
+        ),
+        require_thread_owner=require_thread_owner,
+    )
+
+
 async def _end_thread_flow(*args: Any, **kwargs: Any) -> dict[str, Any]:
     """B12 bridge for the stateless-wake operator acceptance harness."""
 
@@ -8348,6 +8365,7 @@ app.state.job_lifecycle_route_dependencies_factory = (
 app.state.thread_lifecycle_dependencies_factory = (
     lambda: _thread_lifecycle_dependencies()
 )
+app.state.thread_rewind_dependencies_factory = lambda: _thread_rewind_dependencies()
 app.state.job_assignment_dependencies_factory = lambda: _job_assignment_dependencies()
 app.state.expert_catalog_dependencies_factory = lambda: _expert_catalog_dependencies()
 app.state.tables_dependencies = TablesDependencies(db=postgres_db)
@@ -8591,6 +8609,7 @@ app.include_router(product_capabilities_router)
 app.include_router(shared_browser_router)
 app.include_router(vm_guest_router)
 app.include_router(sessions_router)
+app.include_router(thread_rewind_routes.router)
 app.include_router(contacts_router)
 app.include_router(contacts_project_router)
 app.include_router(tables_router)
@@ -11484,6 +11503,7 @@ def _stamp_tool_categories(messages: list[dict[str, Any]]) -> None:
 async def get_thread_messages_history(
     thread_id: str,
     request: Request,
+    response: Response = None,
     limit: Optional[int] = None,
     before: Optional[str] = None,
     after: Optional[str] = None,
@@ -11504,6 +11524,8 @@ async def get_thread_messages_history(
     ``{messages, total, has_more, thread_id}``.
     """
     user, thread = await require_thread_owner(request, postgres_db, thread_id)
+    if response is not None:
+        response.headers["Cache-Control"] = "private, no-store"
 
     def _parse_cursor(value: Optional[str]) -> Optional[datetime]:
         if not value:
@@ -11524,32 +11546,42 @@ async def get_thread_messages_history(
 
     capped_limit = min(limit, 500) if limit is not None else None
 
-    if before_dt is not None or after_dt is not None:
-        messages, has_more = await postgres_db.get_thread_messages_page(
-            thread_id=thread_id,
-            before=before_dt,
-            after=after_dt,
-            limit=capped_limit,
-        )
-        # A cursor window carries no cheap true total; no consumer reads it here.
-        total = len(messages)
-    else:
-        messages = await postgres_db.get_thread_messages_history(
-            thread_id=thread_id,
-            limit=capped_limit,
-            offset=offset,
-        )
-        # Legacy paged read: a full page implies there may be more.
-        has_more = capped_limit is not None and len(messages) == capped_limit
-        # `total` is otherwise unread (the cockpit uses only `.messages`,
-        # persistent-chat.service.ts:748; the MCP tool doesn't read it). Skip the
-        # per-open COUNT(*): a full load (no limit) returns the whole thread so
-        # len(messages) IS the total; charge the COUNT only for the explicit
-        # limit/offset paged read where a paginating client may want it.
-        if capped_limit is None:
-            total = len(messages)
-        else:
-            total = await postgres_db.get_thread_message_count(thread_id)
+    # Rows and their cache fence come from one repeatable-read snapshot. A
+    # rewind cannot therefore pair its newer epoch/revision with an older page
+    # that still contains tombstoned messages (or vice versa).
+    async with postgres_db.acquire() as conn:
+        async with conn.transaction(isolation="repeatable_read", readonly=True):
+            history_state = await conn.fetchrow(
+                "SELECT events_epoch, conversation_revision FROM threads WHERE id=$1",
+                thread_id,
+            )
+            if history_state is None:
+                raise HTTPException(status_code=404, detail="Thread not found")
+            if before_dt is not None or after_dt is not None:
+                messages, has_more = await postgres_db.get_thread_messages_page(
+                    thread_id=thread_id,
+                    before=before_dt,
+                    after=after_dt,
+                    limit=capped_limit,
+                    conn=conn,
+                )
+                # A cursor window carries no cheap true total; no consumer reads it here.
+                total = len(messages)
+            else:
+                messages = await postgres_db.get_thread_messages_history(
+                    thread_id=thread_id,
+                    limit=capped_limit,
+                    offset=offset,
+                    conn=conn,
+                )
+                # Legacy paged read: a full page implies there may be more.
+                has_more = capped_limit is not None and len(messages) == capped_limit
+                if capped_limit is None:
+                    total = len(messages)
+                else:
+                    total = await postgres_db.get_thread_message_count(
+                        thread_id, conn=conn
+                    )
 
     _stamp_tool_categories(messages)
 
@@ -11558,6 +11590,8 @@ async def get_thread_messages_history(
         "total": total,
         "has_more": has_more,
         "thread_id": thread_id,
+        "events_epoch": int(history_state["events_epoch"] or 0),
+        "conversation_revision": int(history_state["conversation_revision"] or 0),
     }
 
 
@@ -12182,6 +12216,7 @@ class ThreadInputRequest(BaseModel):
 
     content: str
     turn_id: Optional[int] = None
+    expected_conversation_revision: int | None = Field(default=None, ge=0)
 
 
 async def _load_thread_for_owner(thread_id: str, user: dict) -> dict:
@@ -12200,7 +12235,11 @@ async def _load_thread_for_owner(thread_id: str, user: dict) -> dict:
     return thread
 
 
-async def _thread_input_stateless(thread: dict, content: str) -> dict[str, Any]:
+async def _thread_input_stateless(
+    thread: dict,
+    content: str,
+    expected_conversation_revision: int | None = None,
+) -> dict[str, Any]:
     """Admit one user turn for a stateless-lane thread (stateless_agents.md
     §5.3.1): persist the message, advance the input watermark, and queue the
     unit — all in ONE transaction, so "message durable ⟺ watermark advanced"
@@ -12247,7 +12286,7 @@ async def _thread_input_stateless(thread: dict, content: str) -> dict[str, Any]:
         async with conn.transaction():
             locked_thread = await conn.fetchrow(
                 "SELECT id, user_id, execution_lane, agent_id, status, "
-                "       total_turns, metadata "
+                "       total_turns, metadata, conversation_revision "
                 "FROM threads WHERE id = $1 FOR UPDATE",
                 thread_id,
             )
@@ -12261,6 +12300,22 @@ async def _thread_input_stateless(thread: dict, content: str) -> dict[str, Any]:
                     detail="Thread is no longer eligible for stateless admission",
                 )
             locked_thread_dict = dict(locked_thread)
+            current_revision = int(locked_thread_dict.get("conversation_revision") or 0)
+            if expected_conversation_revision is None:
+                revision_matches = current_revision == 0
+            else:
+                revision_matches = (
+                    int(expected_conversation_revision) == current_revision
+                )
+            if not revision_matches:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "session_view_stale",
+                        "reason": "conversation_revision_changed",
+                        "conversation_revision": current_revision,
+                    },
+                )
             locked_backend = _require_stateless_workspace(locked_thread_dict)
             locked_status = str(locked_thread["status"] or "")
             if locked_status not in {
@@ -12358,6 +12413,7 @@ async def _thread_input_stateless(thread: dict, content: str) -> dict[str, Any]:
     return {
         "accepted": True,
         "turn_id": turn_number,
+        "conversation_revision": current_revision,
         "queue": {
             "state": state,
             "queue_depth": queue_depth,
@@ -12398,7 +12454,11 @@ async def thread_input(
         # queue), and the lock dict is per-process state — replica-unsafe
         # under the 2-replica topology anyway. body.turn_id is ignored: the
         # queue lane derives the turn number from DB truth (total_turns + 1).
-        return await _thread_input_stateless(lane_thread, body.content)
+        return await _thread_input_stateless(
+            lane_thread,
+            body.content,
+            body.expected_conversation_revision,
+        )
 
     thread, binding = await _resolve_thread_for_forwarding(thread_id, user)
 

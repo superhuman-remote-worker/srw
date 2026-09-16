@@ -2456,6 +2456,19 @@ class TestAffinity:
         }
         assert te.attach_fingerprint(first) == te.attach_fingerprint(second)
 
+    def test_fingerprint_changes_with_conversation_revision_and_event_epoch(self):
+        base = {
+            "thread_id": "t1",
+            "conversation_revision": 0,
+            "events_epoch": 7,
+            "resolved_config": {"agent": {"llm": {"model": "m"}}},
+        }
+        rewound = {**base, "conversation_revision": 1, "events_epoch": 8}
+        epoch_only = {**base, "events_epoch": 8}
+
+        assert te.attach_fingerprint(base) != te.attach_fingerprint(rewound)
+        assert te.attach_fingerprint(base) != te.attach_fingerprint(epoch_only)
+
     def test_fingerprint_ignores_rotating_runtime_actor_credentials_only(self):
         first = {
             "thread_id": "t1",

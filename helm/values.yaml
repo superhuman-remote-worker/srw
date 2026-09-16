@@ -633,6 +633,12 @@ agent:
     # -- Recover an idle thread's stale cloud push through a low-priority
     # bg_task. Default off; requires migration 0233 and matching executors.
     cloudPushRecoveryEnabled: false
+    # -- Admit v1 idle, conversation-only rewinds through the orchestrator.
+    # Keep off until migration 0249, matching Cockpit readers, and all caller
+    # fences have rolled out. Duplicate receipt reads remain available after
+    # this gate is turned off again.
+    rewind:
+      idleConversationEnabled: false
     # -- Rolling-update shape for the executor Deployment. maxUnavailable 0:
     # a replacement pod boots and starts claiming before any old pod is asked
     # to drain; ReplicaSet scale-down then removes idle pods first via the

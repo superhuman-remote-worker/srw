@@ -17,9 +17,26 @@ import pytest
 from orchestrator.main import get_thread_messages_history
 
 
+class _AsyncContext:
+    def __init__(self, value=None):
+        self.value = value
+
+    async def __aenter__(self):
+        return self.value
+
+    async def __aexit__(self, *_args):
+        return False
+
+
 def _patched(db):
     """Patch the endpoint's module-level deps: auth + the db singleton."""
     owner = AsyncMock(return_value=({"id": "u1"}, {"id": "t1", "user_id": "u1"}))
+    conn = MagicMock()
+    conn.transaction.return_value = _AsyncContext()
+    conn.fetchrow = AsyncMock(
+        return_value={"events_epoch": 2, "conversation_revision": 3}
+    )
+    db.acquire.return_value = _AsyncContext(conn)
     return (
         patch("orchestrator.main.require_thread_owner", owner),
         patch("orchestrator.main.postgres_db", db),
@@ -36,6 +53,8 @@ async def test_full_load_skips_count():
         result = await get_thread_messages_history("t1", MagicMock())
     # total comes free from the full transcript, not a COUNT(*).
     assert result["total"] == 2
+    assert result["events_epoch"] == 2
+    assert result["conversation_revision"] == 3
     assert db.get_thread_message_count.call_count == 0, "no per-open COUNT on full load"
 
 

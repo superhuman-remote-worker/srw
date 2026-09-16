@@ -358,6 +358,9 @@ GET    /api/persistent/threads/{thread_id}/messages                             
 GET    /api/persistent/threads/{thread_id}/queue                                        gated:require_thread_owner
 POST   /api/persistent/threads/{thread_id}/queue/retry                                  gated:require_thread_owner
 POST   /api/persistent/threads/{thread_id}/resume                                       gated:require_thread_owner
+POST   /api/persistent/threads/{thread_id}/rewinds                                      gated:require_thread_owner
+GET    /api/persistent/threads/{thread_id}/rewinds/by-client-request/{client_request_id} gated:require_thread_owner
+GET    /api/persistent/threads/{thread_id}/rewinds/preview                              gated:require_thread_owner
 GET    /api/persistent/threads/{thread_id}/state                                        gated:require_thread_owner
 GET    /api/persistent/threads/{thread_id}/stream                                       gated:require_thread_owner
 GET    /api/persistent/threads/{thread_id}/subagents                                    gated:require_thread_owner

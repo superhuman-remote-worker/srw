@@ -697,6 +697,24 @@ async def test_durable_retry_finishes_only_after_provider_admission():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("disposition", ["historical", "superseded"])
+async def test_rewound_delivery_receipt_closes_wake_without_new_execution(disposition):
+    db = _db(claimed=[_claim_row()], thread=_thread(agent_id=None))
+    db.persist_thread_input_delivery = AsyncMock(
+        return_value={
+            "transcript_inserted": False,
+            "thread_id": THREAD_ID,
+            "state": "persisted",
+            "execution_disposition": disposition,
+        }
+    )
+
+    assert await session_wake.drain_pending_wakes(db) == 1
+    db.finish_job_wake.assert_awaited_once_with(JOB_ID, "completed")
+    db.defer_job_wake_for_input.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_wrong_thread_delivery_receipt_cannot_settle_wake():
     db = _db(claimed=[_claim_row()], thread=_thread(agent_id=None))
     db.persist_thread_input_delivery = AsyncMock(

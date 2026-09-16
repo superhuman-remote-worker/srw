@@ -84,6 +84,17 @@ export interface ThreadCursor {
   updatedAt: string;
 }
 
+/** Persisted authority floor for the isolated v2 thread-history cache. */
+export interface ThreadCacheEpoch {
+  /** Thread UUID — primary key. */
+  threadId: string;
+  /** Event epoch returned with the same snapshot as the cached rows. */
+  eventsEpoch: number;
+  /** Transcript revision returned with the same snapshot as the cached rows. */
+  conversationRevision: number;
+  updatedAt: string;
+}
+
 /**
  * Cached persistent-thread message — mirrors the orchestrator's
  * `thread_messages` display row plus the owning `threadId`. The full

@@ -4033,6 +4033,8 @@ async def _attach_session_inner(
     pinned_runtime_generation_contract: Any = None,
     session_runtime_generation: Any = None,
     session_runtime_attach_token: Any = None,
+    conversation_revision: Any = None,
+    events_epoch: Any = None,
     workspace_generation: Any = _ATTACH_WORKSPACE_IDENTITY_UNSET,
     workspace_runtime_incarnation: Any = _ATTACH_WORKSPACE_IDENTITY_UNSET,
 ) -> None:
@@ -5187,6 +5189,8 @@ async def _attach_session(
     pinned_runtime_generation_contract: Any = None,
     session_runtime_generation: Any = None,
     session_runtime_attach_token: Any = None,
+    conversation_revision: Any = None,
+    events_epoch: Any = None,
     workspace_generation: Any = _ATTACH_WORKSPACE_IDENTITY_UNSET,
     workspace_runtime_incarnation: Any = _ATTACH_WORKSPACE_IDENTITY_UNSET,
 ) -> None:
@@ -5206,6 +5210,8 @@ async def _attach_session(
             pinned_runtime_generation_contract=pinned_runtime_generation_contract,
             session_runtime_generation=session_runtime_generation,
             session_runtime_attach_token=session_runtime_attach_token,
+            conversation_revision=conversation_revision,
+            events_epoch=events_epoch,
             workspace_generation=workspace_generation,
             workspace_runtime_incarnation=workspace_runtime_incarnation,
         )

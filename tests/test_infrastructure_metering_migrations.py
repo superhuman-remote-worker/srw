@@ -377,7 +377,7 @@ APP_INPUT_DELIVERY_CONSTRAINTS_NOT_VALID = (
 )
 APP_CURRENT_MIGRATION_HEAD = (
     ROOT
-    / "src/orchestrator/database/migrations/app/0248_retire_unkeyed_credential_provenance.sql"
+    / "src/orchestrator/database/migrations/app/0249_stateless_conversation_rewind.sql"
 )
 AUDIT_EXPANSION = (
     ROOT

@@ -19387,9 +19387,11 @@ CREATE TABLE public.thread_input_deliveries (
     owner_executor text,
     owner_executor_pod_uid text,
     supersedes_input_seq bigint,
+    conversation_revision bigint,
     CONSTRAINT thread_input_deliveries_admission_shape CHECK ((((state <> ALL (ARRAY['admitted'::text, 'settled'::text])) AND (admitted_at IS NULL) AND (admitted_turn_number IS NULL)) OR ((state = ANY (ARRAY['admitted'::text, 'settled'::text])) AND (admitted_at IS NOT NULL) AND (admitted_turn_number IS NOT NULL)))),
     CONSTRAINT thread_input_deliveries_claim_generation_check CHECK ((claim_generation >= 0)),
     CONSTRAINT thread_input_deliveries_claim_shape CHECK ((((execution_lane = 'pinned'::text) AND (((claim_generation = 0) AND (owner_agent_id IS NULL)) OR ((claim_generation > 0) AND (owner_agent_id IS NOT NULL)))) OR (execution_lane = 'stateless'::text))),
+    CONSTRAINT thread_input_deliveries_conversation_revision_nonnegative CHECK (((conversation_revision IS NULL) OR (conversation_revision >= 0))),
     CONSTRAINT thread_input_deliveries_lane_check CHECK ((execution_lane = ANY (ARRAY['pinned'::text, 'stateless'::text]))),
     CONSTRAINT thread_input_deliveries_owner_shape CHECK ((((execution_lane = 'pinned'::text) AND (owner_run_queue_lease_token IS NULL) AND (owner_executor IS NULL) AND (owner_executor_pod_uid IS NULL) AND (((owner_agent_id IS NULL) AND (owner_pod_uid IS NULL) AND (owner_runtime_generation IS NULL)) OR ((owner_agent_id IS NOT NULL) AND (owner_pod_uid IS NOT NULL) AND (owner_runtime_generation IS NOT NULL)))) OR ((execution_lane = 'stateless'::text) AND (owner_agent_id IS NULL) AND (owner_pod_uid IS NULL) AND (owner_runtime_generation IS NULL) AND (((claim_generation = 0) AND (owner_run_queue_lease_token IS NULL) AND (owner_executor IS NULL) AND (owner_executor_pod_uid IS NULL)) OR ((claim_generation > 0) AND (owner_run_queue_lease_token IS NOT NULL) AND (owner_run_queue_lease_token > 0) AND (owner_executor IS NOT NULL) AND (btrim(owner_executor) <> ''::text) AND (owner_executor_pod_uid IS NOT NULL) AND (btrim(owner_executor_pod_uid) <> ''::text)))))),
     CONSTRAINT thread_input_deliveries_settlement_shape CHECK (((state = 'settled'::text) = (settled_at IS NOT NULL))),
@@ -19472,6 +19474,13 @@ COMMENT ON COLUMN public.thread_input_deliveries.owner_executor_pod_uid IS 'Kube
 --
 
 COMMENT ON COLUMN public.thread_input_deliveries.supersedes_input_seq IS 'For a foreground-child recovery event, the exact abandoned parent input sequence replaced by this evidence/continuation turn. NULL otherwise.';
+
+
+--
+-- Name: COLUMN thread_input_deliveries.conversation_revision; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.thread_input_deliveries.conversation_revision IS 'Conversation revision captured when this durable input identity was first admitted. NULL identifies pre-0249 history.';
 
 
 --
@@ -19816,7 +19825,16 @@ CREATE TABLE public.thread_rewinds (
     restored_to_sha text,
     restore_commit_sha text,
     created_at timestamp with time zone DEFAULT now() NOT NULL,
-    CONSTRAINT thread_rewinds_mode_check CHECK ((mode = ANY (ARRAY['both'::text, 'conversation'::text, 'code'::text])))
+    client_request_id uuid,
+    request_payload jsonb,
+    result_payload jsonb,
+    runtime_generation uuid,
+    before_conversation_revision bigint,
+    after_conversation_revision bigint,
+    event_epoch integer,
+    event_seq bigint,
+    CONSTRAINT thread_rewinds_mode_check CHECK ((mode = ANY (ARRAY['both'::text, 'conversation'::text, 'code'::text]))),
+    CONSTRAINT thread_rewinds_stateless_receipt_shape CHECK ((((client_request_id IS NULL) AND (request_payload IS NULL) AND (result_payload IS NULL) AND (runtime_generation IS NULL) AND (before_conversation_revision IS NULL) AND (after_conversation_revision IS NULL) AND (event_epoch IS NULL) AND (event_seq IS NULL)) OR ((client_request_id IS NOT NULL) AND (request_payload IS NOT NULL) AND (jsonb_typeof(request_payload) = 'object'::text) AND (result_payload IS NOT NULL) AND (jsonb_typeof(result_payload) = 'object'::text) AND (runtime_generation IS NOT NULL) AND (before_conversation_revision IS NOT NULL) AND (before_conversation_revision >= 0) AND (after_conversation_revision = (before_conversation_revision + 1)) AND (event_epoch IS NOT NULL) AND (event_epoch >= 0) AND (event_seq IS NOT NULL) AND (event_seq > 0))))
 );
 
 
@@ -19825,6 +19843,27 @@ CREATE TABLE public.thread_rewinds (
 --
 
 COMMENT ON TABLE public.thread_rewinds IS 'One row per session rewind: the audit trail, un-tombstone metadata, and the workspace SHAs of the forward-restore. Append-only.';
+
+
+--
+-- Name: COLUMN thread_rewinds.client_request_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.thread_rewinds.client_request_id IS 'Browser-generated idempotency key for synchronous stateless conversation rewind.';
+
+
+--
+-- Name: COLUMN thread_rewinds.request_payload; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.thread_rewinds.request_payload IS 'Canonical immutable POST body used to detect idempotency-key conflicts.';
+
+
+--
+-- Name: COLUMN thread_rewinds.result_payload; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.thread_rewinds.result_payload IS 'Committed replayable result. Written in the same transaction as the transcript effect.';
 
 
 --
@@ -20054,6 +20093,8 @@ CREATE TABLE public.threads (
     subagent_outcome text,
     subagent_error text,
     report_path text,
+    conversation_revision bigint DEFAULT 0 NOT NULL,
+    CONSTRAINT threads_conversation_revision_nonnegative CHECK ((conversation_revision >= 0)),
     CONSTRAINT threads_kind_check CHECK ((kind = ANY (ARRAY['session'::text, 'subagent'::text]))),
     CONSTRAINT threads_parent_shape_check CHECK ((((kind = 'session'::text) AND (parent_job_id IS NULL) AND (parent_thread_id IS NULL)) OR ((kind = 'subagent'::text) AND (num_nonnulls(parent_job_id, parent_thread_id) = 1)))),
     CONSTRAINT threads_runtime_retirement_external_cleanup_shape CHECK (((runtime_retirement_external_cleanup IS NULL) OR ((runtime_retirement_token IS NOT NULL) AND (runtime_retirement_permanent = true) AND (jsonb_typeof(runtime_retirement_external_cleanup) = 'object'::text)))),
@@ -20253,6 +20294,13 @@ COMMENT ON COLUMN public.threads.subagent_error IS 'kind=subagent only: the erro
 --
 
 COMMENT ON COLUMN public.threads.report_path IS 'kind=subagent only: workspace-relative path of the child''s full spilled report in the PARENT tree (.subagents/<handle>/report.md); NULL when the spill failed. The replay path re-renders the envelope from this file.';
+
+
+--
+-- Name: COLUMN threads.conversation_revision; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.threads.conversation_revision IS 'Monotonic transcript-view revision. Incremented only by an applied conversation rewind; clients fence delayed human input and cached history against it.';
 
 
 --
@@ -24139,6 +24187,13 @@ CREATE INDEX idx_thread_mounts_source_ref ON public.thread_mounts USING btree (s
 --
 
 CREATE INDEX idx_thread_mounts_thread ON public.thread_mounts USING btree (thread_id);
+
+
+--
+-- Name: idx_thread_rewinds_client_request; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX idx_thread_rewinds_client_request ON public.thread_rewinds USING btree (thread_id, client_request_id) WHERE (client_request_id IS NOT NULL);
 
 
 --

@@ -505,6 +505,11 @@ spec:
                 configMapKeyRef:
                   name: {{ include "srw.configMapName" . }}
                   key: STATELESS_CLOUD_PUSH_RECOVERY_ENABLED
+            - name: SESSION_REWIND_IDLE_CONVERSATION_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: SESSION_REWIND_IDLE_CONVERSATION_ENABLED
             - name: STATELESS_WORKER_ENABLED
               valueFrom:
                 configMapKeyRef:
