@@ -1,0 +1,110 @@
+{{- $gate := .Values.orchestrator.vmWorkspaceRecoveryAcceptanceGate -}}
+{{- if $gate.enabled -}}
+{{- if not (and .Values.orchestrator.vmWorkspaceRecovery.enabled .Values.orchestrator.vmWorkspaceRecovery.replacementEnabled) -}}
+{{- fail "orchestrator.vmWorkspaceRecoveryAcceptanceGate.enabled requires both VM workspace recovery gates" -}}
+{{- end -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "srw.fullname" . }}-vm-workspace-recovery-gate-adapter
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "orchestrator") | nindent 4 }}
+data:
+  protocolVersion: "1"
+  target: {{ printf "deploy/%s-orchestrator" (include "srw.fullname" .) | quote }}
+  container: orchestrator
+  commandJson: {{ list "python" "-m" "orchestrator.operator_cli.vm_workspace_recovery_acceptance" | toJson | quote }}
+  capabilitiesJson: {{ list "response_loss" "leader_overlap" "slow_boot" "deadline" "missing_stop_evidence" "forced_deletion" "replacement" | toJson | quote }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "srw.fullname" . }}-vm-workspace-recovery-gate
+  namespace: {{ include "srw.vmControllerNamespace" . }}
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "orchestrator") | nindent 4 }}
+rules:
+  - apiGroups: ["kubevirt.io"]
+    resources: ["virtualmachines", "virtualmachineinstances"]
+    verbs: ["get", "list", "watch", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["pods", "persistentvolumeclaims"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["pods/exec"]
+    verbs: ["create", "get"]
+  - apiGroups: ["cdi.kubevirt.io"]
+    resources: ["datavolumes"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "srw.fullname" . }}-vm-workspace-recovery-gate
+  namespace: {{ include "srw.vmControllerNamespace" . }}
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "orchestrator") | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "srw.fullname" . }}-vm-workspace-recovery-gate
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "srw.orchestratorServiceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "srw.fullname" . }}-vm-workspace-recovery-gate-pv
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "orchestrator") | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["persistentvolumes"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "srw.fullname" . }}-vm-workspace-recovery-gate-pv
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "orchestrator") | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "srw.fullname" . }}-vm-workspace-recovery-gate-pv
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "srw.orchestratorServiceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "srw.fullname" . }}-vm-workspace-recovery-gate-longhorn
+  namespace: longhorn-system
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "orchestrator") | nindent 4 }}
+rules:
+  - apiGroups: ["longhorn.io"]
+    resources: ["volumes"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "srw.fullname" . }}-vm-workspace-recovery-gate-longhorn
+  namespace: longhorn-system
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "orchestrator") | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "srw.fullname" . }}-vm-workspace-recovery-gate-longhorn
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "srw.orchestratorServiceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}

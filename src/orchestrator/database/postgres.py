@@ -4553,6 +4553,7 @@ class PostgresDB:
             if completion_commands_enabled
             else ""
         )
+        recovery_cancellation = None
         async with self.acquire() as conn:
             async with conn.transaction():
                 result = await conn.execute(
@@ -4571,15 +4572,44 @@ class PostgresDB:
                     expected_status,
                 )
                 if result == "UPDATE 1":
-                    await self._resolve_workspace_recovery_cancel_participant(
-                        conn, uuid_val
+                    recovery_cancellation = (
+                        await self._resolve_workspace_recovery_cancel_participant(
+                            conn, uuid_val
+                        )
                     )
+        if recovery_cancellation is not None:
+            self._emit_workspace_recovery_cancel(recovery_cancellation, job_id=uuid_val)
         return result == "UPDATE 1"
+
+    @staticmethod
+    def _emit_workspace_recovery_cancel(
+        cancellation: tuple[UUID, str, bool], *, job_id: UUID
+    ) -> None:
+        """Emit after commit without letting telemetry affect cancellation."""
+
+        recovery_id, reason_code, operation_resolved = cancellation
+        try:
+            from orchestrator.services.vm_workspace_recovery_telemetry import (
+                workspace_recovery_telemetry,
+            )
+
+            workspace_recovery_telemetry.emit(
+                event="cancel",
+                state="cancelled" if operation_resolved else "recovering_workspace",
+                phase="cancelled" if operation_resolved else "recovering",
+                code=reason_code,
+                result="accepted",
+                reason="recovery_participant_cancelled",
+                operation_id=recovery_id,
+                job_id=job_id,
+            )
+        except Exception:
+            logger.exception("VM workspace recovery cancellation telemetry failed")
 
     @staticmethod
     async def _resolve_workspace_recovery_cancel_participant(
         conn: Any, job_uuid: UUID
-    ) -> None:
+    ) -> tuple[UUID, str, bool] | None:
         """Resolve only one cancelled participant and release a final operation."""
 
         participant = await conn.fetchrow(
@@ -4591,7 +4621,7 @@ class PostgresDB:
             return
         recovery_id = participant["recovery_id"]
         operation = await conn.fetchrow(
-            "SELECT id FROM vm_workspace_recoveries "
+            "SELECT id,reason_code FROM vm_workspace_recoveries "
             "WHERE id=$1 AND resolved_at IS NULL FOR UPDATE",
             recovery_id,
         )
@@ -4639,6 +4669,11 @@ class PostgresDB:
                 "WHERE recovery_id=$1 AND released_at IS NULL",
                 recovery_id,
             )
+        return (
+            recovery_id,
+            str(operation["reason_code"] or "none"),
+            remaining is False,
+        )
 
     async def cancel_stateless_job(
         self,
@@ -4669,6 +4704,7 @@ class PostgresDB:
             else ""
         )
         queue_closed = False
+        recovery_cancellation = None
         try:
             async with self.acquire() as conn:
                 async with conn.transaction():
@@ -4712,11 +4748,16 @@ class PostgresDB:
                     )
                     if row is None:
                         raise _CancelCASLostError
-                    await self._resolve_workspace_recovery_cancel_participant(
-                        conn, job_uuid
+                    recovery_cancellation = (
+                        await self._resolve_workspace_recovery_cancel_participant(
+                            conn, job_uuid
+                        )
                     )
         except _CancelCASLostError:
             return False, False
+
+        if recovery_cancellation is not None:
+            self._emit_workspace_recovery_cancel(recovery_cancellation, job_id=job_uuid)
 
         # Even an already-closed queue is finalized by the shared settle path.
         # The durable marker blocks Resume while checkpoint/workspace cleanup

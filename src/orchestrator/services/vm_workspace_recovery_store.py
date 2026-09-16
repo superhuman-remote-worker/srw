@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -11,6 +12,10 @@ from datetime import datetime
 from typing import Any, Mapping
 from uuid import UUID, uuid4, uuid5, NAMESPACE_URL
 
+from orchestrator.services.vm_workspace_recovery_telemetry import (
+    VMWorkspaceRecoveryTelemetry,
+    workspace_recovery_telemetry,
+)
 from shared.worker_queue import (
     get_worker_attempt_disposition,
     park_worker_batch_for_workspace_recovery,
@@ -22,6 +27,9 @@ from shared.workspace_recovery import (
     WorkspaceRecoveryCode,
     WorkspaceRecoveryDisposition,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 def _json(value: Any) -> Any:
@@ -448,9 +456,52 @@ async def complete_vm_cleanup_permit(
 
 
 class VMWorkspaceRecoveryStore:
-    def __init__(self, db: Any, *, worker_id: str | None = None) -> None:
+    def __init__(
+        self,
+        db: Any,
+        *,
+        worker_id: str | None = None,
+        telemetry: VMWorkspaceRecoveryTelemetry | Any | None = None,
+    ) -> None:
         self.db = db
         self.worker_id = worker_id or os.getenv("HOSTNAME", "vm-workspace-recovery")
+        self.telemetry = telemetry or workspace_recovery_telemetry
+
+    def _emit(
+        self,
+        *,
+        event: str,
+        state: str,
+        phase: str,
+        code: WorkspaceRecoveryCode | str,
+        result: str,
+        reason: str | None = None,
+        cleanup_blocker: str | None = None,
+        operation_id: object | None = None,
+        job_id: object | None = None,
+        vm_uid: object | None = None,
+        pvc_uid: object | None = None,
+        accepted_lease_token: int | None = None,
+        hold_lease_token: int | None = None,
+    ) -> None:
+        try:
+            self.telemetry.emit(
+                event=event,
+                state=state,
+                phase=phase,
+                code=code,
+                result=result,
+                reason=reason,
+                cleanup_blocker=cleanup_blocker,
+                operation_id=operation_id,
+                job_id=job_id,
+                vm_uid=vm_uid,
+                pvc_uid=pvc_uid,
+                accepted_lease_token=accepted_lease_token,
+                hold_lease_token=hold_lease_token,
+            )
+        except Exception:
+            logger.exception("VM workspace recovery telemetry emission failed")
 
     @asynccontextmanager
     async def _connection(self, conn: Any | None):
@@ -1169,7 +1220,58 @@ class VMWorkspaceRecoveryStore:
                     recovery_id,
                     json.dumps(receipt),
                 )
-                return disposition
+                accepted = disposition
+
+        state = (
+            "paused_attention"
+            if accepted.action == "paused_attention"
+            else "recovering_workspace"
+        )
+        phase = (
+            "paused_attention"
+            if accepted.action == "paused_attention"
+            else "recovering"
+        )
+        self._emit(
+            event="hold",
+            state=state,
+            phase=phase,
+            code=accepted.code,
+            result="accepted",
+            reason="workspace_hold_committed",
+            operation_id=accepted.operation_id,
+            job_id=job_id,
+            vm_uid=vm_uid,
+            pvc_uid=root_pvc_uid,
+        )
+        self._emit(
+            event="queue_fenced",
+            state=state,
+            phase=phase,
+            code=accepted.code,
+            result="accepted",
+            reason="queue_lease_token_advanced",
+            operation_id=accepted.operation_id,
+            job_id=job_id,
+            vm_uid=vm_uid,
+            pvc_uid=root_pvc_uid,
+            accepted_lease_token=accepted.accepted_lease_token,
+            hold_lease_token=accepted.hold_lease_token,
+        )
+        if accepted.action == "paused_attention":
+            self._emit(
+                event="pause",
+                state=state,
+                phase=phase,
+                code=accepted.code,
+                result="accepted",
+                reason="admission_requires_attention",
+                operation_id=accepted.operation_id,
+                job_id=job_id,
+                vm_uid=vm_uid,
+                pvc_uid=root_pvc_uid,
+            )
+        return accepted
 
     async def unresolved_participation(self, job_id: UUID) -> dict[str, Any] | None:
         async with self.db.acquire() as conn:
@@ -1278,11 +1380,23 @@ class VMWorkspaceRecoveryStore:
                     pvc_uid,
                 )
                 if active_cleanup is not None:
-                    return CleanupPermit(
+                    permit = CleanupPermit(
                         allowed=False,
                         admission_id=active_cleanup["id"],
                         reason="workspace_cleanup_already_admitted",
                     )
+                    self._emit(
+                        event="cleanup_blocked",
+                        state="recovering_workspace",
+                        phase="reconciling_outcome",
+                        code="none",
+                        result="blocked",
+                        reason=permit.reason,
+                        cleanup_blocker=permit.reason,
+                        job_id=owner_id if owner_kind == "job" else None,
+                        pvc_uid=pvc_uid,
+                    )
+                    return permit
                 recovery = await conn.fetchrow(
                     "SELECT r.id FROM vm_workspace_recoveries r "
                     "LEFT JOIN vm_workspace_recovery_retention_pins pin "
@@ -1294,11 +1408,24 @@ class VMWorkspaceRecoveryStore:
                     pvc_uid,
                 )
                 if recovery is not None:
-                    return CleanupPermit(
+                    permit = CleanupPermit(
                         allowed=False,
                         recovery_id=recovery["id"],
                         reason="workspace_recovery_unresolved",
                     )
+                    self._emit(
+                        event="cleanup_blocked",
+                        state="recovering_workspace",
+                        phase="reconciling_outcome",
+                        code="none",
+                        result="blocked",
+                        reason=permit.reason,
+                        cleanup_blocker=permit.reason,
+                        operation_id=permit.recovery_id,
+                        job_id=owner_id if owner_kind == "job" else None,
+                        pvc_uid=pvc_uid,
+                    )
+                    return permit
                 admission_id = uuid4()
                 await conn.execute(
                     "INSERT INTO vm_workspace_cleanup_admissions "
@@ -1540,7 +1667,25 @@ class VMWorkspaceRecoveryStore:
                     successor_id,
                     json.dumps(result),
                 )
-                return result
+                accepted = result
+
+        self._emit(
+            event="retry",
+            state=str(accepted["status"]),
+            phase=(
+                "paused_attention"
+                if accepted["status"] == "paused_attention"
+                else "recovering"
+            ),
+            code=recovery["reason_code"] or "none",
+            result="accepted",
+            reason="operator_retry_accepted",
+            operation_id=successor_id,
+            job_id=job_id,
+            vm_uid=recovery["vm_uid"],
+            pvc_uid=recovery["root_pvc_uid"],
+        )
+        return accepted
 
     async def admit_hold_from_reaper(
         self,
@@ -2002,8 +2147,12 @@ class VMWorkspaceRecoveryStore:
         operation_id: UUID,
         *,
         ttl_seconds: float = 30,
+        permit_ttl_seconds: float = 30,
         max_global_probes: int = 4,
+        max_probes_per_node: int = 1,
     ) -> RecoveryClaim | None:
+        if max_probes_per_node != 1:
+            raise ValueError("recovery protocol v1 supports one probe per node")
         async with self.db.acquire() as conn:
             async with conn.transaction():
                 expired = await conn.fetchval(
@@ -2130,7 +2279,7 @@ class VMWorkspaceRecoveryStore:
                         global_slot,
                         candidate["node_key"],
                         row["claim_token"],
-                        ttl_seconds,
+                        permit_ttl_seconds,
                     )
         if row is None:
             return None
@@ -2202,7 +2351,11 @@ class VMWorkspaceRecoveryStore:
             )
 
     async def renew_claim(
-        self, claim: RecoveryClaim, *, ttl_seconds: float = 30
+        self,
+        claim: RecoveryClaim,
+        *,
+        ttl_seconds: float = 30,
+        permit_ttl_seconds: float = 30,
     ) -> RecoveryClaim | None:
         """Extend one live row+slot claim without changing its fencing term."""
 
@@ -2233,20 +2386,21 @@ class VMWorkspaceRecoveryStore:
                 if current is None:
                     return None
                 remaining = max(0.0, float(current["remaining_seconds"]))
-                extension = min(max(0.1, ttl_seconds), remaining)
+                claim_extension = min(max(0.1, ttl_seconds), remaining)
+                permit_extension = min(max(0.1, permit_ttl_seconds), remaining)
                 await conn.execute(
                     "UPDATE vm_workspace_recoveries "
                     "SET claimed_until=clock_timestamp()+make_interval(secs=>$2::float8) "
                     "WHERE id=$1",
                     claim.operation_id,
-                    extension,
+                    claim_extension,
                 )
                 await conn.execute(
                     "UPDATE vm_workspace_recovery_probe_slots "
                     "SET leased_until=clock_timestamp()+make_interval(secs=>$2::float8) "
                     "WHERE recovery_id=$1 AND claim_token=$3",
                     claim.operation_id,
-                    extension,
+                    permit_extension,
                     claim.claim_token,
                 )
         return RecoveryClaim(

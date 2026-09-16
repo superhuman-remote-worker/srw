@@ -739,6 +739,68 @@ Two Secrets must exist in the release namespace:
 Pin `vmController.defaultVmImage` to a published tag. The default points at the tag that
 matches the chart's `appVersion`, which exists only for released charts.
 
+### Durable VM workspace recovery rollout
+
+Durable recovery is installed reader-first. Its database records, job projection,
+Retry/Cancel controls, disk retention pins and cleanup guards remain active even
+when automatic recovery is disabled. The automatic reconciler and replacement
+adoption are separate default-off gates:
+
+```yaml
+orchestrator:
+  vmWorkspaceRecovery:
+    enabled: false
+    replacementEnabled: false
+    deadlineSeconds: 900
+    maxGlobalProbes: 4
+    maxProbesPerNode: 1
+    claimTtlSeconds: 30
+    permitTtlSeconds: 30
+    externalCallTimeoutSeconds: 10
+```
+
+Roll out schema and hold-aware server/cleanup code first. Next roll out workers
+that understand the version-1 `hold_committed` receipt and drain every older
+stateless worker that treats an arbitrary HTTP 409 as an ordinary failed attempt.
+Verify the controller exposes version-1 signed recovery observations and durable
+pin reconciliation before setting `enabled: true`. Do not downgrade to a server,
+worker or controller that is unaware of unresolved recovery holds.
+
+Keep `replacementEnabled: false` until the exact application, controller and
+guest-image revisions pass the retained-disk gate. The gate requires a real
+Kubernetes/KubeVirt/CDI/Longhorn substrate, exact stop receipts, pinned guest
+identity, network qualification, and the same PVC marker/checkpoint after a
+replacement. It creates and owns its disposable cluster; its default preflight
+mode is read-only:
+
+```bash
+PYTHONPATH=src python scripts/vm-workspace-recovery-k3d-gate.py --preflight \
+  --values-file /path/to/disposable-values.yaml \
+  --guest-image registry.example/srw-vm@sha256:<digest> \
+  --container-engine docker
+
+PYTHONPATH=src python scripts/vm-workspace-recovery-k3d-gate.py --run \
+  --cluster-name srw-vm-recovery-gate-$(date +%s) \
+  --values-file /path/to/disposable-values.yaml \
+  --guest-image registry.example/srw-vm@sha256:<digest> \
+  --container-engine docker \
+  --evidence-output ./vm-recovery-evidence.json
+```
+
+The default scenario driver and in-image adapter are source controlled. The gate
+currently requires Docker because it compares platform-pruned archive config IDs
+with containerd and deployed Pod image IDs; setting `CONTAINER_ENGINE=podman`
+produces an explicit preflight skip. Missing KVM/vhost/tun, active iSCSI,
+`longhornctl`, tools, values, or the immutable guest digest prints `SKIPPED`
+before any cluster command. A created cluster must also pass Longhorn's node
+preflight plus manager/CSI, node readiness, and a real RWO write/recreate/read
+probe before the application scenario starts.
+Successful command execution is insufficient: the gate prints `PASS` only after
+it validates live substrate plus API/database evidence for response loss, leader
+overlap, slow boot, deadline pause, forced deletion, missing stop evidence, and
+marker/checkpoint/PVC survival. The cluster is deleted on success and failure;
+`--keep-on-failure` is the explicit diagnostic exception.
+
 ### Verify
 
 ```bash

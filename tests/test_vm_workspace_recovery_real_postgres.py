@@ -41,6 +41,14 @@ SCHEMA_FILE = (
 OWNER_ID = UUID("00000000-0000-0000-0000-000000000101")
 
 
+class CaptureTelemetry:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+
+    def emit(self, **values) -> None:
+        self.calls.append(values)
+
+
 def test_workspace_recovery_disposition_wire_shape() -> None:
     disposition = WorkspaceRecoveryDisposition.hold_committed(
         operation_id=UUID("00000000-0000-0000-0000-000000000001"),
@@ -193,7 +201,10 @@ async def insert_leased_job(
 
 @pytest.mark.asyncio
 async def test_recovery_hold_and_cleanup_admission_have_one_winner(app_pg) -> None:
-    store = VMWorkspaceRecoveryStore(app_pg, worker_id="test-worker")
+    telemetry = CaptureTelemetry()
+    store = VMWorkspaceRecoveryStore(
+        app_pg, worker_id="test-worker", telemetry=telemetry
+    )
     job_id, lease_token = await insert_leased_job(app_pg)
     kwargs = admission_kwargs(job_id, lease_token)
     cleanup_request_id = uuid4()
@@ -249,6 +260,14 @@ async def test_recovery_hold_and_cleanup_admission_have_one_winner(app_pg) -> No
     )
     assert not blocked.allowed
     assert blocked.recovery_id == disposition.operation_id
+    assert [call["event"] for call in telemetry.calls] == [
+        "cleanup_blocked",
+        "hold",
+        "queue_fenced",
+        "cleanup_blocked",
+    ]
+    assert telemetry.calls[2]["accepted_lease_token"] == lease_token
+    assert telemetry.calls[2]["hold_lease_token"] == lease_token + 1
 
 
 @pytest.mark.asyncio
@@ -376,7 +395,10 @@ async def test_parent_cleanup_blocks_stale_child_owner_recovery_without_pvc(
 async def test_retry_transfers_every_hold_and_pin_atomically_and_replays(
     app_pg,
 ) -> None:
-    store = VMWorkspaceRecoveryStore(app_pg, worker_id="test-worker")
+    telemetry = CaptureTelemetry()
+    store = VMWorkspaceRecoveryStore(
+        app_pg, worker_id="test-worker", telemetry=telemetry
+    )
     job_id, lease_token = await insert_leased_job(app_pg)
     kwargs = admission_kwargs(job_id, lease_token)
     kwargs["code"] = WorkspaceRecoveryCode.TOOL_OUTCOME_UNKNOWN
@@ -423,6 +445,7 @@ async def test_retry_transfers_every_hold_and_pin_atomically_and_replays(
     ] == [(successor, original.hold_lease_token, "held")]
     assert sum(pin["released_at"] is None for pin in pins) == 1
     assert await store.claim_due(successor) is not None
+    assert [call["event"] for call in telemetry.calls].count("retry") == 1
 
 
 @pytest.mark.asyncio

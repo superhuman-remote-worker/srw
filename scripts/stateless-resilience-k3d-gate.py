@@ -6,6 +6,11 @@ SRW_K3D_TEST_PASSWORD if its password was changed. Requires idle session and
 worker queues; older background pushes may recover alongside the test.
 Temporarily lowers the chart's drain budget, then restores the exact local
 overlay bytes. Fails on missing evidence, duplicate answers, or any park.
+
+This gate proves generic stateless executor rotation. Retained VM disks and
+exact stop evidence require the isolated sibling
+``scripts/vm-workspace-recovery-k3d-gate.py``; a successful Pod replacement in
+this script is not evidence for VM workspace recovery.
 """
 
 from __future__ import annotations

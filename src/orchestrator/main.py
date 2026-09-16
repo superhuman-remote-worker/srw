@@ -226,9 +226,8 @@ from orchestrator.services.vm_workspace_recovery_store import (  # noqa: E402
 from orchestrator.services.vm_workspace_recovery import (  # noqa: E402
     VMWorkspaceRecoveryService,
 )
-from shared.workspace_recovery import (  # noqa: E402
-    workspace_recovery_enabled,
-    workspace_replacement_recovery_enabled,
+from orchestrator.services.vm_workspace_recovery_config import (  # noqa: E402
+    VMWorkspaceRecoverySettings,
 )
 from orchestrator.services import (  # noqa: E402
     commissioned_officer_provisioning as commissioned_officer_provisioning_service,
@@ -5771,13 +5770,14 @@ async def lifespan(app: FastAPI):
         if os.getenv("VM_MODE", "off").strip().lower() == "same-cluster"
         else None
     )
+    vm_workspace_recovery_settings = VMWorkspaceRecoverySettings.from_env()
+    vm_workspace_recovery_store = VMWorkspaceRecoveryStore(postgres_db)
     vm_workspace_recovery_task = asyncio.create_task(
         run_when_leader(
-            VMWorkspaceRecoveryService(
-                VMWorkspaceRecoveryStore(postgres_db),
+            VMWorkspaceRecoveryService.from_settings(
+                vm_workspace_recovery_store,
                 vm_provisioner,
-                automatic_enabled=workspace_recovery_enabled(),
-                replacement_enabled=workspace_replacement_recovery_enabled(),
+                settings=vm_workspace_recovery_settings,
             ).run,
             _shutdown_event,
         ),

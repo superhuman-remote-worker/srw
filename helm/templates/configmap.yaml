@@ -5,6 +5,19 @@
 {{- if and (.Values.orchestrator.completionStatusReorderEnabled | default false) (not (.Values.orchestrator.completionCommandsEnabled | default false)) }}
 {{- fail "orchestrator.completionStatusReorderEnabled requires orchestrator.completionCommandsEnabled" }}
 {{- end }}
+{{- $vmRecovery := .Values.orchestrator.vmWorkspaceRecovery -}}
+{{- if and $vmRecovery.replacementEnabled (not $vmRecovery.enabled) }}
+{{- fail "orchestrator.vmWorkspaceRecovery.replacementEnabled requires orchestrator.vmWorkspaceRecovery.enabled" }}
+{{- end }}
+{{- if le (int $vmRecovery.externalCallTimeoutSeconds) 0 }}
+{{- fail "orchestrator.vmWorkspaceRecovery.externalCallTimeoutSeconds must be positive" }}
+{{- end }}
+{{- if le (int $vmRecovery.claimTtlSeconds) (int $vmRecovery.externalCallTimeoutSeconds) }}
+{{- fail "orchestrator.vmWorkspaceRecovery.claimTtlSeconds must exceed externalCallTimeoutSeconds" }}
+{{- end }}
+{{- if le (int $vmRecovery.permitTtlSeconds) (int $vmRecovery.externalCallTimeoutSeconds) }}
+{{- fail "orchestrator.vmWorkspaceRecovery.permitTtlSeconds must exceed externalCallTimeoutSeconds" }}
+{{- end }}
 {{- $vmPvcInventory := .Values.infrastructureMetering.vmPvcInventoryEnabled | default false -}}
 {{- $vmPvInventory := .Values.infrastructureMetering.vmPvInventoryEnabled | default false -}}
 {{- $remoteInventory := or (.Values.infrastructureMetering.vmInventoryEnabled | default false) $vmPvcInventory $vmPvInventory -}}
@@ -351,6 +364,17 @@ data:
   SESSION_REWIND_IDLE_CONVERSATION_ENABLED: {{ .Values.agent.stateless.rewind.idleConversationEnabled | default false | quote }}
   STATELESS_WORKER_ENABLED: {{ .Values.agent.stateless.worker.enabled | default false | quote }}
   STATELESS_WORKER_DEFAULT_ENABLED: {{ .Values.agent.stateless.worker.defaultEnabled | default false | quote }}
+  # Hold-aware workers and the orchestrator read the same default-off protocol
+  # gate. Recovery budgets remain visible even while automation is disabled so
+  # an enable is one coordinated Pod rollout rather than an implicit default.
+  VM_WORKSPACE_RECOVERY_ENABLED: {{ $vmRecovery.enabled | quote }}
+  VM_WORKSPACE_REPLACEMENT_RECOVERY_ENABLED: {{ $vmRecovery.replacementEnabled | quote }}
+  VM_WORKSPACE_RECOVERY_DEADLINE_SECONDS: {{ $vmRecovery.deadlineSeconds | quote }}
+  VM_WORKSPACE_RECOVERY_MAX_GLOBAL_PROBES: {{ $vmRecovery.maxGlobalProbes | quote }}
+  VM_WORKSPACE_RECOVERY_MAX_PROBES_PER_NODE: {{ $vmRecovery.maxProbesPerNode | quote }}
+  VM_WORKSPACE_RECOVERY_CLAIM_TTL_SECONDS: {{ $vmRecovery.claimTtlSeconds | quote }}
+  VM_WORKSPACE_RECOVERY_PERMIT_TTL_SECONDS: {{ $vmRecovery.permitTtlSeconds | quote }}
+  VM_WORKSPACE_RECOVERY_EXTERNAL_CALL_TIMEOUT_SECONDS: {{ $vmRecovery.externalCallTimeoutSeconds | quote }}
   COMPLETION_COMMANDS_ENABLED: {{ .Values.orchestrator.completionCommandsEnabled | default false | quote }}
   # Admission policy is persisted per command; this value never reorders an
   # already accepted row after a restart or rollback.

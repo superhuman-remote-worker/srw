@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import logging
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -15,6 +17,7 @@ from orchestrator.services.vm_workspace_recovery import (
     VMWorkspaceRecoveryService,
     recovery_retry_delay,
 )
+from orchestrator.logging_config import JsonLogFormatter
 from orchestrator.services.vm_workspace_recovery_store import RecoveryClaim
 from orchestrator.services.vm_workspace_recovery_store import RetentionPinCommand
 from shared.workspace_recovery import WorkspaceRecoveryCode
@@ -126,9 +129,20 @@ class FakeStore:
             namespace="agent-vms",
         )
 
-    async def claim_due(self, operation_id, *, ttl_seconds=30):
+    async def claim_due(
+        self,
+        operation_id,
+        *,
+        ttl_seconds=30,
+        permit_ttl_seconds=30,
+        max_global_probes=4,
+        max_probes_per_node=1,
+    ):
         assert operation_id == OPERATION_ID
         assert ttl_seconds == 30
+        assert permit_ttl_seconds == 30
+        assert max_global_probes == 4
+        assert max_probes_per_node == 1
         return self.recovery_claim
 
     async def claim_is_current(self, recovery_claim):
@@ -150,8 +164,9 @@ class FakeStore:
         self.released.append(kwargs)
         return True
 
-    async def renew_claim(self, recovery_claim, *, ttl_seconds):
+    async def renew_claim(self, recovery_claim, *, ttl_seconds, permit_ttl_seconds=30):
         assert ttl_seconds == 30
+        assert permit_ttl_seconds == 30
         self.renewed.append(recovery_claim)
         return recovery_claim
 
@@ -502,6 +517,37 @@ async def test_observer_exception_is_deferred_without_losing_hold() -> None:
 
     assert recovery_store.deferred[-1]["phase"] == "waiting_runtime"
     assert "controller down" in recovery_store.deferred[-1]["diagnostic"]["detail"]
+
+
+@pytest.mark.asyncio
+async def test_reconciler_production_path_emits_redacted_probe_and_pause_audits(
+    caplog,
+) -> None:
+    recovery_store = FakeStore()
+    observation = ready_observation()
+    observation["vm_uid"] = "00000000-0000-4000-8000-00000000feed"
+
+    with caplog.at_level(
+        logging.INFO,
+        logger="orchestrator.services.vm_workspace_recovery_telemetry",
+    ):
+        await service(recovery_store, Observer([observation])).reconcile_once(
+            OPERATION_ID
+        )
+
+    payloads = [
+        json.loads(JsonLogFormatter().format(record))
+        for record in caplog.records
+        if getattr(record, "audit_event", None) == "vm_workspace_recovery"
+    ]
+    assert [payload["recovery_event"] for payload in payloads] == ["probe", "pause"]
+    encoded = json.dumps(payloads)
+    for raw in (str(OPERATION_ID), str(OWNER_ID), str(VM_UID), str(PVC_UID)):
+        assert raw not in encoded
+    assert payloads[-1]["recovery_reason"] == (
+        "captured_workspace_identity_changed_or_ambiguous"
+    )
+    assert payloads[-1]["controller_observation_digest"].startswith("sha256:")
 
 
 @pytest.mark.asyncio

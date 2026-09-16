@@ -103,6 +103,8 @@ src/orchestrator/services/vm_provisioner.py  VMProvisioner.release_vm_captured  
 src/orchestrator/services/vm_readiness.py  VMReadinessService._probe  remote-effect  seed_ide_config_for_user  2ab90cdbc684  #1  vm-authority
 src/orchestrator/services/vm_readiness.py  VMReadinessService._probe  remote-effect  seed_ide_profile  60d991bbb85d  #1  vm-authority
 src/orchestrator/services/vm_readiness.py  VMReadinessService._probe  ssh  wait_for_agent_ssh  4555c1fcc905  #1  vm-authority
+src/orchestrator/services/vm_readiness.py  qualify_recovery_successor  ssh  pinned_agent_ssh_command  3d313169ca78  #1  pinned-host-key
+src/orchestrator/services/vm_readiness.py  qualify_recovery_successor  ssh  wait_for_agent_ssh  4555c1fcc905  #1  pinned-host-key
 src/orchestrator/services/vm_remote_operation.py  VMRemoteOperationLease.__aexit__  remote-effect  self.db.settle_vm_remote_operation  579f12752d18  #1  vm-authority
 src/orchestrator/services/vm_remote_operation.py  claim_vm_remote_operation  remote-effect  VMRemoteOperationLease  53462e29e728  #1  vm-authority
 src/orchestrator/services/vm_remote_operation.py  claim_vm_remote_operation  remote-effect  db.claim_vm_remote_operation  48d70082e804  #1  vm-authority

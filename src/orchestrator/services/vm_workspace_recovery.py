@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import random
@@ -14,6 +15,10 @@ from orchestrator.services.vm_workspace_recovery_store import (
     RecoveryClaim,
     RetentionPinCommand,
     VMWorkspaceRecoveryStore,
+)
+from orchestrator.services.vm_workspace_recovery_telemetry import (
+    VMWorkspaceRecoveryTelemetry,
+    workspace_recovery_telemetry,
 )
 from shared.workspace_recovery import WorkspaceRecoveryCode
 
@@ -112,6 +117,15 @@ def _valid_machine_id(value: object) -> bool:
     return True
 
 
+def _observation_digest(observation: Mapping[str, Any] | None) -> str | None:
+    if observation is None:
+        return None
+    encoded = json.dumps(
+        dict(observation), sort_keys=True, separators=(",", ":"), default=str
+    ).encode("utf-8")
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
 class VMWorkspaceRecoveryService:
     """Run external recovery probes outside short durable claim transactions."""
 
@@ -124,9 +138,14 @@ class VMWorkspaceRecoveryService:
         replacement_enabled: bool = True,
         probe_timeout_seconds: float = 10.0,
         claim_ttl_seconds: float = 30.0,
+        permit_ttl_seconds: float = 30.0,
+        max_global_probes: int = 4,
+        max_probes_per_node: int = 1,
+        deadline_seconds: float = 900.0,
         claim_poll_seconds: float = 0.25,
         scan_interval_seconds: float = 3.0,
         jitter: Callable[[], float] | None = None,
+        telemetry: VMWorkspaceRecoveryTelemetry | Any | None = None,
     ) -> None:
         self.store = store
         self.observer = observer
@@ -134,9 +153,105 @@ class VMWorkspaceRecoveryService:
         self.replacement_enabled = replacement_enabled
         self.probe_timeout_seconds = max(0.1, probe_timeout_seconds)
         self.claim_ttl_seconds = max(self.probe_timeout_seconds + 1, claim_ttl_seconds)
+        self.permit_ttl_seconds = max(
+            self.probe_timeout_seconds + 1, permit_ttl_seconds
+        )
+        self.max_global_probes = max(1, int(max_global_probes))
+        if int(max_probes_per_node) != 1:
+            raise ValueError("recovery protocol v1 supports one probe per node")
+        self.max_probes_per_node = int(max_probes_per_node)
+        self.deadline_seconds = max(0.1, float(deadline_seconds))
         self.claim_poll_seconds = max(0.001, claim_poll_seconds)
         self.scan_interval_seconds = max(0.01, scan_interval_seconds)
         self.jitter = jitter
+        self.telemetry = telemetry or workspace_recovery_telemetry
+
+    @classmethod
+    def from_settings(
+        cls,
+        store: VMWorkspaceRecoveryStore | Any,
+        observer: Any,
+        *,
+        settings: Any,
+        telemetry: VMWorkspaceRecoveryTelemetry | Any | None = None,
+        **kwargs: Any,
+    ) -> "VMWorkspaceRecoveryService":
+        """Build the reconciler from one already-validated rollout envelope."""
+
+        return cls(
+            store,
+            observer,
+            automatic_enabled=settings.enabled,
+            replacement_enabled=settings.replacement_enabled,
+            probe_timeout_seconds=settings.external_call_timeout_seconds,
+            claim_ttl_seconds=settings.claim_ttl_seconds,
+            permit_ttl_seconds=settings.permit_ttl_seconds,
+            max_global_probes=settings.max_global_probes,
+            max_probes_per_node=settings.max_probes_per_node,
+            deadline_seconds=settings.deadline_seconds,
+            telemetry=telemetry,
+            **kwargs,
+        )
+
+    def _emit(
+        self,
+        *,
+        event: str,
+        result: str,
+        phase: str,
+        claim: RecoveryClaim | None = None,
+        command: RetentionPinCommand | None = None,
+        code: WorkspaceRecoveryCode | str = "none",
+        state: str = "recovering_workspace",
+        reason: str | None = None,
+        observation: Mapping[str, Any] | None = None,
+    ) -> None:
+        """Best-effort observability must never acquire recovery authority."""
+
+        identity = claim.captured_identity if claim is not None else {}
+        age_seconds = (
+            min(
+                self.deadline_seconds,
+                max(0.0, self.deadline_seconds - claim.remaining_seconds),
+            )
+            if claim is not None
+            else None
+        )
+        try:
+            self.telemetry.emit(
+                event=event,
+                state=state,
+                phase=phase,
+                code=code,
+                result=result,
+                age_seconds=age_seconds,
+                reason=reason,
+                observation_digest=_observation_digest(observation),
+                operation_id=(
+                    claim.operation_id
+                    if claim is not None
+                    else command.recovery_id
+                    if command is not None
+                    else None
+                ),
+                job_id=(
+                    identity.get("owner_id")
+                    if identity.get("owner_kind") == "job"
+                    else command.owner_id
+                    if command is not None and command.owner_kind == "job"
+                    else None
+                ),
+                vm_uid=identity.get("vm_uid"),
+                pvc_uid=(
+                    identity.get("root_pvc_uid")
+                    if claim is not None
+                    else command.pvc_uid
+                    if command is not None
+                    else None
+                ),
+            )
+        except Exception:
+            logger.exception("VM workspace recovery telemetry emission failed")
 
     async def run(self, shutdown_event: asyncio.Event) -> None:
         if not self.automatic_enabled:
@@ -145,6 +260,14 @@ class VMWorkspaceRecoveryService:
                 logger.warning(
                     "Paused %d VM workspace recoveries because automation is disabled",
                     paused,
+                )
+                self._emit(
+                    event="pause",
+                    state="paused_attention",
+                    phase="paused_attention",
+                    code="none",
+                    result="accepted",
+                    reason="automatic_recovery_disabled",
                 )
             # Hold protection remains active while automation is disabled.
             # Continue reconciling durable controller pin activation/release,
@@ -219,6 +342,13 @@ class VMWorkspaceRecoveryService:
                 if not await self.store.claim_is_current(claim):
                     probe.cancel()
                     await asyncio.gather(probe, return_exceptions=True)
+                    self._emit(
+                        event="probe",
+                        result="lost_claim",
+                        phase="observing",
+                        claim=claim,
+                        reason="durable_claim_lost",
+                    )
                     return None
         except asyncio.CancelledError:
             probe.cancel()
@@ -238,6 +368,13 @@ class VMWorkspaceRecoveryService:
             await self.store.defer_retention_pin_command(
                 command, error="controller recovery pin transport is unavailable"
             )
+            self._emit(
+                event="pin_sync",
+                result="deferred",
+                phase="recovering",
+                command=command,
+                reason="controller_pin_unavailable",
+            )
             return False
         try:
             result = await asyncio.wait_for(
@@ -247,9 +384,29 @@ class VMWorkspaceRecoveryService:
                 result, Mapping
             ) or not await self.store.acknowledge_retention_pin(command, result):
                 raise RuntimeError("controller recovery pin acknowledgement changed")
+            self._emit(
+                event="pin_sync",
+                result="accepted",
+                phase="recovering"
+                if command.desired_state == "active"
+                else "recovered",
+                state=(
+                    "recovering_workspace"
+                    if command.desired_state == "active"
+                    else "recovered"
+                ),
+                command=command,
+            )
             return True
         except Exception as exc:
             await self.store.defer_retention_pin_command(command, error=str(exc))
+            self._emit(
+                event="pin_sync",
+                result="failed",
+                phase="recovering",
+                command=command,
+                reason="controller_pin_sync_failed",
+            )
             return False
 
     async def _reconcile_retention_pins(self) -> None:
@@ -305,7 +462,7 @@ class VMWorkspaceRecoveryService:
         observation: Mapping[str, Any] | None = None,
         diagnostic: Mapping[str, Any] | None = None,
     ) -> None:
-        await self.store.defer_claim(
+        changed = await self.store.defer_claim(
             operation_id=claim.operation_id,
             version=claim.version,
             claim_token=claim.claim_token,
@@ -314,6 +471,16 @@ class VMWorkspaceRecoveryService:
             diagnostic=diagnostic,
             next_check_seconds=self._delay(claim),
         )
+        if changed:
+            reason = diagnostic.get("reason") if diagnostic else None
+            self._emit(
+                event="probe",
+                result="deferred",
+                phase=phase,
+                claim=claim,
+                reason=str(reason) if reason is not None else None,
+                observation=observation,
+            )
 
     async def _pause(
         self,
@@ -323,7 +490,7 @@ class VMWorkspaceRecoveryService:
         reason: str,
         observation: Mapping[str, Any] | None = None,
     ) -> None:
-        await self.store.pause_for_attention(
+        changed = await self.store.pause_for_attention(
             operation_id=claim.operation_id,
             version=claim.version,
             claim_token=claim.claim_token,
@@ -333,6 +500,17 @@ class VMWorkspaceRecoveryService:
                 **({"observation": dict(observation)} if observation else {}),
             },
         )
+        if changed:
+            self._emit(
+                event="pause",
+                state="paused_attention",
+                phase="paused_attention",
+                code=code,
+                result="accepted",
+                claim=claim,
+                reason=reason,
+                observation=observation,
+            )
 
     async def _read_preconditions(
         self, claim: RecoveryClaim, observation: Mapping[str, Any]
@@ -501,10 +679,21 @@ class VMWorkspaceRecoveryService:
 
     async def reconcile_once(self, operation_id: UUID) -> None:
         claim = await self.store.claim_due(
-            operation_id, ttl_seconds=self.claim_ttl_seconds
+            operation_id,
+            ttl_seconds=self.claim_ttl_seconds,
+            permit_ttl_seconds=self.permit_ttl_seconds,
+            max_global_probes=self.max_global_probes,
+            max_probes_per_node=self.max_probes_per_node,
         )
         if claim is None:
             return
+        self._emit(
+            event="probe",
+            result="accepted",
+            phase="observing",
+            claim=claim,
+            reason="durable_claim_acquired",
+        )
         try:
             pin_acknowledged = await self._require_retention_pin(claim)
         except Exception as exc:
@@ -556,7 +745,9 @@ class VMWorkspaceRecoveryService:
         if staged is None:
             return
         staged = await self.store.renew_claim(
-            staged, ttl_seconds=self.claim_ttl_seconds
+            staged,
+            ttl_seconds=self.claim_ttl_seconds,
+            permit_ttl_seconds=self.permit_ttl_seconds,
         )
         if staged is None:
             return
@@ -605,6 +796,16 @@ class VMWorkspaceRecoveryService:
             },
         )
         if released:
+            self._emit(
+                event="release",
+                state="recovered",
+                phase="recovered",
+                code=WorkspaceRecoveryCode.REPLACEMENT_OBSERVED,
+                result="succeeded",
+                claim=staged,
+                reason="final_attestation_accepted",
+                observation=final_observation,
+            )
             # Release is durable in PostgreSQL first. A controller failure keeps
             # the Lease active and the background sync retries the safe leak.
             await self._reconcile_retention_pins()

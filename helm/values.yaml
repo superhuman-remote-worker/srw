@@ -189,6 +189,32 @@ orchestrator:
   # paths; mutation admission is fenced by the application + database gate.
   vmRemoteOperationProtocol:
     enabled: false
+  # -- Durable recovery for held stateless VM workspaces. The reader, cleanup
+  # guards and recovery controls remain active while automation is disabled;
+  # disabling this block pauses outstanding operations without releasing data.
+  vmWorkspaceRecovery:
+    # -- Run bounded automatic recovery probes. Keep false until every worker
+    # understands the v1 hold receipt and old workers have drained.
+    enabled: false
+    # -- Adopt an infrastructure-created replacement on the retained disk.
+    # Requires the disposable KubeVirt/Longhorn evidence gate in addition to
+    # the base recovery gate.
+    replacementEnabled: false
+    # -- Immutable recovery budget from first observation to attention pause.
+    deadlineSeconds: 900
+    # -- Durable concurrency leases shared by overlapping leaders.
+    maxGlobalProbes: 4
+    maxProbesPerNode: 1
+    # -- Database claim and probe-permit lease durations.
+    claimTtlSeconds: 30
+    permitTtlSeconds: 30
+    # -- Per-controller/SSH/network call ceiling inside the outer deadline.
+    externalCallTimeoutSeconds: 10
+  # -- Destructive disposable-cluster acceptance command and temporary RBAC.
+  # The gate wrapper enables this only on the uniquely owned k3d cluster it
+  # creates. Never enable it on a shared or production release.
+  vmWorkspaceRecoveryAcceptanceGate:
+    enabled: false
   resources:
     requests:
       memory: "256Mi"
