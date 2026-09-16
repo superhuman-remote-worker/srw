@@ -572,6 +572,7 @@ async def release_worker_batch_from_workspace_recovery(
     hold_lease_token: int,
     version: int,
     claim_token: int,
+    claimed_by: str,
     resume_receipt: dict[str, Any],
 ) -> bool:
     """Release a participant by exact recovery CAS and advance its wake watermark once.
@@ -594,10 +595,16 @@ async def release_worker_batch_from_workspace_recovery(
             "AND claim_token=$3 AND phase IN ("
             "'recovering','observing','waiting_runtime','verifying_stop',"
             "'attesting','reconciling_outcome') AND resolved_at IS NULL "
-            "AND deadline_at>clock_timestamp() FOR UPDATE",
+            "AND deadline_at>clock_timestamp() AND claimed_by=$4 "
+            "AND claimed_until>clock_timestamp() AND EXISTS ("
+            "SELECT 1 FROM vm_workspace_recovery_probe_slots slot "
+            "WHERE slot.recovery_id=vm_workspace_recoveries.id "
+            "AND slot.claim_token=$3 AND slot.leased_until>clock_timestamp()) "
+            "FOR UPDATE",
             recovery_id,
             version,
             claim_token,
+            claimed_by,
         )
         if operation is None:
             return False

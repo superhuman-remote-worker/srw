@@ -17,6 +17,16 @@ from shared.workspace_recovery import WorkspaceRecoveryCode
 
 logger = logging.getLogger(__name__)
 
+
+_REQUIRED_SUCCESSOR_AUTHORITY = (
+    "vmi_uid",
+    "launcher_uid",
+    "node_uid",
+    "pod_ip",
+    "ssh_registration_id",
+)
+
+
 def recovery_retry_delay(
     attempt: int,
     *,
@@ -52,6 +62,8 @@ def _attestation_key(observation: Mapping[str, Any]) -> tuple[str, ...]:
             observation.get("provision_generation"),
             observation.get("vm_uid"),
             observation.get("root_pvc_uid"),
+            observation.get("prior_runtime"),
+            observation.get("stop_receipt_digest"),
             successor.get("vmi_uid"),
             successor.get("launcher_uid"),
             successor.get("node_uid"),
@@ -59,6 +71,14 @@ def _attestation_key(observation: Mapping[str, Any]) -> tuple[str, ...]:
             successor.get("ssh_registration_id"),
         )
     )
+
+
+def _valid_uuid(value: object) -> bool:
+    try:
+        UUID(str(value))
+    except (TypeError, ValueError, AttributeError):
+        return False
+    return True
 
 
 class VMWorkspaceRecoveryService:
@@ -100,7 +120,10 @@ class VMWorkspaceRecoveryService:
             try:
                 operation_ids = await self.store.list_due_operation_ids(limit=32)
                 results = await asyncio.gather(
-                    *(self.reconcile_once(operation_id) for operation_id in operation_ids),
+                    *(
+                        self.reconcile_once(operation_id)
+                        for operation_id in operation_ids
+                    ),
                     return_exceptions=True,
                 )
                 for operation_id, result in zip(operation_ids, results):
@@ -199,10 +222,139 @@ class VMWorkspaceRecoveryService:
             },
         )
 
-    @staticmethod
-    def _identity_matches(
-        claim: RecoveryClaim, observation: Mapping[str, Any]
+    async def _read_preconditions(
+        self, claim: RecoveryClaim, observation: Mapping[str, Any]
+    ) -> Mapping[str, Any] | None:
+        """Attach database-owned continuation evidence to an external observation."""
+
+        read_preconditions = getattr(self.store, "recovery_preconditions", None)
+        if not callable(read_preconditions):
+            return dict(observation)
+        try:
+            value = await read_preconditions(claim)
+        except Exception as exc:
+            await self._defer(
+                claim,
+                phase="reconciling_outcome",
+                observation=observation,
+                diagnostic={
+                    "reason": "recovery_precondition_read_failed",
+                    "detail": str(exc)[:500],
+                },
+            )
+            return None
+        if value is None:
+            return None
+        return {
+            **dict(observation),
+            "continuation": value.get("continuation", observation.get("continuation")),
+            "remote_operations": value.get(
+                "remote_operations", observation.get("remote_operations")
+            ),
+        }
+
+    async def _reject_unsafe_observation(
+        self, claim: RecoveryClaim, observation: Mapping[str, Any]
     ) -> bool:
+        """Fail closed on every predicate required by the release transaction."""
+
+        if (
+            not self._identity_matches(claim, observation)
+            or observation.get("ambiguous") is not False
+        ):
+            await self._pause(
+                claim,
+                code=WorkspaceRecoveryCode.IDENTITY_CONFLICT,
+                reason="captured_workspace_identity_changed_or_ambiguous",
+                observation=observation,
+            )
+            return True
+        continuation = observation.get("continuation")
+        if continuation not in {"safe", "not_started"}:
+            await self._pause(
+                claim,
+                code=WorkspaceRecoveryCode.TOOL_OUTCOME_UNKNOWN,
+                reason="checkpoint_or_tool_outcome_unknown",
+                observation=observation,
+            )
+            return True
+        if observation.get("remote_operations") != "settled":
+            await self._defer(
+                claim,
+                phase="reconciling_outcome",
+                observation=observation,
+                diagnostic={"reason": "remote_operations_unresolved"},
+            )
+            return True
+        prior_runtime = observation.get("prior_runtime")
+        if prior_runtime not in {"stopped", "same_runtime"}:
+            if prior_runtime == "running":
+                await self._defer(
+                    claim,
+                    phase="verifying_stop",
+                    observation=observation,
+                    diagnostic={"reason": "prior_runtime_still_running"},
+                )
+            else:
+                await self._pause(
+                    claim,
+                    code=WorkspaceRecoveryCode.PRIOR_RUNTIME_UNFENCED,
+                    reason="prior_runtime_stop_evidence_unknown",
+                    observation=observation,
+                )
+            return True
+        successor = _successor(observation)
+        missing_authority = [
+            key
+            for key in _REQUIRED_SUCCESSOR_AUTHORITY
+            if not isinstance(successor.get(key), str)
+            or not str(successor.get(key)).strip()
+        ]
+        if (
+            observation.get("ready") is not True
+            or observation.get("authenticated") is not True
+            or missing_authority
+        ):
+            await self._defer(
+                claim,
+                phase="waiting_runtime",
+                observation=observation,
+                diagnostic={
+                    "reason": "successor_not_authenticated_ready",
+                    "missing_authority": missing_authority,
+                },
+            )
+            return True
+        if not _valid_uuid(successor["vmi_uid"]) or not _valid_uuid(
+            successor["launcher_uid"]
+        ):
+            await self._pause(
+                claim,
+                code=WorkspaceRecoveryCode.IDENTITY_CONFLICT,
+                reason="successor_authority_malformed",
+                observation=observation,
+            )
+            return True
+        replacing = not _same_identifier(
+            successor.get("launcher_uid"),
+            claim.captured_identity.get("prior_launcher_uid"),
+        )
+        if replacing and (
+            prior_runtime != "stopped"
+            or not isinstance(observation.get("stop_receipt_digest"), str)
+            or not str(observation.get("stop_receipt_digest")).strip()
+        ):
+            await self._pause(
+                claim,
+                code=WorkspaceRecoveryCode.PRIOR_RUNTIME_UNFENCED,
+                reason="replacement_missing_exact_stop_evidence",
+                observation=observation,
+            )
+            return True
+        return False
+
+    @staticmethod
+    def _identity_matches(claim: RecoveryClaim, observation: Mapping[str, Any]) -> bool:
         captured = claim.captured_identity
         return all(
             _same_identifier(observation.get(key), captured.get(key))
@@ -236,105 +388,11 @@ class VMWorkspaceRecoveryService:
         if observation is None:
             # A lost durable claim deliberately produces no follow-up write.
             return
-        preconditions: Mapping[str, Any] = {}
-        read_preconditions = getattr(self.store, "recovery_preconditions", None)
-        if callable(read_preconditions):
-            try:
-                value = await read_preconditions(claim)
-            except Exception as exc:
-                await self._defer(
-                    claim,
-                    phase="reconciling_outcome",
-                    observation=observation,
-                    diagnostic={
-                        "reason": "recovery_precondition_read_failed",
-                        "detail": str(exc)[:500],
-                    },
-                )
-                return
-            if value is None:
-                return
-            preconditions = value
-        if not self._identity_matches(claim, observation):
-            await self._pause(
-                claim,
-                code=WorkspaceRecoveryCode.IDENTITY_CONFLICT,
-                reason="captured_workspace_identity_changed",
-                observation=observation,
-            )
+        attached = await self._read_preconditions(claim, observation)
+        if attached is None:
             return
-        if observation.get("ambiguous") is True:
-            await self._pause(
-                claim,
-                code=WorkspaceRecoveryCode.IDENTITY_CONFLICT,
-                reason="controller_observation_ambiguous",
-                observation=observation,
-            )
-            return
-        continuation = preconditions.get(
-            "continuation", observation.get("continuation")
-        )
-        if continuation not in {"safe", "not_started"}:
-            await self._pause(
-                claim,
-                code=WorkspaceRecoveryCode.TOOL_OUTCOME_UNKNOWN,
-                reason="checkpoint_or_tool_outcome_unknown",
-                observation=observation,
-            )
-            return
-        remote_operations = preconditions.get(
-            "remote_operations", observation.get("remote_operations")
-        )
-        if remote_operations != "settled":
-            await self._defer(
-                claim,
-                phase="reconciling_outcome",
-                observation=observation,
-                diagnostic={"reason": "remote_operations_unresolved"},
-            )
-            return
-        if observation.get("prior_runtime") not in {"stopped", "same_runtime"}:
-            if observation.get("prior_runtime") == "running":
-                await self._defer(
-                    claim,
-                    phase="verifying_stop",
-                    observation=observation,
-                    diagnostic={"reason": "prior_runtime_still_running"},
-                )
-            else:
-                await self._pause(
-                    claim,
-                    code=WorkspaceRecoveryCode.PRIOR_RUNTIME_UNFENCED,
-                    reason="prior_runtime_stop_evidence_unknown",
-                    observation=observation,
-                )
-            return
-        successor = _successor(observation)
-        if (
-            observation.get("ready") is not True
-            or observation.get("authenticated") is not True
-            or not successor.get("vmi_uid")
-            or not successor.get("launcher_uid")
-            or not successor.get("pod_ip")
-        ):
-            await self._defer(
-                claim,
-                phase="waiting_runtime",
-                observation=observation,
-                diagnostic={"reason": "successor_not_authenticated_ready"},
-            )
-            return
-        replacing = not _same_identifier(
-            successor.get("launcher_uid"),
-            claim.captured_identity.get("prior_launcher_uid"),
-        )
-        if replacing and not observation.get("stop_receipt_digest"):
-            await self._pause(
-                claim,
-                code=WorkspaceRecoveryCode.PRIOR_RUNTIME_UNFENCED,
-                reason="replacement_missing_stop_receipt",
-                observation=observation,
-            )
+        observation = attached
+        if await self._reject_unsafe_observation(claim, observation):
             return
         staged = await self.store.stage_observation(
             operation_id=claim.operation_id,
@@ -342,6 +400,11 @@ class VMWorkspaceRecoveryService:
             claim_token=claim.claim_token,
             phase="attesting",
             observation=observation,
+        )
+        if staged is None:
+            return
+        staged = await self.store.renew_claim(
+            staged, ttl_seconds=self.claim_ttl_seconds
         )
         if staged is None:
             return
@@ -359,12 +422,13 @@ class VMWorkspaceRecoveryService:
             return
         if final_observation is None:
             return
-        if (
-            not self._identity_matches(staged, final_observation)
-            or _attestation_key(final_observation) != _attestation_key(observation)
-            or final_observation.get("ready") is not True
-            or final_observation.get("authenticated") is not True
-        ):
+        attached_final = await self._read_preconditions(staged, final_observation)
+        if attached_final is None:
+            return
+        final_observation = attached_final
+        if await self._reject_unsafe_observation(staged, final_observation):
+            return
+        if _attestation_key(final_observation) != _attestation_key(observation):
             await self._pause(
                 staged,
                 code=WorkspaceRecoveryCode.IDENTITY_CONFLICT,
@@ -382,9 +446,7 @@ class VMWorkspaceRecoveryService:
                 "kind": "vm_workspace_recovery",
                 "claim_token": staged.claim_token,
                 "successor": dict(_successor(final_observation)),
-                "stop_receipt_digest": final_observation.get(
-                    "stop_receipt_digest"
-                ),
+                "stop_receipt_digest": final_observation.get("stop_receipt_digest"),
             },
         )
 

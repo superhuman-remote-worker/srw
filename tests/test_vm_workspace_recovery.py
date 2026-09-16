@@ -58,6 +58,7 @@ def ready_observation() -> dict[str, object]:
     return {
         "ready": True,
         "authenticated": True,
+        "ambiguous": False,
         "owner_kind": "job",
         "owner_id": str(OWNER_ID),
         "provision_generation": str(GENERATION),
@@ -86,6 +87,7 @@ class FakeStore:
         self.staged: list[dict[str, object]] = []
         self.released: list[dict[str, object]] = []
         self.disabled_pauses = 0
+        self.renewed: list[RecoveryClaim] = []
 
     async def claim_due(self, operation_id, *, ttl_seconds=30):
         assert operation_id == OPERATION_ID
@@ -110,6 +112,11 @@ class FakeStore:
     async def release_recovered(self, **kwargs):
         self.released.append(kwargs)
         return True
+
+    async def renew_claim(self, recovery_claim, *, ttl_seconds):
+        assert ttl_seconds == 30
+        self.renewed.append(recovery_claim)
+        return recovery_claim
 
     async def list_due_operation_ids(self, *, limit=32):
         return [OPERATION_ID]
@@ -163,6 +170,7 @@ async def test_ready_replacement_is_re_attested_before_final_release() -> None:
 
     assert observer.calls == 2
     assert recovery_store.staged[0]["phase"] == "attesting"
+    assert recovery_store.renewed
     assert recovery_store.released[0]["final_observation"] == observation
 
 
@@ -182,6 +190,32 @@ async def test_changed_final_attestation_retains_hold_for_attention() -> None:
 
     assert not recovery_store.released
     assert recovery_store.paused[-1]["code"] is WorkspaceRecoveryCode.IDENTITY_CONFLICT
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda value: value.__setitem__("ambiguous", True),
+        lambda value: value.__setitem__("prior_runtime", "unknown"),
+        lambda value: value["successor"].pop("node_uid"),
+        lambda value: value["successor"].pop("ssh_registration_id"),
+        lambda value: value.__setitem__("continuation", "unknown"),
+        lambda value: value.__setitem__("remote_operations", "pending"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_final_attestation_repeats_every_safety_predicate(mutation) -> None:
+    recovery_store = FakeStore()
+    initial = ready_observation()
+    final = ready_observation()
+    mutation(final)
+
+    await service(recovery_store, Observer([initial, final])).reconcile_once(
+        OPERATION_ID
+    )
+
+    assert not recovery_store.released
+    assert recovery_store.paused or recovery_store.deferred
 
 
 @pytest.mark.parametrize(
@@ -216,7 +250,9 @@ async def test_unknown_tool_outcome_pauses_without_releasing() -> None:
     await service(recovery_store, Observer([observation])).reconcile_once(OPERATION_ID)
 
     assert not recovery_store.released
-    assert recovery_store.paused[-1]["code"] is WorkspaceRecoveryCode.TOOL_OUTCOME_UNKNOWN
+    assert (
+        recovery_store.paused[-1]["code"] is WorkspaceRecoveryCode.TOOL_OUTCOME_UNKNOWN
+    )
 
 
 @pytest.mark.asyncio
@@ -280,7 +316,9 @@ async def test_automation_disabled_visibly_pauses_due_work() -> None:
 async def test_observer_exception_is_deferred_without_losing_hold() -> None:
     recovery_store = FakeStore()
     observer = SimpleNamespace(
-        observe_workspace_recovery=AsyncMock(side_effect=RuntimeError("controller down"))
+        observe_workspace_recovery=AsyncMock(
+            side_effect=RuntimeError("controller down")
+        )
     )
 
     await service(recovery_store, observer).reconcile_once(OPERATION_ID)

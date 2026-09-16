@@ -420,9 +420,7 @@ async def test_retry_transfers_every_hold_and_pin_atomically_and_replays(
     assert [
         (row["recovery_id"], row["hold_lease_token"], row["participation"])
         for row in open_rows
-    ] == [
-        (successor, original.hold_lease_token, "held")
-    ]
+    ] == [(successor, original.hold_lease_token, "held")]
     assert sum(pin["released_at"] is None for pin in pins) == 1
     assert await store.claim_due(successor) is not None
 
@@ -739,6 +737,186 @@ def admission_kwargs(
     }
 
 
+def same_runtime_observation(job_id: UUID, values: dict) -> dict:
+    return {
+        "ready": True,
+        "authenticated": True,
+        "ambiguous": False,
+        "owner_kind": "job",
+        "owner_id": str(job_id),
+        "provision_generation": str(values["provision_generation"]),
+        "vm_uid": str(values["vm_uid"]),
+        "root_pvc_uid": str(values["root_pvc_uid"]),
+        "prior_runtime": "same_runtime",
+        "remote_operations": "settled",
+        "continuation": "safe",
+        "successor": {
+            "vmi_uid": str(values["prior_vmi_uid"]),
+            "launcher_uid": str(values["prior_launcher_uid"]),
+            "node_uid": "node-test",
+            "pod_ip": "10.42.0.90",
+            "ssh_registration_id": "registration-test",
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_expired_probe_claim_cannot_stage_returned_observation(app_pg) -> None:
+    job_id, lease_token = await insert_leased_job(app_pg)
+    values = admission_kwargs(job_id, lease_token)
+    store = VMWorkspaceRecoveryStore(app_pg, worker_id="leader-a")
+    admitted = await store.admit_hold(**values)
+    claimed = await store.claim_due(admitted.operation_id)
+    assert claimed is not None
+    async with app_pg.acquire() as conn:
+        await conn.execute(
+            "UPDATE vm_workspace_recoveries SET claimed_until=clock_timestamp()-interval '1 second' "
+            "WHERE id=$1",
+            admitted.operation_id,
+        )
+        await conn.execute(
+            "UPDATE vm_workspace_recovery_probe_slots "
+            "SET leased_until=clock_timestamp()-interval '1 second' WHERE recovery_id=$1",
+            admitted.operation_id,
+        )
+
+    assert (
+        await store.stage_observation(
+            operation_id=claimed.operation_id,
+            version=claimed.version,
+            claim_token=claimed.claim_token,
+            phase="attesting",
+            observation=same_runtime_observation(job_id, values),
+        )
+        is None
+    )
+    observation = same_runtime_observation(job_id, values)
+    assert not await store.release_recovered(
+        operation_id=claimed.operation_id,
+        version=claimed.version,
+        claim_token=claimed.claim_token,
+        initial_observation=observation,
+        final_observation=observation,
+        resume_receipt={"kind": "expired"},
+    )
+    async with app_pg.acquire() as conn:
+        queue = await conn.fetchrow(
+            "SELECT state,lease_token,park_reason FROM run_queue WHERE unit_id=$1",
+            job_id,
+        )
+        operation = await conn.fetchrow(
+            "SELECT phase,resolved_at FROM vm_workspace_recoveries WHERE id=$1",
+            admitted.operation_id,
+        )
+    assert tuple(queue) == ("parked", lease_token + 1, "workspace_recovery")
+    assert tuple(operation) == ("observing", None)
+
+
+@pytest.mark.asyncio
+async def test_stale_result_cannot_delete_successor_probe_slot(app_pg) -> None:
+    job_id, lease_token = await insert_leased_job(app_pg)
+    values = admission_kwargs(job_id, lease_token)
+    store = VMWorkspaceRecoveryStore(app_pg, worker_id="leader-a")
+    admitted = await store.admit_hold(**values)
+    claimed = await store.claim_due(admitted.operation_id)
+    assert claimed is not None
+    staged = await store.stage_observation(
+        operation_id=claimed.operation_id,
+        version=claimed.version,
+        claim_token=claimed.claim_token,
+        phase="attesting",
+        observation=same_runtime_observation(job_id, values),
+    )
+    assert staged is not None
+
+    assert not await store.defer_claim(
+        operation_id=claimed.operation_id,
+        version=claimed.version,
+        claim_token=claimed.claim_token,
+        phase="waiting_runtime",
+        next_check_seconds=1,
+    )
+    assert await store.claim_is_current(staged)
+    async with app_pg.acquire() as conn:
+        assert (
+            await conn.fetchval(
+                "SELECT count(*) FROM vm_workspace_recovery_probe_slots "
+                "WHERE recovery_id=$1 AND claim_token=$2",
+                staged.operation_id,
+                staged.claim_token,
+            )
+            == 1
+        )
+
+
+@pytest.mark.asyncio
+async def test_release_requires_complete_attestation_evidence(app_pg) -> None:
+    job_id, lease_token = await insert_leased_job(app_pg)
+    values = admission_kwargs(job_id, lease_token)
+    store = VMWorkspaceRecoveryStore(app_pg, worker_id="leader-a")
+    admitted = await store.admit_hold(**values)
+    claimed = await store.claim_due(admitted.operation_id)
+    assert claimed is not None
+
+    assert not await store.release_recovered(
+        operation_id=claimed.operation_id,
+        version=claimed.version,
+        claim_token=claimed.claim_token,
+        initial_observation=None,
+        final_observation=None,
+        resume_receipt={"kind": "invalid"},
+    )
+    async with app_pg.acquire() as conn:
+        queue = await conn.fetchrow(
+            "SELECT state,lease_token,park_reason FROM run_queue WHERE unit_id=$1",
+            job_id,
+        )
+    assert tuple(queue) == ("parked", lease_token + 1, "workspace_recovery")
+
+
+@pytest.mark.asyncio
+async def test_store_rejects_malformed_final_attestation(app_pg) -> None:
+    job_id, lease_token = await insert_leased_job(app_pg)
+    values = admission_kwargs(job_id, lease_token)
+    async with app_pg.acquire() as conn:
+        await conn.execute(
+            "UPDATE jobs SET context=jsonb_build_object('vm',jsonb_build_object("
+            "'provision_generation',$2::text,'vm_uid',$3::text,"
+            "'rootdisk_pvc_uid',$4::text)) WHERE id=$1",
+            job_id,
+            str(values["provision_generation"]),
+            str(values["vm_uid"]),
+            str(values["root_pvc_uid"]),
+        )
+    store = VMWorkspaceRecoveryStore(app_pg, worker_id="leader-a")
+    admitted = await store.admit_hold(**values)
+    claimed = await store.claim_due(admitted.operation_id)
+    assert claimed is not None
+    initial = same_runtime_observation(job_id, values)
+    final = same_runtime_observation(job_id, values)
+    final["successor"].pop("node_uid")
+
+    assert not await store.release_recovered(
+        operation_id=claimed.operation_id,
+        version=claimed.version,
+        claim_token=claimed.claim_token,
+        initial_observation=initial,
+        final_observation=final,
+        resume_receipt={"kind": "malformed"},
+    )
+    async with app_pg.acquire() as conn:
+        operation = await conn.fetchrow(
+            "SELECT phase,reason_code FROM vm_workspace_recoveries WHERE id=$1",
+            admitted.operation_id,
+        )
+        queue = await conn.fetchrow(
+            "SELECT state,lease_token,park_reason FROM run_queue WHERE unit_id=$1",
+            job_id,
+        )
+    assert tuple(operation) == ("paused_attention", "workspace_identity_conflict")
+    assert tuple(queue) == ("parked", lease_token + 1, "workspace_recovery")
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "missing",
@@ -964,26 +1142,33 @@ async def test_schema_rejects_unknown_phases_and_extended_deadlines(app_pg) -> N
 
 @pytest.mark.asyncio
 async def test_claim_due_enforces_four_global_durable_probe_slots(app_pg) -> None:
-    recovery_ids = [
-        await insert_recovery(app_pg, owner_id=uuid4()) for _ in range(5)
-    ]
+    recovery_ids = [await insert_recovery(app_pg, owner_id=uuid4()) for _ in range(5)]
     stores = [
         VMWorkspaceRecoveryStore(app_pg, worker_id=f"reconciler-{index}")
         for index in range(5)
     ]
 
     claims = await asyncio.gather(
-        *(store.claim_due(operation_id) for store, operation_id in zip(stores, recovery_ids))
+        *(
+            store.claim_due(operation_id)
+            for store, operation_id in zip(stores, recovery_ids)
+        )
     )
 
     assert sum(item is not None for item in claims) == 4
     async with app_pg.acquire() as conn:
-        assert await conn.fetchval(
-            "SELECT count(*) FROM vm_workspace_recovery_probe_slots"
-        ) == 4
-        assert await conn.fetchval(
-            "SELECT count(DISTINCT global_slot) FROM vm_workspace_recovery_probe_slots"
-        ) == 4
+        assert (
+            await conn.fetchval(
+                "SELECT count(*) FROM vm_workspace_recovery_probe_slots"
+            )
+            == 4
+        )
+        assert (
+            await conn.fetchval(
+                "SELECT count(DISTINCT global_slot) FROM vm_workspace_recovery_probe_slots"
+            )
+            == 4
+        )
 
 
 @pytest.mark.asyncio
@@ -993,7 +1178,7 @@ async def test_claim_due_enforces_one_durable_probe_per_known_node(app_pg) -> No
     async with app_pg.acquire() as conn:
         await conn.execute(
             "UPDATE vm_workspace_recoveries SET latest_observation="
-            "'{\"successor\":{\"node_uid\":\"node-8\"}}'::jsonb "
+            '\'{"successor":{"node_uid":"node-8"}}\'::jsonb '
             "WHERE id=ANY($1::uuid[])",
             [first, second],
         )
@@ -1100,7 +1285,9 @@ async def test_ordinary_readiness_cas_cannot_promote_recovery_owned_job(app_pg) 
     )
     async with app_pg.acquire() as conn:
         assert (
-            await conn.fetchval("SELECT context->'vm'->>'status' FROM jobs WHERE id=$1", job_id)
+            await conn.fetchval(
+                "SELECT context->'vm'->>'status' FROM jobs WHERE id=$1", job_id
+            )
             == "ssh_pending"
         )
 
@@ -1357,6 +1544,12 @@ async def test_release_after_deadline_retains_hold_and_pauses_attention(app_pg) 
             recovery_id,
         )
         await conn.execute(
+            "INSERT INTO vm_workspace_recovery_probe_slots "
+            "(recovery_id,global_slot,node_key,claim_token,leased_until) "
+            "VALUES ($1,0,'deadline-node',1,clock_timestamp()+interval '30 seconds')",
+            recovery_id,
+        )
+        await conn.execute(
             """
             INSERT INTO jobs (id, description, status, execution_lane, freeze_data)
             VALUES ($1, 'late probe', 'paused', 'stateless',
@@ -1389,12 +1582,41 @@ async def test_release_after_deadline_retains_hold_and_pauses_attention(app_pg) 
             job_id,
             hold_token,
         )
+        identity = await conn.fetchrow(
+            "SELECT owner_kind,owner_id,provision_generation,vm_uid,"
+            "prior_vmi_uid,prior_launcher_uid,root_pvc_uid "
+            "FROM vm_workspace_recoveries WHERE id=$1",
+            recovery_id,
+        )
+
+    observation = {
+        "ready": True,
+        "authenticated": True,
+        "ambiguous": False,
+        "owner_kind": identity["owner_kind"],
+        "owner_id": str(identity["owner_id"]),
+        "provision_generation": str(identity["provision_generation"]),
+        "vm_uid": str(identity["vm_uid"]),
+        "root_pvc_uid": str(identity["root_pvc_uid"]),
+        "prior_runtime": "same_runtime",
+        "remote_operations": "settled",
+        "continuation": "safe",
+        "successor": {
+            "vmi_uid": str(identity["prior_vmi_uid"]),
+            "launcher_uid": str(identity["prior_launcher_uid"]),
+            "node_uid": "deadline-node",
+            "pod_ip": "10.42.0.99",
+            "ssh_registration_id": "deadline-registration",
+        },
+    }
 
     store = VMWorkspaceRecoveryStore(app_pg, worker_id="reconciler-a")
     assert not await store.release_recovered(
         operation_id=recovery_id,
         version=2,
         claim_token=1,
+        initial_observation=observation,
+        final_observation=observation.copy(),
         resume_receipt={"kind": "late-ready"},
     )
 
@@ -1444,8 +1666,19 @@ async def test_release_with_changed_job_projection_retains_hold(
     app_pg, projection_fault: str
 ) -> None:
     job_id, lease_token = await insert_leased_job(app_pg)
+    values = admission_kwargs(job_id, lease_token)
+    async with app_pg.acquire() as conn:
+        await conn.execute(
+            "UPDATE jobs SET context=jsonb_build_object('vm',jsonb_build_object("
+            "'provision_generation',$2::text,'vm_uid',$3::text,"
+            "'rootdisk_pvc_uid',$4::text)) WHERE id=$1",
+            job_id,
+            str(values["provision_generation"]),
+            str(values["vm_uid"]),
+            str(values["root_pvc_uid"]),
+        )
     store = VMWorkspaceRecoveryStore(app_pg, worker_id="reconciler-a")
-    admitted = await store.admit_hold(**admission_kwargs(job_id, lease_token))
+    admitted = await store.admit_hold(**values)
     claim = await store.claim_due(admitted.operation_id)
     assert claim is not None
     async with app_pg.acquire() as conn:
@@ -1473,6 +1706,8 @@ async def test_release_with_changed_job_projection_retains_hold(
         operation_id=admitted.operation_id,
         version=claim.version,
         claim_token=claim.claim_token,
+        initial_observation=same_runtime_observation(job_id, values),
+        final_observation=same_runtime_observation(job_id, values),
         resume_receipt={"kind": "same-runtime-ready"},
     )
 
@@ -1554,6 +1789,15 @@ async def test_store_admits_idempotent_hold_and_releases_exact_queue_token(
             job_id,
             attempt_token,
         )
+        await conn.execute(
+            "UPDATE jobs SET context=jsonb_build_object('vm',jsonb_build_object("
+            "'provision_generation',$2::text,'vm_uid',$3::text,"
+            "'rootdisk_pvc_uid',$4::text)) WHERE id=$1",
+            job_id,
+            str(provision_generation),
+            str(vm_uid),
+            str(pvc_uid),
+        )
 
     store = VMWorkspaceRecoveryStore(app_pg, worker_id="reconciler-a")
     kwargs = dict(
@@ -1607,10 +1851,13 @@ async def test_store_admits_idempotent_hold_and_releases_exact_queue_token(
 
     claim = await store.claim_due(admitted.operation_id)
     assert claim is not None
+    observation = same_runtime_observation(job_id, kwargs)
     assert await store.release_recovered(
         operation_id=admitted.operation_id,
         version=claim.version,
         claim_token=claim.claim_token,
+        initial_observation=observation,
+        final_observation=observation.copy(),
         resume_receipt={"kind": "same_runtime_ready"},
     )
     async with app_pg.acquire() as conn:
@@ -1670,6 +1917,7 @@ async def test_final_recovery_cas_binds_successor_and_releases_once(app_pg) -> N
     observation = {
         "ready": True,
         "authenticated": True,
+        "ambiguous": False,
         "owner_kind": "job",
         "owner_id": str(job_id),
         "provision_generation": str(generation),
@@ -1731,6 +1979,14 @@ async def test_final_recovery_cas_binds_successor_and_releases_once(app_pg) -> N
             "SELECT state,lease_token FROM run_queue WHERE unit_id=$1", job_id
         )
         vm = await conn.fetchval("SELECT context->'vm' FROM jobs WHERE id=$1", job_id)
+        pin_released = await conn.fetchval(
+            "SELECT released_at IS NOT NULL "
+            "FROM vm_workspace_recovery_retention_pins "
+            "WHERE recovery_id=$1 AND pvc_uid=$2 AND provision_generation=$3",
+            admitted.operation_id,
+            pvc_uid,
+            generation,
+        )
     if isinstance(vm, str):
         vm = json.loads(vm)
     assert operation["phase"] == "recovered" and operation["resolved_at"] is not None
@@ -1738,6 +1994,7 @@ async def test_final_recovery_cas_binds_successor_and_releases_once(app_pg) -> N
     assert vm["active_pod_uid"] == str(successor_launcher_uid)
     assert vm["vmi_uid"] == str(successor_vmi_uid)
     assert vm["pod_ip"] == "10.42.0.90"
+    assert pin_released is True
 
 
 @pytest.mark.asyncio
@@ -1763,6 +2020,7 @@ async def test_final_recovery_cas_retains_hold_when_re_attested_generation_chang
     observation = {
         "ready": True,
         "authenticated": True,
+        "ambiguous": False,
         "owner_kind": "job",
         "owner_id": str(job_id),
         "provision_generation": str(kwargs["provision_generation"]),
@@ -2036,6 +2294,7 @@ async def test_recovery_release_cas_advances_input_once_and_preserves_counters(
             hold_lease_token=28,
             version=claim.version,
             claim_token=claim.claim_token,
+            claimed_by="reconciler-a",
             resume_receipt={"ready": True},
         )
         assert not await worker_queue.release_worker_batch_from_workspace_recovery(
@@ -2119,7 +2378,17 @@ async def test_membership_creation_and_reassignment_refuse_open_recovery(
 async def test_shared_recovery_materializes_and_holds_all_member_queues(app_pg) -> None:
     parent_id, token = await insert_leased_job(app_pg)
     child_id = uuid4()
+    values = admission_kwargs(parent_id, token)
     async with app_pg.acquire() as conn:
+        await conn.execute(
+            "UPDATE jobs SET context=jsonb_build_object('vm',jsonb_build_object("
+            "'provision_generation',$2::text,'vm_uid',$3::text,"
+            "'rootdisk_pvc_uid',$4::text)) WHERE id=$1",
+            parent_id,
+            str(values["provision_generation"]),
+            str(values["vm_uid"]),
+            str(values["root_pvc_uid"]),
+        )
         await conn.execute(
             "INSERT INTO jobs (id, description, status, execution_lane, parent_job_id, context) "
             "VALUES ($1, 'never leased child', 'created', 'stateless', $2, "
@@ -2128,7 +2397,7 @@ async def test_shared_recovery_materializes_and_holds_all_member_queues(app_pg) 
             parent_id,
         )
     store = VMWorkspaceRecoveryStore(app_pg, worker_id="reconciler-a")
-    admitted = await store.admit_hold(**admission_kwargs(parent_id, token))
+    admitted = await store.admit_hold(**values)
     async with app_pg.acquire() as conn:
         assert (
             await conn.fetchval(
@@ -2152,10 +2421,13 @@ async def test_shared_recovery_materializes_and_holds_all_member_queues(app_pg) 
         ) == (None, "absent")
     claim = await store.claim_due(admitted.operation_id)
     assert claim is not None
+    observation = same_runtime_observation(parent_id, values)
     assert await store.release_recovered(
         operation_id=admitted.operation_id,
         version=claim.version,
         claim_token=claim.claim_token,
+        initial_observation=observation,
+        final_observation=observation.copy(),
         resume_receipt={"ready": True},
     )
     async with app_pg.acquire() as conn:
