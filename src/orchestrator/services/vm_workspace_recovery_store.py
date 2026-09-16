@@ -37,6 +37,68 @@ class VMWorkspaceRecoveryStore:
         self.db = db
         self.worker_id = worker_id or os.getenv("HOSTNAME", "vm-workspace-recovery")
 
+    @staticmethod
+    async def _accepted_request(
+        conn: Any,
+        *,
+        job_id: UUID,
+        request_id: UUID,
+        intent_digest: str,
+    ) -> WorkspaceRecoveryDisposition | None:
+        prior = await conn.fetchrow(
+            """
+            SELECT intent_digest, accepted_result
+              FROM vm_workspace_recovery_requests
+             WHERE scope_kind='job' AND scope_id=$1 AND request_id=$2
+            """,
+            job_id,
+            request_id,
+        )
+        if prior is None:
+            return None
+        if prior["intent_digest"] != intent_digest:
+            raise RuntimeError(
+                "workspace recovery request ID reused with different intent"
+            )
+        result = _json(prior["accepted_result"])
+        return WorkspaceRecoveryDisposition(
+            code=WorkspaceRecoveryCode(result["code"]),
+            action=result["action"],
+            operation_id=UUID(result["operation_id"]),
+            accepted_lease_token=int(result["accepted_lease_token"]),
+            hold_lease_token=int(result["hold_lease_token"]),
+        )
+
+    @staticmethod
+    async def _pause_locked(
+        conn: Any,
+        *,
+        operation_id: UUID,
+        code: WorkspaceRecoveryCode,
+        diagnostic: Mapping[str, Any],
+    ) -> None:
+        await conn.execute(
+            """
+            UPDATE vm_workspace_recoveries
+               SET phase='paused_attention', reason_code=$2,
+                   latest_diagnostic=$3::jsonb,
+                   claimed_by=NULL, claimed_until=NULL,
+                   version=version+1
+             WHERE id=$1 AND phase='recovering' AND resolved_at IS NULL
+            """,
+            operation_id,
+            code.value,
+            json.dumps(dict(diagnostic)),
+        )
+        await conn.execute(
+            """
+            UPDATE vm_workspace_recovery_jobs
+               SET participation='attention'
+             WHERE recovery_id=$1 AND resolved_at IS NULL
+            """,
+            operation_id,
+        )
+
     async def admit_hold(
         self,
         *,
@@ -65,33 +127,27 @@ class VMWorkspaceRecoveryStore:
 
         async with self.db.acquire() as conn:
             async with conn.transaction():
-                prior = await conn.fetchrow(
-                    """
-                    SELECT intent_digest, accepted_result
-                      FROM vm_workspace_recovery_requests
-                     WHERE scope_kind='job' AND scope_id=$1 AND request_id=$2
-                    """,
-                    job_id,
-                    request_id,
+                prior = await self._accepted_request(
+                    conn,
+                    job_id=job_id,
+                    request_id=request_id,
+                    intent_digest=intent_digest,
                 )
                 if prior is not None:
-                    if prior["intent_digest"] != intent_digest:
-                        raise RuntimeError(
-                            "workspace recovery request ID reused with different intent"
-                        )
-                    result = _json(prior["accepted_result"])
-                    return WorkspaceRecoveryDisposition(
-                        code=WorkspaceRecoveryCode(result["code"]),
-                        action=result["action"],
-                        operation_id=UUID(result["operation_id"]),
-                        accepted_lease_token=int(result["accepted_lease_token"]),
-                        hold_lease_token=int(result["hold_lease_token"]),
-                    )
+                    return prior
 
                 await conn.execute(
                     "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
                     f"workspace-recovery:{owner_kind}:{owner_id}",
                 )
+                prior = await self._accepted_request(
+                    conn,
+                    job_id=job_id,
+                    request_id=request_id,
+                    intent_digest=intent_digest,
+                )
+                if prior is not None:
+                    return prior
                 queue = await conn.fetchrow(
                     "SELECT * FROM run_queue WHERE unit_id=$1 FOR UPDATE",
                     job_id,
@@ -110,6 +166,28 @@ class VMWorkspaceRecoveryStore:
                 )
                 if job is None:
                     raise RuntimeError("recovery job does not exist")
+                attempt = await conn.fetchrow(
+                    """
+                    SELECT job_id
+                      FROM worker_batch_attempts
+                     WHERE job_id=$1 AND lease_token=$2
+                     FOR UPDATE
+                    """,
+                    job_id,
+                    accepted_lease_token,
+                )
+                attention_required = attempt is None
+                disposition_code = (
+                    WorkspaceRecoveryCode.TOOL_OUTCOME_UNKNOWN
+                    if attention_required
+                    else code
+                )
+                phase = "paused_attention" if attention_required else "recovering"
+                diagnostic = (
+                    {"reason": "worker_batch_attempt_missing"}
+                    if attention_required
+                    else None
+                )
 
                 recovery_id = uuid4()
                 await conn.execute(
@@ -118,8 +196,11 @@ class VMWorkspaceRecoveryStore:
                         id, owner_kind, owner_id, workspace_contract_digest,
                         provision_generation, cluster_name, namespace, vm_uid,
                         prior_vmi_uid, prior_launcher_uid, root_pvc_uid,
-                        reason_code, original_cause
-                    ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13::jsonb)
+                        phase, reason_code, original_cause, latest_diagnostic
+                    ) VALUES (
+                        $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14::jsonb,
+                        $15::jsonb
+                    )
                     """,
                     recovery_id,
                     owner_kind,
@@ -132,8 +213,10 @@ class VMWorkspaceRecoveryStore:
                     prior_vmi_uid,
                     prior_launcher_uid,
                     root_pvc_uid,
-                    code.value,
+                    phase,
+                    disposition_code.value,
                     json.dumps(dict(original_cause or {})),
+                    json.dumps(diagnostic),
                 )
                 hold_token = accepted_lease_token + 1
                 await conn.execute(
@@ -165,8 +248,8 @@ class VMWorkspaceRecoveryStore:
                     INSERT INTO vm_workspace_recovery_jobs (
                         recovery_id, job_id, accepted_lease_token, hold_lease_token,
                         prior_queue_state, prior_job_status, prior_freeze_reference,
-                        checkpoint_id, checkpoint_namespace
-                    ) VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9)
+                        checkpoint_id, checkpoint_namespace, participation
+                    ) VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9,$10)
                     """,
                     recovery_id,
                     job_id,
@@ -177,12 +260,18 @@ class VMWorkspaceRecoveryStore:
                     json.dumps(_json(job["freeze_data"])),
                     checkpoint_id,
                     checkpoint_namespace,
+                    "attention" if attention_required else "held",
                 )
-                disposition = WorkspaceRecoveryDisposition.hold_committed(
+                disposition_factory = (
+                    WorkspaceRecoveryDisposition.paused_attention
+                    if attention_required
+                    else WorkspaceRecoveryDisposition.hold_committed
+                )
+                disposition = disposition_factory(
                     operation_id=recovery_id,
                     accepted_lease_token=accepted_lease_token,
                     hold_lease_token=hold_token,
-                    code=code,
+                    code=disposition_code,
                 )
                 receipt = {
                     "code": disposition.code.value,
@@ -191,17 +280,20 @@ class VMWorkspaceRecoveryStore:
                     "accepted_lease_token": disposition.accepted_lease_token,
                     "hold_lease_token": disposition.hold_lease_token,
                 }
-                await conn.execute(
-                    """
-                    UPDATE worker_batch_attempts
-                       SET disposition=$3::jsonb, recovery_id=$4
-                     WHERE job_id=$1 AND lease_token=$2
-                    """,
-                    job_id,
-                    accepted_lease_token,
-                    json.dumps(receipt),
-                    recovery_id,
-                )
+                if attempt is not None:
+                    updated = await conn.execute(
+                        """
+                        UPDATE worker_batch_attempts
+                           SET disposition=$3::jsonb, recovery_id=$4
+                         WHERE job_id=$1 AND lease_token=$2
+                        """,
+                        job_id,
+                        accepted_lease_token,
+                        json.dumps(receipt),
+                        recovery_id,
+                    )
+                    if updated != "UPDATE 1":
+                        raise RuntimeError("worker batch attempt evidence changed")
                 await conn.execute(
                     """
                     INSERT INTO vm_workspace_recovery_requests (
@@ -271,6 +363,32 @@ class VMWorkspaceRecoveryStore:
     ) -> RecoveryClaim | None:
         async with self.db.acquire() as conn:
             async with conn.transaction():
+                expired = await conn.fetchval(
+                    """
+                    UPDATE vm_workspace_recoveries
+                       SET phase='paused_attention',
+                           reason_code='workspace_recovery_deadline_exceeded',
+                           latest_diagnostic=jsonb_build_object(
+                               'reason', 'deadline_elapsed_before_claim',
+                               'observed_at', clock_timestamp()),
+                           claimed_by=NULL, claimed_until=NULL,
+                           version=version+1
+                     WHERE id=$1 AND phase='recovering' AND resolved_at IS NULL
+                       AND deadline_at <= clock_timestamp()
+                    RETURNING id
+                    """,
+                    operation_id,
+                )
+                if expired is not None:
+                    await conn.execute(
+                        """
+                        UPDATE vm_workspace_recovery_jobs
+                           SET participation='attention'
+                         WHERE recovery_id=$1 AND resolved_at IS NULL
+                        """,
+                        operation_id,
+                    )
+                    return None
                 row = await conn.fetchrow(
                     """
                     UPDATE vm_workspace_recoveries
@@ -392,18 +510,22 @@ class VMWorkspaceRecoveryStore:
                 operation_id,
             )
             async with conn.transaction():
+                queues: dict[UUID, Any] = {}
                 for participant in participants:
-                    await conn.fetchrow(
-                        "SELECT unit_id FROM run_queue WHERE unit_id=$1 FOR UPDATE",
+                    queues[participant["job_id"]] = await conn.fetchrow(
+                        "SELECT state, lease_token, park_reason FROM run_queue "
+                        "WHERE unit_id=$1 FOR UPDATE",
                         participant["job_id"],
                     )
+                jobs: dict[UUID, Any] = {}
                 for participant in participants:
-                    await conn.fetchrow(
-                        "SELECT id FROM jobs WHERE id=$1 FOR UPDATE",
+                    jobs[participant["job_id"]] = await conn.fetchrow(
+                        "SELECT status, freeze_data FROM jobs WHERE id=$1 FOR UPDATE",
                         participant["job_id"],
                     )
                 operation = await conn.fetchrow(
-                    "SELECT id FROM vm_workspace_recoveries "
+                    "SELECT id, deadline_at <= clock_timestamp() AS deadline_expired "
+                    "FROM vm_workspace_recoveries "
                     "WHERE id=$1 AND version=$2 AND claim_token=$3 "
                     "AND phase='recovering' AND resolved_at IS NULL FOR UPDATE",
                     operation_id,
@@ -411,6 +533,57 @@ class VMWorkspaceRecoveryStore:
                     claim_token,
                 )
                 if operation is None:
+                    return False
+                if operation["deadline_expired"]:
+                    await self._pause_locked(
+                        conn,
+                        operation_id=operation_id,
+                        code=WorkspaceRecoveryCode.DEADLINE_EXCEEDED,
+                        diagnostic={"reason": "deadline_elapsed_before_release"},
+                    )
+                    return False
+                projection_errors: list[dict[str, str]] = []
+                if not participants:
+                    projection_errors.append(
+                        {"reason": "recovery_participants_missing"}
+                    )
+                for participant in participants:
+                    job_id = participant["job_id"]
+                    hold_token = int(participant["hold_lease_token"])
+                    queue = queues[job_id]
+                    job = jobs[job_id]
+                    queue_valid = bool(
+                        queue is not None
+                        and queue["state"] == "parked"
+                        and queue["park_reason"] == "workspace_recovery"
+                        and int(queue["lease_token"]) == hold_token
+                    )
+                    freeze = _json(job["freeze_data"]) if job is not None else None
+                    job_valid = bool(
+                        job is not None
+                        and job["status"] == "paused"
+                        and isinstance(freeze, dict)
+                        and freeze.get("freeze_type") == "workspace_recovery"
+                        and freeze.get("recovery_id") == str(operation_id)
+                        and type(freeze.get("hold_lease_token")) is int
+                        and freeze["hold_lease_token"] == hold_token
+                    )
+                    if not queue_valid or not job_valid:
+                        projection_errors.append(
+                            {
+                                "reason": "participant_projection_mismatch",
+                                "job_id": str(job_id),
+                                "queue_valid": str(queue_valid).lower(),
+                                "job_valid": str(job_valid).lower(),
+                            }
+                        )
+                if projection_errors:
+                    await self._pause_locked(
+                        conn,
+                        operation_id=operation_id,
+                        code=WorkspaceRecoveryCode.IDENTITY_CONFLICT,
+                        diagnostic={"projection_errors": projection_errors},
+                    )
                     return False
                 for participant in participants:
                     changed = await conn.fetchval(
@@ -426,13 +599,19 @@ class VMWorkspaceRecoveryStore:
                     )
                     if changed is None:
                         raise RuntimeError("workspace recovery hold token changed")
-                    await conn.execute(
-                        "UPDATE jobs SET status='paused', freeze_data=NULL "
+                    job_changed = await conn.fetchval(
+                        "UPDATE jobs SET freeze_data=NULL "
                         "WHERE id=$1 AND status='paused' "
-                        "AND freeze_data->>'recovery_id'=$2",
+                        "AND freeze_data->>'freeze_type'='workspace_recovery' "
+                        "AND freeze_data->>'recovery_id'=$2 "
+                        "AND freeze_data->>'hold_lease_token'=$3 "
+                        "RETURNING 1",
                         participant["job_id"],
                         str(operation_id),
+                        str(participant["hold_lease_token"]),
                     )
+                    if job_changed is None:
+                        raise RuntimeError("workspace recovery job projection changed")
                 await conn.execute(
                     """
                     UPDATE vm_workspace_recovery_jobs
@@ -448,9 +627,12 @@ class VMWorkspaceRecoveryStore:
                     UPDATE vm_workspace_recoveries
                        SET phase='recovered', resolved_at=clock_timestamp(),
                            claimed_by=NULL, claimed_until=NULL, version=version+1
-                     WHERE id=$1
+                     WHERE id=$1 AND version=$2 AND claim_token=$3
+                       AND phase='recovering' AND resolved_at IS NULL
                     """,
                     operation_id,
+                    version,
+                    claim_token,
                 )
         return True
 
