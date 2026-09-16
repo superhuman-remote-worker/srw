@@ -345,3 +345,54 @@ SKIPPED: missing capability: binary:longhornctl, container-engine:k3d-docker-req
 This host still cannot execute the destructive KubeVirt/Longhorn matrix, so the
 report does not claim live PASS evidence for either controlled handoff or the
 15-minute deadline crossing.
+
+## Review Fix Round 3
+
+The third review found that cancelling A's reconciler loop at handoff also
+cancelled `_observe()`. Although the barrier returned later, the cancelled
+production coroutine could not consume that result or attempt any durable
+fenced store call. The old `stale_result_rejected` value therefore inferred
+rejection only from B's recovery, one dispatch, and token ordering.
+
+Two focused regressions first failed: one rejected the explicit
+`stale_task.cancel()` path and required direct stale-boundary evidence; the
+other proved the outer validator still accepted missing direct evidence.
+
+The controlled handoff now models the normal leadership polling window without
+changing production cancellation behavior:
+
+- A and B hold separate checked-out PostgreSQL sessions. A proves exclusive
+  acquisition, unlocks its advisory lock while retaining its session, and B
+  acquires on another session before A's session returns to the pool. Evidence
+  includes distinct positive `pg_backend_pid()` values as well as the distinct
+  durable worker identities.
+- A's already-started service loop remains blocked in the real controller
+  observation while B acquires leadership, mints a higher recovery claim token,
+  and completes the single dispatch. B retains the leader lock while A's
+  delayed observation returns.
+- A then attempts the next production claim-fenced store boundary. The gate
+  records the exact rejected boundary from
+  `accept_stop_evidence`, `trusted_stop_receipt`,
+  `recovery_preconditions`, or `stage_observation`, and records whether staging
+  was attempted. `stale_result_rejected` now requires this direct rejection in
+  addition to B's recovered state, one dispatch, and increasing claim token.
+  The outer validator rejects absent, contradictory, or inferred evidence.
+
+Final verification:
+
+```text
+Focused recovery/acceptance/gate/Helm: 62 passed in 12.03s
+Required backend: 1055 passed, 11 skipped, 18 warnings in 124.95s
+Schema drift: 220 migrations replayed; artifacts are up to date
+```
+
+Ruff, `git diff --check`, the runtime-coordinate inventory, selector help, and
+gate help passed. The changed-file selector returned `ALL`. Read-only preflight
+again exited before mutation:
+
+```text
+SKIPPED: missing capability: binary:longhornctl, container-engine:k3d-docker-required, socket:/run/iscsid/socket, module:iscsi_tcp, file:disposable-values, image:guest-digest
+```
+
+The capable-cluster live matrix remains the only unexecuted verification; no
+mocked or inferred live PASS is claimed.

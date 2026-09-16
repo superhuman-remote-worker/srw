@@ -174,6 +174,12 @@ def test_leader_overlap_uses_real_leader_boundary_and_reconciler_loops() -> None
     assert source.count(".run(") >= 2
     assert ".reconcile_once(" not in source
     assert "leadership_transfer_succeeded" in source
+    assert "stale_task.cancel()" not in source
+    assert "stale_store_boundary_rejected" in source
+    assert "stale_store_boundary" in source
+    assert "stale_stage_attempted" in source
+    assert "leader_a_backend_pid" in source
+    assert "leader_b_backend_pid" in source
 
 
 @pytest.mark.asyncio
@@ -208,10 +214,13 @@ async def test_gate_owned_reconciler_runs_only_inside_its_scenario_scope(
 
 @pytest.mark.asyncio
 async def test_gate_leader_lease_requires_real_exclusive_transfer() -> None:
-    state = {"held": False}
+    state = {"held": False, "next_pid": 4100}
 
     class Connection:
-        async def fetchval(self, query, _lock_id):
+        def __init__(self, backend_pid):
+            self.backend_pid = backend_pid
+
+        async def fetchval(self, query, *_args):
             if "pg_try_advisory_lock" in query:
                 if state["held"]:
                     return False
@@ -221,11 +230,14 @@ async def test_gate_leader_lease_requires_real_exclusive_transfer() -> None:
                 was_held = state["held"]
                 state["held"] = False
                 return was_held
+            if "pg_backend_pid" in query:
+                return self.backend_pid
             raise AssertionError(query)
 
     class Pool:
         async def acquire(self):
-            return Connection()
+            state["next_pid"] += 1
+            return Connection(state["next_pid"])
 
         async def release(self, _connection):
             return None
@@ -236,8 +248,10 @@ async def test_gate_leader_lease_requires_real_exclusive_transfer() -> None:
 
     assert await first.acquire() is True
     assert await second.acquire() is False
-    assert await first.release() is True
+    assert await first.unlock() is True
     assert await second.acquire() is True
+    assert first.backend_pid != second.backend_pid
+    await first.close()
     assert await second.release() is True
     assert first.identity != second.identity
 

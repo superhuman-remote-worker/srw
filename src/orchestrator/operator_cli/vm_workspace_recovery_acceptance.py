@@ -55,6 +55,8 @@ class GateLeaderLease:
         self.lock_id = lock_id
         self.identity = identity
         self.connection: Any | None = None
+        self.backend_pid: int | None = None
+        self.lock_held = False
 
     async def acquire(self) -> bool:
         pool = getattr(self.db, "_pool", None)
@@ -68,21 +70,39 @@ class GateLeaderLease:
             await pool.release(connection)
             return False
         self.connection = connection
+        self.backend_pid = int(await connection.fetchval("SELECT pg_backend_pid()"))
+        self.lock_held = True
         return True
 
-    async def release(self) -> bool:
+    async def unlock(self) -> bool:
+        """Drop leadership while retaining the backend session for evidence."""
+
+        connection = self.connection
+        if connection is None or not self.lock_held:
+            return False
+        released = bool(
+            await connection.fetchval("SELECT pg_advisory_unlock($1)", self.lock_id)
+        )
+        if released:
+            self.lock_held = False
+        return released
+
+    async def close(self) -> None:
         connection = self.connection
         if connection is None:
-            return False
+            return
         pool = self.db._pool
         try:
-            released = bool(
-                await connection.fetchval("SELECT pg_advisory_unlock($1)", self.lock_id)
-            )
-            return released
+            if self.lock_held:
+                await self.unlock()
         finally:
             self.connection = None
             await pool.release(connection)
+
+    async def release(self) -> bool:
+        released = await self.unlock()
+        await self.close()
+        return released
 
 
 def require_execution_guard(
@@ -751,6 +771,45 @@ class LiveScenario:
         )
         from shared.workspace_recovery import WorkspaceRecoveryCode
 
+        class StaleEvidenceStore(VMWorkspaceRecoveryStore):
+            """Record the exact production fence reached by the old leader."""
+
+            boundary_checked: asyncio.Event
+            rejected_boundary: str | None = None
+            stage_attempted = False
+
+            def __init__(self, *args: Any, **kwargs: Any) -> None:
+                super().__init__(*args, **kwargs)
+                self.boundary_checked = asyncio.Event()
+
+            def _record_rejection(self, boundary: str, result: Any) -> None:
+                if result is None and self.rejected_boundary is None:
+                    self.rejected_boundary = boundary
+                    self.boundary_checked.set()
+
+            async def accept_stop_evidence(
+                self, claim: Any, evidence: Mapping[str, Any]
+            ) -> Any:
+                result = await super().accept_stop_evidence(claim, evidence)
+                self._record_rejection("accept_stop_evidence", result)
+                return result
+
+            async def trusted_stop_receipt(self, claim: Any) -> Any:
+                result = await super().trusted_stop_receipt(claim)
+                self._record_rejection("trusted_stop_receipt", result)
+                return result
+
+            async def recovery_preconditions(self, claim: Any) -> Any:
+                result = await super().recovery_preconditions(claim)
+                self._record_rejection("recovery_preconditions", result)
+                return result
+
+            async def stage_observation(self, **kwargs: Any) -> Any:
+                self.stage_attempted = True
+                result = await super().stage_observation(**kwargs)
+                self._record_rejection("stage_observation", result)
+                return result
+
         disposition = await self._admit(
             identity=identity,
             lease_token=lease_token,
@@ -762,7 +821,7 @@ class LiveScenario:
             "SELECT deadline_at FROM vm_workspace_recoveries WHERE id=$1",
             disposition.operation_id,
         )
-        leader_a_store = VMWorkspaceRecoveryStore(
+        leader_a_store = StaleEvidenceStore(
             self.db, worker_id=f"gate-leader-a:{self.run_id}"
         )
         leader_b_store = VMWorkspaceRecoveryStore(
@@ -823,15 +882,24 @@ class LiveScenario:
             if not contender_was_blocked:
                 raise AcceptanceFailure("two gate leaders held the advisory lock")
 
-            # Loss of leadership cancels the leader-gated loop. The barrier
-            # deliberately keeps its already-started external observation alive
-            # so its result returns only after the successor leader completes.
-            stale_task.cancel()
-            await asyncio.wait_for(stale_barrier.cancelled.wait(), timeout=30)
-            leader_a_released = await leader_a_lease.release()
+            # Release leadership while leaving A's in-flight loop alive for the
+            # ordinary run_when_leader polling window. B can win during that
+            # window, and A's late result must hit a durable claim fence.
+            leader_a_released = await leader_a_lease.unlock()
             leader_b_acquired = await leader_b_lease.acquire()
             if not leader_a_released or not leader_b_acquired:
                 raise AcceptanceFailure("gate leadership did not transfer")
+            leader_a_backend_pid = leader_a_lease.backend_pid
+            leader_b_backend_pid = leader_b_lease.backend_pid
+            if (
+                leader_a_backend_pid is None
+                or leader_b_backend_pid is None
+                or leader_a_backend_pid == leader_b_backend_pid
+            ):
+                raise AcceptanceFailure(
+                    "gate leaders did not use distinct PostgreSQL sessions"
+                )
+            await leader_a_lease.close()
             leadership_transferred_at = await self._sql("SELECT clock_timestamp()")
 
             # Expire only the exact application claim held by the old leader.
@@ -886,14 +954,6 @@ class LiveScenario:
                 lambda: self._wait_phase(disposition.operation_id, {"recovered"}),
                 timeout=self.settings.external_call_timeout_seconds * 3,
             )
-            leader_b_shutdown.set()
-            await asyncio.wait_for(
-                winning_task,
-                timeout=self.settings.external_call_timeout_seconds * 3,
-            )
-            await leader_b_lease.release()
-            leader_b_acquired = False
-
             dispatches = int(
                 await self._sql(
                     "SELECT count(*) FROM vm_workspace_recovery_jobs "
@@ -915,8 +975,23 @@ class LiveScenario:
                 stale_barrier.finished.wait(),
                 timeout=self.settings.external_call_timeout_seconds,
             )
+            await asyncio.wait_for(
+                leader_a_store.boundary_checked.wait(),
+                timeout=self.settings.external_call_timeout_seconds,
+            )
             stale_finished_at = await self._sql("SELECT clock_timestamp()")
-            await asyncio.gather(stale_task, return_exceptions=True)
+            leader_a_shutdown.set()
+            await asyncio.wait_for(
+                stale_task,
+                timeout=self.settings.external_call_timeout_seconds * 3,
+            )
+            leader_b_shutdown.set()
+            await asyncio.wait_for(
+                winning_task,
+                timeout=self.settings.external_call_timeout_seconds * 3,
+            )
+            await leader_b_lease.release()
+            leader_b_acquired = False
         finally:
             stale_barrier.release.set()
             winning_barrier.release.set()
@@ -930,9 +1005,9 @@ class LiveScenario:
                 return_exceptions=True,
             )
             if leader_a_lease.connection is not None:
-                await leader_a_lease.release()
+                await leader_a_lease.close()
             if leader_b_lease.connection is not None:
-                await leader_b_lease.release()
+                await leader_b_lease.close()
 
         deadline_after = await self._sql(
             "SELECT deadline_at FROM vm_workspace_recoveries WHERE id=$1",
@@ -947,6 +1022,8 @@ class LiveScenario:
             "leader_instances": 2,
             "leader_a_identity": leader_a_identity,
             "leader_b_identity": leader_b_identity,
+            "leader_a_backend_pid": leader_a_backend_pid,
+            "leader_b_backend_pid": leader_b_backend_pid,
             "leadership_transfer_succeeded": bool(
                 contender_was_blocked
                 and leader_a_released
@@ -966,9 +1043,13 @@ class LiveScenario:
                 stale_barrier.observation_returned
                 and stale_finished_at > handoff["observed_at"]
             ),
+            "stale_store_boundary": leader_a_store.rejected_boundary,
+            "stale_store_boundary_rejected": bool(leader_a_store.rejected_boundary),
+            "stale_stage_attempted": leader_a_store.stage_attempted,
             "stale_result_rejected": bool(
                 recovered.get("phase") == "recovered"
                 and dispatches == 1
+                and bool(leader_a_store.rejected_boundary)
                 and int(stale_claim.get("claim_token") or 0) < winning_token
             ),
             "successor_dispatches": dispatches,

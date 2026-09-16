@@ -259,6 +259,16 @@ def validate_acceptance_evidence(evidence: dict[str, Any]) -> None:
         and leader_a_identity != leader_b_identity,
         "leader overlap did not prove distinct leader identities",
     )
+    leader_a_backend_pid = overlap.get("leader_a_backend_pid")
+    leader_b_backend_pid = overlap.get("leader_b_backend_pid")
+    require(
+        isinstance(leader_a_backend_pid, int)
+        and leader_a_backend_pid > 0
+        and isinstance(leader_b_backend_pid, int)
+        and leader_b_backend_pid > 0
+        and leader_a_backend_pid != leader_b_backend_pid,
+        "leader overlap did not prove distinct PostgreSQL sessions",
+    )
     require(
         overlap.get("leadership_transfer_succeeded") is True,
         "leader overlap did not cross the advisory-lock handoff boundary",
@@ -287,6 +297,23 @@ def validate_acceptance_evidence(evidence: dict[str, Any]) -> None:
     require(
         overlap.get("stale_probe_finished_after_handoff") is True,
         "stale leader probe did not finish after the handoff",
+    )
+    stale_store_boundary = overlap.get("stale_store_boundary")
+    require(
+        stale_store_boundary
+        in {
+            "accept_stop_evidence",
+            "trusted_stop_receipt",
+            "recovery_preconditions",
+            "stage_observation",
+        }
+        and overlap.get("stale_store_boundary_rejected") is True,
+        "stale leader result did not reach and fail a production store fence",
+    )
+    require(
+        overlap.get("stale_stage_attempted")
+        is (stale_store_boundary == "stage_observation"),
+        "stale leader staging evidence contradicts its rejected boundary",
     )
     require(
         overlap.get("stale_result_rejected") is True,
