@@ -1,6 +1,6 @@
--- migration:     0251_vm_workspace_recovery_controls.sql
+-- migration:     0252_vm_workspace_recovery_controls.sql
 -- description:   Atomic retry transfer and cleanup admission for VM workspace recovery.
--- depends-on:    0250_vm_workspace_recovery_attention_identity.sql
+-- depends-on:    0251_vm_workspace_recovery_attention_identity.sql
 -- transactional: yes
 
 BEGIN;

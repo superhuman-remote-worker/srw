@@ -220,6 +220,7 @@ from orchestrator.services import (  # noqa: E402
 from orchestrator.services.vm_workspace_recovery_store import (  # noqa: E402
     VMWorkspaceRecoveryStore,
     acquire_vm_cleanup_permit,
+    completed_cleanup_outcome,
     complete_vm_cleanup_permit,
 )
 from orchestrator.services import (  # noqa: E402
@@ -4046,6 +4047,7 @@ async def _try_dispatch_pending_jobs() -> None:
                                 owner_id=job_id,
                                 identity=identity,
                                 source="dispatcher_vm_recycle",
+                                purge_disk=False,
                             )
                             if not cleanup.allowed:
                                 logger.warning(
@@ -4054,22 +4056,24 @@ async def _try_dispatch_pending_jobs() -> None:
                                     job_id,
                                 )
                                 continue
-                            outcome = await vm_provisioner.release_vm_captured(
-                                job_id,
-                                identity,
-                                entity_type="job",
-                                purge_disk=False,
-                                capture_snapshot=False,
-                            )
-                            if outcome.disposition in {
-                                "completed",
-                                "identity_superseded",
-                            }:
-                                await complete_vm_cleanup_permit(
-                                    recovery_store,
-                                    cleanup,
-                                    outcome=outcome.disposition,
+                            disposition = completed_cleanup_outcome(cleanup)
+                            if disposition is None:
+                                outcome = await vm_provisioner.release_vm_captured(
+                                    job_id,
+                                    identity,
+                                    entity_type="job",
+                                    purge_disk=False,
+                                    capture_snapshot=False,
                                 )
+                                if outcome.disposition in {
+                                    "completed",
+                                    "identity_superseded",
+                                }:
+                                    await complete_vm_cleanup_permit(
+                                        recovery_store,
+                                        cleanup,
+                                        outcome=outcome.disposition,
+                                    )
                         except Exception:
                             logger.exception(
                                 "Dispatcher: failed to delete timed-out VM for job %s",

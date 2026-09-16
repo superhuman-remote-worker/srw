@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import json
 import hashlib
+import json
 import os
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -63,6 +63,7 @@ class CleanupPermit:
     admission_id: UUID | None = None
     recovery_id: UUID | None = None
     reason: str | None = None
+    completed_outcome: str | None = None
 
 
 class WorkspaceRecoveryControlConflict(RuntimeError):
@@ -79,6 +80,26 @@ def _cleanup_uuid(value: Any, *, namespace: str) -> UUID:
         return uuid5(NAMESPACE_URL, f"{namespace}:{value}")
 
 
+def cleanup_intent_digest(intent: Mapping[str, Any]) -> str:
+    """Return a stable digest for the complete destructive resource intent."""
+
+    encoded = json.dumps(
+        intent,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        default=str,
+    ).encode("utf-8")
+    return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
+
+
+def completed_cleanup_outcome(permit: Any) -> str | None:
+    """Read a durable replay outcome without trusting loose test doubles."""
+
+    value = getattr(permit, "completed_outcome", None)
+    return value if isinstance(value, str) and value else None
+
+
 async def acquire_vm_cleanup_permit(
     recovery_store: Any,
     *,
@@ -86,6 +107,7 @@ async def acquire_vm_cleanup_permit(
     owner_id: str | UUID,
     identity: Any,
     source: str,
+    purge_disk: bool,
 ) -> CleanupPermit:
     """Admit one exact VM/PVC cleanup intent through recovery authority."""
 
@@ -106,12 +128,25 @@ async def acquire_vm_cleanup_permit(
             str(pvc_uid or ""),
         )
     )
+    intent_digest = cleanup_intent_digest(
+        {
+            "owner_kind": owner_kind,
+            "owner_id": str(canonical_owner),
+            "provision_generation": str(getattr(identity, "provision_generation", "")),
+            "vm_uid": str(getattr(identity, "vm_uid", "") or ""),
+            "pvc_uid": str(pvc_uid or ""),
+            "purge_disk": bool(purge_disk),
+            "resource": "vm_workspace",
+            "source": source,
+        }
+    )
     return await recovery_store.acquire_cleanup_permit(
         owner_kind=owner_kind,
         owner_id=canonical_owner,
         pvc_uid=pvc_uid,
         request_id=uuid5(NAMESPACE_URL, f"vm-workspace-cleanup:{intent}"),
         source=source,
+        intent_digest=intent_digest,
     )
 
 
@@ -753,8 +788,12 @@ class VMWorkspaceRecoveryStore:
         pvc_uid: UUID | None,
         request_id: UUID,
         source: str,
+        intent_digest: str,
     ) -> CleanupPermit:
         """Serialize destructive admission with recovery and its exact disk pin."""
+
+        if not isinstance(intent_digest, str) or not intent_digest:
+            raise ValueError("cleanup intent digest must be nonempty")
 
         async with self.db.acquire() as conn:
             async with conn.transaction():
@@ -796,7 +835,7 @@ class VMWorkspaceRecoveryStore:
                             )
                         owner_id = canonical_owner
                 prior = await conn.fetchrow(
-                    "SELECT id,completed_at,pvc_uid,source "
+                    "SELECT id,completed_at,pvc_uid,source,intent_digest,outcome "
                     "FROM vm_workspace_cleanup_admissions "
                     "WHERE owner_kind=$1 AND owner_id=$2 AND request_id=$3 FOR UPDATE",
                     owner_kind,
@@ -804,18 +843,27 @@ class VMWorkspaceRecoveryStore:
                     request_id,
                 )
                 if prior is not None:
-                    if prior["pvc_uid"] != pvc_uid or prior["source"] != source:
+                    if (
+                        prior["pvc_uid"] != pvc_uid
+                        or prior["source"] != source
+                        or prior["intent_digest"] != intent_digest
+                    ):
                         raise WorkspaceRecoveryControlConflict(
                             "cleanup_request_id_reused",
                             "Cleanup request ID was already used with different resource intent.",
                         )
                     return CleanupPermit(
-                        allowed=prior["completed_at"] is None,
+                        allowed=True,
                         admission_id=prior["id"],
                         reason=(
                             None
                             if prior["completed_at"] is None
                             else "cleanup_request_already_completed"
+                        ),
+                        completed_outcome=(
+                            prior["outcome"]
+                            if prior["completed_at"] is not None
+                            else None
                         ),
                     )
                 active_cleanup = await conn.fetchrow(
@@ -852,14 +900,15 @@ class VMWorkspaceRecoveryStore:
                 admission_id = uuid4()
                 await conn.execute(
                     "INSERT INTO vm_workspace_cleanup_admissions "
-                    "(id,owner_kind,owner_id,pvc_uid,source,request_id) "
-                    "VALUES ($1,$2,$3,$4,$5,$6)",
+                    "(id,owner_kind,owner_id,pvc_uid,source,request_id,intent_digest) "
+                    "VALUES ($1,$2,$3,$4,$5,$6,$7)",
                     admission_id,
                     owner_kind,
                     owner_id,
                     pvc_uid,
                     source,
                     request_id,
+                    intent_digest,
                 )
                 return CleanupPermit(allowed=True, admission_id=admission_id)
 
@@ -1458,5 +1507,7 @@ __all__ = [
     "VMWorkspaceRecoveryStore",
     "WorkspaceRecoveryControlConflict",
     "acquire_vm_cleanup_permit",
+    "cleanup_intent_digest",
+    "completed_cleanup_outcome",
     "complete_vm_cleanup_permit",
 ]

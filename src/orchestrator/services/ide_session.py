@@ -57,6 +57,7 @@ from orchestrator.services.restore_work_lease import (
 from orchestrator.services.vm_workspace_recovery_store import (
     VMWorkspaceRecoveryStore,
     acquire_vm_cleanup_permit,
+    completed_cleanup_outcome,
     complete_vm_cleanup_permit,
 )
 from shared.runtime.core.managed_repository import (
@@ -2418,22 +2419,27 @@ class IdeSessionService:
                     owner_id=job_id,
                     identity=identity,
                     source="ide_session_vm_delete",
+                    purge_disk=True,
                 )
                 if not permit.allowed:
                     return False
-                outcome = await self._vm_provisioner.release_vm_captured(
-                    job_id,
-                    identity,
-                    entity_type="job",
-                    capture_snapshot=False,
-                )
-                if outcome.disposition in {"completed", "identity_superseded"}:
-                    await complete_vm_cleanup_permit(
-                        self._workspace_recovery_store,
-                        permit,
-                        outcome=outcome.disposition,
+                disposition = completed_cleanup_outcome(permit)
+                if disposition is None:
+                    outcome = await self._vm_provisioner.release_vm_captured(
+                        job_id,
+                        identity,
+                        entity_type="job",
+                        purge_disk=True,
+                        capture_snapshot=False,
                     )
-                return outcome.disposition == "completed"
+                    disposition = outcome.disposition
+                    if disposition in {"completed", "identity_superseded"}:
+                        await complete_vm_cleanup_permit(
+                            self._workspace_recovery_store,
+                            permit,
+                            outcome=disposition,
+                        )
+                return disposition == "completed"
             except Exception:
                 logger.exception("IDE VM cleanup authority failed for job %s", job_id)
                 return False

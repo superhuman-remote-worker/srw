@@ -1,3 +1,8 @@
+-- migration:     0251_vm_workspace_recovery_attention_identity.sql
+-- description:   Permit incomplete identity only on attention recovery holds.
+-- depends-on:    0250_vm_workspace_recovery.sql
+-- transactional: yes
+
 -- Attention holds may retain incomplete identity alongside other blockers.
 -- Automatic recovery and resolved outcomes still require exact runtime identity.
 ALTER TABLE vm_workspace_recoveries

@@ -41,9 +41,11 @@ from orchestrator.services.completion_lifecycle import (
 )
 from orchestrator.services.blocking_effect import joined_blocking_call
 from orchestrator.services.ssh_helpers import orchestrator_can_reach
-from orchestrator.services.vm_provisioner import VMTeardownIdentity
+from orchestrator.services.vm_provisioner import VMTeardownIdentity, VMTeardownResult
 from orchestrator.services.vm_workspace_recovery_store import (
     VMWorkspaceRecoveryStore,
+    cleanup_intent_digest,
+    completed_cleanup_outcome,
 )
 
 from orchestrator.services.lifecycle.types import Instance
@@ -837,26 +839,32 @@ class VMInstanceManager:
                 owner_id=bound,
                 identity=identity,
                 source="delete",
+                purge_disk=purge_disk,
                 permit=permit,
             )
             if cleanup is None:
                 return False
-            async with asyncio.timeout(LIFECYCLE_EXTERNAL_TIMEOUT_SECONDS):
-                outcome = await self._provisioner.release_vm_captured(
-                    bound,
-                    identity,
-                    purge_disk=purge_disk,
-                    entity_type=owner_kind,
-                    capture_snapshot=False,
-                )
+            replayed = completed_cleanup_outcome(cleanup)
+            if replayed is not None:
+                outcome = VMTeardownResult(replayed, replayed == "completed")
+            else:
+                async with asyncio.timeout(LIFECYCLE_EXTERNAL_TIMEOUT_SECONDS):
+                    outcome = await self._provisioner.release_vm_captured(
+                        bound,
+                        identity,
+                        purge_disk=purge_disk,
+                        entity_type=owner_kind,
+                        capture_snapshot=False,
+                    )
             if isinstance(
                 permit, LifecycleActionPermit
             ) and not await self._permit_external(permit):
                 return False
             if outcome.disposition == "identity_superseded":
-                await self._complete_destructive_cleanup(
-                    cleanup, outcome="identity_superseded"
-                )
+                if replayed is None:
+                    await self._complete_destructive_cleanup(
+                        cleanup, outcome="identity_superseded"
+                    )
                 if isinstance(permit, LifecycleActionPermit):
                     permit.skip("vm_identity_superseded", settled=True)
                 return True
@@ -869,7 +877,7 @@ class VMInstanceManager:
                     # or authorized control can retry promptly.
                     permit.skip("vm_retirement_retry_pending", settled=True)
                 return False
-            if outcome.disposition == "completed":
+            if outcome.disposition == "completed" and replayed is None:
                 await self._complete_destructive_cleanup(cleanup, outcome="completed")
             return bool(outcome.deleted)
         except Exception:
@@ -965,14 +973,22 @@ class VMInstanceManager:
                     owner_id=entity_id,
                     identity=identity,
                     source="orphan_delete",
+                    purge_disk=True,
                 )
                 if cleanup is None:
                     continue
-                async with asyncio.timeout(LIFECYCLE_EXTERNAL_TIMEOUT_SECONDS):
-                    outcome = await self._provisioner.delete_orphan_vm_captured(
-                        entity_id, identity, purge_disk=True
-                    )
-                if outcome.disposition in {"completed", "identity_superseded"}:
+                replayed = completed_cleanup_outcome(cleanup)
+                if replayed is not None:
+                    outcome = VMTeardownResult(replayed, replayed == "completed")
+                else:
+                    async with asyncio.timeout(LIFECYCLE_EXTERNAL_TIMEOUT_SECONDS):
+                        outcome = await self._provisioner.delete_orphan_vm_captured(
+                            entity_id, identity, purge_disk=True
+                        )
+                if replayed is None and outcome.disposition in {
+                    "completed",
+                    "identity_superseded",
+                }:
                     await self._complete_destructive_cleanup(
                         cleanup, outcome=outcome.disposition
                     )
@@ -1063,17 +1079,27 @@ class VMInstanceManager:
                             owner_id=str(job_id),
                             identity=identity,
                             source="kept_disk",
+                            purge_disk=True,
                         )
                         if cleanup is None:
                             continue
-                        outcome = await self._provisioner.release_vm_captured(
-                            str(job_id),
-                            identity,
-                            purge_disk=True,
-                            entity_type="job",
-                            capture_snapshot=False,
-                        )
-                    if outcome.disposition in {"completed", "identity_superseded"}:
+                        replayed = completed_cleanup_outcome(cleanup)
+                        if replayed is not None:
+                            outcome = VMTeardownResult(
+                                replayed, replayed == "completed"
+                            )
+                        else:
+                            outcome = await self._provisioner.release_vm_captured(
+                                str(job_id),
+                                identity,
+                                purge_disk=True,
+                                entity_type="job",
+                                capture_snapshot=False,
+                            )
+                    if replayed is None and outcome.disposition in {
+                        "completed",
+                        "identity_superseded",
+                    }:
                         await self._complete_destructive_cleanup(
                             cleanup, outcome=outcome.disposition
                         )
@@ -1111,17 +1137,25 @@ class VMInstanceManager:
                         owner_id=str(job_id),
                         identity=identity,
                         source="kept_disk",
+                        purge_disk=True,
                         permit=permit,
                     )
                     if cleanup is None:
                         continue
                     # Idempotent: a VM that is already gone 404s, which the
                     # provisioner treats as success, and the disk still goes.
-                    async with asyncio.timeout(LIFECYCLE_EXTERNAL_TIMEOUT_SECONDS):
-                        outcome = await self._provisioner.release_vm_captured(
-                            str(job_id), identity, purge_disk=True
-                        )
-                    if outcome.disposition in {"completed", "identity_superseded"}:
+                    replayed = completed_cleanup_outcome(cleanup)
+                    if replayed is not None:
+                        outcome = VMTeardownResult(replayed, replayed == "completed")
+                    else:
+                        async with asyncio.timeout(LIFECYCLE_EXTERNAL_TIMEOUT_SECONDS):
+                            outcome = await self._provisioner.release_vm_captured(
+                                str(job_id), identity, purge_disk=True
+                            )
+                    if replayed is None and outcome.disposition in {
+                        "completed",
+                        "identity_superseded",
+                    }:
                         await self._complete_destructive_cleanup(
                             cleanup, outcome=outcome.disposition
                         )
@@ -1152,6 +1186,7 @@ class VMInstanceManager:
         owner_id: str,
         identity: VMTeardownIdentity,
         source: str,
+        purge_disk: bool,
         permit: LifecycleActionPermit | None = None,
     ) -> Any | None:
         """Serialize an exact VM delete/prune before controller side effects."""
@@ -1186,6 +1221,18 @@ class VMInstanceManager:
                 pvc_uid=parsed_pvc_uid,
                 request_id=request_id,
                 source=f"lifecycle_vm_{source}"[:64],
+                intent_digest=cleanup_intent_digest(
+                    {
+                        "owner_kind": owner_kind,
+                        "owner_id": str(parsed_owner_id),
+                        "provision_generation": identity.provision_generation,
+                        "vm_uid": identity.vm_uid or "",
+                        "pvc_uid": str(parsed_pvc_uid or ""),
+                        "purge_disk": bool(purge_disk),
+                        "resource": "vm_workspace",
+                        "source": f"lifecycle_vm_{source}"[:64],
+                    }
+                ),
             )
         except Exception:
             logger.exception(

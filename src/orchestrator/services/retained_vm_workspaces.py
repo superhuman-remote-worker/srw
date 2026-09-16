@@ -273,6 +273,8 @@ async def reconcile_detached(db, provisioner):
         ):
             from orchestrator.services.vm_workspace_recovery_store import (
                 VMWorkspaceRecoveryStore,
+                cleanup_intent_digest,
+                completed_cleanup_outcome,
             )
 
             try:
@@ -289,11 +291,23 @@ async def reconcile_detached(db, provisioner):
                     f"retained-workspace-detach:{row['id']}:{generation}:{pvc_uid}",
                 ),
                 source="retained_workspace_detach",
+                intent_digest=cleanup_intent_digest(
+                    {
+                        "generation": str(generation),
+                        "owner_kind": "job",
+                        "owner_id": str(row["id"]),
+                        "pvc_uid": str(pvc_uid),
+                        "resource": "retained_workspace_binding",
+                        "source": "retained_workspace_detach",
+                    }
+                ),
             )
             if not cleanup.allowed:
                 continue
-            await provisioner._record_retained_detach(str(row["id"]), current)
-            if cleanup.admission_id is not None:
-                await recovery_store.complete_cleanup_permit(
-                    cleanup.admission_id, outcome="retained_workspace_detached"
-                )
+            replayed = completed_cleanup_outcome(cleanup)
+            if replayed is None:
+                await provisioner._record_retained_detach(str(row["id"]), current)
+                if cleanup.admission_id is not None:
+                    await recovery_store.complete_cleanup_permit(
+                        cleanup.admission_id, outcome="retained_workspace_detached"
+                    )

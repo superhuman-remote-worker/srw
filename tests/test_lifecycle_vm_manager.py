@@ -1935,6 +1935,28 @@ class TestKeptDiskSweep:
         provisioner.release_vm_captured.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_completed_cleanup_replay_finishes_later_state_write(self):
+        mgr, provisioner, db = self._mgr_with_kept([{"id": "job-1"}])
+        recovery_store = MagicMock()
+        recovery_store.acquire_cleanup_permit = AsyncMock(
+            return_value=SimpleNamespace(
+                allowed=True,
+                admission_id="cleanup-1",
+                completed_outcome="completed",
+                reason="cleanup_request_already_completed",
+            )
+        )
+        recovery_store.complete_cleanup_permit = AsyncMock()
+        mgr._workspace_recovery_store = recovery_store
+
+        assert await mgr.purge_kept_disks() == 1
+
+        recovery_store.acquire_cleanup_permit.assert_awaited_once()
+        provisioner.release_vm_captured.assert_not_awaited()
+        db.merge_vm_context.assert_awaited_once_with("job-1", {"rootdisk": None})
+        recovery_store.complete_cleanup_permit.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_control_marker_blocks_kept_disk_destructive_recheck(self):
         job = {
             "id": "job-1",

@@ -68,6 +68,7 @@ from orchestrator.services.session_runtime_admission import (
 )
 from orchestrator.services.vm_workspace_recovery_store import (
     acquire_vm_cleanup_permit,
+    completed_cleanup_outcome,
     complete_vm_cleanup_permit,
 )
 from shared.run_queue import LANE_PINNED
@@ -443,22 +444,27 @@ async def agent_abort_thread_vm_upgrade(
                 owner_id=thread_id,
                 identity=identity,
                 source="abort_thread_vm_upgrade",
+                purge_disk=True,
             )
             if not cleanup.allowed:
                 raise RuntimeError("VM cleanup held for workspace recovery")
-            outcome = await vm_provisioner.release_vm_captured(
-                thread_id,
-                identity,
-                entity_type="thread",
-                capture_snapshot=False,
-            )
-            if outcome.disposition in {"completed", "identity_superseded"}:
-                await complete_vm_cleanup_permit(
-                    dependencies.recovery_store,
-                    cleanup,
-                    outcome=outcome.disposition,
+            disposition = completed_cleanup_outcome(cleanup)
+            if disposition is None:
+                outcome = await vm_provisioner.release_vm_captured(
+                    thread_id,
+                    identity,
+                    entity_type="thread",
+                    purge_disk=True,
+                    capture_snapshot=False,
                 )
-            deleted = outcome.disposition == "completed"
+                disposition = outcome.disposition
+                if disposition in {"completed", "identity_superseded"}:
+                    await complete_vm_cleanup_permit(
+                        dependencies.recovery_store,
+                        cleanup,
+                        outcome=disposition,
+                    )
+            deleted = disposition == "completed"
         except Exception as e:
             logger.warning(
                 "abort-vm-upgrade: delete_thread_vm failed for %s: %s", thread_id, e

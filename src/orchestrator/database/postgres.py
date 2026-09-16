@@ -4569,12 +4569,27 @@ class PostgresDB:
 
         participant = await conn.fetchrow(
             "SELECT recovery_id FROM vm_workspace_recovery_jobs "
-            "WHERE job_id=$1 AND resolved_at IS NULL FOR UPDATE",
+            "WHERE job_id=$1 AND resolved_at IS NULL",
             job_uuid,
         )
         if participant is None:
             return
         recovery_id = participant["recovery_id"]
+        operation = await conn.fetchrow(
+            "SELECT id FROM vm_workspace_recoveries "
+            "WHERE id=$1 AND resolved_at IS NULL FOR UPDATE",
+            recovery_id,
+        )
+        if operation is None:
+            return
+        participants = await conn.fetch(
+            "SELECT job_id FROM vm_workspace_recovery_jobs "
+            "WHERE recovery_id=$1 AND resolved_at IS NULL "
+            "ORDER BY job_id FOR UPDATE",
+            recovery_id,
+        )
+        if not any(row["job_id"] == job_uuid for row in participants):
+            return
         await conn.execute(
             "UPDATE vm_workspace_recovery_jobs "
             "SET participation='cancelled',resolved_at=clock_timestamp(),"

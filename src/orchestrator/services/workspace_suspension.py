@@ -46,6 +46,7 @@ from orchestrator.services.vm_workspace_config import vm_provisioning_options
 from orchestrator.services.vm_workspace_recovery_store import (
     VMWorkspaceRecoveryStore,
     acquire_vm_cleanup_permit,
+    completed_cleanup_outcome,
     complete_vm_cleanup_permit,
 )
 from orchestrator.services.workspace_lifecycle import WorkspaceOwner
@@ -984,22 +985,27 @@ class WorkspaceSuspensionService:
                     owner_id=job_id,
                     identity=vm_identity,
                     source="job_workspace_suspension",
+                    purge_disk=not disk_survives_teardown,
                 )
                 if not cleanup.allowed:
                     raise RuntimeError("VM suspension held for workspace recovery")
-                outcome = await self._vm_provisioner.release_vm_captured(
-                    job_id,
-                    vm_identity,
-                    purge_disk=not disk_survives_teardown,
-                    capture_snapshot=False,
-                    entity_type="job",
-                )
-                if outcome.disposition in {"completed", "identity_superseded"}:
-                    await complete_vm_cleanup_permit(
-                        self._workspace_recovery_store,
-                        cleanup,
-                        outcome=outcome.disposition,
+                replayed = completed_cleanup_outcome(cleanup)
+                if replayed is not None:
+                    outcome = VMTeardownResult(replayed, replayed == "completed")
+                else:
+                    outcome = await self._vm_provisioner.release_vm_captured(
+                        job_id,
+                        vm_identity,
+                        purge_disk=not disk_survives_teardown,
+                        capture_snapshot=False,
+                        entity_type="job",
                     )
+                    if outcome.disposition in {"completed", "identity_superseded"}:
+                        await complete_vm_cleanup_permit(
+                            self._workspace_recovery_store,
+                            cleanup,
+                            outcome=outcome.disposition,
+                        )
                 if (
                     not isinstance(outcome, VMTeardownResult)
                     or outcome.disposition != "completed"
@@ -2024,28 +2030,33 @@ class WorkspaceSuspensionService:
                     owner_id=thread_id,
                     identity=vm_identity,
                     source="thread_workspace_suspension",
+                    purge_disk=False,
                 )
                 if not cleanup.allowed:
                     raise RuntimeError(
                         "thread VM suspension held for workspace recovery"
                     )
-                outcome = await self._vm_provisioner.release_vm_captured(
-                    thread_id,
-                    vm_identity,
-                    entity_type="thread",
-                    # Soft End is resumable. Even when the snapshot succeeded,
-                    # deleting the backing disk here would turn a later restore
-                    # failure into irreversible data loss. Permanent End owns
-                    # the only purge_disk=True path.
-                    purge_disk=False,
-                    capture_snapshot=False,
-                )
-                if outcome.disposition in {"completed", "identity_superseded"}:
-                    await complete_vm_cleanup_permit(
-                        self._workspace_recovery_store,
-                        cleanup,
-                        outcome=outcome.disposition,
+                replayed = completed_cleanup_outcome(cleanup)
+                if replayed is not None:
+                    outcome = VMTeardownResult(replayed, replayed == "completed")
+                else:
+                    outcome = await self._vm_provisioner.release_vm_captured(
+                        thread_id,
+                        vm_identity,
+                        entity_type="thread",
+                        # Soft End is resumable. Even when the snapshot succeeded,
+                        # deleting the backing disk here would turn a later restore
+                        # failure into irreversible data loss. Permanent End owns
+                        # the only purge_disk=True path.
+                        purge_disk=False,
+                        capture_snapshot=False,
                     )
+                    if outcome.disposition in {"completed", "identity_superseded"}:
+                        await complete_vm_cleanup_permit(
+                            self._workspace_recovery_store,
+                            cleanup,
+                            outcome=outcome.disposition,
+                        )
                 if (
                     not isinstance(outcome, VMTeardownResult)
                     or outcome.disposition != "completed"

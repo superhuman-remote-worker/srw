@@ -20835,7 +20835,9 @@ CREATE TABLE public.vm_workspace_cleanup_admissions (
     admitted_at timestamp with time zone DEFAULT clock_timestamp() NOT NULL,
     completed_at timestamp with time zone,
     outcome text,
+    intent_digest text NOT NULL,
     CONSTRAINT vm_workspace_cleanup_admissions_check CHECK ((((completed_at IS NULL) AND (outcome IS NULL)) OR ((completed_at IS NOT NULL) AND (outcome IS NOT NULL) AND (outcome <> ''::text)))),
+    CONSTRAINT vm_workspace_cleanup_admissions_intent_digest_check CHECK ((intent_digest <> ''::text)),
     CONSTRAINT vm_workspace_cleanup_admissions_owner_kind_check CHECK ((owner_kind = ANY (ARRAY['job'::text, 'thread'::text]))),
     CONSTRAINT vm_workspace_cleanup_admissions_source_check CHECK ((source <> ''::text))
 );

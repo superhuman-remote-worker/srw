@@ -32,6 +32,7 @@ from orchestrator.services.manifest_runtime_ownership import (
 )
 from orchestrator.services.vm_workspace_recovery_store import (
     acquire_vm_cleanup_permit,
+    completed_cleanup_outcome,
     complete_vm_cleanup_permit,
 )
 from shared.runtime.core.tool_policy import ToolPolicyError
@@ -200,6 +201,7 @@ class JobControlOperations:
                 owner_id=job_id,
                 identity=identity,
                 source="public_vm_delete",
+                purge_disk=True,
             )
         except Exception as exc:
             raise HTTPException(
@@ -211,19 +213,23 @@ class JobControlOperations:
                 status_code=409,
                 detail="VM cleanup is held for workspace recovery",
             )
-        outcome = await self.dependencies.vm_provisioner.release_vm_captured(
-            job_id,
-            identity,
-            entity_type="job",
-            capture_snapshot=False,
-        )
-        if outcome.disposition in {"completed", "identity_superseded"}:
-            await complete_vm_cleanup_permit(
-                self.dependencies.recovery_store,
-                permit,
-                outcome=outcome.disposition,
+        disposition = completed_cleanup_outcome(permit)
+        if disposition is None:
+            outcome = await self.dependencies.vm_provisioner.release_vm_captured(
+                job_id,
+                identity,
+                entity_type="job",
+                purge_disk=True,
+                capture_snapshot=False,
             )
-        if outcome.disposition != "completed":
+            disposition = outcome.disposition
+            if disposition in {"completed", "identity_superseded"}:
+                await complete_vm_cleanup_permit(
+                    self.dependencies.recovery_store,
+                    permit,
+                    outcome=disposition,
+                )
+        if disposition != "completed":
             raise HTTPException(status_code=500, detail="Failed to delete VM")
         return {"status": "deleting", "job_id": job_id}
 

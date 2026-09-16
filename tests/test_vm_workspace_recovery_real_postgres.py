@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+from contextlib import asynccontextmanager
 from datetime import timedelta
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -202,6 +203,7 @@ async def test_recovery_hold_and_cleanup_admission_have_one_winner(app_pg) -> No
         pvc_uid=kwargs["root_pvc_uid"],
         request_id=cleanup_request_id,
         source="terminal_cleanup",
+        intent_digest="sha256:terminal-cleanup",
     )
     assert cleanup.allowed
     cleanup_replay = await store.acquire_cleanup_permit(
@@ -210,6 +212,7 @@ async def test_recovery_hold_and_cleanup_admission_have_one_winner(app_pg) -> No
         pvc_uid=kwargs["root_pvc_uid"],
         request_id=cleanup_request_id,
         source="terminal_cleanup",
+        intent_digest="sha256:terminal-cleanup",
     )
     assert cleanup_replay.allowed
     assert cleanup_replay.admission_id == cleanup.admission_id
@@ -220,6 +223,7 @@ async def test_recovery_hold_and_cleanup_admission_have_one_winner(app_pg) -> No
         pvc_uid=kwargs["root_pvc_uid"],
         request_id=uuid4(),
         source="terminal_cleanup_retry",
+        intent_digest="sha256:terminal-cleanup-retry",
     )
     assert not competing_cleanup.allowed
     assert competing_cleanup.reason == "workspace_cleanup_already_admitted"
@@ -241,6 +245,7 @@ async def test_recovery_hold_and_cleanup_admission_have_one_winner(app_pg) -> No
         pvc_uid=kwargs["root_pvc_uid"],
         request_id=uuid4(),
         source="terminal_cleanup",
+        intent_digest="sha256:terminal-cleanup-after-recovery",
     )
     assert not blocked.allowed
     assert blocked.recovery_id == disposition.operation_id
@@ -258,6 +263,7 @@ async def test_cleanup_replay_rejects_changed_resource_intent(app_pg) -> None:
         pvc_uid=first_pvc,
         request_id=request_id,
         source="public_vm_delete",
+        intent_digest="sha256:public-vm-delete",
     )
     assert permit.allowed
 
@@ -268,6 +274,7 @@ async def test_cleanup_replay_rejects_changed_resource_intent(app_pg) -> None:
             pvc_uid=first_pvc,
             request_id=request_id,
             source="completion_workspace_teardown",
+            intent_digest="sha256:public-vm-delete",
         )
     assert changed_source.value.code == "cleanup_request_id_reused"
 
@@ -278,8 +285,54 @@ async def test_cleanup_replay_rejects_changed_resource_intent(app_pg) -> None:
             pvc_uid=uuid4(),
             request_id=request_id,
             source="public_vm_delete",
+            intent_digest="sha256:public-vm-delete",
         )
     assert changed_pvc.value.code == "cleanup_request_id_reused"
+
+
+@pytest.mark.asyncio
+async def test_cleanup_replay_binds_keep_vs_purge_and_returns_completed_outcome(
+    app_pg,
+) -> None:
+    store = VMWorkspaceRecoveryStore(app_pg, worker_id="test-worker")
+    owner_id = uuid4()
+    request_id = uuid4()
+    pvc_uid = uuid4()
+    keep_intent = "sha256:keep-exact-vm-and-pvc"
+    permit = await store.acquire_cleanup_permit(
+        owner_kind="job",
+        owner_id=owner_id,
+        pvc_uid=pvc_uid,
+        request_id=request_id,
+        source="lifecycle_vm_delete",
+        intent_digest=keep_intent,
+    )
+    assert permit.allowed and permit.completed_outcome is None
+
+    with pytest.raises(WorkspaceRecoveryControlConflict) as changed_mode:
+        await store.acquire_cleanup_permit(
+            owner_kind="job",
+            owner_id=owner_id,
+            pvc_uid=pvc_uid,
+            request_id=request_id,
+            source="lifecycle_vm_delete",
+            intent_digest="sha256:purge-exact-vm-and-pvc",
+        )
+    assert changed_mode.value.code == "cleanup_request_id_reused"
+
+    assert await store.complete_cleanup_permit(permit.admission_id, outcome="completed")
+    replay = await store.acquire_cleanup_permit(
+        owner_kind="job",
+        owner_id=owner_id,
+        pvc_uid=pvc_uid,
+        request_id=request_id,
+        source="lifecycle_vm_delete",
+        intent_digest=keep_intent,
+    )
+    assert replay.allowed
+    assert replay.admission_id == permit.admission_id
+    assert replay.completed_outcome == "completed"
+    assert replay.reason == "cleanup_request_already_completed"
 
 
 @pytest.mark.asyncio
@@ -307,6 +360,7 @@ async def test_parent_cleanup_blocks_stale_child_owner_recovery_without_pvc(
         pvc_uid=None,
         request_id=uuid4(),
         source="parent_cleanup",
+        intent_digest="sha256:parent-cleanup",
     )
     assert cleanup.allowed
     kwargs = admission_kwargs(child_id, lease_token)
@@ -551,6 +605,109 @@ async def test_pinned_cancel_resolves_only_requesting_recovery_participant(
     assert by_job[other_id]["resolved_at"] is None
     assert operation["phase"] == "paused_attention" and operation["resolved_at"] is None
     assert pin_released is False
+
+
+@pytest.mark.asyncio
+async def test_concurrent_final_pinned_cancellations_resolve_operation_once(
+    app_pg,
+) -> None:
+    recovery_id = await insert_recovery(app_pg, phase="paused_attention")
+    first_id = OWNER_ID
+    second_id = uuid4()
+    async with app_pg.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO jobs (id,description,status,execution_lane,freeze_data) VALUES "
+            "($1,'first participant','paused','pinned',jsonb_build_object("
+            "'freeze_type','workspace_recovery','recovery_id',$3::text)),"
+            "($2,'second participant','paused','pinned',jsonb_build_object("
+            "'freeze_type','workspace_recovery','recovery_id',$3::text))",
+            first_id,
+            second_id,
+            str(recovery_id),
+        )
+        await conn.execute(
+            "INSERT INTO vm_workspace_recovery_jobs "
+            "(recovery_id,job_id,prior_queue_state,prior_job_status,participation) VALUES "
+            "($1,$2,'non_worker','processing','attention'),"
+            "($1,$3,'non_worker','processing','attention')",
+            recovery_id,
+            first_id,
+            second_id,
+        )
+        recovery = await conn.fetchrow(
+            "SELECT root_pvc_uid,provision_generation FROM vm_workspace_recoveries WHERE id=$1",
+            recovery_id,
+        )
+        await conn.execute(
+            "INSERT INTO vm_workspace_recovery_retention_pins "
+            "(recovery_id,pvc_uid,provision_generation) VALUES ($1,$2,$3)",
+            recovery_id,
+            recovery["root_pvc_uid"],
+            recovery["provision_generation"],
+        )
+    remaining_checks = 0
+    both_remaining_checks = asyncio.Event()
+
+    class BarrierConnection:
+        def __init__(self, conn):
+            self._conn = conn
+
+        def __getattr__(self, name):
+            return getattr(self._conn, name)
+
+        async def fetchval(self, query, *args):
+            nonlocal remaining_checks
+            if (
+                "SELECT EXISTS" in query
+                and "vm_workspace_recovery_jobs" in query
+                and "resolved_at IS NULL" in query
+            ):
+                remaining_checks += 1
+                if remaining_checks == 2:
+                    both_remaining_checks.set()
+                try:
+                    await asyncio.wait_for(both_remaining_checks.wait(), timeout=0.25)
+                except TimeoutError:
+                    # The fixed implementation serializes on the operation row,
+                    # so the second transaction cannot reach this query until
+                    # the first one commits. Let that serialized caller proceed.
+                    pass
+            return await self._conn.fetchval(query, *args)
+
+    @asynccontextmanager
+    async def acquire():
+        async with app_pg.acquire() as conn:
+            yield BarrierConnection(conn)
+
+    db = PostgresDB.__new__(PostgresDB)
+    db.acquire = acquire
+
+    results = await asyncio.gather(
+        db.linearize_pinned_cancel(str(first_id), expected_status="paused"),
+        db.linearize_pinned_cancel(str(second_id), expected_status="paused"),
+    )
+
+    assert results == [True, True]
+    async with app_pg.acquire() as conn:
+        operation = await conn.fetchrow(
+            "SELECT phase,resolved_at,version FROM vm_workspace_recoveries WHERE id=$1",
+            recovery_id,
+        )
+        unresolved = await conn.fetchval(
+            "SELECT count(*) FROM vm_workspace_recovery_jobs "
+            "WHERE recovery_id=$1 AND resolved_at IS NULL",
+            recovery_id,
+        )
+        released_pins = await conn.fetchval(
+            "SELECT count(*) FROM vm_workspace_recovery_retention_pins "
+            "WHERE recovery_id=$1 AND released_at IS NOT NULL",
+            recovery_id,
+        )
+    assert unresolved == 0
+    assert operation["phase"] == "cancelled"
+    assert operation["resolved_at"] is not None
+    assert operation["version"] == 2
+    assert released_pins == 1
 
 
 def admission_kwargs(

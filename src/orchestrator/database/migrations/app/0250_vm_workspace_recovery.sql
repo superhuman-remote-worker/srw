@@ -1,6 +1,6 @@
--- migration:     0249_vm_workspace_recovery.sql
+-- migration:     0250_vm_workspace_recovery.sql
 -- description:   Durable authority and evidence for bounded VM workspace recovery.
--- depends-on:    0248_retire_unkeyed_credential_provenance.sql
+-- depends-on:    0249_stateless_conversation_rewind.sql
 -- transactional: yes
 
 BEGIN;

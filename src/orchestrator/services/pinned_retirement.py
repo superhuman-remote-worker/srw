@@ -31,6 +31,7 @@ from orchestrator.services.pinned_agent_authority import (
 from orchestrator.services.workspace_lifecycle import WorkspaceOwner
 from orchestrator.services.vm_workspace_recovery_store import (
     acquire_vm_cleanup_permit,
+    completed_cleanup_outcome,
     complete_vm_cleanup_permit,
 )
 
@@ -58,13 +59,16 @@ class PinnedRetirementOperations:
 
     dependencies: PinnedRetirementDependencies
 
-    async def _admit_vm_cleanup(self, thread_id: str, identity: Any) -> Any | None:
+    async def _admit_vm_cleanup(
+        self, thread_id: str, identity: Any, *, purge_disk: bool
+    ) -> Any | None:
         permit = await acquire_vm_cleanup_permit(
             self.dependencies.recovery_store,
             owner_kind="thread",
             owner_id=thread_id,
             identity=identity,
             source="pinned_thread_retirement",
+            purge_disk=purge_disk,
         )
         return permit if permit.allowed else None
 
@@ -1790,25 +1794,34 @@ class PinnedRetirementOperations:
             if not isinstance(workspace, Mapping) or not isinstance(binding, Mapping):
                 return False
             if captured_vm_identity is not None:
-                cleanup = await self._admit_vm_cleanup(thread_id, captured_vm_identity)
-                if cleanup is None:
-                    return False
-                vm_result = await self.dependencies.vm_provisioner.release_vm_captured(
+                cleanup = await self._admit_vm_cleanup(
                     thread_id,
                     captured_vm_identity,
-                    ssh_host=captured_vm_identity.ssh_host,
-                    ssh_port=captured_vm_identity.ssh_port,
                     purge_disk=permanent,
-                    entity_type="thread",
-                    capture_snapshot=False,
                 )
-                await self._complete_vm_cleanup(cleanup, vm_result.disposition)
-                if vm_result.disposition != "completed":
+                if cleanup is None:
+                    return False
+                disposition = completed_cleanup_outcome(cleanup)
+                if disposition is None:
+                    vm_result = (
+                        await self.dependencies.vm_provisioner.release_vm_captured(
+                            thread_id,
+                            captured_vm_identity,
+                            ssh_host=captured_vm_identity.ssh_host,
+                            ssh_port=captured_vm_identity.ssh_port,
+                            purge_disk=permanent,
+                            entity_type="thread",
+                            capture_snapshot=False,
+                        )
+                    )
+                    disposition = vm_result.disposition
+                    await self._complete_vm_cleanup(cleanup, disposition)
+                if disposition != "completed":
                     self.dependencies.logger.warning(
                         "Pinned retirement VM process-zero remains retryable for "
                         "thread %s: %s",
                         thread_id,
-                        vm_result.disposition,
+                        disposition,
                     )
                     return False
                 receipt = await self.dependencies.store.acknowledge_pinned_thread_local_quiescence(
@@ -2219,20 +2232,27 @@ class PinnedRetirementOperations:
                 ssh_host_key_fingerprint=vm.get("ssh_host_key_fingerprint"),
                 credential_runtime_started=vm.get("credential_runtime_started"),
             )
-            cleanup = await self._admit_vm_cleanup(thread_id, vm_identity)
-            if cleanup is None:
-                raise RuntimeError("exact VM cleanup held for workspace recovery")
-            vm_result = await self.dependencies.vm_provisioner.release_vm_captured(
+            cleanup = await self._admit_vm_cleanup(
                 thread_id,
                 vm_identity,
-                ssh_host=vm.get("ssh_host"),
-                ssh_port=vm.get("ssh_port"),
                 purge_disk=permanent,
-                entity_type="thread",
-                capture_snapshot=False,
             )
-            await self._complete_vm_cleanup(cleanup, vm_result.disposition)
-            if vm_result.disposition != "completed":
+            if cleanup is None:
+                raise RuntimeError("exact VM cleanup held for workspace recovery")
+            disposition = completed_cleanup_outcome(cleanup)
+            if disposition is None:
+                vm_result = await self.dependencies.vm_provisioner.release_vm_captured(
+                    thread_id,
+                    vm_identity,
+                    ssh_host=vm.get("ssh_host"),
+                    ssh_port=vm.get("ssh_port"),
+                    purge_disk=permanent,
+                    entity_type="thread",
+                    capture_snapshot=False,
+                )
+                disposition = vm_result.disposition
+                await self._complete_vm_cleanup(cleanup, disposition)
+            if disposition != "completed":
                 raise RuntimeError("exact VM cleanup is retryable")
             completed_quiescence_protocol = "workspace_actuator_zero_v1"
             completed_external_cleanup_protocol = "workspace_actuator_zero_v1"

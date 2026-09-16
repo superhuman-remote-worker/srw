@@ -87,6 +87,7 @@ class TestThreadVmReleasedOnTeardown:
             ssh_host="vm-thread",
             ssh_port=30022,
             entity_type="thread",
+            purge_disk=True,
         )
 
     @pytest.mark.asyncio
@@ -101,6 +102,7 @@ class TestThreadVmReleasedOnTeardown:
             ssh_host="vm-thread",
             ssh_port=30022,
             entity_type="thread",
+            purge_disk=True,
         )
 
     @pytest.mark.asyncio

@@ -2431,6 +2431,7 @@ async def test_flagged_vm_teardown_captures_replays_and_archives_exact_identity(
         identity,
         ssh_host="100.64.0.8",
         ssh_port=22,
+        purge_disk=True,
     )
     legacy_cleanup.assert_not_awaited()
 
@@ -2486,6 +2487,7 @@ async def test_vm_identity_mismatch_supersedes_only_s36_effect(
         ),
         ssh_host="100.64.0.8",
         ssh_port=22,
+        purge_disk=True,
     )
 
 
