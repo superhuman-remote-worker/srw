@@ -471,6 +471,279 @@ async def test_vm_workspace_failure_keeps_recovery_when_disposition_lookup_times
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error", [RuntimeError("driver bug"), ValueError("bad SQL input")]
+)
+async def test_unrelated_heartbeat_exception_and_lookup_failure_do_not_create_recovery(
+    worker_runtime, monkeypatch, error
+):
+    monkeypatch.setenv("VM_WORKSPACE_RECOVERY_ENABLED", "true")
+    monkeypatch.setattr(turn_executor, "HEARTBEAT_INTERVAL_SECONDS", 0)
+    claim = _claim()
+    executor, agent, client, renew, _, _, _ = _install(monkeypatch, claim, {})
+    executor._worker_workspace_backend = "vm"
+    renew.side_effect = [error, asyncio.CancelledError()]
+    client.get_workspace_recovery_disposition.side_effect = TimeoutError(
+        "lookup offline"
+    )
+    with pytest.raises(asyncio.CancelledError):
+        await executor._worker_heartbeat_loop(claim)
+    assert executor._worker_workspace_recovery is None
+    assert not executor._lease.lost.is_set()
+    client.report_workspace_recovery.assert_not_awaited()
+    assert agent.cleanup_calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "renewal_result",
+    [TimeoutError("response lost"), ConnectionError("disconnected"), None],
+)
+@pytest.mark.parametrize("retirement_fails", [False, True])
+async def test_ambiguous_heartbeat_defers_to_reaper_without_claiming_workspace_recovery(
+    worker_runtime, monkeypatch, renewal_result, retirement_fails
+):
+    monkeypatch.setenv("VM_WORKSPACE_RECOVERY_ENABLED", "true")
+    monkeypatch.setattr(turn_executor, "HEARTBEAT_INTERVAL_SECONDS", 0.001)
+    claim = _claim(attempts=5)
+    writer = _FakeAuditWriter()
+    executor, agent, client, renew, rotate, complete, release = _install(
+        monkeypatch, claim, {}, audit_writer=writer
+    )
+    client.backend = "vm"
+    client.get_workspace_recovery_disposition.side_effect = TimeoutError(
+        "lookup offline"
+    )
+    renew.side_effect = [_renewal(), renewal_result]
+
+    async def stream():
+        await asyncio.Event().wait()
+        yield {}
+
+    agent.process_job = AsyncMock(return_value=stream())
+    if retirement_fails:
+        agent.hold_worker_finalization = AsyncMock(
+            side_effect=RuntimeError("retirement failed")
+        )
+        agent.quiesce_worker_workspace_recovery = AsyncMock(
+            side_effect=RuntimeError("retirement failed")
+        )
+    await asyncio.wait_for(executor._serve_worker_claim(claim), 1)
+    assert executor._worker_workspace_recovery is None
+    assert _claim_timing_payload(writer)["outcome"] == (
+        "quarantined:lease_disposition_uncertain"
+        if retirement_fails
+        else "lease_disposition_uncertain"
+    )
+    assert executor._worker_quarantined is retirement_fails
+    assert executor._stop.is_set() is retirement_fails
+    assert executor._worker_runtime_quiesced is not retirement_fails
+    client.report_workspace_recovery.assert_not_awaited()
+    client.report_completion.assert_not_awaited()
+    rotate.assert_not_awaited()
+    complete.assert_not_awaited()
+    release.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("final_receipt", [False, True])
+@pytest.mark.parametrize("report_result", [False, True])
+async def test_terminal_shell_decision_joins_heartbeat_and_rechecks_exact_disposition(
+    worker_runtime, monkeypatch, final_receipt, report_result
+):
+    monkeypatch.setenv("VM_WORKSPACE_RECOVERY_ENABLED", "true")
+    monkeypatch.setattr(turn_executor, "HEARTBEAT_INTERVAL_SECONDS", 0.001)
+    claim = _claim(attempts=5)
+    writer = _FakeAuditWriter()
+    executor, agent, client, renew, _, complete, release = _install(
+        monkeypatch,
+        claim,
+        {"should_stop": True, "goal_achieved": True},
+        audit_writer=writer,
+        report_result=report_result,
+    )
+    client.backend = "vm"
+    retiring = asyncio.Event()
+    lookup_started = asyncio.Event()
+    cleanup_started = asyncio.Event()
+    receipt = _recovery_receipt(claim)
+    heartbeat = None
+    destructive = []
+    publication_closed_at_cleanup = []
+
+    async def renewal(*args, **kwargs):
+        if (
+            asyncio.current_task().get_name().startswith("worker-lease-heartbeat")
+            and retiring.is_set()
+        ):
+            return None
+        return _renewal(
+            "completed" if client.report_completion.await_count else "processing"
+        )
+
+    async def lookup(*args, **kwargs):
+        nonlocal heartbeat
+        if asyncio.current_task().get_name().startswith("worker-lease-heartbeat"):
+            heartbeat = asyncio.current_task()
+            lookup_started.set()
+            await cleanup_started.wait()
+            return receipt
+        return receipt if lookup_started.is_set() and final_receipt else None
+
+    async def hold(*, strict=False):
+        retiring.set()
+        await lookup_started.wait()
+
+    async def cleanup(*, preserve_shell):
+        publication_closed_at_cleanup.append(heartbeat.done())
+        cleanup_started.set()
+        try:
+            await asyncio.shield(heartbeat)
+        except asyncio.CancelledError:
+            assert heartbeat.cancelled()
+        if not preserve_shell:
+            destructive.append("remote shell destroyed")
+
+    renew.side_effect = renewal
+    client.get_workspace_recovery_disposition.side_effect = lookup
+    agent.hold_worker_finalization = hold
+    agent.cleanup_worker_claim = cleanup
+    await asyncio.wait_for(executor._serve_worker_claim(claim), 1)
+    assert publication_closed_at_cleanup == [True]
+    assert destructive == ([] if final_receipt else ["remote shell destroyed"])
+    if final_receipt:
+        assert executor._worker_workspace_recovery.disposition == receipt
+        assert _claim_timing_payload(writer)["outcome"] == "workspace_recovery"
+        complete.assert_not_awaited()
+    else:
+        assert executor._worker_workspace_recovery is None
+        if report_result:
+            complete.assert_awaited_once()
+        else:
+            complete.assert_not_awaited()
+    if final_receipt or report_result:
+        release.assert_not_awaited()
+    else:
+        release.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_renewal_uncertainty_during_rotation_cleanup_defers_queue_action(
+    worker_runtime, monkeypatch
+):
+    monkeypatch.setenv("VM_WORKSPACE_RECOVERY_ENABLED", "true")
+    monkeypatch.setattr(turn_executor, "HEARTBEAT_INTERVAL_SECONDS", 0.001)
+    claim = _claim()
+    executor, agent, client, renew, rotate, complete, release = _install(
+        monkeypatch,
+        claim,
+        {"should_stop": True, "freeze_data": {"freeze_type": "batch_boundary"}},
+    )
+    client.backend = "vm"
+    retiring = asyncio.Event()
+
+    async def renewal(*args, **kwargs):
+        if retiring.is_set():
+            raise TimeoutError("renewal response lost")
+        return _renewal()
+
+    async def hold(*, strict=False):
+        retiring.set()
+        await executor._lease.lost.wait()
+
+    renew.side_effect = renewal
+    client.get_workspace_recovery_disposition.side_effect = TimeoutError(
+        "lookup offline"
+    )
+    agent.hold_worker_finalization = hold
+    await asyncio.wait_for(executor._serve_worker_claim(claim), 1)
+    assert executor._worker_workspace_recovery is None
+    rotate.assert_not_awaited()
+    complete.assert_not_awaited()
+    release.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_bundle_uses_strict_uncertainty_handoff_before_cleanup(
+    worker_runtime, monkeypatch
+):
+    monkeypatch.setenv("VM_WORKSPACE_RECOVERY_ENABLED", "true")
+    claim = _claim(attempts=5)
+    writer = _FakeAuditWriter()
+    executor, agent, client, _, rotate, complete, release = _install(
+        monkeypatch, claim, {}, audit_writer=writer
+    )
+    client.get_claim_bundle = AsyncMock(
+        side_effect=TimeoutError("bundle response lost")
+    )
+    client.get_workspace_recovery_disposition.side_effect = TimeoutError(
+        "lookup offline"
+    )
+    await executor._serve_worker_claim(claim)
+    assert agent.cleanup_calls == [True]
+    assert executor._worker_runtime_quiesced
+    assert executor._worker_workspace_recovery is None
+    assert _claim_timing_payload(writer)["outcome"] == "lease_disposition_uncertain"
+    client.report_workspace_recovery.assert_not_awaited()
+    client.report_completion.assert_not_awaited()
+    rotate.assert_not_awaited()
+    complete.assert_not_awaited()
+    release.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_nonjoining_terminal_heartbeat_quarantines_without_shell_destruction(
+    worker_runtime, monkeypatch
+):
+    monkeypatch.setenv("VM_WORKSPACE_RECOVERY_ENABLED", "true")
+    monkeypatch.setattr(turn_executor, "HEARTBEAT_INTERVAL_SECONDS", 0.001)
+    monkeypatch.setattr(turn_executor, "WORKER_RECOVERY_QUIESCE_SECONDS", 0.01)
+    claim = _claim()
+    executor, agent, client, renew, _, complete, release = _install(
+        monkeypatch, claim, {"should_stop": True, "goal_achieved": True}
+    )
+    client.backend = "vm"
+    retiring = asyncio.Event()
+    lookup_started = asyncio.Event()
+    publisher_release = asyncio.Event()
+
+    async def renewal(*args, **kwargs):
+        return None if retiring.is_set() else _renewal()
+
+    async def lookup(*args, **kwargs):
+        if retiring.is_set():
+            lookup_started.set()
+            while not publisher_release.is_set():
+                try:
+                    await publisher_release.wait()
+                except asyncio.CancelledError:
+                    pass
+        return None
+
+    async def hold(*, strict=False):
+        retiring.set()
+        await lookup_started.wait()
+
+    renew.side_effect = renewal
+    client.get_workspace_recovery_disposition.side_effect = lookup
+    agent.hold_worker_finalization = hold
+    task = asyncio.create_task(executor._serve_worker_claim(claim))
+    try:
+        done, _ = await asyncio.wait({task}, timeout=0.2)
+        assert task in done, (
+            "quarantined executor waited again for its unjoined heartbeat"
+        )
+    finally:
+        publisher_release.set()
+        await task
+    assert executor._worker_quarantined
+    assert executor._stop.is_set()
+    assert agent.cleanup_calls == []
+    complete.assert_not_awaited()
+    release.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("retirement_fails", [False, True])
 async def test_heartbeat_recovery_during_cleanup_retains_evidence_until_quiesced(
     worker_runtime, monkeypatch, retirement_fails
