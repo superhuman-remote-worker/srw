@@ -28,6 +28,23 @@ def _json(value: Any) -> Any:
     return value
 
 
+def _job_workspace_owner(job_id: UUID, job: Any) -> tuple[UUID, bool]:
+    """Resolve the supported direct-parent contract without guessing malformed flags."""
+    if job is None:
+        return job_id, True
+    context = _json(job["context"]) if job["context"] is not None else {}
+    if not isinstance(context, dict):
+        return job_id, True
+    inherits = context.get("inherits_parent_workspace", False)
+    if inherits is False:
+        return job_id, False
+    parent_id = job["parent_job_id"]
+    if (inherits is True or inherits == "true") and parent_id is not None:
+        return parent_id, False
+    # Conservatively contain the possible parent workspace as attention-only.
+    return parent_id or job_id, True
+
+
 @dataclass(frozen=True, slots=True)
 class RecoveryClaim:
     operation_id: UUID
@@ -142,10 +159,46 @@ class VMWorkspaceRecoveryStore:
                 if prior is not None:
                     return prior
 
-                await conn.execute(
-                    "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
-                    f"workspace-recovery:{owner_kind}:{owner_id}",
+                selected_owner = (owner_kind, owner_id)
+                membership = await conn.fetchrow(
+                    "SELECT parent_job_id, context FROM jobs WHERE id=$1", job_id
                 )
+                # Both sides of an inheritance toggle must be locked before
+                # any queue/job row. A caller's pre-network owner selection is
+                # not authoritative after waiting for the membership writer.
+                owner_locks = {selected_owner, ("job", job_id)}
+                if membership is not None and membership["parent_job_id"] is not None:
+                    owner_locks.add(("job", membership["parent_job_id"]))
+                for kind, identifier in sorted(owner_locks):
+                    await conn.execute(
+                        "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+                        f"workspace-recovery:{kind}:{identifier}",
+                    )
+                membership = await conn.fetchrow(
+                    "SELECT parent_job_id, context FROM jobs WHERE id=$1", job_id
+                )
+                current_owner, owner_ambiguous = _job_workspace_owner(
+                    job_id, membership
+                )
+                if ("job", current_owner) not in owner_locks:
+                    # An uncoordinated parent-id writer changed the snapshot.
+                    # Fence the reporter as attention; never acquire a new
+                    # advisory owner out of canonical order or auto-recover.
+                    current_owner, owner_ambiguous = job_id, True
+                elif current_owner != job_id:
+                    parent = await conn.fetchrow(
+                        "SELECT parent_job_id, context FROM jobs WHERE id=$1",
+                        current_owner,
+                    )
+                    parent_owner, parent_ambiguous = _job_workspace_owner(
+                        current_owner, parent
+                    )
+                    owner_ambiguous |= parent_ambiguous or parent_owner != current_owner
+                owner_conflict = owner_ambiguous or selected_owner != (
+                    "job",
+                    current_owner,
+                )
+                owner_kind, owner_id = "job", current_owner
                 prior = await self._accepted_request(
                     conn,
                     job_id=job_id,
@@ -186,7 +239,8 @@ class VMWorkspaceRecoveryStore:
                 jobs: dict[UUID, Any] = {}
                 for member in members:
                     jobs[member["id"]] = await conn.fetchrow(
-                        "SELECT status, freeze_data, context, execution_lane FROM jobs WHERE id=$1 FOR UPDATE",
+                        "SELECT status, freeze_data, context, execution_lane, parent_job_id "
+                        "FROM jobs WHERE id=$1 FOR UPDATE",
                         member["id"],
                     )
                 queue = queues.get(job_id)
@@ -200,22 +254,65 @@ class VMWorkspaceRecoveryStore:
                 job = jobs.get(job_id)
                 if job is None:
                     raise RuntimeError("recovery job does not exist")
+                locked_owner, locked_ambiguous = _job_workspace_owner(job_id, job)
+                owner_conflict |= locked_ambiguous or locked_owner != owner_id
                 attempts: dict[UUID, Any] = {}
+                references: dict[UUID, Any] = {}
+                uncertain_members: list[str] = []
                 for member in members:
                     member_id = member["id"]
                     if jobs[member_id]["execution_lane"] != "stateless":
                         continue
                     if queues[member_id]["unit_kind"] != "worker_batch":
                         raise RuntimeError("workspace recovery queue kind changed")
-                    if queues[member_id]["state"] == "leased":
-                        attempts[member_id] = await conn.fetchrow(
-                            "SELECT job_id FROM worker_batch_attempts "
-                            "WHERE job_id=$1 AND lease_token=$2 FOR UPDATE",
-                            member_id,
-                            queues[member_id]["lease_token"],
+                    member_queue = queues[member_id]
+                    exact_attempt = await conn.fetchrow(
+                        "SELECT * FROM worker_batch_attempts "
+                        "WHERE job_id=$1 AND lease_token=$2 FOR UPDATE",
+                        member_id,
+                        member_queue["lease_token"],
+                    )
+                    latest_attempt = await conn.fetchrow(
+                        "SELECT * FROM worker_batch_attempts WHERE job_id=$1 "
+                        "ORDER BY lease_token DESC LIMIT 1 FOR UPDATE",
+                        member_id,
+                    )
+                    context = _json(jobs[member_id]["context"]) or {}
+                    never_started = bool(
+                        jobs[member_id]["status"] == "created"
+                        and latest_attempt is None
+                        and member_queue["lease_token"] == 0
+                        and member_queue["attempts_since_completion"] == 0
+                        and member_queue["park_reason"] is None
+                        and (
+                            member_id in missing_queues
+                            or member_queue["state"] == "queued"
                         )
+                        and isinstance(context, dict)
+                        and "_workspace_dispatch_authority" not in context
+                    )
+                    references[member_id] = {
+                        "queue": dict(member_queue)
+                        if member_id not in missing_queues
+                        else {"state": "absent"},
+                        "attempt": dict(exact_attempt)
+                        if exact_attempt is not None
+                        else None,
+                        "latest_attempt": dict(latest_attempt)
+                        if latest_attempt is not None
+                        else None,
+                        "never_started": never_started,
+                    }
+                    if member_queue["state"] == "leased":
+                        attempts[member_id] = exact_attempt
+                    elif not never_started:
+                        # A queued/parked row does not prove execution safety.
+                        # Missing rows/history or an operator park retain debt.
+                        uncertain_members.append(str(member_id))
                 attempt = attempts.get(job_id)
-                attention_required = any(value is None for value in attempts.values())
+                attention_required = bool(uncertain_members) or any(
+                    value is None for value in attempts.values()
+                )
                 # A pre-existing user/completion freeze is independent intent;
                 # preserve its reference and keep the entire workspace held.
                 frozen_members = [
@@ -230,9 +327,13 @@ class VMWorkspaceRecoveryStore:
                     for member_id, member_job in jobs.items()
                     if member_job["execution_lane"] != "stateless"
                 ]
-                attention_required = attention_required or bool(unsupported_writers)
+                attention_required = (
+                    attention_required or bool(unsupported_writers) or owner_conflict
+                )
                 disposition_code = (
-                    WorkspaceRecoveryCode.SHARED_WRITERS_UNFENCED
+                    WorkspaceRecoveryCode.IDENTITY_CONFLICT
+                    if owner_conflict
+                    else WorkspaceRecoveryCode.SHARED_WRITERS_UNFENCED
                     if unsupported_writers
                     else WorkspaceRecoveryCode.TOOL_OUTCOME_UNKNOWN
                     if attention_required
@@ -241,10 +342,30 @@ class VMWorkspaceRecoveryStore:
                 phase = "paused_attention" if attention_required else "recovering"
                 diagnostic = (
                     {
+                        "reason": "canonical_workspace_owner_changed_or_ambiguous",
+                        "selected_owner": {
+                            "kind": selected_owner[0],
+                            "id": str(selected_owner[1]),
+                        },
+                        "observed_owner": {"kind": owner_kind, "id": str(owner_id)},
+                        "ambiguous": owner_ambiguous or locked_ambiguous,
+                    }
+                    if owner_conflict
+                    else {
                         "reason": "shared_workspace_writers_unfenced",
                         "job_ids": unsupported_writers,
                     }
                     if unsupported_writers
+                    else {
+                        "reason": "dependent_execution_evidence_unresolved",
+                        "job_ids": uncertain_members,
+                    }
+                    if uncertain_members
+                    else {
+                        "reason": "participant_control_requires_attention",
+                        "job_ids": frozen_members,
+                    }
+                    if frozen_members
                     else {"reason": "worker_batch_attempt_missing"}
                     if attention_required
                     else None
@@ -315,8 +436,8 @@ class VMWorkspaceRecoveryStore:
                             "UPDATE run_queue SET state='parked', lease_token=lease_token+1, "
                             "leased_by=NULL, last_leased_by=NULL, leased_until=NULL, "
                             "interrupt_admission_lease_token=NULL, interrupt_admission_turn_id=NULL, "
-                            "run_after='infinity', park_reason='workspace_recovery', "
-                            "parked_at=clock_timestamp() WHERE unit_id=$1 RETURNING lease_token",
+                            "run_after='infinity', park_reason=COALESCE(park_reason,'workspace_recovery'), "
+                            "parked_at=COALESCE(parked_at,clock_timestamp()) WHERE unit_id=$1 RETURNING lease_token",
                             member_id,
                         )
                     await conn.execute(
@@ -337,13 +458,13 @@ class VMWorkspaceRecoveryStore:
                     INSERT INTO vm_workspace_recovery_jobs (
                         recovery_id, job_id, accepted_lease_token, hold_lease_token,
                         prior_queue_state, prior_job_status, prior_freeze_reference,
-                        checkpoint_id, checkpoint_namespace, participation
-                    ) VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9,$10)
+                        checkpoint_id, checkpoint_namespace, participation, prior_control_reference
+                    ) VALUES ($1,$2,$3,$4,$5,$6,$7::jsonb,$8,$9,$10,$11::jsonb)
                     """,
                         recovery_id,
                         member_id,
                         member_queue["lease_token"]
-                        if member_queue["state"] == "leased"
+                        if member_queue["lease_token"] > 0
                         else None,
                         hold_tokens[member_id],
                         "absent"
@@ -354,6 +475,7 @@ class VMWorkspaceRecoveryStore:
                         checkpoint_id if member_id == job_id else None,
                         checkpoint_namespace if member_id == job_id else None,
                         "attention" if attention_required else "held",
+                        json.dumps(references[member_id], default=str),
                     )
                 hold_token = hold_tokens[job_id]
                 disposition_factory = (

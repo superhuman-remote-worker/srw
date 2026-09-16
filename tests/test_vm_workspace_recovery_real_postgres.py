@@ -1235,3 +1235,198 @@ async def test_participant_hold_token_is_exact_or_explicitly_non_worker(app_pg) 
             with pytest.raises(asyncpg.CheckViolationError):
                 await conn.execute(insert, recovery_id, job_id, accepted, hold, state)
         await conn.execute(insert, recovery_id, job_id, None, None, "non_worker")
+
+
+@pytest.mark.asyncio
+async def test_owner_reassignment_before_admission_locks_holds_current_workspace(
+    app_pg,
+) -> None:
+    reporter_id, token = await insert_leased_job(app_pg)
+    parent_id, sibling_id = uuid4(), uuid4()
+    async with app_pg.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO jobs (id, description, status, execution_lane) "
+            "VALUES ($1,'parent','created','stateless')",
+            parent_id,
+        )
+        await conn.execute(
+            "INSERT INTO jobs (id, description, status, execution_lane, parent_job_id, context) "
+            "VALUES ($1,'sibling','created','stateless',$2,'{\"inherits_parent_workspace\":true}')",
+            sibling_id,
+            parent_id,
+        )
+        await conn.execute(
+            "UPDATE jobs SET parent_job_id=$2 WHERE id=$1", reporter_id, parent_id
+        )
+    # Runtime/owner selection precedes reassignment. The admission waits on
+    # the real membership writer's locks and must re-resolve after its commit.
+    kwargs = admission_kwargs(reporter_id, token)
+    db = recovery_test_db(app_pg)
+    store = VMWorkspaceRecoveryStore(app_pg)
+    task = None
+    try:
+        async with db.transaction_scope():
+            assert await db.merge_job_context(
+                str(reporter_id), {"inherits_parent_workspace": True}
+            )
+            task = asyncio.create_task(store.admit_hold(**kwargs))
+            async with app_pg.acquire() as observer:
+
+                async def waiting():
+                    while not task.done():
+                        if await observer.fetchval(
+                            "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE datname=current_database() "
+                            "AND wait_event_type='Lock' AND query LIKE '%pg_advisory_xact_lock%')"
+                        ):
+                            return True
+                        await asyncio.sleep(0.01)
+                    return False
+
+                assert await asyncio.wait_for(waiting(), 3)
+        admitted = await asyncio.wait_for(task, 3)
+    finally:
+        if task is not None and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+    assert admitted.action == "paused_attention"
+    assert admitted.code is WorkspaceRecoveryCode.IDENTITY_CONFLICT
+    async with app_pg.acquire() as conn:
+        assert (
+            await conn.fetchval(
+                "SELECT owner_id FROM vm_workspace_recoveries WHERE id=$1",
+                admitted.operation_id,
+            )
+            == parent_id
+        )
+        participants = await conn.fetch(
+            "SELECT job_id, participation FROM vm_workspace_recovery_jobs WHERE recovery_id=$1",
+            admitted.operation_id,
+        )
+        assert {row["job_id"] for row in participants} == {
+            reporter_id,
+            parent_id,
+            sibling_id,
+        }
+        assert {row["participation"] for row in participants} == {"attention"}
+        assert tuple(
+            await conn.fetchrow(
+                "SELECT state, lease_token FROM run_queue WHERE unit_id=$1", reporter_id
+            )
+        ) == ("parked", 28)
+    assert await store.claim_due(admitted.operation_id) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "history",
+    [
+        "queued_legacy",
+        "uncertain_park",
+        "processing_without_queue",
+        "created_with_history",
+    ],
+)
+async def test_nonleased_dependent_requires_positive_initialization_evidence(
+    app_pg, history
+) -> None:
+    parent_id, token = await insert_leased_job(app_pg)
+    child_id, child_token = await insert_leased_job(
+        app_pg, include_attempt=history in {"uncertain_park", "created_with_history"}
+    )
+    async with app_pg.acquire() as conn:
+        await conn.execute(
+            "UPDATE jobs SET parent_job_id=$2, context='{\"inherits_parent_workspace\":true}' WHERE id=$1",
+            child_id,
+            parent_id,
+        )
+        if history == "processing_without_queue":
+            await conn.execute("DELETE FROM run_queue WHERE unit_id=$1", child_id)
+        else:
+            await conn.execute(
+                "UPDATE run_queue SET state=$2, leased_by=NULL, leased_until=NULL, "
+                "park_reason=$3, input_seq=9, consumed_seq=8 WHERE unit_id=$1",
+                child_id,
+                "parked" if history == "uncertain_park" else "queued",
+                "claim_loss_hold" if history == "uncertain_park" else None,
+            )
+        if history == "uncertain_park":
+            await conn.execute(
+                "UPDATE worker_batch_attempts SET bundle_authorized_at=now(), authority_digest='sha256:prior' "
+                "WHERE job_id=$1",
+                child_id,
+            )
+        elif history == "created_with_history":
+            await conn.execute("UPDATE jobs SET status='created' WHERE id=$1", child_id)
+            await conn.execute(
+                "UPDATE run_queue SET lease_token=0, attempts_since_completion=0 WHERE unit_id=$1",
+                child_id,
+            )
+    store = VMWorkspaceRecoveryStore(app_pg)
+    admitted = await store.admit_hold(**admission_kwargs(parent_id, token))
+    assert admitted.action == "paused_attention"
+    assert admitted.code is WorkspaceRecoveryCode.TOOL_OUTCOME_UNKNOWN
+    assert await store.claim_due(admitted.operation_id) is None
+    async with app_pg.acquire() as conn:
+        participant = await conn.fetchrow(
+            "SELECT accepted_lease_token, prior_queue_state, prior_control_reference "
+            "FROM vm_workspace_recovery_jobs WHERE recovery_id=$1 AND job_id=$2",
+            admitted.operation_id,
+            child_id,
+        )
+        reference = participant["prior_control_reference"]
+        if isinstance(reference, str):
+            reference = json.loads(reference)
+        assert reference["never_started"] is False
+        if history in {"queued_legacy", "uncertain_park"}:
+            assert participant["accepted_lease_token"] == child_token
+            assert tuple(
+                await conn.fetchrow(
+                    "SELECT state, attempts_since_completion, input_seq, consumed_seq FROM run_queue WHERE unit_id=$1",
+                    child_id,
+                )
+            ) == ("parked", 2, 9, 8)
+        if history == "uncertain_park":
+            assert reference["queue"]["park_reason"] == "claim_loss_hold"
+            assert reference["attempt"]["lease_token"] == child_token
+            assert reference["attempt"]["authority_digest"] == "sha256:prior"
+            assert (
+                await conn.fetchval(
+                    "SELECT park_reason FROM run_queue WHERE unit_id=$1", child_id
+                )
+                == "claim_loss_hold"
+            )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("inheritance", [True, "ambiguous"])
+async def test_admission_rechecks_canonical_membership_shape(
+    app_pg, inheritance
+) -> None:
+    reporter_id, token = await insert_leased_job(app_pg)
+    parent_id = uuid4()
+    async with app_pg.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO jobs (id, description, status, execution_lane) VALUES ($1,'parent','created','stateless')",
+            parent_id,
+        )
+        await conn.execute(
+            "UPDATE jobs SET parent_job_id=$2, context=$3::jsonb WHERE id=$1",
+            reporter_id,
+            parent_id,
+            json.dumps({"inherits_parent_workspace": inheritance}),
+        )
+    kwargs = admission_kwargs(reporter_id, token)
+    if inheritance is True:
+        kwargs["owner_id"] = parent_id
+    admitted = await VMWorkspaceRecoveryStore(app_pg).admit_hold(**kwargs)
+    if inheritance is True:
+        assert admitted.action == "hold_committed"
+    else:
+        assert admitted.action == "paused_attention"
+        assert admitted.code is WorkspaceRecoveryCode.IDENTITY_CONFLICT
+    async with app_pg.acquire() as conn:
+        assert tuple(
+            await conn.fetchrow(
+                "SELECT state, lease_token FROM run_queue WHERE unit_id=$1", reporter_id
+            )
+        ) == ("parked", 28)
