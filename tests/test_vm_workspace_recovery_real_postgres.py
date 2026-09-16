@@ -1379,11 +1379,17 @@ async def test_historical_stop_receipt_is_accepted_once_and_reused_by_new_term(
         "containers": [
             {
                 "name": "compute",
+                "kind": "regular",
                 "container_id": "containerd://old-compute",
                 "restart_count": 0,
+                "state": "terminated",
+                "last_state": None,
                 "finished_at": datetime.now(timezone.utc).isoformat(),
+                "reason": "Completed",
             }
         ],
+        "declared_containers": {"regular": ["compute"], "init": []},
+        "pod_terminal": {"phase": "Succeeded", "restart_policy": "Never"},
     }
     digest = await store.accept_stop_evidence(first, evidence)
     assert digest and digest.startswith("sha256:")
@@ -1398,6 +1404,79 @@ async def test_historical_stop_receipt_is_accepted_once_and_reused_by_new_term(
     second = await store.claim_due(recovery_id)
     assert second is not None and second.claim_token > first.claim_token
     assert await store.trusted_stop_receipt(second) == digest
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "invalid",
+    ["missing_compute", "unknown_reason", "undeclared", "duplicate"],
+)
+async def test_stop_receipt_store_rejects_incomplete_container_evidence(
+    app_pg, invalid
+) -> None:
+    recovery_id = await insert_recovery(app_pg)
+    store = VMWorkspaceRecoveryStore(app_pg, worker_id="receipt-validator")
+    recovery_claim = await store.claim_due(recovery_id)
+    assert recovery_claim is not None
+    now = datetime.now(timezone.utc).isoformat()
+    evidence = {
+        "protocol_version": 1,
+        "vm_uid": str(recovery_claim.captured_identity["vm_uid"]),
+        "vmi_uid": str(recovery_claim.captured_identity["prior_vmi_uid"]),
+        "launcher_uid": str(recovery_claim.captured_identity["prior_launcher_uid"]),
+        "container_id": "containerd://old-compute",
+        "root_pvc_uid": str(recovery_claim.captured_identity["root_pvc_uid"]),
+        "controller_identity": "controller/pod-1",
+        "observed_at": now,
+        "containers": [
+            {
+                "name": "compute",
+                "kind": "regular",
+                "container_id": "containerd://old-compute",
+                "restart_count": 0,
+                "state": "terminated",
+                "last_state": None,
+                "finished_at": now,
+                "reason": "Completed",
+            },
+            {
+                "name": "guest-console-log",
+                "kind": "regular",
+                "container_id": "containerd://old-log",
+                "restart_count": 0,
+                "state": "terminated",
+                "last_state": None,
+                "finished_at": now,
+                "reason": "Completed",
+            },
+        ],
+        "declared_containers": {
+            "regular": ["compute", "guest-console-log"],
+            "init": [],
+        },
+        "pod_terminal": {"phase": "Succeeded", "restart_policy": "Never"},
+    }
+    if invalid == "missing_compute":
+        evidence["containers"].pop(0)
+    elif invalid == "unknown_reason":
+        evidence["containers"][0]["reason"] = "ContainerStatusUnknown"
+    elif invalid == "undeclared":
+        evidence["containers"].append(
+            {
+                "name": "unexpected-sidecar",
+                "kind": "regular",
+                "container_id": "containerd://unexpected",
+                "restart_count": 0,
+                "state": "terminated",
+                "last_state": None,
+                "finished_at": now,
+                "reason": "Completed",
+            }
+        )
+    else:
+        evidence["containers"].append(dict(evidence["containers"][0]))
+
+    assert await store.accept_stop_evidence(recovery_claim, evidence) is None
 
 
 @pytest.mark.asyncio

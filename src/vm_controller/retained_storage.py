@@ -115,6 +115,11 @@ class RetainedStorage:
 
     async def claim(self, binding, job_id):
         binding = storage_binding(binding)
+        async with self.controller._workspace_lifecycle(binding["owner_id"]):
+            async with self.lock:
+                return await self._claim_serialized(binding, job_id)
+
+    async def _claim_serialized(self, binding, job_id):
         await self._assert_not_recovery_pinned(binding)
         lease = await self._lease(binding)
         labels = storage_labels(binding, job_id)
@@ -210,10 +215,16 @@ class RetainedStorage:
         return pvc.metadata.uid
 
     async def ensure(self, manifest, binding, job_id):
+        binding = storage_binding(binding)
+        async with self.controller._workspace_lifecycle(binding["owner_id"]):
+            async with self.lock:
+                return await self._ensure_serialized(manifest, binding, job_id)
+
+    async def _ensure_serialized(self, manifest, binding, job_id):
         from vm_controller.controller import CDI_GROUP, CDI_VERSION, CDI_PLURAL
 
         await self._assert_not_recovery_pinned(binding)
-        await self.claim(binding, job_id)
+        await self._claim_serialized(binding, job_id)
         name = storage_name(binding)
         templates = manifest["spec"].pop("dataVolumeTemplates", [])
         if len(templates) != 1:
@@ -275,29 +286,30 @@ class RetainedStorage:
     async def detach(self, binding):
         """Durably fence late creates before publishing a reusable instance."""
         binding = storage_binding(binding)
-        await self._assert_not_recovery_pinned(binding)
-        async with self.lock:
-            lease = await self._lease(binding)
-            if not lease or (lease.metadata.labels or {}).get(GENERATION_LABEL) != str(
-                binding["generation"]
-            ):
-                raise RuntimeError("Retained workspace generation changed.")
-            await self.probe(binding)
-            if not await self.unused(binding):
-                return False
-            if (lease.metadata.annotations or {}).get("srw.io/released") == "true":
-                raise RuntimeError("Retained workspace has been released.")
-            lease.metadata.annotations = {
-                **(lease.metadata.annotations or {}),
-                "srw.io/detached": "true",
-            }
-            await asyncio.to_thread(
-                self.controller.coordination_api.replace_namespaced_lease,
-                name=storage_name(binding),
-                namespace=self.namespace,
-                body=lease,
-            )
-            return True
+        async with self.controller._workspace_lifecycle(binding["owner_id"]):
+            async with self.lock:
+                await self._assert_not_recovery_pinned(binding)
+                lease = await self._lease(binding)
+                if not lease or (lease.metadata.labels or {}).get(
+                    GENERATION_LABEL
+                ) != str(binding["generation"]):
+                    raise RuntimeError("Retained workspace generation changed.")
+                await self.probe(binding)
+                if not await self.unused(binding):
+                    return False
+                if (lease.metadata.annotations or {}).get("srw.io/released") == "true":
+                    raise RuntimeError("Retained workspace has been released.")
+                lease.metadata.annotations = {
+                    **(lease.metadata.annotations or {}),
+                    "srw.io/detached": "true",
+                }
+                await asyncio.to_thread(
+                    self.controller.coordination_api.replace_namespaced_lease,
+                    name=storage_name(binding),
+                    namespace=self.namespace,
+                    body=lease,
+                )
+                return True
 
     async def _finished_release(self, binding, lease=None):
         headscale = getattr(self.controller, "headscale", None)
@@ -312,88 +324,91 @@ class RetainedStorage:
     async def delete(self, binding):
         """Tombstone before deleting exact, unattached storage; replay is safe."""
         binding = storage_binding(binding)
-        await self._assert_not_recovery_pinned(binding)
-        async with self.lock:
-            lease = await self._lease(binding)
-            if not await self.unused(binding):
-                raise RuntimeError("Retained workspace is still in use.")
-            if lease is None:
-                if binding["generation"] != 1 or binding["pvc_uid"] is not None:
-                    raise RuntimeError(
-                        "Retained workspace generation record is missing."
-                    )
-                # Cancelled before its first controller create. Absence must be
-                # proved before closing the never-used identity permanently.
-                if (
-                    await self.probe(binding, check_generation=False) is not None
-                    or await self.controller._get_dv(storage_name(binding)) is not None
-                ):
-                    raise RuntimeError("Unrecorded retained workspace storage exists.")
-                await asyncio.to_thread(
-                    self.controller.coordination_api.create_namespaced_lease,
-                    namespace=self.namespace,
-                    body={
-                        "apiVersion": "coordination.k8s.io/v1",
-                        "kind": "Lease",
-                        "metadata": {
-                            "name": storage_name(binding),
-                            "namespace": self.namespace,
-                            "labels": storage_labels(binding, binding["owner_id"]),
-                            "annotations": {"srw.io/released": "true"},
+        async with self.controller._workspace_lifecycle(binding["owner_id"]):
+            async with self.lock:
+                await self._assert_not_recovery_pinned(binding)
+                lease = await self._lease(binding)
+                if not await self.unused(binding):
+                    raise RuntimeError("Retained workspace is still in use.")
+                if lease is None:
+                    if binding["generation"] != 1 or binding["pvc_uid"] is not None:
+                        raise RuntimeError(
+                            "Retained workspace generation record is missing."
+                        )
+                    # Cancelled before its first controller create. Absence must be
+                    # proved before closing the never-used identity permanently.
+                    if (
+                        await self.probe(binding, check_generation=False) is not None
+                        or await self.controller._get_dv(storage_name(binding))
+                        is not None
+                    ):
+                        raise RuntimeError(
+                            "Unrecorded retained workspace storage exists."
+                        )
+                    await asyncio.to_thread(
+                        self.controller.coordination_api.create_namespaced_lease,
+                        namespace=self.namespace,
+                        body={
+                            "apiVersion": "coordination.k8s.io/v1",
+                            "kind": "Lease",
+                            "metadata": {
+                                "name": storage_name(binding),
+                                "namespace": self.namespace,
+                                "labels": storage_labels(binding, binding["owner_id"]),
+                                "annotations": {"srw.io/released": "true"},
+                            },
+                            "spec": {},
                         },
-                        "spec": {},
-                    },
-                )
-                return await self._finished_release(binding, lease)
-            if (lease.metadata.labels or {}).get(GENERATION_LABEL) != str(
-                binding["generation"]
-            ):
-                raise RuntimeError("Retained workspace generation changed.")
-            annotations = lease.metadata.annotations or {}
-            if annotations.get("srw.io/released") != "true":
-                pvc_uid = await self.probe(binding)
-                lease.metadata.annotations = {
-                    **annotations,
-                    "srw.io/released": "true",
-                    "srw.io/released-pvc-uid": pvc_uid or "",
-                }
-                await asyncio.to_thread(
-                    self.controller.coordination_api.replace_namespaced_lease,
-                    name=storage_name(binding),
-                    namespace=self.namespace,
-                    body=lease,
-                )
-            expected_uid = binding["pvc_uid"] or (lease.metadata.annotations or {}).get(
-                "srw.io/released-pvc-uid"
-            )
-            try:
-                pvc = await asyncio.to_thread(
-                    self.controller.core_api.read_namespaced_persistent_volume_claim,
-                    name=storage_name(binding),
-                    namespace=self.namespace,
-                )
-            except ApiException as exc:
-                if exc.status != 404:
-                    raise
-                dv = await self.controller._get_dv(storage_name(binding))
-                if dv is None:
+                    )
                     return await self._finished_release(binding, lease)
-                if expected_uid:
-                    return False
-                if (
-                    dv.get("metadata", {}).get("labels", {}).get(WORKSPACE_LABEL)
-                    != binding["uid"]
+                if (lease.metadata.labels or {}).get(GENERATION_LABEL) != str(
+                    binding["generation"]
                 ):
-                    raise RuntimeError("Retained DataVolume identity changed.")
-                await self.controller._delete_dv(
-                    storage_name(binding), expected_uid=dv["metadata"]["uid"]
+                    raise RuntimeError("Retained workspace generation changed.")
+                annotations = lease.metadata.annotations or {}
+                if annotations.get("srw.io/released") != "true":
+                    pvc_uid = await self.probe(binding)
+                    lease.metadata.annotations = {
+                        **annotations,
+                        "srw.io/released": "true",
+                        "srw.io/released-pvc-uid": pvc_uid or "",
+                    }
+                    await asyncio.to_thread(
+                        self.controller.coordination_api.replace_namespaced_lease,
+                        name=storage_name(binding),
+                        namespace=self.namespace,
+                        body=lease,
+                    )
+                expected_uid = binding["pvc_uid"] or (
+                    lease.metadata.annotations or {}
+                ).get("srw.io/released-pvc-uid")
+                try:
+                    pvc = await asyncio.to_thread(
+                        self.controller.core_api.read_namespaced_persistent_volume_claim,
+                        name=storage_name(binding),
+                        namespace=self.namespace,
+                    )
+                except ApiException as exc:
+                    if exc.status != 404:
+                        raise
+                    dv = await self.controller._get_dv(storage_name(binding))
+                    if dv is None:
+                        return await self._finished_release(binding, lease)
+                    if expected_uid:
+                        return False
+                    if (
+                        dv.get("metadata", {}).get("labels", {}).get(WORKSPACE_LABEL)
+                        != binding["uid"]
+                    ):
+                        raise RuntimeError("Retained DataVolume identity changed.")
+                    # A DataVolume name/UID cannot substitute for exact PVC
+                    # authority. Keep the disk until a captured PVC UID exists.
+                    return False
+                if not expected_uid or pvc.metadata.uid != expected_uid:
+                    raise RuntimeError("Retained workspace PVC was replaced.")
+                await self.controller._delete_captured_rootdisk(
+                    storage_name(binding),
+                    owner_id=binding["owner_id"],
+                    expected_pvc_uid=expected_uid,
                 )
                 return False
-            if not expected_uid or pvc.metadata.uid != expected_uid:
-                raise RuntimeError("Retained workspace PVC was replaced.")
-            await self.controller._delete_captured_rootdisk(
-                storage_name(binding),
-                owner_id=binding["owner_id"],
-                expected_pvc_uid=expected_uid,
-            )
-            return False

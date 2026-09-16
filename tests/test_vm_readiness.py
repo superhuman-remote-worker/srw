@@ -1,5 +1,6 @@
 import asyncio
 from contextlib import asynccontextmanager
+import json
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -7,11 +8,143 @@ import pytest
 from orchestrator.database.postgres import PostgresDB
 from orchestrator.services.container_provisioner import WorkspaceRuntimeAttestation
 from orchestrator.services.vm_readiness import VMReadinessService
+from orchestrator.services.vm_readiness import qualify_recovery_successor
 from orchestrator.services.ssh_helpers import orchestrator_can_reach
 
 
 GENERATION = "11111111-1111-4111-8111-111111111111"
 HOST_KEY_FINGERPRINT = "SHA256:" + ("A" * 43)
+
+
+def complete_recovery_network(challenge="fresh-challenge"):
+    return {
+        "challenge": challenge,
+        "boot_id": "00000000-0000-4000-8000-000000000041",
+        "registration_id": "guest-registration-response",
+        "interfaces": [
+            {
+                "ifname": "eth0",
+                "address": "10.0.2.15",
+                "mac": "02:00:00:00:00:41",
+            }
+        ],
+        "address": "10.0.2.15",
+        "routes": [{"dst": "default", "gateway": "10.0.2.2"}],
+        "default_route": {"dst": "default", "gateway": "10.0.2.2"},
+        "dns": "nameserver 10.0.2.3",
+        "netplan_sha256": {"/etc/netplan/50-cloud-init.yaml": "a" * 64},
+        "networkd_sha256": {},
+        "cloud_init_instance_id": "iid-datasource-none",
+        "cloud_init_cache_identity": "b" * 64,
+        "cloud_init_cache_cleaned": False,
+    }
+
+
+def wire_recovery_qualification(monkeypatch, telemetry):
+    monkeypatch.setattr(
+        "orchestrator.services.vm_readiness.wait_for_agent_ssh",
+        AsyncMock(return_value=(True, 1, None)),
+    )
+    monkeypatch.setattr(
+        "secrets.token_urlsafe",
+        lambda _size: "fresh-challenge",
+    )
+
+    @asynccontextmanager
+    async def command(*_args, **_kwargs):
+        yield ["ssh", "qualified-guest"]
+
+    process = MagicMock(returncode=0)
+    monkeypatch.setattr(
+        "orchestrator.services.vm_readiness.pinned_agent_ssh_command", command
+    )
+    monkeypatch.setattr(
+        "orchestrator.services.vm_readiness.create_owned_subprocess_exec",
+        AsyncMock(return_value=process),
+    )
+    monkeypatch.setattr(
+        "orchestrator.services.vm_readiness.communicate_bounded",
+        AsyncMock(return_value=(json.dumps(telemetry).encode(), b"")),
+    )
+
+
+@pytest.mark.asyncio
+async def test_recovery_successor_requires_complete_fresh_guest_telemetry(
+    monkeypatch,
+) -> None:
+    telemetry = complete_recovery_network()
+    wire_recovery_qualification(monkeypatch, telemetry)
+
+    result = await qualify_recovery_successor(
+        {
+            "pod_ip": "10.42.0.90",
+            "vmi_uid": "00000000-0000-4000-8000-000000000042",
+            "launcher_uid": "00000000-0000-4000-8000-000000000043",
+            "interface_mac": "02:00:00:00:00:41",
+        },
+        host_key_fingerprint=HOST_KEY_FINGERPRINT,
+    )
+
+    assert result == {
+        "pod_ip": "10.42.0.90",
+        "ssh_registration_id": "guest-registration-response",
+        "guest_boot_id": "00000000-0000-4000-8000-000000000041",
+        "guest_network": telemetry,
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "missing",
+    [
+        "interfaces",
+        "address",
+        "default_route",
+        "dns",
+        "cloud_init_instance_id",
+        "cloud_init_cache_identity",
+        "registration_id",
+    ],
+)
+async def test_recovery_successor_rejects_incomplete_guest_telemetry(
+    monkeypatch, missing
+) -> None:
+    telemetry = complete_recovery_network()
+    telemetry.pop(missing)
+    wire_recovery_qualification(monkeypatch, telemetry)
+
+    assert (
+        await qualify_recovery_successor(
+            {
+                "pod_ip": "10.42.0.90",
+                "vmi_uid": "00000000-0000-4000-8000-000000000042",
+                "launcher_uid": "00000000-0000-4000-8000-000000000043",
+                "interface_mac": "02:00:00:00:00:41",
+            },
+            host_key_fingerprint=HOST_KEY_FINGERPRINT,
+        )
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_recovery_successor_rejects_stale_guest_challenge(monkeypatch) -> None:
+    wire_recovery_qualification(
+        monkeypatch, complete_recovery_network(challenge="replayed-challenge")
+    )
+
+    assert (
+        await qualify_recovery_successor(
+            {
+                "pod_ip": "10.42.0.90",
+                "vmi_uid": "00000000-0000-4000-8000-000000000042",
+                "launcher_uid": "00000000-0000-4000-8000-000000000043",
+                "interface_mac": "02:00:00:00:00:41",
+            },
+            host_key_fingerprint=HOST_KEY_FINGERPRINT,
+        )
+        is None
+    )
 
 
 def test_same_cluster_reachability_ignores_address_class(monkeypatch):
@@ -144,9 +277,7 @@ async def test_readiness_does_not_probe_while_recovery_owns_authority() -> None:
     db = FakeDB(jobs=[candidate()], recovery_owned=True)
     provisioner = FakeProvisioner({"ready": True})
 
-    await VMReadinessService(
-        db, provisioner, trigger_dispatch=lambda: None
-    ).run_cycle()
+    await VMReadinessService(db, provisioner, trigger_dispatch=lambda: None).run_cycle()
 
     assert provisioner.queries == []
     assert provisioner.writes == []
@@ -168,9 +299,7 @@ async def test_readiness_does_not_mutate_when_recovery_wins_during_probe() -> No
         }
     )
 
-    await VMReadinessService(
-        db, provisioner, trigger_dispatch=lambda: None
-    ).run_cycle()
+    await VMReadinessService(db, provisioner, trigger_dispatch=lambda: None).run_cycle()
 
     assert provisioner.queries == [("job", candidate()["entity_id"])]
     assert provisioner.writes == []

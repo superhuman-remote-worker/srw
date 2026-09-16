@@ -1511,13 +1511,13 @@ class TestHandleDelete:
         assert payload["vm_name"] == f"agent-vm-{job_id}"
 
     @pytest.mark.asyncio
-    async def test_delete_vm_cleans_headscale_node(self, controller):
-        """VM deletion also removes the Headscale node."""
+    async def test_delete_without_disk_authority_keeps_headscale_node(self, controller):
+        """A retained disk keeps the matching Headscale identity."""
         job_id = "delete-me-5678"
         msg = make_nats_msg({"job_id": job_id})
         await controller.handle_delete(msg)
 
-        controller.headscale.delete_node.assert_awaited_once_with(job_id)
+        controller.headscale.delete_node.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_delete_vm_without_headscale(self, controller_no_headscale):
@@ -2899,7 +2899,21 @@ def _dv_phase(phase: str | None):
             }
         if phase is None:
             raise _FakeApiException(status=404)
-        return {"metadata": {"name": kwargs.get("name")}, "status": {"phase": phase}}
+        name = kwargs.get("name")
+        owner_id = name[len("agent-vm-") : -len("-rootdisk")]
+        return {
+            "metadata": {
+                "name": name,
+                "uid": "rootdisk-dv-uid",
+                "labels": {
+                    "srw.io/owner-kind": (
+                        "thread" if owner_id.startswith("thread-") else "job"
+                    ),
+                    "srw.io/owner-id": owner_id,
+                },
+            },
+            "status": {"phase": phase},
+        }
 
     return _get
 
@@ -3108,16 +3122,18 @@ class TestDeletePurgeIntent:
     node go) or a recreate is expected (both are kept — D2/D3)."""
 
     @pytest.mark.asyncio
-    async def test_default_purges_disk_and_headscale_node(self, controller):
-        """An orchestrator that never sends the field gets today's semantics."""
+    async def test_default_without_captured_uid_keeps_disk_and_headscale(
+        self, controller
+    ):
+        """A legacy purge intent cannot substitute a reusable name for identity."""
         result = await controller._do_delete("job-1")
 
         deletes = _calls_for(
             controller.k8s_client.delete_namespaced_custom_object, CDI_PLURAL
         )
-        assert [c.kwargs["name"] for c in deletes] == [_rootdisk_name("job-1")]
-        controller.headscale.delete_node.assert_awaited_once_with("job-1")
-        assert result["rootdisk"] == "purged"
+        assert deletes == []
+        controller.headscale.delete_node.assert_not_awaited()
+        assert result["rootdisk"] == "kept"
 
     @pytest.mark.asyncio
     async def test_keep_leaves_disk_and_headscale_node(self, controller):
@@ -3159,10 +3175,10 @@ class TestDeletePurgeIntent:
         assert payload["rootdisk"] == "kept"
 
     @pytest.mark.asyncio
-    async def test_handle_delete_defaults_to_purge(self, controller):
+    async def test_handle_delete_default_purge_without_uid_is_kept(self, controller):
         await controller.handle_delete(make_nats_msg({"job_id": "job-1"}))
         payload = json.loads(controller.nc.publish.call_args[0][1].decode())
-        assert payload["rootdisk"] == "purged"
+        assert payload["rootdisk"] == "kept"
 
     @pytest.mark.asyncio
     async def test_http_delete_reads_purge_disk_query_param(self, controller):
@@ -3206,7 +3222,12 @@ class TestGcRootdisks:
         return {
             "metadata": {
                 "name": name,
-                "labels": {"srw.io/rootdisk": "true"},
+                "uid": f"dv-uid-{name}",
+                "labels": {
+                    "srw.io/rootdisk": "true",
+                    "srw.io/owner-kind": "job",
+                    "srw.io/owner-id": name[len("agent-vm-") : -len("-rootdisk")],
+                },
                 "creationTimestamp": ts.strftime("%Y-%m-%dT%H:%M:%SZ"),
             }
         }
@@ -3312,6 +3333,101 @@ class TestGcRootdisks:
         assert not _calls_for(
             controller.k8s_client.delete_namespaced_custom_object, CDI_PLURAL
         )
+
+    @pytest.mark.asyncio
+    async def test_unknown_pvc_identity_refuses_orphan_gc(self, controller):
+        self._wire(controller, [self._dv("agent-vm-j1-rootdisk", 100)], [])
+        controller.core_api.read_namespaced_persistent_volume_claim.side_effect = (
+            RuntimeError("apiserver unavailable")
+        )
+
+        with patch("vm_controller.controller.VM_ROOTDISK_ORPHAN_HOURS", 72):
+            await controller._gc_rootdisks()
+
+        assert not _calls_for(
+            controller.k8s_client.delete_namespaced_custom_object, CDI_PLURAL
+        )
+
+    @pytest.mark.asyncio
+    async def test_pin_activation_cannot_ack_after_gc_crosses_delete_boundary(
+        self, controller
+    ):
+        owner_id = SAMPLE_JOB_CONFIG["job_id"]
+        pvc_uid = "00000000-0000-4000-8000-000000000742"
+        dv = self._dv(f"agent-vm-{owner_id}-rootdisk", 100)
+        self._wire(controller, [dv], [])
+        entered = asyncio.Event()
+        continue_delete = asyncio.Event()
+        deleted = False
+
+        async def probe(*_args, **_kwargs):
+            entered.set()
+            await continue_delete.wait()
+            return True, pvc_uid
+
+        async def pvc_by_uid(*_args, **_kwargs):
+            if deleted:
+                return True, None
+            return True, types.SimpleNamespace(
+                metadata=types.SimpleNamespace(
+                    name=f"agent-vm-{owner_id}-rootdisk",
+                    uid=pvc_uid,
+                    labels={
+                        "srw.io/owner-kind": "job",
+                        "srw.io/owner-id": owner_id,
+                    },
+                    owner_references=[
+                        types.SimpleNamespace(
+                            kind="DataVolume",
+                            uid=dv["metadata"]["uid"],
+                            controller=True,
+                        )
+                    ],
+                )
+            )
+
+        async def delete(*_args, **_kwargs):
+            nonlocal deleted
+            deleted = True
+
+        controller._rootdisk_pvc_probe = probe
+        controller._rootdisk_pvc_by_uid = pvc_by_uid
+        controller._get_dv = AsyncMock(
+            side_effect=lambda _name: None if deleted else dv
+        )
+        controller._delete_dv = AsyncMock(side_effect=delete)
+        controller.coordination_api.read_namespaced_lease.side_effect = (
+            _FakeApiException(status=404)
+        )
+        controller.coordination_api.create_namespaced_lease.return_value = (
+            types.SimpleNamespace(
+                metadata=types.SimpleNamespace(uid="pin-uid", resource_version="1")
+            )
+        )
+        command = {
+            "recovery_id": "00000000-0000-4000-8000-000000000741",
+            "pvc_uid": pvc_uid,
+            "provision_generation": PROVISION_GENERATION,
+            "state": "active",
+            "owner_kind": "job",
+            "owner_id": owner_id,
+            "namespace": VM_NAMESPACE,
+        }
+
+        with patch("vm_controller.controller.VM_ROOTDISK_ORPHAN_HOURS", 72):
+            gc_task = asyncio.create_task(controller._gc_rootdisks())
+            await entered.wait()
+            pin_task = asyncio.create_task(
+                controller._do_reconcile_workspace_recovery_pin(command)
+            )
+            await asyncio.sleep(0)
+            crossed = pin_task.done()
+            continue_delete.set()
+            await gc_task
+
+        assert crossed is False
+        with pytest.raises(RuntimeError, match="PVC identity is unavailable"):
+            await pin_task
 
     @pytest.mark.asyncio
     async def test_create_does_not_run_it_when_disabled(self, controller):
@@ -3852,6 +3968,32 @@ class TestWorkspaceRecoveryControllerEvidence:
             "status": {
                 "conditions": [{"type": "Ready", "status": "True"}],
             },
+            "spec": {
+                "template": {
+                    "spec": {
+                        "volumes": [
+                            {
+                                "name": "rootdisk",
+                                "dataVolume": {
+                                    "name": f"agent-vm-{SAMPLE_JOB_CONFIG['job_id']}-rootdisk"
+                                },
+                            }
+                        ]
+                    }
+                }
+            },
+        }
+        rootdisk_name = f"agent-vm-{SAMPLE_JOB_CONFIG['job_id']}-rootdisk"
+        dv_uid = "00000000-0000-4000-8000-000000000706"
+        dv = {
+            "metadata": {
+                "name": rootdisk_name,
+                "uid": dv_uid,
+                "labels": {
+                    "srw.io/owner-kind": "job",
+                    "srw.io/owner-id": SAMPLE_JOB_CONFIG["job_id"],
+                },
+            }
         }
         vmi = {
             "metadata": {
@@ -3864,6 +4006,9 @@ class TestWorkspaceRecoveryControllerEvidence:
                         "controller": True,
                     }
                 ],
+            },
+            "spec": {
+                "volumes": [{"name": "rootdisk", "dataVolume": {"name": rootdisk_name}}]
             },
             "status": {
                 "phase": "Running" if not terminal else "Failed",
@@ -3878,7 +4023,11 @@ class TestWorkspaceRecoveryControllerEvidence:
         }
 
         def get_object(**kwargs):
-            return vm if kwargs["plural"] == KUBEVIRT_PLURAL else vmi
+            if kwargs["plural"] == KUBEVIRT_PLURAL:
+                return vm
+            if kwargs["plural"] == CDI_PLURAL:
+                return dv
+            return vmi
 
         controller.k8s_client.get_namespaced_custom_object.side_effect = get_object
         controller.core_api.list_namespaced_persistent_volume_claim.return_value = (
@@ -3886,18 +4035,29 @@ class TestWorkspaceRecoveryControllerEvidence:
                 items=[
                     types.SimpleNamespace(
                         metadata=types.SimpleNamespace(
+                            name=rootdisk_name,
                             uid=self.PVC_UID,
                             deletion_timestamp=None,
                             labels={
                                 "srw.io/owner-kind": "job",
                                 "srw.io/owner-id": SAMPLE_JOB_CONFIG["job_id"],
                             },
+                            owner_references=[
+                                types.SimpleNamespace(
+                                    kind="DataVolume", uid=dv_uid, controller=True
+                                )
+                            ],
                         )
                     )
                 ]
             )
         )
-        terminated = {"terminated": {"finishedAt": "2026-09-16T12:00:00Z"}}
+        terminated = {
+            "terminated": {
+                "finishedAt": "2026-09-16T12:00:00Z",
+                "reason": "Completed",
+            }
+        }
         pod = {
             "metadata": {
                 "uid": current_pod,
@@ -3909,7 +4069,20 @@ class TestWorkspaceRecoveryControllerEvidence:
                     }
                 ],
             },
-            "spec": {"nodeName": "node8", "restartPolicy": "Never"},
+            "spec": {
+                "nodeName": "node8",
+                "restartPolicy": "Never",
+                "containers": [
+                    {"name": "compute", "volumeMounts": [{"name": "rootdisk"}]},
+                    {"name": "guest-console-log"},
+                ],
+                "volumes": [
+                    {
+                        "name": "rootdisk",
+                        "persistentVolumeClaim": {"claimName": rootdisk_name},
+                    }
+                ],
+            },
             "status": {
                 "phase": "Succeeded" if terminal else "Running",
                 "podIP": "10.42.0.90",
@@ -3990,6 +4163,71 @@ class TestWorkspaceRecoveryControllerEvidence:
         assert observed["ambiguous"] is True
         assert observed["migration_ambiguous"] is True
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "unsafe",
+        ["missing_compute", "unknown_reason", "undeclared", "duplicate"],
+    )
+    async def test_incomplete_or_unknown_current_container_evidence_is_rejected(
+        self, controller, unsafe
+    ):
+        pod = self.wire(controller, terminal=True)
+        statuses = pod["status"]["containerStatuses"]
+        if unsafe == "missing_compute":
+            statuses.pop(0)
+        elif unsafe == "unknown_reason":
+            statuses[0]["state"]["terminated"]["reason"] = "ContainerStatusUnknown"
+        elif unsafe == "undeclared":
+            statuses.append(
+                {
+                    "name": "unexpected-sidecar",
+                    "containerID": "containerd://unexpected",
+                    "restartCount": 0,
+                    "state": {"terminated": {"finishedAt": "2026-09-16T12:00:00Z"}},
+                }
+            )
+        else:
+            statuses.append(dict(statuses[0]))
+
+        observed = await controller._do_observe_workspace_recovery(self.identity())
+
+        assert observed["prior_runtime"] != "stopped"
+        assert observed["stop_evidence"] == "unknown"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "broken_link",
+        ["vm_volume", "vmi_volume", "launcher_volume", "pvc_owner", "vmi_owner"],
+    )
+    async def test_unrelated_disk_or_non_controller_owner_cannot_mint_evidence(
+        self, controller, broken_link
+    ):
+        pod = self.wire(controller, terminal=True)
+        vm = controller.k8s_client.get_namespaced_custom_object(plural=KUBEVIRT_PLURAL)
+        vmi = controller.k8s_client.get_namespaced_custom_object(plural="other")
+        pvc = controller.core_api.list_namespaced_persistent_volume_claim.return_value.items[
+            0
+        ]
+        if broken_link == "vm_volume":
+            vm["spec"]["template"]["spec"]["volumes"][0]["dataVolume"]["name"] = (
+                "same-owner-unrelated"
+            )
+        elif broken_link == "vmi_volume":
+            vmi["spec"]["volumes"][0]["dataVolume"]["name"] = "same-owner-unrelated"
+        elif broken_link == "launcher_volume":
+            pod["spec"]["volumes"][0]["persistentVolumeClaim"]["claimName"] = (
+                "same-owner-unrelated"
+            )
+        elif broken_link == "pvc_owner":
+            pvc.metadata.owner_references[0].controller = None
+        else:
+            vmi["metadata"]["ownerReferences"][0].pop("controller")
+
+        observed = await controller._do_observe_workspace_recovery(self.identity())
+
+        assert observed["prior_runtime"] != "stopped"
+        assert observed["stop_evidence"] == "unknown"
+
 
 class TestWorkspaceRecoveryControllerPins:
     @pytest.mark.asyncio
@@ -4013,6 +4251,124 @@ class TestWorkspaceRecoveryControllerPins:
         assert not _calls_for(
             controller.k8s_client.create_namespaced_custom_object, CDI_PLURAL
         )
+
+    @pytest.mark.asyncio
+    async def test_unknown_pvc_identity_refuses_failed_datavolume_recreation(
+        self, controller
+    ):
+        controller.k8s_client.get_namespaced_custom_object.side_effect = _dv_phase(
+            "Failed"
+        )
+        controller.core_api.read_namespaced_persistent_volume_claim.side_effect = (
+            RuntimeError("apiserver unavailable")
+        )
+
+        with (
+            patch("vm_controller.controller.VM_PERSISTENT_ROOTDISK", True),
+            pytest.raises(RuntimeError, match="identity is unknown"),
+        ):
+            await controller._do_create(SAMPLE_JOB_CONFIG)
+
+        assert not _calls_for(
+            controller.k8s_client.delete_namespaced_custom_object, CDI_PLURAL
+        )
+
+    @pytest.mark.asyncio
+    async def test_pin_activation_cannot_ack_after_failed_dv_delete_boundary(
+        self, controller
+    ):
+        owner_id = SAMPLE_JOB_CONFIG["job_id"]
+        pvc_uid = "00000000-0000-4000-8000-000000000752"
+        entered = asyncio.Event()
+        continue_delete = asyncio.Event()
+        deleted = False
+
+        def get_object(**kwargs):
+            if kwargs.get("plural") == KUBEVIRT_PLURAL:
+                return {
+                    "metadata": {
+                        "name": f"agent-vm-{owner_id}",
+                        "uid": "vm-uid-after-dv-recreate",
+                    }
+                }
+            if deleted:
+                raise _FakeApiException(status=404)
+            return {
+                "metadata": {
+                    "name": f"agent-vm-{owner_id}-rootdisk",
+                    "uid": "failed-dv-uid",
+                    "labels": {
+                        "srw.io/owner-kind": "job",
+                        "srw.io/owner-id": owner_id,
+                    },
+                },
+                "status": {"phase": "Failed"},
+            }
+
+        async def probe(*_args, **_kwargs):
+            entered.set()
+            await continue_delete.wait()
+            return True, pvc_uid
+
+        async def pvc_by_uid(*_args, **_kwargs):
+            if deleted:
+                return True, None
+            return True, types.SimpleNamespace(
+                metadata=types.SimpleNamespace(
+                    name=f"agent-vm-{owner_id}-rootdisk",
+                    uid=pvc_uid,
+                    labels={
+                        "srw.io/owner-kind": "job",
+                        "srw.io/owner-id": owner_id,
+                    },
+                    owner_references=[
+                        types.SimpleNamespace(
+                            kind="DataVolume", uid="failed-dv-uid", controller=True
+                        )
+                    ],
+                )
+            )
+
+        async def delete(*_args, **_kwargs):
+            nonlocal deleted
+            deleted = True
+
+        controller.k8s_client.get_namespaced_custom_object.side_effect = get_object
+        controller._rootdisk_pvc_probe = probe
+        controller._rootdisk_pvc_by_uid = pvc_by_uid
+        controller._delete_dv = AsyncMock(side_effect=delete)
+        controller.coordination_api.read_namespaced_lease.side_effect = (
+            _FakeApiException(status=404)
+        )
+        controller.coordination_api.create_namespaced_lease.return_value = (
+            types.SimpleNamespace(
+                metadata=types.SimpleNamespace(uid="pin-uid", resource_version="1")
+            )
+        )
+        command = {
+            "recovery_id": "00000000-0000-4000-8000-000000000751",
+            "pvc_uid": pvc_uid,
+            "provision_generation": PROVISION_GENERATION,
+            "state": "active",
+            "owner_kind": "job",
+            "owner_id": owner_id,
+            "namespace": VM_NAMESPACE,
+        }
+
+        with patch("vm_controller.controller.VM_PERSISTENT_ROOTDISK", True):
+            create_task = asyncio.create_task(controller._do_create(SAMPLE_JOB_CONFIG))
+            await entered.wait()
+            pin_task = asyncio.create_task(
+                controller._do_reconcile_workspace_recovery_pin(command)
+            )
+            await asyncio.sleep(0)
+            crossed = pin_task.done()
+            continue_delete.set()
+            await create_task
+
+        assert crossed is False
+        with pytest.raises(RuntimeError, match="PVC identity is unavailable"):
+            await pin_task
 
     @pytest.mark.asyncio
     async def test_pin_create_replay_and_exact_release_survive_restart(
@@ -4039,17 +4395,35 @@ class TestWorkspaceRecoveryControllerPins:
                 items=[
                     types.SimpleNamespace(
                         metadata=types.SimpleNamespace(
+                            name=f"agent-vm-{SAMPLE_JOB_CONFIG['job_id']}-rootdisk",
                             uid=pvc_uid,
                             deletion_timestamp=None,
                             labels={
                                 "srw.io/owner-kind": "job",
                                 "srw.io/owner-id": SAMPLE_JOB_CONFIG["job_id"],
                             },
+                            owner_references=[
+                                types.SimpleNamespace(
+                                    kind="DataVolume",
+                                    uid="pin-dv-uid",
+                                    controller=True,
+                                )
+                            ],
                         )
                     )
                 ]
             )
         )
+        controller.k8s_client.get_namespaced_custom_object.return_value = {
+            "metadata": {
+                "name": f"agent-vm-{SAMPLE_JOB_CONFIG['job_id']}-rootdisk",
+                "uid": "pin-dv-uid",
+                "labels": {
+                    "srw.io/owner-kind": "job",
+                    "srw.io/owner-id": SAMPLE_JOB_CONFIG["job_id"],
+                },
+            }
+        }
         controller.coordination_api.read_namespaced_lease.side_effect = [
             _FakeApiException(status=404),
             lease,
@@ -4115,6 +4489,22 @@ class TestWorkspaceRecoveryControllerPins:
 
 
 class TestLifecycleIdentityGenerationContinuation:
+    @pytest.mark.asyncio
+    async def test_ordinary_purge_without_captured_pvc_uid_leaves_disk_intact(
+        self, controller
+    ):
+        job_id = "purge-without-pvc-authority"
+        controller.k8s_client.get_namespaced_custom_object.return_value = {
+            "metadata": {"name": f"agent-vm-{job_id}", "uid": "vm-uid"}
+        }
+
+        result = await controller._do_delete(job_id, purge_disk=True)
+
+        assert result["rootdisk"] == "kept"
+        assert not _calls_for(
+            controller.k8s_client.delete_namespaced_custom_object, CDI_PLURAL
+        )
+
     @pytest.mark.asyncio
     async def test_captured_delete_response_loss_converges_when_vm_and_disk_absent(
         self, controller

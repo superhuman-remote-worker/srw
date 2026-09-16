@@ -125,11 +125,16 @@ data:
           import json
           import pathlib
           import subprocess
+          import sys
 
           def command(*argv):
               result = subprocess.run(argv, check=False, capture_output=True,
                                       text=True, timeout=5)
               return result.stdout.strip() if result.returncode == 0 else None
+
+          def command_json(*argv):
+              value = command(*argv)
+              return json.loads(value) if value is not None else None
 
           def hashes(pattern):
               return {
@@ -138,17 +143,54 @@ data:
                   if pathlib.Path(path).is_file()
               }
 
-          instance = pathlib.Path('/run/cloud-init/instance-data.json')
+          challenge = sys.argv[1] if len(sys.argv) == 2 else ''
+          if not challenge:
+              raise SystemExit(2)
+          raw_interfaces = command_json('ip', '-j', 'address')
+          routes = command_json('ip', '-j', 'route')
+          if not isinstance(raw_interfaces, list) or not isinstance(routes, list):
+              raise SystemExit(3)
+          interfaces = []
+          for item in raw_interfaces:
+              addresses = item.get('addr_info') or []
+              local = next((entry.get('local') for entry in addresses
+                            if entry.get('local')), None)
+              if item.get('ifname') != 'lo' and local and item.get('address'):
+                  interfaces.append({
+                      'ifname': item['ifname'],
+                      'address': local,
+                      'mac': item['address'],
+                  })
+          default_route = next((route for route in routes
+                                if route.get('dst') in
+                                ('default', '0.0.0.0/0', '::/0')), None)
+          instance_id = pathlib.Path('/var/lib/cloud/data/instance-id')
+          cache = pathlib.Path('/var/lib/cloud/instances')
+          cache_entries = '\n'.join(
+              str(path.relative_to(cache))
+              for path in sorted(cache.rglob('*'))
+              if path.is_file()
+          )
+          boot_id = pathlib.Path(
+              '/proc/sys/kernel/random/boot_id').read_text().strip()
+          machine_id = pathlib.Path('/etc/machine-id').read_text().strip()
           print(json.dumps({
-              'interfaces': command('ip', '-j', 'address'),
-              'routes': command('ip', '-j', 'route'),
+              'challenge': challenge,
+              'boot_id': boot_id,
+              'registration_id': hashlib.sha256(
+                  f'{challenge}:{boot_id}:{machine_id}'.encode()).hexdigest(),
+              'interfaces': interfaces,
+              'address': interfaces[0]['address'] if interfaces else None,
+              'routes': routes,
+              'default_route': default_route,
               'dns': pathlib.Path('/etc/resolv.conf').read_text(errors='replace'),
               'netplan_sha256': hashes('/etc/netplan/*'),
               'networkd_sha256': hashes('/etc/systemd/network/*'),
-              'cloud_init_instance_sha256': (
-                  hashlib.sha256(instance.read_bytes()).hexdigest()
-                  if instance.is_file() else None
+              'cloud_init_instance_id': (
+                  instance_id.read_text().strip() if instance_id.is_file() else None
               ),
+              'cloud_init_cache_identity': hashlib.sha256(
+                  cache_entries.encode()).hexdigest() if cache_entries else None,
               'cloud_init_cache_cleaned': False,
           }, sort_keys=True))
     runcmd:

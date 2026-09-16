@@ -1,6 +1,8 @@
 """Retained disk identity, generation fencing, and deletion preconditions."""
 
+import asyncio
 from copy import deepcopy
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 from uuid import uuid4
@@ -83,6 +85,14 @@ def runtime(value):
     core.list_namespaced_pod.return_value = SimpleNamespace(items=[])
     custom = MagicMock()
     custom.list_namespaced_custom_object.return_value = {"items": []}
+    lifecycle_locks = {}
+
+    @asynccontextmanager
+    async def workspace_lifecycle(owner_id):
+        lock = lifecycle_locks.setdefault(owner_id, asyncio.Lock())
+        async with lock:
+            yield
+
     controller = SimpleNamespace(
         core_api=core,
         k8s_client=custom,
@@ -90,6 +100,7 @@ def runtime(value):
         _get_dv=AsyncMock(return_value=None),
         _delete_captured_rootdisk=AsyncMock(),
         _active_recovery_pins=AsyncMock(return_value=()),
+        _workspace_lifecycle=workspace_lifecycle,
     )
     return RetainedStorage(controller, "test"), pvc
 

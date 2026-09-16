@@ -28,6 +28,7 @@ import asyncio
 import base64
 from collections import OrderedDict
 from collections.abc import Mapping
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 import hashlib
 import json
@@ -539,26 +540,61 @@ def _owned_by(value: object, *, kind: str, uid: str) -> bool:
     return any(
         _object_value(reference, "kind") == kind
         and _object_value(reference, "uid") == uid
-        and _object_value(reference, "controller", True) is not False
+        and _object_value(reference, "controller") is True
         for reference in _owner_references(value)
     )
 
 
-def _pod_container_statuses(pod: object) -> list[object]:
-    status = _object_value(pod, "status", {})
-    values: list[object] = []
-    for camel, snake in (
-        ("initContainerStatuses", "init_container_statuses"),
-        ("containerStatuses", "container_statuses"),
-    ):
-        entries = _object_value(status, camel)
-        if entries is None:
-            entries = _object_value(status, snake, [])
-        values.extend(entries or [])
-    return values
+def _storage_volume_name(value: object, expected_name: str) -> str | None:
+    """Return one volume name bound to the exact DV/PVC name."""
+
+    volumes = _object_value(value, "volumes", [])
+    if not isinstance(volumes, list):
+        return None
+    matches: list[str] = []
+    for volume in volumes:
+        data_volume = _object_value(volume, "dataVolume")
+        if data_volume is None:
+            data_volume = _object_value(volume, "data_volume")
+        claim = _object_value(volume, "persistentVolumeClaim")
+        if claim is None:
+            claim = _object_value(volume, "persistent_volume_claim")
+        source_name = (
+            _object_value(data_volume, "name")
+            if data_volume is not None
+            else _object_value(claim, "claimName") or _object_value(claim, "claim_name")
+        )
+        if source_name == expected_name:
+            name = _object_value(volume, "name")
+            if not isinstance(name, str) or not name:
+                return None
+            matches.append(name)
+    return matches[0] if len(matches) == 1 else None
 
 
-def _exact_terminal_container_evidence(pod: object) -> list[dict] | None:
+def _container_mounts_volume(pod_spec: object, volume_name: str) -> bool:
+    containers = _container_entries(pod_spec, "containers", "containers")
+    if containers is None:
+        return False
+    compute = [item for item in containers if _object_value(item, "name") == "compute"]
+    if len(compute) != 1:
+        return False
+    mounts = _object_value(compute[0], "volumeMounts")
+    if mounts is None:
+        mounts = _object_value(compute[0], "volume_mounts", [])
+    return isinstance(mounts, list) and any(
+        _object_value(mount, "name") == volume_name for mount in mounts
+    )
+
+
+def _container_entries(value: object, camel: str, snake: str) -> list[object] | None:
+    entries = _object_value(value, camel)
+    if entries is None:
+        entries = _object_value(value, snake, [])
+    return list(entries) if isinstance(entries, (list, tuple)) else None
+
+
+def _exact_terminal_container_evidence(pod: object) -> dict | None:
     """Return current kubelet termination evidence, never ``lastState``."""
 
     pod_status = _object_value(pod, "status", {})
@@ -580,44 +616,96 @@ def _exact_terminal_container_evidence(pod: object) -> list[dict] | None:
         restart_policy = _object_value(spec, "restart_policy")
     if restart_policy not in {None, "Never"}:
         return None
-    statuses = _pod_container_statuses(pod)
-    if not statuses:
-        return None
-    evidence: list[dict] = []
-    for status in statuses:
-        container_id = _object_value(status, "containerID")
-        if container_id is None:
-            container_id = _object_value(status, "container_id")
-        restart_count = _object_value(status, "restartCount")
-        if restart_count is None:
-            restart_count = _object_value(status, "restart_count")
-        state = _object_value(status, "state", {})
-        terminated = _object_value(state, "terminated")
-        if terminated is None:
+    declared: dict[str, list[str]] = {}
+    status_groups: dict[str, list[object]] = {}
+    for kind, spec_keys, status_keys in (
+        (
+            "init",
+            ("initContainers", "init_containers"),
+            ("initContainerStatuses", "init_container_statuses"),
+        ),
+        (
+            "regular",
+            ("containers", "containers"),
+            ("containerStatuses", "container_statuses"),
+        ),
+    ):
+        definitions = _container_entries(spec, *spec_keys)
+        statuses = _container_entries(pod_status, *status_keys)
+        if definitions is None or statuses is None:
             return None
-        finished_at = _object_value(terminated, "finishedAt")
-        if finished_at is None:
-            finished_at = _object_value(terminated, "finished_at")
+        names = [_object_value(entry, "name") for entry in definitions]
+        if any(not isinstance(name, str) or not name for name in names):
+            return None
+        if len(set(names)) != len(names):
+            return None
+        status_names = [_object_value(entry, "name") for entry in statuses]
         if (
-            _safe_uid(container_id) is None
-            or type(restart_count) is not int
-            or restart_count != 0
-            or finished_at is None
+            any(not isinstance(name, str) or not name for name in status_names)
+            or len(set(status_names)) != len(status_names)
+            or set(status_names) != set(names)
         ):
             return None
-        evidence.append(
-            {
-                "name": str(_object_value(status, "name") or ""),
-                "container_id": container_id,
-                "restart_count": restart_count,
-                "finished_at": (
-                    finished_at.isoformat()
-                    if isinstance(finished_at, datetime)
-                    else str(finished_at)
-                ),
-            }
-        )
-    return evidence
+        declared[kind] = names
+        status_groups[kind] = statuses
+    if "compute" not in declared["regular"] or not declared["regular"]:
+        return None
+    evidence: list[dict] = []
+    for kind in ("init", "regular"):
+        for status in status_groups[kind]:
+            container_id = _object_value(status, "containerID")
+            if container_id is None:
+                container_id = _object_value(status, "container_id")
+            restart_count = _object_value(status, "restartCount")
+            if restart_count is None:
+                restart_count = _object_value(status, "restart_count")
+            state = _object_value(status, "state", {})
+            last_state = _object_value(status, "lastState")
+            if last_state is None:
+                last_state = _object_value(status, "last_state")
+            if last_state:
+                return None
+            terminated = _object_value(state, "terminated")
+            if terminated is None:
+                return None
+            finished_at = _object_value(terminated, "finishedAt")
+            if finished_at is None:
+                finished_at = _object_value(terminated, "finished_at")
+            reason = _object_value(terminated, "reason")
+            if (
+                _safe_uid(container_id) is None
+                or type(restart_count) is not int
+                or restart_count != 0
+                or finished_at is None
+                or not isinstance(reason, str)
+                or not reason
+                or reason == "ContainerStatusUnknown"
+            ):
+                return None
+            evidence.append(
+                {
+                    "name": str(_object_value(status, "name") or ""),
+                    "kind": kind,
+                    "container_id": container_id,
+                    "restart_count": restart_count,
+                    "state": "terminated",
+                    "last_state": None,
+                    "finished_at": (
+                        finished_at.isoformat()
+                        if isinstance(finished_at, datetime)
+                        else str(finished_at)
+                    ),
+                    "reason": reason,
+                }
+            )
+    return {
+        "containers": evidence,
+        "declared_containers": declared,
+        "pod_terminal": {
+            "phase": _object_value(pod_status, "phase"),
+            "restart_policy": restart_policy or "Never",
+        },
+    }
 
 
 def _admitted_pvc_uid(
@@ -698,6 +786,31 @@ class VMController:
         digest = hashlib.sha256(entity_id.encode("utf-8")).digest()
         return locks[int.from_bytes(digest[:8], "big") % len(locks)]
 
+    @asynccontextmanager
+    async def _workspace_lifecycle(self, owner_id: str):
+        """Serialize one workspace boundary, allowing same-task nesting."""
+
+        lock = self._lifecycle_lock_for(str(owner_id))
+        task = asyncio.current_task()
+        if task is None:
+            raise RuntimeError("workspace lifecycle requires an asyncio task")
+        owners = getattr(self, "_lifecycle_lock_owners", None)
+        if owners is None:
+            owners = {}
+            self._lifecycle_lock_owners = owners
+        key = id(lock)
+        if owners.get(key) is task:
+            yield
+            return
+        await lock.acquire()
+        owners[key] = task
+        try:
+            yield
+        finally:
+            if owners.get(key) is task:
+                owners.pop(key, None)
+            lock.release()
+
     @staticmethod
     def _recovery_pin_name(recovery_id: str) -> str:
         parsed = UUID(str(recovery_id))
@@ -750,7 +863,7 @@ class VMController:
         return any(pin["pvc_uid"] == pvc_uid for pin in pins)
 
     async def _do_reconcile_workspace_recovery_pin(
-        self, payload: Mapping[str, object]
+        self, payload: Mapping[str, object], *, _serialized: bool = False
     ) -> dict:
         """Idempotently project one PostgreSQL pin into a Kubernetes Lease."""
 
@@ -770,6 +883,11 @@ class VMController:
             raise ValueError("workspace recovery pin state is invalid")
         if owner_kind not in {"job", "thread"} or namespace != VM_NAMESPACE:
             raise ValueError("workspace recovery pin owner is invalid")
+        if not _serialized:
+            async with self._workspace_lifecycle(owner_id):
+                return await self._do_reconcile_workspace_recovery_pin(
+                    payload, _serialized=True
+                )
         name = self._recovery_pin_name(recovery_id)
         try:
             lease = await asyncio.to_thread(
@@ -840,11 +958,35 @@ class VMController:
                 "resource_version": resource_version,
             }
         if lease is None:
-            known, observed_pvc_uid = await self._rootdisk_pvc_probe_by_uid(
+            known, pvc = await self._rootdisk_pvc_by_uid(
                 pvc_uid, owner_id=owner_id, owner_kind=str(owner_kind)
             )
-            if not known or observed_pvc_uid != pvc_uid:
+            pvc_name = _metadata_value(pvc, "name") if pvc is not None else None
+            if (
+                not known
+                or pvc is None
+                or _safe_uid(_metadata_value(pvc, "uid")) != pvc_uid
+                or not isinstance(pvc_name, str)
+                or not pvc_name
+            ):
                 raise RuntimeError("workspace recovery PVC identity is unavailable")
+            dv = await self._get_dv(pvc_name)
+            dv_metadata = (dv or {}).get("metadata") or {}
+            dv_labels = dv_metadata.get("labels") or {}
+            dv_uid = _safe_uid(dv_metadata.get("uid"))
+            if (
+                dv is None
+                or dv_uid is None
+                or dv_metadata.get("name") != pvc_name
+                or dv_metadata.get("deletionTimestamp")
+                or not isinstance(dv_labels, Mapping)
+                or dv_labels.get("srw.io/owner-kind") != owner_kind
+                or dv_labels.get("srw.io/owner-id") != owner_id
+                or not _owned_by(pvc, kind="DataVolume", uid=dv_uid)
+            ):
+                raise RuntimeError(
+                    "workspace recovery DataVolume identity is unavailable"
+                )
             created = await asyncio.to_thread(
                 self.coordination_api.create_namespaced_lease,
                 namespace=VM_NAMESPACE,
@@ -1449,18 +1591,21 @@ class VMController:
     async def _do_create(self, job_config: dict) -> dict:
         """Create a KubeVirt VirtualMachine for a job."""
         job_id = job_config.get("job_id", "unknown")
-        async with self._lifecycle_lock_for(str(job_id)):
+        binding = job_config.get("workspace_storage")
+        lifecycle_owner = str(job_id)
+        if binding is not None:
+            from shared.vm_workspace_storage import storage_binding
+
+            binding = storage_binding(binding)
+            lifecycle_owner = binding["owner_id"]
+        async with self._workspace_lifecycle(lifecycle_owner):
             capacity_lock = getattr(self, "_capacity_lock", None)
             if capacity_lock is None:
                 # A few unit-test fixtures intentionally construct via __new__.
                 capacity_lock = asyncio.Lock()
                 self._capacity_lock = capacity_lock
             async with capacity_lock:
-                binding = job_config.get("workspace_storage")
                 if binding is not None:
-                    from shared.vm_workspace_storage import storage_binding
-
-                    storage_binding(binding)
                     if (
                         not VM_PERSISTENT_ROOTDISK
                         or LIFECYCLE_HMAC_SECRET is None
@@ -1469,8 +1614,7 @@ class VMController:
                         raise ValueError(
                             "Retained VM workspaces require persistent disks and authenticated lifecycle hosting."
                         )
-                    async with self._retained_storage().lock:
-                        return await self._do_create_serialized(job_config)
+                    return await self._do_create_serialized(job_config)
                 return await self._do_create_serialized(job_config)
 
     async def _do_create_serialized(self, job_config: dict) -> dict:
@@ -1863,7 +2007,7 @@ class VMController:
         particular, a delete that observes a missing old VM cannot purge the
         reusable rootdisk name after a concurrent create has attached it.
         """
-        async with self._lifecycle_lock_for(job_id):
+        async with self._workspace_lifecycle(job_id):
             return await self._do_delete_serialized(
                 job_id,
                 purge_disk=purge_disk,
@@ -1970,6 +2114,14 @@ class VMController:
 
             if current_vm.get("metadata", {}).get("labels", {}).get(WORKSPACE_LABEL):
                 raise RuntimeError("Retained VM deletion requires its storage binding.")
+        if purge_disk and expected_rootdisk_pvc_uid is None:
+            # A reusable DataVolume name is not immutable authority. Leave the
+            # disk behind unless the caller supplies the captured PVC UID.
+            log.warning(
+                "rootdisk purge refused for %s: captured PVC UID is unavailable",
+                rootdisk,
+            )
+            purge_disk = False
         captured_rootdisk_absent = False
         if expected_rootdisk_pvc_uid is not None:
             rootdisk_known, observed_rootdisk_uid = await self._rootdisk_pvc_probe(
@@ -2041,8 +2193,6 @@ class VMController:
                         owner_id=rootdisk_owner,
                         expected_pvc_uid=expected_rootdisk_pvc_uid,
                     )
-                elif not captured_rootdisk_absent:
-                    await self._delete_dv(rootdisk)
             except Exception as e:
                 if expected_rootdisk_pvc_uid is not None:
                     raise
@@ -2372,10 +2522,35 @@ class VMController:
             or annotations.get("srw.io/provision-generation") != generation
         ):
             return base
-        pvc_known, observed_pvc_uid = await self._rootdisk_pvc_probe_by_uid(
+        pvc_known, pvc = await self._rootdisk_pvc_by_uid(
             pvc_uid, owner_id=owner_id, owner_kind=owner_kind
         )
-        if not pvc_known or observed_pvc_uid != pvc_uid:
+        rootdisk_name = _metadata_value(pvc, "name") if pvc is not None else None
+        if (
+            not pvc_known
+            or pvc is None
+            or _safe_uid(_metadata_value(pvc, "uid")) != pvc_uid
+            or not isinstance(rootdisk_name, str)
+            or not rootdisk_name
+        ):
+            return base
+        dv = await self._get_dv(rootdisk_name)
+        dv_metadata = (dv or {}).get("metadata") or {}
+        dv_labels = dv_metadata.get("labels") or {}
+        dv_uid = _safe_uid(dv_metadata.get("uid"))
+        vm_template_spec = _object_value(
+            _object_value(_object_value(vm, "spec", {}), "template", {}), "spec", {}
+        )
+        if (
+            dv is None
+            or dv_uid is None
+            or dv_metadata.get("name") != rootdisk_name
+            or not isinstance(dv_labels, Mapping)
+            or dv_labels.get("srw.io/owner-kind") != owner_kind
+            or dv_labels.get("srw.io/owner-id") != owner_id
+            or not _owned_by(pvc, kind="DataVolume", uid=dv_uid)
+            or _storage_volume_name(vm_template_spec, rootdisk_name) is None
+        ):
             return base
         try:
             vmi = await asyncio.to_thread(
@@ -2394,6 +2569,9 @@ class VMController:
         if current_vmi_uid is None or not _owned_by(
             vmi, kind="VirtualMachine", uid=vm_uid
         ):
+            return base
+        vmi_spec = _object_value(vmi, "spec", {})
+        if _storage_volume_name(vmi_spec, rootdisk_name) is None:
             return base
         vmi_status = _object_value(vmi, "status", {})
         migration_state = _object_value(vmi_status, "migrationState")
@@ -2431,6 +2609,11 @@ class VMController:
             return base
         pod_status = _object_value(launcher, "status", {})
         pod_spec = _object_value(launcher, "spec", {})
+        launcher_volume = _storage_volume_name(pod_spec, rootdisk_name)
+        if launcher_volume is None or not _container_mounts_volume(
+            pod_spec, launcher_volume
+        ):
+            return base
         status_reason = _object_value(pod_status, "reason")
         status_message = str(_object_value(pod_status, "message") or "")
         if status_reason in {"NodeLost", "ContainerStatusUnknown"} or (
@@ -2509,11 +2692,15 @@ class VMController:
                     "vm_uid": vm_uid,
                     "vmi_uid": old_vmi_uid,
                     "launcher_uid": old_launcher_uid,
-                    "container_id": terminal[0]["container_id"],
+                    "container_id": next(
+                        item["container_id"]
+                        for item in terminal["containers"]
+                        if item["name"] == "compute" and item["kind"] == "regular"
+                    ),
                     "root_pvc_uid": pvc_uid,
                     "controller_identity": WORKSPACE_RECOVERY_CONTROLLER_IDENTITY,
                     "observed_at": observed_at.isoformat(),
-                    "containers": terminal,
+                    **terminal,
                     "node_uid": node_uid,
                     "migration_ambiguous": False,
                 }
@@ -2633,6 +2820,16 @@ class VMController:
     ) -> tuple[bool, str | None]:
         """Find one exact owner-labelled root PVC without guessing its name."""
 
+        known, pvc = await self._rootdisk_pvc_by_uid(
+            pvc_uid, owner_id=owner_id, owner_kind=owner_kind
+        )
+        return known, _safe_uid(_metadata_value(pvc, "uid")) if pvc else None
+
+    async def _rootdisk_pvc_by_uid(
+        self, pvc_uid: str, *, owner_id: str, owner_kind: str
+    ) -> tuple[bool, object | None]:
+        """Read the one exact owner-labelled PVC object by immutable UID."""
+
         if self.core_api is None:
             return False, None
         try:
@@ -2663,7 +2860,7 @@ class VMController:
             or labels.get("srw.io/owner-id") != owner_id
         ):
             return False, None
-        return True, pvc_uid
+        return True, matches[0]
 
     async def _get_dv(self, name: str) -> dict | None:
         """GET a CDI DataVolume by name; None on 404."""
@@ -2689,8 +2886,18 @@ class VMController:
         *,
         owner_id: str,
         expected_pvc_uid: str,
+        _serialized: bool = False,
     ) -> None:
         """Purge only the rootdisk whose immutable PVC UID was captured."""
+
+        if not _serialized:
+            async with self._workspace_lifecycle(owner_id):
+                return await self._delete_captured_rootdisk(
+                    name,
+                    owner_id=owner_id,
+                    expected_pvc_uid=expected_pvc_uid,
+                    _serialized=True,
+                )
 
         if self.core_api is None:
             raise RuntimeError("CoreV1Api is unavailable for captured rootdisk delete")
@@ -3004,22 +3211,50 @@ class VMController:
             log.info("rootdisk reattach: %s (job %s)", log_name, job_id)
             return name
         if dv and phase == "Failed":
-            pins = (
-                tuple(recovery_pins)
-                if recovery_pins is not None
-                else await self._active_recovery_pins()
-            )
-            _known, failed_pvc_uid = await self._rootdisk_pvc_probe(
-                name,
-                owner_id=job_id,
-                owner_kind=owner_kind,
-                wait=False,
-            )
-            if self._pvc_is_recovery_pinned(pins, failed_pvc_uid):
-                raise RuntimeError("failed rootdisk is pinned for workspace recovery")
-            log.warning("rootdisk %s is Failed — recreating", log_name)
-            await self._delete_dv(name)
-            dv = None
+            async with self._workspace_lifecycle(job_id):
+                # The phase read that selected this branch predates lifecycle
+                # admission. Re-read every identity under the shared boundary.
+                dv = await self._get_dv(name)
+                phase = ((dv or {}).get("status") or {}).get("phase", "")
+                if dv and phase == "Succeeded":
+                    return name
+                if dv and phase == "Failed":
+                    dv_metadata = dv.get("metadata") or {}
+                    dv_labels = dv_metadata.get("labels") or {}
+                    if (
+                        dv_metadata.get("name") != name
+                        or not isinstance(dv_labels, Mapping)
+                        or dv_labels.get("srw.io/owner-kind") != owner_kind
+                        or dv_labels.get("srw.io/owner-id") != job_id
+                    ):
+                        raise RuntimeError("failed rootdisk ownership is unknown")
+                    known, failed_pvc_uid = await self._rootdisk_pvc_probe(
+                        name,
+                        owner_id=job_id,
+                        owner_kind=owner_kind,
+                        wait=False,
+                    )
+                    if not known or failed_pvc_uid is None:
+                        raise RuntimeError(
+                            "failed rootdisk PVC identity is unknown; refusing recreation"
+                        )
+                    pins = (
+                        tuple(recovery_pins)
+                        if recovery_pins is not None
+                        else await self._active_recovery_pins()
+                    )
+                    if self._pvc_is_recovery_pinned(pins, failed_pvc_uid):
+                        raise RuntimeError(
+                            "failed rootdisk is pinned for workspace recovery"
+                        )
+                    dv_uid = _safe_uid(dv_metadata.get("uid"))
+                    if dv_uid is None:
+                        raise RuntimeError(
+                            "failed rootdisk DataVolume identity is unknown"
+                        )
+                    log.warning("rootdisk %s is Failed — recreating", log_name)
+                    await self._delete_dv(name, expected_uid=dv_uid)
+                    dv = None
         if dv is not None:
             # Importing / Pending / CloneScheduled — a racing create is already
             # building it, and KubeVirt gates VMI start on DV readiness anyway.
@@ -3105,7 +3340,6 @@ class VMController:
         disks = resp.get("items", [])
         if not disks:
             return
-        recovery_pins = await self._active_recovery_pins()
 
         try:
             vms = await asyncio.to_thread(
@@ -3144,23 +3378,75 @@ class VMController:
             owner_kind = labels.get("srw.io/owner-kind") or "job"
             if not owner_id:
                 owner_id = name[len("agent-vm-") : -len("-rootdisk")]
-            _known, pvc_uid = await self._rootdisk_pvc_probe(
-                name,
-                owner_id=str(owner_id),
-                owner_kind=str(owner_kind),
-                wait=False,
-            )
-            if self._pvc_is_recovery_pinned(recovery_pins, pvc_uid):
-                continue
-            try:
-                await self._delete_dv(name)
-                log.warning(
-                    "rootdisk GC: deleted orphan %s (no VM for >%dh)",
-                    name,
-                    VM_ROOTDISK_ORPHAN_HOURS,
+            async with self._workspace_lifecycle(str(owner_id)):
+                # Re-read object existence and immutable identities after
+                # acquiring the same boundary used by create and pin publish.
+                fresh_disks = await asyncio.to_thread(
+                    self.k8s_client.list_namespaced_custom_object,
+                    group=CDI_GROUP,
+                    version=CDI_VERSION,
+                    namespace=VM_NAMESPACE,
+                    plural=CDI_PLURAL,
+                    label_selector="srw.io/rootdisk",
                 )
-            except Exception as e:
-                log.warning("rootdisk GC: delete %s failed: %s", name, e)
+                exact = [
+                    item
+                    for item in fresh_disks.get("items", [])
+                    if (item.get("metadata") or {}).get("name") == name
+                ]
+                if len(exact) != 1:
+                    continue
+                current_dv = exact[0]
+                current_metadata = current_dv.get("metadata") or {}
+                current_labels = current_metadata.get("labels") or {}
+                dv_uid = _safe_uid(current_metadata.get("uid"))
+                candidate_uid = _safe_uid((dv.get("metadata") or {}).get("uid"))
+                if (
+                    dv_uid is None
+                    or dv_uid != candidate_uid
+                    or not isinstance(current_labels, Mapping)
+                    or current_labels.get("srw.io/owner-kind") != str(owner_kind)
+                    or current_labels.get("srw.io/owner-id") != str(owner_id)
+                    or current_metadata.get("deletionTimestamp")
+                    or _age_minutes(current_dv) < max_age_minutes
+                ):
+                    continue
+                fresh_vms = await asyncio.to_thread(
+                    self.k8s_client.list_namespaced_custom_object,
+                    group=KUBEVIRT_GROUP,
+                    version=KUBEVIRT_VERSION,
+                    namespace=VM_NAMESPACE,
+                    plural=KUBEVIRT_PLURAL,
+                )
+                if any(
+                    (item.get("metadata") or {}).get("name")
+                    == name[: -len("-rootdisk")]
+                    for item in fresh_vms.get("items", [])
+                ):
+                    continue
+                known, pvc_uid = await self._rootdisk_pvc_probe(
+                    name,
+                    owner_id=str(owner_id),
+                    owner_kind=str(owner_kind),
+                    wait=False,
+                )
+                if not known or pvc_uid is None:
+                    log.warning(
+                        "rootdisk GC: refusing %s with unknown PVC identity", name
+                    )
+                    continue
+                recovery_pins = await self._active_recovery_pins()
+                if self._pvc_is_recovery_pinned(recovery_pins, pvc_uid):
+                    continue
+                try:
+                    await self._delete_dv(name, expected_uid=dv_uid)
+                    log.warning(
+                        "rootdisk GC: deleted orphan %s (no VM for >%dh)",
+                        name,
+                        VM_ROOTDISK_ORPHAN_HOURS,
+                    )
+                except Exception as e:
+                    log.warning("rootdisk GC: delete %s failed: %s", name, e)
 
     async def _gc_goldens_safe(self, image: str) -> None:
         """Non-fatal wrapper around _gc_goldens for fire-and-forget scheduling."""
@@ -3873,7 +4159,7 @@ class VMController:
 
         preparation = validate_request(value)
         entity_id = preparation["allocationId"]
-        async with self._lifecycle_lock_for(entity_id):
+        async with self._workspace_lifecycle(entity_id):
             result = await self._workspace_preparation().cancel_with_receipt(
                 preparation
             )

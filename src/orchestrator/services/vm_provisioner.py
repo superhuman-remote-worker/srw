@@ -4,7 +4,6 @@ import base64
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
-import hashlib
 import ipaddress
 import json
 import logging
@@ -2066,17 +2065,6 @@ class VMProvisioner:
         if qualified is None:
             return observation
         successor = {**dict(successor), **qualified}
-        registration_seed = ":".join(
-            (
-                str(captured_identity.get("provision_generation") or ""),
-                str(successor.get("vmi_uid") or ""),
-                str(successor.get("launcher_uid") or ""),
-            )
-        )
-        successor["ssh_registration_id"] = (
-            "recovery-"
-            + hashlib.sha256(registration_seed.encode("utf-8")).hexdigest()[:32]
-        )
         observation.update(
             {
                 "authenticated": True,

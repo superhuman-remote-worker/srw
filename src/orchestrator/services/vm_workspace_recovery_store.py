@@ -68,6 +68,73 @@ def _required_text(value: object) -> bool:
     return isinstance(value, str) and bool(value.strip())
 
 
+def _valid_stop_container_evidence(evidence: Mapping[str, Any]) -> bool:
+    containers = evidence.get("containers")
+    declared = evidence.get("declared_containers")
+    terminal = evidence.get("pod_terminal")
+    if (
+        not isinstance(containers, list)
+        or not containers
+        or not isinstance(declared, Mapping)
+        or set(declared) != {"regular", "init"}
+        or not isinstance(terminal, Mapping)
+        or terminal.get("phase") not in {"Succeeded", "Failed"}
+        or terminal.get("restart_policy") != "Never"
+    ):
+        return False
+    expected: set[tuple[str, str]] = set()
+    all_names: set[str] = set()
+    for kind in ("regular", "init"):
+        names = declared.get(kind)
+        if not isinstance(names, list) or any(
+            not _required_text(name) for name in names
+        ):
+            return False
+        if len(set(names)) != len(names) or all_names.intersection(names):
+            return False
+        all_names.update(names)
+        expected.update((kind, str(name)) for name in names)
+    if ("regular", "compute") not in expected or len(containers) != len(expected):
+        return False
+    observed: set[tuple[str, str]] = set()
+    compute_id = None
+    for item in containers:
+        if not isinstance(item, Mapping):
+            return False
+        name = item.get("name")
+        kind = item.get("kind")
+        container_id = item.get("container_id")
+        restart_count = item.get("restart_count")
+        finished_at = item.get("finished_at")
+        reason = item.get("reason")
+        identity = (str(kind), str(name))
+        if (
+            kind not in {"regular", "init"}
+            or not _required_text(name)
+            or identity in observed
+            or identity not in expected
+            or not _required_text(container_id)
+            or type(restart_count) is not int
+            or restart_count != 0
+            or item.get("state") != "terminated"
+            or item.get("last_state") is not None
+            or not _required_text(finished_at)
+            or not _required_text(reason)
+            or reason == "ContainerStatusUnknown"
+        ):
+            return False
+        try:
+            finished = datetime.fromisoformat(str(finished_at).replace("Z", "+00:00"))
+        except ValueError:
+            return False
+        if finished.tzinfo is None:
+            return False
+        observed.add(identity)
+        if identity == ("regular", "compute"):
+            compute_id = container_id
+    return observed == expected and evidence.get("container_id") == compute_id
+
+
 def _observation_authority_error(
     operation: Mapping[str, Any], observation: object
 ) -> str | None:
@@ -1708,6 +1775,8 @@ class VMWorkspaceRecoveryStore:
             not isinstance(evidence.get(key), str) or not evidence.get(key)
             for key in required
         ):
+            return None
+        if not _valid_stop_container_evidence(evidence):
             return None
         if any(
             str(evidence.get(key)) != str(claim.captured_identity.get(captured))

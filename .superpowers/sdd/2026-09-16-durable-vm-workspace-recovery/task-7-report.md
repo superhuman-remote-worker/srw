@@ -119,3 +119,64 @@ Result: Ruff passed, `19 passed`, and the diff check passed.
   missing evidence.
 - Kubernetes/operator deletion outside the application/controller paths remains
   outside this guarantee, as documented in the issue design.
+
+## Review Fix Round 1
+
+### Changes
+
+- Added a common owner-keyed controller lifecycle boundary with safe same-task
+  reentrancy. Pin activation/release, VM create/delete, Failed-DV recreation,
+  orphan rootdisk GC, preparation cleanup, and every retained-storage
+  claim/ensure/detach/delete now serialize on that boundary.
+- Pin activation now validates the exact current PVC and its owning DataVolume
+  under the boundary before acknowledging. GC and Failed-DV recreation re-read
+  the exact owner, DataVolume UID, PVC UID, and active pins immediately before
+  an external delete. Deterministic interleavings prove that a pin cannot ACK
+  after either destructive path crosses its admission boundary.
+- Unknown PVC identity is now a refusal for GC and Failed-DV recreation.
+  Ordinary purge requests without a captured PVC UID leave the disk and its
+  Headscale identity intact. Captured rootdisk deletion reacquires the same
+  lifecycle boundary and uses UID preconditions.
+- Stop evidence now requires exact declared regular/init container coverage,
+  one current status per name, an explicit compute container, current
+  termination state, empty `lastState`, zero restarts, container IDs, terminal
+  reasons, and finished timestamps. The append-only store independently
+  validates the complete structure before accepting a receipt.
+- Observation now proves the captured PVC is controller-owned by the exact
+  DataVolume and that the VM template, VMI, and launcher/compute mount all
+  reference that exact name. VM to VMI and VMI to launcher ownership requires
+  an explicit `controller=true` owner reference.
+- Successor qualification now sends a fresh nonce through pinned SSH and
+  requires the guest to return that nonce with its boot ID and guest-derived
+  registration response. Complete interface/MAC, address, default route, DNS,
+  effective netplan/networkd, and cloud-init instance/cache identity are
+  mandatory. The orchestrator no longer synthesizes a registration ID from
+  controller identifiers, and the guest helper remains read-only.
+
+### RED Evidence
+
+The initial focused controller/readiness run reported `23 failed, 5 passed`.
+Every new negative case failed for the intended permissive behavior: pin ACK
+during GC/Failed-DV deletion, deletion with unknown PVC identity, name-only
+purge, incomplete/unknown container status, unrelated disk chains, missing
+controller owner bits, partial telemetry, and a replayed challenge.
+
+The independent PostgreSQL receipt-validation run reported `4 failed`; each
+malformed container set was accepted before the store validator was added.
+
+### GREEN and Verification
+
+Focused amended controller, retained-storage, and readiness tests passed:
+`56 passed in 1.14s`. The PostgreSQL receipt tests passed: `5 passed in 9.10s`.
+
+The controller, retained-storage, readiness, and Helm-focused regression run
+passed: `296 passed in 13.02s`.
+
+The required Task 7 gate passed:
+
+```text
+PYTHONPATH=src python -m pytest tests/test_vm_controller.py tests/test_vm_retained_storage.py tests/test_vm_remote_operation_real_postgres.py tests/test_vm_workspace_recovery.py tests/test_vm_workspace_recovery_real_postgres.py tests/test_vm_readiness.py -q --tb=short
+```
+
+Result: `412 passed, 2 warnings in 85.19s`. The warnings are the existing
+testcontainers and Python 3.14/Pydantic deprecations.
