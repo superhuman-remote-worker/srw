@@ -41,6 +41,7 @@ class FakeDB:
         ready_threads=(),
         *,
         promote_result=True,
+        recovery_owned=False,
     ):
         self.jobs = list(jobs)
         self.threads = list(threads)
@@ -49,6 +50,15 @@ class FakeDB:
         self.calls = []
         self.promotions = []
         self.promote_result = promote_result
+        self.recovery_owned = recovery_owned
+        self.recovery_checks = 0
+
+    async def vm_workspace_recovery_owns_authority(self, entity_type, entity_id):
+        del entity_type, entity_id
+        self.recovery_checks += 1
+        if callable(self.recovery_owned):
+            return bool(self.recovery_owned(self.recovery_checks))
+        return bool(self.recovery_owned)
 
     async def list_job_vm_readiness_candidates(self, *, ready=False):
         self.calls.append(("job", ready))
@@ -127,6 +137,44 @@ class FakeProvisioner:
             pod_ip=host,
             port=22,
         )
+
+
+@pytest.mark.asyncio
+async def test_readiness_does_not_probe_while_recovery_owns_authority() -> None:
+    db = FakeDB(jobs=[candidate()], recovery_owned=True)
+    provisioner = FakeProvisioner({"ready": True})
+
+    await VMReadinessService(
+        db, provisioner, trigger_dispatch=lambda: None
+    ).run_cycle()
+
+    assert provisioner.queries == []
+    assert provisioner.writes == []
+    assert db.promotions == []
+
+
+@pytest.mark.asyncio
+async def test_readiness_does_not_mutate_when_recovery_wins_during_probe() -> None:
+    db = FakeDB(
+        jobs=[candidate()],
+        recovery_owned=lambda check: check >= 2,
+    )
+    provisioner = FakeProvisioner(
+        {
+            "ready": True,
+            "pod_ip": "10.42.0.10",
+            "phase": "Running",
+            "active_pod_uid": "pod-1",
+        }
+    )
+
+    await VMReadinessService(
+        db, provisioner, trigger_dispatch=lambda: None
+    ).run_cycle()
+
+    assert provisioner.queries == [("job", candidate()["entity_id"])]
+    assert provisioner.writes == []
+    assert db.promotions == []
 
 
 @pytest.fixture

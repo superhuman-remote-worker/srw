@@ -223,6 +223,10 @@ from orchestrator.services.vm_workspace_recovery_store import (  # noqa: E402
     completed_cleanup_outcome,
     complete_vm_cleanup_permit,
 )
+from orchestrator.services.vm_workspace_recovery import (  # noqa: E402
+    VMWorkspaceRecoveryService,
+)
+from shared.workspace_recovery import workspace_recovery_enabled  # noqa: E402
 from orchestrator.services import (  # noqa: E402
     commissioned_officer_provisioning as commissioned_officer_provisioning_service,
     pinned_session_mutation_target as pinned_session_mutation_target_service,
@@ -5764,6 +5768,17 @@ async def lifespan(app: FastAPI):
         if os.getenv("VM_MODE", "off").strip().lower() == "same-cluster"
         else None
     )
+    vm_workspace_recovery_task = asyncio.create_task(
+        run_when_leader(
+            VMWorkspaceRecoveryService(
+                VMWorkspaceRecoveryStore(postgres_db),
+                vm_provisioner,
+                automatic_enabled=workspace_recovery_enabled(),
+            ).run,
+            _shutdown_event,
+        ),
+        name="vm-workspace-recovery",
+    )
     sudo_sweeper_task = asyncio.create_task(sudo_expiration_sweeper(_shutdown_event))
     thread_events_prune_task = asyncio.create_task(
         thread_events_prune_sweeper(_shutdown_event)
@@ -6253,6 +6268,7 @@ async def lifespan(app: FastAPI):
     await dispatcher_task
     if vm_readiness_task is not None:
         await vm_readiness_task
+    await vm_workspace_recovery_task
     await sudo_sweeper_task
     await thread_events_prune_task
     await run_queue_reaper_task

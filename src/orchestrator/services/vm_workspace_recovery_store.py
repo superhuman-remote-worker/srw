@@ -47,6 +47,24 @@ def _job_workspace_owner(job_id: UUID, job: Any) -> tuple[UUID, bool]:
     return parent_id or job_id, True
 
 
+def _participant_continuation_safe(participant: Mapping[str, Any]) -> bool:
+    if (
+        participant.get("checkpoint_id") is not None
+        and participant.get("checkpoint_namespace") is not None
+    ):
+        return True
+    reference = _json(participant.get("prior_control_reference"))
+    if not isinstance(reference, Mapping):
+        return False
+    if reference.get("never_started") is True:
+        return True
+    attempt = reference.get("attempt")
+    return bool(
+        isinstance(attempt, Mapping)
+        and attempt.get("bundle_authorized_at") is None
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class RecoveryClaim:
     operation_id: UUID
@@ -55,6 +73,9 @@ class RecoveryClaim:
     deadline_at: datetime
     remaining_seconds: float
     captured_identity: Mapping[str, Any]
+    attempt: int = 1
+    global_slot: int | None = None
+    node_key: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -221,7 +242,10 @@ class VMWorkspaceRecoveryStore:
                    latest_diagnostic=$3::jsonb,
                    claimed_by=NULL, claimed_until=NULL,
                    version=version+1
-             WHERE id=$1 AND phase='recovering' AND resolved_at IS NULL
+             WHERE id=$1 AND phase IN (
+                 'recovering','observing','waiting_runtime','verifying_stop',
+                 'attesting','reconciling_outcome'
+             ) AND resolved_at IS NULL
             """,
             operation_id,
             code.value,
@@ -235,6 +259,54 @@ class VMWorkspaceRecoveryStore:
             """,
             operation_id,
         )
+        await conn.execute(
+            "DELETE FROM vm_workspace_recovery_probe_slots WHERE recovery_id=$1",
+            operation_id,
+        )
+
+    @staticmethod
+    async def _pause_expired_claim_locked(
+        conn: Any,
+        *,
+        operation_id: UUID,
+        version: int,
+        claim_token: int,
+    ) -> bool:
+        changed = await conn.fetchval(
+            """
+            UPDATE vm_workspace_recoveries
+               SET phase='paused_attention',
+                   reason_code='workspace_recovery_deadline_exceeded',
+                   latest_diagnostic=jsonb_build_object(
+                       'reason','deadline_elapsed_before_probe_result',
+                       'observed_at',clock_timestamp()),
+                   claimed_by=NULL,claimed_until=NULL,version=version+1
+             WHERE id=$1 AND version=$2 AND claim_token=$3
+               AND phase IN (
+                   'recovering','observing','waiting_runtime','verifying_stop',
+                   'attesting','reconciling_outcome'
+               ) AND resolved_at IS NULL
+               AND deadline_at <= clock_timestamp()
+            RETURNING 1
+            """,
+            operation_id,
+            version,
+            claim_token,
+        )
+        if changed is None:
+            return False
+        await conn.execute(
+            "UPDATE vm_workspace_recovery_jobs SET participation='attention' "
+            "WHERE recovery_id=$1 AND resolved_at IS NULL",
+            operation_id,
+        )
+        await conn.execute(
+            "DELETE FROM vm_workspace_recovery_probe_slots "
+            "WHERE recovery_id=$1 AND claim_token=$2",
+            operation_id,
+            claim_token,
+        )
+        return True
 
     async def admit_hold(
         self,
@@ -1033,12 +1105,19 @@ class VMWorkspaceRecoveryStore:
                     "version=version+1 WHERE id=$1",
                     operation_id,
                 )
+                unresolved_attention = any(
+                    participant["hold_lease_token"] is None
+                    for participant in participants
+                )
+                successor_phase = (
+                    "paused_attention" if unresolved_attention else "recovering"
+                )
                 await conn.execute(
                     "INSERT INTO vm_workspace_recoveries (id,protocol_version,owner_kind,owner_id,"
                     "workspace_contract_digest,provision_generation,cluster_name,namespace,vm_uid,"
                     "prior_vmi_uid,prior_launcher_uid,root_pvc_uid,phase,reason_code,original_cause,"
-                    "latest_diagnostic) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'recovering',"
-                    "$13,$14,$15)",
+                    "latest_diagnostic) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,"
+                    "$14,$15,$16)",
                     successor_id,
                     recovery["protocol_version"],
                     recovery["owner_kind"],
@@ -1051,6 +1130,7 @@ class VMWorkspaceRecoveryStore:
                     recovery["prior_vmi_uid"],
                     recovery["prior_launcher_uid"],
                     recovery["root_pvc_uid"],
+                    successor_phase,
                     recovery["reason_code"],
                     recovery["original_cause"],
                     recovery["latest_diagnostic"],
@@ -1077,7 +1157,9 @@ class VMWorkspaceRecoveryStore:
                         participant["prior_freeze_reference"],
                         participant["checkpoint_id"],
                         participant["checkpoint_namespace"],
-                        participant["participation"],
+                        "held"
+                        if participant["hold_lease_token"] is not None
+                        else "attention",
                         participant["outcome"],
                         participant["resume_receipt"],
                     )
@@ -1232,7 +1314,11 @@ class VMWorkspaceRecoveryStore:
         )
 
     async def claim_due(
-        self, operation_id: UUID, *, ttl_seconds: float = 30
+        self,
+        operation_id: UUID,
+        *,
+        ttl_seconds: float = 30,
+        max_global_probes: int = 4,
     ) -> RecoveryClaim | None:
         async with self.db.acquire() as conn:
             async with conn.transaction():
@@ -1246,7 +1332,10 @@ class VMWorkspaceRecoveryStore:
                                'observed_at', clock_timestamp()),
                            claimed_by=NULL, claimed_until=NULL,
                            version=version+1
-                     WHERE id=$1 AND phase='recovering' AND resolved_at IS NULL
+                     WHERE id=$1 AND phase IN (
+                         'recovering','observing','waiting_runtime','verifying_stop',
+                         'attesting','reconciling_outcome'
+                     ) AND resolved_at IS NULL
                        AND deadline_at <= clock_timestamp()
                     RETURNING id
                     """,
@@ -1262,22 +1351,84 @@ class VMWorkspaceRecoveryStore:
                         operation_id,
                     )
                     return None
-                row = await conn.fetchrow(
+                # Slot selection spans two UNIQUE dimensions. Serialize only
+                # this tiny database allocation section so overlapping leaders
+                # cannot both choose the same free integer before either insert.
+                await conn.execute(
+                    "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+                    "vm-workspace-recovery-probe-slots",
+                )
+                await conn.execute(
+                    "DELETE FROM vm_workspace_recovery_probe_slots "
+                    "WHERE leased_until <= clock_timestamp()"
+                )
+                candidate = await conn.fetchrow(
                     """
-                    UPDATE vm_workspace_recoveries
-                       SET claimed_by=$2,
-                           claimed_until=clock_timestamp()
-                               + make_interval(secs => $3::double precision),
-                           claim_token=claim_token+1,
-                           version=version+1
-                     WHERE id=$1 AND phase='recovering' AND resolved_at IS NULL
+                    SELECT id,
+                           COALESCE(
+                               latest_observation->'successor'->>'node_uid',
+                               latest_observation->>'node_uid',
+                               'unknown:' || id::text
+                           ) AS node_key
+                      FROM vm_workspace_recoveries
+                     WHERE id=$1 AND phase IN (
+                         'recovering','observing','waiting_runtime','verifying_stop',
+                         'attesting','reconciling_outcome'
+                     ) AND resolved_at IS NULL
                        AND next_check_at <= clock_timestamp()
                        AND deadline_at > clock_timestamp()
                        AND (claimed_until IS NULL OR claimed_until <= clock_timestamp())
+                       AND NOT EXISTS (
+                           SELECT 1 FROM vm_workspace_recovery_jobs participant
+                            WHERE participant.recovery_id=vm_workspace_recoveries.id
+                              AND participant.resolved_at IS NULL
+                              AND participant.participation='attention'
+                       )
+                     FOR UPDATE
+                    """,
+                    operation_id,
+                )
+                if candidate is None:
+                    return None
+                node_busy = await conn.fetchval(
+                    "SELECT EXISTS(SELECT 1 FROM vm_workspace_recovery_probe_slots "
+                    "WHERE node_key=$1 AND leased_until > clock_timestamp())",
+                    candidate["node_key"],
+                )
+                if node_busy:
+                    return None
+                global_slot = await conn.fetchval(
+                    """
+                    SELECT slot
+                      FROM generate_series(0, $1::integer - 1) AS slots(slot)
+                     WHERE NOT EXISTS (
+                         SELECT 1 FROM vm_workspace_recovery_probe_slots active
+                          WHERE active.global_slot=slot
+                            AND active.leased_until > clock_timestamp()
+                     )
+                     ORDER BY slot
+                     LIMIT 1
+                    """,
+                    max(1, max_global_probes),
+                )
+                if global_slot is None:
+                    return None
+                row = await conn.fetchrow(
+                    """
+                    UPDATE vm_workspace_recoveries
+                       SET phase='observing', claimed_by=$2,
+                           claimed_until=clock_timestamp()
+                               + make_interval(secs => $3::double precision),
+                           claim_token=claim_token+1,
+                           recovery_attempts=recovery_attempts+1,
+                           version=version+1
+                     WHERE id=$1 AND resolved_at IS NULL
                     RETURNING id, version, claim_token, deadline_at,
                               extract(epoch FROM
                                   (deadline_at-clock_timestamp()))::float8
                                   AS remaining_seconds,
+                              recovery_attempts,
+                              owner_kind, owner_id,
                               provision_generation, cluster_name, namespace,
                               vm_uid, prior_vmi_uid, prior_launcher_uid, root_pvc_uid
                     """,
@@ -1285,6 +1436,18 @@ class VMWorkspaceRecoveryStore:
                     self.worker_id,
                     ttl_seconds,
                 )
+                if row is not None:
+                    await conn.execute(
+                        "INSERT INTO vm_workspace_recovery_probe_slots "
+                        "(recovery_id,global_slot,node_key,claim_token,leased_until) "
+                        "VALUES ($1,$2,$3,$4,clock_timestamp() "
+                        "+ make_interval(secs => $5::double precision))",
+                        operation_id,
+                        global_slot,
+                        candidate["node_key"],
+                        row["claim_token"],
+                        ttl_seconds,
+                    )
         if row is None:
             return None
         return RecoveryClaim(
@@ -1294,6 +1457,8 @@ class VMWorkspaceRecoveryStore:
             deadline_at=row["deadline_at"],
             remaining_seconds=max(0.0, float(row["remaining_seconds"])),
             captured_identity={
+                "owner_kind": row["owner_kind"],
+                "owner_id": row["owner_id"],
                 "provision_generation": row["provision_generation"],
                 "cluster_name": row["cluster_name"],
                 "namespace": row["namespace"],
@@ -1302,7 +1467,268 @@ class VMWorkspaceRecoveryStore:
                 "prior_launcher_uid": row["prior_launcher_uid"],
                 "root_pvc_uid": row["root_pvc_uid"],
             },
+            attempt=int(row["recovery_attempts"]),
+            global_slot=int(global_slot),
+            node_key=str(candidate["node_key"]),
         )
+
+    async def list_due_operation_ids(self, *, limit: int = 32) -> list[UUID]:
+        """Return hints for due automatic work; claims remain authoritative."""
+
+        async with self.db.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT id
+                  FROM vm_workspace_recoveries
+                 WHERE phase IN (
+                     'recovering','observing','waiting_runtime','verifying_stop',
+                     'attesting','reconciling_outcome'
+                 ) AND resolved_at IS NULL
+                   AND next_check_at <= clock_timestamp()
+                 ORDER BY next_check_at, deadline_at, id
+                 LIMIT $1
+                """,
+                max(1, limit),
+            )
+        return [row["id"] for row in rows]
+
+    async def claim_is_current(self, claim: RecoveryClaim) -> bool:
+        async with self.db.acquire() as conn:
+            return bool(
+                await conn.fetchval(
+                    """
+                    SELECT EXISTS(
+                        SELECT 1
+                          FROM vm_workspace_recoveries r
+                          JOIN vm_workspace_recovery_probe_slots slot
+                            ON slot.recovery_id=r.id
+                         WHERE r.id=$1 AND r.version=$2 AND r.claim_token=$3
+                           AND r.claimed_by=$4
+                           AND r.claimed_until > clock_timestamp()
+                           AND r.resolved_at IS NULL
+                           AND slot.claim_token=$3
+                           AND slot.leased_until > clock_timestamp()
+                    )
+                    """,
+                    claim.operation_id,
+                    claim.version,
+                    claim.claim_token,
+                    self.worker_id,
+                )
+            )
+
+    async def recovery_preconditions(
+        self, claim: RecoveryClaim
+    ) -> Mapping[str, str] | None:
+        """Read DB-owned continuation evidence for one still-current claim."""
+
+        async with self.db.acquire() as conn:
+            current = await conn.fetchrow(
+                """
+                SELECT owner_kind,owner_id
+                  FROM vm_workspace_recoveries
+                 WHERE id=$1 AND version=$2 AND claim_token=$3
+                   AND claimed_by=$4 AND claimed_until > clock_timestamp()
+                   AND resolved_at IS NULL AND deadline_at > clock_timestamp()
+                """,
+                claim.operation_id,
+                claim.version,
+                claim.claim_token,
+                self.worker_id,
+            )
+            if current is None:
+                return None
+            participants = await conn.fetch(
+                "SELECT participation,checkpoint_id,checkpoint_namespace,"
+                "prior_control_reference FROM vm_workspace_recovery_jobs "
+                "WHERE recovery_id=$1 AND resolved_at IS NULL",
+                claim.operation_id,
+            )
+            unsettled_remote = await conn.fetchval(
+                "SELECT EXISTS(SELECT 1 FROM vm_remote_operation_leases "
+                "WHERE owner_kind=$1 AND owner_id=$2 AND settled_at IS NULL)",
+                current["owner_kind"],
+                current["owner_id"],
+            )
+        continuation_safe = bool(participants) and all(
+            participant["participation"] == "held"
+            and _participant_continuation_safe(participant)
+            for participant in participants
+        )
+        return {
+            "continuation": "safe" if continuation_safe else "unknown",
+            "remote_operations": "pending" if unsettled_remote else "settled",
+        }
+
+    async def _finish_claim(
+        self,
+        *,
+        operation_id: UUID,
+        version: int,
+        claim_token: int,
+        phase: str,
+        observation: Mapping[str, Any] | None,
+        diagnostic: Mapping[str, Any] | None,
+        next_check_seconds: float,
+        retain_claim: bool,
+    ) -> RecoveryClaim | bool | None:
+        async with self.db.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    """
+                    UPDATE vm_workspace_recoveries
+                       SET phase=$4,
+                           latest_observation=COALESCE($5::jsonb, latest_observation),
+                           latest_diagnostic=COALESCE($6::jsonb, latest_diagnostic),
+                           last_progress_at=clock_timestamp(),
+                           next_check_at=clock_timestamp()
+                               + make_interval(secs => $7::double precision),
+                           claimed_by=CASE WHEN $8 THEN claimed_by ELSE NULL END,
+                           claimed_until=CASE WHEN $8 THEN claimed_until ELSE NULL END,
+                           version=version+1
+                     WHERE id=$1 AND version=$2 AND claim_token=$3
+                       AND resolved_at IS NULL
+                       AND deadline_at > clock_timestamp()
+                    RETURNING id,version,claim_token,deadline_at,
+                              extract(epoch FROM
+                                  (deadline_at-clock_timestamp()))::float8
+                                  AS remaining_seconds,
+                              recovery_attempts,owner_kind,owner_id,
+                              provision_generation,cluster_name,namespace,vm_uid,
+                              prior_vmi_uid,prior_launcher_uid,root_pvc_uid
+                    """,
+                    operation_id,
+                    version,
+                    claim_token,
+                    phase,
+                    json.dumps(dict(observation)) if observation is not None else None,
+                    json.dumps(dict(diagnostic)) if diagnostic is not None else None,
+                    max(0.0, next_check_seconds),
+                    retain_claim,
+                )
+                if not retain_claim:
+                    await conn.execute(
+                        "DELETE FROM vm_workspace_recovery_probe_slots "
+                        "WHERE recovery_id=$1 AND claim_token=$2",
+                        operation_id,
+                        claim_token,
+                    )
+                if row is None:
+                    await self._pause_expired_claim_locked(
+                        conn,
+                        operation_id=operation_id,
+                        version=version,
+                        claim_token=claim_token,
+                    )
+                    return None if retain_claim else False
+                if not retain_claim:
+                    return True
+                slot = await conn.fetchrow(
+                    "SELECT global_slot,node_key FROM vm_workspace_recovery_probe_slots "
+                    "WHERE recovery_id=$1 AND claim_token=$2",
+                    operation_id,
+                    claim_token,
+                )
+        if slot is None:
+            return None
+        return RecoveryClaim(
+            operation_id=row["id"],
+            version=int(row["version"]),
+            claim_token=int(row["claim_token"]),
+            deadline_at=row["deadline_at"],
+            remaining_seconds=max(0.0, float(row["remaining_seconds"])),
+            captured_identity={
+                "owner_kind": row["owner_kind"],
+                "owner_id": row["owner_id"],
+                "provision_generation": row["provision_generation"],
+                "cluster_name": row["cluster_name"],
+                "namespace": row["namespace"],
+                "vm_uid": row["vm_uid"],
+                "prior_vmi_uid": row["prior_vmi_uid"],
+                "prior_launcher_uid": row["prior_launcher_uid"],
+                "root_pvc_uid": row["root_pvc_uid"],
+            },
+            attempt=int(row["recovery_attempts"]),
+            global_slot=int(slot["global_slot"]),
+            node_key=str(slot["node_key"]),
+        )
+
+    async def defer_claim(
+        self,
+        *,
+        operation_id: UUID,
+        version: int,
+        claim_token: int,
+        phase: str,
+        observation: Mapping[str, Any] | None = None,
+        diagnostic: Mapping[str, Any] | None = None,
+        next_check_seconds: float,
+    ) -> bool:
+        changed = await self._finish_claim(
+            operation_id=operation_id,
+            version=version,
+            claim_token=claim_token,
+            phase=phase,
+            observation=observation,
+            diagnostic=diagnostic,
+            next_check_seconds=next_check_seconds,
+            retain_claim=False,
+        )
+        return changed is True
+
+    async def stage_observation(
+        self,
+        *,
+        operation_id: UUID,
+        version: int,
+        claim_token: int,
+        phase: str,
+        observation: Mapping[str, Any],
+    ) -> RecoveryClaim | None:
+        changed = await self._finish_claim(
+            operation_id=operation_id,
+            version=version,
+            claim_token=claim_token,
+            phase=phase,
+            observation=observation,
+            diagnostic=None,
+            next_check_seconds=0,
+            retain_claim=True,
+        )
+        return changed if isinstance(changed, RecoveryClaim) else None
+
+    async def pause_automatic_disabled(self) -> int:
+        """Make feature-off behavior visible while preserving every hold."""
+
+        async with self.db.acquire() as conn:
+            async with conn.transaction():
+                rows = await conn.fetch(
+                    """
+                    UPDATE vm_workspace_recoveries
+                       SET phase='paused_attention',
+                           latest_diagnostic=jsonb_build_object(
+                               'reason','automatic_recovery_disabled',
+                               'observed_at',clock_timestamp()),
+                           claimed_by=NULL,claimed_until=NULL,version=version+1
+                     WHERE phase IN (
+                         'recovering','observing','waiting_runtime','verifying_stop',
+                         'attesting','reconciling_outcome'
+                     ) AND resolved_at IS NULL
+                    RETURNING id
+                    """
+                )
+                if rows:
+                    await conn.execute(
+                        "UPDATE vm_workspace_recovery_jobs SET participation='attention' "
+                        "WHERE recovery_id=ANY($1::uuid[]) AND resolved_at IS NULL",
+                        [row["id"] for row in rows],
+                    )
+                    await conn.execute(
+                        "DELETE FROM vm_workspace_recovery_probe_slots "
+                        "WHERE recovery_id=ANY($1::uuid[])",
+                        [row["id"] for row in rows],
+                    )
+        return len(rows)
 
     async def apply_observation(
         self,
@@ -1325,7 +1751,11 @@ class VMWorkspaceRecoveryStore:
                            claimed_by=NULL, claimed_until=NULL,
                            version=version+1
                      WHERE id=$1 AND version=$2 AND claim_token=$3
-                       AND phase='recovering' AND resolved_at IS NULL
+                       AND phase IN (
+                           'recovering','observing','waiting_runtime','verifying_stop',
+                           'attesting','reconciling_outcome'
+                       ) AND resolved_at IS NULL
+                       AND deadline_at > clock_timestamp()
                     RETURNING 1
                     """,
                     operation_id,
@@ -1334,6 +1764,20 @@ class VMWorkspaceRecoveryStore:
                     json.dumps(dict(observation)),
                     next_check_seconds,
                 )
+                if changed is not None:
+                    await conn.execute(
+                        "DELETE FROM vm_workspace_recovery_probe_slots "
+                        "WHERE recovery_id=$1 AND claim_token=$2",
+                        operation_id,
+                        claim_token,
+                    )
+                else:
+                    await self._pause_expired_claim_locked(
+                        conn,
+                        operation_id=operation_id,
+                        version=version,
+                        claim_token=claim_token,
+                    )
         return changed is not None
 
     async def pause_for_attention(
@@ -1354,8 +1798,12 @@ class VMWorkspaceRecoveryStore:
                            latest_diagnostic=$5::jsonb,
                            claimed_by=NULL, claimed_until=NULL,
                            version=version+1
-                     WHERE id=$1 AND version=$2 AND claim_token=$3
-                       AND phase='recovering' AND resolved_at IS NULL
+                    WHERE id=$1 AND version=$2 AND claim_token=$3
+                       AND phase IN (
+                           'recovering','observing','waiting_runtime','verifying_stop',
+                           'attesting','reconciling_outcome'
+                       ) AND resolved_at IS NULL
+                       AND deadline_at > clock_timestamp()
                     RETURNING 1
                     """,
                     operation_id,
@@ -1364,6 +1812,25 @@ class VMWorkspaceRecoveryStore:
                     code.value,
                     json.dumps(dict(diagnostic)),
                 )
+                if changed is not None:
+                    await conn.execute(
+                        "UPDATE vm_workspace_recovery_jobs SET participation='attention' "
+                        "WHERE recovery_id=$1 AND resolved_at IS NULL",
+                        operation_id,
+                    )
+                    await conn.execute(
+                        "DELETE FROM vm_workspace_recovery_probe_slots "
+                        "WHERE recovery_id=$1 AND claim_token=$2",
+                        operation_id,
+                        claim_token,
+                    )
+                else:
+                    await self._pause_expired_claim_locked(
+                        conn,
+                        operation_id=operation_id,
+                        version=version,
+                        claim_token=claim_token,
+                    )
         return changed is not None
 
     async def release_recovered(
@@ -1373,12 +1840,16 @@ class VMWorkspaceRecoveryStore:
         version: int,
         claim_token: int,
         resume_receipt: Mapping[str, Any],
+        initial_observation: Mapping[str, Any] | None = None,
+        final_observation: Mapping[str, Any] | None = None,
     ) -> bool:
         """Release exact participant holds with queue-before-job lock ordering."""
 
         async with self.db.acquire() as conn:
             participants = await conn.fetch(
-                "SELECT job_id, hold_lease_token, prior_job_status FROM vm_workspace_recovery_jobs "
+                "SELECT job_id,hold_lease_token,prior_job_status,participation,"
+                "checkpoint_id,checkpoint_namespace,prior_control_reference "
+                "FROM vm_workspace_recovery_jobs "
                 "WHERE recovery_id=$1 AND resolved_at IS NULL ORDER BY job_id",
                 operation_id,
             )
@@ -1393,14 +1864,17 @@ class VMWorkspaceRecoveryStore:
                 jobs: dict[UUID, Any] = {}
                 for participant in participants:
                     jobs[participant["job_id"]] = await conn.fetchrow(
-                        "SELECT status, freeze_data FROM jobs WHERE id=$1 FOR UPDATE",
+                        "SELECT status, freeze_data, context FROM jobs "
+                        "WHERE id=$1 FOR UPDATE",
                         participant["job_id"],
                     )
                 operation = await conn.fetchrow(
-                    "SELECT id, deadline_at <= clock_timestamp() AS deadline_expired "
+                    "SELECT *, deadline_at <= clock_timestamp() AS deadline_expired "
                     "FROM vm_workspace_recoveries "
                     "WHERE id=$1 AND version=$2 AND claim_token=$3 "
-                    "AND phase='recovering' AND resolved_at IS NULL FOR UPDATE",
+                    "AND phase IN ('recovering','observing','waiting_runtime',"
+                    "'verifying_stop','attesting','reconciling_outcome') "
+                    "AND resolved_at IS NULL FOR UPDATE",
                     operation_id,
                     version,
                     claim_token,
@@ -1415,6 +1889,149 @@ class VMWorkspaceRecoveryStore:
                         diagnostic={"reason": "deadline_elapsed_before_release"},
                     )
                     return False
+                if not participants or not all(
+                    participant["participation"] == "held"
+                    and _participant_continuation_safe(participant)
+                    for participant in participants
+                ):
+                    await self._pause_locked(
+                        conn,
+                        operation_id=operation_id,
+                        code=WorkspaceRecoveryCode.TOOL_OUTCOME_UNKNOWN,
+                        diagnostic={
+                            "reason": "continuation_evidence_changed_or_unknown"
+                        },
+                    )
+                    return False
+                if initial_observation is not None or final_observation is not None:
+                    initial = dict(initial_observation or {})
+                    final = dict(final_observation or {})
+                    immutable_mismatch = any(
+                        str(final.get(key) or "") != str(operation[key] or "")
+                        for key in (
+                            "owner_kind",
+                            "owner_id",
+                            "provision_generation",
+                            "vm_uid",
+                            "root_pvc_uid",
+                        )
+                    )
+                    initial_successor = initial.get("successor")
+                    final_successor = final.get("successor")
+                    attestation_keys = (
+                        "vmi_uid",
+                        "launcher_uid",
+                        "node_uid",
+                        "pod_ip",
+                        "ssh_registration_id",
+                    )
+                    successor_changed = not (
+                        isinstance(initial_successor, Mapping)
+                        and isinstance(final_successor, Mapping)
+                        and all(
+                            str(initial_successor.get(key) or "")
+                            == str(final_successor.get(key) or "")
+                            for key in attestation_keys
+                        )
+                    )
+                    if (
+                        immutable_mismatch
+                        or successor_changed
+                        or final.get("ready") is not True
+                        or final.get("authenticated") is not True
+                    ):
+                        await self._pause_locked(
+                            conn,
+                            operation_id=operation_id,
+                            code=WorkspaceRecoveryCode.IDENTITY_CONFLICT,
+                            diagnostic={
+                                "reason": "final_re_attestation_or_identity_changed"
+                            },
+                        )
+                        return False
+                    successor = final.get("successor")
+                    if not isinstance(successor, Mapping):
+                        successor = {}
+                    replacing = str(successor.get("launcher_uid") or "") != str(
+                        operation["prior_launcher_uid"] or ""
+                    )
+                    if replacing:
+                        stop_digest = final.get("stop_receipt_digest")
+                        receipt = await conn.fetchval(
+                            """
+                            SELECT EXISTS(
+                                SELECT 1 FROM vm_workspace_recovery_stop_receipts
+                                 WHERE recovery_id=$1 AND accepted_claim_token=$2
+                                   AND vm_uid=$3 AND vmi_uid=$4
+                                   AND launcher_uid=$5 AND root_pvc_uid=$6
+                                   AND evidence_digest=$7
+                            )
+                            """,
+                            operation_id,
+                            claim_token,
+                            operation["vm_uid"],
+                            operation["prior_vmi_uid"],
+                            operation["prior_launcher_uid"],
+                            operation["root_pvc_uid"],
+                            stop_digest,
+                        )
+                        if not receipt:
+                            await self._pause_locked(
+                                conn,
+                                operation_id=operation_id,
+                                code=WorkspaceRecoveryCode.PRIOR_RUNTIME_UNFENCED,
+                                diagnostic={
+                                    "reason": "exact_stop_receipt_not_committed"
+                                },
+                            )
+                            return False
+                    unsettled_remote = await conn.fetchval(
+                        "SELECT EXISTS(SELECT 1 FROM vm_remote_operation_leases "
+                        "WHERE owner_kind=$1 AND owner_id=$2 AND settled_at IS NULL)",
+                        operation["owner_kind"],
+                        operation["owner_id"],
+                    )
+                    if unsettled_remote:
+                        await self._pause_locked(
+                            conn,
+                            operation_id=operation_id,
+                            code=WorkspaceRecoveryCode.TOOL_OUTCOME_UNKNOWN,
+                            diagnostic={
+                                "reason": "remote_operation_unsettled_at_release"
+                            },
+                        )
+                        return False
+                    if operation["owner_kind"] == "job":
+                        owner_job = jobs.get(operation["owner_id"])
+                        owner_context = (
+                            _json(owner_job["context"])
+                            if owner_job is not None
+                            else None
+                        )
+                        owner_vm = (
+                            owner_context.get("vm")
+                            if isinstance(owner_context, Mapping)
+                            else None
+                        )
+                        projection_current = bool(
+                            isinstance(owner_vm, Mapping)
+                            and str(owner_vm.get("provision_generation") or "")
+                            == str(operation["provision_generation"])
+                            and str(owner_vm.get("vm_uid") or "")
+                            == str(operation["vm_uid"])
+                            and str(owner_vm.get("rootdisk_pvc_uid") or "")
+                            == str(operation["root_pvc_uid"])
+                        )
+                        if not projection_current:
+                            await self._pause_locked(
+                                conn,
+                                operation_id=operation_id,
+                                code=WorkspaceRecoveryCode.IDENTITY_CONFLICT,
+                                diagnostic={
+                                    "reason": "owner_vm_projection_changed"
+                                },
+                            )
+                            return False
                 projection_errors: list[dict[str, str]] = []
                 if not participants:
                     projection_errors.append(
@@ -1486,16 +2103,72 @@ class VMWorkspaceRecoveryStore:
                     )
                     if job_changed is None:
                         raise RuntimeError("workspace recovery job projection changed")
+                if final_observation is not None and operation["owner_kind"] == "job":
+                    successor = final_observation.get("successor")
+                    if not isinstance(successor, Mapping):
+                        successor = {}
+                    projected = {
+                        "status": "ready",
+                        "provision_generation": str(operation["provision_generation"]),
+                        "vm_uid": str(operation["vm_uid"]),
+                        "rootdisk_pvc_uid": str(operation["root_pvc_uid"]),
+                        "vmi_uid": str(successor.get("vmi_uid") or ""),
+                        "active_pod_uid": str(successor.get("launcher_uid") or ""),
+                        "pod_ip": successor.get("pod_ip"),
+                        "ssh_host": successor.get("pod_ip"),
+                        "ssh_port": 22,
+                        "ssh_registration_id": successor.get(
+                            "ssh_registration_id"
+                        ),
+                        "ssh_ready_source": "workspace_recovery",
+                        "recovering": False,
+                    }
+                    bound = await conn.fetchval(
+                        """
+                        UPDATE jobs
+                           SET context=jsonb_set(
+                               COALESCE(context,'{}'::jsonb),'{vm}',
+                               COALESCE(context->'vm','{}'::jsonb) || $2::jsonb
+                           )
+                         WHERE id=$1
+                           AND context->'vm'->>'provision_generation'=$3
+                           AND context->'vm'->>'vm_uid'=$4
+                           AND context->'vm'->>'rootdisk_pvc_uid'=$5
+                        RETURNING 1
+                        """,
+                        operation["owner_id"],
+                        json.dumps(projected),
+                        str(operation["provision_generation"]),
+                        str(operation["vm_uid"]),
+                        str(operation["root_pvc_uid"]),
+                    )
+                    if bound is None:
+                        await self._pause_locked(
+                            conn,
+                            operation_id=operation_id,
+                            code=WorkspaceRecoveryCode.IDENTITY_CONFLICT,
+                            diagnostic={"reason": "owner_vm_projection_changed"},
+                        )
+                        return False
                 await conn.execute(
                     """
                     UPDATE vm_workspace_recoveries
                        SET phase='recovered', resolved_at=clock_timestamp(),
                            claimed_by=NULL, claimed_until=NULL, version=version+1
                      WHERE id=$1 AND version=$2 AND claim_token=$3
-                       AND phase='recovering' AND resolved_at IS NULL
+                       AND phase IN (
+                           'recovering','observing','waiting_runtime','verifying_stop',
+                           'attesting','reconciling_outcome'
+                       ) AND resolved_at IS NULL
                     """,
                     operation_id,
                     version,
+                    claim_token,
+                )
+                await conn.execute(
+                    "DELETE FROM vm_workspace_recovery_probe_slots "
+                    "WHERE recovery_id=$1 AND claim_token=$2",
+                    operation_id,
                     claim_token,
                 )
         return True

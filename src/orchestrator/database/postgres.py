@@ -2493,6 +2493,21 @@ class PostgresDB:
                     )
                 ):
                     return None
+                recovery_owned = await conn.fetchval(
+                    "SELECT EXISTS("
+                    "SELECT 1 FROM vm_workspace_recoveries recovery "
+                    "LEFT JOIN vm_workspace_recovery_jobs participant "
+                    "ON participant.recovery_id=recovery.id "
+                    "AND participant.job_id=$2 AND participant.resolved_at IS NULL "
+                    "WHERE recovery.resolved_at IS NULL AND (("
+                    "$1='job' AND participant.job_id IS NOT NULL) OR ("
+                    "$1='thread' AND recovery.owner_kind='thread' "
+                    "AND recovery.owner_id=$2)))",
+                    owner_kind,
+                    owner_uuid,
+                )
+                if recovery_owned:
+                    return None
                 try:
                     owner_state = _strict_json_object(
                         owner.get("state"), label="VM remote operation owner state"
@@ -9798,7 +9813,12 @@ class PostgresDB:
             "), "
             "    updated_at = CURRENT_TIMESTAMP "
             "WHERE id = $2 "
-            "  AND context->'vm'->>'ssh_registration_id' = $3"
+            "  AND context->'vm'->>'ssh_registration_id' = $3 "
+            "  AND NOT EXISTS ("
+            "      SELECT 1 FROM vm_workspace_recovery_jobs participant "
+            "      WHERE participant.job_id=jobs.id "
+            "        AND participant.resolved_at IS NULL"
+            "  )"
         )
         async with self.acquire() as conn:
             result = await conn.execute(
@@ -9842,7 +9862,12 @@ class PostgresDB:
             "WHERE id = $2 "
             "  AND context->'vm'->>'provision_generation' = $3 "
             "  AND ($4::boolean = FALSE "
-            "       OR context->'vm'->>'status' IS DISTINCT FROM 'ready')"
+            "       OR context->'vm'->>'status' IS DISTINCT FROM 'ready') "
+            "  AND NOT EXISTS ("
+            "      SELECT 1 FROM vm_workspace_recovery_jobs participant "
+            "      WHERE participant.job_id=jobs.id "
+            "        AND participant.resolved_at IS NULL"
+            "  )"
         )
         async with self.acquire() as conn:
             result = await conn.execute(
@@ -9875,6 +9900,9 @@ class PostgresDB:
             "context->'vm' AS vm FROM jobs WHERE ("
             + status_clause
             + ") AND jobs.status NOT IN ('completed','failed','cancelled')"
+            + " AND NOT EXISTS ("
+            "SELECT 1 FROM vm_workspace_recovery_jobs participant "
+            "WHERE participant.job_id=jobs.id AND participant.resolved_at IS NULL)"
         )
         async with self.acquire() as conn:
             return [dict(row) for row in await conn.fetch(query)]
@@ -9893,6 +9921,35 @@ class PostgresDB:
         )
         async with self.acquire() as conn:
             return await conn.fetchval(query, uuid_val)
+
+    async def vm_workspace_recovery_owns_authority(
+        self, entity_type: str, entity_id: str
+    ) -> bool:
+        """Fail closed when an unresolved recovery owns VM promotion authority."""
+
+        if entity_type not in {"job", "thread"}:
+            return True
+        try:
+            owner_id = UUID(entity_id)
+        except (TypeError, ValueError):
+            return True
+        async with self.acquire() as conn:
+            if entity_type == "job":
+                return bool(
+                    await conn.fetchval(
+                        "SELECT EXISTS(SELECT 1 FROM vm_workspace_recovery_jobs "
+                        "WHERE job_id=$1 AND resolved_at IS NULL)",
+                        owner_id,
+                    )
+                )
+            return bool(
+                await conn.fetchval(
+                    "SELECT EXISTS(SELECT 1 FROM vm_workspace_recoveries "
+                    "WHERE owner_kind='thread' AND owner_id=$1 "
+                    "AND resolved_at IS NULL)",
+                    owner_id,
+                )
+            )
 
     async def merge_snapshot_context(
         self, job_id: str, snapshot_updates: Dict[str, Any]
@@ -20144,7 +20201,13 @@ class PostgresDB:
             "), "
             "    last_activity = CURRENT_TIMESTAMP "
             "WHERE id = $2 "
-            "  AND metadata->'vm'->>'ssh_registration_id' = $3"
+            "  AND metadata->'vm'->>'ssh_registration_id' = $3 "
+            "  AND NOT EXISTS ("
+            "      SELECT 1 FROM vm_workspace_recoveries recovery "
+            "      WHERE recovery.owner_kind='thread' "
+            "        AND recovery.owner_id=threads.id "
+            "        AND recovery.resolved_at IS NULL"
+            "  )"
         )
         async with self.acquire() as conn:
             result = await conn.execute(
@@ -20183,7 +20246,13 @@ class PostgresDB:
             "WHERE id = $2 "
             "  AND metadata->'vm'->>'provision_generation' = $3 "
             "  AND ($4::boolean = FALSE "
-            "       OR metadata->'vm'->>'status' IS DISTINCT FROM 'ready')"
+            "       OR metadata->'vm'->>'status' IS DISTINCT FROM 'ready') "
+            "  AND NOT EXISTS ("
+            "      SELECT 1 FROM vm_workspace_recoveries recovery "
+            "      WHERE recovery.owner_kind='thread' "
+            "        AND recovery.owner_id=threads.id "
+            "        AND recovery.resolved_at IS NULL"
+            "  )"
         )
         async with self.acquire() as conn:
             result = await conn.execute(
@@ -20226,6 +20295,10 @@ class PostgresDB:
             )
             + ") AND threads.status <> 'ended' AND threads.ended_at IS NULL"
             + " AND runtime_retirement_token IS NULL"
+            + " AND NOT EXISTS ("
+            "SELECT 1 FROM vm_workspace_recoveries recovery "
+            "WHERE recovery.owner_kind='thread' "
+            "AND recovery.owner_id=threads.id AND recovery.resolved_at IS NULL)"
         )
         async with self.acquire() as conn:
             return [dict(row) for row in await conn.fetch(query)]

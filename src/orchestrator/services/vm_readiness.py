@@ -183,6 +183,13 @@ class VMReadinessService:
         reprobe: bool,
     ) -> None:
         key = (entity_type, entity_id, generation)
+        if await self._recovery_owns_authority(entity_type, entity_id):
+            logger.debug(
+                "Recovery owns VM readiness authority for %s %s",
+                entity_type,
+                entity_id,
+            )
+            return
         if entity_type == "thread" and (
             vm.get("status")
             in {
@@ -218,6 +225,12 @@ class VMReadinessService:
                 "controller status unavailable",
                 reprobe=False,
             )
+            return
+
+        # Admission may race the controller read. Once recovery has installed
+        # its durable hold, the ordinary readiness path must remain read-only;
+        # only the recovery final CAS can bind the successor identity.
+        if await self._recovery_owns_authority(entity_type, entity_id):
             return
 
         reported_generation = status.get("provision_generation")
@@ -587,6 +600,23 @@ class VMReadinessService:
         self._retry_after.pop(key, None)
         if entity_type == "job":
             self._trigger_dispatch()
+
+    async def _recovery_owns_authority(
+        self, entity_type: str, entity_id: str
+    ) -> bool:
+        check = getattr(self._db, "vm_workspace_recovery_owns_authority", None)
+        if not callable(check):
+            return False
+        try:
+            return bool(await check(entity_type, entity_id))
+        except Exception:
+            # Losing the authority read is not permission to mutate a runtime.
+            logger.exception(
+                "Failed to read VM workspace recovery authority for %s %s",
+                entity_type,
+                entity_id,
+            )
+            return True
 
     async def _transient_failure(
         self,

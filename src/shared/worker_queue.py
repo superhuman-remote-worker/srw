@@ -591,7 +591,9 @@ async def release_worker_batch_from_workspace_recovery(
             return False
         operation = await conn.fetchval(
             "SELECT 1 FROM vm_workspace_recoveries WHERE id=$1 AND version=$2 "
-            "AND claim_token=$3 AND phase='recovering' AND resolved_at IS NULL "
+            "AND claim_token=$3 AND phase IN ("
+            "'recovering','observing','waiting_runtime','verifying_stop',"
+            "'attesting','reconciling_outcome') AND resolved_at IS NULL "
             "AND deadline_at>clock_timestamp() FOR UPDATE",
             recovery_id,
             version,

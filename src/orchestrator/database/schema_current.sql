@@ -20876,6 +20876,7 @@ CREATE TABLE public.vm_workspace_recoveries (
     claimed_until timestamp with time zone,
     resolved_at timestamp with time zone,
     superseded_by uuid,
+    recovery_attempts integer DEFAULT 0 NOT NULL,
     CONSTRAINT vm_workspace_recoveries_check CHECK ((deadline_at = (first_observed_at + '00:15:00'::interval))),
     CONSTRAINT vm_workspace_recoveries_check1 CHECK ((((claimed_by IS NULL) AND (claimed_until IS NULL)) OR ((claimed_by IS NOT NULL) AND (claimed_by <> ''::text) AND (claimed_until IS NOT NULL) AND (claim_token > 0)))),
     CONSTRAINT vm_workspace_recoveries_claim_token_check CHECK ((claim_token >= 0)),
@@ -20884,10 +20885,11 @@ CREATE TABLE public.vm_workspace_recoveries (
     CONSTRAINT vm_workspace_recoveries_namespace_check CHECK ((namespace <> ''::text)),
     CONSTRAINT vm_workspace_recoveries_original_cause_check CHECK ((jsonb_typeof(original_cause) = 'object'::text)),
     CONSTRAINT vm_workspace_recoveries_owner_kind_check CHECK ((owner_kind = ANY (ARRAY['job'::text, 'thread'::text]))),
-    CONSTRAINT vm_workspace_recoveries_phase_check CHECK ((phase = ANY (ARRAY['recovering'::text, 'paused_attention'::text, 'recovered'::text, 'cancelled'::text, 'superseded'::text]))),
+    CONSTRAINT vm_workspace_recoveries_phase_check CHECK ((phase = ANY (ARRAY['recovering'::text, 'observing'::text, 'waiting_runtime'::text, 'verifying_stop'::text, 'attesting'::text, 'reconciling_outcome'::text, 'paused_attention'::text, 'recovered'::text, 'cancelled'::text, 'superseded'::text]))),
     CONSTRAINT vm_workspace_recoveries_protocol_version_check CHECK ((protocol_version = 1)),
     CONSTRAINT vm_workspace_recoveries_reason_code_check CHECK ((reason_code = ANY (ARRAY['workspace_runtime_not_ready'::text, 'workspace_transport_unavailable'::text, 'workspace_replacement_observed'::text, 'workspace_identity_conflict'::text, 'prior_runtime_unfenced'::text, 'shared_workspace_writers_unfenced'::text, 'tool_outcome_unknown'::text, 'checkpoint_unavailable'::text, 'workspace_recovery_deadline_exceeded'::text]))),
-    CONSTRAINT vm_workspace_recoveries_resolution_check CHECK ((((resolved_at IS NULL) AND (phase = ANY (ARRAY['recovering'::text, 'paused_attention'::text]))) OR ((resolved_at IS NOT NULL) AND (phase = ANY (ARRAY['recovered'::text, 'cancelled'::text, 'superseded'::text]))))),
+    CONSTRAINT vm_workspace_recoveries_recovery_attempts_check CHECK ((recovery_attempts >= 0)),
+    CONSTRAINT vm_workspace_recoveries_resolution_check CHECK ((((resolved_at IS NULL) AND (phase = ANY (ARRAY['recovering'::text, 'observing'::text, 'waiting_runtime'::text, 'verifying_stop'::text, 'attesting'::text, 'reconciling_outcome'::text, 'paused_attention'::text]))) OR ((resolved_at IS NOT NULL) AND (phase = ANY (ARRAY['recovered'::text, 'cancelled'::text, 'superseded'::text]))))),
     CONSTRAINT vm_workspace_recoveries_supersession_check CHECK ((((phase = 'superseded'::text) AND (superseded_by IS NOT NULL)) OR ((phase <> 'superseded'::text) AND (superseded_by IS NULL)))),
     CONSTRAINT vm_workspace_recoveries_version_check CHECK ((version > 0)),
     CONSTRAINT vm_workspace_recoveries_workspace_contract_digest_check CHECK ((workspace_contract_digest <> ''::text))
@@ -25478,7 +25480,7 @@ CREATE UNIQUE INDEX vm_workspace_cleanup_admissions_one_open_owner ON public.vm_
 -- Name: vm_workspace_recoveries_due; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX vm_workspace_recoveries_due ON public.vm_workspace_recoveries USING btree (next_check_at, deadline_at, id) WHERE ((phase = 'recovering'::text) AND (resolved_at IS NULL));
+CREATE INDEX vm_workspace_recoveries_due ON public.vm_workspace_recoveries USING btree (next_check_at, deadline_at, id) WHERE ((phase = ANY (ARRAY['recovering'::text, 'observing'::text, 'waiting_runtime'::text, 'verifying_stop'::text, 'attesting'::text, 'reconciling_outcome'::text])) AND (resolved_at IS NULL));
 
 
 --
