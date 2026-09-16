@@ -8,7 +8,8 @@ helpers neither construct provisioners nor perform network or database I/O.
 from __future__ import annotations
 
 import json
-from typing import Any, Callable, Protocol
+from typing import Any, Callable, Mapping, Protocol
+from uuid import UUID
 
 from orchestrator.services.cloud.handles import SessionFolderHandle
 from shared.workspace_contract import (
@@ -31,6 +32,63 @@ class JobCloudBackend(Protocol):
     ) -> str | None: ...
 
 
+_WORKSPACE_RECOVERY_MESSAGES = {
+    "workspace_runtime_not_ready": "Recovering workspace — waiting for guest networking.",
+    "workspace_transport_unavailable": "Recovering workspace — transport is temporarily unavailable.",
+    "workspace_replacement_observed": "Recovering workspace — validating the replacement runtime.",
+    "workspace_identity_conflict": "Recovery paused — workspace identity changed unexpectedly.",
+    "prior_runtime_unfenced": "Previous workspace execution could not be proven stopped.",
+    "shared_workspace_writers_unfenced": "Recovery paused — another workspace writer could not be proven stopped.",
+    "tool_outcome_unknown": "Recovery paused — an interrupted command may have completed remotely.",
+    "checkpoint_unavailable": "Recovery paused — the durable checkpoint is unavailable.",
+    "workspace_recovery_deadline_exceeded": "Recovery paused — the recovery deadline elapsed.",
+}
+_WORKSPACE_RECOVERY_STATES = {
+    "recovering",
+    "observing",
+    "waiting_runtime",
+    "verifying_stop",
+    "attesting",
+    "reconciling_outcome",
+    "paused_attention",
+}
+
+
+def workspace_recovery_projection(job: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Return the coordinate-free public view of one unresolved recovery."""
+
+    raw = job.get("_workspace_recovery", job.get("workspace_recovery"))
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except (TypeError, ValueError):
+            return None
+    if not isinstance(raw, Mapping):
+        return None
+    try:
+        operation_id = str(UUID(str(raw.get("operation_id"))))
+    except (TypeError, ValueError, AttributeError):
+        return None
+    state = str(raw.get("state") or "")
+    reason_code = str(raw.get("reason_code") or "")
+    if (
+        state not in _WORKSPACE_RECOVERY_STATES
+        or reason_code not in _WORKSPACE_RECOVERY_MESSAGES
+    ):
+        return None
+    return {
+        "operation_id": operation_id,
+        "state": state,
+        "reason_code": reason_code,
+        "message": _WORKSPACE_RECOVERY_MESSAGES[reason_code],
+        "started_at": raw.get("started_at"),
+        "deadline_at": raw.get("deadline_at"),
+        "next_check_at": raw.get("next_check_at"),
+        "retryable": state == "paused_attention",
+        "cleanup_pending": raw.get("cleanup_pending") is True,
+    }
+
+
 def redact_job_config_override(
     job: dict[str, Any],
     *,
@@ -48,6 +106,9 @@ def redact_job_config_override(
         job["workspace_contract"] = workspace_contract_projection(
             job, vm_mode=vm_mode()
         )
+    recovery = workspace_recovery_projection(job)
+    job.pop("_workspace_recovery", None)
+    job["workspace_recovery"] = recovery
     job = redact_nested_workspace_state(
         job, field="context", runtime_incarnation_key=runtime_incarnation_key
     )

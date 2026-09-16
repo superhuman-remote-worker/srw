@@ -1,5 +1,7 @@
 """Request contracts for job resume, approval, VM, and sudo controls."""
 
+from uuid import UUID
+
 from pydantic import BaseModel, Field
 
 
@@ -41,10 +43,18 @@ class JobApproveRequest(BaseModel):
     notes: str | None = Field(None, description="Optional reviewer notes")
 
 
+class WorkspaceRecoveryRetryRequest(BaseModel):
+    """Idempotent explicit retry of one paused workspace recovery."""
+
+    operation_id: UUID
+    request_id: UUID
+
+
 __all__ = [
     "JobApproveRequest",
     "JobResumeRequest",
     "SudoApproveRequest",
     "SudoDenyRequest",
     "SudoRuleCreateRequest",
+    "WorkspaceRecoveryRetryRequest",
 ]

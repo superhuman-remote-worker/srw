@@ -7636,6 +7636,7 @@ def _completion_effect_dependencies() -> (
             lambda: _COMPLETION_S36_EXACT_ABSENCE_TIMEOUT_SECONDS
         ),
         logger=logger,
+        recovery_store=VMWorkspaceRecoveryStore(postgres_db),
     )
 
 
@@ -7902,6 +7903,7 @@ def _job_control_operations() -> job_control_operations.JobControlOperations:
             kick_session_wake_drain=_kick_session_wake_drain,
             get_container_context=_get_container_context,
             get_vm_context=_get_vm_context,
+            recovery_store=VMWorkspaceRecoveryStore(postgres_db),
         )
     )
 

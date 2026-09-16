@@ -749,6 +749,8 @@
       "failed": "Failed",
       "cancelled": "Cancelled",
       "blocked_undelivered": "Blocked / undelivered",
+      "recovering_workspace": "Recovering workspace",
+      "recovery_paused": "Recovery paused",
       "waiting_for_reply": "Waiting for reply",
       "waiting_approval": "Waiting · approval"
     },
@@ -762,6 +764,7 @@
       "canceling": "Canceling",
       "sure": "Sure?",
       "resume": "Resume",
+      "retryRecovery": "Retry recovery",
       "review": "Review",
       "delete": "Delete",
       "confirmDelete": "Confirm?",
@@ -793,6 +796,7 @@
       "openCloudFolder": "Open this job's cloud folder in a new tab",
       "pauseJob": "Pause job",
       "promoteJob": "Promote to project",
+      "retryRecovery": "Retry the paused workspace recovery",
       "resumeJob": "Resume from checkpoint",
       "reviewJob": "Review and approve/continue",
       "reviewQueue": "Open the review queue",
@@ -801,6 +805,11 @@
       "subjobCount": "{{count}} sub-job(s) in this tree, filter or no filter",
       "view": "Open in Workbench",
       "workspace": "Browse workspace in Gitea"
+    },
+    "recovery": {
+      "deadline": "Recovery deadline",
+      "nextCheck": "Next check",
+      "cleanupPending": "Workspace cleanup remains pending"
     },
     "delegationChildren": "{{count}} children",
     "promote": {
@@ -3630,6 +3639,7 @@
       "cancelFailed": "Couldn't cancel the job.",
       "pauseFailed": "Couldn't pause the job.",
       "resumeFailed": "Couldn't resume the job.",
+      "recoveryRetryFailed": "Couldn't retry workspace recovery.",
       "approveFailed": "Couldn't approve the job.",
       "upgradeVmFailed": "Couldn't upgrade to a VM workspace.",
       "replyFailed": "Couldn't send the reply.",
@@ -3674,6 +3684,7 @@
       "cancelled": "Job cancelled",
       "paused": "Job paused",
       "resumed": "Job resumed",
+      "recoveryRetry": "Workspace recovery started",
       "approved": "Job approved",
       "vmUpgradeStarted": "VM upgrade initiated",
       "replySent": "Reply sent",

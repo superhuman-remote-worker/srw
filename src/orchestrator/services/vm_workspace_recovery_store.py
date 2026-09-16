@@ -57,6 +57,21 @@ class RecoveryClaim:
     captured_identity: Mapping[str, Any]
 
 
+@dataclass(frozen=True, slots=True)
+class CleanupPermit:
+    allowed: bool
+    admission_id: UUID | None = None
+    recovery_id: UUID | None = None
+    reason: str | None = None
+
+
+class WorkspaceRecoveryControlConflict(RuntimeError):
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
 class VMWorkspaceRecoveryStore:
     def __init__(self, db: Any, *, worker_id: str | None = None) -> None:
         self.db = db
@@ -185,6 +200,25 @@ class VMWorkspaceRecoveryStore:
                     await conn.execute(
                         "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
                         f"workspace-recovery:{kind}:{identifier}",
+                    )
+                if root_pvc_uid is not None:
+                    await conn.execute(
+                        "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+                        f"workspace-recovery-pvc:{root_pvc_uid}",
+                    )
+                cleanup = await conn.fetchrow(
+                    "SELECT id FROM vm_workspace_cleanup_admissions "
+                    "WHERE ((owner_kind=$1 AND owner_id=$2) "
+                    "OR ($3::uuid IS NOT NULL AND pvc_uid=$3)) "
+                    "AND completed_at IS NULL FOR UPDATE",
+                    owner_kind,
+                    owner_id,
+                    root_pvc_uid,
+                )
+                if cleanup is not None:
+                    raise WorkspaceRecoveryControlConflict(
+                        "workspace_cleanup_already_admitted",
+                        "Workspace cleanup crossed its admission boundary before recovery.",
                     )
                 membership = await conn.fetchrow(
                     "SELECT parent_job_id, context FROM jobs WHERE id=$1", job_id
@@ -494,6 +528,14 @@ class VMWorkspaceRecoveryStore:
                     json.dumps(dict(original_cause or {})),
                     json.dumps(diagnostic),
                 )
+                if provision_generation is not None and root_pvc_uid is not None:
+                    await conn.execute(
+                        "INSERT INTO vm_workspace_recovery_retention_pins "
+                        "(recovery_id,pvc_uid,provision_generation) VALUES ($1,$2,$3)",
+                        recovery_id,
+                        root_pvc_uid,
+                        provision_generation,
+                    )
                 hold_tokens: dict[UUID, int] = {}
                 for member in members:
                     member_id = member["id"]
@@ -637,6 +679,306 @@ class VMWorkspaceRecoveryStore:
                     json.dumps(receipt),
                 )
                 return disposition
+
+    async def unresolved_participation(self, job_id: UUID) -> dict[str, Any] | None:
+        async with self.db.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT r.id AS operation_id, r.owner_kind, r.owner_id, r.phase, "
+                "r.deadline_at, rj.participation FROM vm_workspace_recovery_jobs rj "
+                "JOIN vm_workspace_recoveries r ON r.id=rj.recovery_id "
+                "WHERE rj.job_id=$1 AND rj.resolved_at IS NULL AND r.resolved_at IS NULL",
+                job_id,
+            )
+        return dict(row) if row is not None else None
+
+    async def acquire_cleanup_permit(
+        self,
+        *,
+        owner_kind: str,
+        owner_id: UUID,
+        pvc_uid: UUID | None,
+        request_id: UUID,
+        source: str,
+    ) -> CleanupPermit:
+        """Serialize destructive admission with recovery and its exact disk pin."""
+
+        async with self.db.acquire() as conn:
+            async with conn.transaction():
+                await conn.execute(
+                    "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+                    f"workspace-recovery:{owner_kind}:{owner_id}",
+                )
+                if pvc_uid is not None:
+                    await conn.execute(
+                        "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+                        f"workspace-recovery-pvc:{pvc_uid}",
+                    )
+                prior = await conn.fetchrow(
+                    "SELECT id,completed_at FROM vm_workspace_cleanup_admissions "
+                    "WHERE owner_kind=$1 AND owner_id=$2 AND request_id=$3 FOR UPDATE",
+                    owner_kind,
+                    owner_id,
+                    request_id,
+                )
+                if prior is not None:
+                    return CleanupPermit(
+                        allowed=prior["completed_at"] is None,
+                        admission_id=prior["id"],
+                        reason=(
+                            None
+                            if prior["completed_at"] is None
+                            else "cleanup_request_already_completed"
+                        ),
+                    )
+                active_cleanup = await conn.fetchrow(
+                    "SELECT id FROM vm_workspace_cleanup_admissions "
+                    "WHERE ((owner_kind=$1 AND owner_id=$2) "
+                    "OR ($3::uuid IS NOT NULL AND pvc_uid=$3)) "
+                    "AND completed_at IS NULL FOR UPDATE",
+                    owner_kind,
+                    owner_id,
+                    pvc_uid,
+                )
+                if active_cleanup is not None:
+                    return CleanupPermit(
+                        allowed=False,
+                        admission_id=active_cleanup["id"],
+                        reason="workspace_cleanup_already_admitted",
+                    )
+                recovery = await conn.fetchrow(
+                    "SELECT r.id FROM vm_workspace_recoveries r "
+                    "LEFT JOIN vm_workspace_recovery_retention_pins pin "
+                    "ON pin.recovery_id=r.id AND pin.released_at IS NULL "
+                    "WHERE r.resolved_at IS NULL AND ((r.owner_kind=$1 AND r.owner_id=$2) "
+                    "OR ($3::uuid IS NOT NULL AND pin.pvc_uid=$3)) FOR UPDATE OF r",
+                    owner_kind,
+                    owner_id,
+                    pvc_uid,
+                )
+                if recovery is not None:
+                    return CleanupPermit(
+                        allowed=False,
+                        recovery_id=recovery["id"],
+                        reason="workspace_recovery_unresolved",
+                    )
+                admission_id = uuid4()
+                await conn.execute(
+                    "INSERT INTO vm_workspace_cleanup_admissions "
+                    "(id,owner_kind,owner_id,pvc_uid,source,request_id) "
+                    "VALUES ($1,$2,$3,$4,$5,$6)",
+                    admission_id,
+                    owner_kind,
+                    owner_id,
+                    pvc_uid,
+                    source,
+                    request_id,
+                )
+                return CleanupPermit(allowed=True, admission_id=admission_id)
+
+    async def complete_cleanup_permit(
+        self, admission_id: UUID, *, outcome: str
+    ) -> bool:
+        if not outcome:
+            raise ValueError("cleanup outcome must be nonempty")
+        async with self.db.acquire() as conn:
+            changed = await conn.fetchval(
+                "UPDATE vm_workspace_cleanup_admissions SET completed_at=clock_timestamp(), "
+                "outcome=$2 WHERE id=$1 AND completed_at IS NULL RETURNING 1",
+                admission_id,
+                outcome,
+            )
+        return changed is not None
+
+    async def retry_paused(
+        self,
+        *,
+        job_id: UUID,
+        operation_id: UUID,
+        request_id: UUID,
+        actor_kind: str,
+        actor_id: str,
+    ) -> dict[str, Any]:
+        """Atomically supersede a paused owner recovery without releasing holds."""
+
+        digest = hashlib.sha256(f"retry:{job_id}:{operation_id}".encode()).hexdigest()
+        async with self.db.acquire() as conn:
+            async with conn.transaction():
+                prior = await conn.fetchrow(
+                    "SELECT intent_digest,accepted_result FROM vm_workspace_recovery_requests "
+                    "WHERE scope_kind='recovery' AND scope_id=$1 AND request_id=$2",
+                    operation_id,
+                    request_id,
+                )
+                if prior is not None:
+                    if prior["intent_digest"] != digest:
+                        raise WorkspaceRecoveryControlConflict(
+                            "request_id_reused",
+                            "Recovery request ID was already used with different intent.",
+                        )
+                    return dict(_json(prior["accepted_result"]))
+                observed = await conn.fetchrow(
+                    "SELECT owner_kind,owner_id FROM vm_workspace_recoveries WHERE id=$1",
+                    operation_id,
+                )
+                if observed is None:
+                    raise WorkspaceRecoveryControlConflict(
+                        "workspace_recovery_not_found",
+                        "Workspace recovery was not found.",
+                    )
+                await conn.execute(
+                    "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+                    f"workspace-recovery:{observed['owner_kind']}:{observed['owner_id']}",
+                )
+                roster = await conn.fetch(
+                    "SELECT job_id FROM vm_workspace_recovery_jobs "
+                    "WHERE recovery_id=$1 AND resolved_at IS NULL ORDER BY job_id",
+                    operation_id,
+                )
+                for participant in roster:
+                    await conn.fetchrow(
+                        "SELECT state FROM run_queue WHERE unit_id=$1 FOR UPDATE",
+                        participant["job_id"],
+                    )
+                for participant in roster:
+                    await conn.fetchrow(
+                        "SELECT status FROM jobs WHERE id=$1 FOR UPDATE",
+                        participant["job_id"],
+                    )
+                recovery = await conn.fetchrow(
+                    "SELECT * FROM vm_workspace_recoveries WHERE id=$1 FOR UPDATE",
+                    operation_id,
+                )
+                if recovery is None or recovery["resolved_at"] is not None:
+                    raise WorkspaceRecoveryControlConflict(
+                        "workspace_recovery_resolved",
+                        "Workspace recovery is already resolved.",
+                    )
+                if recovery["phase"] != "paused_attention":
+                    raise WorkspaceRecoveryControlConflict(
+                        "workspace_recovery_not_paused",
+                        "Workspace recovery is already running.",
+                    )
+                if recovery["owner_kind"] != "job" or recovery["owner_id"] != job_id:
+                    raise WorkspaceRecoveryControlConflict(
+                        "workspace_recovery_owner_required",
+                        "Only the canonical workspace owner can retry recovery.",
+                    )
+                participants = await conn.fetch(
+                    "SELECT * FROM vm_workspace_recovery_jobs WHERE recovery_id=$1 "
+                    "AND resolved_at IS NULL ORDER BY job_id FOR UPDATE",
+                    operation_id,
+                )
+                successor_id = uuid4()
+                await conn.execute(
+                    "UPDATE vm_workspace_recovery_jobs SET participation='transferred', "
+                    "resolved_at=clock_timestamp(),outcome=COALESCE(outcome,'{}'::jsonb) "
+                    "|| jsonb_build_object('successor_operation_id',$2::text) "
+                    "WHERE recovery_id=$1 AND resolved_at IS NULL",
+                    operation_id,
+                    str(successor_id),
+                )
+                await conn.execute(
+                    "UPDATE vm_workspace_recoveries SET phase='cancelled', "
+                    "resolved_at=clock_timestamp(),claimed_by=NULL,claimed_until=NULL, "
+                    "version=version+1 WHERE id=$1",
+                    operation_id,
+                )
+                await conn.execute(
+                    "INSERT INTO vm_workspace_recoveries (id,protocol_version,owner_kind,owner_id,"
+                    "workspace_contract_digest,provision_generation,cluster_name,namespace,vm_uid,"
+                    "prior_vmi_uid,prior_launcher_uid,root_pvc_uid,phase,reason_code,original_cause,"
+                    "latest_diagnostic) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'recovering',"
+                    "$13,$14,$15)",
+                    successor_id,
+                    recovery["protocol_version"],
+                    recovery["owner_kind"],
+                    recovery["owner_id"],
+                    recovery["workspace_contract_digest"],
+                    recovery["provision_generation"],
+                    recovery["cluster_name"],
+                    recovery["namespace"],
+                    recovery["vm_uid"],
+                    recovery["prior_vmi_uid"],
+                    recovery["prior_launcher_uid"],
+                    recovery["root_pvc_uid"],
+                    recovery["reason_code"],
+                    recovery["original_cause"],
+                    recovery["latest_diagnostic"],
+                )
+                await conn.execute(
+                    "UPDATE vm_workspace_recoveries SET phase='superseded',superseded_by=$2 "
+                    "WHERE id=$1",
+                    operation_id,
+                    successor_id,
+                )
+                for participant in participants:
+                    await conn.execute(
+                        "INSERT INTO vm_workspace_recovery_jobs (recovery_id,job_id,"
+                        "accepted_lease_token,hold_lease_token,prior_queue_state,prior_job_status,"
+                        "prior_control_reference,prior_freeze_reference,checkpoint_id,checkpoint_namespace,"
+                        "participation,outcome,resume_receipt) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)",
+                        successor_id,
+                        participant["job_id"],
+                        participant["accepted_lease_token"],
+                        participant["hold_lease_token"],
+                        participant["prior_queue_state"],
+                        participant["prior_job_status"],
+                        participant["prior_control_reference"],
+                        participant["prior_freeze_reference"],
+                        participant["checkpoint_id"],
+                        participant["checkpoint_namespace"],
+                        participant["participation"],
+                        participant["outcome"],
+                        participant["resume_receipt"],
+                    )
+                    if participant["hold_lease_token"] is not None:
+                        await conn.execute(
+                            "UPDATE jobs SET freeze_data=jsonb_set(freeze_data,'{recovery_id}',"
+                            "to_jsonb($2::text),false) WHERE id=$1 AND status='paused' "
+                            "AND freeze_data->>'recovery_id'=$3",
+                            participant["job_id"],
+                            str(successor_id),
+                            str(operation_id),
+                        )
+                await conn.execute(
+                    "UPDATE vm_workspace_recovery_retention_pins SET released_at=clock_timestamp() "
+                    "WHERE recovery_id=$1 AND released_at IS NULL",
+                    operation_id,
+                )
+                if (
+                    recovery["root_pvc_uid"] is not None
+                    and recovery["provision_generation"] is not None
+                ):
+                    await conn.execute(
+                        "INSERT INTO vm_workspace_recovery_retention_pins "
+                        "(recovery_id,pvc_uid,provision_generation) VALUES ($1,$2,$3)",
+                        successor_id,
+                        recovery["root_pvc_uid"],
+                        recovery["provision_generation"],
+                    )
+                deadline_at = await conn.fetchval(
+                    "SELECT deadline_at FROM vm_workspace_recoveries WHERE id=$1",
+                    successor_id,
+                )
+                result = {
+                    "status": "recovering_workspace",
+                    "operation_id": str(successor_id),
+                    "supersedes_operation_id": str(operation_id),
+                    "deadline_at": deadline_at.isoformat(),
+                }
+                await conn.execute(
+                    "INSERT INTO vm_workspace_recovery_requests (scope_kind,scope_id,request_id,"
+                    "actor_kind,actor_id,intent_digest,recovery_id,accepted_result) "
+                    "VALUES ('recovery',$1,$2,$3,$4,$5,$6,$7::jsonb)",
+                    operation_id,
+                    request_id,
+                    actor_kind,
+                    actor_id,
+                    digest,
+                    successor_id,
+                    json.dumps(result),
+                )
+                return result
 
     async def admit_hold_from_reaper(
         self,
@@ -1009,4 +1351,9 @@ class VMWorkspaceRecoveryStore:
         return True
 
 
-__all__ = ["RecoveryClaim", "VMWorkspaceRecoveryStore"]
+__all__ = [
+    "CleanupPermit",
+    "RecoveryClaim",
+    "VMWorkspaceRecoveryStore",
+    "WorkspaceRecoveryControlConflict",
+]

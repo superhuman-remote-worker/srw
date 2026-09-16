@@ -84,6 +84,10 @@ def _operations(
             kick_session_wake_drain=MagicMock(),
             get_container_context=MagicMock(return_value={}),
             get_vm_context=MagicMock(return_value={}),
+            recovery_store=MagicMock(
+                unresolved_participation=AsyncMock(return_value=None),
+                retry_paused=AsyncMock(),
+            ),
         )
     )
 
@@ -307,6 +311,37 @@ async def test_command_mode_resume_queues_stateless_before_agent_delivery(
 
 
 @pytest.mark.asyncio
+async def test_generic_resume_routes_unresolved_workspace_recovery_without_unparking(
+    tmp_path: Path,
+) -> None:
+    operations = _operations(tmp_path)
+    recovery_store = operations.dependencies.recovery_store
+    recovery_store.unresolved_participation = AsyncMock(
+        return_value={
+            "operation_id": "11111111-2222-4333-8444-555555555555",
+            "phase": "paused_attention",
+        }
+    )
+    recovery_store.retry_paused = AsyncMock(
+        return_value={"status": "recovering_workspace"}
+    )
+    job = _frozen_job(execution_lane="stateless")
+
+    result = await operations.resume_job(
+        JOB_ID,
+        user={"id": "99999999-9999-4999-8999-999999999999"},
+        job=job,
+        request=None,
+        req=MagicMock(),
+    )
+
+    assert result["status"] == "recovering_workspace"
+    recovery_store.retry_paused.assert_awaited_once()
+    operations.dependencies.completion_control.guard.assert_not_awaited()
+    operations.dependencies.prepare_job_workspace_runtime.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_approve_phase_boundary_requeues_under_completion_claim(
     tmp_path: Path,
 ) -> None:
@@ -400,6 +435,7 @@ def test_extracted_router_openapi_matches_original_surface() -> None:
         "/api/sudo/rules",
         "/api/sudo/rules/{rule_id}",
         "/api/jobs/{job_id}/resume",
+        "/api/jobs/{job_id}/workspace-recovery/retry",
         "/api/jobs/{job_id}/approve",
         "/api/jobs/{job_id}/upgrade-to-vm",
     }

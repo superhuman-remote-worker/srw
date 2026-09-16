@@ -16,6 +16,9 @@ import pytest_asyncio
 from testcontainers.community.postgres import PostgresContainer
 
 from orchestrator.services.vm_workspace_recovery_store import VMWorkspaceRecoveryStore
+from orchestrator.services.vm_workspace_recovery_store import (
+    WorkspaceRecoveryControlConflict,
+)
 from orchestrator.database.postgres import PostgresDB
 import shared.worker_queue as worker_queue
 from shared.run_queue import reap_expired, unpark_unit
@@ -106,7 +109,8 @@ async def app_pg(pg_dsn: str, _schema_applied: None):
     pool = await asyncpg.create_pool(pg_dsn, min_size=1, max_size=4)
     async with pool.acquire() as conn:
         await conn.execute(
-            "TRUNCATE vm_workspace_recovery_requests, "
+            "TRUNCATE vm_workspace_cleanup_admissions, "
+            "vm_workspace_recovery_requests, "
             "vm_workspace_recovery_probe_slots, "
             "vm_workspace_recovery_stop_receipts, "
             "vm_workspace_recovery_retention_pins, worker_batch_attempts, "
@@ -184,6 +188,192 @@ async def insert_leased_job(
                 lease_token,
             )
     return job_id, lease_token
+
+
+@pytest.mark.asyncio
+async def test_recovery_hold_and_cleanup_admission_have_one_winner(app_pg) -> None:
+    store = VMWorkspaceRecoveryStore(app_pg, worker_id="test-worker")
+    job_id, lease_token = await insert_leased_job(app_pg)
+    kwargs = admission_kwargs(job_id, lease_token)
+    cleanup_request_id = uuid4()
+    cleanup = await store.acquire_cleanup_permit(
+        owner_kind="job",
+        owner_id=job_id,
+        pvc_uid=kwargs["root_pvc_uid"],
+        request_id=cleanup_request_id,
+        source="terminal_cleanup",
+    )
+    assert cleanup.allowed
+    cleanup_replay = await store.acquire_cleanup_permit(
+        owner_kind="job",
+        owner_id=job_id,
+        pvc_uid=kwargs["root_pvc_uid"],
+        request_id=cleanup_request_id,
+        source="terminal_cleanup",
+    )
+    assert cleanup_replay.allowed
+    assert cleanup_replay.admission_id == cleanup.admission_id
+
+    competing_cleanup = await store.acquire_cleanup_permit(
+        owner_kind="job",
+        owner_id=job_id,
+        pvc_uid=kwargs["root_pvc_uid"],
+        request_id=uuid4(),
+        source="terminal_cleanup_retry",
+    )
+    assert not competing_cleanup.allowed
+    assert competing_cleanup.reason == "workspace_cleanup_already_admitted"
+
+    with pytest.raises(
+        WorkspaceRecoveryControlConflict,
+        match="crossed its admission boundary",
+    ):
+        await store.admit_hold(**kwargs)
+
+    assert await store.complete_cleanup_permit(
+        cleanup.admission_id, outcome="not_started"
+    )
+    disposition = await store.admit_hold(**kwargs)
+    assert disposition.operation_id is not None
+    blocked = await store.acquire_cleanup_permit(
+        owner_kind="job",
+        owner_id=job_id,
+        pvc_uid=kwargs["root_pvc_uid"],
+        request_id=uuid4(),
+        source="terminal_cleanup",
+    )
+    assert not blocked.allowed
+    assert blocked.recovery_id == disposition.operation_id
+
+
+@pytest.mark.asyncio
+async def test_retry_transfers_every_hold_and_pin_atomically_and_replays(
+    app_pg,
+) -> None:
+    store = VMWorkspaceRecoveryStore(app_pg, worker_id="test-worker")
+    job_id, lease_token = await insert_leased_job(app_pg)
+    kwargs = admission_kwargs(job_id, lease_token)
+    kwargs["code"] = WorkspaceRecoveryCode.TOOL_OUTCOME_UNKNOWN
+    original = await store.admit_hold(**kwargs)
+    request_id = uuid4()
+
+    first = await store.retry_paused(
+        job_id=job_id,
+        operation_id=original.operation_id,
+        request_id=request_id,
+        actor_kind="user",
+        actor_id="operator",
+    )
+    replay = await store.retry_paused(
+        job_id=job_id,
+        operation_id=original.operation_id,
+        request_id=request_id,
+        actor_kind="user",
+        actor_id="operator",
+    )
+
+    assert replay == first
+    successor = UUID(first["operation_id"])
+    async with app_pg.acquire() as conn:
+        old = await conn.fetchrow(
+            "SELECT phase,superseded_by FROM vm_workspace_recoveries WHERE id=$1",
+            original.operation_id,
+        )
+        open_rows = await conn.fetch(
+            "SELECT recovery_id,hold_lease_token FROM vm_workspace_recovery_jobs "
+            "WHERE job_id=$1 AND resolved_at IS NULL",
+            job_id,
+        )
+        pins = await conn.fetch(
+            "SELECT recovery_id,released_at FROM vm_workspace_recovery_retention_pins "
+            "WHERE recovery_id=ANY($1::uuid[]) ORDER BY recovery_id",
+            [original.operation_id, successor],
+        )
+    assert old["phase"] == "superseded" and old["superseded_by"] == successor
+    assert [(row["recovery_id"], row["hold_lease_token"]) for row in open_rows] == [
+        (successor, original.hold_lease_token)
+    ]
+    assert sum(pin["released_at"] is None for pin in pins) == 1
+
+
+@pytest.mark.asyncio
+async def test_child_only_retry_is_refused_without_changing_hold(app_pg) -> None:
+    store = VMWorkspaceRecoveryStore(app_pg, worker_id="test-worker")
+    job_id, lease_token = await insert_leased_job(app_pg)
+    kwargs = admission_kwargs(job_id, lease_token)
+    kwargs["code"] = WorkspaceRecoveryCode.TOOL_OUTCOME_UNKNOWN
+    original = await store.admit_hold(**kwargs)
+
+    with pytest.raises(WorkspaceRecoveryControlConflict) as refused:
+        await store.retry_paused(
+            job_id=uuid4(),
+            operation_id=original.operation_id,
+            request_id=uuid4(),
+            actor_kind="user",
+            actor_id="child-owner",
+        )
+
+    assert refused.value.code == "workspace_recovery_owner_required"
+    assert (await store.unresolved_participation(job_id))[
+        "operation_id"
+    ] == original.operation_id
+
+
+@pytest.mark.asyncio
+async def test_cancel_resolves_only_requesting_recovery_participant(app_pg) -> None:
+    store = VMWorkspaceRecoveryStore(app_pg, worker_id="test-worker")
+    owner_id, lease_token = await insert_leased_job(app_pg)
+    kwargs = admission_kwargs(owner_id, lease_token)
+    kwargs["code"] = WorkspaceRecoveryCode.TOOL_OUTCOME_UNKNOWN
+    recovery = await store.admit_hold(**kwargs)
+    child_id = uuid4()
+    async with app_pg.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO jobs (id,description,status,execution_lane,freeze_data) "
+            "VALUES ($1,'shared child','paused','stateless',"
+            "jsonb_build_object('freeze_type','workspace_recovery','recovery_id',$2::text,'hold_lease_token',1))",
+            child_id,
+            str(recovery.operation_id),
+        )
+        await conn.execute(
+            "INSERT INTO run_queue(unit_id,unit_kind,state,lease_token,run_after,park_reason,parked_at) "
+            "VALUES ($1,'worker_batch','parked',1,'infinity','workspace_recovery',clock_timestamp())",
+            child_id,
+        )
+        await conn.execute(
+            "INSERT INTO vm_workspace_recovery_jobs (recovery_id,job_id,hold_lease_token,"
+            "prior_queue_state,prior_job_status,participation) "
+            "VALUES ($1,$2,1,'queued','created','attention')",
+            recovery.operation_id,
+            child_id,
+        )
+    db = PostgresDB.__new__(PostgresDB)
+    db.acquire = app_pg.acquire
+
+    cancelled, _ = await db.cancel_stateless_job(str(owner_id))
+
+    assert cancelled
+    async with app_pg.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT job_id,participation,resolved_at FROM vm_workspace_recovery_jobs "
+            "WHERE recovery_id=$1 ORDER BY job_id",
+            recovery.operation_id,
+        )
+        operation = await conn.fetchrow(
+            "SELECT phase,resolved_at FROM vm_workspace_recoveries WHERE id=$1",
+            recovery.operation_id,
+        )
+        pin_released = await conn.fetchval(
+            "SELECT released_at IS NOT NULL FROM vm_workspace_recovery_retention_pins "
+            "WHERE recovery_id=$1",
+            recovery.operation_id,
+        )
+    by_job = {row["job_id"]: row for row in rows}
+    assert by_job[owner_id]["participation"] == "cancelled"
+    assert by_job[owner_id]["resolved_at"] is not None
+    assert by_job[child_id]["resolved_at"] is None
+    assert operation["phase"] == "paused_attention" and operation["resolved_at"] is None
+    assert pin_released is False
 
 
 def admission_kwargs(

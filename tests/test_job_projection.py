@@ -22,6 +22,54 @@ def redact(job):
     )
 
 
+def test_workspace_recovery_projection_is_coordinate_free_and_redacts_diagnostics():
+    operation_id = "11111111-2222-4333-8444-555555555555"
+    source = {
+        "id": "job",
+        "_workspace_recovery": {
+            "operation_id": operation_id,
+            "state": "paused_attention",
+            "reason_code": "prior_runtime_unfenced",
+            "started_at": "2026-09-16T08:00:00+00:00",
+            "deadline_at": "2026-09-16T08:15:00+00:00",
+            "next_check_at": None,
+            "cleanup_pending": True,
+            "private_endpoint": "10.0.0.9",
+            "latest_diagnostic": {"controller_error": "synthetic-private"},
+        },
+    }
+
+    result = redact(source)
+
+    assert result["workspace_recovery"] == {
+        "operation_id": operation_id,
+        "state": "paused_attention",
+        "reason_code": "prior_runtime_unfenced",
+        "message": "Previous workspace execution could not be proven stopped.",
+        "started_at": "2026-09-16T08:00:00+00:00",
+        "deadline_at": "2026-09-16T08:15:00+00:00",
+        "next_check_at": None,
+        "retryable": True,
+        "cleanup_pending": True,
+    }
+    assert "_workspace_recovery" not in result
+    assert "10.0.0.9" not in json.dumps(result)
+    assert "synthetic-private" not in json.dumps(result)
+
+
+def test_workspace_recovery_projection_rejects_unknown_reason_and_shape():
+    assert (
+        projection.workspace_recovery_projection(
+            {"_workspace_recovery": {"reason_code": "raw_controller_failure"}}
+        )
+        is None
+    )
+    assert (
+        projection.workspace_recovery_projection({"_workspace_recovery": "not-json"})
+        is None
+    )
+
+
 @pytest.mark.parametrize("as_text", [False, True])
 def test_job_projection_preserves_shape_extensions_and_input(as_text):
     context = {

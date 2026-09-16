@@ -20822,6 +20822,26 @@ COMMENT ON TABLE public.vm_remote_operation_protocol_gate IS 'Default-dark, mono
 
 
 --
+-- Name: vm_workspace_cleanup_admissions; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.vm_workspace_cleanup_admissions (
+    id uuid NOT NULL,
+    owner_kind text NOT NULL,
+    owner_id uuid NOT NULL,
+    pvc_uid uuid,
+    source text NOT NULL,
+    request_id uuid NOT NULL,
+    admitted_at timestamp with time zone DEFAULT clock_timestamp() NOT NULL,
+    completed_at timestamp with time zone,
+    outcome text,
+    CONSTRAINT vm_workspace_cleanup_admissions_check CHECK ((((completed_at IS NULL) AND (outcome IS NULL)) OR ((completed_at IS NOT NULL) AND (outcome IS NOT NULL) AND (outcome <> ''::text)))),
+    CONSTRAINT vm_workspace_cleanup_admissions_owner_kind_check CHECK ((owner_kind = ANY (ARRAY['job'::text, 'thread'::text]))),
+    CONSTRAINT vm_workspace_cleanup_admissions_source_check CHECK ((source <> ''::text))
+);
+
+
+--
 -- Name: vm_workspace_recoveries; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -20853,18 +20873,20 @@ CREATE TABLE public.vm_workspace_recoveries (
     claimed_by text,
     claimed_until timestamp with time zone,
     resolved_at timestamp with time zone,
+    superseded_by uuid,
     CONSTRAINT vm_workspace_recoveries_check CHECK ((deadline_at = (first_observed_at + '00:15:00'::interval))),
     CONSTRAINT vm_workspace_recoveries_check1 CHECK ((((claimed_by IS NULL) AND (claimed_until IS NULL)) OR ((claimed_by IS NOT NULL) AND (claimed_by <> ''::text) AND (claimed_until IS NOT NULL) AND (claim_token > 0)))),
-    CONSTRAINT vm_workspace_recoveries_check2 CHECK ((((resolved_at IS NULL) AND (phase = ANY (ARRAY['recovering'::text, 'paused_attention'::text]))) OR ((resolved_at IS NOT NULL) AND (phase = ANY (ARRAY['recovered'::text, 'cancelled'::text]))))),
     CONSTRAINT vm_workspace_recoveries_claim_token_check CHECK ((claim_token >= 0)),
     CONSTRAINT vm_workspace_recoveries_cluster_name_check CHECK ((cluster_name <> ''::text)),
     CONSTRAINT vm_workspace_recoveries_exact_runtime_identity CHECK ((((prior_vmi_uid IS NOT NULL) AND (prior_launcher_uid IS NOT NULL) AND (provision_generation IS NOT NULL) AND (namespace IS NOT NULL) AND (vm_uid IS NOT NULL) AND (root_pvc_uid IS NOT NULL)) OR (phase = 'paused_attention'::text))),
     CONSTRAINT vm_workspace_recoveries_namespace_check CHECK ((namespace <> ''::text)),
     CONSTRAINT vm_workspace_recoveries_original_cause_check CHECK ((jsonb_typeof(original_cause) = 'object'::text)),
     CONSTRAINT vm_workspace_recoveries_owner_kind_check CHECK ((owner_kind = ANY (ARRAY['job'::text, 'thread'::text]))),
-    CONSTRAINT vm_workspace_recoveries_phase_check CHECK ((phase = ANY (ARRAY['recovering'::text, 'paused_attention'::text, 'recovered'::text, 'cancelled'::text]))),
+    CONSTRAINT vm_workspace_recoveries_phase_check CHECK ((phase = ANY (ARRAY['recovering'::text, 'paused_attention'::text, 'recovered'::text, 'cancelled'::text, 'superseded'::text]))),
     CONSTRAINT vm_workspace_recoveries_protocol_version_check CHECK ((protocol_version = 1)),
     CONSTRAINT vm_workspace_recoveries_reason_code_check CHECK ((reason_code = ANY (ARRAY['workspace_runtime_not_ready'::text, 'workspace_transport_unavailable'::text, 'workspace_replacement_observed'::text, 'workspace_identity_conflict'::text, 'prior_runtime_unfenced'::text, 'shared_workspace_writers_unfenced'::text, 'tool_outcome_unknown'::text, 'checkpoint_unavailable'::text, 'workspace_recovery_deadline_exceeded'::text]))),
+    CONSTRAINT vm_workspace_recoveries_resolution_check CHECK ((((resolved_at IS NULL) AND (phase = ANY (ARRAY['recovering'::text, 'paused_attention'::text]))) OR ((resolved_at IS NOT NULL) AND (phase = ANY (ARRAY['recovered'::text, 'cancelled'::text, 'superseded'::text]))))),
+    CONSTRAINT vm_workspace_recoveries_supersession_check CHECK ((((phase = 'superseded'::text) AND (superseded_by IS NOT NULL)) OR ((phase <> 'superseded'::text) AND (superseded_by IS NULL)))),
     CONSTRAINT vm_workspace_recoveries_version_check CHECK ((version > 0)),
     CONSTRAINT vm_workspace_recoveries_workspace_contract_digest_check CHECK ((workspace_contract_digest <> ''::text))
 );
@@ -20894,9 +20916,9 @@ CREATE TABLE public.vm_workspace_recovery_jobs (
     CONSTRAINT vm_workspace_recovery_jobs_check CHECK ((((prior_queue_state = 'non_worker'::text) AND (accepted_lease_token IS NULL) AND (hold_lease_token IS NULL)) OR ((prior_queue_state <> 'non_worker'::text) AND (hold_lease_token IS NOT NULL)))),
     CONSTRAINT vm_workspace_recovery_jobs_check1 CHECK (((accepted_lease_token IS NULL) OR (hold_lease_token > accepted_lease_token))),
     CONSTRAINT vm_workspace_recovery_jobs_check2 CHECK (((checkpoint_id IS NULL) = (checkpoint_namespace IS NULL))),
-    CONSTRAINT vm_workspace_recovery_jobs_check3 CHECK ((((resolved_at IS NULL) AND (participation = ANY (ARRAY['held'::text, 'attention'::text]))) OR ((resolved_at IS NOT NULL) AND (participation = ANY (ARRAY['released'::text, 'cancelled'::text]))))),
     CONSTRAINT vm_workspace_recovery_jobs_hold_lease_token_check CHECK ((hold_lease_token > 0)),
-    CONSTRAINT vm_workspace_recovery_jobs_participation_check CHECK ((participation = ANY (ARRAY['held'::text, 'attention'::text, 'released'::text, 'cancelled'::text])))
+    CONSTRAINT vm_workspace_recovery_jobs_participation_check CHECK ((participation = ANY (ARRAY['held'::text, 'attention'::text, 'released'::text, 'cancelled'::text, 'transferred'::text]))),
+    CONSTRAINT vm_workspace_recovery_jobs_resolution_check CHECK ((((resolved_at IS NULL) AND (participation = ANY (ARRAY['held'::text, 'attention'::text]))) OR ((resolved_at IS NOT NULL) AND (participation = ANY (ARRAY['released'::text, 'cancelled'::text, 'transferred'::text])))))
 );
 
 
@@ -23282,6 +23304,22 @@ ALTER TABLE ONLY public.vm_remote_operation_protocol_gate
 
 
 --
+-- Name: vm_workspace_cleanup_admissions vm_workspace_cleanup_admissio_owner_kind_owner_id_request_i_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_workspace_cleanup_admissions
+    ADD CONSTRAINT vm_workspace_cleanup_admissio_owner_kind_owner_id_request_i_key UNIQUE (owner_kind, owner_id, request_id);
+
+
+--
+-- Name: vm_workspace_cleanup_admissions vm_workspace_cleanup_admissions_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_workspace_cleanup_admissions
+    ADD CONSTRAINT vm_workspace_cleanup_admissions_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: vm_workspace_recoveries vm_workspace_recoveries_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -25425,6 +25463,13 @@ CREATE INDEX vm_remote_operation_expiry ON public.vm_remote_operation_leases USI
 --
 
 CREATE UNIQUE INDEX vm_remote_operation_one_active_owner ON public.vm_remote_operation_leases USING btree (owner_kind, owner_id) WHERE (settled_at IS NULL);
+
+
+--
+-- Name: vm_workspace_cleanup_admissions_one_open_owner; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX vm_workspace_cleanup_admissions_one_open_owner ON public.vm_workspace_cleanup_admissions USING btree (owner_kind, owner_id) WHERE (completed_at IS NULL);
 
 
 --
@@ -28542,6 +28587,14 @@ ALTER TABLE ONLY public.users
 
 ALTER TABLE ONLY public.users
     ADD CONSTRAINT users_default_project_id_fkey FOREIGN KEY (default_project_id) REFERENCES public.projects(id);
+
+
+--
+-- Name: vm_workspace_recoveries vm_workspace_recoveries_superseded_by_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_workspace_recoveries
+    ADD CONSTRAINT vm_workspace_recoveries_superseded_by_fkey FOREIGN KEY (superseded_by) REFERENCES public.vm_workspace_recoveries(id);
 
 
 --

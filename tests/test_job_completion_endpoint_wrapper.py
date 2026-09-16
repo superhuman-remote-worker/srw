@@ -11,6 +11,7 @@ from tests import b08_completion_helpers as b08_helpers
 
 import builtins
 import copy
+import dataclasses
 import inspect
 import json
 from collections import Counter
@@ -37,6 +38,25 @@ AGENT_ID = UUID("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
 REPORT_ID = UUID("99999999-8888-7777-6666-555555555555")
 COMMAND_ID = "12345678-1234-5678-9abc-123456789abc"
 CURATOR_ID = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa"
+
+
+class _AllowCleanupStore:
+    async def acquire_cleanup_permit(self, **_kwargs):
+        return SimpleNamespace(allowed=True)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_workspace_cleanup_authority(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep legacy completion tests focused on their existing collaborators."""
+
+    original = orchestrator.main._completion_effect_dependencies
+
+    def dependencies():
+        return dataclasses.replace(original(), recovery_store=_AllowCleanupStore())
+
+    monkeypatch.setattr(
+        orchestrator.main, "_completion_effect_dependencies", dependencies
+    )
 
 
 class _RecordingRunner:
@@ -2285,6 +2305,40 @@ async def test_active_s36_marker_status_drift_parks_without_clearing_effect(
     assert runner.pending["workspace_archive_teardown"] == output
     assert "workspace_archive_teardown" not in runner.details
     assert runner.probe_order == []
+    workspace_cleanup.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_workspace_recovery_hold_blocks_completion_cleanup_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = _RouteDB(_route_job(status="completed"))
+    runner = _RecordingRunner()
+    workspace_cleanup = AsyncMock(return_value=["must not release"])
+    deny_store = MagicMock()
+    deny_store.acquire_cleanup_permit = AsyncMock(
+        return_value=SimpleNamespace(allowed=False)
+    )
+    prior_dependencies = orchestrator.main._completion_effect_dependencies
+
+    def dependencies():
+        return dataclasses.replace(prior_dependencies(), recovery_store=deny_store)
+
+    monkeypatch.setattr(orchestrator.main, "postgres_db", database)
+    monkeypatch.setattr(
+        orchestrator.main, "_completion_effect_dependencies", dependencies
+    )
+    monkeypatch.setattr(
+        orchestrator.main.thread_retirement_operations.ThreadRetirementOperations,
+        "archive_and_cleanup_workspace",
+        workspace_cleanup,
+    )
+
+    output = await b08_helpers.run_completion_workspace_teardown(JOB_ID, runner)
+
+    assert output["teardown_disposition"] == "retry_pending"
+    assert "held for unresolved workspace recovery" in output["error"]
+    deny_store.acquire_cleanup_permit.assert_awaited_once()
     workspace_cleanup.assert_not_awaited()
 
 

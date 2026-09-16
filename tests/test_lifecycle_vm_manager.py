@@ -9,6 +9,7 @@ to know which backend is active.
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -40,6 +41,7 @@ def _make_manager(
     completion_commands_enabled: bool = False,
     completion_control_active: bool = False,
     completion_command_exists: bool = False,
+    workspace_recovery_store=None,
 ):
     provisioner = MagicMock()
     provisioner.is_available = is_available
@@ -137,6 +139,14 @@ def _make_manager(
 
     router = MagicMock()
     router.enqueue_job = AsyncMock()
+    if workspace_recovery_store is None:
+        workspace_recovery_store = MagicMock()
+        workspace_recovery_store.acquire_cleanup_permit = AsyncMock(
+            return_value=SimpleNamespace(
+                allowed=True, admission_id="cleanup-1", reason=None
+            )
+        )
+        workspace_recovery_store.complete_cleanup_permit = AsyncMock(return_value=True)
     mgr = VMInstanceManager(
         vm_provisioner=provisioner,
         suspension_service=suspension,
@@ -144,6 +154,7 @@ def _make_manager(
         db=db,
         completion_commands_enabled=completion_commands_enabled,
         completion_router=router if completion_commands_enabled else None,
+        workspace_recovery_store=workspace_recovery_store,
     )
     mgr._test_completion_router = router
     return mgr, provisioner, suspension, snapshot, db
@@ -1042,6 +1053,22 @@ class TestDelete:
         provisioner.release_vm_captured.assert_awaited_once()
 
     @pytest.mark.asyncio
+    async def test_recovery_hold_blocks_external_delete_boundary(self):
+        recovery_store = MagicMock()
+        recovery_store.acquire_cleanup_permit = AsyncMock(
+            return_value=SimpleNamespace(
+                allowed=False, reason="workspace_recovery_unresolved"
+            )
+        )
+        mgr, provisioner, *_ = _make_manager(workspace_recovery_store=recovery_store)
+        inst = Instance(kind="vm", id="x", bound_to="job-1", metadata={"scope": "job"})
+
+        await mgr.delete(inst, grace_s=0)
+
+        recovery_store.acquire_cleanup_permit.assert_awaited_once()
+        provisioner.release_vm_captured.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_noop_when_provisioner_unavailable(self):
         mgr, provisioner, *_ = _make_manager(is_available=False)
         inst = Instance(kind="vm", id="x", bound_to="job-1", metadata={"scope": "job"})
@@ -1890,6 +1917,22 @@ class TestKeptDiskSweep:
             entity_type="job",
             capture_snapshot=False,
         )
+
+    @pytest.mark.asyncio
+    async def test_recovery_hold_blocks_kept_disk_external_prune_boundary(self):
+        mgr, provisioner, _ = self._mgr_with_kept([{"id": "job-1"}])
+        recovery_store = MagicMock()
+        recovery_store.acquire_cleanup_permit = AsyncMock(
+            return_value=SimpleNamespace(
+                allowed=False, reason="workspace_recovery_unresolved"
+            )
+        )
+        mgr._workspace_recovery_store = recovery_store
+
+        assert await mgr.purge_kept_disks() == 0
+
+        recovery_store.acquire_cleanup_permit.assert_awaited_once()
+        provisioner.release_vm_captured.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_control_marker_blocks_kept_disk_destructive_recheck(self):

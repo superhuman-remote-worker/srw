@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 import json
 import logging
 from typing import Any
-from uuid import UUID
+from uuid import NAMESPACE_URL, UUID, uuid5
 
 import httpx
 from fastapi import HTTPException, Request
@@ -22,6 +22,7 @@ from orchestrator.schemas.job_controls import (
     JobApproveRequest,
     JobResumeRequest,
     SudoRuleCreateRequest,
+    WorkspaceRecoveryRetryRequest,
 )
 from orchestrator.schemas.workspaces import VMCreateRequest
 from orchestrator.services.grant_enforcement import GrantDenied
@@ -78,6 +79,7 @@ class JobControlDependencies:
     kick_session_wake_drain: Callable[..., Any]
     get_container_context: Callable[[Mapping[str, Any]], Mapping[str, Any]]
     get_vm_context: Callable[[Mapping[str, Any]], Mapping[str, Any]]
+    recovery_store: Any
 
 
 @dataclass(frozen=True, slots=True)
@@ -208,6 +210,31 @@ class JobControlOperations:
             hook="resume",
         )
         return result
+
+    async def retry_workspace_recovery(
+        self,
+        job_id: str,
+        *,
+        user: Mapping[str, Any],
+        request: WorkspaceRecoveryRetryRequest,
+    ) -> dict[str, Any]:
+        from orchestrator.services.vm_workspace_recovery_store import (
+            WorkspaceRecoveryControlConflict,
+        )
+
+        try:
+            return await self.dependencies.recovery_store.retry_paused(
+                job_id=UUID(job_id),
+                operation_id=request.operation_id,
+                request_id=request.request_id,
+                actor_kind="user",
+                actor_id=str(user.get("id") or "unknown"),
+            )
+        except WorkspaceRecoveryControlConflict as exc:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": exc.code, "message": exc.message},
+            ) from exc
 
     async def approve_job(
         self,
@@ -642,6 +669,38 @@ class JobControlOperations:
         can call it directly. ``req`` is only needed on the internal-actor branch
         (no ``user``), which a notification action never takes."""
         require_srw_runtime(job)
+        recovery = await self.dependencies.recovery_store.unresolved_participation(
+            UUID(job_id)
+        )
+        if recovery is not None:
+            from orchestrator.services.vm_workspace_recovery_store import (
+                WorkspaceRecoveryControlConflict,
+            )
+
+            operation_id = UUID(str(recovery["operation_id"]))
+            actor_id = str(user.get("id") if user is not None else "internal")
+            request_id = uuid5(
+                NAMESPACE_URL,
+                f"generic-resume:{operation_id}:{actor_id}",
+            )
+            try:
+                result = await self.dependencies.recovery_store.retry_paused(
+                    job_id=UUID(job_id),
+                    operation_id=operation_id,
+                    request_id=request_id,
+                    actor_kind="user" if user is not None else "internal",
+                    actor_id=actor_id,
+                )
+            except WorkspaceRecoveryControlConflict as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail={"code": exc.code, "message": exc.message},
+                ) from exc
+            return {
+                "status": str(result["status"]),
+                "job_id": job_id,
+                "agent_id": "",
+            }
         canonical_policy = None
         if job.get("execution_harness_adapter") == "srw/v1":
             from orchestrator.services.manifest_execution_snapshot import (

@@ -336,6 +336,15 @@ export function jobCloudAction(job: JobSummary): JobCloudAction {
                         {{ workspaceContractSummary(row.job) }}
                       </div>
                     }
+                    @if (row.job.workspace_recovery) {
+                      <div
+                        class="workspace-recovery"
+                        [class.attention]="row.job.workspace_recovery.state === 'paused_attention'"
+                        [style.padding-left.px]="row.isChild ? 16 : 0"
+                      >
+                        {{ row.job.workspace_recovery.message }}
+                      </div>
+                    }
                     @if (row.job.status === 'failed' && row.job.error_message) {
                       <div class="job-error" [style.padding-left.px]="row.isChild ? 16 : 0" [title]="row.job.error_message">
                         {{ 'jobs.failureReason' | transloco }}: {{ row.job.error_message }}
@@ -413,7 +422,16 @@ export function jobCloudAction(job: JobSummary): JobCloudAction {
                         >
                           {{ 'jobs.action.review' | transloco }}
                         </app-button>
-                      } @else if (!isBlockedUndelivered(row.job) && (row.job.status === 'failed' || row.job.status === 'cancelled' || row.job.status === 'paused' || row.job.status === 'created')) {
+                      } @else if (row.job.workspace_recovery?.retryable) {
+                        <app-button
+                          variant="success"
+                          size="sm"
+                          [ariaLabel]="'jobs.tooltip.retryRecovery' | transloco"
+                          (clicked)="retryWorkspaceRecovery(row.job); $event.stopPropagation()"
+                        >
+                          {{ 'jobs.action.retryRecovery' | transloco }}
+                        </app-button>
+                      } @else if (!row.job.workspace_recovery && !isBlockedUndelivered(row.job) && (row.job.status === 'failed' || row.job.status === 'cancelled' || row.job.status === 'paused' || row.job.status === 'created')) {
                         <app-button
                           variant="success"
                           size="sm"
@@ -439,9 +457,11 @@ export function jobCloudAction(job: JobSummary): JobCloudAction {
                         <app-menu-item (activated)="goToApproveRequest(row.job)">{{ 'jobs.action.approveRequest' | transloco }}</app-menu-item>
                       } @else if (row.job.status === 'pending_review') {
                         <app-menu-item (activated)="reviewJob(row.job.id)">{{ 'jobs.action.review' | transloco }}</app-menu-item>
+                      } @else if (row.job.workspace_recovery?.retryable) {
+                        <app-menu-item (activated)="retryWorkspaceRecovery(row.job)">{{ 'jobs.action.retryRecovery' | transloco }}</app-menu-item>
                       } @else if (row.job.status === 'processing') {
                         <app-menu-item (activated)="pauseJob(row.job.id)">{{ 'jobs.action.pause' | transloco }}</app-menu-item>
-                      } @else if (!isBlockedUndelivered(row.job) && (row.job.status === 'failed' || row.job.status === 'cancelled' || row.job.status === 'paused' || row.job.status === 'created')) {
+                      } @else if (!row.job.workspace_recovery && !isBlockedUndelivered(row.job) && (row.job.status === 'failed' || row.job.status === 'cancelled' || row.job.status === 'paused' || row.job.status === 'created')) {
                         <app-menu-item (activated)="resumeJob(row.job.id)">{{ 'jobs.action.resume' | transloco }}</app-menu-item>
                       }
                       @if (getWorkspaceUrl(row.job)) {
@@ -925,6 +945,16 @@ export function jobCloudAction(job: JobSummary): JobCloudAction {
       }
 
       .workspace-contract.warning {
+        color: var(--warning);
+      }
+
+      .workspace-recovery {
+        margin-top: 3px;
+        color: var(--info);
+        font-size: 10px;
+      }
+
+      .workspace-recovery.attention {
         color: var(--warning);
       }
 
@@ -1989,6 +2019,14 @@ export class JobListComponent implements OnInit, OnDestroy {
       if (result) {
         this.refresh();
       }
+    });
+  }
+
+  retryWorkspaceRecovery(job: JobSummary): void {
+    const recovery = job.workspace_recovery;
+    if (!recovery?.retryable) return;
+    this.api.retryWorkspaceRecovery(job.id, recovery.operation_id).subscribe((result) => {
+      if (result) this.refresh();
     });
   }
 

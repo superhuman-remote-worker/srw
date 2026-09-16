@@ -301,6 +301,7 @@ GET    /api/jobs/{job_id}/todos/current                                         
 POST   /api/jobs/{job_id}/upgrade-to-vm                                                 gated:require_job_access
 GET    /api/jobs/{job_id}/usage                                                         gated:require_job_access
 GET    /api/jobs/{job_id}/version                                                       gated:require_job_access
+POST   /api/jobs/{job_id}/workspace-recovery/retry                                      gated:require_job_access
 GET    /api/jobs/{job_id}/workspace-status                                              internal:require_internal
 POST   /api/jobs/{target_job_id}/verification/rounds                                    internal:require_internal
 POST   /api/manifests/apply                                                             gated:require_approved_user

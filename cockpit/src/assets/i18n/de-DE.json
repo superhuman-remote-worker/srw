@@ -749,6 +749,8 @@
       "failed": "Fehlgeschlagen",
       "cancelled": "Abgebrochen",
       "blocked_undelivered": "Blockiert / nicht ausgeliefert",
+      "recovering_workspace": "Arbeitsbereich wird wiederhergestellt",
+      "recovery_paused": "Wiederherstellung pausiert",
       "waiting_for_reply": "Wartet auf Antwort",
       "waiting_approval": "Wartet · Freigabe"
     },
@@ -762,6 +764,7 @@
       "canceling": "Wird abgebrochen",
       "sure": "Sicher?",
       "resume": "Fortsetzen",
+      "retryRecovery": "Wiederherstellung erneut versuchen",
       "review": "Prüfen",
       "delete": "Löschen",
       "confirmDelete": "Bestätigen?",
@@ -793,6 +796,7 @@
       "openCloudFolder": "Cloud-Ordner dieses Auftrags in einem neuen Tab öffnen",
       "pauseJob": "Auftrag pausieren",
       "promoteJob": "Zu Projekt heraufstufen",
+      "retryRecovery": "Pausierte Wiederherstellung erneut versuchen",
       "resumeJob": "Vom Checkpoint fortsetzen",
       "reviewJob": "Prüfen und genehmigen/fortsetzen",
       "reviewQueue": "Prüfungswarteschlange öffnen",
@@ -801,6 +805,11 @@
       "subjobCount": "{{count}} Unterauftrag/-aufträge in diesem Baum, unabhängig vom Filter",
       "view": "In der Workbench öffnen",
       "workspace": "Arbeitsbereich in Gitea öffnen"
+    },
+    "recovery": {
+      "deadline": "Wiederherstellungsfrist",
+      "nextCheck": "Nächste Prüfung",
+      "cleanupPending": "Bereinigung des Arbeitsbereichs steht weiterhin aus"
     },
     "delegationChildren": "{{count}} Unteraufträge",
     "promote": {
@@ -3630,6 +3639,7 @@
       "cancelFailed": "Job konnte nicht abgebrochen werden.",
       "pauseFailed": "Job konnte nicht pausiert werden.",
       "resumeFailed": "Job konnte nicht fortgesetzt werden.",
+      "recoveryRetryFailed": "Wiederherstellung des Arbeitsbereichs konnte nicht erneut gestartet werden.",
       "approveFailed": "Job konnte nicht freigegeben werden.",
       "upgradeVmFailed": "Upgrade auf VM-Workspace fehlgeschlagen.",
       "replyFailed": "Antwort konnte nicht gesendet werden.",
@@ -3674,6 +3684,7 @@
       "cancelled": "Job abgebrochen",
       "paused": "Job pausiert",
       "resumed": "Job fortgesetzt",
+      "recoveryRetry": "Wiederherstellung des Arbeitsbereichs gestartet",
       "approved": "Job freigegeben",
       "vmUpgradeStarted": "VM-Upgrade gestartet",
       "replySent": "Antwort gesendet",

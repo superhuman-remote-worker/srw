@@ -2188,6 +2188,18 @@ export interface WorkspaceContractProjection {
   compatibility_derived?: boolean;
 }
 
+export interface WorkspaceRecoveryView {
+  operation_id: string;
+  state: string;
+  reason_code: string;
+  message: string;
+  started_at: string;
+  deadline_at: string;
+  next_check_at: string | null;
+  retryable: boolean;
+  cleanup_pending: boolean;
+}
+
 export interface Job {
   id: string;
   description: string;
@@ -2264,6 +2276,8 @@ export interface Job {
   wake_on_complete?: boolean;
   /** Safe, server-owned workspace tier decision; contains no endpoints. */
   workspace_contract?: WorkspaceContractProjection;
+  /** Safe recovery state; controller coordinates and raw diagnostics are never included. */
+  workspace_recovery?: WorkspaceRecoveryView | null;
 }
 
 /**

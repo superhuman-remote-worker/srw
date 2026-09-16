@@ -31,6 +31,7 @@
       "workspace_contract": {
         "state": "waiting"
       },
+      "workspace_recovery": null,
       "audit_count": null,
       "cloud_review_mode": "open_folder",
       "exported_folder_url": null
@@ -66,6 +67,7 @@
       "workspace_contract": {
         "state": "waiting"
       },
+      "workspace_recovery": null,
       "audit_count": null,
       "cloud_review_mode": "open_folder",
       "exported_folder_url": null

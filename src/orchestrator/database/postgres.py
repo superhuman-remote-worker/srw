@@ -3637,7 +3637,8 @@ class PostgresDB:
                        pa.id AS pending_approval_request_id,
                        page.id AS display_root_id,
                        (page.id = j.id) AS is_display_root,
-                       COALESCE(sc.n, 0) AS subjob_count
+                       COALESCE(sc.n, 0) AS subjob_count,
+                       wr.workspace_recovery AS _workspace_recovery
                 FROM page
                 JOIN jobs j
                   ON j.id = page.id
@@ -3652,6 +3653,23 @@ class PostgresDB:
                     ORDER BY s.requested_at DESC
                     LIMIT 1
                 ) pa ON TRUE
+                LEFT JOIN LATERAL (
+                    SELECT jsonb_build_object(
+                        'operation_id', r.id,
+                        'state', r.phase,
+                        'reason_code', r.reason_code,
+                        'started_at', r.first_observed_at,
+                        'deadline_at', r.deadline_at,
+                        'next_check_at', CASE WHEN r.phase='recovering'
+                            THEN r.next_check_at ELSE NULL END,
+                        'cleanup_pending', false
+                    ) AS workspace_recovery
+                    FROM vm_workspace_recovery_jobs rj
+                    JOIN vm_workspace_recoveries r ON r.id=rj.recovery_id
+                    WHERE rj.job_id=j.id AND rj.resolved_at IS NULL
+                      AND r.resolved_at IS NULL
+                    LIMIT 1
+                ) wr ON TRUE
                 ORDER BY page.created_at DESC, page.id DESC,
                          (page.id = j.id) DESC,
                          j.created_at DESC, j.id DESC
@@ -3755,13 +3773,31 @@ class PostgresDB:
                        j.execution_lane,
                        j.created_by_thread_id, j.wake_on_complete,
                        j.created_at, j.updated_at, j.description, j.context,
-                       (p.main_cloud_folder_handle IS NOT NULL) AS project_has_cloud_folder
+                       (p.main_cloud_folder_handle IS NOT NULL) AS project_has_cloud_folder,
+                       wr.workspace_recovery AS _workspace_recovery
                 FROM jobs j
                 LEFT JOIN projects p ON p.id = j.project_id
                 LEFT JOIN srw_execution_specs execution
                     ON execution.work_kind='Job' AND execution.work_id=j.id
                 LEFT JOIN srw_execution_workspace_bindings workspace_binding
                     ON workspace_binding.execution_id=execution.id
+                LEFT JOIN LATERAL (
+                    SELECT jsonb_build_object(
+                        'operation_id', r.id,
+                        'state', r.phase,
+                        'reason_code', r.reason_code,
+                        'started_at', r.first_observed_at,
+                        'deadline_at', r.deadline_at,
+                        'next_check_at', CASE WHEN r.phase='recovering'
+                            THEN r.next_check_at ELSE NULL END,
+                        'cleanup_pending', false
+                    ) AS workspace_recovery
+                    FROM vm_workspace_recovery_jobs rj
+                    JOIN vm_workspace_recoveries r ON r.id=rj.recovery_id
+                    WHERE rj.job_id=j.id AND rj.resolved_at IS NULL
+                      AND r.resolved_at IS NULL
+                    LIMIT 1
+                ) wr ON TRUE
                 WHERE j.id = $1
                 """,
                 uuid_val,
@@ -4592,6 +4628,47 @@ class PostgresDB:
                     )
                     if row is None:
                         raise _CancelCASLostError
+                    participant = await conn.fetchrow(
+                        "SELECT recovery_id FROM vm_workspace_recovery_jobs "
+                        "WHERE job_id=$1 AND resolved_at IS NULL FOR UPDATE",
+                        job_uuid,
+                    )
+                    if participant is not None:
+                        recovery_id = participant["recovery_id"]
+                        await conn.execute(
+                            "UPDATE vm_workspace_recovery_jobs "
+                            "SET participation='cancelled',resolved_at=clock_timestamp(),"
+                            "outcome=COALESCE(outcome,'{}'::jsonb) || "
+                            '\'{"control":"cancelled"}\'::jsonb '
+                            "WHERE recovery_id=$1 AND job_id=$2 AND resolved_at IS NULL",
+                            recovery_id,
+                            job_uuid,
+                        )
+                        await conn.execute(
+                            "UPDATE jobs SET freeze_data=NULL WHERE id=$1 "
+                            "AND freeze_data->>'freeze_type'='workspace_recovery' "
+                            "AND freeze_data->>'recovery_id'=$2",
+                            job_uuid,
+                            str(recovery_id),
+                        )
+                        remaining = await conn.fetchval(
+                            "SELECT EXISTS (SELECT 1 FROM vm_workspace_recovery_jobs "
+                            "WHERE recovery_id=$1 AND resolved_at IS NULL)",
+                            recovery_id,
+                        )
+                        if remaining is False:
+                            await conn.execute(
+                                "UPDATE vm_workspace_recoveries SET phase='cancelled',"
+                                "resolved_at=clock_timestamp(),claimed_by=NULL,claimed_until=NULL,"
+                                "version=version+1 WHERE id=$1 AND resolved_at IS NULL",
+                                recovery_id,
+                            )
+                            await conn.execute(
+                                "UPDATE vm_workspace_recovery_retention_pins "
+                                "SET released_at=clock_timestamp() "
+                                "WHERE recovery_id=$1 AND released_at IS NULL",
+                                recovery_id,
+                            )
         except _CancelCASLostError:
             return False, False
 
@@ -5881,6 +5958,17 @@ class PostgresDB:
             return 0
         total = 0
         async with self.acquire() as conn:
+            held = await conn.fetchval(
+                "SELECT EXISTS (SELECT 1 FROM vm_workspace_recovery_jobs "
+                "WHERE job_id::text=$1 AND resolved_at IS NULL)",
+                thread_id,
+            )
+            if held is True:
+                logger.info(
+                    "delete_checkpoint_thread: preserving recovery checkpoint for %s",
+                    thread_id,
+                )
+                return 0
             for table in ("checkpoint_writes", "checkpoint_blobs", "checkpoints"):
                 try:
                     total += await self._delete_thread_rows_batched(
@@ -5996,14 +6084,21 @@ class PostgresDB:
                 " row_number() OVER (PARTITION BY thread_id, checkpoint_ns"
                 " ORDER BY checkpoint_id DESC) AS rn FROM checkpoints) r"
                 " WHERE c.thread_id = r.thread_id AND c.checkpoint_ns = r.checkpoint_ns"
-                " AND c.checkpoint_id = r.checkpoint_id AND r.rn > $1",
+                " AND c.checkpoint_id = r.checkpoint_id AND r.rn > $1"
+                " AND NOT EXISTS (SELECT 1 FROM vm_workspace_recovery_jobs wrj"
+                " WHERE wrj.resolved_at IS NULL AND wrj.job_id::text=c.thread_id"
+                " AND (wrj.checkpoint_namespace IS NULL OR ("
+                " wrj.checkpoint_namespace=c.checkpoint_ns AND"
+                " wrj.checkpoint_id=c.checkpoint_id)))",
                 (keep_n,),
             ),
             (
                 "DELETE FROM checkpoint_writes cw WHERE NOT EXISTS ("
                 " SELECT 1 FROM checkpoints c WHERE c.thread_id = cw.thread_id"
                 " AND c.checkpoint_ns = cw.checkpoint_ns"
-                " AND c.checkpoint_id = cw.checkpoint_id)",
+                " AND c.checkpoint_id = cw.checkpoint_id)"
+                " AND NOT EXISTS (SELECT 1 FROM vm_workspace_recovery_jobs wrj"
+                " WHERE wrj.resolved_at IS NULL AND wrj.job_id::text=cw.thread_id)",
                 (),
             ),
             (
@@ -6012,7 +6107,9 @@ class PostgresDB:
                 " row_number() OVER (PARTITION BY thread_id, checkpoint_ns, channel"
                 " ORDER BY version DESC) AS rn FROM checkpoint_blobs) r"
                 " WHERE cb.thread_id = r.thread_id AND cb.checkpoint_ns = r.checkpoint_ns"
-                " AND cb.channel = r.channel AND cb.version = r.version AND r.rn > $1",
+                " AND cb.channel = r.channel AND cb.version = r.version AND r.rn > $1"
+                " AND NOT EXISTS (SELECT 1 FROM vm_workspace_recovery_jobs wrj"
+                " WHERE wrj.resolved_at IS NULL AND wrj.job_id::text=cb.thread_id)",
                 (keep_n,),
             ),
         )
@@ -8599,7 +8696,10 @@ class PostgresDB:
         current = await conn.fetchrow(
             "SELECT parent_job_id FROM jobs WHERE id=$1 FOR UPDATE", job_id
         )
-        return current is not None and current["parent_job_id"] == snapshot["parent_job_id"]
+        return (
+            current is not None
+            and current["parent_job_id"] == snapshot["parent_job_id"]
+        )
 
     async def get_job_deliverable_contract(self, job_id: str) -> Dict[str, Any] | None:
         """Read the immutable server-owned contract for one job."""

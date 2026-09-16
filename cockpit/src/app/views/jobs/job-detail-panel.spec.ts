@@ -57,6 +57,61 @@ function usage(over: Partial<JobUsage> = {}): JobUsage {
   };
 }
 
+describe('workspace recovery detail', () => {
+  beforeAll(async () => {
+    await ɵresolveComponentResources(() => Promise.resolve(''));
+  });
+  afterEach(() => TestBed.resetTestingModule());
+
+  it('renders only the safe recovery message, deadline, and cleanup state', () => {
+    TestBed.configureTestingModule({
+      imports: [
+        JobDetailPanelComponent,
+        TranslocoTestingModule.forRoot({
+          langs: {en},
+          translocoConfig: {availableLangs: ['en'], defaultLang: 'en'},
+        }),
+      ],
+      providers: [provideRouter([])],
+    });
+    const transloco = TestBed.inject(TranslocoService);
+    transloco.setTranslation(en, 'en');
+    transloco.setActiveLang('en');
+    const fixture = TestBed.createComponent(JobDetailPanelComponent);
+    Object.defineProperty(fixture.componentInstance, 'job', {
+      value: signal({
+        id: 'job-1',
+        description: 'Recover the workspace',
+        status: 'paused',
+        created_at: '2026-09-16T08:00:00Z',
+        workspace_recovery: {
+          operation_id: '22222222-bbbb-4222-8222-222222222222',
+          state: 'paused_attention',
+          reason_code: 'prior_runtime_unfenced',
+          message: 'Previous workspace execution could not be proven stopped.',
+          started_at: '2026-09-16T08:00:00Z',
+          deadline_at: '2026-09-16T08:15:00Z',
+          next_check_at: null,
+          retryable: true,
+          cleanup_pending: true,
+          private_endpoint: '10.0.0.9',
+          raw_diagnostic: 'controller credential material',
+        },
+      } as unknown as JobSummary),
+    });
+    Object.defineProperty(fixture.componentInstance, 'data', {value: signal(null)});
+
+    fixture.detectChanges();
+
+    const text = (fixture.nativeElement as HTMLElement).textContent ?? '';
+    expect(text).toContain('Previous workspace execution could not be proven stopped.');
+    expect(text).toContain('Recovery deadline');
+    expect(text).toContain('Workspace cleanup remains pending');
+    expect(text).not.toContain('10.0.0.9');
+    expect(text).not.toContain('controller credential material');
+  });
+});
+
 describe('costDisplay', () => {
   it('shows a complete price plainly', () => {
     expect(costDisplay(usage())).toEqual({amount: 0.94, isFloor: false, reasonKey: null});

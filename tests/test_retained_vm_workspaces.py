@@ -2,6 +2,8 @@
 
 from copy import deepcopy
 import json
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 from uuid import uuid4
 
 from fastapi import HTTPException
@@ -13,6 +15,7 @@ from orchestrator.services.manifest_workspace_selection import (
 )
 from orchestrator.services.retained_vm_workspaces import (
     provision_binding,
+    reconcile_detached,
     record_created,
     record_detached,
     guest_attachment_is_current,
@@ -40,6 +43,62 @@ def assignment(workspace=None):
         "template": {"inline": recipe}
     }
     return doc
+
+
+@pytest.mark.asyncio
+async def test_recovery_hold_blocks_retained_workspace_detach(monkeypatch):
+    from orchestrator.services.vm_workspace_recovery_store import (
+        VMWorkspaceRecoveryStore,
+    )
+
+    job_id = uuid4()
+    generation = str(uuid4())
+    pvc_uid = str(uuid4())
+    db = MagicMock()
+    db.fetch = AsyncMock(
+        return_value=[
+            {
+                "id": job_id,
+                "context": {
+                    "vm": {
+                        "workspace_storage": {"uid": str(uuid4())},
+                        "provision_generation": generation,
+                    }
+                },
+            }
+        ]
+    )
+    db.managed_repository_workspace_process_zero_is_current = AsyncMock(
+        return_value=True
+    )
+    provisioner = MagicMock()
+    provisioner._probe_vm_teardown_identity = AsyncMock(
+        return_value=SimpleNamespace(
+            disposition="absent",
+            rootdisk_identity_known=True,
+            identity=SimpleNamespace(rootdisk_pvc_uid=pvc_uid),
+        )
+    )
+    provisioner._storage_context = AsyncMock(return_value={"pvc_uid": pvc_uid})
+    provisioner._record_retained_detach = AsyncMock()
+    acquire_cleanup = AsyncMock(
+        return_value=SimpleNamespace(
+            allowed=False, reason="workspace_recovery_unresolved"
+        )
+    )
+    monkeypatch.setattr(
+        VMWorkspaceRecoveryStore, "acquire_cleanup_permit", acquire_cleanup
+    )
+    complete_cleanup = AsyncMock()
+    monkeypatch.setattr(
+        VMWorkspaceRecoveryStore, "complete_cleanup_permit", complete_cleanup
+    )
+
+    await reconcile_detached(db, provisioner)
+
+    acquire_cleanup.assert_awaited_once()
+    complete_cleanup.assert_not_awaited()
+    provisioner._record_retained_detach.assert_not_awaited()
 
 
 async def first(database, actor):
