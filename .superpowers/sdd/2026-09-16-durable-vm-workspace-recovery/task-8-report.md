@@ -282,3 +282,66 @@ SKIPPED: missing capability: binary:longhornctl, container-engine:k3d-docker-req
 
 No destructive cluster run was attempted on this incapable host, so this round
 adds executable live proof logic but does not claim a completed live matrix.
+
+## Review Fix Round 2
+
+The second scoped review found three live-execution gaps. Focused tests first
+reported `4 failed`: the acceptance command had no owner for three ordinary
+reconciliation waits, the deadline evidence named a later CAS that production
+never reached, the overlap scenario called `reconcile_once()` directly, and
+the validator still accepted the inaccurate deadline field.
+
+The live command now owns reconciliation end to end:
+
+- Replacement, missing-stop, and forced-deletion scenarios each run a scoped
+  `VMWorkspaceRecoveryService.run()` loop. The loop starts only for that
+  scenario and shuts down before the controlled leader and deadline cases.
+  Retention pins are synchronized and their controller acknowledgements are
+  read back before launcher/VMI fault injection, and the fault is injected
+  before the generic loop can claim the operation.
+- Leader overlap uses two complete reconciler loops with distinct durable
+  worker identities. Each loop is behind a separate PostgreSQL session
+  contending for the same gate-specific advisory lock. Evidence proves B could
+  not acquire while A held leadership, A released its lock, B acquired before
+  starting, and B minted the higher recovery claim token. A's already-started
+  external observation returns only after B completed. The validator requires
+  the distinct identities and successful leadership transfer in addition to
+  one operation, one dispatch, permit limits, an unchanged deadline, and stale
+  result rejection.
+- The deadline observer still begins under a live claim and returns after the
+  immutable database deadline. Production rejects it at
+  `recovery_preconditions()`, before `stage_observation()`. The gate now records
+  that exact rejection, requires that staging and release were never attempted,
+  runs the ordinary expired `claim_due()` path to materialize the attention
+  pause, and proves zero dispatches plus a still-parked queue. No production
+  authority predicate was weakened to reach a later CAS.
+
+Additional behavior tests cover scoped reconciler startup/shutdown, exclusive
+advisory-lock transfer, execution ordering around the injected faults, and the
+new evidence fields. Final focused GREEN:
+
+```text
+PYTHONPATH=src python -m pytest \
+  tests/test_vm_workspace_recovery_acceptance.py \
+  tests/test_vm_workspace_recovery_gate.py \
+  tests/test_helm_vm_workspace_recovery.py \
+  tests/test_vm_workspace_recovery.py -q --tb=short
+
+62 passed in 11.47s
+```
+
+The required backend gate reported `1055 passed, 11 skipped, 18 warnings in
+112.20s`. The schema drift check replayed all 220 transactional migrations and
+reported `OK: schema artifacts are up to date.` Ruff, `git diff --check`, the
+runtime-coordinate inventory, selector help, and gate help passed. The changed
+file selector returned `ALL`.
+
+The final read-only preflight again stopped before cluster mutation:
+
+```text
+SKIPPED: missing capability: binary:longhornctl, container-engine:k3d-docker-required, socket:/run/iscsid/socket, module:iscsi_tcp, file:disposable-values, image:guest-digest
+```
+
+This host still cannot execute the destructive KubeVirt/Longhorn matrix, so the
+report does not claim live PASS evidence for either controlled handoff or the
+15-minute deadline crossing.

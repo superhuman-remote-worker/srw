@@ -15,8 +15,9 @@ from __future__ import annotations
 import argparse
 import asyncio
 from collections.abc import Mapping, Sequence
-from contextlib import suppress
+from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timezone
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -44,6 +45,44 @@ _OUTPUT_ROOT = Path("/tmp/srw-vm-workspace-recovery-gate")
 
 class AcceptanceFailure(RuntimeError):
     """A live authority did not prove an acceptance invariant."""
+
+
+class GateLeaderLease:
+    """A real session advisory-lock boundary owned by one gate reconciler."""
+
+    def __init__(self, db: Any, *, lock_id: int, identity: str) -> None:
+        self.db = db
+        self.lock_id = lock_id
+        self.identity = identity
+        self.connection: Any | None = None
+
+    async def acquire(self) -> bool:
+        pool = getattr(self.db, "_pool", None)
+        if pool is None:
+            raise AcceptanceFailure("PostgreSQL pool is unavailable for leadership")
+        connection = await pool.acquire()
+        acquired = bool(
+            await connection.fetchval("SELECT pg_try_advisory_lock($1)", self.lock_id)
+        )
+        if not acquired:
+            await pool.release(connection)
+            return False
+        self.connection = connection
+        return True
+
+    async def release(self) -> bool:
+        connection = self.connection
+        if connection is None:
+            return False
+        pool = self.db._pool
+        try:
+            released = bool(
+                await connection.fetchval("SELECT pg_advisory_unlock($1)", self.lock_id)
+            )
+            return released
+        finally:
+            self.connection = None
+            await pool.release(connection)
 
 
 def require_execution_guard(
@@ -145,6 +184,70 @@ class LiveScenario:
     async def close(self) -> None:
         await self.provisioner.disconnect()
         await self.db.close()
+
+    @asynccontextmanager
+    async def _gate_owned_reconciler(self, label: str):
+        """Run one generic reconciler only around an uncontrolled scenario."""
+
+        from orchestrator.services.vm_workspace_recovery import (
+            VMWorkspaceRecoveryService,
+        )
+        from orchestrator.services.vm_workspace_recovery_store import (
+            VMWorkspaceRecoveryStore,
+        )
+
+        shutdown = asyncio.Event()
+        store = VMWorkspaceRecoveryStore(
+            self.db, worker_id=f"gate-owned-{label}:{self.run_id}"
+        )
+        service = VMWorkspaceRecoveryService.from_settings(
+            store,
+            self.provisioner,
+            settings=self.settings,
+            claim_poll_seconds=0.05,
+            scan_interval_seconds=0.05,
+        )
+        task = asyncio.create_task(service.run(shutdown))
+        await asyncio.sleep(0)
+        try:
+            yield service
+        finally:
+            shutdown.set()
+            await asyncio.wait_for(
+                task,
+                timeout=max(10, self.settings.external_call_timeout_seconds * 3),
+            )
+
+    async def _sync_gate_retention_pins(self, label: str, operation_id: UUID) -> None:
+        """Acknowledge controller disk protection before injecting a fault."""
+
+        from orchestrator.services.vm_workspace_recovery import (
+            VMWorkspaceRecoveryService,
+        )
+        from orchestrator.services.vm_workspace_recovery_store import (
+            VMWorkspaceRecoveryStore,
+        )
+
+        service = VMWorkspaceRecoveryService.from_settings(
+            VMWorkspaceRecoveryStore(
+                self.db, worker_id=f"gate-pin-sync-{label}:{self.run_id}"
+            ),
+            self.provisioner,
+            settings=self.settings,
+        )
+        await service._reconcile_retention_pins()
+        acknowledged = await self._sql(
+            "SELECT controller_pinned_at IS NOT NULL "
+            "AND controller_pin_uid IS NOT NULL "
+            "AND controller_pin_resource_version IS NOT NULL "
+            "FROM vm_workspace_recovery_retention_pins "
+            "WHERE recovery_id=$1 AND released_at IS NULL",
+            operation_id,
+        )
+        if acknowledged is not True:
+            raise AcceptanceFailure(
+                f"controller retention pin was not acknowledged for {label}"
+            )
 
     async def _sql(self, query: str, *values: object) -> Any:
         async with self.db.acquire() as conn:
@@ -665,118 +768,172 @@ class LiveScenario:
         leader_b_store = VMWorkspaceRecoveryStore(
             self.db, worker_id=f"gate-leader-b:{self.run_id}"
         )
-        leader_b = VMWorkspaceRecoveryService.from_settings(
-            leader_b_store,
-            self.provisioner,
-            settings=self.settings,
-            claim_poll_seconds=0.05,
+        leader_a_identity = leader_a_store.worker_id
+        leader_b_identity = leader_b_store.worker_id
+        lock_digest = hashlib.sha256(
+            f"vm-workspace-recovery-gate:{self.run_id}".encode()
+        ).digest()
+        leader_lock_id = int.from_bytes(lock_digest[:8], "big") & ((1 << 63) - 1)
+        leader_a_lease = GateLeaderLease(
+            self.db, lock_id=leader_lock_id, identity=leader_a_identity
         )
-        # The ordinary background reconciler is intentionally absent while the
-        # acceptance gate is enabled. Prime the production controller pin path
-        # before transferring ownership of the operation claim.
-        await leader_b._reconcile_retention_pins()
+        leader_b_lease = GateLeaderLease(
+            self.db, lock_id=leader_lock_id, identity=leader_b_identity
+        )
 
         stale_barrier = RecoveryObservationBarrier(
             self.provisioner, finish_after_cancellation=True
         )
+        winning_barrier = RecoveryObservationBarrier(self.provisioner)
         leader_a = VMWorkspaceRecoveryService.from_settings(
             leader_a_store,
             stale_barrier,
             settings=self.settings,
             claim_poll_seconds=0.05,
+            scan_interval_seconds=0.05,
         )
-        stale_task = asyncio.create_task(
-            leader_a.reconcile_once(disposition.operation_id)
+        leader_b = VMWorkspaceRecoveryService.from_settings(
+            leader_b_store,
+            winning_barrier,
+            settings=self.settings,
+            claim_poll_seconds=0.05,
+            scan_interval_seconds=0.05,
         )
-        await asyncio.wait_for(stale_barrier.started.wait(), timeout=30)
-        stale_claim = await self._row(
-            "SELECT claim_token,claimed_by FROM vm_workspace_recoveries WHERE id=$1",
-            disposition.operation_id,
-        )
-        if stale_claim.get("claimed_by") != f"gate-leader-a:{self.run_id}":
-            raise AcceptanceFailure("first reconciler did not own the live claim")
-
-        # Gate-only controlled handoff: expire only the exact claim and permit
-        # acquired above. The second production store must mint the next token.
-        async with self.db.acquire() as conn, conn.transaction():
-            expired = await conn.fetchval(
-                "UPDATE vm_workspace_recoveries SET "
-                "claimed_until=clock_timestamp()-interval '1 second' "
-                "WHERE id=$1 AND claim_token=$2 AND claimed_by=$3 RETURNING id",
+        leader_a_shutdown = asyncio.Event()
+        leader_b_shutdown = asyncio.Event()
+        stale_task: asyncio.Task[Any] | None = None
+        winning_task: asyncio.Task[Any] | None = None
+        leader_a_released = False
+        leader_b_acquired = False
+        contender_was_blocked = False
+        try:
+            if not await leader_a_lease.acquire():
+                raise AcceptanceFailure("first gate leader could not acquire its lock")
+            stale_task = asyncio.create_task(leader_a.run(leader_a_shutdown))
+            await asyncio.wait_for(stale_barrier.started.wait(), timeout=30)
+            stale_claim = await self._row(
+                "SELECT claim_token,claimed_by FROM vm_workspace_recoveries "
+                "WHERE id=$1",
                 disposition.operation_id,
-                stale_claim["claim_token"],
-                stale_claim["claimed_by"],
             )
-            if expired is None:
-                raise AcceptanceFailure(
-                    "controlled leader handoff lost its source claim"
+            if stale_claim.get("claimed_by") != leader_a_identity:
+                raise AcceptanceFailure("first reconciler did not own the live claim")
+
+            contender_was_blocked = not await leader_b_lease.acquire()
+            if not contender_was_blocked:
+                raise AcceptanceFailure("two gate leaders held the advisory lock")
+
+            # Loss of leadership cancels the leader-gated loop. The barrier
+            # deliberately keeps its already-started external observation alive
+            # so its result returns only after the successor leader completes.
+            stale_task.cancel()
+            await asyncio.wait_for(stale_barrier.cancelled.wait(), timeout=30)
+            leader_a_released = await leader_a_lease.release()
+            leader_b_acquired = await leader_b_lease.acquire()
+            if not leader_a_released or not leader_b_acquired:
+                raise AcceptanceFailure("gate leadership did not transfer")
+            leadership_transferred_at = await self._sql("SELECT clock_timestamp()")
+
+            # Expire only the exact application claim held by the old leader.
+            # The new leader must mint a higher fencing token through the
+            # production store before it can observe or release anything.
+            async with self.db.acquire() as conn, conn.transaction():
+                expired = await conn.fetchval(
+                    "UPDATE vm_workspace_recoveries SET "
+                    "claimed_until=clock_timestamp()-interval '1 second' "
+                    "WHERE id=$1 AND claim_token=$2 AND claimed_by=$3 RETURNING id",
+                    disposition.operation_id,
+                    stale_claim["claim_token"],
+                    stale_claim["claimed_by"],
                 )
-            await conn.execute(
-                "UPDATE vm_workspace_recovery_probe_slots SET "
-                "leased_until=clock_timestamp()-interval '1 second' "
-                "WHERE recovery_id=$1 AND claim_token=$2",
+                if expired is None:
+                    raise AcceptanceFailure(
+                        "controlled leader handoff lost its source claim"
+                    )
+                await conn.execute(
+                    "UPDATE vm_workspace_recovery_probe_slots SET "
+                    "leased_until=clock_timestamp()-interval '1 second' "
+                    "WHERE recovery_id=$1 AND claim_token=$2",
+                    disposition.operation_id,
+                    stale_claim["claim_token"],
+                )
+
+            winning_task = asyncio.create_task(leader_b.run(leader_b_shutdown))
+            await asyncio.wait_for(winning_barrier.started.wait(), timeout=30)
+            handoff = await self._row(
+                "SELECT clock_timestamp() AS observed_at,claim_token,claimed_by,"
+                "deadline_at FROM vm_workspace_recoveries WHERE id=$1",
                 disposition.operation_id,
-                stale_claim["claim_token"],
+            )
+            if handoff.get("claimed_by") != leader_b_identity:
+                raise AcceptanceFailure("second reconciler did not acquire the handoff")
+            permit_sample = await self._row(
+                "SELECT count(*)::integer AS global_count,"
+                "count(DISTINCT node_key)::integer AS node_count "
+                "FROM vm_workspace_recovery_probe_slots "
+                "WHERE leased_until>clock_timestamp()"
+            )
+            active_operations = int(
+                await self._sql(
+                    "SELECT count(*) FROM vm_workspace_recoveries "
+                    "WHERE owner_kind='job' AND owner_id=$1 AND resolved_at IS NULL",
+                    job_id,
+                )
+            )
+            winning_barrier.release.set()
+            recovered = await self._wait(
+                "leader handoff recovery",
+                lambda: self._wait_phase(disposition.operation_id, {"recovered"}),
+                timeout=self.settings.external_call_timeout_seconds * 3,
+            )
+            leader_b_shutdown.set()
+            await asyncio.wait_for(
+                winning_task,
+                timeout=self.settings.external_call_timeout_seconds * 3,
+            )
+            await leader_b_lease.release()
+            leader_b_acquired = False
+
+            dispatches = int(
+                await self._sql(
+                    "SELECT count(*) FROM vm_workspace_recovery_jobs "
+                    "WHERE recovery_id=$1 AND resume_receipt IS NOT NULL",
+                    disposition.operation_id,
+                )
+            )
+            resume_receipt = _object(
+                await self._sql(
+                    "SELECT resume_receipt FROM vm_workspace_recovery_jobs "
+                    "WHERE recovery_id=$1 AND job_id=$2",
+                    disposition.operation_id,
+                    job_id,
+                )
             )
 
-        winning_barrier = RecoveryObservationBarrier(self.provisioner)
-        leader_b.observer = winning_barrier
-        winning_task = asyncio.create_task(
-            leader_b.reconcile_once(disposition.operation_id)
-        )
-        await asyncio.wait_for(winning_barrier.started.wait(), timeout=30)
-        await asyncio.wait_for(stale_barrier.cancelled.wait(), timeout=30)
-        handoff = await self._row(
-            "SELECT clock_timestamp() AS observed_at,claim_token,claimed_by,"
-            "deadline_at FROM vm_workspace_recoveries WHERE id=$1",
-            disposition.operation_id,
-        )
-        if handoff.get("claimed_by") != f"gate-leader-b:{self.run_id}":
-            raise AcceptanceFailure("second reconciler did not acquire the handoff")
-        permit_sample = await self._row(
-            "SELECT count(*)::integer AS global_count,"
-            "count(DISTINCT node_key)::integer AS node_count "
-            "FROM vm_workspace_recovery_probe_slots WHERE leased_until>clock_timestamp()"
-        )
-        active_operations = int(
-            await self._sql(
-                "SELECT count(*) FROM vm_workspace_recoveries "
-                "WHERE owner_kind='job' AND owner_id=$1 AND resolved_at IS NULL",
-                job_id,
+            stale_barrier.release.set()
+            await asyncio.wait_for(
+                stale_barrier.finished.wait(),
+                timeout=self.settings.external_call_timeout_seconds,
             )
-        )
-        winning_barrier.release.set()
-        await asyncio.wait_for(
-            winning_task,
-            timeout=self.settings.external_call_timeout_seconds * 3,
-        )
-        recovered = await self._operation(disposition.operation_id)
-        dispatches = int(
-            await self._sql(
-                "SELECT count(*) FROM vm_workspace_recovery_jobs WHERE recovery_id=$1 "
-                "AND resume_receipt IS NOT NULL",
-                disposition.operation_id,
+            stale_finished_at = await self._sql("SELECT clock_timestamp()")
+            await asyncio.gather(stale_task, return_exceptions=True)
+        finally:
+            stale_barrier.release.set()
+            winning_barrier.release.set()
+            leader_a_shutdown.set()
+            leader_b_shutdown.set()
+            for task in (stale_task, winning_task):
+                if task is not None and not task.done():
+                    task.cancel()
+            await asyncio.gather(
+                *(task for task in (stale_task, winning_task) if task is not None),
+                return_exceptions=True,
             )
-        )
-        resume_receipt = _object(
-            await self._sql(
-                "SELECT resume_receipt FROM vm_workspace_recovery_jobs "
-                "WHERE recovery_id=$1 AND job_id=$2",
-                disposition.operation_id,
-                job_id,
-            )
-        )
+            if leader_a_lease.connection is not None:
+                await leader_a_lease.release()
+            if leader_b_lease.connection is not None:
+                await leader_b_lease.release()
 
-        stale_barrier.release.set()
-        await asyncio.wait_for(
-            stale_barrier.finished.wait(),
-            timeout=self.settings.external_call_timeout_seconds,
-        )
-        stale_finished_at = await self._sql("SELECT clock_timestamp()")
-        await asyncio.wait_for(
-            stale_task,
-            timeout=self.settings.external_call_timeout_seconds,
-        )
         deadline_after = await self._sql(
             "SELECT deadline_at FROM vm_workspace_recoveries WHERE id=$1",
             disposition.operation_id,
@@ -788,6 +945,13 @@ class LiveScenario:
             "fault_injection": "controlled_leader_handoff",
             "active_operations": active_operations,
             "leader_instances": 2,
+            "leader_a_identity": leader_a_identity,
+            "leader_b_identity": leader_b_identity,
+            "leadership_transfer_succeeded": bool(
+                contender_was_blocked
+                and leader_a_released
+                and leadership_transferred_at <= handoff["observed_at"]
+            ),
             "max_global_probes": max(
                 max_global, int(permit_sample.get("global_count") or 0)
             ),
@@ -832,17 +996,24 @@ class LiveScenario:
         from shared.workspace_recovery import WorkspaceRecoveryCode
 
         class DeadlineEvidenceStore(VMWorkspaceRecoveryStore):
-            """Record the production CAS result without changing its authority."""
+            """Record which production deadline boundary rejects the result."""
 
-            stage_observation_succeeded: bool | None = None
+            precondition_check_rejected = False
+            stage_observation_attempted = False
+            release_attempted = False
             release_recovered_succeeded: bool | None = None
 
-            async def stage_observation(self, **kwargs: Any) -> Any:
-                result = await super().stage_observation(**kwargs)
-                self.stage_observation_succeeded = result is not None
+            async def recovery_preconditions(self, claim: Any) -> Any:
+                result = await super().recovery_preconditions(claim)
+                self.precondition_check_rejected = result is None
                 return result
 
+            async def stage_observation(self, **kwargs: Any) -> Any:
+                self.stage_observation_attempted = True
+                return await super().stage_observation(**kwargs)
+
             async def release_recovered(self, **kwargs: Any) -> bool:
+                self.release_attempted = True
                 result = await super().release_recovered(**kwargs)
                 self.release_recovered_succeeded = result
                 return result
@@ -916,6 +1087,15 @@ class LiveScenario:
             probe_task,
             timeout=self.settings.external_call_timeout_seconds,
         )
+        # The late observation is rejected by recovery_preconditions(). A
+        # normal subsequent claim pass materializes the durable deadline pause.
+        await store.claim_due(
+            disposition.operation_id,
+            ttl_seconds=self.settings.claim_ttl_seconds,
+            permit_ttl_seconds=self.settings.permit_ttl_seconds,
+            max_global_probes=self.settings.max_global_probes,
+            max_probes_per_node=self.settings.max_probes_per_node,
+        )
         outcome = await self._row(
             "SELECT recovery.phase,recovery.reason_code,participant.resume_receipt,"
             "participant.checkpoint_id,queue.state AS queue_state,"
@@ -926,6 +1106,13 @@ class LiveScenario:
             "WHERE recovery.id=$1 AND participant.job_id=$2",
             disposition.operation_id,
             job_id,
+        )
+        dispatches = int(
+            await self._sql(
+                "SELECT count(*) FROM vm_workspace_recovery_jobs "
+                "WHERE recovery_id=$1 AND resume_receipt IS NOT NULL",
+                disposition.operation_id,
+            )
         )
         marker_after = await self._ssh_file(identity, marker_path, None)
         checkpoint_after = await self._ssh_file(identity, checkpoint_path, None)
@@ -940,8 +1127,11 @@ class LiveScenario:
             "probe_finished_after_deadline": bool(
                 barrier.observation_returned and finished_at >= crossed["deadline_at"]
             ),
-            "deadline_cas_rejected": store.stage_observation_succeeded is False,
+            "precondition_check_rejected": store.precondition_check_rejected,
+            "stage_observation_attempted": store.stage_observation_attempted,
+            "release_attempted": store.release_attempted,
             "final_release_succeeded": bool(store.release_recovered_succeeded),
+            "successor_dispatches": dispatches,
             "queue_still_parked": outcome.get("queue_state") == "parked"
             and outcome.get("park_reason") == "workspace_recovery",
             "disk_retained": marker_after == marker,
@@ -1023,29 +1213,31 @@ class LiveScenario:
 
         recovery_started = time.monotonic()
         executor_occupancy_samples = [await self._executor_occupied(job_id)]
+        await self._sync_gate_retention_pins("replacement", disposition.operation_id)
         await self._crash_launcher(identity)
-        stop_receipt = await self._wait(
-            "exact stop receipt",
-            lambda: self._row(
-                "SELECT id,evidence_digest,accepted_claim_token,vm_uid,vmi_uid,"
-                "launcher_uid,root_pvc_uid,container_id,controller_identity "
-                "FROM vm_workspace_recovery_stop_receipts "
-                "WHERE recovery_id=$1 ORDER BY accepted_at DESC LIMIT 1",
-                disposition.operation_id,
-            ),
-            timeout=180,
-        )
-        # A gate-only patch keeps the real KubeVirt VM halted long enough to
-        # exercise recovery waiting without occupying the fenced queue lease.
-        await self._set_vm_run_strategy(job_id, "Halted")
-        await asyncio.sleep(self.slow_boot_delay_seconds)
-        executor_occupancy_samples.append(await self._executor_occupied(job_id))
-        await self._set_vm_run_strategy(job_id, "RerunOnFailure")
-        recovered = await self._wait(
-            "replacement recovery",
-            lambda: self._wait_phase(disposition.operation_id, {"recovered"}),
-            timeout=1200,
-        )
+        async with self._gate_owned_reconciler("replacement"):
+            stop_receipt = await self._wait(
+                "exact stop receipt",
+                lambda: self._row(
+                    "SELECT id,evidence_digest,accepted_claim_token,vm_uid,vmi_uid,"
+                    "launcher_uid,root_pvc_uid,container_id,controller_identity "
+                    "FROM vm_workspace_recovery_stop_receipts "
+                    "WHERE recovery_id=$1 ORDER BY accepted_at DESC LIMIT 1",
+                    disposition.operation_id,
+                ),
+                timeout=180,
+            )
+            # A gate-only patch keeps the real KubeVirt VM halted long enough to
+            # exercise recovery waiting without occupying the fenced queue lease.
+            await self._set_vm_run_strategy(job_id, "Halted")
+            await asyncio.sleep(self.slow_boot_delay_seconds)
+            executor_occupancy_samples.append(await self._executor_occupied(job_id))
+            await self._set_vm_run_strategy(job_id, "RerunOnFailure")
+            recovered = await self._wait(
+                "replacement recovery",
+                lambda: self._wait_phase(disposition.operation_id, {"recovered"}),
+                timeout=1200,
+            )
         replacement_identity = await self._wait(
             "replacement VM readiness",
             lambda: self._ready_identity(job_id),
@@ -1156,11 +1348,12 @@ class LiveScenario:
             code=WorkspaceRecoveryCode.REPLACEMENT_OBSERVED,
             checkpoint=checkpoint,
         )
-        missing_row = await self._wait(
-            "missing-stop-evidence pause",
-            lambda: self._wait_phase(missing.operation_id, {"paused_attention"}),
-            timeout=120,
-        )
+        async with self._gate_owned_reconciler("missing-stop-evidence"):
+            missing_row = await self._wait(
+                "missing-stop-evidence pause",
+                lambda: self._wait_phase(missing.operation_id, {"paused_attention"}),
+                timeout=120,
+            )
         missing_dispatches = int(
             await self._sql(
                 "SELECT count(*) FROM vm_workspace_recovery_jobs "
@@ -1195,12 +1388,14 @@ class LiveScenario:
             code=WorkspaceRecoveryCode.RUNTIME_NOT_READY,
             checkpoint=checkpoint,
         )
+        await self._sync_gate_retention_pins("forced-deletion", forced.operation_id)
         await self._force_delete_vmi(job_id)
-        forced_row = await self._wait(
-            "forced-deletion attention pause",
-            lambda: self._wait_phase(forced.operation_id, {"paused_attention"}),
-            timeout=180,
-        )
+        async with self._gate_owned_reconciler("forced-deletion"):
+            forced_row = await self._wait(
+                "forced-deletion attention pause",
+                lambda: self._wait_phase(forced.operation_id, {"paused_attention"}),
+                timeout=180,
+            )
         forced_dispatches = int(
             await self._sql(
                 "SELECT count(*) FROM vm_workspace_recovery_jobs "

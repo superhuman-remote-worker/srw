@@ -249,6 +249,20 @@ def validate_acceptance_evidence(evidence: dict[str, Any]) -> None:
         overlap.get("leader_instances") == 2,
         "leader overlap did not exercise two reconciler instances",
     )
+    leader_a_identity = overlap.get("leader_a_identity")
+    leader_b_identity = overlap.get("leader_b_identity")
+    require(
+        isinstance(leader_a_identity, str)
+        and isinstance(leader_b_identity, str)
+        and leader_a_identity.startswith("gate-leader-a:")
+        and leader_b_identity.startswith("gate-leader-b:")
+        and leader_a_identity != leader_b_identity,
+        "leader overlap did not prove distinct leader identities",
+    )
+    require(
+        overlap.get("leadership_transfer_succeeded") is True,
+        "leader overlap did not cross the advisory-lock handoff boundary",
+    )
     require(
         overlap.get("deadline_preserved") is True, "leader overlap extended deadline"
     )
@@ -317,8 +331,16 @@ def validate_acceptance_evidence(evidence: dict[str, Any]) -> None:
         "deadline probe did not finish after the immutable deadline",
     )
     require(
-        deadline.get("deadline_cas_rejected") is True,
-        "deadline-crossing observation was not rejected by the durable CAS",
+        deadline.get("precondition_check_rejected") is True,
+        "deadline-crossing observation passed the production precondition check",
+    )
+    require(
+        deadline.get("stage_observation_attempted") is False,
+        "deadline-crossing observation reached the later staging CAS",
+    )
+    require(
+        deadline.get("release_attempted") is False,
+        "deadline-crossing observation reached the release CAS",
     )
     require(
         deadline.get("final_release_succeeded") is False,
@@ -327,6 +349,10 @@ def validate_acceptance_evidence(evidence: dict[str, Any]) -> None:
     require(
         deadline.get("queue_still_parked") is True,
         "deadline-crossing probe removed the queue hold",
+    )
+    require(
+        deadline.get("successor_dispatches") == 0,
+        "deadline-crossing probe dispatched a successor",
     )
     require(deadline.get("disk_retained") is True, "deadline deleted retained disk")
     require(

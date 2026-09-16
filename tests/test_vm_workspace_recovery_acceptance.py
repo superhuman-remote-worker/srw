@@ -5,6 +5,7 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 import asyncio
 import inspect
+from types import SimpleNamespace
 from unittest.mock import ANY
 
 import pytest
@@ -147,6 +148,98 @@ def test_deadline_gate_does_not_rewrite_the_immutable_deadline() -> None:
     deadline_source = inspect.getsource(LiveScenario._deadline_barrier_scenario)
     assert "finish_after_cancellation=True" in deadline_source
     assert "allow_observation_past_deadline_for_acceptance=True" in deadline_source
+    assert "precondition_check_rejected" in deadline_source
+    assert "stage_observation_attempted" in deadline_source
+
+
+def test_execute_owns_reconciliation_for_every_uncontrolled_wait() -> None:
+    source = inspect.getsource(LiveScenario.execute)
+
+    assert source.count("async with self._gate_owned_reconciler(") == 3
+    assert "replacement recovery" in source
+    assert "missing-stop-evidence pause" in source
+    assert "forced-deletion attention pause" in source
+    replacement_start = source.index('self._gate_owned_reconciler("replacement")')
+    crash = source.index("await self._crash_launcher(identity)")
+    assert source.index("await self._sync_gate_retention_pins(") < crash
+    assert crash < replacement_start
+    forced_start = source.index('self._gate_owned_reconciler("forced-deletion")')
+    assert source.index("await self._force_delete_vmi(job_id)") < forced_start
+
+
+def test_leader_overlap_uses_real_leader_boundary_and_reconciler_loops() -> None:
+    source = inspect.getsource(LiveScenario._leader_handoff_scenario)
+
+    assert "GateLeaderLease" in source
+    assert source.count(".run(") >= 2
+    assert ".reconcile_once(" not in source
+    assert "leadership_transfer_succeeded" in source
+
+
+@pytest.mark.asyncio
+async def test_gate_owned_reconciler_runs_only_inside_its_scenario_scope(
+    monkeypatch,
+) -> None:
+    started = asyncio.Event()
+    stopped = asyncio.Event()
+
+    class Service:
+        async def run(self, shutdown):
+            started.set()
+            await shutdown.wait()
+            stopped.set()
+
+    monkeypatch.setattr(
+        "orchestrator.services.vm_workspace_recovery.VMWorkspaceRecoveryService.from_settings",
+        lambda *_args, **_kwargs: Service(),
+    )
+    scenario = object.__new__(LiveScenario)
+    scenario.db = object()
+    scenario.provisioner = object()
+    scenario.run_id = "scope"
+    scenario.settings = SimpleNamespace(external_call_timeout_seconds=1)
+
+    async with scenario._gate_owned_reconciler("replacement"):
+        await asyncio.wait_for(started.wait(), timeout=1)
+        assert stopped.is_set() is False
+
+    assert stopped.is_set() is True
+
+
+@pytest.mark.asyncio
+async def test_gate_leader_lease_requires_real_exclusive_transfer() -> None:
+    state = {"held": False}
+
+    class Connection:
+        async def fetchval(self, query, _lock_id):
+            if "pg_try_advisory_lock" in query:
+                if state["held"]:
+                    return False
+                state["held"] = True
+                return True
+            if "pg_advisory_unlock" in query:
+                was_held = state["held"]
+                state["held"] = False
+                return was_held
+            raise AssertionError(query)
+
+    class Pool:
+        async def acquire(self):
+            return Connection()
+
+        async def release(self, _connection):
+            return None
+
+    db = SimpleNamespace(_pool=Pool())
+    first = acceptance.GateLeaderLease(db, lock_id=91, identity="leader-a")
+    second = acceptance.GateLeaderLease(db, lock_id=91, identity="leader-b")
+
+    assert await first.acquire() is True
+    assert await second.acquire() is False
+    assert await first.release() is True
+    assert await second.acquire() is True
+    assert await second.release() is True
+    assert first.identity != second.identity
 
 
 @pytest.mark.asyncio
