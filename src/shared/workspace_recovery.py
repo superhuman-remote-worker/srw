@@ -15,6 +15,7 @@ class WorkspaceRecoveryCode(str, Enum):
     REPLACEMENT_OBSERVED = "workspace_replacement_observed"
     IDENTITY_CONFLICT = "workspace_identity_conflict"
     PRIOR_RUNTIME_UNFENCED = "prior_runtime_unfenced"
+    SHARED_WRITERS_UNFENCED = "shared_workspace_writers_unfenced"
     TOOL_OUTCOME_UNKNOWN = "tool_outcome_unknown"
     CHECKPOINT_UNAVAILABLE = "checkpoint_unavailable"
     DEADLINE_EXCEEDED = "workspace_recovery_deadline_exceeded"
@@ -118,8 +119,7 @@ class RecoveryAttemptDisposition:
             return True
         return bool(
             self.disposition
-            and self.disposition.get("action")
-            in {"hold_committed", "paused_attention"}
+            and self.disposition.get("action") in {"hold_committed", "paused_attention"}
         )
 
 

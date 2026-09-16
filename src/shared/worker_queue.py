@@ -1,6 +1,6 @@
 """Worker-job composition over the shared :mod:`run_queue` substrate.
 
-``shared.run_queue`` deliberately touches only ``run_queue``.  Worker
+``shared.run_queue`` mutates only ``run_queue`` and reads recovery fences. Worker
 claims need one additional invariant: the queue lease and the authoritative
 ``jobs`` row move together.  This module is the narrow composition layer used
 by both the orchestrator (admission/control/fence reads) and the stateless
@@ -44,6 +44,7 @@ from shared.workspace_contract import (
     stateless_worker_backend_admissible,
     vm_mode_from_env,
 )
+from shared.workspace_recovery import RecoveryAttemptDisposition
 
 logger = logging.getLogger(__name__)
 
@@ -149,6 +150,11 @@ WITH candidate AS (
           WHERE completion_route.job_id = job.id
       )
       AND NOT ({_CONTROL_CLAIM_ACTIVE_SQL})
+      AND NOT EXISTS (
+          SELECT 1 FROM vm_workspace_recovery_jobs AS recovery_job
+          WHERE recovery_job.job_id = job.id
+            AND recovery_job.resolved_at IS NULL
+      )
     ORDER BY queue.priority DESC, queue.queued_at, queue.enqueue_ord
     LIMIT 1
     FOR UPDATE OF queue SKIP LOCKED
@@ -191,6 +197,11 @@ WHERE queue.unit_id = $1::uuid
   AND queue.state = 'leased'
   AND queue.lease_token = $2::bigint
   AND job.execution_lane = 'stateless'
+  AND NOT EXISTS (
+      SELECT 1 FROM vm_workspace_recovery_jobs AS recovery_job
+      WHERE recovery_job.job_id = job.id
+        AND recovery_job.resolved_at IS NULL
+  )
 RETURNING queue.leased_until,
           job.status::text AS job_status,
           job.context AS job_context
@@ -410,6 +421,204 @@ class WorkerRotation:
     @property
     def state(self) -> str:
         return self.completed_state
+
+
+@dataclass(frozen=True, slots=True)
+class WorkerRecoveryHold:
+    hold_lease_token: int
+    refunded: bool
+
+
+async def lock_workspace_recovery_membership(
+    conn: Any, *, owner_ids: list[UUID], job_id: UUID | None = None
+) -> bool:
+    """Lock old/new job workspace owners before any queue/job publication lock.
+
+    Callers hold a transaction and recheck their membership snapshot after
+    these locks. Ordinary claimers must never acquire this advisory lock.
+    """
+    owners = sorted(set(owner_ids))
+    for owner_id in owners:
+        await conn.execute(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+            f"workspace-recovery:job:{owner_id}",
+        )
+    return not await conn.fetchval(
+        "SELECT EXISTS (SELECT 1 FROM vm_workspace_recoveries "
+        "WHERE owner_kind='job' AND owner_id=ANY($1::uuid[]) AND resolved_at IS NULL) "
+        "OR EXISTS (SELECT 1 FROM vm_workspace_recovery_jobs "
+        "WHERE job_id=$2 AND resolved_at IS NULL)",
+        owners,
+        job_id,
+    )
+
+
+async def get_worker_attempt_disposition(
+    conn: Any, *, job_id: UUID | str, lease_token: int
+) -> RecoveryAttemptDisposition | None:
+    """Read exact attempt evidence; absent historical rows remain unknown."""
+    row = await conn.fetchrow(
+        "SELECT * FROM worker_batch_attempts WHERE job_id=$1 AND lease_token=$2",
+        _uuid(job_id),
+        lease_token,
+    )
+    if row is None:
+        return None
+    return RecoveryAttemptDisposition(
+        job_id=row["job_id"],
+        lease_token=int(row["lease_token"]),
+        bundle_authorized=row["bundle_authorized_at"] is not None,
+        authority_digest=row["authority_digest"],
+        disposition=_json_object(row["disposition"])
+        if row["disposition"] is not None
+        else None,
+        recovery_id=row["recovery_id"],
+        refunded=row["refunded_at"] is not None,
+    )
+
+
+async def record_worker_bundle_authorized(
+    conn: Any, *, job_id: UUID | str, lease_token: int, authority_digest: str
+) -> bool:
+    """Serialize the authority boundary with holds using queue-before-attempt locks."""
+    async with conn.transaction():
+        current = await conn.fetchval(
+            "SELECT 1 FROM run_queue WHERE unit_id=$1 AND unit_kind='worker_batch' "
+            "AND state='leased' AND lease_token=$2 AND NOT EXISTS ("
+            "SELECT 1 FROM vm_workspace_recovery_jobs WHERE job_id=$1 "
+            "AND resolved_at IS NULL) FOR UPDATE",
+            _uuid(job_id),
+            lease_token,
+        )
+        if current is None:
+            return False
+        return (
+            await conn.fetchval(
+                "UPDATE worker_batch_attempts SET bundle_authorized_at=clock_timestamp(), "
+                "authority_digest=$3 WHERE job_id=$1 AND lease_token=$2 "
+                "AND bundle_authorized_at IS NULL AND authority_digest IS NULL "
+                "AND refunded_at IS NULL AND recovery_id IS NULL RETURNING 1",
+                _uuid(job_id),
+                lease_token,
+                authority_digest,
+            )
+            is not None
+        )
+
+
+async def park_worker_batch_for_workspace_recovery(
+    conn: Any, *, job_id: UUID | str, accepted_lease_token: int, recovery_id: UUID | str
+) -> WorkerRecoveryHold | None:
+    """Fence exactly one live attempt and refund only proven pre-bundle work once."""
+    job_id, recovery_id = _uuid(job_id), _uuid(recovery_id)
+    async with conn.transaction():
+        queue = await conn.fetchrow(
+            "SELECT attempts_since_completion FROM run_queue WHERE unit_id=$1 "
+            "AND unit_kind='worker_batch' AND state='leased' AND lease_token=$2 FOR UPDATE",
+            job_id,
+            accepted_lease_token,
+        )
+        if queue is None:
+            return None
+        attempt = await conn.fetchrow(
+            "SELECT * FROM worker_batch_attempts WHERE job_id=$1 AND lease_token=$2 FOR UPDATE",
+            job_id,
+            accepted_lease_token,
+        )
+        refund = bool(
+            attempt is not None
+            and attempt["bundle_authorized_at"] is None
+            and attempt["refunded_at"] is None
+            and attempt["recovery_id"] is None
+            and attempt["claimed_attempt"] == queue["attempts_since_completion"]
+        )
+        row = await conn.fetchrow(
+            """
+            UPDATE run_queue SET state='parked', lease_token=lease_token+1,
+                attempts_since_completion=attempts_since_completion-$3::integer,
+                leased_by=NULL, last_leased_by=NULL, leased_until=NULL,
+                interrupt_admission_lease_token=NULL, interrupt_admission_turn_id=NULL,
+                run_after='infinity'::timestamptz, park_reason='workspace_recovery',
+                parked_at=clock_timestamp()
+            WHERE unit_id=$1 AND unit_kind='worker_batch'
+              AND state='leased' AND lease_token=$2
+            RETURNING lease_token
+            """,
+            job_id,
+            accepted_lease_token,
+            int(refund),
+        )
+        if row is None:
+            raise RuntimeError("workspace recovery lost locked queue lease")
+        if attempt is not None:
+            await conn.execute(
+                "UPDATE worker_batch_attempts SET recovery_id=$3, "
+                "refunded_at=CASE WHEN $4 THEN clock_timestamp() ELSE refunded_at END, "
+                "refund_reason=CASE WHEN $4 THEN 'workspace_recovery_pre_bundle' "
+                "ELSE refund_reason END WHERE job_id=$1 AND lease_token=$2",
+                job_id,
+                accepted_lease_token,
+                recovery_id,
+                refund,
+            )
+        return WorkerRecoveryHold(int(row["lease_token"]), refund)
+
+
+async def release_worker_batch_from_workspace_recovery(
+    conn: Any,
+    *,
+    job_id: UUID | str,
+    recovery_id: UUID | str,
+    hold_lease_token: int,
+    version: int,
+    claim_token: int,
+    resume_receipt: dict[str, Any],
+) -> bool:
+    """Release a participant by exact recovery CAS and advance its wake watermark once.
+
+    The store composes this with all participant queue/job locks, projection
+    validation and operation settlement in the surrounding transaction.
+    """
+    job_id, recovery_id = _uuid(job_id), _uuid(recovery_id)
+    async with conn.transaction():
+        queue = await conn.fetchval(
+            "SELECT 1 FROM run_queue WHERE unit_id=$1 AND unit_kind='worker_batch' "
+            "AND state='parked' AND park_reason='workspace_recovery' AND lease_token=$2 FOR UPDATE",
+            job_id,
+            hold_lease_token,
+        )
+        if queue is None:
+            return False
+        operation = await conn.fetchval(
+            "SELECT 1 FROM vm_workspace_recoveries WHERE id=$1 AND version=$2 "
+            "AND claim_token=$3 AND phase='recovering' AND resolved_at IS NULL "
+            "AND deadline_at>clock_timestamp() FOR UPDATE",
+            recovery_id,
+            version,
+            claim_token,
+        )
+        if operation is None:
+            return False
+        participant = await conn.fetchval(
+            "UPDATE vm_workspace_recovery_jobs SET participation='released', "
+            "resolved_at=clock_timestamp(), resume_receipt=$4::jsonb "
+            "WHERE recovery_id=$1 AND job_id=$2 AND hold_lease_token=$3 "
+            "AND participation='held' AND resolved_at IS NULL RETURNING 1",
+            recovery_id,
+            job_id,
+            hold_lease_token,
+            json.dumps(resume_receipt),
+        )
+        if participant is None:
+            return False
+        await conn.execute(
+            "UPDATE run_queue SET state='queued', run_after=clock_timestamp(), "
+            "queued_at=clock_timestamp(), park_reason=NULL, parked_at=NULL, "
+            "input_seq=GREATEST(COALESCE(input_seq,0),COALESCE(consumed_seq,0))+1 "
+            "WHERE unit_id=$1",
+            job_id,
+        )
+        return True
 
 
 def _uuid(value: UUID | str) -> UUID:
@@ -748,6 +957,13 @@ async def claim_worker_batch(
                         "worker jobs-row CAS failed after eligibility lock "
                         f"(job={unit.unit_id}, status={prior_status})"
                     )
+                await conn.execute(
+                    "INSERT INTO worker_batch_attempts (job_id, lease_token, claimed_attempt) "
+                    "VALUES ($1, $2, $3)",
+                    unit.unit_id,
+                    unit.lease_token,
+                    unit.attempts_since_completion,
+                )
                 return WorkerClaim(
                     unit=unit,
                     prior_job_status=prior_status,
@@ -991,11 +1207,17 @@ __all__ = [
     "WorkerCompletionAcceptance",
     "WorkerRenewal",
     "WorkerRotation",
+    "WorkerRecoveryHold",
     "cancel_queued_worker_batch",
     "claim_worker_batch",
     "complete_worker_batch",
     "enqueue_worker_batch",
     "get_worker_completion_acceptance",
+    "get_worker_attempt_disposition",
+    "lock_workspace_recovery_membership",
+    "park_worker_batch_for_workspace_recovery",
+    "record_worker_bundle_authorized",
+    "release_worker_batch_from_workspace_recovery",
     "renew_worker_batch",
     "release_worker_batch",
     "rotate_worker_batch",

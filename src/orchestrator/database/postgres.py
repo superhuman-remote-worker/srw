@@ -4040,6 +4040,17 @@ class PostgresDB:
                 lock_manifest_execution_catalog,
             )
 
+            from shared.worker_queue import lock_workspace_recovery_membership
+
+            # Publish inherited membership under the same owner lock used by
+            # recovery's dependent scan, before taking any jobs-row lock.
+            if context.get("inherits_parent_workspace") in (True, "true"):
+                if parent_uuid is None:
+                    raise RuntimeError("inherited workspace has no parent")
+                if not await lock_workspace_recovery_membership(
+                    active_conn, owner_ids=[parent_uuid, job_uuid], job_id=job_uuid
+                ):
+                    raise RuntimeError("workspace recovery blocks new membership")
             await lock_manifest_execution_catalog(active_conn)
             await _lock_and_compare_policy_snapshot(
                 active_conn,
@@ -8561,9 +8572,34 @@ class PostgresDB:
             "WHERE id = $2"
         )
         async with self.acquire() as conn:
-            result = await conn.execute(query, json_module.dumps(updates), uuid_val)
+            async with conn.transaction():
+                if "inherits_parent_workspace" in updates:
+                    if not await self._lock_job_workspace_membership(conn, uuid_val):
+                        return False
+                result = await conn.execute(query, json_module.dumps(updates), uuid_val)
 
         return result == "UPDATE 1"
+
+    async def _lock_job_workspace_membership(self, conn: Any, job_id: UUID) -> bool:
+        """Fence both sides of inheritance changes before locking the job."""
+        from shared.worker_queue import lock_workspace_recovery_membership
+
+        snapshot = await conn.fetchrow(
+            "SELECT parent_job_id FROM jobs WHERE id=$1", job_id
+        )
+        if snapshot is None:
+            return False
+        owners = [job_id]
+        if snapshot["parent_job_id"] is not None:
+            owners.append(snapshot["parent_job_id"])
+        if not await lock_workspace_recovery_membership(
+            conn, owner_ids=owners, job_id=job_id
+        ):
+            return False
+        current = await conn.fetchrow(
+            "SELECT parent_job_id FROM jobs WHERE id=$1 FOR UPDATE", job_id
+        )
+        return current is not None and current["parent_job_id"] == snapshot["parent_job_id"]
 
     async def get_job_deliverable_contract(self, job_id: str) -> Dict[str, Any] | None:
         """Read the immutable server-owned contract for one job."""
@@ -8742,7 +8778,11 @@ class PostgresDB:
             "WHERE id = $2"
         )
         async with self.acquire() as conn:
-            result = await conn.execute(query, list(keys), uuid_val)
+            async with conn.transaction():
+                if "inherits_parent_workspace" in keys:
+                    if not await self._lock_job_workspace_membership(conn, uuid_val):
+                        return False
+                result = await conn.execute(query, list(keys), uuid_val)
 
         return result == "UPDATE 1"
 

@@ -34,6 +34,7 @@ CREATE TABLE vm_workspace_recoveries (
         'workspace_replacement_observed',
         'workspace_identity_conflict',
         'prior_runtime_unfenced',
+        'shared_workspace_writers_unfenced',
         'tool_outcome_unknown',
         'checkpoint_unavailable',
         'workspace_recovery_deadline_exceeded'
@@ -68,7 +69,7 @@ CREATE TABLE vm_workspace_recovery_jobs (
     recovery_id uuid NOT NULL REFERENCES vm_workspace_recoveries(id) ON DELETE CASCADE,
     job_id uuid NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
     accepted_lease_token bigint CHECK (accepted_lease_token > 0),
-    hold_lease_token bigint NOT NULL CHECK (hold_lease_token > 0),
+    hold_lease_token bigint CHECK (hold_lease_token > 0),
     prior_queue_state text NOT NULL,
     prior_job_status text NOT NULL,
     prior_control_reference jsonb,
@@ -82,6 +83,9 @@ CREATE TABLE vm_workspace_recovery_jobs (
     created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
     resolved_at timestamptz,
     PRIMARY KEY (recovery_id, job_id),
+    CHECK ((prior_queue_state = 'non_worker'
+            AND accepted_lease_token IS NULL AND hold_lease_token IS NULL)
+        OR (prior_queue_state <> 'non_worker' AND hold_lease_token IS NOT NULL)),
     CHECK (accepted_lease_token IS NULL OR hold_lease_token > accepted_lease_token),
     CHECK ((checkpoint_id IS NULL) = (checkpoint_namespace IS NULL)),
     CHECK ((resolved_at IS NULL AND participation IN ('held', 'attention'))

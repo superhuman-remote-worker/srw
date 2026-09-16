@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from datetime import timedelta
 from pathlib import Path
 from uuid import UUID, uuid4
+from urllib.parse import urlsplit
 
 import asyncpg
 import pytest
@@ -14,6 +16,9 @@ import pytest_asyncio
 from testcontainers.community.postgres import PostgresContainer
 
 from orchestrator.services.vm_workspace_recovery_store import VMWorkspaceRecoveryStore
+from orchestrator.database.postgres import PostgresDB
+import shared.worker_queue as worker_queue
+from shared.run_queue import reap_expired, unpark_unit
 from shared.workspace_recovery import (
     RecoveryAttemptDisposition,
     WorkspaceRecoveryCode,
@@ -70,6 +75,12 @@ def test_workspace_recovery_feature_flag_defaults_off(
 
 @pytest.fixture(scope="module")
 def pg_dsn():
+    dsn = os.getenv("VM_RECOVERY_TEST_DSN")
+    if dsn:
+        if "test" not in urlsplit(dsn).path.rsplit("/", 1)[-1].lower():
+            pytest.fail("VM_RECOVERY_TEST_DSN must name a disposable test database")
+        yield dsn
+        return
     try:
         with PostgresContainer("postgres:15") as postgres:
             yield postgres.get_connection_url().replace(
@@ -83,6 +94,8 @@ def pg_dsn():
 async def _schema_applied(pg_dsn: str) -> None:
     conn = await asyncpg.connect(pg_dsn)
     try:
+        if os.getenv("VM_RECOVERY_TEST_DSN"):
+            await conn.execute("DROP SCHEMA public CASCADE; CREATE SCHEMA public")
         await conn.execute(SCHEMA_FILE.read_text())
     finally:
         await conn.close()
@@ -141,7 +154,9 @@ async def insert_recovery(
         )
 
 
-async def insert_leased_job(app_pg, *, include_attempt: bool = True) -> tuple[UUID, int]:
+async def insert_leased_job(
+    app_pg, *, include_attempt: bool = True
+) -> tuple[UUID, int]:
     job_id = uuid4()
     lease_token = 27
     async with app_pg.acquire() as conn:
@@ -365,11 +380,16 @@ async def test_attempt_store_authorization_and_recovery_claim_use_cas(app_pg) ->
             """
             INSERT INTO worker_batch_attempts
                 (job_id, lease_token, claimed_attempt, recovery_id, disposition)
-            VALUES ($1, 27, 3, $2,
+            VALUES ($1, 27, 3, NULL,
                     '{"code":"workspace_runtime_not_ready", "action":"hold_committed"}'::jsonb)
             """,
             job_id,
-            recovery_id,
+        )
+        await conn.execute(
+            "INSERT INTO run_queue (unit_id, unit_kind, state, lease_token, "
+            "leased_by, leased_until) VALUES ($1, 'worker_batch', 'leased', 27, "
+            "'pod-a', now()+interval '1 minute')",
+            job_id,
         )
 
     store = VMWorkspaceRecoveryStore(app_pg, worker_id="reconciler-a")
@@ -398,7 +418,7 @@ async def test_attempt_store_authorization_and_recovery_claim_use_cas(app_pg) ->
             "code": "workspace_runtime_not_ready",
             "action": "hold_committed",
         },
-        recovery_id=recovery_id,
+        recovery_id=None,
         refunded=False,
     )
     assert attempt.requires_recovery_hold
@@ -636,7 +656,9 @@ async def test_concurrent_identical_admissions_return_one_receipt(app_pg) -> Non
 
 
 @pytest.mark.asyncio
-async def test_store_admits_idempotent_hold_and_releases_exact_queue_token(app_pg) -> None:
+async def test_store_admits_idempotent_hold_and_releases_exact_queue_token(
+    app_pg,
+) -> None:
     job_id = uuid4()
     attempt_token = 27
     request_id = uuid4()
@@ -708,7 +730,7 @@ async def test_store_admits_idempotent_hold_and_releases_exact_queue_token(app_p
     assert tuple(queue) == (
         "parked",
         attempt_token + 1,
-        2,
+        1,
         4,
         3,
         "workspace_recovery",
@@ -740,7 +762,476 @@ async def test_store_admits_idempotent_hold_and_releases_exact_queue_token(app_p
             "SELECT phase, resolved_at FROM vm_workspace_recoveries WHERE id=$1",
             admitted.operation_id,
         )
-    assert tuple(queue) == ("queued", attempt_token + 1, 2, 4, 3, None)
+    assert tuple(queue) == ("queued", attempt_token + 1, 1, 5, 3, None)
     assert tuple(job) == ("paused", None)
     assert operation["phase"] == "recovered"
     assert operation["resolved_at"] is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("commands", [False, True])
+async def test_worker_claim_commits_exact_attempt_and_rolls_back_on_ledger_conflict(
+    app_pg, commands
+) -> None:
+    async with app_pg.acquire() as conn:
+        job_id = await conn.fetchval(
+            "INSERT INTO jobs (description, status, execution_lane) "
+            "VALUES ('claim ledger', 'created', 'stateless') RETURNING id"
+        )
+        await worker_queue.enqueue_worker_batch(conn, job_id=job_id)
+    claim = await worker_queue.claim_worker_batch(
+        app_pg, pod_name="worker-a", completion_commands_enabled=commands
+    )
+    assert claim is not None
+    async with app_pg.acquire() as conn:
+        attempt = await conn.fetchrow(
+            "SELECT lease_token, claimed_attempt, bundle_authorized_at "
+            "FROM worker_batch_attempts WHERE job_id=$1",
+            job_id,
+        )
+        assert attempt is not None
+        assert tuple(attempt) == (1, 1, None)
+        await worker_queue.release_worker_batch(
+            conn,
+            unit_id=job_id,
+            lease_token=1,
+            park_on_exhaustion=True,
+            backoff_base_seconds=0,
+        )
+        await conn.execute(
+            "INSERT INTO worker_batch_attempts (job_id, lease_token, claimed_attempt) "
+            "VALUES ($1, 2, 2)",
+            job_id,
+        )
+    with pytest.raises(asyncpg.UniqueViolationError):
+        await worker_queue.claim_worker_batch(
+            app_pg, pod_name="worker-a", completion_commands_enabled=commands
+        )
+    async with app_pg.acquire() as conn:
+        assert tuple(
+            await conn.fetchrow(
+                "SELECT state, lease_token, attempts_since_completion FROM run_queue "
+                "WHERE unit_id=$1",
+                job_id,
+            )
+        ) == ("queued", 1, 1)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "evidence", ["pre_bundle", "authorized", "missing", "refunded"]
+)
+async def test_recovery_hold_rotates_token_without_resetting_failures(
+    app_pg, evidence
+) -> None:
+    job_id, token = await insert_leased_job(
+        app_pg, include_attempt=evidence != "missing"
+    )
+    recovery_id = await insert_recovery(app_pg)
+    async with app_pg.acquire() as conn:
+        await conn.execute(
+            "UPDATE run_queue SET attempts_since_completion=4, input_seq=9, "
+            "consumed_seq=8, control_input_seq=7, control_consumed_seq=6, "
+            "last_leased_by='worker-a' WHERE unit_id=$1",
+            job_id,
+        )
+        await conn.execute(
+            "UPDATE worker_batch_attempts SET claimed_attempt=4 WHERE job_id=$1", job_id
+        )
+        if evidence == "authorized":
+            await conn.execute(
+                "UPDATE worker_batch_attempts SET bundle_authorized_at=now(), "
+                "authority_digest='sha256:bundle' WHERE job_id=$1",
+                job_id,
+            )
+        elif evidence == "refunded":
+            await conn.execute(
+                "UPDATE worker_batch_attempts SET refunded_at=now(), "
+                "refund_reason='already_refunded' WHERE job_id=$1",
+                job_id,
+            )
+        held = await worker_queue.park_worker_batch_for_workspace_recovery(
+            conn, job_id=job_id, accepted_lease_token=27, recovery_id=recovery_id
+        )
+        assert held.hold_lease_token == 28
+        assert (
+            await worker_queue.park_worker_batch_for_workspace_recovery(
+                conn, job_id=job_id, accepted_lease_token=27, recovery_id=recovery_id
+            )
+            is None
+        )
+        row = await conn.fetchrow(
+            "SELECT state, lease_token, attempts_since_completion, input_seq, consumed_seq, "
+            "control_input_seq, control_consumed_seq, leased_by, last_leased_by, "
+            "leased_until, run_after='infinity'::timestamptz AS indefinite "
+            "FROM run_queue WHERE unit_id=$1",
+            job_id,
+        )
+        expected_attempts = 3 if evidence == "pre_bundle" else 4
+        assert tuple(row) == (
+            "parked",
+            28,
+            expected_attempts,
+            9,
+            8,
+            7,
+            6,
+            None,
+            None,
+            None,
+            True,
+        )
+        disposition = await worker_queue.get_worker_attempt_disposition(
+            conn, job_id=job_id, lease_token=token
+        )
+        if evidence == "missing":
+            assert disposition is None
+        else:
+            assert disposition.refunded is (evidence in {"pre_bundle", "refunded"})
+        assert not await worker_queue.record_worker_bundle_authorized(
+            conn, job_id=job_id, lease_token=token, authority_digest="sha256:late"
+        )
+
+
+@pytest.mark.asyncio
+async def test_bundle_authorization_serializes_with_recovery_hold(app_pg) -> None:
+    job_id, token = await insert_leased_job(app_pg)
+    recovery_id = await insert_recovery(app_pg)
+    async with app_pg.acquire() as conn:
+        assert await worker_queue.record_worker_bundle_authorized(
+            conn, job_id=job_id, lease_token=token, authority_digest="sha256:bundle"
+        )
+        held = await worker_queue.park_worker_batch_for_workspace_recovery(
+            conn, job_id=job_id, accepted_lease_token=token, recovery_id=recovery_id
+        )
+        assert not held.refunded
+        assert (
+            await conn.fetchval(
+                "SELECT attempts_since_completion FROM run_queue WHERE unit_id=$1",
+                job_id,
+            )
+            == 2
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("commands", [False, True])
+async def test_unresolved_recovery_blocks_claim_renew_complete_and_reap(
+    app_pg, commands
+) -> None:
+    job_id, token = await insert_leased_job(app_pg)
+    recovery_id = await insert_recovery(app_pg)
+    async with app_pg.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO vm_workspace_recovery_jobs (recovery_id, job_id, "
+            "accepted_lease_token, hold_lease_token, prior_queue_state, prior_job_status) "
+            "VALUES ($1, $2, 26, 27, 'leased', 'processing')",
+            recovery_id,
+            job_id,
+        )
+        assert (
+            await worker_queue.renew_worker_batch(
+                conn, unit_id=job_id, lease_token=token
+            )
+            is None
+        )
+        assert (
+            await worker_queue.complete_worker_batch(
+                conn, unit_id=job_id, lease_token=token, consumed_seq=4
+            )
+            is None
+        )
+        await conn.execute(
+            "UPDATE run_queue SET leased_until=now()-interval '1 minute' WHERE unit_id=$1",
+            job_id,
+        )
+        assert await reap_expired(conn, unit_kind="worker_batch", grace_seconds=0) == []
+        await conn.execute(
+            "UPDATE run_queue SET state='parked', leased_by=NULL, leased_until=NULL "
+            "WHERE unit_id=$1",
+            job_id,
+        )
+        assert not await unpark_unit(conn, unit_id=job_id)
+        await conn.execute(
+            "UPDATE run_queue SET state='queued', last_leased_by=NULL, run_after=now() "
+            "WHERE unit_id=$1",
+            job_id,
+        )
+        runnable_id = await conn.fetchval(
+            "INSERT INTO jobs (description, status, execution_lane) "
+            "VALUES ('not held', 'created', 'stateless') RETURNING id"
+        )
+        await worker_queue.enqueue_worker_batch(conn, job_id=runnable_id)
+    claim = await worker_queue.claim_worker_batch(
+        app_pg, pod_name="worker-b", completion_commands_enabled=commands
+    )
+    assert claim is not None and claim.unit_id == runnable_id
+    async with app_pg.acquire() as conn:
+        assert tuple(
+            await conn.fetchrow(
+                "SELECT lease_token, attempts_since_completion FROM run_queue WHERE unit_id=$1",
+                job_id,
+            )
+        ) == (27, 2)
+
+
+@pytest.mark.asyncio
+async def test_recovery_release_cas_advances_input_once_and_preserves_counters(
+    app_pg,
+) -> None:
+    job_id, token = await insert_leased_job(app_pg)
+    store = VMWorkspaceRecoveryStore(app_pg, worker_id="reconciler-a")
+    admitted = await store.admit_hold(**admission_kwargs(job_id, token))
+    claim = await store.claim_due(admitted.operation_id)
+    assert claim is not None
+    async with app_pg.acquire() as conn:
+        args = dict(
+            job_id=job_id,
+            recovery_id=admitted.operation_id,
+            hold_lease_token=28,
+            version=claim.version,
+            claim_token=claim.claim_token,
+            resume_receipt={"ready": True},
+        )
+        assert not await worker_queue.release_worker_batch_from_workspace_recovery(
+            conn, **(args | {"hold_lease_token": 29})
+        )
+        assert not await worker_queue.release_worker_batch_from_workspace_recovery(
+            conn, **(args | {"claim_token": claim.claim_token + 1})
+        )
+        assert await worker_queue.release_worker_batch_from_workspace_recovery(
+            conn, **args
+        )
+        assert not await worker_queue.release_worker_batch_from_workspace_recovery(
+            conn, **args
+        )
+        assert tuple(
+            await conn.fetchrow(
+                "SELECT state, lease_token, attempts_since_completion, input_seq, consumed_seq "
+                "FROM run_queue WHERE unit_id=$1",
+                job_id,
+            )
+        ) == ("queued", 28, 1, 5, 3)
+
+
+def recovery_test_db(pool):
+    db = PostgresDB.__new__(PostgresDB)
+    db._pool = pool
+    return db
+
+
+@pytest.mark.asyncio
+async def test_membership_creation_and_reassignment_refuse_open_recovery(
+    app_pg,
+) -> None:
+    parent_id, token = await insert_leased_job(app_pg)
+    child_id = uuid4()
+    db = recovery_test_db(app_pg)
+    async with app_pg.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO jobs (id, description, status, parent_job_id) "
+            "VALUES ($1, 'child', 'created', $2)",
+            child_id,
+            parent_id,
+        )
+    recovery_id = await insert_recovery(app_pg, owner_id=parent_id)
+    with pytest.raises(RuntimeError, match="workspace recovery"):
+        async with db.transaction_scope():
+            await db.create_job(
+                description="late child",
+                parent_job_id=str(parent_id),
+                context={"inherits_parent_workspace": True},
+            )
+    assert not await db.merge_job_context(
+        str(child_id), {"inherits_parent_workspace": True}
+    )
+    async with app_pg.acquire() as conn:
+        await conn.execute(
+            "UPDATE jobs SET context='{"
+            + '"inherits_parent_workspace":true'
+            + "}'::jsonb "
+            "WHERE id=$1",
+            child_id,
+        )
+    assert not await db.merge_job_context(
+        str(child_id), {"inherits_parent_workspace": False}
+    )
+    assert not await db.delete_job_context_keys(
+        str(child_id), ["inherits_parent_workspace"]
+    )
+    async with app_pg.acquire() as conn:
+        assert await conn.fetchval("SELECT count(*) FROM jobs") == 2
+        await conn.execute(
+            "UPDATE vm_workspace_recoveries SET phase='cancelled', resolved_at=now() WHERE id=$1",
+            recovery_id,
+        )
+    assert await db.merge_job_context(
+        str(child_id), {"inherits_parent_workspace": False}
+    )
+
+
+@pytest.mark.asyncio
+async def test_shared_recovery_materializes_and_holds_all_member_queues(app_pg) -> None:
+    parent_id, token = await insert_leased_job(app_pg)
+    child_id = uuid4()
+    async with app_pg.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO jobs (id, description, status, execution_lane, parent_job_id, context) "
+            "VALUES ($1, 'never leased child', 'created', 'stateless', $2, "
+            "'{\"inherits_parent_workspace\":true}'::jsonb)",
+            child_id,
+            parent_id,
+        )
+    store = VMWorkspaceRecoveryStore(app_pg, worker_id="reconciler-a")
+    admitted = await store.admit_hold(**admission_kwargs(parent_id, token))
+    async with app_pg.acquire() as conn:
+        assert (
+            await conn.fetchval(
+                "SELECT count(*) FROM vm_workspace_recovery_jobs WHERE recovery_id=$1",
+                admitted.operation_id,
+            )
+            == 2
+        )
+        assert tuple(
+            await conn.fetchrow(
+                "SELECT state, lease_token, attempts_since_completion FROM run_queue WHERE unit_id=$1",
+                child_id,
+            )
+        ) == ("parked", 1, 0)
+        assert tuple(
+            await conn.fetchrow(
+                "SELECT accepted_lease_token, prior_queue_state FROM vm_workspace_recovery_jobs "
+                "WHERE job_id=$1",
+                child_id,
+            )
+        ) == (None, "absent")
+    claim = await store.claim_due(admitted.operation_id)
+    assert claim is not None
+    assert await store.release_recovered(
+        operation_id=admitted.operation_id,
+        version=claim.version,
+        claim_token=claim.claim_token,
+        resume_receipt={"ready": True},
+    )
+    async with app_pg.acquire() as conn:
+        assert tuple(
+            await conn.fetchrow(
+                "SELECT state, lease_token, attempts_since_completion, input_seq FROM run_queue WHERE unit_id=$1",
+                child_id,
+            )
+        ) == ("queued", 1, 0, 1)
+        assert (
+            await conn.fetchval("SELECT status FROM jobs WHERE id=$1", child_id)
+            == "created"
+        )
+
+
+@pytest.mark.asyncio
+async def test_child_creation_waits_for_membership_lock_then_observes_hold(
+    app_pg,
+) -> None:
+    parent_id, _ = await insert_leased_job(app_pg)
+    db = recovery_test_db(app_pg)
+
+    async def create_child():
+        async with db.transaction_scope():
+            return await db.create_job(
+                description="racing child",
+                parent_job_id=str(parent_id),
+                context={"inherits_parent_workspace": True},
+            )
+
+    task = None
+    try:
+        async with app_pg.acquire() as owner:
+            async with owner.transaction():
+                await owner.execute(
+                    "SELECT pg_advisory_xact_lock(hashtextextended($1,0))",
+                    f"workspace-recovery:job:{parent_id}",
+                )
+                task = asyncio.create_task(create_child())
+                async with app_pg.acquire() as observer:
+
+                    async def waiting():
+                        while not task.done():
+                            if await observer.fetchval(
+                                "SELECT EXISTS (SELECT 1 FROM pg_stat_activity "
+                                "WHERE datname=current_database() AND wait_event_type='Lock' "
+                                "AND query LIKE '%pg_advisory_xact_lock%')"
+                            ):
+                                return True
+                            await asyncio.sleep(0.01)
+                        return False
+
+                    assert await asyncio.wait_for(waiting(), 3)
+                await insert_recovery(app_pg, owner_id=parent_id)
+            with pytest.raises(RuntimeError, match="workspace recovery"):
+                await asyncio.wait_for(task, 3)
+    finally:
+        if task is not None and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_pinned_shared_writer_forces_attention_without_worker_queue(
+    app_pg,
+) -> None:
+    parent_id, token = await insert_leased_job(app_pg)
+    child_id = uuid4()
+    async with app_pg.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO jobs (id, description, status, execution_lane, parent_job_id, context) "
+            "VALUES ($1, 'pinned writer', 'created', 'pinned', $2, "
+            "'{\"inherits_parent_workspace\":true}'::jsonb)",
+            child_id,
+            parent_id,
+        )
+    store = VMWorkspaceRecoveryStore(app_pg)
+    admitted = await store.admit_hold(**admission_kwargs(parent_id, token))
+    assert admitted.action == "paused_attention"
+    assert admitted.code is WorkspaceRecoveryCode.SHARED_WRITERS_UNFENCED
+    async with app_pg.acquire() as conn:
+        assert (
+            await conn.fetchval(
+                "SELECT latest_diagnostic->>'reason' FROM vm_workspace_recoveries WHERE id=$1",
+                admitted.operation_id,
+            )
+            == "shared_workspace_writers_unfenced"
+        )
+        assert tuple(
+            await conn.fetchrow(
+                "SELECT participation, accepted_lease_token, hold_lease_token, prior_queue_state "
+                "FROM vm_workspace_recovery_jobs WHERE recovery_id=$1 AND job_id=$2",
+                admitted.operation_id,
+                child_id,
+            )
+        ) == ("attention", None, None, "non_worker")
+        assert not await conn.fetchval(
+            "SELECT EXISTS (SELECT 1 FROM run_queue WHERE unit_id=$1)", child_id
+        )
+        assert (
+            await conn.fetchval("SELECT status FROM jobs WHERE id=$1", child_id)
+            == "created"
+        )
+    assert await store.claim_due(admitted.operation_id) is None
+
+
+@pytest.mark.asyncio
+async def test_participant_hold_token_is_exact_or_explicitly_non_worker(app_pg) -> None:
+    recovery_id = await insert_recovery(app_pg)
+    job_id, _ = await insert_leased_job(app_pg)
+    async with app_pg.acquire() as conn:
+        insert = (
+            "INSERT INTO vm_workspace_recovery_jobs (recovery_id, job_id, "
+            "accepted_lease_token, hold_lease_token, prior_queue_state, prior_job_status, participation) "
+            "VALUES ($1,$2,$3,$4,$5,'created','attention')"
+        )
+        for accepted, hold, state in [
+            (None, 1, "non_worker"),
+            (None, None, "queued"),
+            (27, None, "non_worker"),
+        ]:
+            with pytest.raises(asyncpg.CheckViolationError):
+                await conn.execute(insert, recovery_id, job_id, accepted, hold, state)
+        await conn.execute(insert, recovery_id, job_id, None, None, "non_worker")

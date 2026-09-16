@@ -20863,7 +20863,7 @@ CREATE TABLE public.vm_workspace_recoveries (
     CONSTRAINT vm_workspace_recoveries_owner_kind_check CHECK ((owner_kind = ANY (ARRAY['job'::text, 'thread'::text]))),
     CONSTRAINT vm_workspace_recoveries_phase_check CHECK ((phase = ANY (ARRAY['recovering'::text, 'paused_attention'::text, 'recovered'::text, 'cancelled'::text]))),
     CONSTRAINT vm_workspace_recoveries_protocol_version_check CHECK ((protocol_version = 1)),
-    CONSTRAINT vm_workspace_recoveries_reason_code_check CHECK ((reason_code = ANY (ARRAY['workspace_runtime_not_ready'::text, 'workspace_transport_unavailable'::text, 'workspace_replacement_observed'::text, 'workspace_identity_conflict'::text, 'prior_runtime_unfenced'::text, 'tool_outcome_unknown'::text, 'checkpoint_unavailable'::text, 'workspace_recovery_deadline_exceeded'::text]))),
+    CONSTRAINT vm_workspace_recoveries_reason_code_check CHECK ((reason_code = ANY (ARRAY['workspace_runtime_not_ready'::text, 'workspace_transport_unavailable'::text, 'workspace_replacement_observed'::text, 'workspace_identity_conflict'::text, 'prior_runtime_unfenced'::text, 'shared_workspace_writers_unfenced'::text, 'tool_outcome_unknown'::text, 'checkpoint_unavailable'::text, 'workspace_recovery_deadline_exceeded'::text]))),
     CONSTRAINT vm_workspace_recoveries_version_check CHECK ((version > 0)),
     CONSTRAINT vm_workspace_recoveries_workspace_contract_digest_check CHECK ((workspace_contract_digest <> ''::text))
 );
@@ -20877,7 +20877,7 @@ CREATE TABLE public.vm_workspace_recovery_jobs (
     recovery_id uuid NOT NULL,
     job_id uuid NOT NULL,
     accepted_lease_token bigint,
-    hold_lease_token bigint NOT NULL,
+    hold_lease_token bigint,
     prior_queue_state text NOT NULL,
     prior_job_status text NOT NULL,
     prior_control_reference jsonb,
@@ -20890,9 +20890,10 @@ CREATE TABLE public.vm_workspace_recovery_jobs (
     created_at timestamp with time zone DEFAULT clock_timestamp() NOT NULL,
     resolved_at timestamp with time zone,
     CONSTRAINT vm_workspace_recovery_jobs_accepted_lease_token_check CHECK ((accepted_lease_token > 0)),
-    CONSTRAINT vm_workspace_recovery_jobs_check CHECK (((accepted_lease_token IS NULL) OR (hold_lease_token > accepted_lease_token))),
-    CONSTRAINT vm_workspace_recovery_jobs_check1 CHECK (((checkpoint_id IS NULL) = (checkpoint_namespace IS NULL))),
-    CONSTRAINT vm_workspace_recovery_jobs_check2 CHECK ((((resolved_at IS NULL) AND (participation = ANY (ARRAY['held'::text, 'attention'::text]))) OR ((resolved_at IS NOT NULL) AND (participation = ANY (ARRAY['released'::text, 'cancelled'::text]))))),
+    CONSTRAINT vm_workspace_recovery_jobs_check CHECK ((((prior_queue_state = 'non_worker'::text) AND (accepted_lease_token IS NULL) AND (hold_lease_token IS NULL)) OR ((prior_queue_state <> 'non_worker'::text) AND (hold_lease_token IS NOT NULL)))),
+    CONSTRAINT vm_workspace_recovery_jobs_check1 CHECK (((accepted_lease_token IS NULL) OR (hold_lease_token > accepted_lease_token))),
+    CONSTRAINT vm_workspace_recovery_jobs_check2 CHECK (((checkpoint_id IS NULL) = (checkpoint_namespace IS NULL))),
+    CONSTRAINT vm_workspace_recovery_jobs_check3 CHECK ((((resolved_at IS NULL) AND (participation = ANY (ARRAY['held'::text, 'attention'::text]))) OR ((resolved_at IS NOT NULL) AND (participation = ANY (ARRAY['released'::text, 'cancelled'::text]))))),
     CONSTRAINT vm_workspace_recovery_jobs_hold_lease_token_check CHECK ((hold_lease_token > 0)),
     CONSTRAINT vm_workspace_recovery_jobs_participation_check CHECK ((participation = ANY (ARRAY['held'::text, 'attention'::text, 'released'::text, 'cancelled'::text])))
 );

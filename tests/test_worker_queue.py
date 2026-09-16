@@ -15,6 +15,7 @@ class _Connection:
     def __init__(self) -> None:
         self.fetchrow = AsyncMock()
         self.fetchval = AsyncMock()
+        self.execute = AsyncMock()
 
     @asynccontextmanager
     async def transaction(self):

@@ -41,7 +41,8 @@ Contract invariants (the point of this module — do not weaken):
   cycle parks at ``max_attempts`` instead of hot-looping LLM spend.
 * **Dedup is queued-only.** One pending and one running collapsible task may
   coexist; a signal arriving mid-run is never swallowed.
-* **Layering:** this module touches ONLY ``run_queue``. Epoch bumps, system
+* **Layering:** this module mutates ONLY ``run_queue`` and reads unresolved
+  recovery participants to fence worker claims, completion and reaping. Epoch bumps, system
   frames (``turn.interrupted`` / ``turn.parked``), and job-row CASes belong
   to the callers (reaper loop / executor), keyed off the returned records.
 
@@ -285,6 +286,11 @@ _CLAIM_SQL = (
 WITH c AS (
     SELECT unit_id FROM run_queue
     WHERE state = 'queued' AND unit_kind = $1::text AND run_after <= now()
+      AND NOT EXISTS (
+          SELECT 1 FROM vm_workspace_recovery_jobs AS recovery_job
+          WHERE recovery_job.job_id = run_queue.unit_id
+            AND recovery_job.resolved_at IS NULL
+      )
       AND (last_leased_by IS NULL
            OR last_leased_by = $2::text
            OR queued_at <= now() - make_interval(secs => $4::float8))
@@ -305,6 +311,11 @@ WITH c AS (
     SELECT unit_id FROM run_queue
     WHERE unit_id = $4::uuid
       AND state = 'queued' AND unit_kind = $1::text AND run_after <= now()
+      AND NOT EXISTS (
+          SELECT 1 FROM vm_workspace_recovery_jobs AS recovery_job
+          WHERE recovery_job.job_id = run_queue.unit_id
+            AND recovery_job.resolved_at IS NULL
+      )
     FOR UPDATE SKIP LOCKED
 )
 """
@@ -476,6 +487,11 @@ UPDATE run_queue SET
     interrupt_admission_turn_id = NULL,
     run_after = now()
 WHERE unit_id = $1::uuid AND lease_token = $2::bigint AND state = 'leased'
+  AND NOT EXISTS (
+      SELECT 1 FROM vm_workspace_recovery_jobs AS recovery_job
+      WHERE recovery_job.job_id = run_queue.unit_id
+        AND recovery_job.resolved_at IS NULL
+  )
 RETURNING state
 """
 
@@ -649,6 +665,11 @@ SELECT unit_id, unit_kind, leased_by, lease_token,
 FROM run_queue
 WHERE state = 'leased'
   AND leased_until < now() - make_interval(secs => $1::float8)
+  AND NOT EXISTS (
+      SELECT 1 FROM vm_workspace_recovery_jobs AS recovery_job
+      WHERE recovery_job.job_id = run_queue.unit_id
+        AND recovery_job.resolved_at IS NULL
+  )
   AND ($2::text IS NULL OR unit_kind = $2::text)
 ORDER BY leased_until
 LIMIT $3::int
@@ -669,6 +690,11 @@ WITH previous AS (
       AND lease_token = $2::bigint
       AND state = 'leased'
       AND leased_until < now() - make_interval(secs => $4::float8)
+      AND NOT EXISTS (
+          SELECT 1 FROM vm_workspace_recovery_jobs AS recovery_job
+          WHERE recovery_job.job_id = run_queue.unit_id
+            AND recovery_job.resolved_at IS NULL
+      )
     FOR UPDATE
 )
 UPDATE run_queue AS queue SET
@@ -709,6 +735,11 @@ UPDATE run_queue SET
     run_after = now(),
     queued_at = now()
 WHERE unit_id = $1::uuid AND state = 'parked'
+  AND NOT EXISTS (
+      SELECT 1 FROM vm_workspace_recovery_jobs AS recovery_job
+      WHERE recovery_job.job_id = run_queue.unit_id
+        AND recovery_job.resolved_at IS NULL
+  )
 RETURNING state
 """
 
