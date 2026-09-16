@@ -838,9 +838,7 @@ class LiveScenario:
         )
         stale_claim_check = asyncio.Event()
         leader_a_store = StaleEvidenceStore(
-            VMWorkspaceRecoveryStore(
-                self.db, worker_id=f"gate-leader-a:{self.run_id}"
-            ),
+            VMWorkspaceRecoveryStore(self.db, worker_id=f"gate-leader-a:{self.run_id}"),
             claim_check_gate=stale_claim_check,
         )
         leader_b_store = VMWorkspaceRecoveryStore(

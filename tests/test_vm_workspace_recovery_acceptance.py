@@ -144,7 +144,9 @@ async def test_stale_observation_barrier_finishes_only_after_claim_handoff() -> 
 
 
 @pytest.mark.asyncio
-async def test_stale_observe_records_claim_fence_before_discarding_late_result() -> None:
+async def test_stale_observe_records_claim_fence_before_discarding_late_result() -> (
+    None
+):
     class Store:
         worker_id = "gate-leader-a:test"
 
@@ -156,9 +158,7 @@ async def test_stale_observe_records_claim_fence_before_discarding_late_result()
             return {"state": "ready"}
 
     claim_check_gate = asyncio.Event()
-    store = acceptance.StaleEvidenceStore(
-        Store(), claim_check_gate=claim_check_gate
-    )
+    store = acceptance.StaleEvidenceStore(Store(), claim_check_gate=claim_check_gate)
     barrier = acceptance.RecoveryObservationBarrier(
         Observer(), finish_after_cancellation=True
     )
