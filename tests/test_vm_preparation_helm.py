@@ -153,6 +153,8 @@ def test_recovery_observation_has_node_uid_read_and_read_only_guest_diagnostic()
         if d["kind"] == "ConfigMap" and "cloud-init.yaml" in d.get("data", {})
     )
     assert "/usr/local/bin/srw-network-qualification" in template
+    assert "'machine_id': machine_id" in template
+    assert "'registration_id':" not in template
     assert "cloud_init_cache_cleaned': False" in template
     assert "cloud-init clean" not in template
 

@@ -4052,12 +4052,16 @@ class TestWorkspaceRecoveryControllerEvidence:
                 ]
             )
         )
-        terminated = {
-            "terminated": {
-                "finishedAt": "2026-09-16T12:00:00Z",
-                "reason": "Completed",
+
+        def terminated(container_id):
+            return {
+                "terminated": {
+                    "containerID": container_id,
+                    "finishedAt": "2026-09-16T12:00:00Z",
+                    "reason": "Completed",
+                }
             }
-        }
+
         pod = {
             "metadata": {
                 "uid": current_pod,
@@ -4091,13 +4095,21 @@ class TestWorkspaceRecoveryControllerEvidence:
                         "name": "compute",
                         "containerID": "containerd://compute-old",
                         "restartCount": 0,
-                        "state": terminated if terminal else {"running": {}},
+                        "state": (
+                            terminated("containerd://compute-old")
+                            if terminal
+                            else {"running": {}}
+                        ),
                     },
                     {
                         "name": "guest-console-log",
                         "containerID": "containerd://console-old",
                         "restartCount": 0,
-                        "state": terminated if terminal else {"running": {}},
+                        "state": (
+                            terminated("containerd://console-old")
+                            if terminal
+                            else {"running": {}}
+                        ),
                     },
                 ],
             },
@@ -4138,6 +4150,33 @@ class TestWorkspaceRecoveryControllerEvidence:
             status["lastState"] = status.pop("state")
         else:
             status["restartCount"] = 1
+
+        observed = await controller._do_observe_workspace_recovery(self.identity())
+
+        assert observed["prior_runtime"] != "stopped"
+        assert observed["stop_evidence"] == "unknown"
+
+    @pytest.mark.asyncio
+    async def test_missing_restart_policy_is_not_stop_proof(self, controller):
+        pod = self.wire(controller, terminal=True)
+        pod["spec"].pop("restartPolicy")
+
+        observed = await controller._do_observe_workspace_recovery(self.identity())
+
+        assert observed["prior_runtime"] != "stopped"
+        assert observed["stop_evidence"] == "unknown"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("termination_identity", ["missing", "mismatched"])
+    async def test_ambiguous_current_termination_identity_is_not_stop_proof(
+        self, controller, termination_identity
+    ):
+        pod = self.wire(controller, terminal=True)
+        terminated = pod["status"]["containerStatuses"][0]["state"]["terminated"]
+        if termination_identity == "missing":
+            terminated.pop("containerID")
+        else:
+            terminated["containerID"] = "containerd://different-incarnation"
 
         observed = await controller._do_observe_workspace_recovery(self.identity())
 

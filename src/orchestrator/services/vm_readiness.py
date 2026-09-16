@@ -48,6 +48,20 @@ def _generation(value: object) -> str | None:
     return str(parsed) if str(parsed) == value else None
 
 
+def _machine_identity(value: object) -> str | None:
+    """Return one canonical, nonzero systemd machine ID."""
+
+    if (
+        not isinstance(value, str)
+        or len(value) != 32
+        or value != value.lower()
+        or value == "0" * 32
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        return None
+    return value
+
+
 def _complete_recovery_network(
     value: object, *, challenge: str, expected_mac: str
 ) -> bool:
@@ -61,8 +75,8 @@ def _complete_recovery_network(
     if (
         value.get("challenge") != challenge
         or _generation(value.get("boot_id")) is None
-        or not isinstance(value.get("registration_id"), str)
-        or not value["registration_id"].strip()
+        or _machine_identity(value.get("machine_id")) is None
+        or "registration_id" in value
         or not isinstance(interfaces, list)
         or not interfaces
         or not any(
@@ -158,8 +172,9 @@ async def qualify_recovery_successor(
         return None
     return {
         "pod_ip": pod_ip,
-        "ssh_registration_id": network["registration_id"],
+        "ssh_registration_id": uuid4().hex,
         "guest_boot_id": network["boot_id"],
+        "guest_machine_id": network["machine_id"],
         "guest_network": dict(network),
     }
 

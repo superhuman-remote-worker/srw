@@ -737,6 +737,30 @@ def admission_kwargs(
     }
 
 
+def recovery_guest_network(challenge: str = "fresh-challenge") -> dict:
+    return {
+        "challenge": challenge,
+        "boot_id": "00000000-0000-4000-8000-000000000041",
+        "machine_id": "41" * 16,
+        "interfaces": [
+            {
+                "ifname": "eth0",
+                "address": "10.0.2.15",
+                "mac": "02:00:00:00:00:41",
+            }
+        ],
+        "address": "10.0.2.15",
+        "routes": [{"dst": "default", "gateway": "10.0.2.2"}],
+        "default_route": {"dst": "default", "gateway": "10.0.2.2"},
+        "dns": "nameserver 10.0.2.3",
+        "netplan_sha256": {"/etc/netplan/50-cloud-init.yaml": "a" * 64},
+        "networkd_sha256": {},
+        "cloud_init_instance_id": "iid-datasource-none",
+        "cloud_init_cache_identity": "b" * 64,
+        "cloud_init_cache_cleaned": False,
+    }
+
+
 def same_runtime_observation(job_id: UUID, values: dict) -> dict:
     return {
         "ready": True,
@@ -755,7 +779,11 @@ def same_runtime_observation(job_id: UUID, values: dict) -> dict:
             "launcher_uid": str(values["prior_launcher_uid"]),
             "node_uid": "node-test",
             "pod_ip": "10.42.0.90",
-            "ssh_registration_id": "registration-test",
+            "ssh_registration_id": "51" * 16,
+            "guest_boot_id": "00000000-0000-4000-8000-000000000041",
+            "guest_machine_id": "41" * 16,
+            "interface_mac": "02:00:00:00:00:41",
+            "guest_network": recovery_guest_network(),
         },
     }
 
@@ -875,7 +903,9 @@ async def test_release_requires_complete_attestation_evidence(app_pg) -> None:
 
 
 @pytest.mark.asyncio
-async def test_store_rejects_malformed_final_attestation(app_pg) -> None:
+async def test_store_rejects_changed_guest_identity_on_final_attestation(
+    app_pg,
+) -> None:
     job_id, lease_token = await insert_leased_job(app_pg)
     values = admission_kwargs(job_id, lease_token)
     async with app_pg.acquire() as conn:
@@ -894,7 +924,8 @@ async def test_store_rejects_malformed_final_attestation(app_pg) -> None:
     assert claimed is not None
     initial = same_runtime_observation(job_id, values)
     final = same_runtime_observation(job_id, values)
-    final["successor"].pop("node_uid")
+    final["successor"]["guest_machine_id"] = "42" * 16
+    final["successor"]["guest_network"]["machine_id"] = "42" * 16
 
     assert not await store.release_recovered(
         operation_id=claimed.operation_id,
@@ -1381,6 +1412,7 @@ async def test_historical_stop_receipt_is_accepted_once_and_reused_by_new_term(
                 "name": "compute",
                 "kind": "regular",
                 "container_id": "containerd://old-compute",
+                "terminated_container_id": "containerd://old-compute",
                 "restart_count": 0,
                 "state": "terminated",
                 "last_state": None,
@@ -1409,7 +1441,13 @@ async def test_historical_stop_receipt_is_accepted_once_and_reused_by_new_term(
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "invalid",
-    ["missing_compute", "unknown_reason", "undeclared", "duplicate"],
+    [
+        "missing_compute",
+        "unknown_reason",
+        "undeclared",
+        "duplicate",
+        "termination_identity_mismatch",
+    ],
 )
 async def test_stop_receipt_store_rejects_incomplete_container_evidence(
     app_pg, invalid
@@ -1433,6 +1471,7 @@ async def test_stop_receipt_store_rejects_incomplete_container_evidence(
                 "name": "compute",
                 "kind": "regular",
                 "container_id": "containerd://old-compute",
+                "terminated_container_id": "containerd://old-compute",
                 "restart_count": 0,
                 "state": "terminated",
                 "last_state": None,
@@ -1443,6 +1482,7 @@ async def test_stop_receipt_store_rejects_incomplete_container_evidence(
                 "name": "guest-console-log",
                 "kind": "regular",
                 "container_id": "containerd://old-log",
+                "terminated_container_id": "containerd://old-log",
                 "restart_count": 0,
                 "state": "terminated",
                 "last_state": None,
@@ -1466,6 +1506,7 @@ async def test_stop_receipt_store_rejects_incomplete_container_evidence(
                 "name": "unexpected-sidecar",
                 "kind": "regular",
                 "container_id": "containerd://unexpected",
+                "terminated_container_id": "containerd://unexpected",
                 "restart_count": 0,
                 "state": "terminated",
                 "last_state": None,
@@ -1473,8 +1514,12 @@ async def test_stop_receipt_store_rejects_incomplete_container_evidence(
                 "reason": "Completed",
             }
         )
-    else:
+    elif invalid == "duplicate":
         evidence["containers"].append(dict(evidence["containers"][0]))
+    else:
+        evidence["containers"][0]["terminated_container_id"] = (
+            "containerd://different-incarnation"
+        )
 
     assert await store.accept_stop_evidence(recovery_claim, evidence) is None
 
@@ -1835,7 +1880,11 @@ async def test_release_after_deadline_retains_hold_and_pauses_attention(app_pg) 
             "launcher_uid": str(identity["prior_launcher_uid"]),
             "node_uid": "deadline-node",
             "pod_ip": "10.42.0.99",
-            "ssh_registration_id": "deadline-registration",
+            "ssh_registration_id": "53" * 16,
+            "guest_boot_id": "00000000-0000-4000-8000-000000000041",
+            "guest_machine_id": "41" * 16,
+            "interface_mac": "02:00:00:00:00:41",
+            "guest_network": recovery_guest_network(),
         },
     }
 
@@ -2081,12 +2130,15 @@ async def test_store_admits_idempotent_hold_and_releases_exact_queue_token(
     claim = await store.claim_due(admitted.operation_id)
     assert claim is not None
     observation = same_runtime_observation(job_id, kwargs)
+    final_observation = same_runtime_observation(job_id, kwargs)
+    final_observation["successor"]["ssh_registration_id"] = "52" * 16
+    final_observation["successor"]["guest_network"]["challenge"] = "fresh-challenge-two"
     assert await store.release_recovered(
         operation_id=admitted.operation_id,
         version=claim.version,
         claim_token=claim.claim_token,
         initial_observation=observation,
-        final_observation=observation.copy(),
+        final_observation=final_observation,
         resume_receipt={"kind": "same_runtime_ready"},
     )
     async with app_pg.acquire() as conn:
@@ -2096,14 +2148,17 @@ async def test_store_admits_idempotent_hold_and_releases_exact_queue_token(
             job_id,
         )
         job = await conn.fetchrow(
-            "SELECT status, freeze_data FROM jobs WHERE id=$1", job_id
+            "SELECT status, freeze_data, context->'vm' AS vm FROM jobs WHERE id=$1",
+            job_id,
         )
         operation = await conn.fetchrow(
             "SELECT phase, resolved_at FROM vm_workspace_recoveries WHERE id=$1",
             admitted.operation_id,
         )
     assert tuple(queue) == ("queued", attempt_token + 1, 1, 5, 3, None)
-    assert tuple(job) == ("paused", None)
+    assert (job["status"], job["freeze_data"]) == ("paused", None)
+    vm = job["vm"] if isinstance(job["vm"], dict) else json.loads(job["vm"])
+    assert vm["ssh_registration_id"] == "52" * 16
     assert operation["phase"] == "recovered"
     assert operation["resolved_at"] is not None
 
@@ -2161,7 +2216,11 @@ async def test_final_recovery_cas_binds_successor_and_releases_once(app_pg) -> N
             "launcher_uid": str(successor_launcher_uid),
             "node_uid": "node-8",
             "pod_ip": "10.42.0.90",
-            "ssh_registration_id": "registration-1",
+            "ssh_registration_id": "54" * 16,
+            "guest_boot_id": "00000000-0000-4000-8000-000000000041",
+            "guest_machine_id": "41" * 16,
+            "interface_mac": "02:00:00:00:00:41",
+            "guest_network": recovery_guest_network(),
         },
     }
     staged = await store.stage_observation(
@@ -2263,7 +2322,11 @@ async def test_final_recovery_cas_retains_hold_when_re_attested_generation_chang
             "launcher_uid": str(kwargs["prior_launcher_uid"]),
             "node_uid": "node-8",
             "pod_ip": "10.42.0.91",
-            "ssh_registration_id": "registration-2",
+            "ssh_registration_id": "55" * 16,
+            "guest_boot_id": "00000000-0000-4000-8000-000000000041",
+            "guest_machine_id": "41" * 16,
+            "interface_mac": "02:00:00:00:00:41",
+            "guest_network": recovery_guest_network(),
         },
     }
     staged = await store.stage_observation(

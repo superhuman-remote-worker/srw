@@ -68,6 +68,87 @@ def _required_text(value: object) -> bool:
     return isinstance(value, str) and bool(value.strip())
 
 
+def _canonical_hex_identity(value: object, *, reject_zero: bool = False) -> bool:
+    if (
+        not isinstance(value, str)
+        or len(value) != 32
+        or value != value.lower()
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        return False
+    if reject_zero and value == "0" * 32:
+        return False
+    return True
+
+
+def _valid_successor_guest_attestation(successor: Mapping[str, Any]) -> bool:
+    try:
+        boot_id = str(UUID(str(successor.get("guest_boot_id"))))
+    except (TypeError, ValueError, AttributeError):
+        return False
+    machine_id = successor.get("guest_machine_id")
+    registration_id = successor.get("ssh_registration_id")
+    network = successor.get("guest_network")
+    if (
+        boot_id != successor.get("guest_boot_id")
+        or not _canonical_hex_identity(machine_id, reject_zero=True)
+        or not _canonical_hex_identity(registration_id)
+        or not isinstance(network, Mapping)
+        or "registration_id" in network
+        or not _required_text(network.get("challenge"))
+        or network.get("boot_id") != boot_id
+        or network.get("machine_id") != machine_id
+    ):
+        return False
+    interfaces = network.get("interfaces")
+    routes = network.get("routes")
+    default_route = network.get("default_route")
+    expected_mac = successor.get("interface_mac")
+    netplan = network.get("netplan_sha256")
+    networkd = network.get("networkd_sha256")
+    if (
+        not _required_text(expected_mac)
+        or not isinstance(interfaces, list)
+        or not interfaces
+        or not any(
+            isinstance(interface, Mapping)
+            and interface.get("mac") == expected_mac
+            and _required_text(interface.get("address"))
+            for interface in interfaces
+        )
+        or not _required_text(network.get("address"))
+        or not isinstance(routes, list)
+        or not routes
+        or not isinstance(default_route, Mapping)
+        or default_route.get("dst") not in {"default", "0.0.0.0/0", "::/0"}
+        or not _required_text(network.get("dns"))
+        or not isinstance(netplan, Mapping)
+        or not isinstance(networkd, Mapping)
+        or not (netplan or networkd)
+        or not _required_text(network.get("cloud_init_instance_id"))
+        or not _required_text(network.get("cloud_init_cache_identity"))
+        or network.get("cloud_init_cache_cleaned") is not False
+    ):
+        return False
+    return all(
+        _required_text(path) and _required_text(digest)
+        for mapping in (netplan, networkd)
+        for path, digest in mapping.items()
+    )
+
+
+def _stable_guest_network_key(successor: Mapping[str, Any]) -> str:
+    network = successor.get("guest_network")
+    if not isinstance(network, Mapping):
+        return ""
+    stable = {
+        str(key): value
+        for key, value in network.items()
+        if key not in {"challenge", "registration_id"}
+    }
+    return json.dumps(stable, sort_keys=True, separators=(",", ":"), default=str)
+
+
 def _valid_stop_container_evidence(evidence: Mapping[str, Any]) -> bool:
     containers = evidence.get("containers")
     declared = evidence.get("declared_containers")
@@ -104,6 +185,7 @@ def _valid_stop_container_evidence(evidence: Mapping[str, Any]) -> bool:
         name = item.get("name")
         kind = item.get("kind")
         container_id = item.get("container_id")
+        terminated_container_id = item.get("terminated_container_id")
         restart_count = item.get("restart_count")
         finished_at = item.get("finished_at")
         reason = item.get("reason")
@@ -114,6 +196,8 @@ def _valid_stop_container_evidence(evidence: Mapping[str, Any]) -> bool:
             or identity in observed
             or identity not in expected
             or not _required_text(container_id)
+            or not _required_text(terminated_container_id)
+            or terminated_container_id != container_id
             or type(restart_count) is not int
             or restart_count != 0
             or item.get("state") != "terminated"
@@ -171,6 +255,9 @@ def _observation_authority_error(
         "node_uid",
         "pod_ip",
         "ssh_registration_id",
+        "guest_boot_id",
+        "guest_machine_id",
+        "interface_mac",
     ):
         if not _required_text(successor.get(key)):
             return f"successor_{key}_missing"
@@ -179,6 +266,8 @@ def _observation_authority_error(
             UUID(str(successor[key]))
         except (TypeError, ValueError, AttributeError):
             return f"successor_{key}_malformed"
+    if not _valid_successor_guest_attestation(successor):
+        return "successor_guest_attestation_malformed"
     replacing = str(successor["launcher_uid"]) != str(
         operation.get("prior_launcher_uid") or ""
     )
@@ -207,7 +296,9 @@ def _attestation_authority_key(observation: Mapping[str, Any]) -> tuple[str, ...
             successor.get("launcher_uid"),
             successor.get("node_uid"),
             successor.get("pod_ip"),
-            successor.get("ssh_registration_id"),
+            successor.get("guest_boot_id"),
+            successor.get("guest_machine_id"),
+            _stable_guest_network_key(successor),
         )
     )
 

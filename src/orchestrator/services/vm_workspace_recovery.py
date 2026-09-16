@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import random
 from collections.abc import Callable, Mapping
@@ -25,6 +26,9 @@ _REQUIRED_SUCCESSOR_AUTHORITY = (
     "node_uid",
     "pod_ip",
     "ssh_registration_id",
+    "guest_boot_id",
+    "guest_machine_id",
+    "interface_mac",
 )
 
 
@@ -53,6 +57,18 @@ def _successor(observation: Mapping[str, Any]) -> Mapping[str, Any]:
     return value if isinstance(value, Mapping) else {}
 
 
+def _stable_guest_network_key(successor: Mapping[str, Any]) -> str:
+    network = successor.get("guest_network")
+    if not isinstance(network, Mapping):
+        return ""
+    stable = {
+        str(key): value
+        for key, value in network.items()
+        if key not in {"challenge", "registration_id"}
+    }
+    return json.dumps(stable, sort_keys=True, separators=(",", ":"), default=str)
+
+
 def _attestation_key(observation: Mapping[str, Any]) -> tuple[str, ...]:
     successor = _successor(observation)
     return tuple(
@@ -69,7 +85,9 @@ def _attestation_key(observation: Mapping[str, Any]) -> tuple[str, ...]:
             successor.get("launcher_uid"),
             successor.get("node_uid"),
             successor.get("pod_ip"),
-            successor.get("ssh_registration_id"),
+            successor.get("guest_boot_id"),
+            successor.get("guest_machine_id"),
+            _stable_guest_network_key(successor),
         )
     )
 
@@ -78,6 +96,18 @@ def _valid_uuid(value: object) -> bool:
     try:
         UUID(str(value))
     except (TypeError, ValueError, AttributeError):
+        return False
+    return True
+
+
+def _valid_machine_id(value: object) -> bool:
+    if (
+        not isinstance(value, str)
+        or len(value) != 32
+        or value != value.lower()
+        or value == "0" * 32
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
         return False
     return True
 
@@ -415,6 +445,18 @@ class VMWorkspaceRecoveryService:
                 code=WorkspaceRecoveryCode.IDENTITY_CONFLICT,
                 reason="successor_authority_malformed",
                 observation=observation,
+            )
+            return True
+        if (
+            not _valid_uuid(successor["guest_boot_id"])
+            or not _valid_machine_id(successor["guest_machine_id"])
+            or not isinstance(successor.get("guest_network"), Mapping)
+        ):
+            await self._defer(
+                claim,
+                phase="waiting_runtime",
+                observation=observation,
+                diagnostic={"reason": "successor_guest_identity_malformed"},
             )
             return True
         replacing = not _same_identifier(

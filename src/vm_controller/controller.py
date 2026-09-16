@@ -614,7 +614,7 @@ def _exact_terminal_container_evidence(pod: object) -> dict | None:
     restart_policy = _object_value(spec, "restartPolicy")
     if restart_policy is None:
         restart_policy = _object_value(spec, "restart_policy")
-    if restart_policy not in {None, "Never"}:
+    if restart_policy != "Never":
         return None
     declared: dict[str, list[str]] = {}
     status_groups: dict[str, list[object]] = {}
@@ -668,12 +668,17 @@ def _exact_terminal_container_evidence(pod: object) -> dict | None:
             terminated = _object_value(state, "terminated")
             if terminated is None:
                 return None
+            terminated_container_id = _object_value(terminated, "containerID")
+            if terminated_container_id is None:
+                terminated_container_id = _object_value(terminated, "container_id")
             finished_at = _object_value(terminated, "finishedAt")
             if finished_at is None:
                 finished_at = _object_value(terminated, "finished_at")
             reason = _object_value(terminated, "reason")
             if (
                 _safe_uid(container_id) is None
+                or _safe_uid(terminated_container_id) is None
+                or terminated_container_id != container_id
                 or type(restart_count) is not int
                 or restart_count != 0
                 or finished_at is None
@@ -687,6 +692,7 @@ def _exact_terminal_container_evidence(pod: object) -> dict | None:
                     "name": str(_object_value(status, "name") or ""),
                     "kind": kind,
                     "container_id": container_id,
+                    "terminated_container_id": terminated_container_id,
                     "restart_count": restart_count,
                     "state": "terminated",
                     "last_state": None,
@@ -703,7 +709,7 @@ def _exact_terminal_container_evidence(pod: object) -> dict | None:
         "declared_containers": declared,
         "pod_terminal": {
             "phase": _object_value(pod_status, "phase"),
-            "restart_policy": restart_policy or "Never",
+            "restart_policy": restart_policy,
         },
     }
 

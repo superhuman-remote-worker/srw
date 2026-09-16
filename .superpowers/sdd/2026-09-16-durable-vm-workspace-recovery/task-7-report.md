@@ -180,3 +180,52 @@ PYTHONPATH=src python -m pytest tests/test_vm_controller.py tests/test_vm_retain
 
 Result: `412 passed, 2 warnings in 85.19s`. The warnings are the existing
 testcontainers and Python 3.14/Pydantic deprecations.
+
+## Review Fix Round 2
+
+### Evidence Contract Ruling
+
+The installed Kubernetes client schema exposes
+`V1ContainerStateTerminated.container_id` as JSON `containerID`. Stop evidence
+therefore requires both the outer current `ContainerStatus.containerID` and the
+current `state.terminated.containerID`, and requires exact equality. It also
+requires an explicit Pod `restartPolicy: Never`; a missing policy is no longer
+defaulted. The serialized evidence carries both identities, and the append-only
+receipt store independently rejects missing or mismatched values.
+
+The guest qualification helper no longer creates or returns a registration ID.
+It echoes the fresh nonce plus canonical boot and systemd machine identities
+over the pinned SSH channel. After strict response and network validation, the
+orchestrator mints a new server registration UUID, following the existing guest
+registration authority. Initial/final attestation excludes the fresh nonce and
+rotating server registration ID, while comparing boot ID, machine ID,
+runtime/storage identities, and all stable guest network telemetry. Release
+persists the final server-minted registration ID.
+
+### RED Evidence
+
+The focused RED run reported `9 failed, 4 passed`. Missing restart policy and
+missing/mismatched current termination IDs were accepted; an arbitrary
+guest-supplied registration ID was trusted; valid telemetry without that old
+field was rejected; a rotating server registration caused a false conflict;
+changed guest identity was missed; and the receipt store accepted an
+outer/current container-ID mismatch.
+
+### GREEN and Verification
+
+- Focused controller, readiness, and reconciliation contract tests:
+  `38 passed`.
+- Focused PostgreSQL receipt and stable-attestation tests: `8 passed`.
+- Controller, readiness, recovery, and Helm regression tests: `305 passed`.
+- Required Task 7 gate: `422 passed, 2 warnings in 89.28s`; warnings are the
+  existing testcontainers and Python 3.14/Pydantic warnings.
+- Final Helm helper check: `13 passed`.
+- Ruff check, Ruff format check for all touched Python files, and
+  `git diff --check` passed. The first format check identified three touched
+  files; they were formatted and the final check reports all nine files
+  formatted.
+
+The final store regression proves that two observations with different nonces
+and different server registration IDs release only when boot, machine, and
+stable network identity match, and that the final registration ID is the value
+persisted into the workspace projection.

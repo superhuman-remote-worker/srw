@@ -177,8 +177,7 @@ data:
           print(json.dumps({
               'challenge': challenge,
               'boot_id': boot_id,
-              'registration_id': hashlib.sha256(
-                  f'{challenge}:{boot_id}:{machine_id}'.encode()).hexdigest(),
+              'machine_id': machine_id,
               'interfaces': interfaces,
               'address': interfaces[0]['address'] if interfaces else None,
               'routes': routes,

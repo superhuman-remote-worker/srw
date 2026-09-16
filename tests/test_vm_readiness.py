@@ -2,6 +2,7 @@ import asyncio
 from contextlib import asynccontextmanager
 import json
 from unittest.mock import AsyncMock, MagicMock
+from uuid import UUID
 
 import pytest
 
@@ -14,13 +15,15 @@ from orchestrator.services.ssh_helpers import orchestrator_can_reach
 
 GENERATION = "11111111-1111-4111-8111-111111111111"
 HOST_KEY_FINGERPRINT = "SHA256:" + ("A" * 43)
+GUEST_MACHINE_ID = "41" * 16
+SERVER_REGISTRATION_ID = "51" * 16
 
 
 def complete_recovery_network(challenge="fresh-challenge"):
     return {
         "challenge": challenge,
         "boot_id": "00000000-0000-4000-8000-000000000041",
-        "registration_id": "guest-registration-response",
+        "machine_id": GUEST_MACHINE_ID,
         "interfaces": [
             {
                 "ifname": "eth0",
@@ -48,6 +51,10 @@ def wire_recovery_qualification(monkeypatch, telemetry):
     monkeypatch.setattr(
         "secrets.token_urlsafe",
         lambda _size: "fresh-challenge",
+    )
+    monkeypatch.setattr(
+        "orchestrator.services.vm_readiness.uuid4",
+        lambda: UUID(hex=SERVER_REGISTRATION_ID),
     )
 
     @asynccontextmanager
@@ -87,8 +94,9 @@ async def test_recovery_successor_requires_complete_fresh_guest_telemetry(
 
     assert result == {
         "pod_ip": "10.42.0.90",
-        "ssh_registration_id": "guest-registration-response",
+        "ssh_registration_id": SERVER_REGISTRATION_ID,
         "guest_boot_id": "00000000-0000-4000-8000-000000000041",
+        "guest_machine_id": GUEST_MACHINE_ID,
         "guest_network": telemetry,
     }
 
@@ -103,7 +111,7 @@ async def test_recovery_successor_requires_complete_fresh_guest_telemetry(
         "dns",
         "cloud_init_instance_id",
         "cloud_init_cache_identity",
-        "registration_id",
+        "machine_id",
     ],
 )
 async def test_recovery_successor_rejects_incomplete_guest_telemetry(
@@ -145,6 +153,90 @@ async def test_recovery_successor_rejects_stale_guest_challenge(monkeypatch) -> 
         )
         is None
     )
+
+
+@pytest.mark.asyncio
+async def test_recovery_successor_rejects_guest_supplied_registration_id(
+    monkeypatch,
+) -> None:
+    telemetry = complete_recovery_network()
+    telemetry["registration_id"] = "constant-unbound-registration"
+    wire_recovery_qualification(monkeypatch, telemetry)
+
+    assert (
+        await qualify_recovery_successor(
+            {
+                "pod_ip": "10.42.0.90",
+                "vmi_uid": "00000000-0000-4000-8000-000000000042",
+                "launcher_uid": "00000000-0000-4000-8000-000000000043",
+                "interface_mac": "02:00:00:00:00:41",
+            },
+            host_key_fingerprint=HOST_KEY_FINGERPRINT,
+        )
+        is None
+    )
+
+
+@pytest.mark.asyncio
+async def test_recovery_successor_re_attests_same_guest_with_fresh_nonces(
+    monkeypatch,
+) -> None:
+    challenges = iter(("fresh-challenge-one", "fresh-challenge-two"))
+    registrations = iter((UUID(int=81), UUID(int=82)))
+    telemetry = iter(
+        (
+            complete_recovery_network("fresh-challenge-one"),
+            complete_recovery_network("fresh-challenge-two"),
+        )
+    )
+    monkeypatch.setattr(
+        "orchestrator.services.vm_readiness.wait_for_agent_ssh",
+        AsyncMock(return_value=(True, 1, None)),
+    )
+    monkeypatch.setattr("secrets.token_urlsafe", lambda _size: next(challenges))
+    monkeypatch.setattr(
+        "orchestrator.services.vm_readiness.uuid4", lambda: next(registrations)
+    )
+
+    @asynccontextmanager
+    async def command(*_args, **_kwargs):
+        yield ["ssh", "qualified-guest"]
+
+    process = MagicMock(returncode=0)
+    monkeypatch.setattr(
+        "orchestrator.services.vm_readiness.pinned_agent_ssh_command", command
+    )
+    monkeypatch.setattr(
+        "orchestrator.services.vm_readiness.create_owned_subprocess_exec",
+        AsyncMock(return_value=process),
+    )
+    monkeypatch.setattr(
+        "orchestrator.services.vm_readiness.communicate_bounded",
+        AsyncMock(
+            side_effect=lambda *_args, **_kwargs: (
+                json.dumps(next(telemetry)).encode(),
+                b"",
+            )
+        ),
+    )
+    successor = {
+        "pod_ip": "10.42.0.90",
+        "vmi_uid": "00000000-0000-4000-8000-000000000042",
+        "launcher_uid": "00000000-0000-4000-8000-000000000043",
+        "interface_mac": "02:00:00:00:00:41",
+    }
+
+    first = await qualify_recovery_successor(
+        successor, host_key_fingerprint=HOST_KEY_FINGERPRINT
+    )
+    second = await qualify_recovery_successor(
+        successor, host_key_fingerprint=HOST_KEY_FINGERPRINT
+    )
+
+    assert first is not None and second is not None
+    assert first["ssh_registration_id"] != second["ssh_registration_id"]
+    assert first["guest_boot_id"] == second["guest_boot_id"]
+    assert first["guest_machine_id"] == second["guest_machine_id"]
 
 
 def test_same_cluster_reachability_ignores_address_class(monkeypatch):

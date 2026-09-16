@@ -56,6 +56,27 @@ def claim(*, version: int = 2, attempt: int = 1) -> RecoveryClaim:
 
 
 def ready_observation() -> dict[str, object]:
+    guest_network = {
+        "challenge": "fresh-challenge-one",
+        "boot_id": "00000000-0000-4000-8000-000000000041",
+        "machine_id": "41" * 16,
+        "interfaces": [
+            {
+                "ifname": "eth0",
+                "address": "10.0.2.15",
+                "mac": "02:00:00:00:00:41",
+            }
+        ],
+        "address": "10.0.2.15",
+        "routes": [{"dst": "default", "gateway": "10.0.2.2"}],
+        "default_route": {"dst": "default", "gateway": "10.0.2.2"},
+        "dns": "nameserver 10.0.2.3",
+        "netplan_sha256": {"/etc/netplan/50-cloud-init.yaml": "a" * 64},
+        "networkd_sha256": {},
+        "cloud_init_instance_id": "iid-datasource-none",
+        "cloud_init_cache_identity": "b" * 64,
+        "cloud_init_cache_cleaned": False,
+    }
     return {
         "ready": True,
         "authenticated": True,
@@ -74,7 +95,11 @@ def ready_observation() -> dict[str, object]:
             "launcher_uid": str(NEW_LAUNCHER_UID),
             "node_uid": "node-new",
             "pod_ip": "10.42.0.90",
-            "ssh_registration_id": "registration-1",
+            "ssh_registration_id": "51" * 16,
+            "guest_boot_id": "00000000-0000-4000-8000-000000000041",
+            "guest_machine_id": "41" * 16,
+            "interface_mac": "02:00:00:00:00:41",
+            "guest_network": guest_network,
         },
     }
 
@@ -286,6 +311,46 @@ async def test_ready_replacement_is_re_attested_before_final_release() -> None:
 
 
 @pytest.mark.asyncio
+async def test_fresh_re_attestation_allows_server_registration_rotation() -> None:
+    recovery_store = FakeStore()
+    initial = ready_observation()
+    final = ready_observation()
+    final["successor"] = {
+        **final["successor"],  # type: ignore[arg-type]
+        "ssh_registration_id": "52" * 16,
+        "guest_network": {
+            **final["successor"]["guest_network"],  # type: ignore[index]
+            "challenge": "fresh-challenge-two",
+        },
+    }
+
+    await service(recovery_store, Observer([initial, final])).reconcile_once(
+        OPERATION_ID
+    )
+
+    assert not recovery_store.paused
+    assert recovery_store.released[0]["final_observation"] == final
+
+
+@pytest.mark.asyncio
+async def test_fresh_re_attestation_rejects_changed_guest_identity() -> None:
+    recovery_store = FakeStore()
+    initial = ready_observation()
+    final = ready_observation()
+    final["successor"] = {
+        **final["successor"],  # type: ignore[arg-type]
+        "guest_machine_id": "42" * 16,
+    }
+
+    await service(recovery_store, Observer([initial, final])).reconcile_once(
+        OPERATION_ID
+    )
+
+    assert not recovery_store.released
+    assert recovery_store.paused[-1]["code"] is WorkspaceRecoveryCode.IDENTITY_CONFLICT
+
+
+@pytest.mark.asyncio
 async def test_changed_final_attestation_retains_hold_for_attention() -> None:
     recovery_store = FakeStore()
     initial = ready_observation()
@@ -309,6 +374,8 @@ async def test_changed_final_attestation_retains_hold_for_attention() -> None:
         lambda value: value.__setitem__("ambiguous", True),
         lambda value: value["successor"].pop("node_uid"),
         lambda value: value["successor"].pop("ssh_registration_id"),
+        lambda value: value["successor"].pop("guest_boot_id"),
+        lambda value: value["successor"].pop("guest_machine_id"),
         lambda value: value.__setitem__("continuation", "unknown"),
         lambda value: value.__setitem__("remote_operations", "pending"),
     ],
