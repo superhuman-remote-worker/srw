@@ -50,6 +50,7 @@ from orchestrator.services.container_provisioner import (
     WORKSPACE_RUNTIME_INCARNATION_KEY,
     WorkspaceRuntimeAttestation,
     WorkspaceRuntimeAuthorityError,
+    WorkspaceRuntimeRecoveryRequired,
 )
 from orchestrator.services.job_workspace_adoption import (
     ensure_legacy_k8s_job_runtime_authority,
@@ -66,6 +67,15 @@ from shared.workspace_contract import (
     resolve_workspace_runtime,
     workspace_runtime_authority_digest,
 )
+from shared.workspace_recovery import WorkspaceRecoveryCode
+
+
+class RecoverableWorkspaceAuthorityRefusal(HTTPException):
+    """Preserve an explicit recovery reason across the authority boundary."""
+
+    def __init__(self, recovery_code: WorkspaceRecoveryCode) -> None:
+        super().__init__(409, "Stateless worker workspace authority unavailable")
+        self.recovery_code = recovery_code
 
 
 # Bounded wait for a subjob to inherit its parent's provisioned workspace.
@@ -282,6 +292,8 @@ async def attest_stateless_worker_vm_workspace(
                 "stateless worker VM owner is not a job"
             )
         return await dependencies.vm_provisioner.attest_workspace_runtime(owner.id)
+    except WorkspaceRuntimeRecoveryRequired as exc:
+        raise RecoverableWorkspaceAuthorityRefusal(exc.recovery_code) from exc
     except WorkspaceRuntimeAuthorityError as exc:
         dependencies.logger.warning(
             "Stateless worker VM workspace attestation refused for %s %s: %s",

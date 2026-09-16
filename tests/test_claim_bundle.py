@@ -786,8 +786,13 @@ async def test_worker_bundle_reuses_job_start_builder_and_rechecks_lease(monkeyp
     assert builder.await_args.kwargs["persist_dispatch_state"] is False
     assert attest.await_count == 2
     assert attest.await_args_list[0].args[0] == orch_main.WorkspaceOwner.job(UNIT_ID)
-    db.conn.fetchval.assert_awaited_once()
-    assert "state = 'leased'" in db.conn.fetchval.await_args.args[0]
+    lease_reads = [
+        call
+        for call in db.conn.fetchval.await_args_list
+        if "SELECT EXISTS (SELECT 1 FROM run_queue" in call.args[0]
+    ]
+    assert len(lease_reads) == 1
+    assert lease_reads[0].args[1:] == (UNIT_ID, 7)
     assert out == {
         "unit_id": UNIT_ID,
         "job_id": UNIT_ID,
@@ -1239,7 +1244,10 @@ async def test_pre_0175_inherited_worker_final_reread_converges_parent(monkeypat
     )
 
     builder.assert_awaited_once()
-    db.conn.fetchval.assert_awaited_once()
+    assert any(
+        "UPDATE worker_batch_attempts SET bundle_authorized_at" in call.args[0]
+        for call in db.conn.fetchval.await_args_list
+    )
     assert out["job"]["workspace_owner_id"] == parent_id
     assert out["job"]["workspace_runtime_incarnation"] == WORKSPACE_RUNTIME
     assert attest.await_count == 7
@@ -1778,7 +1786,8 @@ async def test_recovery_routes_require_internal_auth(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_vm_attestation_refusal_commits_recovery_hold(monkeypatch):
+@pytest.mark.parametrize("failure", ["unknown", "untyped_409", "untyped_authority"])
+async def test_vm_unknown_attestation_refusals_remain_generic(monkeypatch, failure):
     import httpx
     from orchestrator import main as orch_main
     from orchestrator.services.container_provisioner import (
@@ -1786,10 +1795,15 @@ async def test_vm_attestation_refusal_commits_recovery_hold(monkeypatch):
     )
 
     app, db, store = recovery_protocol_app(monkeypatch, ready=True)
+    error = {
+        "unknown": RuntimeError("unexpected bug"),
+        "untyped_409": HTTPException(409, "unknown refusal"),
+        "untyped_authority": WorkspaceRuntimeAuthorityError("unavailable"),
+    }[failure]
     monkeypatch.setattr(
         orch_main.vm_provisioner,
         "attest_workspace_runtime",
-        AsyncMock(side_effect=WorkspaceRuntimeAuthorityError("unavailable")),
+        AsyncMock(side_effect=error),
     )
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://test"
@@ -1799,7 +1813,99 @@ async def test_vm_attestation_refusal_commits_recovery_hold(monkeypatch):
             params={"lease_token": 7, "pod_name": POD_NAME, "pod_uid": POD_UID},
         )
     assert response.status_code == 409
+    assert "recovery" not in response.json()
+    assert "code" not in response.json()
+    assert store.receipt is None
+    assert not store.authorized
+
+
+@pytest.mark.asyncio
+async def test_untyped_authority_boundary_409_does_not_admit_recovery(monkeypatch):
+    import httpx
+
+    app, db, store = recovery_protocol_app(monkeypatch, ready=True)
+    monkeypatch.setattr(
+        job_workspace_authority,
+        "attest_stateless_worker_vm_workspace",
+        AsyncMock(side_effect=HTTPException(409, "generic refusal")),
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.get(
+            f"/internal/units/{UNIT_ID}/claim-bundle",
+            params={"lease_token": 7, "pod_name": POD_NAME, "pod_uid": POD_UID},
+        )
+    assert response.status_code == 409
+    assert "recovery" not in response.json()
+    assert store.receipt is None
+
+
+@pytest.mark.asyncio
+async def test_disabled_admission_still_records_bundle_authorization(monkeypatch):
+    import httpx
+
+    app, db, store = recovery_protocol_app(monkeypatch, ready=True)
+    monkeypatch.setenv("VM_WORKSPACE_RECOVERY_ENABLED", "false")
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.get(
+            f"/internal/units/{UNIT_ID}/claim-bundle",
+            params={"lease_token": 7, "pod_name": POD_NAME, "pod_uid": POD_UID},
+        )
+    assert response.status_code == 200
+    assert store.authorized
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "observation,code",
+    [
+        ({"ready": False}, "workspace_runtime_not_ready"),
+        (
+            {"active_pod_uid": "66666666-6666-4666-8666-666666666666"},
+            "workspace_replacement_observed",
+        ),
+    ],
+)
+async def test_explicit_vm_attestation_condition_commits_typed_hold(
+    monkeypatch, observation, code
+):
+    import httpx
+    from orchestrator import main as orch_main
+    from orchestrator.services.vm_provisioner import VMProvisioner
+
+    app, db, store = recovery_protocol_app(monkeypatch, ready=True)
+    db._job["context"]["vm"]["ssh_registration_id"] = "registration-1"
+    vm = db._job["context"]["vm"]
+    provisioner = VMProvisioner()
+    provisioner._controller_url = "http://vm-controller:8080"
+    provisioner._http_client = MagicMock()
+    provisioner._lifecycle_hmac_secret = b"test-attestation-secret-at-least-32-bytes"
+    provisioner._db = db
+    provisioner._query_http = AsyncMock(
+        return_value={
+            "_identity_authenticated": True,
+            "provision_generation": vm["provision_generation"],
+            "vm_uid": vm["vm_uid"],
+            "active_pod_uid": vm["active_pod_uid"],
+            "pod_ip": vm["pod_ip"],
+            "ready": True,
+            **observation,
+        }
+    )
+    monkeypatch.setattr(orch_main, "vm_provisioner", provisioner)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.get(
+            f"/internal/units/{UNIT_ID}/claim-bundle",
+            params={"lease_token": 7, "pod_name": POD_NAME, "pod_uid": POD_UID},
+        )
+    assert response.status_code == 409
     assert response.json()["recovery"]["action"] == "hold_committed"
+    assert response.json()["code"] == code
     assert not store.authorized
 
 

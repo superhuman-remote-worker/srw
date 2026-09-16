@@ -326,6 +326,83 @@ async def test_worker_uncertainty_codes_require_attention(app_pg, code):
 
 
 @pytest.mark.asyncio
+async def test_disabled_bundle_then_enabled_hold_never_refunds_executable_attempt(
+    app_pg, monkeypatch
+):
+    import httpx
+    from orchestrator import main as orch_main
+    from tests.test_claim_bundle import (
+        recovery_protocol_app,
+        UNIT_ID,
+        POD_NAME,
+        POD_UID,
+    )
+
+    app, db, _ = recovery_protocol_app(monkeypatch, ready=True)
+    db.acquire = app_pg.acquire
+    store = VMWorkspaceRecoveryStore(app_pg)
+    monkeypatch.setattr(orch_main, "VMWorkspaceRecoveryStore", lambda db: store)
+    job_id = UUID(UNIT_ID)
+    async with app_pg.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO jobs (id,description,status,execution_lane,context,config_override) VALUES ($1,'disabled bundle','processing','stateless',$2::jsonb,$3::jsonb)",
+            job_id,
+            json.dumps(db._job["context"]),
+            json.dumps(db._job["config_override"]),
+        )
+        await conn.execute(
+            "INSERT INTO run_queue (unit_id,unit_kind,state,lease_token,leased_by,leased_until,attempts_since_completion) VALUES ($1,'worker_batch','leased',7,$2,clock_timestamp()+interval '1 minute',1)",
+            job_id,
+            POD_NAME,
+        )
+        await conn.execute(
+            "INSERT INTO worker_batch_attempts (job_id,lease_token,claimed_attempt) VALUES ($1,7,1)",
+            job_id,
+        )
+        await conn.execute(
+            "INSERT INTO agents (config_name,hostname,pod_uid) VALUES ('test',$1,$2)",
+            POD_NAME,
+            POD_UID,
+        )
+    monkeypatch.setenv("VM_WORKSPACE_RECOVERY_ENABLED", "false")
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        bundle = await client.get(
+            f"/internal/units/{UNIT_ID}/claim-bundle",
+            params={"lease_token": 7, "pod_name": POD_NAME, "pod_uid": POD_UID},
+        )
+        assert bundle.status_code == 200
+        monkeypatch.setenv("VM_WORKSPACE_RECOVERY_ENABLED", "true")
+        hold = await client.post(
+            f"/internal/units/{UNIT_ID}/workspace-recovery",
+            json={
+                "lease_token": 7,
+                "pod_name": POD_NAME,
+                "pod_uid": POD_UID,
+                "request_id": str(uuid4()),
+                "code": "workspace_transport_unavailable",
+            },
+        )
+        assert hold.status_code == 200
+        assert hold.json()["recovery"]["action"] == "hold_committed"
+    async with app_pg.acquire() as conn:
+        attempt = await conn.fetchrow(
+            "SELECT bundle_authorized_at,refunded_at FROM worker_batch_attempts WHERE job_id=$1 AND lease_token=7",
+            job_id,
+        )
+        assert attempt["bundle_authorized_at"] is not None
+        assert attempt["refunded_at"] is None
+        assert (
+            await conn.fetchval(
+                "SELECT attempts_since_completion FROM run_queue WHERE unit_id=$1",
+                job_id,
+            )
+            == 1
+        )
+
+
+@pytest.mark.asyncio
 async def test_schema_allows_only_one_unresolved_recovery_per_owner(app_pg) -> None:
     first = await insert_recovery(app_pg)
     with pytest.raises(asyncpg.UniqueViolationError):

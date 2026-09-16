@@ -23,7 +23,9 @@ from orchestrator.services.container_provisioner import (
     DEFAULT_NETWORK_TIER,
     WorkspaceRuntimeAttestation,
     WorkspaceRuntimeAuthorityError,
+    WorkspaceRuntimeRecoveryRequired,
 )
+from shared.workspace_recovery import WorkspaceRecoveryCode
 from orchestrator.services.nats_bridge import nats_bridge
 from orchestrator.services.vm_lifecycle_auth import (
     AUTH_FIELD,
@@ -572,14 +574,38 @@ class VMProvisioner:
             raise WorkspaceRuntimeAuthorityError(
                 "VM controller status is unauthenticated"
             )
-        if _provision_generation(observed.get("provision_generation")) != generation:
+        observed_generation = _provision_generation(
+            observed.get("provision_generation")
+        )
+        if observed_generation is not None and observed_generation != generation:
+            raise WorkspaceRuntimeRecoveryRequired(
+                "VM provision generation changed",
+                recovery_code=WorkspaceRecoveryCode.REPLACEMENT_OBSERVED,
+            )
+        if observed_generation != generation:
             raise WorkspaceRuntimeAuthorityError("VM provision generation changed")
-        if _safe_vm_uid(observed.get("vm_uid")) != expected_vm_uid:
+        observed_vm_uid = _safe_vm_uid(observed.get("vm_uid"))
+        if observed_vm_uid is not None and observed_vm_uid != expected_vm_uid:
+            raise WorkspaceRuntimeRecoveryRequired(
+                "VM UID changed",
+                recovery_code=WorkspaceRecoveryCode.REPLACEMENT_OBSERVED,
+            )
+        if observed_vm_uid != expected_vm_uid:
             raise WorkspaceRuntimeAuthorityError("VM UID changed")
+        if observed.get("ready") is False:
+            raise WorkspaceRuntimeRecoveryRequired(
+                "VM is not Kubernetes-ready",
+                recovery_code=WorkspaceRecoveryCode.RUNTIME_NOT_READY,
+            )
         if observed.get("ready") is not True:
             raise WorkspaceRuntimeAuthorityError("VM is not Kubernetes-ready")
 
         launcher_uid = _provision_generation(observed.get("active_pod_uid"))
+        if launcher_uid is not None and launcher_uid != expected_launcher_uid:
+            raise WorkspaceRuntimeRecoveryRequired(
+                "VM launcher Pod UID changed",
+                recovery_code=WorkspaceRecoveryCode.REPLACEMENT_OBSERVED,
+            )
         if launcher_uid != expected_launcher_uid:
             raise WorkspaceRuntimeAuthorityError("VM launcher Pod UID changed")
 

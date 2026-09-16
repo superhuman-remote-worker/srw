@@ -288,10 +288,8 @@ async def _attest_recoverable_vm(owner: Any, *, dependencies: Any) -> Any:
         return await job_workspace_authority.attest_stateless_worker_vm_workspace(
             owner, dependencies=dependencies
         )
-    except HTTPException as exc:
-        if exc.status_code == 409:
-            raise _WorkspaceRecoveryRefusal(exc.detail) from exc
-        raise
+    except job_workspace_authority.RecoverableWorkspaceAuthorityRefusal as exc:
+        raise _WorkspaceRecoveryRefusal(exc.detail, exc.recovery_code) from exc
 
 
 async def claim_bundle_for_unit(
@@ -750,26 +748,27 @@ async def _assemble_claim_bundle(
         if iteration_cap is not None and iteration_cap <= 0:
             iteration_cap = None
 
-        if workspace_recovery_enabled():
-            async with dependencies.db.acquire() as conn:
-                async with conn.transaction():
-                    await _validate_worker_identity(
-                        conn,
-                        unit_id=unit_id,
-                        lease_token=lease_token,
-                        pod_name=pod_name,
-                        pod_uid=pod_uid,
-                    )
-                    authorized = (
-                        await dependencies.recovery_store.record_bundle_authorized(
-                            conn,
-                            job_id=UUID(unit_id),
-                            lease_token=lease_token,
-                            authority_digest=initial_runtime_digest,
-                        )
-                    )
-                    if not authorized:
-                        raise HTTPException(403, "Lease validation failed")
+        # Execution evidence is independent of admission policy: a later flag
+        # change must never turn an issued bundle into pre-bundle refund debt.
+        if dependencies.recovery_store is None:
+            raise HTTPException(503, "Worker bundle authorization is unavailable")
+        async with dependencies.db.acquire() as conn:
+            async with conn.transaction():
+                await _validate_worker_identity(
+                    conn,
+                    unit_id=unit_id,
+                    lease_token=lease_token,
+                    pod_name=pod_name,
+                    pod_uid=pod_uid,
+                )
+                authorized = await dependencies.recovery_store.record_bundle_authorized(
+                    conn,
+                    job_id=UUID(unit_id),
+                    lease_token=lease_token,
+                    authority_digest=initial_runtime_digest,
+                )
+                if not authorized:
+                    raise HTTPException(403, "Lease validation failed")
         return {
             "unit_id": unit_id,
             "job_id": unit_id,

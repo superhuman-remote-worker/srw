@@ -27,6 +27,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Literal, Optional
 from uuid import UUID, uuid4
+from shared.workspace_recovery import WorkspaceRecoveryCode
 
 from orchestrator.services import resolve_ssh_key_path, workspace_metering
 from orchestrator.services.blocking_effect import joined_blocking_call
@@ -123,6 +124,20 @@ class WorkspaceSSHAuthenticationError(RuntimeError):
 
 class WorkspaceRuntimeAuthorityError(RuntimeError):
     """A deterministic Pod name no longer identifies the authorized runtime."""
+
+
+class WorkspaceRuntimeRecoveryRequired(WorkspaceRuntimeAuthorityError):
+    """An explicitly observed, allowlisted runtime recovery condition."""
+
+    def __init__(self, detail: str, *, recovery_code: WorkspaceRecoveryCode) -> None:
+        self.recovery_code = WorkspaceRecoveryCode(recovery_code)
+        if self.recovery_code not in {
+            WorkspaceRecoveryCode.RUNTIME_NOT_READY,
+            WorkspaceRecoveryCode.TRANSPORT_UNAVAILABLE,
+            WorkspaceRecoveryCode.REPLACEMENT_OBSERVED,
+        }:
+            raise ValueError("Unsupported runtime recovery condition")
+        super().__init__(detail)
 
 
 def _canonical_manifest_digest(payload: dict[str, Any]) -> str:

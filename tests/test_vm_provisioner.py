@@ -253,6 +253,41 @@ def test_connect_logs_mode(mock_db, caplog):
 
 
 class TestVmWorkspaceRuntimeAttestation:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "observation,code",
+        [
+            ({"ready": False}, "workspace_runtime_not_ready"),
+            (
+                {"active_pod_uid": "00000000-0000-4000-8000-000000000099"},
+                "workspace_replacement_observed",
+            ),
+            ({"vm_uid": "replacement-vm-uid"}, "workspace_replacement_observed"),
+            (
+                {"provision_generation": "00000000-0000-4000-8000-000000000099"},
+                "workspace_replacement_observed",
+            ),
+            ({"ready": None}, None),
+            ({"active_pod_uid": None}, None),
+            ({"provision_generation": None}, None),
+            ({"vm_uid": None}, None),
+        ],
+    )
+    async def test_only_explicit_runtime_observations_carry_recovery_codes(
+        self, mock_db, observation, code
+    ):
+        from orchestrator.services.container_provisioner import (
+            WorkspaceRuntimeAuthorityError,
+        )
+
+        with patch.dict(os.environ, {"VM_MODE": "same-cluster"}):
+            provisioner = self._provisioner(
+                mock_db, self._context(), self._status(**observation)
+            )
+            with pytest.raises(WorkspaceRuntimeAuthorityError) as caught:
+                await provisioner.attest_workspace_runtime("job-1")
+        assert getattr(caught.value, "recovery_code", None) == code
+
     @staticmethod
     def _context(**overrides):
         context = {
