@@ -72,6 +72,8 @@ _mock_k8s.client = _mock_k8s_client  # type: ignore[attr-defined]
 _mock_k8s.config = _mock_k8s_config  # type: ignore[attr-defined]
 _mock_k8s_config.load_incluster_config = MagicMock()  # type: ignore[attr-defined]
 
+from kubernetes.client import ApiClient as KubernetesApiClient  # noqa: E402
+
 _K8S_STUB_MODULES = {
     "kubernetes": _mock_k8s,
     "kubernetes.client": _mock_k8s_client,
@@ -4150,6 +4152,59 @@ class TestWorkspaceRecoveryControllerEvidence:
             status["lastState"] = status.pop("state")
         else:
             status["restartCount"] = 1
+
+        observed = await controller._do_observe_workspace_recovery(self.identity())
+
+        assert observed["prior_runtime"] != "stopped"
+        assert observed["stop_evidence"] == "unknown"
+
+    @pytest.mark.asyncio
+    async def test_deserialized_empty_last_state_preserves_stop_proof(self, controller):
+        pod = self.wire(controller, terminal=True)
+        empty_last_state = KubernetesApiClient()._ApiClient__deserialize(  # noqa: SLF001
+            {}, "V1ContainerState"
+        )
+        assert empty_last_state
+        assert all(
+            getattr(empty_last_state, field) is None
+            for field in ("running", "waiting", "terminated")
+        )
+        pod["status"]["containerStatuses"][0]["lastState"] = empty_last_state
+
+        observed = await controller._do_observe_workspace_recovery(self.identity())
+
+        assert observed["prior_runtime"] == "stopped"
+        assert observed["stop_evidence"] != "unknown"
+
+    @pytest.mark.asyncio
+    async def test_deserialized_previous_termination_is_not_stop_proof(
+        self, controller
+    ):
+        pod = self.wire(controller, terminal=True)
+        previous_state = KubernetesApiClient()._ApiClient__deserialize(  # noqa: SLF001
+            {
+                "terminated": {
+                    "containerID": "containerd://previous-incarnation",
+                    "exitCode": 0,
+                    "finishedAt": "2026-09-16T11:00:00Z",
+                    "reason": "Completed",
+                    "startedAt": "2026-09-16T10:00:00Z",
+                }
+            },
+            "V1ContainerState",
+        )
+        assert previous_state.terminated is not None
+        pod["status"]["containerStatuses"][0]["lastState"] = previous_state
+
+        observed = await controller._do_observe_workspace_recovery(self.identity())
+
+        assert observed["prior_runtime"] != "stopped"
+        assert observed["stop_evidence"] == "unknown"
+
+    @pytest.mark.asyncio
+    async def test_malformed_last_state_is_not_stop_proof(self, controller):
+        pod = self.wire(controller, terminal=True)
+        pod["status"]["containerStatuses"][0]["lastState"] = {"unknownState": {}}
 
         observed = await controller._do_observe_workspace_recovery(self.identity())
 

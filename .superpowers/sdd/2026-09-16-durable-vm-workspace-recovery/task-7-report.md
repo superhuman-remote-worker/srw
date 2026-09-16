@@ -229,3 +229,25 @@ The final store regression proves that two observations with different nonces
 and different server registration IDs release only when boot, machine, and
 stable network identity match, and that the final registration ID is the value
 persisted into the workspace projection.
+
+## Review Fix Round 3
+
+The installed Kubernetes `ApiClient` deserializes `lastState: {}` as a truthy
+`V1ContainerState` whose `running`, `waiting`, and `terminated` fields are all
+`None`. The controller now recognizes only that exact empty model/serialized
+shape as no previous state. Any populated state, unknown key, or unrecognized
+object remains ambiguous and cannot mint stop evidence.
+
+The corrected RED reproduction failed because the valid terminal launcher was
+reported as `running` instead of `stopped`. The focused evidence class passed
+after the change (`20 passed`), followed by the full controller suite
+(`225 passed`). Ruff format/check and `git diff --check` passed.
+
+The required Task 7 gate completed with `425 passed, 1 failed, 2 warnings in
+86.40s`. The only failure was the concurrently added Task 8 test
+`test_reconciler_production_path_emits_redacted_probe_and_pause_audits`: its
+expected `recovery_reason` was `captured_identity_changed`, while the concurrent
+telemetry implementation emitted
+`captured_workspace_identity_changed_or_ambiguous`. This test and its telemetry
+files are outside the Task 7 controller change and were left to Task 8. The two
+warnings remain the existing testcontainers and Python 3.14/Pydantic warnings.

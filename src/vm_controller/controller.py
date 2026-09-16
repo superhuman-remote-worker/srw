@@ -594,6 +594,24 @@ def _container_entries(value: object, camel: str, snake: str) -> list[object] | 
     return list(entries) if isinstance(entries, (list, tuple)) else None
 
 
+def _empty_container_state(value: object) -> bool:
+    """Recognize only an empty Kubernetes ContainerState representation."""
+
+    fields = {"running", "waiting", "terminated"}
+    if value is None:
+        return True
+    if isinstance(value, Mapping):
+        return not (set(value) - fields) and all(
+            value.get(field) is None for field in fields
+        )
+    attribute_map = getattr(value, "attribute_map", None)
+    if not isinstance(attribute_map, Mapping) or set(attribute_map) != fields:
+        return False
+    if any(attribute_map.get(field) != field for field in fields):
+        return False
+    return all(getattr(value, field, None) is None for field in fields)
+
+
 def _exact_terminal_container_evidence(pod: object) -> dict | None:
     """Return current kubelet termination evidence, never ``lastState``."""
 
@@ -663,7 +681,7 @@ def _exact_terminal_container_evidence(pod: object) -> dict | None:
             last_state = _object_value(status, "lastState")
             if last_state is None:
                 last_state = _object_value(status, "last_state")
-            if last_state:
+            if not _empty_container_state(last_state):
                 return None
             terminated = _object_value(state, "terminated")
             if terminated is None:
