@@ -168,6 +168,60 @@ class RecoveryObservationBarrier:
         return await self.delegate.reconcile_workspace_recovery_pin(command)
 
 
+class StaleEvidenceStore:
+    """Record the first production store fence rejecting an old leader."""
+
+    def __init__(
+        self,
+        delegate: Any,
+        *,
+        claim_check_gate: asyncio.Event | None = None,
+    ) -> None:
+        self.delegate = delegate
+        self.claim_check_gate = claim_check_gate
+        self.boundary_checked = asyncio.Event()
+        self.rejected_boundary: str | None = None
+        self.stage_attempted = False
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.delegate, name)
+
+    def _record_rejection(self, boundary: str, rejected: bool) -> None:
+        if rejected and self.rejected_boundary is None:
+            self.rejected_boundary = boundary
+            self.boundary_checked.set()
+
+    async def claim_is_current(self, claim: Any) -> bool:
+        if self.claim_check_gate is not None:
+            await self.claim_check_gate.wait()
+        result = bool(await self.delegate.claim_is_current(claim))
+        self._record_rejection("claim_is_current", not result)
+        return result
+
+    async def accept_stop_evidence(
+        self, claim: Any, evidence: Mapping[str, Any]
+    ) -> Any:
+        result = await self.delegate.accept_stop_evidence(claim, evidence)
+        self._record_rejection("accept_stop_evidence", result is None)
+        return result
+
+    async def trusted_stop_receipt(self, claim: Any) -> Any:
+        result = await self.delegate.trusted_stop_receipt(claim)
+        self._record_rejection("trusted_stop_receipt", result is None)
+        return result
+
+    async def recovery_preconditions(self, claim: Any) -> Any:
+        result = await self.delegate.recovery_preconditions(claim)
+        self._record_rejection("recovery_preconditions", result is None)
+        return result
+
+    async def stage_observation(self, **kwargs: Any) -> Any:
+        self.stage_attempted = True
+        result = await self.delegate.stage_observation(**kwargs)
+        self._record_rejection("stage_observation", result is None)
+        return result
+
+
 class LiveScenario:
     def __init__(self, run_id: str) -> None:
         from orchestrator.database.postgres import PostgresDB
@@ -771,45 +825,6 @@ class LiveScenario:
         )
         from shared.workspace_recovery import WorkspaceRecoveryCode
 
-        class StaleEvidenceStore(VMWorkspaceRecoveryStore):
-            """Record the exact production fence reached by the old leader."""
-
-            boundary_checked: asyncio.Event
-            rejected_boundary: str | None = None
-            stage_attempted = False
-
-            def __init__(self, *args: Any, **kwargs: Any) -> None:
-                super().__init__(*args, **kwargs)
-                self.boundary_checked = asyncio.Event()
-
-            def _record_rejection(self, boundary: str, result: Any) -> None:
-                if result is None and self.rejected_boundary is None:
-                    self.rejected_boundary = boundary
-                    self.boundary_checked.set()
-
-            async def accept_stop_evidence(
-                self, claim: Any, evidence: Mapping[str, Any]
-            ) -> Any:
-                result = await super().accept_stop_evidence(claim, evidence)
-                self._record_rejection("accept_stop_evidence", result)
-                return result
-
-            async def trusted_stop_receipt(self, claim: Any) -> Any:
-                result = await super().trusted_stop_receipt(claim)
-                self._record_rejection("trusted_stop_receipt", result)
-                return result
-
-            async def recovery_preconditions(self, claim: Any) -> Any:
-                result = await super().recovery_preconditions(claim)
-                self._record_rejection("recovery_preconditions", result)
-                return result
-
-            async def stage_observation(self, **kwargs: Any) -> Any:
-                self.stage_attempted = True
-                result = await super().stage_observation(**kwargs)
-                self._record_rejection("stage_observation", result)
-                return result
-
         disposition = await self._admit(
             identity=identity,
             lease_token=lease_token,
@@ -821,8 +836,12 @@ class LiveScenario:
             "SELECT deadline_at FROM vm_workspace_recoveries WHERE id=$1",
             disposition.operation_id,
         )
+        stale_claim_check = asyncio.Event()
         leader_a_store = StaleEvidenceStore(
-            self.db, worker_id=f"gate-leader-a:{self.run_id}"
+            VMWorkspaceRecoveryStore(
+                self.db, worker_id=f"gate-leader-a:{self.run_id}"
+            ),
+            claim_check_gate=stale_claim_check,
         )
         leader_b_store = VMWorkspaceRecoveryStore(
             self.db, worker_id=f"gate-leader-b:{self.run_id}"
@@ -935,6 +954,14 @@ class LiveScenario:
             )
             if handoff.get("claimed_by") != leader_b_identity:
                 raise AcceptanceFailure("second reconciler did not acquire the handoff")
+            # Let A perform its production claim-current check only after B has
+            # minted and durably owns the successor claim. This deterministically
+            # proves the exact fence that discards A's still-blocked probe.
+            stale_claim_check.set()
+            await asyncio.wait_for(
+                leader_a_store.boundary_checked.wait(),
+                timeout=self.settings.external_call_timeout_seconds,
+            )
             permit_sample = await self._row(
                 "SELECT count(*)::integer AS global_count,"
                 "count(DISTINCT node_key)::integer AS node_count "
@@ -973,10 +1000,6 @@ class LiveScenario:
             stale_barrier.release.set()
             await asyncio.wait_for(
                 stale_barrier.finished.wait(),
-                timeout=self.settings.external_call_timeout_seconds,
-            )
-            await asyncio.wait_for(
-                leader_a_store.boundary_checked.wait(),
                 timeout=self.settings.external_call_timeout_seconds,
             )
             stale_finished_at = await self._sql("SELECT clock_timestamp()")

@@ -300,19 +300,12 @@ def validate_acceptance_evidence(evidence: dict[str, Any]) -> None:
     )
     stale_store_boundary = overlap.get("stale_store_boundary")
     require(
-        stale_store_boundary
-        in {
-            "accept_stop_evidence",
-            "trusted_stop_receipt",
-            "recovery_preconditions",
-            "stage_observation",
-        }
+        stale_store_boundary == "claim_is_current"
         and overlap.get("stale_store_boundary_rejected") is True,
-        "stale leader result did not reach and fail a production store fence",
+        "stale leader result did not fail the production claim-current fence",
     )
     require(
-        overlap.get("stale_stage_attempted")
-        is (stale_store_boundary == "stage_observation"),
+        overlap.get("stale_stage_attempted") is False,
         "stale leader staging evidence contradicts its rejected boundary",
     )
     require(

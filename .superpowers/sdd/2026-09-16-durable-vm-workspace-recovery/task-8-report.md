@@ -396,3 +396,55 @@ SKIPPED: missing capability: binary:longhornctl, container-engine:k3d-docker-req
 
 The capable-cluster live matrix remains the only unexecuted verification; no
 mocked or inferred live PASS is claimed.
+
+## Review Fix Round 4
+
+The fourth review identified the exact point where the old leader is fenced.
+While A's controller observation is still blocked, production `_observe()`
+polls `claim_is_current()`. Once B owns the higher claim, that check returns
+false, cancels and gathers A's probe, and returns without calling any later
+stop-evidence or staging method. The previous gate waited for a later store
+boundary, so a capable live run would time out even though production rejected
+the stale work correctly.
+
+The focused regressions were written first and reported `2 failed`: the
+acceptance module did not expose an instrumentable store wrapper for the real
+`_observe()` path, and the outer validator rejected truthful
+`claim_is_current` evidence. The gate now holds A's claim check at a controlled
+barrier until the database proves B durably owns the successor claim, then
+delegates the check to the real store and records its false result. The
+production service cancels the delayed probe through its normal lost-claim
+path. Evidence requires `stale_store_boundary=claim_is_current`,
+`stale_store_boundary_rejected=true`, and `stale_stage_attempted=false`.
+An additional validator regression then failed `1 failed, 10 passed` while the
+old allowed-boundary set still accepted `recovery_preconditions`; it is GREEN
+after requiring the exact claim-current boundary.
+The validator rejects a later-boundary assertion because this controlled
+ordering must stop at the claim-current fence. The two leaders still use
+separate held PostgreSQL connections; their distinct positive
+`pg_backend_pid()` values and the advisory-lock exclusivity/transfer proof are
+unchanged.
+
+The new behavioral test drives `VMWorkspaceRecoveryService._observe()` with a
+blocked controller observer. It proves the store check cannot run before the
+controlled handoff, then observes the real false claim-current result, probe
+cancellation, no staging, and a final `None` after the delayed observer is
+released. Final verification:
+
+```text
+Focused recovery/acceptance/gate/Helm: 63 passed in 11.99s
+Required backend: 1055 passed, 11 skipped, 18 warnings in 134.05s
+Schema drift: 220 migrations replayed; artifacts are up to date
+```
+
+Ruff, `git diff --check`, the runtime-coordinate inventory, selector help, and
+gate help passed. The changed-file selector returned `ALL`. Read-only preflight
+again exited before any cluster mutation:
+
+```text
+SKIPPED: missing capability: binary:longhornctl, container-engine:k3d-docker-required, socket:/run/iscsid/socket, module:iscsi_tcp, file:disposable-values, image:guest-digest
+```
+
+This host still cannot execute the destructive KubeVirt/Longhorn matrix, so
+round 4 corrects the executable evidence contract without claiming a live
+cluster PASS.

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 import asyncio
+from datetime import datetime, timedelta, timezone
 import inspect
 from types import SimpleNamespace
 from unittest.mock import ANY
@@ -12,6 +13,8 @@ import pytest
 
 from orchestrator.services import vm_workspace_recovery_config as recovery_config
 from orchestrator.services.ssh_helpers import SSHHostKeyVerificationError
+from orchestrator.services.vm_workspace_recovery import VMWorkspaceRecoveryService
+from orchestrator.services.vm_workspace_recovery_store import RecoveryClaim
 from orchestrator.operator_cli.vm_workspace_recovery_acceptance import (
     CONFIRMATION,
     LiveScenario,
@@ -138,6 +141,57 @@ async def test_stale_observation_barrier_finishes_only_after_claim_handoff() -> 
     barrier.release.set()
     assert await task == {"owner_id": "job-1"}
     assert barrier.finished.is_set() is True
+
+
+@pytest.mark.asyncio
+async def test_stale_observe_records_claim_fence_before_discarding_late_result() -> None:
+    class Store:
+        worker_id = "gate-leader-a:test"
+
+        async def claim_is_current(self, _claim):
+            return False
+
+    class Observer:
+        async def observe_workspace_recovery(self, _identity):
+            return {"state": "ready"}
+
+    claim_check_gate = asyncio.Event()
+    store = acceptance.StaleEvidenceStore(
+        Store(), claim_check_gate=claim_check_gate
+    )
+    barrier = acceptance.RecoveryObservationBarrier(
+        Observer(), finish_after_cancellation=True
+    )
+    service = VMWorkspaceRecoveryService(
+        store,
+        barrier,
+        probe_timeout_seconds=1,
+        claim_poll_seconds=0.001,
+    )
+    claim = RecoveryClaim(
+        operation_id=acceptance.uuid4(),
+        version=2,
+        claim_token=7,
+        deadline_at=datetime.now(timezone.utc) + timedelta(minutes=15),
+        remaining_seconds=900,
+        captured_identity={"owner_kind": "job", "owner_id": str(acceptance.uuid4())},
+    )
+
+    task = asyncio.create_task(service._observe(claim))
+    await asyncio.wait_for(barrier.started.wait(), timeout=1)
+    await asyncio.sleep(0.01)
+    assert store.boundary_checked.is_set() is False
+
+    claim_check_gate.set()
+    await asyncio.wait_for(store.boundary_checked.wait(), timeout=1)
+    await asyncio.wait_for(barrier.cancelled.wait(), timeout=1)
+
+    assert store.rejected_boundary == "claim_is_current"
+    assert store.stage_attempted is False
+    assert task.done() is False
+
+    barrier.release.set()
+    assert await asyncio.wait_for(task, timeout=1) is None
 
 
 def test_deadline_gate_does_not_rewrite_the_immutable_deadline() -> None:
