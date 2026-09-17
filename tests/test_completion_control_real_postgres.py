@@ -69,6 +69,12 @@ async def pg(pg_dsn, _schema_applied):
 
 
 class _PoolDB:
+    _resolve_workspace_recovery_cancel_participant = staticmethod(
+        PostgresDB._resolve_workspace_recovery_cancel_participant
+    )
+    _emit_workspace_recovery_cancel = staticmethod(
+        PostgresDB._emit_workspace_recovery_cancel
+    )
     _queue_job_for_resume_on_conn = PostgresDB._queue_job_for_resume_on_conn
     _completion_resume_blocked_on_conn = PostgresDB._completion_resume_blocked_on_conn
     _UNSTICK_REVIEWING_SQL = PostgresDB._UNSTICK_REVIEWING_SQL
@@ -404,12 +410,16 @@ async def test_vm_lifecycle_retains_real_claim_for_ambiguous_teardown(pg):
 
     await manager.delete(listed, grace_s=0)
 
+    parent_cleanup = provisioner.release_vm_captured.await_args.kwargs["parent_cleanup"]
+    assert parent_cleanup["intent"]["owner_id"] == str(job_id)
+    assert parent_cleanup["intent"]["vm_uid"] == identity.vm_uid
     provisioner.release_vm_captured.assert_awaited_once_with(
         str(job_id),
         identity,
         purge_disk=True,
         entity_type="job",
         capture_snapshot=False,
+        parent_cleanup=parent_cleanup,
     )
     marker, db_now = await _claim_clock_snapshot(pg, job_id)
     assert marker["source"] == "lifecycle_vm_delete"

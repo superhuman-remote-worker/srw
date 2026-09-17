@@ -196,6 +196,22 @@ excluded_rules = [
 #                also raised are fixed rather than excluded: both CHECKs are
 #                now added NOT VALID and validated by app/0239, so this entry
 #                covers only the two deliberate nullability relaxations.
+#        - app/0251-0256: immutable recovery rollout shipped in 2a9f65a3;
+#                reviewed after develop run 35196885330 reported 43 findings.
+#                These only alter the recovery/cleanup ledgers introduced by
+#                0250/0252 in the same rollout, not jobs or other existing hot
+#                tables. 0251/0252/0254 widen phase/identity checks; 0253
+#                backfills the new intent digest before enforcing NOT NULL;
+#                0255 adds controller evidence with all-null initial shape;
+#                0256 atomically replaces uniqueness with parent/child fences.
+#                Their scans, volatile-default rewrite (0255), and ordinary
+#                index builds are confined to these new ledgers. Recovery is
+#                default-off. The runner wraps even files without explicit
+#                BEGIN in a transaction and records the checksum atomically,
+#                so partial retries cannot leave the unguarded DDL behind.
+#                Preserve shipped SQL bytes: retrofitting NOT VALID, IF EXISTS,
+#                or concurrent indexes would cause checksum drift. These are
+#                exact-file exceptions; future migrations retain all rules.
 excluded_paths = [
     "src/orchestrator/database/migrations/app/0001_initial.sql",
     "src/orchestrator/database/migrations/vector/0001_initial.sql",
@@ -215,5 +231,11 @@ excluded_paths = [
     "src/orchestrator/database/migrations/app/0204_ssh_attachments.sql",
     "src/orchestrator/database/migrations/app/0212_search_fetch_capabilities.sql",
     "src/orchestrator/database/migrations/app/0235_manifest_user_retirement.sql",
+    "src/orchestrator/database/migrations/app/0251_vm_workspace_recovery_attention_identity.sql",
+    "src/orchestrator/database/migrations/app/0252_vm_workspace_recovery_controls.sql",
+    "src/orchestrator/database/migrations/app/0253_vm_workspace_cleanup_intent.sql",
+    "src/orchestrator/database/migrations/app/0254_vm_workspace_recovery_reconciler.sql",
+    "src/orchestrator/database/migrations/app/0255_vm_workspace_recovery_controller_evidence.sql",
+    "src/orchestrator/database/migrations/app/0256_vm_workspace_cleanup_delegation.sql",
     "src/orchestrator/database/migrations/vector/0008_kb_index_chunking.sql",
 ]

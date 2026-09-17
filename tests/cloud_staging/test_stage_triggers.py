@@ -21,6 +21,8 @@ from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
 
+from tests._workspace_recovery_fakes import idle_recovery_store
+
 import pytest
 from fastapi import HTTPException
 
@@ -289,6 +291,7 @@ def _make_suspension_service(db):
         container_provisioner=container_provisioner,
         vm_provisioner=vm_provisioner,
     )
+    svc._workspace_recovery_store = idle_recovery_store()
     return svc, snapshot_service, container_provisioner
 
 

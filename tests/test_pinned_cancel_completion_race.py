@@ -28,6 +28,12 @@ pg = postgres_fixtures.pg
 class _RacingPostgres:
     """Use real status writes; cancel immediately before a selected mutation."""
 
+    _resolve_workspace_recovery_cancel_participant = staticmethod(
+        PostgresDB._resolve_workspace_recovery_cancel_participant
+    )
+    _emit_workspace_recovery_cancel = staticmethod(
+        PostgresDB._emit_workspace_recovery_cancel
+    )
     _queue_job_for_resume_on_conn = PostgresDB._queue_job_for_resume_on_conn
 
     def __init__(self, pool, job, *, race_at="update_job_status"):

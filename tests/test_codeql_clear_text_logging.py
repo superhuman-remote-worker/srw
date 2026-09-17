@@ -352,7 +352,16 @@ class TestVmControllerLogging:
         }
 
         ctrl = controller_mod.VMController.__new__(controller_mod.VMController)
-        ctrl._get_dv = AsyncMock(return_value={"status": {"phase": "Succeeded"}})
+        ctrl._list_workspace_cleanup_carriers = AsyncMock(return_value=())
+        dv = {"status": {"phase": "Succeeded"}}
+        ctrl._get_dv = AsyncMock(return_value=dv)
+        ctrl._exact_rootdisk_identity = AsyncMock(
+            return_value=(dv, {}, "dv-uid", "pvc-uid")
+        )
+        ctrl._active_recovery_pins = AsyncMock(return_value=())
+        ctrl._acquire_workspace_cleanup_reservation = AsyncMock(
+            return_value={"admission_id": "cleanup-admission"}
+        )
 
         with caplog.at_level(logging.DEBUG, logger=controller_mod.log.name):
             name = await ctrl._ensure_rootdisk(manifest, job_id)

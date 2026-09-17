@@ -207,7 +207,10 @@ def test_mode_controls_same_cluster_object_set(
     if expected:
         assert required <= kinds
         for doc in controller_docs:
-            assert doc["metadata"].get("namespace") == RELEASE_NAMESPACE
+            if doc["kind"] in {"ClusterRole", "ClusterRoleBinding"}:
+                assert "namespace" not in doc["metadata"]
+            else:
+                assert doc["metadata"].get("namespace") == RELEASE_NAMESPACE
     else:
         assert not controller_docs, f"{mode} unexpectedly rendered {kinds}"
 
@@ -300,6 +303,7 @@ def test_same_cluster_vm_and_cloud_init_contract() -> None:
         GUEST_ENV_PATH,
         "/run/agent/job-config.json",
         AUTHORIZED_KEYS_PATH,
+        "/usr/local/bin/srw-network-qualification",
     }
     assert "NATS_URL" not in cloud_init(rendered)
     assert "tailscale up" not in cloud_init(rendered)

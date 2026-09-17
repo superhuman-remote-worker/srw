@@ -4411,7 +4411,10 @@ async def test_pinned_vm_retirement_uses_credential_process_zero_release(db):
         purge_disk,
         entity_type,
         capture_snapshot,
+        parent_cleanup,
     ):
+        assert parent_cleanup["intent"]["owner_id"] == ids["thread"]
+        assert parent_cleanup["intent"]["vm_uid"] == vm_uid
         assert thread_id == ids["thread"]
         assert identity.provision_generation == generation
         assert identity.vm_uid == vm_uid
