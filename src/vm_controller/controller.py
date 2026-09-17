@@ -31,6 +31,7 @@ from collections.abc import Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 import hashlib
+import hmac
 import json
 import logging
 import os
@@ -40,7 +41,7 @@ import sys
 import time
 from datetime import datetime, timezone
 from typing import Literal
-from uuid import UUID
+from uuid import NAMESPACE_URL, UUID, uuid5
 
 import yaml
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -253,6 +254,28 @@ WORKSPACE_RECOVERY_PIN_LABEL = "srw.io/vm-workspace-recovery-pin"
 WORKSPACE_RECOVERY_ID_LABEL = "srw.io/recovery-id"
 WORKSPACE_RECOVERY_PVC_LABEL = "srw.io/recovery-pvc-uid"
 WORKSPACE_RECOVERY_GENERATION_LABEL = "srw.io/recovery-generation"
+WORKSPACE_CLEANUP_CARRIER_LABEL = "srw.io/vm-workspace-cleanup-carrier"
+_CLEANUP_ANNOTATIONS = {
+    "admission_id": "srw.io/cleanup-admission-id",
+    "request_id": "srw.io/cleanup-request-id",
+    "intent_digest": "srw.io/cleanup-intent-digest",
+    "owner_kind": "srw.io/cleanup-owner-kind",
+    "owner_id": "srw.io/cleanup-owner-id",
+    "source": "srw.io/cleanup-source",
+    "outcome": "srw.io/cleanup-outcome",
+    "name": "srw.io/cleanup-rootdisk-name",
+    "old_dv_uid": "srw.io/cleanup-old-dv-uid",
+    "old_pvc_uid": "srw.io/cleanup-old-pvc-uid",
+    "provision_generation": "srw.io/cleanup-generation",
+    "nonce": "srw.io/cleanup-nonce",
+    "successor_dv_uid": "srw.io/cleanup-successor-dv-uid",
+    "successor_pvc_uid": "srw.io/cleanup-successor-pvc-uid",
+}
+_CLEANUP_OUTCOMES = {
+    "controller_rootdisk_delete": "deleted",
+    "controller_failed_dv_recreate": "recreated",
+    "controller_rootdisk_adopt": "adopted",
+}
 WORKSPACE_RECOVERY_CONTROLLER_IDENTITY = os.environ.get(
     "POD_UID", os.environ.get("HOSTNAME", "vm-controller/unknown")
 )
@@ -840,6 +863,508 @@ class VMController:
         parsed = UUID(str(recovery_id))
         return f"srw-recovery-{parsed}"
 
+    async def _workspace_cleanup_authority_request(
+        self, path: str, payload: Mapping[str, object], *, operation: str
+    ) -> dict[str, object]:
+        """Call the database-backed cleanup authority over the lifecycle MAC."""
+
+        import httpx
+
+        if LIFECYCLE_HMAC_SECRET is None or not ORCHESTRATOR_URL:
+            raise RuntimeError("workspace cleanup authority is unavailable")
+        signed = sign_payload(
+            payload,
+            direction="request",
+            operation=operation,
+            secret=LIFECYCLE_HMAC_SECRET,
+        )
+        auth = signed.get(AUTH_FIELD)
+        request_id = auth.get("request_id") if isinstance(auth, Mapping) else None
+        if not isinstance(request_id, str):
+            raise RuntimeError("workspace cleanup authority request is malformed")
+        async with httpx.AsyncClient(base_url=ORCHESTRATOR_URL, timeout=10.0) as client:
+            response = await client.post(path, json=signed)
+        try:
+            value = response.json()
+        except ValueError as exc:
+            raise RuntimeError(
+                "workspace cleanup authority response is malformed"
+            ) from exc
+        if not isinstance(value, Mapping) or not verify_payload(
+            value,
+            direction="response",
+            operation=operation,
+            secret=LIFECYCLE_HMAC_SECRET,
+            expected_correlation_id=request_id,
+        ):
+            raise RuntimeError(
+                "workspace cleanup authority response is unauthenticated"
+            )
+        response.raise_for_status()
+        return dict(unsigned_payload(value))
+
+    @staticmethod
+    def _workspace_cleanup_carrier_name(admission_id: str) -> str:
+        return f"srw-cleanup-{UUID(str(admission_id)).hex}"
+
+    @staticmethod
+    def _workspace_cleanup_carrier_signature(
+        *, name: str, uid: str, values: Mapping[str, object]
+    ) -> str:
+        """Authenticate durable intent without the transport's message expiry."""
+        if LIFECYCLE_HMAC_SECRET is None:
+            raise RuntimeError("workspace cleanup carrier authentication unavailable")
+        payload = {
+            "domain": "srw-workspace-cleanup-carrier-v1",
+            "namespace": VM_NAMESPACE,
+            "name": name,
+            "uid": uid,
+            "values": {key: str(values.get(key) or "") for key in _CLEANUP_ANNOTATIONS},
+        }
+        return hmac.new(
+            LIFECYCLE_HMAC_SECRET,
+            json.dumps(payload, sort_keys=True, separators=(",", ":")).encode(),
+            hashlib.sha256,
+        ).hexdigest()
+
+    def _parse_workspace_cleanup_carrier(self, lease: object) -> dict[str, object]:
+        metadata = _object_value(lease, "metadata")
+        labels = _metadata_value(lease, "labels", {}) or {}
+        annotations = _metadata_value(lease, "annotations", {}) or {}
+        name = _metadata_value(lease, "name")
+        uid = _metadata_value(lease, "uid")
+        resource_version = _metadata_value(lease, "resourceVersion") or _metadata_value(
+            lease, "resource_version"
+        )
+        if (
+            metadata is None
+            or not isinstance(labels, Mapping)
+            or labels.get(WORKSPACE_CLEANUP_CARRIER_LABEL) != "true"
+            or not isinstance(annotations, Mapping)
+            or not isinstance(name, str)
+            or not isinstance(uid, str)
+            or not uid
+            or not isinstance(resource_version, str)
+            or not resource_version
+        ):
+            raise RuntimeError("workspace cleanup carrier metadata is incomplete")
+        carrier = {
+            key: str(annotations.get(annotation) or "")
+            for key, annotation in _CLEANUP_ANNOTATIONS.items()
+        }
+        signature = annotations.get("srw.io/cleanup-carrier-signature")
+        sealed = isinstance(signature, str) and bool(signature)
+        if not sealed:
+            # Initial creation is signed before Kubernetes assigns a UID. It
+            # cannot carry a successor; refresh seals the observed Lease UID
+            # before database revalidation or any disk effect.
+            signature = annotations.get("srw.io/cleanup-creation-signature")
+        if (
+            _metadata_value(lease, "namespace") != VM_NAMESPACE
+            or not isinstance(signature, str)
+            or (
+                not sealed
+                and (carrier["successor_dv_uid"] or carrier["successor_pvc_uid"])
+            )
+            or not hmac.compare_digest(
+                signature,
+                self._workspace_cleanup_carrier_signature(
+                    name=name, uid=uid if sealed else "", values=carrier
+                ),
+            )
+        ):
+            raise RuntimeError("workspace cleanup carrier authentication failed")
+        required = (
+            "admission_id",
+            "request_id",
+            "intent_digest",
+            "owner_kind",
+            "owner_id",
+            "source",
+            "outcome",
+            "name",
+            "old_dv_uid",
+            "old_pvc_uid",
+            "provision_generation",
+            "nonce",
+        )
+        if (
+            not all(carrier[key] for key in required)
+            or carrier["owner_kind"] not in _OWNER_KINDS
+            or _CLEANUP_OUTCOMES.get(carrier["source"]) != carrier["outcome"]
+            or not carrier["intent_digest"].startswith("sha256:")
+            or name != self._workspace_cleanup_carrier_name(carrier["admission_id"])
+        ):
+            raise RuntimeError("workspace cleanup carrier identity is malformed")
+        try:
+            UUID(carrier["admission_id"])
+            UUID(carrier["request_id"])
+            UUID(carrier["owner_id"])
+            UUID(carrier["nonce"])
+        except (TypeError, ValueError, AttributeError) as exc:
+            raise RuntimeError(
+                "workspace cleanup carrier identity is malformed"
+            ) from exc
+        if bool(carrier["successor_dv_uid"]) != bool(carrier["successor_pvc_uid"]):
+            raise RuntimeError("workspace cleanup successor binding is incomplete")
+        carrier.update(
+            {
+                "carrier_name": name,
+                "carrier_uid": uid,
+                "carrier_resource_version": resource_version,
+                "carrier_sealed": sealed,
+            }
+        )
+        return carrier
+
+    async def _ensure_workspace_cleanup_carrier(
+        self,
+        reservation: Mapping[str, object],
+        *,
+        source: str,
+        owner_kind: str,
+        owner_id: str,
+        pvc_uid: str,
+        dv_uid: str,
+        provision_generation: str,
+    ) -> dict[str, object]:
+        """Publish the durable Kubernetes half before returning DB authority."""
+
+        from kubernetes.client.exceptions import ApiException
+
+        admission_id = str(reservation.get("admission_id") or "")
+        request_id = str(reservation.get("request_id") or "")
+        intent_digest = str(reservation.get("intent_digest") or "")
+        if (
+            not admission_id
+            or not request_id
+            or not intent_digest.startswith("sha256:")
+            or source not in _CLEANUP_OUTCOMES
+        ):
+            raise RuntimeError("workspace cleanup reservation identity is incomplete")
+        carrier_name = self._workspace_cleanup_carrier_name(admission_id)
+        nonce = str(
+            uuid5(NAMESPACE_URL, f"srw-cleanup-carrier:{admission_id}:{request_id}")
+        )
+        values = {
+            "admission_id": admission_id,
+            "request_id": request_id,
+            "intent_digest": intent_digest,
+            "owner_kind": owner_kind,
+            "owner_id": owner_id,
+            "source": source,
+            "outcome": _CLEANUP_OUTCOMES[source],
+            "name": _rootdisk_name(owner_id),
+            "old_dv_uid": dv_uid,
+            "old_pvc_uid": pvc_uid,
+            "provision_generation": provision_generation,
+            "nonce": nonce,
+        }
+        body = {
+            "apiVersion": "coordination.k8s.io/v1",
+            "kind": "Lease",
+            "metadata": {
+                "name": carrier_name,
+                "namespace": VM_NAMESPACE,
+                "labels": {WORKSPACE_CLEANUP_CARRIER_LABEL: "true"},
+                "annotations": {
+                    _CLEANUP_ANNOTATIONS[key]: value for key, value in values.items()
+                },
+            },
+            "spec": {"holderIdentity": admission_id},
+        }
+        body["metadata"]["annotations"]["srw.io/cleanup-creation-signature"] = (
+            self._workspace_cleanup_carrier_signature(
+                name=carrier_name, uid="", values=values
+            )
+        )
+        try:
+            lease = await asyncio.to_thread(
+                self.coordination_api.create_namespaced_lease,
+                namespace=VM_NAMESPACE,
+                body=body,
+            )
+        except ApiException as exc:
+            if exc.status != 409:
+                raise RuntimeError("workspace cleanup carrier is unavailable") from exc
+            lease = await asyncio.to_thread(
+                self.coordination_api.read_namespaced_lease,
+                name=carrier_name,
+                namespace=VM_NAMESPACE,
+            )
+        # Kubernetes assigns the UID. Seal it with the complete intent before
+        # returning any destructive authority. A restart can authenticate the
+        # creation signature, seal the assigned UID, then revalidate the exact
+        # database reservation before any external effects.
+        annotations = _metadata_value(lease, "annotations", {}) or {}
+        if not annotations.get("srw.io/cleanup-carrier-signature"):
+            self._parse_workspace_cleanup_carrier(lease)
+            uid = _metadata_value(lease, "uid")
+            version = _metadata_value(lease, "resourceVersion") or _metadata_value(
+                lease, "resource_version"
+            )
+            if (
+                not uid
+                or not version
+                or any(
+                    annotations.get(_CLEANUP_ANNOTATIONS[key]) != value
+                    for key, value in values.items()
+                )
+            ):
+                raise RuntimeError("workspace cleanup carrier identity changed")
+            body["metadata"].update({"uid": uid, "resourceVersion": version})
+            body["metadata"]["annotations"].pop(
+                "srw.io/cleanup-creation-signature", None
+            )
+            body["metadata"]["annotations"]["srw.io/cleanup-carrier-signature"] = (
+                self._workspace_cleanup_carrier_signature(
+                    name=carrier_name, uid=uid, values=values
+                )
+            )
+            lease = await asyncio.to_thread(
+                self.coordination_api.replace_namespaced_lease,
+                name=carrier_name,
+                namespace=VM_NAMESPACE,
+                body=body,
+            )
+        carrier = self._parse_workspace_cleanup_carrier(lease)
+        if any(str(carrier[key]) != value for key, value in values.items()):
+            raise RuntimeError("workspace cleanup carrier identity changed")
+        return carrier
+
+    async def _list_workspace_cleanup_carriers(self) -> tuple[dict[str, object], ...]:
+        if self.coordination_api is None:
+            raise RuntimeError("workspace cleanup carrier authority is unavailable")
+        response = await asyncio.to_thread(
+            self.coordination_api.list_namespaced_lease,
+            namespace=VM_NAMESPACE,
+            label_selector=f"{WORKSPACE_CLEANUP_CARRIER_LABEL}=true",
+        )
+        items = _object_value(response, "items")
+        if items is None and isinstance(response, Mapping):
+            items = response.get("items")
+        if not isinstance(items, list):
+            raise RuntimeError("workspace cleanup carrier authority is malformed")
+        carriers = []
+        for item in items:
+            labels = _metadata_value(item, "labels", {}) or {}
+            if (
+                not isinstance(labels, Mapping)
+                or labels.get(WORKSPACE_CLEANUP_CARRIER_LABEL) != "true"
+            ):
+                continue
+            carrier = self._parse_workspace_cleanup_carrier(item)
+            if not carrier["carrier_sealed"]:
+                carrier = await self._refresh_workspace_cleanup_carrier(carrier)
+            carriers.append(carrier)
+        return tuple(carriers)
+
+    async def _find_workspace_cleanup_carrier(
+        self,
+        *,
+        owner_kind: str,
+        owner_id: str,
+        source: str,
+        name: str,
+    ) -> dict[str, object] | None:
+        matches = [
+            carrier
+            for carrier in await self._list_workspace_cleanup_carriers()
+            if carrier["owner_kind"] == owner_kind
+            and carrier["owner_id"] == owner_id
+            and carrier["source"] == source
+            and carrier["name"] == name
+        ]
+        if len(matches) > 1:
+            raise RuntimeError("workspace cleanup carrier identity is ambiguous")
+        return matches[0] if matches else None
+
+    async def _refresh_workspace_cleanup_carrier(
+        self, carrier: Mapping[str, object]
+    ) -> dict[str, object]:
+        try:
+            lease = await asyncio.to_thread(
+                self.coordination_api.read_namespaced_lease,
+                name=str(carrier["carrier_name"]),
+                namespace=VM_NAMESPACE,
+            )
+        except Exception as exc:
+            raise RuntimeError("workspace cleanup carrier is unavailable") from exc
+        current = self._parse_workspace_cleanup_carrier(lease)
+        for key, value in carrier.items():
+            if key in current and current[key] != value:
+                raise RuntimeError("workspace cleanup carrier identity changed")
+        if not current["carrier_sealed"]:
+            annotations = {
+                annotation: str(current[key])
+                for key, annotation in _CLEANUP_ANNOTATIONS.items()
+                if current.get(key)
+            }
+            annotations["srw.io/cleanup-carrier-signature"] = (
+                self._workspace_cleanup_carrier_signature(
+                    name=str(current["carrier_name"]),
+                    uid=str(current["carrier_uid"]),
+                    values=current,
+                )
+            )
+            body = {
+                "apiVersion": "coordination.k8s.io/v1",
+                "kind": "Lease",
+                "metadata": {
+                    "name": current["carrier_name"],
+                    "namespace": VM_NAMESPACE,
+                    "uid": current["carrier_uid"],
+                    "resourceVersion": current["carrier_resource_version"],
+                    "labels": {WORKSPACE_CLEANUP_CARRIER_LABEL: "true"},
+                    "annotations": annotations,
+                },
+                "spec": {"holderIdentity": current["admission_id"]},
+            }
+            lease = await asyncio.to_thread(
+                self.coordination_api.replace_namespaced_lease,
+                name=str(current["carrier_name"]),
+                namespace=VM_NAMESPACE,
+                body=body,
+            )
+            current = self._parse_workspace_cleanup_carrier(lease)
+        return current
+
+    async def _delete_workspace_cleanup_carrier(
+        self, carrier: Mapping[str, object]
+    ) -> None:
+        from kubernetes.client.exceptions import ApiException
+
+        try:
+            await asyncio.to_thread(
+                self.coordination_api.delete_namespaced_lease,
+                name=str(carrier["carrier_name"]),
+                namespace=VM_NAMESPACE,
+                body={
+                    "apiVersion": "v1",
+                    "kind": "DeleteOptions",
+                    "preconditions": {"uid": str(carrier["carrier_uid"])},
+                },
+            )
+        except ApiException as exc:
+            if exc.status != 404:
+                raise
+
+    async def _acquire_workspace_cleanup_reservation(
+        self,
+        *,
+        source: str,
+        owner_kind: str,
+        owner_id: str,
+        pvc_uid: str,
+        dv_uid: str,
+        provision_generation: str,
+        parent_cleanup: Mapping | None = None,
+        parent_provision_generation: str | None = None,
+        expected_vm_uid: str | None = None,
+    ) -> dict[str, object]:
+        identity = {
+            "source": source,
+            "owner_kind": owner_kind,
+            "owner_id": owner_id,
+            "pvc_uid": pvc_uid,
+            "dv_uid": dv_uid,
+            "provision_generation": provision_generation,
+        }
+        canonical = json.dumps(identity, sort_keys=True, separators=(",", ":"))
+        if parent_cleanup is not None:
+            canonical += ":parent:" + str(parent_cleanup.get("admission_id"))
+        request_id = str(uuid5(NAMESPACE_URL, f"srw-controller-cleanup:{canonical}"))
+        intent_digest = (
+            "sha256:"
+            + hashlib.sha256(
+                json.dumps(
+                    identity,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=True,
+                    default=str,
+                ).encode("utf-8")
+            ).hexdigest()
+        )
+        result = await self._workspace_cleanup_authority_request(
+            "/api/internal/vm-workspace-cleanup-authority/acquire",
+            {
+                **identity,
+                "request_id": request_id,
+                **(
+                    {
+                        "parent_cleanup": dict(parent_cleanup),
+                        "parent_provision_generation": parent_provision_generation,
+                        "expected_vm_uid": expected_vm_uid,
+                    }
+                    if parent_cleanup is not None
+                    else {}
+                ),
+            },
+            operation="recovery-cleanup-acquire",
+        )
+        if result.get("allowed") is not True:
+            raise RuntimeError(
+                "workspace cleanup is blocked by recovery authority: "
+                f"{result.get('reason') or 'refused'}"
+            )
+        if (
+            result.get("request_id") != request_id
+            or result.get("intent_digest") != intent_digest
+        ):
+            raise RuntimeError("workspace cleanup reservation identity changed")
+        admission_id = result.get("admission_id")
+        if not isinstance(admission_id, str) or not admission_id:
+            raise RuntimeError("workspace cleanup reservation was not acknowledged")
+        if result.get("completed_outcome") is None:
+            result["carrier"] = await self._ensure_workspace_cleanup_carrier(
+                result,
+                source=source,
+                owner_kind=owner_kind,
+                owner_id=owner_id,
+                pvc_uid=pvc_uid,
+                dv_uid=dv_uid,
+                provision_generation=provision_generation,
+            )
+        return result
+
+    async def _complete_workspace_cleanup_reservation(
+        self, carrier: Mapping[str, object], *, outcome: str
+    ) -> None:
+        if carrier.get("outcome") != outcome:
+            raise RuntimeError("workspace cleanup carrier outcome changed")
+        carrier = await self._refresh_workspace_cleanup_carrier(carrier)
+        result = await self._workspace_cleanup_authority_request(
+            "/api/internal/vm-workspace-cleanup-authority/complete",
+            {
+                "admission_id": str(carrier["admission_id"]),
+                "request_id": str(carrier["request_id"]),
+                "intent_digest": str(carrier["intent_digest"]),
+                "outcome": outcome,
+            },
+            operation="recovery-cleanup-complete",
+        )
+        if result.get("completed") is not True:
+            raise RuntimeError("workspace cleanup completion was not acknowledged")
+        await self._delete_workspace_cleanup_carrier(carrier)
+
+    async def _resume_workspace_cleanup_reservation(
+        self, carrier: Mapping[str, object]
+    ) -> dict[str, object]:
+        carrier = await self._refresh_workspace_cleanup_carrier(carrier)
+        return await self._workspace_cleanup_authority_request(
+            "/api/internal/vm-workspace-cleanup-authority/resume",
+            {
+                "admission_id": str(carrier["admission_id"]),
+                "request_id": str(carrier["request_id"]),
+                "intent_digest": str(carrier["intent_digest"]),
+                "source": str(carrier["source"]),
+                "owner_kind": str(carrier["owner_kind"]),
+                "owner_id": str(carrier["owner_id"]),
+            },
+            operation="recovery-cleanup-resume",
+        )
+
     async def _active_recovery_pins(self) -> tuple[dict[str, str], ...]:
         """Read the complete controller-side pin set or fail closed."""
 
@@ -860,6 +1385,10 @@ class VMController:
             labels = _metadata_value(item, "labels", {}) or {}
             if not isinstance(labels, Mapping):
                 raise RuntimeError("workspace recovery pin labels are malformed")
+            if labels.get(WORKSPACE_CLEANUP_CARRIER_LABEL) == "true":
+                continue
+            if labels.get(WORKSPACE_RECOVERY_PIN_LABEL) != "true":
+                continue
             pin = {
                 "recovery_id": str(labels.get(WORKSPACE_RECOVERY_ID_LABEL) or ""),
                 "pvc_uid": str(labels.get(WORKSPACE_RECOVERY_PVC_LABEL) or ""),
@@ -1814,10 +2343,19 @@ class VMController:
         # AFTER the clone mutation above — it lifts the template's dataVolume
         # spec as-is, clone source included.
         workspace_storage = job_config.get("workspace_storage")
+        rootdisk_reservation: dict[str, object] | None = None
         if workspace_storage is not None:
             await self._retained_storage().ensure(manifest, workspace_storage, job_id)
         elif VM_PERSISTENT_ROOTDISK:
-            await self._ensure_rootdisk(manifest, job_id, owner_kind=owner_kind)
+            await self._ensure_rootdisk(
+                manifest,
+                job_id,
+                owner_kind=owner_kind,
+                provision_generation=generation or "legacy",
+            )
+            candidate = manifest.pop("_srwRootdiskReservation", None)
+            if isinstance(candidate, dict):
+                rootdisk_reservation = candidate
 
         cloud_init_secret_created = False
         if cloud_init_user_data is not None:
@@ -1841,7 +2379,74 @@ class VMController:
         max_retries = 12  # ~60s total
         admitted_vm: object | None = None
         try:
+            if rootdisk_reservation is not None:
+                carrier = rootdisk_reservation.get("carrier")
+                if rootdisk_reservation.get("completed") is not True:
+                    if not isinstance(carrier, Mapping):
+                        raise RuntimeError(
+                            "workspace cleanup carrier was not published"
+                        )
+                    carrier = await self._refresh_workspace_cleanup_carrier(carrier)
+                    if (
+                        carrier["owner_kind"] != rootdisk_reservation["owner_kind"]
+                        or carrier["owner_id"] != rootdisk_reservation["owner_id"]
+                        or carrier["name"] != rootdisk_reservation["name"]
+                        or carrier["provision_generation"] != (generation or "legacy")
+                    ):
+                        raise RuntimeError(
+                            "workspace cleanup carrier generation or owner changed"
+                        )
+                    resumed = await self._resume_workspace_cleanup_reservation(carrier)
+                    if resumed.get("allowed") is not True:
+                        raise RuntimeError(
+                            "workspace cleanup reservation is no longer active"
+                        )
+                    if rootdisk_reservation["outcome"] == "recreated" and (
+                        carrier["successor_dv_uid"] != rootdisk_reservation["dv_uid"]
+                        or carrier["successor_pvc_uid"]
+                        != rootdisk_reservation["pvc_uid"]
+                    ):
+                        raise RuntimeError(
+                            "workspace cleanup successor binding changed"
+                        )
+                    if rootdisk_reservation["outcome"] == "adopted" and (
+                        carrier["old_dv_uid"] != rootdisk_reservation["dv_uid"]
+                        or carrier["old_pvc_uid"] != rootdisk_reservation["pvc_uid"]
+                    ):
+                        raise RuntimeError("workspace cleanup adopted identity changed")
+                    rootdisk_reservation["carrier"] = carrier
+                _, _, _, current_pvc_uid = await self._exact_rootdisk_identity(
+                    str(rootdisk_reservation["name"]),
+                    owner_kind=str(rootdisk_reservation["owner_kind"]),
+                    owner_id=str(rootdisk_reservation["owner_id"]),
+                    expected_dv_uid=str(rootdisk_reservation["dv_uid"]),
+                    expected_pvc_uid=str(rootdisk_reservation["pvc_uid"]),
+                )
+                if self._pvc_is_recovery_pinned(
+                    await self._active_recovery_pins(), current_pvc_uid
+                ):
+                    raise RuntimeError("rootdisk is pinned for workspace recovery")
+                if rootdisk_reservation.get("completed") is True:
+                    # The only safe replay of a completed adoption is the VM
+                    # admitted while that reservation was open. A later
+                    # recovery may begin after completion, so never perform a
+                    # new create from a completed permit.
+                    admitted_vm = await asyncio.to_thread(
+                        self.k8s_client.get_namespaced_custom_object,
+                        group=KUBEVIRT_GROUP,
+                        version=KUBEVIRT_VERSION,
+                        namespace=VM_NAMESPACE,
+                        plural=KUBEVIRT_PLURAL,
+                        name=vm_name,
+                    )
+                    replay_generation = _admitted_provision_generation(admitted_vm)
+                    if generation is not None and replay_generation != generation:
+                        raise RuntimeError(
+                            "completed rootdisk adoption has no exact admitted VM"
+                        )
             for attempt in range(max_retries + 1):
+                if admitted_vm is not None:
+                    break
                 try:
                     admitted_vm = await asyncio.to_thread(
                         self.k8s_client.create_namespaced_custom_object,
@@ -1929,6 +2534,26 @@ class VMController:
         if generation is not None and admitted_generation != generation:
             raise RuntimeError(
                 "Kubernetes admitted VM response has another provision generation"
+            )
+        if (
+            rootdisk_reservation is not None
+            and rootdisk_reservation.get("completed") is True
+            and isinstance(rootdisk_reservation.get("carrier"), Mapping)
+        ):
+            completed_carrier = await self._refresh_workspace_cleanup_carrier(
+                rootdisk_reservation["carrier"]
+            )
+            await self._delete_workspace_cleanup_carrier(completed_carrier)
+        if (
+            rootdisk_reservation is not None
+            and rootdisk_reservation.get("completed") is not True
+        ):
+            carrier = rootdisk_reservation.get("carrier")
+            if not isinstance(carrier, Mapping):
+                raise RuntimeError("workspace cleanup carrier was not published")
+            await self._complete_workspace_cleanup_reservation(
+                carrier,
+                outcome=str(rootdisk_reservation["outcome"]),
             )
 
         if workspace_storage is not None:
@@ -2019,11 +2644,13 @@ class VMController:
     async def _do_delete(
         self,
         job_id: str,
+        owner_kind: str = "job",
         purge_disk: bool = True,
         provision_generation: str | None = None,
         expected_vm_uid: str | None = None,
         expected_rootdisk_pvc_uid: str | None = None,
         workspace_storage: dict | None = None,
+        parent_cleanup: Mapping | None = None,
     ) -> dict:
         """Delete a KubeVirt VirtualMachine for a job.
 
@@ -2034,10 +2661,16 @@ class VMController:
         async with self._workspace_lifecycle(job_id):
             return await self._do_delete_serialized(
                 job_id,
+                owner_kind=owner_kind,
                 purge_disk=purge_disk,
                 provision_generation=provision_generation,
                 expected_vm_uid=expected_vm_uid,
                 expected_rootdisk_pvc_uid=expected_rootdisk_pvc_uid,
+                **(
+                    {"parent_cleanup": parent_cleanup}
+                    if parent_cleanup is not None
+                    else {}
+                ),
                 **(
                     {"workspace_storage": workspace_storage}
                     if workspace_storage is not None
@@ -2048,11 +2681,13 @@ class VMController:
     async def _do_delete_serialized(
         self,
         job_id: str,
+        owner_kind: str = "job",
         purge_disk: bool = True,
         provision_generation: str | None = None,
         expected_vm_uid: str | None = None,
         expected_rootdisk_pvc_uid: str | None = None,
         workspace_storage: dict | None = None,
+        parent_cleanup: Mapping | None = None,
     ) -> dict:
         """Delete while holding the reusable entity-name lifecycle lock.
 
@@ -2214,8 +2849,18 @@ class VMController:
                 ):
                     await self._delete_captured_rootdisk(
                         rootdisk,
+                        owner_kind=owner_kind,
                         owner_id=rootdisk_owner,
                         expected_pvc_uid=expected_rootdisk_pvc_uid,
+                        **(
+                            {
+                                "parent_cleanup": parent_cleanup,
+                                "provision_generation": generation,
+                                "expected_vm_uid": expected_vm_uid,
+                            }
+                            if parent_cleanup is not None
+                            else {}
+                        ),
                     )
             except Exception as e:
                 if expected_rootdisk_pvc_uid is not None:
@@ -2904,12 +3549,307 @@ class VMController:
                 return None
             raise
 
+    async def _exact_rootdisk_identity(
+        self,
+        name: str,
+        *,
+        owner_kind: str,
+        owner_id: str,
+        expected_pvc_uid: str | None = None,
+        expected_dv_uid: str | None = None,
+    ) -> tuple[dict, object, str, str]:
+        """Bind one reusable name to its exact DV/PVC ownership chain."""
+
+        dv = await self._get_dv(name)
+        metadata = dv.get("metadata") if isinstance(dv, Mapping) else None
+        labels = metadata.get("labels") if isinstance(metadata, Mapping) else None
+        dv_uid = (
+            _safe_uid(metadata.get("uid")) if isinstance(metadata, Mapping) else None
+        )
+        if (
+            not isinstance(metadata, Mapping)
+            or metadata.get("name") != name
+            or metadata.get("deletionTimestamp")
+            or not isinstance(labels, Mapping)
+            or labels.get("srw.io/owner-kind") != owner_kind
+            or labels.get("srw.io/owner-id") != owner_id
+            or dv_uid is None
+            or (expected_dv_uid is not None and dv_uid != expected_dv_uid)
+        ):
+            raise RuntimeError("rootdisk DataVolume identity is not exact")
+        known, pvc_uid = await self._rootdisk_pvc_probe(
+            name,
+            owner_id=owner_id,
+            owner_kind=owner_kind,
+            wait=False,
+        )
+        if (
+            not known
+            or pvc_uid is None
+            or (expected_pvc_uid is not None and pvc_uid != expected_pvc_uid)
+        ):
+            raise RuntimeError("rootdisk PVC identity is unknown")
+        try:
+            pvc = await asyncio.to_thread(
+                self.core_api.read_namespaced_persistent_volume_claim,
+                name=name,
+                namespace=VM_NAMESPACE,
+            )
+        except Exception as exc:
+            raise RuntimeError("rootdisk PVC identity is unknown") from exc
+        pvc_labels = _metadata_value(pvc, "labels", {}) or {}
+        if (
+            _metadata_value(pvc, "name") != name
+            or _metadata_value(pvc, "deletionTimestamp") is not None
+            or _metadata_value(pvc, "deletion_timestamp") is not None
+            or not isinstance(pvc_labels, Mapping)
+            or pvc_labels.get("srw.io/owner-kind") != owner_kind
+            or pvc_labels.get("srw.io/owner-id") != owner_id
+            or not _owned_by(pvc, kind="DataVolume", uid=dv_uid)
+        ):
+            raise RuntimeError("rootdisk PVC ownership is not exact")
+        return dv, pvc, dv_uid, pvc_uid
+
+    async def _cleanup_carrier_pvc(self, name: str) -> object | None:
+        from kubernetes.client.exceptions import ApiException
+
+        try:
+            return await asyncio.to_thread(
+                self.core_api.read_namespaced_persistent_volume_claim,
+                name=name,
+                namespace=VM_NAMESPACE,
+            )
+        except ApiException as exc:
+            if exc.status == 404:
+                return None
+            raise
+
+    def _validate_cleanup_carrier_pvc(
+        self, pvc: object, carrier: Mapping[str, object]
+    ) -> None:
+        labels = _metadata_value(pvc, "labels", {}) or {}
+        if (
+            _metadata_value(pvc, "name") != carrier["name"]
+            or _metadata_value(pvc, "uid") != carrier["old_pvc_uid"]
+            or not isinstance(labels, Mapping)
+            or labels.get("srw.io/owner-kind") != carrier["owner_kind"]
+            or labels.get("srw.io/owner-id") != carrier["owner_id"]
+            or not _owned_by(
+                pvc,
+                kind="DataVolume",
+                uid=str(carrier["old_dv_uid"]),
+            )
+        ):
+            raise RuntimeError("workspace cleanup carrier PVC identity changed")
+
+    async def _reconcile_cleanup_carrier_old_identity(
+        self,
+        carrier: Mapping[str, object],
+        *,
+        require_failed_dv: bool,
+    ) -> bool:
+        """Delete only the carrier's old immutable DV/PVC identities."""
+
+        name = str(carrier["name"])
+        dv = await self._get_dv(name)
+        if dv is not None:
+            metadata = dv.get("metadata") if isinstance(dv, Mapping) else None
+            labels = metadata.get("labels") if isinstance(metadata, Mapping) else None
+            if (
+                not isinstance(metadata, Mapping)
+                or metadata.get("name") != name
+                or _safe_uid(metadata.get("uid")) != carrier["old_dv_uid"]
+                or not isinstance(labels, Mapping)
+                or labels.get("srw.io/owner-kind") != carrier["owner_kind"]
+                or labels.get("srw.io/owner-id") != carrier["owner_id"]
+            ):
+                raise RuntimeError("workspace cleanup carrier DataVolume UID drifted")
+            if require_failed_dv and (
+                ((dv.get("status") or {}).get("phase") != "Failed")
+                and not metadata.get("deletionTimestamp")
+            ):
+                raise RuntimeError(
+                    "workspace cleanup old DataVolume is no longer Failed"
+                )
+        pvc = await self._cleanup_carrier_pvc(name)
+        if pvc is not None:
+            self._validate_cleanup_carrier_pvc(pvc, carrier)
+
+        if dv is not None:
+            await self._delete_dv(name, expected_uid=str(carrier["old_dv_uid"]))
+        if pvc is not None:
+            from kubernetes.client.exceptions import ApiException
+
+            try:
+                await asyncio.to_thread(
+                    self.core_api.delete_namespaced_persistent_volume_claim,
+                    name=name,
+                    namespace=VM_NAMESPACE,
+                    body={
+                        "apiVersion": "v1",
+                        "kind": "DeleteOptions",
+                        "preconditions": {"uid": str(carrier["old_pvc_uid"])},
+                    },
+                )
+            except ApiException as exc:
+                if exc.status != 404:
+                    raise
+
+        remaining_dv = await self._get_dv(name)
+        if remaining_dv is not None:
+            remaining_uid = _safe_uid((remaining_dv.get("metadata") or {}).get("uid"))
+            if remaining_uid != carrier["old_dv_uid"]:
+                raise RuntimeError("workspace cleanup carrier DataVolume UID drifted")
+            return False
+        remaining_pvc = await self._cleanup_carrier_pvc(name)
+        if remaining_pvc is not None:
+            if _metadata_value(remaining_pvc, "uid") != carrier["old_pvc_uid"]:
+                raise RuntimeError("workspace cleanup carrier PVC UID drifted")
+            return False
+        return True
+
+    async def _reconcile_workspace_cleanup_carrier(
+        self, carrier: Mapping[str, object]
+    ) -> bool:
+        async with self._workspace_lifecycle(str(carrier["owner_id"])):
+            carrier = await self._refresh_workspace_cleanup_carrier(carrier)
+            resumed = await self._resume_workspace_cleanup_reservation(carrier)
+            if resumed.get("allowed") is not True:
+                if resumed.get("completed_outcome") == carrier["outcome"]:
+                    if carrier["source"] == "controller_failed_dv_recreate":
+                        # Completion proves a VM was admitted, but the successor
+                        # DV still carries this carrier UID/nonce. Let the create
+                        # replay validate that exact DV and VM before removing
+                        # the only durable bridge back to the completed intent.
+                        return False
+                    await self._delete_workspace_cleanup_carrier(carrier)
+                    return True
+                raise RuntimeError("workspace cleanup carrier DB intent changed")
+            source = str(carrier["source"])
+            if source == "controller_rootdisk_delete":
+                absent = await self._reconcile_cleanup_carrier_old_identity(
+                    carrier, require_failed_dv=False
+                )
+                if absent:
+                    await self._complete_workspace_cleanup_reservation(
+                        carrier, outcome="deleted"
+                    )
+                    return True
+            elif source == "controller_failed_dv_recreate":
+                if carrier["successor_dv_uid"] and carrier["successor_pvc_uid"]:
+                    successor = await self._get_dv(str(carrier["name"]))
+                    annotations = ((successor or {}).get("metadata") or {}).get(
+                        "annotations"
+                    ) or {}
+                    if (
+                        not isinstance(annotations, Mapping)
+                        or annotations.get("srw.io/cleanup-carrier-uid")
+                        != carrier["carrier_uid"]
+                        or annotations.get(_CLEANUP_ANNOTATIONS["nonce"])
+                        != carrier["nonce"]
+                        or annotations.get(_PROVISION_GENERATION_ANNOTATION)
+                        != carrier["provision_generation"]
+                    ):
+                        raise RuntimeError(
+                            "workspace cleanup successor metadata changed"
+                        )
+                    await self._exact_rootdisk_identity(
+                        str(carrier["name"]),
+                        owner_kind=str(carrier["owner_kind"]),
+                        owner_id=str(carrier["owner_id"]),
+                        expected_dv_uid=str(carrier["successor_dv_uid"]),
+                        expected_pvc_uid=str(carrier["successor_pvc_uid"]),
+                    )
+                    return False
+                await self._reconcile_cleanup_carrier_old_identity(
+                    carrier, require_failed_dv=True
+                )
+            return False
+
+    async def _reconcile_workspace_cleanup_carriers(self) -> None:
+        for carrier in await self._list_workspace_cleanup_carriers():
+            try:
+                await self._reconcile_workspace_cleanup_carrier(carrier)
+            except Exception as exc:
+                log.warning(
+                    "workspace cleanup carrier %s reconciliation failed: %s",
+                    carrier["carrier_name"],
+                    exc,
+                )
+
+    async def _bind_workspace_cleanup_successor(
+        self,
+        carrier: Mapping[str, object],
+        *,
+        dv_uid: str,
+        pvc_uid: str,
+    ) -> dict[str, object]:
+        carrier = await self._refresh_workspace_cleanup_carrier(carrier)
+        if carrier["successor_dv_uid"] or carrier["successor_pvc_uid"]:
+            if (
+                carrier["successor_dv_uid"] != dv_uid
+                or carrier["successor_pvc_uid"] != pvc_uid
+            ):
+                raise RuntimeError("workspace cleanup successor identity changed")
+            return carrier
+        annotations = {
+            _CLEANUP_ANNOTATIONS[key]: str(carrier[key])
+            for key in _CLEANUP_ANNOTATIONS
+            if carrier.get(key)
+        }
+        annotations[_CLEANUP_ANNOTATIONS["successor_dv_uid"]] = dv_uid
+        annotations[_CLEANUP_ANNOTATIONS["successor_pvc_uid"]] = pvc_uid
+        annotations["srw.io/cleanup-carrier-signature"] = (
+            self._workspace_cleanup_carrier_signature(
+                name=str(carrier["carrier_name"]),
+                uid=str(carrier["carrier_uid"]),
+                values={
+                    **carrier,
+                    "successor_dv_uid": dv_uid,
+                    "successor_pvc_uid": pvc_uid,
+                },
+            )
+        )
+        body = {
+            "apiVersion": "coordination.k8s.io/v1",
+            "kind": "Lease",
+            "metadata": {
+                "name": str(carrier["carrier_name"]),
+                "namespace": VM_NAMESPACE,
+                "uid": str(carrier["carrier_uid"]),
+                "resourceVersion": str(carrier["carrier_resource_version"]),
+                "labels": {WORKSPACE_CLEANUP_CARRIER_LABEL: "true"},
+                "annotations": annotations,
+            },
+            "spec": {"holderIdentity": str(carrier["admission_id"])},
+        }
+        lease = await asyncio.to_thread(
+            self.coordination_api.replace_namespaced_lease,
+            name=str(carrier["carrier_name"]),
+            namespace=VM_NAMESPACE,
+            body=body,
+        )
+        bound = self._parse_workspace_cleanup_carrier(lease)
+        if (
+            bound["carrier_uid"] != carrier["carrier_uid"]
+            or bound["successor_dv_uid"] != dv_uid
+            or bound["successor_pvc_uid"] != pvc_uid
+        ):
+            raise RuntimeError(
+                "workspace cleanup successor binding was not acknowledged"
+            )
+        return bound
+
     async def _delete_captured_rootdisk(
         self,
         name: str,
         *,
+        owner_kind: str,
         owner_id: str,
         expected_pvc_uid: str,
+        parent_cleanup: Mapping | None = None,
+        provision_generation: str | None = None,
+        expected_vm_uid: str | None = None,
         _serialized: bool = False,
     ) -> None:
         """Purge only the rootdisk whose immutable PVC UID was captured."""
@@ -2918,48 +3858,78 @@ class VMController:
             async with self._workspace_lifecycle(owner_id):
                 return await self._delete_captured_rootdisk(
                     name,
+                    owner_kind=owner_kind,
                     owner_id=owner_id,
                     expected_pvc_uid=expected_pvc_uid,
+                    parent_cleanup=parent_cleanup,
+                    provision_generation=provision_generation,
+                    expected_vm_uid=expected_vm_uid,
                     _serialized=True,
                 )
 
         if self.core_api is None:
             raise RuntimeError("CoreV1Api is unavailable for captured rootdisk delete")
-        known, observed_uid = await self._rootdisk_pvc_probe(
-            name,
+        carried = await self._find_workspace_cleanup_carrier(
+            owner_kind=owner_kind,
             owner_id=owner_id,
-            owner_kind=None,
-            wait=False,
+            source="controller_rootdisk_delete",
+            name=name,
         )
-        if not known:
-            raise RuntimeError("captured rootdisk PVC identity is unknown")
-        if observed_uid != expected_pvc_uid:
-            raise RuntimeError("refusing to delete a superseded rootdisk PVC UID")
+        if carried is not None:
+            if carried["old_pvc_uid"] != expected_pvc_uid:
+                raise RuntimeError("captured rootdisk cleanup carrier identity changed")
+            if await self._reconcile_workspace_cleanup_carrier(carried):
+                return
+            raise RuntimeError("captured rootdisk cleanup is still reconciling")
+        dv, _pvc, dv_uid, observed_uid = await self._exact_rootdisk_identity(
+            name,
+            owner_kind=owner_kind,
+            owner_id=owner_id,
+            expected_pvc_uid=expected_pvc_uid,
+        )
         if self._pvc_is_recovery_pinned(
             await self._active_recovery_pins(), observed_uid
         ):
             raise RuntimeError("captured rootdisk is pinned for workspace recovery")
 
-        # Bind the reusable DataVolume name to the exact object observed beside
-        # the captured PVC, then use Kubernetes UID preconditions on both
-        # deletes.  The explicit PVC delete makes the captured storage fence
-        # authoritative even if CDI cascade cleanup is delayed.
-        dv = await self._get_dv(name)
-        dv_uid = None
-        if dv is not None:
-            metadata = dv.get("metadata") if isinstance(dv, Mapping) else None
-            labels = metadata.get("labels") if isinstance(metadata, Mapping) else None
-            if (
-                not isinstance(metadata, Mapping)
-                or not isinstance(labels, Mapping)
-                or labels.get("srw.io/owner-id") != owner_id
-                or labels.get("srw.io/owner-kind") not in _OWNER_KINDS
-            ):
-                raise RuntimeError("rootdisk DataVolume ownership is not exact")
-            dv_uid = _safe_uid(metadata.get("uid"))
-            if dv_uid is None:
-                raise RuntimeError("rootdisk DataVolume UID is unavailable")
-            await self._delete_dv(name, expected_uid=dv_uid)
+        metadata = dv.get("metadata") or {}
+        generation = str(
+            (metadata.get("annotations") or {}).get(_PROVISION_GENERATION_ANNOTATION)
+            or "unknown"
+        )
+        reservation = await self._acquire_workspace_cleanup_reservation(
+            source="controller_rootdisk_delete",
+            owner_kind=owner_kind,
+            owner_id=owner_id,
+            pvc_uid=observed_uid,
+            dv_uid=dv_uid,
+            provision_generation=generation,
+            **(
+                {
+                    "parent_cleanup": parent_cleanup,
+                    "parent_provision_generation": provision_generation,
+                    "expected_vm_uid": expected_vm_uid,
+                }
+                if parent_cleanup is not None
+                else {}
+            ),
+        )
+        if reservation.get("completed_outcome") == "deleted":
+            return
+        carrier = reservation.get("carrier")
+        if not isinstance(carrier, Mapping):
+            raise RuntimeError("workspace cleanup carrier was not published")
+
+        # The database reservation was acquired after the first Kubernetes
+        # read. Rebind the exact chain before crossing the delete boundary.
+        await self._exact_rootdisk_identity(
+            name,
+            owner_kind=owner_kind,
+            owner_id=owner_id,
+            expected_pvc_uid=expected_pvc_uid,
+            expected_dv_uid=dv_uid,
+        )
+        await self._delete_dv(name, expected_uid=dv_uid)
 
         from kubernetes.client.exceptions import ApiException
 
@@ -2977,6 +3947,11 @@ class VMController:
         except ApiException as exc:
             if exc.status != 404:
                 raise
+        if not await self._reconcile_cleanup_carrier_old_identity(
+            carrier, require_failed_dv=False
+        ):
+            raise RuntimeError("captured rootdisk cleanup is still reconciling")
+        await self._complete_workspace_cleanup_reservation(carrier, outcome="deleted")
 
     async def _delete_dv(self, name: str, *, expected_uid: str | None = None) -> None:
         """DELETE a CDI DataVolume (its PVC cascades); 404 is success."""
@@ -3186,6 +4161,7 @@ class VMController:
         job_id: str,
         *,
         owner_kind: str = "job",
+        provision_generation: str = "legacy",
         recovery_pins: tuple[dict[str, str], ...] | list[dict[str, str]] | None = None,
     ) -> str:
         """Detach the rootdisk from the VM object, creating it if absent.
@@ -3227,11 +4203,214 @@ class VMController:
         if isinstance(source_pvc, dict) and not source_pvc.get("namespace"):
             source_pvc["namespace"] = VM_NAMESPACE
 
+        async def reserve_existing(
+            expected_dv_uid: str | None = None,
+            expected_pvc_uid: str | None = None,
+            *,
+            source: str,
+            outcome: str,
+        ) -> tuple[dict, str, str, dict[str, object]]:
+            (
+                exact_dv,
+                _pvc,
+                exact_dv_uid,
+                exact_pvc_uid,
+            ) = await self._exact_rootdisk_identity(
+                name,
+                owner_kind=owner_kind,
+                owner_id=job_id,
+                expected_dv_uid=expected_dv_uid,
+                expected_pvc_uid=expected_pvc_uid,
+            )
+            pins = (
+                tuple(recovery_pins)
+                if recovery_pins is not None
+                else await self._active_recovery_pins()
+            )
+            if self._pvc_is_recovery_pinned(pins, exact_pvc_uid):
+                raise RuntimeError("rootdisk is pinned for workspace recovery")
+            annotations = (exact_dv.get("metadata") or {}).get("annotations") or {}
+            if isinstance(annotations, Mapping) and any(
+                annotations.get(key)
+                for key in (
+                    _CLEANUP_ANNOTATIONS["admission_id"],
+                    "srw.io/cleanup-carrier-uid",
+                    _CLEANUP_ANNOTATIONS["nonce"],
+                )
+            ):
+                raise RuntimeError(
+                    "rootdisk carries cleanup metadata without an exact carrier"
+                )
+            reservation = await self._acquire_workspace_cleanup_reservation(
+                source=source,
+                owner_kind=owner_kind,
+                owner_id=job_id,
+                pvc_uid=exact_pvc_uid,
+                dv_uid=exact_dv_uid,
+                provision_generation=provision_generation,
+            )
+            if reservation.get("completed_outcome") not in {None, outcome}:
+                raise RuntimeError("rootdisk reservation outcome changed")
+            return exact_dv, exact_dv_uid, exact_pvc_uid, reservation
+
+        # Settle an interrupted deletion before any same-name successor exists,
+        # even when periodic rootdisk garbage collection is disabled.
+        for carrier in await self._list_workspace_cleanup_carriers():
+            if (
+                carrier["owner_kind"] == owner_kind
+                and carrier["owner_id"] == job_id
+                and carrier["source"] == "controller_rootdisk_delete"
+            ):
+                if not await self._reconcile_workspace_cleanup_carrier(carrier):
+                    raise RuntimeError("rootdisk deletion is still reconciling")
         dv = await self._get_dv(name)
         phase = ((dv or {}).get("status") or {}).get("phase", "")
+        dv_annotations = ((dv or {}).get("metadata") or {}).get("annotations") or {}
+        replacement_carrier: dict[str, object] | None = None
+        if (
+            dv is None
+            or phase == "Failed"
+            or (
+                isinstance(dv_annotations, Mapping)
+                and (
+                    dv_annotations.get("srw.io/cleanup-carrier-uid")
+                    or dv_annotations.get(_CLEANUP_ANNOTATIONS["admission_id"])
+                )
+            )
+        ):
+            replacement_carrier = await self._find_workspace_cleanup_carrier(
+                owner_kind=owner_kind,
+                owner_id=job_id,
+                source="controller_failed_dv_recreate",
+                name=name,
+            )
+        if replacement_carrier is not None:
+            if replacement_carrier["provision_generation"] != provision_generation:
+                raise RuntimeError(
+                    "failed rootdisk recreation carrier generation changed"
+                )
+            resumed = await self._resume_workspace_cleanup_reservation(
+                replacement_carrier
+            )
+            recreation_completed = resumed.get("completed_outcome") == "recreated"
+            if resumed.get("allowed") is not True and not recreation_completed:
+                raise RuntimeError("failed rootdisk recreation carrier is unavailable")
+            successor_dv_uid = str(replacement_carrier.get("successor_dv_uid") or "")
+            successor_pvc_uid = str(replacement_carrier.get("successor_pvc_uid") or "")
+            if recreation_completed and (not successor_dv_uid or not successor_pvc_uid):
+                raise RuntimeError(
+                    "completed rootdisk recreation has no successor binding"
+                )
+            if dv is None:
+                if successor_dv_uid or successor_pvc_uid:
+                    raise RuntimeError(
+                        "failed rootdisk recreation successor disappeared"
+                    )
+                old_identity_absent = (
+                    await self._reconcile_cleanup_carrier_old_identity(
+                        replacement_carrier, require_failed_dv=True
+                    )
+                )
+                if not old_identity_absent:
+                    raise RuntimeError(
+                        "failed rootdisk recreation old identity is still deleting"
+                    )
+            else:
+                observed_dv_uid = _safe_uid(((dv.get("metadata") or {}).get("uid")))
+                if observed_dv_uid == replacement_carrier["old_dv_uid"]:
+                    if recreation_completed:
+                        raise RuntimeError(
+                            "completed rootdisk recreation still exposes old identity"
+                        )
+                    if phase != "Failed":
+                        raise RuntimeError(
+                            "failed rootdisk recreation old identity changed phase"
+                        )
+                    old_identity_absent = (
+                        await self._reconcile_cleanup_carrier_old_identity(
+                            replacement_carrier, require_failed_dv=True
+                        )
+                    )
+                    if not old_identity_absent:
+                        raise RuntimeError(
+                            "failed rootdisk recreation old identity is still deleting"
+                        )
+                    dv = None
+                else:
+                    annotations = (dv.get("metadata") or {}).get("annotations") or {}
+                    if (
+                        not isinstance(annotations, Mapping)
+                        or annotations.get("srw.io/cleanup-carrier-uid")
+                        != replacement_carrier["carrier_uid"]
+                        or annotations.get(_CLEANUP_ANNOTATIONS["nonce"])
+                        != replacement_carrier["nonce"]
+                        or annotations.get(_PROVISION_GENERATION_ANNOTATION)
+                        != provision_generation
+                    ):
+                        raise RuntimeError(
+                            "failed rootdisk recreation successor metadata changed"
+                        )
+                    (
+                        _,
+                        _,
+                        observed_dv_uid,
+                        observed_pvc_uid,
+                    ) = await self._exact_rootdisk_identity(
+                        name,
+                        owner_kind=owner_kind,
+                        owner_id=job_id,
+                        expected_dv_uid=(successor_dv_uid or None),
+                        expected_pvc_uid=(successor_pvc_uid or None),
+                    )
+                    if self._pvc_is_recovery_pinned(
+                        await self._active_recovery_pins(), observed_pvc_uid
+                    ):
+                        raise RuntimeError("rootdisk is pinned for workspace recovery")
+                    replacement_carrier = await self._bind_workspace_cleanup_successor(
+                        replacement_carrier,
+                        dv_uid=observed_dv_uid,
+                        pvc_uid=observed_pvc_uid,
+                    )
+                    manifest["_srwRootdiskReservation"] = {
+                        "name": name,
+                        "owner_kind": owner_kind,
+                        "owner_id": job_id,
+                        "dv_uid": observed_dv_uid,
+                        "pvc_uid": observed_pvc_uid,
+                        "admission_id": replacement_carrier["admission_id"],
+                        "completed": recreation_completed,
+                        "outcome": "recreated",
+                        "carrier": replacement_carrier,
+                    }
+                    return name
+            dv = None
+            manifest["_srwRootdiskReservation"] = {
+                "name": name,
+                "owner_kind": owner_kind,
+                "owner_id": job_id,
+                "dv_uid": replacement_carrier["old_dv_uid"],
+                "pvc_uid": replacement_carrier["old_pvc_uid"],
+                "admission_id": replacement_carrier["admission_id"],
+                "completed": False,
+                "outcome": "recreated",
+                "replacement": True,
+                "carrier": replacement_carrier,
+            }
         if dv and phase == "Succeeded":
-            # The recovery path: files are already there, and the ~3m27s clone
-            # is skipped entirely — recovery is faster than a fresh start.
+            dv, dv_uid, pvc_uid, reservation = await reserve_existing(
+                source="controller_rootdisk_adopt", outcome="adopted"
+            )
+            manifest["_srwRootdiskReservation"] = {
+                "name": name,
+                "owner_kind": owner_kind,
+                "owner_id": job_id,
+                "dv_uid": dv_uid,
+                "pvc_uid": pvc_uid,
+                "admission_id": reservation["admission_id"],
+                "completed": reservation.get("completed_outcome") == "adopted",
+                "outcome": reservation.get("_srw_outcome", "adopted"),
+                "carrier": reservation.get("carrier"),
+            }
             log.info("rootdisk reattach: %s (job %s)", log_name, job_id)
             return name
         if dv and phase == "Failed":
@@ -3241,47 +4420,66 @@ class VMController:
                 dv = await self._get_dv(name)
                 phase = ((dv or {}).get("status") or {}).get("phase", "")
                 if dv and phase == "Succeeded":
+                    dv, dv_uid, pvc_uid, reservation = await reserve_existing(
+                        source="controller_rootdisk_adopt", outcome="adopted"
+                    )
+                    manifest["_srwRootdiskReservation"] = {
+                        "name": name,
+                        "owner_kind": owner_kind,
+                        "owner_id": job_id,
+                        "dv_uid": dv_uid,
+                        "pvc_uid": pvc_uid,
+                        "admission_id": reservation["admission_id"],
+                        "completed": (
+                            reservation.get("completed_outcome") == "adopted"
+                        ),
+                        "outcome": reservation.get("_srw_outcome", "adopted"),
+                        "carrier": reservation.get("carrier"),
+                    }
                     return name
                 if dv and phase == "Failed":
-                    dv_metadata = dv.get("metadata") or {}
-                    dv_labels = dv_metadata.get("labels") or {}
-                    if (
-                        dv_metadata.get("name") != name
-                        or not isinstance(dv_labels, Mapping)
-                        or dv_labels.get("srw.io/owner-kind") != owner_kind
-                        or dv_labels.get("srw.io/owner-id") != job_id
-                    ):
-                        raise RuntimeError("failed rootdisk ownership is unknown")
-                    known, failed_pvc_uid = await self._rootdisk_pvc_probe(
-                        name,
-                        owner_id=job_id,
-                        owner_kind=owner_kind,
-                        wait=False,
+                    dv, dv_uid, failed_pvc_uid, reservation = await reserve_existing(
+                        source="controller_failed_dv_recreate", outcome="recreated"
                     )
-                    if not known or failed_pvc_uid is None:
+                    if reservation.get("completed_outcome") == "recreated":
                         raise RuntimeError(
-                            "failed rootdisk PVC identity is unknown; refusing recreation"
+                            "completed rootdisk recreation has not become observable"
                         )
-                    pins = (
-                        tuple(recovery_pins)
-                        if recovery_pins is not None
-                        else await self._active_recovery_pins()
-                    )
-                    if self._pvc_is_recovery_pinned(pins, failed_pvc_uid):
+                    carrier = reservation.get("carrier")
+                    if not isinstance(carrier, Mapping):
                         raise RuntimeError(
-                            "failed rootdisk is pinned for workspace recovery"
-                        )
-                    dv_uid = _safe_uid(dv_metadata.get("uid"))
-                    if dv_uid is None:
-                        raise RuntimeError(
-                            "failed rootdisk DataVolume identity is unknown"
+                            "workspace cleanup carrier was not published"
                         )
                     log.warning("rootdisk %s is Failed — recreating", log_name)
                     await self._delete_dv(name, expected_uid=dv_uid)
                     dv = None
+                    manifest["_srwRootdiskReservation"] = {
+                        "name": name,
+                        "owner_kind": owner_kind,
+                        "owner_id": job_id,
+                        "dv_uid": dv_uid,
+                        "pvc_uid": failed_pvc_uid,
+                        "admission_id": reservation["admission_id"],
+                        "completed": False,
+                        "outcome": "recreated",
+                        "replacement": True,
+                        "carrier": carrier,
+                    }
         if dv is not None:
-            # Importing / Pending / CloneScheduled — a racing create is already
-            # building it, and KubeVirt gates VMI start on DV readiness anyway.
+            dv, dv_uid, pvc_uid, reservation = await reserve_existing(
+                source="controller_rootdisk_adopt", outcome="adopted"
+            )
+            manifest["_srwRootdiskReservation"] = {
+                "name": name,
+                "owner_kind": owner_kind,
+                "owner_id": job_id,
+                "dv_uid": dv_uid,
+                "pvc_uid": pvc_uid,
+                "admission_id": reservation["admission_id"],
+                "completed": reservation.get("completed_outcome") == "adopted",
+                "outcome": reservation.get("_srw_outcome", "adopted"),
+                "carrier": reservation.get("carrier"),
+            }
             log.info("rootdisk %s in progress (%s) — adopting", log_name, phase or "?")
             return name
 
@@ -3313,6 +4511,21 @@ class VMController:
             # WaitForFirstConsumer so it binds on the VM's node.
             "spec": dvt.get("spec", {}),
         }
+        replacement_reservation = manifest.get("_srwRootdiskReservation")
+        if isinstance(replacement_reservation, Mapping) and replacement_reservation.get(
+            "replacement"
+        ):
+            carrier = replacement_reservation.get("carrier")
+            if not isinstance(carrier, Mapping):
+                raise RuntimeError("workspace cleanup carrier was not published")
+            body["metadata"]["annotations"] = {
+                "srw.io/cleanup-admission-id": str(
+                    replacement_reservation["admission_id"]
+                ),
+                "srw.io/cleanup-carrier-uid": str(carrier["carrier_uid"]),
+                _CLEANUP_ANNOTATIONS["nonce"]: str(carrier["nonce"]),
+                _PROVISION_GENERATION_ANNOTATION: provision_generation,
+            }
         try:
             await asyncio.to_thread(
                 self.k8s_client.create_namespaced_custom_object,
@@ -3327,6 +4540,33 @@ class VMController:
             if e.status != 409:
                 raise
             log.info("rootdisk %s already exists — adopting", log_name)
+        if isinstance(replacement_reservation, dict) and replacement_reservation.get(
+            "replacement"
+        ):
+            (
+                _,
+                _,
+                replacement_dv_uid,
+                replacement_pvc_uid,
+            ) = await self._exact_rootdisk_identity(
+                name,
+                owner_kind=owner_kind,
+                owner_id=job_id,
+            )
+            if replacement_dv_uid == str(
+                replacement_reservation["dv_uid"]
+            ) or replacement_pvc_uid == str(replacement_reservation["pvc_uid"]):
+                raise RuntimeError(
+                    "failed rootdisk replacement identity did not advance"
+                )
+            carrier = await self._bind_workspace_cleanup_successor(
+                replacement_reservation["carrier"],
+                dv_uid=replacement_dv_uid,
+                pvc_uid=replacement_pvc_uid,
+            )
+            replacement_reservation["dv_uid"] = replacement_dv_uid
+            replacement_reservation["pvc_uid"] = replacement_pvc_uid
+            replacement_reservation["carrier"] = carrier
         return name
 
     async def _gc_rootdisks_safe(self) -> None:
@@ -3348,6 +4588,11 @@ class VMController:
         disk looks orphaned, and this is a destructive sweep.
         """
         from kubernetes.client.exceptions import ApiException
+
+        # A prior pass may have deleted the exact DV/PVC and then lost the DB
+        # completion response. Carriers remain discoverable after the DV name
+        # disappears, so settle them before relying on the DV list.
+        await self._reconcile_workspace_cleanup_carriers()
 
         try:
             resp = await asyncio.to_thread(
@@ -3463,12 +4708,67 @@ class VMController:
                 if self._pvc_is_recovery_pinned(recovery_pins, pvc_uid):
                     continue
                 try:
-                    await self._delete_dv(name, expected_uid=dv_uid)
-                    log.warning(
-                        "rootdisk GC: deleted orphan %s (no VM for >%dh)",
-                        name,
-                        VM_ROOTDISK_ORPHAN_HOURS,
+                    reservation = await self._acquire_workspace_cleanup_reservation(
+                        source="controller_rootdisk_delete",
+                        owner_kind=str(owner_kind),
+                        owner_id=str(owner_id),
+                        pvc_uid=pvc_uid,
+                        dv_uid=dv_uid,
+                        provision_generation=str(
+                            (current_metadata.get("annotations") or {}).get(
+                                _PROVISION_GENERATION_ANNOTATION
+                            )
+                            or "unknown"
+                        ),
                     )
+                    if reservation.get("completed_outcome") == "deleted":
+                        continue
+                    carrier = reservation.get("carrier")
+                    if not isinstance(carrier, Mapping):
+                        raise RuntimeError(
+                            "workspace cleanup carrier was not published"
+                        )
+                    # Reservation acquisition crossed the database boundary.
+                    # Re-read both controller pin authority and the immutable
+                    # DV UID before deletion.
+                    if self._pvc_is_recovery_pinned(
+                        await self._active_recovery_pins(), pvc_uid
+                    ):
+                        continue
+                    after_reservation = await asyncio.to_thread(
+                        self.k8s_client.list_namespaced_custom_object,
+                        group=CDI_GROUP,
+                        version=CDI_VERSION,
+                        namespace=VM_NAMESPACE,
+                        plural=CDI_PLURAL,
+                        label_selector="srw.io/rootdisk",
+                    )
+                    rebound = [
+                        item
+                        for item in after_reservation.get("items", [])
+                        if (item.get("metadata") or {}).get("name") == name
+                        and _safe_uid((item.get("metadata") or {}).get("uid")) == dv_uid
+                    ]
+                    if len(rebound) != 1:
+                        continue
+                    await self._delete_dv(name, expected_uid=dv_uid)
+                    absent = await self._reconcile_cleanup_carrier_old_identity(
+                        carrier, require_failed_dv=False
+                    )
+                    if absent:
+                        await self._complete_workspace_cleanup_reservation(
+                            carrier, outcome="deleted"
+                        )
+                        log.warning(
+                            "rootdisk GC: deleted orphan %s (no VM for >%dh)",
+                            name,
+                            VM_ROOTDISK_ORPHAN_HOURS,
+                        )
+                    else:
+                        log.info(
+                            "rootdisk GC: deletion of %s is still reconciling",
+                            name,
+                        )
                 except Exception as e:
                     log.warning("rootdisk GC: delete %s failed: %s", name, e)
 
@@ -3621,6 +4921,10 @@ class VMController:
                 "purge_disk": data.get("purge_disk", True) is not False,
                 "provision_generation": data.get("provision_generation"),
             }
+            if data.get("entity_type") is not None:
+                delete_kwargs["owner_kind"] = data["entity_type"]
+            if data.get("parent_cleanup") is not None:
+                delete_kwargs["parent_cleanup"] = data["parent_cleanup"]
             if data.get("expected_vm_uid") is not None:
                 delete_kwargs["expected_vm_uid"] = data["expected_vm_uid"]
             if data.get("expected_rootdisk_pvc_uid") is not None:
@@ -3834,6 +5138,16 @@ class VMController:
                 "purge_disk": purge_disk,
                 "provision_generation": request.query.get("provision_generation"),
                 **(
+                    {"parent_cleanup": request.query["parent_cleanup"]}
+                    if "parent_cleanup" in request.query
+                    else {}
+                ),
+                **(
+                    {"entity_type": request.query["entity_type"]}
+                    if "entity_type" in request.query
+                    else {}
+                ),
+                **(
                     {"workspace_storage": request.query["workspace_storage"]}
                     if "workspace_storage" in request.query
                     else {}
@@ -3867,6 +5181,12 @@ class VMController:
                 "purge_disk": purge_disk,
                 "provision_generation": request_payload.get("provision_generation"),
             }
+            if request_payload.get("entity_type") is not None:
+                delete_kwargs["owner_kind"] = request_payload["entity_type"]
+            if request_payload.get("parent_cleanup") is not None:
+                delete_kwargs["parent_cleanup"] = json.loads(
+                    request_payload["parent_cleanup"]
+                )
             if request_payload.get("expected_vm_uid") is not None:
                 delete_kwargs["expected_vm_uid"] = request_payload["expected_vm_uid"]
             if request_payload.get("expected_rootdisk_pvc_uid") is not None:

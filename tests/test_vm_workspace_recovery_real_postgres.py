@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -199,6 +199,127 @@ async def insert_leased_job(
     return job_id, lease_token
 
 
+async def prepare_checkpoint_rows(
+    app_pg, job_id: UUID, *, checkpoint_count: int
+) -> None:
+    """Create the minimal LangGraph tables needed by checkpoint-prune races."""
+
+    async with app_pg.acquire() as conn:
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS checkpoints (
+                thread_id text NOT NULL,
+                checkpoint_ns text NOT NULL DEFAULT '',
+                checkpoint_id text NOT NULL,
+                PRIMARY KEY (thread_id, checkpoint_ns, checkpoint_id)
+            );
+            CREATE TABLE IF NOT EXISTS checkpoint_writes (
+                thread_id text NOT NULL,
+                checkpoint_ns text NOT NULL DEFAULT '',
+                checkpoint_id text NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS checkpoint_blobs (
+                thread_id text NOT NULL,
+                checkpoint_ns text NOT NULL DEFAULT '',
+                channel text NOT NULL,
+                version text NOT NULL
+            );
+            TRUNCATE checkpoint_writes, checkpoint_blobs, checkpoints;
+            """
+        )
+        await conn.executemany(
+            "INSERT INTO checkpoints (thread_id,checkpoint_ns,checkpoint_id) "
+            "VALUES ($1,'',$2)",
+            [(str(job_id), f"{index:04d}") for index in range(1, checkpoint_count + 1)],
+        )
+        await conn.executemany(
+            "INSERT INTO checkpoint_writes (thread_id,checkpoint_ns,checkpoint_id) "
+            "VALUES ($1,'',$2)",
+            [(str(job_id), f"{index:04d}") for index in range(1, checkpoint_count + 1)],
+        )
+        await conn.executemany(
+            "INSERT INTO checkpoint_blobs "
+            "(thread_id,checkpoint_ns,channel,version) VALUES ($1,'','state',$2)",
+            [(str(job_id), f"{index:04d}") for index in range(1, checkpoint_count + 1)],
+        )
+
+
+async def checkpoint_count(app_pg, job_id: UUID) -> int:
+    async with app_pg.acquire() as conn:
+        return int(
+            await conn.fetchval(
+                "SELECT count(*) FROM checkpoints WHERE thread_id=$1", str(job_id)
+            )
+        )
+
+
+async def checkpoint_row_counts(app_pg, job_id: UUID) -> tuple[int, int, int]:
+    async with app_pg.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT "
+            "(SELECT count(*) FROM checkpoint_writes WHERE thread_id=$1) AS writes,"
+            "(SELECT count(*) FROM checkpoint_blobs WHERE thread_id=$1) AS blobs,"
+            "(SELECT count(*) FROM checkpoints WHERE thread_id=$1) AS checkpoints",
+            str(job_id),
+        )
+    return int(row["writes"]), int(row["blobs"]), int(row["checkpoints"])
+
+
+async def checkpoint_cleanup_admissions(app_pg, job_id: UUID) -> list[asyncpg.Record]:
+    async with app_pg.acquire() as conn:
+        return list(
+            await conn.fetch(
+                "SELECT id,source,intent_digest,completed_at,outcome "
+                "FROM vm_workspace_cleanup_admissions "
+                "WHERE owner_kind='job' AND owner_id=$1 ORDER BY admitted_at,id",
+                job_id,
+            )
+        )
+
+
+async def wait_for_checkpoint_cleanup_admission(app_pg, job_id: UUID) -> None:
+    for _ in range(100):
+        async with app_pg.acquire() as conn:
+            admitted = await conn.fetchval(
+                "SELECT EXISTS (SELECT 1 FROM vm_workspace_cleanup_admissions "
+                "WHERE owner_kind='job' AND owner_id=$1 AND completed_at IS NULL)",
+                job_id,
+            )
+        if admitted:
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError("checkpoint cleanup did not publish its durable admission")
+
+
+async def checkpoint_cleanup_outcome(app_pg, job_id: UUID, source: str) -> str | None:
+    async with app_pg.acquire() as conn:
+        return await conn.fetchval(
+            "SELECT outcome FROM vm_workspace_cleanup_admissions "
+            "WHERE owner_kind='job' AND owner_id=$1 AND source=$2 "
+            "ORDER BY admitted_at DESC LIMIT 1",
+            job_id,
+            source,
+        )
+
+
+async def hold_checkpoint_row_lock(app_pg, job_id: UUID):
+    conn = await app_pg.acquire()
+    transaction = conn.transaction()
+    await transaction.start()
+    await conn.fetchrow(
+        "SELECT checkpoint_id FROM checkpoints WHERE thread_id=$1 "
+        "ORDER BY checkpoint_id LIMIT 1 FOR UPDATE",
+        str(job_id),
+    )
+    return conn, transaction
+
+
+def postgres_db(app_pg) -> PostgresDB:
+    db = PostgresDB.__new__(PostgresDB)
+    db.acquire = app_pg.acquire
+    return db
+
+
 @pytest.mark.asyncio
 async def test_recovery_hold_and_cleanup_admission_have_one_winner(app_pg) -> None:
     telemetry = CaptureTelemetry()
@@ -268,6 +389,37 @@ async def test_recovery_hold_and_cleanup_admission_have_one_winner(app_pg) -> No
     ]
     assert telemetry.calls[2]["accepted_lease_token"] == lease_token
     assert telemetry.calls[2]["hold_lease_token"] == lease_token + 1
+
+
+@pytest.mark.asyncio
+async def test_committed_hold_blocks_controller_cleanup_before_pin_publication(
+    app_pg,
+) -> None:
+    store = VMWorkspaceRecoveryStore(app_pg, worker_id="controller-boundary")
+    job_id, lease_token = await insert_leased_job(app_pg)
+    kwargs = admission_kwargs(job_id, lease_token)
+
+    admitted = await store.admit_hold(**kwargs)
+    async with app_pg.acquire() as conn:
+        assert not await conn.fetchval(
+            "SELECT controller_pinned_at IS NOT NULL "
+            "FROM vm_workspace_recovery_retention_pins WHERE recovery_id=$1",
+            admitted.operation_id,
+        )
+
+    cleanup = await store.acquire_cleanup_permit(
+        owner_kind="job",
+        owner_id=job_id,
+        pvc_uid=kwargs["root_pvc_uid"],
+        request_id=uuid4(),
+        source="controller_rootdisk_delete",
+        intent_digest="sha256:controller-delete-before-pin",
+        revalidate_completed=True,
+    )
+
+    assert not cleanup.allowed
+    assert cleanup.recovery_id == admitted.operation_id
+    assert cleanup.reason == "workspace_recovery_unresolved"
 
 
 @pytest.mark.asyncio
@@ -352,6 +504,171 @@ async def test_cleanup_replay_binds_keep_vs_purge_and_returns_completed_outcome(
     assert replay.admission_id == permit.admission_id
     assert replay.completed_outcome == "completed"
     assert replay.reason == "cleanup_request_already_completed"
+
+
+@pytest.mark.asyncio
+async def test_controller_cleanup_reservation_resumes_only_while_open(app_pg) -> None:
+    store = VMWorkspaceRecoveryStore(app_pg, worker_id="controller-boundary")
+    owner_id = uuid4()
+    request_id = uuid4()
+    intent_digest = "sha256:failed-dv-recreate-g1-old-dv-old-pvc"
+    permit = await store.acquire_cleanup_permit(
+        owner_kind="job",
+        owner_id=owner_id,
+        pvc_uid=uuid4(),
+        request_id=request_id,
+        source="controller_failed_dv_recreate",
+        intent_digest=intent_digest,
+    )
+    assert permit.allowed and permit.admission_id is not None
+
+    resumed = await store.resume_cleanup_permit(
+        permit.admission_id,
+        owner_kind="job",
+        owner_id=owner_id,
+        source="controller_failed_dv_recreate",
+        request_id=request_id,
+        intent_digest=intent_digest,
+    )
+    assert resumed.allowed and resumed.admission_id == permit.admission_id
+
+    changed_intent = await store.resume_cleanup_permit(
+        permit.admission_id,
+        owner_kind="job",
+        owner_id=owner_id,
+        source="controller_failed_dv_recreate",
+        request_id=request_id,
+        intent_digest="sha256:failed-dv-recreate-g2-old-dv-old-pvc",
+    )
+    assert not changed_intent.allowed
+    assert changed_intent.reason == "cleanup_reservation_changed"
+
+    assert await store.complete_cleanup_permit(
+        permit.admission_id,
+        outcome="recreated",
+        request_id=request_id,
+        intent_digest=intent_digest,
+    )
+    assert await store.complete_cleanup_permit(
+        permit.admission_id,
+        outcome="recreated",
+        request_id=request_id,
+        intent_digest=intent_digest,
+    )
+    assert not await store.complete_cleanup_permit(
+        permit.admission_id,
+        outcome="deleted",
+        request_id=request_id,
+        intent_digest=intent_digest,
+    )
+    assert not await store.complete_cleanup_permit(
+        permit.admission_id,
+        outcome="recreated",
+        request_id=request_id,
+        intent_digest="sha256:failed-dv-recreate-g2-old-dv-old-pvc",
+    )
+    completed = await store.resume_cleanup_permit(
+        permit.admission_id,
+        owner_kind="job",
+        owner_id=owner_id,
+        source="controller_failed_dv_recreate",
+        request_id=request_id,
+        intent_digest=intent_digest,
+    )
+    assert not completed.allowed
+    assert completed.reason == "cleanup_request_already_completed"
+    assert completed.completed_outcome == "recreated"
+
+
+@pytest.mark.asyncio
+async def test_nested_vm_cleanup_child_survives_parent_completion(app_pg) -> None:
+    from types import SimpleNamespace
+    from orchestrator.services.vm_workspace_recovery_store import (
+        acquire_vm_cleanup_permit,
+    )
+
+    store = VMWorkspaceRecoveryStore(app_pg)
+    owner_id, lease_token = await insert_leased_job(app_pg)
+    hold = admission_kwargs(owner_id, lease_token)
+    pvc_uid, generation = hold["root_pvc_uid"], hold["provision_generation"]
+    identity = SimpleNamespace(
+        provision_generation=str(generation),
+        vm_uid="vm-original",
+        rootdisk_pvc_uid=str(pvc_uid),
+    )
+    parent = await acquire_vm_cleanup_permit(
+        store,
+        owner_kind="job",
+        owner_id=owner_id,
+        identity=identity,
+        source="public_vm_delete",
+        purge_disk=True,
+    )
+    boundary = dict(
+        owner_kind="job",
+        owner_id=owner_id,
+        pvc_uid=pvc_uid,
+        parent_provision_generation=str(generation),
+        expected_vm_uid="vm-original",
+        source="controller_rootdisk_delete",
+        request_id=uuid4(),
+        intent_digest="sha256:exact-child-dv-pvc",
+    )
+    proof = parent.parent_cleanup
+    assert proof
+    child = await store.acquire_cleanup_permit(parent_cleanup=proof, **boundary)
+    assert child.allowed and child.admission_id != parent.admission_id
+    assert (
+        await store.acquire_cleanup_permit(parent_cleanup=proof, **boundary)
+    ).admission_id == child.admission_id
+    for field, value in (
+        ("owner_id", uuid4()),
+        ("pvc_uid", uuid4()),
+        ("parent_provision_generation", str(uuid4())),
+        ("expected_vm_uid", "vm-successor"),
+        ("source", "controller_rootdisk_adopt"),
+    ):
+        assert not (
+            await store.acquire_cleanup_permit(
+                parent_cleanup=proof, **{**boundary, field: value}
+            )
+        ).allowed
+    for field, value in (
+        ("source", "lifecycle_vm_delete"),
+        ("purge_disk", False),
+        ("resource", "checkpoint"),
+    ):
+        changed = {**proof, "intent": {**proof["intent"], field: value}}
+        assert not (
+            await store.acquire_cleanup_permit(parent_cleanup=changed, **boundary)
+        ).allowed
+    assert await store.complete_cleanup_permit(
+        parent.admission_id, outcome="identity_superseded"
+    )
+    # Existing child replay survives parent completion, but no new child does.
+    assert (
+        await store.acquire_cleanup_permit(parent_cleanup=proof, **boundary)
+    ).admission_id == child.admission_id
+    assert not (
+        await store.acquire_cleanup_permit(
+            parent_cleanup=proof, **{**boundary, "request_id": uuid4()}
+        )
+    ).allowed
+    with pytest.raises(
+        WorkspaceRecoveryControlConflict, match="crossed its admission boundary"
+    ):
+        await store.admit_hold(**hold)
+    competing = await store.acquire_cleanup_permit(
+        owner_kind="job",
+        owner_id=owner_id,
+        pvc_uid=pvc_uid,
+        request_id=uuid4(),
+        source="new-root",
+        intent_digest="new-root",
+    )
+    assert not competing.allowed
+    assert await store.complete_cleanup_permit(child.admission_id, outcome="deleted")
+    assert (await store.admit_hold(**hold)).operation_id is not None
 
 
 @pytest.mark.asyncio
@@ -446,6 +763,57 @@ async def test_retry_transfers_every_hold_and_pin_atomically_and_replays(
     assert sum(pin["released_at"] is None for pin in pins) == 1
     assert await store.claim_due(successor) is not None
     assert [call["event"] for call in telemetry.calls].count("retry") == 1
+
+
+@pytest.mark.asyncio
+async def test_retry_activates_successor_pin_before_predecessor_release(app_pg) -> None:
+    store = VMWorkspaceRecoveryStore(app_pg, worker_id="controller-sync")
+    job_id, lease_token = await insert_leased_job(app_pg)
+    kwargs = admission_kwargs(job_id, lease_token)
+    kwargs["code"] = WorkspaceRecoveryCode.TOOL_OUTCOME_UNKNOWN
+    original = await store.admit_hold(**kwargs)
+    original_command = (await store.list_retention_pin_commands())[0]
+    assert await store.acknowledge_retention_pin(
+        original_command,
+        {
+            "state": "active",
+            "recovery_id": str(original.operation_id),
+            "pvc_uid": str(original_command.pvc_uid),
+            "provision_generation": str(original_command.provision_generation),
+            "pin_uid": "predecessor-pin",
+            "resource_version": "1",
+        },
+    )
+    retried = await store.retry_paused(
+        job_id=job_id,
+        operation_id=original.operation_id,
+        request_id=uuid4(),
+        actor_kind="user",
+        actor_id="operator",
+    )
+    successor_id = UUID(retried["operation_id"])
+
+    commands = await store.list_retention_pin_commands()
+    assert [(command.recovery_id, command.desired_state) for command in commands] == [
+        (successor_id, "active")
+    ]
+    successor_command = commands[0]
+    assert await store.acknowledge_retention_pin(
+        successor_command,
+        {
+            "state": "active",
+            "recovery_id": str(successor_id),
+            "pvc_uid": str(successor_command.pvc_uid),
+            "provision_generation": str(successor_command.provision_generation),
+            "pin_uid": "successor-pin",
+            "resource_version": "2",
+        },
+    )
+
+    commands = await store.list_retention_pin_commands()
+    assert [(command.recovery_id, command.desired_state) for command in commands] == [
+        (original.operation_id, "released")
+    ]
 
 
 @pytest.mark.asyncio
@@ -758,6 +1126,445 @@ def admission_kwargs(
         "actor_id": "worker-a",
         "intent_digest": "sha256:intent",
     }
+
+
+@pytest.mark.asyncio
+async def test_terminal_checkpoint_prune_serializes_cleanup_before_recovery(
+    app_pg, monkeypatch
+) -> None:
+    """A hold cannot commit after the prune's check but before its delete."""
+
+    monkeypatch.setenv("CHECKPOINTER_BACKEND", "postgres")
+    job_id, lease_token = await insert_leased_job(app_pg)
+    await prepare_checkpoint_rows(app_pg, job_id, checkpoint_count=1)
+    blocker, blocker_tx = await hold_checkpoint_row_lock(app_pg, job_id)
+    db = postgres_db(app_pg)
+    store = VMWorkspaceRecoveryStore(app_pg, worker_id="recovery-racer")
+
+    prune_task = asyncio.create_task(db.delete_checkpoint_thread(str(job_id)))
+    hold_task = None
+    try:
+        await wait_for_checkpoint_cleanup_admission(app_pg, job_id)
+        hold_task = asyncio.create_task(
+            store.admit_hold(**admission_kwargs(job_id, lease_token))
+        )
+        await asyncio.sleep(0.1)
+        assert not hold_task.done(), "recovery crossed an active prune boundary"
+        hold_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await hold_task
+    finally:
+        await blocker_tx.commit()
+        await app_pg.release(blocker)
+        if hold_task is not None and not hold_task.done():
+            hold_task.cancel()
+        if not prune_task.done():
+            await prune_task
+
+    assert await prune_task == 3
+    assert await checkpoint_count(app_pg, job_id) == 0
+    assert (
+        await checkpoint_cleanup_outcome(app_pg, job_id, "terminal_checkpoint_prune")
+        == "completed"
+    )
+
+
+@pytest.mark.asyncio
+async def test_terminal_checkpoint_prune_serializes_recovery_before_cleanup(
+    app_pg, monkeypatch
+) -> None:
+    """A committed hold wins when pruning waited on the same owner lock."""
+
+    monkeypatch.setenv("CHECKPOINTER_BACKEND", "postgres")
+    job_id, lease_token = await insert_leased_job(app_pg)
+    await prepare_checkpoint_rows(app_pg, job_id, checkpoint_count=1)
+    db = postgres_db(app_pg)
+    store = VMWorkspaceRecoveryStore(app_pg, worker_id="recovery-winner")
+    conn = await app_pg.acquire()
+    transaction = conn.transaction()
+    await transaction.start()
+    try:
+        recovery = await store.admit_hold(
+            **admission_kwargs(job_id, lease_token), _conn=conn
+        )
+        prune_task = asyncio.create_task(
+            db.delete_checkpoint_thread(str(job_id), strict=True)
+        )
+        await asyncio.sleep(0.1)
+        assert not prune_task.done(), "prune bypassed the recovery owner lock"
+        await transaction.commit()
+    except BaseException:
+        await transaction.rollback()
+        raise
+    finally:
+        await app_pg.release(conn)
+
+    assert recovery.operation_id is not None
+    with pytest.raises(RuntimeError, match="blocked by workspace recovery authority"):
+        await prune_task
+    assert await checkpoint_count(app_pg, job_id) == 1
+
+
+@pytest.mark.asyncio
+async def test_global_checkpoint_prune_serializes_cleanup_before_recovery(
+    app_pg, monkeypatch
+) -> None:
+    """Global retention publishes authority before waiting on checkpoint I/O."""
+
+    monkeypatch.setenv("CHECKPOINTER_BACKEND", "postgres")
+    job_id, lease_token = await insert_leased_job(app_pg)
+    await prepare_checkpoint_rows(app_pg, job_id, checkpoint_count=3)
+    blocker, blocker_tx = await hold_checkpoint_row_lock(app_pg, job_id)
+    db = postgres_db(app_pg)
+    store = VMWorkspaceRecoveryStore(app_pg, worker_id="global-racer")
+
+    prune_task = asyncio.create_task(db.prune_checkpoints_keep_last(1))
+    hold_task = None
+    try:
+        await wait_for_checkpoint_cleanup_admission(app_pg, job_id)
+        hold_task = asyncio.create_task(
+            store.admit_hold(**admission_kwargs(job_id, lease_token))
+        )
+        await asyncio.sleep(0.1)
+        assert not hold_task.done(), "recovery crossed global retention deletion"
+        hold_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await hold_task
+    finally:
+        await blocker_tx.commit()
+        await app_pg.release(blocker)
+        if hold_task is not None and not hold_task.done():
+            hold_task.cancel()
+        if not prune_task.done():
+            await prune_task
+
+    assert await prune_task == 6
+    assert await checkpoint_count(app_pg, job_id) == 1
+    assert (
+        await checkpoint_cleanup_outcome(
+            app_pg, job_id, f"checkpoint_retention_prune:v1:thread:{job_id}:keep:1"
+        )
+        == "completed"
+    )
+
+
+@pytest.mark.asyncio
+async def test_global_checkpoint_prune_serializes_recovery_before_cleanup(
+    app_pg, monkeypatch
+) -> None:
+    """Global retention preserves every checkpoint of an unresolved recovery."""
+
+    monkeypatch.setenv("CHECKPOINTER_BACKEND", "postgres")
+    job_id, lease_token = await insert_leased_job(app_pg)
+    await prepare_checkpoint_rows(app_pg, job_id, checkpoint_count=3)
+    db = postgres_db(app_pg)
+    store = VMWorkspaceRecoveryStore(app_pg, worker_id="global-winner")
+    conn = await app_pg.acquire()
+    transaction = conn.transaction()
+    await transaction.start()
+    try:
+        recovery = await store.admit_hold(
+            **admission_kwargs(job_id, lease_token), _conn=conn
+        )
+        prune_task = asyncio.create_task(db.prune_checkpoints_keep_last(1))
+        await asyncio.sleep(0.1)
+        assert not prune_task.done(), "global prune bypassed recovery owner lock"
+        await transaction.commit()
+    except BaseException:
+        await transaction.rollback()
+        raise
+    finally:
+        await app_pg.release(conn)
+
+    assert recovery.operation_id is not None
+    assert await prune_task == 0
+    assert await checkpoint_count(app_pg, job_id) == 3
+
+
+@pytest.mark.asyncio
+async def test_terminal_checkpoint_prune_resumes_cancelled_open_admission(
+    app_pg, monkeypatch
+) -> None:
+    monkeypatch.setenv("CHECKPOINTER_BACKEND", "postgres")
+    job_id, _ = await insert_leased_job(app_pg)
+    await prepare_checkpoint_rows(app_pg, job_id, checkpoint_count=2)
+    blocker, blocker_tx = await hold_checkpoint_row_lock(app_pg, job_id)
+    db = postgres_db(app_pg)
+
+    prune_task = asyncio.create_task(db.delete_checkpoint_thread(str(job_id)))
+    try:
+        await wait_for_checkpoint_cleanup_admission(app_pg, job_id)
+        prune_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await prune_task
+    finally:
+        await blocker_tx.rollback()
+        await app_pg.release(blocker)
+
+    assert await checkpoint_row_counts(app_pg, job_id) == (2, 2, 2)
+    admissions = await checkpoint_cleanup_admissions(app_pg, job_id)
+    assert len(admissions) == 1
+    assert admissions[0]["completed_at"] is None
+
+    assert await db.delete_checkpoint_thread(str(job_id), strict=True) == 6
+    assert await checkpoint_row_counts(app_pg, job_id) == (0, 0, 0)
+    replayed = await checkpoint_cleanup_admissions(app_pg, job_id)
+    assert len(replayed) == 1
+    assert replayed[0]["id"] == admissions[0]["id"]
+    assert replayed[0]["outcome"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_global_checkpoint_prune_resumes_cancelled_generation_then_advances(
+    app_pg, monkeypatch
+) -> None:
+    monkeypatch.setenv("CHECKPOINTER_BACKEND", "postgres")
+    job_id, _ = await insert_leased_job(app_pg)
+    await prepare_checkpoint_rows(app_pg, job_id, checkpoint_count=5)
+    blocker, blocker_tx = await hold_checkpoint_row_lock(app_pg, job_id)
+    db = postgres_db(app_pg)
+
+    prune_task = asyncio.create_task(db.prune_checkpoints_keep_last(3))
+    try:
+        await wait_for_checkpoint_cleanup_admission(app_pg, job_id)
+        prune_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await prune_task
+    finally:
+        await blocker_tx.rollback()
+        await app_pg.release(blocker)
+
+    assert await checkpoint_row_counts(app_pg, job_id) == (5, 5, 5)
+    first = await checkpoint_cleanup_admissions(app_pg, job_id)
+    assert len(first) == 1 and first[0]["completed_at"] is None
+
+    # The changed policy first completes the durable keep-3 generation, then
+    # opens and applies keep-1 as a new generation in the same sweep.
+    assert await db.prune_checkpoints_keep_last(1) == 12
+    replayed = await checkpoint_cleanup_admissions(app_pg, job_id)
+    assert len(replayed) == 2
+    assert replayed[0]["id"] == first[0]["id"]
+    assert all(row["outcome"] == "completed" for row in replayed)
+    assert await checkpoint_row_counts(app_pg, job_id) == (1, 1, 1)
+
+    await prepare_checkpoint_rows(app_pg, job_id, checkpoint_count=4)
+    assert await db.prune_checkpoints_keep_last(1) == 9
+    generations = await checkpoint_cleanup_admissions(app_pg, job_id)
+    assert len(generations) == 3
+    assert all(row["outcome"] == "completed" for row in generations)
+
+
+@pytest.mark.asyncio
+async def test_orphan_uuid_checkpoints_prune_without_stranding_authority(
+    app_pg, monkeypatch
+):
+    monkeypatch.setenv("CHECKPOINTER_BACKEND", "postgres")
+    job_id = uuid4()
+    await prepare_checkpoint_rows(app_pg, job_id, checkpoint_count=3)
+    db = postgres_db(app_pg)
+    assert await db.prune_checkpoints_keep_last(1) == 6
+    assert await db.delete_checkpoint_thread(str(job_id), strict=True) == 3
+    assert await checkpoint_row_counts(app_pg, job_id) == (0, 0, 0)
+    assert all(
+        row["outcome"] == "completed"
+        for row in await checkpoint_cleanup_admissions(app_pg, job_id)
+    )
+
+
+@pytest.mark.asyncio
+async def test_retention_relaxed_policy_discovers_prior_generation(app_pg, monkeypatch):
+    monkeypatch.setenv("CHECKPOINTER_BACKEND", "postgres")
+    job_id, _ = await insert_leased_job(app_pg)
+    await prepare_checkpoint_rows(app_pg, job_id, checkpoint_count=3)
+    db = postgres_db(app_pg)
+    authority = await db._acquire_checkpoint_prune_authority(
+        str(job_id),
+        source=f"checkpoint_retention_prune:v1:thread:{job_id}:keep:1",
+        intent={"mode": "keep_last", "keep_n": 1},
+    )
+    assert authority.allowed
+    assert await db.prune_checkpoints_keep_last(5) == 6
+    assert all(
+        row["outcome"] == "completed"
+        for row in await checkpoint_cleanup_admissions(app_pg, job_id)
+    )
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_prune_refuses_mismatched_open_admission(
+    app_pg, monkeypatch
+) -> None:
+    monkeypatch.setenv("CHECKPOINTER_BACKEND", "postgres")
+    job_id, _ = await insert_leased_job(app_pg)
+    await prepare_checkpoint_rows(app_pg, job_id, checkpoint_count=3)
+    db = postgres_db(app_pg)
+    terminal = await db._acquire_checkpoint_prune_authority(
+        str(job_id),
+        source="terminal_checkpoint_prune",
+        intent={"mode": "delete_thread"},
+    )
+    assert terminal.allowed and terminal.admission_id is not None
+
+    assert await db.prune_checkpoints_keep_last(1) == 0
+    assert await checkpoint_row_counts(app_pg, job_id) == (3, 3, 3)
+    admissions = await checkpoint_cleanup_admissions(app_pg, job_id)
+    assert len(admissions) == 1
+    assert admissions[0]["id"] == terminal.admission_id
+    assert admissions[0]["completed_at"] is None
+
+    assert await db.delete_checkpoint_thread(str(job_id)) == 9
+    assert await checkpoint_row_counts(app_pg, job_id) == (0, 0, 0)
+
+
+@pytest.mark.parametrize("failure_table", ["checkpoint_writes", "checkpoint_blobs"])
+@pytest.mark.asyncio
+async def test_terminal_checkpoint_prune_rolls_back_statement_error_and_retries(
+    app_pg, monkeypatch, failure_table
+) -> None:
+    monkeypatch.setenv("CHECKPOINTER_BACKEND", "postgres")
+    job_id, _ = await insert_leased_job(app_pg)
+    await prepare_checkpoint_rows(app_pg, job_id, checkpoint_count=2)
+    db = postgres_db(app_pg)
+    async with app_pg.acquire() as conn:
+        await conn.execute(
+            """
+            CREATE OR REPLACE FUNCTION fail_checkpoint_prune() RETURNS trigger
+            LANGUAGE plpgsql AS $$ BEGIN
+                RAISE EXCEPTION 'injected checkpoint prune failure';
+            END $$
+            """
+        )
+        await conn.execute(
+            f"CREATE TRIGGER fail_checkpoint_prune_trigger BEFORE DELETE "
+            f"ON {failure_table} FOR EACH STATEMENT "
+            "EXECUTE FUNCTION fail_checkpoint_prune()"
+        )
+
+    try:
+        assert await db.delete_checkpoint_thread(str(job_id)) == 0
+        assert await checkpoint_row_counts(app_pg, job_id) == (2, 2, 2)
+        admissions = await checkpoint_cleanup_admissions(app_pg, job_id)
+        assert len(admissions) == 1
+        assert admissions[0]["completed_at"] is None
+    finally:
+        async with app_pg.acquire() as conn:
+            await conn.execute(
+                f"DROP TRIGGER IF EXISTS fail_checkpoint_prune_trigger "
+                f"ON {failure_table}"
+            )
+            await conn.execute("DROP FUNCTION IF EXISTS fail_checkpoint_prune()")
+
+    assert await db.delete_checkpoint_thread(str(job_id)) == 6
+    assert await checkpoint_row_counts(app_pg, job_id) == (0, 0, 0)
+    replayed = await checkpoint_cleanup_admissions(app_pg, job_id)
+    assert len(replayed) == 1
+    assert replayed[0]["id"] == admissions[0]["id"]
+    assert replayed[0]["outcome"] == "completed"
+
+
+@pytest.mark.parametrize("failure_table", ["checkpoints", "checkpoint_writes"])
+@pytest.mark.asyncio
+async def test_global_checkpoint_prune_rolls_back_statement_error_and_retries(
+    app_pg, monkeypatch, failure_table
+) -> None:
+    monkeypatch.setenv("CHECKPOINTER_BACKEND", "postgres")
+    job_id, _ = await insert_leased_job(app_pg)
+    await prepare_checkpoint_rows(app_pg, job_id, checkpoint_count=3)
+    db = postgres_db(app_pg)
+    async with app_pg.acquire() as conn:
+        await conn.execute(
+            """
+            CREATE OR REPLACE FUNCTION fail_checkpoint_prune() RETURNS trigger
+            LANGUAGE plpgsql AS $$ BEGIN
+                RAISE EXCEPTION 'injected checkpoint prune failure';
+            END $$
+            """
+        )
+        await conn.execute(
+            f"CREATE TRIGGER fail_checkpoint_prune_trigger BEFORE DELETE "
+            f"ON {failure_table} FOR EACH STATEMENT "
+            "EXECUTE FUNCTION fail_checkpoint_prune()"
+        )
+
+    try:
+        assert await db.prune_checkpoints_keep_last(1) == 0
+        assert await checkpoint_row_counts(app_pg, job_id) == (3, 3, 3)
+        admissions = await checkpoint_cleanup_admissions(app_pg, job_id)
+        assert len(admissions) == 1
+        assert admissions[0]["completed_at"] is None
+    finally:
+        async with app_pg.acquire() as conn:
+            await conn.execute(
+                f"DROP TRIGGER IF EXISTS fail_checkpoint_prune_trigger "
+                f"ON {failure_table}"
+            )
+            await conn.execute("DROP FUNCTION IF EXISTS fail_checkpoint_prune()")
+
+    assert await db.prune_checkpoints_keep_last(1) == 6
+    assert await checkpoint_row_counts(app_pg, job_id) == (1, 1, 1)
+    replayed = await checkpoint_cleanup_admissions(app_pg, job_id)
+    assert len(replayed) == 1
+    assert replayed[0]["id"] == admissions[0]["id"]
+    assert replayed[0]["outcome"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_terminal_checkpoint_prune_missing_table_uses_savepoint(
+    app_pg, monkeypatch
+) -> None:
+    monkeypatch.setenv("CHECKPOINTER_BACKEND", "postgres")
+    job_id, _ = await insert_leased_job(app_pg)
+    await prepare_checkpoint_rows(app_pg, job_id, checkpoint_count=2)
+    db = postgres_db(app_pg)
+    async with app_pg.acquire() as conn:
+        await conn.execute("DROP TABLE checkpoint_blobs")
+
+    assert await db.delete_checkpoint_thread(str(job_id)) == 4
+    async with app_pg.acquire() as conn:
+        assert (
+            await conn.fetchval(
+                "SELECT count(*) FROM checkpoint_writes WHERE thread_id=$1",
+                str(job_id),
+            )
+            == 0
+        )
+        assert (
+            await conn.fetchval(
+                "SELECT count(*) FROM checkpoints WHERE thread_id=$1", str(job_id)
+            )
+            == 0
+        )
+    admissions = await checkpoint_cleanup_admissions(app_pg, job_id)
+    assert len(admissions) == 1
+    assert admissions[0]["outcome"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_terminal_checkpoint_prune_batch_cap_rolls_back_and_retries(
+    app_pg, monkeypatch
+) -> None:
+    import orchestrator.database.postgres as postgres_module
+
+    monkeypatch.setenv("CHECKPOINTER_BACKEND", "postgres")
+    monkeypatch.setattr(postgres_module, "_CHECKPOINT_DELETE_BATCH", 2)
+    monkeypatch.setattr(postgres_module, "_CHECKPOINT_DELETE_MAX_BATCHES", 1)
+    job_id, _ = await insert_leased_job(app_pg)
+    await prepare_checkpoint_rows(app_pg, job_id, checkpoint_count=3)
+    db = postgres_db(app_pg)
+
+    assert await db.delete_checkpoint_thread(str(job_id)) == 0
+    assert await checkpoint_row_counts(app_pg, job_id) == (3, 3, 3)
+    admissions = await checkpoint_cleanup_admissions(app_pg, job_id)
+    assert len(admissions) == 1
+    assert admissions[0]["completed_at"] is None
+
+    monkeypatch.setattr(postgres_module, "_CHECKPOINT_DELETE_MAX_BATCHES", 2)
+    assert await db.delete_checkpoint_thread(str(job_id)) == 9
+    assert await checkpoint_row_counts(app_pg, job_id) == (0, 0, 0)
+    replayed = await checkpoint_cleanup_admissions(app_pg, job_id)
+    assert len(replayed) == 1
+    assert replayed[0]["id"] == admissions[0]["id"]
+    assert replayed[0]["outcome"] == "completed"
 
 
 def recovery_guest_network(challenge: str = "fresh-challenge") -> dict:
@@ -1197,6 +2004,14 @@ async def test_schema_rejects_unknown_phases_and_extended_deadlines(app_pg) -> N
 @pytest.mark.asyncio
 async def test_claim_due_enforces_four_global_durable_probe_slots(app_pg) -> None:
     recovery_ids = [await insert_recovery(app_pg, owner_id=uuid4()) for _ in range(5)]
+    async with app_pg.acquire() as conn:
+        for index, recovery_id in enumerate(recovery_ids):
+            await conn.execute(
+                "UPDATE vm_workspace_recoveries SET latest_observation=$2::jsonb "
+                "WHERE id=$1",
+                recovery_id,
+                json.dumps({"successor": {"node_uid": f"node-{index}"}}),
+            )
     stores = [
         VMWorkspaceRecoveryStore(app_pg, worker_id=f"reconciler-{index}")
         for index in range(5)
@@ -1245,6 +2060,21 @@ async def test_claim_due_enforces_one_durable_probe_per_known_node(app_pg) -> No
     assert (first_claim is None) != (second_claim is None)
     claimed = first_claim or second_claim
     assert claimed is not None and claimed.node_key == "node-8"
+
+
+@pytest.mark.asyncio
+async def test_claim_due_serializes_all_unknown_node_probes(app_pg) -> None:
+    first = await insert_recovery(app_pg, owner_id=uuid4())
+    second = await insert_recovery(app_pg, owner_id=uuid4())
+
+    first_claim, second_claim = await asyncio.gather(
+        VMWorkspaceRecoveryStore(app_pg, worker_id="leader-a").claim_due(first),
+        VMWorkspaceRecoveryStore(app_pg, worker_id="leader-b").claim_due(second),
+    )
+
+    assert (first_claim is None) != (second_claim is None)
+    claimed = first_claim or second_claim
+    assert claimed is not None and claimed.node_key == "unknown"
 
 
 @pytest.mark.asyncio

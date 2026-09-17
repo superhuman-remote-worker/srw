@@ -46,6 +46,7 @@ from orchestrator.services.vm_workspace_config import vm_provisioning_options
 from orchestrator.services.vm_workspace_recovery_store import (
     VMWorkspaceRecoveryStore,
     acquire_vm_cleanup_permit,
+    vm_cleanup_kwargs,
     completed_cleanup_outcome,
     complete_vm_cleanup_permit,
 )
@@ -999,6 +1000,7 @@ class WorkspaceSuspensionService:
                         purge_disk=not disk_survives_teardown,
                         capture_snapshot=False,
                         entity_type="job",
+                        **vm_cleanup_kwargs(cleanup),
                     )
                     if outcome.disposition in {"completed", "identity_superseded"}:
                         await complete_vm_cleanup_permit(

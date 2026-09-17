@@ -44,6 +44,8 @@ from orchestrator.services.ssh_helpers import orchestrator_can_reach
 from orchestrator.services.vm_provisioner import VMTeardownIdentity, VMTeardownResult
 from orchestrator.services.vm_workspace_recovery_store import (
     VMWorkspaceRecoveryStore,
+    bind_vm_cleanup_permit,
+    vm_cleanup_kwargs,
     cleanup_intent_digest,
     completed_cleanup_outcome,
 )
@@ -855,6 +857,7 @@ class VMInstanceManager:
                         purge_disk=purge_disk,
                         entity_type=owner_kind,
                         capture_snapshot=False,
+                        **vm_cleanup_kwargs(cleanup),
                     )
             if isinstance(
                 permit, LifecycleActionPermit
@@ -983,7 +986,10 @@ class VMInstanceManager:
                 else:
                     async with asyncio.timeout(LIFECYCLE_EXTERNAL_TIMEOUT_SECONDS):
                         outcome = await self._provisioner.delete_orphan_vm_captured(
-                            entity_id, identity, purge_disk=True
+                            entity_id,
+                            identity,
+                            purge_disk=True,
+                            **vm_cleanup_kwargs(cleanup),
                         )
                 if replayed is None and outcome.disposition in {
                     "completed",
@@ -1095,6 +1101,7 @@ class VMInstanceManager:
                                 purge_disk=True,
                                 entity_type="job",
                                 capture_snapshot=False,
+                                **vm_cleanup_kwargs(cleanup),
                             )
                     if replayed is None and outcome.disposition in {
                         "completed",
@@ -1150,7 +1157,10 @@ class VMInstanceManager:
                     else:
                         async with asyncio.timeout(LIFECYCLE_EXTERNAL_TIMEOUT_SECONDS):
                             outcome = await self._provisioner.release_vm_captured(
-                                str(job_id), identity, purge_disk=True
+                                str(job_id),
+                                identity,
+                                purge_disk=True,
+                                **vm_cleanup_kwargs(cleanup),
                             )
                     if replayed is None and outcome.disposition in {
                         "completed",
@@ -1214,6 +1224,16 @@ class VMInstanceManager:
             f"{source}:{owner_kind}:{owner_id}:{identity.provision_generation}:"
             f"{identity.vm_uid}:{identity.rootdisk_pvc_uid}",
         )
+        resource_intent = {
+            "owner_kind": owner_kind,
+            "owner_id": str(parsed_owner_id),
+            "provision_generation": identity.provision_generation,
+            "vm_uid": identity.vm_uid or "",
+            "pvc_uid": str(parsed_pvc_uid or ""),
+            "purge_disk": bool(purge_disk),
+            "resource": "vm_workspace",
+            "source": f"lifecycle_vm_{source}"[:64],
+        }
         try:
             cleanup = await self._workspace_recovery_store.acquire_cleanup_permit(
                 owner_kind=owner_kind,
@@ -1221,18 +1241,7 @@ class VMInstanceManager:
                 pvc_uid=parsed_pvc_uid,
                 request_id=request_id,
                 source=f"lifecycle_vm_{source}"[:64],
-                intent_digest=cleanup_intent_digest(
-                    {
-                        "owner_kind": owner_kind,
-                        "owner_id": str(parsed_owner_id),
-                        "provision_generation": identity.provision_generation,
-                        "vm_uid": identity.vm_uid or "",
-                        "pvc_uid": str(parsed_pvc_uid or ""),
-                        "purge_disk": bool(purge_disk),
-                        "resource": "vm_workspace",
-                        "source": f"lifecycle_vm_{source}"[:64],
-                    }
-                ),
+                intent_digest=cleanup_intent_digest(resource_intent),
             )
         except Exception:
             logger.exception(
@@ -1244,7 +1253,9 @@ class VMInstanceManager:
                 permit.skip("workspace_cleanup_admission_unavailable", settled=True)
             return None
         if cleanup.allowed:
-            return cleanup
+            return bind_vm_cleanup_permit(
+                cleanup, request_id=request_id, intent=resource_intent
+            )
         logger.info(
             "VM cleanup held for %s %s (%s)",
             owner_kind,

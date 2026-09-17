@@ -186,6 +186,7 @@ async def test_exact_deletion_tombstone_survives_controller_restart():
     assert not await service.delete(captured)
     service.controller._delete_captured_rootdisk.assert_awaited_once_with(
         storage_name(value),
+        owner_kind=value["owner_kind"],
         owner_id=value["owner_id"],
         expected_pvc_uid=pvc.metadata.uid,
     )

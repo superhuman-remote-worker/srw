@@ -32,6 +32,7 @@ from orchestrator.services.manifest_runtime_ownership import (
 )
 from orchestrator.services.vm_workspace_recovery_store import (
     acquire_vm_cleanup_permit,
+    vm_cleanup_kwargs,
     completed_cleanup_outcome,
     complete_vm_cleanup_permit,
 )
@@ -221,6 +222,7 @@ class JobControlOperations:
                 entity_type="job",
                 purge_disk=True,
                 capture_snapshot=False,
+                **vm_cleanup_kwargs(permit),
             )
             disposition = outcome.disposition
             if disposition in {"completed", "identity_superseded"}:

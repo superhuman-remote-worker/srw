@@ -98,6 +98,9 @@ GATE_NAMES = {
     # (orchestrator/security/vm_guest.py). Authenticated service boundary, no
     # user identity involved, so it classifies alongside require_internal.
     "require_vm_guest",
+    # Controller -> orchestrator lifecycle-HMAC boundary. The signature binds
+    # operation, body, timestamp and request/correlation IDs.
+    "require_vm_cleanup_authority",
     "user_can_access_any_job",
     "user_can_access_job",
     # job-first then thread-owner resolver — gates session citations whose
@@ -909,6 +912,7 @@ def _classify(
         "_dispatch_infrastructure_ingestion": 2,
         "require_internal": 2,
         "require_vm_guest": 2,
+        "require_vm_cleanup_authority": 2,
         "is_internal_call": 2,
         "require_approved_user": 3,
     }
@@ -922,6 +926,7 @@ def _classify(
         "_dispatch_infrastructure_ingestion",
         "require_internal",
         "require_vm_guest",
+        "require_vm_cleanup_authority",
         "is_internal_call",
     ):
         return f"internal:{primary}"

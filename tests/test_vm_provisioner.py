@@ -1514,8 +1514,9 @@ class TestCapturedVmTeardown:
         assert identity.rootdisk_pvc_uid == "late-root-uid"
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("parent_cleanup", [None, {"admission_id": "exact-parent"}])
     async def test_thread_capture_and_delete_use_exact_thread_generation(
-        self, provisioner_with_db, mock_db
+        self, provisioner_with_db, mock_db, parent_cleanup
     ):
         mock_db.get_thread.return_value = {
             "metadata": {
@@ -1544,7 +1545,7 @@ class TestCapturedVmTeardown:
         provisioner_with_db._delete_vm_with_identity = AsyncMock(return_value=True)
 
         outcome = await provisioner_with_db.delete_vm_captured(
-            "thread-1", identity, entity_type="thread"
+            "thread-1", identity, entity_type="thread", parent_cleanup=parent_cleanup
         )
 
         assert outcome.disposition == "completed"
@@ -1555,15 +1556,20 @@ class TestCapturedVmTeardown:
             expected_vm_uid="captured-vm-uid",
             expected_rootdisk_pvc_uid="captured-root-uid",
             entity_type="thread",
+            **(
+                {"parent_cleanup": parent_cleanup} if parent_cleanup is not None else {}
+            ),
         )
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("credential_runtime_started", [False, True])
+    @pytest.mark.parametrize("parent_cleanup", [None, {"admission_id": "exact-parent"}])
     async def test_release_records_process_zero_before_captured_delete(
         self,
         provisioner_with_db,
         mock_db,
         credential_runtime_started,
+        parent_cleanup,
     ):
         from orchestrator.services.vm_provisioner import (
             VMTeardownIdentity,
@@ -1602,6 +1608,7 @@ class TestCapturedVmTeardown:
                 "job-1",
                 identity,
                 capture_snapshot=False,
+                parent_cleanup=parent_cleanup,
             )
 
         assert (outcome.disposition, outcome.deleted) == ("completed", True)
@@ -1633,6 +1640,9 @@ class TestCapturedVmTeardown:
             identity,
             purge_disk=True,
             entity_type="job",
+            **(
+                {"parent_cleanup": parent_cleanup} if parent_cleanup is not None else {}
+            ),
         )
 
     @pytest.mark.asyncio

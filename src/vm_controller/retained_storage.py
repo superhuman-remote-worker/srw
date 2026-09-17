@@ -408,6 +408,7 @@ class RetainedStorage:
                     raise RuntimeError("Retained workspace PVC was replaced.")
                 await self.controller._delete_captured_rootdisk(
                     storage_name(binding),
+                    owner_kind=binding["owner_kind"],
                     owner_id=binding["owner_id"],
                     expected_pvc_uid=expected_uid,
                 )

@@ -68,6 +68,7 @@ from orchestrator.services.session_runtime_admission import (
 )
 from orchestrator.services.vm_workspace_recovery_store import (
     acquire_vm_cleanup_permit,
+    vm_cleanup_kwargs,
     completed_cleanup_outcome,
     complete_vm_cleanup_permit,
 )
@@ -456,6 +457,7 @@ async def agent_abort_thread_vm_upgrade(
                     entity_type="thread",
                     purge_disk=True,
                     capture_snapshot=False,
+                    **vm_cleanup_kwargs(cleanup),
                 )
                 disposition = outcome.disposition
                 if disposition in {"completed", "identity_superseded"}:

@@ -167,6 +167,35 @@ async def test_shared_cockpit_fixture_is_actual_serialized_list_json(wire):
 
 
 @pytest.mark.asyncio
+async def test_list_retry_action_is_only_projected_for_canonical_recovery_owner(wire):
+    recovery = {
+        "operation_id": "44444444-4444-4444-8444-444444444444",
+        "state": "paused_attention",
+        "reason_code": "prior_runtime_unfenced",
+        "started_at": "2026-09-16T08:00:00Z",
+        "deadline_at": "2026-09-16T08:15:00Z",
+        "next_check_at": None,
+    }
+    wire.result.jobs = [
+        row(_workspace_recovery={**recovery, "canonical_owner": True}),
+        row(
+            id=UUID(CHILD),
+            parent_job_id=UUID(JOB),
+            is_display_root=False,
+            _workspace_recovery={**recovery, "canonical_owner": False},
+        ),
+    ]
+
+    response = await get(wire)
+
+    assert response.status_code == 200
+    owner, child = response.json()["jobs"]
+    assert owner["workspace_recovery"]["retryable"] is True
+    assert child["workspace_recovery"]["retryable"] is False
+    assert "canonical_owner" not in json.dumps(response.json())
+
+
+@pytest.mark.asyncio
 async def test_default_query_echo_and_watermark_round_trip_without_count(wire):
     before = datetime.now(timezone.utc)
     first = await get(wire)

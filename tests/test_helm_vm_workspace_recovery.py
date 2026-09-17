@@ -42,6 +42,15 @@ def _orchestrator(documents: list[dict]) -> dict:
     )
 
 
+def _stateless_agent(documents: list[dict]) -> dict:
+    return next(
+        document
+        for document in documents
+        if document.get("kind") == "Deployment"
+        and document["metadata"]["name"].endswith("-agent-stateless")
+    )
+
+
 def _env(documents: list[dict], deployment: dict) -> dict[str, str]:
     config_maps = {
         document["metadata"]["name"]: document.get("data", {})
@@ -103,16 +112,25 @@ def test_workspace_recovery_defaults_render_safe_bounded_runtime() -> None:
     }
 
 
-def test_workspace_recovery_settings_roll_orchestrator_and_preserve_separate_gates() -> (
-    None
-):
-    default_documents = render()
-    enabled_documents = render("orchestrator.vmWorkspaceRecovery.enabled=true")
+def test_workspace_recovery_settings_roll_orchestrator_and_stateless_agents() -> None:
+    default_documents = render("agent.stateless.enabled=true")
+    enabled_documents = render(
+        "agent.stateless.enabled=true",
+        "orchestrator.vmWorkspaceRecovery.enabled=true",
+    )
     replacement_documents = render(
+        "agent.stateless.enabled=true",
         "orchestrator.vmWorkspaceRecovery.enabled=true",
         "orchestrator.vmWorkspaceRecovery.replacementEnabled=true",
     )
-    tuned_documents = render("orchestrator.vmWorkspaceRecovery.maxGlobalProbes=3")
+    tuned_documents = render(
+        "agent.stateless.enabled=true",
+        "orchestrator.vmWorkspaceRecovery.maxGlobalProbes=3",
+    )
+    unrelated_documents = render(
+        "agent.stateless.enabled=true",
+        "agent.stateless.replicas=3",
+    )
     default = _orchestrator(default_documents)
     enabled = _orchestrator(enabled_documents)
     replacement = _orchestrator(replacement_documents)
@@ -143,6 +161,30 @@ def test_workspace_recovery_settings_roll_orchestrator_and_preserve_separate_gat
             "VM_WORKSPACE_REPLACEMENT_RECOVERY_ENABLED"
         ]
         == "true"
+    )
+
+    def stateless_checksum(documents: list[dict]) -> str:
+        return _stateless_agent(documents)["spec"]["template"]["metadata"][
+            "annotations"
+        ]["checksum/vm-workspace-recovery"]
+
+    assert stateless_checksum(default_documents) != stateless_checksum(
+        enabled_documents
+    )
+    assert stateless_checksum(default_documents) != stateless_checksum(
+        replacement_documents
+    )
+    assert stateless_checksum(default_documents) != stateless_checksum(tuned_documents)
+    assert stateless_checksum(default_documents) == stateless_checksum(
+        unrelated_documents
+    )
+    assert (
+        _stateless_agent(default_documents)["spec"]["template"]["spec"]["containers"][
+            0
+        ]["command"]
+        == _stateless_agent(enabled_documents)["spec"]["template"]["spec"][
+            "containers"
+        ][0]["command"]
     )
 
 

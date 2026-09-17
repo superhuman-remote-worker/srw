@@ -221,6 +221,9 @@ POST   /api/internal/ssh-attachments                                            
 POST   /api/internal/ssh-attachments/{attachment_id}/close                              gated:user_can_access_ide_entity
 POST   /api/internal/ssh-keys/used                                                      internal:require_internal
 GET    /api/internal/ssh-targets/{handle}                                               gated:user_can_access_ide_entity
+POST   /api/internal/vm-workspace-cleanup-authority/acquire                             internal:require_vm_cleanup_authority
+POST   /api/internal/vm-workspace-cleanup-authority/complete                            internal:require_vm_cleanup_authority
+POST   /api/internal/vm-workspace-cleanup-authority/resume                              internal:require_vm_cleanup_authority
 POST   /api/internal/vm/{entity_id}/heartbeat                                           internal:require_vm_guest
 POST   /api/internal/vm/{entity_id}/register                                            internal:require_vm_guest
 POST   /api/internal/vm/{entity_id}/sudo                                                internal:require_vm_guest

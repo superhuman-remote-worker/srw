@@ -147,6 +147,64 @@ _DOCKER_WORKSPACE_TRANSITION_PRESERVED_FIELDS = _DOCKER_WORKSPACE_PRESERVED_FIEL
 # prune insensitive to row count. The max-batches value is a runaway guard.
 _CHECKPOINT_DELETE_BATCH = 1000
 _CHECKPOINT_DELETE_MAX_BATCHES = 1000
+_CHECKPOINT_RETENTION_SOURCE_PREFIX = "checkpoint_retention_prune:v1:"
+_CHECKPOINT_RETENTION_SOURCE_RE = re.compile(
+    r"^checkpoint_retention_prune:v1:thread:"
+    r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})"
+    r":keep:([1-9][0-9]*)$"
+)
+
+
+def _checkpoint_prune_intent_digest(thread_id: str, intent: Mapping[str, Any]) -> str:
+    encoded = json.dumps(
+        {"resource": "checkpoint_thread", "thread_id": thread_id, **intent},
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+        default=str,
+    ).encode("utf-8")
+    return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
+
+
+def _checkpoint_retention_source(thread_id: str, keep_n: int) -> str:
+    return (
+        f"{_CHECKPOINT_RETENTION_SOURCE_PREFIX}thread:{UUID(thread_id)}:keep:{keep_n}"
+    )
+
+
+def _parse_checkpoint_retention_source(source: object) -> tuple[str, int] | None:
+    if not isinstance(source, str):
+        return None
+    matched = _CHECKPOINT_RETENTION_SOURCE_RE.fullmatch(source)
+    if matched is None:
+        return None
+    return str(UUID(matched.group(1))), int(matched.group(2))
+
+
+@dataclass(frozen=True, slots=True)
+class _CheckpointPruneAuthority:
+    """Durable recovery exclusion for one UUID-backed checkpoint thread."""
+
+    allowed: bool
+    coordinated: bool
+    admission_id: UUID | None = None
+    source: str | None = None
+    intent_digest: str | None = None
+    completed: bool = False
+    retention_keep_n: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _CheckpointPruneResult:
+    deleted: int
+    boundary_complete: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _CheckpointBatchDeleteResult:
+    deleted: int
+    drained: bool
+
 
 _DOCKER_WORKSPACE_GENERATION_KEY = "_canvas_workspace_generation"
 _DOCKER_WORKSPACE_LEASE_KEY = "_docker_workspace_lease_id"
@@ -3671,6 +3729,8 @@ class PostgresDB:
                 LEFT JOIN LATERAL (
                     SELECT jsonb_build_object(
                         'operation_id', r.id,
+                        'canonical_owner',
+                            (r.owner_kind='job' AND r.owner_id=j.id),
                         'state', r.phase,
                         'reason_code', r.reason_code,
                         'started_at', r.first_observed_at,
@@ -3799,6 +3859,8 @@ class PostgresDB:
                 LEFT JOIN LATERAL (
                     SELECT jsonb_build_object(
                         'operation_id', r.id,
+                        'canonical_owner',
+                            (r.owner_kind='job' AND r.owner_id=j.id),
                         'state', r.phase,
                         'reason_code', r.reason_code,
                         'started_at', r.first_observed_at,
@@ -6005,6 +6067,308 @@ class PostgresDB:
             )
             return True
 
+    async def _acquire_checkpoint_prune_authority(
+        self,
+        thread_id: str,
+        *,
+        source: str,
+        intent: Mapping[str, Any],
+        strict: bool = False,
+        resume_retention_generation: bool = False,
+    ) -> _CheckpointPruneAuthority:
+        """Publish cleanup admission before a UUID job thread is pruned.
+
+        LangGraph also permits arbitrary string thread IDs. Those legacy IDs
+        cannot be workspace-recovery owners and retain the historical prune
+        path. UUID job threads use the same durable cleanup admission as VM/PVC
+        deletion; this closes the check/delete window where a recovery hold
+        could otherwise commit after the old unresolved-participant probe.
+        """
+
+        try:
+            owner_id = UUID(thread_id)
+        except (TypeError, ValueError, AttributeError):
+            return _CheckpointPruneAuthority(allowed=True, coordinated=False)
+        thread_id = str(owner_id)
+
+        intent_digest = _checkpoint_prune_intent_digest(thread_id, intent)
+        try:
+            # Local import avoids making the database layer and recovery store
+            # import each other while still reusing the one admission protocol.
+            from orchestrator.services.vm_workspace_recovery_store import (
+                VMWorkspaceRecoveryStore,
+            )
+
+            permit = await VMWorkspaceRecoveryStore(self).acquire_cleanup_permit(
+                owner_kind="job",
+                owner_id=owner_id,
+                pvc_uid=None,
+                request_id=uuid4(),
+                source=source,
+                intent_digest=intent_digest,
+            )
+        except Exception as exc:
+            # A deployment without the recovery schema cannot admit recovery,
+            # so it keeps the pre-feature cleanup behavior. Once recovery is
+            # enabled, missing authority or any ambiguous result fails closed.
+            pre_recovery_schema = type(exc).__name__ == "UndefinedTableError"
+            recovery_enabled = os.getenv(
+                "VM_WORKSPACE_RECOVERY_ENABLED", "false"
+            ).strip().lower() in {"1", "true", "yes", "on"}
+            if pre_recovery_schema and not recovery_enabled:
+                try:
+                    async with self.acquire() as conn:
+                        unresolved = await conn.fetchval(
+                            "SELECT EXISTS ("
+                            "SELECT 1 FROM vm_workspace_recoveries r "
+                            "WHERE r.resolved_at IS NULL AND ("
+                            "(r.owner_kind='job' AND r.owner_id=$1) OR EXISTS ("
+                            "SELECT 1 FROM vm_workspace_recovery_jobs rj "
+                            "WHERE rj.recovery_id=r.id "
+                            "AND rj.resolved_at IS NULL AND rj.job_id=$1)))",
+                            owner_id,
+                        )
+                except Exception as probe_exc:
+                    if type(probe_exc).__name__ == "UndefinedTableError":
+                        return _CheckpointPruneAuthority(
+                            allowed=True, coordinated=False
+                        )
+                    if strict:
+                        raise
+                    logger.warning(
+                        "%s: legacy recovery probe failed for %s (%s: %s); "
+                        "checkpoint rows retained",
+                        source,
+                        thread_id,
+                        type(probe_exc).__name__,
+                        probe_exc,
+                    )
+                    return _CheckpointPruneAuthority(allowed=False, coordinated=False)
+                if unresolved:
+                    if strict:
+                        raise RuntimeError(
+                            "strict checkpoint prune blocked by legacy workspace recovery"
+                        )
+                    return _CheckpointPruneAuthority(allowed=False, coordinated=False)
+                return _CheckpointPruneAuthority(allowed=True, coordinated=False)
+            level = logging.WARNING
+            logger.log(
+                level,
+                "%s: checkpoint prune authority unavailable for %s (%s: %s); "
+                "checkpoint rows retained",
+                source,
+                thread_id,
+                type(exc).__name__,
+                exc,
+            )
+            if strict:
+                raise
+            return _CheckpointPruneAuthority(allowed=False, coordinated=True)
+
+        if not permit.allowed and permit.admission_id is not None:
+            # A process may disappear after publishing authority but before it
+            # reaches (or reports) the destructive transaction. Resume only
+            # the exact durable intent. The owner lock and canonical ownership
+            # are revalidated again immediately around the SQL boundary.
+            async with self.acquire() as conn:
+                prior = await conn.fetchrow(
+                    "SELECT owner_kind,owner_id,source,intent_digest,"
+                    "completed_at,outcome FROM vm_workspace_cleanup_admissions "
+                    "WHERE id=$1",
+                    permit.admission_id,
+                )
+            replay_source = source
+            replay_digest = intent_digest
+            replay_retention = _parse_checkpoint_retention_source(source)
+            exact_replay = bool(
+                prior is not None
+                and prior["owner_kind"] == "job"
+                and prior["source"] == source
+                and prior["intent_digest"] == intent_digest
+            )
+            if prior is not None and not exact_replay and resume_retention_generation:
+                parsed = _parse_checkpoint_retention_source(prior["source"])
+                if parsed is not None and parsed[0] == thread_id:
+                    prior_digest = _checkpoint_prune_intent_digest(
+                        thread_id,
+                        {"mode": "keep_last", "keep_n": parsed[1]},
+                    )
+                    if prior["intent_digest"] == prior_digest:
+                        replay_source = prior["source"]
+                        replay_digest = prior_digest
+                        replay_retention = parsed
+                        exact_replay = True
+            if (
+                exact_replay
+                and prior is not None
+                and (prior["completed_at"] is None or prior["outcome"] == "completed")
+            ):
+                return _CheckpointPruneAuthority(
+                    allowed=True,
+                    coordinated=True,
+                    admission_id=permit.admission_id,
+                    source=replay_source,
+                    intent_digest=replay_digest,
+                    completed=prior["completed_at"] is not None,
+                    retention_keep_n=(
+                        replay_retention[1] if replay_retention is not None else None
+                    ),
+                )
+
+        if not permit.allowed or permit.admission_id is None:
+            logger.info(
+                "%s: preserving checkpoint thread %s (%s)",
+                source,
+                thread_id,
+                permit.reason or "workspace recovery unresolved",
+            )
+            if strict:
+                raise RuntimeError(
+                    "strict checkpoint prune blocked by workspace recovery authority"
+                )
+            return _CheckpointPruneAuthority(allowed=False, coordinated=True)
+        parsed_source = _parse_checkpoint_retention_source(source)
+        return _CheckpointPruneAuthority(
+            allowed=True,
+            coordinated=True,
+            admission_id=permit.admission_id,
+            source=source,
+            intent_digest=intent_digest,
+            retention_keep_n=(parsed_source[1] if parsed_source is not None else None),
+        )
+
+    async def _run_checkpoint_prune_under_authority(
+        self,
+        authority: _CheckpointPruneAuthority,
+        thread_id: str,
+        operation: Callable[[Any], Awaitable[_CheckpointPruneResult]],
+    ) -> _CheckpointPruneResult:
+        """Run one prune while its canonical recovery-owner lock is held."""
+
+        if authority.completed:
+            return _CheckpointPruneResult(deleted=0, boundary_complete=True)
+        if authority.coordinated and authority.admission_id is None:
+            return _CheckpointPruneResult(deleted=0, boundary_complete=False)
+
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                if not authority.coordinated:
+                    result = await operation(conn)
+                    if not result.boundary_complete:
+                        raise RuntimeError(
+                            "checkpoint prune did not reach its boundary"
+                        )
+                    return result
+                observed = await conn.fetchrow(
+                    "SELECT owner_kind,owner_id FROM vm_workspace_cleanup_admissions "
+                    "WHERE id=$1 AND completed_at IS NULL",
+                    authority.admission_id,
+                )
+                if observed is None:
+                    raise RuntimeError(
+                        "checkpoint cleanup admission is no longer active"
+                    )
+                await conn.execute(
+                    "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+                    f"workspace-recovery:{observed['owner_kind']}:{observed['owner_id']}",
+                )
+                current = await conn.fetchrow(
+                    "SELECT owner_kind,owner_id,source,intent_digest "
+                    "FROM vm_workspace_cleanup_admissions "
+                    "WHERE id=$1 AND completed_at IS NULL FOR UPDATE",
+                    authority.admission_id,
+                )
+                if (
+                    current is None
+                    or current["owner_kind"] != observed["owner_kind"]
+                    or current["owner_id"] != observed["owner_id"]
+                    or current["source"] != authority.source
+                    or current["intent_digest"] != authority.intent_digest
+                ):
+                    raise RuntimeError("checkpoint cleanup authority changed")
+                unresolved = await conn.fetchval(
+                    "SELECT EXISTS ("
+                    "SELECT 1 FROM vm_workspace_recoveries r "
+                    "WHERE r.resolved_at IS NULL AND ("
+                    "(r.owner_kind=$1 AND r.owner_id=$2) OR EXISTS ("
+                    "SELECT 1 FROM vm_workspace_recovery_jobs rj "
+                    "WHERE rj.recovery_id=r.id AND rj.resolved_at IS NULL "
+                    "AND rj.job_id::text=$3)))",
+                    current["owner_kind"],
+                    current["owner_id"],
+                    thread_id,
+                )
+                if unresolved:
+                    raise RuntimeError(
+                        "workspace recovery crossed checkpoint cleanup admission"
+                    )
+                from orchestrator.services.vm_workspace_recovery_store import (
+                    _job_workspace_owner,
+                )
+
+                job_id = UUID(thread_id)
+                membership = await conn.fetchrow(
+                    "SELECT parent_job_id,context FROM jobs WHERE id=$1",
+                    job_id,
+                )
+                canonical_owner, ambiguous = _job_workspace_owner(job_id, membership)
+                # LangGraph UUID threads can outlive the jobs row. With no
+                # membership left, only that original UUID can own cleanup.
+                if membership is None:
+                    canonical_owner, ambiguous = job_id, False
+                if (
+                    ambiguous
+                    or current["owner_kind"] != "job"
+                    or current["owner_id"] != canonical_owner
+                ):
+                    raise RuntimeError(
+                        "checkpoint cleanup canonical owner changed or is ambiguous"
+                    )
+                result = await operation(conn)
+                if not result.boundary_complete:
+                    raise RuntimeError("checkpoint prune did not reach its boundary")
+                completed = await conn.fetchval(
+                    "UPDATE vm_workspace_cleanup_admissions "
+                    "SET completed_at=clock_timestamp(),outcome='completed' "
+                    "WHERE id=$1 AND completed_at IS NULL "
+                    "AND owner_kind=$2 AND owner_id=$3 AND source=$4 "
+                    "AND intent_digest=$5 RETURNING 1",
+                    authority.admission_id,
+                    current["owner_kind"],
+                    current["owner_id"],
+                    authority.source,
+                    authority.intent_digest,
+                )
+                if completed is None:
+                    raise RuntimeError("checkpoint cleanup completion CAS was lost")
+                return result
+
+    async def _complete_checkpoint_prune_authority(
+        self,
+        authority: _CheckpointPruneAuthority,
+        *,
+        boundary_complete: bool,
+    ) -> None:
+        """Verify the atomic prune/completion outcome by durable read."""
+
+        if (
+            not authority.coordinated
+            or authority.admission_id is None
+            or not boundary_complete
+        ):
+            return
+        async with self.acquire() as conn:
+            completed = await conn.fetchval(
+                "SELECT EXISTS (SELECT 1 FROM vm_workspace_cleanup_admissions "
+                "WHERE id=$1 AND source=$2 AND intent_digest=$3 "
+                "AND completed_at IS NOT NULL AND outcome='completed')",
+                authority.admission_id,
+                authority.source,
+                authority.intent_digest,
+            )
+        if completed is not True:
+            raise RuntimeError("checkpoint cleanup admission completion was lost")
+
     async def delete_checkpoint_thread(
         self,
         thread_id: str,
@@ -6043,24 +6407,29 @@ class PostgresDB:
             != "postgres"
         ):
             return 0
-        total = 0
-        async with self.acquire() as conn:
-            held = await conn.fetchval(
-                "SELECT EXISTS (SELECT 1 FROM vm_workspace_recovery_jobs "
-                "WHERE job_id::text=$1 AND resolved_at IS NULL)",
-                thread_id,
-            )
-            if held is True:
-                logger.info(
-                    "delete_checkpoint_thread: preserving recovery checkpoint for %s",
-                    thread_id,
-                )
-                return 0
+
+        authority = await self._acquire_checkpoint_prune_authority(
+            thread_id,
+            source="terminal_checkpoint_prune",
+            # Strictness changes verification/error policy, not the durable
+            # destructive boundary. Either caller can resume the same prune.
+            intent={"mode": "delete_thread"},
+            strict=strict,
+        )
+        if not authority.allowed:
+            return 0
+
+        async def _delete(conn: Any) -> _CheckpointPruneResult:
+            total = 0
             for table in ("checkpoint_writes", "checkpoint_blobs", "checkpoints"):
                 try:
-                    total += await self._delete_thread_rows_batched(
-                        conn, table, thread_id
-                    )
+                    # A nested transaction is a PostgreSQL savepoint. A benign
+                    # pre-checkpointer missing table can be rolled back locally
+                    # without poisoning the owner-locked outer transaction.
+                    async with conn.transaction():
+                        batch = await self._delete_thread_rows_batched(
+                            conn, table, thread_id
+                        )
                 except Exception as e:
                     # A missing table is benign (sqlite-backed deploy, pre-migration)
                     # and stays quiet. Anything else — timeout, cancellation, lock
@@ -6083,15 +6452,22 @@ class PostgresDB:
                             type(e).__name__,
                             e,
                         )
-                        if strict:
-                            raise
+                        raise
+                    continue
+                if not batch.drained:
+                    raise RuntimeError(
+                        "checkpoint prune batch cap left rows behind "
+                        f"(table={table}, thread_id={thread_id})"
+                    )
+                total += batch.deleted
             if strict:
                 for table in ("checkpoint_writes", "checkpoint_blobs", "checkpoints"):
                     try:
-                        remains = await conn.fetchval(
-                            f"SELECT EXISTS (SELECT 1 FROM {table} WHERE thread_id = $1)",
-                            thread_id,
-                        )
+                        async with conn.transaction():
+                            remains = await conn.fetchval(
+                                f"SELECT EXISTS (SELECT 1 FROM {table} WHERE thread_id = $1)",
+                                thread_id,
+                            )
                     except Exception as e:
                         if type(e).__name__ == "UndefinedTableError":
                             continue
@@ -6101,11 +6477,46 @@ class PostgresDB:
                             "strict checkpoint prune left rows behind "
                             f"(table={table}, thread_id={thread_id})"
                         )
-        return total
+            return _CheckpointPruneResult(
+                deleted=total,
+                boundary_complete=True,
+            )
+
+        try:
+            result = await self._run_checkpoint_prune_under_authority(
+                authority, thread_id, _delete
+            )
+        except Exception as exc:
+            if strict:
+                raise
+            logger.warning(
+                "delete_checkpoint_thread: authority lost for %s (%s: %s); "
+                "checkpoint rows retained",
+                thread_id,
+                type(exc).__name__,
+                exc,
+            )
+            return 0
+        try:
+            await self._complete_checkpoint_prune_authority(
+                authority,
+                boundary_complete=result.boundary_complete,
+            )
+        except Exception as exc:
+            if strict:
+                raise
+            logger.warning(
+                "delete_checkpoint_thread: cleanup completion verification failed "
+                "for %s after prune (%s: %s)",
+                thread_id,
+                type(exc).__name__,
+                exc,
+            )
+        return result.deleted
 
     async def _delete_thread_rows_batched(
         self, conn: Any, table: str, thread_id: str
-    ) -> int:
+    ) -> _CheckpointBatchDeleteResult:
         """Delete one thread's rows from ``table`` in bounded ctid batches.
 
         Loops until a batch deletes nothing. ``_CHECKPOINT_DELETE_MAX_BATCHES``
@@ -6125,16 +6536,24 @@ class PostgresDB:
                 batch = int(result.split()[1])
             deleted += batch
             if batch < _CHECKPOINT_DELETE_BATCH:
-                return deleted
+                return _CheckpointBatchDeleteResult(deleted=deleted, drained=True)
+        remains = await conn.fetchval(
+            f"SELECT EXISTS (SELECT 1 FROM {table} WHERE thread_id=$1)",
+            thread_id,
+        )
         logger.warning(
             "delete_checkpoint_thread: %s hit the %s-batch cap for thread %s "
-            "(%s rows deleted so far) — remaining rows left for the retention sweeper",
+            "(%s rows deleted so far, remains=%s)",
             table,
             _CHECKPOINT_DELETE_MAX_BATCHES,
             thread_id,
             deleted,
+            bool(remains),
         )
-        return deleted
+        return _CheckpointBatchDeleteResult(
+            deleted=deleted,
+            drained=not bool(remains),
+        )
 
     async def prune_checkpoints_keep_last(self, keep_n: int) -> int:
         """Keep only the newest ``keep_n`` checkpoints per (thread_id, checkpoint_ns)
@@ -6162,53 +6581,156 @@ class PostgresDB:
             return 0
         if os.getenv("CHECKPOINTER_BACKEND", "sqlite").strip().lower() != "postgres":
             return 0
-        # Order matters: prune `checkpoints` first, then the `checkpoint_writes`
-        # rows orphaned by that delete.
-        statements = (
+        candidate_queries = (
             (
-                "DELETE FROM checkpoints c USING ("
-                " SELECT thread_id, checkpoint_ns, checkpoint_id,"
-                " row_number() OVER (PARTITION BY thread_id, checkpoint_ns"
-                " ORDER BY checkpoint_id DESC) AS rn FROM checkpoints) r"
-                " WHERE c.thread_id = r.thread_id AND c.checkpoint_ns = r.checkpoint_ns"
-                " AND c.checkpoint_id = r.checkpoint_id AND r.rn > $1"
-                " AND NOT EXISTS (SELECT 1 FROM vm_workspace_recovery_jobs wrj"
-                " WHERE wrj.resolved_at IS NULL AND wrj.job_id::text=c.thread_id"
-                " AND (wrj.checkpoint_namespace IS NULL OR ("
-                " wrj.checkpoint_namespace=c.checkpoint_ns AND"
-                " wrj.checkpoint_id=c.checkpoint_id)))",
+                "SELECT thread_id FROM checkpoints "
+                "GROUP BY thread_id,checkpoint_ns HAVING count(*) > $1",
                 (keep_n,),
             ),
             (
-                "DELETE FROM checkpoint_writes cw WHERE NOT EXISTS ("
+                "SELECT DISTINCT cw.thread_id FROM checkpoint_writes cw "
+                "WHERE NOT EXISTS ("
                 " SELECT 1 FROM checkpoints c WHERE c.thread_id = cw.thread_id"
                 " AND c.checkpoint_ns = cw.checkpoint_ns"
-                " AND c.checkpoint_id = cw.checkpoint_id)"
-                " AND NOT EXISTS (SELECT 1 FROM vm_workspace_recovery_jobs wrj"
-                " WHERE wrj.resolved_at IS NULL AND wrj.job_id::text=cw.thread_id)",
+                " AND c.checkpoint_id = cw.checkpoint_id)",
                 (),
             ),
             (
-                "DELETE FROM checkpoint_blobs cb USING ("
-                " SELECT thread_id, checkpoint_ns, channel, version,"
-                " row_number() OVER (PARTITION BY thread_id, checkpoint_ns, channel"
-                " ORDER BY version DESC) AS rn FROM checkpoint_blobs) r"
-                " WHERE cb.thread_id = r.thread_id AND cb.checkpoint_ns = r.checkpoint_ns"
-                " AND cb.channel = r.channel AND cb.version = r.version AND r.rn > $1"
-                " AND NOT EXISTS (SELECT 1 FROM vm_workspace_recovery_jobs wrj"
-                " WHERE wrj.resolved_at IS NULL AND wrj.job_id::text=cb.thread_id)",
+                "SELECT thread_id FROM checkpoint_blobs "
+                "GROUP BY thread_id,checkpoint_ns,channel HAVING count(*) > $1",
                 (keep_n,),
             ),
         )
-        total = 0
+        candidate_threads: set[str] = set()
         async with self.acquire() as conn:
-            for sql, params in statements:
+            for sql, params in candidate_queries:
                 try:
-                    result = await conn.execute(sql, *params)
-                    if isinstance(result, str) and result.startswith("DELETE "):
-                        total += int(result.split()[1])
-                except Exception as e:
-                    logger.debug("prune_checkpoints_keep_last: skip (%s)", e)
+                    rows = await conn.fetch(sql, *params)
+                    candidate_threads.update(str(row["thread_id"]) for row in rows)
+                except Exception as exc:
+                    logger.debug(
+                        "prune_checkpoints_keep_last: candidate scan skipped (%s)",
+                        exc,
+                    )
+            # An interrupted generation remains work even when a relaxed new
+            # policy would not select any checkpoint rows on its own.
+            try:
+                admissions = await conn.fetch(
+                    "SELECT source FROM vm_workspace_cleanup_admissions "
+                    "WHERE completed_at IS NULL AND source LIKE $1",
+                    _CHECKPOINT_RETENTION_SOURCE_PREFIX + "%",
+                )
+                for admission in admissions:
+                    parsed = _parse_checkpoint_retention_source(admission["source"])
+                    if parsed is not None:
+                        candidate_threads.add(parsed[0])
+            except Exception as exc:
+                logger.debug("checkpoint admission scan skipped (%s)", exc)
+
+        total = 0
+        # Order matters within each owner transaction: prune `checkpoints`
+        # first, then the `checkpoint_writes` rows orphaned by that delete.
+        for thread_id in sorted(candidate_threads):
+            # Complete the prior policy before applying a new generation.
+            for _generation in range(2):
+                try:
+                    source = _checkpoint_retention_source(thread_id, keep_n)
+                except (ValueError, TypeError, AttributeError):
+                    source = "checkpoint_retention_prune"
+                authority = await self._acquire_checkpoint_prune_authority(
+                    thread_id,
+                    source=source,
+                    intent={"mode": "keep_last", "keep_n": keep_n},
+                    resume_retention_generation=True,
+                )
+                if not authority.allowed:
+                    break
+                generation_keep_n = authority.retention_keep_n or keep_n
+
+                statements = (
+                    (
+                        "DELETE FROM checkpoints c USING ("
+                        " SELECT checkpoint_ns,checkpoint_id,"
+                        " row_number() OVER (PARTITION BY checkpoint_ns"
+                        " ORDER BY checkpoint_id DESC) AS rn FROM checkpoints"
+                        " WHERE thread_id=$2) r"
+                        " WHERE c.thread_id=$2 AND c.checkpoint_ns=r.checkpoint_ns"
+                        " AND c.checkpoint_id=r.checkpoint_id AND r.rn > $1",
+                        (generation_keep_n, thread_id),
+                    ),
+                    (
+                        "DELETE FROM checkpoint_writes cw WHERE cw.thread_id=$1"
+                        " AND NOT EXISTS (SELECT 1 FROM checkpoints c"
+                        " WHERE c.thread_id=cw.thread_id"
+                        " AND c.checkpoint_ns=cw.checkpoint_ns"
+                        " AND c.checkpoint_id=cw.checkpoint_id)",
+                        (thread_id,),
+                    ),
+                    (
+                        "DELETE FROM checkpoint_blobs cb USING ("
+                        " SELECT checkpoint_ns,channel,version,"
+                        " row_number() OVER (PARTITION BY checkpoint_ns,channel"
+                        " ORDER BY version DESC) AS rn FROM checkpoint_blobs"
+                        " WHERE thread_id=$2) r"
+                        " WHERE cb.thread_id=$2 AND cb.checkpoint_ns=r.checkpoint_ns"
+                        " AND cb.channel=r.channel AND cb.version=r.version AND r.rn > $1",
+                        (generation_keep_n, thread_id),
+                    ),
+                )
+
+                async def _prune(conn: Any) -> _CheckpointPruneResult:
+                    deleted = 0
+                    for sql, params in statements:
+                        try:
+                            async with conn.transaction():
+                                statement_result = await conn.execute(sql, *params)
+                        except Exception as exc:
+                            if type(exc).__name__ == "UndefinedTableError":
+                                logger.debug(
+                                    "prune_checkpoints_keep_last: thread %s missing "
+                                    "checkpoint table (%s)",
+                                    thread_id,
+                                    exc,
+                                )
+                                continue
+                            raise
+                        if isinstance(
+                            statement_result, str
+                        ) and statement_result.startswith("DELETE "):
+                            deleted += int(statement_result.split()[1])
+                    return _CheckpointPruneResult(
+                        deleted=deleted,
+                        boundary_complete=True,
+                    )
+
+                try:
+                    result = await self._run_checkpoint_prune_under_authority(
+                        authority, thread_id, _prune
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "prune_checkpoints_keep_last: authority lost for %s (%s: %s)",
+                        thread_id,
+                        type(exc).__name__,
+                        exc,
+                    )
+                    break
+                total += result.deleted
+                try:
+                    await self._complete_checkpoint_prune_authority(
+                        authority,
+                        boundary_complete=result.boundary_complete,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "prune_checkpoints_keep_last: cleanup completion verification "
+                        "failed for %s (%s: %s)",
+                        thread_id,
+                        type(exc).__name__,
+                        exc,
+                    )
+                if generation_keep_n == keep_n:
+                    break
         return total
 
     async def create_job_change_record(

@@ -20836,8 +20836,10 @@ CREATE TABLE public.vm_workspace_cleanup_admissions (
     completed_at timestamp with time zone,
     outcome text,
     intent_digest text NOT NULL,
+    parent_admission_id uuid,
     CONSTRAINT vm_workspace_cleanup_admissions_check CHECK ((((completed_at IS NULL) AND (outcome IS NULL)) OR ((completed_at IS NOT NULL) AND (outcome IS NOT NULL) AND (outcome <> ''::text)))),
     CONSTRAINT vm_workspace_cleanup_admissions_intent_digest_check CHECK ((intent_digest <> ''::text)),
+    CONSTRAINT vm_workspace_cleanup_admissions_not_self_parent CHECK ((parent_admission_id IS DISTINCT FROM id)),
     CONSTRAINT vm_workspace_cleanup_admissions_owner_kind_check CHECK ((owner_kind = ANY (ARRAY['job'::text, 'thread'::text]))),
     CONSTRAINT vm_workspace_cleanup_admissions_source_check CHECK ((source <> ''::text))
 );
@@ -25482,10 +25484,17 @@ CREATE UNIQUE INDEX vm_remote_operation_one_active_owner ON public.vm_remote_ope
 
 
 --
+-- Name: vm_workspace_cleanup_admissions_one_open_child; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX vm_workspace_cleanup_admissions_one_open_child ON public.vm_workspace_cleanup_admissions USING btree (parent_admission_id) WHERE ((completed_at IS NULL) AND (parent_admission_id IS NOT NULL));
+
+
+--
 -- Name: vm_workspace_cleanup_admissions_one_open_owner; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE UNIQUE INDEX vm_workspace_cleanup_admissions_one_open_owner ON public.vm_workspace_cleanup_admissions USING btree (owner_kind, owner_id) WHERE (completed_at IS NULL);
+CREATE UNIQUE INDEX vm_workspace_cleanup_admissions_one_open_owner ON public.vm_workspace_cleanup_admissions USING btree (owner_kind, owner_id) WHERE ((completed_at IS NULL) AND (parent_admission_id IS NULL));
 
 
 --
@@ -28610,6 +28619,14 @@ ALTER TABLE ONLY public.users
 
 ALTER TABLE ONLY public.users
     ADD CONSTRAINT users_default_project_id_fkey FOREIGN KEY (default_project_id) REFERENCES public.projects(id);
+
+
+--
+-- Name: vm_workspace_cleanup_admissions vm_workspace_cleanup_admissions_parent_admission_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_workspace_cleanup_admissions
+    ADD CONSTRAINT vm_workspace_cleanup_admissions_parent_admission_id_fkey FOREIGN KEY (parent_admission_id) REFERENCES public.vm_workspace_cleanup_admissions(id);
 
 
 --

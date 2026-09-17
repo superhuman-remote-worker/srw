@@ -31,6 +31,7 @@ from orchestrator.services.pinned_agent_authority import (
 from orchestrator.services.workspace_lifecycle import WorkspaceOwner
 from orchestrator.services.vm_workspace_recovery_store import (
     acquire_vm_cleanup_permit,
+    vm_cleanup_kwargs,
     completed_cleanup_outcome,
     complete_vm_cleanup_permit,
 )
@@ -1812,6 +1813,7 @@ class PinnedRetirementOperations:
                             purge_disk=permanent,
                             entity_type="thread",
                             capture_snapshot=False,
+                            **vm_cleanup_kwargs(cleanup),
                         )
                     )
                     disposition = vm_result.disposition
@@ -2249,6 +2251,7 @@ class PinnedRetirementOperations:
                     purge_disk=permanent,
                     entity_type="thread",
                     capture_snapshot=False,
+                    **vm_cleanup_kwargs(cleanup),
                 )
                 disposition = vm_result.disposition
                 await self._complete_vm_cleanup(cleanup, disposition)

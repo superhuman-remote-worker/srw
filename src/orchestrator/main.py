@@ -173,6 +173,9 @@ from orchestrator.routers import (  # noqa: E402
 )
 from orchestrator.routers import voice as voice_routes  # noqa: E402
 from orchestrator.routers import system_settings as system_settings_routes  # noqa: E402
+from orchestrator.routers import (  # noqa: E402
+    vm_workspace_cleanup_authority as vm_workspace_cleanup_authority_routes,
+)
 from orchestrator.routers import capacity as capacity_routes  # noqa: E402
 from orchestrator.routers import (  # noqa: E402
     user_administration as user_administration_routes,
@@ -8709,6 +8712,10 @@ app.include_router(provider_credentials_routes.router)
 app.include_router(subscription_management_routes.router)
 app.include_router(voice_routes.router)
 app.include_router(system_settings_routes.router)
+vm_workspace_cleanup_authority_routes.configure(
+    store_factory=lambda: VMWorkspaceRecoveryStore(postgres_db)
+)
+app.include_router(vm_workspace_cleanup_authority_routes.router)
 app.include_router(capacity_routes.router)
 app.include_router(user_administration_routes.router)
 app.include_router(job_diagnostics_routes.router)

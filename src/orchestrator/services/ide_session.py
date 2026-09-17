@@ -57,6 +57,7 @@ from orchestrator.services.restore_work_lease import (
 from orchestrator.services.vm_workspace_recovery_store import (
     VMWorkspaceRecoveryStore,
     acquire_vm_cleanup_permit,
+    vm_cleanup_kwargs,
     completed_cleanup_outcome,
     complete_vm_cleanup_permit,
 )
@@ -2431,6 +2432,7 @@ class IdeSessionService:
                         entity_type="job",
                         purge_disk=True,
                         capture_snapshot=False,
+                        **vm_cleanup_kwargs(permit),
                     )
                     disposition = outcome.disposition
                     if disposition in {"completed", "identity_superseded"}:

@@ -174,11 +174,103 @@ describe('JobListComponent — server-resolved tree', () => {
     expect(retryWorkspaceRecovery).toHaveBeenCalledWith(
       recovering.id,
       recovering.workspace_recovery?.operation_id,
+      expect.any(String),
     );
     expect(cancelJob).toHaveBeenCalledWith(recovering.id);
     expect(resumeJob).not.toHaveBeenCalled();
     expect(en.jobs.action.retryRecovery).toBe('Retry recovery');
     expect(en.jobs.action.cancel).toBe('Cancel');
+  });
+
+  it('does not offer recovery retry for a shared child participant', () => {
+    const retryWorkspaceRecovery = vi.fn().mockReturnValue(of(null));
+    const child = job('recovery-child', {
+      is_display_root: false,
+      display_root_id: 'recovery-owner',
+      status: 'paused',
+      workspace_recovery: {
+        operation_id: '22222222-bbbb-4222-8222-222222222222',
+        state: 'paused_attention',
+        reason_code: 'prior_runtime_unfenced',
+        message: 'Previous workspace execution could not be proven stopped.',
+        started_at: '2026-09-16T08:00:00Z',
+        deadline_at: '2026-09-16T08:15:00Z',
+        next_check_at: null,
+        retryable: false,
+        cleanup_pending: true,
+      },
+    }) as JobSummary;
+    const {fixture, component} = mountLogic({
+      api: {retryWorkspaceRecovery} as Partial<ApiService>,
+    });
+    fixture.detectChanges();
+
+    component.retryWorkspaceRecovery(child);
+
+    expect(retryWorkspaceRecovery).not.toHaveBeenCalled();
+  });
+
+  it('replays one recovery request id until read-back shows a successor', () => {
+    const randomUUID = vi
+      .spyOn(crypto, 'randomUUID')
+      .mockReturnValueOnce('aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa')
+      .mockReturnValueOnce('bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb');
+    const paused = job('recovery-owner', {
+      status: 'paused',
+      workspace_recovery: {
+        operation_id: '22222222-bbbb-4222-8222-222222222222',
+        state: 'paused_attention',
+        reason_code: 'prior_runtime_unfenced',
+        message: 'Previous workspace execution could not be proven stopped.',
+        started_at: '2026-09-16T08:00:00Z',
+        deadline_at: '2026-09-16T08:15:00Z',
+        next_check_at: null,
+        retryable: true,
+        cleanup_pending: true,
+      },
+    }) as JobSummary;
+    const successor = job('recovery-owner', {
+      ...paused,
+      workspace_recovery: {
+        ...paused.workspace_recovery!,
+        operation_id: '33333333-cccc-4333-8333-333333333333',
+      },
+    }) as JobSummary;
+    const getJobsPage = vi
+      .fn()
+      .mockReturnValueOnce(of(page([paused])))
+      .mockReturnValueOnce(of(page([paused])))
+      .mockReturnValueOnce(of(page([successor])))
+      .mockReturnValue(of(page([successor])));
+    const retryWorkspaceRecovery = vi.fn().mockReturnValue(of(null));
+    const {fixture, component} = mountLogic({
+      api: {getJobsPage, retryWorkspaceRecovery} as Partial<ApiService>,
+    });
+    fixture.detectChanges();
+
+    component.retryWorkspaceRecovery(component.jobs()[0]);
+    component.retryWorkspaceRecovery(component.jobs()[0]);
+    component.retryWorkspaceRecovery(component.jobs()[0]);
+
+    expect(retryWorkspaceRecovery.mock.calls).toEqual([
+      [
+        'recovery-owner',
+        '22222222-bbbb-4222-8222-222222222222',
+        'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+      ],
+      [
+        'recovery-owner',
+        '22222222-bbbb-4222-8222-222222222222',
+        'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+      ],
+      [
+        'recovery-owner',
+        '33333333-cccc-4333-8333-333333333333',
+        'bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb',
+      ],
+    ]);
+    expect(getJobsPage).toHaveBeenCalledTimes(4);
+    randomUUID.mockRestore();
   });
 
   it('renders each display root once, with children only when expanded', () => {

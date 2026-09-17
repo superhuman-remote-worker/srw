@@ -1254,6 +1254,15 @@ export class JobListComponent implements OnInit, OnDestroy {
   readonly exportingJobIds = signal<Set<string>>(new Set());
   readonly ideLoadingJobIds = signal<Set<string>>(new Set());
   private idePollingIntervals = new Map<string, ReturnType<typeof setInterval>>();
+  /**
+   * One idempotency key per displayed recovery operation. A transport error
+   * or 409 cannot tell us whether the write committed, so the key survives
+   * until a later list read proves that job moved to a successor or resolved.
+   */
+  private readonly recoveryRetryRequests = new Map<
+    string,
+    {jobId: string; requestId: string}
+  >();
 
   // Themed confirm-dialog state (delete + cancel), replacing the old inline
   // two-tap confirms — consistent with the Sessions page.
@@ -1495,6 +1504,7 @@ export class JobListComponent implements OnInit, OnDestroy {
     this.api.getJobsPage(query).subscribe({
       next: (page) => {
         if (serial !== this.requestSerial) return;
+        this.reconcileRecoveryRetryRequests(page.jobs);
         this.jobs.set(page.jobs);
         this.hasMore.set(page.has_more);
         if (page.total !== null && page.total !== undefined) {
@@ -2025,9 +2035,25 @@ export class JobListComponent implements OnInit, OnDestroy {
   retryWorkspaceRecovery(job: JobSummary): void {
     const recovery = job.workspace_recovery;
     if (!recovery?.retryable) return;
-    this.api.retryWorkspaceRecovery(job.id, recovery.operation_id).subscribe((result) => {
-      if (result) this.refresh();
-    });
+    let pending = this.recoveryRetryRequests.get(recovery.operation_id);
+    if (!pending || pending.jobId !== job.id) {
+      pending = {jobId: job.id, requestId: crypto.randomUUID()};
+      this.recoveryRetryRequests.set(recovery.operation_id, pending);
+    }
+    this.api
+      .retryWorkspaceRecovery(job.id, recovery.operation_id, pending.requestId)
+      .subscribe(() => this.refresh());
+  }
+
+  private reconcileRecoveryRetryRequests(jobs: JobSummary[]): void {
+    if (this.recoveryRetryRequests.size === 0) return;
+    const displayed = new Map(jobs.map((job) => [job.id, job]));
+    for (const [operationId, pending] of this.recoveryRetryRequests) {
+      const job = displayed.get(pending.jobId);
+      if (job && job.workspace_recovery?.operation_id !== operationId) {
+        this.recoveryRetryRequests.delete(operationId);
+      }
+    }
   }
 
   askDelete(job: JobSummary): void {

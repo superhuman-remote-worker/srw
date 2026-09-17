@@ -34,6 +34,7 @@ def test_workspace_recovery_projection_is_coordinate_free_and_redacts_diagnostic
             "deadline_at": "2026-09-16T08:15:00+00:00",
             "next_check_at": None,
             "cleanup_pending": True,
+            "canonical_owner": True,
             "private_endpoint": "10.0.0.9",
             "latest_diagnostic": {"controller_error": "synthetic-private"},
         },
@@ -68,6 +69,29 @@ def test_workspace_recovery_projection_rejects_unknown_reason_and_shape():
         projection.workspace_recovery_projection({"_workspace_recovery": "not-json"})
         is None
     )
+
+
+@pytest.mark.parametrize(
+    ("canonical_owner", "retryable"),
+    [(True, True), (False, False), (None, False)],
+)
+def test_paused_recovery_is_retryable_only_for_canonical_owner(
+    canonical_owner, retryable
+):
+    raw = {
+        "operation_id": "11111111-2222-4333-8444-555555555555",
+        "state": "paused_attention",
+        "reason_code": "prior_runtime_unfenced",
+        "started_at": "2026-09-16T08:00:00+00:00",
+        "deadline_at": "2026-09-16T08:15:00+00:00",
+        "canonical_owner": canonical_owner,
+    }
+
+    result = projection.workspace_recovery_projection({"_workspace_recovery": raw})
+
+    assert result is not None
+    assert result["retryable"] is retryable
+    assert "canonical_owner" not in result
 
 
 @pytest.mark.parametrize("as_text", [False, True])

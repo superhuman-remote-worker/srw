@@ -1234,6 +1234,7 @@ class VMProvisioner:
         *,
         purge_disk: bool = True,
         entity_type: str = "job",
+        parent_cleanup: Mapping[str, Any] | None = None,
     ) -> VMTeardownResult:
         """Delete only the VM/rootdisk incarnation captured in an intent."""
 
@@ -1279,6 +1280,9 @@ class VMProvisioner:
             expected_vm_uid=_safe_vm_uid(identity.vm_uid),
             expected_rootdisk_pvc_uid=_safe_vm_uid(identity.rootdisk_pvc_uid),
             entity_type=entity_type,
+            **(
+                {"parent_cleanup": parent_cleanup} if parent_cleanup is not None else {}
+            ),
         )
         reprobe = await self._probe_vm_teardown_identity(job_id, generation)
         reclassification = self._classify_captured_probe(
@@ -1477,6 +1481,7 @@ class VMProvisioner:
         entity_type: str = "job",
         purge_disk: bool = True,
         capture_snapshot: bool = True,
+        parent_cleanup: Mapping[str, Any] | None = None,
     ) -> VMTeardownResult:
         """Best-effort archive, then release only the captured VM incarnation."""
 
@@ -1551,6 +1556,11 @@ class VMProvisioner:
                 identity,
                 purge_disk=purge_disk,
                 entity_type=entity_type,
+                **(
+                    {"parent_cleanup": parent_cleanup}
+                    if parent_cleanup is not None
+                    else {}
+                ),
             )
 
         if (
@@ -1680,6 +1690,9 @@ class VMProvisioner:
             identity,
             purge_disk=purge_disk,
             entity_type=entity_type,
+            **(
+                {"parent_cleanup": parent_cleanup} if parent_cleanup is not None else {}
+            ),
         )
 
     async def delete_orphan_vm_captured(
@@ -1688,6 +1701,7 @@ class VMProvisioner:
         identity: VMTeardownIdentity,
         *,
         purge_disk: bool = True,
+        parent_cleanup: Mapping[str, Any] | None = None,
     ) -> VMTeardownResult:
         """Delete an inventory-proven VM after both owning rows are absent."""
 
@@ -1726,6 +1740,9 @@ class VMProvisioner:
             provision_generation=generation,
             expected_vm_uid=vm_uid,
             expected_rootdisk_pvc_uid=rootdisk_uid,
+            **(
+                {"parent_cleanup": parent_cleanup} if parent_cleanup is not None else {}
+            ),
         )
         reprobe = await self._probe_vm_teardown_identity(job_id, generation)
         reclassification = self._classify_captured_probe(
@@ -1778,6 +1795,7 @@ class VMProvisioner:
         expected_vm_uid: str | None = None,
         expected_rootdisk_pvc_uid: str | None = None,
         entity_type: str = "job",
+        parent_cleanup: Mapping[str, Any] | None = None,
     ) -> bool:
         generation = _provision_generation(provision_generation)
         if self._nats_available:
@@ -1790,6 +1808,8 @@ class VMProvisioner:
                 kwargs["expected_vm_uid"] = expected_vm_uid
             if expected_rootdisk_pvc_uid is not None:
                 kwargs["expected_rootdisk_pvc_uid"] = expected_rootdisk_pvc_uid
+            if parent_cleanup is not None:
+                kwargs["parent_cleanup"] = dict(parent_cleanup)
             return await nats_bridge.request_vm_delete(job_id, **kwargs)
 
         if self._http_available:
@@ -1802,6 +1822,8 @@ class VMProvisioner:
                 kwargs["expected_vm_uid"] = expected_vm_uid
             if expected_rootdisk_pvc_uid is not None:
                 kwargs["expected_rootdisk_pvc_uid"] = expected_rootdisk_pvc_uid
+            if parent_cleanup is not None:
+                kwargs["parent_cleanup"] = dict(parent_cleanup)
             return await self._delete_http(job_id, **kwargs)
 
         return False
@@ -1814,6 +1836,7 @@ class VMProvisioner:
         expected_vm_uid: str,
         expected_rootdisk_pvc_uid: str | None,
         purge_disk: bool,
+        parent_cleanup: Mapping[str, Any] | None = None,
     ) -> bool:
         """Delete one captured thread VM incarnation, never its successor."""
 
@@ -1835,6 +1858,9 @@ class VMProvisioner:
             expected_vm_uid=vm_uid,
             expected_rootdisk_pvc_uid=rootdisk_uid,
             entity_type="thread",
+            **(
+                {"parent_cleanup": parent_cleanup} if parent_cleanup is not None else {}
+            ),
         )
 
     async def release_vm(
@@ -2460,6 +2486,7 @@ class VMProvisioner:
         provision_generation: str | None = None,
         expected_vm_uid: str | None = None,
         expected_rootdisk_pvc_uid: str | None = None,
+        parent_cleanup: Mapping[str, Any] | None = None,
     ) -> bool:
         """Delete a VM by sending DELETE to the co-located VM controller."""
         if self._http_client is None:
@@ -2478,11 +2505,20 @@ class VMProvisioner:
             "purge_disk": purge_disk,
             "provision_generation": generation,
         }
+        if entity_type != "job":
+            signed_payload["entity_type"] = entity_type
         if expected_vm_uid is not None:
             signed_payload["expected_vm_uid"] = expected_vm_uid
         if expected_rootdisk_pvc_uid is not None:
             signed_payload["expected_rootdisk_pvc_uid"] = expected_rootdisk_pvc_uid
         params: dict[str, str] = {}
+        if parent_cleanup is not None:
+            signed_payload["parent_cleanup"] = json.dumps(
+                parent_cleanup, sort_keys=True, separators=(",", ":")
+            )
+            params["parent_cleanup"] = signed_payload["parent_cleanup"]
+        if entity_type != "job":
+            params["entity_type"] = entity_type
         if not purge_disk:
             params["purge_disk"] = "false"
         if generation is not None:

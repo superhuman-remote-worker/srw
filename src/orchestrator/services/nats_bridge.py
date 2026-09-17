@@ -407,6 +407,7 @@ class NatsBridge:
         entity_type: str = "job",
         expected_vm_uid: str | None = None,
         expected_rootdisk_pvc_uid: str | None = None,
+        parent_cleanup: Mapping[str, Any] | None = None,
     ) -> bool:
         """Publish a VM deletion request.
 
@@ -449,6 +450,10 @@ class NatsBridge:
             payload["expected_vm_uid"] = expected_vm_uid
         if expected_rootdisk_pvc_uid is not None:
             payload["expected_rootdisk_pvc_uid"] = expected_rootdisk_pvc_uid
+        if entity_type != "job":
+            payload["entity_type"] = entity_type
+        if parent_cleanup is not None:
+            payload["parent_cleanup"] = dict(parent_cleanup)
         payload = sign_payload(
             payload,
             direction="request",

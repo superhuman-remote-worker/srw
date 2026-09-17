@@ -67,6 +67,60 @@ describe('ApiService.createJob public wire contract', () => {
   });
 });
 
+describe('ApiService.retryWorkspaceRecovery', () => {
+  let api: ApiService;
+  let httpMock: HttpTestingController;
+  const toast = {danger: vi.fn(), success: vi.fn()};
+
+  beforeEach(() => {
+    toast.danger.mockClear();
+    toast.success.mockClear();
+    TestBed.resetTestingModule();
+    TestBed.configureTestingModule({
+      providers: [
+        ApiService,
+        provideHttpClient(),
+        provideHttpClientTesting(),
+        {provide: AppToastService, useValue: toast},
+        {provide: TranslocoService, useValue: {translate: (key: string) => key}},
+        {
+          provide: ErrorMessageService,
+          useValue: {translate: (_e: unknown, key: string) => key},
+        },
+      ],
+    });
+    api = TestBed.inject(ApiService);
+    httpMock = TestBed.inject(HttpTestingController);
+  });
+
+  afterEach(() => httpMock.verify());
+
+  it('sends the caller-owned request id unchanged and surfaces a 409 as ambiguous', async () => {
+    const pending = firstValueFrom(
+      api.retryWorkspaceRecovery(
+        'job-1',
+        '22222222-bbbb-4222-8222-222222222222',
+        'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+      ),
+    );
+    const request = httpMock.expectOne((item) =>
+      item.url.endsWith('/jobs/job-1/workspace-recovery/retry'),
+    );
+    expect(request.request.body).toEqual({
+      operation_id: '22222222-bbbb-4222-8222-222222222222',
+      request_id: 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',
+    });
+
+    request.flush(
+      {detail: {code: 'recovery_superseded', message: 'Read back current state'}},
+      {status: 409, statusText: 'Conflict'},
+    );
+
+    await expect(pending).resolves.toBeNull();
+    expect(toast.danger).toHaveBeenCalledOnce();
+  });
+});
+
 describe('ApiService.getJobPullRequestStatus', () => {
   let api: ApiService;
   let httpMock: HttpTestingController;

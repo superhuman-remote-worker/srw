@@ -84,7 +84,10 @@ def workspace_recovery_projection(job: Mapping[str, Any]) -> dict[str, Any] | No
         "started_at": raw.get("started_at"),
         "deadline_at": raw.get("deadline_at"),
         "next_check_at": raw.get("next_check_at"),
-        "retryable": state == "paused_attention",
+        # Shared workspace participants see the same coordinate-free recovery
+        # state, but only the canonical job owner may create its successor.
+        # Missing ownership evidence fails closed for rolling-upgrade rows.
+        "retryable": state == "paused_attention" and raw.get("canonical_owner") is True,
         "cleanup_pending": raw.get("cleanup_pending") is True,
     }
 

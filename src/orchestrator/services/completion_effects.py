@@ -12,6 +12,8 @@ from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 from orchestrator.services.completion_effect_policy import COMPLETION_EFFECT_INDEX
 from orchestrator.services.container_provisioner import WorkspaceTeardownIdentity
 from orchestrator.services.vm_workspace_recovery_store import (
+    bind_vm_cleanup_permit,
+    vm_cleanup_kwargs,
     cleanup_intent_digest,
     completed_cleanup_outcome,
 )
@@ -138,31 +140,32 @@ async def run_completion_workspace_teardown(
                 parsed_pvc_uid = UUID(str(pvc_uid)) if pvc_uid is not None else None
             except (TypeError, ValueError, AttributeError):
                 parsed_pvc_uid = None
+            request_id = uuid5(
+                cleanup_request_namespace, f"{resource}:{parsed_pvc_uid or 'none'}"
+            )
+            resource_intent = {
+                **intent,
+                "owner_kind": "job",
+                "owner_id": job_id,
+                "pvc_uid": str(parsed_pvc_uid or ""),
+                "resource": resource,
+                "source": "completion_workspace_teardown",
+            }
             permit = await recovery_store.acquire_cleanup_permit(
                 owner_kind="job",
                 owner_id=UUID(job_id),
                 pvc_uid=parsed_pvc_uid,
-                request_id=uuid5(
-                    cleanup_request_namespace,
-                    f"{resource}:{parsed_pvc_uid or 'none'}",
-                ),
+                request_id=request_id,
                 source="completion_workspace_teardown",
-                intent_digest=cleanup_intent_digest(
-                    {
-                        **intent,
-                        "owner_kind": "job",
-                        "owner_id": job_id,
-                        "pvc_uid": str(parsed_pvc_uid or ""),
-                        "resource": resource,
-                        "source": "completion_workspace_teardown",
-                    }
-                ),
+                intent_digest=cleanup_intent_digest(resource_intent),
             )
             if not permit.allowed:
                 raise RuntimeError(
                     "workspace teardown held for unresolved workspace recovery"
                 )
-            return permit
+            return bind_vm_cleanup_permit(
+                permit, request_id=request_id, intent=resource_intent
+            )
 
         async def _complete_destructive_cleanup(permit: Any, outcome: str) -> None:
             admission_id = getattr(permit, "admission_id", None)
@@ -241,6 +244,7 @@ async def run_completion_workspace_teardown(
                     ssh_host=ssh_host,
                     ssh_port=ssh_port,
                     purge_disk=True,
+                    **vm_cleanup_kwargs(cleanup),
                 )
                 if outcome.disposition in {"completed", "identity_superseded"}:
                     await _complete_destructive_cleanup(cleanup, outcome.disposition)

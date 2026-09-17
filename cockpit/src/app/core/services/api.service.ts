@@ -1871,7 +1871,7 @@ export class ApiService {
   retryWorkspaceRecovery(
     jobId: string,
     operationId: string,
-    requestId: string = crypto.randomUUID(),
+    requestId: string,
   ): Observable<{
     status: string;
     operation_id: string;

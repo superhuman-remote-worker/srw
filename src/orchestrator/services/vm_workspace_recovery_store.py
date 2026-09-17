@@ -7,7 +7,7 @@ import json
 import logging
 import os
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Any, Mapping
 from uuid import UUID, uuid4, uuid5, NAMESPACE_URL
@@ -341,6 +341,7 @@ class CleanupPermit:
     recovery_id: UUID | None = None
     reason: str | None = None
     completed_outcome: str | None = None
+    parent_cleanup: Mapping[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -394,6 +395,62 @@ def completed_cleanup_outcome(permit: Any) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
+def bind_vm_cleanup_permit(
+    permit: Any, *, request_id: UUID, intent: Mapping[str, Any]
+) -> Any:
+    """Carry the admitted exact intent across the authenticated controller hop."""
+    if not isinstance(permit, CleanupPermit) or not permit.allowed:
+        return permit
+    return replace(
+        permit,
+        parent_cleanup={
+            "admission_id": str(permit.admission_id),
+            "request_id": str(request_id),
+            "intent_digest": cleanup_intent_digest(intent),
+            "intent": dict(intent),
+        },
+    )
+
+
+def vm_cleanup_kwargs(permit: Any) -> dict[str, Any]:
+    proof = getattr(permit, "parent_cleanup", None)
+    return {"parent_cleanup": dict(proof)} if isinstance(proof, Mapping) else {}
+
+
+def _parent_cleanup_identity(
+    proof: Mapping[str, Any],
+    *,
+    owner_kind: str,
+    owner_id: UUID,
+    pvc_uid: UUID | None,
+    provision_generation: str | None,
+    expected_vm_uid: str | None,
+) -> tuple[UUID, UUID, str, str] | None:
+    try:
+        intent = proof["intent"]
+        if (
+            not isinstance(intent, Mapping)
+            or intent.get("owner_kind") != owner_kind
+            or intent.get("owner_id") != str(owner_id)
+            or intent.get("pvc_uid") != str(pvc_uid)
+            or not provision_generation
+            or intent.get("provision_generation") != provision_generation
+            or intent.get("vm_uid") != (expected_vm_uid or "")
+            or intent.get("purge_disk") is not True
+            or intent.get("resource") not in {"vm", "vm_workspace"}
+            or cleanup_intent_digest(intent) != proof["intent_digest"]
+        ):
+            return None
+        return (
+            UUID(str(proof["admission_id"])),
+            UUID(str(proof["request_id"])),
+            str(proof["intent_digest"]),
+            str(intent["source"]),
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
 async def acquire_vm_cleanup_permit(
     recovery_store: Any,
     *,
@@ -422,26 +479,26 @@ async def acquire_vm_cleanup_permit(
             str(pvc_uid or ""),
         )
     )
-    intent_digest = cleanup_intent_digest(
-        {
-            "owner_kind": owner_kind,
-            "owner_id": str(canonical_owner),
-            "provision_generation": str(getattr(identity, "provision_generation", "")),
-            "vm_uid": str(getattr(identity, "vm_uid", "") or ""),
-            "pvc_uid": str(pvc_uid or ""),
-            "purge_disk": bool(purge_disk),
-            "resource": "vm_workspace",
-            "source": source,
-        }
-    )
-    return await recovery_store.acquire_cleanup_permit(
+    resource_intent = {
+        "owner_kind": owner_kind,
+        "owner_id": str(canonical_owner),
+        "provision_generation": str(getattr(identity, "provision_generation", "")),
+        "vm_uid": str(getattr(identity, "vm_uid", "") or ""),
+        "pvc_uid": str(pvc_uid or ""),
+        "purge_disk": bool(purge_disk),
+        "resource": "vm_workspace",
+        "source": source,
+    }
+    request_id = uuid5(NAMESPACE_URL, f"vm-workspace-cleanup:{intent}")
+    permit = await recovery_store.acquire_cleanup_permit(
         owner_kind=owner_kind,
         owner_id=canonical_owner,
         pvc_uid=pvc_uid,
-        request_id=uuid5(NAMESPACE_URL, f"vm-workspace-cleanup:{intent}"),
+        request_id=request_id,
         source=source,
-        intent_digest=intent_digest,
+        intent_digest=cleanup_intent_digest(resource_intent),
     )
+    return bind_vm_cleanup_permit(permit, request_id=request_id, intent=resource_intent)
 
 
 async def complete_vm_cleanup_permit(
@@ -1293,11 +1350,30 @@ class VMWorkspaceRecoveryStore:
         request_id: UUID,
         source: str,
         intent_digest: str,
+        revalidate_completed: bool = False,
+        parent_cleanup: Mapping[str, Any] | None = None,
+        parent_provision_generation: str | None = None,
+        expected_vm_uid: str | None = None,
     ) -> CleanupPermit:
         """Serialize destructive admission with recovery and its exact disk pin."""
 
         if not isinstance(intent_digest, str) or not intent_digest:
             raise ValueError("cleanup intent digest must be nonempty")
+        parent_identity = None
+        if parent_cleanup is not None:
+            parent_identity = _parent_cleanup_identity(
+                parent_cleanup,
+                owner_kind=owner_kind,
+                owner_id=owner_id,
+                pvc_uid=pvc_uid,
+                provision_generation=parent_provision_generation,
+                expected_vm_uid=expected_vm_uid,
+            )
+            if source != "controller_rootdisk_delete" or parent_identity is None:
+                return CleanupPermit(
+                    allowed=False, reason="parent_cleanup_identity_changed"
+                )
+        parent_id = parent_identity[0] if parent_identity is not None else None
 
         async with self.db.acquire() as conn:
             async with conn.transaction():
@@ -1339,23 +1415,77 @@ class VMWorkspaceRecoveryStore:
                             )
                         owner_id = canonical_owner
                 prior = await conn.fetchrow(
-                    "SELECT id,completed_at,pvc_uid,source,intent_digest,outcome "
+                    "SELECT id,completed_at,pvc_uid,source,intent_digest,outcome,parent_admission_id "
                     "FROM vm_workspace_cleanup_admissions "
                     "WHERE owner_kind=$1 AND owner_id=$2 AND request_id=$3 FOR UPDATE",
                     owner_kind,
                     owner_id,
                     request_id,
                 )
+                if parent_identity is not None:
+                    parent = await conn.fetchrow(
+                        "SELECT owner_kind,owner_id,pvc_uid,source,request_id,intent_digest,completed_at,parent_admission_id "
+                        "FROM vm_workspace_cleanup_admissions WHERE id=$1 FOR UPDATE",
+                        parent_id,
+                    )
+                    if (
+                        parent is None
+                        or (parent["completed_at"] is not None and prior is None)
+                        or parent["parent_admission_id"] is not None
+                        or parent["owner_kind"] != owner_kind
+                        or parent["owner_id"] != owner_id
+                        or parent["pvc_uid"] != pvc_uid
+                        or parent["request_id"] != parent_identity[1]
+                        or parent["intent_digest"] != parent_identity[2]
+                        or parent["source"] != parent_identity[3]
+                    ):
+                        return CleanupPermit(
+                            allowed=False, reason="parent_cleanup_identity_changed"
+                        )
                 if prior is not None:
                     if (
                         prior["pvc_uid"] != pvc_uid
                         or prior["source"] != source
                         or prior["intent_digest"] != intent_digest
+                        or prior["parent_admission_id"] != parent_id
                     ):
                         raise WorkspaceRecoveryControlConflict(
                             "cleanup_request_id_reused",
                             "Cleanup request ID was already used with different resource intent.",
                         )
+                    if prior["completed_at"] is not None and revalidate_completed:
+                        later_recovery = await conn.fetchrow(
+                            "SELECT r.id FROM vm_workspace_recoveries r "
+                            "LEFT JOIN vm_workspace_recovery_retention_pins pin "
+                            "ON pin.recovery_id=r.id AND pin.released_at IS NULL "
+                            "WHERE r.resolved_at IS NULL AND ((r.owner_kind=$1 AND r.owner_id=$2) "
+                            "OR ($3::uuid IS NOT NULL AND pin.pvc_uid=$3)) FOR UPDATE OF r",
+                            owner_kind,
+                            owner_id,
+                            pvc_uid,
+                        )
+                        if later_recovery is not None:
+                            return CleanupPermit(
+                                allowed=False,
+                                recovery_id=later_recovery["id"],
+                                reason="workspace_recovery_unresolved",
+                            )
+                        later_cleanup = await conn.fetchrow(
+                            "SELECT id FROM vm_workspace_cleanup_admissions "
+                            "WHERE id<>$1 AND ((owner_kind=$2 AND owner_id=$3) "
+                            "OR ($4::uuid IS NOT NULL AND pvc_uid=$4)) "
+                            "AND completed_at IS NULL FOR UPDATE",
+                            prior["id"],
+                            owner_kind,
+                            owner_id,
+                            pvc_uid,
+                        )
+                        if later_cleanup is not None:
+                            return CleanupPermit(
+                                allowed=False,
+                                admission_id=later_cleanup["id"],
+                                reason="workspace_cleanup_already_admitted",
+                            )
                     return CleanupPermit(
                         allowed=True,
                         admission_id=prior["id"],
@@ -1374,10 +1504,11 @@ class VMWorkspaceRecoveryStore:
                     "SELECT id FROM vm_workspace_cleanup_admissions "
                     "WHERE ((owner_kind=$1 AND owner_id=$2) "
                     "OR ($3::uuid IS NOT NULL AND pvc_uid=$3)) "
-                    "AND completed_at IS NULL FOR UPDATE",
+                    "AND completed_at IS NULL AND ($4::uuid IS NULL OR id<>$4) FOR UPDATE",
                     owner_kind,
                     owner_id,
                     pvc_uid,
+                    parent_id,
                 )
                 if active_cleanup is not None:
                     permit = CleanupPermit(
@@ -1429,8 +1560,8 @@ class VMWorkspaceRecoveryStore:
                 admission_id = uuid4()
                 await conn.execute(
                     "INSERT INTO vm_workspace_cleanup_admissions "
-                    "(id,owner_kind,owner_id,pvc_uid,source,request_id,intent_digest) "
-                    "VALUES ($1,$2,$3,$4,$5,$6,$7)",
+                    "(id,owner_kind,owner_id,pvc_uid,source,request_id,intent_digest,parent_admission_id) "
+                    "VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
                     admission_id,
                     owner_kind,
                     owner_id,
@@ -1438,22 +1569,85 @@ class VMWorkspaceRecoveryStore:
                     source,
                     request_id,
                     intent_digest,
+                    parent_id,
                 )
                 return CleanupPermit(allowed=True, admission_id=admission_id)
 
     async def complete_cleanup_permit(
-        self, admission_id: UUID, *, outcome: str
+        self,
+        admission_id: UUID,
+        *,
+        outcome: str,
+        request_id: UUID | None = None,
+        intent_digest: str | None = None,
     ) -> bool:
         if not outcome:
             raise ValueError("cleanup outcome must be nonempty")
-        async with self.db.acquire() as conn:
-            changed = await conn.fetchval(
-                "UPDATE vm_workspace_cleanup_admissions SET completed_at=clock_timestamp(), "
-                "outcome=$2 WHERE id=$1 AND completed_at IS NULL RETURNING 1",
-                admission_id,
-                outcome,
+        if (request_id is None) != (intent_digest is None):
+            raise ValueError(
+                "cleanup request ID and intent digest must be supplied together"
             )
-        return changed is not None
+        async with self.db.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    "SELECT request_id,intent_digest,completed_at,outcome "
+                    "FROM vm_workspace_cleanup_admissions WHERE id=$1 FOR UPDATE",
+                    admission_id,
+                )
+                if row is None or (
+                    request_id is not None
+                    and (
+                        row["request_id"] != request_id
+                        or row["intent_digest"] != intent_digest
+                    )
+                ):
+                    return False
+                if row["completed_at"] is not None:
+                    return row["outcome"] == outcome
+                await conn.execute(
+                    "UPDATE vm_workspace_cleanup_admissions "
+                    "SET completed_at=clock_timestamp(),outcome=$2 WHERE id=$1",
+                    admission_id,
+                    outcome,
+                )
+                return True
+
+    async def resume_cleanup_permit(
+        self,
+        admission_id: UUID,
+        *,
+        owner_kind: str,
+        owner_id: UUID,
+        source: str,
+        request_id: UUID,
+        intent_digest: str,
+    ) -> CleanupPermit:
+        """Validate a controller reservation recovered from Kubernetes state."""
+
+        async with self.db.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT id,owner_kind,owner_id,source,request_id,intent_digest,"
+                "completed_at,outcome "
+                "FROM vm_workspace_cleanup_admissions WHERE id=$1",
+                admission_id,
+            )
+        if (
+            row is None
+            or row["owner_kind"] != owner_kind
+            or row["owner_id"] != owner_id
+            or row["source"] != source
+            or row["request_id"] != request_id
+            or row["intent_digest"] != intent_digest
+        ):
+            return CleanupPermit(allowed=False, reason="cleanup_reservation_changed")
+        if row["completed_at"] is not None:
+            return CleanupPermit(
+                allowed=False,
+                admission_id=admission_id,
+                reason="cleanup_request_already_completed",
+                completed_outcome=row["outcome"],
+            )
+        return CleanupPermit(allowed=True, admission_id=admission_id)
 
     async def retry_paused(
         self,
@@ -1807,7 +2001,20 @@ class VMWorkspaceRecoveryStore:
                          AND pin.controller_pinned_at IS NULL)
                         OR (pin.released_at IS NOT NULL
                             AND pin.controller_pinned_at IS NOT NULL
-                            AND pin.controller_released_at IS NULL))
+                            AND pin.controller_released_at IS NULL
+                            AND (
+                                recovery.superseded_by IS NULL
+                                OR EXISTS (
+                                    SELECT 1
+                                      FROM vm_workspace_recovery_retention_pins successor_pin
+                                     WHERE successor_pin.recovery_id=recovery.superseded_by
+                                       AND successor_pin.pvc_uid=pin.pvc_uid
+                                       AND successor_pin.provision_generation=pin.provision_generation
+                                       AND successor_pin.released_at IS NULL
+                                       AND successor_pin.controller_pinned_at IS NOT NULL
+                                       AND successor_pin.controller_released_at IS NULL
+                                )
+                            )))
                  ORDER BY pin.controller_sync_after,pin.pinned_at
                  LIMIT $1
                 """,
@@ -2201,7 +2408,7 @@ class VMWorkspaceRecoveryStore:
                            COALESCE(
                                latest_observation->'successor'->>'node_uid',
                                latest_observation->>'node_uid',
-                               'unknown:' || id::text
+                               'unknown'
                            ) AS node_key
                       FROM vm_workspace_recoveries
                      WHERE id=$1 AND phase IN (

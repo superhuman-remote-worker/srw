@@ -43,6 +43,7 @@ from orchestrator.services.stateless_workspace_gate import (
 from orchestrator.services.workspace_lifecycle import WorkspaceOwner
 from orchestrator.services.vm_workspace_recovery_store import (
     acquire_vm_cleanup_permit,
+    vm_cleanup_kwargs,
     completed_cleanup_outcome,
     complete_vm_cleanup_permit,
 )
@@ -2149,6 +2150,7 @@ async def archive_and_cleanup_workspace(
                         ssh_port=vm_ctx.get("ssh_port"),
                         entity_type="thread",
                         purge_disk=True,
+                        **vm_cleanup_kwargs(cleanup),
                     )
                     disposition = outcome.disposition
                     if disposition in {"completed", "identity_superseded"}:
@@ -2211,6 +2213,7 @@ async def archive_and_cleanup_workspace(
                         ssh_host=vm_ctx.get("ssh_host"),
                         ssh_port=vm_ctx.get("ssh_port"),
                         purge_disk=True,
+                        **vm_cleanup_kwargs(cleanup),
                     )
                     disposition = outcome.disposition
                     if disposition in {"completed", "identity_superseded"}:
