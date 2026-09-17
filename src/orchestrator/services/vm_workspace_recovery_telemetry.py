@@ -7,7 +7,33 @@ import logging
 import re
 from typing import Any
 
-from opentelemetry import metrics
+try:
+    from opentelemetry import metrics
+
+    _HAS_OTEL = True
+except Exception:  # pragma: no cover — defensive for images without OTel API
+    metrics = None  # type: ignore[assignment]
+    _HAS_OTEL = False
+
+
+class _NullInstrument:
+    """No-op counter/histogram used when the OTel API is not installed."""
+
+    def add(self, *_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    def record(self, *_args: Any, **_kwargs: Any) -> None:
+        return None
+
+
+class _NullMeter:
+    """No-op meter factory used when the OTel API is not installed."""
+
+    def create_counter(self, *_args: Any, **_kwargs: Any) -> _NullInstrument:
+        return _NullInstrument()
+
+    def create_histogram(self, *_args: Any, **_kwargs: Any) -> _NullInstrument:
+        return _NullInstrument()
 
 from shared.workspace_recovery import WorkspaceRecoveryCode
 
@@ -121,9 +147,14 @@ class VMWorkspaceRecoveryTelemetry:
     """Emit bounded OTel dimensions and identifier-free recovery audit logs."""
 
     def __init__(self, *, meter: Any | None = None) -> None:
-        source = meter or metrics.get_meter(
-            "orchestrator.services.vm_workspace_recovery", "1"
-        )
+        if meter is None:
+            if _HAS_OTEL and metrics is not None:
+                meter = metrics.get_meter(
+                    "orchestrator.services.vm_workspace_recovery", "1"
+                )
+            else:
+                meter = _NullMeter()
+        source = meter
         self._events = source.create_counter(
             "srw.vm_workspace_recovery.events",
             unit="{event}",

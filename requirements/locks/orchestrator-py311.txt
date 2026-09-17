@@ -1271,6 +1271,9 @@ openai==3.8.0 \
     # via
     #   -r src/orchestrator/requirements.txt
     #   langchain-openai
+opentelemetry-api==1.44.0 \
+    --hash=sha256:94b98c893a91b88657eaac1e3ba89618cdb85be6918196705354f34728b2cdef
+    # via -r src/orchestrator/requirements.txt
 orjson==3.12.0 \
     --hash=sha256:010811c1b69773450a01cef97727a67b223242f350b77d4ca000e59a9ef2155a \
     --hash=sha256:01efac2074fffb4cb1ea3fab7861e9d0f2a26913854a972f5ac760525dbdaf6e \
@@ -2290,6 +2293,7 @@ typing-extensions==4.16.0 \
     #   langchain-protocol
     #   langsmith
     #   openai
+    #   opentelemetry-api
     #   pydantic
     #   pydantic-core
     #   referencing

@@ -61,3 +61,10 @@ aiohttp>=3.9.0
 # (services/cron_dispatcher.py). Pairs with zoneinfo (stdlib) for
 # DST-aware next-fire-time computation against IANA-named timezones.
 croniter>=2.0.0
+# VM workspace recovery telemetry (services/vm_workspace_recovery_telemetry.py)
+# imports `opentelemetry.metrics` at startup via main.py. API package only —
+# SDK/exporter installation remains an ops choice. Without this the
+# orchestrator image fails to boot with ModuleNotFoundError (live-diagnosed
+# 2026-09-17, sha-2a9f65a). The module also has a no-op fallback so dev
+# stays safe if the API is absent.
+opentelemetry-api>=1.20.0
