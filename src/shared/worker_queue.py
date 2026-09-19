@@ -335,7 +335,7 @@ _CLOSE_WORKER_PREFLIGHT_SQL = """
 UPDATE run_queue
 SET state = 'done',
     lease_token = lease_token + CASE WHEN state = 'leased' THEN 1 ELSE 0 END,
-    attempts_since_completion = 0,
+    attempts_since_completion = CASE WHEN $2::boolean THEN attempts_since_completion ELSE 0 END,
     leased_by = NULL,
     last_leased_by = NULL,
     leased_until = NULL,
@@ -786,6 +786,7 @@ async def hold_worker_batch_for_preflight(
     conn: Any,
     *,
     job_id: UUID | str,
+    preserve_attempts: bool = False,
 ) -> None:
     """Make a workspace-reprovisioning job non-runnable under the queue lock.
 
@@ -795,7 +796,8 @@ async def hold_worker_batch_for_preflight(
     lease also advances its token so the predecessor's saver and completion
     report fail closed immediately. When no row exists, create and close one
     inside the same transaction so concurrent admission cannot pass between
-    queue and jobs updates.
+    queue and jobs updates. ``preserve_attempts=True`` retains genuine worker
+    failures while VM creation preflight waits; the legacy default resets them.
     """
 
     job_uuid = _uuid(job_id)
@@ -807,7 +809,9 @@ async def hold_worker_batch_for_preflight(
         )
     if current is None:
         await enqueue_worker_batch(conn, job_id=job_uuid)
-    closed = await conn.fetchrow(_CLOSE_WORKER_PREFLIGHT_SQL, job_uuid)
+    closed = await conn.fetchrow(
+        _CLOSE_WORKER_PREFLIGHT_SQL, job_uuid, preserve_attempts
+    )
     if closed is None:
         raise RuntimeError(f"worker preflight lost queue unit {job_uuid}")
 
@@ -850,7 +854,31 @@ async def worker_lease_is_current(
     )
 
 
+class _VMCreationPending(Exception):
+    """Roll back a raced claim without consuming a genuine worker attempt."""
+
+
 async def claim_worker_batch(
+    db: Any,
+    *,
+    pod_name: str,
+    lease_ttl_seconds: float = LEASE_TTL_SECONDS,
+    affinity_grace_seconds: float = AFFINITY_GRACE_SECONDS,
+    completion_commands_enabled: bool = False,
+) -> WorkerClaim | None:
+    try:
+        return await _claim_worker_batch(
+            db,
+            pod_name=pod_name,
+            lease_ttl_seconds=lease_ttl_seconds,
+            affinity_grace_seconds=affinity_grace_seconds,
+            completion_commands_enabled=completion_commands_enabled,
+        )
+    except _VMCreationPending:
+        return None
+
+
+async def _claim_worker_batch(
     db: Any,
     *,
     pod_name: str,
@@ -924,6 +952,10 @@ async def claim_worker_batch(
                     )
             prior_status = str(job["status"]) if job is not None else None
             job_context = _json_object(job.get("context")) if job is not None else {}
+            if "_vm_creation_pending" in job_context:
+                # Even a stale enqueuer cannot publish execution while creation
+                # or readiness remains pending. Roll back lease + attempt count.
+                raise _VMCreationPending
             resume_id_value = job_context.get("worker_resume_id")
             resume_id = (
                 str(resume_id_value)

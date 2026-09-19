@@ -30283,6 +30283,7 @@ class PostgresDB:
                            AND status IN ('created', 'paused')
                            AND assigned_agent_id IS NULL
                            AND freeze_data IS NULL
+                           AND NOT (COALESCE(context, '{{}}'::jsonb) ? '_vm_creation_pending')
                            AND (
                                (
                                    jsonb_typeof(

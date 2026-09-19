@@ -330,7 +330,10 @@ async def test_workspace_preflight_creates_then_closes_absent_worker_row(monkeyp
     enqueue.assert_awaited_once_with(conn, job_id=job_id)
     close_sql = conn.fetchrow.await_args_list[1].args[0]
     assert "state = 'done'" in close_sql
-    assert "attempts_since_completion = 0" in close_sql
+    assert (
+        "CASE WHEN $2::boolean THEN attempts_since_completion ELSE 0 END" in close_sql
+    )
+    assert conn.fetchrow.await_args_list[1].args[2] is False
 
 
 @pytest.mark.asyncio
@@ -365,7 +368,10 @@ async def test_workspace_preflight_resets_parked_attempts_before_closing(monkeyp
     await worker_queue.hold_worker_batch_for_preflight(conn, job_id=job_id)
 
     close_sql = conn.fetchrow.await_args_list[1].args[0]
-    assert "attempts_since_completion = 0" in close_sql
+    assert (
+        "CASE WHEN $2::boolean THEN attempts_since_completion ELSE 0 END" in close_sql
+    )
+    assert conn.fetchrow.await_args_list[1].args[2] is False
     assert "state = 'done'" in close_sql
 
 

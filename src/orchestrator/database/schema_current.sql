@@ -341,6 +341,23 @@ COMMENT ON FUNCTION public.audit_officer_ticket_claim_job_delete() IS '0162 dele
 
 
 --
+-- Name: cancel_vm_creation_retry_on_job_control(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.cancel_vm_creation_retry_on_job_control() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    IF NEW.status::text IN ('cancelled','completed') OR
+       NEW.context ?| ARRAY['_stateless_delete_pending','_stateless_cancel_cleanup_pending'] THEN
+        PERFORM request_vm_creation_retry_cancel(NEW.id);
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
 -- Name: cancel_workspace_creation_on_terminal_owner_transition(); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -7417,6 +7434,43 @@ $$;
 
 
 --
+-- Name: guard_vm_creation_retry_identity(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.guard_vm_creation_retry_identity() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    IF ROW(NEW.request_id,NEW.job_id,NEW.provision_generation,NEW.origin,
+           NEW.request_digest,NEW.canonical_request,NEW.controller_configuration_digest,
+           NEW.execution_id,NEW.execution_revision,NEW.execution_generation,NEW.admission_deadline,
+           NEW.expected_pvc_uid,NEW.predecessor_evidence,NEW.predecessor_cleanup_admission_id,NEW.created_at)
+       IS DISTINCT FROM
+       ROW(OLD.request_id,OLD.job_id,OLD.provision_generation,OLD.origin,
+           OLD.request_digest,OLD.canonical_request,OLD.controller_configuration_digest,
+           OLD.execution_id,OLD.execution_revision,OLD.execution_generation,OLD.admission_deadline,
+           OLD.expected_pvc_uid,OLD.predecessor_evidence,OLD.predecessor_cleanup_admission_id,OLD.created_at)
+       OR (OLD.creation_admission_id IS NOT NULL AND NEW.creation_admission_id IS DISTINCT FROM OLD.creation_admission_id)
+       OR (OLD.observed_vm_uid IS NOT NULL AND NEW.observed_vm_uid IS DISTINCT FROM OLD.observed_vm_uid)
+       OR (OLD.observed_pvc_uid IS NOT NULL AND NEW.observed_pvc_uid IS DISTINCT FROM OLD.observed_pvc_uid)
+       OR (OLD.boot_counted AND NOT NEW.boot_counted)
+       OR NEW.revision < OLD.revision THEN
+        RAISE EXCEPTION 'VM creation retry identity is immutable' USING ERRCODE='23514';
+    END IF;
+    IF NEW.state <> OLD.state AND NOT (
+        (OLD.state='queued' AND NEW.state IN ('reconciling','cancel_requested')) OR
+        (OLD.state='reconciling' AND NEW.state IN ('queued','attention','succeeded','cancel_requested')) OR
+        (OLD.state='attention' AND NEW.state IN ('queued','cancel_requested')) OR
+        (OLD.state='cancel_requested' AND NEW.state='settled')
+    ) THEN
+        RAISE EXCEPTION 'Invalid VM creation retry transition' USING ERRCODE='23514';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
 -- Name: lock_inventory_epoch_boundary_statement(); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -12463,6 +12517,26 @@ BEGIN
     RAISE EXCEPTION
         'usage rate-card components are immutable; insert a successor version'
         USING ERRCODE = '55000';
+END;
+$$;
+
+
+--
+-- Name: request_vm_creation_retry_cancel(uuid, text); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.request_vm_creation_retry_cancel(p_job_id uuid, p_generation text DEFAULT NULL::text) RETURNS boolean
+    LANGUAGE plpgsql
+    AS $$
+DECLARE touched integer;
+BEGIN
+    UPDATE vm_creation_retries SET state='cancel_requested',revision=revision+1,
+        claim_token=NULL,claim_expires_at=NULL,next_probe_at=clock_timestamp(),
+        reason='job_cancelled',updated_at=clock_timestamp()
+    WHERE job_id=p_job_id AND (p_generation IS NULL OR provision_generation::text=p_generation)
+      AND state IN ('queued','reconciling','attention');
+    GET DIAGNOSTICS touched = ROW_COUNT;
+    RETURN touched > 0;
 END;
 $$;
 
@@ -20745,6 +20819,59 @@ COMMENT ON COLUMN public.users.cloud_identity IS 'Per-backend cloud identity cac
 
 
 --
+-- Name: vm_creation_retries; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.vm_creation_retries (
+    request_id uuid NOT NULL,
+    job_id uuid NOT NULL,
+    provision_generation uuid NOT NULL,
+    origin text NOT NULL,
+    request_digest text NOT NULL,
+    canonical_request jsonb NOT NULL,
+    controller_configuration_digest text NOT NULL,
+    execution_id uuid NOT NULL,
+    execution_revision text NOT NULL,
+    execution_generation bigint NOT NULL,
+    admission_deadline timestamp with time zone,
+    expected_pvc_uid uuid,
+    predecessor_evidence jsonb DEFAULT '{}'::jsonb NOT NULL,
+    predecessor_cleanup_admission_id uuid,
+    creation_admission_id uuid,
+    state text DEFAULT 'queued'::text NOT NULL,
+    revision bigint DEFAULT 0 NOT NULL,
+    claim_token uuid,
+    claim_expires_at timestamp with time zone,
+    next_probe_at timestamp with time zone DEFAULT clock_timestamp() NOT NULL,
+    backoff_attempt integer DEFAULT 0 NOT NULL,
+    transport_outage_started_at timestamp with time zone,
+    reason text,
+    boot_counted boolean DEFAULT false NOT NULL,
+    observed_vm_uid uuid,
+    observed_pvc_uid uuid,
+    ready_at timestamp with time zone,
+    resolved_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT clock_timestamp() NOT NULL,
+    updated_at timestamp with time zone DEFAULT clock_timestamp() NOT NULL,
+    CONSTRAINT vm_creation_retries_backoff_attempt_check CHECK ((backoff_attempt >= 0)),
+    CONSTRAINT vm_creation_retries_canonical_request_check CHECK ((jsonb_typeof(canonical_request) = 'object'::text)),
+    CONSTRAINT vm_creation_retries_check CHECK (((claim_token IS NULL) = (claim_expires_at IS NULL))),
+    CONSTRAINT vm_creation_retries_check1 CHECK (((claim_token IS NULL) OR (state = ANY (ARRAY['reconciling'::text, 'cancel_requested'::text])))),
+    CONSTRAINT vm_creation_retries_check2 CHECK (((resolved_at IS NOT NULL) = (state = ANY (ARRAY['succeeded'::text, 'settled'::text])))),
+    CONSTRAINT vm_creation_retries_check3 CHECK (((state <> 'succeeded'::text) OR ((observed_vm_uid IS NOT NULL) AND (observed_pvc_uid IS NOT NULL) AND (creation_admission_id IS NOT NULL)))),
+    CONSTRAINT vm_creation_retries_check4 CHECK (((ready_at IS NULL) OR (state = 'succeeded'::text))),
+    CONSTRAINT vm_creation_retries_check5 CHECK (((expected_pvc_uid IS NULL) OR (observed_pvc_uid IS NULL) OR (expected_pvc_uid = observed_pvc_uid))),
+    CONSTRAINT vm_creation_retries_check6 CHECK (((predecessor_cleanup_admission_id IS NULL) OR (expected_pvc_uid IS NOT NULL))),
+    CONSTRAINT vm_creation_retries_controller_configuration_digest_check CHECK ((controller_configuration_digest ~ '^sha256:[0-9a-f]{64}$'::text)),
+    CONSTRAINT vm_creation_retries_origin_check CHECK ((origin = ANY (ARRAY['initial'::text, 'resume'::text]))),
+    CONSTRAINT vm_creation_retries_predecessor_evidence_check CHECK ((jsonb_typeof(predecessor_evidence) = 'object'::text)),
+    CONSTRAINT vm_creation_retries_request_digest_check CHECK ((request_digest ~ '^sha256:[0-9a-f]{64}$'::text)),
+    CONSTRAINT vm_creation_retries_revision_check CHECK ((revision >= 0)),
+    CONSTRAINT vm_creation_retries_state_check CHECK ((state = ANY (ARRAY['queued'::text, 'reconciling'::text, 'succeeded'::text, 'attention'::text, 'cancel_requested'::text, 'settled'::text])))
+);
+
+
+--
 -- Name: vm_remote_operation_claim_seq; Type: SEQUENCE; Schema: public; Owner: -
 --
 
@@ -23306,6 +23433,22 @@ ALTER TABLE ONLY public.users
 
 
 --
+-- Name: vm_creation_retries vm_creation_retries_job_id_provision_generation_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_creation_retries
+    ADD CONSTRAINT vm_creation_retries_job_id_provision_generation_key UNIQUE (job_id, provision_generation);
+
+
+--
+-- Name: vm_creation_retries vm_creation_retries_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_creation_retries
+    ADD CONSTRAINT vm_creation_retries_pkey PRIMARY KEY (request_id);
+
+
+--
 -- Name: vm_remote_operation_leases vm_remote_operation_leases_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -25470,6 +25613,13 @@ CREATE INDEX usage_rates_v2_lookup_idx ON public.usage_rates_v2 USING btree (cos
 
 
 --
+-- Name: vm_creation_retries_due; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX vm_creation_retries_due ON public.vm_creation_retries USING btree (next_probe_at, request_id) WHERE (state = ANY (ARRAY['queued'::text, 'reconciling'::text, 'cancel_requested'::text]));
+
+
+--
 -- Name: vm_remote_operation_expiry; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -26741,6 +26891,20 @@ CREATE TRIGGER usage_rates_v2_immutable BEFORE DELETE OR UPDATE ON public.usage_
 --
 
 CREATE TRIGGER usage_rates_v2_referenced_range_guard BEFORE UPDATE OF effective_to ON public.usage_rates_v2 FOR EACH ROW EXECUTE FUNCTION public.protect_usage_rate_v2_referenced_range();
+
+
+--
+-- Name: vm_creation_retries vm_creation_retry_identity; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER vm_creation_retry_identity BEFORE UPDATE ON public.vm_creation_retries FOR EACH ROW EXECUTE FUNCTION public.guard_vm_creation_retry_identity();
+
+
+--
+-- Name: jobs vm_creation_retry_job_control; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER vm_creation_retry_job_control AFTER UPDATE OF status, context ON public.jobs FOR EACH ROW EXECUTE FUNCTION public.cancel_vm_creation_retry_on_job_control();
 
 
 --
@@ -28619,6 +28783,38 @@ ALTER TABLE ONLY public.users
 
 ALTER TABLE ONLY public.users
     ADD CONSTRAINT users_default_project_id_fkey FOREIGN KEY (default_project_id) REFERENCES public.projects(id);
+
+
+--
+-- Name: vm_creation_retries vm_creation_retries_creation_admission_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_creation_retries
+    ADD CONSTRAINT vm_creation_retries_creation_admission_id_fkey FOREIGN KEY (creation_admission_id) REFERENCES public.vm_workspace_cleanup_admissions(id);
+
+
+--
+-- Name: vm_creation_retries vm_creation_retries_execution_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_creation_retries
+    ADD CONSTRAINT vm_creation_retries_execution_id_fkey FOREIGN KEY (execution_id) REFERENCES public.srw_execution_specs(id);
+
+
+--
+-- Name: vm_creation_retries vm_creation_retries_job_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_creation_retries
+    ADD CONSTRAINT vm_creation_retries_job_id_fkey FOREIGN KEY (job_id) REFERENCES public.jobs(id);
+
+
+--
+-- Name: vm_creation_retries vm_creation_retries_predecessor_cleanup_admission_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_creation_retries
+    ADD CONSTRAINT vm_creation_retries_predecessor_cleanup_admission_id_fkey FOREIGN KEY (predecessor_cleanup_admission_id) REFERENCES public.vm_workspace_cleanup_admissions(id);
 
 
 --
