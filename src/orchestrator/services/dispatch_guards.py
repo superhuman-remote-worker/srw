@@ -184,12 +184,22 @@ def vm_provisioning_decision(
       'ready'            → READY (proceed to claim)
     """
     status = vm_ctx.get("status")
+    retry_after = vm_ctx.get("retirement_retry_after")
+    cleanup_backoff = (
+        type(retry_after) in (int, float) and now < retry_after <= now + 300
+    )
+    # An HTTP delete response can arrive before the VM disappears and before
+    # the cleanup admission is completed. Never start a successor in that gap.
+    if vm_ctx.get("retirement_cleanup_pending") is True:
+        return VM_WAIT if cleanup_backoff else VM_RECYCLE
     if not status or status == "deleted":
         if provision_attempts >= max_provision_attempts:
             return VM_PARK_EXHAUSTED
         return VM_PROVISION
     if status == "failed":
         return VM_PARKED
+    if status != "ready" and cleanup_backoff:
+        return VM_WAIT
     if status in SUSPEND_STATUSES:
         return VM_WAIT
     if status == "deleting":

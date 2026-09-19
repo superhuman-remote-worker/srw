@@ -22,6 +22,53 @@ def redact(job):
     )
 
 
+def test_retirement_wait_is_visible_without_exposing_endpoint_or_promoting_job():
+    source = {
+        "id": "job",
+        "status": "created",
+        "error_message": None,
+        "config_override": {"workspace": {"backend": "vm"}},
+        "context": {
+            "vm": {
+                "status": "retiring_process_zero",
+                "retirement_last_result": "process_zero_unproven",
+                "ssh_host": "10.42.3.220",
+            }
+        },
+    }
+    result = redact(source)
+    assert "cleanup" in result["error_message"].lower()
+    assert "stopped" in result["error_message"]
+    assert result["status"] == "created"
+    assert "10.42.3.220" not in json.dumps(result)
+    assert source["error_message"] is None
+
+
+def test_retirement_diagnostic_preserves_a_jobs_existing_failure():
+    result = redact(
+        {
+            "status": "failed",
+            "error_message": "Original failure",
+            "context": {"vm": {"status": "retiring_process_zero"}},
+        }
+    )
+    assert result["error_message"] == "Original failure"
+
+
+def test_pending_delete_admission_remains_visible_after_delete_acceptance():
+    result = redact(
+        {
+            "status": "created",
+            "error_message": None,
+            "context": {
+                "vm": {"status": "deleted", "retirement_cleanup_pending": True}
+            },
+        }
+    )
+    assert result["error_message"] is not None
+    assert "cleanup" in result["error_message"].lower()
+
+
 def test_workspace_recovery_projection_is_coordinate_free_and_redacts_diagnostics():
     operation_id = "11111111-2222-4333-8444-555555555555"
     source = {

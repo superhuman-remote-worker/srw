@@ -253,4 +253,57 @@ describe('ThemeService', () => {
       expect(document.body.classList.contains('accent-tyrian')).toBe(true);
     });
   });
+
+  describe('PWA theme color', () => {
+    let styles: HTMLStyleElement;
+    let meta: HTMLMetaElement;
+
+    beforeEach(() => {
+      styles = document.createElement('style');
+      // Distinct values prove that metadata follows the applied CSS token,
+      // including when the app theme overrides the OS preference.
+      styles.textContent = `
+        .theme-travertine.accent-tyrian { --accent-color: #5f499c; }
+        .theme-senate.accent-tyrian { --accent-color: #7f65ca; }
+        .theme-senate.accent-porphyry { --accent-color: #cc4647; }
+      `;
+      meta = document.createElement('meta');
+      meta.name = 'theme-color';
+      meta.content = '#5f499c';
+      document.head.append(styles, meta);
+    });
+
+    afterEach(() => {
+      styles.remove();
+      meta.remove();
+    });
+
+    it('restores the stored accent and updates it without a reload', () => {
+      window.localStorage.setItem('cockpit:accent', 'porphyry');
+      const service = makeService();
+      expect(meta.content).toBe('#cc4647');
+
+      service.setAccent('tyrian');
+      TestBed.tick();
+      expect(meta.content).toBe('#7f65ca');
+    });
+
+    it('follows system changes and then an explicit app theme', () => {
+      const service = makeService();
+      expect(meta.content).toBe('#7f65ca');
+      mql.fire(false);
+      TestBed.tick();
+      expect(meta.content).toBe('#5f499c');
+
+      service.setPreference('senate');
+      TestBed.tick();
+      expect(meta.content).toBe('#7f65ca');
+    });
+
+    it('keeps the static fallback when theme styles are unavailable', () => {
+      styles.remove();
+      makeService();
+      expect(meta.content).toBe('#5f499c');
+    });
+  });
 });

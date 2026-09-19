@@ -123,6 +123,25 @@ def redact_job_config_override(
         except (json.JSONDecodeError, TypeError):
             context = None
     if isinstance(context, dict):
+        vm = context.get("vm")
+        if (
+            job.get("status") in {"created", "paused"}
+            and not job.get("error_message")
+            and isinstance(vm, dict)
+            and (
+                vm.get("status") == "retiring_process_zero"
+                or vm.get("retirement_cleanup_pending") is True
+            )
+        ):
+            reason = (
+                "VM cleanup is waiting to verify that previous workspace processes "
+                "have stopped. "
+                if vm.get("status") == "retiring_process_zero"
+                else "VM cleanup is waiting for the previous workspace release to finish. "
+            )
+            job["error_message"] = reason + (
+                "The workspace disk is retained; cleanup retries automatically."
+            )
         # The coordinate-free workspace_contract projection above is the
         # public contract. Provisioner branches contain SSH hosts, pod/service
         # coordinates and generation authority needed only by server and

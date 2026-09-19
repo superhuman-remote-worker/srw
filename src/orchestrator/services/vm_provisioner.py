@@ -1144,10 +1144,40 @@ class VMProvisioner:
             return _VMTeardownProbe("superseded")
         status = str(result.get("status") or "")
         rootdisk_known = result.get("rootdisk_identity_known") is True
+        # A VM may boot after retirement started, before readiness ever stored
+        # an endpoint. Keep this controller observation local to teardown: it
+        # must not promote or publish a retiring runtime as ready.
+        pod_ip = None
+        if (
+            self.mode == "same-cluster"
+            and result.get("ready") is True
+            and _safe_vm_uid(result.get("active_pod_uid")) is not None
+        ):
+            raw_ip = result.get("pod_ip")
+            try:
+                address = (
+                    ipaddress.ip_address(raw_ip) if isinstance(raw_ip, str) else None
+                )
+            except ValueError:
+                address = None
+            if (
+                address is not None
+                and str(address) == raw_ip
+                and not (
+                    address.is_unspecified
+                    or address.is_loopback
+                    or address.is_link_local
+                    or address.is_multicast
+                    or "%" in raw_ip
+                )
+            ):
+                pod_ip = raw_ip
         identity = VMTeardownIdentity(
             provision_generation=generation,
             vm_uid=_safe_vm_uid(result.get("vm_uid")),
             rootdisk_pvc_uid=_safe_vm_uid(result.get("rootdisk_pvc_uid")),
+            ssh_host=pod_ip,
+            ssh_port=22 if pod_ip is not None else None,
             credential_runtime_started=(
                 result.get("credential_runtime_started")
                 if type(result.get("credential_runtime_started")) is bool
@@ -1649,13 +1679,27 @@ class VMProvisioner:
             current_identity is not None
             and current_identity.credential_runtime_started is False
         )
+        discovered_endpoint = False
         if not never_started:
+            if (
+                not effective_ssh_host
+                and not effective_ssh_port
+                and self.mode == "same-cluster"
+                and current_identity is not None
+                and self._classify_captured_probe(probe, identity, purge_disk=True)
+                == "matched"
+            ):
+                effective_ssh_host = current_identity.ssh_host
+                effective_ssh_port = current_identity.ssh_port
+                discovered_endpoint = bool(effective_ssh_host and effective_ssh_port)
             if (
                 not effective_ssh_host
                 or not effective_ssh_port
                 or not identity.ssh_host_key_fingerprint
             ):
                 return VMTeardownResult("process_zero_unproven", False)
+            # Never learn a new host key from the candidate endpoint. The SSH
+            # actuator authenticates the captured, controller-admitted pin.
             retired = await retire_managed_repository_processes(
                 host=effective_ssh_host,
                 port=int(effective_ssh_port),
@@ -1669,7 +1713,7 @@ class VMProvisioner:
             self._classify_captured_probe(
                 reprobe,
                 identity,
-                purge_disk=purge_disk,
+                purge_disk=purge_disk or discovered_endpoint,
             )
             != "matched"
         ):
@@ -2769,6 +2813,10 @@ class VMProvisioner:
             # incarnation read as instantly-stuck the moment it enters
             # 'deleting', and the dispatcher would recycle it on sight.
             "deleting_started_at": None,
+            "retirement_attempts": 0,
+            "retirement_cleanup_pending": False,
+            "retirement_last_result": None,
+            "retirement_retry_after": None,
             "headscale_error": None,
             "provisioned_at": time.time(),
         }

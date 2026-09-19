@@ -724,6 +724,10 @@ class TestFreshProvisionReset:
         # A stale teardown anchor would make the next incarnation read as
         # instantly-stuck in 'deleting' and be recycled on sight.
         assert ctx["deleting_started_at"] is None
+        assert ctx["retirement_cleanup_pending"] is False
+        assert ctx["retirement_attempts"] == 0
+        assert ctx["retirement_last_result"] is None
+        assert ctx["retirement_retry_after"] is None
         assert isinstance(ctx["provisioned_at"], float)
 
     @pytest.mark.asyncio
@@ -1450,6 +1454,152 @@ class TestPurgeDiskIntent:
 
 
 class TestCapturedVmTeardown:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("entity_type", ["job", "thread"])
+    @pytest.mark.parametrize("retirement_succeeds", [True, False])
+    async def test_late_boot_retires_through_controller_endpoint_without_promotion(
+        self,
+        provisioner_with_db,
+        mock_db,
+        monkeypatch,
+        entity_type,
+        retirement_succeeds,
+    ):
+        from orchestrator.services.vm_provisioner import VMTeardownResult
+
+        monkeypatch.setenv("VM_MODE", "same-cluster")
+        provisioner_with_db._controller_url = "http://controller"
+        context = _ready_vm_context(
+            status="retiring_process_zero", ssh_host=None, ssh_port=None
+        )
+        mock_db.get_job.return_value = {"context": {"vm": context}}
+        mock_db.get_thread.return_value = {"metadata": {"vm": context}}
+        mock_db.managed_repository_workspace_process_zero_is_current.return_value = (
+            False
+        )
+        provisioner_with_db._query_http = AsyncMock(
+            return_value={
+                "_identity_authenticated": True,
+                "provision_generation": PROVISION_GENERATION,
+                "vm_uid": "captured-vm-uid",
+                "rootdisk_pvc_uid": "captured-root-uid",
+                "rootdisk_identity_known": True,
+                "credential_runtime_started": True,
+                "ready": True,
+                "pod_ip": "10.42.3.220",
+                "active_pod_uid": LAUNCHER_POD_UID,
+            }
+        )
+        provisioner_with_db.delete_vm_captured = AsyncMock(
+            return_value=VMTeardownResult("completed", True)
+        )
+        identity = await provisioner_with_db.capture_vm_teardown_identity(
+            "job-1", entity_type=entity_type
+        )
+        with patch(
+            "orchestrator.services.vm_provisioner.retire_managed_repository_processes",
+            new=AsyncMock(return_value=retirement_succeeds),
+        ) as retire:
+            result = await provisioner_with_db.release_vm_captured(
+                "job-1",
+                identity,
+                entity_type=entity_type,
+                purge_disk=False,
+                capture_snapshot=False,
+            )
+
+        assert result == (
+            VMTeardownResult("completed", True)
+            if retirement_succeeds
+            else VMTeardownResult("process_zero_unproven", False)
+        )
+        retire.assert_awaited_once_with(
+            host="10.42.3.220",
+            port=22,
+            host_key_fingerprint=TEST_HOST_KEY_FINGERPRINT,
+            operation="VM managed repository process retirement",
+        )
+        if retirement_succeeds:
+            mock_db.record_managed_repository_workspace_process_zero.assert_awaited_once()
+            assert (
+                provisioner_with_db.delete_vm_captured.await_args.kwargs["purge_disk"]
+                is False
+            )
+        else:
+            mock_db.record_managed_repository_workspace_process_zero.assert_not_awaited()
+            provisioner_with_db.delete_vm_captured.assert_not_awaited()
+        mock_db.merge_vm_context_if_provision_generation.assert_not_awaited()
+        mock_db.merge_thread_vm_context_if_provision_generation.assert_not_awaited()
+        assert context["status"] == "retiring_process_zero"
+        assert context["ssh_host"] is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "changed",
+        [
+            {"_identity_authenticated": False},
+            {"vm_uid": "replacement-vm"},
+            {"rootdisk_pvc_uid": "replacement-disk"},
+            {"rootdisk_identity_known": False},
+            {"provision_generation": "00000000-0000-4000-8000-000000000099"},
+            {"ready": False},
+            {"active_pod_uid": None},
+            {"pod_ip": "guest.example"},
+            {"pod_ip": "127.0.0.1"},
+            {"pod_ip": "169.254.169.254"},
+            {"pod_ip": "0.0.0.0"},
+            {"pod_ip": "224.0.0.1"},
+            {"pod_ip": "10.42.3.220 "},
+            {"missing_stored_pin": True},
+        ],
+    )
+    async def test_late_boot_endpoint_requires_exact_authenticated_runtime(
+        self, provisioner_with_db, mock_db, monkeypatch, changed
+    ):
+        monkeypatch.setenv("VM_MODE", "same-cluster")
+        provisioner_with_db._controller_url = "http://controller"
+        mock_db.get_job.return_value = {
+            "context": {
+                "vm": _ready_vm_context(
+                    status="retiring_process_zero", ssh_host=None, ssh_port=None
+                )
+            }
+        }
+        mock_db.managed_repository_workspace_process_zero_is_current.return_value = (
+            False
+        )
+        if changed.get("missing_stored_pin"):
+            mock_db.get_job.return_value["context"]["vm"][
+                "ssh_host_key_fingerprint"
+            ] = None
+        provisioner_with_db._query_http = AsyncMock(
+            return_value={
+                "_identity_authenticated": True,
+                "provision_generation": PROVISION_GENERATION,
+                "vm_uid": "captured-vm-uid",
+                "rootdisk_pvc_uid": "captured-root-uid",
+                "rootdisk_identity_known": True,
+                "credential_runtime_started": True,
+                "ready": True,
+                "pod_ip": "10.42.3.220",
+                "active_pod_uid": LAUNCHER_POD_UID,
+                **changed,
+            }
+        )
+        identity = await provisioner_with_db.capture_vm_teardown_identity("job-1")
+        provisioner_with_db.delete_vm_captured = AsyncMock()
+        with patch(
+            "orchestrator.services.vm_provisioner.retire_managed_repository_processes",
+            new=AsyncMock(return_value=True),
+        ) as retire:
+            result = await provisioner_with_db.release_vm_captured(
+                "job-1", identity, purge_disk=False, capture_snapshot=False
+            )
+        assert not result.deleted
+        retire.assert_not_awaited()
+        mock_db.record_managed_repository_workspace_process_zero.assert_not_awaited()
+        provisioner_with_db.delete_vm_captured.assert_not_awaited()
+
     @staticmethod
     def _identity():
         from orchestrator.services.vm_provisioner import VMTeardownIdentity

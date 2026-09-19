@@ -481,6 +481,7 @@ async def fail_vm_parked_job(
         status="failed",
         error_message=(
             f"VM provisioning failed: {vm_error}. "
-            "To retry, clear context.vm and re-queue the job."
+            "Use Resume to retry through guarded workspace cleanup. "
+            "If retirement proof is unavailable, operator recovery is required."
         ),
     )

@@ -222,10 +222,8 @@ from orchestrator.services import (  # noqa: E402
 )
 from orchestrator.services.vm_workspace_recovery_store import (  # noqa: E402
     VMWorkspaceRecoveryStore,
-    acquire_vm_cleanup_permit,
-    completed_cleanup_outcome,
-    complete_vm_cleanup_permit,
 )
+from orchestrator.services.vm_provisioning_cleanup import recycle_provisioning_vm  # noqa: E402
 from orchestrator.services.vm_workspace_recovery import (  # noqa: E402
     VMWorkspaceRecoveryService,
 )
@@ -4033,62 +4031,22 @@ async def _try_dispatch_pending_jobs() -> None:
                         # (VM_PARK_EXHAUSTED). With the reconciler now handing off
                         # provisioning VMs (is_reapable=False for dispatchable jobs)
                         # nothing else would time it out.
-                        elapsed = int(time.time() - float(vm_ctx["provisioned_at"]))
                         logger.warning(
-                            "Dispatcher: job %s VM stuck in '%s' for %ss "
-                            "(> %ss budget) — recycling (attempt %d/%d)",
+                            "Dispatcher: job %s VM stuck in '%s' — checking "
+                            "cleanup for provision attempt %d/%d",
                             job_id,
                             vm_status,
-                            elapsed,
-                            timeout_s,
                             provision_attempts,
                             max_provision_attempts,
                         )
-                        try:
-                            identity = (
-                                await vm_provisioner.capture_vm_teardown_identity(
-                                    job_id, entity_type="job"
-                                )
-                            )
-                            recovery_store = VMWorkspaceRecoveryStore(postgres_db)
-                            cleanup = await acquire_vm_cleanup_permit(
-                                recovery_store,
-                                owner_kind="job",
-                                owner_id=job_id,
-                                identity=identity,
-                                source="dispatcher_vm_recycle",
-                                purge_disk=False,
-                            )
-                            if not cleanup.allowed:
-                                logger.warning(
-                                    "Dispatcher: timed-out VM cleanup held for "
-                                    "workspace recovery on job %s",
-                                    job_id,
-                                )
-                                continue
-                            disposition = completed_cleanup_outcome(cleanup)
-                            if disposition is None:
-                                outcome = await vm_provisioner.release_vm_captured(
-                                    job_id,
-                                    identity,
-                                    entity_type="job",
-                                    purge_disk=False,
-                                    capture_snapshot=False,
-                                )
-                                if outcome.disposition in {
-                                    "completed",
-                                    "identity_superseded",
-                                }:
-                                    await complete_vm_cleanup_permit(
-                                        recovery_store,
-                                        cleanup,
-                                        outcome=outcome.disposition,
-                                    )
-                        except Exception:
-                            logger.exception(
-                                "Dispatcher: failed to delete timed-out VM for job %s",
-                                job_id,
-                            )
+                        await recycle_provisioning_vm(
+                            job_id,
+                            vm_ctx,
+                            db=postgres_db,
+                            provisioner=vm_provisioner,
+                            recovery_store=VMWorkspaceRecoveryStore(postgres_db),
+                            now=time.time(),
+                        )
                         continue
                     if vm_decision == VM_WAIT:
                         # Provisioning / creating / deleting in flight — wait.
