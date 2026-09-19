@@ -53,7 +53,9 @@ from typing import Any, Callable, Mapping, NamedTuple, Sequence
 
 ROOT = Path(__file__).resolve().parents[1]
 CLUSTER_PREFIX = "srw-vm-recovery-gate-"
-DEFAULT_KUBEVIRT_VERSION = "v1.8.4"
+# KubeVirt v1.6 supports Kubernetes 1.31-1.33, matching DEFAULT_K3S_IMAGE.
+# https://kubevirt.io/user-guide/release_notes/#v160
+DEFAULT_KUBEVIRT_VERSION = "v1.6.6"
 DEFAULT_CDI_VERSION = "v1.66.0"
 DEFAULT_LONGHORN_VERSION = "1.10.1"
 DEFAULT_NAMESPACE = "srw"
