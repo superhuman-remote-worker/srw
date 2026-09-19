@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SRW repository banner</title>
+<style>
+@font-face{font-family:Inter;src:url(brand/inter-var.woff2);font-weight:100 900}
+@font-face{font-family:Cinzel;src:url(brand/cinzel-var.woff2);font-weight:400 900}
+@font-face{font-family:JetBrains;src:url(brand/jetbrainsmono-var.woff2);font-weight:100 800}
+*{box-sizing:border-box}
+html,body{margin:0}
+body{background:#f3ece0;color:#2a1d12;font-family:Inter,Arial,sans-serif}
+.banner{width:1200px;height:480px;position:relative;overflow:hidden;padding:36px 48px}
+.brand{display:flex;align-items:center;gap:18px}
+.wordmark{font:600 38px/1 Cinzel,Georgia,serif;letter-spacing:-.08em}
+.brand-caption{border-left:1px solid #dccfb6;padding-left:18px;font:8px/1.6 JetBrains,monospace;letter-spacing:.035em}
+.position{margin:28px 0 15px;color:#5f499c;font:10px/1.6 JetBrains,monospace;letter-spacing:.045em}
+h1{font-size:54px;line-height:1.06;letter-spacing:-.055em;font-weight:570;margin:0;position:relative;z-index:1}
+h1 span{color:#5f499c}
+.description{font-size:16px;line-height:1.7;color:#5a4632;margin:22px 0 0;max-width:550px}
+.temple{position:absolute;width:420px;height:420px;object-fit:contain;right:36px;top:18px}
+.footer{position:absolute;left:48px;right:48px;bottom:24px;display:flex;align-items:center;justify-content:space-between;font:10px/1.6 JetBrains,monospace;color:#5a4632}
+.footer p{margin:0}
+</style>
+</head>
+<body>
+<main class="banner">
+  <div class="brand"><span class="wordmark">SRW</span><span class="brand-caption">SUPERHUMAN<br>REMOTE WORKER</span></div>
+  <p class="position">THE ALTERNATIVE TO MANAGED AI WORKSPACES</p>
+  <h1>A complete<br>agent platform<br><span>Under your control</span></h1>
+  <p class="description">Choose your models, tools and infrastructure<br>Build agents that research, create and automate</p>
+  <img class="temple" src="brand/srw-temple-angle-1280.webp" alt="Three-pillar Roman temple with SRW on its roof">
+  <div class="footer"><p>A few powerful parts · A whole world of agents</p><p>superhuman-remote-worker.com</p></div>
+</main>
+</body>
+</html>
