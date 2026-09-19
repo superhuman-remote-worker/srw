@@ -126,6 +126,6 @@ export interface CachedThreadMessage {
   turn_number: number | null;
   tool_call_id?: string | null;
   thinking?: string | null;
-  /** ISO-8601; lexicographically sortable — the `[threadId+createdAt]` index. */
+  /** ISO-8601; lexicographically sortable — the `[threadId+created_at]` index. */
   created_at: string | null;
 }

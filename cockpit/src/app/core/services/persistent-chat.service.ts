@@ -2566,8 +2566,7 @@ export class PersistentChatService {
         this._recordDurableMessages(threadId, cached.length);
       }
 
-      // 2. Refresh from the server. With a cache, fetch only what's newer
-      //    (?after=<newest cached>, inclusive); otherwise the full thread.
+      // 2. Refresh from the server under the history revision fence.
       const cacheWithEpoch = this.cache as IndexedDbService & {
         getThreadCacheEpoch?: (id: string) => Promise<{
           eventsEpoch: number;
@@ -2592,10 +2591,13 @@ export class PersistentChatService {
         historyGeneration !== this.historyLoadGeneration
       )
         return;
-      // Versioned history is fetched as a complete snapshot. If its epoch
-      // advanced, an `after=` request based on the old epoch could return an
-      // empty suffix and incorrectly replace the cache with no transcript.
-      const newest = !cacheEpoch && cached.length ? cached[cached.length - 1].created_at : null;
+      // A versioned response can replace the cache, including on the first
+      // legacy-to-versioned load. Always request the full snapshot when this
+      // client supports versioned history; a suffix would lose earlier turns.
+      const newest =
+        !cacheWithEpoch.applyThreadHistoryPage && !cacheEpoch && cached.length
+          ? cached[cached.length - 1].created_at
+          : null;
       const url = newest
         ? `${environment.apiUrl}/persistent/threads/${threadId}/messages` +
           `?after=${encodeURIComponent(newest)}`

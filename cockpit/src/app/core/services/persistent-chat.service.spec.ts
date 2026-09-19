@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { NgZone, signal } from '@angular/core';
+import { Injector, NgZone, PLATFORM_ID, runInInjectionContext, signal } from '@angular/core';
+import Dexie from 'dexie';
 import { TestBed } from '@angular/core/testing';
 import { HttpClient } from '@angular/common/http';
 import { NEVER, from, of, Subject, throwError } from 'rxjs';
@@ -129,6 +130,7 @@ function createMockWs() {
 function createService(
   opts: {
     cursor?: { epoch: number; seq: number } | null;
+    cache?: IndexedDbService;
   } = {},
 ) {
   const mockHttp: any = {
@@ -149,7 +151,7 @@ function createService(
     retryThreadQueue: vi.fn().mockReturnValue(of({ kind: 'ok', state: 'queued' })),
   };
 
-  const mockCache: any = {
+  const mockCache: any = opts.cache ?? {
     getThreadCursor: vi.fn().mockResolvedValue(opts.cursor ?? null),
     setThreadCursor: vi.fn().mockResolvedValue(undefined),
     deleteThreadCursor: vi.fn().mockResolvedValue(undefined),
@@ -590,6 +592,84 @@ describe('PersistentChatService — message cache (loadHistory)', () => {
     (globalThis as any).EventSource = originalEs;
     (globalThis as any).WebSocket = originalWs;
     vi.clearAllMocks();
+  });
+
+  it('restores the complete conversation when a legacy cache first receives versioned history', async () => {
+    for (const name of ['cockpit-cache', 'srw-thread-history-v2']) await Dexie.delete(name);
+    const cache = runInInjectionContext(
+      Injector.create({ providers: [{ provide: PLATFORM_ID, useValue: 'browser' }] }),
+      () => new IndexedDbService(),
+    );
+    const { service, mockHttp } = createService({ cache });
+    const threadId = 'legacy-to-versioned';
+    const rows = [
+      {
+        id: 'earlier-user',
+        threadId,
+        role: 'human',
+        content: 'Earlier question',
+        tool_calls: null,
+        turn_number: 1,
+        created_at: '2026-09-07T08:00:00Z',
+      },
+      {
+        id: 'earlier-answer',
+        threadId,
+        role: 'ai',
+        content: 'Earlier answer',
+        tool_calls: null,
+        turn_number: 1,
+        created_at: '2026-09-07T08:01:00Z',
+      },
+      {
+        id: 'latest-answer',
+        threadId,
+        role: 'ai',
+        content: 'Latest answer',
+        tool_calls: null,
+        turn_number: 17,
+        created_at: '2026-09-16T14:57:13Z',
+      },
+    ];
+    try {
+      await vi.waitFor(() => expect(cache.isReady()).toBe(true));
+      await cache.upsertThreadMessages(rows);
+      mockHttp.get.mockImplementation((url: string) => {
+        if (url.includes('/messages')) {
+          const messages = url.includes('after=') ? rows.slice(-1) : rows;
+          return of({
+            messages,
+            total: messages.length,
+            events_epoch: 0,
+            conversation_revision: 0,
+          });
+        }
+        return activeSessionGet(url);
+      });
+      await service.connect(threadId);
+      expect(service.turns().map((t) => t.id)).toEqual([
+        'earlier-user',
+        'earlier-answer',
+        'latest-answer',
+      ]);
+      expect((await cache.getThreadMessages(threadId)).map((m) => m.id)).toEqual([
+        'earlier-user',
+        'earlier-answer',
+        'latest-answer',
+      ]);
+    } finally {
+      service.disconnect();
+      TestBed.resetTestingModule();
+      const resources = cache as unknown as {
+        db: Dexie;
+        historyDb: Dexie;
+        historyChannel: BroadcastChannel | null;
+      };
+      resources.db.close();
+      resources.historyDb.close();
+      resources.historyChannel?.close();
+      for (const name of ['cockpit-cache', 'srw-thread-history-v2']) await Dexie.delete(name);
+    }
   });
 
   it('full-loads when nothing is cached (no ?after=) and caches the result', async () => {

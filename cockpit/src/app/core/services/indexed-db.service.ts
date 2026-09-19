@@ -15,7 +15,7 @@ import {
 } from '../models/cache.model';
 
 /** Current cache schema version */
-const CACHE_VERSION = 4;
+const CACHE_VERSION = 5;
 
 export function compareThreadHistoryFence(
   current: Pick<ThreadCacheEpoch, 'eventsEpoch' | 'conversationRevision'> | null,
@@ -86,6 +86,11 @@ class CockpitDatabase extends Dexie {
       // New: full per-thread message cache for the persistent-chat display.
       threadMessages: 'id, threadId, [threadId+createdAt]',
     });
+    // Reindex existing REST-shaped rows as well as future writes. Changing
+    // only v4 would leave already-installed databases on the broken index.
+    this.version(5).stores({
+      threadMessages: 'id, threadId, [threadId+created_at]',
+    });
   }
 }
 
@@ -105,6 +110,9 @@ class ThreadHistoryDatabase extends Dexie {
       threadCursors: 'threadId',
       threadMessages: 'id, threadId, [threadId+createdAt]',
       threadEpochs: 'threadId',
+    });
+    this.version(2).stores({
+      threadMessages: 'id, threadId, [threadId+created_at]',
     });
   }
 }
@@ -492,7 +500,7 @@ export class IndexedDbService {
     const epoch = await this.historyDb.threadEpochs.get(threadId);
     const table = epoch ? this.historyDb.threadMessages : this.db.threadMessages;
     return table
-      .where('[threadId+createdAt]')
+      .where('[threadId+created_at]')
       .between([threadId, Dexie.minKey], [threadId, Dexie.maxKey], true, true)
       .toArray();
   }
@@ -506,7 +514,7 @@ export class IndexedDbService {
     const epoch = await this.historyDb.threadEpochs.get(threadId);
     const table = epoch ? this.historyDb.threadMessages : this.db.threadMessages;
     const row = await table
-      .where('[threadId+createdAt]')
+      .where('[threadId+created_at]')
       .between([threadId, Dexie.minKey], [threadId, Dexie.maxKey], true, true)
       .last();
     return row?.created_at ?? null;
@@ -556,7 +564,7 @@ export class IndexedDbService {
         });
         if (fence === 'discard') {
           const messages = await this.historyDb!.threadMessages
-            .where('[threadId+createdAt]')
+            .where('[threadId+created_at]')
             .between([threadId, Dexie.minKey], [threadId, Dexie.maxKey], true, true)
             .toArray();
           return { accepted: false, replaced: false, messages };
@@ -574,7 +582,7 @@ export class IndexedDbService {
         });
         if (rows.length) await this.historyDb!.threadMessages.bulkPut(rows);
         const messages = await this.historyDb!.threadMessages
-          .where('[threadId+createdAt]')
+          .where('[threadId+created_at]')
           .between([threadId, Dexie.minKey], [threadId, Dexie.maxKey], true, true)
           .toArray();
         return { accepted: true, replaced, messages };
