@@ -30,7 +30,9 @@ class KeycloakGroupSync:
     def __init__(self) -> None:
         # python-keycloak joins relative endpoints with urljoin. A context
         # path without the trailing slash would be replaced (e.g. /identity).
-        self._server_url = os.getenv("KEYCLOAK_URL", "http://localhost:8180").rstrip("/") + "/"
+        self._server_url = (
+            os.getenv("KEYCLOAK_URL", "http://localhost:8180").rstrip("/") + "/"
+        )
         self._realm = os.getenv("KEYCLOAK_REALM", "srw")
         self._admin_user = os.getenv("KEYCLOAK_ADMIN_USER", "")
         self._admin_password = os.getenv("KEYCLOAK_ADMIN_PASSWORD", "")

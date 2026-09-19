@@ -37,6 +37,14 @@ certificate without cert-manager; replacement on Helm upgrade is intentional.
 | Worker job and public Git | Pinned sandbox job reached review after 12 deterministic tool steps; repository, commit history and raw file returned 200 through `/git`; normal approval/deletion removed the job and workspace |
 | Gitea startup reconciliation | Real 1.22.6, fresh and existing SQLite, preserved source ID and group settings while updating discovery/client credentials before web startup |
 
+Before integration into `develop`, the changed Python files were formatted with
+the CI-pinned Ruff 0.14.10; all 14 syntax trees were unchanged. Lint and formatting
+checks passed, followed by 210 focused Python tests (six existing warnings).
+The generator feature was applied to its existing `develop` branch without the
+unrelated site changes on `main`, retaining the current installer repository and
+chart URLs. Its full `www/test/*.mjs` run passed 79 tests with one existing skipped
+page-budget test. Both regenerated chart fixtures matched byte-for-byte.
+
 ## Findings incorporated
 
 - The Keycloak Python client requires a trailing slash to preserve `/identity`

@@ -99,13 +99,20 @@ def test_single_origin_presets_stage_installation_attestation_without_enabling_p
 ):
     values = yaml.safe_load(preset.read_text())
     assert values["nextcloud"]["protectedEffect"]["enabled"] is True
-    assert str(values.get("agent", {}).get("protectedCloudModeEnabled", "false")).lower() != "true"
+    assert (
+        str(values.get("agent", {}).get("protectedCloudModeEnabled", "false")).lower()
+        != "true"
+    )
 
 
 @pytest.mark.parametrize(
     "preset,expected_secret,chart_managed",
     [
-        (ROOT / "helm/ci/single-origin-local-values.yaml", "srw-protected-effect", True),
+        (
+            ROOT / "helm/ci/single-origin-local-values.yaml",
+            "srw-protected-effect",
+            True,
+        ),
         (
             ROOT / "deployment/values-single-origin-server.yaml.example",
             "srw-protected-effect",
@@ -119,7 +126,10 @@ def test_single_origin_presets_render_stable_nextcloud_installation_attestation(
 ):
     rendered = render_preset(preset)
     nextcloud = rendered["Deployment", "srw-nextcloud"]
-    assert {container["name"] for container in nextcloud["spec"]["template"]["spec"]["containers"]} == {
+    assert {
+        container["name"]
+        for container in nextcloud["spec"]["template"]["spec"]["containers"]
+    } == {
         "nextcloud",
         "nextcloud-protected-effect-fpm",
         "nextcloud-protected-effect-nginx",
@@ -134,7 +144,8 @@ def test_single_origin_presets_render_stable_nextcloud_installation_attestation(
 
     orchestrator = container(rendered, "srw-orchestrator", "orchestrator")
     effect_env = {
-        item["name"]: item for item in orchestrator["env"]
+        item["name"]: item
+        for item in orchestrator["env"]
         if item["name"].startswith("NEXTCLOUD_PROTECTED_EFFECT_")
     }
     assert set(effect_env) == {
@@ -142,7 +153,9 @@ def test_single_origin_presets_render_stable_nextcloud_installation_attestation(
         "NEXTCLOUD_PROTECTED_EFFECT_CONFIG_SHA256",
         "NEXTCLOUD_PROTECTED_EFFECT_HMAC_KEY",
     }
-    assert effect_env["NEXTCLOUD_PROTECTED_EFFECT_HMAC_KEY"]["valueFrom"]["secretKeyRef"] == {
+    assert effect_env["NEXTCLOUD_PROTECTED_EFFECT_HMAC_KEY"]["valueFrom"][
+        "secretKeyRef"
+    ] == {
         "name": expected_secret,
         "key": "NEXTCLOUD_PROTECTED_EFFECT_HMAC_KEY",
         "optional": False,
@@ -158,7 +171,10 @@ def test_single_origin_presets_render_stable_nextcloud_installation_attestation(
 
 
 def test_identity_context_backchannels_and_health(manifests):
-    assert manifests["Deployment", "srw-keycloak"]["spec"]["strategy"] == {"type": "Recreate", "rollingUpdate": None}
+    assert manifests["Deployment", "srw-keycloak"]["spec"]["strategy"] == {
+        "type": "Recreate",
+        "rollingUpdate": None,
+    }
     kc = container(manifests, "srw-keycloak", "keycloak")
     values = env(kc)
     assert values["KC_HOSTNAME"] == ORIGIN + "/identity"
@@ -204,10 +220,15 @@ def test_gitea_public_base_and_internal_oidc_reconciliation(manifests):
     assert f'KP="{ORIGIN}/identity"' in bootstrap
     assert '"issuer"' in bootstrap
     assert bootstrap.index("gitea migrate") < bootstrap.index("gitea admin auth")
-    assert bootstrap.index("gitea admin auth update-oauth") < bootstrap.index("exec gitea web")
+    assert bootstrap.index("gitea admin auth update-oauth") < bootstrap.index(
+        "exec gitea web"
+    )
     assert "--use-custom-urls" not in bootstrap  # ignored by the OpenID provider
     assert "|| true" not in bootstrap
-    assert git["startupProbe"]["failureThreshold"] * git["startupProbe"]["periodSeconds"] >= 300
+    assert (
+        git["startupProbe"]["failureThreshold"] * git["startupProbe"]["periodSeconds"]
+        >= 300
+    )
 
 
 def test_cloud_overwrites_and_existing_pvc_reconciliation(manifests):
@@ -244,9 +265,27 @@ def test_bootstrap_users_have_valid_email_without_a_domain(manifests):
 
 def test_legacy_keycloak_keeps_rolling_update_strategy():
     rendered = subprocess.run(
-        ["helm", "template", "srw", str(ROOT / "helm"), "-f", str(ROOT / "helm/ci/test-values.yaml")],
-        check=True, capture_output=True, text=True,
+        [
+            "helm",
+            "template",
+            "srw",
+            str(ROOT / "helm"),
+            "-f",
+            str(ROOT / "helm/ci/test-values.yaml"),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
     )
-    deployments = [doc for doc in yaml.safe_load_all(rendered.stdout) if doc and doc["kind"] == "Deployment"]
-    keycloak = next(doc for doc in deployments if doc["metadata"]["name"].endswith("-keycloak"))
-    assert keycloak["spec"].get("strategy", {}).get("type", "RollingUpdate") == "RollingUpdate"
+    deployments = [
+        doc
+        for doc in yaml.safe_load_all(rendered.stdout)
+        if doc and doc["kind"] == "Deployment"
+    ]
+    keycloak = next(
+        doc for doc in deployments if doc["metadata"]["name"].endswith("-keycloak")
+    )
+    assert (
+        keycloak["spec"].get("strategy", {}).get("type", "RollingUpdate")
+        == "RollingUpdate"
+    )

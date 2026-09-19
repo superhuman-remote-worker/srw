@@ -1201,12 +1201,17 @@ def test_connection_probes_persisted_metadata_with_the_correct_cloud_requirement
         fake_main.session_router.ensure_route.assert_not_awaited()
 
 
-@pytest.mark.parametrize("public_origin, expected_authority", [
-    (None, "api.test.example"),
-    ("https://192.0.2.10:30443", "192.0.2.10:30443"),
-    ("https://localhost:8443", "localhost:8443"),
-])
-def test_connection_returns_ws_url_and_token_when_ready(monkeypatch, public_origin, expected_authority):
+@pytest.mark.parametrize(
+    "public_origin, expected_authority",
+    [
+        (None, "api.test.example"),
+        ("https://192.0.2.10:30443", "192.0.2.10:30443"),
+        ("https://localhost:8443", "localhost:8443"),
+    ],
+)
+def test_connection_returns_ws_url_and_token_when_ready(
+    monkeypatch, public_origin, expected_authority
+):
     """GET /connection returns 200 with ws_url + token when bound + ready."""
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
@@ -1234,7 +1239,9 @@ def test_connection_returns_ws_url_and_token_when_ready(monkeypatch, public_orig
     monkeypatch.setattr(sessions_mod, "probe_ready", _probe_ok, raising=True)
 
     # Inject a real SessionTokenService and a fake session_router.
-    test_tokens = SessionTokenService(secret="test-secret-do-not-use-at-least-32-bytes", ttl_seconds=60)
+    test_tokens = SessionTokenService(
+        secret="test-secret-do-not-use-at-least-32-bytes", ttl_seconds=60
+    )
 
     fake_main.session_tokens = test_tokens
     fake_main.session_router = MagicMock()

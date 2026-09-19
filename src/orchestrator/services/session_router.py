@@ -728,7 +728,8 @@ class SessionRouterService:
             and annotations == self._annotations
             and _value(spec, "ingress_class_name", "ingressClassName")
             == (None if self._single_origin else self._ingress_class)
-            and _value(rule, "host") == (None if self._single_origin else self._ingress_host)
+            and _value(rule, "host")
+            == (None if self._single_origin else self._ingress_host)
             and _value(path, "path") == f"/p/{thread_id}"
             and _value(path, "path_type", "pathType") == "Prefix"
             and _value(service, "name") == name

@@ -1093,9 +1093,11 @@ def externalize_gitea_url(url: str | None) -> str | None:
     internal_path = int_p.path.rstrip("/")
     if u.path != internal_path and not u.path.startswith(internal_path + "/"):
         return url
-    public_path = ext_p.path.rstrip("/") + u.path[len(internal_path):]
+    public_path = ext_p.path.rstrip("/") + u.path[len(internal_path) :]
     netloc = ext_p.netloc.rsplit("@", 1)[-1]
-    return urlunparse(u._replace(scheme=ext_p.scheme or u.scheme, netloc=netloc, path=public_path))
+    return urlunparse(
+        u._replace(scheme=ext_p.scheme or u.scheme, netloc=netloc, path=public_path)
+    )
 
 
 def redact_repository(repo: dict[str, Any]) -> dict[str, Any]:

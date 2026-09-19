@@ -17,7 +17,18 @@ def _write_executable(path: Path, body: str) -> None:
 def _fake_path(tmp_path: Path, *, include_mkcert: bool = False) -> Path:
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir(parents=True)
-    for name in ("bash", "dirname", "mktemp", "rm", "tr", "head", "cat", "date", "sed", "grep"):
+    for name in (
+        "bash",
+        "dirname",
+        "mktemp",
+        "rm",
+        "tr",
+        "head",
+        "cat",
+        "date",
+        "sed",
+        "grep",
+    ):
         target = Path("/usr/bin") / name
         if not target.exists():
             target = Path("/bin") / name
@@ -65,8 +76,12 @@ fi
     return bin_dir
 
 
-def _run_bootstrap(tmp_path: Path, **env_overrides: str) -> subprocess.CompletedProcess[str]:
-    fake_path = _fake_path(tmp_path, include_mkcert=env_overrides.pop("include_mkcert", "0") == "1")
+def _run_bootstrap(
+    tmp_path: Path, **env_overrides: str
+) -> subprocess.CompletedProcess[str]:
+    fake_path = _fake_path(
+        tmp_path, include_mkcert=env_overrides.pop("include_mkcert", "0") == "1"
+    )
     env = {
         **os.environ,
         "PATH": str(fake_path),
@@ -84,18 +99,22 @@ def _run_bootstrap(tmp_path: Path, **env_overrides: str) -> subprocess.Completed
     )
 
 
-def test_single_origin_skips_mkcert_and_creates_dedicated_nodeport_mapping(tmp_path: Path) -> None:
+def test_single_origin_skips_mkcert_and_creates_dedicated_nodeport_mapping(
+    tmp_path: Path,
+) -> None:
     result = _run_bootstrap(tmp_path, SRW_EXPOSURE_MODE="single-origin")
 
     assert result.returncode == 0, result.stderr
-    assert '--port 127.0.0.1:8443:30443@server:0' in result.stdout
+    assert "--port 127.0.0.1:8443:30443@server:0" in result.stdout
     assert "cert-manager" not in result.stdout
     assert "mkcert" not in result.stdout
     assert "https://localhost:8443/" in result.stdout
     assert "deployment/values-local-single-origin.yaml" in result.stdout
 
 
-def test_single_origin_rejects_an_existing_cluster_with_the_wrong_mapping(tmp_path: Path) -> None:
+def test_single_origin_rejects_an_existing_cluster_with_the_wrong_mapping(
+    tmp_path: Path,
+) -> None:
     result = _run_bootstrap(
         tmp_path,
         SRW_EXPOSURE_MODE="single-origin",
@@ -144,7 +163,9 @@ def test_tilt_wrapper_prints_the_single_origin_url(tmp_path: Path) -> None:
     (repo / "deployment").mkdir()
     for name in ("local-dev-up.sh", "local-dev-tilt-up.sh"):
         shutil.copy2(REPO / "scripts" / name, repo / "scripts" / name)
-    (repo / "deployment" / "values-local.yaml").write_text("license:\n  acceptTerms: true\n")
+    (repo / "deployment" / "values-local.yaml").write_text(
+        "license:\n  acceptTerms: true\n"
+    )
     fake_path = _fake_path(tmp_path / "fake")
     env = {
         **os.environ,

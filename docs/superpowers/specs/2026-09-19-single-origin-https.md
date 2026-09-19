@@ -17,8 +17,8 @@ related:
 **Status:** Implemented for SRW and the values generator, with source integration
 targeting `develop` in both repositories. The design below records the approved scope and
 research; the [implementation evidence](2026-09-19-single-origin-https-validation.md)
-records actual checks and remaining deployment boundaries. No release or existing
-installation has been updated. Implementation date: 2026-09-19.
+records actual checks and remaining deployment boundaries. Validation did not
+update a release or existing installation. Implementation date: 2026-09-19.
 
 ## Problem and intended outcome
 
