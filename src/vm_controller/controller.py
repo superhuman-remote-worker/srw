@@ -3040,6 +3040,7 @@ class VMController:
             if exc.status != 404:
                 raise
             vmi_observed = False
+            vmi = None
         else:
             vmi_observed = True
             vmi_status = vmi.get("status", {})
@@ -3085,6 +3086,25 @@ class VMController:
             )
         if rootdisk_pvc_uid is not None:
             result["rootdisk_pvc_uid"] = rootdisk_pvc_uid
+        if not exact_absence:
+            result.update(
+                await self._provisioning_status_evidence(
+                    vm=vm,
+                    vmi=vmi,
+                    owner_id=job_id,
+                    owner_kind=entity_type,
+                    generation=generation,
+                    rootdisk_name=rootdisk,
+                    rootdisk_owner_id=rootdisk_owner,
+                    rootdisk_owner_kind=(
+                        workspace_storage["owner_kind"]
+                        if workspace_storage is not None
+                        else entity_type
+                    ),
+                    expected_pvc_uid=rootdisk_pvc_uid,
+                    direct_retained=workspace_storage is not None,
+                )
+            )
         prepared_annotation = (
             vm.get("metadata", {})
             .get("annotations", {})
@@ -3100,6 +3120,68 @@ class VMController:
                     pvc_uid=rootdisk_pvc_uid,
                 )
         return result
+
+    async def _provisioning_status_evidence(
+        self,
+        *,
+        vm,
+        vmi,
+        owner_id,
+        owner_kind,
+        generation,
+        rootdisk_name,
+        rootdisk_owner_id,
+        rootdisk_owner_kind,
+        expected_pvc_uid,
+        direct_retained,
+    ) -> dict:
+        """Read bounded phase evidence; an unavailable read is never absence."""
+        from kubernetes.client.exceptions import ApiException
+        from vm_controller.provisioning_observation import (
+            build_provisioning_observation,
+        )
+
+        unknown = {"provisioning_reason": "vm_phase_unproven"}
+        try:
+            # Legacy/malformed identity has no phase authority and needs no new
+            # Kubernetes probes. Do not synthesize a boot clock from VM age.
+            UUID(str(_metadata_value(vm, "uid")))
+            UUID(str(generation))
+            UUID(str(owner_id))
+            if owner_kind not in _OWNER_KINDS or self.core_api is None:
+                return unknown
+            dv = None if direct_retained else await self._get_dv(rootdisk_name)
+            try:
+                pvc = await asyncio.to_thread(
+                    self.core_api.read_namespaced_persistent_volume_claim,
+                    name=rootdisk_name,
+                    namespace=VM_NAMESPACE,
+                )
+            except ApiException as exc:
+                if exc.status != 404:
+                    raise
+                pvc = None
+            observation = build_provisioning_observation(
+                vm=vm,
+                vmi=vmi,
+                datavolume=dv,
+                pvc=pvc,
+                namespace=VM_NAMESPACE,
+                owner_kind=owner_kind,
+                owner_id=owner_id,
+                generation=generation,
+                rootdisk_name=rootdisk_name,
+                rootdisk_owner_kind=rootdisk_owner_kind,
+                rootdisk_owner_id=rootdisk_owner_id,
+            )
+            if observation["rootdisk_pvc_uid"] != expected_pvc_uid:
+                return unknown
+            return {"provisioning": observation}
+        except Exception:
+            # The signed status remains usable for established consumers; only
+            # phase-based actions are withheld. Never expose API bodies here.
+            log.debug("VM provisioning phase evidence unavailable for %s", owner_id)
+            return unknown
 
     async def _do_observe_workspace_recovery(
         self, captured_identity: Mapping[str, object]
