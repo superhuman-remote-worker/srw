@@ -102,7 +102,7 @@ class VMCreationRetryStore:
                 conn, job_id=job_id, preserve_attempts=True
             )
         return await conn.fetchrow(
-            "SELECT *,clock_timestamp() AS database_now FROM jobs WHERE id=$1 FOR UPDATE",
+            "SELECT * FROM jobs WHERE id=$1 FOR UPDATE",
             job_id,
         )
 
@@ -153,19 +153,26 @@ class VMCreationRetryStore:
             or execution["deadline"] != retry["admission_deadline"]
         ):
             raise VMCreationRetryConflict("execution_manifest_changed")
-        if execution["deadline"] and execution["deadline"] <= job["database_now"]:
+        # A SELECT target expression can run before its FOR UPDATE/SHARE wait.
+        # Read the clock separately after every relevant row is locked.
+        database_now = await conn.fetchval("SELECT clock_timestamp()")
+        if execution["deadline"] and execution["deadline"] <= database_now:
             raise VMCreationRetryConflict("job_admission_expired")
         return context, vm, execution
 
     async def _predecessor(self, conn, job, pvc_uid, proposal):
         evidence = proposal.get("predecessor_evidence") or {}
+        old = (_json(job["context"]) or {}).get("last_vm") or {}
         if pvc_uid is None:
-            if evidence or proposal.get("predecessor_cleanup_admission_id"):
+            if (
+                old.get("rootdisk_pvc_uid")
+                or evidence
+                or proposal.get("predecessor_cleanup_admission_id")
+            ):
                 raise VMCreationRetryConflict("retained_disk_changed")
             return {}, None
         # Evidence must match durable predecessor context, receipt and the full
         # completed cleanup intent, not a same-name disk or arbitrary receipt.
-        old = (_json(job["context"]) or {}).get("last_vm") or {}
         if (
             old.get("identity_authenticated") is not True
             or old.get("identity_provision_generation")
@@ -277,11 +284,15 @@ class VMCreationRetryStore:
             or not config_digest
         ):
             raise VMCreationRetryConflict("creation_request_unproven")
-        storage = payload.get("workspace_storage") or {}
-        if not isinstance(storage, dict) or storage.get("pvc_uid") != (
-            str(pvc_uid) if pvc_uid else None
+        storage = payload.get("workspace_storage")
+        if storage is not None and (
+            not isinstance(storage, dict)
+            or storage.get("pvc_uid") != (str(pvc_uid) if pvc_uid else None)
         ):
             raise VMCreationRetryConflict("retained_disk_changed")
+        # Ordinary per-job retained rootdisks have no workspace_storage binding.
+        # Their expected PVC still requires the exact predecessor receipt and
+        # cleanup chain checked below; absence of a binding is not new-disk proof.
         if existing:
             await self._current(conn, job, generation, retry=existing)
             if (
@@ -398,10 +409,11 @@ class VMCreationRetryStore:
                             UUID(request_id),
                         )
                     )
+                    database_now = await conn.fetchval("SELECT clock_timestamp()")
                     if (
                         row["state"] != "reconciling"
                         or row["claim_token"] != UUID(claim_token)
-                        or row["claim_expires_at"] <= job["database_now"]
+                        or row["claim_expires_at"] <= database_now
                     ):
                         raise VMCreationRetryConflict("retry_claim_changed")
                     expected = {
@@ -444,6 +456,16 @@ class VMCreationRetryStore:
                         raise VMCreationRetryConflict(
                             permit.reason or "creation_reservation_completed"
                         )
+                    # The composed permit helper can itself wait for a row.
+                    # Expiry here must roll back its tentative admission too.
+                    database_now = await conn.fetchval("SELECT clock_timestamp()")
+                    if row["claim_expires_at"] <= database_now:
+                        raise VMCreationRetryConflict("retry_claim_changed")
+                    if (
+                        row["admission_deadline"]
+                        and row["admission_deadline"] <= database_now
+                    ):
+                        raise VMCreationRetryConflict("job_admission_expired")
                     await conn.execute(
                         "UPDATE vm_creation_retries SET creation_admission_id=$2,updated_at=clock_timestamp() WHERE request_id=$1",
                         row["request_id"],
@@ -485,26 +507,27 @@ class VMCreationRetryStore:
         async with self.db.acquire() as conn:
             async with conn.transaction():
                 row = await conn.fetchrow(
-                    "SELECT *,clock_timestamp() AS database_now FROM vm_creation_retries WHERE request_id=$1 FOR UPDATE",
+                    "SELECT * FROM vm_creation_retries WHERE request_id=$1 FOR UPDATE",
                     UUID(request_id),
                 )
+                database_now = await conn.fetchval("SELECT clock_timestamp()")
                 if (
                     not row
                     or row["claim_token"] != UUID(claim_token)
                     or row["revision"] != expected_revision
-                    or row["claim_expires_at"] <= row["database_now"]
+                    or row["claim_expires_at"] <= database_now
                     or row["state"] not in {"reconciling", "cancel_requested"}
                 ):
                     return False
                 attempt = row["backoff_attempt"] + 1
                 outage = (
-                    (row["transport_outage_started_at"] or row["database_now"])
+                    (row["transport_outage_started_at"] or database_now)
                     if outcome == "transport_unknown"
                     else None
                 )
                 attention = outcome == "blocked" or (
                     outage is not None
-                    and row["database_now"] - outage >= timedelta(seconds=900)
+                    and database_now - outage >= timedelta(seconds=900)
                 )
                 state = (
                     "cancel_requested"

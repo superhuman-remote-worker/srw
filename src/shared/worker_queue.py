@@ -854,31 +854,7 @@ async def worker_lease_is_current(
     )
 
 
-class _VMCreationPending(Exception):
-    """Roll back a raced claim without consuming a genuine worker attempt."""
-
-
 async def claim_worker_batch(
-    db: Any,
-    *,
-    pod_name: str,
-    lease_ttl_seconds: float = LEASE_TTL_SECONDS,
-    affinity_grace_seconds: float = AFFINITY_GRACE_SECONDS,
-    completion_commands_enabled: bool = False,
-) -> WorkerClaim | None:
-    try:
-        return await _claim_worker_batch(
-            db,
-            pod_name=pod_name,
-            lease_ttl_seconds=lease_ttl_seconds,
-            affinity_grace_seconds=affinity_grace_seconds,
-            completion_commands_enabled=completion_commands_enabled,
-        )
-    except _VMCreationPending:
-        return None
-
-
-async def _claim_worker_batch(
     db: Any,
     *,
     pod_name: str,
@@ -953,9 +929,16 @@ async def _claim_worker_batch(
             prior_status = str(job["status"]) if job is not None else None
             job_context = _json_object(job.get("context")) if job is not None else {}
             if "_vm_creation_pending" in job_context:
-                # Even a stale enqueuer cannot publish execution while creation
-                # or readiness remains pending. Roll back lease + attempt count.
-                raise _VMCreationPending
+                # A stale enqueuer may reopen the held row. Close it under our
+                # queue/job locks so it cannot starve the next runnable job.
+                # Undo only this tentative claim's increment, retaining every
+                # genuine prior worker attempt and publishing no worker lease.
+                await conn.fetchrow(_CLOSE_WORKER_PREFLIGHT_SQL, unit.unit_id, True)
+                await conn.execute(
+                    "UPDATE run_queue SET attempts_since_completion=attempts_since_completion-1 WHERE unit_id=$1",
+                    unit.unit_id,
+                )
+                return None
             resume_id_value = job_context.get("worker_resume_id")
             resume_id = (
                 str(resume_id_value)

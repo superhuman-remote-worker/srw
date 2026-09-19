@@ -484,8 +484,13 @@ async def test_attention_resume_requeues_failed_job_without_new_request(db):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("proof", ["valid", "missing_receipt", "wrong_cleanup"])
-async def test_retained_disk_requires_exact_predecessor_receipt_and_cleanup(db, proof):
+@pytest.mark.parametrize(
+    "proof", ["valid", "missing_receipt", "wrong_cleanup", "forgotten_retained_disk"]
+)
+@pytest.mark.parametrize("with_binding", [True, False])
+async def test_retained_disk_requires_exact_predecessor_receipt_and_cleanup(
+    db, proof, with_binding
+):
     from orchestrator.services.vm_workspace_recovery_store import cleanup_intent_digest
     from shared.vm_creation_retry import canonical_request_digest
 
@@ -515,7 +520,8 @@ async def test_retained_disk_requires_exact_predecessor_receipt_and_cleanup(db, 
             "rootdisk_pvc_uid": str(pvc),
         }
         snapshot = context["vm"]["creation_request"]
-        snapshot["request"]["workspace_storage"] = {"pvc_uid": str(pvc)}
+        if with_binding:
+            snapshot["request"]["workspace_storage"] = {"pvc_uid": str(pvc)}
         snapshot["request_digest"] = canonical_request_digest(snapshot["request"])
         proposal.update(
             request_digest=snapshot["request_digest"],
@@ -542,6 +548,12 @@ async def test_retained_disk_requires_exact_predecessor_receipt_and_cleanup(db, 
                 {**intent, "purge_disk": True} if proof == "wrong_cleanup" else intent
             ),
         )
+    if proof == "forgotten_retained_disk":
+        proposal.update(
+            expected_pvc_uid=None,
+            predecessor_evidence={},
+            predecessor_cleanup_admission_id=None,
+        )
     if proof != "valid":
         with pytest.raises(VMCreationRetryConflict):
             await admit(db, job, generation, proposal)
@@ -560,3 +572,126 @@ async def test_retained_disk_requires_exact_predecessor_receipt_and_cleanup(db, 
         observed=evidence,
     )
     assert permit["allowed"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("completion_commands_enabled", [False, True])
+async def test_pending_creation_at_queue_head_does_not_starve_runnable_job(
+    db, completion_commands_enabled
+):
+    from shared.worker_queue import claim_worker_batch
+
+    pending_job, generation, proposal = await admitted_job(db, lane="stateless")
+    await admit(db, pending_job, generation, proposal)
+    runnable_job, _, _ = await admitted_job(db, lane="stateless")
+    async with db.acquire() as conn:
+        await enqueue_worker_batch(conn, job_id=pending_job, priority=100)
+        await conn.execute(
+            "UPDATE run_queue SET attempts_since_completion=3 WHERE unit_id=$1",
+            pending_job,
+        )
+        await enqueue_worker_batch(conn, job_id=runnable_job, priority=0)
+    # A claimant may skip the held row or close it on its first pass. Neither
+    # path may repeatedly select it instead of the next runnable worker.
+    claim = None
+    for _ in range(2):
+        claim = await claim_worker_batch(
+            db,
+            pod_name="healthy-worker",
+            completion_commands_enabled=completion_commands_enabled,
+        )
+        if claim is not None:
+            break
+    assert claim is not None
+    assert claim.unit_id == runnable_job
+    async with db.acquire() as conn:
+        held = await conn.fetchrow(
+            "SELECT state,attempts_since_completion FROM run_queue WHERE unit_id=$1",
+            pending_job,
+        )
+        assert held["state"] != "leased"
+        assert held["attempts_since_completion"] == 3
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("expires", ["claim", "deadline"])
+async def test_authorization_rechecks_expiry_after_waiting_for_job_lock(db, expires):
+    job, generation, proposal = await admitted_job(
+        db, timeout=2 if expires == "deadline" else 3600
+    )
+    row = await admit(db, job, generation, proposal)
+    store = VMCreationRetryStore(db)
+    claim = (await store.claim_due(limit=1))[0]
+    async with db.acquire() as conn:
+        if expires == "claim":
+            await conn.execute(
+                "UPDATE vm_creation_retries SET claim_expires_at=clock_timestamp()+interval '1 second' WHERE request_id=$1",
+                row["request_id"],
+            )
+        async with conn.transaction():
+            await conn.execute("SELECT id FROM jobs WHERE id=$1 FOR UPDATE", job)
+            authorization = asyncio.create_task(
+                store.authorize_controller(
+                    request_id=str(row["request_id"]),
+                    claim_token=str(claim["claim_token"]),
+                    observed=observed(job, generation, proposal),
+                )
+            )
+            await asyncio.sleep(2.2 if expires == "deadline" else 1.3)
+            assert not authorization.done()
+        result = await asyncio.wait_for(authorization, timeout=5)
+        assert result == {
+            "allowed": False,
+            "reason": "retry_claim_changed"
+            if expires == "claim"
+            else "job_admission_expired",
+        }
+        assert (
+            await conn.fetchval(
+                "SELECT creation_admission_id FROM vm_creation_retries WHERE request_id=$1",
+                row["request_id"],
+            )
+            is None
+        )
+        assert (
+            await conn.fetchval(
+                "SELECT count(*) FROM vm_workspace_cleanup_admissions WHERE owner_id=$1",
+                job,
+            )
+            == 0
+        )
+
+
+@pytest.mark.asyncio
+async def test_observation_rechecks_claim_expiry_after_retry_row_lock_wait(db):
+    job, generation, proposal = await admitted_job(db)
+    row = await admit(db, job, generation, proposal)
+    store = VMCreationRetryStore(db)
+    claim = (await store.claim_due(limit=1))[0]
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE vm_creation_retries SET claim_expires_at=clock_timestamp()+interval '1 second' WHERE request_id=$1",
+            row["request_id"],
+        )
+        async with conn.transaction():
+            await conn.execute(
+                "SELECT request_id FROM vm_creation_retries WHERE request_id=$1 FOR UPDATE",
+                row["request_id"],
+            )
+            observation = asyncio.create_task(
+                store.apply_observation(
+                    request_id=str(row["request_id"]),
+                    claim_token=str(claim["claim_token"]),
+                    expected_revision=claim["revision"],
+                    observation={"outcome": "transport_unknown"},
+                )
+            )
+            await asyncio.sleep(1.3)
+            assert not observation.done()
+        assert await asyncio.wait_for(observation, timeout=5) is False
+        current = await conn.fetchrow(
+            "SELECT revision,backoff_attempt FROM vm_creation_retries WHERE request_id=$1",
+            row["request_id"],
+        )
+        assert current["revision"] == claim["revision"]
+        assert current["backoff_attempt"] == 0
