@@ -10393,6 +10393,51 @@ class PostgresDB:
 
         return result == "UPDATE 1"
 
+    async def capture_vm_creation_request_if_generation(
+        self,
+        job_id: str,
+        expected_generation: str,
+        snapshot: Dict[str, Any] | None,
+    ) -> Dict[str, Any] | None:
+        """Read or freeze the first caller-owned request for this VM generation.
+
+        The UPDATE locks/rechecks the row and retains an existing snapshot, so
+        concurrent initial creators receive the same winner. This is request
+        persistence, not controller issuance or retirement authority.
+        """
+        try:
+            job_uuid = UUID(job_id)
+        except (TypeError, ValueError):
+            return None
+        guard = (
+            "id=$1 AND context->'vm'->>'provision_generation'=$2 "
+            "AND status NOT IN ('completed','failed','cancelled') "
+            "AND COALESCE(context->'vm'->>'retirement_cleanup_pending','false') <> 'true' "
+            "AND COALESCE(context->'vm'->>'status','') NOT IN "
+            "('retiring_process_zero','retired','deleting','deleted','delete_failed') "
+            "AND NOT EXISTS (SELECT 1 FROM vm_workspace_recovery_jobs p "
+            "WHERE p.job_id=jobs.id AND p.resolved_at IS NULL)"
+        )
+        async with self.acquire() as conn:
+            if snapshot is None:
+                value = await conn.fetchval(
+                    "SELECT context->'vm'->'creation_request' FROM jobs WHERE " + guard,
+                    job_uuid,
+                    expected_generation,
+                )
+            else:
+                value = await conn.fetchval(
+                    "UPDATE jobs SET context=jsonb_set(context,'{vm,creation_request}', "
+                    "COALESCE(NULLIF(context->'vm'->'creation_request','null'::jsonb),$3::jsonb)), "
+                    "updated_at=CURRENT_TIMESTAMP WHERE "
+                    + guard
+                    + " RETURNING context->'vm'->'creation_request'",
+                    job_uuid,
+                    expected_generation,
+                    json.dumps(snapshot),
+                )
+        return json.loads(value) if isinstance(value, str) else value
+
     async def merge_vm_context_if_provision_generation(
         self,
         job_id: str,

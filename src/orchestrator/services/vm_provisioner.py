@@ -2214,55 +2214,81 @@ class VMProvisioner:
         if self._http_client is None:
             return False
 
-        network_tier = DEFAULT_NETWORK_TIER
-        if self._db is not None:
-            try:
-                network_tier = (
-                    await self._db.get_workspace_network_tier(job_id, entity_type)
-                    or DEFAULT_NETWORK_TIER
-                )
-            except Exception:
-                logger.exception(
-                    "Failed to resolve network_tier for %s=%s; using default",
-                    entity_type,
-                    job_id,
-                )
+        from orchestrator.services.vm_creation_request import (
+            build_vm_creation_request,
+            capture_vm_creation_request,
+        )
 
-        payload: dict[str, Any] = {
-            "job_id": job_id,
-            "entity_type": entity_type,
-            "agent_config": agent_config,
-            "cpu_cores": cpu_cores,
-            "memory": memory,
-            "description": description,
-            "nats_url": "",  # No NATS in same-cluster mode
-            "network_tier": network_tier,
-        }
-        if orchestrator_url := os.getenv("ORCHESTRATOR_URL"):
-            payload["orchestrator_url"] = orchestrator_url
-        if workspace_storage is not None:
-            payload["workspace_storage"] = workspace_storage
-        if preparation is not None:
-            payload["preparation"] = preparation
-        if disk_size:
-            payload["disk_size"] = disk_size
-        if initialization is not None:
-            from shared.workspace_initialization import validate_initialization_request
-
-            payload["initialization"] = validate_initialization_request(initialization)
         generation = _provision_generation(provision_generation)
         if self._lifecycle_hmac_secret is not None and generation is None:
+            logger.error("Refusing authenticated HTTP VM create without a generation")
+            return False
+        # Only Job creates with a durable store participate in snapshot capture.
+        # Legacy no-store and thread transports retain their existing behavior.
+        capture_request = (
+            entity_type == "job" and generation is not None and self._db is not None
+        )
+        snapshot = None
+        try:
+            if capture_request:
+                snapshot = await capture_vm_creation_request(
+                    self._db,
+                    job_id=job_id,
+                    generation=generation,
+                )
+            if snapshot is None:
+                network_tier = DEFAULT_NETWORK_TIER
+                if self._db is not None:
+                    try:
+                        network_tier = (
+                            await self._db.get_workspace_network_tier(
+                                job_id, entity_type
+                            )
+                            or DEFAULT_NETWORK_TIER
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Failed to resolve network_tier for %s=%s; using default",
+                            entity_type,
+                            job_id,
+                        )
+                payload = build_vm_creation_request(
+                    job_id=job_id,
+                    agent_config=agent_config,
+                    vm_image=vm_image,
+                    cpu_cores=cpu_cores,
+                    memory=memory,
+                    description=description,
+                    entity_type=entity_type,
+                    network_tier=network_tier,
+                    provision_generation=generation,
+                    orchestrator_url=os.getenv("ORCHESTRATOR_URL"),
+                    disk_size=disk_size,
+                    initialization=initialization,
+                    workspace_storage=workspace_storage,
+                    preparation=preparation,
+                )
+                if capture_request:
+                    snapshot = await capture_vm_creation_request(
+                        self._db,
+                        job_id=job_id,
+                        generation=generation,
+                        request=payload,
+                        initial_request=set_provisioning,
+                    )
+                    if snapshot is None:
+                        return False
+            if snapshot is not None:
+                payload = snapshot["request"]
+                preparation = payload.get("preparation")
+                workspace_storage = payload.get("workspace_storage")
+        except Exception:
+            # Capture failure cannot degrade into an uncaptured create. Do not
+            # log option values (initialization/description may contain secrets).
             logger.error(
-                "Refusing authenticated HTTP VM create for %s %s without a "
-                "current provision generation",
-                entity_type,
-                job_id,
+                "VM creation request capture refused for %s %s", entity_type, job_id
             )
             return False
-        if generation is not None:
-            payload["provision_generation"] = generation
-        if vm_image:
-            payload["vm_image"] = vm_image
         payload = sign_payload(
             payload,
             direction="request",
@@ -2276,15 +2302,24 @@ class VMProvisioner:
             else None
         )
 
+        response_authenticated = False
+        observation = {
+            "version": 1,
+            "provision_generation": generation,
+            "outcome": "response_unproven",
+            "authenticated": False,
+        }
         try:
             if set_provisioning:
                 if generation is not None:
-                    await self._set_context_if_generation(
+                    persisted = await self._set_context_if_generation(
                         entity_type,
                         job_id,
                         generation,
                         {"status": "provisioning"},
                     )
+                    if self._db is not None and not persisted:
+                        return False
                 else:
                     await self._set_context(
                         entity_type, job_id, {"status": "provisioning"}
@@ -2301,8 +2336,17 @@ class VMProvisioner:
                 raise RuntimeError(
                     "VM controller create response authentication failed"
                 )
-            resp.raise_for_status()
             data = unsigned_payload(data)
+            response_authenticated = (
+                self._lifecycle_hmac_secret is not None
+                and generation is not None
+                and data.get("provision_generation") == generation
+            )
+            observation.update(
+                authenticated=response_authenticated,
+                outcome="observed" if response_authenticated else "response_unproven",
+            )
+            resp.raise_for_status()
             if preparation is not None and data.get("status") == "created":
                 receipt = data.get("preparation") or {}
                 if (
@@ -2327,6 +2371,7 @@ class VMProvisioner:
                 "vm_name": data.get("vm_name"),
                 "namespace": data.get("namespace"),
                 "provisioned_by": "http",
+                "creation_observation": observation,
             }
             # New controllers return the immutable admitted VM UID. During a
             # rolling upgrade an older controller may omit it; the fresh
@@ -2466,10 +2511,15 @@ class VMProvisioner:
                 job_id,
                 error,
             )
+            observation.update(
+                outcome="rejected" if response_authenticated else "response_unproven",
+                http_status=e.response.status_code,
+            )
             failure = {
                 "status": "failed",
                 "error": error,
                 "provisioned_by": "http",
+                "creation_observation": observation,
             }
             if generation is not None:
                 await self._set_context_if_generation(
@@ -2479,12 +2529,14 @@ class VMProvisioner:
                 await self._set_context(entity_type, job_id, failure)
             return False
         except httpx.RequestError:
+            observation.update(outcome="transport_unknown", authenticated=False)
             if preparation is not None and generation is not None:
                 # The controller may already have persisted the build or VM.
                 # Poll the SAME admitted allocation; a lost reply is neither a
                 # successful build nor permission for another disk writer.
                 waiting = {
                     "status": "waiting_preparation",
+                    "creation_observation": observation,
                     "preparation": {
                         "allocationId": preparation["allocationId"],
                         "phase": "Pending",
@@ -2499,6 +2551,7 @@ class VMProvisioner:
                 "status": "failed",
                 "error": "VM controller transport unavailable",
                 "provisioned_by": "http",
+                "creation_observation": observation,
             }
             if generation is not None:
                 await self._set_context_if_generation(
@@ -2508,11 +2561,13 @@ class VMProvisioner:
                 await self._set_context(entity_type, job_id, failure)
             return False
         except Exception as e:
+            observation["outcome"] = "response_unproven"
             logger.error("HTTP create failed for %s %s: %s", entity_type, job_id, e)
             failure = {
                 "status": "failed",
                 "error": str(e),
                 "provisioned_by": "http",
+                "creation_observation": observation,
             }
             if generation is not None:
                 await self._set_context_if_generation(
@@ -2792,6 +2847,8 @@ class VMProvisioner:
             "rootdisk_pvc_uid": None,
             "identity_authenticated": False,
             "identity_provision_generation": None,
+            "creation_request": None,
+            "creation_observation": None,
             # Opaque incarnation nonce. Controller identities are merged only
             # through a DB-side compare-and-merge against this exact value.
             "provision_generation": str(uuid4()),

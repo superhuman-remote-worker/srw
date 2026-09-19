@@ -56,6 +56,9 @@ def mock_db():
     db.merge_thread_vm_context = AsyncMock()
     db.begin_pinned_thread_vm_provisioning = AsyncMock(return_value=True)
     db.merge_vm_context_if_provision_generation = AsyncMock(return_value=True)
+    db.capture_vm_creation_request_if_generation = AsyncMock(
+        side_effect=lambda _job, _generation, snapshot: snapshot
+    )
     db.merge_thread_vm_context_if_provision_generation = AsyncMock(return_value=True)
     db.managed_repository_workspace_process_zero_is_current = AsyncMock(
         return_value=True
