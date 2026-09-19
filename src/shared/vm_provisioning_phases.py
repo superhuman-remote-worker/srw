@@ -117,6 +117,8 @@ def _stored_state(previous: Mapping, now: float) -> dict:
     stage = previous.get("disk_stage_high_water")
     if type(stage) is not int or not -1 <= stage <= 3:
         raise ValueError("provisioning disk stage is invalid")
+    if started is not None and (identity["rootdisk_pvc_uid"] is None or stage != 3):
+        raise ValueError("provisioning boot history has no ready disk identity")
     progress = previous.get("disk_progress_high_water")
     if progress is not None and (not _number(progress) or progress > 100):
         raise ValueError("provisioning disk progress is invalid")

@@ -226,3 +226,13 @@ def test_unbounded_number_and_unrecognized_attention_reason_are_not_exposed():
     state = observe_provisioning(None, evidence(disk_phase="unknown"), now=100)
     state["attention_reason"] = "https://internal-server/private-token"
     assert provisioning_decision(state, now=200).reason == "vm_phase_unproven"
+
+
+@pytest.mark.parametrize("field", ["rootdisk_pvc_uid", "disk_stage_high_water"])
+def test_impossible_boot_history_never_authorizes_cleanup(field):
+    state = observe_provisioning(None, running(), now=100)
+    if field == "rootdisk_pvc_uid":
+        state["identity"][field] = None
+    else:
+        state[field] = -1
+    assert provisioning_decision(state, now=701).action == "attention"
