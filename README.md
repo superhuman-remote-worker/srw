@@ -92,7 +92,8 @@ SRW deploys through Helm to Kubernetes. The supported local evaluation path
 runs the same chart on a single-node [k3d](https://k3d.io) cluster.
 
 You need a Linux host with at least **8 vCPU and 16 GiB RAM**, plus Docker,
-`kubectl`, Helm 3.12+, k3d, `mkcert`, OpenSSL, and an SSH client. You also need
+`kubectl`, Helm 3.12+, k3d, OpenSSL, and an SSH client. The default multi-host
+local profile also needs `mkcert`; the single-origin profile does not. You need
 an API key for at least one configured LLM provider. See the
 [complete local prerequisites](docs/local-kubernetes.md#prerequisites) before
 starting.
@@ -119,6 +120,24 @@ helm install srw ./helm \
   --values deployment/values-local.yaml \
   --values deployment/values-local-images.yaml
 ```
+
+To use one self-signed HTTPS address without `mkcert`, cert-manager, or local
+DNS setup, select the single-origin profile when creating the cluster and add
+its overlay to Helm:
+
+```bash
+SRW_EXPOSURE_MODE=single-origin ./scripts/local-dev-up.sh
+helm install srw ./helm \
+  --namespace srw \
+  --kube-context k3d-srw \
+  --values deployment/values-local.yaml \
+  --values deployment/values-local-single-origin.yaml \
+  --values deployment/values-local-images.yaml
+```
+
+Open <https://localhost:8443/> and accept the certificate warning for that
+origin. An existing k3d cluster created with the 80/443 mapping must be
+recreated to obtain the dedicated `127.0.0.1:8443:30443@server:0` mapping.
 
 Wait for the workloads, then open the Cockpit:
 

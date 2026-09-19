@@ -1114,6 +1114,7 @@ const EXPIRY_OPTIONS = [
         </section>
 
         <!-- MCP Tokens Section -->
+        @if (externalClientsEnabled) {
         <section class="settings-section section-spacer">
           <h2 class="section-title">{{ 'settings.mcp.title' | transloco }}</h2>
           <p class="section-desc">{{ 'settings.mcp.desc' | transloco }}</p>
@@ -1278,6 +1279,8 @@ const EXPIRY_OPTIONS = [
           </div>
         </section>
 
+        }
+
         <!-- API Keys (PATs) link card — separate page per design doc §3.4 -->
         <section class="settings-section section-spacer">
           <h2 class="section-title">{{ 'settings.apiKeys.linkTitle' | transloco }}</h2>
@@ -1288,6 +1291,7 @@ const EXPIRY_OPTIONS = [
         </section>
 
         <!-- SSH Keys link card — separate page, same pattern as the PAT card above -->
+        @if (externalClientsEnabled) {
         <section class="settings-section section-spacer">
           <h2 class="section-title">{{ 'settings.sshKeys.linkTitle' | transloco }}</h2>
           <p class="section-desc">{{ 'settings.sshKeys.linkDesc' | transloco }}</p>
@@ -1295,6 +1299,8 @@ const EXPIRY_OPTIONS = [
             {{ 'settings.sshKeys.linkManage' | transloco }}
           </app-button>
         </section>
+
+        }
 
         <!-- AI Subscriptions Section (Admin Only) -->
         @if (userService.currentUser()?.is_admin) {
@@ -2627,6 +2633,7 @@ const EXPIRY_OPTIONS = [
   ],
 })
 export class SettingsComponent implements OnInit, OnDestroy {
+  readonly externalClientsEnabled = environment.externalClientsEnabled;
   readonly tokenService = inject(McpTokenService);
   readonly userService = inject(UserService);
   readonly settingsService = inject(SettingsService);
@@ -3214,7 +3221,7 @@ export class SettingsComponent implements OnInit, OnDestroy {
 
   ngOnInit(): void {
     this.modelService.load();
-    this.tokenService.loadTokens();
+    if (this.externalClientsEnabled) this.tokenService.loadTokens();
     this.settingsService.loadApiKeys();
     this.settingsService.loadPreferences();
     this.loadExpertDefaults();
@@ -3277,6 +3284,7 @@ export class SettingsComponent implements OnInit, OnDestroy {
   }
 
   mcpJsonSnippet = () => {
+    if (!this.externalClientsEnabled) return '';
     const token = this.newToken()?.token ?? 'srw_YOUR_TOKEN_HERE';
     const mcpUrl = environment.mcpUrl;
     return JSON.stringify(
@@ -3297,7 +3305,7 @@ export class SettingsComponent implements OnInit, OnDestroy {
   };
 
   mcpServerUrl = () => {
-    return environment.mcpUrl;
+    return this.externalClientsEnabled ? environment.mcpUrl : '';
   };
 
   asInputValue(event: Event): string {
@@ -3563,6 +3571,7 @@ export class SettingsComponent implements OnInit, OnDestroy {
   }
 
   createToken(): void {
+    if (!this.externalClientsEnabled) return;
     const name = this.newName().trim();
     if (!name) return;
     this.creating.set(true);

@@ -570,16 +570,16 @@ data:
   # When sameOriginApi=true, the BFF redirect lives on the cockpit origin
   # (path-routed to the orchestrator) so the OIDC callback and the cockpit
   # share an origin and the session cookie is first-party.
-  SRW_BFF_REDIRECT_URI: {{ printf "%s/auth/callback" (ternary (include "srw.cockpitUrl" .) (include "srw.apiUrl" .) .Values.auth.bff.sameOriginApi) | quote }}
+  SRW_BFF_REDIRECT_URI: {{ printf "%s/auth/callback" (ternary (include "srw.publicOrigin" .) (ternary (include "srw.cockpitUrl" .) (include "srw.apiUrl" .) .Values.auth.bff.sameOriginApi) (ne (include "srw.singleOrigin" .) "")) | quote }}
   SRW_SPA_BASE_URL: {{ include "srw.cockpitUrl" . | quote }}
   # auth.bff.cookieDomain semantics:
   #   "auto" (default) → ".<global.domain>" (rides on cockpit + api subdomains)
   #   ""               → host-only (right for localhost dev where browsers
   #                                  may reject Domain=.localhost as a public-suffix)
   #   anything else    → emitted literally
-  SRW_COOKIE_DOMAIN: {{ if eq .Values.auth.bff.cookieDomain "auto" }}{{ printf ".%s" .Values.global.domain | quote }}{{ else }}{{ .Values.auth.bff.cookieDomain | quote }}{{ end }}
-  SRW_COOKIE_SECURE: {{ .Values.auth.bff.cookieSecure | default "1" | quote }}
-  SRW_COOKIE_SAMESITE: {{ .Values.auth.bff.cookieSamesite | default "lax" | quote }}
+  SRW_COOKIE_DOMAIN: {{ if include "srw.singleOrigin" . }}""{{ else if eq .Values.auth.bff.cookieDomain "auto" }}{{ printf ".%s" .Values.global.domain | quote }}{{ else }}{{ .Values.auth.bff.cookieDomain | quote }}{{ end }}
+  SRW_COOKIE_SECURE: {{ ternary "1" (.Values.auth.bff.cookieSecure | default "1") (ne (include "srw.singleOrigin" .) "") | quote }}
+  SRW_COOKIE_SAMESITE: {{ ternary "lax" (.Values.auth.bff.cookieSamesite | default "lax") (ne (include "srw.singleOrigin" .) "") | quote }}
   SRW_SESSION_IDLE_TIMEOUT_S: {{ .Values.auth.bff.sessionIdleTimeoutSeconds | default 1800 | int | quote }}
   SRW_SESSION_ABSOLUTE_TIMEOUT_S: {{ .Values.auth.bff.sessionAbsoluteTimeoutSeconds | default 2592000 | int | quote }}
   SRW_ACCESS_TOKEN_REFRESH_SKEW_S: {{ .Values.auth.bff.accessTokenRefreshSkewSeconds | default 60 | int | quote }}
@@ -587,7 +587,7 @@ data:
   # CORS (orchestrator reads this comma-separated list for allowed origins).
   # Canonical cockpit URL first, then any ingress.cors.additionalOrigins (e.g.
   # a legacy hostname kept as an alias during a domain migration).
-  CORS_ORIGINS: {{ concat (list (include "srw.cockpitUrl" .)) (.Values.ingress.cors.additionalOrigins | default list) | join "," | quote }}
+  CORS_ORIGINS: {{ ternary (include "srw.publicOrigin" .) (concat (list (include "srw.cockpitUrl" .)) (.Values.ingress.cors.additionalOrigins | default list) | join ",") (ne (include "srw.singleOrigin" .) "") | quote }}
 
   # Cockpit external URL (for deep links in emails/notifications)
   COCKPIT_EXTERNAL_URL: {{ include "srw.cockpitUrl" . | quote }}

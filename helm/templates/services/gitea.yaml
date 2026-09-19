@@ -200,7 +200,7 @@ spec:
             - name: GITEA__cron_0X2E_git_gc_repos__SCHEDULE
               value: "@weekly"
             - name: GITEA__server__ROOT_URL
-              value: {{ include "srw.gitUrl" . | quote }}
+              value: {{ if include "srw.singleOrigin" . }}{{ printf "%s/" (include "srw.gitUrl" .) | quote }}{{ else }}{{ include "srw.gitUrl" . | quote }}{{ end }}
             - name: GITEA__server__HTTP_PORT
               value: "3000"
             - name: GITEA__security__INSTALL_LOCK
@@ -253,6 +253,57 @@ spec:
                 secretKeyRef:
                   name: {{ include "srw.secretName" . }}
                   key: GITEA_OIDC_CLIENT_SECRET
+          {{- if include "srw.singleOrigin" . }}
+          # Retain the image entrypoint: it prepares app.ini from environment.
+          # Gitea caches OIDC discovery in its web process. Reconcile BEFORE web
+          # starts, and wait out an old Keycloak pod during a rolling upgrade.
+          # OpenID Connect ignores Gitea's GitHub/GitLab custom URL flags;
+          # Keycloak's dynamic backchannel discovery supplies internal endpoints.
+          args:
+            - /bin/sh
+            - -ec
+            - |
+              KI="{{ include "srw.keycloakInternalUrl" . }}"
+              KP="{{ include "srw.authUrl" . }}"
+              R="{{ .Values.keycloak.realm }}"
+              DISCOVERY="${KI}/realms/${R}/.well-known/openid-configuration"
+              ready=false
+              for attempt in $(seq 1 60); do
+                issuer=$(wget -q -T 5 -O- "$DISCOVERY" | sed -n 's/.*"issuer"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')
+                if [ "$issuer" = "${KP}/realms/${R}" ]; then ready=true; break; fi
+                sleep 2
+              done
+              if [ "$ready" != true ]; then
+                echo "Keycloak discovery has not adopted the configured public origin" >&2
+                exit 1
+              fi
+              gitea migrate
+              if ! gitea admin user list | awk -v name="$GITEA_ADMIN_USER" '$2 == name {found=1} END {exit !found}'; then
+                gitea admin user create --admin \
+                  --username "$GITEA_ADMIN_USER" --password "$GITEA_ADMIN_PASSWORD" \
+                  --email "${GITEA_ADMIN_USER}@srw.local" --must-change-password=false
+              fi
+              GAID=$(gitea admin auth list | awk '$2 == "Keycloak" {print $1; exit}')
+              if [ -n "$GAID" ]; then
+                gitea admin auth update-oauth --id "$GAID" \
+                  --key "gitea" --secret "$GITEA_OIDC_CLIENT_SECRET" \
+                  --auto-discover-url "$DISCOVERY"
+              else
+                gitea admin auth add-oauth --name "Keycloak" --provider "openidConnect" \
+                  --key "gitea" --secret "$GITEA_OIDC_CLIENT_SECRET" \
+                  --auto-discover-url "$DISCOVERY" \
+                  --group-claim-name "groups" --admin-group "admin" --skip-local-2fa
+              fi
+              exec gitea web
+          startupProbe:
+            httpGet:
+              path: /api/v1/version
+              port: 3000
+            periodSeconds: 2
+            # Discovery waits at most 60 * (5s request + 2s sleep); leave
+            # another three minutes for migration and server startup.
+            failureThreshold: 300
+          {{- else }}
           lifecycle:
             postStart:
               exec:
@@ -270,14 +321,14 @@ spec:
                       --must-change-password=false 2>/dev/null || true
                     # Register Keycloak OIDC if not already present
                     if ! gitea admin auth list 2>/dev/null | grep -q "Keycloak"; then
-                      KI="http://{{ include "srw.fullname" . }}-keycloak:8080"
+                      KI="{{ include "srw.keycloakInternalUrl" . }}"
                       KP="{{ include "srw.authUrl" . }}"
                       R="{{ .Values.keycloak.realm }}"
                       gitea admin auth add-oauth \
                         --name "Keycloak" --provider "openidConnect" \
                         --key "gitea" --secret "$GITEA_OIDC_CLIENT_SECRET" \
                         --auto-discover-url "${KI}/realms/${R}/.well-known/openid-configuration" \
-                        --use-custom-urls \
+                        --use-custom-urls=true \
                         --custom-auth-url "${KP}/realms/${R}/protocol/openid-connect/auth" \
                         --custom-token-url "${KI}/realms/${R}/protocol/openid-connect/token" \
                         --custom-profile-url "${KI}/realms/${R}/protocol/openid-connect/userinfo" \
@@ -291,11 +342,17 @@ spec:
                     # if it starts on a stale host, KC bounces the browser mid-flow to
                     # KC_HOSTNAME and the transient auth-session cookie is lost →
                     # temporarily_unavailable/authentication_expired. token/profile URLs
-                    # stay on the internal service (KI) and are unaffected by the flip.
+                    # stay on the internal service (KI), including its context path.
+                    KI="{{ include "srw.keycloakInternalUrl" . }}"
                     GKP="{{ include "srw.authUrl" . }}"; GR="{{ .Values.keycloak.realm }}"
                     GAID=$(gitea admin auth list 2>/dev/null | grep -w "Keycloak" | awk '{print $1}' | head -1)
                     [ -n "$GAID" ] && gitea admin auth update-oauth --id "$GAID" \
+                      --auto-discover-url "${KI}/realms/${GR}/.well-known/openid-configuration" \
+                      --use-custom-urls=true \
+                      --custom-token-url "${KI}/realms/${GR}/protocol/openid-connect/token" \
+                      --custom-profile-url "${KI}/realms/${GR}/protocol/openid-connect/userinfo" \
                       --custom-auth-url "${GKP}/realms/${GR}/protocol/openid-connect/auth" 2>/dev/null || true
+          {{- end }}
           volumeMounts:
             - name: data
               mountPath: /var/lib/gitea

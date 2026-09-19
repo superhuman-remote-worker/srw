@@ -153,6 +153,10 @@ jobs:
           - installer-evaluation
           - installer-production
           - installer-production-vms
+          - single-origin-server
+          - single-origin-local
+          - installer-single-origin-server
+          - installer-single-origin-local
     steps:
       - uses: actions/checkout@v4
         with:
@@ -186,6 +190,17 @@ jobs:
                 -schema-location default \
                 -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json' \
                 -summary
+
+      - name: Verify single-origin has no certificate controller or Traefik CRDs
+        if: contains(matrix.scenario, 'single-origin')
+        run: |
+          rendered=$(mktemp)
+          helm template srw helm/ -f helm/ci/${{ matrix.scenario }}-values.yaml > "$rendered"
+          if grep -Eq '^(apiVersion: cert-manager.io/|kind: (Certificate|Issuer|ClusterIssuer|CustomResourceDefinition|IngressRoute|Middleware|TLSOption|TLSStore|TraefikService)$)' "$rendered"; then
+            echo "::error::single-origin rendered a cert-manager resource, CRD, or Traefik custom resource"
+            grep -En '^(apiVersion: cert-manager.io/|kind: (Certificate|Issuer|ClusterIssuer|CustomResourceDefinition|IngressRoute|Middleware|TLSOption|TLSStore|TraefikService)$)' "$rendered"
+            exit 1
+          fi
 
       - name: Verify chart-created Secret contract
         if: matrix.scenario == 'eval'

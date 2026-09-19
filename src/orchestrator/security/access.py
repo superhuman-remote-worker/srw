@@ -1064,10 +1064,9 @@ def externalize_gitea_url(url: str | None) -> str | None:
     ``http://srw-gitea:3000``) so in-cluster workspace pods can reach the host.
     That address is unroutable from a VM (a tailnet node) or a browser — which
     is both the F29 clone/push failure *and* the reason the Repos tab shows an
-    unusable link. Swap the internal host[:port]+scheme for ``GITEA_URL`` (the
-    ingress address). The helper preserves legacy userinfo for compatibility;
-    every public projection immediately strips it, and managed runtime delivery
-    no longer uses this helper or an HTTP bearer.
+    unusable link. Replace the exact internal base with ``GITEA_URL`` (including
+    its public subpath) and discard legacy credentials from rewritten links.
+    Managed runtime delivery uses internal endpoints, not this public projection.
 
     No-op when the URL doesn't point at the internal host, or when either env
     var is unset or already equal — so external repos and dev setups (where the
@@ -1087,18 +1086,16 @@ def externalize_gitea_url(url: str | None) -> str | None:
     u = urlparse(url)
     if not int_p.hostname or not ext_p.hostname:
         return url
-    # Only rewrite URLs that actually target the internal Gitea host; leave
-    # user-supplied external source repos (github.com, ...) alone.
-    if u.hostname != int_p.hostname:
+    # Match the whole origin and a path boundary, not merely a hostname.
+    # Another service on the same host/port or a sibling path is not Gitea.
+    if (u.scheme, u.hostname, u.port) != (int_p.scheme, int_p.hostname, int_p.port):
         return url
-
-    creds = ""
-    if u.username:
-        creds = u.username + (f":{u.password}" if u.password else "") + "@"
-    netloc = f"{creds}{ext_p.hostname}"
-    if ext_p.port:
-        netloc += f":{ext_p.port}"
-    return urlunparse(u._replace(scheme=ext_p.scheme or u.scheme, netloc=netloc))
+    internal_path = int_p.path.rstrip("/")
+    if u.path != internal_path and not u.path.startswith(internal_path + "/"):
+        return url
+    public_path = ext_p.path.rstrip("/") + u.path[len(internal_path):]
+    netloc = ext_p.netloc.rsplit("@", 1)[-1]
+    return urlunparse(u._replace(scheme=ext_p.scheme or u.scheme, netloc=netloc, path=public_path))
 
 
 def redact_repository(repo: dict[str, Any]) -> dict[str, Any]:

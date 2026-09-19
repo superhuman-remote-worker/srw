@@ -757,14 +757,26 @@ spec:
                   optional: true
             - name: SESSION_JWT_TTL_S
               value: {{ .Values.sessionRouter.jwtTtlSeconds | default 60 | quote }}
+            {{- if include "srw.singleOrigin" . }}
+            - name: SESSION_PUBLIC_ORIGIN
+              value: {{ include "srw.publicOrigin" . | quote }}
+            - name: SESSION_INGRESS_HOST
+              value: ""
+            - name: SESSION_INGRESS_CLASS
+              value: {{ include "srw.singleOriginIngressClass" . | quote }}
+            - name: SESSION_INGRESS_SINGLE_ORIGIN
+              value: "1"
+            - name: SESSION_INGRESS_TLS_SECRET
+              value: ""
+            {{- else }}
+            - name: SESSION_PUBLIC_ORIGIN
+              value: ""
             - name: SESSION_INGRESS_HOST
               value: {{ .Values.sessionRouter.ingressHost | default (printf "api.%s" .Values.global.domain) | quote }}
             - name: SESSION_INGRESS_CLASS
               value: {{ .Values.sessionRouter.ingressClass | default "traefik" | quote }}
-            - name: SESSION_INGRESS_NAMESPACE
-              value: {{ .Release.Namespace | quote }}
-            - name: SESSION_INGRESS_ANNOTATIONS
-              value: {{ .Values.sessionRouter.annotations | default dict | toJson | quote }}
+            - name: SESSION_INGRESS_SINGLE_ORIGIN
+              value: "0"
             {{- if .Values.sessionRouter.tlsSecretName }}
             # Per-session Ingress emits a `tls:` block so the browser can open
             # wss:// on the same TLS entrypoint as the cockpit. Only needed
@@ -773,6 +785,15 @@ spec:
             - name: SESSION_INGRESS_TLS_SECRET
               value: {{ .Values.sessionRouter.tlsSecretName | quote }}
             {{- end }}
+            {{- end }}
+            - name: SESSION_INGRESS_NAMESPACE
+              value: {{ .Release.Namespace | quote }}
+            - name: SESSION_INGRESS_ANNOTATIONS
+              {{- if include "srw.singleOrigin" . }}
+              value: {{ mergeOverwrite (dict) (.Values.sessionRouter.annotations | default dict) (dict "kubernetes.io/ingress.class" (include "srw.singleOriginIngressClass" .) "traefik.ingress.kubernetes.io/router.entrypoints" "websecure") | toJson | quote }}
+              {{- else }}
+              value: {{ .Values.sessionRouter.annotations | default dict | toJson | quote }}
+              {{- end }}
             # Name + key of the Secret holding the shared HS256 JWT key.
             # The orchestrator passes both through to dynamically-provisioned
             # agent pod manifests (services/agent_provisioner.py) so the

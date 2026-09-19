@@ -95,15 +95,24 @@ class SessionRouterService:
         # Injected for testability; lazy-resolved in production.
         core_api: Any = None,
         networking_api: Any = None,
+        single_origin: bool = False,
     ) -> None:
         self._namespace = namespace
         self._ingress_host = ingress_host
         self._ingress_class = ingress_class
         self._annotations = annotations or {}
+        self._single_origin = single_origin
+        if single_origin:
+            self._annotations = {
+                **self._annotations,
+                "kubernetes.io/ingress.class": ingress_class,
+                "traefik.ingress.kubernetes.io/router.entrypoints": "websecure",
+                "traefik.ingress.kubernetes.io/router.tls": "true",
+            }
         # Local dev needs the per-session Ingress to be on the same TLS
         # entrypoint as the cockpit (mkcert/cert-manager). When set, the
         # Ingress gets a `tls:` block + websecure entrypoint annotation.
-        self._tls_secret_name = tls_secret_name
+        self._tls_secret_name = None if single_origin else tls_secret_name
         self._db = db
         self._core_api = core_api
         self._networking_api = networking_api
@@ -391,6 +400,7 @@ class SessionRouterService:
             and isinstance(binding.pod_namespace, str)
             and _KUBERNETES_NAMESPACE.fullmatch(binding.pod_namespace) is not None
             and (pod_namespace is None or binding.pod_namespace == pod_namespace)
+            and (not self._single_origin or binding.pod_namespace == self._namespace)
             and binding.pod_uid == pod_uid
             and binding.agent_status in {"booting", "ready", "working", "session"}
             and (pod_ip is None or binding.pod_ip == pod_ip)
@@ -717,8 +727,8 @@ class SessionRouterService:
             )
             and annotations == self._annotations
             and _value(spec, "ingress_class_name", "ingressClassName")
-            == self._ingress_class
-            and _value(rule, "host") == self._ingress_host
+            == (None if self._single_origin else self._ingress_class)
+            and _value(rule, "host") == (None if self._single_origin else self._ingress_host)
             and _value(path, "path") == f"/p/{thread_id}"
             and _value(path, "path_type", "pathType") == "Prefix"
             and _value(service, "name") == name
@@ -996,6 +1006,9 @@ class SessionRouterService:
                 }
             ],
         }
+        if self._single_origin:
+            del spec["ingressClassName"]
+            del spec["rules"][0]["host"]
         if self._tls_secret_name:
             spec["tls"] = [
                 {

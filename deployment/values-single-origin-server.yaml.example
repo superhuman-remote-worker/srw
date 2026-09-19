@@ -1,0 +1,71 @@
+# Standalone server-IP example for the single-origin HTTPS preset.
+#
+# Copy to a private values file, choose storage settings for your cluster, and
+# create the normal application Secret, srw-session-jwt, and the dedicated
+# immutable srw-protected-effect Secret as documented in
+# helm/README.md. TCP 30443 must be reachable from users. No DNS, mkcert,
+# or cert-manager installation is required.
+license:
+  acceptTerms: true
+
+fullnameOverride: srw
+
+secrets:
+  # Must contain IDE_CREDENTIAL_KEY (at least 32 random bytes) for the browser
+  # IDE promised by this preset. See helm/README.md.
+  existingSecret: srw-secrets
+
+sessionRouter:
+  jwtSecretName: srw-session-jwt
+  jwtSecretKey: jwt-secret
+
+exposure:
+  mode: single-origin
+  singleOrigin:
+    address: "192.0.2.10" # replace with the server's reachable IPv4 address
+    publicPort: 30443
+    service:
+      nodePort: 30443
+    tls:
+      mode: self-signed
+      validityDays: 365
+
+keycloak:
+  enabled: true
+  internal: true
+gitea:
+  enabled: true
+  internal: true
+  ssh:
+    externalService:
+      enabled: false
+nextcloud:
+  enabled: true
+  internal: true
+  replicas: 1
+  # This internal lane signs the provider-owned installation identity used to
+  # bind ordinary cloud effects. It does not enable protected cloud mode.
+  protectedEffect:
+    enabled: true
+    hmacSecretName: srw-protected-effect
+  objectStore:
+    enabled: false
+opencloud:
+  enabled: false
+
+databases:
+  neo4j:
+    boltTls:
+      enabled: false
+    loadBalancer:
+      enabled: false
+
+sshGateway:
+  enabled: false
+collabora:
+  enabled: false
+canvas:
+  livePreview:
+    enabled: false
+    viewer:
+      enabled: false

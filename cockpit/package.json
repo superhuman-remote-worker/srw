@@ -28,7 +28,8 @@
     "i18n:check": "node scripts/check-i18n-parity.mjs && node scripts/check-i18n-hardcoded.mjs",
     "i18n:check:parity": "node scripts/check-i18n-parity.mjs",
     "i18n:check:hardcoded": "node scripts/check-i18n-hardcoded.mjs",
-    "serve:ssr:cockpit": "node dist/cockpit/server/server.mjs"
+    "serve:ssr:cockpit": "node dist/cockpit/server/server.mjs",
+    "test:e2e:single-origin": "playwright test --config=e2e/single-origin/playwright.config.ts"
   },
   "prettier": {
     "printWidth": 100,

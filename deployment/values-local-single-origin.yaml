@@ -1,0 +1,51 @@
+# Local k3d single-origin HTTPS overlay.
+# Apply after deployment/values-local.yaml. The chart owns the self-signed
+# certificate; no mkcert, cert-manager, DNS override, or trust-store setup is
+# used. The k3d bootstrap maps localhost:8443 to this NodePort.
+exposure:
+  mode: single-origin
+  singleOrigin:
+    address: localhost
+    publicPort: 8443
+    service:
+      nodePort: 30443
+    tls:
+      mode: self-signed
+      validityDays: 365
+
+# The initial single-origin preset supports the bundled browser services.
+keycloak:
+  enabled: true
+  internal: true
+gitea:
+  enabled: true
+  internal: true
+  ssh:
+    externalService:
+      enabled: false
+nextcloud:
+  enabled: true
+  internal: true
+  # Stage the signed installation-attestation lane so ordinary cloud effects
+  # can bind this Nextcloud installation. Protected cloud mode remains off.
+  protectedEffect:
+    enabled: true
+opencloud:
+  enabled: false
+
+databases:
+  neo4j:
+    boltTls:
+      enabled: false
+    loadBalancer:
+      enabled: false
+
+sshGateway:
+  enabled: false
+collabora:
+  enabled: false
+canvas:
+  livePreview:
+    enabled: false
+    viewer:
+      enabled: false

@@ -3,6 +3,7 @@ import {Router} from '@angular/router';
 import {TranslocoPipe} from '@jsverse/transloco';
 import {AppMenuComponent, AppMenuItemComponent, AppMenuTriggerDirective} from '../../ui/menu';
 import {UserService} from '../../core/services/user.service';
+import {environment} from '../../core/environment';
 
 /**
  * The rail's avatar flyout — the split rule's instance-facing half (see
@@ -26,7 +27,9 @@ import {UserService} from '../../core/services/user.service';
       <app-menu #accountMenu>
         <app-menu-item (activated)="go('/settings')">{{ 'nav.settings' | transloco }}</app-menu-item>
         <app-menu-item (activated)="go('/settings/api-keys')">{{ 'nav.apiKeys' | transloco }}</app-menu-item>
-        <app-menu-item (activated)="go('/settings/ssh-keys')">{{ 'nav.sshKeys' | transloco }}</app-menu-item>
+        @if (externalClientsEnabled) {
+          <app-menu-item (activated)="go('/settings/ssh-keys')">{{ 'nav.sshKeys' | transloco }}</app-menu-item>
+        }
         @if (showAdmin()) {
           <app-menu-item class="menu-divider" (activated)="go('/admin/models')">{{ 'nav.admin' | transloco }}</app-menu-item>
         }
@@ -95,6 +98,7 @@ import {UserService} from '../../core/services/user.service';
   `],
 })
 export class RailAccountMenuComponent {
+  readonly externalClientsEnabled = environment.externalClientsEnabled;
   protected readonly userService = inject(UserService);
   private readonly router = inject(Router);
 

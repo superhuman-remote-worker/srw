@@ -106,6 +106,7 @@ const MODE_ROUTES: Record<RailMode, string> = {
         }
 
         @if (isWorkbenchRoute()) {
+          @if (adminToolsEnabled) {
           <div class="section">
             <div class="section-title">Databases</div>
             <a class="section-link" [href]="neo4jUrl" target="_blank" rel="noopener">
@@ -116,15 +117,18 @@ const MODE_ROUTES: Record<RailMode, string> = {
             </a>
           </div>
 
+          }
           <div class="section">
             <div class="section-title">Tools</div>
             <a class="section-link" [href]="giteaUrl" target="_blank" rel="noopener">
               <span class="link-icon">&#x1F375;</span>Gitea
             </a>
+            @if (adminToolsEnabled) {
             <a class="section-link" [href]="dozzleUrl" target="_blank" rel="noopener">
               <span class="link-icon">&#x1F4CB;</span>Dozzle
             </a>
-            @if (minioConsoleUrl) {
+            }
+            @if (adminToolsEnabled && minioConsoleUrl) {
               <a class="section-link" [href]="minioConsoleUrl" target="_blank" rel="noopener">
                 <span class="link-icon">&#x1F4E6;</span>MinIO
               </a>
@@ -780,6 +784,7 @@ export class SidebarComponent {
     () => this.currentUrl()?.startsWith('/workbench') ?? false,
   );
 
+  readonly adminToolsEnabled = environment.adminToolsEnabled;
   readonly giteaUrl = environment.giteaUrl;
   readonly dozzleUrl = environment.dozzleUrl;
   readonly neo4jUrl = environment.neo4jUrl;

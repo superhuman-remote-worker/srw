@@ -1011,15 +1011,14 @@ export function clearDraft(threadId: string | null): void {
               @if (chat.cloudSessionUrl() || chat.ncSessionFolder()) {
                 <app-menu-item (activated)="openSessionFiles()">{{ sessionFilesLabelKey() | transloco }}</app-menu-item>
               }
-              @if (ideStatus(); as ide) {
-                @if (ide.gitea_url) {
-                  <app-menu-item (activated)="openIde(ide.gitea_url!)">{{ 'chat.header.gitButton' | transloco }}</app-menu-item>
-                }
-                @if (ide.status === 'active' && ide.code_server_url) {
-                  <app-menu-item (activated)="openCodeServer()">{{ 'chat.header.ideButton' | transloco }}</app-menu-item>
-                } @else if (ide.status === 'restoring') {
-                  <app-menu-item [disabled]="true">{{ 'chat.header.ideLoadingTooltip' | transloco }}</app-menu-item>
-                }
+              @if (ideStatus()?.gitea_url; as giteaUrl) {
+                <app-menu-item (activated)="openIde(giteaUrl)">{{ 'chat.header.gitButton' | transloco }}</app-menu-item>
+              }
+              @if (ideStatus()?.status === 'active' && ideStatus()?.code_server_url) {
+                <app-menu-item (activated)="openCodeServer()">{{ 'chat.header.ideButton' | transloco }}</app-menu-item>
+              }
+              @if (ideStatus()?.status === 'restoring') {
+                <app-menu-item [disabled]="true">{{ 'chat.header.ideLoadingTooltip' | transloco }}</app-menu-item>
               }
               @if (sshButtonVisible()) {
                 <app-menu-item (activated)="showSshPanel.update(v => !v)">{{ 'chat.header.sshButton' | transloco }}</app-menu-item>

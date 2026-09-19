@@ -1201,7 +1201,12 @@ def test_connection_probes_persisted_metadata_with_the_correct_cloud_requirement
         fake_main.session_router.ensure_route.assert_not_awaited()
 
 
-def test_connection_returns_ws_url_and_token_when_ready(monkeypatch):
+@pytest.mark.parametrize("public_origin, expected_authority", [
+    (None, "api.test.example"),
+    ("https://192.0.2.10:30443", "192.0.2.10:30443"),
+    ("https://localhost:8443", "localhost:8443"),
+])
+def test_connection_returns_ws_url_and_token_when_ready(monkeypatch, public_origin, expected_authority):
     """GET /connection returns 200 with ws_url + token when bound + ready."""
     from fastapi import FastAPI
     from fastapi.testclient import TestClient
@@ -1229,12 +1234,16 @@ def test_connection_returns_ws_url_and_token_when_ready(monkeypatch):
     monkeypatch.setattr(sessions_mod, "probe_ready", _probe_ok, raising=True)
 
     # Inject a real SessionTokenService and a fake session_router.
-    test_tokens = SessionTokenService(secret="test-secret-do-not-use", ttl_seconds=60)
+    test_tokens = SessionTokenService(secret="test-secret-do-not-use-at-least-32-bytes", ttl_seconds=60)
 
     fake_main.session_tokens = test_tokens
     fake_main.session_router = MagicMock()
     fake_main.session_router.ensure_route = AsyncMock(return_value="/p/t1")
     monkeypatch.setenv("SESSION_INGRESS_HOST", "api.test.example")
+    if public_origin:
+        monkeypatch.setenv("SESSION_PUBLIC_ORIGIN", public_origin)
+    else:
+        monkeypatch.delenv("SESSION_PUBLIC_ORIGIN", raising=False)
 
     app.state.sessions_dependencies_factory = lambda: fake_main.dependencies
     app.include_router(sessions_router)
@@ -1244,8 +1253,8 @@ def test_connection_returns_ws_url_and_token_when_ready(monkeypatch):
     body = resp.json()
     assert body["state"] == "ready"
     assert body["control_socket"] == "websocket"
-    assert body["ws_url"].startswith(
-        f"wss://api.test.example/p/{CONNECTION_THREAD_ID}/ws?t="
+    assert body["ws_url"] == (
+        f"wss://{expected_authority}/p/{CONNECTION_THREAD_ID}/ws?t={body['token']}"
     )
     assert isinstance(body["token"], str) and body["token"]
     assert isinstance(body["expires_at"], int)

@@ -189,6 +189,75 @@
         }
       }
     },
+    "exposure": {
+      "type": "object",
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": [
+            "multi-host",
+            "single-origin"
+          ]
+        },
+        "singleOrigin": {
+          "type": "object",
+          "properties": {
+            "address": {
+              "type": "string"
+            },
+            "publicPort": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 65535
+            },
+            "service": {
+              "type": "object",
+              "properties": {
+                "nodePort": {
+                  "type": "integer",
+                  "minimum": 30000,
+                  "maximum": 32767
+                },
+                "externalTrafficPolicy": {
+                  "type": "string",
+                  "enum": [
+                    "Cluster",
+                    "Local"
+                  ]
+                }
+              }
+            },
+            "tls": {
+              "type": "object",
+              "properties": {
+                "mode": {
+                  "type": "string",
+                  "enum": [
+                    "self-signed"
+                  ]
+                },
+                "validityDays": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 3650
+                }
+              }
+            },
+            "gateway": {
+              "type": "object",
+              "properties": {
+                "image": {
+                  "$ref": "#/definitions/firstPartyImage"
+                },
+                "resources": {
+                  "type": "object"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "image": {
       "type": "object",
       "properties": {

@@ -32,7 +32,8 @@ helm upgrade --help 2>/dev/null | grep -F -- '--take-ownership' >/dev/null \
   || die "deployment/values-local.yaml is missing — copy the example and add an LLM key first"
 
 # --- 1. Base bootstrap -------------------------------------------------------
-log "running base bootstrap (cluster + local DNS/TLS + namespace + Secrets)"
+EXPOSURE_MODE="${SRW_EXPOSURE_MODE:-multi-host}"
+log "running base bootstrap (exposure: $EXPOSURE_MODE; cluster + namespace + Secrets)"
 "$SCRIPT_DIR/local-dev-up.sh"
 
 # --- 2. Run Tilt -------------------------------------------------------------
@@ -41,7 +42,7 @@ cat <<EOF
 $(printf '\033[1;32m✓ Cluster ready. Starting Tilt.\033[0m')
 
 Tilt UI:      https://localhost:10350
-Cockpit:      https://localhost   (test/srw-k3d-dev-test, after first build completes)
+Cockpit:      $([ "$EXPOSURE_MODE" = single-origin ] && printf 'https://localhost:8443' || printf 'https://localhost')   (test/srw-k3d-dev-test, after first build completes)
 
 Press Ctrl-C to stop Tilt (cluster keeps running). To stop the cluster too:
   k3d cluster stop srw

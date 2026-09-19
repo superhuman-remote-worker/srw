@@ -42,9 +42,9 @@ server, etc.) — see [Production install](#production-install-bring-your-own).
 ## Prerequisites
 
 - **Kubernetes** 1.28+ with at least 8 vCPU / 16 GiB RAM available for the namespace
-- **Ingress controller** — `nginx`, `traefik`, or another. The chart defaults to `traefik` (override via `ingress.className`)
-- **cert-manager** with a `ClusterIssuer` for TLS (set `ingress.tls.issuerName`)
-- **DNS** — wildcard or per-subdomain records pointing at your ingress LB for `*.<global.domain>` (`api`, `auth`, `git`, `cloud`, `mcp`)
+- **Ingress controller** — `nginx`, `traefik`, or another. The chart defaults to `traefik` (override via `ingress.className`). The opt-in single-origin profile supplies its own namespaced gateway instead.
+- **cert-manager** with a `ClusterIssuer` for multi-host TLS (set `ingress.tls.issuerName`). It is not required by the self-signed single-origin profile.
+- **DNS** — wildcard or per-subdomain records pointing at your ingress LB for `*.<global.domain>` (`api`, `auth`, `git`, `cloud`, `mcp`). An IP-based single-origin profile needs no DNS.
 - **Helm** 3.12+
 - **A `dockerconfigjson` pull secret** if you're pulling private GHCR images. Public images need no credentials.
 
@@ -254,11 +254,124 @@ helm install srw oci://ghcr.io/superhuman-remote-worker/charts/superhuman-remote
   --set secrets.create=true
 ```
 
-`secrets.create=true` makes the chart auto-generate an `APP_ENCRYPTION_KEY`
-and create internal credentials. **This mode is for evaluation only** — see
+`secrets.create=true` makes the chart auto-generate `APP_ENCRYPTION_KEY`,
+`MCP_INTERNAL_KEY`, and `IDE_CREDENTIAL_KEY`, and create internal credentials.
+**This mode is for evaluation only** — see
 [Secrets](#secrets) for production options.
 
 After install, follow the printed `NOTES.txt` to back up the encryption key.
+
+---
+
+## Single-origin self-signed HTTPS
+
+Keycloak uses a recreate rollout in this profile to prevent mixed old/new login
+addresses from being cached during an address change. Identity configuration
+upgrades briefly interrupt login. The default multi-host strategy is unchanged.
+
+
+For an evaluation server that has a reachable IPv4 address but no domain or
+certificate issuer, start from
+`deployment/values-single-origin-server.yaml.example`. The browser-visible
+contract is one origin such as `https://192.0.2.10:30443`:
+
+```yaml
+exposure:
+  mode: single-origin
+  singleOrigin:
+    address: "192.0.2.10"
+    publicPort: 30443
+    service:
+      nodePort: 30443
+    tls:
+      mode: self-signed
+      validityDays: 365
+```
+
+`publicPort` is the address users open; `service.nodePort` is the Kubernetes
+NodePort. Setting one does not create NAT or a load-balancer rule for the
+other. The server example exposes NodePort 30443 directly. Local k3d instead
+advertises `https://localhost:8443` and maps host port 8443 to NodePort 30443.
+For operator-managed NAT or a load balancer, configure the external mapping
+and keep `publicPort` equal to the port users actually see.
+
+This preset requires bundled Keycloak, Gitea, and Nextcloud. It disables
+OpenCloud, Neo4j Bolt TLS, the external SSH gateway, Collabora, and the Canvas
+viewer. It creates no cert-manager resources or Traefik CRDs. The chart may
+generate a new certificate during an upgrade; users then accept the replacement
+warning at the same origin.
+
+The preset also stages Nextcloud's internal signed installation-attestation
+lane. This lets ordinary cloud effects bind the exact persistent Nextcloud
+installation; it does not enable protected cloud mode. When `secrets.create`
+is true, the chart creates and retains the lane's dedicated immutable Secret.
+The standalone server example uses operator-owned secrets, so create its HMAC
+root once before installing and preserve it with the Nextcloud data:
+
+```bash
+kubectl create namespace srw --dry-run=client -o yaml | kubectl apply -f -
+kubectl -n srw create secret generic srw-protected-effect \
+  --from-literal=NEXTCLOUD_PROTECTED_EFFECT_HMAC_KEY="$(openssl rand -hex 32)"
+kubectl -n srw patch secret srw-protected-effect \
+  --type=merge --patch '{"immutable":true}'
+```
+
+Do not rotate or recreate this Secret during an upgrade, and do not copy its
+key into the application Secret consumed by agent Pods.
+
+The normal `srw-secrets` application Secret must separately contain an
+independently generated `IDE_CREDENTIAL_KEY` of at least 32 random bytes. The
+browser IDE fails closed and withholds its URL when this key is absent.
+
+The supported promise covers browser Cockpit/login/API/session WebSockets,
+top-level browser IDE, Gitea, and Nextcloud. Chrome service workers are disabled
+for this preset because click-through certificates do not make their script
+fetch trusted. Standalone Git, WebDAV/desktop sync, MCP, SSH/JetBrains clients,
+managed browsers that prohibit certificate exceptions, embedded IDE webviews,
+and generated application previews need separate trust or exposure design.
+
+Keep the normal application Secret, storage, image pins, database sizing, and
+workspace prerequisites. The self-signed gateway only replaces public DNS and
+certificate bootstrap.
+
+### Returning a retained Nextcloud installation to multi-host
+
+Nextcloud persists some reverse-proxy settings on its data volume. Switching
+Helm values back to `multi-host` does not clear the old IP address and `/cloud`
+prefix automatically. After applying the multi-host values and completing the
+Nextcloud rollout, update its trusted domains and remove the old overrides
+before opening the new cloud hostname. Keep the existing data volume and HMAC
+Secret. Back up the Nextcloud configuration before changing it.
+
+For the bundled Apache image, run `occ` as its configuration owner, `www-data`:
+
+```bash
+SRW_NAMESPACE=srw
+SRW_NEXTCLOUD_DEPLOYMENT=srw-nextcloud # adjust to the rendered Deployment name
+nextcloud_occ() {
+  kubectl -n "$SRW_NAMESPACE" exec "deployment/$SRW_NEXTCLOUD_DEPLOYMENT" \
+    -c nextcloud -- runuser -u www-data -- php /var/www/html/occ "$@"
+}
+
+# Replace these with the internal Service name and actual new cloud hostname.
+# Include any additional trusted domains your installation needs.
+nextcloud_occ config:system:set trusted_domains --type=json \
+  --value='["srw-nextcloud","cloud.example.org"]'
+for key in overwritehost overwritewebroot overwrite.cli.url; do
+  nextcloud_occ config:system:delete "$key"
+done
+
+nextcloud_occ config:system:get trusted_domains
+nextcloud_occ config:system:get trusted_proxies
+nextcloud_occ config:system:get overwriteprotocol
+```
+
+The last checks should show the new domains, the configured multi-host proxy
+ranges, and `https`. Confirm that the three deleted overrides are absent, then
+check login and file access at the new cloud URL. The chart reconciles the OIDC
+provider in both modes. Automatic reverse migration of these persisted settings
+is outside this preset's scope; see the
+[Nextcloud Docker reverse-proxy configuration guidance](https://github.com/nextcloud/docker#using-the-image-behind-a-reverse-proxy-and-specifying-the-server-host-and-protocol).
 
 ---
 
@@ -369,9 +482,10 @@ secrets:
 
 ### Mode 3 — Chart-created Secret (evaluation / dev only)
 
-The chart generates `APP_ENCRYPTION_KEY` and `MCP_INTERNAL_KEY` independently
-when absent, preserves both across upgrades via `lookup`, and inlines any keys
-you provide in `secrets.values`. **Do not use in production** — values end up
+The chart generates `APP_ENCRYPTION_KEY`, `MCP_INTERNAL_KEY`, and
+`IDE_CREDENTIAL_KEY` independently when absent, preserves them across upgrades
+via `lookup`, and inlines any keys you provide in `secrets.values`.
+**Do not use in production** — values end up
 in `helm get values` output.
 
 ```yaml
@@ -391,6 +505,10 @@ deployment — what you need depends on which optional components you enable.
 - `APP_ENCRYPTION_KEY` — base64-encoded 32-byte key. Encrypts user/system API
   keys and LLM endpoint credentials at rest. **If lost, all stored credentials
   become unrecoverable.** Back up immediately after install.
+- `IDE_CREDENTIAL_KEY` — at least 32 random bytes. Derives a credential bound
+  to each workspace runtime for the browser IDE. If absent, the orchestrator
+  deliberately withholds every browser-IDE URL rather than starting an
+  unauthenticated code-server. Chart-created mode generates and preserves it.
 
 **Database credentials** — discrete user + password keys only. The chart
 composes the DSN at runtime from these + ConfigMap-provided host/port/db,
@@ -563,6 +681,7 @@ A skeleton `srw.env` to feed into `kubectl create secret generic ... --from-env-
 ```env
 APP_ENCRYPTION_KEY=<base64-encoded 32-byte key>
 MCP_INTERNAL_KEY=<independently-generated random shared secret>
+IDE_CREDENTIAL_KEY=<independently-generated random workspace credential root>
 POSTGRES_USER=srw
 POSTGRES_PASSWORD=changeme
 VECTOR_POSTGRES_USER=srw
@@ -578,6 +697,7 @@ Generate the independent keys with:
 ```bash
 openssl rand -base64 32  # APP_ENCRYPTION_KEY
 openssl rand -base64 48  # MCP_INTERNAL_KEY
+openssl rand -base64 48  # IDE_CREDENTIAL_KEY
 ```
 
 ---
@@ -1078,9 +1198,12 @@ kubectl -n srw get secret srw-secrets \
   -o jsonpath='{.data.APP_ENCRYPTION_KEY}' | base64 -d
 ```
 
-Then visit `https://<global.domain>` for the Cockpit UI. The default
-realm administrator credentials (when using internal Keycloak) are
-`admin` / value of `KC_REALM_ADMIN_PASSWORD`.
+Then visit `https://<global.domain>` for a multi-host deployment, or the exact
+`https://<exposure.singleOrigin.address>:<publicPort>` origin for single-origin
+mode; omit `:443` when using the default HTTPS port. The seeded realm administrator
+credentials (when using internal Keycloak) are
+`test` / value of `KC_REALM_ADMIN_PASSWORD`. The separate Keycloak server
+administrator uses `KEYCLOAK_ADMIN_USER` and `KEYCLOAK_ADMIN_PASSWORD`.
 
 ---
 

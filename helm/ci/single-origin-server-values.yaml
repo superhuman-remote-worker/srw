@@ -1,0 +1,54 @@
+# Maintained CI profile: server IP on the gateway NodePort.
+license:
+  acceptTerms: true
+fullnameOverride: srw
+secrets:
+  create: true
+  values: {}
+sessionRouter:
+  jwtSecret: "ci-only-not-a-secret-0000000000000000000000000000000000000000"
+exposure:
+  mode: single-origin
+  singleOrigin:
+    address: "192.0.2.10"
+    publicPort: 30443
+    service:
+      nodePort: 30443
+    tls:
+      mode: self-signed
+      validityDays: 365
+keycloak:
+  enabled: true
+  internal: true
+gitea:
+  enabled: true
+  internal: true
+  ssh:
+    externalService:
+      enabled: false
+nextcloud:
+  enabled: true
+  internal: true
+  replicas: 1
+  protectedEffect:
+    enabled: true
+  objectStore:
+    enabled: false
+opencloud:
+  enabled: false
+databases:
+  neo4j:
+    enabled: false
+    boltTls:
+      enabled: false
+    loadBalancer:
+      enabled: false
+sshGateway:
+  enabled: false
+collabora:
+  enabled: false
+canvas:
+  livePreview:
+    enabled: false
+    viewer:
+      enabled: false

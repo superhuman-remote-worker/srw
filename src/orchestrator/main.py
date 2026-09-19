@@ -1091,6 +1091,7 @@ session_router = SessionRouterService(
     ingress_class=os.environ.get("SESSION_INGRESS_CLASS", "traefik"),
     annotations=_session_annotations,
     tls_secret_name=os.environ.get("SESSION_INGRESS_TLS_SECRET") or None,
+    single_origin=os.environ.get("SESSION_INGRESS_SINGLE_ORIGIN", "").lower() in {"1", "true"},
     db=postgres_db,
 )
 

@@ -1,4 +1,14 @@
 {{- include "srw.nextcloudProtectedEffectValidate" . -}}
+{{- define "srw.nextcloudSingleOriginEnv" -}}
+- name: OVERWRITEHOST
+  value: {{ (urlParse (include "srw.publicOrigin" .)).host | quote }}
+- name: OVERWRITEPROTOCOL
+  value: "https"
+- name: OVERWRITEWEBROOT
+  value: "/cloud"
+- name: OVERWRITECLIURL
+  value: {{ include "srw.cloudUrl" . | quote }}
+{{- end -}}
 {{- if and .Values.nextcloud.enabled .Values.nextcloud.internal }}
 apiVersion: v1
 kind: ConfigMap
@@ -62,6 +72,14 @@ data:
         exit 0
     fi
 
+    {{- if include "srw.singleOrigin" . }}
+    # The image initializes trusted_domains only on first install. Reconcile
+    # persisted config on every start, including PVCs from multi-host installs.
+    # No forwarded client IP ranges are trusted by this evaluation preset.
+    occ config:system:set trusted_domains --type=json --value='{{ list (printf "%s-nextcloud" (include "srw.fullname" .)) (urlParse (include "srw.publicOrigin" .)).host | toJson }}' || exit 1
+    occ config:system:delete trusted_proxies || exit 1
+    {{- end }}
+
     # =========================================================================
     # 0. Allow connections to cluster-internal services (SSRF protection override)
     #    Required because Keycloak runs as an internal K8s service.
@@ -85,24 +103,26 @@ data:
         occ app:install user_oidc 2>/dev/null || true
         occ app:enable user_oidc 2>/dev/null || true
 
-        if occ user_oidc:providers 2>/dev/null | grep -q "$PROVIDER_NAME"; then
-            echo "[nc-setup] OIDC provider '$PROVIDER_NAME' already configured"
+        # The command updates an existing provider in place, preserving
+        # identity mappings when the discovery URL or secret changes.
+        echo "[nc-setup] Reconciling OIDC provider '$PROVIDER_NAME'..."
+        if occ user_oidc:provider "$PROVIDER_NAME" \
+            --clientid="$CLIENT_ID" \
+            --clientsecret="$CLIENT_SECRET" \
+            --discoveryuri="$DISCOVERY_URI" \
+            --unique-uid=1 \
+            --mapping-uid=preferred_username \
+            --mapping-display-name=name \
+            --check-bearer=1 \
+            --group-provisioning=1 2>&1; then
+            echo "[nc-setup] OIDC provider reconciled successfully"
         else
-            echo "[nc-setup] Registering OIDC provider '$PROVIDER_NAME'..."
-            if occ user_oidc:provider "$PROVIDER_NAME" \
-                --clientid="$CLIENT_ID" \
-                --clientsecret="$CLIENT_SECRET" \
-                --discoveryuri="$DISCOVERY_URI" \
-                --unique-uid=1 \
-                --mapping-uid=preferred_username \
-                --mapping-display-name=name \
-                --check-bearer=1 \
-                --group-provisioning=1 2>&1; then
-                echo "[nc-setup] OIDC provider registered successfully"
-            else
-                echo "[nc-setup] WARNING: Failed to register OIDC provider (non-fatal)"
-            fi
+            echo "[nc-setup] WARNING: Failed to register OIDC provider (non-fatal)"
         fi
+
+        {{- if include "srw.singleOrigin" . }}
+        occ config:app:set user_oidc allow_insecure_http --value=0 2>&1 || true
+        {{- end }}
 
         # Enable group provisioning with whitelist so only project-* groups are
         # OIDC-managed. This protects srw-agents and other manually-managed groups
@@ -221,11 +241,15 @@ spec:
             - name: SQLITE_DATABASE
               value: "nextcloud"
             - name: NEXTCLOUD_TRUSTED_DOMAINS
-              value: "{{ include "srw.fullname" . }}-nextcloud {{ trimPrefix "https://" (include "srw.cloudUrl" .) }}"
-            - name: NEXTCLOUD_TRUSTED_PROXIES
+              value: "{{ include "srw.fullname" . }}-nextcloud {{ (urlParse (include "srw.cloudUrl" .)).host }}"
+            {{- if include "srw.singleOrigin" . }}
+            {{- include "srw.nextcloudSingleOriginEnv" . | nindent 12 }}
+            {{- else }}
+            - name: TRUSTED_PROXIES
               value: "10.0.0.0/8 172.16.0.0/12 192.168.0.0/16"
             - name: OVERWRITEPROTOCOL
               value: "https"
+            {{- end }}
             {{- if .Values.nextcloud.objectStore.enabled }}
             # S3 primary storage (existing cluster MinIO). Disable via
             # nextcloud.objectStore.enabled=false to store files on the PVC
@@ -263,7 +287,7 @@ spec:
                   key: NEXTCLOUD_OIDC_CLIENT_SECRET
                   optional: true
             - name: NEXTCLOUD_OIDC_DISCOVERY_URI
-              value: "http://{{ include "srw.fullname" . }}-keycloak:8080/realms/{{ .Values.keycloak.realm }}/.well-known/openid-configuration"
+              value: "{{ include "srw.keycloakInternalUrl" . }}/realms/{{ .Values.keycloak.realm }}/.well-known/openid-configuration"
             - name: NEXTCLOUD_AGENT_PASSWORD
               valueFrom:
                 secretKeyRef:
@@ -312,6 +336,9 @@ spec:
             - /bin/sh
             - /opt/srw-protected-effect/start-fpm.sh
           env:
+            {{- if include "srw.singleOrigin" . }}
+            {{- include "srw.nextcloudSingleOriginEnv" . | nindent 12 }}
+            {{- end }}
             - name: NEXTCLOUD_PROTECTED_EFFECT_HMAC_KEY
               valueFrom:
                 secretKeyRef:

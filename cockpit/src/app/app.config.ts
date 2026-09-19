@@ -152,7 +152,7 @@ export const appConfig: ApplicationConfig = {
     provideServiceWorker('ngsw-worker.js', {
       // Only register in production builds. Dev mode reloads frequently and
       // a stale SW would shadow code changes.
-      enabled: !isDevMode(),
+      enabled: !isDevMode() && environment.serviceWorkerEnabled,
       // Register immediately: Chrome decides install-as-app vs. bookmark
       // shortcut based on whether a SW controls the page at install time, so
       // a deferred registration loses the standalone-window install.

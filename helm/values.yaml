@@ -1187,6 +1187,41 @@ mcp:
       cpu: "200m"
 
 # =============================================================================
+# Public exposure profile
+# =============================================================================
+exposure:
+  # -- Existing domain-based Ingress resources remain the default. The
+  # single-origin profile owns a dedicated HTTPS NodePort and self-signed cert.
+  mode: multi-host
+  singleOrigin:
+    # -- Browser-visible IPv4 address, or localhost for the local k3d profile.
+    address: ""
+    # -- Browser-visible port. This is deliberately separate from nodePort so
+    # a local host/NAT mapping can advertise 8443 while targeting 30443.
+    publicPort: 30443
+    service:
+      nodePort: 30443
+      externalTrafficPolicy: Cluster
+    tls:
+      mode: self-signed
+      validityDays: 365
+    gateway:
+      image:
+        repository: docker.io/library/traefik
+        # Traefik 3.7 is in active/security support as of 2026-09-19. Pin the
+        # patched release explicitly; never use the mutable `latest` tag.
+        tag: "3.7.13"
+        digest: ""
+        pullPolicy: IfNotPresent
+      resources:
+        requests:
+          cpu: 25m
+          memory: 32Mi
+        limits:
+          cpu: 250m
+          memory: 128Mi
+
+# =============================================================================
 # Ingress
 # =============================================================================
 ingress:

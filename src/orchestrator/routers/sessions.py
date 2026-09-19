@@ -53,6 +53,7 @@ from orchestrator.services.session_provisioning_state import (
     agent_pod_provisioning_in_progress,
 )
 from orchestrator.services.session_router import SessionRouteAuthorityError
+from orchestrator.services.session_urls import session_websocket_origin
 from orchestrator.services.deployment_gates import (
     stateless_idle_conversation_rewind_enabled,
 )
@@ -1037,8 +1038,11 @@ async def get_connection(
             session_identity_fingerprint=identity_fingerprint,
         )
 
-        host = os.environ.get("SESSION_INGRESS_HOST", "api.example.com")
-        ws_url = f"wss://{host}/p/{runtime_authority.thread_id}/ws?t={token}"
+        socket_origin = session_websocket_origin(
+            os.environ.get("SESSION_PUBLIC_ORIGIN", ""),
+            os.environ.get("SESSION_INGRESS_HOST", "api.example.com"),
+        )
+        ws_url = f"{socket_origin}/p/{runtime_authority.thread_id}/ws?t={token}"
         response = PinnedConnectionResponse(
             state="ready",
             control_socket="websocket",
