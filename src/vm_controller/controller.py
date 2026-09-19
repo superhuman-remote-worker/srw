@@ -3102,7 +3102,6 @@ class VMController:
                         else entity_type
                     ),
                     expected_pvc_uid=rootdisk_pvc_uid,
-                    direct_retained=workspace_storage is not None,
                 )
             )
         prepared_annotation = (
@@ -3133,7 +3132,6 @@ class VMController:
         rootdisk_owner_id,
         rootdisk_owner_kind,
         expected_pvc_uid,
-        direct_retained,
     ) -> dict:
         """Read bounded phase evidence; an unavailable read is never absence."""
         from kubernetes.client.exceptions import ApiException
@@ -3150,7 +3148,10 @@ class VMController:
             UUID(str(owner_id))
             if owner_kind not in _OWNER_KINDS or self.core_api is None:
                 return unknown
-            dv = None if direct_retained else await self._get_dv(rootdisk_name)
+            # RetainedStorage currently renders a dataVolume-backed volume too.
+            # Its binding is not evidence that no DV needs observation. A real
+            # direct-PVC volume remains valid when this exact read returns 404.
+            dv = await self._get_dv(rootdisk_name)
             try:
                 pvc = await asyncio.to_thread(
                     self.core_api.read_namespaced_persistent_volume_claim,

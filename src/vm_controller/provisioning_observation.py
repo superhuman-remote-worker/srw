@@ -171,9 +171,16 @@ def build_provisioning_observation(
         _owner(pvc_meta, rootdisk_owner_kind, rootdisk_owner_id)
         if mode == "clone" and dv_uid is not None:
             _reference(pvc_meta, "DataVolume", dv_uid)
-        bound = _field(_field(pvc, "status"), "phase") == "Bound"
+        pvc_phase = _field(_field(pvc, "status"), "phase")
+        bound = pvc_phase == "Bound"
         if mode == "retained":
-            disk_phase = "ready" if bound else "waiting_for_consumer"
+            disk_phase = "unknown"
+            if bound:
+                disk_phase = "ready"
+            elif pvc_phase == "Pending":
+                disk_phase = "waiting_for_consumer"
+            elif pvc_phase == "Lost":
+                disk_phase = "failed"
         elif disk_phase == "ready" and not bound:
             disk_phase = "unknown"
     elif disk_phase == "ready":

@@ -265,3 +265,42 @@ async def test_phase_read_failure_is_unproven_not_object_absence(status_controll
     assert "provisioning" not in result
     assert result["provisioning_reason"] == "vm_phase_unproven"
     assert "private internal endpoint" not in str(result)
+
+
+@pytest.mark.asyncio
+async def test_retained_storage_binding_with_actual_datavolume_volume_is_observed(
+    status_controller,
+):
+    from unittest.mock import AsyncMock
+    from shared.vm_workspace_storage import storage_labels, storage_name
+
+    ctrl, value = status_controller
+    binding = {
+        "uid": OWNER,
+        "generation": 2,
+        "pvc_uid": PVC_UID,
+        "owner_id": OWNER,
+        "owner_kind": "job",
+    }
+    name = storage_name(binding)
+    value["datavolume"]["metadata"]["name"] = name
+    value["pvc"]["metadata"]["name"] = name
+    value["vm"]["metadata"]["labels"].update(storage_labels(binding, OWNER))
+    for obj in (value["vm"]["spec"]["template"], value["vmi"]):
+        obj["spec"]["volumes"][0]["dataVolume"]["name"] = name
+    # Keep actual volume/attachment verification; only the separate lease/PVC
+    # control probe is already proven outside this phase-observation boundary.
+    ctrl._retained_storage().probe = AsyncMock(return_value=PVC_UID)
+    result = await ctrl._do_status(OWNER, GENERATION, workspace_storage=binding)
+    assert result["provisioning"]["disk_phase"] == "ready"
+    assert result["provisioning"]["rootdisk_dv_uid"] == DV_UID
+
+
+@pytest.mark.parametrize(
+    "phase,expected", [("Lost", "failed"), (None, "unknown"), ([], "unknown")]
+)
+def test_retained_disk_loss_or_unknown_state_is_not_placement_wait(phase, expected):
+    value = objects(direct=True)
+    value["datavolume"] = None
+    value["pvc"]["status"]["phase"] = phase
+    assert observe(value)["disk_phase"] == expected
