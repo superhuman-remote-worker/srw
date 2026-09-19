@@ -122,12 +122,45 @@ def test_transport_backoff_is_bounded():
 - [ ] Add all-proven, malformed UUID/hash, changed request digest and invalid
   backoff-input cases; rerun and commit `feat: define VM creation retry contract`.
 
-## Task 2: Persist immutable admission and compose guarded Resume
+## Task 2a: Freeze initial create intent before transport
+
+**Files:**
+- Create `src/orchestrator/services/vm_creation_request.py` and
+  `tests/test_vm_creation_request.py`.
+- Modify `src/orchestrator/services/vm_provisioner.py`; extend
+  `tests/test_vm_provisioner.py`.
+
+**Interfaces:** Factor `build_vm_creation_request(...) -> dict` from the existing
+unsigned HTTP payload construction, using the same explicit field names. Add
+`capture_vm_creation_request(...)` for generation-CAS persistence of versioned
+canonical request/digest before the first POST. Its stored identity includes a
+separate authenticated controller configuration digest; absent controller identity
+means the record is not yet eligible for retry, not permission to infer defaults.
+Task 3 supplies the authenticated configuration resolution/issuance contract.
+
+- [ ] Write failing tests for initial snapshot before POST, failed CAS causing no
+  POST, identical deferred-create replay after current network/project options
+  change, and stale-generation refusal.
+- [ ] Implement a shared unsigned request builder using Task 1's canonical digest.
+  Persist exact caller-owned options under the current generation before I/O; no
+  raw credentials/signatures enter the stored snapshot. Preserve public call
+  compatibility and old-controller behavior while retry admission is disabled.
+- [ ] Add structured authenticated rejection versus transport-unknown facts without
+  treating a historical error string as authority. A rejected/stale context write
+  must not authorize side effects. Replay captured inputs; never overwrite the
+  first snapshot with freshly resolved defaults on a poll.
+- [ ] Run focused creation/provisioner tests and commit this foundation. Do not
+  advertise end-to-end retry readiness: controller effective config/defaults and
+  original issuance fencing must be completed in Task 3 before admission is enabled.
+
+## Task 2b: Persist immutable admission and compose guarded Resume
 
 **Files:**
 - Create `src/orchestrator/database/migrations/app/0257_vm_creation_retries.sql`.
 - Create `src/orchestrator/services/vm_creation_retry_store.py`.
 - Modify `src/orchestrator/database/postgres.py` and `schema_current.sql`.
+- Modify `src/orchestrator/services/vm_workspace_recovery_store.py` to extract
+  transaction-composable cleanup admission while retaining the existing wrapper.
 - Create `tests/test_vm_creation_retry_real_postgres.py`.
 - Extend `tests/test_queue_job_for_resume.py` as needed for transaction composition.
 
@@ -201,6 +234,12 @@ CREATE TABLE vm_creation_retries (
   controller create reservation durably using existing cleanup-admission/carrier
   identity; add a reference column if required by that established schema. An
   expired observer claim cannot settle that reservation or mint a successor.
+- [ ] Make identity columns immutable in PostgreSQL, enforce digest/JSON/state/claim
+  consistency, use UUID PVC identities as in cleanup admissions, and add a due index
+  plus durable backoff/boot-accounting fields. Compose authorization and the exact
+  adoption reservation in one transaction with the established owner/PVC then
+  queue/job lock order. Integrate cancellation into actual pinned/stateless control
+  transactions; do not rely only on a background status read.
 - [ ] Test concurrent completion/cancel/cleanup/recovery admission, claim takeover,
   late observations and duplicate admission after a lost response. Assert one
   outcome, intact receipts, no partial requeue and no lock-order deadlock. Generate
@@ -216,7 +255,7 @@ CREATE TABLE vm_creation_retries (
   `tests/test_vm_creation_retry_authority.py`.
 - Update endpoint-auth inventory/contracts using the existing repository workflow.
 
-**Interfaces:** Add authenticated `POST /internal/vm-creation-retries/authorize`
+**Interfaces:** Add authenticated `POST /api/internal/vm-creation-retries/authorize`
 using lifecycle MAC operation `creation_retry_authorize` and correlation checking.
 Input is Task 1's retry identity plus controller-observed VM/disk/adoption identity;
 output is a typed allow/blocked disposition bound to the existing reservation.
@@ -233,6 +272,13 @@ Controller health/capability output advertises `vm_creation_retry_protocol: 1`.
   cleanup-admission checks so a newly opened hold cannot be crossed between
   authorization and VM create. Revalidate exact disk identity at the existing
   pre-create check, not only during the earlier status probe.
+- [ ] Bind initial creates as well as retries to immutable issuance authority and
+  authenticated controller effective-configuration identity. Protocol capability
+  must not be advertised until both paths are fenced. For cancellation: revoke
+  unissued admission definitively; for an exact issued VM, settle adoption before
+  ordinary exact retirement; for unknown issuance, retain its reservation and
+  schedule reconciliation. Do not let the open adoption block its own cancellation
+  indefinitely or release it based on a lease/absence observation.
 - [ ] Implement same-generation replay with these branches:
 
 ```text

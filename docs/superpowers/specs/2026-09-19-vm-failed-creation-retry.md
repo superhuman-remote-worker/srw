@@ -56,6 +56,14 @@ the authenticated controller. If that provenance is unavailable, refuse the repa
 
 ## Durable state and admission
 
+Freeze the complete unsigned initial creation request under its provision
+generation before first transport I/O. A generation-CAS failure prevents that I/O.
+Capture controller-resolved defaults/template configuration through an authenticated
+configuration identity; a protocol version or a snapshot of omitted options is not
+an effective-request identity. Initial issuance must obey the same durable authority
+as retries, otherwise an old initial request could land after cancellation. Older
+unbound initial requests remain unsupported unless definitive non-issuance is proven.
+
 Persist one immutable retry request per `(job_id, provision_generation)` in a
 dedicated application table `vm_creation_retries`. It contains `request_id`,
 canonical unsigned request data/hash (no credentials), expected retained PVC UID,
@@ -84,6 +92,12 @@ canonical request hash, lifecycle control claim, explicit deadline, open recover
 and cleanup holds, and predecessor evidence. Repeated Resume returns the existing
 request ID. Competing cancellation/completion either wins before admission or
 leaves a durable cancel request that reconciliation must settle.
+
+Compose with the existing cleanup authority by extracting a transaction-aware
+`acquire_cleanup_permit_on_conn` helper, preserving its public wrapper. Use existing
+sorted owner locks, exact PVC lock, cleanup/recovery locks, then queue/job order;
+authorization and adoption reservation must commit together. Do not reuse the
+container/IDE creation ledger's timeout-based effect quiescence as VM stop proof.
 
 Existing creation failures need a structured reason going forward. Allow only
 explicit creation failures/waits with a recoverable request; do not whitelist
