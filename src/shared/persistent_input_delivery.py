@@ -39,6 +39,23 @@ def _dict(row: Any) -> dict[str, Any]:
     return dict(row) if row is not None else {}
 
 
+def _with_idle_exit(update_sql: str) -> str:
+    """Close an old wait only with the successful execution-admission CAS.
+
+    Caller already holds thread/runtime authority in the usual lock order.
+    No flag gates exit: disabling new tracking must not strand an old episode.
+    Presence, queued input, replay and settlement do not reach this statement.
+    """
+    return (
+        "WITH admitted_delivery AS (" + update_sql + "), idle_exit AS ("
+        "UPDATE threads SET workspace_idle_episode=NULL, "
+        "workspace_idle_revision=workspace_idle_revision+1 "
+        "FROM admitted_delivery WHERE threads.id=admitted_delivery.thread_id "
+        "AND threads.workspace_idle_episode IS NOT NULL RETURNING threads.id) "
+        "SELECT delivery_id FROM admitted_delivery"
+    )
+
+
 async def lock_runtime_authority(
     conn: Any,
     *,
@@ -722,6 +739,7 @@ async def transition_stateless_input_delivery(
         lease_token=lease_token,
         executor_id=executor_id,
         pod_uid=pod_uid,
+        for_update=transition == "admitted",
     )
     if transition == "admitted":
         if (
@@ -762,7 +780,7 @@ async def transition_stateless_input_delivery(
         )
     else:  # pragma: no cover - caller contract
         raise ValueError(f"unsupported input delivery transition: {transition}")
-    updated = await conn.fetchval(
+    update_sql = (
         "WITH input_params AS ("
         "SELECT $7::bigint AS turn_number, $8::text AS reason) "
         f"UPDATE thread_input_deliveries SET {assignments} FROM input_params "
@@ -771,7 +789,10 @@ async def transition_stateless_input_delivery(
         "AND claim_generation = $4 "
         "AND owner_run_queue_lease_token = $5 "
         "AND owner_executor = $6 AND owner_executor_pod_uid = $9 "
-        "RETURNING delivery_id",
+        "RETURNING delivery_id, thread_id"
+    )
+    updated = await conn.fetchval(
+        _with_idle_exit(update_sql) if transition == "admitted" else update_sql,
         UUID(str(delivery_id)),
         UUID(str(thread_id)),
         list(states),
@@ -978,8 +999,7 @@ async def transition_input_delivery(
         "AND delivery.source = 'direct_human'" if transition == "cancelled" else ""
     )
 
-    row = await conn.fetchrow(
-        f"""
+    update_sql = f"""
         UPDATE thread_input_deliveries delivery
            SET {assignments}
           FROM threads thread, agents agent
@@ -1001,8 +1021,10 @@ async def transition_input_delivery(
            AND agent.status NOT IN ('offline', 'deleted')
            AND ($6::bigint IS NULL OR TRUE)
            AND ($7::text IS NULL OR TRUE)
-        RETURNING delivery.delivery_id
-        """,
+        RETURNING delivery.delivery_id, delivery.thread_id
+        """
+    row = await conn.fetchrow(
+        _with_idle_exit(update_sql) if transition == "admitted" else update_sql,
         UUID(str(delivery_id)),
         list(states),
         int(claim_generation),
