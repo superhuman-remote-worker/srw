@@ -7646,6 +7646,56 @@ $$;
 
 
 --
+-- Name: guard_workspace_idle_episode(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.guard_workspace_idle_episode() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+    previous JSONB;
+    current_episode JSONB;
+    owner_kind TEXT;
+BEGIN
+    IF TG_OP='INSERT' THEN
+        IF NEW.workspace_idle_revision<>0 OR NEW.workspace_idle_episode IS NOT NULL THEN
+            RAISE EXCEPTION 'Idle episodes require an authorized owner transition' USING ERRCODE='23514';
+        END IF;
+        RETURN NEW;
+    END IF;
+    previous := OLD.workspace_idle_episode;
+    current_episode := NEW.workspace_idle_episode;
+    IF NEW.workspace_idle_revision=OLD.workspace_idle_revision AND current_episode IS NOT DISTINCT FROM previous THEN
+        RETURN NEW;
+    END IF;
+    IF NEW.workspace_idle_revision<>OLD.workspace_idle_revision+1 THEN
+        RAISE EXCEPTION 'Idle episode revision must advance exactly once' USING ERRCODE='23514';
+    END IF;
+    IF current_episode IS NULL THEN
+        RETURN NEW;
+    END IF;
+    owner_kind := CASE WHEN TG_TABLE_NAME='jobs' THEN 'job' ELSE 'thread' END;
+    IF current_episode ? 'revision' OR current_episode->'version' IS DISTINCT FROM '1'::jsonb
+        OR current_episode->'runtime_identity'->>'owner_kind' IS DISTINCT FROM owner_kind
+        OR current_episode->'runtime_identity'->>'owner_id' IS DISTINCT FROM NEW.id::text THEN
+        RAISE EXCEPTION 'Idle episode owner identity changed' USING ERRCODE='23514';
+    END IF;
+    IF previous IS NOT NULL AND previous->'episode_id'=current_episode->'episode_id' THEN
+        IF ROW(previous->'wait_kind',previous->'wait_key',previous->'entered_at') IS DISTINCT FROM
+           ROW(current_episode->'wait_kind',current_episode->'wait_key',current_episode->'entered_at')
+           OR (current_episode->>'extend_count')::bigint < (previous->>'extend_count')::bigint
+           OR (previous->>'override_until' IS NOT NULL AND
+               (current_episode->>'override_until' IS NULL OR
+                (current_episode->>'override_until')::timestamptz < (previous->>'override_until')::timestamptz)) THEN
+            RAISE EXCEPTION 'Idle wait identity and age are immutable' USING ERRCODE='23514';
+        END IF;
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
 -- Name: lock_inventory_epoch_boundary_statement(); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -16058,6 +16108,8 @@ CREATE TABLE public.jobs (
     wake_delivery_id uuid,
     wake_delivery_claim_attempt integer,
     completion_outcome_kind text,
+    workspace_idle_revision bigint DEFAULT 0 NOT NULL,
+    workspace_idle_episode jsonb,
     CONSTRAINT jobs_diff_status_check CHECK (((diff_status IS NULL) OR (diff_status = ANY (ARRAY['pending'::text, 'accepted'::text, 'rejected'::text])))),
     CONSTRAINT jobs_runner_kind_check CHECK ((runner_kind = ANY (ARRAY['user'::text, 'lifecycle'::text, 'service'::text]))),
     CONSTRAINT jobs_wake_delivery_claim_attempt_check CHECK (((wake_delivery_claim_attempt IS NULL) OR (wake_delivery_claim_attempt >= 0))),
@@ -20417,6 +20469,8 @@ CREATE TABLE public.threads (
     subagent_error text,
     report_path text,
     conversation_revision bigint DEFAULT 0 NOT NULL,
+    workspace_idle_revision bigint DEFAULT 0 NOT NULL,
+    workspace_idle_episode jsonb,
     CONSTRAINT threads_conversation_revision_nonnegative CHECK ((conversation_revision >= 0)),
     CONSTRAINT threads_kind_check CHECK ((kind = ANY (ARRAY['session'::text, 'subagent'::text]))),
     CONSTRAINT threads_parent_shape_check CHECK ((((kind = 'session'::text) AND (parent_job_id IS NULL) AND (parent_thread_id IS NULL)) OR ((kind = 'subagent'::text) AND (num_nonnulls(parent_job_id, parent_thread_id) = 1)))),
@@ -22088,6 +22142,14 @@ ALTER TABLE ONLY public.jobs
 
 
 --
+-- Name: jobs jobs_workspace_idle_shape; Type: CHECK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE public.jobs
+    ADD CONSTRAINT jobs_workspace_idle_shape CHECK (((workspace_idle_revision >= 0) AND ((workspace_idle_episode IS NULL) OR ((jsonb_typeof(workspace_idle_episode) = 'object'::text) AND (octet_length((workspace_idle_episode)::text) <= 4096))))) NOT VALID;
+
+
+--
 -- Name: knowledge_materialization_intents knowledge_materialization_intents_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -23579,6 +23641,14 @@ COMMENT ON CONSTRAINT threads_main_cloud_instance_pairing ON public.threads IS '
 
 ALTER TABLE ONLY public.threads
     ADD CONSTRAINT threads_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: threads threads_workspace_idle_shape; Type: CHECK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE public.threads
+    ADD CONSTRAINT threads_workspace_idle_shape CHECK (((workspace_idle_revision >= 0) AND ((workspace_idle_episode IS NULL) OR ((jsonb_typeof(workspace_idle_episode) = 'object'::text) AND (octet_length((workspace_idle_episode)::text) <= 4096))))) NOT VALID;
 
 
 --
@@ -26471,6 +26541,20 @@ CREATE TRIGGER guard_vm_resource_reservation BEFORE INSERT OR DELETE OR UPDATE O
 --
 
 CREATE TRIGGER guard_vm_resource_waiter BEFORE INSERT OR UPDATE ON public.vm_resource_waiters FOR EACH ROW EXECUTE FUNCTION public.guard_vm_resource_waiter();
+
+
+--
+-- Name: jobs guard_workspace_idle_episode; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER guard_workspace_idle_episode BEFORE INSERT OR UPDATE ON public.jobs FOR EACH ROW EXECUTE FUNCTION public.guard_workspace_idle_episode();
+
+
+--
+-- Name: threads guard_workspace_idle_episode; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER guard_workspace_idle_episode BEFORE INSERT OR UPDATE ON public.threads FOR EACH ROW EXECUTE FUNCTION public.guard_workspace_idle_episode();
 
 
 --
