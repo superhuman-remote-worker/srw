@@ -389,6 +389,28 @@ def verify_creation_carrier(carrier, *, secret):
         raise ValueError("Creation carrier evidence incomplete") from exc
 
 
+def prepared_source_metadata(source):
+    """Public receipt projection from an already validated prepared source."""
+    return {
+        "allocationId": source["allocation"]["request"]["allocationId"],
+        "uid": source["artifact"]["uid"],
+        "baseImage": source["artifact"]["request"]["baseImage"],
+        **source["receipt"],
+    }
+
+
+def validate_prepared_vm_metadata(source, obj):
+    from shared.workspace_preparation import PREPARATION_LABEL
+
+    metadata = obj["metadata"]
+    if metadata.get("labels", {}).get(PREPARATION_LABEL) != source["artifact"][
+        "uid"
+    ] or json.loads(
+        metadata.get("annotations", {}).get("srw.io/prepared-artifact", "null")
+    ) != prepared_source_metadata(source):
+        raise ValueError("VM preparation receipt changed")
+
+
 def public_effect_observation(
     values, carrier, observation, *, rootdisk=None, cloud_init=None
 ):
@@ -476,13 +498,13 @@ def public_effect_observation(
                 source = values["rootdisk_source"]
                 expected_source = (
                     {"pvc": {"namespace": source["namespace"], "name": source["name"]}}
-                    if source["kind"] == "golden"
+                    if source["kind"] in {"golden", "prepared"}
                     else {"registry": {"url": "docker://" + source["image"]}}
                 )
                 if obj.get("spec", {}).get("source") != expected_source:
                     raise ValueError("Observed rootdisk source changed")
                 if (
-                    source["kind"] == "golden"
+                    source["kind"] in {"golden", "prepared"}
                     and obj.get("spec", {}).get("storage", {}).get("volumeMode")
                     != "Filesystem"
                 ):
@@ -515,6 +537,9 @@ def public_effect_observation(
                 raise ValueError("Creation Secret host key identity missing")
             result["ssh_host_key_fingerprint"] = fingerprint
         else:
+            source = values.get("rootdisk_source", {})
+            if source.get("kind") == "prepared":
+                validate_prepared_vm_metadata(source, obj)
             if (
                 not isinstance(rootdisk, Mapping)
                 or rootdisk.get("outcome") != "observed"

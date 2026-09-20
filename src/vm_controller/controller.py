@@ -3137,15 +3137,16 @@ class VMController:
             .get("annotations", {})
             .get("srw.io/vm-create-request-id")
         )
+        creation = None
         if creation_request and not exact_absence:
             try:
-                from vm_controller.creation_sources import GoldenSources
+                from vm_controller.creation_actuation import CreationActuator
+                from vm_controller.creation_sources import source_manager
 
-                sources = GoldenSources(self)
-                creation = await sources.reader.authority(
+                creation = await CreationActuator(self).authority(
                     "inspect", request_id=creation_request
                 )
-                await sources.release_completed(creation)
+                await source_manager(self, creation).release_completed(creation)
             except Exception:
                 log.warning(
                     "completed clone source retention remains pending for VM %s",
@@ -3157,8 +3158,20 @@ class VMController:
             .get("srw.io/prepared-artifact")
         )
         if prepared_annotation and not exact_absence:
-            result["preparation"] = json.loads(prepared_annotation)
-            if rootdisk_pvc_uid is not None:
+            prepared_metadata = json.loads(prepared_annotation)
+            if creation_request:
+                # A protocol VM's receipt must agree with its immutable source;
+                # failed authority reads must not promote raw annotations.
+                prepared_metadata = None
+                if creation is not None:
+                    from vm_controller.creation_preparation import (
+                        observed_preparation_metadata,
+                    )
+
+                    prepared_metadata = observed_preparation_metadata(creation, vm)
+            if prepared_metadata is not None:
+                result["preparation"] = prepared_metadata
+            if rootdisk_pvc_uid is not None and not creation_request:
                 await self._workspace_preparation().observe_workspace(
                     "session" if entity_type == "thread" else "job",
                     job_id,

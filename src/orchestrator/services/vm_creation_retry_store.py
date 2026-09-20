@@ -662,6 +662,13 @@ class VMCreationRetryStore:
                 raise VMCreationRetryConflict(
                     "creation_rootdisk_source_changed"
                 ) from exc
+            source = values["rootdisk_source"]
+            if (
+                source.get("kind") == "prepared"
+                and source.get("mode") == "retained"
+                and source["retained_root"]["dv_uid"] != values["retained_dv_uid"]
+            ):
+                raise VMCreationRetryConflict("creation_rootdisk_source_changed")
             original = await conn.fetchval(
                 "SELECT carrier_intent FROM vm_creation_effects WHERE request_id=$1 ORDER BY effect_number LIMIT 1",
                 row["request_id"],
@@ -1144,6 +1151,14 @@ class VMCreationRetryStore:
                         + (0 if row["boot_counted"] else 1),
                     }
                 )
+                source = values.get("rootdisk_source", {})
+                if source.get("kind") == "prepared":
+                    from shared.vm_creation_issuance import prepared_source_metadata
+
+                    current["preparation"] = prepared_source_metadata(source)
+                    current["preparation_request"] = row["canonical_request"][
+                        "preparation"
+                    ]
                 if not cancelled:
                     current["status"] = "created"
                 context["vm"] = current

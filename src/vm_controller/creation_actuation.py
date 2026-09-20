@@ -409,7 +409,7 @@ class CreationActuator:
                 )
         if values["effect_kind"] == "rootdisk":
             frozen = values["rootdisk_source"]
-            if frozen["kind"] == "golden":
+            if frozen["kind"] in {"golden", "prepared"}:
                 templates[0]["spec"]["source"] = {
                     "pvc": {"name": frozen["name"], "namespace": frozen["namespace"]}
                 }
@@ -447,6 +447,17 @@ class CreationActuator:
         else:
             result = manifest
         metadata = result["metadata"]
+        frozen = values["rootdisk_source"]
+        if values["effect_kind"] == "vm" and frozen["kind"] == "prepared":
+            from shared.workspace_preparation import PREPARATION_LABEL, canonical
+            from shared.vm_creation_issuance import prepared_source_metadata
+
+            metadata.setdefault("labels", {})[PREPARATION_LABEL] = frozen["artifact"][
+                "uid"
+            ]
+            metadata.setdefault("annotations", {})["srw.io/prepared-artifact"] = (
+                canonical(prepared_source_metadata(frozen))
+            )
         if metadata["name"] != values["object_name"]:
             raise CreationUnproven("creation_object_name_changed")
         metadata["namespace"] = self.namespace
@@ -488,9 +499,12 @@ class CreationActuator:
             "provision_generation": payload.get("provision_generation"),
         }
         from vm_controller.creation_sources import GoldenWaiting
+        from vm_controller.creation_preparation import PreparedWaiting
 
         try:
             return await self._run(payload)
+        except PreparedWaiting:
+            return {**base, "status": "creation_pending", "reason": "preparation_wait"}
         except GoldenWaiting:
             return {**base, "status": "creation_pending", "reason": "golden_wait"}
         except (CreationUnproven, ValueError, KeyError, TypeError):
@@ -567,9 +581,9 @@ class CreationActuator:
                     raise CreationUnproven("creation_carrier_changed")
                 verify_creation_carrier(lease, secret=self.secret)
                 observations = await self.exact_previous(row, lease)
-                from vm_controller.creation_sources import GoldenSources
+                from vm_controller.creation_sources import source_manager
 
-                await GoldenSources(self.controller).release_completed(row)
+                await source_manager(self.controller, row).release_completed(row)
                 if latest and latest["state"] == "issued":
                     observation = await self.observation(row, latest, lease)
                     if observation is None:
@@ -597,7 +611,16 @@ class CreationActuator:
                     if result.get("settled") is not True:
                         return pending
                     vm = latest["evidence"]
+                    source = latest["carrier_intent"].get("rootdisk_source", {})
+                    prepared = {}
+                    if source.get("kind") == "prepared":
+                        from shared.vm_creation_issuance import (
+                            prepared_source_metadata,
+                        )
+
+                        prepared = {"preparation": prepared_source_metadata(source)}
                     return {
+                        **prepared,
                         **base,
                         "status": "created",
                         "vm_name": vm["name"],
@@ -623,10 +646,6 @@ class CreationActuator:
                 != row["controller_configuration_digest"]
             ):
                 raise CreationUnproven("creation_configuration_changed")
-            # Preparation uses its own artifact authority; never substitute a
-            # golden or registry source for that requested contract.
-            if request.get("preparation") is not None:
-                raise CreationUnproven("creation_source_preparation_unproven")
             if await self.controller._capacity_wait("agent-vm-" + row["job_id"]):
                 return {**pending, "reason": "capacity_wait"}
             _, dv, pvc = await self.disk(row)
@@ -664,9 +683,9 @@ class CreationActuator:
                 if latest
                 else "rootdisk"
             )
-            from vm_controller.creation_sources import GoldenSources
+            from vm_controller.creation_sources import source_manager
 
-            sources = GoldenSources(self.controller)
+            sources = source_manager(self.controller, row)
             frozen = previous.get("rootdisk_source") if previous else None
             rootdisk_source = (
                 await sources.prepare(row, frozen) if kind == "rootdisk" else frozen
@@ -752,9 +771,9 @@ async def reconcile_creation_carrier(controller, carrier):
     if row.get("creation_carrier_uid") != current["metadata"]["uid"]:
         raise CreationUnproven("creation_carrier_changed")
     observations = await actuator.exact_previous(row, current)
-    from vm_controller.creation_sources import GoldenSources
+    from vm_controller.creation_sources import source_manager
 
-    await GoldenSources(controller).release_completed(row)
+    await source_manager(controller, row).release_completed(row)
     latest = row["effects"][-1] if row["effects"] else None
     if latest and latest["state"] == "issued":
         observation = await actuator.observation(row, latest, current)

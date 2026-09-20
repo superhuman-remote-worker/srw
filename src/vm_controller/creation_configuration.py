@@ -106,6 +106,15 @@ def resolve_creation_configuration(controller, request):
         if preparation_service is not None
         else PreparationSettings.from_environment()
     )
+    if payload.get("preparation") is not None:
+        from shared.workspace_preparation_settings import disk_bytes
+
+        if disk_bytes(payload["disk_size"]) < disk_bytes(
+            preparation_settings.disk_size
+        ):
+            if request.get("disk_size") is not None:
+                raise ValueError("Prepared source exceeds requested disk capacity")
+            payload["disk_size"] = preparation_settings.disk_size
     configuration = {
         "version": 1,
         "namespace": settings.VM_NAMESPACE,

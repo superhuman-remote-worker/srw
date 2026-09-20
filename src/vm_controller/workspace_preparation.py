@@ -677,7 +677,16 @@ class VMWorkspacePreparation:
             "preparation": payload,
         }, None
 
-    async def mark_allocated(self, request, *, rootdisk, pvc_uid):
+    async def mark_allocated(
+        self,
+        request,
+        *,
+        rootdisk,
+        pvc_uid,
+        creation=None,
+        creation_source=None,
+        rootdisk_dv_uid=None,
+    ):
         """Release the cache pin only after CDI has finished the workspace clone."""
         request = validate_request(request)
         async with self.lock:
@@ -688,17 +697,31 @@ class VMWorkspacePreparation:
                 or allocation.state["phase"] != "Cloning"
             ):
                 return
-            if "creation_binding" in allocation.state:
+            bound = "creation_binding" in allocation.state
+            if bound and creation is None:
                 # Legacy owner/name observation cannot release a protocol hold.
-                # Its source helper must first prove the durable effect nonce
-                # and exact completed DV/PVC identities.
                 return
+            if creation is not None and (
+                not bound
+                or allocation.state["creation_binding"] != creation
+                or allocation.state.get("creation_source") != creation_source
+                or creation_source is None
+                or creation_source["allocation"]["uid"] != allocation.uid
+                or not rootdisk_dv_uid
+                or rootdisk != "agent-vm-" + request["allocationId"] + "-rootdisk"
+            ):
+                raise PreparationConflict("Prepared completion authority changed.")
             dv, pvc = await self.store.dv(rootdisk), await self.store.pvc(rootdisk)
             if (
                 not dv
                 or not pvc
                 or pvc.metadata.uid != pvc_uid
                 or dv.get("status", {}).get("phase") != "Succeeded"
+                or bound
+                and (
+                    dv["metadata"].get("uid") != rootdisk_dv_uid
+                    or getattr(pvc.status, "phase", None) != "Bound"
+                )
             ):
                 return
             artifact = await self.store.get(allocation.state["artifact"])
@@ -719,6 +742,17 @@ class VMWorkspacePreparation:
                     "phase": "Allocated",
                     "rootdisk": rootdisk,
                     "rootdisk_uid": pvc_uid,
+                    **(
+                        {
+                            "creation_root": {
+                                "name": rootdisk,
+                                "dv_uid": rootdisk_dv_uid,
+                                "pvc_uid": pvc_uid,
+                            }
+                        }
+                        if bound
+                        else {}
+                    ),
                 },
             )
 
