@@ -1,4 +1,4 @@
-"""Muse Spark 1.3 config, prompts, and offline OpenRouter SDK requests."""
+"""Muse Spark 1.3 config, prompts, and offline provider SDK requests."""
 
 import json
 
@@ -62,6 +62,7 @@ def test_contributor_capability_caps_at_xhigh(prefix):
         ("muse-spark-1.3-contributorish", False),
         ("contributor-org/muse-spark-1.3", False),
         ("openrouter/contributor-org/muse-spark-1.3", False),
+        ("muse-spark-1.3-contributor-team/muse-spark-1.3", False),
         ("muse-spark-1.3", False),
         ("meta/muse-spark-1.3", False),
         ("openrouter/meta/muse-spark-1.3", False),
@@ -110,37 +111,6 @@ def test_capability_lookup_order_independent(order):
         "high",
         "xhigh",
     ]
-
-
-@pytest.mark.parametrize(
-    "model_id,expected_effort",
-    [
-        ("meta/muse-spark-1.3", "max"),
-        ("meta/muse-spark-1.3-contributor", "xhigh"),
-    ],
-)
-def test_openai_compatible_serialized_reasoning_effort(
-    tmp_path, monkeypatch, model_id, expected_effort
-):
-    """Direct OpenAI-compatible transport: Contributor max -> xhigh (Standard max)."""
-    captured = {}
-
-    class _FakeChat:
-        def __init__(self, **kwargs):
-            captured.update(kwargs)
-
-    monkeypatch.setattr(loader, "ReasoningChatOpenAI", _FakeChat)
-    config = _load(
-        tmp_path,
-        model_id,
-        provider="openai",
-        api_key="fixture-key",
-        base_url="https://muse-fixture.invalid/v1",
-        reasoning_level="max",
-        max_retries=0,
-    )
-    loader.create_llm(config.llm, limits=config.limits)
-    assert captured["model_kwargs"]["reasoning_effort"] == expected_effort
 
 
 def _load(tmp_path, model, *, role="worker_base", **overrides):
@@ -217,12 +187,13 @@ def test_explicit_settings_override_family_defaults(tmp_path):
 
 @pytest.mark.parametrize("model", ["muse-spark-1.3", "muse-spark-1.3-contributor"])
 @pytest.mark.parametrize("mode", ["sync", "async"])
+@pytest.mark.parametrize("provider", ["openai", "openrouter"])
 @pytest.mark.parametrize(
     "requested", ["minimal", "low", "medium", "high", "xhigh", "max", "none"]
 )
 @pytest.mark.asyncio
-async def test_openrouter_serialized_request(
-    tmp_path, monkeypatch, model, mode, requested
+async def test_serialized_request(
+    tmp_path, monkeypatch, model, mode, provider, requested
 ):
     """Exercise the real SDK through offline HTTP; no provider acceptance claim."""
     captured = []
@@ -272,8 +243,8 @@ async def test_openrouter_serialized_request(
     monkeypatch.setattr(reasoning_chat, "count_request_tokens", lambda *a, **kw: 10)
     config = _load(
         tmp_path,
-        "openrouter/meta/" + model,
-        provider="openrouter",
+        ("openrouter/meta/" if provider == "openrouter" else "meta/") + model,
+        provider=provider,
         api_key="fixture-key",
         base_url="https://muse-fixture.invalid/v1",
         reasoning_level=requested,
@@ -325,10 +296,16 @@ async def test_openrouter_serialized_request(
         expected = requested
         if requested == "max" and "contributor" in model.lower():
             expected = "xhigh"
-        assert body.get("reasoning") == (
-            None if requested == "none" else {"effort": expected}
-        )
-        assert "reasoning_effort" not in body
+        if provider == "openrouter":
+            assert body.get("reasoning") == (
+                None if requested == "none" else {"effort": expected}
+            )
+            assert "reasoning_effort" not in body
+        else:
+            assert body.get("reasoning_effort") == (
+                None if requested == "none" else expected
+            )
+            assert "reasoning" not in body
         assert "thinking" not in body
         assert body["messages"][0]["content"][1]["type"] == "image_url"
     finally:
