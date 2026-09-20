@@ -105,7 +105,7 @@ def _validate_prepared_source(source, *, request, configuration, expected_pvc_ui
         cache_key,
         revision,
     )
-    from shared.workspace_preparation_settings import PreparationSettings
+    from shared.workspace_preparation_settings import PreparationSettings, disk_bytes
 
     if source.get("kind") != "prepared":
         raise ValueError("Prepared rootdisk source is unproven")
@@ -212,7 +212,7 @@ def _validate_prepared_source(source, *, request, configuration, expected_pvc_ui
         or any(receipt.get(key) != value for key, value in expected_receipt.items())
         or type(receipt["version"]) is not int
         or type(receipt["diskBytes"]) is not int
-        or receipt["diskBytes"] <= 0
+        or not 0 < receipt["diskBytes"] <= disk_bytes(settings.disk_size)
         or not isinstance(receipt["diskSha256"], str)
         or not re.fullmatch(r"[0-9a-f]{64}", receipt["diskSha256"])
     ):
