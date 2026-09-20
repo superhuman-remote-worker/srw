@@ -5353,6 +5353,41 @@ class TestWorkspaceRecoveryControllerEvidence:
         assert observed["prior_runtime"] != "stopped"
         assert observed["stop_evidence"] == "unknown"
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "unsafe", [None, "running", "restarted", "last_state", "missing", "grace_zero"]
+    )
+    async def test_native_console_sidecar_requires_real_current_termination_even_when_retained(
+        self, controller, unsafe
+    ):
+        pod = self.wire(controller, terminal=True)
+        sidecar = pod["spec"]["containers"].pop()
+        sidecar["restartPolicy"] = "Always"
+        pod["spec"]["initContainers"] = [sidecar]
+        status = pod["status"]["containerStatuses"].pop()
+        pod["status"]["initContainerStatuses"] = [status]
+        # Retention is only fixture metadata; it must never create stop proof.
+        pod["metadata"]["finalizers"] = ["srw.io/vm-recovery-gate-stop-evidence"]
+        if unsafe == "running":
+            status["state"] = {"running": {}}
+        elif unsafe == "restarted":
+            status["restartCount"] = 1
+        elif unsafe == "last_state":
+            status["lastState"] = status["state"].copy()
+        elif unsafe == "missing":
+            pod["status"]["initContainerStatuses"] = []
+        elif unsafe == "grace_zero":
+            pod["metadata"]["deletionGracePeriodSeconds"] = 0
+        observed = await controller._do_observe_workspace_recovery(self.identity())
+        if unsafe is None:
+            assert observed["prior_runtime"] == "stopped"
+            assert {
+                entry["kind"] for entry in observed["stop_evidence"]["containers"]
+            } == {"init", "regular"}
+        else:
+            assert observed["prior_runtime"] != "stopped"
+            assert observed["stop_evidence"] == "unknown"
+
 
 class TestWorkspaceRecoveryControllerPins:
     @pytest.mark.asyncio
