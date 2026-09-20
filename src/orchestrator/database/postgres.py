@@ -2398,6 +2398,7 @@ class PostgresDB:
     """
 
     supports_vm_phase_observations = True
+    supports_vm_creation_retry = True
 
     async def activate_vm_remote_operation_protocol(
         self,

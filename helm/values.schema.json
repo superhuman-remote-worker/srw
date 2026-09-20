@@ -1561,6 +1561,7 @@
           "type": "object",
           "required": ["rootdiskStallTimeoutSeconds"],
           "properties": {
+            "creationRetryEnabled": {"type": "boolean"},
             "rootdiskStallTimeoutSeconds": {"type": "integer", "minimum": 1}
           },
           "additionalProperties": false

@@ -923,6 +923,41 @@ class VMProvisioner:
             The controller response when HTTP accepted the request, otherwise
             the transport's boolean acknowledgement.
         """
+        protocol_enabled = (
+            self.mode == "same-cluster"
+            and os.getenv("VM_CREATION_RETRY_ENABLED", "false").lower() == "true"
+        )
+        if protocol_enabled or (
+            self.mode == "same-cluster"
+            and getattr(self._db, "supports_vm_creation_retry", False) is True
+        ):
+            from orchestrator.services.vm_creation_preflight import (
+                VMCreationPreflightStore, _preflight, creation_preflight_response,
+            )
+            from orchestrator.services.vm_creation_retry_store import VMCreationRetryConflict
+            from orchestrator.services.vm_creation_request import build_vm_creation_request
+
+            if self._db is None:
+                raise VMCreationRetryConflict("creation_request_unproven")
+            job = await self._db.get_job(job_id)
+            context = (job.get("context") or {}) if isinstance(job, Mapping) else None
+            context = json.loads(context) if isinstance(context, str) else context
+            if not isinstance(context, Mapping):
+                raise VMCreationRetryConflict("creation_request_unproven")
+            vm = context.get("vm") or {}
+            if not isinstance(vm, dict):
+                raise VMCreationRetryConflict("creation_request_unproven")
+            previous = _preflight(vm)
+            if previous and (vm.get("status") != "deleted" or not protocol_enabled):
+                # Existing operations keep their own authority even if admission
+                # was disabled or today's defaults differ. No queue mutation.
+                return creation_preflight_response(previous)
+            if not protocol_enabled and (
+                "_vm_creation_pending" in context or vm.get("creation_request_id")
+            ):
+                raise VMCreationRetryConflict("retry_protocol_unavailable")
+            if protocol_enabled and not fresh:
+                raise VMCreationRetryConflict("creation_request_unproven")
         if preparation is not None:
             preparation = await self._validate_preparation(job_id, "job", preparation)
         if workspace_storage is not None:
@@ -950,6 +985,26 @@ class VMProvisioner:
             # not leave a durable row pretending an unusable VM is pending.
             logger.warning("VM create refused: %s", self.unavailable_reason)
             return False
+        if protocol_enabled:
+            fresh_context = self._fresh_provision_ctx()
+            network_tier = (
+                await self._db.get_workspace_network_tier(job_id, "job")
+                or DEFAULT_NETWORK_TIER
+            )
+            request = build_vm_creation_request(
+                job_id=job_id, agent_config=agent_config, vm_image=vm_image,
+                cpu_cores=cpu_cores, memory=memory, description=description,
+                network_tier=network_tier,
+                provision_generation=fresh_context["provision_generation"],
+                orchestrator_url=os.getenv("ORCHESTRATOR_URL"), disk_size=disk_size,
+                initialization=initialization, workspace_storage=workspace_storage,
+                preparation=preparation,
+            )
+            preflight = await VMCreationPreflightStore(self._db).begin(
+                job_id=job_id, request=request, fresh_context=fresh_context,
+                max_attempts=int(os.getenv("VM_PROVISION_MAX_ATTEMPTS", "3")),
+            )
+            return creation_preflight_response(preflight)
         # A (re)provisioned VM must start with a CLEAN reap counter and no stale
         # SSH endpoint. context.vm is *merged* (not replaced) across provisions,
         # so a prior incarnation's snapshot_attempts — which reaches the reaper's

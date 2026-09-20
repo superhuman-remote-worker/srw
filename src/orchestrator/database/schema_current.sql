@@ -7474,6 +7474,26 @@ $$;
 
 
 --
+-- Name: guard_vm_creation_ready_release(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.guard_vm_creation_ready_release() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    IF (OLD.ready_at IS NOT NULL AND NEW.ready_at IS DISTINCT FROM OLD.ready_at)
+       OR (NEW.ready_at IS NOT NULL AND NOT (
+           NEW.state='succeeded' AND NEW.boot_counted
+           AND NEW.observed_vm_uid IS NOT NULL AND NEW.observed_pvc_uid IS NOT NULL
+       )) THEN
+        RAISE EXCEPTION 'VM creation Ready release is immutable and requires adoption' USING ERRCODE='23514';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
 -- Name: guard_vm_creation_retry_identity(); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -27010,6 +27030,13 @@ CREATE TRIGGER vm_creation_carrier_identity BEFORE UPDATE ON public.vm_creation_
 --
 
 CREATE TRIGGER vm_creation_effect_identity BEFORE UPDATE ON public.vm_creation_effects FOR EACH ROW EXECUTE FUNCTION public.guard_vm_creation_effect_identity();
+
+
+--
+-- Name: vm_creation_retries vm_creation_ready_release; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER vm_creation_ready_release BEFORE UPDATE ON public.vm_creation_retries FOR EACH ROW EXECUTE FUNCTION public.guard_vm_creation_ready_release();
 
 
 --

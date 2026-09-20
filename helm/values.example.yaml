@@ -65,6 +65,7 @@ orchestrator:
   kbExternalReindexConcurrency: 2
   kbReindexSweepSeconds: 900
   vmProvisioning:
+    creationRetryEnabled: false
     rootdiskStallTimeoutSeconds: 2700
   # Recovery readers, controls and cleanup guards ship in every version. These
   # switches open automatic probes only after the protocol rollout described

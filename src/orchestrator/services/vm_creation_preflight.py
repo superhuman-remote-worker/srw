@@ -61,6 +61,19 @@ def _preflight(vm):
     return deepcopy(value)
 
 
+def creation_preflight_response(value):
+    """A scheduling acknowledgement; it is never an actual boot attempt."""
+    return {
+        "creation_retry_protocol": 1,
+        "status": "creation_attention"
+        if value["state"] == "attention"
+        else "creation_pending",
+        "job_id": value["job_id"],
+        "provision_generation": value["request"]["provision_generation"],
+        "request_id": value["request_id"],
+    }
+
+
 class VMCreationPreflightStore:
     def __init__(self, db):
         self.db = db

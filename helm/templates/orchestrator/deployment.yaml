@@ -1438,6 +1438,8 @@ spec:
               value: "/run/secrets/vm-ssh-key"
             - name: VM_ROOTDISK_STALL_TIMEOUT_S
               value: {{ .Values.orchestrator.vmProvisioning.rootdiskStallTimeoutSeconds | quote }}
+            - name: VM_CREATION_RETRY_ENABLED
+              value: {{ .Values.orchestrator.vmProvisioning.creationRetryEnabled | default false | quote }}
             - name: VM_WORKSPACE_RECOVERY_ACCEPTANCE_GATE_ENABLED
               value: {{ .Values.orchestrator.vmWorkspaceRecoveryAcceptanceGate.enabled | quote }}
             {{- if .Values.orchestrator.vmWorkspaceRecoveryAcceptanceGate.enabled }}

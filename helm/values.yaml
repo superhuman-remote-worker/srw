@@ -190,6 +190,9 @@ orchestrator:
   vmRemoteOperationProtocol:
     enabled: false
   vmProvisioning:
+    # -- Admit new jobs through the durable creation protocol. Keep disabled
+    # until every controller supports the complete creation and cleanup contract.
+    creationRetryEnabled: false
     # -- Active rootdisk preparation time without forward progress before
     # attention. Placement waits pause this clock; the disk is retained.
     rootdiskStallTimeoutSeconds: 2700

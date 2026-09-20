@@ -872,6 +872,15 @@ Initialization keeps its separate deadline. Roll out the phase-aware controller
 before the orchestrator; older controller responses cannot authorize a boot
 timeout cleanup. Phase observations never bypass SSH or initialization checks.
 
+`orchestrator.vmProvisioning.creationRetryEnabled` defaults to `false`
+(`VM_CREATION_RETRY_ENABLED`). It admits new Job VM creates through durable
+configuration resolution, fenced creation effects, and a separate SSH/init Ready
+release. Existing operations keep reconciling when admission is disabled.
+Migration `0260_vm_creation_ready_release.sql` and compatible controllers are
+required. Keep this switch off until the source, attachment, cancellation and
+live acceptance gates in the failed-creation retry plan have passed; the current
+controller deliberately does not advertise the complete protocol capability.
+
 Durable recovery is installed reader-first. Its database records, job projection,
 Retry/Cancel controls, disk retention pins and cleanup guards remain active even
 when automatic recovery is disabled. The automatic reconciler and replacement

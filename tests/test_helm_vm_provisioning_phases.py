@@ -28,3 +28,10 @@ def test_rootdisk_stall_budget_default_and_override():
 def test_rootdisk_stall_budget_rejects_nonpositive_or_fractional_values(value):
     with pytest.raises(subprocess.CalledProcessError):
         render(f"orchestrator.vmProvisioning.rootdiskStallTimeoutSeconds={value}")
+
+
+def test_creation_retry_admission_defaults_off_and_can_be_enabled():
+    default = render()
+    enabled = render("orchestrator.vmProvisioning.creationRetryEnabled=true")
+    assert _env(default, _orchestrator(default))["VM_CREATION_RETRY_ENABLED"] == "false"
+    assert _env(enabled, _orchestrator(enabled))["VM_CREATION_RETRY_ENABLED"] == "true"

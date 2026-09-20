@@ -225,6 +225,8 @@ from orchestrator.services.vm_workspace_recovery_store import (  # noqa: E402
     VMWorkspaceRecoveryStore,
 )
 from orchestrator.services.vm_creation_retry_store import VMCreationRetryStore  # noqa: E402
+from orchestrator.services.vm_creation_retry import VMCreationRetryService  # noqa: E402
+from orchestrator.services.vm_creation_dispatch import handle_creation_pending  # noqa: E402
 from orchestrator.services.vm_provisioning_cleanup import handle_provisioning_wait  # noqa: E402
 from orchestrator.services.vm_workspace_recovery import (  # noqa: E402
     VMWorkspaceRecoveryService,
@@ -3531,6 +3533,8 @@ async def _try_dispatch_pending_jobs() -> None:
             for job in pending_jobs:
                 job_id = str(job["id"])
                 stateless_worker = job.get("execution_lane") == "stateless"
+                if await handle_creation_pending(job, db=postgres_db):
+                    continue
                 (
                     workspace_action,
                     job,
@@ -3805,6 +3809,15 @@ async def _try_dispatch_pending_jobs() -> None:
                             **vm_options,
                             description=job.get("description", ""),
                         )
+                        protocol_pending = (
+                            isinstance(ok, dict)
+                            and type(ok.get("creation_retry_protocol")) is int
+                            and ok["creation_retry_protocol"] == 1
+                        )
+                        if protocol_pending:
+                            # Exact VM adoption counts a boot in the ledger;
+                            # scheduling and dependency waits count no attempt.
+                            continue
                         if ok:
                             # Count the attempt so a VM that never boots parks
                             # after max_provision_attempts. create_vm stamped a
@@ -5725,6 +5738,17 @@ async def lifespan(app: FastAPI):
         else None
     )
     vm_workspace_recovery_settings = VMWorkspaceRecoverySettings.from_env()
+    vm_creation_retry_task = (
+        asyncio.create_task(
+            run_when_leader(
+                VMCreationRetryService(postgres_db, vm_provisioner).run,
+                _shutdown_event,
+            ),
+            name="vm-creation-retry",
+        )
+        if os.getenv("VM_MODE", "off").strip().lower() == "same-cluster"
+        else None
+    )
     vm_workspace_recovery_store = VMWorkspaceRecoveryStore(postgres_db)
     vm_workspace_recovery_task = (
         asyncio.create_task(
@@ -6230,6 +6254,8 @@ async def lifespan(app: FastAPI):
     await dispatcher_task
     if vm_readiness_task is not None:
         await vm_readiness_task
+    if vm_creation_retry_task is not None:
+        await vm_creation_retry_task
     if vm_workspace_recovery_task is not None:
         await vm_workspace_recovery_task
     await sudo_sweeper_task
