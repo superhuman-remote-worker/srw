@@ -212,6 +212,18 @@ excluded_rules = [
 #                Preserve shipped SQL bytes: retrofitting NOT VALID, IF EXISTS,
 #                or concurrent indexes would cause checksum drift. These are
 #                exact-file exceptions; future migrations retain all rules.
+#        - app/0258: one constraint-missing-not-valid on the new 0257 retry
+#                ledger. Both migrations enter develop together with creation
+#                admission disabled; the ledger has no pre-rollout writers.
+#                The pair constraint must be atomic with its new columns.
+#        - app/0261: one constraint-missing-not-valid on same-transaction
+#                validation of the effect-kind check. The 0258 effect ledger
+#                is new in this rollout, and the replacement only widens its
+#                accepted values, so every existing row satisfies it. Keeping
+#                the replacement atomic avoids an unconstrained interval.
+#                These two exact files have also already been applied to the
+#                preserved disposable acceptance database. Preserve their SQL
+#                checksums; all other new migrations retain full lint coverage.
 excluded_paths = [
     "src/orchestrator/database/migrations/app/0001_initial.sql",
     "src/orchestrator/database/migrations/vector/0001_initial.sql",
@@ -237,5 +249,7 @@ excluded_paths = [
     "src/orchestrator/database/migrations/app/0254_vm_workspace_recovery_reconciler.sql",
     "src/orchestrator/database/migrations/app/0255_vm_workspace_recovery_controller_evidence.sql",
     "src/orchestrator/database/migrations/app/0256_vm_workspace_cleanup_delegation.sql",
+    "src/orchestrator/database/migrations/app/0258_vm_creation_effects.sql",
+    "src/orchestrator/database/migrations/app/0261_vm_creation_attachment_effect.sql",
     "src/orchestrator/database/migrations/vector/0008_kb_index_chunking.sql",
 ]

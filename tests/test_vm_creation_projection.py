@@ -140,8 +140,13 @@ def test_progress_does_not_replace_existing_failure_or_cleanup():
 
 
 def test_explicit_cleanup_marker_does_not_require_status():
-    result = redact({"status": "paused", "_vm_creation": progress(),
-                     "context": {"vm": {"retirement_cleanup_pending": True}}})
+    result = redact(
+        {
+            "status": "paused",
+            "_vm_creation": progress(),
+            "context": {"vm": {"retirement_cleanup_pending": True}},
+        }
+    )
     assert "cleanup" in result["error_message"].lower()
 
 

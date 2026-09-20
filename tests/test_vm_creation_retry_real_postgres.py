@@ -144,9 +144,12 @@ async def test_injected_waiter_refusal_rolls_back_retry_and_precedes_resume(db):
         context = json.loads(saved["context"])
         assert saved["description"] == "retry"
         assert "_vm_creation_pending" not in context
-        assert await conn.fetchval(
-            "SELECT count(*) FROM vm_creation_retries WHERE job_id=$1", job
-        ) == 0
+        assert (
+            await conn.fetchval(
+                "SELECT count(*) FROM vm_creation_retries WHERE job_id=$1", job
+            )
+            == 0
+        )
 
 
 @pytest.mark.asyncio

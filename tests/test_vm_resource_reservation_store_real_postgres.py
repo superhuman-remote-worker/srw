@@ -210,7 +210,10 @@ async def retry_without_waiter(db, store, inventory, *, priority):
 @pytest.mark.asyncio
 async def test_two_replicas_cannot_spend_final_vector_and_replay_keeps_sequence(db):
     store, inventory, snapshot = await environment(db)
-    first, second = await waiter(db, store, inventory), await waiter(db, store, inventory)
+    first, second = (
+        await waiter(db, store, inventory),
+        await waiter(db, store, inventory),
+    )
     results = await asyncio.gather(decide(store, first), decide(store, second))
     assert sum(result["action"] == "admitted" for result in results) == 1
     held = await db.fetch(
@@ -296,9 +299,7 @@ async def test_winner_changes_while_waiting_without_locking_foreign_job(db):
             )
             task = asyncio.create_task(decide(store, first))
             await wait_for_policy_lock(db)
-            later, user = await retry_without_waiter(
-                db, store, inventory, priority=99
-            )
+            later, user = await retry_without_waiter(db, store, inventory, priority=99)
             # This raw insert is deliberate: the test must publish a waiter in
             # the policy transaction without retaining the foreign Job lock.
             await blocker.execute(

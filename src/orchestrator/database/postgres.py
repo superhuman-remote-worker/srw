@@ -3791,14 +3791,18 @@ class PostgresDB:
                     total_is_capped = True
 
         rows = [dict(row) for row in fetched]
-        from orchestrator.services.vm_creation_progress import preflight_creation_progress
+        from orchestrator.services.vm_creation_progress import (
+            preflight_creation_progress,
+        )
         from orchestrator.services.job_projection import vm_provisioning_message
 
         for row in rows:
             workspace_context = row.pop("_workspace_context", None)
             if not row.get("_vm_creation"):
                 row["_vm_creation"] = preflight_creation_progress(workspace_context)
-            if row.get("status") in {"created", "paused"} and not row.get("error_message"):
+            if row.get("status") in {"created", "paused"} and not row.get(
+                "error_message"
+            ):
                 row["error_message"] = vm_provisioning_message(
                     _json_object_or_empty(workspace_context).get("vm")
                 )
@@ -4659,7 +4663,9 @@ class PostgresDB:
         async with self.acquire() as conn:
             async with conn.transaction():
                 if expected_execution_deadline is not None:
-                    from orchestrator.services.execution_deadline import lock_expired_execution
+                    from orchestrator.services.execution_deadline import (
+                        lock_expired_execution,
+                    )
 
                     if not await lock_expired_execution(
                         conn, uuid_val, expected_execution_deadline
@@ -4830,7 +4836,9 @@ class PostgresDB:
                         conn, job_id=job_uuid
                     )
                     if expected_execution_deadline is not None:
-                        from orchestrator.services.execution_deadline import lock_expired_execution
+                        from orchestrator.services.execution_deadline import (
+                            lock_expired_execution,
+                        )
 
                         if not await lock_expired_execution(
                             conn, job_uuid, expected_execution_deadline
@@ -10481,6 +10489,7 @@ class PostgresDB:
             "AND NOT EXISTS (SELECT 1 FROM vm_workspace_recovery_jobs p "
             "WHERE p.job_id=jobs.id AND p.resolved_at IS NULL)"
         )
+
         async def capture(conn):
             if snapshot is None:
                 value = await conn.fetchval(
@@ -28977,7 +28986,7 @@ class PostgresDB:
                         return None
                     args.extend([scope["job_id"], scope["project_id"]])
                     officer_guard += (
-                        f" AND job_id=${len(args)-1} AND project_id=${len(args)}"
+                        f" AND job_id=${len(args) - 1} AND project_id=${len(args)}"
                     )
                     if actor_kind == "officer":
                         args.append(officer_incarnation)

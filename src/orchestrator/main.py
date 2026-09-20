@@ -4009,7 +4009,10 @@ async def _try_dispatch_pending_jobs() -> None:
                         await _fail_vm_parked_job(job_id, park_error)
                         continue
                     if await handle_provisioning_wait(
-                        vm_decision, job_id, vm_ctx, db=postgres_db,
+                        vm_decision,
+                        job_id,
+                        vm_ctx,
+                        db=postgres_db,
                         provisioner=vm_provisioner,
                         recovery_store=VMWorkspaceRecoveryStore(postgres_db),
                         now=time.time(),
@@ -4018,7 +4021,9 @@ async def _try_dispatch_pending_jobs() -> None:
                     ):
                         continue
                     if vm_decision != VM_READY:
-                        logger.warning("Dispatcher: job %s has an unhandled VM decision", job_id)
+                        logger.warning(
+                            "Dispatcher: job %s has an unhandled VM decision", job_id
+                        )
                         continue
                     # VM_READY: proceed with dispatch.
                     logger.info("Dispatcher: job %s using VM workspace", job_id)

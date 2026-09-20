@@ -26,7 +26,8 @@ def test_retained_manual_launcher_has_current_native_sidecar_stop_evidence():
     evidence = _exact_terminal_container_evidence(pod)
     assert evidence is not None
     assert evidence["declared_containers"] == {
-        "init": ["guest-console-log"], "regular": ["compute"]
+        "init": ["guest-console-log"],
+        "regular": ["compute"],
     }
     assert len(evidence["containers"]) == 2
     assert all(item["restart_count"] == 0 for item in evidence["containers"])

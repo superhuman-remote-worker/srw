@@ -932,10 +932,16 @@ class VMProvisioner:
             and getattr(self._db, "supports_vm_creation_retry", False) is True
         ):
             from orchestrator.services.vm_creation_preflight import (
-                VMCreationPreflightStore, _preflight, creation_preflight_response,
+                VMCreationPreflightStore,
+                _preflight,
+                creation_preflight_response,
             )
-            from orchestrator.services.vm_creation_retry_store import VMCreationRetryConflict
-            from orchestrator.services.vm_creation_request import build_vm_creation_request
+            from orchestrator.services.vm_creation_retry_store import (
+                VMCreationRetryConflict,
+            )
+            from orchestrator.services.vm_creation_request import (
+                build_vm_creation_request,
+            )
 
             if self._db is None:
                 raise VMCreationRetryConflict("creation_request_unproven")
@@ -992,16 +998,24 @@ class VMProvisioner:
                 or DEFAULT_NETWORK_TIER
             )
             request = build_vm_creation_request(
-                job_id=job_id, agent_config=agent_config, vm_image=vm_image,
-                cpu_cores=cpu_cores, memory=memory, description=description,
+                job_id=job_id,
+                agent_config=agent_config,
+                vm_image=vm_image,
+                cpu_cores=cpu_cores,
+                memory=memory,
+                description=description,
                 network_tier=network_tier,
                 provision_generation=fresh_context["provision_generation"],
-                orchestrator_url=os.getenv("ORCHESTRATOR_URL"), disk_size=disk_size,
-                initialization=initialization, workspace_storage=workspace_storage,
+                orchestrator_url=os.getenv("ORCHESTRATOR_URL"),
+                disk_size=disk_size,
+                initialization=initialization,
+                workspace_storage=workspace_storage,
                 preparation=preparation,
             )
             preflight = await VMCreationPreflightStore(self._db).begin(
-                job_id=job_id, request=request, fresh_context=fresh_context,
+                job_id=job_id,
+                request=request,
+                fresh_context=fresh_context,
                 max_attempts=int(os.getenv("VM_PROVISION_MAX_ATTEMPTS", "3")),
             )
             return creation_preflight_response(preflight)

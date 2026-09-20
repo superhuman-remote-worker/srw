@@ -5906,8 +5906,10 @@ class VMController:
         from vm_controller.resource_inventory_runtime import inventory_observer_context
 
         async with inventory_observer_context(
-            InventorySettings.from_environment(), base_url=ORCHESTRATOR_URL,
-            secret=LIFECYCLE_HMAC_SECRET, stop=self._shutdown,
+            InventorySettings.from_environment(),
+            base_url=ORCHESTRATOR_URL,
+            secret=LIFECYCLE_HMAC_SECRET,
+            stop=self._shutdown,
         ):
             await self._run_transports()
 

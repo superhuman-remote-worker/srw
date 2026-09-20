@@ -383,13 +383,17 @@ class ManifestExecutionService:
                 if job:
                     try:
                         await self.cancel_srw(
-                            job, expected_execution_deadline=ExecutionDeadline.from_row(item)
+                            job,
+                            expected_execution_deadline=ExecutionDeadline.from_row(
+                                item
+                            ),
                         )
                     except HTTPException:
                         # Control or exact retirement can remain blocked. A
                         # failed cleanup must not starve other overdue owners.
                         logger.warning(
-                            "SRW deadline cancellation remains pending for job %s", item["id"]
+                            "SRW deadline cancellation remains pending for job %s",
+                            item["id"],
                         )
         rows = await self.db.fetch("""SELECT s.id FROM srw_execution_specs s JOIN jobs j ON s.work_kind='Job' AND s.work_id=j.id
             WHERE s.harness_adapter='generic' AND (j.status IN ('created','processing') OR EXISTS(

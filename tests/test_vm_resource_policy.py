@@ -215,9 +215,7 @@ def test_enforcement_snapshot_requires_all_capabilities_without_broadening_obser
         ("shadowEnabled", 1),
     ],
 )
-def test_enforcement_snapshot_refuses_missing_or_untyped_capability(
-    flag, replacement
-):
+def test_enforcement_snapshot_refuses_missing_or_untyped_capability(flag, replacement):
     value = enforcement_policy()
     value["policy"][flag] = replacement
     with pytest.raises(ResourceAdmissionError, match="invalid_resource_policy"):

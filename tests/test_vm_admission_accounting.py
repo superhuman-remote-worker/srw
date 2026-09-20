@@ -69,7 +69,11 @@ def test_unknown_or_changed_admission_is_not_a_second_vm(marker):
 
 @pytest.mark.parametrize(
     "field,bad",
-    [("generation", str(uuid4())), ("generation", True), ("vm_uid", "opaque")],
+    [
+        pytest.param("generation", str(uuid4()), id="different-generation"),
+        ("generation", True),
+        ("vm_uid", "opaque"),
+    ],
 )
 def test_only_exact_canonical_generation_and_uid_can_count(field, bad):
     args = {"generation": GENERATION, "vm_uid": VM, field: bad}

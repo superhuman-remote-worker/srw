@@ -85,9 +85,7 @@ def _policy_values(document, inventory):
     return parse_resource_policy_values(policy)
 
 
-def _expected_waiter_request_fields(
-    retry, *, inventory, policy_document, cost
-):
+def _expected_waiter_request_fields(retry, *, inventory, policy_document, cost):
     """Rebuild waiter request fields; fairness metadata is write-once separately."""
     try:
         request = _json(retry["canonical_request"])
@@ -387,9 +385,7 @@ class VMResourceReservationStore:
             if row is not None:
                 raise ResourceAdmissionError("resource_waiter_changed")
             owner_key = (
-                "system"
-                if job["user_id"] is None
-                else "user:" + str(job["user_id"])
+                "system" if job["user_id"] is None else "user:" + str(job["user_id"])
             )
             row = await conn.fetchrow(
                 "INSERT INTO vm_resource_waiters(request_id,job_id,provision_generation,cluster_id,policy_digest,owner_key,project_id,priority,request_digest,guest_vcpus,guest_memory_bytes,cpu_millicores,memory_bytes,kvm_devices,placement) "

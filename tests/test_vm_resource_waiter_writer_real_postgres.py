@@ -179,10 +179,13 @@ async def test_admission_refuses_raw_waiter_with_tampered_frozen_placement(db):
         "action": "unavailable",
         "reason": "resource_waiter_changed",
     }
-    assert await db.fetchval(
-        "SELECT count(*) FROM vm_resource_reservations WHERE request_id=$1",
-        retry["request_id"],
-    ) == 0
+    assert (
+        await db.fetchval(
+            "SELECT count(*) FROM vm_resource_reservations WHERE request_id=$1",
+            retry["request_id"],
+        )
+        == 0
+    )
 
 
 @pytest.mark.asyncio
@@ -280,9 +283,12 @@ async def test_writer_refuses_equivalent_vector_from_different_host_policy(db):
                     proposal=proposal,
                 )
 
-    assert await db.fetchval(
-        "SELECT count(*) FROM vm_creation_retries WHERE job_id=$1", job
-    ) == 0
+    assert (
+        await db.fetchval(
+            "SELECT count(*) FROM vm_creation_retries WHERE job_id=$1", job
+        )
+        == 0
+    )
     assert await db.fetchval("SELECT count(*) FROM vm_resource_waiters") == 0
 
 
@@ -308,10 +314,13 @@ async def test_existing_v2_retry_without_waiter_is_never_backfilled(db):
                     proposal=proposal,
                 )
 
-    assert await db.fetchval(
-        "SELECT count(*) FROM vm_creation_retries WHERE request_id=$1",
-        retry["request_id"],
-    ) == 1
+    assert (
+        await db.fetchval(
+            "SELECT count(*) FROM vm_creation_retries WHERE request_id=$1",
+            retry["request_id"],
+        )
+        == 1
+    )
     assert await db.fetchval("SELECT count(*) FROM vm_resource_waiters") == 0
 
 
@@ -346,9 +355,12 @@ async def test_deadline_after_policy_wait_rolls_back_retry_and_waiter(db):
     with pytest.raises(VMCreationRetryConflict, match="^job_admission_expired$"):
         await task
 
-    assert await db.fetchval(
-        "SELECT count(*) FROM vm_creation_retries WHERE job_id=$1", job
-    ) == 0
+    assert (
+        await db.fetchval(
+            "SELECT count(*) FROM vm_creation_retries WHERE job_id=$1", job
+        )
+        == 0
+    )
     assert await db.fetchval("SELECT count(*) FROM vm_resource_waiters") == 0
 
 
@@ -363,9 +375,7 @@ async def test_two_retry_replicas_create_one_waiter_and_preserve_snapshot(db):
     await db.execute(
         "INSERT INTO users(id,display_name) VALUES($1,'concurrent-owner')", user
     )
-    await db.execute(
-        "UPDATE jobs SET user_id=$2,priority=23 WHERE id=$1", job, user
-    )
+    await db.execute("UPDATE jobs SET user_id=$2,priority=23 WHERE id=$1", job, user)
 
     async def attempt():
         async with db.acquire() as conn, conn.transaction():
@@ -401,10 +411,13 @@ async def test_two_retry_replicas_create_one_waiter_and_preserve_snapshot(db):
 async def test_ownerless_fresh_retry_uses_one_literal_system_lane(db):
     store, inventory, _ = await environment(db)
     retry, _ = await admit_with_writer(db, store, inventory)
-    assert await db.fetchval(
-        "SELECT owner_key FROM vm_resource_waiters WHERE request_id=$1",
-        retry["request_id"],
-    ) == "system"
+    assert (
+        await db.fetchval(
+            "SELECT owner_key FROM vm_resource_waiters WHERE request_id=$1",
+            retry["request_id"],
+        )
+        == "system"
+    )
 
 
 @pytest.mark.asyncio
@@ -425,7 +438,10 @@ async def test_legacy_configuration_cannot_create_resource_authority(db):
                     request_id=str(uuid4()),
                     proposal=proposal,
                 )
-    assert await db.fetchval(
-        "SELECT count(*) FROM vm_creation_retries WHERE job_id=$1", job
-    ) == 0
+    assert (
+        await db.fetchval(
+            "SELECT count(*) FROM vm_creation_retries WHERE job_id=$1", job
+        )
+        == 0
+    )
     assert await db.fetchval("SELECT count(*) FROM vm_resource_waiters") == 0

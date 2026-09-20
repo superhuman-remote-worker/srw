@@ -504,12 +504,16 @@ async def accept_completion_command(
                         "tool_call_id": tool_call_id,
                     }
             idle_source = await capture_completion_wait_on_conn(
-                conn, job=job, report=canonical_payload, lease_token=accepted_token,
+                conn,
+                job=job,
+                report=canonical_payload,
+                lease_token=accepted_token,
                 # Preserve legacy marker behavior above, but never invent new
                 # idle evidence by stringifying malformed historical JSON.
                 decision_tool_call_id=(
                     completion_decision.get("tool_call_id")
-                    if isinstance(completion_decision, Mapping) else None
+                    if isinstance(completion_decision, Mapping)
+                    else None
                 ),
             )
             if idle_source is not None:

@@ -84,10 +84,13 @@ async def test_concurrent_exact_shadow_install_has_one_row_and_one_receipt(db):
     assert json.loads(row["document_text"]) == json.loads(policy.canonical_document)
     assert row["revision"] == 1
     assert row["mode"] == "shadow"
-    assert await db.fetchval(
-        "SELECT count(*) FROM vm_resource_admission_policy WHERE cluster_id=$1",
-        policy.inventory.cluster_id,
-    ) == 1
+    assert (
+        await db.fetchval(
+            "SELECT count(*) FROM vm_resource_admission_policy WHERE cluster_id=$1",
+            policy.inventory.cluster_id,
+        )
+        == 1
+    )
 
 
 @pytest.mark.asyncio
@@ -217,9 +220,7 @@ async def test_begin_drain_accepts_exact_preexisting_enforce_receipt(db):
     )
 
     drained = await lifecycle.begin_drain(expected=enforce)
-    assert drained == replace(
-        enforce, revision=3, mode="drain"
-    )
+    assert drained == replace(enforce, revision=3, mode="drain")
     settings = policy.inventory
     inventory = VMResourceInventoryStore(
         db,
@@ -297,10 +298,13 @@ async def test_concurrent_begin_drain_increments_once_and_rejects_stale_caller(d
     assert len(errors) == 1
     assert isinstance(errors[0], ResourceAdmissionError)
     assert str(errors[0]) == "resource_policy_changed"
-    assert await db.fetchval(
-        "SELECT revision FROM vm_resource_admission_policy WHERE cluster_id=$1",
-        policy.inventory.cluster_id,
-    ) == 2
+    assert (
+        await db.fetchval(
+            "SELECT revision FROM vm_resource_admission_policy WHERE cluster_id=$1",
+            policy.inventory.cluster_id,
+        )
+        == 2
+    )
 
 
 @pytest.mark.asyncio

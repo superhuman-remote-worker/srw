@@ -78,7 +78,9 @@ async def run_persisted_completion_workflow(
         ACCEPTED_COMPLETION_DECISION_KEY,
     )
 
-    from orchestrator.services.workspace_idle_completion_events import ACCEPTED_IDLE_WAIT_SOURCE_KEY
+    from orchestrator.services.workspace_idle_completion_events import (
+        ACCEPTED_IDLE_WAIT_SOURCE_KEY,
+    )
 
     payload.pop(ACCEPTED_COMPLETION_DECISION_KEY, None)
     payload.pop(ACCEPTED_IDLE_WAIT_SOURCE_KEY, None)

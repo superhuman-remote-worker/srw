@@ -484,8 +484,12 @@ def test_controller_packaged_modules_and_lazy_shared_imports_load(tmp_path):
     for source, destination in _controller_source_copies():
         target = tmp_path / destination.removeprefix("./")
         if (REPO / source).is_dir():
-            shutil.copytree(REPO / source, target, dirs_exist_ok=True,
-                            ignore=shutil.ignore_patterns("__pycache__"))
+            shutil.copytree(
+                REPO / source,
+                target,
+                dirs_exist_ok=True,
+                ignore=shutil.ignore_patterns("__pycache__"),
+            )
         else:
             target.mkdir(parents=True, exist_ok=True)
             shutil.copy2(REPO / source, target)
@@ -502,8 +506,16 @@ assert "shared.kubernetes_quantities" in sys.modules
 assert "shared.runtime" not in sys.modules
 """
     result = subprocess.run(
-        [sys.executable, "-I", "-c", script, str(tmp_path / "src"),
-         str(REPO / "scripts/check_vm_controller_imports.py")],
-        capture_output=True, text=True, timeout=30,
+        [
+            sys.executable,
+            "-I",
+            "-c",
+            script,
+            str(tmp_path / "src"),
+            str(REPO / "scripts/check_vm_controller_imports.py"),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
     )
     assert result.returncode == 0, result.stderr

@@ -125,7 +125,7 @@ def test_unproven_or_nonhuman_report_skips(key, value):
 @pytest.mark.parametrize(
     "key,value",
     [
-        ("job_id", str(uuid4())),
+        pytest.param("job_id", str(uuid4()), id="different-job"),
         ("job_id", "not-a-uuid"),
         ("status", "reviewing"),
         ("freeze_type", "capacity"),
@@ -148,7 +148,7 @@ def test_freeze_must_identify_same_exact_human_question(key, value):
 @pytest.mark.parametrize(
     "key,value",
     [
-        ("parent_job_id", str(uuid4())),
+        pytest.param("parent_job_id", str(uuid4()), id="parent-job"),
         ("context", {"loop_id": str(uuid4())}),
         ("context", None),
         ("context", []),

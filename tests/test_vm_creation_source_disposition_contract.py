@@ -69,7 +69,7 @@ async def test_preparation_delete_recognizes_exact_disposed_pin():
     [
         ("version", True),
         ("disposition_id", "missing"),
-        ("dv_uid", str(uuid4())),
+        pytest.param("dv_uid", str(uuid4()), id="different-dv-uid"),
         ("rootdisk_name", "arbitrary"),
         ("target", {"done": True}),
     ],
