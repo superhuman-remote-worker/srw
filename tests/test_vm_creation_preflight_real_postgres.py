@@ -309,7 +309,9 @@ async def test_cancelled_preflight_cannot_settle_an_existing_creation_ledger(db)
 
 
 @pytest.mark.asyncio
-async def test_preflight_deadline_becomes_visible_attention_without_hot_polling(db):
+async def test_preflight_execution_change_becomes_visible_attention_without_hot_polling(
+    db,
+):
     job, store, claim, _ = await resolving(db)
     async with db.acquire() as conn:
         await conn.execute(
@@ -328,7 +330,7 @@ async def test_preflight_deadline_becomes_visible_attention_without_hot_polling(
             )
         )
         assert value["state"] == "attention"
-        assert value["reason"] == "job_admission_expired"
+        assert value["reason"] == "execution_manifest_changed"
         assert value["claim_token"] is None
 
 
@@ -395,7 +397,11 @@ async def test_retired_successor_preflight_keeps_disk_proof_and_boot_history(db,
 
 
 @pytest.mark.asyncio
-async def test_retired_protocol_generation_can_begin_proven_successor(db, monkeypatch):
+@pytest.mark.parametrize("archived", [False, True])
+@pytest.mark.parametrize("deadline_changed", [False, True])
+async def test_retired_protocol_generation_can_begin_proven_successor(
+    db, monkeypatch, archived, deadline_changed
+):
     from tests.test_vm_creation_effects_real_postgres import observed_creation
     from shared.vm_creation_retry import canonical_request_digest
 
@@ -413,6 +419,10 @@ async def test_retired_protocol_generation_can_begin_proven_successor(db, monkey
         "request": row["canonical_request"],
         "request_digest": canonical_request_digest(row["canonical_request"]),
         "request_id": str(row["request_id"]),
+        "execution_id": str(row["execution_id"]),
+        "execution_revision": row["execution_revision"],
+        "execution_generation": row["execution_generation"],
+        "admission_deadline": row["admission_deadline"].isoformat(),
         "revision": 2,
         "attempt": 0,
         "state": "admitted",
@@ -452,10 +462,28 @@ async def test_retired_protocol_generation_can_begin_proven_successor(db, monkey
             job,
             json.dumps({"vm": old}),
         )
+        if deadline_changed:
+            await conn.execute(
+                "UPDATE srw_execution_specs SET created_at=created_at+interval '1 hour' WHERE work_id=$1",
+                job,
+            )
+    if archived:
+        assert await db.shed_workspace_context(str(job), "vm")
     newreq, newctx = candidate(job)
+    if deadline_changed:
+        with pytest.raises(VMCreationRetryConflict, match="execution_manifest_changed"):
+            await store.begin(job_id=str(job), request=newreq, fresh_context=newctx)
+        return
     value = await store.begin(job_id=str(job), request=newreq, fresh_context=newctx)
     assert value["request"]["provision_generation"] == newreq["provision_generation"]
     assert value["expected_pvc_uid"] == pvc_uid
+    for key in (
+        "execution_id",
+        "execution_revision",
+        "execution_generation",
+        "admission_deadline",
+    ):
+        assert value[key] == prior[key]
 
 
 @pytest.mark.asyncio
@@ -494,3 +522,53 @@ async def test_control_held_head_does_not_hide_next_due_preflight(db):
     results = await store.claim_due(limit=1)
     assert len(results) == 1
     assert results[0]["job_id"] == str(jobs[1])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["revision", "generation", "deadline"])
+async def test_resolution_handoff_rejects_execution_snapshot_drift(db, change):
+    job, store, claim, resolved = await resolving(db)
+    async with db.acquire() as conn:
+        if change == "revision":
+            await conn.execute(
+                "UPDATE srw_execution_specs SET revision='revision-changed' WHERE work_id=$1",
+                job,
+            )
+        elif change == "generation":
+            await conn.execute(
+                "UPDATE srw_execution_specs SET generation=generation+1 WHERE work_id=$1",
+                job,
+            )
+        else:
+            await conn.execute(
+                "UPDATE srw_execution_specs SET created_at=created_at+interval '1 hour' WHERE work_id=$1",
+                job,
+            )
+    with pytest.raises(VMCreationRetryConflict, match="execution_manifest_changed"):
+        await store.complete_resolution(claim, resolved)
+    async with db.acquire() as conn:
+        assert not await conn.fetchval(
+            "SELECT EXISTS(SELECT 1 FROM vm_creation_retries WHERE job_id=$1)", job
+        )
+        assert await conn.fetchval(
+            "SELECT context->'vm'->'creation_request' FROM jobs WHERE id=$1", job
+        ) in (None, "null")
+
+
+@pytest.mark.asyncio
+async def test_original_preflight_deadline_expires_without_manifest_change(db):
+    job = await initial_job(db, timeout=1)
+    request, fresh = candidate(job)
+    store = VMCreationPreflightStore(db)
+    value = await store.begin(job_id=str(job), request=request, fresh_context=fresh)
+    await asyncio.sleep(1.1)
+    assert await store.claim_due(limit=1) == []
+    async with db.acquire() as conn:
+        current = json.loads(
+            await conn.fetchval(
+                "SELECT context->'vm'->'creation_preflight' FROM jobs WHERE id=$1", job
+            )
+        )
+    assert current["state"] == "attention"
+    assert current["reason"] == "job_admission_expired"
+    assert current["admission_deadline"] == value["admission_deadline"]

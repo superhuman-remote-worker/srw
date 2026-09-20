@@ -6,6 +6,7 @@ commit together before any protocol create is eligible.
 """
 
 from copy import deepcopy
+from datetime import datetime
 import json
 import math
 from uuid import UUID, uuid4
@@ -28,11 +29,38 @@ def _object(value):
     return value
 
 
+def _execution_binding(value):
+    execution_id = UUID(value["execution_id"])
+    if str(execution_id) != value["execution_id"]:
+        raise ValueError("Invalid execution identity")
+    revision = value["execution_revision"]
+    generation = value["execution_generation"]
+    if (
+        not isinstance(revision, str)
+        or not revision
+        or type(generation) is not int
+        or generation < 1
+    ):
+        raise ValueError("Invalid execution snapshot")
+    deadline = value["admission_deadline"]
+    if deadline is not None:
+        deadline = datetime.fromisoformat(deadline)
+        if deadline.tzinfo is None or deadline.utcoffset() is None:
+            raise ValueError("Invalid execution deadline")
+    return {
+        "execution_id": execution_id,
+        "execution_revision": revision,
+        "execution_generation": generation,
+        "admission_deadline": deadline,
+    }
+
+
 def _preflight(vm):
     value = _object(vm.get("creation_preflight"))
     if not value:
         return None
     try:
+        _execution_binding(value)
         if (
             type(value["version"]) is not int
             or value["version"] != 1
@@ -162,7 +190,10 @@ class VMCreationPreflightStore:
                 )
                 if prior and not (retired and prior["state"] == "admitted"):
                     await self.retry._current(
-                        conn, job, UUID(old_vm["provision_generation"])
+                        conn,
+                        job,
+                        UUID(old_vm["provision_generation"]),
+                        retry=_execution_binding(prior),
                     )
                     return prior
                 if (
@@ -206,10 +237,16 @@ class VMCreationPreflightStore:
                     "provision_attempts": attempts,
                 }
                 context["vm"] = vm
-                await self.retry._current(
+                _, _, execution = await self.retry._current(
                     conn,
                     {**dict(job), "context": context},
                     UUID(vm["provision_generation"]),
+                    retry=_execution_binding(predecessor_preflight)
+                    if (
+                        predecessor_preflight := prior
+                        or _preflight(_object(context.get("last_vm")))
+                    )
+                    else None,
                 )
                 now = await conn.fetchval(
                     "SELECT extract(epoch FROM clock_timestamp())::double precision"
@@ -227,6 +264,12 @@ class VMCreationPreflightStore:
                     "claim_token": None,
                     "claim_expires_at": None,
                     "outage_started_at": None,
+                    "execution_id": str(execution["id"]),
+                    "execution_revision": execution["revision"],
+                    "execution_generation": execution["generation"],
+                    "admission_deadline": execution["deadline"].isoformat()
+                    if execution["deadline"]
+                    else None,
                     **predecessor,
                 }
                 vm["creation_preflight"] = value
@@ -284,10 +327,20 @@ class VMCreationPreflightStore:
                     job, _, vm, value = await self._lock(conn, job_id)
                     try:
                         await self.retry._current(
-                            conn, job, UUID(vm["provision_generation"])
+                            conn,
+                            job,
+                            UUID(vm["provision_generation"]),
+                            retry=_execution_binding(value) if value else None,
                         )
                     except VMCreationRetryConflict as exc:
-                        if exc.reason != "job_admission_expired" or not value:
+                        if (
+                            exc.reason
+                            not in {
+                                "job_admission_expired",
+                                "execution_manifest_changed",
+                            }
+                            or not value
+                        ):
                             raise
                         value.update(
                             state="attention",
@@ -335,7 +388,12 @@ class VMCreationPreflightStore:
 
     async def _claimed(self, conn, claim):
         job, _, vm, value = await self._lock(conn, UUID(claim["job_id"]))
-        await self.retry._current(conn, job, UUID(vm["provision_generation"]))
+        await self.retry._current(
+            conn,
+            job,
+            UUID(vm["provision_generation"]),
+            retry=_execution_binding(value) if value else None,
+        )
         now = await conn.fetchval(
             "SELECT extract(epoch FROM clock_timestamp())::double precision"
         )
