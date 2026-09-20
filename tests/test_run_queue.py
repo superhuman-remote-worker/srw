@@ -167,6 +167,7 @@ async def _apply_schema() -> None:
         await conn.execute("DROP TABLE IF EXISTS thread_control_requests CASCADE")
         await conn.execute("DROP TABLE IF EXISTS thread_interrupt_requests CASCADE")
         await conn.execute("DROP TABLE IF EXISTS run_queue_bg_tasks CASCADE")
+        await conn.execute("DROP TABLE IF EXISTS vm_workspace_recovery_jobs CASCADE")
         await conn.execute("DROP TABLE IF EXISTS run_queue CASCADE")
         await conn.execute("DROP TABLE IF EXISTS canvases CASCADE")
         await conn.execute("DROP TABLE IF EXISTS thread_input_deliveries CASCADE")
@@ -175,6 +176,12 @@ async def _apply_schema() -> None:
         await conn.execute("DROP TABLE IF EXISTS users CASCADE")
         await conn.execute("DROP TABLE IF EXISTS agents CASCADE")
         await conn.execute('CREATE EXTENSION IF NOT EXISTS "uuid-ossp"')
+        # Recovery's authoritative exclusion is read by claim/completion/reap.
+        # Its full DDL and lifecycle are exercised by the recovery suite.
+        await conn.execute(
+            "CREATE TABLE vm_workspace_recovery_jobs ("
+            "job_id UUID NOT NULL, resolved_at TIMESTAMPTZ)"
+        )
         # Minimal prerequisite stubs: 0115 ALTERs threads and 0119 ALTERs
         # thread_events. The queue API does not otherwise touch either table;
         # they exist here only so the queue-shaping migrations apply verbatim.

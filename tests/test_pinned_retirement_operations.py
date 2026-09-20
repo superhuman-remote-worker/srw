@@ -34,7 +34,13 @@ def _operations(
     agent_provisioner: object | None = None,
     persistent_provisioner: object | None = None,
     vm_provisioner: object | None = None,
+    recovery_store: object | None = None,
 ) -> PinnedRetirementOperations:
+    if recovery_store is None:
+        recovery_store = MagicMock()
+        recovery_store.acquire_cleanup_permit = AsyncMock(
+            return_value=SimpleNamespace(allowed=True, admission_id=None)
+        )
     return PinnedRetirementOperations(
         PinnedRetirementDependencies(
             store=store or MagicMock(),
@@ -43,6 +49,7 @@ def _operations(
             container_provisioner=MagicMock(),
             docker_provisioner=MagicMock(),
             vm_provisioner=vm_provisioner or MagicMock(),
+            recovery_store=recovery_store,
             session_router=MagicMock(),
             resolve_protected_reader_backend=AsyncMock(),
             resolve_ssh_key_path=lambda: None,
@@ -372,6 +379,48 @@ async def test_vm_recovery_stops_exact_pod_before_releasing_captured_vm() -> Non
         expected_workspace_runtime_incarnation="vm-uid-a",
         quiescence_actor="orchestrator",
     )
+
+
+@pytest.mark.asyncio
+async def test_vm_recovery_hold_blocks_pinned_retirement_vm_release() -> None:
+    store = MagicMock()
+    store.get_thread = AsyncMock(
+        side_effect=[_current_vm_thread(), _current_vm_thread()]
+    )
+
+    @asynccontextmanager
+    async def lifecycle_lock(_thread_id: str):
+        yield True
+
+    store.try_thread_advisory_lock = lifecycle_lock
+    agent_provisioner = MagicMock()
+    agent_provisioner.is_available = True
+    agent_provisioner.delete_agent_pod_exact = AsyncMock(return_value=True)
+    agent_provisioner.agent_pod_authority = AsyncMock(
+        side_effect=["exact_terminal", "exact_absent"]
+    )
+    agent_provisioner.release_agent_pod_finalizer_exact = AsyncMock(return_value=True)
+    vm_provisioner = MagicMock()
+    vm_provisioner.lifecycle_available = True
+    vm_provisioner.release_vm_captured = AsyncMock()
+    recovery_store = MagicMock()
+    recovery_store.acquire_cleanup_permit = AsyncMock(
+        return_value=SimpleNamespace(
+            allowed=False,
+            reason="workspace_recovery_unresolved",
+        )
+    )
+    operations = _operations(
+        store=store,
+        agent_provisioner=agent_provisioner,
+        vm_provisioner=vm_provisioner,
+        recovery_store=recovery_store,
+    )
+
+    assert not await operations.recover_captured_process_zero(_vm_retirement())
+
+    recovery_store.acquire_cleanup_permit.assert_awaited_once()
+    vm_provisioner.release_vm_captured.assert_not_awaited()
 
 
 @pytest.mark.asyncio

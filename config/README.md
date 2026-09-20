@@ -167,7 +167,13 @@ config/
 │   ├── summarization_prompt_minimax_m3.txt # MiniMax M3 summarization
 │   ├── systemprompt_glm.txt                # GLM-5.2 worker system prompt
 │   ├── systemprompt_interactive_glm.txt    # GLM-5.2 persistent-chat system prompt
-│   └── persona_glm.txt                     # GLM-5.2 persona
+│   ├── persona_glm.txt                     # GLM-5.2 persona
+│   ├── systemprompt_glm_5_3.txt            # GLM-5.3 / Flash worker prompt
+│   ├── systemprompt_interactive_glm_5_3.txt # GLM-5.3 / Flash chat prompt
+│   ├── persona_glm_5_3.txt                 # GLM-5.3 / Flash persona
+│   ├── systemprompt_muse_spark_1_3.txt     # Muse Spark 1.3 worker prompt
+│   ├── systemprompt_interactive_muse_spark_1_3.txt # Muse Spark 1.3 chat prompt
+│   └── persona_muse_spark_1_3.txt          # Muse Spark 1.3 persona
 └── templates/                   # Instruction templates (non-prompt files)
     ├── instructions.md                  # Default agent instructions
     ├── instructions_minimax.md          # MiniMax M2.7-optimized instructions
@@ -706,6 +712,44 @@ tools:
 `null` clears a key for *that* merge only — a later layer (a job override)
 re-adds it. Keys a role must never see are declared with `$ignore_keys` on the
 role overlay instead (see above); they are pruned after every layer.
+
+## Z.ai GLM-5.3 models
+
+The `glm-5.3` family covers the text-only flagship; `glm-5.3-flash` also enables
+image input. Both use the GLM-5.3 worker/chat/persona prompts, temperature `1.0`,
+top-p `0.95`, reasoning `max` (options: `low`, `high`, `max`), a 1M-token context,
+and a 131,072-token output budget. Reasoning cannot be disabled. Older models
+such as GLM-5.2 retain the `glm` family.
+
+In **Admin → Models**, add `z-ai/glm-5.3-flash` using your OpenRouter provider;
+`openrouter/z-ai/glm-5.3-flash` is also recognized. The family is detected
+automatically. For Z.ai's OpenAI-compatible endpoint, use the bare model ID
+`glm-5.3-flash`. Explicit model/expert/user settings override the family defaults.
+
+Sampling and reasoning follow [Z.ai's documented settings](https://docs.z.ai/guides/vlm/glm-5.3-flash).
+Context limits can vary by OpenRouter provider; an explicit catalog context/output
+limit overrides the family values. Adding a family does not create a catalog row.
+
+## Meta Muse Spark 1.3
+
+The `muse-spark-1.3` family supplies worker/chat/persona prompts, image input,
+a 1,048,576-token context window, and a 131,072-token response budget including
+reasoning. The response budget follows SRW's existing runtime ceiling;
+[OpenRouter advertises a larger provider limit](https://openrouter.ai/api/v1/models/meta/muse-spark-1.3/endpoints).
+
+Reasoning defaults to `medium`, with `minimal`, `low`, `medium`, `high`, `xhigh`,
+and `max` available. Reasoning is required, as declared in the
+[OpenRouter model catalog](https://openrouter.ai/api/v1/models).
+Temperature `1.0` and top-p `1.0` follow the conventional defaults listed in
+[OpenRouter's parameter guide](https://openrouter.ai/docs/api/reference/parameters),
+not a verified Meta-specific recommendation. Explicit settings override them.
+
+In **Admin → Models**, add `meta/muse-spark-1.3` using your OpenRouter provider.
+The family is detected automatically, including with an `openrouter/` prefix.
+The separately selected `meta/muse-spark-1.3-contributor` also uses this family;
+family detection preserves the selected model ID and tier. Adding the family
+does not register a catalog row. Audio/video input transport is outside this
+family configuration change.
 
 ## Schema Validation
 

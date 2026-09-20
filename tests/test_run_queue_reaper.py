@@ -14,14 +14,54 @@ intent settles applied/hard on owner loss and consumes its exact target input.
 import asyncio
 import json
 import uuid
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
+import asyncpg
 
 from orchestrator.services import run_queue_reaper as mod
 from shared import session_permission_retirement as permission_retirement
 from shared.run_queue import StolenUnit
 from shared.run_queue import queries as queue_queries
+from shared.workspace_recovery import RecoveryAttemptDisposition
+from tests import test_vm_workspace_recovery_real_postgres as recovery_postgres
+
+pg_dsn = recovery_postgres.pg_dsn
+_schema_applied = recovery_postgres._schema_applied
+app_pg = recovery_postgres.app_pg
+insert_leased_job = recovery_postgres.insert_leased_job
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["paused_attention", "recovering", "recovered"])
+async def test_incomplete_runtime_identity_is_only_valid_for_attention(app_pg, phase):
+    operation_id = uuid.uuid4()
+    async with app_pg.acquire() as conn:
+        sql = (
+            "INSERT INTO vm_workspace_recoveries (id, owner_kind, owner_id, "
+            "workspace_contract_digest, provision_generation, cluster_name, namespace, "
+            "vm_uid, prior_vmi_uid, prior_launcher_uid, root_pvc_uid, phase, "
+            "first_observed_at, deadline_at, next_check_at, reason_code, resolved_at) "
+            "VALUES ($1, 'job', $1, 'contract', $1, 'local', 'workers', $1, NULL, $1, $1, "
+            "$2, now(), now()+interval '15 minutes', now(), 'tool_outcome_unknown', "
+            "CASE WHEN $2='recovered' THEN now() ELSE NULL END)"
+        )
+        if phase == "paused_attention":
+            await conn.execute(sql, operation_id, phase)
+            assert (
+                await conn.fetchval(
+                    "SELECT reason_code FROM vm_workspace_recoveries WHERE id=$1",
+                    operation_id,
+                )
+                == "tool_outcome_unknown"
+            )
+        else:
+            with pytest.raises(
+                asyncpg.CheckViolationError, match="exact_runtime_identity"
+            ):
+                await conn.execute(sql, operation_id, phase)
+
 
 UNIT_A = uuid.UUID("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
 UNIT_B = uuid.UUID("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb")
@@ -29,6 +69,255 @@ REQUEST_A = uuid.UUID("11111111-1111-1111-1111-111111111111")
 REQUEST_B = uuid.UUID("22222222-2222-2222-2222-222222222222")
 CLIENT_A = uuid.UUID("33333333-3333-3333-3333-333333333333")
 CLIENT_B = uuid.UUID("44444444-4444-4444-4444-444444444444")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("handled", [False, True])
+async def test_worker_steal_callback_precedes_generic_exhaustion(handled):
+    candidate = {
+        "unit_id": UNIT_A,
+        "unit_kind": "worker_batch",
+        "leased_by": "pod-1",
+        "lease_token": 8,
+        "attempts_since_completion": 5,
+        "max_attempts": 5,
+    }
+    conn = MagicMock()
+    conn.fetch = AsyncMock(return_value=[candidate])
+    conn.fetchrow = AsyncMock(
+        return_value={
+            **candidate,
+            "lease_token": 9,
+            "state": "parked",
+            "interrupt_admission_lease_token": None,
+            "interrupt_admission_turn_id": None,
+        }
+    )
+    callback = AsyncMock(return_value=None)
+    kwargs = {"worker_steal": callback} if handled else {}
+    result = await queue_queries.reap_expired(conn, **kwargs)
+    if handled:
+        assert result == []
+        conn.fetchrow.assert_not_awaited()
+        assert callback.await_args.kwargs["candidate"]["lease_token"] == 8
+    else:
+        assert len(result) == 1 and result[0].state == "parked"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("evidence", ["pre_bundle", "authorized", "missing", "held"])
+async def test_worker_reaper_resolves_exact_attempt_before_exhaustion(
+    monkeypatch, evidence
+):
+    monkeypatch.setenv("VM_WORKSPACE_RECOVERY_ENABLED", "true")
+    conn = _conn()
+    conn.queue_row = {
+        **_queue(state="leased", token=8, attempts=5),
+        "unit_kind": "worker_batch",
+    }
+    candidate = {
+        "unit_id": UNIT_A,
+        "unit_kind": "worker_batch",
+        "lease_token": 8,
+        "leased_by": "pod-1",
+        "attempts_since_completion": 5,
+        "max_attempts": 5,
+    }
+    attempt = (
+        None
+        if evidence == "missing"
+        else RecoveryAttemptDisposition(
+            job_id=UNIT_A,
+            lease_token=8,
+            bundle_authorized=evidence == "authorized",
+            authority_digest="digest" if evidence == "authorized" else None,
+            disposition=None,
+            recovery_id=REQUEST_A if evidence == "held" else None,
+            refunded=False,
+        )
+    )
+    store = SimpleNamespace(
+        get_attempt_disposition=AsyncMock(return_value=attempt),
+        admit_hold_from_reaper=AsyncMock(return_value=True),
+    )
+    monkeypatch.setattr(mod, "VMWorkspaceRecoveryStore", lambda db: store)
+    await mod._try_steal_worker_with_recovery(
+        conn, candidate=candidate, backoff_seconds=0, grace_seconds=0
+    )
+    store.get_attempt_disposition.assert_awaited_once_with(
+        conn, job_id=UNIT_A, lease_token=8
+    )
+    store.admit_hold_from_reaper.assert_awaited_once()
+    kwargs = store.admit_hold_from_reaper.await_args.kwargs
+    assert kwargs["disposition"] is attempt
+    assert kwargs["lease_token"] == 8
+    assert not any(
+        call.args[0] == queue_queries._REAP_STEAL_SQL
+        for call in conn.fetchrow.await_args_list
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("evidence", ["pre_bundle", "authorized", "missing"])
+@pytest.mark.parametrize("identity_complete", [True, False])
+async def test_expired_vm_attempt_five_holds_or_pauses_unknown_in_postgres(
+    app_pg, monkeypatch, evidence, identity_complete
+):
+    monkeypatch.setenv("VM_WORKSPACE_RECOVERY_ENABLED", "true")
+    job_id, token = await insert_leased_job(
+        app_pg, include_attempt=evidence != "missing"
+    )
+    vm = {
+        key: str(uuid.uuid4())
+        for key in (
+            "provision_generation",
+            "vm_uid",
+            "vmi_uid",
+            "active_pod_uid",
+            "rootdisk_pvc_uid",
+        )
+    }
+    vm["namespace"] = "workers"
+    if not identity_complete:
+        vm.pop("vmi_uid")
+    async with app_pg.acquire() as conn:
+        await conn.execute(
+            "UPDATE jobs SET config_override=$2::jsonb, context=$3::jsonb WHERE id=$1",
+            job_id,
+            json.dumps({"workspace": {"backend": "vm"}}),
+            json.dumps({"vm": vm}),
+        )
+        await conn.execute(
+            "UPDATE run_queue SET attempts_since_completion=5, leased_until=clock_timestamp()-interval '1 minute' WHERE unit_id=$1",
+            job_id,
+        )
+        await conn.execute(
+            "UPDATE worker_batch_attempts SET claimed_attempt=5 WHERE job_id=$1", job_id
+        )
+        if evidence == "authorized":
+            await conn.execute(
+                "UPDATE worker_batch_attempts SET bundle_authorized_at=clock_timestamp(), authority_digest='digest' WHERE job_id=$1",
+                job_id,
+            )
+        await mod.reap_cycle(conn, grace_seconds=0)
+        queue = await conn.fetchrow("SELECT * FROM run_queue WHERE unit_id=$1", job_id)
+        operation = await conn.fetchrow(
+            "SELECT * FROM vm_workspace_recoveries WHERE owner_id=$1", job_id
+        )
+        attempt = await conn.fetchrow(
+            "SELECT * FROM worker_batch_attempts WHERE job_id=$1", job_id
+        )
+        assert queue["state"] == "parked"
+        assert queue["park_reason"] == "workspace_recovery"
+        assert queue["lease_token"] == token + 1
+        assert operation["phase"] == (
+            "recovering"
+            if evidence == "pre_bundle" and identity_complete
+            else "paused_attention"
+        )
+        assert operation["reason_code"] == (
+            "workspace_runtime_not_ready"
+            if evidence == "pre_bundle" and identity_complete
+            else "workspace_identity_conflict"
+            if evidence == "pre_bundle"
+            else "tool_outcome_unknown"
+        )
+        assert queue["attempts_since_completion"] == (
+            4 if evidence == "pre_bundle" else 5
+        )
+        if evidence != "pre_bundle":
+            diagnostic = json.loads(operation["latest_diagnostic"])
+            assert "tool_outcome_unknown" in diagnostic["recovery_codes"]
+            assert diagnostic["attempt_ledger_present"] is (evidence != "missing")
+            if not identity_complete:
+                assert "workspace_identity_conflict" in diagnostic["recovery_codes"]
+                assert "prior_vmi_uid" in diagnostic["missing_identity_fields"]
+        if attempt:
+            assert bool(attempt["refunded_at"]) is (evidence == "pre_bundle")
+
+
+@pytest.mark.asyncio
+async def test_expired_vm_reaper_rereads_authorization_under_lock(app_pg, monkeypatch):
+    monkeypatch.setenv("VM_WORKSPACE_RECOVERY_ENABLED", "true")
+    job_id, token = await insert_leased_job(app_pg)
+    async with app_pg.acquire() as conn:
+        vm = {
+            key: str(uuid.uuid4())
+            for key in (
+                "provision_generation",
+                "vm_uid",
+                "vmi_uid",
+                "active_pod_uid",
+                "rootdisk_pvc_uid",
+            )
+        }
+        vm["namespace"] = "workers"
+        await conn.execute(
+            "UPDATE jobs SET config_override=$2::jsonb, context=$3::jsonb WHERE id=$1",
+            job_id,
+            json.dumps({"workspace": {"backend": "vm"}}),
+            json.dumps({"vm": vm}),
+        )
+        await conn.execute(
+            "UPDATE run_queue SET leased_until=clock_timestamp()-interval '1 minute' WHERE unit_id=$1",
+            job_id,
+        )
+        store = mod.VMWorkspaceRecoveryStore(app_pg)
+        old = await store.get_attempt_disposition(
+            conn, job_id=job_id, lease_token=token
+        )
+        await conn.execute(
+            "UPDATE worker_batch_attempts SET bundle_authorized_at=clock_timestamp(), authority_digest='digest' WHERE job_id=$1",
+            job_id,
+        )
+        await store.admit_hold_from_reaper(
+            conn, disposition=old, job_id=job_id, lease_token=token, grace_seconds=0
+        )
+        assert (
+            await conn.fetchval(
+                "SELECT reason_code FROM vm_workspace_recoveries WHERE owner_id=$1",
+                job_id,
+            )
+            == "tool_outcome_unknown"
+        )
+        assert (
+            await conn.fetchval(
+                "SELECT refunded_at FROM worker_batch_attempts WHERE job_id=$1", job_id
+            )
+            is None
+        )
+
+
+@pytest.mark.asyncio
+async def test_renewed_vm_lease_is_not_reaped_from_stale_candidate(app_pg, monkeypatch):
+    monkeypatch.setenv("VM_WORKSPACE_RECOVERY_ENABLED", "true")
+    job_id, token = await insert_leased_job(app_pg)
+    async with app_pg.acquire() as conn:
+        await conn.execute(
+            "UPDATE jobs SET config_override=$2::jsonb WHERE id=$1",
+            job_id,
+            json.dumps({"workspace": {"backend": "vm"}}),
+        )
+        result = await mod._try_steal_worker_with_recovery(
+            conn,
+            candidate={
+                "unit_id": job_id,
+                "unit_kind": "worker_batch",
+                "lease_token": token,
+                "leased_by": "worker-a",
+                "attempts_since_completion": 5,
+            },
+            backoff_seconds=0,
+            grace_seconds=0,
+        )
+        assert result is None
+        assert (
+            await conn.fetchval(
+                "SELECT lease_token FROM run_queue WHERE unit_id=$1", job_id
+            )
+            == token
+        )
+        assert await conn.fetchval("SELECT count(*) FROM vm_workspace_recoveries") == 0
 
 
 def _stolen(

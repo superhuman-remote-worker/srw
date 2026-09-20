@@ -553,6 +553,30 @@ class TestRequestVmDelete:
     """Tests for NatsBridge.request_vm_delete()."""
 
     @pytest.mark.asyncio
+    async def test_parent_cleanup_proof_is_covered_by_delete_signature(
+        self, bridge_with_db, mock_nc
+    ):
+        from orchestrator.services.vm_lifecycle_auth import verify_payload
+
+        secret = b"parent-cleanup-transport-test-secret"
+        bridge_with_db._lifecycle_hmac_secret = secret
+        proof = {"admission_id": "parent-admission", "intent_digest": "sha256:exact"}
+        assert await bridge_with_db.request_vm_delete(
+            "test-job-456",
+            provision_generation="00000000-0000-4000-8000-000000000001",
+            parent_cleanup=proof,
+        )
+        payload = json.loads(mock_nc.publish.call_args.args[1].decode())
+        assert payload["parent_cleanup"] == proof
+        assert verify_payload(
+            payload, direction="request", operation="delete", secret=secret
+        )
+        payload["parent_cleanup"]["admission_id"] = "different-parent"
+        assert not verify_payload(
+            payload, direction="request", operation="delete", secret=secret
+        )
+
+    @pytest.mark.asyncio
     async def test_delete_publishes_correct_payload(
         self, bridge_with_db, mock_nc, mock_db
     ):

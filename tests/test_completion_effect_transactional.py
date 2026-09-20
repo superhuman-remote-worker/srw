@@ -211,7 +211,17 @@ async def test_transactional_effect_domain_write_and_marker_share_transaction():
     assert domain_write[2] > 0
     assert completion_marker[2] > 0
     assert domain_write[3] is completion_marker[3] is asyncio.current_task()
-    assert parent.transaction_events == ["begin:1", "begin:2", "commit:2", "commit:1"]
+    # Preparation and the callback's database helper each use a savepoint
+    # inside the task-scoped transaction. Both settle before the outer domain
+    # transaction, which also owns the completion marker.
+    assert parent.transaction_events == [
+        "begin:1",
+        "begin:2",
+        "commit:2",
+        "begin:2",
+        "commit:2",
+        "commit:1",
+    ]
     assert child.calls == []
     assert ledger.pool_events == ["acquire:parent", "release:parent"]
     assert any(
@@ -305,6 +315,8 @@ async def test_transactional_callback_error_rolls_back_without_shield_child_writ
     assert ledger.committed_mutations == []
     assert parent.transaction_events == [
         "begin:1",
+        "begin:2",
+        "commit:2",
         "begin:2",
         "commit:2",
         "rollback:1",

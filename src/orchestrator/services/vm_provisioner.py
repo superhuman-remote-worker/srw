@@ -23,7 +23,9 @@ from orchestrator.services.container_provisioner import (
     DEFAULT_NETWORK_TIER,
     WorkspaceRuntimeAttestation,
     WorkspaceRuntimeAuthorityError,
+    WorkspaceRuntimeRecoveryRequired,
 )
+from shared.workspace_recovery import WorkspaceRecoveryCode
 from orchestrator.services.nats_bridge import nats_bridge
 from orchestrator.services.vm_lifecycle_auth import (
     AUTH_FIELD,
@@ -572,14 +574,38 @@ class VMProvisioner:
             raise WorkspaceRuntimeAuthorityError(
                 "VM controller status is unauthenticated"
             )
-        if _provision_generation(observed.get("provision_generation")) != generation:
+        observed_generation = _provision_generation(
+            observed.get("provision_generation")
+        )
+        if observed_generation is not None and observed_generation != generation:
+            raise WorkspaceRuntimeRecoveryRequired(
+                "VM provision generation changed",
+                recovery_code=WorkspaceRecoveryCode.REPLACEMENT_OBSERVED,
+            )
+        if observed_generation != generation:
             raise WorkspaceRuntimeAuthorityError("VM provision generation changed")
-        if _safe_vm_uid(observed.get("vm_uid")) != expected_vm_uid:
+        observed_vm_uid = _safe_vm_uid(observed.get("vm_uid"))
+        if observed_vm_uid is not None and observed_vm_uid != expected_vm_uid:
+            raise WorkspaceRuntimeRecoveryRequired(
+                "VM UID changed",
+                recovery_code=WorkspaceRecoveryCode.REPLACEMENT_OBSERVED,
+            )
+        if observed_vm_uid != expected_vm_uid:
             raise WorkspaceRuntimeAuthorityError("VM UID changed")
+        if observed.get("ready") is False:
+            raise WorkspaceRuntimeRecoveryRequired(
+                "VM is not Kubernetes-ready",
+                recovery_code=WorkspaceRecoveryCode.RUNTIME_NOT_READY,
+            )
         if observed.get("ready") is not True:
             raise WorkspaceRuntimeAuthorityError("VM is not Kubernetes-ready")
 
         launcher_uid = _provision_generation(observed.get("active_pod_uid"))
+        if launcher_uid is not None and launcher_uid != expected_launcher_uid:
+            raise WorkspaceRuntimeRecoveryRequired(
+                "VM launcher Pod UID changed",
+                recovery_code=WorkspaceRecoveryCode.REPLACEMENT_OBSERVED,
+            )
         if launcher_uid != expected_launcher_uid:
             raise WorkspaceRuntimeAuthorityError("VM launcher Pod UID changed")
 
@@ -1118,10 +1144,40 @@ class VMProvisioner:
             return _VMTeardownProbe("superseded")
         status = str(result.get("status") or "")
         rootdisk_known = result.get("rootdisk_identity_known") is True
+        # A VM may boot after retirement started, before readiness ever stored
+        # an endpoint. Keep this controller observation local to teardown: it
+        # must not promote or publish a retiring runtime as ready.
+        pod_ip = None
+        if (
+            self.mode == "same-cluster"
+            and result.get("ready") is True
+            and _safe_vm_uid(result.get("active_pod_uid")) is not None
+        ):
+            raw_ip = result.get("pod_ip")
+            try:
+                address = (
+                    ipaddress.ip_address(raw_ip) if isinstance(raw_ip, str) else None
+                )
+            except ValueError:
+                address = None
+            if (
+                address is not None
+                and str(address) == raw_ip
+                and not (
+                    address.is_unspecified
+                    or address.is_loopback
+                    or address.is_link_local
+                    or address.is_multicast
+                    or "%" in raw_ip
+                )
+            ):
+                pod_ip = raw_ip
         identity = VMTeardownIdentity(
             provision_generation=generation,
             vm_uid=_safe_vm_uid(result.get("vm_uid")),
             rootdisk_pvc_uid=_safe_vm_uid(result.get("rootdisk_pvc_uid")),
+            ssh_host=pod_ip,
+            ssh_port=22 if pod_ip is not None else None,
             credential_runtime_started=(
                 result.get("credential_runtime_started")
                 if type(result.get("credential_runtime_started")) is bool
@@ -1208,6 +1264,7 @@ class VMProvisioner:
         *,
         purge_disk: bool = True,
         entity_type: str = "job",
+        parent_cleanup: Mapping[str, Any] | None = None,
     ) -> VMTeardownResult:
         """Delete only the VM/rootdisk incarnation captured in an intent."""
 
@@ -1253,6 +1310,9 @@ class VMProvisioner:
             expected_vm_uid=_safe_vm_uid(identity.vm_uid),
             expected_rootdisk_pvc_uid=_safe_vm_uid(identity.rootdisk_pvc_uid),
             entity_type=entity_type,
+            **(
+                {"parent_cleanup": parent_cleanup} if parent_cleanup is not None else {}
+            ),
         )
         reprobe = await self._probe_vm_teardown_identity(job_id, generation)
         reclassification = self._classify_captured_probe(
@@ -1451,6 +1511,7 @@ class VMProvisioner:
         entity_type: str = "job",
         purge_disk: bool = True,
         capture_snapshot: bool = True,
+        parent_cleanup: Mapping[str, Any] | None = None,
     ) -> VMTeardownResult:
         """Best-effort archive, then release only the captured VM incarnation."""
 
@@ -1525,6 +1586,11 @@ class VMProvisioner:
                 identity,
                 purge_disk=purge_disk,
                 entity_type=entity_type,
+                **(
+                    {"parent_cleanup": parent_cleanup}
+                    if parent_cleanup is not None
+                    else {}
+                ),
             )
 
         if (
@@ -1613,13 +1679,27 @@ class VMProvisioner:
             current_identity is not None
             and current_identity.credential_runtime_started is False
         )
+        discovered_endpoint = False
         if not never_started:
+            if (
+                not effective_ssh_host
+                and not effective_ssh_port
+                and self.mode == "same-cluster"
+                and current_identity is not None
+                and self._classify_captured_probe(probe, identity, purge_disk=True)
+                == "matched"
+            ):
+                effective_ssh_host = current_identity.ssh_host
+                effective_ssh_port = current_identity.ssh_port
+                discovered_endpoint = bool(effective_ssh_host and effective_ssh_port)
             if (
                 not effective_ssh_host
                 or not effective_ssh_port
                 or not identity.ssh_host_key_fingerprint
             ):
                 return VMTeardownResult("process_zero_unproven", False)
+            # Never learn a new host key from the candidate endpoint. The SSH
+            # actuator authenticates the captured, controller-admitted pin.
             retired = await retire_managed_repository_processes(
                 host=effective_ssh_host,
                 port=int(effective_ssh_port),
@@ -1633,7 +1713,7 @@ class VMProvisioner:
             self._classify_captured_probe(
                 reprobe,
                 identity,
-                purge_disk=purge_disk,
+                purge_disk=purge_disk or discovered_endpoint,
             )
             != "matched"
         ):
@@ -1654,6 +1734,9 @@ class VMProvisioner:
             identity,
             purge_disk=purge_disk,
             entity_type=entity_type,
+            **(
+                {"parent_cleanup": parent_cleanup} if parent_cleanup is not None else {}
+            ),
         )
 
     async def delete_orphan_vm_captured(
@@ -1662,6 +1745,7 @@ class VMProvisioner:
         identity: VMTeardownIdentity,
         *,
         purge_disk: bool = True,
+        parent_cleanup: Mapping[str, Any] | None = None,
     ) -> VMTeardownResult:
         """Delete an inventory-proven VM after both owning rows are absent."""
 
@@ -1700,6 +1784,9 @@ class VMProvisioner:
             provision_generation=generation,
             expected_vm_uid=vm_uid,
             expected_rootdisk_pvc_uid=rootdisk_uid,
+            **(
+                {"parent_cleanup": parent_cleanup} if parent_cleanup is not None else {}
+            ),
         )
         reprobe = await self._probe_vm_teardown_identity(job_id, generation)
         reclassification = self._classify_captured_probe(
@@ -1752,6 +1839,7 @@ class VMProvisioner:
         expected_vm_uid: str | None = None,
         expected_rootdisk_pvc_uid: str | None = None,
         entity_type: str = "job",
+        parent_cleanup: Mapping[str, Any] | None = None,
     ) -> bool:
         generation = _provision_generation(provision_generation)
         if self._nats_available:
@@ -1764,6 +1852,8 @@ class VMProvisioner:
                 kwargs["expected_vm_uid"] = expected_vm_uid
             if expected_rootdisk_pvc_uid is not None:
                 kwargs["expected_rootdisk_pvc_uid"] = expected_rootdisk_pvc_uid
+            if parent_cleanup is not None:
+                kwargs["parent_cleanup"] = dict(parent_cleanup)
             return await nats_bridge.request_vm_delete(job_id, **kwargs)
 
         if self._http_available:
@@ -1776,6 +1866,8 @@ class VMProvisioner:
                 kwargs["expected_vm_uid"] = expected_vm_uid
             if expected_rootdisk_pvc_uid is not None:
                 kwargs["expected_rootdisk_pvc_uid"] = expected_rootdisk_pvc_uid
+            if parent_cleanup is not None:
+                kwargs["parent_cleanup"] = dict(parent_cleanup)
             return await self._delete_http(job_id, **kwargs)
 
         return False
@@ -1788,6 +1880,7 @@ class VMProvisioner:
         expected_vm_uid: str,
         expected_rootdisk_pvc_uid: str | None,
         purge_disk: bool,
+        parent_cleanup: Mapping[str, Any] | None = None,
     ) -> bool:
         """Delete one captured thread VM incarnation, never its successor."""
 
@@ -1809,6 +1902,9 @@ class VMProvisioner:
             expected_vm_uid=vm_uid,
             expected_rootdisk_pvc_uid=rootdisk_uid,
             entity_type="thread",
+            **(
+                {"parent_cleanup": parent_cleanup} if parent_cleanup is not None else {}
+            ),
         )
 
     async def release_vm(
@@ -1922,6 +2018,138 @@ class VMProvisioner:
                 return None
             result.pop("_identity_authenticated", None)
         return result
+
+    async def reconcile_workspace_recovery_pin(self, command: Any) -> Mapping[str, Any]:
+        """Project one durable DB pin into the controller's Lease registry."""
+
+        if not self._http_available or self._http_client is None:
+            raise RuntimeError("same-cluster recovery pin transport is unavailable")
+        payload = {
+            "recovery_id": str(command.recovery_id),
+            "pvc_uid": str(command.pvc_uid),
+            "provision_generation": str(command.provision_generation),
+            "state": command.desired_state,
+            "owner_kind": command.owner_kind,
+            "owner_id": str(command.owner_id),
+            "namespace": command.namespace,
+        }
+        if command.controller_pin_uid is not None:
+            payload["pin_uid"] = command.controller_pin_uid
+        if command.controller_pin_resource_version is not None:
+            payload["resource_version"] = command.controller_pin_resource_version
+        signed = sign_payload(
+            payload,
+            direction="request",
+            operation="recovery-pin",
+            secret=self._lifecycle_hmac_secret,
+        )
+        auth = signed.get(AUTH_FIELD)
+        request_id = auth.get("request_id") if isinstance(auth, Mapping) else None
+        response = await self._http_client.post(
+            "/workspace-recovery/pins", json=signed, timeout=self._http_timeout
+        )
+        data = response.json()
+        if not isinstance(data, Mapping) or not verify_payload(
+            data,
+            direction="response",
+            operation="recovery-pin",
+            secret=self._lifecycle_hmac_secret,
+            expected_correlation_id=request_id,
+        ):
+            raise RuntimeError("workspace recovery pin response is unauthenticated")
+        response.raise_for_status()
+        return unsigned_payload(data)
+
+    async def observe_workspace_recovery(
+        self, captured_identity: Mapping[str, Any]
+    ) -> Mapping[str, Any]:
+        """Observe recovery authority without calling status persistence."""
+
+        if not self._http_available or self._http_client is None:
+            raise RuntimeError("same-cluster recovery observation is unavailable")
+        payload = {key: str(value) for key, value in captured_identity.items()}
+        signed = sign_payload(
+            payload,
+            direction="request",
+            operation="recovery-observe",
+            secret=self._lifecycle_hmac_secret,
+        )
+        auth = signed.get(AUTH_FIELD)
+        request_id = auth.get("request_id") if isinstance(auth, Mapping) else None
+        response = await self._http_client.post(
+            "/workspace-recovery/observe", json=signed, timeout=self._http_timeout
+        )
+        data = response.json()
+        if not isinstance(data, Mapping) or not verify_payload(
+            data,
+            direction="response",
+            operation="recovery-observe",
+            secret=self._lifecycle_hmac_secret,
+            expected_correlation_id=request_id,
+        ):
+            raise RuntimeError("workspace recovery observation is unauthenticated")
+        response.raise_for_status()
+        observation = dict(unsigned_payload(data))
+        owner_kind = str(captured_identity.get("owner_kind") or "")
+        owner_id = str(captured_identity.get("owner_id") or "")
+        try:
+            row = (
+                await self._db.get_thread(owner_id)
+                if owner_kind == "thread"
+                else await self._db.get_job(owner_id)
+            )
+        except Exception as exc:
+            raise RuntimeError("workspace recovery owner read failed") from exc
+        if not isinstance(row, Mapping):
+            raise RuntimeError("workspace recovery owner is unavailable")
+        context = (
+            _extract_thread_vm_context(row)
+            if owner_kind == "thread"
+            else _extract_vm_context(dict(row))
+        )
+        if any(
+            str(context.get(context_key) or "")
+            != str(captured_identity.get(captured_key) or "")
+            for context_key, captured_key in (
+                ("provision_generation", "provision_generation"),
+                ("vm_uid", "vm_uid"),
+                ("rootdisk_pvc_uid", "root_pvc_uid"),
+            )
+        ):
+            observation["ambiguous"] = True
+            return observation
+        successor = observation.get("successor")
+        if observation.get("ready") is not True or not isinstance(successor, Mapping):
+            return observation
+        fingerprint = _safe_ssh_host_key_fingerprint(
+            context.get("ssh_host_key_fingerprint")
+        )
+        if fingerprint is None:
+            return observation
+        from orchestrator.services.vm_readiness import qualify_recovery_successor
+
+        qualified = await qualify_recovery_successor(
+            successor,
+            host_key_fingerprint=fingerprint,
+        )
+        if qualified is None:
+            return observation
+        successor = {**dict(successor), **qualified}
+        observation.update(
+            {
+                "authenticated": True,
+                "successor": successor,
+                "network_qualification": {
+                    **dict(observation.get("network_qualification") or {}),
+                    **dict(qualified.get("guest_network") or {}),
+                    "address": successor.get("pod_ip"),
+                    "cloud_init_cache": "untouched",
+                    "legacy_cloud_init_cache_cleaned": False,
+                    "qualified": True,
+                },
+            }
+        )
+        return observation
 
     async def list_vms(
         self, *, include_teardown_identity: bool = False
@@ -2302,6 +2530,7 @@ class VMProvisioner:
         provision_generation: str | None = None,
         expected_vm_uid: str | None = None,
         expected_rootdisk_pvc_uid: str | None = None,
+        parent_cleanup: Mapping[str, Any] | None = None,
     ) -> bool:
         """Delete a VM by sending DELETE to the co-located VM controller."""
         if self._http_client is None:
@@ -2320,11 +2549,20 @@ class VMProvisioner:
             "purge_disk": purge_disk,
             "provision_generation": generation,
         }
+        if entity_type != "job":
+            signed_payload["entity_type"] = entity_type
         if expected_vm_uid is not None:
             signed_payload["expected_vm_uid"] = expected_vm_uid
         if expected_rootdisk_pvc_uid is not None:
             signed_payload["expected_rootdisk_pvc_uid"] = expected_rootdisk_pvc_uid
         params: dict[str, str] = {}
+        if parent_cleanup is not None:
+            signed_payload["parent_cleanup"] = json.dumps(
+                parent_cleanup, sort_keys=True, separators=(",", ":")
+            )
+            params["parent_cleanup"] = signed_payload["parent_cleanup"]
+        if entity_type != "job":
+            params["entity_type"] = entity_type
         if not purge_disk:
             params["purge_disk"] = "false"
         if generation is not None:
@@ -2575,6 +2813,10 @@ class VMProvisioner:
             # incarnation read as instantly-stuck the moment it enters
             # 'deleting', and the dispatcher would recycle it on sight.
             "deleting_started_at": None,
+            "retirement_attempts": 0,
+            "retirement_cleanup_pending": False,
+            "retirement_last_result": None,
+            "retirement_retry_after": None,
             "headscale_error": None,
             "provisioned_at": time.time(),
         }

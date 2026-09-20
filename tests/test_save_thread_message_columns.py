@@ -13,6 +13,10 @@ async def test_save_thread_message_inserts_component_columns():
     cm.__aenter__ = AsyncMock(return_value=conn)
     cm.__aexit__ = AsyncMock(return_value=False)
     db.acquire = MagicMock(return_value=cm)
+    transaction = MagicMock()
+    transaction.__aenter__ = AsyncMock(return_value=None)
+    transaction.__aexit__ = AsyncMock(return_value=False)
+    conn.transaction = MagicMock(return_value=transaction)
 
     await db.save_thread_message(
         thread_id="t1",

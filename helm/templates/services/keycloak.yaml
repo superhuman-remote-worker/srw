@@ -1,4 +1,24 @@
 {{- if and .Values.keycloak.enabled .Values.keycloak.internal }}
+{{- $bootstrapEmailDomain := .Values.global.domain | default "srw.invalid" -}}
+{{- $cockpitRedirects := list "http://localhost:4200/*" "http://localhost:4000/*" (printf "%s/*" (include "srw.cockpitUrl" .)) -}}
+{{- $cockpitOrigins := list "http://localhost:4200" "http://localhost:4000" (include "srw.cockpitUrl" .) -}}
+{{- $bffRedirects := list "http://localhost:8085/auth/callback" (printf "%s/auth/callback" (include "srw.apiUrl" .)) (printf "%s/auth/callback" (include "srw.cockpitUrl" .)) | uniq -}}
+{{- $bffOrigins := list (include "srw.apiUrl" .) (include "srw.cockpitUrl" .) | uniq -}}
+{{- $gitRedirects := list "http://localhost:3000/user/oauth2/Keycloak/callback" (printf "%s/user/oauth2/Keycloak/callback" (include "srw.gitUrl" .)) -}}
+{{- $gitOrigins := list "http://localhost:3000" (include "srw.gitUrl" .) -}}
+{{- $cloudRedirects := list "http://localhost:8800/apps/user_oidc/code" (printf "%s/apps/user_oidc/code" (include "srw.cloudUrl" .)) -}}
+{{- $cloudOrigins := list "http://localhost:8800" (include "srw.cloudUrl" .) -}}
+{{- if include "srw.singleOrigin" . -}}
+{{- $origin := include "srw.publicOrigin" . -}}
+{{- $cockpitRedirects = list (printf "%s/*" $origin) -}}
+{{- $cockpitOrigins = list $origin -}}
+{{- $bffRedirects = list (printf "%s/auth/callback" $origin) -}}
+{{- $bffOrigins = list $origin -}}
+{{- $gitRedirects = list (printf "%s/git/user/oauth2/Keycloak/callback" $origin) -}}
+{{- $gitOrigins = list $origin -}}
+{{- $cloudRedirects = list (printf "%s/cloud/apps/user_oidc/code" $origin) -}}
+{{- $cloudOrigins = list $origin -}}
+{{- end -}}
 # Keycloak SSO — Identity provider for all SRW services
 #
 # Secrets injected via env vars (Vault/ESO/manual → secret):
@@ -82,16 +102,8 @@ data:
           "implicitFlowEnabled": false,
           "directAccessGrantsEnabled": false,
           "serviceAccountsEnabled": false,
-          "redirectUris": [
-            "http://localhost:4200/*",
-            "http://localhost:4000/*",
-            "{{ include "srw.cockpitUrl" . }}/*"
-          ],
-          "webOrigins": [
-            "http://localhost:4200",
-            "http://localhost:4000",
-            "{{ include "srw.cockpitUrl" . }}"
-          ],
+          "redirectUris": {{ $cockpitRedirects | toJson }},
+          "webOrigins": {{ $cockpitOrigins | toJson }},
           "protocol": "openid-connect",
           "attributes": {
             "pkce.code.challenge.method": "S256",
@@ -146,13 +158,8 @@ data:
           "directAccessGrantsEnabled": false,
           "serviceAccountsEnabled": false,
           "protocol": "openid-connect",
-          "redirectUris": [
-            "http://localhost:8085/auth/callback",
-            "{{ include "srw.apiUrl" . }}/auth/callback"
-          ],
-          "webOrigins": [
-            "{{ include "srw.apiUrl" . }}"
-          ],
+          "redirectUris": {{ $bffRedirects | toJson }},
+          "webOrigins": {{ $bffOrigins | toJson }},
           "attributes": {
             "post.logout.redirect.uris": "{{ include "srw.cockpitUrl" . }}/*##{{ include "srw.apiUrl" . }}/*",
             "backchannel.logout.url": "{{ include "srw.orchestratorInternalUrl" . }}/auth/backchannel-logout",
@@ -191,14 +198,8 @@ data:
           "directAccessGrantsEnabled": false,
           "serviceAccountsEnabled": false,
           "secret": "${GITEA_OIDC_CLIENT_SECRET}",
-          "redirectUris": [
-            "http://localhost:3000/user/oauth2/Keycloak/callback",
-            "{{ include "srw.gitUrl" . }}/user/oauth2/Keycloak/callback"
-          ],
-          "webOrigins": [
-            "http://localhost:3000",
-            "{{ include "srw.gitUrl" . }}"
-          ],
+          "redirectUris": {{ $gitRedirects | toJson }},
+          "webOrigins": {{ $gitOrigins | toJson }},
           "protocol": "openid-connect",
           "defaultClientScopes": [
             "openid",
@@ -259,14 +260,8 @@ data:
           "directAccessGrantsEnabled": false,
           "serviceAccountsEnabled": false,
           "secret": "${NEXTCLOUD_OIDC_CLIENT_SECRET}",
-          "redirectUris": [
-            "http://localhost:8800/apps/user_oidc/code",
-            "{{ include "srw.cloudUrl" . }}/apps/user_oidc/code"
-          ],
-          "webOrigins": [
-            "http://localhost:8800",
-            "{{ include "srw.cloudUrl" . }}"
-          ],
+          "redirectUris": {{ $cloudRedirects | toJson }},
+          "webOrigins": {{ $cloudOrigins | toJson }},
           "protocol": "openid-connect",
           "defaultClientScopes": [
             "openid",
@@ -337,7 +332,7 @@ data:
       "users": [
         {
           "username": "test",
-          "email": "admin@{{ .Values.global.domain }}",
+          "email": {{ printf "admin@%s" $bootstrapEmailDomain | quote }},
           "emailVerified": true,
           "enabled": true,
           "firstName": "Test",
@@ -362,7 +357,7 @@ data:
         {{- range .Values.keycloak.devUsers.users }},
         {
           "username": {{ .username | quote }},
-          "email": {{ printf "%s@%s" .username $.Values.global.domain | quote }},
+          "email": {{ printf "%s@%s" .username $bootstrapEmailDomain | quote }},
           "emailVerified": true,
           "enabled": true,
           "realmRoles": [
@@ -577,6 +572,13 @@ metadata:
   {{- end }}
 spec:
   replicas: {{ .Values.keycloak.replicas }}
+  {{- if include "srw.singleOrigin" . }}
+  # A mixed set of old/new public issuers can poison Gitea's discovery cache.
+  # This evaluation profile accepts auth downtime during identity upgrades.
+  strategy:
+    type: Recreate
+    rollingUpdate: null
+  {{- end }}
   selector:
     matchLabels:
       {{- include "srw.componentSelectorLabels" (dict "context" . "component" "keycloak") | nindent 6 }}
@@ -698,6 +700,12 @@ spec:
             # Hostname — must match what the browser sees
             - name: KC_HOSTNAME
               value: {{ include "srw.authUrl" . | quote }}
+            {{- if include "srw.singleOrigin" . }}
+            - name: KC_HTTP_RELATIVE_PATH
+              value: "/identity"
+            - name: KC_HTTP_MANAGEMENT_RELATIVE_PATH
+              value: "/"
+            {{- end }}
             - name: KC_HOSTNAME_BACKCHANNEL_DYNAMIC
               value: "true"
             - name: KC_PROXY_HEADERS
@@ -830,7 +838,7 @@ spec:
                     # set + groups exist (idempotent).
                     KC="/opt/keycloak/bin/kcadm.sh"
                     until (echo > /dev/tcp/localhost/9000) 2>/dev/null; do sleep 3; done
-                    $KC config credentials --server http://localhost:8080 \
+                    $KC config credentials --server http://localhost:8080{{ if include "srw.singleOrigin" . }}/identity{{ end }} \
                       --realm master --user "$KEYCLOAK_ADMIN" --password "$KEYCLOAK_ADMIN_PASSWORD" 2>/dev/null || exit 0
                     # --- Set realm admin password ---
                     # Realm import does resolve ${KC_REALM_ADMIN_PASSWORD} on
@@ -873,6 +881,8 @@ spec:
                       COCKID=$($KC get clients -r {{ .Values.keycloak.realm }} -q "clientId=$COCKPIT_CLIENT_ID" --fields id --format csv --noquotes 2>/dev/null | tail -1)
                       if [ -n "$COCKID" ]; then
                         $KC update "clients/$COCKID" -r {{ .Values.keycloak.realm }} \
+                          -s 'redirectUris={{ $cockpitRedirects | toJson }}' \
+                          -s 'webOrigins={{ $cockpitOrigins | toJson }}' \
                           -s "publicClient=true" \
                           -s "clientAuthenticatorType=client-secret" 2>/dev/null \
                           || echo "WARN: kcadm cockpit public-flip failed"
@@ -897,8 +907,8 @@ spec:
                           -s "standardFlowEnabled=true" \
                           -s "directAccessGrantsEnabled=false" \
                           -s "serviceAccountsEnabled=false" \
-                          -s "redirectUris=[\"http://localhost:8085/auth/callback\",\"$API_URL/auth/callback\",\"$COCKPIT_URL/auth/callback\"]" \
-                          -s "webOrigins=[\"$API_URL\",\"$COCKPIT_URL\"]" \
+                          -s 'redirectUris={{ $bffRedirects | toJson }}' \
+                          -s 'webOrigins={{ $bffOrigins | toJson }}' \
                           -s "attributes.\"backchannel.logout.url\"=$ORCHESTRATOR_INTERNAL_URL/auth/backchannel-logout" \
                           -s "attributes.\"backchannel.logout.session.required\"=true" \
                           -s "attributes.\"backchannel.logout.revoke.offline.tokens\"=false" 2>/dev/null \
@@ -911,8 +921,8 @@ spec:
                         $KC update "clients/$BFFID" -r {{ .Values.keycloak.realm }} \
                           -s "publicClient=false" \
                           -s "clientAuthenticatorType=client-secret" \
-                          -s "redirectUris=[\"http://localhost:8085/auth/callback\",\"$API_URL/auth/callback\",\"$COCKPIT_URL/auth/callback\"]" \
-                          -s "webOrigins=[\"$API_URL\",\"$COCKPIT_URL\"]" \
+                          -s 'redirectUris={{ $bffRedirects | toJson }}' \
+                          -s 'webOrigins={{ $bffOrigins | toJson }}' \
                           -s "attributes.\"backchannel.logout.url\"=$ORCHESTRATOR_INTERNAL_URL/auth/backchannel-logout" \
                           -s "attributes.\"backchannel.logout.session.required\"=true" 2>/dev/null \
                           || echo "WARN: kcadm cockpit-bff update failed"
@@ -1164,8 +1174,8 @@ spec:
                       fi
                       if [ -n "$NCID" ]; then
                         $KC update "clients/$NCID" -r {{ .Values.keycloak.realm }} \
-                          -s 'redirectUris=["http://localhost:8800/apps/user_oidc/code","{{ include "srw.cloudUrl" . }}/apps/user_oidc/code"]' \
-                          -s 'webOrigins=["http://localhost:8800","{{ include "srw.cloudUrl" . }}"]' 2>/dev/null \
+                          -s 'redirectUris={{ $cloudRedirects | toJson }}' \
+                          -s 'webOrigins={{ $cloudOrigins | toJson }}' 2>/dev/null \
                           || echo "WARN: kcadm nextcloud redirectUris re-assert failed"
                         # Match the realm-import defaultClientScopes.
                         for SNAME in openid profile email groups; do
@@ -1187,8 +1197,8 @@ spec:
                       # redirect from ROOT_URL (srw.gitUrl), so only that host is ever
                       # sent; localhost stays for in-cluster/dev callbacks.
                       $KC update "clients/$GID" -r {{ .Values.keycloak.realm }} \
-                        -s "redirectUris=[\"http://localhost:3000/user/oauth2/Keycloak/callback\",\"{{ include "srw.gitUrl" . }}/user/oauth2/Keycloak/callback\"]" \
-                        -s "webOrigins=[\"http://localhost:3000\",\"{{ include "srw.gitUrl" . }}\"]" 2>/dev/null \
+                        -s 'redirectUris={{ $gitRedirects | toJson }}' \
+                        -s 'webOrigins={{ $gitOrigins | toJson }}' 2>/dev/null \
                         || echo "WARN: kcadm gitea redirectUris update failed"
                       ensure_mapper() {
                         NAME="$1"; ATTR="$2"; CLAIM="$3"; JTYPE="$4"

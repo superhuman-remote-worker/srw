@@ -2,6 +2,7 @@ import {ChangeDetectionStrategy, Component, computed, input, output} from '@angu
 import {TranslocoDirective} from '@jsverse/transloco';
 import {AppSelectComponent} from '../../ui/select';
 import {AppIconButtonComponent} from '../../ui/icon-button';
+import {AppIconComponent} from '../../ui/icon';
 
 /**
  * Pagination footer for the jobs list.
@@ -16,7 +17,7 @@ import {AppIconButtonComponent} from '../../ui/icon-button';
   selector: 'app-job-list-footer',
   standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [TranslocoDirective, AppSelectComponent, AppIconButtonComponent],
+  imports: [TranslocoDirective, AppSelectComponent, AppIconButtonComponent, AppIconComponent],
   template: `
     <nav
       class="job-footer"
@@ -60,7 +61,6 @@ import {AppIconButtonComponent} from '../../ui/icon-button';
         <app-icon-button
           size="sm"
           variant="ghost"
-          icon="chevron_left"
           [disabled]="!hasPrevious() || loading()"
           [ariaLabel]="
             hasPrevious()
@@ -69,11 +69,12 @@ import {AppIconButtonComponent} from '../../ui/icon-button';
           "
           [tooltip]="t('jobs.pagination.previous')"
           (clicked)="pageChange.emit(page() - 1)"
-        />
+        >
+          <app-icon size="sm">chevron_left</app-icon>
+        </app-icon-button>
         <app-icon-button
           size="sm"
           variant="ghost"
-          icon="chevron_right"
           [disabled]="!hasNext() || loading()"
           [ariaLabel]="
             hasNext()
@@ -82,7 +83,9 @@ import {AppIconButtonComponent} from '../../ui/icon-button';
           "
           [tooltip]="t('jobs.pagination.next')"
           (clicked)="pageChange.emit(page() + 1)"
-        />
+        >
+          <app-icon size="sm">chevron_right</app-icon>
+        </app-icon-button>
       </div>
     </nav>
   `,

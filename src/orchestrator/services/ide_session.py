@@ -54,6 +54,13 @@ from orchestrator.services.restore_work_lease import (
     RestoreWorkLeaseHeartbeat,
     RestoreWorkLeaseLost,
 )
+from orchestrator.services.vm_workspace_recovery_store import (
+    VMWorkspaceRecoveryStore,
+    acquire_vm_cleanup_permit,
+    vm_cleanup_kwargs,
+    completed_cleanup_outcome,
+    complete_vm_cleanup_permit,
+)
 from shared.runtime.core.managed_repository import (
     managed_repository_agent_launch_command,
     managed_repository_agent_retirement_command,
@@ -144,6 +151,7 @@ class IdeSessionService:
         self._db: Any = None
         self._snapshot_service: Any = None
         self._vm_provisioner: Any = None
+        self._workspace_recovery_store: Any = None
         self._container_provisioner: Any = None
         self._gitea_client: Any = None
         # Background restores are process-local, but their runtime identity is
@@ -186,6 +194,7 @@ class IdeSessionService:
             container_provisioner: ContainerProvisioner (optional, for K8s IDE pods).
         """
         self._db = db
+        self._workspace_recovery_store = VMWorkspaceRecoveryStore(db)
         self._snapshot_service = snapshot_service
         self._vm_provisioner = vm_provisioner
         self._container_provisioner = container_provisioner
@@ -2401,7 +2410,41 @@ class IdeSessionService:
     async def _delete_ide_vm(self, job_id: str, vm_name: str) -> bool:
         """Delete an IDE session VM."""
         if self._vm_provisioner and self._vm_provisioner.lifecycle_available:
-            return bool(await self._vm_provisioner.delete_vm(job_id))
+            try:
+                identity = await self._vm_provisioner.capture_vm_teardown_identity(
+                    job_id, entity_type="job"
+                )
+                permit = await acquire_vm_cleanup_permit(
+                    self._workspace_recovery_store,
+                    owner_kind="job",
+                    owner_id=job_id,
+                    identity=identity,
+                    source="ide_session_vm_delete",
+                    purge_disk=True,
+                )
+                if not permit.allowed:
+                    return False
+                disposition = completed_cleanup_outcome(permit)
+                if disposition is None:
+                    outcome = await self._vm_provisioner.release_vm_captured(
+                        job_id,
+                        identity,
+                        entity_type="job",
+                        purge_disk=True,
+                        capture_snapshot=False,
+                        **vm_cleanup_kwargs(permit),
+                    )
+                    disposition = outcome.disposition
+                    if disposition in {"completed", "identity_superseded"}:
+                        await complete_vm_cleanup_permit(
+                            self._workspace_recovery_store,
+                            permit,
+                            outcome=disposition,
+                        )
+                return disposition == "completed"
+            except Exception:
+                logger.exception("IDE VM cleanup authority failed for job %s", job_id)
+                return False
         return False
 
     async def _delete_ide_container(

@@ -173,6 +173,9 @@ from orchestrator.routers import (  # noqa: E402
 )
 from orchestrator.routers import voice as voice_routes  # noqa: E402
 from orchestrator.routers import system_settings as system_settings_routes  # noqa: E402
+from orchestrator.routers import (  # noqa: E402
+    vm_workspace_cleanup_authority as vm_workspace_cleanup_authority_routes,
+)
 from orchestrator.routers import capacity as capacity_routes  # noqa: E402
 from orchestrator.routers import (  # noqa: E402
     user_administration as user_administration_routes,
@@ -216,6 +219,17 @@ from orchestrator.services import (  # noqa: E402
     agent_thread_status as agent_thread_status_service,
     run_queue_admin as run_queue_admin_service,
     unit_claim_bundle as unit_claim_bundle_service,
+)
+from orchestrator.services.vm_workspace_recovery_store import (  # noqa: E402
+    VMWorkspaceRecoveryStore,
+)
+from orchestrator.services.vm_provisioning_cleanup import recycle_provisioning_vm  # noqa: E402
+from orchestrator.services.vm_workspace_recovery import (  # noqa: E402
+    VMWorkspaceRecoveryService,
+)
+from orchestrator.services.vm_workspace_recovery_config import (  # noqa: E402
+    VMWorkspaceRecoverySettings,
+    automatic_reconciler_enabled,
 )
 from orchestrator.services import (  # noqa: E402
     commissioned_officer_provisioning as commissioned_officer_provisioning_service,
@@ -338,6 +352,7 @@ from orchestrator.routers import job_completion as job_completion_routes  # noqa
 from orchestrator.routers import job_controls as job_control_routes  # noqa: E402
 from orchestrator.routers import job_lifecycle as job_lifecycle_routes  # noqa: E402
 from orchestrator.routers import thread_lifecycle as thread_lifecycle_routes  # noqa: E402
+from orchestrator.routers import thread_rewind as thread_rewind_routes  # noqa: E402
 from orchestrator.routers import verification as verification_routes  # noqa: E402
 from orchestrator.services import (  # noqa: E402
     completion_effects as completion_effect_operations,
@@ -353,6 +368,7 @@ from orchestrator.services import (  # noqa: E402
 )
 from orchestrator.services import (  # noqa: E402
     thread_resume as thread_resume_operations,
+    thread_rewind as thread_rewind_operations,
     thread_retirement as thread_retirement_operations,
 )
 from orchestrator.schemas.job_controls import (  # noqa: E402,F401
@@ -1075,6 +1091,8 @@ session_router = SessionRouterService(
     ingress_class=os.environ.get("SESSION_INGRESS_CLASS", "traefik"),
     annotations=_session_annotations,
     tls_secret_name=os.environ.get("SESSION_INGRESS_TLS_SECRET") or None,
+    single_origin=os.environ.get("SESSION_INGRESS_SINGLE_ORIGIN", "").lower()
+    in {"1", "true"},
     db=postgres_db,
 )
 
@@ -1090,6 +1108,7 @@ def _pinned_retirement_operations() -> PinnedRetirementOperations:
             container_provisioner=container_provisioner,
             docker_provisioner=docker_provisioner,
             vm_provisioner=vm_provisioner,
+            recovery_store=VMWorkspaceRecoveryStore(postgres_db),
             session_router=session_router,
             resolve_protected_reader_backend=functools.partial(
                 protected_cloud_engage._resolve_protected_reader_backend,
@@ -2660,6 +2679,10 @@ from orchestrator.services.deployment_gates import (  # noqa: E402
     require_pinned_status_identity as _require_pinned_status_identity,
 )
 
+from orchestrator.services.deployment_gates import (  # noqa: E402
+    stateless_idle_conversation_rewind_enabled as _stateless_idle_conversation_rewind_enabled,
+)
+
 
 def _session_config_dependencies() -> (
     session_config_resolution.SessionConfigDependencies
@@ -4010,24 +4033,22 @@ async def _try_dispatch_pending_jobs() -> None:
                         # (VM_PARK_EXHAUSTED). With the reconciler now handing off
                         # provisioning VMs (is_reapable=False for dispatchable jobs)
                         # nothing else would time it out.
-                        elapsed = int(time.time() - float(vm_ctx["provisioned_at"]))
                         logger.warning(
-                            "Dispatcher: job %s VM stuck in '%s' for %ss "
-                            "(> %ss budget) — recycling (attempt %d/%d)",
+                            "Dispatcher: job %s VM stuck in '%s' — checking "
+                            "cleanup for provision attempt %d/%d",
                             job_id,
                             vm_status,
-                            elapsed,
-                            timeout_s,
                             provision_attempts,
                             max_provision_attempts,
                         )
-                        try:
-                            await vm_provisioner.delete_vm(job_id)
-                        except Exception:
-                            logger.exception(
-                                "Dispatcher: failed to delete timed-out VM for job %s",
-                                job_id,
-                            )
+                        await recycle_provisioning_vm(
+                            job_id,
+                            vm_ctx,
+                            db=postgres_db,
+                            provisioner=vm_provisioner,
+                            recovery_store=VMWorkspaceRecoveryStore(postgres_db),
+                            now=time.time(),
+                        )
                         continue
                     if vm_decision == VM_WAIT:
                         # Provisioning / creating / deleting in flight — wait.
@@ -5713,6 +5734,23 @@ async def lifespan(app: FastAPI):
         if os.getenv("VM_MODE", "off").strip().lower() == "same-cluster"
         else None
     )
+    vm_workspace_recovery_settings = VMWorkspaceRecoverySettings.from_env()
+    vm_workspace_recovery_store = VMWorkspaceRecoveryStore(postgres_db)
+    vm_workspace_recovery_task = (
+        asyncio.create_task(
+            run_when_leader(
+                VMWorkspaceRecoveryService.from_settings(
+                    vm_workspace_recovery_store,
+                    vm_provisioner,
+                    settings=vm_workspace_recovery_settings,
+                ).run,
+                _shutdown_event,
+            ),
+            name="vm-workspace-recovery",
+        )
+        if automatic_reconciler_enabled()
+        else None
+    )
     sudo_sweeper_task = asyncio.create_task(sudo_expiration_sweeper(_shutdown_event))
     thread_events_prune_task = asyncio.create_task(
         thread_events_prune_sweeper(_shutdown_event)
@@ -6202,6 +6240,8 @@ async def lifespan(app: FastAPI):
     await dispatcher_task
     if vm_readiness_task is not None:
         await vm_readiness_task
+    if vm_workspace_recovery_task is not None:
+        await vm_workspace_recovery_task
     await sudo_sweeper_task
     await thread_events_prune_task
     await run_queue_reaper_task
@@ -6861,6 +6901,7 @@ def _thread_config_update_dependencies() -> (
         store=postgres_db,
         vm_provisioner=vm_provisioner,
         container_provisioner=container_provisioner,
+        recovery_store=VMWorkspaceRecoveryStore(postgres_db),
         apply_thread_config_update_locked=_apply_thread_config_update_locked,
         enforce_workspace_upgrade_grants=(
             lambda *args, **kwargs: (
@@ -7051,6 +7092,7 @@ def _unit_claim_bundle_dependencies() -> (
         job_workspace_authority_dependencies=_job_workspace_authority_dependencies,
         job_start_bundle_dependencies=_job_start_bundle_dependencies,
         dispatch_credential_dependencies=_dispatch_credential_dependencies,
+        recovery_store=VMWorkspaceRecoveryStore(postgres_db),
     )
 
 
@@ -7628,6 +7670,7 @@ def _completion_effect_dependencies() -> (
             lambda: _COMPLETION_S36_EXACT_ABSENCE_TIMEOUT_SECONDS
         ),
         logger=logger,
+        recovery_store=VMWorkspaceRecoveryStore(postgres_db),
     )
 
 
@@ -7647,6 +7690,7 @@ def _legacy_completion_dependencies() -> (
         workspace=legacy_job_completion_operations.LegacyWorkspaceDependencies(
             container_provisioner=container_provisioner,
             vm_provisioner=vm_provisioner,
+            recovery_store=VMWorkspaceRecoveryStore(postgres_db),
             cloud_router=main_cloud_router,
             sudo_gate=sudo_gate,
             get_container_context=_get_container_context,
@@ -7894,6 +7938,7 @@ def _job_control_operations() -> job_control_operations.JobControlOperations:
             kick_session_wake_drain=_kick_session_wake_drain,
             get_container_context=_get_container_context,
             get_vm_context=_get_vm_context,
+            recovery_store=VMWorkspaceRecoveryStore(postgres_db),
         )
     )
 
@@ -8085,6 +8130,7 @@ def _thread_retirement_operations() -> (
             persistent_provisioner=persistent_provisioner,
             container_provisioner=container_provisioner,
             vm_provisioner=vm_provisioner,
+            recovery_store=VMWorkspaceRecoveryStore(postgres_db),
             docker_provisioner=docker_provisioner,
             workspace_suspension_service=workspace_suspension_service,
             snapshot_service=snapshot_service,
@@ -8191,6 +8237,17 @@ def _thread_lifecycle_dependencies() -> (
         store=postgres_db,
         retirement=retirement,
         resume=_thread_resume_operations(retirement),
+        require_thread_owner=require_thread_owner,
+    )
+
+
+def _thread_rewind_dependencies() -> thread_rewind_routes.ThreadRewindDependencies:
+    return thread_rewind_routes.ThreadRewindDependencies(
+        store=postgres_db,
+        service=thread_rewind_operations.ThreadRewindService(
+            postgres_db,
+            _stateless_idle_conversation_rewind_enabled,
+        ),
         require_thread_owner=require_thread_owner,
     )
 
@@ -8348,6 +8405,7 @@ app.state.job_lifecycle_route_dependencies_factory = (
 app.state.thread_lifecycle_dependencies_factory = (
     lambda: _thread_lifecycle_dependencies()
 )
+app.state.thread_rewind_dependencies_factory = lambda: _thread_rewind_dependencies()
 app.state.job_assignment_dependencies_factory = lambda: _job_assignment_dependencies()
 app.state.expert_catalog_dependencies_factory = lambda: _expert_catalog_dependencies()
 app.state.tables_dependencies = TablesDependencies(db=postgres_db)
@@ -8591,6 +8649,7 @@ app.include_router(product_capabilities_router)
 app.include_router(shared_browser_router)
 app.include_router(vm_guest_router)
 app.include_router(sessions_router)
+app.include_router(thread_rewind_routes.router)
 app.include_router(contacts_router)
 app.include_router(contacts_project_router)
 app.include_router(tables_router)
@@ -8613,6 +8672,10 @@ app.include_router(provider_credentials_routes.router)
 app.include_router(subscription_management_routes.router)
 app.include_router(voice_routes.router)
 app.include_router(system_settings_routes.router)
+vm_workspace_cleanup_authority_routes.configure(
+    store_factory=lambda: VMWorkspaceRecoveryStore(postgres_db)
+)
+app.include_router(vm_workspace_cleanup_authority_routes.router)
 app.include_router(capacity_routes.router)
 app.include_router(user_administration_routes.router)
 app.include_router(job_diagnostics_routes.router)
@@ -11484,6 +11547,7 @@ def _stamp_tool_categories(messages: list[dict[str, Any]]) -> None:
 async def get_thread_messages_history(
     thread_id: str,
     request: Request,
+    response: Response = None,
     limit: Optional[int] = None,
     before: Optional[str] = None,
     after: Optional[str] = None,
@@ -11504,6 +11568,8 @@ async def get_thread_messages_history(
     ``{messages, total, has_more, thread_id}``.
     """
     user, thread = await require_thread_owner(request, postgres_db, thread_id)
+    if response is not None:
+        response.headers["Cache-Control"] = "private, no-store"
 
     def _parse_cursor(value: Optional[str]) -> Optional[datetime]:
         if not value:
@@ -11524,32 +11590,42 @@ async def get_thread_messages_history(
 
     capped_limit = min(limit, 500) if limit is not None else None
 
-    if before_dt is not None or after_dt is not None:
-        messages, has_more = await postgres_db.get_thread_messages_page(
-            thread_id=thread_id,
-            before=before_dt,
-            after=after_dt,
-            limit=capped_limit,
-        )
-        # A cursor window carries no cheap true total; no consumer reads it here.
-        total = len(messages)
-    else:
-        messages = await postgres_db.get_thread_messages_history(
-            thread_id=thread_id,
-            limit=capped_limit,
-            offset=offset,
-        )
-        # Legacy paged read: a full page implies there may be more.
-        has_more = capped_limit is not None and len(messages) == capped_limit
-        # `total` is otherwise unread (the cockpit uses only `.messages`,
-        # persistent-chat.service.ts:748; the MCP tool doesn't read it). Skip the
-        # per-open COUNT(*): a full load (no limit) returns the whole thread so
-        # len(messages) IS the total; charge the COUNT only for the explicit
-        # limit/offset paged read where a paginating client may want it.
-        if capped_limit is None:
-            total = len(messages)
-        else:
-            total = await postgres_db.get_thread_message_count(thread_id)
+    # Rows and their cache fence come from one repeatable-read snapshot. A
+    # rewind cannot therefore pair its newer epoch/revision with an older page
+    # that still contains tombstoned messages (or vice versa).
+    async with postgres_db.acquire() as conn:
+        async with conn.transaction(isolation="repeatable_read", readonly=True):
+            history_state = await conn.fetchrow(
+                "SELECT events_epoch, conversation_revision FROM threads WHERE id=$1",
+                thread_id,
+            )
+            if history_state is None:
+                raise HTTPException(status_code=404, detail="Thread not found")
+            if before_dt is not None or after_dt is not None:
+                messages, has_more = await postgres_db.get_thread_messages_page(
+                    thread_id=thread_id,
+                    before=before_dt,
+                    after=after_dt,
+                    limit=capped_limit,
+                    conn=conn,
+                )
+                # A cursor window carries no cheap true total; no consumer reads it here.
+                total = len(messages)
+            else:
+                messages = await postgres_db.get_thread_messages_history(
+                    thread_id=thread_id,
+                    limit=capped_limit,
+                    offset=offset,
+                    conn=conn,
+                )
+                # Legacy paged read: a full page implies there may be more.
+                has_more = capped_limit is not None and len(messages) == capped_limit
+                if capped_limit is None:
+                    total = len(messages)
+                else:
+                    total = await postgres_db.get_thread_message_count(
+                        thread_id, conn=conn
+                    )
 
     _stamp_tool_categories(messages)
 
@@ -11558,6 +11634,8 @@ async def get_thread_messages_history(
         "total": total,
         "has_more": has_more,
         "thread_id": thread_id,
+        "events_epoch": int(history_state["events_epoch"] or 0),
+        "conversation_revision": int(history_state["conversation_revision"] or 0),
     }
 
 
@@ -12182,6 +12260,7 @@ class ThreadInputRequest(BaseModel):
 
     content: str
     turn_id: Optional[int] = None
+    expected_conversation_revision: int | None = Field(default=None, ge=0)
 
 
 async def _load_thread_for_owner(thread_id: str, user: dict) -> dict:
@@ -12200,7 +12279,11 @@ async def _load_thread_for_owner(thread_id: str, user: dict) -> dict:
     return thread
 
 
-async def _thread_input_stateless(thread: dict, content: str) -> dict[str, Any]:
+async def _thread_input_stateless(
+    thread: dict,
+    content: str,
+    expected_conversation_revision: int | None = None,
+) -> dict[str, Any]:
     """Admit one user turn for a stateless-lane thread (stateless_agents.md
     §5.3.1): persist the message, advance the input watermark, and queue the
     unit — all in ONE transaction, so "message durable ⟺ watermark advanced"
@@ -12247,7 +12330,7 @@ async def _thread_input_stateless(thread: dict, content: str) -> dict[str, Any]:
         async with conn.transaction():
             locked_thread = await conn.fetchrow(
                 "SELECT id, user_id, execution_lane, agent_id, status, "
-                "       total_turns, metadata "
+                "       total_turns, metadata, conversation_revision "
                 "FROM threads WHERE id = $1 FOR UPDATE",
                 thread_id,
             )
@@ -12261,6 +12344,22 @@ async def _thread_input_stateless(thread: dict, content: str) -> dict[str, Any]:
                     detail="Thread is no longer eligible for stateless admission",
                 )
             locked_thread_dict = dict(locked_thread)
+            current_revision = int(locked_thread_dict.get("conversation_revision") or 0)
+            if expected_conversation_revision is None:
+                revision_matches = current_revision == 0
+            else:
+                revision_matches = (
+                    int(expected_conversation_revision) == current_revision
+                )
+            if not revision_matches:
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "code": "session_view_stale",
+                        "reason": "conversation_revision_changed",
+                        "conversation_revision": current_revision,
+                    },
+                )
             locked_backend = _require_stateless_workspace(locked_thread_dict)
             locked_status = str(locked_thread["status"] or "")
             if locked_status not in {
@@ -12358,6 +12457,7 @@ async def _thread_input_stateless(thread: dict, content: str) -> dict[str, Any]:
     return {
         "accepted": True,
         "turn_id": turn_number,
+        "conversation_revision": current_revision,
         "queue": {
             "state": state,
             "queue_depth": queue_depth,
@@ -12398,7 +12498,11 @@ async def thread_input(
         # queue), and the lock dict is per-process state — replica-unsafe
         # under the 2-replica topology anyway. body.turn_id is ignored: the
         # queue lane derives the turn number from DB truth (total_turns + 1).
-        return await _thread_input_stateless(lane_thread, body.content)
+        return await _thread_input_stateless(
+            lane_thread,
+            body.content,
+            body.expected_conversation_revision,
+        )
 
     thread, binding = await _resolve_thread_for_forwarding(thread_id, user)
 

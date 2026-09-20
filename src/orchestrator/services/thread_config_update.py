@@ -66,6 +66,12 @@ from orchestrator.services.session_runtime_admission import (
     protected_cloud_marker_state,
     thread_runtime_authority,
 )
+from orchestrator.services.vm_workspace_recovery_store import (
+    acquire_vm_cleanup_permit,
+    vm_cleanup_kwargs,
+    completed_cleanup_outcome,
+    complete_vm_cleanup_permit,
+)
 from shared.run_queue import LANE_PINNED
 from shared.runtime.core.loader import canonical_config_name
 
@@ -107,6 +113,7 @@ class ThreadConfigUpdateDependencies:
     store: ThreadConfigStore
     vm_provisioner: Any
     container_provisioner: Any
+    recovery_store: Any
     apply_thread_config_update_locked: Callable[..., Awaitable[Any]]
     enforce_workspace_upgrade_grants: Callable[..., Awaitable[Any]]
     require_internal: Callable[[Request], Awaitable[Any]]
@@ -429,7 +436,37 @@ async def agent_abort_thread_vm_upgrade(
     deleted = False
     if vm_provisioner.lifecycle_available:
         try:
-            deleted = await vm_provisioner.delete_thread_vm(thread_id)
+            identity = await vm_provisioner.capture_vm_teardown_identity(
+                thread_id, entity_type="thread"
+            )
+            cleanup = await acquire_vm_cleanup_permit(
+                dependencies.recovery_store,
+                owner_kind="thread",
+                owner_id=thread_id,
+                identity=identity,
+                source="abort_thread_vm_upgrade",
+                purge_disk=True,
+            )
+            if not cleanup.allowed:
+                raise RuntimeError("VM cleanup held for workspace recovery")
+            disposition = completed_cleanup_outcome(cleanup)
+            if disposition is None:
+                outcome = await vm_provisioner.release_vm_captured(
+                    thread_id,
+                    identity,
+                    entity_type="thread",
+                    purge_disk=True,
+                    capture_snapshot=False,
+                    **vm_cleanup_kwargs(cleanup),
+                )
+                disposition = outcome.disposition
+                if disposition in {"completed", "identity_superseded"}:
+                    await complete_vm_cleanup_permit(
+                        dependencies.recovery_store,
+                        cleanup,
+                        outcome=disposition,
+                    )
+            deleted = disposition == "completed"
         except Exception as e:
             logger.warning(
                 "abort-vm-upgrade: delete_thread_vm failed for %s: %s", thread_id, e

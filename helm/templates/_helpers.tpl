@@ -384,15 +384,23 @@ URL scheme — "https" when TLS is enabled on the ingress, "http" otherwise.
 Centralized so every URL helper picks up local-dev (no-TLS) deployments.
 */}}
 {{- define "srw.urlScheme" -}}
-{{- if .Values.ingress.tls.enabled -}}https{{- else -}}http{{- end -}}
+{{- if or (include "srw.singleOrigin" .) .Values.ingress.tls.enabled -}}https{{- else -}}http{{- end -}}
 {{- end }}
 
 {{- define "srw.cockpitUrl" -}}
+{{- if include "srw.singleOrigin" . -}}
+{{- include "srw.publicOrigin" . -}}
+{{- else -}}
 {{- printf "%s://%s" (include "srw.urlScheme" .) (include "srw.host" (dict "context" . "key" "cockpit" "default" "")) }}
+{{- end -}}
 {{- end }}
 
 {{- define "srw.apiUrl" -}}
+{{- if include "srw.singleOrigin" . -}}
+{{- include "srw.publicOrigin" . -}}
+{{- else -}}
 {{- printf "%s://%s" (include "srw.urlScheme" .) (include "srw.host" (dict "context" . "key" "api" "default" "api")) }}
+{{- end -}}
 {{- end }}
 
 {{/*
@@ -419,7 +427,9 @@ the gateway pod and came back a bare 403 with nothing in the gateway's logs.
 {{- end }}
 
 {{- define "srw.authUrl" -}}
-{{- if and .Values.keycloak.enabled (not .Values.keycloak.internal) .Values.keycloak.externalIssuerUrl }}
+{{- if include "srw.singleOrigin" . -}}
+{{- printf "%s/identity" (include "srw.publicOrigin" .) -}}
+{{- else if and .Values.keycloak.enabled (not .Values.keycloak.internal) .Values.keycloak.externalIssuerUrl }}
 {{- .Values.keycloak.externalIssuerUrl }}
 {{- else }}
 {{- printf "%s://%s" (include "srw.urlScheme" .) (include "srw.host" (dict "context" . "key" "auth" "default" "auth")) }}
@@ -465,7 +475,7 @@ Internal cluster URL for Keycloak — used by orchestrator for back-channel JWKS
 */}}
 {{- define "srw.keycloakInternalUrl" -}}
 {{- if .Values.keycloak.internal }}
-{{- printf "http://%s-keycloak:8080" (include "srw.fullname" .) }}
+{{- printf "http://%s-keycloak:8080%s" (include "srw.fullname" .) (ternary "/identity" "" (ne (include "srw.singleOrigin" .) "")) }}
 {{- else if .Values.keycloak.externalInternalUrl }}
 {{- .Values.keycloak.externalInternalUrl }}
 {{- else }}
@@ -653,7 +663,9 @@ CLOUD_SERVICE_PASSWORD). Resolves to either:
 {{- end }}
 
 {{- define "srw.gitUrl" -}}
-{{- if and .Values.gitea.enabled (not .Values.gitea.internal) .Values.gitea.externalUrl }}
+{{- if include "srw.singleOrigin" . -}}
+{{- printf "%s/git" (include "srw.publicOrigin" .) -}}
+{{- else if and .Values.gitea.enabled (not .Values.gitea.internal) .Values.gitea.externalUrl }}
 {{- .Values.gitea.externalUrl }}
 {{- else }}
 {{- printf "%s://%s" (include "srw.urlScheme" .) (include "srw.host" (dict "context" . "key" "git" "default" "git")) }}
@@ -674,7 +686,9 @@ Internal cluster URL for Gitea — used by orchestrator/agents for back-end API 
 {{- end }}
 
 {{- define "srw.cloudUrl" -}}
-{{- if and (not .Values.opencloud.enabled) (not .Values.nextcloud.enabled) .Values.cloud.externalUrl }}
+{{- if include "srw.singleOrigin" . -}}
+{{- printf "%s/cloud" (include "srw.publicOrigin" .) -}}
+{{- else if and (not .Values.opencloud.enabled) (not .Values.nextcloud.enabled) .Values.cloud.externalUrl }}
 {{- .Values.cloud.externalUrl }}
 {{- else }}
 {{- printf "%s://%s" (include "srw.urlScheme" .) (include "srw.host" (dict "context" . "key" "cloud" "default" "cloud")) }}
@@ -694,19 +708,28 @@ Falls back to externalUrl if externalServiceUrl is not set.
 {{- end }}
 
 {{- define "srw.mcpUrl" -}}
-{{- printf "%s://%s" (include "srw.urlScheme" .) (include "srw.host" (dict "context" . "key" "mcp" "default" "mcp")) }}
+{{- if include "srw.singleOrigin" . -}}
+{{- include "srw.publicOrigin" . -}}
+{{- else -}}
+{{- printf "%s://%s" (include "srw.urlScheme" .) (include "srw.host" (dict "context" . "key" "mcp" "default" "mcp")) -}}
+{{- end -}}
 {{- end }}
 
 {{- define "srw.headscaleUrl" -}}
 {{- if .Values.headscale.url }}
 {{- .Values.headscale.url }}
+{{- else if include "srw.singleOrigin" . -}}
 {{- else }}
 {{- printf "%s://%s" (include "srw.urlScheme" .) (include "srw.host" (dict "context" . "key" "headscale" "default" "headscale")) }}
 {{- end }}
 {{- end }}
 
 {{- define "srw.neo4jBoltHost" -}}
+{{- if include "srw.singleOrigin" . -}}
+{{- printf "%s-neo4j" (include "srw.fullname" .) -}}
+{{- else -}}
 {{- include "srw.host" (dict "context" . "key" "neo4jBolt" "default" "bolt-neo4j") }}
+{{- end -}}
 {{- end }}
 
 {{/*
@@ -715,19 +738,35 @@ have no URL helper because nothing else in the chart uses them as URLs —
 they're consumed only as ingress hosts and as window.env.* deep-links.
 */}}
 {{- define "srw.neo4jBrowserHost" -}}
+{{- if include "srw.singleOrigin" . -}}
+{{- include "srw.urlHost" (include "srw.publicOrigin" .) -}}
+{{- else -}}
 {{- include "srw.host" (dict "context" . "key" "neo4j" "default" "neo4j") }}
+{{- end -}}
 {{- end }}
 
 {{- define "srw.pgadminHost" -}}
+{{- if include "srw.singleOrigin" . -}}
+{{- include "srw.urlHost" (include "srw.publicOrigin" .) -}}
+{{- else -}}
 {{- include "srw.host" (dict "context" . "key" "pgadmin" "default" "pgadmin") }}
+{{- end -}}
 {{- end }}
 
 {{- define "srw.dozzleHost" -}}
+{{- if include "srw.singleOrigin" . -}}
+{{- include "srw.urlHost" (include "srw.publicOrigin" .) -}}
+{{- else -}}
 {{- include "srw.host" (dict "context" . "key" "dozzle" "default" "dozzle") }}
+{{- end -}}
 {{- end }}
 
 {{- define "srw.minioHost" -}}
+{{- if include "srw.singleOrigin" . -}}
+{{- include "srw.urlHost" (include "srw.publicOrigin" .) -}}
+{{- else -}}
 {{- include "srw.host" (dict "context" . "key" "minio" "default" "minio") }}
+{{- end -}}
 {{- end }}
 
 {{/*

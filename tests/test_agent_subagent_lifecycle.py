@@ -275,6 +275,8 @@ async def test_lease_loss_abandons_before_worker_cleanup(monkeypatch):
     monkeypatch.setattr(persistent_app, "_agent", agent)
 
     executor = StatelessTurnExecutor.__new__(StatelessTurnExecutor)
+    executor._worker_retirement_lock = asyncio.Lock()
+    executor._worker_workspace_backend = "sandbox"
     executor._lease = LeaseHandle()
     executor._lease.update("job-1", 7)
     executor._lease.mark_lost()

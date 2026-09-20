@@ -191,6 +191,11 @@ def _freeze_reason(job: dict[str, Any]) -> Optional[str]:
     return f"freeze type '{freeze_type}'" if freeze_type else None
 
 
+def _workspace_recovery(job: dict[str, Any]) -> dict[str, Any]:
+    value = job.get("_workspace_recovery", job.get("workspace_recovery"))
+    return _parse_json_field(value)
+
+
 async def _audit_last_write(
     audit_reader: Any, job_id: str
 ) -> tuple[Optional[datetime], bool]:
@@ -272,6 +277,22 @@ async def compute_job_liveness(
             "threshold_source": effective_policy.stall.source,
             "sources": sources,
         }
+
+    recovery = _workspace_recovery(job)
+    recovery_state = str(recovery.get("state") or "")
+    if recovery_state == "paused_attention":
+        reasons.append("workspace recovery requires operator attention")
+        return verdict("paused")
+    if recovery_state in {
+        "recovering",
+        "observing",
+        "waiting_runtime",
+        "verifying_stop",
+        "attesting",
+        "reconciling_outcome",
+    }:
+        reasons.append("workspace recovery is in progress")
+        return verdict("waiting")
 
     # Authority 1: terminal / explicit control-plane state.
     if status in TERMINAL_STATUSES:

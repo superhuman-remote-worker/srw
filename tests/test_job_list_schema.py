@@ -155,3 +155,21 @@ def test_list_document_excludes_private_join_fields(document):
         "_workspace_context",
         "project_has_cloud_folder",
     }.isdisjoint(fields)
+    assert "workspace_recovery" in fields
+    recovery = document["components"]["schemas"]["WorkspaceRecoveryView"]
+    assert set(recovery["properties"]) == {
+        "operation_id",
+        "state",
+        "reason_code",
+        "message",
+        "started_at",
+        "deadline_at",
+        "next_check_at",
+        "retryable",
+        "cleanup_pending",
+    }
+    assert {
+        "private_endpoint",
+        "latest_diagnostic",
+        "captured_identity",
+    }.isdisjoint(recovery["properties"])

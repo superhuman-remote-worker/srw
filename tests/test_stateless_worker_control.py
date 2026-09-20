@@ -346,6 +346,8 @@ async def test_leased_cancel_publishes_status_without_pruning_checkpoint():
             return {"state": "leased"}
         if normalized.startswith("UPDATE run_queue"):
             return None
+        if normalized.startswith("SELECT recovery_id FROM vm_workspace_recovery_jobs"):
+            return None
         if normalized.startswith("UPDATE jobs"):
             return {"id": UUID(JOB_ID)}
         raise AssertionError(normalized)
@@ -1248,6 +1250,10 @@ async def test_same_cluster_vm_dispatch_stays_stateless_and_reaches_admission(
 
 @pytest.mark.asyncio
 async def test_resume_retries_pinned_verb_after_vm_lane_repair(monkeypatch):
+    monkeypatch.setattr(
+        "orchestrator.services.vm_workspace_recovery_store.VMWorkspaceRecoveryStore.unresolved_participation",
+        AsyncMock(return_value=None),
+    )
     from orchestrator import main
 
     job = {
@@ -1547,6 +1553,7 @@ async def test_flag_on_completed_pinned_cancel_stays_completed_without_cleanup(
 @pytest.mark.asyncio
 async def test_pinned_cancel_linearizer_has_terminal_status_parity_guard():
     conn = AsyncMock()
+    conn.transaction = MagicMock(return_value=_AsyncCM())
     conn.execute.return_value = "UPDATE 0"
     db = _db_with_conn(conn)
 

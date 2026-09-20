@@ -46,6 +46,7 @@ def test_collabora_runtime_config_and_network_policy_fail_closed() -> None:
     configmap = (ROOT / "helm/templates/configmap.yaml").read_text()
     deployment = (ROOT / "helm/templates/orchestrator/deployment.yaml").read_text()
     cockpit = (ROOT / "helm/templates/cockpit/deployment.yaml").read_text()
+    cockpit_environment = (ROOT / "helm/templates/_cockpit.tpl").read_text()
     ingress = (ROOT / "helm/templates/ingress.yaml").read_text()
     network = (ROOT / "helm/templates/collabora/network-policy.yaml").read_text()
     environment = (ROOT / "cockpit/src/assets/env.js").read_text()
@@ -63,7 +64,8 @@ def test_collabora_runtime_config_and_network_policy_fail_closed() -> None:
         assert name in configmap
         assert name in deployment
 
-    assert "canvasOfficeOrigin" in cockpit
+    assert "srw.cockpitEnvironment" in cockpit
+    assert "canvasOfficeOrigin" in cockpit_environment
     assert "canvasOfficeOrigin" in environment
     assert "canvasOfficeOrigin" in docker_env
     assert "COLLABORA_PUBLIC_URL" in docker_env

@@ -8,6 +8,8 @@ from datetime import datetime, timezone
 import json
 import logging
 import os
+import secrets
+import shlex
 import time
 from typing import Any
 from uuid import UUID, uuid4
@@ -20,6 +22,11 @@ from orchestrator.services.ide_settings import (
     seed_ide_profile,
 )
 from orchestrator.services.ssh_helpers import wait_for_agent_ssh
+from orchestrator.services.ssh_helpers import pinned_agent_ssh_command
+from orchestrator.services.subprocess_effect import (
+    communicate_bounded,
+    create_owned_subprocess_exec,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +46,137 @@ def _generation(value: object) -> str | None:
     except (TypeError, ValueError):
         return None
     return str(parsed) if str(parsed) == value else None
+
+
+def _machine_identity(value: object) -> str | None:
+    """Return one canonical, nonzero systemd machine ID."""
+
+    if (
+        not isinstance(value, str)
+        or len(value) != 32
+        or value != value.lower()
+        or value == "0" * 32
+        or any(character not in "0123456789abcdef" for character in value)
+    ):
+        return None
+    return value
+
+
+def _complete_recovery_network(
+    value: object, *, challenge: str, expected_mac: str
+) -> bool:
+    if not isinstance(value, Mapping):
+        return False
+    interfaces = value.get("interfaces")
+    routes = value.get("routes")
+    default_route = value.get("default_route")
+    netplan = value.get("netplan_sha256")
+    networkd = value.get("networkd_sha256")
+    if (
+        value.get("challenge") != challenge
+        or _generation(value.get("boot_id")) is None
+        or _machine_identity(value.get("machine_id")) is None
+        or "registration_id" in value
+        or not isinstance(interfaces, list)
+        or not interfaces
+        or not any(
+            isinstance(interface, Mapping)
+            and interface.get("mac") == expected_mac
+            and isinstance(interface.get("address"), str)
+            and bool(interface["address"].strip())
+            for interface in interfaces
+        )
+        or not isinstance(value.get("address"), str)
+        or not value["address"].strip()
+        or not isinstance(routes, list)
+        or not routes
+        or not isinstance(default_route, Mapping)
+        or default_route.get("dst") not in {"default", "0.0.0.0/0", "::/0"}
+        or not isinstance(value.get("dns"), str)
+        or not value["dns"].strip()
+        or not isinstance(netplan, Mapping)
+        or not isinstance(networkd, Mapping)
+        or not (netplan or networkd)
+        or not isinstance(value.get("cloud_init_instance_id"), str)
+        or not value["cloud_init_instance_id"].strip()
+        or not isinstance(value.get("cloud_init_cache_identity"), str)
+        or not value["cloud_init_cache_identity"].strip()
+        or value.get("cloud_init_cache_cleaned") is not False
+    ):
+        return False
+    return all(
+        isinstance(path, str)
+        and bool(path)
+        and isinstance(digest, str)
+        and bool(digest)
+        for mapping in (netplan, networkd)
+        for path, digest in mapping.items()
+    )
+
+
+async def qualify_recovery_successor(
+    successor: Mapping[str, Any], *, host_key_fingerprint: str
+) -> dict[str, Any] | None:
+    """Read-only pinned-SSH qualification for a controller-observed successor."""
+
+    pod_ip = successor.get("pod_ip")
+    if not isinstance(pod_ip, str) or not pod_ip or pod_ip != pod_ip.strip():
+        return None
+    if (
+        _generation(successor.get("vmi_uid")) is None
+        or _generation(successor.get("launcher_uid")) is None
+    ):
+        return None
+    interface_mac = successor.get("interface_mac")
+    if not isinstance(interface_mac, str) or not interface_mac.strip():
+        return None
+    ready, _attempts, _error = await wait_for_agent_ssh(
+        pod_ip,
+        22,
+        key_path=resolve_ssh_key_path(),
+        deadline_s=10.0,
+        connect_timeout_s=10,
+        interval_s=0.5,
+        expected_host_key_fingerprint=host_key_fingerprint,
+    )
+    if not ready:
+        return None
+    challenge = secrets.token_urlsafe(32)
+    try:
+        async with pinned_agent_ssh_command(
+            pod_ip,
+            22,
+            "/usr/local/bin/srw-network-qualification " + shlex.quote(challenge),
+            expected_host_key_fingerprint=host_key_fingerprint,
+            key_path=resolve_ssh_key_path(),
+            connect_timeout_s=10,
+            batch_mode=True,
+        ) as command:
+            process = await create_owned_subprocess_exec(
+                *command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, _stderr = await communicate_bounded(
+                process,
+                timeout=15,
+                stdout_limit=128 * 1024,
+                stderr_limit=16 * 1024,
+            )
+        network = json.loads(stdout) if process.returncode == 0 else None
+    except Exception:
+        return None
+    if not _complete_recovery_network(
+        network, challenge=challenge, expected_mac=interface_mac
+    ):
+        return None
+    return {
+        "pod_ip": pod_ip,
+        "ssh_registration_id": uuid4().hex,
+        "guest_boot_id": network["boot_id"],
+        "guest_machine_id": network["machine_id"],
+        "guest_network": dict(network),
+    }
 
 
 class VMReadinessService:
@@ -183,6 +321,13 @@ class VMReadinessService:
         reprobe: bool,
     ) -> None:
         key = (entity_type, entity_id, generation)
+        if await self._recovery_owns_authority(entity_type, entity_id):
+            logger.debug(
+                "Recovery owns VM readiness authority for %s %s",
+                entity_type,
+                entity_id,
+            )
+            return
         if entity_type == "thread" and (
             vm.get("status")
             in {
@@ -218,6 +363,12 @@ class VMReadinessService:
                 "controller status unavailable",
                 reprobe=False,
             )
+            return
+
+        # Admission may race the controller read. Once recovery has installed
+        # its durable hold, the ordinary readiness path must remain read-only;
+        # only the recovery final CAS can bind the successor identity.
+        if await self._recovery_owns_authority(entity_type, entity_id):
             return
 
         reported_generation = status.get("provision_generation")
@@ -587,6 +738,21 @@ class VMReadinessService:
         self._retry_after.pop(key, None)
         if entity_type == "job":
             self._trigger_dispatch()
+
+    async def _recovery_owns_authority(self, entity_type: str, entity_id: str) -> bool:
+        check = getattr(self._db, "vm_workspace_recovery_owns_authority", None)
+        if not callable(check):
+            return False
+        try:
+            return bool(await check(entity_type, entity_id))
+        except Exception:
+            # Losing the authority read is not permission to mutate a runtime.
+            logger.exception(
+                "Failed to read VM workspace recovery authority for %s %s",
+                entity_type,
+                entity_id,
+            )
+            return True
 
     async def _transient_failure(
         self,

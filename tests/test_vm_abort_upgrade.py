@@ -16,6 +16,8 @@ torn down instead of leaking — the orphan that previously needed a manual
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from tests._workspace_recovery_fakes import idle_recovery_store
+
 import pytest
 
 # R1.B06: these handlers moved to services/thread_config_update with their
@@ -38,8 +40,25 @@ def _provisioner(*, available=True, delete_result=True, delete_exc=None):
     return SimpleNamespace(
         is_available=available,
         lifecycle_available=available,
-        delete_thread_vm=AsyncMock(return_value=delete_result, side_effect=delete_exc),
+        capture_vm_teardown_identity=AsyncMock(
+            return_value=SimpleNamespace(
+                provision_generation="generation", vm_uid="vm", rootdisk_pvc_uid="disk"
+            )
+        ),
+        release_vm_captured=AsyncMock(
+            return_value=SimpleNamespace(
+                disposition="completed" if delete_result else "unproven"
+            ),
+            side_effect=delete_exc,
+        ),
     )
+
+
+@pytest.fixture(autouse=True)
+def recovery_store(monkeypatch):
+    store = idle_recovery_store()
+    monkeypatch.setattr(orch_main, "VMWorkspaceRecoveryStore", lambda db: store)
+    return store
 
 
 class TestAbortThreadVmUpgrade:
@@ -74,7 +93,12 @@ class TestAbortThreadVmUpgrade:
                 dependencies=orch_main._thread_config_update_dependencies(),
             )
 
-        prov.delete_thread_vm.assert_awaited_once_with("tid")
+        prov.release_vm_captured.assert_awaited_once()
+        call = prov.release_vm_captured.await_args
+        assert call.args == ("tid", prov.capture_vm_teardown_identity.return_value)
+        assert call.kwargs["entity_type"] == "thread"
+        assert call.kwargs["purge_disk"] is True
+        assert call.kwargs["parent_cleanup"]["intent"]["vm_uid"] == "vm"
         db.merge_thread_vm_context.assert_awaited_once_with(
             "tid", {"status": "aborted"}
         )
@@ -96,7 +120,7 @@ class TestAbortThreadVmUpgrade:
                     dependencies=orch_main._thread_config_update_dependencies(),
                 )
 
-        prov.delete_thread_vm.assert_not_called()
+        prov.release_vm_captured.assert_not_called()
         db.merge_thread_vm_context.assert_not_awaited()
         assert exc.value.status_code == 503
         assert exc.value.detail == {

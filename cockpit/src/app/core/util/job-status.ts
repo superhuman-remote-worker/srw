@@ -71,10 +71,16 @@ export function canResumeJobStatus(status: string | null | undefined): boolean {
 export interface JobOutcomeView {
     status?: string | null;
     completion_outcome_kind?: string | null;
+    workspace_recovery?: {state?: string | null} | null;
 }
 
 /** Presentation status for a job whose storage status stays rolling-safe. */
 export function effectiveJobStatus(job: JobOutcomeView | null | undefined): string {
+    if (job?.workspace_recovery) {
+        return job.workspace_recovery.state === 'paused_attention'
+            ? 'recovery_paused'
+            : 'recovering_workspace';
+    }
     return job?.completion_outcome_kind === 'blocked_undelivered'
         ? 'blocked_undelivered'
         : (job?.status ?? '');
@@ -133,6 +139,7 @@ const LABELLED_JOB_STATUSES: ReadonlySet<string> = new Set([
     'created', 'processing', 'completed', 'failed', 'cancelled',
     'pending_review', 'paused', 'reviewing', 'waiting', 'waiting_for_reply',
     'blocked_undelivered',
+    'recovering_workspace', 'recovery_paused',
 ]);
 
 /** i18n key for a job status, or null when it has no label to fall back from. */
@@ -146,10 +153,12 @@ export function jobStatusTone(status: string): BadgeTone {
         case 'completed':
             return 'success';
         case 'processing':
+        case 'recovering_workspace':
         case 'pending_review':
         case 'blocked_undelivered':
             return 'warning';
         case 'failed':
+        case 'recovery_paused':
             return 'danger';
         case 'created':
         case 'waiting':

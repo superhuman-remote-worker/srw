@@ -859,6 +859,89 @@ async def test_queue_steal_waits_for_saver_fence_transaction(pg, saver_pool):
     assert stolen[0].state == "queued"
 
 
+async def test_recovery_hold_waits_for_saver_then_rejects_stale_writes(pg, saver_pool):
+    from orchestrator.services.vm_workspace_recovery_store import (
+        VMWorkspaceRecoveryStore,
+    )
+    from shared.workspace_recovery import WorkspaceRecoveryCode
+
+    job_id = uuid4()
+    async with pg.acquire() as conn:
+        await _insert_stateless_job(conn, job_id)
+    claim = await claim_worker_batch(pg, pod_name="recovery-saver")
+    assert claim is not None
+    saver = FencedAsyncPostgresSaver(
+        saver_pool, unit_id=str(job_id), lease_token=claim.lease_token
+    )
+    store = VMWorkspaceRecoveryStore(pg)
+    hold_task = None
+    try:
+        async with _lease(job_id, claim.lease_token):
+            async with saver._cursor(pipeline=True) as cursor:
+                await cursor.execute("SELECT 42")
+                hold_task = asyncio.create_task(
+                    store.admit_hold(
+                        job_id=job_id,
+                        accepted_lease_token=claim.lease_token,
+                        owner_kind="job",
+                        owner_id=job_id,
+                        workspace_contract_digest="sha256:workspace",
+                        provision_generation=uuid4(),
+                        cluster_name="test",
+                        namespace="workers",
+                        vm_uid=uuid4(),
+                        prior_vmi_uid=uuid4(),
+                        prior_launcher_uid=uuid4(),
+                        root_pvc_uid=uuid4(),
+                        code=WorkspaceRecoveryCode.RUNTIME_NOT_READY,
+                        request_id=uuid4(),
+                        actor_kind="worker",
+                        actor_id="recovery-saver",
+                        intent_digest="sha256:intent",
+                    )
+                )
+                async with pg.acquire() as observer:
+
+                    async def waiting():
+                        while not hold_task.done():
+                            if await observer.fetchval(
+                                "SELECT EXISTS (SELECT 1 FROM pg_stat_activity "
+                                "WHERE datname=current_database() AND wait_event_type='Lock' "
+                                "AND query LIKE '%SELECT * FROM run_queue%')"
+                            ):
+                                return True
+                            await asyncio.sleep(0.01)
+                        return False
+
+                    assert await asyncio.wait_for(waiting(), 3)
+                assert not hold_task.done()
+        held = await asyncio.wait_for(hold_task, 3)
+        assert held.hold_lease_token == claim.lease_token + 1
+        checkpoint, versions = _checkpoint(blob_value="late", version=1)
+        async with _lease(job_id, claim.lease_token):
+            with pytest.raises(LeaseLostError):
+                await saver.aput(
+                    {"configurable": {"thread_id": str(job_id), "checkpoint_ns": ""}},
+                    checkpoint,
+                    {"source": "loop", "step": 1, "parents": {}},
+                    versions,
+                )
+        async with pg.acquire() as conn:
+            assert (
+                await conn.fetchval(
+                    "SELECT attempts_since_completion FROM run_queue WHERE unit_id=$1",
+                    job_id,
+                )
+                == 0
+            )
+            assert await conn.fetchval("SELECT count(*) FROM checkpoints") == 0
+    finally:
+        if hold_task is not None and not hold_task.done():
+            hold_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await hold_task
+
+
 async def test_transient_retry_refences_and_rejects_intervening_steal(
     pg,
     saver_pool,

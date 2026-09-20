@@ -1,4 +1,4 @@
-{{- if .Values.ingress.enabled }}
+{{- if and .Values.ingress.enabled (not (include "srw.singleOrigin" .)) }}
 {{- $fullName := include "srw.fullname" . -}}
 {{- $cockpitHost := include "srw.host" (dict "context" . "key" "cockpit" "default" "") -}}
 {{- $apiHost     := include "srw.urlHost" (include "srw.apiUrl" .) -}}

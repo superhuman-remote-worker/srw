@@ -4,6 +4,8 @@ import asyncio
 import logging
 from contextlib import asynccontextmanager
 
+from tests._workspace_recovery_fakes import idle_recovery_store
+
 import pytest
 from fastapi import HTTPException
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -1036,6 +1038,9 @@ async def test_non_sandbox_recovery_uses_the_captured_vm_actuator(monkeypatch, b
     """Leader recovery must break the VM receipt/End retry dependency cycle."""
     from orchestrator.services.vm_provisioner import VMTeardownResult
 
+    monkeypatch.setattr(
+        main, "VMWorkspaceRecoveryStore", lambda db: idle_recovery_store()
+    )
     retirement, current = _vm_retirement(backend=backend)
     db, provisioner = _lite_recovery_mocks(current)
     vm_provisioner = MagicMock(lifecycle_available=True)
@@ -1075,7 +1080,11 @@ async def test_non_sandbox_recovery_uses_the_captured_vm_actuator(monkeypatch, b
     )
     assert call.args[1].vm_uid == retirement["context"]["vm"]["vm_uid"]
     assert call.args[1].rootdisk_pvc_uid == "rootdisk-pvc-uid"
+    parent_cleanup = call.kwargs["parent_cleanup"]
+    assert parent_cleanup["intent"]["owner_id"] == call.args[0]
+    assert parent_cleanup["intent"]["vm_uid"] == call.args[1].vm_uid
     assert call.kwargs == {
+        "parent_cleanup": parent_cleanup,
         "ssh_host": "192.0.2.44",
         "ssh_port": 22,
         "purge_disk": True,

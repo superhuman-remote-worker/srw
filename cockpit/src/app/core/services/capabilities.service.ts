@@ -8,6 +8,7 @@ import type {
   UserCapabilityFeatures,
 } from '../models/api.model';
 import {allowedEnumOptions} from '../../views/agent-settings/capability-gates';
+import {environment} from '../environment';
 
 /** `CapabilitiesService.sshGateway()`'s shape when the deployment has a
  * gateway configured — `hostname` plus its public host keys for client-side
@@ -79,6 +80,7 @@ export class CapabilitiesService {
   }
 
   private loadSshGateway(): void {
+    if (!environment.externalClientsEnabled) return;
     this.api.getSshHostKeys().subscribe((r: SshGatewayHostKeysResponse | null) => {
       if (r && r.host_keys.length > 0) {
         this.sshGateway.set({hostname: r.hostname, host_keys: r.host_keys});

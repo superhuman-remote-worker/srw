@@ -4632,7 +4632,8 @@ def _create_openrouter_llm(
     model_kwargs = {}
 
     # OpenRouter uses a nested reasoning object in the request body.
-    # OpenRouter supports all levels (none, minimal, low, medium, high, xhigh) — no clamping needed.
+    # Its gateway accepts a broad effort enum, but each model may accept only
+    # a subset (e.g. GLM-5.3: low/high/max). Apply the family ladder below.
     # It must travel via extra_body: langchain-openai >= 1.x forwards a
     # first-class ``reasoning`` field into the Chat Completions payload, and
     # the OpenAI SDK's typed create() rejects it (TypeError: unexpected
@@ -4641,8 +4642,10 @@ def _create_openrouter_llm(
     extra_body = {}
     _rplan = resolve_reasoning_plan(config)
     if _rplan["method"] == "effort_enum" and _rplan.get("value"):
-        # OpenRouter supports the full effort set (incl. xhigh) — no clamp.
-        extra_body["reasoning"] = {"effort": _rplan["value"]}
+        level = _clamp_reasoning_level(
+            _rplan["value"], _supported_efforts(_rplan["cap"])
+        )
+        extra_body["reasoning"] = {"effort": level}
 
     # top_k is likewise non-standard for the typed Chat Completions signature.
     if config.top_k is not None:
@@ -4720,8 +4723,9 @@ def _create_openrouter_llm(
 
     key_info = f"{len(keys)} key(s)" if len(keys) > 1 else "1 key"
     reasoning_mode = (
-        f"chat_completions(effort={config.reasoning_level})"
-        if config.reasoning_level and config.reasoning_level != "none"
+        f"chat_completions(effort={extra_body['reasoning']['effort']})"
+        if isinstance(extra_body.get("reasoning"), dict)
+        and extra_body["reasoning"].get("effort")
         else "none"
     )
     logger.info(

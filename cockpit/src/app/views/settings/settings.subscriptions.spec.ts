@@ -6,7 +6,7 @@
  * upstream reporting "ok" is not proof the credential was persisted, so only
  * `connected` may refresh the account list.
  */
-import {CUSTOM_ELEMENTS_SCHEMA, signal, ɵresolveComponentResources} from '@angular/core';
+import {CUSTOM_ELEMENTS_SCHEMA, Pipe, signal, ɵresolveComponentResources} from '@angular/core';
 import {TestBed} from '@angular/core/testing';
 import {afterEach, beforeAll, beforeEach, describe, expect, it, vi} from 'vitest';
 import {of, throwError} from 'rxjs';
@@ -22,6 +22,7 @@ import {I18nService} from '../../core/services/i18n.service';
 import {TranslocoService} from '@jsverse/transloco';
 import {Router} from '@angular/router';
 import {SubscriptionLogin, SubscriptionsStatus} from '../../core/models/api.model';
+import {environment} from '../../core/environment';
 
 function status(overrides: Partial<SubscriptionsStatus> = {}): SubscriptionsStatus {
   return {
@@ -111,7 +112,12 @@ function makeSettingsService() {
   };
 }
 
-function setup(service: ReturnType<typeof makeSettingsService>) {
+@Pipe({name: 'transloco', standalone: true})
+class TestTranslocoPipe {
+  transform(key: string): string { return key; }
+}
+
+function setup(service: ReturnType<typeof makeSettingsService>, renderTemplate = false) {
   TestBed.resetTestingModule();
   TestBed.configureTestingModule({
     imports: [SettingsComponent],
@@ -130,6 +136,8 @@ function setup(service: ReturnType<typeof makeSettingsService>) {
         provide: ModelService,
         useValue: {
           models: signal([]),
+          auxiliaryModels: signal([]), embeddingModels: signal([]), ttsModels: signal([]),
+          visionModels: signal([]), whisperModels: signal([]),
           groups: signal([]),
           load: vi.fn(),
           loading: signal(false),
@@ -141,7 +149,7 @@ function setup(service: ReturnType<typeof makeSettingsService>) {
           getMyCapabilities: () => of(null),
           getProjects: () => of([]),
           getExperts: () => of([]),
-          getExpertDefaults: () => of({}),
+          getExpertDefaults: () => of({defaults: {worker: {personal: null, effective: null}, session: {personal: null, effective: null}}}),
           getTtsLibrarySetting: () => of({enabled: false}),
           listTtsVoices: () => of([]),
         },
@@ -168,7 +176,9 @@ function setup(service: ReturnType<typeof makeSettingsService>) {
     ],
   });
   TestBed.overrideComponent(SettingsComponent, {
-    set: {imports: [], schemas: [CUSTOM_ELEMENTS_SCHEMA], template: ''},
+    set: renderTemplate
+      ? {imports: [TestTranslocoPipe], schemas: [CUSTOM_ELEMENTS_SCHEMA]}
+      : {imports: [], schemas: [CUSTOM_ELEMENTS_SCHEMA], template: ''},
   });
   const fixture = TestBed.createComponent(SettingsComponent);
   // Flush ngOnInit + the admin-gated constructor effect (which loads the
@@ -189,6 +199,37 @@ describe('SettingsComponent — AI Subscriptions', () => {
 
   afterEach(() => {
     vi.useRealTimers();
+  });
+
+  it('withholds MCP setup and token loading in the self-signed browser preset', () => {
+    const previous = environment.externalClientsEnabled;
+    environment.externalClientsEnabled = false;
+    try {
+      const component = setup(makeSettingsService()).componentInstance;
+      expect(component.externalClientsEnabled).toBe(false);
+      expect(TestBed.inject(McpTokenService).loadTokens).not.toHaveBeenCalled();
+      expect(component.mcpJsonSnippet()).toBe('');
+      expect(component.mcpServerUrl()).toBe('');
+    } finally {
+      environment.externalClientsEnabled = previous;
+    }
+  });
+
+  it.each([false, true])('renders MCP and SSH setup only when external clients are enabled (%s)', (enabled) => {
+    const previous = environment.externalClientsEnabled;
+    environment.externalClientsEnabled = enabled;
+    try {
+      // Keep the actual template and its control flow; only unrelated child
+      // controls/translations are shallow stubs in this component test.
+      const fixture = setup(makeSettingsService(), true);
+      const headings = [...fixture.nativeElement.querySelectorAll('h2')]
+        .map((node: any) => node.textContent.trim());
+      expect(headings.includes('settings.mcp.title')).toBe(enabled);
+      expect(fixture.nativeElement.textContent.includes('settings.sshKeys.linkTitle')).toBe(enabled);
+      fixture.destroy();
+    } finally {
+      environment.externalClientsEnabled = previous;
+    }
   });
 
   it('opens the authorization page for a browser flow', () => {

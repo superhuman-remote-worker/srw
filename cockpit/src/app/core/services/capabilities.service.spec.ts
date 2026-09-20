@@ -1,4 +1,5 @@
-import {describe, it, expect} from 'vitest';
+import {describe, it, expect, vi} from 'vitest';
+import {environment} from '../environment';
 import {TestBed} from '@angular/core/testing';
 import {NEVER, of} from 'rxjs';
 import {CapabilitiesService} from './capabilities.service';
@@ -192,6 +193,25 @@ describe('CapabilitiesService.datasourceScopeAutoAttachAvailable', () => {
 });
 
 describe('CapabilitiesService.sshGateway', () => {
+  it('does not advertise or fetch external SSH setup when the deployment disables external clients', () => {
+    const previous = environment.externalClientsEnabled;
+    environment.externalClientsEnabled = false;
+    const getSshHostKeys = vi.fn();
+    try {
+      TestBed.configureTestingModule({providers: [
+        CapabilitiesService,
+        {provide: ApiService, useValue: {
+          getMyCapabilities: () => of({is_admin: false, grants: {}, catalog: CATALOG}),
+          getSshHostKeys,
+        }},
+      ]});
+      expect(TestBed.inject(CapabilitiesService).sshGateway()).toBeNull();
+      expect(getSshHostKeys).not.toHaveBeenCalled();
+    } finally {
+      environment.externalClientsEnabled = previous;
+    }
+  });
+
   it('is null when the deployment has no gateway configured (empty host_keys)', () => {
     // GET /api/ssh/host-keys answers {host_keys: [], hostname: ...} rather
     // than erroring in this case — the empty list must fold to null so the

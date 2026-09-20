@@ -3,6 +3,7 @@ import Dexie from 'dexie';
 import { AuditEntry, AuditStepType } from '../models/audit.model';
 import { ChatEntry, ChatInput, ChatResponse } from '../models/chat.model';
 import { GraphDelta, GraphChanges } from '../../workbench/graph.model';
+import { compareThreadHistoryFence } from './indexed-db.service';
 
 // Since IndexedDbService uses Angular's @Injectable and signal,
 // we test the database logic directly using Dexie
@@ -588,5 +589,28 @@ describe('IndexedDB Schema', () => {
         .toArray();
       expect(rangeResults.length).toBe(11);
     });
+  });
+});
+
+describe('thread-history v2 fence ordering', () => {
+  const current = { eventsEpoch: 8, conversationRevision: 2 };
+
+  it('replaces on a newer epoch or revision and merges an equal fence', () => {
+    expect(compareThreadHistoryFence(current, current)).toBe('merge');
+    expect(
+      compareThreadHistoryFence(current, { eventsEpoch: 9, conversationRevision: 2 }),
+    ).toBe('replace');
+    expect(
+      compareThreadHistoryFence(current, { eventsEpoch: 8, conversationRevision: 3 }),
+    ).toBe('replace');
+  });
+
+  it('discards either dimension moving backwards', () => {
+    expect(
+      compareThreadHistoryFence(current, { eventsEpoch: 7, conversationRevision: 2 }),
+    ).toBe('discard');
+    expect(
+      compareThreadHistoryFence(current, { eventsEpoch: 9, conversationRevision: 1 }),
+    ).toBe('discard');
   });
 });

@@ -1,6 +1,6 @@
 # Superhuman Remote Worker
 
-**Stop building agents. Start delegating work.**
+**A complete agent platform — Under your control**
 
 [![Main CI](https://github.com/superhuman-remote-worker/srw/actions/workflows/main.yml/badge.svg)](https://github.com/superhuman-remote-worker/srw/actions/workflows/main.yml)
 [![Latest tag](https://img.shields.io/github/v/tag/superhuman-remote-worker/srw?label=release)](https://github.com/superhuman-remote-worker/srw/tags)
@@ -10,11 +10,12 @@
 [Documentation](docs/README.md) ·
 [Helm install](helm/README.md)
 
-[![SRW — Stop building agents. Start delegating work.](docs/assets/readme-hero.png)](https://superhuman-remote-worker.com/)
+[![SRW — A complete agent platform, under your control. Travertine banner with a three-pillar Roman temple.](docs/assets/readme-hero.png)](https://superhuman-remote-worker.com/)
 
-Superhuman Remote Worker (SRW) is a self-hosted runtime for AI work, from a
-help-desk assistant with no tools to a week-long autonomous project. It has
-three building bricks and an engine that puts them together:
+Superhuman Remote Worker (SRW) is a self-hosted agent platform for interactive
+assistance and autonomous work. Choose your models, tools and infrastructure,
+then combine three reusable building blocks to create agents that research,
+create and automate:
 
 - an **expert** — the harness image and its private settings. The included SRW
   harness supplies configurable prompts, models and tools;
@@ -23,11 +24,10 @@ three building bricks and an engine that puts them together:
 - a **connector** — what it can reach: a repository, a database, a cloud folder,
   a mailbox, an MCP server. A knowledge base is a connector too.
 
-A job is an expert plus a workspace plus connectors. The runtime is the engine,
-not a brick: it queues the job, issues the credentials, runs the workspace,
-keeps the audit trail, and hands back a reviewable result and a receipt.
-Sessions, projects, officers and subagents are the same three bricks,
-combined.
+A job brings an expert, a workspace and connectors together. The SRW
+orchestrator deploys and manages the work, coordinates execution, and returns
+progress, results and an audit trail. The included agent harness works with
+the orchestrator to support both interactive sessions and background jobs.
 
 The [`srw/v1alpha1` resource manifests](examples/manifests/README.md) define
 Experts, WorkspaceTemplates, Connectors, Projects and Jobs in JSON or YAML.
@@ -46,8 +46,8 @@ and recovery layers around it are the product.
 
 ## The mental model
 
-SRW organizes work around three concepts, each a combination of the bricks
-above: a session is an expert you talk to, a job is an expert working
+SRW organizes work around three concepts, each a combination of the building
+blocks above: a session is an expert you talk to, a job is an expert working
 unattended in a workspace, and a project is a saved recipe of experts,
 workspace tier and connectors.
 
@@ -92,7 +92,8 @@ SRW deploys through Helm to Kubernetes. The supported local evaluation path
 runs the same chart on a single-node [k3d](https://k3d.io) cluster.
 
 You need a Linux host with at least **8 vCPU and 16 GiB RAM**, plus Docker,
-`kubectl`, Helm 3.12+, k3d, `mkcert`, OpenSSL, and an SSH client. You also need
+`kubectl`, Helm 3.12+, k3d, OpenSSL, and an SSH client. The default multi-host
+local profile also needs `mkcert`; the single-origin profile does not. You need
 an API key for at least one configured LLM provider. See the
 [complete local prerequisites](docs/local-kubernetes.md#prerequisites) before
 starting.
@@ -119,6 +120,24 @@ helm install srw ./helm \
   --values deployment/values-local.yaml \
   --values deployment/values-local-images.yaml
 ```
+
+To use one self-signed HTTPS address without `mkcert`, cert-manager, or local
+DNS setup, select the single-origin profile when creating the cluster and add
+its overlay to Helm:
+
+```bash
+SRW_EXPOSURE_MODE=single-origin ./scripts/local-dev-up.sh
+helm install srw ./helm \
+  --namespace srw \
+  --kube-context k3d-srw \
+  --values deployment/values-local.yaml \
+  --values deployment/values-local-single-origin.yaml \
+  --values deployment/values-local-images.yaml
+```
+
+Open <https://localhost:8443/> and accept the certificate warning for that
+origin. An existing k3d cluster created with the 80/443 mapping must be
+recreated to obtain the dedicated `127.0.0.1:8443:30443@server:0` mapping.
 
 Wait for the workloads, then open the Cockpit:
 

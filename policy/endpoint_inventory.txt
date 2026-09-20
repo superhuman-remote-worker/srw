@@ -221,6 +221,9 @@ POST   /api/internal/ssh-attachments                                            
 POST   /api/internal/ssh-attachments/{attachment_id}/close                              gated:user_can_access_ide_entity
 POST   /api/internal/ssh-keys/used                                                      internal:require_internal
 GET    /api/internal/ssh-targets/{handle}                                               gated:user_can_access_ide_entity
+POST   /api/internal/vm-workspace-cleanup-authority/acquire                             internal:require_vm_cleanup_authority
+POST   /api/internal/vm-workspace-cleanup-authority/complete                            internal:require_vm_cleanup_authority
+POST   /api/internal/vm-workspace-cleanup-authority/resume                              internal:require_vm_cleanup_authority
 POST   /api/internal/vm/{entity_id}/heartbeat                                           internal:require_vm_guest
 POST   /api/internal/vm/{entity_id}/register                                            internal:require_vm_guest
 POST   /api/internal/vm/{entity_id}/sudo                                                internal:require_vm_guest
@@ -301,6 +304,7 @@ GET    /api/jobs/{job_id}/todos/current                                         
 POST   /api/jobs/{job_id}/upgrade-to-vm                                                 gated:require_job_access
 GET    /api/jobs/{job_id}/usage                                                         gated:require_job_access
 GET    /api/jobs/{job_id}/version                                                       gated:require_job_access
+POST   /api/jobs/{job_id}/workspace-recovery/retry                                      gated:require_job_access
 GET    /api/jobs/{job_id}/workspace-status                                              internal:require_internal
 POST   /api/jobs/{target_job_id}/verification/rounds                                    internal:require_internal
 POST   /api/manifests/apply                                                             gated:require_approved_user
@@ -358,6 +362,9 @@ GET    /api/persistent/threads/{thread_id}/messages                             
 GET    /api/persistent/threads/{thread_id}/queue                                        gated:require_thread_owner
 POST   /api/persistent/threads/{thread_id}/queue/retry                                  gated:require_thread_owner
 POST   /api/persistent/threads/{thread_id}/resume                                       gated:require_thread_owner
+POST   /api/persistent/threads/{thread_id}/rewinds                                      gated:require_thread_owner
+GET    /api/persistent/threads/{thread_id}/rewinds/by-client-request/{client_request_id} gated:require_thread_owner
+GET    /api/persistent/threads/{thread_id}/rewinds/preview                              gated:require_thread_owner
 GET    /api/persistent/threads/{thread_id}/state                                        gated:require_thread_owner
 GET    /api/persistent/threads/{thread_id}/stream                                       gated:require_thread_owner
 GET    /api/persistent/threads/{thread_id}/subagents                                    gated:require_thread_owner

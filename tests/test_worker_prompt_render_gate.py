@@ -61,6 +61,9 @@ _FAMILY_MODELS = {
     "claude-opus": "claude-opus-4-6",  # -> the base systemprompt.txt
     "deepseek": "deepseek-v4",
     "glm": "glm-5.1",
+    "glm-5.3": "glm-5.3",
+    "glm-5.3-flash": "glm-5.3-flash",
+    "muse-spark-1.3": "meta/muse-spark-1.3",
     "gpt-5": "gpt-5.5",
     "codex-spark": "gpt-5.3-codex-spark",
     "gpt-oss": "gpt-oss-120b",
@@ -138,7 +141,7 @@ def test_every_shipped_worker_template_is_phase_agnostic():
         for p in (_CONFIG / "prompts").glob("systemprompt*.txt")
         if "interactive" not in p.name and "subagent" not in p.name
     )
-    assert len(templates) == 9, templates
+    assert len(templates) == 11, templates
     for path in templates:
         raw = path.read_text(encoding="utf-8")
         assert not is_legacy_phase_template(raw), path.name
@@ -342,13 +345,13 @@ def test_frozen_pre_u2_template_keeps_the_swap_for_an_in_flight_job():
 
 
 def test_every_worker_template_states_the_per_call_gate_once():
-    """All nine worker templates carry the WP3 sentence exactly once."""
+    """All worker templates carry the WP3 sentence exactly once."""
     templates = [
         f
         for f in sorted(_CONFIG.glob("prompts/systemprompt*.txt"))
         if "interactive" not in f.name and "subagent" not in f.name
     ]
-    assert len(templates) == 9, [f.name for f in templates]
+    assert len(templates) == 11, [f.name for f in templates]
     for template in templates:
         text = template.read_text(encoding="utf-8")
         assert text.count(_PER_CALL_GATE_SENTENCE) == 1, template.name

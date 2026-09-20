@@ -115,6 +115,38 @@ class TestVmProvisioningDecision:
     def test_ready_dispatches(self):
         assert self._decide({"status": "ready"}) == VM_READY
 
+    def test_unproven_retirement_waits_until_its_durable_retry_time(self):
+        ctx = {
+            "status": "retiring_process_zero",
+            "provisioned_at": 1.0,
+            "retirement_retry_after": 1100.0,
+        }
+        assert self._decide(ctx, now=1000.0) == VM_WAIT
+        assert self._decide(ctx, now=1100.0) == VM_RECYCLE
+
+    def test_stale_retry_metadata_cannot_block_ready_or_new_provision(self):
+        for status, expected in [("ready", VM_READY), ("deleted", VM_PROVISION)]:
+            assert (
+                self._decide(
+                    {
+                        "status": status,
+                        "retirement_retry_after": 1100.0,
+                    }
+                )
+                == expected
+            )
+
+    def test_legacy_retirement_without_retry_metadata_gets_an_attempt(self):
+        assert (
+            self._decide(
+                {
+                    "status": "retiring_process_zero",
+                    "provisioned_at": 1.0,
+                }
+            )
+            == VM_RECYCLE
+        )
+
     def test_provisioning_within_budget_waits(self):
         # 'created' 100s ago, 600s budget → still booting, wait.
         ctx = {"status": "created", "provisioned_at": 900.0}

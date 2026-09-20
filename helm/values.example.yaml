@@ -64,6 +64,21 @@ orchestrator:
   kbGitAllowedHosts: "git.internal.example.com"
   kbExternalReindexConcurrency: 2
   kbReindexSweepSeconds: 900
+  # Recovery readers, controls and cleanup guards ship in every version. These
+  # switches open automatic probes only after the protocol rollout described
+  # in the chart README and its disposable-cluster gate have passed.
+  vmWorkspaceRecovery:
+    enabled: false
+    replacementEnabled: false
+    deadlineSeconds: 900
+    maxGlobalProbes: 4
+    maxProbesPerNode: 1
+    claimTtlSeconds: 30
+    permitTtlSeconds: 30
+    externalCallTimeoutSeconds: 10
+  # Disposable k3d gate only; installs its in-image command contract and RBAC.
+  vmWorkspaceRecoveryAcceptanceGate:
+    enabled: false
 
 # -----------------------------------------------------------------------------
 # Office Canvas — Collabora Online remains dark until every exact-origin and

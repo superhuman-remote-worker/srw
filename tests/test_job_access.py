@@ -580,6 +580,35 @@ class TestGetJob:
         assert "audit_count" in result
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("canonical_owner", "retryable"), [(True, True), (False, False)]
+    )
+    async def test_detail_retry_action_requires_canonical_recovery_owner(
+        self,
+        canonical_owner,
+        retryable,
+        user_a,
+        job_a,
+        fake_db,
+        fake_request,
+    ):
+        from orchestrator.main import get_job
+
+        job_a["_workspace_recovery"] = {
+            "operation_id": "44444444-4444-4444-8444-444444444444",
+            "state": "paused_attention",
+            "reason_code": "prior_runtime_unfenced",
+            "started_at": "2026-09-16T08:00:00Z",
+            "deadline_at": "2026-09-16T08:15:00Z",
+            "canonical_owner": canonical_owner,
+        }
+        with _patch_caller_and_db(user_a, fake_db), _patch_audit_unavailable():
+            result = await get_job(fake_request, str(job_a["id"]))
+
+        assert result["workspace_recovery"]["retryable"] is retryable
+        assert "canonical_owner" not in result["workspace_recovery"]
+
+    @pytest.mark.asyncio
     async def test_cross_user_403(self, user_b, job_a, fake_db, fake_request):
         from orchestrator.main import get_job
 

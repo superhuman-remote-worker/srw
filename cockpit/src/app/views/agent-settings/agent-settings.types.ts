@@ -202,7 +202,10 @@ export function detectModelFamily(model: string): string {
   if (name.startsWith('gpt-4o')) return 'gpt-4o';
   if (name.startsWith('o1') || name.startsWith('o3') || name.startsWith('o4')) return 'o-series';
   if (name.includes('deepseek')) return 'deepseek';
+  if (name.includes('glm-5.3-flash')) return 'glm-5.3-flash';
+  if (name.includes('glm-5.3')) return 'glm-5.3';
   if (name.includes('glm')) return 'glm';
+  if (/(?:^|\/)muse-spark-1\.3(?:$|[-:])/.test(name)) return 'muse-spark-1.3';
   if (
     name.startsWith('mistral') || name.startsWith('codestral') || name.startsWith('magistral') ||
     name.startsWith('ministral') || name.startsWith('devstral') || name.startsWith('pixtral') ||

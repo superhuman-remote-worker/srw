@@ -1,4 +1,4 @@
-{{- if and .Values.sshGateway.enabled .Values.ingress.enabled }}
+{{- if and .Values.sshGateway.enabled .Values.ingress.enabled (not (include "srw.singleOrigin" .)) }}
 {{- $fullName := include "srw.fullname" . -}}
 {{- /*
   Host wherever cockpit's OWN generated ProxyCommand will actually dial --

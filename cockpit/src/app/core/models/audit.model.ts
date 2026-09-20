@@ -1,4 +1,4 @@
-import type { WorkspaceContractProjection } from './api.model';
+import type { WorkspaceContractProjection, WorkspaceRecoveryView } from './api.model';
 
 /**
  * Audit step types from MongoDB agent_audit collection.
@@ -168,6 +168,7 @@ export interface JobSummary {
   subjob_count?: number;
   /** Safe requested/assigned/effective workspace tier observation. */
   workspace_contract?: WorkspaceContractProjection;
+  workspace_recovery?: WorkspaceRecoveryView | null;
 }
 
 /**

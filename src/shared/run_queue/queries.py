@@ -41,7 +41,8 @@ Contract invariants (the point of this module — do not weaken):
   cycle parks at ``max_attempts`` instead of hot-looping LLM spend.
 * **Dedup is queued-only.** One pending and one running collapsible task may
   coexist; a signal arriving mid-run is never swallowed.
-* **Layering:** this module touches ONLY ``run_queue``. Epoch bumps, system
+* **Layering:** this module mutates ONLY ``run_queue`` and reads unresolved
+  recovery participants to fence worker claims, completion and reaping. Epoch bumps, system
   frames (``turn.interrupted`` / ``turn.parked``), and job-row CASes belong
   to the callers (reaper loop / executor), keyed off the returned records.
 
@@ -285,6 +286,11 @@ _CLAIM_SQL = (
 WITH c AS (
     SELECT unit_id FROM run_queue
     WHERE state = 'queued' AND unit_kind = $1::text AND run_after <= now()
+      AND NOT EXISTS (
+          SELECT 1 FROM vm_workspace_recovery_jobs AS recovery_job
+          WHERE recovery_job.job_id = run_queue.unit_id
+            AND recovery_job.resolved_at IS NULL
+      )
       AND (last_leased_by IS NULL
            OR last_leased_by = $2::text
            OR queued_at <= now() - make_interval(secs => $4::float8))
@@ -305,6 +311,11 @@ WITH c AS (
     SELECT unit_id FROM run_queue
     WHERE unit_id = $4::uuid
       AND state = 'queued' AND unit_kind = $1::text AND run_after <= now()
+      AND NOT EXISTS (
+          SELECT 1 FROM vm_workspace_recovery_jobs AS recovery_job
+          WHERE recovery_job.job_id = run_queue.unit_id
+            AND recovery_job.resolved_at IS NULL
+      )
     FOR UPDATE SKIP LOCKED
 )
 """
@@ -476,6 +487,11 @@ UPDATE run_queue SET
     interrupt_admission_turn_id = NULL,
     run_after = now()
 WHERE unit_id = $1::uuid AND lease_token = $2::bigint AND state = 'leased'
+  AND NOT EXISTS (
+      SELECT 1 FROM vm_workspace_recovery_jobs AS recovery_job
+      WHERE recovery_job.job_id = run_queue.unit_id
+        AND recovery_job.resolved_at IS NULL
+  )
 RETURNING state
 """
 
@@ -649,6 +665,11 @@ SELECT unit_id, unit_kind, leased_by, lease_token,
 FROM run_queue
 WHERE state = 'leased'
   AND leased_until < now() - make_interval(secs => $1::float8)
+  AND NOT EXISTS (
+      SELECT 1 FROM vm_workspace_recovery_jobs AS recovery_job
+      WHERE recovery_job.job_id = run_queue.unit_id
+        AND recovery_job.resolved_at IS NULL
+  )
   AND ($2::text IS NULL OR unit_kind = $2::text)
 ORDER BY leased_until
 LIMIT $3::int
@@ -669,6 +690,11 @@ WITH previous AS (
       AND lease_token = $2::bigint
       AND state = 'leased'
       AND leased_until < now() - make_interval(secs => $4::float8)
+      AND NOT EXISTS (
+          SELECT 1 FROM vm_workspace_recovery_jobs AS recovery_job
+          WHERE recovery_job.job_id = run_queue.unit_id
+            AND recovery_job.resolved_at IS NULL
+      )
     FOR UPDATE
 )
 UPDATE run_queue AS queue SET
@@ -709,6 +735,11 @@ UPDATE run_queue SET
     run_after = now(),
     queued_at = now()
 WHERE unit_id = $1::uuid AND state = 'parked'
+  AND NOT EXISTS (
+      SELECT 1 FROM vm_workspace_recovery_jobs AS recovery_job
+      WHERE recovery_job.job_id = run_queue.unit_id
+        AND recovery_job.resolved_at IS NULL
+  )
 RETURNING state
 """
 
@@ -1280,6 +1311,7 @@ async def reap_expired(
     backoff_base_seconds: float = 5.0,
     jitter: float = 0.2,
     session_steal: Callable[..., Awaitable[StolenUnit | None]] | None = None,
+    worker_steal: Callable[..., Awaitable[StolenUnit | None]] | None = None,
 ) -> list[StolenUnit]:
     """Steal expired leases, per-row (§5.2 reaper) — never one bulk UPDATE.
 
@@ -1302,12 +1334,13 @@ async def reap_expired(
     Each steal commits independently (run this OUTSIDE any transaction): a
     crash mid-pass keeps the steals already made.
 
-    ``session_steal`` is the one deliberate layering seam.  When supplied for
-    a session candidate it owns the exact per-row steal and returns the same
-    :class:`StolenUnit` result.  The orchestrator uses it to lock
+    ``session_steal`` and ``worker_steal`` are optional layering seams. Each
+    owns the exact per-row transition for its unit kind and returns a
+    :class:`StolenUnit` or None. The orchestrator uses the session hook to lock
     ``threads -> run_queue`` and record old-claim I/O-quiescence provenance in
-    the *same transaction* as the token bump; generic worker/background rows
-    keep the queue-only statement below.
+    the same transaction as the token bump. The worker hook reconciles durable
+    disposition before retry/exhaustion. Without a matching hook, the existing
+    queue-only statement below remains authoritative.
 
     Layering: without that callback this module touches only ``run_queue``. The CALLER (the
     leader-gated reaper loop — advisory lock ``RUN_QUEUE_REAPER_ID`` in
@@ -1323,8 +1356,15 @@ async def reap_expired(
     for cand in candidates:
         attempts = cand["attempts_since_completion"]
         backoff = backoff_base_seconds * attempts * (1.0 + random.uniform(0.0, jitter))
-        if cand["unit_kind"] == UNIT_KIND_SESSION_TURN and session_steal is not None:
-            unit = await session_steal(
+        steal = (
+            session_steal
+            if cand["unit_kind"] == UNIT_KIND_SESSION_TURN
+            else worker_steal
+            if cand["unit_kind"] == UNIT_KIND_WORKER_BATCH
+            else None
+        )
+        if steal is not None:
+            unit = await steal(
                 conn,
                 candidate=cand,
                 backoff_seconds=backoff,

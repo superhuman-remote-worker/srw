@@ -169,6 +169,28 @@ def test_the_internal_guard_runs_after_body_validation():
     assert resp.status_code == 422
 
 
+def test_stateless_legacy_message_writer_refusal_is_a_409():
+    store = _store(
+        save_thread_message=AsyncMock(
+            side_effect=RuntimeError(
+                "legacy message writer is unavailable for stateless threads"
+            )
+        )
+    )
+    response = _client(_deps(store=store)).post(
+        f"/api/agents/threads/{THREAD_ID}/messages",
+        json={"role": "human", "content": "stale writer"},
+    )
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "detail": {
+            "code": "stateless_legacy_writer_refused",
+            "message": "legacy message writer is unavailable for stateless threads",
+        }
+    }
+
+
 # --- declaration order -------------------------------------------------------
 
 

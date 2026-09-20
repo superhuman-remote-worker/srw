@@ -37,7 +37,7 @@ import {AgentLoopDiagramComponent} from './agent-loop-diagram.component';
  * (gpt_5, gpt_oss, codex_spark) never resolved against the hyphenated family
  * key — corrected here, and minimax-m3 added.
  */
-const FAMILIES = ['gemma', 'gpt-5', 'gpt-5.6', 'gpt-oss', 'deepseek', 'glm', 'minimax', 'minimax-m3', 'codex', 'codex-spark'];
+const FAMILIES = ['gemma', 'gpt-5', 'gpt-5.6', 'gpt-oss', 'deepseek', 'glm', 'glm-5.3', 'glm-5.3-flash', 'muse-spark-1.3', 'minimax', 'minimax-m3', 'codex', 'codex-spark'];
 
 @Component({
   selector: 'app-admin-config',

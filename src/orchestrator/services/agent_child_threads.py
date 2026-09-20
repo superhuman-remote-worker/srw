@@ -691,6 +691,16 @@ async def agent_save_message(
             response_metadata=body.response_metadata,
         )
         return {"message_id": message_id, "status": "saved"}
+    except RuntimeError as e:
+        if "legacy message writer is unavailable for stateless threads" in str(e):
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "stateless_legacy_writer_refused",
+                    "message": str(e),
+                },
+            ) from e
+        raise HTTPException(status_code=500, detail=str(e)) from e
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
 

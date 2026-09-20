@@ -475,6 +475,7 @@ async def build_session_state_snapshot(
 
     return {
         "thread_id": str(thread_source["id"]),
+        "conversation_revision": int(thread_source.get("conversation_revision") or 0),
         "permission_mode": str(permission_mode),
         "narration_mode": str(narration_mode),
         "turn_count": turn_count,

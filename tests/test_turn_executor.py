@@ -34,6 +34,152 @@ from agent.api.orchestrator_client import ClaimBundleError
 from shared.run_queue import ClaimedUnit
 
 
+@pytest.mark.asyncio
+async def test_recovery_receipt_for_another_attempt_cannot_handoff_current_claim(
+    monkeypatch,
+):
+    from shared.worker_queue import WorkerClaim
+    from shared.workspace_recovery import (
+        WorkspaceRecoveryCode,
+        WorkspaceRecoveryDisposition,
+    )
+
+    monkeypatch.delenv("VM_WORKSPACE_RECOVERY_ENABLED", raising=False)
+    claim = WorkerClaim(
+        unit=make_claim(token=7), prior_job_status="processing", resume=True
+    )
+    executor = te.StatelessTurnExecutor(pod_name="worker", audit_writer=None)
+    other = WorkspaceRecoveryDisposition.hold_committed(
+        code=WorkspaceRecoveryCode.RUNTIME_NOT_READY,
+        operation_id=uuid4(),
+        accepted_lease_token=6,
+        hold_lease_token=7,
+    )
+    assert not await executor._resolve_workspace_recovery(
+        claim, error=ClaimBundleError(409, recovery=other)
+    )
+    assert executor._worker_workspace_recovery is None
+
+
+@pytest.mark.asyncio
+async def test_cancelled_local_join_quarantines_instead_of_reusing_slot():
+    executor = te.StatelessTurnExecutor(pod_name="worker", audit_writer=None)
+    finished = asyncio.Event()
+    local_task = asyncio.create_task(finished.wait())
+    join_task = asyncio.create_task(executor._join_worker_local_task(local_task))
+    await asyncio.sleep(0)
+    join_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await join_task
+    try:
+        assert executor._worker_quarantined and executor._stop.is_set()
+        assert not local_task.done()
+        with pytest.raises(te._ClaimQuiescenceError):
+            executor.start()
+    finally:
+        finished.set()
+        await local_task
+
+
+@pytest.mark.asyncio
+async def test_singleton_start_cannot_replace_a_quarantined_executor(monkeypatch):
+    executor = te.StatelessTurnExecutor(pod_name="worker", audit_writer=None)
+    executor._worker_quarantined = True
+    monkeypatch.setattr(te, "_executor", executor)
+    with pytest.raises(te._ClaimQuiescenceError, match="quarantined"):
+        await te.start_stateless_executor()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("known", [True, False])
+async def test_client_claim_bundle_parses_only_known_exact_recovery(known):
+    import httpx
+    from agent.api.orchestrator_client import OrchestratorClient
+    from shared.workspace_recovery import WorkspaceRecoveryCode
+
+    payload = {
+        "detail": "unavailable",
+        "code": "workspace_runtime_not_ready" if known else "future_error",
+        "recovery": {
+            "version": 1,
+            "action": "hold_committed",
+            "operation_id": "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+            "accepted_lease_token": 7,
+            "hold_lease_token": 8,
+        },
+    }
+    client = OrchestratorClient("http://test", "127.0.0.1", 8000, "worker", "default")
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda req: httpx.Response(409, json=payload))
+    ) as transport:
+        client._client = transport
+        with pytest.raises(ClaimBundleError) as caught:
+            await client.get_claim_bundle("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", 7)
+        assert caught.value.code == (
+            WorkspaceRecoveryCode.RUNTIME_NOT_READY if known else None
+        )
+        if known:
+            assert caught.value.recovery.accepted_lease_token == 7
+            assert caught.value.recovery.hold_lease_token == 8
+        else:
+            assert caught.value.recovery is None
+
+
+@pytest.mark.asyncio
+async def test_client_recovery_methods_preserve_identity_and_bounded_timeout(
+    monkeypatch,
+):
+    import httpx
+    import json
+    from agent.api.orchestrator_client import OrchestratorClient
+    from shared.workspace_recovery import WorkspaceRecoveryCode
+
+    monkeypatch.setenv("POD_NAME", "worker-a")
+    monkeypatch.setenv("POD_UID", "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+    request_id = uuid4()
+    requests = []
+    payload = {
+        "detail": "unavailable",
+        "code": "workspace_transport_unavailable",
+        "recovery": {
+            "version": 1,
+            "action": "hold_committed",
+            "operation_id": "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+            "accepted_lease_token": 7,
+            "hold_lease_token": 8,
+        },
+    }
+
+    def respond(request):
+        requests.append(request)
+        return httpx.Response(200, json=payload)
+
+    client = OrchestratorClient("http://test", "127.0.0.1", 8000, "worker", "default")
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as transport:
+        client._client = transport
+        result = await client.report_workspace_recovery(
+            "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+            7,
+            code=WorkspaceRecoveryCode.TRANSPORT_UNAVAILABLE,
+            request_id=request_id,
+        )
+        replay = await client.get_workspace_recovery_disposition(
+            "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", 7
+        )
+    assert result == replay
+    assert result.accepted_lease_token == 7
+    body = json.loads(requests[0].content)
+    assert body == {
+        "lease_token": 7,
+        "code": "workspace_transport_unavailable",
+        "request_id": str(request_id),
+        "pod_name": "worker-a",
+        "pod_uid": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    }
+    assert requests[1].url.params["lease_token"] == "7"
+    assert all(0 < r.extensions["timeout"]["read"] <= 30 for r in requests)
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -2455,6 +2601,19 @@ class TestAffinity:
             },
         }
         assert te.attach_fingerprint(first) == te.attach_fingerprint(second)
+
+    def test_fingerprint_changes_with_conversation_revision_and_event_epoch(self):
+        base = {
+            "thread_id": "t1",
+            "conversation_revision": 0,
+            "events_epoch": 7,
+            "resolved_config": {"agent": {"llm": {"model": "m"}}},
+        }
+        rewound = {**base, "conversation_revision": 1, "events_epoch": 8}
+        epoch_only = {**base, "events_epoch": 8}
+
+        assert te.attach_fingerprint(base) != te.attach_fingerprint(rewound)
+        assert te.attach_fingerprint(base) != te.attach_fingerprint(epoch_only)
 
     def test_fingerprint_ignores_rotating_runtime_actor_credentials_only(self):
         first = {

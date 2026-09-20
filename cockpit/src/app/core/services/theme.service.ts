@@ -86,17 +86,12 @@ export class ThemeService {
       }
     }
 
-    // Apply the body class whenever resolved theme changes. Runs at construction
-    // (so first paint matches the stored preference) and on every flip.
+    // Apply both appearance axes before reading their CSS token for browser/PWA
+    // chrome. One effect keeps the color in sync on theme and accent changes.
     effect(() => {
-      const theme = this.resolved();
-      this.applyBodyClass(theme);
-    });
-
-    // Same contract for the accent: one `accent-*` class on <body>, swapped
-    // in lockstep with the signal.
-    effect(() => {
+      this.applyBodyClass(this.resolved());
       this.applyAccentClass(this.accent());
+      this.applyBrowserThemeColor();
     });
   }
 
@@ -174,6 +169,15 @@ export class ThemeService {
     });
     toRemove.forEach((c) => body.classList.remove(c));
     body.classList.add(`theme-${theme}`);
+  }
+
+  private applyBrowserThemeColor(): void {
+    if (!this.isBrowser) return;
+    const color = window.getComputedStyle(document.body).getPropertyValue('--accent-color').trim();
+    // Preserve the purple HTML fallback if styles haven't loaded.
+    if (!color) return;
+    document.querySelectorAll<HTMLMetaElement>('meta[name="theme-color"], meta[name="msapplication-TileColor"]')
+      .forEach((meta) => { meta.content = color; });
   }
 
   private applyAccentClass(accent: AccentPreference): void {

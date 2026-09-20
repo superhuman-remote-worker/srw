@@ -10,11 +10,32 @@ import {
   CachedGraphDelta,
   CachedThreadMessage,
   JobCacheMetadata,
+  ThreadCacheEpoch,
   ThreadCursor,
 } from '../models/cache.model';
 
 /** Current cache schema version */
-const CACHE_VERSION = 4;
+const CACHE_VERSION = 5;
+
+export function compareThreadHistoryFence(
+  current: Pick<ThreadCacheEpoch, 'eventsEpoch' | 'conversationRevision'> | null,
+  incoming: Pick<ThreadCacheEpoch, 'eventsEpoch' | 'conversationRevision'>,
+): 'replace' | 'merge' | 'discard' {
+  if (!current) return 'replace';
+  if (
+    incoming.eventsEpoch < current.eventsEpoch ||
+    incoming.conversationRevision < current.conversationRevision
+  ) {
+    return 'discard';
+  }
+  if (
+    incoming.eventsEpoch > current.eventsEpoch ||
+    incoming.conversationRevision > current.conversationRevision
+  ) {
+    return 'replace';
+  }
+  return 'merge';
+}
 
 /**
  * Dexie database class for cockpit cache.
@@ -65,6 +86,34 @@ class CockpitDatabase extends Dexie {
       // New: full per-thread message cache for the persistent-chat display.
       threadMessages: 'id, threadId, [threadId+createdAt]',
     });
+    // Reindex existing REST-shaped rows as well as future writes. Changing
+    // only v4 would leave already-installed databases on the broken index.
+    this.version(5).stores({
+      threadMessages: 'id, threadId, [threadId+created_at]',
+    });
+  }
+}
+
+/**
+ * Version-fenced persistent-session history. Keeping this in a distinct
+ * database prevents an already-open pre-rewind Cockpit build from writing
+ * unversioned rows into the authoritative cache used by this build.
+ */
+class ThreadHistoryDatabase extends Dexie {
+  threadCursors!: Table<ThreadCursor>;
+  threadMessages!: Table<CachedThreadMessage>;
+  threadEpochs!: Table<ThreadCacheEpoch>;
+
+  constructor() {
+    super('srw-thread-history-v2');
+    this.version(1).stores({
+      threadCursors: 'threadId',
+      threadMessages: 'id, threadId, [threadId+createdAt]',
+      threadEpochs: 'threadId',
+    });
+    this.version(2).stores({
+      threadMessages: 'id, threadId, [threadId+created_at]',
+    });
   }
 }
 
@@ -80,8 +129,13 @@ class CockpitDatabase extends Dexie {
 @Injectable({ providedIn: 'root' })
 export class IndexedDbService {
   private db: CockpitDatabase | null = null;
+  private historyDb: ThreadHistoryDatabase | null = null;
   private readonly platformId = inject(PLATFORM_ID);
   private readonly isBrowser: boolean;
+  private historyChannel: BroadcastChannel | null = null;
+
+  /** Best-effort wake-up edge; the database fence remains authoritative. */
+  readonly threadHistoryEpochChanged = signal<ThreadCacheEpoch | null>(null);
 
   /** Whether the database is ready for operations */
   readonly isReady = signal(false);
@@ -93,15 +147,25 @@ export class IndexedDbService {
     this.isBrowser = isPlatformBrowser(this.platformId);
     if (this.isBrowser) {
       this.db = new CockpitDatabase();
+      this.historyDb = new ThreadHistoryDatabase();
+      if (typeof BroadcastChannel !== 'undefined') {
+        this.historyChannel = new BroadcastChannel('srw-thread-history-v2');
+        this.historyChannel.onmessage = (event) => {
+          const value = event.data as ThreadCacheEpoch | null;
+          if (value?.threadId && Number.isInteger(value.eventsEpoch)) {
+            this.threadHistoryEpochChanged.set(value);
+          }
+        };
+      }
       this.init();
     }
     // On server, db stays null and isReady stays false - that's fine for SSR
   }
 
   private async init(): Promise<void> {
-    if (!this.db) return;
+    if (!this.db || !this.historyDb) return;
     try {
-      await this.db.open();
+      await Promise.all([this.db.open(), this.historyDb.open()]);
       this.isReady.set(true);
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -388,8 +452,8 @@ export class IndexedDbService {
    * without a `Last-Event-ID` header in that case.
    */
   async getThreadCursor(threadId: string): Promise<ThreadCursor | null> {
-    if (!this.db) return null;
-    const row = await this.db.threadCursors.get(threadId);
+    if (!this.historyDb) return null;
+    const row = await this.historyDb.threadCursors.get(threadId);
     return row ?? null;
   }
 
@@ -400,12 +464,18 @@ export class IndexedDbService {
    * viewed.
    */
   async setThreadCursor(threadId: string, epoch: number, seq: number): Promise<void> {
-    if (!this.db) return;
-    await this.db.threadCursors.put({
-      threadId,
-      epoch,
-      seq,
-      updatedAt: new Date().toISOString(),
+    if (!this.historyDb) return;
+    await this.historyDb.transaction('rw', this.historyDb.threadCursors, async () => {
+      const current = await this.historyDb!.threadCursors.get(threadId);
+      if (current && (epoch < current.epoch || (epoch === current.epoch && seq <= current.seq))) {
+        return;
+      }
+      await this.historyDb!.threadCursors.put({
+        threadId,
+        epoch,
+        seq,
+        updatedAt: new Date().toISOString(),
+      });
     });
   }
 
@@ -415,8 +485,8 @@ export class IndexedDbService {
    * fresh stream rather than insist on the stale cursor.
    */
   async deleteThreadCursor(threadId: string): Promise<void> {
-    if (!this.db) return;
-    await this.db.threadCursors.delete(threadId);
+    if (!this.historyDb) return;
+    await this.historyDb.threadCursors.delete(threadId);
   }
 
   // ===== Thread Messages (full conversation cache) =====
@@ -426,9 +496,11 @@ export class IndexedDbService {
    * thread hasn't been cached yet. Feed straight into `historyToTurns`.
    */
   async getThreadMessages(threadId: string): Promise<CachedThreadMessage[]> {
-    if (!this.db) return [];
-    return this.db.threadMessages
-      .where('[threadId+createdAt]')
+    if (!this.db || !this.historyDb) return [];
+    const epoch = await this.historyDb.threadEpochs.get(threadId);
+    const table = epoch ? this.historyDb.threadMessages : this.db.threadMessages;
+    return table
+      .where('[threadId+created_at]')
       .between([threadId, Dexie.minKey], [threadId, Dexie.maxKey], true, true)
       .toArray();
   }
@@ -438,9 +510,11 @@ export class IndexedDbService {
    * cached. Used as the `?after=` cursor to fetch only what we've missed.
    */
   async getNewestCachedCreatedAt(threadId: string): Promise<string | null> {
-    if (!this.db) return null;
-    const row = await this.db.threadMessages
-      .where('[threadId+createdAt]')
+    if (!this.db || !this.historyDb) return null;
+    const epoch = await this.historyDb.threadEpochs.get(threadId);
+    const table = epoch ? this.historyDb.threadMessages : this.db.threadMessages;
+    const row = await table
+      .where('[threadId+created_at]')
       .between([threadId, Dexie.minKey], [threadId, Dexie.maxKey], true, true)
       .last();
     return row?.created_at ?? null;
@@ -451,14 +525,86 @@ export class IndexedDbService {
    * which would lose history). Idempotent: re-receiving a row overwrites it.
    */
   async upsertThreadMessages(rows: CachedThreadMessage[]): Promise<void> {
-    if (!this.db || rows.length === 0) return;
+    if (!this.db || !this.historyDb || rows.length === 0) return;
+    // Unversioned responses stay in the legacy database. Once a thread has
+    // observed the versioned contract they can no longer poison or downgrade
+    // its isolated v2 cache.
+    if (await this.historyDb.threadEpochs.get(rows[0].threadId)) return;
     await this.db.threadMessages.bulkPut(rows);
+  }
+
+  /** Current authoritative cache floor, if this tab has observed v2 history. */
+  async getThreadCacheEpoch(threadId: string): Promise<ThreadCacheEpoch | null> {
+    if (!this.historyDb) return null;
+    return (await this.historyDb.threadEpochs.get(threadId)) ?? null;
+  }
+
+  /**
+   * Merge one snapshot-consistent history response under its revision fence.
+   * A newer epoch/revision atomically replaces rows and the replay cursor; an
+   * equal fence merges by id; an older completion is discarded.
+   */
+  async applyThreadHistoryPage(
+    threadId: string,
+    eventsEpoch: number,
+    conversationRevision: number,
+    rows: CachedThreadMessage[],
+  ): Promise<{ accepted: boolean; replaced: boolean; messages: CachedThreadMessage[] }> {
+    if (!this.historyDb) return { accepted: true, replaced: false, messages: rows };
+    const result = await this.historyDb.transaction(
+      'rw',
+      this.historyDb.threadEpochs,
+      this.historyDb.threadMessages,
+      this.historyDb.threadCursors,
+      async () => {
+        const current = await this.historyDb!.threadEpochs.get(threadId);
+        const fence = compareThreadHistoryFence(current ?? null, {
+          eventsEpoch,
+          conversationRevision,
+        });
+        if (fence === 'discard') {
+          const messages = await this.historyDb!.threadMessages
+            .where('[threadId+created_at]')
+            .between([threadId, Dexie.minKey], [threadId, Dexie.maxKey], true, true)
+            .toArray();
+          return { accepted: false, replaced: false, messages };
+        }
+        const replaced = fence === 'replace';
+        if (replaced) {
+          await this.historyDb!.threadMessages.where('threadId').equals(threadId).delete();
+          await this.historyDb!.threadCursors.delete(threadId);
+        }
+        await this.historyDb!.threadEpochs.put({
+          threadId,
+          eventsEpoch,
+          conversationRevision,
+          updatedAt: new Date().toISOString(),
+        });
+        if (rows.length) await this.historyDb!.threadMessages.bulkPut(rows);
+        const messages = await this.historyDb!.threadMessages
+          .where('[threadId+created_at]')
+          .between([threadId, Dexie.minKey], [threadId, Dexie.maxKey], true, true)
+          .toArray();
+        return { accepted: true, replaced, messages };
+      },
+    );
+    if (result.accepted && result.replaced) {
+      const epoch = await this.historyDb.threadEpochs.get(threadId);
+      if (epoch) {
+        this.threadHistoryEpochChanged.set(epoch);
+        this.historyChannel?.postMessage(epoch);
+      }
+    }
+    return result;
   }
 
   /** Drop a thread's cached messages (e.g. manual cache reset). */
   async clearThreadMessages(threadId: string): Promise<void> {
-    if (!this.db) return;
-    await this.db.threadMessages.where('threadId').equals(threadId).delete();
+    if (!this.db || !this.historyDb) return;
+    await Promise.all([
+      this.db.threadMessages.where('threadId').equals(threadId).delete(),
+      this.historyDb.threadMessages.where('threadId').equals(threadId).delete(),
+    ]);
   }
 
   // ===== Cache Management =====
@@ -488,6 +634,9 @@ export class IndexedDbService {
       this.db.jobMetadata.clear(),
       this.db.threadCursors.clear(),
       this.db.threadMessages.clear(),
+      this.historyDb?.threadCursors.clear(),
+      this.historyDb?.threadMessages.clear(),
+      this.historyDb?.threadEpochs.clear(),
     ]);
   }
 

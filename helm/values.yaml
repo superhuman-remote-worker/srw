@@ -189,6 +189,32 @@ orchestrator:
   # paths; mutation admission is fenced by the application + database gate.
   vmRemoteOperationProtocol:
     enabled: false
+  # -- Durable recovery for held stateless VM workspaces. The reader, cleanup
+  # guards and recovery controls remain active while automation is disabled;
+  # disabling this block pauses outstanding operations without releasing data.
+  vmWorkspaceRecovery:
+    # -- Run bounded automatic recovery probes. Keep false until every worker
+    # understands the v1 hold receipt and old workers have drained.
+    enabled: false
+    # -- Adopt an infrastructure-created replacement on the retained disk.
+    # Requires the disposable KubeVirt/Longhorn evidence gate in addition to
+    # the base recovery gate.
+    replacementEnabled: false
+    # -- Immutable recovery budget from first observation to attention pause.
+    deadlineSeconds: 900
+    # -- Durable concurrency leases shared by overlapping leaders.
+    maxGlobalProbes: 4
+    maxProbesPerNode: 1
+    # -- Database claim and probe-permit lease durations.
+    claimTtlSeconds: 30
+    permitTtlSeconds: 30
+    # -- Per-controller/SSH/network call ceiling inside the outer deadline.
+    externalCallTimeoutSeconds: 10
+  # -- Destructive disposable-cluster acceptance command and temporary RBAC.
+  # The gate wrapper enables this only on the uniquely owned k3d cluster it
+  # creates. Never enable it on a shared or production release.
+  vmWorkspaceRecoveryAcceptanceGate:
+    enabled: false
   resources:
     requests:
       memory: "256Mi"
@@ -633,6 +659,12 @@ agent:
     # -- Recover an idle thread's stale cloud push through a low-priority
     # bg_task. Default off; requires migration 0233 and matching executors.
     cloudPushRecoveryEnabled: false
+    # -- Admit v1 idle, conversation-only rewinds through the orchestrator.
+    # Keep off until migration 0249, matching Cockpit readers, and all caller
+    # fences have rolled out. Duplicate receipt reads remain available after
+    # this gate is turned off again.
+    rewind:
+      idleConversationEnabled: false
     # -- Rolling-update shape for the executor Deployment. maxUnavailable 0:
     # a replacement pod boots and starts claiming before any old pod is asked
     # to drain; ReplicaSet scale-down then removes idle pods first via the
@@ -1153,6 +1185,41 @@ mcp:
     limits:
       memory: "256Mi"
       cpu: "200m"
+
+# =============================================================================
+# Public exposure profile
+# =============================================================================
+exposure:
+  # -- Existing domain-based Ingress resources remain the default. The
+  # single-origin profile owns a dedicated HTTPS NodePort and self-signed cert.
+  mode: multi-host
+  singleOrigin:
+    # -- Browser-visible IPv4 address, or localhost for the local k3d profile.
+    address: ""
+    # -- Browser-visible port. This is deliberately separate from nodePort so
+    # a local host/NAT mapping can advertise 8443 while targeting 30443.
+    publicPort: 30443
+    service:
+      nodePort: 30443
+      externalTrafficPolicy: Cluster
+    tls:
+      mode: self-signed
+      validityDays: 365
+    gateway:
+      image:
+        repository: docker.io/library/traefik
+        # Traefik 3.7 is in active/security support as of 2026-09-19. Pin the
+        # patched release explicitly; never use the mutable `latest` tag.
+        tag: "3.7.13"
+        digest: ""
+        pullPolicy: IfNotPresent
+      resources:
+        requests:
+          cpu: 25m
+          memory: 32Mi
+        limits:
+          cpu: 250m
+          memory: 128Mi
 
 # =============================================================================
 # Ingress

@@ -7,7 +7,8 @@
 #
 # Prerequisite: ./scripts/local-dev-tilt-up.sh has been run once. That script:
 #   - creates the k3d cluster `srw` with an embedded registry on localhost:5005
-#   - installs cert-manager + the mkcert ClusterIssuer
+#   - installs cert-manager + the mkcert ClusterIssuer in multi-host mode, or
+#     maps localhost:8443 to the chart-owned gateway in single-origin mode
 #   - creates the srw namespace + srw-vm-ssh-key + srw-session-jwt Secrets
 #   - drops a values-local.yaml from the example template
 #
@@ -398,6 +399,14 @@ for i in range(len(_srw_images)):
     if _srw_images[i][0] in ['srw-mcp', 'srw-vm-preparer']:
         _srw_helm_env['TILT_IMAGE_KEY_DIGEST_%s' % i] = _srw_images[i][2][:-4] + '.digest'
 
+_srw_exposure_mode = os.getenv('SRW_EXPOSURE_MODE') or 'multi-host'
+_srw_values_args = [
+    '--values=deployment/values-local.yaml',
+]
+if _srw_exposure_mode == 'single-origin':
+    _srw_values_args.append('--values=deployment/values-local-single-origin.yaml')
+_srw_values_args.append('--values=deployment/values-tilt.yaml')
+
 k8s_custom_deploy(
     'srw',
     apply_cmd=[
@@ -411,9 +420,7 @@ k8s_custom_deploy(
         # the complete release, including databases and immutable collectors.
         '--wait',
         '--timeout=14m',
-        '--values=deployment/values-local.yaml',
-        '--values=deployment/values-tilt.yaml',
-    ],
+    ] + _srw_values_args,
     apply_env=_srw_helm_env,
     delete_cmd=['helm', 'uninstall', '--namespace', 'srw', 'srw'],
     # Values edits DO trigger a redeploy (changed 2026-08-30). This was `deps=[]`,
@@ -427,6 +434,7 @@ k8s_custom_deploy(
     # rendering is driven by the values above.
     deps=[
         'deployment/values-local.yaml',
+        'deployment/values-local-single-origin.yaml',
         'deployment/values-tilt.yaml',
         'scripts/tilt-helm-apply.sh',
         'scripts/tilt-image-digest.py',

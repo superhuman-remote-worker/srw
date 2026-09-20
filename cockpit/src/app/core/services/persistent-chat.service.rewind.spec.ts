@@ -14,7 +14,7 @@ import {describe, expect, it, vi} from 'vitest';
 import {signal} from '@angular/core';
 import {TestBed} from '@angular/core/testing';
 import {HttpClient} from '@angular/common/http';
-import {of} from 'rxjs';
+import {of, throwError} from 'rxjs';
 import {TranslocoService} from '@jsverse/transloco';
 import {PersistentChatService} from './persistent-chat.service';
 import {ApiService} from './api.service';
@@ -131,6 +131,155 @@ describe('PersistentChatService rewind', () => {
         expect(frame.method).toBe('compact');
         expect(frame.boundary_message_id).toBe('row-2');
     });
+
+    it('uses preview plus the unchanged expected boundary for REST rewind', async () => {
+        const {service, mockHttp} = createService();
+        service.threadId.set('thread-rw');
+        (service as any).controlSocket = 'none';
+        (service as any).controlCapabilities.set({
+            threadId: 'thread-rw',
+            controls: {rewind: 'rest'},
+            options: {rewind: {version: 1, modes: ['conversation'], requires_idle: true}},
+        });
+        const expected = {
+            session_runtime_generation: '00000000-0000-4000-8000-000000000001',
+            conversation_revision: 0,
+            events_epoch: 3,
+            transcript_tail_seq: '7',
+            input_seq: '2',
+            consumed_seq: '2',
+        };
+        mockHttp.get.mockImplementation((url: string) => {
+            if (url.includes('/rewinds/preview')) {
+                return of({
+                    message_id: 'row-1',
+                    mode: 'conversation',
+                    prompt: 'original prompt',
+                    eligible: true,
+                    refusal_code: null,
+                    swept_count: 2,
+                    expected,
+                });
+            }
+            if (url.endsWith('/messages')) {
+                return of({messages: [], total: 0, events_epoch: 4, conversation_revision: 1});
+            }
+            if (url.endsWith('/state')) {
+                return of({
+                    thread_id: 'thread-rw',
+                    permission_mode: 'supervised',
+                    narration_mode: 'verbose',
+                    turn_count: 0,
+                    turn_in_flight: false,
+                    message_count: 0,
+                    model: null,
+                    temperature: null,
+                    running_tool: null,
+                    pending_permissions: [],
+                    event_cursor: {epoch: 4, seq: 1},
+                    replay_cursor: {epoch: 4, seq: 1},
+                    conversation_revision: 1,
+                    snapshot_source: 'durable_journal',
+                });
+            }
+            return of({status: 'active', total_turns: 0});
+        });
+        mockHttp.post.mockImplementation((_url: string, body: any) =>
+            of({
+                state: 'applied',
+                rewind_id: '00000000-0000-4000-8000-000000000003',
+                client_request_id: body.client_request_id,
+                message_id: body.message_id,
+                mode: 'conversation',
+                prompt: 'original prompt',
+                swept_count: 2,
+                surviving_turn: 0,
+                conversation_revision: 1,
+                events_epoch: 4,
+                event_seq: '1',
+                duplicate: false,
+            }),
+        );
+
+        await service.prepareRewind('row-1');
+        const requestId = service.rewind('row-1', 'conversation', 'draft');
+
+        await vi.waitFor(() => expect(service.rewindInFlight()).toBe(false));
+        const rewindCall = mockHttp.post.mock.calls.find((call: any[]) =>
+            String(call[0]).endsWith('/rewinds'),
+        );
+        expect(rewindCall?.[1]).toEqual({
+            client_request_id: requestId,
+            message_id: 'row-1',
+            mode: 'conversation',
+            expected,
+        });
+        expect(service.conversationRevision()).toBe(1);
+        expect(service.rewindPrefill()).toEqual({
+            prompt: 'original prompt',
+            draftSnapshot: 'draft',
+            draftRevision: 0,
+            clientRequestId: requestId,
+        });
+        expect((service as any).controlOutbox).toEqual([]);
+    });
+
+    it('does not flush a pre-rewind outbox entry and returns it for review', async () => {
+        const {service, mockHttp} = createService();
+        service.threadId.set('thread-rw');
+        service.conversationRevision.set(2);
+        service.sessionReady.set(true);
+        service.outbox.set([{
+            localId: 'local-old',
+            displayContent: 'draft from the old view',
+            threadId: 'thread-rw',
+            attempts: 0,
+            expectedConversationRevision: 1,
+        }]);
+
+        await (service as any)._flushOutbox();
+
+        expect(mockHttp.post).not.toHaveBeenCalled();
+        expect(service.outbox()[0].requiresReview).toBe(true);
+        expect(service.takeQueuedSendForReview('local-old')).toBe('draft from the old view');
+        expect(service.outbox()).toEqual([]);
+    });
+
+    it('keeps an input rejected by a concurrent rewind and marks it for review', async () => {
+        const {service, mockHttp} = createService();
+        service.threadId.set('thread-rw');
+        service.conversationRevision.set(1);
+        service.sessionReady.set(true);
+        service.outbox.set([{
+            localId: 'local-raced',
+            displayContent: 'draft sent while another tab rewound',
+            threadId: 'thread-rw',
+            attempts: 0,
+            expectedConversationRevision: 1,
+        }]);
+        mockHttp.post.mockReturnValue(throwError(() => ({
+            status: 409,
+            error: {
+                detail: {
+                    code: 'session_view_stale',
+                    conversation_revision: 2,
+                },
+            },
+        })));
+
+        await (service as any)._flushOutbox();
+
+        expect(mockHttp.post).toHaveBeenCalledWith(
+            expect.stringMatching(/\/persistent\/threads\/thread-rw\/input$/),
+            {
+                content: 'draft sent while another tab rewound',
+                expected_conversation_revision: 1,
+            },
+        );
+        expect(service.conversationRevision()).toBe(2);
+        expect(service.outbox()[0].requiresReview).toBe(true);
+        expect(service.error()).toBe('chat.rewind.staleOutbox');
+    });
 });
 
 /**
@@ -151,9 +300,7 @@ describe('PersistentChatService — rewind refuses to queue when the control WS 
         expect(requestId).toBeTruthy();
         expect((service as any).controlOutbox).toEqual([]);
         expect(service.rewindInFlight()).toBe(false);
-        expect(service.error()).toBe(
-            'Session connection is down — reconnect before rewinding',
-        );
+        expect(service.error()).toBe('chat.rewind.connectionDown');
     });
 
     it('controlWs present but not OPEN (e.g. CONNECTING): same refusal, no queueing', () => {
@@ -168,9 +315,7 @@ describe('PersistentChatService — rewind refuses to queue when the control WS 
         expect(connecting.send).not.toHaveBeenCalled();
         expect((service as any).controlOutbox).toEqual([]);
         expect(service.rewindInFlight()).toBe(false);
-        expect(service.error()).toBe(
-            'Session connection is down — reconnect before rewinding',
-        );
+        expect(service.error()).toBe('chat.rewind.connectionDown');
     });
 
     it('does not arm the ack-fallback timer on refusal (nothing to disarm later)', async () => {
@@ -202,6 +347,20 @@ describe('PersistentChatService — rewind refuses to queue when the control WS 
         expect(live.send).toHaveBeenCalledTimes(1);
         expect(service.rewindInFlight()).toBe(true);
         expect(service.error()).toBeNull();
+    });
+
+    it('a send throw is refused and never enters the reconnect outbox', () => {
+        const {service} = createService();
+        const live = createMockWs();
+        live.send.mockImplementation(() => { throw new Error('closed'); });
+        service.threadId.set('thread-rw');
+        (service as any).controlWs = live;
+
+        service.rewind('row-1', 'conversation');
+
+        expect((service as any).controlOutbox).toEqual([]);
+        expect(service.rewindInFlight()).toBe(false);
+        expect(service.error()).toBe('chat.rewind.connectionDown');
     });
 });
 

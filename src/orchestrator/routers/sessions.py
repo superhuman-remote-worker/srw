@@ -26,6 +26,7 @@ carry the ports rather than look them up later.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import uuid
@@ -52,6 +53,10 @@ from orchestrator.services.session_provisioning_state import (
     agent_pod_provisioning_in_progress,
 )
 from orchestrator.services.session_router import SessionRouteAuthorityError
+from orchestrator.services.session_urls import session_websocket_origin
+from orchestrator.services.deployment_gates import (
+    stateless_idle_conversation_rewind_enabled,
+)
 
 # R1.B05 moved these three out of `main`; they are pure, so this router
 # reaches their owners directly instead of going back through the
@@ -795,6 +800,8 @@ class PinnedConnectionResponse(BaseModel):
     controls: dict[str, ControlTransport] = Field(
         default_factory=lambda: dict(PINNED_CONTROLS)
     )
+    control_options: dict[str, Any] = Field(default_factory=dict)
+    conversation_revision: int = 0
     # Queue lifecycle block (stateless_turn_resilience.md step 2). Always
     # None on the pinned lane: a pinned session has no run_queue unit.
     queue: dict[str, Any] | None = None
@@ -813,6 +820,8 @@ class StatelessConnectionResponse(BaseModel):
     controls: dict[str, ControlTransport] = Field(
         default_factory=lambda: dict(STATELESS_CONTROLS)
     )
+    control_options: dict[str, Any] = Field(default_factory=dict)
+    conversation_revision: int = 0
     # Queue lifecycle block (stateless_turn_resilience.md step 2): the same
     # shape POST …/input and GET …/queue return, so a reload can re-derive a
     # queued or parked turn instead of erasing it. None only when the read
@@ -884,9 +893,40 @@ async def get_connection(
                 status_code=409,
                 detail="Stateless session has an incompatible agent binding",
             )
-        # Queue-served sessions can accept turns as soon as the row exists.
-        # The marker reports only the absence of a socket; it deliberately
-        # does not advertise a REST control plane that has not been built.
+        controls = dict(STATELESS_CONTROLS)
+        control_options: dict[str, Any] = {}
+        officer = False
+        if stateless_idle_conversation_rewind_enabled() and (
+            str(thread.get("kind") or "") == "session"
+            and thread.get("parent_job_id") is None
+            and thread.get("parent_thread_id") is None
+        ):
+            metadata = thread.get("metadata")
+            if isinstance(metadata, str):
+                try:
+                    metadata = json.loads(metadata)
+                except (TypeError, ValueError):
+                    metadata = None
+            officer = not isinstance(metadata, dict) or bool(
+                isinstance(metadata.get("config_override"), dict)
+                and isinstance(metadata["config_override"].get("officer"), dict)
+                and metadata["config_override"]["officer"].get("enabled") is True
+            )
+            async with db.acquire() as conn:
+                officer = officer or bool(
+                    await conn.fetchval(
+                        "SELECT EXISTS (SELECT 1 FROM project_officers "
+                        "WHERE thread_id=$1)",
+                        thread_id,
+                    )
+                )
+            if not officer:
+                controls["rewind"] = "rest"
+                control_options["rewind"] = {
+                    "version": 1,
+                    "modes": ["conversation"],
+                    "requires_idle": True,
+                }
         return StatelessConnectionResponse(
             state="ready",
             control_socket="none",
@@ -894,6 +934,9 @@ async def get_connection(
             token=None,
             expires_at=None,
             session_runtime_generation=runtime_authority.generation,
+            controls=controls,
+            control_options=control_options,
+            conversation_revision=int(thread.get("conversation_revision") or 0),
             queue=await _read_queue_block(db, thread),
         )
     if execution_lane != LANE_PINNED:
@@ -995,8 +1038,11 @@ async def get_connection(
             session_identity_fingerprint=identity_fingerprint,
         )
 
-        host = os.environ.get("SESSION_INGRESS_HOST", "api.example.com")
-        ws_url = f"wss://{host}/p/{runtime_authority.thread_id}/ws?t={token}"
+        socket_origin = session_websocket_origin(
+            os.environ.get("SESSION_PUBLIC_ORIGIN", ""),
+            os.environ.get("SESSION_INGRESS_HOST", "api.example.com"),
+        )
+        ws_url = f"{socket_origin}/p/{runtime_authority.thread_id}/ws?t={token}"
         response = PinnedConnectionResponse(
             state="ready",
             control_socket="websocket",
@@ -1004,6 +1050,7 @@ async def get_connection(
             token=token,
             expires_at=expires_at,
             session_runtime_generation=runtime_authority.generation,
+            conversation_revision=int(thread.get("conversation_revision") or 0),
         )
         route_committed = True
         return response

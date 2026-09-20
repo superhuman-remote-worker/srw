@@ -146,6 +146,11 @@ def service_factory():
         gitea_client=None,
         container_provisioner=container_provisioner,
     )
+    recovery_store = MagicMock()
+    recovery_store.acquire_cleanup_permit = AsyncMock(
+        return_value=MagicMock(allowed=True, admission_id=None)
+    )
+    svc._workspace_recovery_store = recovery_store
     return svc
 
 
@@ -162,6 +167,40 @@ def _k8s_ide_job(*, job_id: str, runtime_incarnation: str) -> dict:
             }
         },
     }
+
+
+@pytest.mark.asyncio
+async def test_vm_ide_delete_stands_down_for_workspace_recovery(
+    service_factory,
+) -> None:
+    from types import SimpleNamespace
+
+    job_id = "11111111-1111-4111-8111-111111111111"
+    svc = service_factory
+    svc._vm_provisioner.lifecycle_available = True
+    svc._vm_provisioner.capture_vm_teardown_identity = AsyncMock(
+        return_value=SimpleNamespace(
+            provision_generation="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            vm_uid="bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            rootdisk_pvc_uid="cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+        )
+    )
+    svc._vm_provisioner.release_vm_captured = AsyncMock()
+    svc._vm_provisioner.delete_vm = AsyncMock(return_value=True)
+    recovery_store = MagicMock()
+    recovery_store.acquire_cleanup_permit = AsyncMock(
+        return_value=SimpleNamespace(
+            allowed=False,
+            reason="workspace_recovery_unresolved",
+        )
+    )
+    svc._workspace_recovery_store = recovery_store
+
+    assert not await svc._delete_ide_vm(job_id, "ide-vm")
+
+    recovery_store.acquire_cleanup_permit.assert_awaited_once()
+    svc._vm_provisioner.release_vm_captured.assert_not_awaited()
+    svc._vm_provisioner.delete_vm.assert_not_awaited()
 
 
 @pytest.mark.asyncio

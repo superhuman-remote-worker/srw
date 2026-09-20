@@ -7,6 +7,17 @@ import {
 } from './reasoning-options';
 
 describe('getReasoningOptions (capability-driven)', () => {
+  it('offers GLM-5.3 Low/High/Max with Max as default and no disable option', () => {
+    const cap = {method: 'effort_enum' as const, default: 'max', options: ['low', 'high', 'max']};
+    expect(getReasoningOptions(cap)).toEqual([
+      {value: null, label: 'Default'},
+      {value: 'low', label: 'Low'},
+      {value: 'high', label: 'High'},
+      {value: 'max', label: 'Max'},
+    ]);
+    expect(defaultSelectableReasoning(cap)).toBe('max');
+  });
+
   it('returns Default-only for method=none', () => {
     const opts = getReasoningOptions({method: 'none', default: null, options: []});
     expect(opts).toEqual([{value: null, label: 'Default'}]);
@@ -110,6 +121,18 @@ describe('getSelectableReasoningOptions (no Default sentinel)', () => {
 });
 
 describe('defaultSelectableReasoning', () => {
+  it('exposes mandatory Muse reasoning from minimal through max, defaulting to medium', () => {
+    const cap = {
+      method: 'effort_enum',
+      default: 'medium',
+      options: ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'],
+    };
+    expect(getSelectableReasoningOptions(cap).map((option) => option.label)).toEqual([
+      'Minimal', 'Low', 'Medium', 'High', 'X-High', 'Max',
+    ]);
+    expect(defaultSelectableReasoning(cap)).toBe('medium');
+  });
+
   it('resolves to the family default when selectable', () => {
     expect(
       defaultSelectableReasoning({method: 'binary_toggle', default: 'on', options: ['on', 'off']}),

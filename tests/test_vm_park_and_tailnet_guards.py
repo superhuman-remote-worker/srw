@@ -177,4 +177,5 @@ class TestFailVmParkedJob:
         assert update.call_args.args[0] == "job-parked"
         assert kwargs["status"] == "failed"
         assert "provisioning exhausted after 3 attempts" in kwargs["error_message"]
-        assert "clear context.vm" in kwargs["error_message"].lower()
+        assert "resume" in kwargs["error_message"].lower()
+        assert "clear context.vm" not in kwargs["error_message"].lower()

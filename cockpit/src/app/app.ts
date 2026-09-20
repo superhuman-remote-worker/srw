@@ -85,7 +85,9 @@ import {AppIconComponent} from './ui/icon';
             <app-empty-catalog-banner />
             <app-view-mode-banner />
           }
-          <router-outlet />
+          <div class="route-content">
+            <router-outlet />
+          </div>
         }
       </div>
     </div>
@@ -93,12 +95,27 @@ import {AppIconComponent} from './ui/icon';
   `,
   styles: [
     `
-      .app-container {
+      :host {
         display: flex;
+        flex-direction: column;
         height: 100vh;
         height: 100dvh;
-        width: 100vw;
         overflow: hidden;
+      }
+
+      .app-container {
+        display: flex;
+        flex: 1;
+        min-height: 0;
+        width: 100%;
+        overflow: hidden;
+      }
+
+      app-pwa-banner,
+      app-readiness-gate-banner,
+      app-empty-catalog-banner,
+      app-view-mode-banner {
+        flex-shrink: 0;
       }
 
       .content-area {
@@ -111,9 +128,15 @@ import {AppIconComponent} from './ui/icon';
         position: relative;
       }
 
-      .content-area > router-outlet ~ * {
+      /* Routed hosts do not receive this component's scoped style attribute.
+         Size a shell-owned wrapper so their height: 100% uses only the space
+         left below the banners, including when banner text wraps. */
+      .route-content {
         flex: 1;
+        min-width: 0;
         min-height: 0;
+        overflow: hidden;
+        position: relative;
       }
 
       .pending-approval {

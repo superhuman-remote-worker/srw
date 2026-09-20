@@ -55,6 +55,8 @@ spec:
         checksum/workspace-lifecycle-protocol-cutover: {{ dict "enabled" $workspaceLifecycleCutover | toJson | sha256sum | quote }}
         checksum/workspace-lifecycle-service-account: {{ .Values.orchestrator.workspaceLifecycleServiceAccountGeneration | default "0197" | toString | sha256sum | quote }}
         checksum/vm-remote-operation-protocol: {{ dict "enabled" $vmRemoteProtocol | toJson | sha256sum | quote }}
+        checksum/vm-workspace-recovery: {{ toJson .Values.orchestrator.vmWorkspaceRecovery | sha256sum | quote }}
+        checksum/vm-workspace-recovery-acceptance-gate: {{ toJson .Values.orchestrator.vmWorkspaceRecoveryAcceptanceGate | sha256sum | quote }}
     spec:
       serviceAccountName: {{ include "srw.orchestratorServiceAccountName" . }}
       terminationGracePeriodSeconds: {{ .Values.orchestrator.terminationGracePeriodSeconds }}
@@ -505,6 +507,11 @@ spec:
                 configMapKeyRef:
                   name: {{ include "srw.configMapName" . }}
                   key: STATELESS_CLOUD_PUSH_RECOVERY_ENABLED
+            - name: SESSION_REWIND_IDLE_CONVERSATION_ENABLED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: SESSION_REWIND_IDLE_CONVERSATION_ENABLED
             - name: STATELESS_WORKER_ENABLED
               valueFrom:
                 configMapKeyRef:
@@ -515,6 +522,16 @@ spec:
                 configMapKeyRef:
                   name: {{ include "srw.configMapName" . }}
                   key: STATELESS_WORKER_DEFAULT_ENABLED
+            # Recovery admission, workers, and the leader reconciler consume
+            # one rendered protocol surface. This Deployment does not use the
+            # shared ConfigMap through envFrom, so every key is explicit here.
+            {{- range $key := list "VM_WORKSPACE_RECOVERY_ENABLED" "VM_WORKSPACE_REPLACEMENT_RECOVERY_ENABLED" "VM_WORKSPACE_RECOVERY_DEADLINE_SECONDS" "VM_WORKSPACE_RECOVERY_MAX_GLOBAL_PROBES" "VM_WORKSPACE_RECOVERY_MAX_PROBES_PER_NODE" "VM_WORKSPACE_RECOVERY_CLAIM_TTL_SECONDS" "VM_WORKSPACE_RECOVERY_PERMIT_TTL_SECONDS" "VM_WORKSPACE_RECOVERY_EXTERNAL_CALL_TIMEOUT_SECONDS" }}
+            - name: {{ $key }}
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" $ }}
+                  key: {{ $key }}
+            {{- end }}
             # Durable completion admission and the finalizer/drain must flip as
             # one gate. Stateless agents inherit this same ConfigMap key via
             # envFrom, while the orchestrator intentionally uses an explicit
@@ -740,14 +757,26 @@ spec:
                   optional: true
             - name: SESSION_JWT_TTL_S
               value: {{ .Values.sessionRouter.jwtTtlSeconds | default 60 | quote }}
+            {{- if include "srw.singleOrigin" . }}
+            - name: SESSION_PUBLIC_ORIGIN
+              value: {{ include "srw.publicOrigin" . | quote }}
+            - name: SESSION_INGRESS_HOST
+              value: ""
+            - name: SESSION_INGRESS_CLASS
+              value: {{ include "srw.singleOriginIngressClass" . | quote }}
+            - name: SESSION_INGRESS_SINGLE_ORIGIN
+              value: "1"
+            - name: SESSION_INGRESS_TLS_SECRET
+              value: ""
+            {{- else }}
+            - name: SESSION_PUBLIC_ORIGIN
+              value: ""
             - name: SESSION_INGRESS_HOST
               value: {{ .Values.sessionRouter.ingressHost | default (printf "api.%s" .Values.global.domain) | quote }}
             - name: SESSION_INGRESS_CLASS
               value: {{ .Values.sessionRouter.ingressClass | default "traefik" | quote }}
-            - name: SESSION_INGRESS_NAMESPACE
-              value: {{ .Release.Namespace | quote }}
-            - name: SESSION_INGRESS_ANNOTATIONS
-              value: {{ .Values.sessionRouter.annotations | default dict | toJson | quote }}
+            - name: SESSION_INGRESS_SINGLE_ORIGIN
+              value: "0"
             {{- if .Values.sessionRouter.tlsSecretName }}
             # Per-session Ingress emits a `tls:` block so the browser can open
             # wss:// on the same TLS entrypoint as the cockpit. Only needed
@@ -756,6 +785,15 @@ spec:
             - name: SESSION_INGRESS_TLS_SECRET
               value: {{ .Values.sessionRouter.tlsSecretName | quote }}
             {{- end }}
+            {{- end }}
+            - name: SESSION_INGRESS_NAMESPACE
+              value: {{ .Release.Namespace | quote }}
+            - name: SESSION_INGRESS_ANNOTATIONS
+              {{- if include "srw.singleOrigin" . }}
+              value: {{ mergeOverwrite (dict) (.Values.sessionRouter.annotations | default dict) (dict "kubernetes.io/ingress.class" (include "srw.singleOriginIngressClass" .) "traefik.ingress.kubernetes.io/router.entrypoints" "websecure") | toJson | quote }}
+              {{- else }}
+              value: {{ .Values.sessionRouter.annotations | default dict | toJson | quote }}
+              {{- end }}
             # Name + key of the Secret holding the shared HS256 JWT key.
             # The orchestrator passes both through to dynamically-provisioned
             # agent pod manifests (services/agent_provisioner.py) so the
@@ -1398,6 +1436,12 @@ spec:
               value: {{ .Release.Name | quote }}
             - name: SSH_KEY_PATH
               value: "/run/secrets/vm-ssh-key"
+            - name: VM_WORKSPACE_RECOVERY_ACCEPTANCE_GATE_ENABLED
+              value: {{ .Values.orchestrator.vmWorkspaceRecoveryAcceptanceGate.enabled | quote }}
+            {{- if .Values.orchestrator.vmWorkspaceRecoveryAcceptanceGate.enabled }}
+            - name: VM_WORKSPACE_RECOVERY_GATE_SLOW_BOOT_SECONDS
+              value: "15"
+            {{- end }}
             # Budget for the WS proxy's /ready poll. Must outlast the agent's
             # own _poll_workspace_ready (120s) plus margin for cold image pulls.
             - name: WS_READY_TIMEOUT_S

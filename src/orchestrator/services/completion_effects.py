@@ -7,10 +7,16 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import logging
 from typing import Any
-from uuid import UUID, uuid4
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from orchestrator.services.completion_effect_policy import COMPLETION_EFFECT_INDEX
 from orchestrator.services.container_provisioner import WorkspaceTeardownIdentity
+from orchestrator.services.vm_workspace_recovery_store import (
+    bind_vm_cleanup_permit,
+    vm_cleanup_kwargs,
+    cleanup_intent_digest,
+    completed_cleanup_outcome,
+)
 from orchestrator.services.workspace_lifecycle import WorkspaceOwner
 
 
@@ -26,6 +32,7 @@ class CompletionEffectDependencies:
     archive_and_cleanup_workspace: Callable[[str], Coroutine[Any, Any, list[str]]]
     s36_exact_absence_timeout_seconds: Callable[[], float]
     logger: logging.Logger
+    recovery_store: Any
 
 
 def completion_effect_dedup_key(
@@ -113,10 +120,65 @@ async def run_completion_workspace_teardown(
         dependencies.s36_exact_absence_timeout_seconds()
     )
     logger = dependencies.logger
+    recovery_store = dependencies.recovery_store
 
     async def _archive_and_teardown_workspace() -> dict[str, Any]:
+        try:
+            cleanup_request_namespace = UUID(str(effect_runner.command_id))
+        except (AttributeError, TypeError, ValueError):
+            cleanup_request_namespace = uuid5(
+                NAMESPACE_URL, f"completion-cleanup:{job_id}"
+            )
+
+        async def _admit_destructive_cleanup(
+            pvc_uid: Any,
+            *,
+            resource: str,
+            intent: Mapping[str, Any],
+        ) -> Any:
+            try:
+                parsed_pvc_uid = UUID(str(pvc_uid)) if pvc_uid is not None else None
+            except (TypeError, ValueError, AttributeError):
+                parsed_pvc_uid = None
+            request_id = uuid5(
+                cleanup_request_namespace, f"{resource}:{parsed_pvc_uid or 'none'}"
+            )
+            resource_intent = {
+                **intent,
+                "owner_kind": "job",
+                "owner_id": job_id,
+                "pvc_uid": str(parsed_pvc_uid or ""),
+                "resource": resource,
+                "source": "completion_workspace_teardown",
+            }
+            permit = await recovery_store.acquire_cleanup_permit(
+                owner_kind="job",
+                owner_id=UUID(job_id),
+                pvc_uid=parsed_pvc_uid,
+                request_id=request_id,
+                source="completion_workspace_teardown",
+                intent_digest=cleanup_intent_digest(resource_intent),
+            )
+            if not permit.allowed:
+                raise RuntimeError(
+                    "workspace teardown held for unresolved workspace recovery"
+                )
+            return bind_vm_cleanup_permit(
+                permit, request_id=request_id, intent=resource_intent
+            )
+
+        async def _complete_destructive_cleanup(permit: Any, outcome: str) -> None:
+            admission_id = getattr(permit, "admission_id", None)
+            if admission_id is not None:
+                await recovery_store.complete_cleanup_permit(
+                    admission_id, outcome=outcome
+                )
+
         async def _release_captured_vm(intent: Mapping[str, Any]) -> Any:
-            from orchestrator.services.vm_provisioner import VMTeardownIdentity
+            from orchestrator.services.vm_provisioner import (
+                VMTeardownIdentity,
+                VMTeardownResult,
+            )
 
             generation = intent.get("provision_generation")
             vm_uid = intent.get("vm_uid")
@@ -156,19 +218,37 @@ async def run_completion_workspace_teardown(
                 or any(character.isspace() for character in ssh_host_key_fingerprint)
             ):
                 raise RuntimeError("VM teardown intent has invalid SSH host key")
-            return await vm_provisioner.release_vm_captured(
-                job_id,
-                VMTeardownIdentity(
-                    provision_generation=generation,
-                    vm_uid=vm_uid,
-                    rootdisk_pvc_uid=rootdisk_uid,
+            cleanup = await _admit_destructive_cleanup(
+                rootdisk_uid,
+                resource="vm",
+                intent={
+                    "provision_generation": generation,
+                    "purge_disk": True,
+                    "vm_uid": vm_uid or "",
+                },
+            )
+            replayed = completed_cleanup_outcome(cleanup)
+            if replayed is not None:
+                outcome = VMTeardownResult(replayed, replayed == "completed")
+            else:
+                outcome = await vm_provisioner.release_vm_captured(
+                    job_id,
+                    VMTeardownIdentity(
+                        provision_generation=generation,
+                        vm_uid=vm_uid,
+                        rootdisk_pvc_uid=rootdisk_uid,
+                        ssh_host=ssh_host,
+                        ssh_port=ssh_port,
+                        ssh_host_key_fingerprint=ssh_host_key_fingerprint,
+                    ),
                     ssh_host=ssh_host,
                     ssh_port=ssh_port,
-                    ssh_host_key_fingerprint=ssh_host_key_fingerprint,
-                ),
-                ssh_host=ssh_host,
-                ssh_port=ssh_port,
-            )
+                    purge_disk=True,
+                    **vm_cleanup_kwargs(cleanup),
+                )
+                if outcome.disposition in {"completed", "identity_superseded"}:
+                    await _complete_destructive_cleanup(cleanup, outcome.disposition)
+            return outcome
 
         async def _capture_kubernetes_teardown_detail() -> dict[str, Any]:
             captured = await container_provisioner.capture_terminal_workspace_identity(
@@ -226,6 +306,18 @@ async def run_completion_workspace_teardown(
                 ssh_host_key_fingerprint=host_key,
                 ssh_port=ssh_port,
             )
+            cleanup = await _admit_destructive_cleanup(
+                pvc_uid,
+                resource="kubernetes",
+                intent={
+                    "pod_uid": pod_uid,
+                    "service_uid": service_uid or "",
+                    "snapshot_generation": str(snapshot_generation),
+                },
+            )
+            replayed = completed_cleanup_outcome(cleanup)
+            if replayed is not None:
+                return replayed
             released = await container_provisioner.release_workspace(
                 WorkspaceOwner.job(job_id),
                 teardown_identity=teardown_identity,
@@ -241,11 +333,17 @@ async def run_completion_workspace_teardown(
                 ),
             )
             if released:
+                await _complete_destructive_cleanup(cleanup, "completed")
                 return "completed"
-            return await container_provisioner.classify_workspace_teardown_identity(
-                WorkspaceOwner.job(job_id),
-                teardown_identity,
+            disposition = (
+                await container_provisioner.classify_workspace_teardown_identity(
+                    WorkspaceOwner.job(job_id),
+                    teardown_identity,
+                )
             )
+            if disposition == "identity_superseded":
+                await _complete_destructive_cleanup(cleanup, disposition)
+            return disposition
 
         try:
             if effect_runner is not None:
@@ -435,7 +533,15 @@ async def run_completion_workspace_teardown(
             if not (
                 use_identity_fenced_vm_teardown or use_uid_fenced_kubernetes_teardown
             ):
-                cleanup_actions = await _archive_and_cleanup_workspace(job_id)
+                cleanup = await _admit_destructive_cleanup(
+                    None,
+                    resource="legacy_workspace",
+                    intent={"purge_workspace": True},
+                )
+                replayed = completed_cleanup_outcome(cleanup)
+                if replayed is None:
+                    cleanup_actions = await _archive_and_cleanup_workspace(job_id)
+                    await _complete_destructive_cleanup(cleanup, "completed")
         except Exception as exc:
             logger.warning(
                 "Workspace cleanup failed for job %s (non-blocking): %s",

@@ -9,6 +9,7 @@ import {
   signal,
   viewChild,
 } from '@angular/core';
+import {DatePipe} from '@angular/common';
 import {RouterLink} from '@angular/router';
 import {TranslocoModule} from '@jsverse/transloco';
 import {
@@ -239,7 +240,7 @@ export function subjobBlockedKey(
   selector: 'app-job-detail-panel',
   standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [RouterLink, TranslocoModule, AppBadgeComponent, AppSpinnerComponent],
+  imports: [RouterLink, DatePipe, TranslocoModule, AppBadgeComponent, AppSpinnerComponent],
   template: `
     <div class="detail-panel">
       @if (job().description) {
@@ -300,6 +301,25 @@ export function subjobBlockedKey(
           <span class="fact-value">{{ formatCount(job().audit_count) }}</span>
         </div>
       </div>
+
+      @if (job().workspace_recovery; as recovery) {
+        <section class="recovery-detail" [class.attention]="recovery.state === 'paused_attention'">
+          <strong>{{ recovery.message }}</strong>
+          <span>
+            {{ 'jobs.recovery.deadline' | transloco }}:
+            {{ recovery.deadline_at | date:'medium' }}
+          </span>
+          @if (recovery.next_check_at) {
+            <span>
+              {{ 'jobs.recovery.nextCheck' | transloco }}:
+              {{ recovery.next_check_at | date:'mediumTime' }}
+            </span>
+          }
+          @if (recovery.cleanup_pending) {
+            <span>{{ 'jobs.recovery.cleanupPending' | transloco }}</span>
+          }
+        </section>
+      }
 
       @if (data()?.loading || (scope() === 'subtree' && data()?.loadingSubtree)) {
         <div class="detail-loading">
@@ -602,6 +622,19 @@ export function subjobBlockedKey(
         gap: 8px;
         font-size: 12px;
         color: var(--text-muted);
+      }
+      .recovery-detail {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px 14px;
+        padding: 10px;
+        border: 1px solid var(--info);
+        border-radius: var(--radius-control);
+        color: var(--text-secondary);
+        font-size: 12px;
+      }
+      .recovery-detail.attention {
+        border-color: var(--warning);
       }
       .usage-block {
         display: flex;

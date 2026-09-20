@@ -183,6 +183,11 @@ def make_service(*, s3_available=True, k8s_available=True):
         snapshot_service=mock_snapshot,
         container_provisioner=mock_container,
     )
+    recovery_store = MagicMock()
+    recovery_store.acquire_cleanup_permit = AsyncMock(
+        return_value=MagicMock(allowed=True, admission_id=None)
+    )
+    svc._workspace_recovery_store = recovery_store
     return svc
 
 
@@ -2157,6 +2162,25 @@ class TestVmJobSuspendRidesThePersistentRootdisk:
         svc._vm_provisioner.delete_vm.assert_awaited_once_with(
             "job-vm-1", purge_disk=False
         )
+
+    @pytest.mark.asyncio
+    async def test_recovery_hold_blocks_vm_suspend_external_release(self, monkeypatch):
+        monkeypatch.setenv("VM_PERSISTENT_ROOTDISK", "true")
+        svc, vm_prov = make_vm_service(host="100.64.1.9")
+        svc._db.get_job = AsyncMock(return_value=self._vm_job())
+        recovery_store = MagicMock()
+        recovery_store.acquire_cleanup_permit = AsyncMock(
+            return_value=MagicMock(
+                allowed=False,
+                reason="workspace_recovery_unresolved",
+            )
+        )
+        svc._workspace_recovery_store = recovery_store
+
+        assert await svc.suspend_workspace("job-vm-1") is False
+
+        recovery_store.acquire_cleanup_permit.assert_awaited_once()
+        vm_prov.release_vm_captured.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_git_only_container_metadata_does_not_hide_vm_target(

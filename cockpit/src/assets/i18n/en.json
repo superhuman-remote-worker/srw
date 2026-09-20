@@ -749,6 +749,8 @@
       "failed": "Failed",
       "cancelled": "Cancelled",
       "blocked_undelivered": "Blocked / undelivered",
+      "recovering_workspace": "Recovering workspace",
+      "recovery_paused": "Recovery paused",
       "waiting_for_reply": "Waiting for reply",
       "waiting_approval": "Waiting · approval"
     },
@@ -762,6 +764,7 @@
       "canceling": "Canceling",
       "sure": "Sure?",
       "resume": "Resume",
+      "retryRecovery": "Retry recovery",
       "review": "Review",
       "delete": "Delete",
       "confirmDelete": "Confirm?",
@@ -793,6 +796,7 @@
       "openCloudFolder": "Open this job's cloud folder in a new tab",
       "pauseJob": "Pause job",
       "promoteJob": "Promote to project",
+      "retryRecovery": "Retry the paused workspace recovery",
       "resumeJob": "Resume from checkpoint",
       "reviewJob": "Review and approve/continue",
       "reviewQueue": "Open the review queue",
@@ -801,6 +805,11 @@
       "subjobCount": "{{count}} sub-job(s) in this tree, filter or no filter",
       "view": "Open in Workbench",
       "workspace": "Browse workspace in Gitea"
+    },
+    "recovery": {
+      "deadline": "Recovery deadline",
+      "nextCheck": "Next check",
+      "cleanupPending": "Workspace cleanup remains pending"
     },
     "delegationChildren": "{{count}} children",
     "promote": {
@@ -1816,7 +1825,34 @@
       "yesterday": "Yesterday",
       "hidesOne": "hides 1 later message",
       "hidesMany": "hides {{count}} later messages",
-      "refillHint": "Your message returns to the composer so you can edit and resend it."
+      "refillHint": "Your message returns to the composer so you can edit and resend it.",
+      "insertOriginalPrompt": "Insert original prompt",
+      "checking": "Checking that the session is idle…",
+      "connectionDown": "Session connection is down — reconnect before rewinding.",
+      "unavailable": "Rewind is not available for this session.",
+      "previewRequired": "Review the current rewind preview before confirming.",
+      "stalePreview": "The session changed after the preview. Review it again before rewinding.",
+      "outcomeUnknown": "The server may have applied this rewind. Refresh its receipt before retrying.",
+      "refreshReceipt": "Refresh receipt",
+      "retryExact": "Retry same request",
+      "staleOutbox": "This draft was queued before the conversation changed. Review it before sending.",
+      "reviewDraft": "Review draft",
+      "unchangedState": "Files, checklist items, saved memory, and external effects stay unchanged.",
+      "refusal": {
+        "feature_disabled": "Conversation rewind is currently disabled.",
+        "queue_not_idle": "Wait for the current work to finish before rewinding.",
+        "queue_leased": "Wait for the current work to finish before rewinding.",
+        "input_pending": "A message is still waiting to run.",
+        "control_pending": "A session change is still being applied.",
+        "pending_input_delivery": "New session input is still being settled.",
+        "pending_scheduled_wake": "A scheduled update is still pending.",
+        "pending_child": "A delegated task is still reporting back.",
+        "pending_job_wake": "A job result is still being delivered.",
+        "active_job": "A delegated job is still running.",
+        "pending_final_memory": "Saved memory is still being finalized.",
+        "target_invalid": "That message can no longer be used as a rewind point.",
+        "unavailable": "Rewind is not available for the session in its current state."
+      }
     },
     "diff": {
       "replace": "Diff",
@@ -3603,6 +3639,7 @@
       "cancelFailed": "Couldn't cancel the job.",
       "pauseFailed": "Couldn't pause the job.",
       "resumeFailed": "Couldn't resume the job.",
+      "recoveryRetryFailed": "Couldn't retry workspace recovery.",
       "approveFailed": "Couldn't approve the job.",
       "upgradeVmFailed": "Couldn't upgrade to a VM workspace.",
       "replyFailed": "Couldn't send the reply.",
@@ -3647,6 +3684,7 @@
       "cancelled": "Job cancelled",
       "paused": "Job paused",
       "resumed": "Job resumed",
+      "recoveryRetry": "Workspace recovery started",
       "approved": "Job approved",
       "vmUpgradeStarted": "VM upgrade initiated",
       "replySent": "Reply sent",

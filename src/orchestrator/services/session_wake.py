@@ -544,6 +544,12 @@ async def _deliver_durable(
         )
         return WakeDeliveryResult.FAILED
 
+    disposition = str(result.get("execution_disposition") or "current")
+    if disposition in {"historical", "superseded"}:
+        # The stable wake identity was already observed before a rewind. Close
+        # the source outbox obligation without scheduling another model turn.
+        return WakeDeliveryResult.EXECUTED
+
     # Best-effort user-facing ping. Only on the durable branch — a live session
     # already showed the user the wake, and emailing them about it would be
     # noise. Failure here must not un-deliver the notice above.
@@ -1365,7 +1371,13 @@ async def drain_pending_event_wakes(
                 source="officer_wake",
             )
             delivery_state = _delivery_state_for_thread(persisted, thread_id)
-            if delivery_state in {
+            execution_disposition = str(
+                persisted.get("execution_disposition") or "current"
+            )
+            if execution_disposition in {"historical", "superseded"}:
+                await db.finish_session_wake_events(ids)
+                delivered += 1
+            elif delivery_state in {
                 "admitted",
                 "settled",
             }:

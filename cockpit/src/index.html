@@ -18,8 +18,9 @@
        Double-tap zoom is separately disabled via touch-action in styles.scss. -->
   <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, interactive-widget=resizes-content">
   <link rel="manifest" href="manifest.webmanifest">
-  <meta name="theme-color" content="#5f499c" media="(prefers-color-scheme: light)">
-  <meta name="theme-color" content="#141418" media="(prefers-color-scheme: dark)">
+  <!-- Purple fallback; pre-paint resolution and ThemeService follow the app's
+       selected accent and mode, which can differ from the OS preference. -->
+  <meta name="theme-color" content="#5f499c">
   <link rel="icon" href="favicon.ico" sizes="any">
   <link rel="icon" href="favicon.svg" type="image/svg+xml">
   <link rel="icon" href="favicon-16.png" sizes="16x16" type="image/png">
@@ -89,6 +90,23 @@
         document.body.classList.remove('accent-tyrian', 'accent-porphyry', 'accent-graphite');
         document.body.classList.add('accent-' + accent);
       } catch (e) { /* leave fallback class in place */ }
+      // Read the same token as the app rather than duplicating the palette.
+      // ThemeService repeats this after bootstrap and on appearance changes.
+      function syncBrowserThemeColor() {
+        var color = window.getComputedStyle(document.body).getPropertyValue('--accent-color').trim();
+        if (color) {
+          document.querySelectorAll('meta[name="theme-color"], meta[name="msapplication-TileColor"]')
+            .forEach(function (meta) { meta.content = color; });
+        }
+      }
+      syncBrowserThemeColor();
+      // Production CSS can arrive after this script AND Angular bootstrap.
+      // Wait until its onload handler has changed media="print" to "all".
+      document.addEventListener('load', function (event) {
+        if (event.target instanceof HTMLLinkElement && event.target.rel === 'stylesheet') {
+          window.requestAnimationFrame(syncBrowserThemeColor);
+        }
+      }, true);
     })();
   </script>
   <app-root></app-root>

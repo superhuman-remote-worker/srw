@@ -73,6 +73,12 @@ spec:
       {{- include "srw.componentSelectorLabels" (dict "context" . "component" "agent-stateless") | nindent 6 }}
   template:
     metadata:
+      # This pool deliberately opts out of generic ConfigMap reloads, but VM
+      # recovery admission is read from that ConfigMap at process start. Tie
+      # the bounded recovery settings to the pod template so a Helm change
+      # drains and replaces executors with the same gate as the orchestrator.
+      annotations:
+        checksum/vm-workspace-recovery: {{ toJson .Values.orchestrator.vmWorkspaceRecovery | sha256sum | quote }}
       labels:
         {{- include "srw.componentSelectorLabels" (dict "context" . "component" "agent-stateless") | nindent 8 }}
         # `app` keys the agent egress NetworkPolicy (agent/network-policy.yaml

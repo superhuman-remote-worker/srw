@@ -274,7 +274,7 @@ export class MenuComponent {
   readonly pickerLeft = signal(0);
 
   readonly menuSections: MenuSection[] = [
-    {
+    ...(environment.adminToolsEnabled ? [{
       title: 'Databases',
       items: [
         {
@@ -290,7 +290,7 @@ export class MenuComponent {
           description: 'pgAdmin database manager',
         },
       ],
-    },
+    }] : []),
     {
       title: 'Tools',
       items: [
@@ -300,12 +300,12 @@ export class MenuComponent {
           icon: '🍵',
           description: 'Git repository browser',
         },
-        {
+        ...(environment.adminToolsEnabled ? [{
           label: 'Dozzle',
           url: environment.dozzleUrl,
           icon: '📋',
           description: 'Container log viewer',
-        },
+        }] : []),
       ],
     },
   ];

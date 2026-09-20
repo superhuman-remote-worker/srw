@@ -230,8 +230,13 @@ async def test_flag_off_guard_never_builds_completion_service():
     ],
 )
 async def test_public_control_endpoints_return_exact_409_before_mutation(
-    endpoint, auth_name
+    endpoint, auth_name, monkeypatch
 ):
+    monkeypatch.setattr(
+        main.VMWorkspaceRecoveryStore,
+        "unresolved_participation",
+        AsyncMock(return_value=None),
+    )
     job_id = str(uuid4())
     job = {"id": job_id, "status": "pending_review", "context": {}}
     guard = AsyncMock(side_effect=HTTPException(409, "completion finalizing"))
@@ -291,7 +296,14 @@ async def test_blocking_reply_internal_resume_guard_precedes_queue_mutation():
 
 
 @pytest.mark.asyncio
-async def test_flag_on_pinned_resume_queues_without_agent_selection_or_post():
+async def test_flag_on_pinned_resume_queues_without_agent_selection_or_post(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        main.VMWorkspaceRecoveryStore,
+        "unresolved_participation",
+        AsyncMock(return_value=None),
+    )
     job_id = str(uuid4())
     job = {
         "id": job_id,

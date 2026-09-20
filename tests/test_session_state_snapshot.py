@@ -169,6 +169,7 @@ def _control_receipt(
 async def test_snapshot_has_full_lane_free_shape_and_normalizes_durable_rows():
     conn = _SnapshotConn(
         thread=_thread(
+            conversation_revision=6,
             metadata=json.dumps(
                 {
                     "config_override": {
@@ -177,7 +178,7 @@ async def test_snapshot_has_full_lane_free_shape_and_normalizes_durable_rows():
                     },
                     "execution_lane": "must-not-return",
                 }
-            )
+            ),
         ),
         lifecycle={
             "latest_kind": "turn.started",
@@ -227,6 +228,7 @@ async def test_snapshot_has_full_lane_free_shape_and_normalizes_durable_rows():
 
     assert result == {
         "thread_id": "thread-1",
+        "conversation_revision": 6,
         # The first-class thread column is the durable permission authority.
         "permission_mode": "supervised",
         "narration_mode": "verbose",

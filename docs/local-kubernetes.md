@@ -15,7 +15,7 @@ The maintained helper targets Linux. Allocate at least:
 - 8 vCPU;
 - 16 GiB RAM available to the cluster;
 - enough local disk for container images and persistent volumes; and
-- host ports 80, 443, and 5005.
+- host port 5005, plus either 80/443 for multi-host or 8443 for single-origin.
 
 Install these tools on the host:
 
@@ -23,7 +23,7 @@ Install these tools on the host:
 - kubectl
 - Helm 3.12 or newer
 - k3d
-- mkcert
+- mkcert (multi-host mode only)
 - OpenSSL
 - `ssh-keygen`
 
@@ -45,7 +45,7 @@ sudo dnf -y install kubernetes-client helm mkcert nss-tools openssl
 Start a new login shell after changing Docker group membership. Install k3d
 from the [official instructions](https://k3d.io/stable/#installation).
 
-Create and trust one local certificate authority. The second command installs
+For multi-host mode, create and trust one local certificate authority. The second command installs
 the same CA into the system trust store rather than creating another root-owned
 CA:
 
@@ -61,7 +61,7 @@ docker run --rm hello-world
 k3d version
 kubectl version --client
 helm version
-mkcert -CAROOT
+mkcert -CAROOT # multi-host only
 ```
 
 ## 1. Clone and configure
@@ -104,20 +104,40 @@ deployment, use a tagged OCI chart and override every component image with the
 matching release tag or a verified digest, as described in the
 [production install guide](../helm/README.md#production-install-bring-your-own).
 
+Choose one exposure mode before creating the cluster:
+
+- `multi-host` is the existing default. It uses `https://localhost`,
+  `https://auth.localhost`, and the other `*.localhost` names with a trusted
+  mkcert CA and cert-manager.
+- `single-origin` uses only <https://localhost:8443>. The chart generates a
+  self-signed certificate and routes Cockpit, login, API, Gitea, Nextcloud,
+  and session WebSockets by path. It needs no mkcert, cert-manager, DNS
+  override, or trust-store installation. Accept the browser warning once.
+
+The k3d port map is part of cluster creation. A cluster created in one mode
+cannot be reused in the other mode; the bootstrap reports the exact delete and
+recreate command when its mapping is incompatible.
+
 ## 2. Bootstrap the cluster
 
 ```bash
 ./scripts/local-dev-up.sh
 ```
 
+For single-origin mode:
+
+```bash
+SRW_EXPOSURE_MODE=single-origin ./scripts/local-dev-up.sh
+```
+
 The script is idempotent. It:
 
 1. creates or starts the `srw` k3d cluster;
-2. installs the pinned cert-manager release;
-3. uploads the mkcert CA and creates a ClusterIssuer;
+2. in multi-host mode, installs cert-manager, uploads the mkcert CA, and creates a ClusterIssuer;
+3. in single-origin mode, creates `127.0.0.1:8443:30443@server:0` and verifies that mapping on reuse;
 4. creates the `srw` namespace;
 5. creates the session-router JWT and local VM SSH Secrets if absent;
-6. maps the local ingress hostnames through cluster DNS;
+6. maps the local ingress hostnames through cluster DNS in multi-host mode;
 7. downloads the Helm dependencies pinned by `Chart.lock`; and
 8. pins the component image tags to this checkout in
    `deployment/values-local-images.yaml`.
@@ -131,6 +151,18 @@ helm install srw ./helm \
   --namespace srw \
   --kube-context k3d-srw \
   --values deployment/values-local.yaml \
+  --values deployment/values-local-images.yaml
+```
+
+Single-origin mode adds the committed preset overlay between the private values
+and image pins:
+
+```bash
+helm install srw ./helm \
+  --namespace srw \
+  --kube-context k3d-srw \
+  --values deployment/values-local.yaml \
+  --values deployment/values-local-single-origin.yaml \
   --values deployment/values-local-images.yaml
 ```
 
@@ -154,7 +186,8 @@ workloads are ready.
 
 ## 4. Log in
 
-Open <https://localhost/> and use:
+Open <https://localhost/> in multi-host mode, or <https://localhost:8443/> in
+single-origin mode and accept its certificate warning. Then use:
 
 | Username | Password | Roles |
 |---|---|---|
@@ -180,6 +213,12 @@ The local overlay also enables published multi-user test accounts:
 
 ## Local endpoints
 
+Single-origin mode has one browser endpoint: <https://localhost:8443/>. The
+browser follows same-origin paths such as `/identity`, `/git/`, `/cloud/`,
+`/api`, and `/p/<thread>`; it does not need to approve another certificate.
+
+Multi-host mode exposes:
+
 | URL | Service |
 |---|---|
 | <https://localhost/> | Cockpit |
@@ -199,8 +238,9 @@ Run these checks after a fresh install or cluster recreation.
 
 ### Cockpit and identity
 
-Open <https://localhost/>, sign in as `test`, and confirm the Sessions page
-loads without a refresh loop.
+Open <https://localhost/> in multi-host mode or <https://localhost:8443/> in
+single-origin mode, sign in as `test`, and confirm the Sessions page loads
+without a refresh loop.
 
 ### Interactive session
 
@@ -231,11 +271,16 @@ claim a worker runtime, and eventually reach a terminal or review state.
 
 ### Gitea and Nextcloud SSO
 
-- Open <https://git.localhost/>, choose **Sign In**, then **Sign in with
-  Keycloak**. It should land on the `test` dashboard without another password.
-- Open <https://cloud.localhost/> and use the Keycloak login. A cheaper service
-  check is `curl -sk https://cloud.localhost/status.php`; it should report
-  `"installed": true`.
+- Open <https://git.localhost/> in multi-host mode or
+  <https://localhost:8443/git/> in single-origin mode, choose **Sign In**, then
+  **Sign in with Keycloak**. It should land on the `test` dashboard without
+  another password.
+- Open <https://cloud.localhost/> in multi-host mode or
+  <https://localhost:8443/cloud/> in single-origin mode and use the Keycloak
+  login. A cheaper service check is
+  `curl -sk https://cloud.localhost/status.php` for multi-host or
+  `curl -sk https://localhost:8443/cloud/status.php` for single-origin; it
+  should report `"installed": true`.
 
 ## Fast development with Tilt
 
@@ -245,6 +290,10 @@ After installing Tilt and creating `deployment/values-local.yaml`, run:
 ```bash
 ./scripts/local-dev-tilt-up.sh
 ```
+
+Use `SRW_EXPOSURE_MODE=single-origin ./scripts/local-dev-tilt-up.sh` for the
+localhost:8443 profile. The Tilt wrapper passes the same mode to the bootstrap
+and includes `deployment/values-local-single-origin.yaml` in Helm applies.
 
 The wrapper runs the base bootstrap and starts Tilt in the foreground. See the
 [development guide](development.md#fast-inner-loop-with-tilt) for live-update
@@ -311,7 +360,16 @@ stop the cluster for the day.
 
 ### Browser reports an untrusted certificate
 
-Make sure the browser trusts the same CA that the cluster uses. Do not run a
+In single-origin mode this is expected on first use and after an upgrade that
+regenerates the 365-day certificate. Accept the warning for
+`https://localhost:8443`; do not install a CA. Chrome service workers are
+disabled in this profile. Standalone Git, WebDAV/desktop sync, MCP,
+SSH/JetBrains clients, managed browsers that forbid exceptions, embedded IDE
+webviews, and generated application previews are outside the no-extra-trust
+browser support boundary.
+
+In multi-host mode, the warning means the mkcert CA is not trusted. Make sure
+the browser trusts the same CA that the cluster uses. Do not run a
 plain root-owned `mkcert -install`, which creates a second CA. Repeat:
 
 ```bash
@@ -327,6 +385,11 @@ the life of the process.
 Another local server or cluster owns the port. Stop that process or the other
 k3d cluster before starting `srw`. `k3d cluster stop srw` releases SRW's host
 ports when it is not in use.
+
+For single-origin mode, the equivalent host port is 8443. The chart Service
+always uses NodePort 30443: changing `publicPort` does not create a corresponding
+host/NAT mapping. Recreate local k3d with the bootstrap's exact mapping, or
+configure that mapping explicitly on an operator-managed server or load balancer.
 
 ### ImagePullBackOff
 

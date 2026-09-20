@@ -4,6 +4,7 @@ import {TestBed} from '@angular/core/testing';
 import {Router} from '@angular/router';
 import {TranslocoTestingModule} from '@jsverse/transloco';
 import {SshKeysPageComponent} from './ssh-keys-page.component';
+import {environment} from '../../../core/environment';
 import {SshKeysService} from '../../../core/services/ssh-keys.service';
 import {SidebarService} from '../../../core/services/sidebar.service';
 
@@ -71,6 +72,22 @@ describe('SshKeysPageComponent', () => {
     fixture.detectChanges();
     await fixture.whenStable();
     expect(service.loadKeys).toHaveBeenCalled();
+  });
+
+  it('redirects direct navigation without keys or registration controls when external clients are disabled', async () => {
+    const previous = environment.externalClientsEnabled;
+    environment.externalClientsEnabled = false;
+    try {
+      const fixture = TestBed.createComponent(SshKeysPageComponent);
+      fixture.detectChanges();
+      await fixture.whenStable();
+      expect(service.loadKeys).not.toHaveBeenCalled();
+      expect(TestBed.inject(Router).navigateByUrl).toHaveBeenCalledWith('/settings');
+      expect(fixture.nativeElement.querySelector('form')).toBeNull();
+      expect(fixture.nativeElement.querySelector('button')).toBeNull();
+    } finally {
+      environment.externalClientsEnabled = previous;
+    }
   });
 
   it('shows the sign command containing the issued challenge', async () => {

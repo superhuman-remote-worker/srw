@@ -1,0 +1,371 @@
+{{- if include "srw.singleOrigin" . }}
+{{- include "srw.singleOriginValidate" . }}
+{{- $single := .Values.exposure.singleOrigin -}}
+{{- $gatewayName := include "srw.singleOriginGatewayName" . -}}
+{{- $tlsSecretName := include "srw.singleOriginTlsSecretName" . -}}
+{{- $ingressClass := include "srw.singleOriginIngressClass" . -}}
+{{- $identity := printf "%s/%s" .Release.Namespace .Release.Name -}}
+{{- $routeBase := printf "%s-%s" (include "srw.fullname" . | trunc 23 | trimSuffix "-") ($identity | sha256sum | trunc 10) -}}
+{{- $dnsNames := list -}}
+{{- $ipAddresses := list -}}
+{{- if eq $single.address "localhost" -}}
+  {{- $dnsNames = list $single.address -}}
+{{- else -}}
+  {{- $ipAddresses = list $single.address -}}
+{{- end -}}
+{{- $cert := genSelfSignedCert $single.address $ipAddresses $dnsNames (int $single.tls.validityDays) -}}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $tlsSecretName }}
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "single-origin-gateway") | nindent 4 }}
+type: kubernetes.io/tls
+data:
+  tls.crt: {{ $cert.Cert | b64enc | quote }}
+  tls.key: {{ $cert.Key | b64enc | quote }}
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $gatewayName }}
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "single-origin-gateway") | nindent 4 }}
+data:
+  dynamic.yaml: |
+    tls:
+      stores:
+        default:
+          defaultCertificate:
+            certFile: /etc/traefik/tls/tls.crt
+            keyFile: /etc/traefik/tls/tls.key
+    http:
+      middlewares:
+        strip-git:
+          stripPrefix:
+            prefixes:
+              - /git
+        strip-cloud:
+          stripPrefix:
+            prefixes:
+              - /cloud
+        redirect-git-slash:
+          redirectRegex:
+            regex: '^https://([^/]+)/git(\?.*)?$'
+            replacement: 'https://${1}/git/${2}'
+            permanent: true
+        redirect-cloud-slash:
+          redirectRegex:
+            regex: '^https://([^/]+)/cloud(\?.*)?$'
+            replacement: 'https://${1}/cloud/${2}'
+            permanent: true
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ $gatewayName }}
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "single-origin-gateway") | nindent 4 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ $gatewayName }}
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "single-origin-gateway") | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["services", "endpoints", "secrets"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ $gatewayName }}
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "single-origin-gateway") | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ $gatewayName }}
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ $gatewayName }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $gatewayName }}
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "single-origin-gateway") | nindent 4 }}
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "srw.componentSelectorLabels" (dict "context" . "component" "single-origin-gateway") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "srw.componentSelectorLabels" (dict "context" . "component" "single-origin-gateway") | nindent 8 }}
+      annotations:
+        checksum/tls-certificate: {{ $cert.Cert | sha256sum }}
+    spec:
+      serviceAccountName: {{ $gatewayName }}
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: traefik
+          image: {{ include "srw.imageRef" (dict "image" $single.gateway.image) | quote }}
+          imagePullPolicy: {{ $single.gateway.image.pullPolicy }}
+          args:
+            - --entrypoints.websecure.address=:8443
+            - --entrypoints.websecure.http.tls=true
+            - --entrypoints.traefik.address=:9000
+            - --ping=true
+            - --ping.entrypoint=traefik
+            - --providers.kubernetesingress=true
+            - --providers.kubernetesingress.namespaces={{ .Release.Namespace }}
+            - --providers.kubernetesingress.ingressclass={{ $ingressClass }}
+            - --providers.kubernetesingress.disableclusterscoperesources=true
+            - --providers.file.directory=/etc/traefik/dynamic
+            - --providers.file.watch=true
+          ports:
+            - name: websecure
+              containerPort: 8443
+              protocol: TCP
+            - name: health
+              containerPort: 9000
+              protocol: TCP
+          readinessProbe:
+            httpGet:
+              path: /ping
+              port: health
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /ping
+              port: health
+            periodSeconds: 10
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+            readOnlyRootFilesystem: true
+          resources:
+            {{- toYaml $single.gateway.resources | nindent 12 }}
+          volumeMounts:
+            - name: dynamic-config
+              mountPath: /etc/traefik/dynamic
+              readOnly: true
+            - name: tls
+              mountPath: /etc/traefik/tls
+              readOnly: true
+      volumes:
+        - name: dynamic-config
+          configMap:
+            name: {{ $gatewayName }}
+        - name: tls
+          secret:
+            secretName: {{ $tlsSecretName }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $gatewayName }}
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "single-origin-gateway") | nindent 4 }}
+spec:
+  type: NodePort
+  externalTrafficPolicy: {{ $single.service.externalTrafficPolicy }}
+  selector:
+    {{- include "srw.componentSelectorLabels" (dict "context" . "component" "single-origin-gateway") | nindent 4 }}
+  ports:
+    - name: https
+      protocol: TCP
+      port: 443
+      targetPort: 8443
+      nodePort: {{ $single.service.nodePort }}
+---
+# API, BFF and control WebSocket. Per-session /p routes remain dynamic.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ $routeBase }}-single-origin-orchestrator
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "single-origin-gateway") | nindent 4 }}
+  annotations:
+    kubernetes.io/ingress.class: {{ $ingressClass | quote }}
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+spec:
+  rules:
+    - http:
+        paths:
+          - path: /api
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "srw.fullname" . }}-orchestrator
+                port:
+                  number: 8085
+          - path: /auth
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "srw.fullname" . }}-orchestrator
+                port:
+                  number: 8085
+          - path: /ws
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "srw.fullname" . }}-orchestrator
+                port:
+                  number: 8085
+{{- if and .Values.keycloak.enabled .Values.keycloak.internal }}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ $routeBase }}-single-origin-identity
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "single-origin-gateway") | nindent 4 }}
+  annotations:
+    kubernetes.io/ingress.class: {{ $ingressClass | quote }}
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+spec:
+  rules:
+    - http:
+        paths:
+          - path: /identity
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "srw.fullname" . }}-keycloak
+                port:
+                  number: 8080
+{{- end }}
+{{- if and .Values.gitea.enabled .Values.gitea.internal }}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ $routeBase }}-single-origin-git
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "single-origin-gateway") | nindent 4 }}
+  annotations:
+    kubernetes.io/ingress.class: {{ $ingressClass | quote }}
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+    traefik.ingress.kubernetes.io/router.middlewares: strip-git@file
+spec:
+  rules:
+    - http:
+        paths:
+          - path: /git/
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "srw.fullname" . }}-gitea
+                port:
+                  number: 3000
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ $routeBase }}-single-origin-git-redirect
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "single-origin-gateway") | nindent 4 }}
+  annotations:
+    kubernetes.io/ingress.class: {{ $ingressClass | quote }}
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+    traefik.ingress.kubernetes.io/router.middlewares: redirect-git-slash@file
+spec:
+  rules:
+    - http:
+        paths:
+          - path: /git
+            pathType: Exact
+            backend:
+              service:
+                name: {{ include "srw.fullname" . }}-gitea
+                port:
+                  number: 3000
+{{- end }}
+{{- if and .Values.nextcloud.enabled .Values.nextcloud.internal }}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ $routeBase }}-single-origin-cloud
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "single-origin-gateway") | nindent 4 }}
+  annotations:
+    kubernetes.io/ingress.class: {{ $ingressClass | quote }}
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+    traefik.ingress.kubernetes.io/router.middlewares: strip-cloud@file
+spec:
+  rules:
+    - http:
+        paths:
+          - path: /cloud/
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "srw.fullname" . }}-nextcloud
+                port:
+                  number: 80
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ $routeBase }}-single-origin-cloud-redirect
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "single-origin-gateway") | nindent 4 }}
+  annotations:
+    kubernetes.io/ingress.class: {{ $ingressClass | quote }}
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+    traefik.ingress.kubernetes.io/router.middlewares: redirect-cloud-slash@file
+spec:
+  rules:
+    - http:
+        paths:
+          - path: /cloud
+            pathType: Exact
+            backend:
+              service:
+                name: {{ include "srw.fullname" . }}-nextcloud
+                port:
+                  number: 80
+{{- end }}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ $routeBase }}-single-origin-cockpit
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "single-origin-gateway") | nindent 4 }}
+  annotations:
+    kubernetes.io/ingress.class: {{ $ingressClass | quote }}
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+spec:
+  rules:
+    - http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "srw.fullname" . }}-cockpit
+                port:
+                  number: 4000
+{{- end }}

@@ -16,6 +16,7 @@ from orchestrator.schemas.job_controls import (
     SudoApproveRequest,
     SudoDenyRequest,
     SudoRuleCreateRequest,
+    WorkspaceRecoveryRetryRequest,
 )
 from orchestrator.schemas.workspaces import VMCreateRequest
 from orchestrator.services.job_controls import JobControlOperations
@@ -479,6 +480,24 @@ async def resume_job(
         job=job,
         request=request,
         req=req,
+    )
+
+
+@router.post("/api/jobs/{job_id}/workspace-recovery/retry")
+async def retry_workspace_recovery(
+    req: Request,
+    job_id: str,
+    request: WorkspaceRecoveryRetryRequest,
+    *,
+    dependencies: JobControlRouteDependencies = Depends(get_job_control_dependencies),
+) -> dict[str, Any]:
+    """Retry a paused recovery after the ordinary job access gate."""
+
+    user, _job = await dependencies.require_job_access(req, dependencies.store, job_id)
+    return await dependencies.operations.retry_workspace_recovery(
+        job_id,
+        user=user,
+        request=request,
     )
 
 

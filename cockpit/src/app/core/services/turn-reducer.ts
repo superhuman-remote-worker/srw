@@ -34,7 +34,7 @@ import {ChatAttachment} from './persistent-chat.service';
 
 export type ReducerAction =
     | { type: 'reset'; threadId?: string | null }
-    | { type: 'load_history'; threadId: string; turns: Turn[] }
+    | { type: 'load_history'; threadId: string; turns: Turn[]; preserveLive?: boolean }
     | {
         type: 'user_message';
         id: string;
@@ -93,6 +93,22 @@ export function reduce(state: ConversationState, action: ReducerAction): Convers
             return {...EMPTY_CONVERSATION, threadId: action.threadId ?? null};
 
         case 'load_history':
+            if (action.preserveLive) {
+                const historyIds = new Set(action.turns.map((turn) => turn.id));
+                const live = state.turns.filter(
+                    (turn) =>
+                        (!("historical" in turn) || turn.historical !== true) &&
+                        !historyIds.has(turn.id),
+                );
+                return {
+                    threadId: action.threadId,
+                    turns: [...action.turns, ...live],
+                    activeAssistantTurnId:
+                        live.some((turn) => turn.id === state.activeAssistantTurnId)
+                            ? state.activeAssistantTurnId
+                            : null,
+                };
+            }
             return {
                 threadId: action.threadId,
                 turns: action.turns,

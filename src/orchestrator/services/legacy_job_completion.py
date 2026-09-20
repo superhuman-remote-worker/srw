@@ -28,6 +28,11 @@ from orchestrator.services.container_provisioner import (
     WorkspaceCleanupOutcome,
 )
 from orchestrator.services.workspace_lifecycle import WorkspaceOwner
+from orchestrator.services.vm_workspace_recovery_store import (
+    acquire_vm_cleanup_permit,
+    completed_cleanup_outcome,
+    complete_vm_cleanup_permit,
+)
 
 
 CompletionCallback = Callable[..., Any]
@@ -44,6 +49,7 @@ class LegacyPersistenceDependencies:
 class LegacyWorkspaceDependencies:
     container_provisioner: Any
     vm_provisioner: Any
+    recovery_store: Any
     cloud_router: Any
     sudo_gate: Any
     get_container_context: CompletionCallback
@@ -996,14 +1002,38 @@ async def complete_job_legacy(
                             job_id,
                             entity_type="job",
                         )
-                        release = await vm_provisioner.release_vm_captured(
-                            job_id,
-                            identity,
+                        cleanup = await acquire_vm_cleanup_permit(
+                            dependencies.workspace.recovery_store,
+                            owner_kind="job",
+                            owner_id=job_id,
+                            identity=identity,
+                            source="legacy_vm_recovery_release",
                             purge_disk=False,
-                            entity_type="job",
-                            capture_snapshot=False,
                         )
-                        vm_deleted = release.disposition == "completed"
+                        if not cleanup.allowed:
+                            raise RuntimeError(
+                                "legacy VM recovery held for workspace recovery"
+                            )
+                        disposition = completed_cleanup_outcome(cleanup)
+                        if disposition is None:
+                            release = await vm_provisioner.release_vm_captured(
+                                job_id,
+                                identity,
+                                purge_disk=False,
+                                entity_type="job",
+                                capture_snapshot=False,
+                            )
+                            disposition = release.disposition
+                            if disposition in {
+                                "completed",
+                                "identity_superseded",
+                            }:
+                                await complete_vm_cleanup_permit(
+                                    dependencies.workspace.recovery_store,
+                                    cleanup,
+                                    outcome=disposition,
+                                )
+                        vm_deleted = disposition == "completed"
                     except Exception:
                         vm_deleted = False
                         logger.exception(

@@ -188,6 +188,92 @@ def svc(db, k8s_core_api, k8s_networking_api):
     )
 
 
+@pytest.fixture
+def single_origin_svc(db, k8s_core_api, k8s_networking_api):
+    return SessionRouterService(
+        namespace="srw",
+        ingress_host="",
+        ingress_class="srw-evaluation-abc123",
+        single_origin=True,
+        db=db,
+        core_api=k8s_core_api,
+        networking_api=k8s_networking_api,
+    )
+
+
+@pytest.mark.asyncio
+async def test_single_origin_route_is_hostless_and_reconciles(
+    single_origin_svc, k8s_networking_api
+):
+    for _ in range(2):
+        await single_origin_svc.ensure_route(
+            THREAD_ID, POD_NAME, POD_UID, RUNTIME_GENERATION
+        )
+    route = k8s_networking_api._ingresses[f"session-{THREAD_ID}"]
+    assert route["metadata"]["annotations"] == {
+        "kubernetes.io/ingress.class": "srw-evaluation-abc123",
+        "traefik.ingress.kubernetes.io/router.entrypoints": "websecure",
+        "traefik.ingress.kubernetes.io/router.tls": "true",
+    }
+    assert "ingressClassName" not in route["spec"]
+    assert "tls" not in route["spec"]
+    rule = route["spec"]["rules"][0]
+    assert "host" not in rule
+    assert rule["http"]["paths"] == [
+        {
+            "path": f"/p/{THREAD_ID}",
+            "pathType": "Prefix",
+            "backend": {
+                "service": {"name": f"session-{THREAD_ID}", "port": {"number": 8001}}
+            },
+        }
+    ]
+    assert k8s_networking_api.create_namespaced_ingress.call_count == 1
+    assert k8s_networking_api.patch_namespaced_ingress.call_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "mutation", ["host", "class", "owner", "target", "tls", "annotation"]
+)
+async def test_single_origin_reconciliation_refuses_changed_route_authority(
+    single_origin_svc, k8s_core_api, k8s_networking_api, mutation
+):
+    await single_origin_svc.ensure_route(
+        THREAD_ID, POD_NAME, POD_UID, RUNTIME_GENERATION
+    )
+    route = k8s_networking_api._ingresses[f"session-{THREAD_ID}"]
+    if mutation == "host":
+        route["spec"]["rules"][0]["host"] = "old.example.com"
+    elif mutation == "class":
+        route["spec"]["ingressClassName"] = "traefik"
+    elif mutation == "owner":
+        route["metadata"]["ownerReferences"][0]["uid"] = "foreign-pod"
+    elif mutation == "target":
+        route["spec"]["rules"][0]["http"]["paths"][0]["backend"]["service"]["name"] = (
+            "foreign-service"
+        )
+    elif mutation == "tls":
+        route["spec"]["tls"] = [{"secretName": "foreign-certificate"}]
+    else:
+        route["metadata"]["annotations"]["kubernetes.io/ingress.class"] = "traefik"
+    k8s_core_api.patch_namespaced_pod.reset_mock()
+    with pytest.raises(SessionRouteAuthorityError, match="Ingress is not trusted"):
+        await single_origin_svc.ensure_route(
+            THREAD_ID, POD_NAME, POD_UID, RUNTIME_GENERATION
+        )
+    k8s_core_api.patch_namespaced_pod.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_single_origin_refuses_legacy_namespace_binding(single_origin_svc, db):
+    db.get_pinned_session_binding.return_value = _binding(pod_namespace="agents-old")
+    with pytest.raises(SessionRouteAuthorityError):
+        await single_origin_svc.ensure_route(
+            THREAD_ID, POD_NAME, POD_UID, RUNTIME_GENERATION
+        )
+
+
 @pytest.mark.asyncio
 async def test_route_creation_is_pod_uid_resource_version_and_generation_fenced(
     svc, db, k8s_core_api, k8s_networking_api

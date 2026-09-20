@@ -22,6 +22,125 @@ def redact(job):
     )
 
 
+def test_retirement_wait_is_visible_without_exposing_endpoint_or_promoting_job():
+    source = {
+        "id": "job",
+        "status": "created",
+        "error_message": None,
+        "config_override": {"workspace": {"backend": "vm"}},
+        "context": {
+            "vm": {
+                "status": "retiring_process_zero",
+                "retirement_last_result": "process_zero_unproven",
+                "ssh_host": "10.42.3.220",
+            }
+        },
+    }
+    result = redact(source)
+    assert "cleanup" in result["error_message"].lower()
+    assert "stopped" in result["error_message"]
+    assert result["status"] == "created"
+    assert "10.42.3.220" not in json.dumps(result)
+    assert source["error_message"] is None
+
+
+def test_retirement_diagnostic_preserves_a_jobs_existing_failure():
+    result = redact(
+        {
+            "status": "failed",
+            "error_message": "Original failure",
+            "context": {"vm": {"status": "retiring_process_zero"}},
+        }
+    )
+    assert result["error_message"] == "Original failure"
+
+
+def test_pending_delete_admission_remains_visible_after_delete_acceptance():
+    result = redact(
+        {
+            "status": "created",
+            "error_message": None,
+            "context": {
+                "vm": {"status": "deleted", "retirement_cleanup_pending": True}
+            },
+        }
+    )
+    assert result["error_message"] is not None
+    assert "cleanup" in result["error_message"].lower()
+
+
+def test_workspace_recovery_projection_is_coordinate_free_and_redacts_diagnostics():
+    operation_id = "11111111-2222-4333-8444-555555555555"
+    source = {
+        "id": "job",
+        "_workspace_recovery": {
+            "operation_id": operation_id,
+            "state": "paused_attention",
+            "reason_code": "prior_runtime_unfenced",
+            "started_at": "2026-09-16T08:00:00+00:00",
+            "deadline_at": "2026-09-16T08:15:00+00:00",
+            "next_check_at": None,
+            "cleanup_pending": True,
+            "canonical_owner": True,
+            "private_endpoint": "10.0.0.9",
+            "latest_diagnostic": {"controller_error": "synthetic-private"},
+        },
+    }
+
+    result = redact(source)
+
+    assert result["workspace_recovery"] == {
+        "operation_id": operation_id,
+        "state": "paused_attention",
+        "reason_code": "prior_runtime_unfenced",
+        "message": "Previous workspace execution could not be proven stopped.",
+        "started_at": "2026-09-16T08:00:00+00:00",
+        "deadline_at": "2026-09-16T08:15:00+00:00",
+        "next_check_at": None,
+        "retryable": True,
+        "cleanup_pending": True,
+    }
+    assert "_workspace_recovery" not in result
+    assert "10.0.0.9" not in json.dumps(result)
+    assert "synthetic-private" not in json.dumps(result)
+
+
+def test_workspace_recovery_projection_rejects_unknown_reason_and_shape():
+    assert (
+        projection.workspace_recovery_projection(
+            {"_workspace_recovery": {"reason_code": "raw_controller_failure"}}
+        )
+        is None
+    )
+    assert (
+        projection.workspace_recovery_projection({"_workspace_recovery": "not-json"})
+        is None
+    )
+
+
+@pytest.mark.parametrize(
+    ("canonical_owner", "retryable"),
+    [(True, True), (False, False), (None, False)],
+)
+def test_paused_recovery_is_retryable_only_for_canonical_owner(
+    canonical_owner, retryable
+):
+    raw = {
+        "operation_id": "11111111-2222-4333-8444-555555555555",
+        "state": "paused_attention",
+        "reason_code": "prior_runtime_unfenced",
+        "started_at": "2026-09-16T08:00:00+00:00",
+        "deadline_at": "2026-09-16T08:15:00+00:00",
+        "canonical_owner": canonical_owner,
+    }
+
+    result = projection.workspace_recovery_projection({"_workspace_recovery": raw})
+
+    assert result is not None
+    assert result["retryable"] is retryable
+    assert "canonical_owner" not in result
+
+
 @pytest.mark.parametrize("as_text", [False, True])
 def test_job_projection_preserves_shape_extensions_and_input(as_text):
     context = {

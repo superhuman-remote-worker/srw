@@ -11,9 +11,12 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, HTTPException, Query, Request
+from fastapi.responses import JSONResponse
+from uuid import UUID
 
 from orchestrator.services import unit_claim_bundle
+from orchestrator.schemas.agent_runtime import WorkspaceRecoveryReport
 
 # No `tags=`: the declaration this replaces carried none, and a tag would
 # change the published OpenAPI operation for a route whose identity this batch
@@ -59,10 +62,54 @@ async def internal_unit_claim_bundle(
     """
     dependencies = get_unit_claim_bundle_dependencies(request)
     await dependencies.require_internal(request)
-    return await unit_claim_bundle.claim_bundle_for_unit(
-        unit_id,
+    try:
+        return await unit_claim_bundle.claim_bundle_for_unit(
+            unit_id,
+            lease_token=lease_token,
+            pod_name=pod_name,
+            pod_uid=pod_uid,
+            dependencies=dependencies,
+        )
+    except HTTPException as exc:
+        if (
+            exc.status_code == 409
+            and isinstance(exc.detail, dict)
+            and "recovery" in exc.detail
+        ):
+            return JSONResponse(status_code=409, content=exc.detail)
+        raise
+
+
+@router.post("/internal/units/{unit_id}/workspace-recovery")
+async def internal_workspace_recovery(
+    unit_id: UUID,
+    body: WorkspaceRecoveryReport,
+    request: Request,
+) -> dict[str, Any]:
+    dependencies = get_unit_claim_bundle_dependencies(request)
+    await dependencies.require_internal(request)
+    return (
+        await unit_claim_bundle.report_workspace_recovery(
+            unit_id=str(unit_id),
+            report=body,
+            dependencies=dependencies,
+        )
+    ).as_error_detail()
+
+
+@router.get("/internal/units/{unit_id}/workspace-recovery-disposition")
+async def internal_workspace_recovery_disposition(
+    unit_id: UUID,
+    request: Request,
+    lease_token: int = Query(gt=0),
+) -> dict[str, Any]:
+    dependencies = get_unit_claim_bundle_dependencies(request)
+    await dependencies.require_internal(request)
+    receipt = await unit_claim_bundle.get_workspace_recovery_disposition(
+        unit_id=str(unit_id),
         lease_token=lease_token,
-        pod_name=pod_name,
-        pod_uid=pod_uid,
         dependencies=dependencies,
     )
+    if receipt is None:
+        raise HTTPException(404, "No workspace recovery disposition")
+    return receipt.as_error_detail()

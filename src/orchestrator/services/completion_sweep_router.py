@@ -231,6 +231,14 @@ class CompletionSweepRouter:
                 if locked_job_id is None:
                     return self._result(job_id, "missing_job"), None
 
+                recovery_held = await conn.fetchval(
+                    "SELECT EXISTS (SELECT 1 FROM vm_workspace_recovery_jobs "
+                    "WHERE job_id=$1::uuid AND resolved_at IS NULL)",
+                    UUID(job_id),
+                )
+                if recovery_held is True:
+                    return self._result(job_id, "stand_down"), None
+
                 route_row = await conn.fetchrow(
                     """
                     SELECT job_id, command_id, command_attempts, route

@@ -9,6 +9,10 @@
 #   helm dependency build ./helm
 #   helm install srw ./helm -n srw --create-namespace -f deployment/values-local.yaml
 #
+# For one self-signed browser origin without mkcert/cert-manager, create the
+# cluster with SRW_EXPOSURE_MODE=single-origin and apply
+# deployment/values-local-single-origin.yaml after this private file.
+#
 # Everything else here is dev-only defaults that just work after `helm install`:
 #   - All credentials are stub/dev passwords (NOT for production)
 #   - APP_ENCRYPTION_KEY is a fixed dev key — local DB only, regenerate with

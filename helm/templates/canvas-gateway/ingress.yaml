@@ -1,5 +1,5 @@
 {{- $viewer := .Values.canvas.livePreview.viewer }}
-{{- if and $viewer.enabled $viewer.ingress.enabled }}
+{{- if and $viewer.enabled $viewer.ingress.enabled (not (include "srw.singleOrigin" .)) }}
 {{- $fullName := include "srw.fullname" . -}}
 {{- if not $viewer.hostSuffix }}
 {{- fail "canvas.livePreview.viewer.ingress.enabled requires a non-empty hostSuffix" }}

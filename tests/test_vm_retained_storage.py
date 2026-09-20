@@ -1,6 +1,8 @@
 """Retained disk identity, generation fencing, and deletion preconditions."""
 
+import asyncio
 from copy import deepcopy
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 from uuid import uuid4
@@ -83,12 +85,22 @@ def runtime(value):
     core.list_namespaced_pod.return_value = SimpleNamespace(items=[])
     custom = MagicMock()
     custom.list_namespaced_custom_object.return_value = {"items": []}
+    lifecycle_locks = {}
+
+    @asynccontextmanager
+    async def workspace_lifecycle(owner_id):
+        lock = lifecycle_locks.setdefault(owner_id, asyncio.Lock())
+        async with lock:
+            yield
+
     controller = SimpleNamespace(
         core_api=core,
         k8s_client=custom,
         coordination_api=LeaseAPI(),
         _get_dv=AsyncMock(return_value=None),
         _delete_captured_rootdisk=AsyncMock(),
+        _active_recovery_pins=AsyncMock(return_value=()),
+        _workspace_lifecycle=workspace_lifecycle,
     )
     return RetainedStorage(controller, "test"), pvc
 
@@ -174,6 +186,7 @@ async def test_exact_deletion_tombstone_survives_controller_restart():
     assert not await service.delete(captured)
     service.controller._delete_captured_rootdisk.assert_awaited_once_with(
         storage_name(value),
+        owner_kind=value["owner_kind"],
         owner_id=value["owner_id"],
         expected_pvc_uid=pvc.metadata.uid,
     )
@@ -194,6 +207,31 @@ async def test_replaced_pvc_is_never_adopted_or_deleted():
     captured = {**value, "pvc_uid": str(uuid4())}
     with pytest.raises(RuntimeError, match="identity changed"):
         await service.delete(captured)
+    service.controller._delete_captured_rootdisk.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["claim", "detach", "delete"])
+async def test_recovery_pin_blocks_retained_storage_reuse_and_cleanup(operation):
+    value = binding()
+    service, pvc = runtime(value)
+    await service.claim(value, value["owner_id"])
+    captured = {**value, "pvc_uid": pvc.metadata.uid}
+    service.controller._active_recovery_pins.return_value = (
+        {"pvc_uid": pvc.metadata.uid},
+    )
+
+    with pytest.raises(RuntimeError, match="pinned for recovery"):
+        if operation == "claim":
+            await service.claim(
+                {**captured, "generation": 2},
+                str(uuid4()),
+            )
+        elif operation == "detach":
+            await service.detach(captured)
+        else:
+            await service.delete(captured)
+
     service.controller._delete_captured_rootdisk.assert_not_awaited()
 
 

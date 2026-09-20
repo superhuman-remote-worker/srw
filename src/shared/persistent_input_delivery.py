@@ -60,7 +60,8 @@ async def lock_runtime_authority(
 
     thread = await conn.fetchrow(
         "SELECT id, agent_id, status, execution_lane, runtime_generation, "
-        "runtime_attach_token, runtime_retirement_token, user_id, total_turns "
+        "runtime_attach_token, runtime_retirement_token, user_id, total_turns, "
+        "conversation_revision "
         "FROM threads "
         "WHERE id = $1 FOR UPDATE",
         thread_uuid,
@@ -114,7 +115,7 @@ async def _lock_stateless_runtime_authority(
     lock_clause = "FOR UPDATE" if for_update else "FOR SHARE"
     thread = await conn.fetchrow(
         "SELECT id, agent_id, status, execution_lane, user_id, total_turns, "
-        "metadata "
+        "metadata, conversation_revision "
         f"FROM threads WHERE id = $1 {lock_clause}",
         thread_uuid,
     )
@@ -211,7 +212,8 @@ async def persist_input_delivery(
     # End cleared the live binding.
     thread_row = await conn.fetchrow(
         "SELECT id, agent_id, status, execution_lane, runtime_generation, "
-        "runtime_attach_token, runtime_retirement_token, user_id, total_turns "
+        "runtime_attach_token, runtime_retirement_token, user_id, total_turns, "
+        "conversation_revision "
         "FROM threads WHERE id = $1 FOR UPDATE",
         thread_uuid,
     )
@@ -231,7 +233,7 @@ async def persist_input_delivery(
     # current-lane path below so a lane mismatch cannot re-arm or launder them.
     terminal_replay = await conn.fetchrow(
         "SELECT delivery.*, message.seq, message.thread_id AS message_thread_id, "
-        "message.role, message.content, message.turn_number "
+        "message.role, message.content, message.turn_number, message.rewound_at "
         "FROM thread_input_deliveries AS delivery "
         "JOIN thread_messages AS message ON message.id=delivery.message_id "
         "WHERE delivery.delivery_id=$1 "
@@ -285,6 +287,53 @@ async def persist_input_delivery(
                 # This is provenance, not the thread's newly selected lane.
                 "execution_lane": str(terminal_replay["execution_lane"]),
                 "queue_state": None,
+                "execution_disposition": (
+                    "historical"
+                    if terminal_replay["rewound_at"] is not None
+                    else "current"
+                ),
+            }
+        )
+        return result
+
+    historical = await conn.fetchrow(
+        "SELECT delivery.*, message.seq, message.thread_id AS message_thread_id, "
+        "message.role, message.content, message.turn_number, message.rewound_at "
+        "FROM thread_input_deliveries AS delivery "
+        "JOIN thread_messages AS message ON message.id=delivery.message_id "
+        "WHERE delivery.delivery_id=$1 FOR UPDATE OF delivery",
+        delivery_uuid,
+    )
+    if historical is not None and historical["rewound_at"] is not None:
+        if (
+            str(historical["thread_id"]) != str(thread_uuid)
+            or str(historical["message_thread_id"]) != str(thread_uuid)
+            or str(historical["message_id"]) != str(row_id)
+            or str(historical["source"]) != source_value
+            or str(historical["role"]) != str(role)
+            or historical.get("supersedes_input_seq") != supersedes_input_seq
+        ):
+            raise InputDeliveryConflict(
+                "stable input identity conflicts with historical delivery"
+            )
+        stored_content = str(historical["content"] or "")
+        if stored_content != str(content) and source_value != "officer_wake":
+            raise InputDeliveryConflict(
+                "stable input identity conflicts with historical transcript"
+            )
+        result = _dict(historical)
+        result.update(
+            {
+                "message_id": str(row_id),
+                "message_row_id": str(row_id),
+                "seq": int(historical["seq"]),
+                "transcript_inserted": False,
+                "content": stored_content,
+                "role": str(historical["role"]),
+                "turn_number": historical["turn_number"],
+                "execution_lane": str(historical["execution_lane"]),
+                "queue_state": None,
+                "execution_disposition": "superseded",
             }
         )
         return result
@@ -457,8 +506,8 @@ async def persist_input_delivery(
         """
         INSERT INTO thread_input_deliveries
             (delivery_id, thread_id, message_id, source, execution_lane,
-             supersedes_input_seq)
-        VALUES ($1, $2, $3, $4, $5, $6)
+             supersedes_input_seq, conversation_revision)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
         ON CONFLICT (delivery_id) DO NOTHING
         """,
         delivery_uuid,
@@ -467,6 +516,7 @@ async def persist_input_delivery(
         source_value,
         execution_lane,
         supersedes_input_seq,
+        int(thread.get("conversation_revision") or 0),
     )
     delivery = await conn.fetchrow(
         "SELECT * FROM thread_input_deliveries WHERE delivery_id = $1 FOR UPDATE",
@@ -568,6 +618,7 @@ async def persist_input_delivery(
             "turn_number": message.get("turn_number"),
             "execution_lane": execution_lane,
             "queue_state": queue_state,
+            "execution_disposition": "current",
         }
     )
     return result
@@ -586,7 +637,7 @@ async def claim_stateless_input_delivery(
 
     thread_uuid = UUID(str(thread_id))
     delivery_uuid = UUID(str(delivery_id))
-    await _lock_stateless_runtime_authority(
+    thread, _queue = await _lock_stateless_runtime_authority(
         conn,
         thread_id=thread_uuid,
         lease_token=lease_token,
@@ -595,12 +646,17 @@ async def claim_stateless_input_delivery(
     )
     row = await conn.fetchrow(
         "SELECT delivery.*, message.seq, message.role, message.content, "
-        "message.turn_number FROM thread_input_deliveries AS delivery "
+        "message.turn_number, message.rewound_at "
+        "FROM thread_input_deliveries AS delivery "
         "JOIN thread_messages AS message ON message.id = delivery.message_id "
         "WHERE delivery.delivery_id = $1 AND delivery.thread_id = $2 "
+        "AND message.rewound_at IS NULL "
+        "AND (delivery.conversation_revision=$3 OR "
+        "(delivery.conversation_revision IS NULL AND $3=0)) "
         "FOR UPDATE OF delivery",
         delivery_uuid,
         thread_uuid,
+        int(thread.get("conversation_revision") or 0),
     )
     if (
         row is None
@@ -746,7 +802,7 @@ async def claim_pending_input_deliveries(
     runtime_uuid = UUID(str(runtime_generation))
     attach_uuid = UUID(str(runtime_attach_token))
     session_runtime = session_runtime_generation or runtime_generation
-    await lock_runtime_authority(
+    thread = await lock_runtime_authority(
         conn,
         thread_id=thread_uuid,
         agent_id=agent_uuid,
@@ -761,6 +817,9 @@ async def claim_pending_input_deliveries(
           JOIN thread_messages AS message ON message.id = delivery.message_id
          WHERE delivery.thread_id = $1
            AND delivery.state IN ('persisted', 'owned', 'queued', 'deferred')
+           AND message.rewound_at IS NULL
+           AND (delivery.conversation_revision=$2 OR
+                (delivery.conversation_revision IS NULL AND $2=0))
          ORDER BY
              CASE WHEN delivery.source = 'subagent'
                         AND delivery.supersedes_input_seq IS NOT NULL
@@ -770,6 +829,7 @@ async def claim_pending_input_deliveries(
          FOR UPDATE OF delivery
         """,
         thread_uuid,
+        int(thread.get("conversation_revision") or 0),
     )
     result: list[dict[str, Any]] = []
     for raw in rows:
@@ -961,7 +1021,23 @@ async def get_input_delivery(
     conn: Any, delivery_id: str | UUID
 ) -> dict[str, Any] | None:
     row = await conn.fetchrow(
-        "SELECT * FROM thread_input_deliveries WHERE delivery_id = $1",
+        "SELECT delivery.*, message.rewound_at, "
+        "thread.conversation_revision AS current_conversation_revision "
+        "FROM thread_input_deliveries AS delivery "
+        "JOIN thread_messages AS message ON message.id=delivery.message_id "
+        "JOIN threads AS thread ON thread.id=delivery.thread_id "
+        "WHERE delivery.delivery_id = $1",
         UUID(str(delivery_id)),
     )
-    return _dict(row) if row is not None else None
+    if row is None:
+        return None
+    result = _dict(row)
+    if row["rewound_at"] is not None:
+        result["execution_disposition"] = (
+            "historical"
+            if str(row["state"] or "") in {"admitted", "settled"}
+            else "superseded"
+        )
+    else:
+        result["execution_disposition"] = "current"
+    return result

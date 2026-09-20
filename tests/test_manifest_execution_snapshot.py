@@ -1040,6 +1040,10 @@ async def test_job_resume_uses_frozen_config_and_requires_capable_recipient(
 
 @pytest.mark.asyncio
 async def test_resume_preflight_checks_frozen_policy_without_live_expert(monkeypatch):
+    monkeypatch.setattr(
+        "orchestrator.services.vm_workspace_recovery_store.VMWorkspaceRecoveryStore.unresolved_participation",
+        AsyncMock(return_value=None),
+    )
     import orchestrator.main as main
 
     frozen = snapshots.rendered_srw_snapshot(

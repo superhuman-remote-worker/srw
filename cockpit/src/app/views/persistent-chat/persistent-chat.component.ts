@@ -28,7 +28,7 @@ import {CitationRefDirective} from '../../core/markdown/citation-ref.directive';
 import {WorkspaceFileLinkDirective} from '../../core/markdown/workspace-file-link.directive';
 import {KatexDirective} from '../../core/markdown/katex.directive';
 import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
-import {ChatAttachment, PermissionRequest, PersistentChatService, RunningToolInfo, ToolCallInfo,} from '../../core/services/persistent-chat.service';
+import {ChatAttachment, PermissionRequest, PersistentChatService, RewindPrefill, RunningToolInfo, ToolCallInfo,} from '../../core/services/persistent-chat.service';
 import {uploadSummary} from '../../core/services/upload-stage';
 import {
     AssistantTurn,
@@ -1011,15 +1011,14 @@ export function clearDraft(threadId: string | null): void {
               @if (chat.cloudSessionUrl() || chat.ncSessionFolder()) {
                 <app-menu-item (activated)="openSessionFiles()">{{ sessionFilesLabelKey() | transloco }}</app-menu-item>
               }
-              @if (ideStatus(); as ide) {
-                @if (ide.gitea_url) {
-                  <app-menu-item (activated)="openIde(ide.gitea_url!)">{{ 'chat.header.gitButton' | transloco }}</app-menu-item>
-                }
-                @if (ide.status === 'active' && ide.code_server_url) {
-                  <app-menu-item (activated)="openCodeServer()">{{ 'chat.header.ideButton' | transloco }}</app-menu-item>
-                } @else if (ide.status === 'restoring') {
-                  <app-menu-item [disabled]="true">{{ 'chat.header.ideLoadingTooltip' | transloco }}</app-menu-item>
-                }
+              @if (ideStatus()?.gitea_url; as giteaUrl) {
+                <app-menu-item (activated)="openIde(giteaUrl)">{{ 'chat.header.gitButton' | transloco }}</app-menu-item>
+              }
+              @if (ideStatus()?.status === 'active' && ideStatus()?.code_server_url) {
+                <app-menu-item (activated)="openCodeServer()">{{ 'chat.header.ideButton' | transloco }}</app-menu-item>
+              }
+              @if (ideStatus()?.status === 'restoring') {
+                <app-menu-item [disabled]="true">{{ 'chat.header.ideLoadingTooltip' | transloco }}</app-menu-item>
               }
               @if (sshButtonVisible()) {
                 <app-menu-item (activated)="showSshPanel.update(v => !v)">{{ 'chat.header.sshButton' | transloco }}</app-menu-item>
@@ -1458,16 +1457,22 @@ export function clearDraft(threadId: string | null): void {
                   <!-- Stalled queue: the flush has no timed auto-retry, so
                        without these the bubble spins on "sending" forever. -->
                   @if (stalled) {
+                    @let requiresReview = chat.outboxItem(turn.id)?.requiresReview;
                     <div class="queued-actions">
-                      <span class="queued-note">{{ 'chat.queued.notSent' | transloco }}</span>
-                      <button type="button" class="queued-action"
-                              (click)="chat.retryQueuedSends()">{{ 'chat.queued.retry' | transloco }}</button>
+                      <span class="queued-note">{{ (requiresReview ? 'chat.rewind.staleOutbox' : 'chat.queued.notSent') | transloco }}</span>
+                      @if (requiresReview) {
+                        <button type="button" class="queued-action"
+                                (click)="reviewQueuedSend(turn.id)">{{ 'chat.rewind.reviewDraft' | transloco }}</button>
+                      } @else {
+                        <button type="button" class="queued-action"
+                                (click)="chat.retryQueuedSends()">{{ 'chat.queued.retry' | transloco }}</button>
+                      }
                       <button type="button" class="queued-action"
                               (click)="chat.discardQueuedSend(turn.id)">{{ 'chat.queued.discard' | transloco }}</button>
                     </div>
                   }
                 </div>
-                @if (turn.historical && !chat.outboxIds().has(turn.id)) {
+                @if (turn.historical && !chat.outboxIds().has(turn.id) && chat.rewindModeAvailable('conversation')) {
                   <button type="button"
                           class="rewind-btn"
                           [attr.aria-label]="'chat.rewind.button' | transloco"
@@ -2065,7 +2070,7 @@ export function clearDraft(threadId: string | null): void {
           [class.recording]="isRecording()"
         >
           <!-- Slash command autocomplete -->
-          @if (showSlashMenu()) {
+          @if (showSlashMenu() && filteredCommands().length > 0) {
             <div class="slash-menu">
               @for (cmd of filteredCommands(); track cmd.command) {
                 <div
@@ -2169,6 +2174,22 @@ export function clearDraft(threadId: string | null): void {
               </button>
             </div>
           } @else {
+            @if (chat.rewindOutcomeUnknown()) {
+              <div class="queued-actions">
+                <span class="queued-note">{{ 'chat.rewind.outcomeUnknown' | transloco }}</span>
+                <button type="button" class="queued-action"
+                        [disabled]="chat.rewindInFlight()"
+                        (click)="chat.refreshPendingRewindReceipt()">{{ 'chat.rewind.refreshReceipt' | transloco }}</button>
+                <button type="button" class="queued-action"
+                        [disabled]="chat.rewindInFlight()"
+                        (click)="chat.retryPendingRewind()">{{ 'chat.rewind.retryExact' | transloco }}</button>
+              </div>
+            }
+            @if (chat.rewindPrefill(); as prefill) {
+              <button type="button" class="queued-action" (click)="insertRewindPrompt(prefill)">
+                {{ 'chat.rewind.insertOriginalPrompt' | transloco }}
+              </button>
+            }
             <textarea
               #inputEl
               class="chat-input"
@@ -2365,36 +2386,46 @@ export function clearDraft(threadId: string | null): void {
             <span> · {{ (rewindHiddenCount() === 1 ? 'chat.rewind.hidesOne' : 'chat.rewind.hidesMany') | transloco: {count: rewindHiddenCount()} }}</span>
           }
         </p>
+        @if (chat.rewindPreviewLoading()) {
+          <p class="rewind-caveat">{{ 'chat.rewind.checking' | transloco }}</p>
+        }
         <div class="rewind-options">
-          <button type="button" class="rewind-option"
-                  [disabled]="chat.rewindInFlight()"
-                  (click)="confirmRewind('both')">
-            <app-icon size="sm" class="rewind-option-icon">history</app-icon>
-            <span class="rewind-option-text">
-              <span class="rewind-option-title">{{ 'chat.rewind.both' | transloco }}</span>
-              <span class="rewind-option-desc">{{ 'chat.rewind.bothDesc' | transloco }}</span>
-            </span>
-          </button>
-          <button type="button" class="rewind-option"
-                  [disabled]="chat.rewindInFlight()"
+          @if (chat.rewindModeAvailable('both')) {
+            <button type="button" class="rewind-option"
+                    [disabled]="chat.rewindInFlight()"
+                    (click)="confirmRewind('both')">
+              <app-icon size="sm" class="rewind-option-icon">history</app-icon>
+              <span class="rewind-option-text">
+                <span class="rewind-option-title">{{ 'chat.rewind.both' | transloco }}</span>
+                <span class="rewind-option-desc">{{ 'chat.rewind.bothDesc' | transloco }}</span>
+              </span>
+            </button>
+          }
+          @if (chat.rewindModeAvailable('conversation')) {
+            <button type="button" class="rewind-option"
+                  [disabled]="chat.rewindInFlight() || chat.rewindPreviewLoading() || (chat.controlTransport('rewind') === 'rest' && !chat.rewindPreview()?.eligible)"
                   (click)="confirmRewind('conversation')">
-            <app-icon size="sm" class="rewind-option-icon">chat_bubble</app-icon>
-            <span class="rewind-option-text">
-              <span class="rewind-option-title">{{ 'chat.rewind.conversation' | transloco }}</span>
-              <span class="rewind-option-desc">{{ 'chat.rewind.conversationDesc' | transloco }}</span>
-            </span>
-          </button>
-          <button type="button" class="rewind-option"
-                  [disabled]="chat.rewindInFlight()"
-                  (click)="confirmRewind('code')">
-            <app-icon size="sm" class="rewind-option-icon">folder</app-icon>
-            <span class="rewind-option-text">
-              <span class="rewind-option-title">{{ 'chat.rewind.code' | transloco }}</span>
-              <span class="rewind-option-desc">{{ 'chat.rewind.codeDesc' | transloco }}</span>
-            </span>
-          </button>
+              <app-icon size="sm" class="rewind-option-icon">chat_bubble</app-icon>
+              <span class="rewind-option-text">
+                <span class="rewind-option-title">{{ 'chat.rewind.conversation' | transloco }}</span>
+                <span class="rewind-option-desc">{{ 'chat.rewind.conversationDesc' | transloco }}</span>
+              </span>
+            </button>
+          }
+          @if (chat.rewindModeAvailable('code')) {
+            <button type="button" class="rewind-option"
+                    [disabled]="chat.rewindInFlight()"
+                    (click)="confirmRewind('code')">
+              <app-icon size="sm" class="rewind-option-icon">folder</app-icon>
+              <span class="rewind-option-text">
+                <span class="rewind-option-title">{{ 'chat.rewind.code' | transloco }}</span>
+                <span class="rewind-option-desc">{{ 'chat.rewind.codeDesc' | transloco }}</span>
+              </span>
+            </button>
+          }
         </div>
-        <div class="rewind-options rewind-options-secondary">
+        @if (chat.summarizeAvailable()) {
+          <div class="rewind-options rewind-options-secondary">
           <button type="button" class="rewind-option"
                   (click)="confirmSummarizeUpTo()">
             <app-icon size="sm" class="rewind-option-icon">compress</app-icon>
@@ -2403,8 +2434,12 @@ export function clearDraft(threadId: string | null): void {
               <span class="rewind-option-desc">{{ 'chat.rewind.summarizeDesc' | transloco }}</span>
             </span>
           </button>
-        </div>
+          </div>
+        }
         <p class="rewind-caveat">{{ 'chat.rewind.refillHint' | transloco }}</p>
+        @if (chat.controlTransport('rewind') === 'rest') {
+          <p class="rewind-caveat">{{ 'chat.rewind.unchangedState' | transloco }}</p>
+        }
         <p class="rewind-caveat">{{ 'chat.rewind.caveat' | transloco }}</p>
         <ng-container appDialogActions>
           <app-button variant="ghost" size="sm" (clicked)="closeRewindSheet()">
@@ -2552,6 +2587,7 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     @ViewChild('waveformCanvas') waveformCanvas?: ElementRef<HTMLCanvasElement>;
 
     inputText = '';
+    private composerDraftRevision = 0;
 
     // Settings panel
     readonly showViewMenu = signal(false);
@@ -2670,7 +2706,11 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     // Slash command autocomplete
     readonly showSlashMenu = signal(false);
     readonly slashSelectedIndex = signal(0);
-    readonly filteredCommands = signal<SlashCommand[]>([]);
+    private readonly slashQuery = signal('');
+    readonly filteredCommands = computed(() =>
+        SLASH_COMMANDS.filter(c =>
+            c.command.startsWith(this.slashQuery()) &&
+            (c.command !== '/rewind' || this.chat.rewindModeAvailable('conversation'))));
 
     // Empty-state suggestions (loaded once per mount; the whole set renders, nothing is picked)
     private readonly pickedSuggestions = signal<Suggestion[]>([]);
@@ -2833,11 +2873,16 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         // ngModel field: assign + saveDraft by hand (no ngModelChange fires),
         // same trap denyOffer documents.
         effect(() => {
-            const prompt = this.chat.rewindPrefill();
-            if (prompt === null) return;
-            this.inputText = prompt;
+            const prefill = this.chat.rewindPrefill();
+            if (
+                prefill === null ||
+                this.inputText !== prefill.draftSnapshot ||
+                this.composerDraftRevision !== prefill.draftRevision
+            ) return;
+            this.inputText = prefill.prompt;
+            this.composerDraftRevision++;
             saveDraft(this.chat.threadId(), this.inputText);
-            this.chat.rewindPrefill.set(null);
+            this.chat.consumeRewindPrefill(prefill.clientRequestId);
             setTimeout(() => {
                 this.inputEl?.nativeElement?.focus();
                 this.autoResizeInput();
@@ -3283,6 +3328,7 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         // /rewind is pure UI — open the target picker instead of handing the
         // text to the service, which would send it to the agent as chat.
         if (isRewindCommand(text)) {
+            if (!this.chat.rewindModeAvailable('conversation')) return;
             this.inputText = '';
             clearDraft(threadId);
             this.openRewindPicker();
@@ -3619,14 +3665,15 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     }
 
     onInputChange(value: string): void {
+        this.composerDraftRevision++;
         const trimmed = value.trimStart();
         if (trimmed.startsWith('/')) {
             const query = trimmed.split(/\s/)[0].toLowerCase();
-            const filtered = SLASH_COMMANDS.filter(c => c.command.startsWith(query));
-            this.filteredCommands.set(filtered);
-            this.showSlashMenu.set(filtered.length > 0);
+            this.slashQuery.set(query);
+            this.showSlashMenu.set(this.filteredCommands().length > 0);
             this.slashSelectedIndex.set(0);
         } else {
+            this.slashQuery.set('');
             this.showSlashMenu.set(false);
         }
         // Persist the draft synchronously so an abrupt reload (auth redirect)
@@ -3744,10 +3791,12 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
 
     openRewindSheet(turn: UserTurn): void {
         this.rewindTarget.set(turn);
+        void this.chat.prepareRewind(turn.id);
     }
 
     closeRewindSheet(): void {
         this.rewindTarget.set(null);
+        this.chat.rewindPreview.set(null);
     }
 
     /** /rewind target picker (newest prompt first). Same eligibility gate as
@@ -3764,6 +3813,7 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         filterRewindCandidates(this.rewindCandidates(), this.rewindPickerQuery()));
 
     openRewindPicker(): void {
+        if (!this.chat.rewindModeAvailable('conversation')) return;
         this.rewindPickerQuery.set('');
         this.rewindPickerOpen.set(true);
         // The dialog's focus trap auto-captures onto its close button; move
@@ -3834,8 +3884,31 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     confirmRewind(mode: 'both' | 'conversation' | 'code'): void {
         const target = this.rewindTarget();
         if (!target) return;
-        this.chat.rewind(target.id, mode);
+        this.chat.rewind(target.id, mode, this.inputText, this.composerDraftRevision);
         this.rewindTarget.set(null);
+    }
+
+    insertRewindPrompt(prefill: RewindPrefill): void {
+        this.inputText = prefill.prompt;
+        this.composerDraftRevision++;
+        saveDraft(this.chat.threadId(), this.inputText);
+        this.chat.consumeRewindPrefill(prefill.clientRequestId);
+        setTimeout(() => {
+            this.inputEl?.nativeElement?.focus();
+            this.autoResizeInput();
+        });
+    }
+
+    reviewQueuedSend(localId: string): void {
+        const text = this.chat.takeQueuedSendForReview(localId);
+        if (text === null) return;
+        this.inputText = text;
+        this.composerDraftRevision++;
+        saveDraft(this.chat.threadId(), text);
+        setTimeout(() => {
+            this.inputEl?.nativeElement?.focus();
+            this.autoResizeInput();
+        });
     }
 
     confirmSummarizeUpTo(): void {
@@ -3854,7 +3927,7 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
 
     onKeydown(event: KeyboardEvent): void {
         // Slash menu navigation
-        if (this.showSlashMenu()) {
+        if (this.showSlashMenu() && this.filteredCommands().length > 0) {
             const cmds = this.filteredCommands();
             if (event.key === 'ArrowDown') {
                 event.preventDefault();

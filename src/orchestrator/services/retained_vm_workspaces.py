@@ -3,7 +3,7 @@
 from copy import deepcopy
 import json
 import os
-from uuid import UUID, uuid4
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 from fastapi import HTTPException
 
@@ -206,7 +206,9 @@ async def record_detached(db, job_id, binding):
         initialized=i.initialized OR COALESCE(j.context->'vm'->'initialization_receipt'->>'phase','')='Succeeded',updated_at=now()
         FROM srw_execution_specs s JOIN jobs j ON s.work_kind='Job' AND s.work_id=j.id
         WHERE i.execution_id=s.id AND s.work_id=$1 AND i.id=$2 AND i.generation=$3
-        AND i.status IN ('Reserved','Attached') AND i.pvc_uid IS NOT NULL AND j.status IN ('completed','failed','cancelled')""",
+        AND i.status IN ('Reserved','Attached') AND i.pvc_uid IS NOT NULL AND j.status IN ('completed','failed','cancelled')
+        AND NOT EXISTS (SELECT 1 FROM vm_workspace_recovery_jobs wrj
+            WHERE wrj.job_id=j.id AND wrj.resolved_at IS NULL)""",
         UUID(str(job_id)),
         UUID(binding["uid"]),
         binding["generation"],
@@ -240,6 +242,8 @@ async def reconcile_detached(db, provisioner):
         JOIN jobs j ON s.work_kind='Job' AND s.work_id=j.id
         WHERE i.recipe->>'backend'='vm' AND i.recipe->>'retention'='Retain'
         AND i.status IN ('Reserved','Attached') AND i.pvc_uid IS NOT NULL AND j.status IN ('completed','failed','cancelled')
+        AND NOT EXISTS (SELECT 1 FROM vm_workspace_recovery_jobs wrj
+            WHERE wrj.job_id=j.id AND wrj.resolved_at IS NULL)
         ORDER BY i.updated_at LIMIT 20"""
     )
     for row in rows:
@@ -267,4 +271,43 @@ async def reconcile_detached(db, provisioner):
             and probe.identity
             and probe.identity.rootdisk_pvc_uid == current["pvc_uid"]
         ):
-            await provisioner._record_retained_detach(str(row["id"]), current)
+            from orchestrator.services.vm_workspace_recovery_store import (
+                VMWorkspaceRecoveryStore,
+                cleanup_intent_digest,
+                completed_cleanup_outcome,
+            )
+
+            try:
+                pvc_uid = UUID(str(current["pvc_uid"]))
+            except (TypeError, ValueError, AttributeError):
+                continue
+            recovery_store = VMWorkspaceRecoveryStore(db)
+            cleanup = await recovery_store.acquire_cleanup_permit(
+                owner_kind="job",
+                owner_id=UUID(str(row["id"])),
+                pvc_uid=pvc_uid,
+                request_id=uuid5(
+                    NAMESPACE_URL,
+                    f"retained-workspace-detach:{row['id']}:{generation}:{pvc_uid}",
+                ),
+                source="retained_workspace_detach",
+                intent_digest=cleanup_intent_digest(
+                    {
+                        "generation": str(generation),
+                        "owner_kind": "job",
+                        "owner_id": str(row["id"]),
+                        "pvc_uid": str(pvc_uid),
+                        "resource": "retained_workspace_binding",
+                        "source": "retained_workspace_detach",
+                    }
+                ),
+            )
+            if not cleanup.allowed:
+                continue
+            replayed = completed_cleanup_outcome(cleanup)
+            if replayed is None:
+                await provisioner._record_retained_detach(str(row["id"]), current)
+                if cleanup.admission_id is not None:
+                    await recovery_store.complete_cleanup_permit(
+                        cleanup.admission_id, outcome="retained_workspace_detached"
+                    )

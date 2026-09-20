@@ -136,6 +136,29 @@ def test_disabling_admission_keeps_existing_builder_policy_and_cleanup_authority
     )
 
 
+def test_recovery_observation_has_node_uid_read_and_read_only_guest_diagnostic():
+    docs = render(*ENABLED)
+    cluster_role = next(
+        d
+        for d in docs
+        if d["kind"] == "ClusterRole"
+        and d["metadata"]["name"].endswith("-vm-controller-node-observer")
+    )
+    assert cluster_role["rules"] == [
+        {"apiGroups": [""], "resources": ["nodes"], "verbs": ["get"]}
+    ]
+    template = next(
+        d["data"]["cloud-init.yaml"]
+        for d in docs
+        if d["kind"] == "ConfigMap" and "cloud-init.yaml" in d.get("data", {})
+    )
+    assert "/usr/local/bin/srw-network-qualification" in template
+    assert "'machine_id': machine_id" in template
+    assert "'registration_id':" not in template
+    assert "cloud_init_cache_cleaned': False" in template
+    assert "cloud-init clean" not in template
+
+
 def test_pod_firewall_profile_is_shared_by_admission_and_controller():
     docs = render(*ENABLED, "vmController.preparation.network.podFirewall=true")
     config = next(

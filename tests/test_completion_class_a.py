@@ -18,6 +18,8 @@ from contextlib import ExitStack, asynccontextmanager
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import UUID
 
+from tests._workspace_recovery_fakes import idle_recovery_store
+
 import pytest
 from fastapi import HTTPException
 
@@ -471,6 +473,12 @@ def _job(*, freeze_data: dict | None = None, **overrides) -> dict:
 
 
 def _patch_completion(stack: ExitStack, db: _EndpointDB) -> None:
+    stack.enter_context(
+        patch(
+            "orchestrator.main.VMWorkspaceRecoveryStore",
+            return_value=idle_recovery_store(),
+        )
+    )
     stack.enter_context(patch("orchestrator.main.require_internal", AsyncMock()))
     stack.enter_context(patch("orchestrator.main.postgres_db", db))
     gitea = MagicMock()

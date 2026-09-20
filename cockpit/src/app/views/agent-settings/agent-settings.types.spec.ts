@@ -7,7 +7,30 @@ import {
 } from './agent-settings.types';
 import type {EffectiveModels} from '../../core/models/api.model';
 
+describe('detectModelFamily — Muse Spark 1.3', () => {
+  it.each(['', 'meta/', 'openrouter/meta/'])(
+    'recognizes standard and Contributor IDs with prefix %s', (prefix) => {
+      expect(detectModelFamily(`${prefix}Muse-Spark-1.3`)).toBe('muse-spark-1.3');
+      expect(detectModelFamily(`${prefix}muse-spark-1.3-contributor`)).toBe('muse-spark-1.3');
+      expect(detectModelFamily(`${prefix}muse-spark-1.3-20260902`)).toBe('muse-spark-1.3');
+      expect(detectModelFamily(`${prefix}muse-spark-1.3:exacto`)).toBe('muse-spark-1.3');
+      expect(detectModelFamily(`${prefix}muse-spark-1.2`)).toBe('default');
+      expect(detectModelFamily(`${prefix}muse-spark-1.30`)).toBe('default');
+    },
+  );
+});
+
 describe('detectModelFamily — GLM', () => {
+  it.each(['', 'z-ai/', 'openrouter/z-ai/', 'zai-org/'])(
+    'distinguishes GLM-5.3 Flash vision settings with prefix %s', (prefix) => {
+      expect(detectModelFamily(`${prefix}GLM-5.3-Flash`)).toBe('glm-5.3-flash');
+      expect(detectModelFamily(`${prefix}glm-5.3-flash:exacto`)).toBe('glm-5.3-flash');
+      expect(detectModelFamily(`${prefix}glm-5.3`)).toBe('glm-5.3');
+      expect(detectModelFamily(`${prefix}glm-5.3-20260816`)).toBe('glm-5.3');
+      expect(detectModelFamily(`${prefix}glm-4.7-flash`)).toBe('glm');
+    },
+  );
+
   it('maps GLM-5.2 IDs to the glm family across transports', () => {
     expect(detectModelFamily('openrouter/z-ai/glm-5.2')).toBe('glm');
     expect(detectModelFamily('z-ai/glm-5.2')).toBe('glm');

@@ -1677,6 +1677,20 @@ class TestSaveThreadMessage:
     """Tests for save_thread_message method."""
 
     @pytest.mark.asyncio
+    async def test_rejects_legacy_writer_for_stateless_thread(self):
+        conn = _mock_conn()
+        conn.fetchrow = AsyncMock(return_value={"execution_lane": "stateless"})
+        db = _make_db_with_conn(conn)
+
+        with pytest.raises(
+            RuntimeError,
+            match="legacy message writer is unavailable for stateless threads",
+        ):
+            await db.save_thread_message("tid-1", "user", "hello")
+
+        assert conn.fetchrow.await_count == 1
+
+    @pytest.mark.asyncio
     async def test_returns_uuid_string(self):
         conn = _mock_conn()
         conn.fetchrow = AsyncMock(

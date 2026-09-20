@@ -33,18 +33,54 @@ def gitea_env(monkeypatch):
 # --- externalize_gitea_url ---------------------------------------------------
 
 
-def test_externalize_swaps_host_scheme_keeps_creds_and_path(gitea_env):
+def test_externalize_swaps_host_scheme_and_removes_credentials(gitea_env):
     out = access.externalize_gitea_url(CREDENTIALED)
-    # host + scheme rewritten to the external ingress; creds + path preserved so
-    # the agent (F29) can still clone/push.
-    assert out == "https://srw:s3cr3t-P4ss@git.h4ll.net/srw/project-abc-jobs.git"
+    assert out == "https://git.h4ll.net/srw/project-abc-jobs.git"
 
 
 def test_externalize_preserves_external_port(monkeypatch):
     monkeypatch.setenv("GITEA_INTERNAL_URL", INTERNAL)
     monkeypatch.setenv("GITEA_URL", "https://git.h4ll.net:8443")
     out = access.externalize_gitea_url(CREDENTIALED)
-    assert out == "https://srw:s3cr3t-P4ss@git.h4ll.net:8443/srw/project-abc-jobs.git"
+    assert out == "https://git.h4ll.net:8443/srw/project-abc-jobs.git"
+
+
+@pytest.mark.parametrize(
+    "internal, url, expected",
+    [
+        (
+            INTERNAL,
+            CREDENTIALED,
+            "https://192.0.2.10:30443/git/srw/project-abc-jobs.git",
+        ),
+        (
+            INTERNAL + "/gitea",
+            INTERNAL + "/gitea/team/repo.git?ref=main#readme",
+            "https://192.0.2.10:30443/git/team/repo.git?ref=main#readme",
+        ),
+        (
+            INTERNAL + "/gitea",
+            INTERNAL + "/gitea-other/team/repo.git",
+            INTERNAL + "/gitea-other/team/repo.git",
+        ),
+        (
+            INTERNAL,
+            "http://srw-gitea:3001/team/repo.git",
+            "http://srw-gitea:3001/team/repo.git",
+        ),
+        (
+            INTERNAL,
+            "https://srw-gitea:3000/team/repo.git",
+            "https://srw-gitea:3000/team/repo.git",
+        ),
+    ],
+)
+def test_externalize_matches_exact_internal_base_and_preserves_public_prefix(
+    monkeypatch, internal, url, expected
+):
+    monkeypatch.setenv("GITEA_INTERNAL_URL", internal)
+    monkeypatch.setenv("GITEA_URL", "https://192.0.2.10:30443/git")
+    assert access.externalize_gitea_url(url) == expected
 
 
 def test_externalize_leaves_foreign_host_untouched(gitea_env):

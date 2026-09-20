@@ -31,6 +31,7 @@ import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator
+from uuid import NAMESPACE_URL, UUID, uuid5
 
 from orchestrator.services.completion_lifecycle import (
     CompletionLifecycleOwnership,
@@ -40,7 +41,14 @@ from orchestrator.services.completion_lifecycle import (
 )
 from orchestrator.services.blocking_effect import joined_blocking_call
 from orchestrator.services.ssh_helpers import orchestrator_can_reach
-from orchestrator.services.vm_provisioner import VMTeardownIdentity
+from orchestrator.services.vm_provisioner import VMTeardownIdentity, VMTeardownResult
+from orchestrator.services.vm_workspace_recovery_store import (
+    VMWorkspaceRecoveryStore,
+    bind_vm_cleanup_permit,
+    vm_cleanup_kwargs,
+    cleanup_intent_digest,
+    completed_cleanup_outcome,
+)
 
 from orchestrator.services.lifecycle.types import Instance
 from orchestrator.services.lifecycle.workspace_manager import (
@@ -174,6 +182,7 @@ class VMInstanceManager:
         *,
         completion_commands_enabled: bool = False,
         completion_router: Any | None = None,
+        workspace_recovery_store: Any | None = None,
     ):
         self._provisioner = vm_provisioner
         self._suspension = suspension_service
@@ -187,6 +196,9 @@ class VMInstanceManager:
             CompletionLifecycleOwnership(db, completion_router)
             if completion_commands_enabled and completion_router is not None
             else None
+        )
+        self._workspace_recovery_store = (
+            workspace_recovery_store or VMWorkspaceRecoveryStore(db)
         )
         # Reachability probe cache: ssh_host -> (probed_at, ok).
         self._reach_cache: dict[str, tuple[float, bool]] = {}
@@ -824,19 +836,38 @@ class VMInstanceManager:
                         bound,
                         entity_type=owner_kind,
                     )
-            async with asyncio.timeout(LIFECYCLE_EXTERNAL_TIMEOUT_SECONDS):
-                outcome = await self._provisioner.release_vm_captured(
-                    bound,
-                    identity,
-                    purge_disk=purge_disk,
-                    entity_type=owner_kind,
-                    capture_snapshot=False,
-                )
+            cleanup = await self._admit_destructive_cleanup(
+                owner_kind=owner_kind,
+                owner_id=bound,
+                identity=identity,
+                source="delete",
+                purge_disk=purge_disk,
+                permit=permit,
+            )
+            if cleanup is None:
+                return False
+            replayed = completed_cleanup_outcome(cleanup)
+            if replayed is not None:
+                outcome = VMTeardownResult(replayed, replayed == "completed")
+            else:
+                async with asyncio.timeout(LIFECYCLE_EXTERNAL_TIMEOUT_SECONDS):
+                    outcome = await self._provisioner.release_vm_captured(
+                        bound,
+                        identity,
+                        purge_disk=purge_disk,
+                        entity_type=owner_kind,
+                        capture_snapshot=False,
+                        **vm_cleanup_kwargs(cleanup),
+                    )
             if isinstance(
                 permit, LifecycleActionPermit
             ) and not await self._permit_external(permit):
                 return False
             if outcome.disposition == "identity_superseded":
+                if replayed is None:
+                    await self._complete_destructive_cleanup(
+                        cleanup, outcome="identity_superseded"
+                    )
                 if isinstance(permit, LifecycleActionPermit):
                     permit.skip("vm_identity_superseded", settled=True)
                 return True
@@ -849,6 +880,8 @@ class VMInstanceManager:
                     # or authorized control can retry promptly.
                     permit.skip("vm_retirement_retry_pending", settled=True)
                 return False
+            if outcome.disposition == "completed" and replayed is None:
+                await self._complete_destructive_cleanup(cleanup, outcome="completed")
             return bool(outcome.deleted)
         except Exception:
             logger.exception("Failed to delete VM %s", inst.id)
@@ -938,9 +971,32 @@ class VMInstanceManager:
                 rootdisk_pvc_uid=rootdisk_uid,
             )
             try:
-                async with asyncio.timeout(LIFECYCLE_EXTERNAL_TIMEOUT_SECONDS):
-                    outcome = await self._provisioner.delete_orphan_vm_captured(
-                        entity_id, identity, purge_disk=True
+                cleanup = await self._admit_destructive_cleanup(
+                    owner_kind="job",
+                    owner_id=entity_id,
+                    identity=identity,
+                    source="orphan_delete",
+                    purge_disk=True,
+                )
+                if cleanup is None:
+                    continue
+                replayed = completed_cleanup_outcome(cleanup)
+                if replayed is not None:
+                    outcome = VMTeardownResult(replayed, replayed == "completed")
+                else:
+                    async with asyncio.timeout(LIFECYCLE_EXTERNAL_TIMEOUT_SECONDS):
+                        outcome = await self._provisioner.delete_orphan_vm_captured(
+                            entity_id,
+                            identity,
+                            purge_disk=True,
+                            **vm_cleanup_kwargs(cleanup),
+                        )
+                if replayed is None and outcome.disposition in {
+                    "completed",
+                    "identity_superseded",
+                }:
+                    await self._complete_destructive_cleanup(
+                        cleanup, outcome=outcome.disposition
                     )
                 if outcome.deleted:
                     reaped += 1
@@ -1024,12 +1080,35 @@ class VMInstanceManager:
                         identity = await self._provisioner.capture_vm_teardown_identity(
                             str(job_id), entity_type="job"
                         )
-                        outcome = await self._provisioner.release_vm_captured(
-                            str(job_id),
-                            identity,
+                        cleanup = await self._admit_destructive_cleanup(
+                            owner_kind="job",
+                            owner_id=str(job_id),
+                            identity=identity,
+                            source="kept_disk",
                             purge_disk=True,
-                            entity_type="job",
-                            capture_snapshot=False,
+                        )
+                        if cleanup is None:
+                            continue
+                        replayed = completed_cleanup_outcome(cleanup)
+                        if replayed is not None:
+                            outcome = VMTeardownResult(
+                                replayed, replayed == "completed"
+                            )
+                        else:
+                            outcome = await self._provisioner.release_vm_captured(
+                                str(job_id),
+                                identity,
+                                purge_disk=True,
+                                entity_type="job",
+                                capture_snapshot=False,
+                                **vm_cleanup_kwargs(cleanup),
+                            )
+                    if replayed is None and outcome.disposition in {
+                        "completed",
+                        "identity_superseded",
+                    }:
+                        await self._complete_destructive_cleanup(
+                            cleanup, outcome=outcome.disposition
                         )
                     if not outcome.deleted:
                         continue
@@ -1060,11 +1139,35 @@ class VMInstanceManager:
                 if not isinstance(identity, VMTeardownIdentity):
                     continue
                 try:
+                    cleanup = await self._admit_destructive_cleanup(
+                        owner_kind="job",
+                        owner_id=str(job_id),
+                        identity=identity,
+                        source="kept_disk",
+                        purge_disk=True,
+                        permit=permit,
+                    )
+                    if cleanup is None:
+                        continue
                     # Idempotent: a VM that is already gone 404s, which the
                     # provisioner treats as success, and the disk still goes.
-                    async with asyncio.timeout(LIFECYCLE_EXTERNAL_TIMEOUT_SECONDS):
-                        outcome = await self._provisioner.release_vm_captured(
-                            str(job_id), identity, purge_disk=True
+                    replayed = completed_cleanup_outcome(cleanup)
+                    if replayed is not None:
+                        outcome = VMTeardownResult(replayed, replayed == "completed")
+                    else:
+                        async with asyncio.timeout(LIFECYCLE_EXTERNAL_TIMEOUT_SECONDS):
+                            outcome = await self._provisioner.release_vm_captured(
+                                str(job_id),
+                                identity,
+                                purge_disk=True,
+                                **vm_cleanup_kwargs(cleanup),
+                            )
+                    if replayed is None and outcome.disposition in {
+                        "completed",
+                        "identity_superseded",
+                    }:
+                        await self._complete_destructive_cleanup(
+                            cleanup, outcome=outcome.disposition
                         )
                     if not await self._permit_external(permit):
                         continue
@@ -1085,6 +1188,101 @@ class VMInstanceManager:
                 except Exception:
                     logger.exception("Kept-disk purge failed for job %s", job_id)
         return purged
+
+    async def _admit_destructive_cleanup(
+        self,
+        *,
+        owner_kind: str,
+        owner_id: str,
+        identity: VMTeardownIdentity,
+        source: str,
+        purge_disk: bool,
+        permit: LifecycleActionPermit | None = None,
+    ) -> Any | None:
+        """Serialize an exact VM delete/prune before controller side effects."""
+
+        try:
+            parsed_owner_id = UUID(str(owner_id))
+        except (TypeError, ValueError, AttributeError):
+            # Lifecycle's production owners are UUID-backed rows. Keeping a
+            # deterministic fallback makes old test doubles and imported rows
+            # serialize consistently without weakening real UUID ownership.
+            parsed_owner_id = uuid5(
+                NAMESPACE_URL, f"workspace-cleanup-owner:{owner_kind}:{owner_id}"
+            )
+        try:
+            parsed_pvc_uid = (
+                UUID(str(identity.rootdisk_pvc_uid))
+                if identity.rootdisk_pvc_uid is not None
+                else None
+            )
+        except (TypeError, ValueError, AttributeError):
+            parsed_pvc_uid = None
+        request_id = uuid5(
+            NAMESPACE_URL,
+            "workspace-cleanup:"
+            f"{source}:{owner_kind}:{owner_id}:{identity.provision_generation}:"
+            f"{identity.vm_uid}:{identity.rootdisk_pvc_uid}",
+        )
+        resource_intent = {
+            "owner_kind": owner_kind,
+            "owner_id": str(parsed_owner_id),
+            "provision_generation": identity.provision_generation,
+            "vm_uid": identity.vm_uid or "",
+            "pvc_uid": str(parsed_pvc_uid or ""),
+            "purge_disk": bool(purge_disk),
+            "resource": "vm_workspace",
+            "source": f"lifecycle_vm_{source}"[:64],
+        }
+        try:
+            cleanup = await self._workspace_recovery_store.acquire_cleanup_permit(
+                owner_kind=owner_kind,
+                owner_id=parsed_owner_id,
+                pvc_uid=parsed_pvc_uid,
+                request_id=request_id,
+                source=f"lifecycle_vm_{source}"[:64],
+                intent_digest=cleanup_intent_digest(resource_intent),
+            )
+        except Exception:
+            logger.exception(
+                "VM cleanup admission unavailable for %s %s — preserving workspace",
+                owner_kind,
+                owner_id,
+            )
+            if isinstance(permit, LifecycleActionPermit):
+                permit.skip("workspace_cleanup_admission_unavailable", settled=True)
+            return None
+        if cleanup.allowed:
+            return bind_vm_cleanup_permit(
+                cleanup, request_id=request_id, intent=resource_intent
+            )
+        logger.info(
+            "VM cleanup held for %s %s (%s)",
+            owner_kind,
+            owner_id,
+            cleanup.reason or "workspace_recovery_unresolved",
+        )
+        if isinstance(permit, LifecycleActionPermit):
+            permit.skip("workspace_recovery_hold", settled=True)
+        return None
+
+    async def _complete_destructive_cleanup(
+        self, cleanup: Any, *, outcome: str
+    ) -> None:
+        admission_id = getattr(cleanup, "admission_id", None)
+        if admission_id is None:
+            return
+        try:
+            await self._workspace_recovery_store.complete_cleanup_permit(
+                admission_id, outcome=outcome
+            )
+        except Exception:
+            # The controller result is already conclusive. Leaving the durable
+            # admission open is the safe failure mode and keeps later recovery
+            # or pruning from racing an unrecorded cleanup result.
+            logger.exception(
+                "VM cleanup admission %s could not be completed", admission_id
+            )
 
     # -------------------------------------------------------------------------
     # Internals

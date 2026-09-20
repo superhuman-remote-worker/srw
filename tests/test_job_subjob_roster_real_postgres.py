@@ -21,6 +21,7 @@ assert the mock. What is actually at stake:
 
 from __future__ import annotations
 
+import json
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -228,6 +229,67 @@ class TestRosterShape:
     @pytest.mark.asyncio
     async def test_an_unknown_job_is_an_empty_roster(self, db):
         assert await db.get_job_subjob_roster(str(uuid.uuid4())) == []
+
+
+@pytest.mark.asyncio
+async def test_recovery_owner_evidence_is_consistent_in_list_and_detail_sql(db):
+    owner = await _job(db, description="recovery owner", status="paused")
+    child = await _job(
+        db,
+        description="shared recovery child",
+        origin="subjob",
+        parent=owner,
+        status="paused",
+    )
+    async with db.acquire() as conn:
+        recovery_id = await conn.fetchval(
+            """
+            INSERT INTO vm_workspace_recoveries (
+                owner_kind, owner_id, workspace_contract_digest, cluster_name,
+                phase, reason_code
+            ) VALUES (
+                'job', $1, 'sha256:list-detail-projection', 'test-cluster',
+                'paused_attention', 'prior_runtime_unfenced'
+            ) RETURNING id
+            """,
+            uuid.UUID(owner),
+        )
+        await conn.executemany(
+            """
+            INSERT INTO vm_workspace_recovery_jobs (
+                recovery_id, job_id, prior_queue_state, prior_job_status,
+                participation
+            ) VALUES ($1, $2, 'non_worker', 'paused', 'attention')
+            """,
+            [
+                (recovery_id, uuid.UUID(owner)),
+                (recovery_id, uuid.UUID(child)),
+            ],
+        )
+
+    listed = await db.query_jobs(origins=[*HUMAN, "subjob"], limit=25, offset=0)
+
+    def recovery_payload(value):
+        return json.loads(value) if isinstance(value, str) else value
+
+    list_recovery = {
+        str(row["id"]): recovery_payload(row["_workspace_recovery"])
+        for row in listed.jobs
+    }
+    owner_detail = await db.get_job(owner)
+    child_detail = await db.get_job(child)
+
+    assert list_recovery[owner]["canonical_owner"] is True
+    assert list_recovery[child]["canonical_owner"] is False
+    assert owner_detail is not None
+    assert child_detail is not None
+    assert (
+        recovery_payload(owner_detail["_workspace_recovery"])["canonical_owner"] is True
+    )
+    assert (
+        recovery_payload(child_detail["_workspace_recovery"])["canonical_owner"]
+        is False
+    )
 
 
 class TestCyclesTerminate:

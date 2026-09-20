@@ -12,9 +12,19 @@ const getEnvOrNull = (key: string): string | null => {
   return null;
 };
 
+const getBooleanEnv = (key: string, fallback: boolean): boolean => {
+  const value = typeof window !== 'undefined' ? (window as any)['env']?.[key] : undefined;
+  if (value === true || value === 'true') return true;
+  if (value === false || value === 'false') return false;
+  return fallback;
+};
+
 export const environment = {
   // Core
   apiUrl: getEnv('apiUrl', 'http://localhost:8085/api'),
+  serviceWorkerEnabled: getBooleanEnv('serviceWorkerEnabled', true),
+  externalClientsEnabled: getBooleanEnv('externalClientsEnabled', true),
+  adminToolsEnabled: getBooleanEnv('adminToolsEnabled', true),
   // Isolated Dynamic Canvas viewer suffix (for example
   // `.canvas.example-userland.com`). Null keeps live apps dark-shipped.
   canvasViewerHostSuffix: getEnvOrNull('canvasViewerHostSuffix'),

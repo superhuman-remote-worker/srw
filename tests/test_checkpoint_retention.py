@@ -14,7 +14,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from orchestrator.database.postgres import PostgresDB
+from orchestrator.database.postgres import PostgresDB, _CheckpointPruneAuthority
 
 _JOB_ID = "11111111-1111-1111-1111-111111111111"
 
@@ -25,11 +25,25 @@ def _make_db(mock_conn):
     db._connection_string = "test"
     db._queries = {}
 
+    def _transaction():
+        transaction = MagicMock()
+        transaction.__aenter__ = AsyncMock(return_value=None)
+        transaction.__aexit__ = AsyncMock(return_value=False)
+        return transaction
+
+    mock_conn.transaction = MagicMock(side_effect=_transaction)
+
     @asynccontextmanager
     async def _acquire():
         yield mock_conn
 
     db.acquire = _acquire
+    # These unit tests isolate checkpoint SQL and backend gating. The durable
+    # recovery/cleanup interlock is exercised against PostgreSQL in
+    # test_vm_workspace_recovery_real_postgres.py.
+    db._acquire_checkpoint_prune_authority = AsyncMock(
+        return_value=_CheckpointPruneAuthority(allowed=True, coordinated=False)
+    )
     return db
 
 
@@ -48,6 +62,7 @@ class TestDeleteCheckpointThread:
         monkeypatch.setenv("CHECKPOINTER_BACKEND", "postgres")
         conn = AsyncMock()
         conn.execute = AsyncMock(return_value="DELETE 2")
+        conn.fetchval = AsyncMock(return_value=False)
         db = _make_db(conn)
 
         deleted = await db.delete_checkpoint_thread("job-1")
@@ -67,9 +82,26 @@ class TestDeleteCheckpointThread:
         monkeypatch.setenv("CHECKPOINTER_BACKEND", "postgres")
         conn = AsyncMock()
         conn.execute = AsyncMock(side_effect=Exception("relation does not exist"))
+        conn.fetchval = AsyncMock(return_value=False)
         db = _make_db(conn)
 
         assert await db.delete_checkpoint_thread("job-1") == 0  # swallowed
+
+    @pytest.mark.asyncio
+    async def test_unresolved_workspace_recovery_preserves_checkpoint_thread(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv("CHECKPOINTER_BACKEND", "postgres")
+        conn = AsyncMock()
+        conn.fetchval = AsyncMock(return_value=True)
+        db = _make_db(conn)
+        db._acquire_checkpoint_prune_authority = AsyncMock(
+            return_value=_CheckpointPruneAuthority(allowed=False, coordinated=True)
+        )
+
+        assert await db.delete_checkpoint_thread(_JOB_ID) == 0
+
+        conn.execute.assert_not_awaited()
 
 
 class TestUpdateJobStatusPrunes:
@@ -133,11 +165,13 @@ class TestPruneCheckpointsKeepLast:
         monkeypatch.setenv("CHECKPOINTER_BACKEND", "postgres")
         conn = AsyncMock()
         conn.execute = AsyncMock(return_value="DELETE 5")
+        conn.fetch = AsyncMock(side_effect=[[{"thread_id": "job-1"}], [], []])
         db = _make_db(conn)
 
         deleted = await db.prune_checkpoints_keep_last(3)
 
         assert deleted == 15  # 3 tables × 5 rows
+        assert conn.fetch.await_count == 4
         assert conn.execute.await_count == 3
         sql = [c.args[0] for c in conn.execute.await_args_list]
         # checkpoints must be pruned BEFORE checkpoint_writes — the writes
@@ -148,6 +182,7 @@ class TestPruneCheckpointsKeepLast:
         # the windowed deletes keep the newest N (bound as $1)
         assert conn.execute.await_args_list[0].args[1] == 3
         assert conn.execute.await_args_list[2].args[1] == 3
+        assert all("thread_id" in statement for statement in sql)
 
     @pytest.mark.asyncio
     async def test_keep_zero_is_rejected(self, monkeypatch):
@@ -164,9 +199,11 @@ class TestPruneCheckpointsKeepLast:
         monkeypatch.setenv("CHECKPOINTER_BACKEND", "postgres")
         conn = AsyncMock()
         conn.execute = AsyncMock(side_effect=Exception("relation does not exist"))
+        conn.fetch = AsyncMock(side_effect=[[{"thread_id": "job-1"}], [], []])
         db = _make_db(conn)
 
         assert await db.prune_checkpoints_keep_last(3) == 0  # swallowed
+        assert conn.execute.await_count == 1
 
 
 class TestRetentionTick:

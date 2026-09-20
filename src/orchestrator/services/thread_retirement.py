@@ -41,6 +41,12 @@ from orchestrator.services.stateless_workspace_gate import (
     thread_metadata_object,
 )
 from orchestrator.services.workspace_lifecycle import WorkspaceOwner
+from orchestrator.services.vm_workspace_recovery_store import (
+    acquire_vm_cleanup_permit,
+    vm_cleanup_kwargs,
+    completed_cleanup_outcome,
+    complete_vm_cleanup_permit,
+)
 from shared.pinned_session_identity import PinnedSessionBinding
 
 
@@ -53,6 +59,7 @@ class ThreadRetirementDependencies:
     persistent_provisioner: Any
     container_provisioner: Any
     vm_provisioner: Any
+    recovery_store: Any
     docker_provisioner: Any
     workspace_suspension_service: Any
     snapshot_service: Any
@@ -2063,6 +2070,7 @@ async def archive_and_cleanup_workspace(
     postgres_db = dependencies.store
     container_provisioner = dependencies.container_provisioner
     vm_provisioner = dependencies.vm_provisioner
+    recovery_store = dependencies.recovery_store
     docker_provisioner = dependencies.docker_provisioner
     _get_container_context = dependencies.get_container_context
     _get_vm_context = dependencies.get_vm_context
@@ -2123,16 +2131,37 @@ async def archive_and_cleanup_workspace(
                     entity_id,
                     entity_type="thread",
                 )
-                outcome = await vm_provisioner.release_vm_captured(
-                    entity_id,
-                    teardown_identity,
-                    ssh_host=vm_ctx.get("ssh_host"),
-                    ssh_port=vm_ctx.get("ssh_port"),
-                    entity_type="thread",
+                cleanup = await acquire_vm_cleanup_permit(
+                    recovery_store,
+                    owner_kind="thread",
+                    owner_id=entity_id,
+                    identity=teardown_identity,
+                    source="thread_terminal_vm_release",
+                    purge_disk=True,
                 )
-                if outcome.disposition != "completed":
+                if not cleanup.allowed:
+                    raise RuntimeError("thread VM cleanup held for workspace recovery")
+                disposition = completed_cleanup_outcome(cleanup)
+                if disposition is None:
+                    outcome = await vm_provisioner.release_vm_captured(
+                        entity_id,
+                        teardown_identity,
+                        ssh_host=vm_ctx.get("ssh_host"),
+                        ssh_port=vm_ctx.get("ssh_port"),
+                        entity_type="thread",
+                        purge_disk=True,
+                        **vm_cleanup_kwargs(cleanup),
+                    )
+                    disposition = outcome.disposition
+                    if disposition in {"completed", "identity_superseded"}:
+                        await complete_vm_cleanup_permit(
+                            recovery_store,
+                            cleanup,
+                            outcome=disposition,
+                        )
+                if disposition != "completed":
                     raise RuntimeError(
-                        "Thread VM exact teardown remains " + outcome.disposition
+                        "Thread VM exact teardown remains " + str(disposition)
                     )
                 actions.append("thread vm released")
 
@@ -2166,16 +2195,35 @@ async def archive_and_cleanup_workspace(
                 teardown_identity = await vm_provisioner.capture_vm_teardown_identity(
                     entity_id
                 )
-                outcome = await vm_provisioner.release_vm_captured(
-                    entity_id,
-                    teardown_identity,
-                    ssh_host=vm_ctx.get("ssh_host"),
-                    ssh_port=vm_ctx.get("ssh_port"),
+                cleanup = await acquire_vm_cleanup_permit(
+                    recovery_store,
+                    owner_kind="job",
+                    owner_id=entity_id,
+                    identity=teardown_identity,
+                    source="job_terminal_vm_release",
+                    purge_disk=True,
                 )
-                if outcome.disposition != "completed":
-                    raise RuntimeError(
-                        "VM exact teardown remains " + outcome.disposition
+                if not cleanup.allowed:
+                    raise RuntimeError("job VM cleanup held for workspace recovery")
+                disposition = completed_cleanup_outcome(cleanup)
+                if disposition is None:
+                    outcome = await vm_provisioner.release_vm_captured(
+                        entity_id,
+                        teardown_identity,
+                        ssh_host=vm_ctx.get("ssh_host"),
+                        ssh_port=vm_ctx.get("ssh_port"),
+                        purge_disk=True,
+                        **vm_cleanup_kwargs(cleanup),
                     )
+                    disposition = outcome.disposition
+                    if disposition in {"completed", "identity_superseded"}:
+                        await complete_vm_cleanup_permit(
+                            recovery_store,
+                            cleanup,
+                            outcome=disposition,
+                        )
+                if disposition != "completed":
+                    raise RuntimeError("VM exact teardown remains " + str(disposition))
                 actions.append("vm released")
 
         # Workspace container cleanup (snapshot + delete)

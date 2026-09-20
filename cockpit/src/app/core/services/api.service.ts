@@ -1868,6 +1868,36 @@ export class ApiService {
       );
   }
 
+  retryWorkspaceRecovery(
+    jobId: string,
+    operationId: string,
+    requestId: string,
+  ): Observable<{
+    status: string;
+    operation_id: string;
+    supersedes_operation_id: string;
+    deadline_at: string;
+  } | null> {
+    return this.http
+      .post<{
+        status: string;
+        operation_id: string;
+        supersedes_operation_id: string;
+        deadline_at: string;
+      }>(`${this.baseUrl}/jobs/${jobId}/workspace-recovery/retry`, {
+        operation_id: operationId,
+        request_id: requestId,
+      })
+      .pipe(
+        tap(() => this.toast.success(this.t('toasts.jobs.recoveryRetry'))),
+        catchError((error) => {
+          console.error(`Failed to retry workspace recovery for ${jobId}:`, error);
+          this.toast.danger(this.errors.translate(error, 'errors.jobs.recoveryRetryFailed'));
+          return of(null);
+        }),
+      );
+  }
+
   /**
    * Get IDE session status for a job.
    */

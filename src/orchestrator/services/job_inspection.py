@@ -76,6 +76,7 @@ async def get_job_progress(
 ) -> dict[str, Any]:
     """Run the existing read after its transport authorization has completed."""
     from orchestrator.services.job_liveness import compute_job_liveness
+    from orchestrator.services.job_projection import workspace_recovery_projection
 
     try:
         progress = await dependencies.store.get_job_progress(job_id)
@@ -86,7 +87,11 @@ async def get_job_progress(
             audit_reader=dependencies.audit_reader,
             db=dependencies.store,
         )
-        return {**progress, **liveness}
+        return {
+            **progress,
+            **liveness,
+            "workspace_recovery": workspace_recovery_projection(authorized_job),
+        }
     except HTTPException:
         raise
     except Exception as e:

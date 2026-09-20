@@ -120,6 +120,7 @@ RUN python -m orchestrator.operator_cli.stateless_wake_acceptance --help >/dev/n
 # a Helm revision becomes ready. ``--help`` proves the installed image imports
 # it without opening a database connection.
 RUN python -m orchestrator.operator_cli.canvas_viewer_database_attestation --help >/dev/null
+RUN python -m orchestrator.operator_cli.vm_workspace_recovery_acceptance --help >/dev/null
 
 USER srw
 

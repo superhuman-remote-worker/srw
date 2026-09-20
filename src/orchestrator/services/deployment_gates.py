@@ -106,6 +106,14 @@ def is_protected_cloud_mode_enabled() -> bool:
     )
 
 
+def stateless_idle_conversation_rewind_enabled() -> bool:
+    """Whether new idle stateless conversation rewinds may be admitted."""
+
+    return os.getenv(
+        "SESSION_REWIND_IDLE_CONVERSATION_ENABLED", "false"
+    ).lower().strip() in ("true", "1", "yes")
+
+
 def require_pinned_status_identity() -> bool:
     """Require exact pinned lifecycle identity unless explicitly disabled."""
 
@@ -125,4 +133,5 @@ __all__ = [
     "mcp_datasources_enabled",
     "mcp_stdio_enabled",
     "require_pinned_status_identity",
+    "stateless_idle_conversation_rewind_enabled",
 ]

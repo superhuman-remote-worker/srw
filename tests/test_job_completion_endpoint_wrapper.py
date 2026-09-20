@@ -11,6 +11,7 @@ from tests import b08_completion_helpers as b08_helpers
 
 import builtins
 import copy
+import dataclasses
 import inspect
 import json
 from collections import Counter
@@ -37,6 +38,40 @@ AGENT_ID = UUID("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee")
 REPORT_ID = UUID("99999999-8888-7777-6666-555555555555")
 COMMAND_ID = "12345678-1234-5678-9abc-123456789abc"
 CURATOR_ID = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa"
+
+
+class _AllowCleanupStore:
+    async def acquire_cleanup_permit(self, **_kwargs):
+        return SimpleNamespace(allowed=True)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_workspace_cleanup_authority(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep legacy completion tests focused on their existing collaborators."""
+
+    original = orchestrator.main._completion_effect_dependencies
+    legacy_original = orchestrator.main._legacy_completion_dependencies
+
+    def dependencies():
+        return dataclasses.replace(original(), recovery_store=_AllowCleanupStore())
+
+    monkeypatch.setattr(
+        orchestrator.main, "_completion_effect_dependencies", dependencies
+    )
+
+    def legacy_dependencies():
+        resolved = legacy_original()
+        return dataclasses.replace(
+            resolved,
+            workspace=dataclasses.replace(
+                resolved.workspace,
+                recovery_store=_AllowCleanupStore(),
+            ),
+        )
+
+    monkeypatch.setattr(
+        orchestrator.main, "_legacy_completion_dependencies", legacy_dependencies
+    )
 
 
 class _RecordingRunner:
@@ -2289,6 +2324,40 @@ async def test_active_s36_marker_status_drift_parks_without_clearing_effect(
 
 
 @pytest.mark.asyncio
+async def test_workspace_recovery_hold_blocks_completion_cleanup_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database = _RouteDB(_route_job(status="completed"))
+    runner = _RecordingRunner()
+    workspace_cleanup = AsyncMock(return_value=["must not release"])
+    deny_store = MagicMock()
+    deny_store.acquire_cleanup_permit = AsyncMock(
+        return_value=SimpleNamespace(allowed=False)
+    )
+    prior_dependencies = orchestrator.main._completion_effect_dependencies
+
+    def dependencies():
+        return dataclasses.replace(prior_dependencies(), recovery_store=deny_store)
+
+    monkeypatch.setattr(orchestrator.main, "postgres_db", database)
+    monkeypatch.setattr(
+        orchestrator.main, "_completion_effect_dependencies", dependencies
+    )
+    monkeypatch.setattr(
+        orchestrator.main.thread_retirement_operations.ThreadRetirementOperations,
+        "archive_and_cleanup_workspace",
+        workspace_cleanup,
+    )
+
+    output = await b08_helpers.run_completion_workspace_teardown(JOB_ID, runner)
+
+    assert output["teardown_disposition"] == "retry_pending"
+    assert "held for unresolved workspace recovery" in output["error"]
+    deny_store.acquire_cleanup_permit.assert_awaited_once()
+    workspace_cleanup.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_flagged_vm_teardown_captures_replays_and_archives_exact_identity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2362,6 +2431,7 @@ async def test_flagged_vm_teardown_captures_replays_and_archives_exact_identity(
         identity,
         ssh_host="100.64.0.8",
         ssh_port=22,
+        purge_disk=True,
     )
     legacy_cleanup.assert_not_awaited()
 
@@ -2417,6 +2487,7 @@ async def test_vm_identity_mismatch_supersedes_only_s36_effect(
         ),
         ssh_host="100.64.0.8",
         ssh_port=22,
+        purge_disk=True,
     )
 
 
@@ -2502,6 +2573,24 @@ async def test_hybrid_vm_and_kubernetes_s36_captures_and_releases_both(
     }
     runner = _RecordingRunner()
     release_order: list[str] = []
+    cleanup_requests: list[UUID] = []
+    active_cleanup: UUID | None = None
+
+    class SequentialCleanupStore:
+        async def acquire_cleanup_permit(self, **kwargs):
+            nonlocal active_cleanup
+            request_id = kwargs["request_id"]
+            assert active_cleanup is None, "distinct resources must settle sequentially"
+            active_cleanup = request_id
+            cleanup_requests.append(request_id)
+            return SimpleNamespace(allowed=True, admission_id=request_id)
+
+        async def complete_cleanup_permit(self, admission_id, *, outcome):
+            nonlocal active_cleanup
+            assert admission_id == active_cleanup
+            assert outcome == "completed"
+            active_cleanup = None
+            return True
 
     async def release_vm(*_args, **_kwargs):
         release_order.append("vm")
@@ -2512,6 +2601,14 @@ async def test_hybrid_vm_and_kubernetes_s36_captures_and_releases_both(
         return True
 
     monkeypatch.setattr(orchestrator.main, "postgres_db", _RouteDB(job))
+    original_dependencies = orchestrator.main._completion_effect_dependencies
+    monkeypatch.setattr(
+        orchestrator.main,
+        "_completion_effect_dependencies",
+        lambda: dataclasses.replace(
+            original_dependencies(), recovery_store=SequentialCleanupStore()
+        ),
+    )
     monkeypatch.setattr(
         orchestrator.main.container_provisioner,
         "capture_terminal_workspace_identity",
@@ -2571,6 +2668,9 @@ async def test_hybrid_vm_and_kubernetes_s36_captures_and_releases_both(
         "snapshot_created_at": intent["kubernetes"]["snapshot_created_at"],
     }
     assert release_order == ["vm", "kubernetes"]
+    assert len(cleanup_requests) == 2
+    assert cleanup_requests[0] != cleanup_requests[1]
+    assert active_cleanup is None
     assert runner.callback_counts["workspace_archive_teardown"] == 1
     legacy_cleanup.assert_not_awaited()
 

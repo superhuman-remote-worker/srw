@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # =============================================================================
-# Local development bootstrap: k3d cluster + cert-manager + KEDA + mkcert
-# ClusterIssuer + namespace + local runtime Secrets + vendored Helm chart
-# dependencies.
+# Local development bootstrap: k3d cluster + KEDA + namespace + local runtime
+# Secrets + vendored Helm chart dependencies. Multi-host mode additionally
+# installs cert-manager and the host's mkcert CA; single-origin mode uses the
+# chart-owned self-signed gateway at https://localhost:8443.
 #
 # Idempotent: re-runs are safe. Skips anything that already exists.
 #
@@ -13,9 +14,8 @@
 #     -f deployment/values-local.yaml -f deployment/values-local-images.yaml
 #
 # Prerequisites (must be done once on the host BEFORE running this):
-#   - docker + k3d + kubectl + helm + mkcert + openssl installed
-#   - `mkcert -install` (user-level trust)
-#   - `sudo CAROOT="$HOME/.local/share/mkcert" mkcert -install` (system + Chrome trust)
+#   - docker + k3d + kubectl + helm + openssl installed
+#   - multi-host only: mkcert installed, plus `mkcert -install`
 # =============================================================================
 set -euo pipefail
 
@@ -28,52 +28,88 @@ KUBE_CONTEXT="k3d-${CLUSTER_NAME}"
 MKCERT_CAROOT="${MKCERT_CAROOT:-$HOME/.local/share/mkcert}"
 CERT_MANAGER_VERSION="${CERT_MANAGER_VERSION:-v1.16.2}"
 KEDA_VERSION="${KEDA_VERSION:-2.20.2}"
+SRW_EXPOSURE_MODE="${SRW_EXPOSURE_MODE:-multi-host}"
 
 log()  { printf '\033[1;34m[bootstrap]\033[0m %s\n' "$*"; }
 ok()   { printf '\033[1;32m[ok]\033[0m %s\n' "$*"; }
 skip() { printf '\033[1;33m[skip]\033[0m %s\n' "$*"; }
 die()  { printf '\033[1;31m[error]\033[0m %s\n' "$*" >&2; exit 1; }
 
+case "$SRW_EXPOSURE_MODE" in
+  multi-host|single-origin) ;;
+  *) die "SRW_EXPOSURE_MODE must be 'multi-host' or 'single-origin' (got '$SRW_EXPOSURE_MODE')" ;;
+esac
+
 # --- Prereq checks ----------------------------------------------------------
-for bin in docker k3d kubectl helm mkcert openssl ssh-keygen git curl; do
+for bin in docker k3d kubectl helm openssl ssh-keygen git curl; do
   command -v "$bin" >/dev/null || die "missing required binary: $bin"
 done
 
-[[ -f "$MKCERT_CAROOT/rootCA.pem" && -f "$MKCERT_CAROOT/rootCA-key.pem" ]] \
-  || die "mkcert CA not found at $MKCERT_CAROOT — run 'mkcert -install' first"
+if [ "$SRW_EXPOSURE_MODE" = "multi-host" ]; then
+  command -v mkcert >/dev/null || die "missing required binary: mkcert"
+  [[ -f "$MKCERT_CAROOT/rootCA.pem" && -f "$MKCERT_CAROOT/rootCA-key.pem" ]] \
+    || die "mkcert CA not found at $MKCERT_CAROOT — run 'mkcert -install' first"
+fi
 
 # --- 1. k3d cluster ---------------------------------------------------------
 if k3d cluster list "$CLUSTER_NAME" >/dev/null 2>&1; then
   skip "k3d cluster '$CLUSTER_NAME' already exists"
+  if [ "$SRW_EXPOSURE_MODE" = "single-origin" ]; then
+    EXISTING_MAPPING=$(docker port "k3d-${CLUSTER_NAME}-server-0" 30443/tcp 2>/dev/null || true)
+    if [ "$EXISTING_MAPPING" != "127.0.0.1:8443" ]; then
+      die "existing cluster '$CLUSTER_NAME' does not map 127.0.0.1:8443 to server-0:30443 (found '${EXISTING_MAPPING:-no mapping}'). A k3d port mapping cannot be changed in place. Back up any existing cluster data before deliberately running 'k3d cluster delete $CLUSTER_NAME', then recreate it with SRW_EXPOSURE_MODE=single-origin."
+    fi
+  else
+    EXISTING_HTTP_MAPPING=$(docker port "k3d-${CLUSTER_NAME}-serverlb" 80/tcp 2>/dev/null || true)
+    EXISTING_HTTPS_MAPPING=$(docker port "k3d-${CLUSTER_NAME}-serverlb" 443/tcp 2>/dev/null || true)
+    if ! grep -Eq '(^|:)80$' <<<"$EXISTING_HTTP_MAPPING" \
+      || ! grep -Eq '(^|:)443$' <<<"$EXISTING_HTTPS_MAPPING"; then
+      die "existing cluster '$CLUSTER_NAME' does not expose load-balancer ports 80 and 443 (found 80/tcp='${EXISTING_HTTP_MAPPING:-no mapping}', 443/tcp='${EXISTING_HTTPS_MAPPING:-no mapping}'). A k3d port mapping cannot be changed in place. Back up any existing cluster data before deliberately running 'k3d cluster delete $CLUSTER_NAME', then recreate it with SRW_EXPOSURE_MODE=multi-host."
+    fi
+  fi
 else
   log "creating k3d cluster '$CLUSTER_NAME'"
-  k3d cluster create "$CLUSTER_NAME" \
-    --servers 1 \
-    --port "80:80@loadbalancer" \
-    --port "443:443@loadbalancer" \
-    --registry-create "${CLUSTER_NAME}-registry:0.0.0.0:5005"
+  if [ "$SRW_EXPOSURE_MODE" = "single-origin" ]; then
+    if command -v ss >/dev/null && ss -H -ltn '( sport = :8443 )' 2>/dev/null | grep -q .; then
+      die "TCP port 127.0.0.1:8443 is already in use; stop that listener or choose a different local mapping before creating the cluster"
+    fi
+    k3d cluster create "$CLUSTER_NAME" \
+      --servers 1 \
+      --port "127.0.0.1:8443:30443@server:0" \
+      --registry-create "${CLUSTER_NAME}-registry:0.0.0.0:5005"
+  else
+    k3d cluster create "$CLUSTER_NAME" \
+      --servers 1 \
+      --port "80:80@loadbalancer" \
+      --port "443:443@loadbalancer" \
+      --registry-create "${CLUSTER_NAME}-registry:0.0.0.0:5005"
+  fi
   ok "cluster created"
 fi
 
 # Ensure kubectl is pointed at it for this script's commands
 KCTL="kubectl --context=$KUBE_CONTEXT"
 
-# --- 2. cert-manager --------------------------------------------------------
-if $KCTL -n cert-manager get deploy cert-manager >/dev/null 2>&1; then
-  skip "cert-manager already installed"
+# --- 2. cert-manager (multi-host only) --------------------------------------
+if [ "$SRW_EXPOSURE_MODE" = "multi-host" ]; then
+  if $KCTL -n cert-manager get deploy cert-manager >/dev/null 2>&1; then
+    skip "cert-manager already installed"
+  else
+    log "installing cert-manager $CERT_MANAGER_VERSION"
+    helm repo add jetstack https://charts.jetstack.io --force-update >/dev/null
+    helm repo update >/dev/null
+    helm install cert-manager jetstack/cert-manager \
+      --kube-context "$KUBE_CONTEXT" \
+      --namespace cert-manager --create-namespace \
+      --version "$CERT_MANAGER_VERSION" --set crds.enabled=true >/dev/null
+    log "waiting for cert-manager to be ready"
+    $KCTL -n cert-manager rollout status deploy/cert-manager --timeout=180s
+    $KCTL -n cert-manager rollout status deploy/cert-manager-webhook --timeout=180s
+    $KCTL -n cert-manager rollout status deploy/cert-manager-cainjector --timeout=180s
+    ok "cert-manager ready"
+  fi
 else
-  log "installing cert-manager $CERT_MANAGER_VERSION"
-  helm repo add jetstack https://charts.jetstack.io --force-update >/dev/null
-  helm repo update >/dev/null
-  helm install cert-manager jetstack/cert-manager \
-    --kube-context "$KUBE_CONTEXT" \
-    --namespace cert-manager --create-namespace \
-    --version "$CERT_MANAGER_VERSION" --set crds.enabled=true >/dev/null
-  log "waiting for cert-manager to be ready"
-  $KCTL -n cert-manager rollout status deploy/cert-manager --timeout=180s
-  $KCTL -n cert-manager rollout status deploy/cert-manager-webhook --timeout=180s
-  $KCTL -n cert-manager rollout status deploy/cert-manager-cainjector --timeout=180s
-  ok "cert-manager ready"
+  skip "single-origin mode uses the chart-owned self-signed certificate"
 fi
 
 # --- 2b. KEDA (queue-driven autoscaling of the stateless agent pool) --------
@@ -99,21 +135,22 @@ else
   ok "KEDA ready"
 fi
 
-# --- 3. mkcert CA Secret + ClusterIssuer ------------------------------------
-if $KCTL -n cert-manager get secret mkcert-ca-key-pair >/dev/null 2>&1; then
-  skip "secret mkcert-ca-key-pair already exists"
-else
-  log "uploading mkcert CA to cert-manager namespace"
-  $KCTL -n cert-manager create secret tls mkcert-ca-key-pair \
-    --cert="$MKCERT_CAROOT/rootCA.pem" --key="$MKCERT_CAROOT/rootCA-key.pem"
-  ok "CA secret created"
-fi
+# --- 3. mkcert CA Secret + ClusterIssuer (multi-host only) ------------------
+if [ "$SRW_EXPOSURE_MODE" = "multi-host" ]; then
+  if $KCTL -n cert-manager get secret mkcert-ca-key-pair >/dev/null 2>&1; then
+    skip "secret mkcert-ca-key-pair already exists"
+  else
+    log "uploading mkcert CA to cert-manager namespace"
+    $KCTL -n cert-manager create secret tls mkcert-ca-key-pair \
+      --cert="$MKCERT_CAROOT/rootCA.pem" --key="$MKCERT_CAROOT/rootCA-key.pem"
+    ok "CA secret created"
+  fi
 
-if $KCTL get clusterissuer mkcert-issuer >/dev/null 2>&1; then
-  skip "ClusterIssuer mkcert-issuer already exists"
-else
-  log "creating mkcert ClusterIssuer"
-  $KCTL apply -f - <<'EOF'
+  if $KCTL get clusterissuer mkcert-issuer >/dev/null 2>&1; then
+    skip "ClusterIssuer mkcert-issuer already exists"
+  else
+    log "creating mkcert ClusterIssuer"
+    $KCTL apply -f - <<'EOF'
 apiVersion: cert-manager.io/v1
 kind: ClusterIssuer
 metadata:
@@ -122,7 +159,8 @@ spec:
   ca:
     secretName: mkcert-ca-key-pair
 EOF
-  ok "ClusterIssuer created"
+    ok "ClusterIssuer created"
+  fi
 fi
 
 # --- 4. SRW namespace + local runtime Secrets -------------------------------
@@ -160,12 +198,13 @@ fi
 # to Traefik's ClusterIP through the k3s coredns-custom hook so every pod gets
 # the same answer. Idempotent; the ClusterIP is stable for the life of the
 # cluster (re-run this script after `k3d cluster delete && create`).
-TRAEFIK_IP=$($KCTL -n kube-system get svc traefik -o jsonpath='{.spec.clusterIP}' 2>/dev/null || true)
-if [ -z "$TRAEFIK_IP" ]; then
-  skip "traefik svc not up yet — re-run this script later to install the *.localhost DNS override"
-else
-  log "installing coredns-custom override: *.localhost ingress hosts -> $TRAEFIK_IP"
-  $KCTL apply -f - <<COREDNS_EOF >/dev/null
+if [ "$SRW_EXPOSURE_MODE" = "multi-host" ]; then
+  TRAEFIK_IP=$($KCTL -n kube-system get svc traefik -o jsonpath='{.spec.clusterIP}' 2>/dev/null || true)
+  if [ -z "$TRAEFIK_IP" ]; then
+    skip "traefik svc not up yet — re-run this script later to install the *.localhost DNS override"
+  else
+    log "installing coredns-custom override: *.localhost ingress hosts -> $TRAEFIK_IP"
+    $KCTL apply -f - <<COREDNS_EOF >/dev/null
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -182,8 +221,9 @@ data:
         }
     }
 COREDNS_EOF
-  $KCTL -n kube-system rollout restart deploy/coredns >/dev/null
-  ok "coredns-custom override applied (cloud/auth/git.localhost -> $TRAEFIK_IP)"
+    $KCTL -n kube-system rollout restart deploy/coredns >/dev/null
+    ok "coredns-custom override applied (cloud/auth/git.localhost -> $TRAEFIK_IP)"
+  fi
 fi
 
 # --- 6. Vendored Helm chart dependencies ------------------------------------
@@ -290,6 +330,14 @@ else
 fi
 
 # --- Done -------------------------------------------------------------------
+if [ "$SRW_EXPOSURE_MODE" = "single-origin" ]; then
+  EXTRA_VALUES='  -f deployment/values-local-single-origin.yaml \'
+  COCKPIT_URL='https://localhost:8443/'
+else
+  EXTRA_VALUES=''
+  COCKPIT_URL='https://localhost/'
+fi
+
 cat <<EOF
 
 $(printf '\033[1;32m✓ Local cluster ready.\033[0m')
@@ -299,9 +347,10 @@ Next:
   \$EDITOR deployment/values-local.yaml      # paste at least one LLM key
   helm install srw ./helm -n $NAMESPACE --kube-context $KUBE_CONTEXT \
     -f deployment/values-local.yaml \
+${EXTRA_VALUES}
     -f deployment/values-local-images.yaml   # images pinned to this checkout
 
-Then open https://localhost/ and log in as test / srw-k3d-dev-test.
+Then open $COCKPIT_URL and log in as test / srw-k3d-dev-test.
 
 Cluster lifecycle:
   k3d cluster stop  $CLUSTER_NAME

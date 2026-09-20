@@ -7,6 +7,7 @@ import {AppButtonComponent} from '../../../ui/button';
 import {AppInputComponent} from '../../../ui/input';
 import {AppTextareaComponent} from '../../../ui/textarea';
 import {AppIconComponent} from '../../../ui/icon';
+import {environment} from '../../../core/environment';
 
 /** The signature namespace every registration challenge is minted under.
  *  Mirrors `SIGNATURE_NAMESPACE` in `orchestrator/main.py` — kept here only
@@ -72,6 +73,7 @@ function emptyForm(): SshKeyForm {
     AppIconComponent,
   ],
   template: `
+    @if (externalClientsEnabled) {
     <div class="ssh-keys-page">
       <div class="ssh-keys-container">
         <div class="page-header">
@@ -214,10 +216,12 @@ function emptyForm(): SshKeyForm {
         </section>
       </div>
     </div>
+    }
   `,
   styleUrl: './ssh-keys-page.component.scss',
 })
 export class SshKeysPageComponent implements OnInit {
+  readonly externalClientsEnabled = environment.externalClientsEnabled;
   readonly service = inject(SshKeysService);
   private readonly router = inject(Router);
 
@@ -242,6 +246,10 @@ export class SshKeysPageComponent implements OnInit {
   form: SshKeyForm = emptyForm();
 
   ngOnInit(): void {
+    if (!this.externalClientsEnabled) {
+      void this.router.navigateByUrl('/settings');
+      return;
+    }
     void this.refreshKeys();
   }
 

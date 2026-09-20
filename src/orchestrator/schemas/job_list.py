@@ -13,6 +13,20 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field
 
 
+class WorkspaceRecoveryView(BaseModel):
+    """Coordinate-free public recovery contract shared by list/detail/progress."""
+
+    operation_id: UUID
+    state: str
+    reason_code: str
+    message: str
+    started_at: datetime
+    deadline_at: datetime
+    next_check_at: datetime | None
+    retryable: bool
+    cleanup_pending: bool
+
+
 class PublicJobListItem(BaseModel):
     """Current list-row projection; additional public fields remain compatible."""
 
@@ -49,6 +63,9 @@ class PublicJobListItem(BaseModel):
     )
     workspace_contract: dict[str, Any] = Field(
         description="Safe workspace tier/state projection; no private lease identity or endpoints."
+    )
+    workspace_recovery: WorkspaceRecoveryView | None = Field(
+        description="Safe unresolved VM workspace recovery state; no controller coordinates or diagnostics."
     )
     audit_count: int | None = Field(
         description="Null when the optional audit service is unavailable; zero when available with no entries."

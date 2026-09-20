@@ -170,7 +170,9 @@ def _config_deps(**over: Any) -> tcu.ThreadConfigUpdateDependencies:
         require_thread_owner=AsyncMock(return_value=(USER, _thread())),
     )
     fields.update(over)
-    return tcu.ThreadConfigUpdateDependencies(**fields)
+    return tcu.ThreadConfigUpdateDependencies(
+        recovery_store=SimpleNamespace(), **fields
+    )
 
 
 def _client(admission=None, config=None) -> TestClient:

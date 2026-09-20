@@ -75,6 +75,8 @@ First-run preference is `'system'` — the app respects the OS preference. A pre
 
 Picker: `app-accent-toggle` (`src/app/ui/accent-toggle/`) on the Settings page, labels from `settings.appearance.accents.<key>`. Danger, Success, Warning and Info do not change with the accent.
 
+The browser/PWA `theme-color` and Windows tile color follow the resolved `--accent-color` token once theme CSS is available and whenever the theme or accent changes. The HTML and web manifest retain Tyrian purple as the static fallback. Installed icons and launch screens use static assets/manifest metadata; their refresh timing is controlled by the browser, not the appearance picker. Regenerate the purple PWA icons and favicons from their SVG sources with `node scripts/generate-pwa-icons.mjs` from `cockpit/` (requires Inkscape and ImageMagick).
+
 `theme.service.ts` migrates legacy localStorage values transparently:
 - `dark` → `senate` (Catppuccin era)
 - `light` → `travertine` (Catppuccin era)
