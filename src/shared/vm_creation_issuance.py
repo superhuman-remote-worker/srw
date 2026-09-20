@@ -49,13 +49,59 @@ def _uuid(value):
         raise ValueError("Noncanonical creation identity")
 
 
+def validate_rootdisk_source(source, *, request, configuration, expected_pvc_uid):
+    """Validate complete typed clone input against immutable admitted semantics."""
+    if not isinstance(source, Mapping):
+        raise ValueError("Rootdisk source is unproven")
+    if expected_pvc_uid is not None:
+        if source != {"kind": "retained", "pvc_uid": expected_pvc_uid}:
+            raise ValueError("Retained rootdisk source changed")
+        _uuid(expected_pvc_uid)
+        return
+    image = request["vm_image"]
+    if source.get("kind") == "registry":
+        if configuration["golden_enabled"] or source != {
+            "kind": "registry",
+            "image": image,
+        }:
+            raise ValueError("Registry source changed")
+        return
+    expected = {
+        "kind": "golden",
+        "image": image,
+        "namespace": configuration["namespace"],
+        "name": "agent-vm-golden-" + hashlib.sha256(image.encode()).hexdigest()[:12],
+        "dv_uid": source.get("dv_uid"),
+        "pvc_uid": source.get("pvc_uid"),
+        "pvc_owner_dv_uid": source.get("dv_uid"),
+        "image_ref": image,
+        "registry_source": {"registry": {"url": "docker://" + image}},
+        "storage": {
+            "accessModes": ["ReadWriteOnce"],
+            "volumeMode": "Filesystem",
+            "storageClassName": configuration["storage_class"],
+            "resources": {"requests": {"storage": configuration["golden_disk_size"]}},
+        },
+        "pvc_volume_mode": "Filesystem",
+    }
+    if not configuration["golden_enabled"] or dict(source) != expected:
+        raise ValueError("Golden rootdisk source changed")
+    _uuid(source["dv_uid"])
+    _uuid(source["pvc_uid"])
+
+
 def _values(value):
-    if not isinstance(value, Mapping) or set(value) != _FIELDS:
+    fields = (
+        _FIELDS | {"rootdisk_source"}
+        if isinstance(value, Mapping) and value.get("version") == 2
+        else _FIELDS
+    )
+    if not isinstance(value, Mapping) or set(value) != fields:
         raise ValueError("Incomplete creation carrier intent")
     value = dict(value)
     if (
         type(value["version"]) is not int
-        or value["version"] != 1
+        or value["version"] not in (1, 2)
         or value["source"] != CREATION_SOURCE
         or value["effect_kind"] not in EFFECT_KINDS
     ):
@@ -280,6 +326,21 @@ def public_effect_observation(
             "namespace": metadata["namespace"],
         }
         if kind == "rootdisk":
+            if values["version"] == 2 and not retained:
+                source = values["rootdisk_source"]
+                expected_source = (
+                    {"pvc": {"namespace": source["namespace"], "name": source["name"]}}
+                    if source["kind"] == "golden"
+                    else {"registry": {"url": "docker://" + source["image"]}}
+                )
+                if obj.get("spec", {}).get("source") != expected_source:
+                    raise ValueError("Observed rootdisk source changed")
+                if (
+                    source["kind"] == "golden"
+                    and obj.get("spec", {}).get("storage", {}).get("volumeMode")
+                    != "Filesystem"
+                ):
+                    raise ValueError("Observed clone volume mode changed")
             pvc = observation["pvc"]
             pvc_metadata = pvc["metadata"]
             _uuid(pvc_metadata["uid"])

@@ -646,6 +646,31 @@ class VMCreationRetryStore:
             or configuration["namespace"] != carrier["metadata"]["namespace"]
         ):
             raise VMCreationRetryConflict("creation_configuration_changed")
+        if values["version"] == 2:
+            from shared.vm_creation_issuance import validate_rootdisk_source
+
+            try:
+                validate_rootdisk_source(
+                    values["rootdisk_source"],
+                    request=row["canonical_request"],
+                    configuration=configuration,
+                    expected_pvc_uid=str(row["expected_pvc_uid"])
+                    if row["expected_pvc_uid"]
+                    else None,
+                )
+            except (ValueError, KeyError, TypeError) as exc:
+                raise VMCreationRetryConflict(
+                    "creation_rootdisk_source_changed"
+                ) from exc
+            original = await conn.fetchval(
+                "SELECT carrier_intent FROM vm_creation_effects WHERE request_id=$1 ORDER BY effect_number LIMIT 1",
+                row["request_id"],
+            )
+            if (
+                original
+                and _json(original).get("rootdisk_source") != values["rootdisk_source"]
+            ):
+                raise VMCreationRetryConflict("creation_rootdisk_source_changed")
         expected = {
             "retry_request_id": str(row["request_id"]),
             "job_id": str(row["job_id"]),

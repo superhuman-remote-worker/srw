@@ -2714,10 +2714,16 @@ class TestEnsureGolden:
 
     @pytest.mark.asyncio
     async def test_failed_golden_is_recreated(self, controller):
+        failed = {
+            "metadata": {"uid": "golden-uid", "resourceVersion": "7"},
+            "status": {"phase": "Failed"},
+        }
         self._get(controller).side_effect = [
-            {"status": {"phase": "Failed"}},
+            failed,
+            failed,
             {"status": {"phase": "Succeeded"}},
         ]
+        controller.k8s_client.list_namespaced_custom_object.return_value = {"items": []}
         with patch("asyncio.sleep", new_callable=AsyncMock):
             name = await controller._ensure_golden("img:sha-a")
         assert name == _golden_name("img:sha-a")
@@ -2824,7 +2830,11 @@ class TestGoldenStateNowait:
 
     @pytest.mark.asyncio
     async def test_failed_golden_recreated_then_waits(self, controller):
-        self._get(controller).return_value = {"status": {"phase": "Failed"}}
+        self._get(controller).return_value = {
+            "metadata": {"uid": "golden-uid", "resourceVersion": "7"},
+            "status": {"phase": "Failed"},
+        }
+        controller.k8s_client.list_namespaced_custom_object.return_value = {"items": []}
         name, waiting = await controller._golden_state_nowait("img:sha-a")
         assert name is None
         assert waiting is not None
@@ -2938,7 +2948,14 @@ class TestGcGoldens:
                 }
             ]
         }
-        controller.k8s_client.list_namespaced_custom_object.side_effect = [goldens, vms]
+        controller.k8s_client.list_namespaced_custom_object.side_effect = [
+            goldens,
+            vms,
+            {"items": []},
+        ]
+        controller.k8s_client.get_namespaced_custom_object.return_value = {
+            "metadata": {"uid": "golden-uid", "resourceVersion": "7"}
+        }
         with (
             patch("vm_controller.controller.VM_GOLDEN_KEEP", 1),
             patch("vm_controller.controller.VM_GOLDEN_GC_MIN_AGE_MINUTES", 0),

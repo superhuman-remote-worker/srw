@@ -193,7 +193,11 @@ def setup(monkeypatch):
                 "dataVolumeTemplates": [
                     {
                         "metadata": {"name": name + "-rootdisk"},
-                        "spec": {"source": {"registry": {"url": "docker://image"}}},
+                        "spec": {
+                            "source": {
+                                "registry": {"url": "docker://" + args[0]["vm_image"]}
+                            }
+                        },
                     }
                 ],
                 "template": {
@@ -396,10 +400,19 @@ async def test_protocol_objects_retain_a2_disk_observation_associations(setup):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("bound", [False, True])
-async def test_retained_exact_disk_reuses_same_permit_without_dv_write(setup, bound):
+@pytest.mark.parametrize("golden_enabled", [False, True])
+async def test_retained_exact_disk_reuses_same_permit_without_dv_write(
+    setup, bound, golden_enabled, monkeypatch
+):
     from shared.vm_workspace_storage import storage_labels, storage_name
 
     ctrl, api, authority, payload = setup
+    monkeypatch.setattr(settings, "VM_GOLDEN_IMAGE_ENABLED", golden_enabled)
+    resolved = resolve_creation_configuration(ctrl, authority.row["request"])
+    authority.row.update(resolved)
+    payload["creation_retry"]["controller_configuration_digest"] = resolved[
+        "controller_configuration_digest"
+    ]
     job = payload["job_id"]
     name = "agent-vm-" + job + "-rootdisk"
     pvc_uid = str(uuid4())

@@ -3129,6 +3129,28 @@ class VMController:
                     expected_pvc_uid=rootdisk_pvc_uid,
                 )
             )
+        # Completed clone retention is independent of guest readiness and of
+        # the adoption carrier's lifetime. Status polling rereads the durable
+        # source intent; failed observation simply retains the source pin.
+        creation_request = (
+            vm.get("metadata", {})
+            .get("annotations", {})
+            .get("srw.io/vm-create-request-id")
+        )
+        if creation_request and not exact_absence:
+            try:
+                from vm_controller.creation_sources import GoldenSources
+
+                sources = GoldenSources(self)
+                creation = await sources.reader.authority(
+                    "inspect", request_id=creation_request
+                )
+                await sources.release_completed(creation)
+            except Exception:
+                log.warning(
+                    "completed clone source retention remains pending for VM %s",
+                    vm_name,
+                )
         prepared_annotation = (
             vm.get("metadata", {})
             .get("annotations", {})
@@ -4067,6 +4089,10 @@ class VMController:
 
     async def _delete_dv(self, name: str, *, expected_uid: str | None = None) -> None:
         """DELETE a CDI DataVolume (its PVC cascades); 404 is success."""
+        if name.startswith("agent-vm-golden-"):
+            from vm_controller.creation_sources import GoldenSources
+
+            return await GoldenSources(self).delete(name, expected_uid=expected_uid)
         from kubernetes.client.exceptions import ApiException
 
         try:
