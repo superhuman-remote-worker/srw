@@ -14139,6 +14139,22 @@ $$;
 
 
 --
+-- Name: vm_resource_inventory_immutable(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.vm_resource_inventory_immutable() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    IF NEW IS DISTINCT FROM OLD THEN
+        RAISE EXCEPTION 'Resource inventory observations are immutable' USING ERRCODE = '23514';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
 -- Name: agent_metering_binding_events; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -21064,6 +21080,49 @@ COMMENT ON TABLE public.vm_remote_operation_protocol_gate IS 'Default-dark, mono
 
 
 --
+-- Name: vm_resource_inventory_heads; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.vm_resource_inventory_heads (
+    cluster_id text NOT NULL,
+    policy_digest text NOT NULL,
+    namespace text NOT NULL,
+    label_keys jsonb NOT NULL,
+    current_snapshot_id uuid,
+    observed_high_water timestamp with time zone,
+    observation_conflict boolean DEFAULT false NOT NULL,
+    CONSTRAINT vm_resource_inventory_heads_check CHECK (((current_snapshot_id IS NULL) = (observed_high_water IS NULL))),
+    CONSTRAINT vm_resource_inventory_heads_cluster_id_check CHECK (((length(cluster_id) >= 1) AND (length(cluster_id) <= 253))),
+    CONSTRAINT vm_resource_inventory_heads_label_keys_check CHECK ((jsonb_typeof(label_keys) = 'array'::text)),
+    CONSTRAINT vm_resource_inventory_heads_namespace_check CHECK (((length(namespace) >= 1) AND (length(namespace) <= 253))),
+    CONSTRAINT vm_resource_inventory_heads_policy_digest_check CHECK ((policy_digest ~ '^sha256:[0-9a-f]{64}$'::text))
+);
+
+
+--
+-- Name: vm_resource_inventory_snapshots; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.vm_resource_inventory_snapshots (
+    snapshot_id uuid NOT NULL,
+    cluster_id text NOT NULL,
+    policy_digest text NOT NULL,
+    controller_id uuid NOT NULL,
+    sequence bigint NOT NULL,
+    digest text NOT NULL,
+    started_at timestamp with time zone NOT NULL,
+    finished_at timestamp with time zone NOT NULL,
+    received_at timestamp with time zone DEFAULT clock_timestamp() NOT NULL,
+    complete boolean NOT NULL,
+    document jsonb NOT NULL,
+    CONSTRAINT vm_resource_inventory_snapshots_check CHECK (((started_at <= finished_at) AND (finished_at <= received_at))),
+    CONSTRAINT vm_resource_inventory_snapshots_digest_check CHECK ((digest ~ '^sha256:[0-9a-f]{64}$'::text)),
+    CONSTRAINT vm_resource_inventory_snapshots_document_check CHECK ((jsonb_typeof(document) = 'object'::text)),
+    CONSTRAINT vm_resource_inventory_snapshots_sequence_check CHECK ((sequence > 0))
+);
+
+
+--
 -- Name: vm_workspace_cleanup_admissions; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -23604,6 +23663,30 @@ ALTER TABLE ONLY public.vm_remote_operation_protocol_gate
 
 
 --
+-- Name: vm_resource_inventory_heads vm_resource_inventory_heads_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_resource_inventory_heads
+    ADD CONSTRAINT vm_resource_inventory_heads_pkey PRIMARY KEY (cluster_id, policy_digest);
+
+
+--
+-- Name: vm_resource_inventory_snapshots vm_resource_inventory_snapsho_snapshot_id_cluster_id_policy_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_resource_inventory_snapshots
+    ADD CONSTRAINT vm_resource_inventory_snapsho_snapshot_id_cluster_id_policy_key UNIQUE (snapshot_id, cluster_id, policy_digest);
+
+
+--
+-- Name: vm_resource_inventory_snapshots vm_resource_inventory_snapshots_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_resource_inventory_snapshots
+    ADD CONSTRAINT vm_resource_inventory_snapshots_pkey PRIMARY KEY (snapshot_id);
+
+
+--
 -- Name: vm_workspace_cleanup_admissions vm_workspace_cleanup_admissio_owner_kind_owner_id_request_i_key; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -25780,6 +25863,13 @@ CREATE UNIQUE INDEX vm_remote_operation_one_active_owner ON public.vm_remote_ope
 
 
 --
+-- Name: vm_resource_inventory_history_idx; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX vm_resource_inventory_history_idx ON public.vm_resource_inventory_snapshots USING btree (cluster_id, policy_digest, started_at DESC);
+
+
+--
 -- Name: vm_workspace_cleanup_admissions_one_open_child; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -27072,6 +27162,13 @@ CREATE TRIGGER vm_creation_retry_identity BEFORE UPDATE ON public.vm_creation_re
 --
 
 CREATE TRIGGER vm_creation_retry_job_control AFTER UPDATE OF status, context ON public.jobs FOR EACH ROW EXECUTE FUNCTION public.cancel_vm_creation_retry_on_job_control();
+
+
+--
+-- Name: vm_resource_inventory_snapshots vm_resource_inventory_immutable; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER vm_resource_inventory_immutable BEFORE UPDATE ON public.vm_resource_inventory_snapshots FOR EACH ROW EXECUTE FUNCTION public.vm_resource_inventory_immutable();
 
 
 --
@@ -28990,6 +29087,22 @@ ALTER TABLE ONLY public.vm_creation_retries
 
 ALTER TABLE ONLY public.vm_creation_retries
     ADD CONSTRAINT vm_creation_retries_predecessor_cleanup_admission_id_fkey FOREIGN KEY (predecessor_cleanup_admission_id) REFERENCES public.vm_workspace_cleanup_admissions(id);
+
+
+--
+-- Name: vm_resource_inventory_heads vm_resource_inventory_current_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_resource_inventory_heads
+    ADD CONSTRAINT vm_resource_inventory_current_fkey FOREIGN KEY (current_snapshot_id, cluster_id, policy_digest) REFERENCES public.vm_resource_inventory_snapshots(snapshot_id, cluster_id, policy_digest);
+
+
+--
+-- Name: vm_resource_inventory_snapshots vm_resource_inventory_snapshots_cluster_id_policy_digest_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_resource_inventory_snapshots
+    ADD CONSTRAINT vm_resource_inventory_snapshots_cluster_id_policy_digest_fkey FOREIGN KEY (cluster_id, policy_digest) REFERENCES public.vm_resource_inventory_heads(cluster_id, policy_digest);
 
 
 --

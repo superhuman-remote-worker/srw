@@ -377,7 +377,7 @@ APP_INPUT_DELIVERY_CONSTRAINTS_NOT_VALID = (
 )
 APP_CURRENT_MIGRATION_HEAD = (
     ROOT
-    / "src/orchestrator/database/migrations/app/0262_srw_execution_deadline_scan.sql"
+    / "src/orchestrator/database/migrations/app/0263_vm_resource_inventory.sql"
 )
 AUDIT_EXPANSION = (
     ROOT
