@@ -154,6 +154,21 @@ def test_hidden_demand_and_storage_mismatch_are_refused(mutation):
 
 
 @pytest.mark.parametrize(
+    "field,value",
+    [
+        ("volumeName", "pv-fixed-to-other-node"),
+        ("selector", {"matchLabels": {"zone": "${OTHER_ZONE}"}}),
+        ("dataSourceRef", {"kind": "VolumeSnapshot", "name": "old"}),
+    ],
+)
+def test_unprojected_storage_binding_constraints_are_refused(field, value):
+    doc = template()
+    doc["spec"]["dataVolumeTemplates"][0]["spec"]["storage"][field] = value
+    with pytest.raises(ResourceAdmissionError):
+        inspect(doc)
+
+
+@pytest.mark.parametrize(
     "source",
     [
         "kind: VirtualMachine\nkind: VirtualMachine\n",

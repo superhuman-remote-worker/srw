@@ -192,10 +192,26 @@ def inspect_resource_template(
         disks = spec["dataVolumeTemplates"]
         if not isinstance(disks, list) or len(disks) != 1:
             _refuse()
-        root = disks[0]
-        if root["metadata"]["name"] != "agent-vm-${JOB_ID}-rootdisk":
+        root = _object(disks[0], {"metadata", "spec"}, {"metadata", "spec"})
+        metadata = _object(root["metadata"], {"name", "labels"}, {"name"})
+        if metadata["name"] != "agent-vm-${JOB_ID}-rootdisk":
             _refuse()
-        storage = root["spec"]["storage"]
+        root_spec = _object(root["spec"], {"storage", "source"}, {"storage", "source"})
+        if root_spec["source"] != {"registry": {"url": "docker://${VM_IMAGE}"}}:
+            _refuse()
+        storage_fields = {"storageClassName", "volumeMode", "accessModes", "resources"}
+        storage = _object(root_spec["storage"], storage_fields, storage_fields)
+        resources = _object(storage["resources"], {"requests"}, {"requests"})
+        disk_size = _object(resources["requests"], {"storage"}, {"storage"})["storage"]
+        if disk_size != "${VM_DISK_SIZE}":
+            expected_bytes = normalize_byte_quantity(
+                request["disk_size"]
+            ).normalized_value
+            if (
+                expected_bytes <= 0
+                or normalize_byte_quantity(disk_size).normalized_value != expected_bytes
+            ):
+                _refuse()
         if storage["storageClassName"] not in {"${VM_STORAGE_CLASS}", storage_class}:
             _refuse()
         if storage.get("volumeMode") != "Filesystem" or storage.get("accessModes") != [
