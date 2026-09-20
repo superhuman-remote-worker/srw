@@ -52,8 +52,6 @@ class CreationAttachment:
 
     async def prepare(self, row, frozen=None):
         binding = storage_binding(row["request"]["workspace_storage"])
-        if row["request"].get("preparation") is not None:
-            raise ValueError("Prepared attachment target proof is not integrated")
         lease = await self.actuator.read("lease", storage_name(binding))
         prior = self.prior(lease, binding) if lease is not None else None
         intent = {

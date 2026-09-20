@@ -125,6 +125,17 @@ def _validate_prepared_source(source, *, request, configuration, expected_pvc_ui
     }
     if mode == "retained":
         fields.add("retained_root")
+    binding = request.get("workspace_storage")
+    if binding is not None:
+        from shared.vm_preparation_target import validate_workspace_target
+
+        fields.add("target")
+        validate_workspace_target(
+            source.get("target"),
+            allocation_id=request["job_id"],
+            namespace=configuration["namespace"],
+            binding=binding,
+        )
     if (
         set(source) != fields
         or source["mode"] != mode

@@ -13,11 +13,17 @@ class PreparedWaiting(RuntimeError):
     pass
 
 
-def creation_binding(row):
-    return {
+def creation_binding(row, *, namespace=None):
+    result = {
         key: row[key]
         for key in ("request_id", "provision_generation", "request_digest")
     }
+    binding = row["request"].get("workspace_storage")
+    if binding is not None:
+        from shared.vm_preparation_target import workspace_target
+
+        result["target"] = workspace_target(binding, namespace)
+    return result
 
 
 def observed_preparation_metadata(row, vm):
@@ -72,7 +78,8 @@ class PreparedSources(CreationSourcePins):
     async def facts(self, row):
         allocation = await self.allocation(row)
         if (
-            allocation.state.get("creation_binding") != creation_binding(row)
+            allocation.state.get("creation_binding")
+            != creation_binding(row, namespace=self.namespace)
             or allocation.state.get("phase") not in {"Cloning", "Allocated"}
             or allocation.state.get("workspace_source_issued") is not True
         ):
@@ -138,6 +145,9 @@ class PreparedSources(CreationSourcePins):
             },
             "receipt": deepcopy(artifact.state["receipt"]),
         }
+        target = creation_binding(row, namespace=self.namespace).get("target")
+        if target is not None:
+            source["target"] = target
         self.check(row, source)
         return source, dv
 
@@ -158,6 +168,10 @@ class PreparedSources(CreationSourcePins):
             "mode": "retained",
             "retained_root": deepcopy(root),
         }
+        if source.get("target") != (allocation.state.get("creation_binding") or {}).get(
+            "target"
+        ):
+            raise ValueError("Prepared retained target changed")
         self.check(row, source)
         name, dv, pvc = await self.reader.disk(row)
         if (
@@ -174,10 +188,6 @@ class PreparedSources(CreationSourcePins):
         return source
 
     async def prepare(self, row, frozen=None):
-        # Reusable preparation attachments require a separately proven target
-        # binding. Do not substitute the ordinary job root completion contract.
-        if row["request"].get("workspace_storage") is not None:
-            raise ValueError("Prepared reusable attachment is not yet proven")
         if row["expected_pvc_uid"] is not None:
             source = await self.retained(row)
             if frozen is not None and source != frozen:
@@ -189,7 +199,8 @@ class PreparedSources(CreationSourcePins):
         saved = allocation.state.get("creation_source") if allocation else None
         if frozen is None and saved is None:
             ready, waiting = await self.service.prepare(
-                row["request"]["preparation"], creation=creation_binding(row)
+                row["request"]["preparation"],
+                creation=creation_binding(row, namespace=self.namespace),
             )
             if waiting is not None:
                 allocation = await self.allocation(row)
@@ -212,7 +223,9 @@ class PreparedSources(CreationSourcePins):
                 current = allocation.state.get("creation_source")
                 if current is not None and current != source:
                     raise ValueError("Prepared source capture changed")
-                if allocation.state.get("creation_binding") != creation_binding(row):
+                if allocation.state.get("creation_binding") != creation_binding(
+                    row, namespace=self.namespace
+                ):
                     raise ValueError("Prepared source owner changed")
                 await self.service.store.save(
                     allocation, {**allocation.state, "creation_source": source}
@@ -240,7 +253,8 @@ class PreparedSources(CreationSourcePins):
         source, values, evidence = completed
         allocation = await self.allocation(row)
         if (
-            allocation.state.get("creation_binding") != creation_binding(row)
+            allocation.state.get("creation_binding")
+            != creation_binding(row, namespace=self.namespace)
             or allocation.state.get("creation_source") != source
             or source["allocation"]["uid"] != allocation.uid
         ):
@@ -249,7 +263,7 @@ class PreparedSources(CreationSourcePins):
             row["request"]["preparation"],
             rootdisk=values["object_name"],
             pvc_uid=evidence["pvc_uid"],
-            creation=creation_binding(row),
+            creation=creation_binding(row, namespace=self.namespace),
             creation_source=source,
             rootdisk_dv_uid=evidence["uid"],
         )

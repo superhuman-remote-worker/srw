@@ -54,12 +54,25 @@ def creation_held(allocation):
         or allocation.state.get("workspace_source_issued") is False
     ):
         return False
+    from shared.vm_preparation_target import creation_root_name
+
+    try:
+        expected = creation_root_name(
+            allocation.state["creation_binding"], allocation.request
+        )
+    except (ValueError, TypeError, KeyError):
+        return True
+    target = allocation.state["creation_binding"].get("target")
+    source = allocation.state.get("creation_source")
+    if target is not None and (
+        not isinstance(source, dict) or source.get("target") != target
+    ):
+        return True
     root = allocation.state.get("creation_root")
     if (
         not isinstance(root, dict)
         or set(root) != {"name", "dv_uid", "pvc_uid"}
-        or root["name"]
-        != "agent-vm-" + allocation.request["allocationId"] + "-rootdisk"
+        or root["name"] != expected
     ):
         return True
     try:
@@ -88,18 +101,14 @@ class VMWorkspacePreparation:
     async def prepare(self, value, *, creation=None):
         request = validate_request(value)
         if creation is not None:
-            if (
-                not isinstance(creation, dict)
-                or set(creation)
-                != {"request_id", "provision_generation", "request_digest"}
-                or request["ownerKind"] != "job"
-                or any(
-                    str(UUID(creation[key])) != creation[key]
-                    for key in ("request_id", "provision_generation")
-                )
-                or not re.fullmatch(r"sha256:[0-9a-f]{64}", creation["request_digest"])
-            ):
-                raise PreparationConflict("Creation allocation binding is invalid.")
+            from shared.vm_preparation_target import creation_root_name
+
+            try:
+                creation_root_name(creation, request, namespace=self.store.namespace)
+            except (ValueError, TypeError, KeyError) as exc:
+                raise PreparationConflict(
+                    "Creation allocation binding is invalid."
+                ) from exc
         if not self.settings.enabled:
             raise PreparationConflict("VM workspace preparation is not enabled.")
         self.resolver.permitted(request["image"])
@@ -689,6 +698,13 @@ class VMWorkspacePreparation:
     ):
         """Release the cache pin only after CDI has finished the workspace clone."""
         request = validate_request(request)
+        from shared.vm_preparation_target import creation_root_name
+
+        expected_root = (
+            creation_root_name(creation, request, namespace=self.store.namespace)
+            if creation is not None
+            else None
+        )
         async with self.lock:
             allocation = await self.store.get(allocation_name(request))
             if (
@@ -708,7 +724,7 @@ class VMWorkspacePreparation:
                 or creation_source is None
                 or creation_source["allocation"]["uid"] != allocation.uid
                 or not rootdisk_dv_uid
-                or rootdisk != "agent-vm-" + request["allocationId"] + "-rootdisk"
+                or rootdisk != expected_root
             ):
                 raise PreparationConflict("Prepared completion authority changed.")
             dv, pvc = await self.store.dv(rootdisk), await self.store.pvc(rootdisk)

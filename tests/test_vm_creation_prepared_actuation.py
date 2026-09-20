@@ -455,13 +455,13 @@ async def test_prepared_root_unknown_with_builder_drift_never_rebuilds(prepared)
 
 
 @pytest.mark.asyncio
-async def test_prepared_workspace_binding_waits_for_attachment_contract(prepared):
+async def test_prepared_workspace_binding_requires_complete_identity(prepared):
     from vm_controller.creation_preparation import PreparedSources
 
     ctrl, api, authority, _, service = prepared
     row = deepcopy(authority.row)
     row["request"]["workspace_storage"] = {"uid": str(uuid4())}
-    with pytest.raises(ValueError, match="attachment"):
+    with pytest.raises(ValueError, match="binding"):
         await PreparedSources(ctrl).prepare(row)
     assert not api.writes
     assert not service.store.created_pods
