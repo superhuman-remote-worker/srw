@@ -606,3 +606,68 @@ async def test_independent_child_vm_keeps_legacy_parent_cleanup_scope(db):
         job_id=str(child), request=request, fresh_context=fresh
     )
     assert value["expected_pvc_uid"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "change", ["authentication", "vm_uid", "rootdisk_pvc_uid", "binding"]
+)
+async def test_historical_last_vm_cannot_override_current_identity(db, change):
+    jobs, request, fresh, history = await inherited(db)
+    old = history[-1]["vm"]
+    current = dict(old)
+    current.pop("workspace_storage")
+    if change == "authentication":
+        current["identity_authenticated"] = False
+    elif change != "binding":
+        current[change] = str(uuid4())
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE jobs SET context=$2::jsonb WHERE id=$1",
+            jobs[-2],
+            json.dumps({"vm": current, "last_vm": old}),
+        )
+    with pytest.raises(VMCreationRetryConflict):
+        await VMCreationPreflightStore(db).begin(
+            job_id=str(jobs[-1]), request=request, fresh_context=fresh
+        )
+
+
+@pytest.mark.asyncio
+async def test_fresh_handoff_grant_cannot_use_contradictory_last_vm(db, attached):
+    ctrl, api, _, _ = attached
+    jobs, history, store, row, payload = await controller_bridge(db, attached)
+    old = history[-1]["vm"]
+    current = {**old, "vm_uid": str(uuid4())}
+    current.pop("workspace_storage")
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE jobs SET context=$2::jsonb WHERE id=$1",
+            jobs[-2],
+            json.dumps({"vm": current, "last_vm": old}),
+        )
+    assert (await ctrl._do_create_serialized(payload))["status"] != "created"
+    assert not (await store.inspect(request_id=str(row["request_id"])))["effects"]
+    assert not any(
+        kind in api.writes for kind in ("DataVolume", "Secret", "VirtualMachine")
+    )
+
+
+@pytest.mark.asyncio
+async def test_current_retirement_binding_requires_canonical_generation_type(db):
+    from copy import deepcopy
+
+    jobs, request, fresh, history = await inherited(db)
+    old = history[-1]["vm"]
+    current = deepcopy(old)
+    current["workspace_storage"]["generation"] = True
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE jobs SET context=$2::jsonb WHERE id=$1",
+            jobs[-2],
+            json.dumps({"vm": current, "last_vm": old}),
+        )
+    with pytest.raises(VMCreationRetryConflict):
+        await VMCreationPreflightStore(db).begin(
+            job_id=str(jobs[-1]), request=request, fresh_context=fresh
+        )

@@ -195,6 +195,7 @@ async def prove(conn, *, job_id, binding, scope=None, expected=None, adoption=Fa
             + ") FROM jobs WHERE id=$1",
             UUID(identity),
         )
+        current_vm = _object(_object(job["context"]).get("vm")) if job else {}
         if (
             not job
             or job["status"] not in {"completed", "failed", "cancelled"}
@@ -214,8 +215,9 @@ async def prove(conn, *, job_id, binding, scope=None, expected=None, adoption=Fa
                 "SELECT EXISTS(SELECT 1 FROM run_queue WHERE unit_id=$1 AND state='leased')",
                 UUID(identity),
             )
-            or _object(_object(job["context"]).get("vm")).get("provision_generation")
-            != vm.get("provision_generation")
+            # A historical candidate cannot override contradictory or missing
+            # current retirement identity, even within the same generation.
+            or any(current_vm.get(key) != value for key, value in vm.items())
             or vm.get("status") != "deleted"
             or vm.get("retirement_cleanup_pending") is True
             or vm.get("identity_authenticated") is not True
