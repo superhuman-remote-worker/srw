@@ -349,10 +349,9 @@ class LiveScenario:
         self.gate_user_id = user_id
         return user_id
 
-    async def _create_job(self) -> tuple[UUID, int]:
+    async def _create_job(self) -> UUID:
         gate_user_id = await self._ensure_gate_user()
         job_id = uuid4()
-        lease_token = 27
         created = await self.db.create_job(
             description=f"[vm-recovery-gate:{self.run_id}] retained disk fixture",
             context={"vm_workspace_recovery_acceptance_gate": self.run_id},
@@ -364,42 +363,57 @@ class LiveScenario:
         )
         if UUID(str(created["id"])) != job_id:
             raise AcceptanceFailure("job helper changed the preallocated fixture ID")
+        self.job_id = job_id
+        return job_id
+
+    async def _issue_fixture_lease(self, job_id: UUID) -> int:
+        """Issue the synthetic worker lease only after VM and SSH readiness."""
+
+        lease_token = 27
         async with self.db.acquire() as conn, conn.transaction():
-            await conn.execute(
+            current = await conn.fetchrow(
+                "SELECT status,execution_lane,user_id,"
+                "context->>'vm_workspace_recovery_acceptance_gate' AS gate_run "
+                "FROM jobs WHERE id=$1 FOR UPDATE",
+                job_id,
+            )
+            if (
+                current is None
+                or current["status"] != "processing"
+                or current["execution_lane"] != "stateless"
+                or current["user_id"] != self.gate_user_id
+                or current["gate_run"] != self.run_id
+            ):
+                raise AcceptanceFailure(
+                    "synthetic worker lease could not be issued after readiness"
+                )
+            issued = await conn.fetchval(
                 "INSERT INTO run_queue (unit_id,unit_kind,state,lease_token,"
-                "leased_by,leased_until,input_seq,consumed_seq,attempts_since_completion) "
-                "VALUES ($1,'worker_batch','leased',$2,$3,clock_timestamp()+interval '5 minutes',1,0,1)",
+                "leased_by,leased_until,input_seq,consumed_seq,"
+                "attempts_since_completion) SELECT "
+                "$1,'worker_batch','leased',$2,$3,"
+                "clock_timestamp()+interval '5 minutes',1,0,1 "
+                "FROM jobs WHERE id=$1 AND status='processing' AND user_id=$4 "
+                "AND context->>'vm_workspace_recovery_acceptance_gate'=$5 "
+                "AND NOT EXISTS (SELECT 1 FROM run_queue WHERE unit_id=$1) "
+                "RETURNING lease_token",
                 job_id,
                 lease_token,
                 f"vm-recovery-gate:{self.run_id}",
+                self.gate_user_id,
+                self.run_id,
             )
+            if issued != lease_token:
+                raise AcceptanceFailure(
+                    "synthetic worker lease could not be issued after readiness"
+                )
             await conn.execute(
                 "INSERT INTO worker_batch_attempts "
                 "(job_id,lease_token,claimed_attempt) VALUES ($1,$2,1)",
                 job_id,
                 lease_token,
             )
-        self.job_id = job_id
-        return job_id, lease_token
-
-    async def _refresh_fixture_lease(
-        self, job_id: UUID, lease_token: int
-    ) -> None:
-        """Refresh the synthetic lease after cold boot and before admission."""
-
-        async with self.db.acquire() as conn:
-            refreshed = await conn.fetchval(
-                "UPDATE run_queue SET leased_until=clock_timestamp()+interval '5 minutes' "
-                "WHERE unit_id=$1 AND unit_kind='worker_batch' AND state='leased' "
-                "AND lease_token=$2 AND leased_by=$3 RETURNING lease_token",
-                job_id,
-                lease_token,
-                f"vm-recovery-gate:{self.run_id}",
-            )
-        if refreshed != lease_token:
-            raise AcceptanceFailure(
-                "synthetic worker lease could not be refreshed before admission"
-            )
+        return lease_token
 
     async def _wait(self, label: str, probe: Any, timeout: float = 900) -> Any:
         stop = time.monotonic() + timeout
@@ -1299,7 +1313,7 @@ class LiveScenario:
     async def execute(self) -> dict[str, Any]:
         from shared.workspace_recovery import WorkspaceRecoveryCode
 
-        job_id, lease_token = await self._create_job()
+        job_id = await self._create_job()
         created = await self.provisioner.create_vm(
             str(job_id), cpu_cores=2, memory="2Gi", disk_size="12Gi"
         )
@@ -1325,7 +1339,7 @@ class LiveScenario:
         await self._ssh_file(identity, marker_path, marker)
         await self._ssh_file(identity, checkpoint_path, checkpoint)
 
-        await self._refresh_fixture_lease(job_id, lease_token)
+        lease_token = await self._issue_fixture_lease(job_id)
         request_id = uuid4()
         disposition = await self._admit(
             identity=identity,

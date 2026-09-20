@@ -389,7 +389,7 @@ async def test_acceptance_fixture_uses_production_job_creation_boundary() -> Non
     scenario.job_id = None
     scenario.gate_user_id = None
 
-    job_id, lease_token = await scenario._create_job()
+    job_id = await scenario._create_job()
 
     assert create_kwargs == [
         {
@@ -402,16 +402,10 @@ async def test_acceptance_fixture_uses_production_job_creation_boundary() -> Non
             "job_id": job_id,
         }
     ]
-    assert lease_token == 27
     assert scenario.job_id == job_id
     assert "INSERT INTO users" in executed[0][0]
     assert "true,false" in executed[0][0]
-    assert ["run_queue" in query for query, _values in executed] == [False, True, False]
-    assert ["worker_batch_attempts" in query for query, _values in executed] == [
-        False,
-        False,
-        True,
-    ]
+    assert len(executed) == 1  # Only the dedicated gate principal is inserted.
     assert all("INSERT INTO jobs" not in query for query, _values in executed)
 
 
@@ -489,8 +483,7 @@ async def test_job_api_probe_requires_fixture_owner_headers(monkeypatch, owned):
         await client.aclose()
 
 
-# The lease refresh is operator-fixture SQL: use real PostgreSQL to prove its
-# predicate instead of teaching a fake database the same conditional update.
+# Fixture issuance is operator-only SQL; test its guards against real PostgreSQL.
 from tests.test_non_pinned_workspace_lifecycle_real_postgres import (  # noqa: E402
     _schema_applied,  # noqa: F401
     db as _gate_lease_db,
@@ -501,61 +494,148 @@ from tests.test_non_pinned_workspace_lifecycle_real_postgres import (  # noqa: E
 gate_lease_db = _gate_lease_db
 
 
+async def _issuance_fixture(db):
+    from uuid import uuid4
+
+    scenario = object.__new__(LiveScenario)
+    scenario.db, scenario.run_id = db, "lease-issuance-review"
+    scenario.gate_user_id = None
+    owner = await scenario._ensure_gate_user()
+    job = uuid4()
+    await db.create_job(
+        job_id=job,
+        description="gate lease issuance test",
+        status="processing",
+        origin="lifecycle",
+        execution_lane="stateless",
+        user_id=str(owner),
+        context={"vm_workspace_recovery_acceptance_gate": scenario.run_id},
+    )
+    return scenario, job
+
+
+@pytest.mark.asyncio
+async def test_fixture_job_has_no_preboot_queue_or_attempt(gate_lease_db):
+    from uuid import UUID
+
+    scenario = object.__new__(LiveScenario)
+    scenario.db, scenario.run_id = gate_lease_db, "no-preboot-queue"
+    scenario.gate_user_id, scenario.job_id = None, None
+    job = await scenario._create_job()
+    assert isinstance(job, UUID)
+    async with gate_lease_db.acquire() as conn:
+        assert not await conn.fetchval(
+            "SELECT EXISTS(SELECT 1 FROM run_queue WHERE unit_id=$1)", job
+        )
+        assert not await conn.fetchval(
+            "SELECT EXISTS(SELECT 1 FROM worker_batch_attempts WHERE job_id=$1)", job
+        )
+        assert (
+            await conn.fetchval("SELECT status FROM jobs WHERE id=$1", job)
+            == "processing"
+        )
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "changed", [None, "token", "owner", "parked", "queued", "done", "unit_kind"]
+    "changed",
+    [
+        None,
+        "queue_leased",
+        "queue_queued",
+        "queue_parked",
+        "queue_done",
+        "queue_other_kind",
+        "owner",
+        "status",
+        "marker",
+        "missing_marker",
+        "lane",
+    ],
 )
-async def test_fixture_lease_refresh_requires_exact_current_synthetic_owner(
+async def test_fixture_lease_issuance_requires_exact_unused_gate_job(
     gate_lease_db, changed
 ):
+    import json
     from uuid import uuid4
 
     db = gate_lease_db
-    job, run_id, token = uuid4(), "lease-refresh-review", 27
-    owner = f"vm-recovery-gate:{run_id}"
-    state = changed if changed in {"parked", "queued", "done"} else "leased"
+    scenario, job = await _issuance_fixture(db)
     async with db.acquire() as conn:
-        await conn.execute(
-            "INSERT INTO jobs(id,description,status,execution_lane) "
-            "VALUES($1,'gate lease test','created','stateless')",
-            job,
+        if changed and changed.startswith("queue_"):
+            state = changed.removeprefix("queue_")
+            await conn.execute(
+                "INSERT INTO run_queue(unit_id,unit_kind,state,lease_token,leased_by,"
+                "leased_until,input_seq,consumed_seq,attempts_since_completion) "
+                "VALUES($1,$2,$3,28,'another-worker',clock_timestamp()-interval '1 minute',4,2,3)",
+                job,
+                "session_turn" if state == "other_kind" else "worker_batch",
+                "leased" if state == "other_kind" else state,
+            )
+        elif changed == "owner":
+            other = uuid4()
+            await conn.execute(
+                "INSERT INTO users(id,display_name) VALUES($1,'another owner')", other
+            )
+            await conn.execute("UPDATE jobs SET user_id=$2 WHERE id=$1", job, other)
+        elif changed == "lane":
+            await conn.execute(
+                "UPDATE jobs SET execution_lane='pinned' WHERE id=$1", job
+            )
+        elif changed == "status":
+            await conn.execute("UPDATE jobs SET status='cancelled' WHERE id=$1", job)
+        elif changed in {"marker", "missing_marker"}:
+            context = (
+                {}
+                if changed == "missing_marker"
+                else {"vm_workspace_recovery_acceptance_gate": "another-run"}
+            )
+            await conn.execute(
+                "UPDATE jobs SET context=$2::jsonb WHERE id=$1",
+                job,
+                json.dumps(context),
+            )
+        before_job = await conn.fetchrow("SELECT * FROM jobs WHERE id=$1", job)
+        before_queue = await conn.fetch("SELECT * FROM run_queue WHERE unit_id=$1", job)
+        before_attempts = await conn.fetch(
+            "SELECT * FROM worker_batch_attempts WHERE job_id=$1", job
         )
-        await conn.execute(
-            "INSERT INTO run_queue(unit_id,unit_kind,state,lease_token,leased_by,"
-            "leased_until,input_seq,consumed_seq,attempts_since_completion) "
-            "VALUES($1,$2,$3,$4,$5,clock_timestamp()-interval '1 minute',1,0,3)",
-            job,
-            "session_turn" if changed == "unit_kind" else "worker_batch",
-            state,
-            token + 1 if changed == "token" else token,
-            "another-worker" if changed == "owner" else owner,
-        )
-        before = dict(
-            await conn.fetchrow("SELECT * FROM run_queue WHERE unit_id=$1", job)
-        )
-    scenario = object.__new__(LiveScenario)
-    scenario.db, scenario.run_id = db, run_id
     if changed is None:
-        await scenario._refresh_fixture_lease(job, token)
+        assert await scenario._issue_fixture_lease(job) == 27
     else:
-        with pytest.raises(
-            acceptance.AcceptanceFailure, match="could not be refreshed"
-        ):
-            await scenario._refresh_fixture_lease(job, token)
+        with pytest.raises(acceptance.AcceptanceFailure, match="could not be issued"):
+            await scenario._issue_fixture_lease(job)
     async with db.acquire() as conn:
-        after = dict(
-            await conn.fetchrow("SELECT * FROM run_queue WHERE unit_id=$1", job)
+        assert await conn.fetchrow("SELECT * FROM jobs WHERE id=$1", job) == before_job
+        queue = await conn.fetch("SELECT * FROM run_queue WHERE unit_id=$1", job)
+        attempts = await conn.fetch(
+            "SELECT * FROM worker_batch_attempts WHERE job_id=$1", job
         )
         now = await conn.fetchval("SELECT clock_timestamp()")
-    if changed is None:
-        assert before["leased_until"] < now < after["leased_until"]
-        assert after["leased_until"] <= now + timedelta(minutes=5)
-        after["leased_until"] = before["leased_until"]
-    assert after == before  # Includes token, claimant, state and attempt count.
+    if changed is not None:
+        assert queue == before_queue and attempts == before_attempts
+        return
+    assert len(queue) == len(attempts) == 1
+    assert queue[0]["state"] == "leased"
+    assert queue[0]["lease_token"] == attempts[0]["lease_token"] == 27
+    assert queue[0]["leased_by"] == "vm-recovery-gate:lease-issuance-review"
+    assert queue[0]["attempts_since_completion"] == attempts[0]["claimed_attempt"] == 1
+    assert queue[0]["input_seq"] == 1 and queue[0]["consumed_seq"] == 0
+    assert now < queue[0]["leased_until"] <= now + timedelta(minutes=5)
+    with pytest.raises(acceptance.AcceptanceFailure, match="could not be issued"):
+        await scenario._issue_fixture_lease(job)
+    async with db.acquire() as conn:
+        assert (
+            await conn.fetch("SELECT * FROM run_queue WHERE unit_id=$1", job) == queue
+        )
+        assert (
+            await conn.fetch("SELECT * FROM worker_batch_attempts WHERE job_id=$1", job)
+            == attempts
+        )
 
 
 @pytest.mark.asyncio
-async def test_fixture_refresh_occurs_once_after_ssh_setup_not_on_admission_replay(
+async def test_fixture_issuance_occurs_once_after_ssh_setup_not_on_admission_replay(
     monkeypatch,
 ):
     from uuid import uuid4
@@ -567,8 +647,8 @@ async def test_fixture_refresh_occurs_once_after_ssh_setup_not_on_admission_repl
     job, token, identity = uuid4(), 27, {"fixture": "ready"}
     events = []
     scenario = object.__new__(LiveScenario)
-    scenario.run_id = "lease-refresh-placement"
-    scenario._create_job = AsyncMock(return_value=(job, token))
+    scenario.run_id = "lease-issuance-placement"
+    scenario._create_job = AsyncMock(return_value=job)
     scenario.provisioner = SimpleNamespace(create_vm=AsyncMock(return_value=True))
     scenario._wait = AsyncMock(return_value=identity)
     scenario._application_api_evidence = AsyncMock(return_value={"job_visible": True})
@@ -578,9 +658,10 @@ async def test_fixture_refresh_occurs_once_after_ssh_setup_not_on_admission_repl
         assert _identity is identity and value
         events.append(path.rsplit("/", 1)[1])
 
-    async def refresh(actual_job, actual_token):
-        assert (actual_job, actual_token) == (job, token)
-        events.append("refresh")
+    async def issue(actual_job):
+        assert actual_job == job
+        events.append("issue")
+        return token
 
     admissions = []
 
@@ -592,9 +673,102 @@ async def test_fixture_refresh_occurs_once_after_ssh_setup_not_on_admission_repl
         return SimpleNamespace(operation_id=uuid4())
 
     scenario._ssh_file = ssh
-    monkeypatch.setattr(scenario, "_refresh_fixture_lease", refresh, raising=False)
+    monkeypatch.setattr(scenario, "_issue_fixture_lease", issue, raising=False)
     scenario._admit = admit
     with pytest.raises(ReplayReached):
         await scenario.execute()
-    assert events == ["marker", "checkpoint", "refresh", "admit", "admit"]
+    assert events == ["marker", "checkpoint", "issue", "admit", "admit"]
     assert admissions[0] == admissions[1]
+    assert admissions[0]["lease_token"] == token
+
+
+@pytest.mark.asyncio
+async def test_fixture_issuance_rolls_back_queue_if_attempt_already_exists(
+    gate_lease_db,
+):
+    import asyncpg
+
+    db = gate_lease_db
+    scenario, job = await _issuance_fixture(db)
+    async with db.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO worker_batch_attempts(job_id,lease_token,claimed_attempt) VALUES($1,27,1)",
+            job,
+        )
+        before = await conn.fetch(
+            "SELECT * FROM worker_batch_attempts WHERE job_id=$1", job
+        )
+    with pytest.raises((acceptance.AcceptanceFailure, asyncpg.UniqueViolationError)):
+        await scenario._issue_fixture_lease(job)
+    async with db.acquire() as conn:
+        assert not await conn.fetchval(
+            "SELECT EXISTS(SELECT 1 FROM run_queue WHERE unit_id=$1)", job
+        )
+        assert (
+            await conn.fetch("SELECT * FROM worker_batch_attempts WHERE job_id=$1", job)
+            == before
+        )
+
+
+@pytest.mark.asyncio
+async def test_fixture_issuance_rechecks_job_after_row_lock_wait(gate_lease_db):
+    db = gate_lease_db
+    scenario, job = await _issuance_fixture(db)
+    async with db.acquire() as blocker:
+        async with blocker.transaction():
+            await blocker.execute("SELECT id FROM jobs WHERE id=$1 FOR UPDATE", job)
+            task = asyncio.create_task(scenario._issue_fixture_lease(job))
+            await asyncio.sleep(0.15)
+            assert not task.done()
+            await blocker.execute("UPDATE jobs SET status='cancelled' WHERE id=$1", job)
+        with pytest.raises(acceptance.AcceptanceFailure, match="could not be issued"):
+            await task
+    async with db.acquire() as conn:
+        assert (
+            await conn.fetchval("SELECT status FROM jobs WHERE id=$1", job)
+            == "cancelled"
+        )
+        assert not await conn.fetchval(
+            "SELECT EXISTS(SELECT 1 FROM run_queue WHERE unit_id=$1)", job
+        )
+        assert not await conn.fetchval(
+            "SELECT EXISTS(SELECT 1 FROM worker_batch_attempts WHERE job_id=$1)", job
+        )
+
+
+@pytest.mark.asyncio
+async def test_fixture_concurrent_issuance_creates_one_lease_and_attempt(gate_lease_db):
+    import asyncpg
+
+    db = gate_lease_db
+    scenario, job = await _issuance_fixture(db)
+    results = await asyncio.gather(
+        scenario._issue_fixture_lease(job),
+        scenario._issue_fixture_lease(job),
+        return_exceptions=True,
+    )
+    assert results.count(27) == 1
+    assert (
+        sum(
+            isinstance(
+                result, (acceptance.AcceptanceFailure, asyncpg.UniqueViolationError)
+            )
+            for result in results
+        )
+        == 1
+    )
+    async with db.acquire() as conn:
+        assert (
+            await conn.fetchval(
+                "SELECT count(*) FROM run_queue WHERE unit_id=$1 AND lease_token=27 AND state='leased'",
+                job,
+            )
+            == 1
+        )
+        assert (
+            await conn.fetchval(
+                "SELECT count(*) FROM worker_batch_attempts WHERE job_id=$1 AND lease_token=27 AND claimed_attempt=1",
+                job,
+            )
+            == 1
+        )
