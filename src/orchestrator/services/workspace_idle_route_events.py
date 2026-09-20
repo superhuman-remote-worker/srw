@@ -1,0 +1,109 @@
+"""Transaction adapters for accepted officer/system human handoffs.
+
+Nominate routes without retaining locks, then take post/thread (officer only),
+Job, and route locks in publication order. Delivery is always after commit.
+"""
+
+import json
+from uuid import UUID
+
+from orchestrator.services.workspace_idle_events import record_human_route_wait_on_conn
+
+
+async def lock_handoff_source_on_conn(
+    conn, *, route_id, actor_kind, officer_thread_id, officer_incarnation
+):
+    """Return the nominated scope only after current source and Job locks.
+
+    The caller must include this scope in its subsequent route CAS. This helper
+    consumes authenticated officer facts from the action adapter, never actor_id.
+    """
+    route = await conn.fetchrow(
+        "SELECT job_id,project_id FROM job_message_routes WHERE route_id=$1", route_id
+    )
+    if route is None:
+        return None
+    if actor_kind == "officer":
+        if type(officer_incarnation) is not int or officer_incarnation < 0:
+            return None
+        try:
+            officer_id = UUID(str(officer_thread_id))
+        except (ValueError, TypeError):
+            return None
+        post = await conn.fetchrow(
+            "SELECT thread_id,incarnations FROM project_officers WHERE project_id=$1 FOR UPDATE",
+            route["project_id"],
+        )
+        if post is None or post["thread_id"] != officer_id:
+            return None
+        incarnations = post["incarnations"]
+        if isinstance(incarnations, str):
+            incarnations = json.loads(incarnations)
+        if (
+            not isinstance(incarnations, list)
+            or len(incarnations) != officer_incarnation
+        ):
+            return None
+        thread = await conn.fetchrow(
+            "SELECT project_id,status FROM threads WHERE id=$1 FOR UPDATE", officer_id
+        )
+        if (
+            thread is None
+            or thread["project_id"] != route["project_id"]
+            or thread["status"] == "ended"
+        ):
+            return None
+    elif actor_kind != "system":
+        return None
+    job = await conn.fetchrow(
+        "SELECT id,project_id FROM jobs WHERE id=$1 FOR UPDATE", route["job_id"]
+    )
+    if job is None or job["project_id"] != route["project_id"]:
+        return None
+    return route
+
+
+async def claim_human_route_sla(db, *, now, limit):
+    """Bounded nominations; each accepted Job -> route CAS owns one episode."""
+    if type(limit) is not int or not 1 <= limit <= 100:
+        raise ValueError("route SLA limit must be between 1 and 100")
+    async with db.acquire() as conn:
+        candidates = await conn.fetch(
+            "SELECT route_id,job_id,project_id FROM job_message_routes "
+            "WHERE state='pending_officer' AND blocking AND officer_deadline <= $1 "
+            "ORDER BY officer_deadline,route_id LIMIT $2",
+            now,
+            limit,
+        )
+    accepted = []
+    for candidate in candidates:
+        async with db.acquire() as conn:
+            async with conn.transaction():
+                job = await conn.fetchrow(
+                    "SELECT id,project_id FROM jobs WHERE id=$1 FOR UPDATE SKIP LOCKED",
+                    candidate["job_id"],
+                )
+                if job is None or job["project_id"] != candidate["project_id"]:
+                    continue
+                # Recheck the complete nomination after Job acquisition. A
+                # reply may have settled the route while we waited for locks.
+                row = await conn.fetchrow(
+                    "UPDATE job_message_routes SET state='escalated_to_user', "
+                    "transitions=transitions||jsonb_build_array(jsonb_build_object("
+                    "'at',clock_timestamp()::text,'from',state,'to','escalated_to_user',"
+                    "'actor_kind','system','note','officer_sla_expired')),updated_at=now() "
+                    "WHERE route_id=$1 AND job_id=$2 AND project_id=$3 "
+                    "AND state='pending_officer' AND blocking AND officer_deadline <= $4 "
+                    "RETURNING *",
+                    candidate["route_id"],
+                    candidate["job_id"],
+                    candidate["project_id"],
+                    now,
+                )
+                if row is None:
+                    continue
+                await record_human_route_wait_on_conn(
+                    conn, job_id=row["job_id"], route_id=row["route_id"]
+                )
+                accepted.append(db._message_route_row_to_dict(row))
+    return accepted

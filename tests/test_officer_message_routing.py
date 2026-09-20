@@ -1063,6 +1063,8 @@ class TestOfficerActionFlows:
         kwargs = escalate.await_args.kwargs
         assert kwargs["reason"] == "officer_escalated"
         assert kwargs["actor_kind"] == "officer"
+        assert kwargs["officer_thread_id"] == OFFICER_TID
+        assert kwargs["officer_incarnation"] == 0
         assert kwargs["officer_context"].startswith("I recommend")
 
     @pytest.mark.asyncio

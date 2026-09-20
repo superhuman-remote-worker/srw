@@ -28746,6 +28746,7 @@ class PostgresDB:
                     # unfenced pinned publishers do not gain idle capability.
                     if str(route.get("state")) in {
                         "user_direct",
+                        "pending_both",
                         "escalated_to_user",
                     } and (expected_lane == "stateless" or agent_uuid is not None):
                         from orchestrator.services.workspace_idle_events import (
@@ -28927,28 +28928,62 @@ class PostgresDB:
                 f", resolved_by_id = ${id_arg}"
                 ", resolved_at = now()"
             )
+        track_handoff = (
+            to_state == "escalated_to_user"
+            and os.getenv("WORKSPACE_IDLE_RELEASE_ENABLED", "false").lower() == "true"
+        )
         async with self.acquire() as conn:
-            row = await conn.fetchrow(
-                f"""
-                UPDATE job_message_routes
-                   SET state = $2,
-                       effective_audience = CASE
-                           WHEN $2 = 'escalated_to_user'
-                                AND effective_audience = 'officer'
-                           THEN 'officer_and_user'
-                           ELSE effective_audience
-                       END,
-                       transitions = transitions
-                           || jsonb_set($4::jsonb, '{{0,from}}', to_jsonb(state)),
-                       updated_at = now()
-                       {resolved_sets}
-                 WHERE route_id = $1
-                   AND state = ANY($3::text[])
-                   {officer_guard}
-                RETURNING *
-                """,
-                *args,
-            )
+            async with conn.transaction():
+                if track_handoff:
+                    from orchestrator.services.workspace_idle_route_events import (
+                        lock_handoff_source_on_conn,
+                    )
+
+                    scope = await lock_handoff_source_on_conn(
+                        conn,
+                        route_id=route_uuid,
+                        actor_kind=actor_kind,
+                        officer_thread_id=officer_thread_id,
+                        officer_incarnation=officer_incarnation,
+                    )
+                    if scope is None:
+                        return None
+                    args.extend([scope["job_id"], scope["project_id"]])
+                    officer_guard += (
+                        f" AND job_id=${len(args)-1} AND project_id=${len(args)}"
+                    )
+                    if actor_kind == "officer":
+                        args.append(officer_incarnation)
+                        officer_guard += f" AND officer_incarnation=${len(args)}"
+                row = await conn.fetchrow(
+                    f"""
+                    UPDATE job_message_routes
+                       SET state = $2,
+                           effective_audience = CASE
+                               WHEN $2 = 'escalated_to_user'
+                                    AND effective_audience = 'officer'
+                               THEN 'officer_and_user'
+                               ELSE effective_audience
+                           END,
+                           transitions = transitions
+                               || jsonb_set($4::jsonb, '{{0,from}}', to_jsonb(state)),
+                           updated_at = now()
+                           {resolved_sets}
+                     WHERE route_id = $1
+                       AND state = ANY($3::text[])
+                       {officer_guard}
+                    RETURNING *
+                    """,
+                    *args,
+                )
+                if track_handoff and row is not None:
+                    from orchestrator.services.workspace_idle_events import (
+                        record_human_route_wait_on_conn,
+                    )
+
+                    await record_human_route_wait_on_conn(
+                        conn, job_id=row["job_id"], route_id=row["route_id"]
+                    )
         return self._message_route_row_to_dict(row)
 
     async def mark_route_user_delivery(self, route_id: str) -> bool:
@@ -29027,6 +29062,13 @@ class PostgresDB:
         ``user_delivery_at`` (redelivery leg retries a failed dispatch).
         """
         now = now or datetime.now(timezone.utc)
+        if os.getenv("WORKSPACE_IDLE_RELEASE_ENABLED", "false").lower() == "true":
+            from orchestrator.services.workspace_idle_route_events import (
+                claim_human_route_sla,
+            )
+
+            return await claim_human_route_sla(self, now=now, limit=limit)
+
         async with self.acquire() as conn:
             rows = await conn.fetch(
                 """

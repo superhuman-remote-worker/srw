@@ -29,6 +29,18 @@ async def record_human_route_wait_on_conn(conn, *, job_id, route_id):
     if row is None or row["status"] != "waiting_for_reply":
         return False
     row = dict(row)
+    route = await conn.fetchrow(
+        "SELECT job_id,project_id,blocking,state FROM job_message_routes WHERE route_id=$1",
+        UUID(str(route_id)),
+    )
+    if (
+        route is None
+        or route["job_id"] != row["id"]
+        or route["project_id"] != row["project_id"]
+        or not route["blocking"]
+        or route["state"] not in {"user_direct", "pending_both", "escalated_to_user"}
+    ):
+        return False
     for key in ("context", "config_override", "freeze_data", "workspace_idle_episode"):
         if isinstance(row[key], str):
             row[key] = json.loads(row[key])

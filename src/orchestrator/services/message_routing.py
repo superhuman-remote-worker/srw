@@ -770,6 +770,8 @@ async def escalate_route(
     reason: str,
     actor_kind: str,
     actor_id: Optional[str] = None,
+    officer_thread_id: Optional[str] = None,
+    officer_incarnation: Optional[int] = None,
     officer_context: Optional[str] = None,
     expected_states: Optional[tuple] = None,
     notifier: Any = None,
@@ -781,6 +783,11 @@ async def escalate_route(
     ``{"escalated": bool, "delivered": bool}``. Never raises.
     """
     try:
+        officer_source = {}
+        if officer_thread_id is not None:
+            officer_source["officer_thread_id"] = officer_thread_id
+        if officer_incarnation is not None:
+            officer_source["officer_incarnation"] = officer_incarnation
         updated = await db.transition_message_route(
             str(route["route_id"]),
             to_state="escalated_to_user",
@@ -790,6 +797,7 @@ async def escalate_route(
             actor_kind=actor_kind,
             actor_id=actor_id,
             note=reason,
+            **officer_source,
         )
     except Exception:
         logger.exception(

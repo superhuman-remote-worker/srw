@@ -212,6 +212,8 @@ async def officer_escalate_worker_message(
         reason="officer_escalated",
         actor_kind="officer",
         actor_id=str(officer["id"]),
+        officer_thread_id=str(officer["id"]),
+        officer_incarnation=incarnation,
         officer_context=body.context,
         expected_states=("pending_officer", "pending_both"),
         notifier=dependencies.notifier,
