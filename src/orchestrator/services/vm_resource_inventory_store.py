@@ -144,12 +144,15 @@ class VMResourceInventoryStore:
                     snapshot_id,
                     started,
                 )
-                # D3 must preserve referenced snapshots when reservations are
-                # introduced. Today only the current pointer references history.
+                # Referenced evidence is additional to the bounded unreferenced
+                # receipt window. Never lock a reservation from publication;
+                # admission holds this inventory head before adding a reference.
                 await conn.execute(
                     "DELETE FROM vm_resource_inventory_snapshots WHERE snapshot_id IN ("
-                    "SELECT snapshot_id FROM vm_resource_inventory_snapshots "
-                    "WHERE cluster_id=$1 AND policy_digest=$2 ORDER BY started_at DESC OFFSET $3)",
+                    "SELECT s.snapshot_id FROM vm_resource_inventory_snapshots s "
+                    "WHERE s.cluster_id=$1 AND s.policy_digest=$2 AND NOT EXISTS ("
+                    "SELECT 1 FROM vm_resource_reservations r WHERE r.snapshot_id=s.snapshot_id) "
+                    "ORDER BY s.started_at DESC OFFSET $3)",
                     self.cluster_id,
                     self.policy_digest,
                     self.history_limit,

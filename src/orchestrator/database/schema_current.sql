@@ -7541,6 +7541,111 @@ $$;
 
 
 --
+-- Name: guard_vm_resource_reservation(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.guard_vm_resource_reservation() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    IF TG_OP='DELETE' THEN
+        IF OLD.state<>'released' THEN
+            RAISE EXCEPTION 'Held VM resource reservation cannot be deleted' USING ERRCODE='23514';
+        END IF;
+        RETURN OLD;
+    END IF;
+    IF TG_OP='INSERT' THEN
+        -- Scope is covered by the existing composite FK. Digest is immutable
+        -- on the retained parent, so no extra parent-table index is necessary.
+        IF NOT EXISTS (SELECT 1 FROM public.vm_resource_inventory_snapshots s
+            WHERE s.snapshot_id=NEW.snapshot_id AND s.digest=NEW.snapshot_digest) THEN
+            RAISE EXCEPTION 'VM resource snapshot identity mismatch' USING ERRCODE='23503';
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM public.vm_resource_waiters w
+            WHERE w.request_id=NEW.request_id AND w.cpu_millicores=NEW.cpu_millicores
+            AND w.memory_bytes=NEW.memory_bytes AND w.kvm_devices=NEW.kvm_devices)
+            OR NEW.state<>'reserved' THEN
+            RAISE EXCEPTION 'VM resource reservation must preserve initial demand' USING ERRCODE='23514';
+        END IF;
+        RETURN NEW;
+    END IF;
+    IF ROW(NEW.id,NEW.request_id,NEW.revision,NEW.cluster_id,NEW.policy_digest,NEW.node_uid,NEW.node_name,
+           NEW.cpu_millicores,NEW.memory_bytes,NEW.kvm_devices,NEW.snapshot_id,NEW.snapshot_digest,NEW.created_at)
+       IS DISTINCT FROM
+       ROW(OLD.id,OLD.request_id,OLD.revision,OLD.cluster_id,OLD.policy_digest,OLD.node_uid,OLD.node_name,
+           OLD.cpu_millicores,OLD.memory_bytes,OLD.kvm_devices,OLD.snapshot_id,OLD.snapshot_digest,OLD.created_at)
+       OR (OLD.vm_uid IS NOT NULL AND NEW.vm_uid IS DISTINCT FROM OLD.vm_uid)
+       OR (OLD.vmi_uid IS NOT NULL AND NEW.vmi_uid IS DISTINCT FROM OLD.vmi_uid)
+       OR (OLD.launcher_uid IS NOT NULL AND NEW.launcher_uid IS DISTINCT FROM OLD.launcher_uid)
+       OR (OLD.state='released' AND NEW IS DISTINCT FROM OLD) THEN
+        RAISE EXCEPTION 'VM resource reservation identity is immutable' USING ERRCODE='23514';
+    END IF;
+    IF NEW.state <> OLD.state AND NOT (
+        (OLD.state='reserved' AND NEW.state IN ('active','teardown','released')) OR
+        (OLD.state='active' AND NEW.state IN ('warm','teardown')) OR
+        (OLD.state='warm' AND NEW.state IN ('active','teardown')) OR
+        (OLD.state='teardown' AND NEW.state='released')
+    ) THEN
+        RAISE EXCEPTION 'Invalid VM resource reservation transition' USING ERRCODE='23514';
+    END IF;
+    IF NEW.state='released' AND (
+        (NEW.release_evidence->>'kind') IS NULL OR
+        NEW.release_evidence->>'kind' NOT IN ('never_vm_issued','exact_compute_absent') OR
+        (NEW.release_evidence->>'kind'='never_vm_issued' AND NEW.vm_uid IS NOT NULL) OR
+        (OLD.state='reserved' AND NEW.release_evidence->>'kind'<>'never_vm_issued')
+    ) THEN
+        RAISE EXCEPTION 'VM resource release evidence is required' USING ERRCODE='23514';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: guard_vm_resource_waiter(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.guard_vm_resource_waiter() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    IF TG_OP='INSERT' THEN
+        -- The parent fields are already immutable. Its existing PK/FK retains
+        -- identity; this comparison avoids a blocking duplicate UNIQUE index.
+        IF NOT EXISTS (SELECT 1 FROM public.vm_creation_retries r
+            WHERE r.request_id=NEW.request_id AND r.job_id=NEW.job_id
+            AND r.provision_generation=NEW.provision_generation AND r.request_digest=NEW.request_digest) THEN
+            RAISE EXCEPTION 'VM resource waiter source identity mismatch' USING ERRCODE='23503';
+        END IF;
+        IF NEW.state<>'waiting' OR NEW.bypasses<>0 OR NEW.protected_order IS NOT NULL THEN
+            RAISE EXCEPTION 'VM resource waiter must start waiting' USING ERRCODE='23514';
+        END IF;
+        RETURN NEW;
+    END IF;
+    IF ROW(NEW.request_id,NEW.job_id,NEW.provision_generation,NEW.cluster_id,NEW.policy_digest,
+           NEW.owner_key,NEW.project_id,NEW.priority,NEW.request_digest,NEW.guest_vcpus,
+           NEW.guest_memory_bytes,NEW.cpu_millicores,NEW.memory_bytes,NEW.kvm_devices,NEW.placement,NEW.enqueued_at)
+       IS DISTINCT FROM
+       ROW(OLD.request_id,OLD.job_id,OLD.provision_generation,OLD.cluster_id,OLD.policy_digest,
+           OLD.owner_key,OLD.project_id,OLD.priority,OLD.request_digest,OLD.guest_vcpus,
+           OLD.guest_memory_bytes,OLD.cpu_millicores,OLD.memory_bytes,OLD.kvm_devices,OLD.placement,OLD.enqueued_at)
+       OR NEW.revision < OLD.revision OR NEW.bypasses < OLD.bypasses
+       OR (OLD.protected_order IS NOT NULL AND NEW.protected_order IS DISTINCT FROM OLD.protected_order) THEN
+        RAISE EXCEPTION 'VM resource waiter identity is immutable' USING ERRCODE='23514';
+    END IF;
+    IF NEW.state <> OLD.state AND NOT (
+        (OLD.state='waiting' AND NEW.state IN ('nonfit','admitted','cancelled')) OR
+        (OLD.state='nonfit' AND NEW.state IN ('waiting','cancelled')) OR
+        (OLD.state='admitted' AND NEW.state='released')
+    ) THEN
+        RAISE EXCEPTION 'Invalid VM resource waiter transition' USING ERRCODE='23514';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
 -- Name: lock_inventory_epoch_boundary_statement(); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -21080,6 +21185,32 @@ COMMENT ON TABLE public.vm_remote_operation_protocol_gate IS 'Default-dark, mono
 
 
 --
+-- Name: vm_resource_admission_policy; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.vm_resource_admission_policy (
+    cluster_id text NOT NULL,
+    namespace text NOT NULL,
+    policy_digest text NOT NULL,
+    document jsonb NOT NULL,
+    mode text DEFAULT 'off'::text NOT NULL,
+    revision bigint DEFAULT 1 NOT NULL,
+    admission_sequence bigint DEFAULT 0 NOT NULL,
+    maintenance_enqueued_at timestamp with time zone,
+    maintenance_request_id uuid,
+    created_at timestamp with time zone DEFAULT clock_timestamp() NOT NULL,
+    CONSTRAINT vm_resource_admission_policy_admission_sequence_check CHECK ((admission_sequence >= 0)),
+    CONSTRAINT vm_resource_admission_policy_check CHECK (((maintenance_enqueued_at IS NULL) = (maintenance_request_id IS NULL))),
+    CONSTRAINT vm_resource_admission_policy_cluster_id_check CHECK (((length(cluster_id) >= 1) AND (length(cluster_id) <= 253))),
+    CONSTRAINT vm_resource_admission_policy_document_check CHECK ((jsonb_typeof(document) = 'object'::text)),
+    CONSTRAINT vm_resource_admission_policy_mode_check CHECK ((mode = ANY (ARRAY['off'::text, 'shadow'::text, 'enforce'::text, 'drain'::text]))),
+    CONSTRAINT vm_resource_admission_policy_namespace_check CHECK (((length(namespace) >= 1) AND (length(namespace) <= 63))),
+    CONSTRAINT vm_resource_admission_policy_policy_digest_check CHECK ((policy_digest ~ '^sha256:[0-9a-f]{64}$'::text)),
+    CONSTRAINT vm_resource_admission_policy_revision_check CHECK ((revision > 0))
+);
+
+
+--
 -- Name: vm_resource_inventory_heads; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -21119,6 +21250,114 @@ CREATE TABLE public.vm_resource_inventory_snapshots (
     CONSTRAINT vm_resource_inventory_snapshots_digest_check CHECK ((digest ~ '^sha256:[0-9a-f]{64}$'::text)),
     CONSTRAINT vm_resource_inventory_snapshots_document_check CHECK ((jsonb_typeof(document) = 'object'::text)),
     CONSTRAINT vm_resource_inventory_snapshots_sequence_check CHECK ((sequence > 0))
+);
+
+
+--
+-- Name: vm_resource_nodes; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.vm_resource_nodes (
+    cluster_id text NOT NULL,
+    node_uid uuid NOT NULL,
+    node_name text NOT NULL,
+    created_at timestamp with time zone DEFAULT clock_timestamp() NOT NULL,
+    CONSTRAINT vm_resource_nodes_node_name_check CHECK (((length(node_name) >= 1) AND (length(node_name) <= 253)))
+);
+
+
+--
+-- Name: vm_resource_owner_fairness; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.vm_resource_owner_fairness (
+    cluster_id text NOT NULL,
+    owner_key text NOT NULL,
+    last_admitted_sequence bigint DEFAULT 0 NOT NULL,
+    CONSTRAINT vm_resource_owner_fairness_last_admitted_sequence_check CHECK ((last_admitted_sequence >= 0)),
+    CONSTRAINT vm_resource_owner_fairness_owner_key_check CHECK (((length(owner_key) >= 1) AND (length(owner_key) <= 253)))
+);
+
+
+--
+-- Name: vm_resource_reservations; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.vm_resource_reservations (
+    id uuid NOT NULL,
+    request_id uuid NOT NULL,
+    revision bigint NOT NULL,
+    cluster_id text NOT NULL,
+    policy_digest text NOT NULL,
+    node_uid uuid NOT NULL,
+    node_name text NOT NULL,
+    cpu_millicores bigint NOT NULL,
+    memory_bytes bigint NOT NULL,
+    kvm_devices bigint NOT NULL,
+    snapshot_id uuid NOT NULL,
+    snapshot_digest text NOT NULL,
+    state text DEFAULT 'reserved'::text NOT NULL,
+    vm_uid uuid,
+    vmi_uid uuid,
+    launcher_uid uuid,
+    created_at timestamp with time zone DEFAULT clock_timestamp() NOT NULL,
+    released_at timestamp with time zone,
+    release_evidence jsonb,
+    CONSTRAINT vm_resource_reservations_check CHECK (((state = 'released'::text) = ((released_at IS NOT NULL) AND (release_evidence IS NOT NULL)))),
+    CONSTRAINT vm_resource_reservations_check1 CHECK (((state = 'released'::text) OR ((released_at IS NULL) AND (release_evidence IS NULL)))),
+    CONSTRAINT vm_resource_reservations_check2 CHECK (((state <> ALL (ARRAY['active'::text, 'warm'::text])) OR ((vm_uid IS NOT NULL) AND (vmi_uid IS NOT NULL) AND (launcher_uid IS NOT NULL)))),
+    CONSTRAINT vm_resource_reservations_cpu_millicores_check CHECK ((cpu_millicores > 0)),
+    CONSTRAINT vm_resource_reservations_kvm_devices_check CHECK ((kvm_devices > 0)),
+    CONSTRAINT vm_resource_reservations_memory_bytes_check CHECK ((memory_bytes > 0)),
+    CONSTRAINT vm_resource_reservations_policy_digest_check CHECK ((policy_digest ~ '^sha256:[0-9a-f]{64}$'::text)),
+    CONSTRAINT vm_resource_reservations_release_evidence_check CHECK ((jsonb_typeof(release_evidence) = 'object'::text)),
+    CONSTRAINT vm_resource_reservations_revision_check CHECK ((revision > 0)),
+    CONSTRAINT vm_resource_reservations_snapshot_digest_check CHECK ((snapshot_digest ~ '^sha256:[0-9a-f]{64}$'::text)),
+    CONSTRAINT vm_resource_reservations_state_check CHECK ((state = ANY (ARRAY['reserved'::text, 'active'::text, 'warm'::text, 'teardown'::text, 'released'::text])))
+);
+
+
+--
+-- Name: vm_resource_waiters; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.vm_resource_waiters (
+    request_id uuid NOT NULL,
+    job_id uuid NOT NULL,
+    provision_generation uuid NOT NULL,
+    cluster_id text NOT NULL,
+    policy_digest text NOT NULL,
+    owner_key text NOT NULL,
+    project_id uuid,
+    priority integer NOT NULL,
+    request_digest text NOT NULL,
+    guest_vcpus bigint NOT NULL,
+    guest_memory_bytes bigint NOT NULL,
+    cpu_millicores bigint NOT NULL,
+    memory_bytes bigint NOT NULL,
+    kvm_devices bigint NOT NULL,
+    placement jsonb NOT NULL,
+    state text DEFAULT 'waiting'::text NOT NULL,
+    reason text,
+    bypasses bigint DEFAULT 0 NOT NULL,
+    protected_order bigint,
+    revision bigint DEFAULT 1 NOT NULL,
+    evaluated_snapshot_id uuid,
+    enqueued_at timestamp with time zone DEFAULT clock_timestamp() NOT NULL,
+    CONSTRAINT vm_resource_waiters_bypasses_check CHECK ((bypasses >= 0)),
+    CONSTRAINT vm_resource_waiters_cpu_millicores_check CHECK ((cpu_millicores > 0)),
+    CONSTRAINT vm_resource_waiters_guest_memory_bytes_check CHECK ((guest_memory_bytes > 0)),
+    CONSTRAINT vm_resource_waiters_guest_vcpus_check CHECK ((guest_vcpus > 0)),
+    CONSTRAINT vm_resource_waiters_kvm_devices_check CHECK ((kvm_devices > 0)),
+    CONSTRAINT vm_resource_waiters_memory_bytes_check CHECK ((memory_bytes > 0)),
+    CONSTRAINT vm_resource_waiters_owner_key_check CHECK (((length(owner_key) >= 1) AND (length(owner_key) <= 253))),
+    CONSTRAINT vm_resource_waiters_placement_check CHECK ((jsonb_typeof(placement) = 'object'::text)),
+    CONSTRAINT vm_resource_waiters_policy_digest_check CHECK ((policy_digest ~ '^sha256:[0-9a-f]{64}$'::text)),
+    CONSTRAINT vm_resource_waiters_protected_order_check CHECK ((protected_order >= 0)),
+    CONSTRAINT vm_resource_waiters_reason_check CHECK ((length(reason) <= 80)),
+    CONSTRAINT vm_resource_waiters_request_digest_check CHECK ((request_digest ~ '^sha256:[0-9a-f]{64}$'::text)),
+    CONSTRAINT vm_resource_waiters_revision_check CHECK ((revision > 0)),
+    CONSTRAINT vm_resource_waiters_state_check CHECK ((state = ANY (ARRAY['waiting'::text, 'nonfit'::text, 'admitted'::text, 'cancelled'::text, 'released'::text])))
 );
 
 
@@ -23663,6 +23902,14 @@ ALTER TABLE ONLY public.vm_remote_operation_protocol_gate
 
 
 --
+-- Name: vm_resource_admission_policy vm_resource_admission_policy_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_resource_admission_policy
+    ADD CONSTRAINT vm_resource_admission_policy_pkey PRIMARY KEY (cluster_id);
+
+
+--
 -- Name: vm_resource_inventory_heads vm_resource_inventory_heads_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -23684,6 +23931,62 @@ ALTER TABLE ONLY public.vm_resource_inventory_snapshots
 
 ALTER TABLE ONLY public.vm_resource_inventory_snapshots
     ADD CONSTRAINT vm_resource_inventory_snapshots_pkey PRIMARY KEY (snapshot_id);
+
+
+--
+-- Name: vm_resource_nodes vm_resource_nodes_cluster_id_node_uid_node_name_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_resource_nodes
+    ADD CONSTRAINT vm_resource_nodes_cluster_id_node_uid_node_name_key UNIQUE (cluster_id, node_uid, node_name);
+
+
+--
+-- Name: vm_resource_nodes vm_resource_nodes_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_resource_nodes
+    ADD CONSTRAINT vm_resource_nodes_pkey PRIMARY KEY (cluster_id, node_uid);
+
+
+--
+-- Name: vm_resource_owner_fairness vm_resource_owner_fairness_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_resource_owner_fairness
+    ADD CONSTRAINT vm_resource_owner_fairness_pkey PRIMARY KEY (cluster_id, owner_key);
+
+
+--
+-- Name: vm_resource_reservations vm_resource_reservations_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_resource_reservations
+    ADD CONSTRAINT vm_resource_reservations_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: vm_resource_reservations vm_resource_reservations_request_id_revision_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_resource_reservations
+    ADD CONSTRAINT vm_resource_reservations_request_id_revision_key UNIQUE (request_id, revision);
+
+
+--
+-- Name: vm_resource_waiters vm_resource_waiters_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_resource_waiters
+    ADD CONSTRAINT vm_resource_waiters_pkey PRIMARY KEY (request_id);
+
+
+--
+-- Name: vm_resource_waiters vm_resource_waiters_request_id_cluster_id_policy_digest_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_resource_waiters
+    ADD CONSTRAINT vm_resource_waiters_request_id_cluster_id_policy_digest_key UNIQUE (request_id, cluster_id, policy_digest);
 
 
 --
@@ -25863,10 +26166,66 @@ CREATE UNIQUE INDEX vm_remote_operation_one_active_owner ON public.vm_remote_ope
 
 
 --
+-- Name: vm_resource_held_node; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX vm_resource_held_node ON public.vm_resource_reservations USING btree (cluster_id, node_uid) WHERE (state <> 'released'::text);
+
+
+--
 -- Name: vm_resource_inventory_history_idx; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE INDEX vm_resource_inventory_history_idx ON public.vm_resource_inventory_snapshots USING btree (cluster_id, policy_digest, started_at DESC);
+
+
+--
+-- Name: vm_resource_one_held_launcher; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX vm_resource_one_held_launcher ON public.vm_resource_reservations USING btree (cluster_id, launcher_uid) WHERE ((state <> 'released'::text) AND (launcher_uid IS NOT NULL));
+
+
+--
+-- Name: vm_resource_one_held_request; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX vm_resource_one_held_request ON public.vm_resource_reservations USING btree (request_id) WHERE (state <> 'released'::text);
+
+
+--
+-- Name: vm_resource_one_held_vm; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX vm_resource_one_held_vm ON public.vm_resource_reservations USING btree (cluster_id, vm_uid) WHERE ((state <> 'released'::text) AND (vm_uid IS NOT NULL));
+
+
+--
+-- Name: vm_resource_one_held_vmi; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX vm_resource_one_held_vmi ON public.vm_resource_reservations USING btree (cluster_id, vmi_uid) WHERE ((state <> 'released'::text) AND (vmi_uid IS NOT NULL));
+
+
+--
+-- Name: vm_resource_snapshot_references; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX vm_resource_snapshot_references ON public.vm_resource_reservations USING btree (snapshot_id);
+
+
+--
+-- Name: vm_resource_waiter_heads; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX vm_resource_waiter_heads ON public.vm_resource_waiters USING btree (cluster_id, state, owner_key, enqueued_at, request_id);
+
+
+--
+-- Name: vm_resource_waiter_maintenance; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX vm_resource_waiter_maintenance ON public.vm_resource_waiters USING btree (cluster_id, enqueued_at, request_id);
 
 
 --
@@ -26098,6 +26457,20 @@ CREATE TRIGGER compute_shadow_observations_immutable BEFORE INSERT OR DELETE OR 
 --
 
 CREATE TRIGGER datasource_project_policy_change AFTER INSERT OR DELETE OR UPDATE ON public.project_datasources FOR EACH ROW EXECUTE FUNCTION public.reconcile_datasource_project_policy_change();
+
+
+--
+-- Name: vm_resource_reservations guard_vm_resource_reservation; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER guard_vm_resource_reservation BEFORE INSERT OR DELETE OR UPDATE ON public.vm_resource_reservations FOR EACH ROW EXECUTE FUNCTION public.guard_vm_resource_reservation();
+
+
+--
+-- Name: vm_resource_waiters guard_vm_resource_waiter; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER guard_vm_resource_waiter BEFORE INSERT OR UPDATE ON public.vm_resource_waiters FOR EACH ROW EXECUTE FUNCTION public.guard_vm_resource_waiter();
 
 
 --
@@ -29103,6 +29476,62 @@ ALTER TABLE ONLY public.vm_resource_inventory_heads
 
 ALTER TABLE ONLY public.vm_resource_inventory_snapshots
     ADD CONSTRAINT vm_resource_inventory_snapshots_cluster_id_policy_digest_fkey FOREIGN KEY (cluster_id, policy_digest) REFERENCES public.vm_resource_inventory_heads(cluster_id, policy_digest);
+
+
+--
+-- Name: vm_resource_nodes vm_resource_nodes_cluster_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_resource_nodes
+    ADD CONSTRAINT vm_resource_nodes_cluster_id_fkey FOREIGN KEY (cluster_id) REFERENCES public.vm_resource_admission_policy(cluster_id);
+
+
+--
+-- Name: vm_resource_owner_fairness vm_resource_owner_fairness_cluster_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_resource_owner_fairness
+    ADD CONSTRAINT vm_resource_owner_fairness_cluster_id_fkey FOREIGN KEY (cluster_id) REFERENCES public.vm_resource_admission_policy(cluster_id);
+
+
+--
+-- Name: vm_resource_reservations vm_resource_reservations_cluster_id_node_uid_node_name_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_resource_reservations
+    ADD CONSTRAINT vm_resource_reservations_cluster_id_node_uid_node_name_fkey FOREIGN KEY (cluster_id, node_uid, node_name) REFERENCES public.vm_resource_nodes(cluster_id, node_uid, node_name);
+
+
+--
+-- Name: vm_resource_reservations vm_resource_reservations_request_id_cluster_id_policy_dige_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_resource_reservations
+    ADD CONSTRAINT vm_resource_reservations_request_id_cluster_id_policy_dige_fkey FOREIGN KEY (request_id, cluster_id, policy_digest) REFERENCES public.vm_resource_waiters(request_id, cluster_id, policy_digest);
+
+
+--
+-- Name: vm_resource_reservations vm_resource_reservations_snapshot_id_cluster_id_policy_dig_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_resource_reservations
+    ADD CONSTRAINT vm_resource_reservations_snapshot_id_cluster_id_policy_dig_fkey FOREIGN KEY (snapshot_id, cluster_id, policy_digest) REFERENCES public.vm_resource_inventory_snapshots(snapshot_id, cluster_id, policy_digest);
+
+
+--
+-- Name: vm_resource_waiters vm_resource_waiters_cluster_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_resource_waiters
+    ADD CONSTRAINT vm_resource_waiters_cluster_id_fkey FOREIGN KEY (cluster_id) REFERENCES public.vm_resource_admission_policy(cluster_id);
+
+
+--
+-- Name: vm_resource_waiters vm_resource_waiters_request_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_resource_waiters
+    ADD CONSTRAINT vm_resource_waiters_request_id_fkey FOREIGN KEY (request_id) REFERENCES public.vm_creation_retries(request_id);
 
 
 --
