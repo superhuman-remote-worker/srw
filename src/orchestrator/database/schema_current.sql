@@ -7498,12 +7498,22 @@ BEGIN
         RAISE EXCEPTION 'VM creation retry identity is immutable' USING ERRCODE='23514';
     END IF;
     IF NEW.state <> OLD.state AND NOT (
-        (OLD.state='queued' AND NEW.state IN ('reconciling','cancel_requested')) OR
+        (OLD.state='queued' AND NEW.state IN ('reconciling','cancel_requested','succeeded')) OR
         (OLD.state='reconciling' AND NEW.state IN ('queued','attention','succeeded','cancel_requested')) OR
-        (OLD.state='attention' AND NEW.state IN ('queued','cancel_requested')) OR
+        (OLD.state='attention' AND NEW.state IN ('queued','cancel_requested','succeeded')) OR
         (OLD.state='cancel_requested' AND NEW.state='settled')
     ) THEN
         RAISE EXCEPTION 'Invalid VM creation retry transition' USING ERRCODE='23514';
+    END IF;
+    IF NEW.state='succeeded' AND OLD.state IN ('queued','attention') AND NOT (
+        NEW.boot_counted AND NEW.reason='creation_adopted' AND EXISTS (
+            SELECT 1 FROM vm_creation_effects e
+            WHERE e.request_id=NEW.request_id AND e.effect_kind='vm' AND e.state='observed'
+              AND e.evidence->>'uid'=NEW.observed_vm_uid::text
+              AND e.evidence->>'pvc_uid'=NEW.observed_pvc_uid::text
+        )
+    ) THEN
+        RAISE EXCEPTION 'Late VM adoption requires observed issuance' USING ERRCODE='23514';
     END IF;
     RETURN NEW;
 END;

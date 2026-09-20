@@ -718,3 +718,218 @@ async def test_nonpersistent_controller_configuration_cannot_grant_staged_creati
             claim_token=str(claim["claim_token"]),
             carrier=carrier,
         )
+
+
+async def observed_creation(db, monkeypatch, *, timeout=3600):
+    from shared.vm_creation_issuance import (
+        verify_creation_carrier,
+        EFFECT_NONCE_ANNOTATION,
+        REQUEST_ANNOTATION,
+    )
+
+    store, row, claim, carrier = await reserved(db, monkeypatch, timeout=timeout)
+    observations = {}
+    original = verify_creation_carrier(carrier, secret=SECRET)
+    for kind in ("rootdisk", "cloud_init", "vm"):
+        if kind != "rootdisk":
+            values = {
+                **original,
+                "effect_kind": kind,
+                "effect_nonce": str(uuid4()),
+                "object_name": f"agent-vm-{row['job_id']}"
+                + ("-cloudinit" if kind == "cloud_init" else ""),
+                "current_dv_uid": observations["rootdisk"]["object"]["metadata"]["uid"],
+                "current_pvc_uid": observations["rootdisk"]["pvc"]["metadata"]["uid"],
+                "current_secret_uid": observations["cloud_init"]["object"]["metadata"][
+                    "uid"
+                ]
+                if kind == "vm"
+                else None,
+            }
+            carrier = seal_creation_carrier(
+                values,
+                namespace="agent-vms",
+                uid=carrier["metadata"]["uid"],
+                resource_version="3",
+                secret=SECRET,
+            )
+        else:
+            values = original
+        await store.begin_effect(
+            request_id=str(row["request_id"]),
+            claim_token=str(claim["claim_token"]),
+            carrier=carrier,
+        )
+        if kind == "rootdisk":
+            observation = disk_observation(carrier)
+        else:
+            observation = {
+                "outcome": "observed",
+                "object": {
+                    "apiVersion": "v1" if kind == "cloud_init" else "kubevirt.io/v1",
+                    "kind": "Secret" if kind == "cloud_init" else "VirtualMachine",
+                    "metadata": {
+                        "uid": str(uuid4()),
+                        "name": values["object_name"],
+                        "namespace": "agent-vms",
+                        "labels": {
+                            "srw.io/owner-kind": "job",
+                            "srw.io/owner-id": str(row["job_id"]),
+                        },
+                        "annotations": {
+                            EFFECT_NONCE_ANNOTATION: values["effect_nonce"],
+                            REQUEST_ANNOTATION: str(row["request_id"]),
+                            "srw.io/provision-generation": str(
+                                row["provision_generation"]
+                            ),
+                            "srw.io/ssh-host-key-fingerprint": "SHA256:" + "A" * 43,
+                        },
+                    },
+                    "spec": {
+                        "template": {
+                            "spec": {
+                                "volumes": [
+                                    {
+                                        "name": "rootdisk",
+                                        "dataVolume": {"name": original["object_name"]},
+                                    },
+                                    {
+                                        "name": "cloud-init",
+                                        "cloudInitNoCloud": {
+                                            "secretRef": {
+                                                "name": f"agent-vm-{row['job_id']}-cloudinit"
+                                            }
+                                        },
+                                    },
+                                ]
+                            }
+                        }
+                    },
+                },
+            }
+        await store.observe_effect(
+            request_id=str(row["request_id"]), carrier=carrier, observation=observation
+        )
+        observations[kind] = observation
+    return store, row, carrier, observations
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancelled", [False, True])
+async def test_exact_adoption_settles_same_permit_once_and_preserves_worker_hold(
+    db, monkeypatch, cancelled
+):
+    import json
+
+    store, row, carrier, observations = await observed_creation(db, monkeypatch)
+    if cancelled:
+        async with db.acquire() as conn:
+            await conn.execute(
+                "UPDATE jobs SET status='cancelled' WHERE id=$1", row["job_id"]
+            )
+    result = await store.settle_adopted(
+        request_id=str(row["request_id"]), carrier=carrier, observations=observations
+    )
+    assert result["settled"] is True
+    assert (
+        await store.settle_adopted(
+            request_id=str(row["request_id"]),
+            carrier=carrier,
+            observations=observations,
+        )
+        == result
+    )
+    async with db.acquire() as conn:
+        retry = await conn.fetchrow(
+            "SELECT * FROM vm_creation_retries WHERE request_id=$1", row["request_id"]
+        )
+        job = await conn.fetchrow("SELECT * FROM jobs WHERE id=$1", row["job_id"])
+        permit = await conn.fetchrow(
+            "SELECT * FROM vm_workspace_cleanup_admissions WHERE id=$1",
+            retry["creation_admission_id"],
+        )
+    context = json.loads(job["context"])
+    assert retry["boot_counted"] is True
+    assert retry["ready_at"] is None
+    assert retry["state"] == ("settled" if cancelled else "succeeded")
+    assert permit["outcome"] == "adopted" and permit["completed_at"] is not None
+    assert context["_vm_creation_pending"] == str(row["request_id"])
+    assert context["vm"]["vm_uid"] == observations["vm"]["object"]["metadata"]["uid"]
+    assert context["vm"]["provision_attempts"] == 1
+    if cancelled:
+        assert job["status"] == "cancelled"
+
+
+@pytest.mark.asyncio
+async def test_adoption_refuses_replaced_secret_or_disk_without_releasing_authority(
+    db, monkeypatch
+):
+    from copy import deepcopy
+
+    store, row, carrier, observations = await observed_creation(db, monkeypatch)
+    for kind in ("rootdisk", "cloud_init", "vm"):
+        changed = deepcopy(observations)
+        changed[kind]["object"]["metadata"]["uid"] = str(uuid4())
+        with pytest.raises((ValueError, VMCreationRetryConflict)):
+            await store.settle_adopted(
+                request_id=str(row["request_id"]), carrier=carrier, observations=changed
+            )
+    async with db.acquire() as conn:
+        assert await conn.fetchval(
+            "SELECT completed_at IS NULL FROM vm_workspace_cleanup_admissions WHERE id=(SELECT creation_admission_id FROM vm_creation_retries WHERE request_id=$1)",
+            row["request_id"],
+        )
+
+
+@pytest.mark.asyncio
+async def test_source_inspection_is_public_observation_only(db, monkeypatch):
+    store, row, carrier, observations = await observed_creation(db, monkeypatch)
+    result = await store.inspect(request_id=str(row["request_id"]))
+    assert result["request"] == row["canonical_request"]
+    assert len(result["effects"]) == 3
+    assert result["creation_carrier_uid"] == carrier["metadata"]["uid"]
+    assert "claim_token" not in result
+    assert "actuation_allowed" not in result
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state", ["queued", "attention"])
+async def test_late_adoption_from_wait_needs_no_live_claim(db, monkeypatch, state):
+    store, row, carrier, observations = await observed_creation(db, monkeypatch)
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE vm_creation_retries SET state=$2,claim_token=NULL,claim_expires_at=NULL WHERE request_id=$1",
+            row["request_id"],
+            state,
+        )
+    assert (
+        await store.settle_adopted(
+            request_id=str(row["request_id"]),
+            carrier=carrier,
+            observations=observations,
+        )
+    )["settled"]
+
+
+@pytest.mark.asyncio
+async def test_accepted_vm_can_be_adopted_after_immutable_deadline(db, monkeypatch):
+    store, row, carrier, observations = await observed_creation(
+        db, monkeypatch, timeout=2
+    )
+    async with db.acquire() as conn:
+        await conn.execute(
+            "SELECT pg_sleep(GREATEST(0,extract(epoch FROM (admission_deadline-clock_timestamp())))+0.05) FROM vm_creation_retries WHERE request_id=$1",
+            row["request_id"],
+        )
+    assert (
+        await store.settle_adopted(
+            request_id=str(row["request_id"]),
+            carrier=carrier,
+            observations=observations,
+        )
+    )["settled"]
+    async with db.acquire() as conn:
+        assert await conn.fetchval(
+            "SELECT ready_at IS NULL AND admission_deadline<clock_timestamp() FROM vm_creation_retries WHERE request_id=$1",
+            row["request_id"],
+        )

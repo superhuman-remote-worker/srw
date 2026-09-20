@@ -97,3 +97,13 @@ async def settle_never_issued(request: Request) -> JSONResponse:
     return await _dispatch(
         request, "creation_retry_settle_never_issued", "settle_never_issued"
     )
+
+
+@router.post("/inspect")
+async def inspect(request: Request) -> JSONResponse:
+    return await _dispatch(request, "creation_retry_inspect", "inspect")
+
+
+@router.post("/settle-adopted")
+async def settle_adopted(request: Request) -> JSONResponse:
+    return await _dispatch(request, "creation_retry_settle_adopted", "settle_adopted")

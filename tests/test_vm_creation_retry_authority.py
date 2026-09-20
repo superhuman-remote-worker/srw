@@ -68,6 +68,8 @@ def test_authorize_is_reservation_only_and_correlated(monkeypatch):
     [
         ("begin-effect", "creation_retry_begin_effect", "begin_effect"),
         ("observe-effect", "creation_retry_observe_effect", "observe_effect"),
+        ("inspect", "creation_retry_inspect", "inspect"),
+        ("settle-adopted", "creation_retry_settle_adopted", "settle_adopted"),
         (
             "settle-never-issued",
             "creation_retry_settle_never_issued",
