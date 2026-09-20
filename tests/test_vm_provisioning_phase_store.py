@@ -382,7 +382,8 @@ async def test_deadline_expiring_during_job_lock_wait_withholds_phase_update(db)
 
 
 @pytest.mark.asyncio
-async def test_real_recovery_admission_wins_against_inflight_phase(db):
+@pytest.mark.parametrize("commit_during_lock_wait", [False, True])
+async def test_real_recovery_admission_wins_against_inflight_phase(db, commit_during_lock_wait):
     from orchestrator.services.vm_workspace_recovery_store import (
         VMWorkspaceRecoveryStore,
     )
@@ -406,15 +407,42 @@ async def test_real_recovery_admission_wins_against_inflight_phase(db):
         )
     store = VMProvisioningPhaseStore(db)
     token = await store.capture(str(job), generation)
-    await VMWorkspaceRecoveryStore(db).admit_hold(**kwargs)
     reply = status(
         str(job),
         generation,
         vm_uid=str(kwargs["vm_uid"]),
         rootdisk_pvc_uid=str(kwargs["root_pvc_uid"]),
     )
-    assert await store.apply_status(token, reply) == "held"
+    if commit_during_lock_wait:
+        async with db.acquire() as blocking:
+            async with blocking.transaction():
+                await VMWorkspaceRecoveryStore(db).admit_hold(**kwargs, _conn=blocking)
+                pending = asyncio.create_task(store.apply_status(token, reply))
+                await asyncio.sleep(0.2)
+                assert not pending.done()
+        assert await pending == "held"
+    else:
+        await VMWorkspaceRecoveryStore(db).admit_hold(**kwargs)
+        assert await store.apply_status(token, reply) == "held"
     assert "provisioning" not in await vm_context(db, str(job))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("malformed", ["not-json", []])
+@pytest.mark.parametrize("path", ["workspace_storage", "creation_request", "creation_request.request", "creation_request.request.workspace_storage"])
+async def test_malformed_nested_authority_cannot_admit_first_identity(db, malformed, path):
+    fields = {}
+    target = fields
+    names = path.split(".")
+    for key in names[:-1]:
+        target[key] = {}
+        target = target[key]
+    target[names[-1]] = malformed
+    job, generation = await seed(db, vm_fields=fields)
+    store = VMProvisioningPhaseStore(db)
+    result = await store.apply_status(await store.capture(job, generation), status(job, generation))
+    assert result in {"conflict", "held"}
+    assert "vm_uid" not in await vm_context(db, job)
 
 
 @pytest.mark.asyncio

@@ -23,6 +23,15 @@ def _object(value) -> dict:
     return dict(value) if isinstance(value, Mapping) else {}
 
 
+def _nested_object(value) -> dict:
+    """Optional nested authority must be a JSON object, never encoded JSON."""
+    if value is None:
+        return {}
+    if not isinstance(value, Mapping):
+        raise ValueError("invalid nested VM authority")
+    return dict(value)
+
+
 def _revision(vm: Mapping) -> int | None:
     value = vm.get("provisioning_revision", 0)
     return value if type(value) is int and 0 <= value < 2**63 - 1 else None
@@ -103,11 +112,11 @@ class VMProvisioningPhaseStore:
         for field in ("vm_uid", "rootdisk_pvc_uid", "namespace", "vm_name"):
             if vm.get(field) is not None and vm[field] != status.get(field):
                 return True
-        snapshot = _object(vm.get("creation_request"))
-        request = _object(snapshot.get("request"))
+        snapshot = _nested_object(vm.get("creation_request"))
+        request = _nested_object(snapshot.get("request"))
         for storage in (
-            _object(vm.get("workspace_storage")),
-            _object(request.get("workspace_storage")),
+            _nested_object(vm.get("workspace_storage")),
+            _nested_object(request.get("workspace_storage")),
         ):
             if storage.get("pvc_uid") is not None and storage["pvc_uid"] != pvc_uid:
                 return True
@@ -152,13 +161,25 @@ class VMProvisioningPhaseStore:
                 )
                 if row is None:
                     return "held"
+                # The locking SELECT can wait with a snapshot that predates
+                # recovery admission. Admission also locks this job; a fresh
+                # read after acquiring it sees any hold committed meanwhile.
+                if await conn.fetchval(
+                    "SELECT EXISTS (SELECT 1 FROM vm_workspace_recovery_jobs "
+                    "WHERE job_id=$1 AND resolved_at IS NULL)",
+                    token.job_id,
+                ):
+                    return "held"
                 vm = _object(_object(row["context"]).get("vm"))
                 if _revision(vm) != token.revision:
                     return "stale"
                 if await self.db._completion_resume_blocked_on_conn(conn, token.job_id):
                     return "held"
                 updates = {"provisioning_revision": token.revision + 1}
-                conflict = self._identity_conflict(vm, status, token)
+                try:
+                    conflict = self._identity_conflict(vm, status, token)
+                except ValueError:
+                    conflict = True
                 # The ordinary retained-rootdisk lane has no workspace_storage
                 # field. Its separate A1 authority still pins first PVC binding.
                 expected_pvc = await conn.fetchval(
