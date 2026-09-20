@@ -176,6 +176,7 @@ from orchestrator.routers import system_settings as system_settings_routes  # no
 from orchestrator.routers import (  # noqa: E402
     vm_workspace_cleanup_authority as vm_workspace_cleanup_authority_routes,
     vm_creation_retry_authority as vm_creation_retry_authority_routes,
+    vm_resource_inventory as vm_resource_inventory_routes,
 )
 from orchestrator.routers import capacity as capacity_routes  # noqa: E402
 from orchestrator.routers import (  # noqa: E402
@@ -8653,6 +8654,8 @@ vm_creation_retry_authority_routes.configure(
     store_factory=lambda: VMCreationRetryStore(postgres_db)
 )
 app.include_router(vm_creation_retry_authority_routes.router)
+vm_resource_inventory_routes.configure_from_environment(postgres_db)
+app.include_router(vm_resource_inventory_routes.router)
 app.include_router(capacity_routes.router)
 app.include_router(user_administration_routes.router)
 app.include_router(job_diagnostics_routes.router)

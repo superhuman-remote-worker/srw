@@ -1,7 +1,7 @@
 import asyncio
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 
@@ -15,8 +15,8 @@ from orchestrator.services.vm_resource_inventory_store import VMResourceInventor
 from tests.test_vm_resource_inventory_contract import snapshot
 from tests.test_vm_creation_retry_real_postgres import (
     db as _db_fixture,
-    postgres_db_fixture,
-    pg_dsn,
+    postgres_db_fixture,  # noqa: F401
+    pg_dsn,  # noqa: F401
     _schema_applied,  # noqa: F401
 )
 
@@ -72,6 +72,50 @@ async def test_newer_incomplete_invalidates_complete_and_replay_never_refreshes(
     replay = await publish(store, value)
     assert replay["received_at"] == first["received_at"] and replay["current"] is False
     assert (await store.current())["snapshot"]["snapshot_id"] == failed["snapshot_id"]
+
+
+@pytest.mark.asyncio
+async def test_authenticated_publisher_to_configured_router_persists_exact_receipt(
+    db, monkeypatch
+):
+    import json
+    import httpx
+    from fastapi import FastAPI
+    from orchestrator.routers import vm_resource_inventory as route
+    from shared.vm_resource_inventory_settings import InventorySettings
+    from vm_controller.resource_inventory_runtime import InventoryPublisher
+    from tests.test_vm_resource_inventory_settings import configuration
+
+    policy = configuration()
+    policy["policy"]["stableClusterId"] = "test-" + str(uuid4())
+    secret = "integrated-inventory-secret-at-least-32-bytes"
+    monkeypatch.setenv("VM_RESOURCE_ADMISSION_CONFIG", json.dumps(policy))
+    monkeypatch.setenv("VM_LIFECYCLE_HMAC_SECRET", secret)
+    monkeypatch.setattr(route, "_configuration", None)
+    route.configure_from_environment(db)
+    settings = InventorySettings.from_environment()
+    value = snapshot()
+    value.update(cluster_id=settings.cluster_id, policy_digest=settings.policy_digest)
+    value["started_at"] = value["finished_at"] = (
+        datetime.now(timezone.utc) - timedelta(seconds=2)
+    ).isoformat()
+    app = FastAPI()
+    app.include_router(route.router)
+    async with httpx.AsyncClient(
+        base_url="http://orchestrator", transport=httpx.ASGITransport(app=app)
+    ) as client:
+        publisher = InventoryPublisher(
+            client, secret=secret.encode(), timeout_seconds=3
+        )
+        first = await publisher.publish(value)
+        replay = await publisher.publish(value)
+    assert first == replay
+    row = await db.fetchrow(
+        "SELECT received_at,digest,document FROM vm_resource_inventory_snapshots WHERE snapshot_id=$1",
+        UUID(value["snapshot_id"]),
+    )
+    assert row["received_at"].isoformat() == first["received_at"]
+    assert row["digest"] == first["digest"]
 
 
 @pytest.mark.asyncio

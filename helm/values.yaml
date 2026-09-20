@@ -3482,6 +3482,38 @@ vm:
   # same-cluster mode, by the VM controller.
   lifecycleAuthSecretName: ""
   lifecycleAuthSecretKey: VM_LIFECYCLE_HMAC_SECRET
+  # Observe VM resource occupancy; capacity enforcement is not implemented yet.
+  # Explicit limits and cluster-wide read acknowledgement are required to enable.
+  resourceAdmission:
+    observerEnabled: false
+    shadowEnabled: false
+    enforcementEnabled: false
+    clusterWidePodReadAcknowledged: false
+    stableClusterId: ""
+    inventory:
+      publishIntervalSeconds: null
+      staleAfterSeconds: null
+      maxItems: null
+      maxBytes: null
+      requestTimeoutSeconds: null
+      collectionTimeoutSeconds: null
+      publicationTimeoutSeconds: null
+      historyLimit: null
+      nodeLabelKeys: []
+    hostCost:
+      cpuMillicoresPerVcpuNumerator: null
+      cpuMillicoresPerVcpuDenominator: null
+      launcherCpuOverheadMillicores: null
+      fixedMemoryOverheadBytes: null
+      perVcpuMemoryOverheadBytes: null
+      memoryOverheadBasisPoints: null
+    nodeHeadroom:
+      cpuMillicores: null
+      memoryBytes: null
+      kvmDevices: null
+    fairness:
+      maxBypasses: null
+      priorityAgingSeconds: null
   preflight:
     # -- Fail install/upgrade from a hook Job when KubeVirt/CDI CRDs are absent.
     enabled: true

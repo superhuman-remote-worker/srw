@@ -5882,6 +5882,17 @@ class VMController:
         self.load_template()
         self.init_k8s()
         await self.headscale.init()
+        from shared.vm_resource_inventory_settings import InventorySettings
+        from vm_controller.resource_inventory_runtime import inventory_observer_context
+
+        async with inventory_observer_context(
+            InventorySettings.from_environment(), base_url=ORCHESTRATOR_URL,
+            secret=LIFECYCLE_HMAC_SECRET, stop=self._shutdown,
+        ):
+            await self._run_transports()
+
+    async def _run_transports(self):
+        """Serve lifecycle requests within the inventory observer lifetime."""
         preparation_task = asyncio.create_task(self._preparation_loop())
 
         # Pre-warm the default image's golden so the first job doesn't pay the

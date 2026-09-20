@@ -32,6 +32,9 @@ spec:
         srw.io/vm-remote-operation-protocol: v1
         {{- end }}
       annotations:
+        {{- if .Values.vm.resourceAdmission.observerEnabled }}
+        checksum/vm-resource-policy: {{ include "srw.vmResourceInventoryConfig" . | sha256sum | quote }}
+        {{- end }}
         checksum/infrastructure-metering-gates: {{ toJson .Values.infrastructureMetering | sha256sum | quote }}
         # This flag is a money-spending admission fence. The orchestrator reads
         # it from a ConfigMap key, so bind its exact value into the Pod template
@@ -1318,6 +1321,10 @@ spec:
                   key: NTFY_TOKEN
                   optional: true
             # VM lifecycle (optional)
+            {{- if .Values.vm.resourceAdmission.observerEnabled }}
+            - name: VM_RESOURCE_ADMISSION_CONFIG
+              value: {{ include "srw.vmResourceInventoryConfig" . | quote }}
+            {{- end }}
             - name: VM_MODE
               valueFrom:
                 configMapKeyRef:

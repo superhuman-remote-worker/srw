@@ -16,6 +16,10 @@ spec:
       {{- include "srw.componentSelectorLabels" (dict "context" . "component" "vm-controller") | nindent 6 }}
   template:
     metadata:
+      {{- if .Values.vm.resourceAdmission.observerEnabled }}
+      annotations:
+        checksum/vm-resource-policy: {{ include "srw.vmResourceInventoryConfig" . | sha256sum | quote }}
+      {{- end }}
       labels:
         {{- include "srw.componentSelectorLabels" (dict "context" . "component" "vm-controller") | nindent 8 }}
     spec:
@@ -29,6 +33,10 @@ spec:
           image: "{{ .Values.vmController.image.repository }}:{{ .Values.vmController.image.tag }}"
           imagePullPolicy: {{ .Values.vmController.image.pullPolicy }}
           env:
+            {{- if .Values.vm.resourceAdmission.observerEnabled }}
+            - name: VM_RESOURCE_ADMISSION_CONFIG
+              value: {{ include "srw.vmResourceInventoryConfig" . | quote }}
+            {{- end }}
             - name: TRANSPORT
               value: "http"
             - name: LISTEN_PORT
