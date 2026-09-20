@@ -1,0 +1,75 @@
+{
+  "expected": {
+    "cpu_millicores": 205,
+    "kvm_devices": 1,
+    "memory_bytes": 861277888
+  },
+  "pod": {
+    "apiVersion": "v1",
+    "kind": "Pod",
+    "metadata": {
+      "name": "virt-launcher-fixture",
+      "namespace": "fixture",
+      "resourceVersion": "1",
+      "uid": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+    },
+    "spec": {
+      "containers": [
+        {
+          "name": "compute",
+          "resources": {
+            "limits": {
+              "devices.kubevirt.io/kvm": "1",
+              "devices.kubevirt.io/tun": "1",
+              "devices.kubevirt.io/vhost-net": "1"
+            },
+            "requests": {
+              "cpu": "200m",
+              "devices.kubevirt.io/kvm": "1",
+              "devices.kubevirt.io/tun": "1",
+              "devices.kubevirt.io/vhost-net": "1",
+              "ephemeral-storage": "50M",
+              "memory": "788Mi"
+            }
+          }
+        }
+      ],
+      "initContainers": [
+        {
+          "name": "guest-console-log",
+          "resources": {
+            "limits": {
+              "cpu": "15m",
+              "memory": "60M"
+            },
+            "requests": {
+              "cpu": "5m",
+              "memory": "35M"
+            }
+          },
+          "restartPolicy": "Always"
+        }
+      ],
+      "nodeName": "fixture-node"
+    },
+    "status": {
+      "phase": "Running"
+    }
+  },
+  "policy": {
+    "cpuMillicoresPerVcpuDenominator": 10,
+    "cpuMillicoresPerVcpuNumerator": 1000,
+    "fixedMemoryOverheadBytes": 307629760,
+    "launcherCpuOverheadMillicores": 5,
+    "memoryOverheadBasisPoints": 0,
+    "perVcpuMemoryOverheadBytes": 8388608
+  },
+  "provenance": {
+    "architecture": "amd64",
+    "disk": "disposable blank CDI DV, local-path",
+    "guest_memory": "512Mi",
+    "guest_vcpus": 2,
+    "kubevirt": "v1.6.6",
+    "scope": "default local fixture only; no production policy or job readiness claim"
+  }
+}

@@ -26,8 +26,15 @@ cancellation disposition and pre-grant source-hold protection (`67e56398e`,
 migration 0266) passed independent review and 94 distinct local checks. Authenticated
 controller disposition discovery now enters that frozen cancellation record through
 `a15dd4c69`; it is observation-only and grants neither deletion nor completion.
-Fixed-UID disk/Secret/source/attachment settlement and the typed completion writer
-remain. Controller capability remains absent and admission defaults off. Task 6
+Exact partial Secret/DV/PVC disposal (`f5fe3e037`, corrected by `32588c40a`)
+passed independent review and 116 checks. Source-only reconciliation (`7835fc6fc`)
+is now also reviewed: immutable source-disposition intent, exact golden/prepared
+pin CAS, prepared-allocation receipts, completed retained-clone checks, lost replies
+and delayed-publisher fencing. Final source/progress checks: 39 passed; legacy
+source/preparation checks: 125 passed; independent concurrency checks: two passed.
+The source stage remains a plan and cannot complete the parent. Attachment
+settlement and durable typed completion, including source evidence before cache
+collection, remain. Controller capability remains absent and admission defaults off. Task 6
 live acceptance is open. A2 and A3 code/review are complete locally; their live
 gates remain open. B, C and D have their own remaining work and gates.
 
