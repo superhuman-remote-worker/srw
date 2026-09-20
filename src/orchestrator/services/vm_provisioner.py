@@ -185,6 +185,7 @@ class VMProvisioner:
 
     def __init__(self):
         self._db: Optional[Any] = None
+        self._phase_store = None
         self._snapshot_service: Optional[Any] = None
         self._vm_namespace: str = os.environ.get("VM_NAMESPACE", "agent-vms")
         self._default_vm_image: str = os.environ.get(
@@ -340,7 +341,12 @@ class VMProvisioner:
         )
 
     async def _persist_status_identity(
-        self, entity_type: str, entity_id: str, data: Mapping[str, Any]
+        self,
+        entity_type: str,
+        entity_id: str,
+        data: Mapping[str, Any],
+        *,
+        phase_token=None,
     ) -> bool:
         """Persist query-discovered identities only from authenticated evidence."""
 
@@ -372,12 +378,22 @@ class VMProvisioner:
             updates["ssh_host_key_fingerprint"] = fingerprint
         if type(data.get("credential_runtime_started")) is bool:
             updates["credential_runtime_started"] = data["credential_runtime_started"]
-        merged = await self._set_context_if_generation(
-            entity_type,
-            entity_id,
-            generation,
-            updates,
-        )
+        if entity_type == "job" and self._phase_store is not None:
+            if phase_token is None:
+                return False
+            disposition = await self._phase_store.apply_status(
+                phase_token,
+                data,
+                identity_updates=updates,
+            )
+            merged = disposition in {"observed", "unproven"}
+        else:
+            merged = await self._set_context_if_generation(
+                entity_type,
+                entity_id,
+                generation,
+                updates,
+            )
 
         if merged and entity_type == "job" and root_uid is not None:
             binding = await self._storage_context(entity_id)
@@ -410,6 +426,12 @@ class VMProvisioner:
         """
         self._db = db
         self._snapshot_service = snapshot_service
+        if getattr(db, "supports_vm_phase_observations", False) is True:
+            from orchestrator.services.vm_provisioning_phases import (
+                VMProvisioningPhaseStore,
+            )
+
+            self._phase_store = VMProvisioningPhaseStore(db)
 
         if self._http_available:
             self._http_client = httpx.AsyncClient(
@@ -1992,6 +2014,17 @@ class VMProvisioner:
             Status dict or None if unavailable.
         """
         generation = await self._current_provision_generation(entity_type, job_id)
+        phase_token = None
+        if entity_type == "job" and self._phase_store is not None:
+            try:
+                phase_token = await self._phase_store.capture(job_id, generation)
+            except Exception:
+                logger.exception(
+                    "Could not capture VM phase observation for %s", job_id
+                )
+                return None
+            if phase_token is None:
+                return None
         result: Optional[dict]
         if self._nats_available:
             result = await nats_bridge.query_vm_status(
@@ -2013,7 +2046,12 @@ class VMProvisioner:
             if result.get("status") == "not_found":
                 return None
             authenticated = result.get("_identity_authenticated") is True
-            current = await self._persist_status_identity(entity_type, job_id, result)
+            current = await self._persist_status_identity(
+                entity_type,
+                job_id,
+                result,
+                **({"phase_token": phase_token} if phase_token is not None else {}),
+            )
             if authenticated and not current:
                 return None
             result.pop("_identity_authenticated", None)
@@ -2849,6 +2887,9 @@ class VMProvisioner:
             "identity_provision_generation": None,
             "creation_request": None,
             "creation_observation": None,
+            "provisioning": None,
+            "provisioning_revision": 0,
+            "provisioning_attention_reason": None,
             # Opaque incarnation nonce. Controller identities are merged only
             # through a DB-side compare-and-merge against this exact value.
             "provision_generation": str(uuid4()),
