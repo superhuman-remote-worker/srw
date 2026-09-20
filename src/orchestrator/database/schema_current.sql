@@ -7725,6 +7725,26 @@ BEGIN
         END IF;
         RETURN NEW;
     END IF;
+    -- Status authorization belongs to the original writer and its other
+    -- guards. Normalize only an unchanged prior episode, inside that exact
+    -- terminal statement. Never hide an explicit invalid metadata mutation.
+    IF TG_TABLE_NAME='jobs' AND NEW.status::text IN ('completed','failed','cancelled') THEN
+        IF NEW.workspace_idle_episode IS NOT NULL THEN
+            IF OLD.workspace_idle_episode IS NULL
+               OR NEW.workspace_idle_episode IS DISTINCT FROM OLD.workspace_idle_episode
+               OR NEW.workspace_idle_revision<>OLD.workspace_idle_revision THEN
+                RAISE EXCEPTION 'Terminal Jobs cannot publish an idle episode' USING ERRCODE='23514';
+            END IF;
+            NEW.workspace_idle_episode := NULL;
+            NEW.workspace_idle_revision := OLD.workspace_idle_revision+1;
+        ELSIF OLD.workspace_idle_episode IS NOT NULL THEN
+            IF NEW.workspace_idle_revision<>OLD.workspace_idle_revision+1 THEN
+                RAISE EXCEPTION 'Terminal idle exit revision must advance exactly once' USING ERRCODE='23514';
+            END IF;
+        ELSIF NEW.workspace_idle_revision<>OLD.workspace_idle_revision THEN
+            RAISE EXCEPTION 'Terminal replay cannot advance idle revision' USING ERRCODE='23514';
+        END IF;
+    END IF;
     previous := OLD.workspace_idle_episode;
     current_episode := NEW.workspace_idle_episode;
     IF NEW.workspace_idle_revision=OLD.workspace_idle_revision AND current_episode IS NOT DISTINCT FROM previous THEN
