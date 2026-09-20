@@ -67,6 +67,11 @@ def _vm_phase_attention_message(vm: Mapping[str, Any]) -> str | None:
 
     if vm.get("status") == "query_failed":
         return "VM startup needs attention because its progress could not be verified. The workspace disk is retained."
+    if vm.get("status") == "ready" and (
+        vm.get("provisioning_attention_reason") is None
+        and vm.get("provisioning") is None
+    ):
+        return None
     # Existing cleanup, dependency and initialization handlers own their
     # diagnostics. Only initial VM startup uses the new phase policy.
     if vm.get("status") not in {
@@ -77,6 +82,7 @@ def _vm_phase_attention_message(vm: Mapping[str, Any]) -> str | None:
         "ssh_pending",
         "running",
         "query_failed",
+        "ready",
     }:
         return None
     if vm.get("initialization_started_at") is not None:

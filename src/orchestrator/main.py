@@ -4036,6 +4036,8 @@ async def _try_dispatch_pending_jobs() -> None:
                         provisioner=vm_provisioner,
                         recovery_store=VMWorkspaceRecoveryStore(postgres_db),
                         now=time.time(),
+                        boot_timeout_s=timeout_s,
+                        rootdisk_stall_timeout_s=rootdisk_stall_timeout_s,
                     ):
                         continue
                     if vm_decision != VM_READY:

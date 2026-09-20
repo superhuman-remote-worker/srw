@@ -433,6 +433,15 @@ class TestVmTeardownAndSuspendDecision:
         context = phase_context(running(), status="query_failed")
         assert self._decide(context, now=10000) == VM_ATTENTION
 
+    def test_ready_cannot_hide_recorded_identity_attention(self):
+        context = phase_context(running(), status="ready")
+        context["provisioning_attention_reason"] = "vm_phase_identity_conflict"
+        assert self._decide(context) == VM_ATTENTION
+
+    def test_ready_cannot_hide_attention_in_authenticated_phase(self):
+        context = phase_context(evidence(disk_phase="unknown"), status="ready")
+        assert self._decide(context) == VM_ATTENTION
+
     # --- P1-6: never tear down a deliberately-suspended VM ------------------
 
     def test_suspended_long_past_budget_is_not_recycled(self):

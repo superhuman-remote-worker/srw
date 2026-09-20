@@ -246,6 +246,20 @@ def vm_provisioning_decision(
         return VM_WAIT
     if status in SUSPEND_STATUSES:
         return VM_WAIT
+    if status == "ready" and (
+        vm_ctx.get("provisioning_attention_reason") is not None
+        or vm_ctx.get("provisioning") is not None
+    ):
+        if (
+            vm_phase_decision(
+                vm_ctx,
+                now=now,
+                timeout_s=timeout_s,
+                rootdisk_stall_timeout_s=rootdisk_stall_timeout_s,
+            ).action
+            == "attention"
+        ):
+            return VM_ATTENTION
     if status == "retiring_process_zero":
         return VM_RECYCLE
     if status == "query_failed":

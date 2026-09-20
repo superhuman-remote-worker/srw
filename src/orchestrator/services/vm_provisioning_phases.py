@@ -55,6 +55,97 @@ class VMProvisioningPhaseStore:
     def __init__(self, db):
         self.db = db
 
+    async def admit_boot_cleanup(
+        self, job_id, snapshot, *, identity, boot_timeout_s, rootdisk_stall_timeout_s
+    ):
+        """Linearize a phase timeout with its existing cleanup reservation.
+
+        Reserve under owner/PVC locks before locking the job. A lost phase CAS
+        rolls the whole reservation back; a winner fences later phase/Ready
+        writes before releasing locks. Network teardown happens after commit.
+        """
+        from orchestrator.services.dispatch_guards import vm_phase_decision
+        from orchestrator.services.vm_workspace_recovery_store import (
+            VMWorkspaceRecoveryStore,
+            acquire_vm_cleanup_permit,
+        )
+
+        class Refused(Exception):
+            pass
+
+        if not _uuid(job_id) or _revision(snapshot) is None:
+            return None
+        generation = snapshot.get("provision_generation")
+        if not _uuid(generation) or generation != identity.provision_generation:
+            return None
+        try:
+            async with self.db.acquire() as conn:
+                async with conn.transaction():
+                    permit = await acquire_vm_cleanup_permit(
+                        VMWorkspaceRecoveryStore(self.db),
+                        owner_kind="job",
+                        owner_id=job_id,
+                        identity=identity,
+                        source="dispatcher_vm_recycle",
+                        purge_disk=False,
+                        _conn=conn,
+                    )
+                    if not permit.allowed or permit.completed_outcome is not None:
+                        raise Refused
+                    row = await self._current(conn, UUID(job_id), generation, lock=True)
+                    if row is None:
+                        raise Refused
+                    vm = _object(_object(row["context"]).get("vm"))
+                    if (
+                        _revision(vm) != _revision(snapshot)
+                        or vm.get("status") == "ready"
+                        or vm.get("initialization_started_at") is not None
+                        or vm.get("vm_uid") != identity.vm_uid
+                        or vm.get("rootdisk_pvc_uid") != identity.rootdisk_pvc_uid
+                        or await self.db._completion_resume_blocked_on_conn(
+                            conn, UUID(job_id)
+                        )
+                    ):
+                        raise Refused
+                    if await conn.fetchval(
+                        "SELECT EXISTS(SELECT 1 FROM vm_workspace_recovery_jobs WHERE job_id=$1 AND resolved_at IS NULL)",
+                        UUID(job_id),
+                    ):
+                        raise Refused
+                    now = await conn.fetchval(
+                        "SELECT extract(epoch FROM clock_timestamp())::double precision"
+                    )
+                    deadline = await conn.fetchval(
+                        "SELECT extract(epoch FROM created_at + (resolved->'spec'->>'timeoutSeconds')::double precision * interval '1 second') "
+                        "FROM srw_execution_specs WHERE work_kind='Job' AND work_id=$1",
+                        UUID(job_id),
+                    )
+                    if deadline is not None and deadline <= now:
+                        raise Refused
+                    phase = vm_phase_decision(
+                        vm,
+                        now=now,
+                        timeout_s=boot_timeout_s,
+                        rootdisk_stall_timeout_s=rootdisk_stall_timeout_s,
+                    )
+                    state = vm.get("provisioning")
+                    phase_identity = (
+                        state.get("identity", {}) if isinstance(state, Mapping) else {}
+                    )
+                    if (
+                        phase.action != "boot_timeout"
+                        or phase_identity.get("owner_id") != job_id
+                    ):
+                        raise Refused
+                    await conn.execute(
+                        "UPDATE jobs SET context=jsonb_set(context,'{vm}',context->'vm' || "
+                        "'{\"retirement_cleanup_pending\":true}'::jsonb),updated_at=clock_timestamp() WHERE id=$1",
+                        UUID(job_id),
+                    )
+                    return permit
+        except Refused:
+            return None
+
     async def _current(self, conn, job_id, generation, *, lock=False):
         from orchestrator.database.postgres import _completion_control_active_sql
 

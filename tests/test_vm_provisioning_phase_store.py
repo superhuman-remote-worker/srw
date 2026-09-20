@@ -53,6 +53,180 @@ async def vm_context(db, job):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "winner", ["attention", "ready", "initializing", "revision", "cancelled"]
+)
+async def test_newer_observation_or_control_refuses_stale_boot_cleanup_without_reservation(
+    db, winner
+):
+    from orchestrator.services.vm_provisioner import VMTeardownIdentity
+    from shared.vm_provisioning_phases import observe_provisioning
+
+    job, generation = await seed(db)
+    observation = status(job, generation, boot=True)
+    stale = {
+        "status": "starting",
+        "provisioning_revision": 1,
+        **{
+            key: observation[key]
+            for key in (
+                "vm_uid",
+                "rootdisk_pvc_uid",
+                "namespace",
+                "provision_generation",
+            )
+        },
+        "provisioning": observe_provisioning(
+            None, observation["provisioning"], now=100
+        ),
+    }
+    await db.merge_vm_context_if_provision_generation(job, generation, stale)
+    update = {
+        "attention": {"provisioning_attention_reason": "vm_phase_identity_conflict"},
+        "ready": {"status": "ready"},
+        "initializing": {"initialization_started_at": 200},
+        "revision": {"provisioning_revision": 2},
+        "cancelled": {},
+    }[winner]
+    await db.merge_vm_context_if_provision_generation(job, generation, update)
+    if winner == "cancelled":
+        async with db.acquire() as conn:
+            await conn.execute(
+                "UPDATE jobs SET status='cancelled' WHERE id=$1", UUID(job)
+            )
+    result = await VMProvisioningPhaseStore(db).admit_boot_cleanup(
+        job,
+        stale,
+        identity=VMTeardownIdentity(
+            generation, stale["vm_uid"], stale["rootdisk_pvc_uid"]
+        ),
+        boot_timeout_s=600,
+        rootdisk_stall_timeout_s=2700,
+    )
+    assert result is None
+    async with db.acquire() as conn:
+        assert (
+            await conn.fetchval(
+                "SELECT count(*) FROM vm_workspace_cleanup_admissions WHERE owner_id=$1",
+                UUID(job),
+            )
+            == 0
+        )
+    assert (await vm_context(db, job)).get("retirement_cleanup_pending") is not True
+
+
+@pytest.mark.asyncio
+async def test_boot_cleanup_winner_blocks_late_phase_and_ready_promotion(db):
+    from orchestrator.services.vm_provisioner import VMTeardownIdentity
+    from shared.vm_provisioning_phases import observe_provisioning
+
+    job, generation = await seed(db)
+    observation = status(job, generation, boot=True)
+    stale = {
+        "status": "starting",
+        "provisioning_revision": 1,
+        **{
+            key: observation[key]
+            for key in (
+                "vm_uid",
+                "rootdisk_pvc_uid",
+                "namespace",
+                "provision_generation",
+            )
+        },
+        "provisioning": observe_provisioning(
+            None, observation["provisioning"], now=100
+        ),
+    }
+    await db.merge_vm_context_if_provision_generation(job, generation, stale)
+    await db.merge_vm_context_if_provision_generation(
+        job, generation, {"ssh_registration_id": "registration"}
+    )
+    store = VMProvisioningPhaseStore(db)
+    token = await store.capture(job, generation)
+    permit = await store.admit_boot_cleanup(
+        job,
+        stale,
+        identity=VMTeardownIdentity(
+            generation, stale["vm_uid"], stale["rootdisk_pvc_uid"]
+        ),
+        boot_timeout_s=600,
+        rootdisk_stall_timeout_s=2700,
+    )
+    assert permit.allowed
+    assert (await vm_context(db, job))["retirement_cleanup_pending"] is True
+    assert await store.apply_status(token, observation) == "held"
+    assert not await db.merge_vm_context_if_provision_generation(
+        job, generation, {"status": "ready"}
+    )
+    assert not await db.merge_vm_context_if_provision_generation(
+        job, generation, {"initialization_started_at": 300}
+    )
+    assert not await db.merge_vm_context_if_current(
+        job, "registration", {"status": "ready"}
+    )
+    assert not await db.merge_vm_context_if_current(
+        job, "registration", {"initialization_started_at": 300}
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "update",
+    [
+        {"status": "ready"},
+        {"initialization_started_at": 200},
+        {"provisioning_attention_reason": "vm_phase_identity_conflict"},
+    ],
+)
+async def test_boot_cleanup_rechecks_winner_committed_during_job_lock_wait(db, update):
+    from orchestrator.services.vm_provisioner import VMTeardownIdentity
+    from shared.vm_provisioning_phases import observe_provisioning
+
+    job, generation = await seed(db)
+    observation = status(job, generation, boot=True)
+    stale = {
+        "status": "starting",
+        "provisioning_revision": 1,
+        **{
+            key: observation[key]
+            for key in (
+                "vm_uid",
+                "rootdisk_pvc_uid",
+                "namespace",
+                "provision_generation",
+            )
+        },
+        "provisioning": observe_provisioning(
+            None, observation["provisioning"], now=100
+        ),
+    }
+    await db.merge_vm_context_if_provision_generation(job, generation, stale)
+    async with db.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute(
+                "UPDATE jobs SET context=jsonb_set(context,'{vm}',context->'vm' || $2::jsonb) WHERE id=$1",
+                UUID(job),
+                json.dumps(update),
+            )
+            pending = asyncio.create_task(
+                VMProvisioningPhaseStore(db).admit_boot_cleanup(
+                    job,
+                    stale,
+                    identity=VMTeardownIdentity(
+                        generation, stale["vm_uid"], stale["rootdisk_pvc_uid"]
+                    ),
+                    boot_timeout_s=600,
+                    rootdisk_stall_timeout_s=2700,
+                )
+            )
+            await asyncio.sleep(0.2)
+            assert not pending.done()
+    assert await asyncio.wait_for(pending, 5) is None
+    assert (await vm_context(db, job)).get("retirement_cleanup_pending") is not True
+
+
+@pytest.mark.asyncio
 async def test_two_observers_commit_once_without_regressing_progress(db):
     job, generation = await seed(db)
     store = VMProvisioningPhaseStore(db)
@@ -383,7 +557,9 @@ async def test_deadline_expiring_during_job_lock_wait_withholds_phase_update(db)
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("commit_during_lock_wait", [False, True])
-async def test_real_recovery_admission_wins_against_inflight_phase(db, commit_during_lock_wait):
+async def test_real_recovery_admission_wins_against_inflight_phase(
+    db, commit_during_lock_wait
+):
     from orchestrator.services.vm_workspace_recovery_store import (
         VMWorkspaceRecoveryStore,
     )
@@ -429,8 +605,18 @@ async def test_real_recovery_admission_wins_against_inflight_phase(db, commit_du
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("malformed", ["not-json", []])
-@pytest.mark.parametrize("path", ["workspace_storage", "creation_request", "creation_request.request", "creation_request.request.workspace_storage"])
-async def test_malformed_nested_authority_cannot_admit_first_identity(db, malformed, path):
+@pytest.mark.parametrize(
+    "path",
+    [
+        "workspace_storage",
+        "creation_request",
+        "creation_request.request",
+        "creation_request.request.workspace_storage",
+    ],
+)
+async def test_malformed_nested_authority_cannot_admit_first_identity(
+    db, malformed, path
+):
     fields = {}
     target = fields
     names = path.split(".")
@@ -440,7 +626,9 @@ async def test_malformed_nested_authority_cannot_admit_first_identity(db, malfor
     target[names[-1]] = malformed
     job, generation = await seed(db, vm_fields=fields)
     store = VMProvisioningPhaseStore(db)
-    result = await store.apply_status(await store.capture(job, generation), status(job, generation))
+    result = await store.apply_status(
+        await store.capture(job, generation), status(job, generation)
+    )
     assert result in {"conflict", "held"}
     assert "vm_uid" not in await vm_context(db, job)
 

@@ -22,10 +22,15 @@ GENERATION = "00000000-0000-4000-8000-000000000001"
 )
 async def test_phase_decision_to_action_keeps_disk_and_only_recycles_expired_boot(
     phase,
+    monkeypatch,
 ):
     from orchestrator.services.vm_provisioning_cleanup import handle_provisioning_wait
     from tests.test_dispatch_guards import phase_context
     from tests.test_vm_provisioning_phases import evidence, running
+    from orchestrator.services.vm_provisioning_phases import VMProvisioningPhaseStore
+
+    admission = AsyncMock(return_value=CleanupPermit(True, UUID(int=2)))
+    monkeypatch.setattr(VMProvisioningPhaseStore, "admit_boot_cleanup", admission)
 
     observation = {
         "clone": evidence(),
@@ -73,7 +78,9 @@ async def test_phase_decision_to_action_keeps_disk_and_only_recycles_expired_boo
         assert decision == VM_RECYCLE
         provisioner.release_vm_captured.assert_awaited_once()
         assert provisioner.release_vm_captured.await_args.kwargs["purge_disk"] is False
+        admission.assert_awaited_once()
     else:
+        admission.assert_not_awaited()
         provisioner.capture_vm_teardown_identity.assert_not_awaited()
         provisioner.release_vm_captured.assert_not_awaited()
         store.acquire_cleanup_permit.assert_not_awaited()

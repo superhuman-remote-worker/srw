@@ -459,6 +459,7 @@ async def acquire_vm_cleanup_permit(
     identity: Any,
     source: str,
     purge_disk: bool,
+    _conn: Any = None,
 ) -> CleanupPermit:
     """Admit one exact VM/PVC cleanup intent through recovery authority."""
 
@@ -490,7 +491,7 @@ async def acquire_vm_cleanup_permit(
         "source": source,
     }
     request_id = uuid5(NAMESPACE_URL, f"vm-workspace-cleanup:{intent}")
-    permit = await recovery_store.acquire_cleanup_permit(
+    arguments = dict(
         owner_kind=owner_kind,
         owner_id=canonical_owner,
         pvc_uid=pvc_uid,
@@ -498,6 +499,10 @@ async def acquire_vm_cleanup_permit(
         source=source,
         intent_digest=cleanup_intent_digest(resource_intent),
     )
+    if _conn is None:
+        permit = await recovery_store.acquire_cleanup_permit(**arguments)
+    else:
+        permit = await recovery_store.acquire_cleanup_permit_on_conn(_conn, **arguments)
     return bind_vm_cleanup_permit(permit, request_id=request_id, intent=resource_intent)
 
 
