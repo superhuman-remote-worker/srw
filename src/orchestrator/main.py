@@ -720,7 +720,6 @@ from orchestrator.services.dispatch_guards import (  # noqa: E402
     VM_PREPARATION_POLL,
     VM_PARK_PREPARATION,
     VM_HEADSCALE_POLL,
-    VM_PARK_CAPACITY,
     VM_PARK_EXHAUSTED,
     VM_PARK_GOLDEN,
     VM_PARK_INITIALIZATION,
@@ -3709,8 +3708,8 @@ async def _try_dispatch_pending_jobs() -> None:
                     # Bounded provisioning retries. A VM that never reaches 'ready'
                     # (real infra failure) must park after N attempts instead of
                     # re-provisioning forever against the shared VM cluster. The
-                    # counter is monotonic in context.vm and reset to 0 once the VM
-                    # boots (VM_READY below), so it survives the async controller
+                    # counter records one exact admitted VM per generation and
+                    # resets atomically with verified Ready, so it survives async
                     # status callbacks that a status-based park cannot. Decision
                     # logic is extracted + unit-tested in dispatch_guards.
                     provision_attempts = int(vm_ctx.get("provision_attempts") or 0)
@@ -3724,9 +3723,6 @@ async def _try_dispatch_pending_jobs() -> None:
                     golden_timeout_s = int(
                         os.environ.get("VM_GOLDEN_WAIT_TIMEOUT_S", "2700")
                     )
-                    capacity_timeout_s = int(
-                        os.environ.get("VM_CAPACITY_WAIT_TIMEOUT_S", "2700")
-                    )
                     headscale_timeout_s = int(
                         os.environ.get("VM_HEADSCALE_WAIT_TIMEOUT_S", "900")
                     )
@@ -3738,7 +3734,6 @@ async def _try_dispatch_pending_jobs() -> None:
                         timeout_s=timeout_s,
                         rootdisk_stall_timeout_s=rootdisk_stall_timeout_s,
                         golden_timeout_s=golden_timeout_s,
-                        capacity_timeout_s=capacity_timeout_s,
                         headscale_timeout_s=headscale_timeout_s,
                     )
                     if vm_decision == VM_PARK_EXHAUSTED:
@@ -3818,27 +3813,12 @@ async def _try_dispatch_pending_jobs() -> None:
                             # Exact VM adoption counts a boot in the ledger;
                             # scheduling and dependency waits count no attempt.
                             continue
-                        if ok:
-                            # Count the attempt so a VM that never boots parks
-                            # after max_provision_attempts. create_vm stamped a
-                            # fresh provisioned_at; the timeout recycles this
-                            # attempt if it stalls.
-                            await postgres_db.merge_vm_context(
-                                job_id,
-                                {"provision_attempts": provision_attempts + 1},
-                            )
-                            logger.info(
-                                "Dispatcher: auto-provisioned VM for job %s "
-                                "(attempt %d/%d)",
-                                job_id,
-                                provision_attempts + 1,
-                                max_provision_attempts,
-                            )
-                        else:
+                        if not ok:
                             logger.warning(
-                                "Dispatcher: VM provisioning failed for job %s",
-                                job_id,
+                                "Dispatcher: VM provisioning failed for job %s", job_id
                             )
+                        # Authenticated phase observation accounts admission;
+                        # a create acknowledgement or dependency wait does not.
                         continue  # Skip this job — wait for VM to register
                     if vm_decision == VM_PARKED:
                         # Provisioning failed terminally — do NOT hot-retry every
@@ -3930,23 +3910,6 @@ async def _try_dispatch_pending_jobs() -> None:
                                 or vm_ctx.get("golden_phase")
                                 or "importing",
                             )
-                        continue
-                    if vm_decision == VM_PARK_CAPACITY:
-                        elapsed = int(
-                            time.time()
-                            - float(vm_ctx.get("capacity_wait_started_at") or 0)
-                        )
-                        park_error = (
-                            "VM capacity did not become available within "
-                            f"{capacity_timeout_s}s (running "
-                            f"{vm_ctx.get('running_vms') or 'unknown'}/"
-                            f"{vm_ctx.get('max_concurrent_vms') or 'unknown'}, "
-                            f"waited {elapsed}s) — VM never created"
-                        )
-                        await postgres_db.merge_vm_context(
-                            job_id, {"status": "failed", "error": park_error}
-                        )
-                        await _fail_vm_parked_job(job_id, park_error)
                         continue
                     if vm_decision == VM_PARK_GOLDEN:
                         # The golden import outlived even the golden budget —
@@ -4057,12 +4020,6 @@ async def _try_dispatch_pending_jobs() -> None:
                         logger.warning("Dispatcher: job %s has an unhandled VM decision", job_id)
                         continue
                     # VM_READY: proceed with dispatch.
-                    if provision_attempts:
-                        # VM booted — clear the retry budget so a later
-                        # re-provision (crash recovery) starts fresh.
-                        await postgres_db.merge_vm_context(
-                            job_id, {"provision_attempts": 0}
-                        )
                     logger.info("Dispatcher: job %s using VM workspace", job_id)
                 elif _job_needs_sandbox(job):
                     # Phase 1: a pre-agent scholar spawned before its parent had a

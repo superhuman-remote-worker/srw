@@ -72,7 +72,6 @@ VM_PARK_INITIALIZATION = (
     "park_initialization"  # setup did not finish → fail without retry
 )
 VM_CAPACITY_POLL = "capacity_poll"  # controller at capacity → re-poll create
-VM_PARK_CAPACITY = "park_capacity"  # capacity never became available → fail
 VM_HEADSCALE_POLL = "headscale_poll"  # mesh VPN down → re-poll create, free
 VM_PARK_HEADSCALE = "park_headscale"  # mesh VPN never recovered → fail + park
 VM_PREPARATION_POLL = "preparation_poll"
@@ -95,7 +94,6 @@ SUSPEND_STATUSES = ("suspending", "suspended", "restoring")
 # (900), which is the misalignment that burned a loop iteration (see
 # knowledge-history/done/golden_image_cold_import_fails_inflight_vm_jobs.md).
 DEFAULT_GOLDEN_WAIT_TIMEOUT_S = 2700.0
-DEFAULT_CAPACITY_WAIT_TIMEOUT_S = 2700.0
 DEFAULT_ROOTDISK_STALL_TIMEOUT_S = 2700.0
 
 # Bounded patience for a Headscale outage. The controller refuses to build a
@@ -166,7 +164,7 @@ def vm_provisioning_decision(
     now: float,
     timeout_s: float,
     golden_timeout_s: float = DEFAULT_GOLDEN_WAIT_TIMEOUT_S,
-    capacity_timeout_s: float = DEFAULT_CAPACITY_WAIT_TIMEOUT_S,
+    capacity_timeout_s: float | None = None,
     headscale_timeout_s: float = DEFAULT_HEADSCALE_WAIT_TIMEOUT_S,
     rootdisk_stall_timeout_s: float = DEFAULT_ROOTDISK_STALL_TIMEOUT_S,
 ) -> str:
@@ -209,10 +207,11 @@ def vm_provisioning_decision(
                            counting attempts would park every job dispatched
                            into the import window — the exact failure this
                            branch removes.
-      'waiting_capacity' → CAPACITY_POLL within ``capacity_timeout_s`` of
-                           ``capacity_wait_started_at``, else PARK_CAPACITY.
-                           Like waiting_golden, no VM exists yet and polling
-                           does not consume a boot attempt.
+      'waiting_capacity' → CAPACITY_POLL regardless of elapsed time. Explicit
+                           immutable Job deadlines and cancellation are enforced
+                           by their existing admission/control owners. The legacy
+                           ``capacity_timeout_s`` keyword is ignored for call
+                           compatibility; it cannot restore terminal waiting.
       'waiting_headscale'→ HEADSCALE_POLL within ``headscale_timeout_s`` of
                            ``headscale_wait_started_at``, else PARK_HEADSCALE.
                            Same shape as waiting_golden and for the same
@@ -297,9 +296,6 @@ def vm_provisioning_decision(
             return VM_PARK_PREPARATION
         return VM_PREPARATION_POLL
     if status == "waiting_capacity":
-        started = vm_ctx.get("capacity_wait_started_at")
-        if started and (now - float(started)) > capacity_timeout_s:
-            return VM_PARK_CAPACITY
         return VM_CAPACITY_POLL
     if status == "waiting_headscale":
         started = vm_ctx.get("headscale_wait_started_at")

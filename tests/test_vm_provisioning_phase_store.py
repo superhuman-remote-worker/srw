@@ -2,7 +2,7 @@
 
 import asyncio
 import json
-from uuid import UUID, uuid4
+from uuid import UUID, uuid4, uuid5
 
 import pytest
 
@@ -31,6 +31,9 @@ async def seed(db, *, vm_fields=None, status="created"):
 
 
 def status(job, generation, *, boot=False, **changes):
+    # Each owner has its own disk. Reusing the pure-policy fixture's constant
+    # PVC across jobs makes a prior cleanup permit block unrelated race tests.
+    changes.setdefault("rootdisk_pvc_uid", str(uuid5(UUID(job), "rootdisk")))
     observation = (running if boot else evidence)(
         owner_id=job, provision_generation=generation, **changes
     )

@@ -8,12 +8,13 @@ knowledge-history/done/preemption_before_first_checkpoint_replays_job_opening.md
 
 from __future__ import annotations
 
+import pytest
+
 from orchestrator.services.dispatch_guards import (
     VM_ATTENTION,
     VM_CAPACITY_POLL,
     VM_GOLDEN_POLL,
     VM_HEADSCALE_POLL,
-    VM_PARK_CAPACITY,
     VM_PARK_EXHAUSTED,
     VM_PARK_GOLDEN,
     VM_PARK_HEADSCALE,
@@ -295,10 +296,24 @@ class TestVmCapacityWaitDecision:
     def test_waiting_capacity_polls_before_anchor(self):
         assert self._decide({"status": "waiting_capacity"}) == VM_CAPACITY_POLL
 
-    def test_waiting_capacity_parks_past_budget(self):
+    @pytest.mark.parametrize("elapsed", [2700.1, 26 * 3600, 7 * 86400])
+    def test_capacity_wait_has_no_elapsed_failure_or_boot_attempt(self, elapsed):
         ctx = {"status": "waiting_capacity", "capacity_wait_started_at": 100.0}
-        assert self._decide(ctx, now=2800.0) == VM_CAPACITY_POLL
-        assert self._decide(ctx, now=2800.1) == VM_PARK_CAPACITY
+        before = dict(ctx)
+        assert self._decide(ctx, now=100 + elapsed) == VM_CAPACITY_POLL
+        assert ctx == before
+
+    def test_old_capacity_timeout_argument_cannot_restore_terminal_policy(self):
+        ctx = {"status": "waiting_capacity", "capacity_wait_started_at": 100.0}
+        assert self._decide(ctx, now=100000.0, capacity_timeout_s=1) == VM_CAPACITY_POLL
+
+    def test_capacity_wait_preserves_cleanup_precedence(self):
+        ctx = {
+            "status": "waiting_capacity",
+            "capacity_wait_started_at": 100.0,
+            "retirement_cleanup_pending": True,
+        }
+        assert self._decide(ctx, now=100000.0) == VM_RECYCLE
 
 
 class TestVmHeadscaleWaitDecision:

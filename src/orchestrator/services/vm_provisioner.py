@@ -2942,6 +2942,8 @@ class VMProvisioner:
             "identity_provision_generation": None,
             "creation_request": None,
             "creation_observation": None,
+            "admission_accounting_version": 1,
+            "provision_admission": None,
             "provisioning": None,
             "provisioning_revision": 0,
             "provisioning_attention_reason": None,

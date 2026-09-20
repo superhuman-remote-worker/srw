@@ -8,6 +8,7 @@ import json
 from uuid import UUID
 
 from shared.vm_provisioning_phases import observe_provisioning
+from shared.vm_admission_accounting import admission_updates
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,6 +55,111 @@ class VMProvisioningPhaseStore:
 
     def __init__(self, db):
         self.db = db
+
+    async def publish_ready(self, job_id, generation, registration, vm_uid, updates):
+        """Commit the final prober result and legacy budget reset together.
+
+        This is called only after SSH, initialization and mutation attestation.
+        A1 owns its separate worker-hold release and budget reset. No queue or
+        execution state is changed here, and no I/O occurs under the job lock.
+        """
+        from orchestrator.services.vm_creation_readiness import _verified_epoch
+        from orchestrator.services.dispatch_guards import vm_phase_decision
+
+        if not _uuid(job_id) or not _uuid(generation) or not _uuid(vm_uid):
+            return False
+        if not isinstance(updates, Mapping) or updates.get("status") != "ready":
+            return False
+        verified = _verified_epoch(updates.get("ssh_verified_at"))
+        if verified is None or updates.get("ssh_ready_source") != "provisioner_probe":
+            return False
+        async with self.db.acquire() as conn:
+            async with conn.transaction():
+                row = await self._current(conn, UUID(job_id), generation, lock=True)
+                if (
+                    row is None
+                    or await conn.fetchval(
+                        "SELECT EXISTS(SELECT 1 FROM vm_workspace_recovery_jobs WHERE job_id=$1 AND resolved_at IS NULL)",
+                        UUID(job_id),
+                    )
+                    or await self.db._completion_resume_blocked_on_conn(
+                        conn, UUID(job_id)
+                    )
+                ):
+                    return False
+                vm = _object(_object(row["context"]).get("vm"))
+                deadline = await conn.fetchval(
+                    "SELECT extract(epoch FROM created_at + (resolved->'spec'->>'timeoutSeconds')::double precision * interval '1 second') FROM srw_execution_specs WHERE work_kind='Job' AND work_id=$1",
+                    UUID(job_id),
+                )
+                now = await conn.fetchval(
+                    "SELECT extract(epoch FROM clock_timestamp())::double precision"
+                )
+                if (
+                    not 0 < verified <= now
+                    or deadline is not None
+                    and deadline <= now
+                    or vm.get("vm_uid") != vm_uid
+                    or vm.get("identity_authenticated") is not True
+                    or vm.get("identity_provision_generation") != generation
+                    or vm.get("ssh_registration_id") != registration
+                    or updates.get("ssh_registration_id") != registration
+                    or vm_phase_decision(vm, now=now, timeout_s=600).action
+                    == "attention"
+                ):
+                    return False
+                for field in (
+                    "active_pod_uid",
+                    "ssh_host",
+                    "pod_ip",
+                    "ssh_port",
+                    "ssh_host_key_fingerprint",
+                ):
+                    if not updates.get(field) or vm.get(field) != updates[field]:
+                        return False
+                try:
+                    initialization = vm.get("initialization")
+                    if initialization is not None:
+                        from shared.workspace_initialization import (
+                            initialization_receipt,
+                            validate_initialization_request,
+                        )
+
+                        initialization = validate_initialization_request(initialization)
+                        receipt = initialization_receipt(
+                            vm.get("initialization_receipt"),
+                            owner_id=(vm.get("workspace_storage") or {}).get(
+                                "uid", job_id
+                            ),
+                            revision=initialization["revision"],
+                        )
+                        if receipt["phase"] != "Succeeded" or receipt["step"] != len(
+                            initialization["steps"]
+                        ):
+                            return False
+                    a1_owned = await conn.fetchval(
+                        "SELECT EXISTS(SELECT 1 FROM vm_creation_retries WHERE job_id=$1 AND provision_generation=$2)",
+                        UUID(job_id),
+                        UUID(generation),
+                    )
+                    delta = dict(updates)
+                    if not a1_owned:
+                        delta.update(
+                            admission_updates(
+                                {**vm, "status": "ready"},
+                                generation=generation,
+                                vm_uid=vm_uid,
+                            )
+                        )
+                        delta["provision_attempts"] = 0
+                except (ValueError, TypeError, KeyError, AttributeError):
+                    return False
+                await conn.execute(
+                    "UPDATE jobs SET context=jsonb_set(context,'{vm}',context->'vm' || $2::jsonb),updated_at=clock_timestamp() WHERE id=$1",
+                    UUID(job_id),
+                    json.dumps(delta),
+                )
+                return True
 
     async def admit_boot_cleanup(
         self, job_id, snapshot, *, identity, boot_timeout_s, rootdisk_stall_timeout_s
@@ -273,12 +379,13 @@ class VMProvisioningPhaseStore:
                     conflict = True
                 # The ordinary retained-rootdisk lane has no workspace_storage
                 # field. Its separate A1 authority still pins first PVC binding.
-                expected_pvc = await conn.fetchval(
+                creation = await conn.fetchrow(
                     "SELECT expected_pvc_uid::text FROM vm_creation_retries "
                     "WHERE job_id=$1 AND provision_generation=$2",
                     token.job_id,
                     UUID(token.generation),
                 )
+                expected_pvc = creation["expected_pvc_uid"] if creation else None
                 if expected_pvc is not None and expected_pvc != status.get(
                     "rootdisk_pvc_uid"
                 ):
@@ -304,11 +411,20 @@ class VMProvisioningPhaseStore:
                     observation = status.get("provisioning")
                     if isinstance(observation, Mapping):
                         try:
-                            updates["provisioning"] = observe_provisioning(
+                            phase = observe_provisioning(
                                 vm.get("provisioning"),
                                 observation,
                                 now=now,
                             )
+                            if creation is None:
+                                updates.update(
+                                    admission_updates(
+                                        vm,
+                                        generation=token.generation,
+                                        vm_uid=status["vm_uid"],
+                                    )
+                                )
+                            updates["provisioning"] = phase
                             disposition, reason = "observed", None
                         except (ValueError, TypeError, KeyError):
                             # Reject this reply as a whole: a changed nested VMI

@@ -726,12 +726,20 @@ class VMReadinessService:
             "ssh_probe_error": None,
             "recovering": False,
         }
-        promote = (
-            self._db.merge_thread_vm_context_if_current
-            if entity_type == "thread"
-            else self._db.merge_vm_context_if_current
-        )
-        promoted = bool(await promote(entity_id, registration_id, ready_updates))
+        if entity_type == "job" and getattr(self._db, "supports_vm_phase_observations", False) is True:
+            from orchestrator.services.vm_provisioning_phases import VMProvisioningPhaseStore
+
+            ready_updates["ssh_host_key_fingerprint"] = final_attestation.ssh_host_key_fingerprint
+            promoted = await VMProvisioningPhaseStore(self._db).publish_ready(
+                entity_id, generation, registration_id, status.get("vm_uid"), ready_updates,
+            )
+        else:
+            promote = (
+                self._db.merge_thread_vm_context_if_current
+                if entity_type == "thread"
+                else self._db.merge_vm_context_if_current
+            )
+            promoted = bool(await promote(entity_id, registration_id, ready_updates))
         if not promoted:
             return
         self._failures.pop(key, None)
