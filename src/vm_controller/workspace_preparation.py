@@ -49,10 +49,19 @@ def allocation_name(request):
 
 def creation_held(allocation):
     """A delivered protocol source stays held until exact clone disposition."""
-    if (
-        "creation_binding" not in allocation.state
-        or allocation.state.get("workspace_source_issued") is False
+    if allocation.state.get("workspace_source_issued") is False:
+        return False
+    binding = allocation.state.get("creation_binding")
+    source = allocation.state.get("creation_source")
+    binding_has_target = isinstance(binding, dict) and "target" in binding
+    source_has_target = isinstance(source, dict) and "target" in source
+    # Missing binding metadata cannot downgrade an already delivered workspace
+    # source to an ordinary allocation, including the legacy no-binding path.
+    if binding_has_target != source_has_target or (
+        binding_has_target and binding["target"] != source["target"]
     ):
+        return True
+    if "creation_binding" not in allocation.state:
         return False
     from shared.vm_preparation_target import creation_root_name
 
@@ -61,12 +70,6 @@ def creation_held(allocation):
             allocation.state["creation_binding"], allocation.request
         )
     except (ValueError, TypeError, KeyError):
-        return True
-    target = allocation.state["creation_binding"].get("target")
-    source = allocation.state.get("creation_source")
-    if target is not None and (
-        not isinstance(source, dict) or source.get("target") != target
-    ):
         return True
     root = allocation.state.get("creation_root")
     if (

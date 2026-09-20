@@ -260,3 +260,56 @@ async def test_changed_completion_target_cannot_hide_original_source_hold(worksp
     # A well-formed replacement target is still inconsistent with this
     # allocation's immutable delivered source; GC must retain its hold.
     assert creation_held(allocation)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("missing", ["target", "binding"])
+async def test_missing_target_metadata_preserves_delivered_workspace_hold(
+    workspace, missing
+):
+    _, _, _, payload, service = workspace
+    assert (await finish_prepared(workspace))["status"] == "created"
+    allocation = await service.store.get(allocation_name(payload["preparation"]))
+    assert creation_held(allocation)
+    assert allocation.state["creation_source"]["target"]
+    if missing == "target":
+        del allocation.state["creation_binding"]["target"]
+    else:
+        del allocation.state["creation_binding"]
+    allocation.state["creation_root"] = {
+        "name": "agent-vm-" + payload["job_id"] + "-rootdisk",
+        "dv_uid": str(uuid4()),
+        "pvc_uid": str(uuid4()),
+    }
+    assert creation_held(allocation)
+
+
+@pytest.mark.asyncio
+async def test_ordinary_completed_source_preserves_legacy_binding_compatibility(
+    prepared,
+):
+    _, _, _, payload, service = prepared
+    assert (await finish_prepared(prepared))["status"] == "created"
+    allocation = await service.store.get(allocation_name(payload["preparation"]))
+    assert "target" not in allocation.state["creation_binding"]
+    assert "target" not in allocation.state["creation_source"]
+    assert creation_held(allocation)
+    allocation.state["creation_root"] = {
+        "name": "agent-vm-" + payload["job_id"] + "-rootdisk",
+        "dv_uid": str(uuid4()),
+        "pvc_uid": str(uuid4()),
+    }
+    assert not creation_held(allocation)
+    del allocation.state["creation_binding"]
+    assert not creation_held(allocation)
+
+
+@pytest.mark.asyncio
+async def test_never_issued_workspace_preparation_has_no_clone_hold(workspace):
+    ctrl, _, _, payload, service = workspace
+    assert (await ctrl._do_create_serialized(payload))["reason"] == "preparation_wait"
+    allocation = await service.store.get(allocation_name(payload["preparation"]))
+    assert allocation.state["workspace_source_issued"] is False
+    assert "creation_source" not in allocation.state
+    assert allocation.state["creation_binding"]["target"]
+    assert not creation_held(allocation)
