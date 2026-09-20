@@ -217,3 +217,22 @@ async def test_system_handoff_and_disabled_compatibility(db, monkeypatch, enable
         officer_incarnation=None,
     )
     assert (await episode(db, seed["job_id"]))[0] == int(enabled)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("legacy_context", [None, [], "legacy"])
+async def test_unproven_legacy_context_does_not_block_human_handoff(db, legacy_context):
+    from tests._previous_release_seed import seed_previous_release_row
+
+    seed, _ = await seeded(db)
+    _, route = await publish(db, seed, state="pending_officer")
+    async with db.acquire() as conn:
+        await seed_previous_release_row(
+            conn,
+            "jobs",
+            "UPDATE jobs SET context=$2::jsonb WHERE id=$1",
+            UUID(seed["job_id"]),
+            json.dumps(legacy_context),
+        )
+    assert await escalate(db, seed, route)
+    assert await episode(db, seed["job_id"]) == (0, None)

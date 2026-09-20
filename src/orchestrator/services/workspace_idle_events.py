@@ -47,6 +47,8 @@ async def record_human_route_wait_on_conn(conn, *, job_id, route_id):
     freeze = row["freeze_data"]
     if not isinstance(freeze, dict) or freeze.get("route_id") != str(route_id):
         return False
+    if not isinstance(row["context"], dict):
+        return False
     owner, ambiguous = _job_workspace_owner(UUID(str(job_id)), row)
     if ambiguous or owner != UUID(str(job_id)):
         return False
