@@ -14,6 +14,7 @@ from pathlib import Path
 from shared.vm_creation_retry import canonical_request_digest, _validate_json
 from shared.vm_creation_issuance import canonical_configuration_digest
 from shared.workspace_preparation_settings import PreparationSettings
+from shared.vm_resource_policy import CompleteResourcePolicySnapshot
 
 
 def _digest(value):
@@ -31,7 +32,12 @@ def _digest(value):
     )
 
 
-def resolve_creation_configuration(controller, request):
+def resolve_creation_configuration(
+    controller,
+    request,
+    *,
+    _resource_policy_snapshot: CompleteResourcePolicySnapshot | None = None,
+):
     from vm_controller import controller as settings
     from vm_controller import headscale_client
     import shared
@@ -148,6 +154,16 @@ def resolve_creation_configuration(controller, request):
     # JSON-normalize tuple settings before credential validation. No credential
     # values, generated guest tokens or rendered cloud-init enter this document.
     configuration = json.loads(json.dumps(configuration))
+    if _resource_policy_snapshot is not None:
+        from shared.vm_resource_configuration import build_resource_configuration
+
+        configuration["version"] = 2
+        configuration["resource_admission"] = build_resource_configuration(
+            _resource_policy_snapshot,
+            template=template,
+            request=payload,
+            configuration=configuration,
+        )
     _validate_json(configuration)
     return {
         "request": payload,

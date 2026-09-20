@@ -15,6 +15,9 @@ from shared.vm_resource_admission import ResourceAdmissionError
 from shared.vm_resource_placement import _labels, _unmatched_taints, affinity_label_keys
 
 
+RESOURCE_TEMPLATE_ALGORITHM = "srw-vm-template-profile-v1"
+
+
 def _refuse():
     raise ResourceAdmissionError("unsupported_resource_template")
 

@@ -703,9 +703,13 @@ def canonical_configuration_digest(configuration):
 
     if (
         not isinstance(configuration, dict)
-        or set(configuration) != _CONFIGURATION_FIELDS
-        or type(configuration["version"]) is not int
-        or configuration["version"] != 1
+        or type(configuration.get("version")) is not int
+        or configuration["version"] not in (1, 2)
+        or set(configuration)
+        != (
+            _CONFIGURATION_FIELDS
+            | ({"resource_admission"} if configuration["version"] == 2 else set())
+        )
     ):
         raise ValueError("Effective controller configuration is incomplete")
     if not isinstance(configuration["namespace"], str) or not re.fullmatch(
@@ -719,6 +723,12 @@ def canonical_configuration_digest(configuration):
         ):
             raise ValueError("Controller configuration identity is invalid")
     _validate_json(configuration)
+    if configuration["version"] == 2:
+        from shared.vm_resource_configuration import validate_resource_configuration
+
+        validate_resource_configuration(
+            configuration["resource_admission"], configuration
+        )
     return (
         "sha256:"
         + hashlib.sha256(
