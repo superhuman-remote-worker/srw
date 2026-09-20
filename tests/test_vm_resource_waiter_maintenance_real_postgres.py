@@ -585,3 +585,115 @@ async def test_cleanup_added_during_owner_wait_is_observed_before_policy(db):
         "action": "parked",
         "reason": "workspace_cleanup_held",
     }
+
+
+async def break_lineage(db, request):
+    execution_id = request["execution_id"]
+    owner = await db.fetchval(
+        "INSERT INTO users(display_name,is_approved) VALUES('lineage proof',TRUE) RETURNING id"
+    )
+    instance_id = uuid4()
+    await db.execute(
+        "INSERT INTO srw_workspace_instances(id,owner_id,recipe,revision,pvc_name,pvc_uid,generation,execution_id,backend_state) "
+        "VALUES($1,$2,$3::jsonb,'fixture','fixture-pvc',$4,2,$5,'{}')",
+        instance_id,
+        owner,
+        json.dumps({"backend": "vm", "retention": "Retain"}),
+        str(uuid4()),
+        execution_id,
+    )
+    await db.execute(
+        "INSERT INTO srw_execution_workspace_bindings(execution_id,instance_id) VALUES($1,$2)",
+        execution_id,
+        instance_id,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("terminal", [False, True])
+async def test_broken_lineage_quarantine_cannot_cancel_or_block_other_owners(
+    db, terminal
+):
+    store, inventory, _ = await environment(db)
+    bad, good = await waiter(db, inventory), await waiter(db, inventory)
+    await db.execute(
+        "UPDATE vm_resource_waiters SET bypasses=1,protected_order=0 WHERE request_id=$1",
+        bad["request_id"],
+    )
+    before = await row(db, bad)
+    await break_lineage(db, bad)
+    if terminal:
+        await db.execute(
+            "UPDATE jobs SET status='cancelled' WHERE id=$1", bad["job_id"]
+        )
+    retry_before = dict(
+        await db.fetchrow(
+            "SELECT * FROM vm_creation_retries WHERE request_id=$1", bad["request_id"]
+        )
+    )
+    assert await maintenance(store).maintain(request_id=str(bad["request_id"])) == {
+        "action": "parked",
+        "reason": "creation_attachment_lineage_unproven",
+    }
+    assert (
+        dict(
+            await db.fetchrow(
+                "SELECT * FROM vm_creation_retries WHERE request_id=$1",
+                bad["request_id"],
+            )
+        )
+        == retry_before
+    )
+    parked = await row(db, bad)
+    assert all(
+        parked[key] == before[key]
+        for key in ("enqueued_at", "bypasses", "protected_order")
+    )
+    assert (await decide(store, good))["action"] == "admitted"
+    assert (await decide(store, bad))["action"] == "unavailable"
+    assert (await maintenance(store).maintain(request_id=str(bad["request_id"])))[
+        "action"
+    ] == "parked"
+    assert await row(db, bad) == parked
+    if not terminal:
+        # Restore this fixture's original no-binding contract. Quarantine alone
+        # cannot reactivate it; a new complete authority pass must succeed.
+        await db.execute(
+            "DELETE FROM srw_execution_workspace_bindings WHERE execution_id=$1",
+            bad["execution_id"],
+        )
+        assert (await maintenance(store).maintain(request_id=str(bad["request_id"])))[
+            "action"
+        ] == "reactivated"
+        restored = await row(db, bad)
+        assert all(
+            restored[key] == before[key]
+            for key in ("enqueued_at", "bypasses", "protected_order")
+        )
+
+
+@pytest.mark.asyncio
+async def test_broken_lineage_quarantine_never_changes_held_reservation(db):
+    store, inventory, _ = await environment(db)
+    request = await waiter(db, inventory)
+    assert (await decide(store, request))["action"] == "admitted"
+    before = dict(
+        await db.fetchrow(
+            "SELECT * FROM vm_resource_reservations WHERE request_id=$1",
+            request["request_id"],
+        )
+    )
+    await break_lineage(db, request)
+    assert await maintenance(store).maintain(request_id=str(request["request_id"])) == {
+        "action": "unchanged",
+        "reason": "held_or_admitted",
+    }
+    assert (
+        dict(
+            await db.fetchrow(
+                "SELECT * FROM vm_resource_reservations WHERE request_id=$1",
+                request["request_id"],
+            )
+        )
+        == before
+    )

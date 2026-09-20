@@ -16,9 +16,21 @@ from orchestrator.services.vm_workspace_recovery_store import _job_workspace_own
 from shared.vm_resource_admission import ResourceAdmissionError
 
 
+async def _lineage_snapshot(conn, job_id):
+    from orchestrator.services.vm_creation_lineage import discover
+
+    try:
+        return await discover(conn, job_id), False
+    except VMCreationRetryConflict as exc:
+        if exc.reason != "creation_attachment_lineage_unproven":
+            raise
+        # This permits only quarantining our own waiter. It is never source,
+        # owner, cancellation, reactivation, or physical-absence evidence.
+        return None, True
+
+
 async def _scope(conn, request_id):
     """Inspect blockers under normal locks, without granting creation authority."""
-    from orchestrator.services.vm_creation_lineage import discover
     from orchestrator.database.postgres import _completion_control_active_sql
 
     prior = _record(
@@ -34,7 +46,7 @@ async def _scope(conn, request_id):
     )
     if membership is None:
         raise VMCreationRetryConflict("job_changed")
-    lineage = await discover(conn, job_id)
+    lineage, quarantine = await _lineage_snapshot(conn, job_id)
     owners = {job_id, *(UUID(v) for v in lineage["owners"])} if lineage else {job_id}
     if membership["parent_job_id"]:
         owners.add(membership["parent_job_id"])
@@ -101,11 +113,13 @@ async def _scope(conn, request_id):
         "SELECT * FROM vm_creation_effects WHERE request_id=$1 ORDER BY effect_number FOR UPDATE",
         request_id,
     )
-    if await discover(conn, job_id) != lineage:
+    if await _lineage_snapshot(conn, job_id) != (lineage, quarantine):
         raise VMCreationRetryConflict("scope_raced")
     owner, ambiguous = _job_workspace_owner(job_id, job)
     blocker = None
-    if (
+    if quarantine:
+        blocker = "creation_attachment_lineage_unproven"
+    elif (
         ambiguous
         or owner != job_id
         or (lineage and str(pvc) != lineage["binding"]["pvc_uid"])
@@ -130,6 +144,10 @@ async def _scope(conn, request_id):
 
 
 def _outcome(retry, job, execution, effects, blocker, policy_digest, waiter, now):
+    if blocker == "creation_attachment_lineage_unproven":
+        # A narrower, known target scope can only remove eligibility. Full
+        # lineage authority must be re-established before every other action.
+        return "parked", blocker
     context = _json(job["context"])
     vm = context.get("vm") if isinstance(context, dict) else None
     # Partial effects are a separate cleanup protocol, even for terminal jobs.
