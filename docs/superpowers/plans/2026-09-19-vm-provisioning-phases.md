@@ -1,7 +1,9 @@
 # VM provisioning phases and resilient waiting
 
-Status (2026-09-20): A2 and A3 code and independent reviews passed locally;
-live acceptance is pending. A3 checkpoints are `59dbf3e19` and `2e8a7c194`.
+Status (2026-09-20): A2 and A3 code and independent reviews are published to
+develop through `11a33debf`; live acceptance is pending. See the
+[delegation handoff](2026-09-20-vm-delegation-handoff.md).
+A3 checkpoints are `59dbf3e19` and `2e8a7c194`.
 This follows the VM reliability roadmap, A2 and A3. A1 owns all creation
 issuance, reservation, cancellation and frozen-request authority.
 

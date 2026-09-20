@@ -16,9 +16,13 @@ Longhorn, pytest and the existing Podman-compatible PostgreSQL test fixtures.
 
 **Spec:** `docs/superpowers/specs/2026-09-19-vm-failed-creation-retry.md`.
 
-**Status (2026-09-20):** Implemented locally through ordinary Resume and public
-progress (`5e3ef3231`) on `feat/vm-reliability-20260919`; not pushed or deployed to
-main dev. Tasks 1, 2a, 2b, 4 and 5 passed scoped independent review. Task 3 has
+**Status (2026-09-20):** Reviewed foundations, including ordinary Resume and public
+progress, are published to `develop` through `11a33debf`. See the
+[release checkpoint](2026-09-20-vm-reviewed-checkpoint.md) and
+[delegation handoff](2026-09-20-vm-delegation-handoff.md). Unfinished migration 0269
+and cancellation settlement remain only in the preserved implementation worktree;
+admission stays disabled. Live main-dev execution has not been verified for this
+checkpoint. Tasks 1, 2a, 2b, 4 and 5 passed scoped independent review. Task 3 has
 reviewed configuration, per-effect issuance, golden/prepared sources and exact
 adoption; new/same-owner, inherited and prepared-target attachment now also passed
 review (`90eb9f1bc` includes inherited prepared reuse). Immutable partial-creation
@@ -39,7 +43,7 @@ checks plus three independent interleavings passed. This returned evidence is
 separate from planned progress and does not complete the parent. Persisting the
 completion receipt, exact attachment settlement, and the native terminal
 transaction remain. Controller capability remains absent and admission defaults off. Task 6
-live acceptance is open. A2 and A3 code/review are complete locally; their live
+live acceptance is open. A2 and A3 code/review are published on develop; their live
 gates remain open. B, C and D have their own remaining work and gates.
 
 Task 5 evidence: 107 actual-PostgreSQL tests, 86 projection/compatibility tests,

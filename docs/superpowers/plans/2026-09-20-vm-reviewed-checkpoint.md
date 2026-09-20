@@ -2,8 +2,11 @@
 
 This release integrates reviewed implementation through `83ac143f0`
 with the existing develop changes through `9e2fb32dc0e6cebe51f04b7688368193c8924e0e`.
-Publication verification and formatting corrections follow on the integration
-branch.
+Published to `develop` as `7611c36a1`, followed by test-fixture correction
+`11a33debf`. The latter's develop pipeline completed successfully. This records
+publication and CI, not a fresh inspection of main-dev runtime state.
+
+Resume work from [the delegation handoff](2026-09-20-vm-delegation-handoff.md).
 
 ## Behavior available after rollout
 
@@ -86,6 +89,15 @@ artifact, migration lint found zero issues in the ten non-exempt files, strict
 chart lint passed, and endpoint authentication, Ruff and formatting checks passed.
 Formatting preserved the Python AST in all nine affected production files. Four
 randomized parameter IDs were made stable so parallel pytest collection agrees.
+
+The first full CI run found 12 failures in older tests: two JSON expectations
+lacked `vm_creation: null`, and minimal PostgreSQL fixtures lacked columns now
+used by resume/completion queries. Its result was 33,964 passed, 12 failed and
+181 skipped. Commit `11a33debf` updates only those three test files. All 124 tests
+in those files passed locally, as did lint and formatting. The successful
+[CI rerun](https://github.com/superhuman-remote-worker/srw/actions/runs/35526136186)
+used an affected-test selection (650 passed, two skipped); it was not another full-suite
+run. The develop, ci-policy and application-e2e-observation workflows succeeded.
 
 Pushing develop starts the existing component-image and dev-chart pipeline;
 Fleet may deploy the resulting chart. Start the development pilot with one VM

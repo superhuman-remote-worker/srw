@@ -1,6 +1,6 @@
 # C: idle compute release and authorized wake implementation seams
 
-> For implementation: use `superpowers:executing-plans`, with review at each stage. Stage 1 foundations and the first Job adapters are implemented locally; physical release and wake remain unavailable.
+> For implementation: use `superpowers:executing-plans`, with review at each stage. Reviewed foundations and adapters below are published to develop through `11a33debf`; physical release and wake remain unavailable. See the [delegation handoff](2026-09-20-vm-delegation-handoff.md) before continuing. Checkpoint test counts below are historical local evidence.
 
 **Local checkpoint (2026-09-20):** pure policy `351835197` and durable Job/thread episode fields plus migration 0265 (`669f08afe`) passed independent review, 33 policy checks and 11 actual-PostgreSQL store checks. The first real human-route publication and execution Resume adapters (`09b1b35f3`, corrected by `1b92f8cf6`) passed independent review, 104 regression checks and 15 final PostgreSQL event checks. Stateless routed replies now carry the captured route UUID through the existing same-statement queue guard (`76ebd7f56`); stale replies cannot close a newer question or reset its queue state. An unchanged human question preserves its entry time across access-only runtime rebinding; browser presence cannot reset that clock. Extend preserves the existing rearm-from-now interval and click cap, with explicit Never/TTL overrides. No lane has physical idle-release capability.
 

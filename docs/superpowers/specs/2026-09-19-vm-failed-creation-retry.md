@@ -1,12 +1,15 @@
 # Safe retry of failed VM creation
 
-**Status (2026-09-20):** A1 implementation is in progress on the local
-`feat/vm-reliability-20260919` branch. Frozen preflight, controller effect authority,
+**Status (2026-09-20):** Reviewed A1 foundations are published to `develop` through
+`11a33debf`. Frozen preflight, controller effect authority,
 golden/prepared source retention, exact adoption, Ready release, ordinary Resume
-and bounded API/Cockpit progress are implemented and reviewed. Retained attachment,
-partial-create cancellation settlement and disposable execution acceptance remain.
+and bounded API/Cockpit progress are implemented and reviewed, including retained
+attachment. Final cancellation settlement and disposable execution acceptance remain;
+unfinished migration 0269 is excluded from the published schema (head 0268).
 Capability is not advertised; admission defaults off. No main-dev deployment or
 historical-job repair is claimed.
+
+Current handoff: `docs/superpowers/plans/2026-09-20-vm-delegation-handoff.md`.
 
 **Roadmap:** `knowledge-base/knowledge/issues/vm_reliability_roadmap_2026_09_19.md`.
 **Incident:** `knowledge-base/knowledge/issues/legacy_job_resume_missing_vm_retirement_authority.md`.
