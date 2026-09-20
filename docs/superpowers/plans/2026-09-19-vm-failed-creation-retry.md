@@ -16,9 +16,20 @@ Longhorn, pytest and the existing Podman-compatible PostgreSQL test fixtures.
 
 **Spec:** `docs/superpowers/specs/2026-09-19-vm-failed-creation-retry.md`.
 
-**Status:** Plan written; all implementation tasks remain unchecked. This is A1,
-not the entire VM roadmap. A2 phase deadlines, A3 general waiting/retries, B live
-outage-recovery rollout, C idle/wake and D resource admission have separate gates.
+**Status (2026-09-20):** Implemented locally through ordinary Resume and public
+progress (`5e3ef3231`) on `feat/vm-reliability-20260919`; not pushed or deployed to
+main dev. Tasks 1, 2a, 2b, 4 and 5 passed scoped independent review. Task 3 has
+reviewed configuration, per-effect issuance, golden/prepared sources and exact
+adoption; retained attachment and disk/Secret-only cancellation settlement remain.
+Controller capability remains absent and admission defaults off. Task 6 live
+acceptance is open. A2 code/review is complete locally; A3, B, C and D have their
+own remaining work and gates.
+
+Task 5 evidence: 107 actual-PostgreSQL tests, 86 projection/compatibility tests,
+124 focused frontend tests, production AOT build and independent reviews passed.
+A production-bundle Chromium fixture at 1440, 768 and 390 pixels verified bounded
+messages, eligible-only Resume, mobile menus, keyboard activation and zero page
+overflow; no browser exceptions. These are local results, not VM execution proof.
 
 ## Global Constraints
 
@@ -77,7 +88,7 @@ and guarded branches. Do not extract unrelated code.
   `job_id`, `provision_generation`, `request_digest`, `expected_pvc_uid`, and
   `claim_token`. MAC envelope/correlation uses the existing lifecycle primitives.
 
-- [ ] Write failing pure-policy tests, including this complete refusal matrix:
+- [x] Write failing pure-policy tests, including this complete refusal matrix:
 
 ```python
 import pytest
@@ -112,14 +123,14 @@ def test_transport_backoff_is_bounded():
     assert retry_delay_seconds(8, 0.2) == 360
 ```
 
-- [ ] Run `.venv/bin/python -m pytest tests/test_vm_creation_retry.py -q`
+- [x] Run `.venv/bin/python -m pytest tests/test_vm_creation_retry.py -q`
   with `PYTHONPATH=src`; confirm missing-module failure before implementation.
-- [ ] Implement strict evidence checks (`is True`, missing/invalid is refusal),
+- [x] Implement strict evidence checks (`is True`, missing/invalid is refusal),
   deterministic reason precedence, wire-field validation and backoff. Reject
   attempt <1 and jitter outside 0..0.2. Canonical hashes exclude credentials,
   transport signatures and timestamps; retain image/resources/network/storage/
   preparation/initialization/config identity that determines the created workspace.
-- [ ] Add all-proven, malformed UUID/hash, changed request digest and invalid
+- [x] Add all-proven, malformed UUID/hash, changed request digest and invalid
   backoff-input cases; rerun and commit `feat: define VM creation retry contract`.
 
 ## Task 2a: Freeze initial create intent before transport
@@ -138,18 +149,18 @@ separate authenticated controller configuration digest; absent controller identi
 means the record is not yet eligible for retry, not permission to infer defaults.
 Task 3 supplies the authenticated configuration resolution/issuance contract.
 
-- [ ] Write failing tests for initial snapshot before POST, failed CAS causing no
+- [x] Write failing tests for initial snapshot before POST, failed CAS causing no
   POST, identical deferred-create replay after current network/project options
   change, and stale-generation refusal.
-- [ ] Implement a shared unsigned request builder using Task 1's canonical digest.
+- [x] Implement a shared unsigned request builder using Task 1's canonical digest.
   Persist exact caller-owned options under the current generation before I/O; no
   raw credentials/signatures enter the stored snapshot. Preserve public call
   compatibility and old-controller behavior while retry admission is disabled.
-- [ ] Add structured authenticated rejection versus transport-unknown facts without
+- [x] Add structured authenticated rejection versus transport-unknown facts without
   treating a historical error string as authority. A rejected/stale context write
   must not authorize side effects. Replay captured inputs; never overwrite the
   first snapshot with freshly resolved defaults on a poll.
-- [ ] Run focused creation/provisioner tests and commit this foundation. Do not
+- [x] Run focused creation/provisioner tests and commit this foundation. Do not
   advertise end-to-end retry readiness: controller effective config/defaults and
   original issuance fencing must be completed in Task 3 before admission is enabled.
 
@@ -189,14 +200,14 @@ Every returned record contains the immutable fields from Task 1 plus `state`,
 contains frozen canonical options, their digest, expected PVC UID, and predecessor
 admission reference; these are reconstructed server-side, never trusted from Resume.
 
-- [ ] Reuse the real PostgreSQL/schema fixtures from
+- [x] Reuse the real PostgreSQL/schema fixtures from
   `tests/test_vm_preparation_retirement.py`. Add tests proving two concurrent Resume
   admissions return one request ID, stale generation/digest is refused, and the
   existing process-zero trigger still refuses raw context shedding.
-- [ ] Run `PYTHONPATH=src .venv/bin/python -m pytest
+- [x] Run `PYTHONPATH=src .venv/bin/python -m pytest
   tests/test_vm_creation_retry_real_postgres.py -q`; require failures at the missing
   relation/API, not connection errors or fixture skips.
-- [ ] Add the table with foreign keys, unique `(job_id, provision_generation)`,
+- [x] Add the table with foreign keys, unique `(job_id, provision_generation)`,
   constrained states and immutable identity/request columns. Adapt this core shape
   to the repository's migration conventions:
 
@@ -224,23 +235,23 @@ CREATE TABLE vm_creation_retries (
 );
 ```
 
-- [ ] Compose `admit_on_conn` with the existing queue-first Resume transaction.
+- [x] Compose `admit_on_conn` with the existing queue-first Resume transaction.
   Retain job-control/completion checks and `void_completion_decision=False` for
   this infrastructure-only retry. Under the same transaction verify the immutable
   Job deadline and predecessor receipt/cleanup chain, insert-or-read the request,
   and queue the job while preserving its VM context. Use DB time for due/lease
   comparisons. Do not call a helper that opens a second independent transaction.
-- [ ] Add controller authorization and CAS observation updates. Record the active
+- [x] Add controller authorization and CAS observation updates. Record the active
   controller create reservation durably using existing cleanup-admission/carrier
   identity; add a reference column if required by that established schema. An
   expired observer claim cannot settle that reservation or mint a successor.
-- [ ] Make identity columns immutable in PostgreSQL, enforce digest/JSON/state/claim
+- [x] Make identity columns immutable in PostgreSQL, enforce digest/JSON/state/claim
   consistency, use UUID PVC identities as in cleanup admissions, and add a due index
   plus durable backoff/boot-accounting fields. Compose authorization and the exact
   adoption reservation in one transaction with the established owner/PVC then
   queue/job lock order. Integrate cancellation into actual pinned/stateless control
   transactions; do not rely only on a background status read.
-- [ ] Test concurrent completion/cancel/cleanup/recovery admission, claim takeover,
+- [x] Test concurrent completion/cancel/cleanup/recovery admission, claim takeover,
   late observations and duplicate admission after a lost response. Assert one
   outcome, intact receipts, no partial requeue and no lock-order deadlock. Generate
   and check the schema snapshot; rerun tests and commit the schema/store slice.
@@ -259,7 +270,10 @@ CREATE TABLE vm_creation_retries (
 using lifecycle MAC operation `creation_retry_authorize` and correlation checking.
 Input is Task 1's retry identity plus controller-observed VM/disk/adoption identity;
 output is a typed allow/blocked disposition bound to the existing reservation.
-Controller health/capability output advertises `vm_creation_retry_protocol: 1`.
+Controller capability will advertise `vm_creation_retry_protocol: 1` only after
+all source, attachment, cancellation and acceptance gates pass. The dedicated
+`/vm-creation/create` route prevents old replicas from accepting an envelope they
+do not understand. Current migrations are 0257–0260; attachment reserves 0261.
 
 - [ ] Write tests for MAC/correlation/generation/digest/disk mismatches, expired
   claims, cancellation-before-authorization and missing capability. Assert refusal
@@ -316,11 +330,11 @@ now: datetime) -> str` returns the committed retry state. Add a provisioner meth
 retry authority without generating a new provision context or resetting clocks.
 The ordinary initial-create signature remains compatible.
 
-- [ ] Write tests with `AsyncMock` collaborators: transport timeout before/after
+- [x] Write tests with `AsyncMock` collaborators: transport timeout before/after
   acceptance, no I/O before `next_probe_at`, late token rejection, cancellation,
   confirmed same-generation creation and an active retirement-pending marker.
-- [ ] Run the targeted tests and confirm missing retry behavior fails.
-- [ ] Implement this orchestration order; every store update uses the captured
+- [x] Run the targeted tests and confirm missing retry behavior fails.
+- [x] Implement this orchestration order; every store update uses the captured
   request/revision/claim, and external calls run after transaction exit:
 
 ```text
@@ -334,11 +348,11 @@ authenticated capacity wait -> remain queued without boot/worker attempt increme
 stale generation/token or conflicting identity -> refuse update/retain attention
 ```
 
-- [ ] Give retry reconciliation precedence over the generic failed-state park, but
+- [x] Give retry reconciliation precedence over the generic failed-state park, but
   preserve cleanup/recovery/cancellation precedence over retry. Persist transport
   outage start once, clear it after authenticated progress, and do not count
   successful reconciliation of an already-counted generation as another boot.
-- [ ] Test restart/backoff continuity, concurrent observers, no endpoint promotion
+- [x] Test restart/backoff continuity, concurrent observers, no endpoint promotion
   before readiness, capacity waits longer than 2700 seconds on this retry path,
   and generation change during a request. Run the focused suites and commit.
 
@@ -358,22 +372,22 @@ failures invoke Task 2's admission in the existing control transaction. Return t
 existing queued response shape plus `vm_creation_retry_request_id`; repeated
 requests return the same ID. Noneligible runtime/legacy cases retain guarded behavior.
 
-- [ ] Add failing regressions for the d843 incident shape, duplicate Resume, an
+- [x] Add failing regressions for the d843 incident shape, duplicate Resume, an
   expired canonical Job deadline, a changed manifest, unknown predecessor identity,
   missing controller capability and a genuine executed runtime requiring retirement.
-- [ ] Implement the adapter without public client-supplied disk/generation authority.
+- [x] Implement the adapter without public client-supplied disk/generation authority.
   Reconstruct evidence from immutable admission and cleanup records. If the legacy
   create request cannot be reconstructed exactly, return a structured 409 with
   `creation_request_unproven`; do not guess from current defaults or error text.
-- [ ] Add projection reasons for queued/reconciling/attention states. Validate that
+- [x] Add projection reasons for queued/reconciling/attention states. Validate that
   error details omit credentials, endpoint coordinates and raw controller bodies.
   Keep existing Resume authorization and feedback behavior; infrastructure-only
   requeue must preserve checkpoint/completion state.
-- [ ] Add `orchestrator.vmCreationRetry.enabled: false` and render
+- [x] Add `orchestrator.vmProvisioning.creationRetryEnabled: false` and render
   `VM_CREATION_RETRY_ENABLED`. Test false by default, explicit true, invalid value
   rejection and admission refusal while disabled. Existing request reconciliation
   remains active when the flag is turned off; test that rollback behavior too.
-- [ ] Run the Resume/projection suites and real-PostgreSQL race tests. Assert job ID,
+- [x] Run the Resume/projection suites and real-PostgreSQL race tests. Assert job ID,
   generation, original PVC identity and deadline are unchanged through successful
   admission; context-shedding spies must not be called. Commit the integration.
 

@@ -1,7 +1,12 @@
 # Safe retry of failed VM creation
 
-**Status:** Planned, 2026-09-19. First slice of the owner-approved VM reliability
-roadmap; no application change or live job repair is included in this document.
+**Status (2026-09-20):** A1 implementation is in progress on the local
+`feat/vm-reliability-20260919` branch. Frozen preflight, controller effect authority,
+golden/prepared source retention, exact adoption, Ready release, ordinary Resume
+and bounded API/Cockpit progress are implemented and reviewed. Retained attachment,
+partial-create cancellation settlement and disposable execution acceptance remain.
+Capability is not advertised; admission defaults off. No main-dev deployment or
+historical-job repair is claimed.
 
 **Roadmap:** `knowledge-base/knowledge/issues/vm_reliability_roadmap_2026_09_19.md`.
 **Incident:** `knowledge-base/knowledge/issues/legacy_job_resume_missing_vm_retirement_authority.md`.
@@ -22,8 +27,10 @@ execution still require the existing workspace authority checks.
 
 ## Chosen approach and alternatives
 
-Use the existing same-generation `create_vm(..., fresh=False)` capability behind
-a durable retry admission and exact controller replay checks. This is smaller than
+Use a dedicated same-generation `/vm-creation/create` protocol behind a durable
+retry admission and exact controller replay checks. Initial intent is persisted
+before configuration I/O; every rootdisk, Secret and VM effect requires its own
+durable grant. The legacy create route cannot accept this protocol. This is smaller than
 a general legacy-runtime repair system and does not need a forged stop receipt.
 Extend the established job-control and cleanup authorities rather than introducing
 an independent lock hierarchy or bypass route.
@@ -155,7 +162,7 @@ Use an additive migration and an explicit controller protocol capability for ret
 validation. Deploy schema/controller support before callers. If capability is
 missing, Resume explains the unsupported repair and keeps the existing job intact.
 Add `VM_CREATION_RETRY_ENABLED=false`, rendered from
-`orchestrator.vmCreationRetry.enabled` in Helm, to gate new retry admission only.
+`orchestrator.vmProvisioning.creationRetryEnabled` in Helm, to gate new retry admission only.
 Enable it after the disposable acceptance gate; reconciliation of existing requests
 must not depend on this flag. On rollback, stop new retry admission but continue reconciling admitted operations;
 do not roll back to an image that cannot recognize unresolved retry records.

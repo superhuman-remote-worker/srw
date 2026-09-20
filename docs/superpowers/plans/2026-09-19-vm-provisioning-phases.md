@@ -1,6 +1,7 @@
 # VM provisioning phases and resilient waiting
 
-Status: implementation in progress under the owner's overnight authorization.
+Status (2026-09-20): A2 code and independent review passed locally; live acceptance
+is pending. A3 is in progress under the owner's overnight authorization.
 This follows the VM reliability roadmap, A2 and A3. A1 owns all creation
 issuance, reservation, cancellation and frozen-request authority.
 
@@ -55,8 +56,9 @@ capacity clears that outage clock. No explicit deadline is extended by Resume.
   integration tests assert no deletion for clone/placement/unknown evidence.
 - [ ] A3 durable waiting, one admission count, immutable deadline enforcement;
   real PostgreSQL concurrency and lost-response tests, ordinary capacity >26h.
-- [ ] Helm/projection documentation and independent review. Run focused suites,
-  schema/contracts and disposable k3d acceptance; record full storage gate separately.
+- [x] A2 Helm/projection documentation and independent review; focused suites and
+  real-PostgreSQL phase/cleanup races passed.
+- [ ] Disposable k3d acceptance; record the full Longhorn storage gate separately.
 
 Full implementation seams and reconnaissance evidence are retained in the local
 work report `.superpowers/a2-a3-implementation-seams.md`. A2 is integrated locally and its independent review passed. Live acceptance
