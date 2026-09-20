@@ -15,7 +15,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 from collections.abc import Mapping, Sequence
-from contextlib import asynccontextmanager, suppress
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -253,12 +253,17 @@ class LiveScenario:
         await self.db.connect()
         self.provisioner.connect(self.db)
         config.load_incluster_config()
-        self._core = client.CoreV1Api()
-        self._custom = client.CustomObjectsApi()
+        configuration = client.Configuration.get_default_copy()
+        configuration.retries = 0
+        self._gate_api_client = client.ApiClient(configuration=configuration)
+        self._core = client.CoreV1Api(self._gate_api_client)
+        self._custom = client.CustomObjectsApi(self._gate_api_client)
 
     async def close(self) -> None:
         await self.provisioner.disconnect()
         await self.db.close()
+        if getattr(self, "_gate_api_client", None) is not None:
+            self._gate_api_client.close()
 
     @asynccontextmanager
     async def _gate_owned_reconciler(self, label: str):
@@ -656,33 +661,160 @@ class LiveScenario:
         row = await self._operation(operation_id)
         return row if row.get("phase") in phases else None
 
-    async def _crash_launcher(self, identity: Mapping[str, Any]) -> None:
-        from kubernetes.stream import stream
+    @asynccontextmanager
+    async def _positive_stop_retention(self, identity, operation_id):
+        from orchestrator.operator_cli.vm_recovery_gate_stop_control import (
+            GateStopControl,
+            GateStopError,
+            GateStopStore,
+            KubernetesStopObjects,
+            joined_call,
+            validate_document,
+        )
 
-        pods = await asyncio.to_thread(
+        if (
+            identity.get("owner_kind") != "job"
+            or identity.get("namespace") != self.namespace
+        ):
+            raise GateStopError("stop_fixture_changed")
+        pods = await joined_call(
             self._core.list_namespaced_pod,
             namespace=self.namespace,
             label_selector=f"vm.kubevirt.io/name=agent-vm-{identity['owner_id']}",
+            _request_timeout=(3, 5),
         )
-        candidates = [
-            pod
-            for pod in pods.items
-            if str(pod.metadata.uid) == str(identity["prior_launcher_uid"])
-        ]
-        if len(candidates) != 1:
-            raise AcceptanceFailure("exact launcher pod is unavailable")
-        await asyncio.to_thread(
-            stream,
-            self._core.connect_get_namespaced_pod_exec,
-            candidates[0].metadata.name,
-            self.namespace,
-            container="compute",
-            command=["/bin/sh", "-c", "kill -TERM 1"],
-            stderr=True,
-            stdin=False,
-            stdout=True,
-            tty=False,
+        if (
+            len(pods.items) != 1
+            or str(pods.items[0].metadata.uid) != identity["prior_launcher_uid"]
+        ):
+            raise GateStopError("stop_launcher_ambiguous")
+        doc = {
+            "version": 1,
+            "run_id": self.run_id,
+            "user_id": str(self.gate_user_id),
+            "job_id": identity["owner_id"],
+            "operation_id": str(operation_id),
+            "generation": identity["provision_generation"],
+            "namespace": self.namespace,
+            "vm_name": "agent-vm-" + identity["owner_id"],
+            "vm_uid": identity["vm_uid"],
+            "vmi_name": "agent-vm-" + identity["owner_id"],
+            "vmi_uid": identity["prior_vmi_uid"],
+            "pod_name": pods.items[0].metadata.name,
+            "pod_uid": identity["prior_launcher_uid"],
+            "pvc_uid": identity["root_pvc_uid"],
+            "original_strategy": "RerunOnFailure",
+            "stage": "planned",
+        }
+        validate_document(doc)
+        store = GateStopStore(self.db, self.run_id)
+        control = GateStopControl(KubernetesStopObjects(self._core), store)
+        original_error = None
+        try:
+            await control.prepare(doc)
+            self._gate_stop = (control, doc)
+            yield control, doc
+        except BaseException as exc:
+            original_error = exc
+            raise
+        finally:
+            self._gate_stop = None
+
+            # A failed write-ahead creates no object effects. A lost save reply
+            # is settled from SQL rather than the in-memory stage.
+            async def abort_unfinished():
+                stored = next(
+                    (
+                        item
+                        for item in await store.load()
+                        if item["operation_id"] == doc["operation_id"]
+                    ),
+                    None,
+                )
+                if stored and stored["stage"] not in {"restored", "aborted"}:
+                    await control.abort(stored)
+                    return True
+                return False
+
+            try:
+                # Shield the SQL reconstruction too, not only Kubernetes cleanup.
+                cleanup = asyncio.create_task(abort_unfinished())
+                while not cleanup.done():
+                    try:
+                        await asyncio.shield(cleanup)
+                    except asyncio.CancelledError:
+                        continue
+                aborted = cleanup.result()
+                if aborted and original_error is None:
+                    raise GateStopError("stop_control_not_restored")
+            except BaseException as cleanup_error:
+                if original_error is None:
+                    raise
+                original_error.add_note(
+                    "Gate stop-retention cleanup failed; rerun --cleanup-only for this run. "
+                    + type(cleanup_error).__name__
+                )
+
+    async def _cleanup_stop_retention(self):
+        from orchestrator.operator_cli.vm_recovery_gate_stop_control import (
+            GateStopControl,
+            GateStopStore,
+            KubernetesStopObjects,
         )
+
+        store = GateStopStore(self.db, self.run_id)
+        control = GateStopControl(KubernetesStopObjects(self._core), store)
+        for doc in await store.load():
+            if doc["stage"] not in {"restored", "aborted"}:
+                await control.abort(doc)
+
+    async def _crash_launcher(self, identity: Mapping[str, Any]) -> None:
+        from kubernetes.stream import stream
+        from orchestrator.operator_cli.vm_recovery_gate_stop_control import (
+            FINALIZER,
+            GateStopError,
+            joined_call,
+        )
+
+        pair = getattr(self, "_gate_stop", None)
+        if pair is None:
+            raise GateStopError("stop_retention_missing")
+        control, doc = pair
+        if identity["prior_launcher_uid"] != doc["pod_uid"]:
+            raise GateStopError("stop_launcher_changed")
+        async with control.store.authorized(doc) as check:
+            await control.kube.assert_quiet(doc)
+            vm = control._exact(doc, "vm", await control.kube.read(doc, "vm"))
+            if (
+                vm is None
+                or vm.get("spec", {}).get("runStrategy") != "Manual"
+                or vm.get("status", {}).get("stateChangeRequests")
+                or type(vm.get("metadata", {}).get("generation")) is not int
+                or vm.get("status", {}).get("desiredGeneration")
+                != vm["metadata"]["generation"]
+            ):
+                raise GateStopError("stop_strategy_changed")
+            for kind in ("vmi", "pod"):
+                obj = control._exact(doc, kind, await control.kube.read(doc, kind))
+                if obj is None or FINALIZER not in obj["metadata"].get(
+                    "finalizers", []
+                ):
+                    raise GateStopError("stop_retention_missing")
+            if check is not None:
+                await check()
+            await joined_call(
+                stream,
+                self._core.connect_get_namespaced_pod_exec,
+                doc["pod_name"],
+                self.namespace,
+                container="compute",
+                command=["/bin/sh", "-c", "kill -TERM 1"],
+                stderr=True,
+                stdin=False,
+                stdout=True,
+                tty=False,
+                _request_timeout=8,
+            )
 
     async def _force_delete_vmi(self, job_id: UUID) -> None:
         from kubernetes.client import V1DeleteOptions
@@ -1385,30 +1517,33 @@ class LiveScenario:
         recovery_started = time.monotonic()
         executor_occupancy_samples = [await self._executor_occupied(job_id)]
         await self._sync_gate_retention_pins("replacement", disposition.operation_id)
-        await self._crash_launcher(identity)
-        async with self._gate_owned_reconciler("replacement"):
-            stop_receipt = await self._wait(
-                "exact stop receipt",
-                lambda: self._row(
-                    "SELECT id,evidence_digest,accepted_claim_token,vm_uid,vmi_uid,"
-                    "launcher_uid,root_pvc_uid,container_id,controller_identity "
-                    "FROM vm_workspace_recovery_stop_receipts "
-                    "WHERE recovery_id=$1 ORDER BY accepted_at DESC LIMIT 1",
-                    disposition.operation_id,
-                ),
-                timeout=180,
-            )
-            # A gate-only patch keeps the real KubeVirt VM halted long enough to
-            # exercise recovery waiting without occupying the fenced queue lease.
-            await self._set_vm_run_strategy(job_id, "Halted")
-            await asyncio.sleep(self.slow_boot_delay_seconds)
-            executor_occupancy_samples.append(await self._executor_occupied(job_id))
-            await self._set_vm_run_strategy(job_id, "RerunOnFailure")
-            recovered = await self._wait(
-                "replacement recovery",
-                lambda: self._wait_phase(disposition.operation_id, {"recovered"}),
-                timeout=1200,
-            )
+        async with self._positive_stop_retention(
+            identity, disposition.operation_id
+        ) as (stop_control, stop_document):
+            await self._crash_launcher(identity)
+            async with self._gate_owned_reconciler("replacement"):
+                stop_receipt = await self._wait(
+                    "exact stop receipt",
+                    lambda: self._row(
+                        "SELECT id,evidence_digest,accepted_claim_token,vm_uid,vmi_uid,"
+                        "launcher_uid,root_pvc_uid,container_id,controller_identity "
+                        "FROM vm_workspace_recovery_stop_receipts "
+                        "WHERE recovery_id=$1 ORDER BY accepted_at DESC LIMIT 1",
+                        disposition.operation_id,
+                    ),
+                    timeout=180,
+                )
+                # A gate-only patch keeps the real KubeVirt VM halted long enough to
+                # exercise recovery waiting without occupying the fenced queue lease.
+                await stop_control.release(stop_document)
+                await asyncio.sleep(self.slow_boot_delay_seconds)
+                executor_occupancy_samples.append(await self._executor_occupied(job_id))
+                await stop_control.restore(stop_document)
+                recovered = await self._wait(
+                    "replacement recovery",
+                    lambda: self._wait_phase(disposition.operation_id, {"recovered"}),
+                    timeout=1200,
+                )
         replacement_identity = await self._wait(
             "replacement VM readiness",
             lambda: self._ready_identity(job_id),
@@ -1662,11 +1797,17 @@ class LiveScenario:
         }
 
     async def cleanup(self) -> None:
+        await self._cleanup_stop_retention()
         rows: list[dict[str, Any]] = []
         async with self.db.acquire() as conn:
             records = await conn.fetch(
-                "SELECT id FROM jobs WHERE description LIKE $1",
-                f"[vm-recovery-gate:{self.run_id}]%",
+                "SELECT j.id FROM jobs j JOIN users u ON u.id=j.user_id "
+                "WHERE j.description=$1 AND j.execution_lane='stateless' "
+                "AND j.context->>'vm_workspace_recovery_acceptance_gate'=$2 "
+                "AND u.display_name=$3 AND u.is_admin=false",
+                f"[vm-recovery-gate:{self.run_id}] retained disk fixture",
+                self.run_id,
+                f"VM recovery gate {self.run_id}",
             )
             rows = [dict(record) for record in records]
         for row in rows:
@@ -1692,8 +1833,50 @@ class LiveScenario:
                     "FROM vm_workspace_recovery_jobs WHERE job_id=$1)",
                     job_id,
                 )
-            with suppress(Exception):
-                await self.provisioner.delete_vm(str(job_id), purge_disk=True)
+            await self._purge_fixture(job_id)
+
+    async def _purge_fixture(self, job_id):
+        from orchestrator.operator_cli.vm_recovery_gate_stop_control import (
+            GateFixturePurge,
+            GateStopError,
+            KubernetesStopObjects,
+        )
+
+        # Capture before Kubernetes inventory. The later normal release must
+        # use this identity, never recapture a same-name replacement.
+        try:
+            identity = await self.provisioner.capture_vm_teardown_identity(str(job_id))
+        except Exception:
+            identity = None
+        anchor = (
+            {
+                "generation": identity.provision_generation,
+                "vm": identity.vm_uid,
+                "pvc": identity.rootdisk_pvc_uid,
+            }
+            if identity is not None
+            else None
+        )
+
+        async def release_captured(job, *, purge_disk):
+            if identity is None:
+                raise GateStopError("purge_identity_unproven")
+            result = await self.provisioner.release_vm_captured(
+                job,
+                identity,
+                purge_disk=purge_disk,
+                capture_snapshot=False,
+            )
+            return result.disposition == "completed"
+
+        await GateFixturePurge(
+            self.db,
+            KubernetesStopObjects(self._core),
+            release_captured,
+            self.run_id,
+            self.namespace,
+            anchor=anchor,
+        ).run(job_id)
 
 
 def _output_path(value: str) -> Path:
