@@ -265,6 +265,23 @@ class VMResourceReservationStore:
         except (VMCreationRetryConflict, ResourceAdmissionError, InventoryError) as exc:
             return {"action": "unavailable", "reason": str(exc)}
 
+    async def _lock_policy(self, conn, *, allow_drain=False):
+        policy = await conn.fetchrow(
+            "SELECT * FROM vm_resource_admission_policy WHERE cluster_id=$1 FOR UPDATE",
+            self.inventory.cluster_id,
+        )
+        if (
+            policy is None
+            or policy["namespace"] != self.inventory.namespace
+            or policy["policy_digest"] != self.inventory.policy_digest
+            or policy["revision"] != self.policy_revision
+            or _encoded(_json(policy["document"])) != self.policy_encoded
+            or policy["mode"]
+            not in ({"enforce", "drain"} if allow_drain else {"enforce"})
+        ):
+            raise ResourceAdmissionError("resource_policy_changed")
+        return policy
+
     async def _admit(self, conn, request_id):
         retry, job = await self.creation._effect_scope(conn, request_id)
         await self.creation._current(
@@ -275,19 +292,7 @@ class VMResourceReservationStore:
             retry["request_id"],
         )
         inventory = self.inventory
-        policy = await conn.fetchrow(
-            "SELECT * FROM vm_resource_admission_policy WHERE cluster_id=$1 FOR UPDATE",
-            inventory.cluster_id,
-        )
-        if (
-            policy is None
-            or policy["namespace"] != inventory.namespace
-            or policy["policy_digest"] != inventory.policy_digest
-            or policy["revision"] != self.policy_revision
-            or _encoded(_json(policy["document"])) != self.policy_encoded
-            or policy["mode"] != "enforce"
-        ):
-            raise ResourceAdmissionError("resource_policy_changed")
+        policy = await self._lock_policy(conn)
         # All legitimate writers serialize on policy before taking these rows.
         # Read idempotence before inventory, but never before request authority.
         held = await conn.fetchrow(

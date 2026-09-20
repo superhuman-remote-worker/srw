@@ -7695,8 +7695,9 @@ BEGIN
         RAISE EXCEPTION 'VM resource waiter identity is immutable' USING ERRCODE='23514';
     END IF;
     IF NEW.state <> OLD.state AND NOT (
-        (OLD.state='waiting' AND NEW.state IN ('nonfit','admitted','cancelled')) OR
-        (OLD.state='nonfit' AND NEW.state IN ('waiting','cancelled')) OR
+        (OLD.state='waiting' AND NEW.state IN ('nonfit','admitted','cancelled','parked')) OR
+        (OLD.state='nonfit' AND NEW.state IN ('waiting','cancelled','parked')) OR
+        (OLD.state='parked' AND NEW.state IN ('waiting','cancelled')) OR
         (OLD.state='admitted' AND NEW.state='released')
     ) THEN
         RAISE EXCEPTION 'Invalid VM resource waiter transition' USING ERRCODE='23514';
@@ -21473,8 +21474,7 @@ CREATE TABLE public.vm_resource_waiters (
     CONSTRAINT vm_resource_waiters_protected_order_check CHECK ((protected_order >= 0)),
     CONSTRAINT vm_resource_waiters_reason_check CHECK ((length(reason) <= 80)),
     CONSTRAINT vm_resource_waiters_request_digest_check CHECK ((request_digest ~ '^sha256:[0-9a-f]{64}$'::text)),
-    CONSTRAINT vm_resource_waiters_revision_check CHECK ((revision > 0)),
-    CONSTRAINT vm_resource_waiters_state_check CHECK ((state = ANY (ARRAY['waiting'::text, 'nonfit'::text, 'admitted'::text, 'cancelled'::text, 'released'::text])))
+    CONSTRAINT vm_resource_waiters_revision_check CHECK ((revision > 0))
 );
 
 
@@ -24128,6 +24128,14 @@ ALTER TABLE ONLY public.vm_resource_waiters
 
 ALTER TABLE ONLY public.vm_resource_waiters
     ADD CONSTRAINT vm_resource_waiters_request_id_cluster_id_policy_digest_key UNIQUE (request_id, cluster_id, policy_digest);
+
+
+--
+-- Name: vm_resource_waiters vm_resource_waiters_state_check; Type: CHECK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE public.vm_resource_waiters
+    ADD CONSTRAINT vm_resource_waiters_state_check CHECK ((state = ANY (ARRAY['waiting'::text, 'nonfit'::text, 'parked'::text, 'admitted'::text, 'cancelled'::text, 'released'::text]))) NOT VALID;
 
 
 --
