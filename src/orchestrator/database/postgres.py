@@ -29682,6 +29682,9 @@ class PostgresDB:
                        )
                    ),
                    status = 'paused',
+                   workspace_idle_revision = workspace_idle_revision
+                       + CASE WHEN workspace_idle_episode IS NULL THEN 0 ELSE 1 END,
+                   workspace_idle_episode = NULL,
                    assigned_agent_id = NULL,
                    lease_expires_at = NULL,
                    freeze_data = NULL,

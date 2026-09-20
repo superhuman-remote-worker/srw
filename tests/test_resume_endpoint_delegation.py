@@ -619,6 +619,9 @@ class TestResumeJobOnAgentRejection:
 @pytest.fixture
 def endpoint_collaborators(monkeypatch, fake_conn):
     """Patch the endpoint's collaborators around the delegation seam."""
+    # This fixture covers ordinary Resume delegation with a nontransactional
+    # fake connection. Creation-intent Resume has dedicated real-PG coverage.
+    monkeypatch.setattr(orchestrator.main.postgres_db, "supports_vm_creation_retry", False)
     job = _job(assigned_agent_id=AGENT_ID)
     agent = _agent()
 
