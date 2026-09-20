@@ -1,6 +1,6 @@
 # Task D: Resource-based VM admission seams and implementation plan
 
-**Status:** implementation under the owner-approved remaining roadmap. The pure host-cost, Pod request and node-placement foundation has 195 passing tests and awaits independent review. Inventory ingestion, durable reservations/fairness, creation integration and rollout remain incomplete. Production policy values and live acceptance remain rollout prerequisites.
+**Status:** implementation under the owner-approved remaining roadmap. D1 resource/placement primitives (`c62177172`), D2 sanitized collector (`5b3219e07`) and immutable inventory store/migration 0263 (`24feabea8`) passed independent review. Authenticated ingestion, default-off observer runtime and shared Helm policy (`94b13145a`) passed independent review, 133 inventory/Helm checks and 23 startup/runtime compatibility tests. Direct read-only collection on dedicated k3d returned complete eight-kind inventory; no live publication or admission is claimed. D3 exact occupancy (`bb1b26daa`, 24 tests), persistent fairness nomination (`7596fd415`, 12 tests), and immutable reservation schema/evidence retention (`0e1ee5a88`, 24 PostgreSQL/head tests) passed independent review. The unconnected atomic admission store is being tested; trusted waiter projection and lifecycle integration remain next. Durable reservations/fairness, creation integration, accounting visibility and enforcement remain incomplete. Production policy values and live acceptance remain rollout prerequisites.
 
 **Snapshot inspected:** worktree HEAD `91f9971e14ade45d154bf8bff946dfaed3700b85` on 2026-09-20. The worktree also contained unrelated in-progress Task 3 changes; line numbers must be refreshed before implementation.
 
@@ -58,9 +58,9 @@ The VM controller is the narrowest existing component that already reads KubeVir
 
 The observer requires an explicit cluster-wide read acknowledgement because exact external occupancy needs Pods in every namespace. Its ClusterRole is read-only and limited to:
 
-- `nodes`: `get`, `list`, `watch`
-- `pods`: `get`, `list`, `watch`
-- `persistentvolumes` and `storageclasses`: `get`, `list`, `watch` for topology only
+- `nodes`: `list` (the existing separate exact-identity role retains `get`)
+- `pods`: `list`
+- `persistentvolumes` and `storageclasses`: `list` for topology only
 - the existing namespaced VM/VMI/PVC/DataVolume reads
 
 The published document is sanitized: node UID/name, allowlisted placement labels, taints/conditions, allocatable CPU/RAM/KVM, normalized Pod UID/node/effective request/terminal/deleting state, VM/VMI/launcher public identity and owner-generation labels, and PV/StorageClass topology. It must exclude environment, commands, images, Secret references, raw annotations, raw status messages, and API exception text. Cap item count and encoded bytes; any pagination, normalization, watch-gap, or truncation failure marks the snapshot incomplete.
@@ -99,6 +99,12 @@ Create a durable VM-specific wait row as part of creation retry admission. Its o
 4. Temporarily nonfitting owner heads can be bypassed only up to an explicitly configured `maxBypasses`. At the limit they become protected, preventing unlimited small-request backfill. Do not invent the production value; require an explicit value when enforcement is enabled. `0` gives strict no-bypass behavior.
 5. Update the global admission sequence and owner's last-admitted sequence in the same transaction that inserts the reservation.
 
+Protection is persisted on the skipped waiter and survives new priorities or a different ordinary head for the same owner. Protected heads precede bypassable work, ordered by persisted protection sequence, enqueue time and request UUID. `maxBypasses: 0` protects the first temporarily blocked eligible head immediately. Increment bypass counts only in a committed later reservation, never for polling, CAS loss, inventory refusal or nonfit classification. Global/owner fairness sequence advances in that same commit.
+
+Select a candidate outside its authority transaction, then acquire only that request's established Job/retry locks before cluster policy and inventory-head locks. Recompute the winner after waiting. A different winner returns a nomination; end the transaction and acquire the nominee's normal authority on the next attempt. Never lock a foreign Job after policy. Cancelled/expired/recovery-held heads require bounded maintenance under their own authority; use persisted cursor progress so a prefix of invalid heads cannot hide valid work across replicas/restarts.
+
+`nonfit` requires complete supported static capacity evidence and size failure independent of occupancy. Ready/cordon/device advertisement changes, unknown label coverage and unbound topology are waits, not permanent nonfit. Reconsider nonfit under newer relevant inventory/policy while preserving enqueue identity, priority aging and prior fairness history.
+
 Optional hard owner CPU/RAM budgets are distinct from fairness. An absent owner budget means no separate hard quota; it does not disable global fit. If budgets are configured later, persist a versioned policy and compare active plus held reservations atomically.
 
 Reservation states and their capacity behavior are:
@@ -123,11 +129,11 @@ The minimum slice intentionally pins the initial VMI to one selected Node UID/na
 
 ## Database model and lock order
 
-Use the next app migration number available at implementation time (the inspected head is 0260). Update `src/orchestrator/database/schema_current.sql` and the migration-head checks in the same change.
+Use the next app migration number available at implementation time (current local head is 0264; coordinate with remaining A1 cancellation work). Update `src/orchestrator/database/schema_current.sql` and the migration-head checks in the same change.
 
 Suggested tables:
 
-- `vm_resource_inventory_snapshots`: snapshot UUID, cluster ID, controller instance, observed time, node/pod resourceVersions, complete flag, digest, bounded sanitized JSON, policy digest, received time. Keep bounded history and one current complete pointer.
+- `vm_resource_inventory_snapshots`: snapshot UUID, cluster ID, controller instance, observed time, node/pod resourceVersions, complete flag, digest, bounded sanitized JSON, policy digest, received time. Keep bounded history, a persisted observation high-water mark and one current observation pointer, including incomplete/stale observations. Never fall back to older complete capacity. Identical retained snapshots return the original immutable receipt; after history pruning, older IDs are refused by the high-water mark. D3 must protect every reservation-referenced snapshot from pruning.
 - `vm_resource_waiters`: one row per retry request; request/Job/generation FK identity, owner/project keys, priority, enqueue time, immutable guest and host vectors, policy digest, state/reason, bypass count/protection time, revision.
 - `vm_resource_reservations`: reservation UUID, request ID unique, selected node UID/name, immutable host vector and KVM count, policy/snapshot digests, lifecycle state, exact VMI/launcher identities when learned, teardown/release evidence and timestamps.
 - `vm_resource_admission_policy`: singleton cluster/policy revision, mode, current inventory pointer, global admission sequence and rollout state.
@@ -135,25 +141,25 @@ Suggested tables:
 
 Use integer millicores and bytes with nonnegative/bounded checks. Store Kubernetes quantity source strings only in sanitized evidence, not as arithmetic authority. Add unique constraints for one waiter/reservation per retry request and immutable triggers for request, generation, node UID/name after VM-effect issue, resource vector, and policy digest.
 
-All resource admission/reconciliation paths use this lock order:
+All resource admission/reconciliation paths use this lock order (D3 must lock the current inventory-head row together with the resource policy in one consistent order):
 
 1. Existing owner/PVC advisory locks and cleanup/recovery locks when the operation also changes Job or retry authority.
 2. Job, retry, and effect rows using the existing `_scope` order.
-3. The singleton resource policy row.
+3. One cluster-wide resource policy row (key excludes namespace/policy digest); all earlier-policy held vectors remain charged unchanged.
 4. Candidate node ledger rows ordered by Node UID.
 5. Waiter, reservation, and owner-fairness rows ordered by UUID/owner key.
 
-Inventory publication never locks Job rows. It stores a complete immutable snapshot first, then swaps the current pointer under the policy-row lock. Admission never performs Kubernetes I/O inside a database transaction.
+Inventory publication never locks Job rows. It stores an immutable complete or incomplete observation, then advances the current pointer under the inventory-head lock. Collection freshness starts at the earliest LIST, and receipt freshness uses database time sampled after that lock. Equal observation timestamps with different identities invalidate availability; future observation time is refused. Neither transport re-signing nor replay refreshes an old receipt. Admission never performs Kubernetes I/O inside a database transaction.
 
 ## Service boundaries
 
 Add these focused modules rather than growing `vm_creation_retry_store.py` further:
 
 - `src/shared/vm_resource_admission.py`: typed resource vectors, canonical policy/snapshot/reservation digests, sanitized wire validation, and reason enums.
-- `src/vm_controller/resource_inventory.py`: bounded LIST/WATCH cache, node/Pod/VMI/PV normalization, complete snapshot creation, and authenticated publication.
+- `src/vm_controller/resource_inventory.py`: bounded paginated LIST collection, node/Pod/VMI/PV normalization, complete/incomplete observations, and authenticated publication. Watch is deferred until explicit gap invalidation exists.
 - `src/orchestrator/services/vm_resource_admission_store.py`: short PostgreSQL transactions for waiter creation, atomic fit/fairness selection, reservation lookup, bind/teardown/release reconciliation, and admin projection.
 - `src/orchestrator/services/vm_resource_admission.py`: leader loop; no network calls while store transactions are open.
-- `src/orchestrator/routers/vm_resource_inventory.py`: lifecycle-HMAC authenticated snapshot ingestion. Reuse `require_vm_cleanup_authority` with a new domain-separated operation name.
+- `src/orchestrator/routers/vm_resource_inventory.py`: lifecycle-HMAC authenticated snapshot ingestion. Reuse the shared HMAC primitive with operation `vm_resource_inventory_publish`; read the bounded request stream before JSON decoding, reject duplicate keys/deep or ambiguous JSON, and return a signed correlated receipt. The existing unbounded request.json authentication helper is unsuitable for this endpoint.
 
 Integration changes:
 
@@ -184,6 +190,11 @@ vm:
       staleAfterSeconds: null
       maxItems: null
       maxBytes: null
+      requestTimeoutSeconds: null
+      collectionTimeoutSeconds: null
+      publicationTimeoutSeconds: null
+      historyLimit: null
+      nodeLabelKeys: [] # explicitly include hostname and every placement/topology key
     hostCost:
       cpuMillicoresPerVcpuNumerator: null
       cpuMillicoresPerVcpuDenominator: null
@@ -267,7 +278,9 @@ Current local foundation covers arithmetic, explicit policy digests, shared Pod 
 
 ### 3. Durable waiters and atomic reservations
 
-**Files:** add the next migration (next free number after attachment migration 0261; do not reuse its number), update `schema_current.sql` and migration checks, add `vm_resource_admission_store.py`, and add `tests/test_vm_resource_admission_real_postgres.py`.
+Before introducing reservation FKs, extend D2 pruning with a nonlocking reference exclusion and retain restrictive FKs. Referenced history is additional to the bounded unreferenced receipt window.
+
+**Files:** add the next migration (next free number after current inventory migration 0263; coordinate with A1 and do not reuse its number), update `schema_current.sql` and migration checks, add `vm_resource_admission_store.py`, and add `tests/test_vm_resource_admission_real_postgres.py`.
 
 - RED with actual PostgreSQL: two concurrent replicas compete for the final fitting vector; exactly one reservation commits.
 - RED: repeat admission of one request returns the same reservation and does not change totals.
@@ -331,7 +344,7 @@ The local-path result proves CPU/RAM/KVM admission, cross-replica PostgreSQL ser
 
 ## Minimum cohesive slice acceptance checklist
 
-- [ ] Default chart values leave observer, shadow, and enforcement off.
+- [x] Default chart values leave observer, shadow, and enforcement off; unfinished shadow/enforcement modes currently refuse enablement.
 - [ ] Enabling enforcement requires explicit operator policy and cluster-wide read acknowledgement.
 - [ ] Complete, fresh, sanitized inventory includes eligible nodes and all scheduled external Pod requests.
 - [ ] One PostgreSQL transaction selects an owner-fair waiter and inserts one per-node reservation.
