@@ -159,3 +159,177 @@ async def test_real_authority_refuses_forged_semantic_golden_source(
             carrier=sealed(),
         )
     )["actuation_allowed"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "prepared, carrier_version", [(False, 1), (True, 1), (True, 2)]
+)
+async def test_new_clone_source_grant_requires_supported_proof(
+    db, monkeypatch, prepared, carrier_version
+):
+    monkeypatch.setattr(settings, "VM_GOLDEN_IMAGE_ENABLED", not prepared)
+    if prepared:
+        from tests import test_vm_creation_retry_real_postgres as fixtures
+        from shared.workspace_preparation import preparation_request
+
+        original = fixtures.build_vm_creation_request
+
+        def with_preparation(**kwargs):
+            request = original(**kwargs)
+            request["preparation"] = preparation_request(
+                {"image": request["vm_image"], "prepare": []},
+                scope_kind="Project",
+                scope_uid=str(uuid4()),
+                allocation_id=request["job_id"],
+                owner_kind="job",
+            )
+            return request
+
+        monkeypatch.setattr(fixtures, "build_vm_creation_request", with_preparation)
+    store, row, claim, carrier = await reserved(db, monkeypatch)
+    if carrier_version == 2:
+        import json
+
+        async with db.acquire() as conn:
+            request = json.loads(
+                await conn.fetchval(
+                    "SELECT canonical_request FROM vm_creation_retries WHERE request_id=$1",
+                    row["request_id"],
+                )
+            )
+        values = verify_creation_carrier(carrier, secret=SECRET)
+        values.update(
+            version=2,
+            rootdisk_source={"kind": "registry", "image": request["vm_image"]},
+        )
+        carrier = seal_creation_carrier(
+            values,
+            namespace=carrier["metadata"]["namespace"],
+            uid=carrier["metadata"]["uid"],
+            resource_version="3",
+            secret=SECRET,
+        )
+    with pytest.raises(
+        VMCreationRetryConflict, match="creation_rootdisk_source_(required|changed)"
+    ):
+        await store.begin_effect(
+            request_id=str(row["request_id"]),
+            claim_token=str(claim["claim_token"]),
+            carrier=carrier,
+        )
+    async with db.acquire() as conn:
+        assert (
+            await conn.fetchval(
+                "SELECT count(*) FROM vm_creation_effects WHERE request_id=$1",
+                row["request_id"],
+            )
+            == 0
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["observed", "rejected"])
+async def test_historical_v1_golden_effect_observes_but_never_grants_new_nonce(
+    db, monkeypatch, outcome
+):
+    import json
+    from uuid import UUID
+    from tests.test_vm_creation_effects_real_postgres import disk_observation
+
+    monkeypatch.setattr(settings, "VM_GOLDEN_IMAGE_ENABLED", True)
+    store, row, claim, carrier = await reserved(db, monkeypatch)
+    values = verify_creation_carrier(carrier, secret=SECRET)
+    # Seed an effect issued by the previous controller/store version, using the
+    # actual immutable ledger rather than allowing the new code to grant it.
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE vm_creation_retries SET creation_carrier_uid=$2,creation_carrier_namespace=$3 WHERE request_id=$1",
+            row["request_id"],
+            UUID(carrier["metadata"]["uid"]),
+            carrier["metadata"]["namespace"],
+        )
+        await conn.execute(
+            "INSERT INTO vm_creation_effects(effect_nonce,request_id,effect_number,effect_kind,carrier_uid,carrier_namespace,carrier_intent) VALUES($1,$2,1,'rootdisk',$3,$4,$5::jsonb)",
+            UUID(values["effect_nonce"]),
+            row["request_id"],
+            UUID(carrier["metadata"]["uid"]),
+            carrier["metadata"]["namespace"],
+            json.dumps(values),
+        )
+    result = await store.begin_effect(
+        request_id=str(row["request_id"]),
+        claim_token=str(claim["claim_token"]),
+        carrier=carrier,
+    )
+    assert result == {
+        "actuation_allowed": False,
+        "disposition": "observe_only",
+        "effect_state": "issued",
+    }
+    observation = (
+        disk_observation(carrier)
+        if outcome == "observed"
+        else {
+            "outcome": "rejected",
+            "api_status": {
+                "apiVersion": "v1",
+                "kind": "Status",
+                "status": "Failure",
+                "code": 422,
+                "reason": "Invalid",
+            },
+        }
+    )
+    assert (
+        await store.observe_effect(
+            request_id=str(row["request_id"]), carrier=carrier, observation=observation
+        )
+    )["effect_state"] == outcome
+    if outcome == "observed":
+        values.update(
+            effect_kind="cloud_init",
+            object_name="agent-vm-" + str(row["job_id"]) + "-cloudinit",
+            current_dv_uid=observation["object"]["metadata"]["uid"],
+            current_pvc_uid=observation["pvc"]["metadata"]["uid"],
+        )
+    values["effect_nonce"] = str(uuid4())
+    next_carrier = seal_creation_carrier(
+        values,
+        namespace=carrier["metadata"]["namespace"],
+        uid=carrier["metadata"]["uid"],
+        resource_version="3",
+        secret=SECRET,
+    )
+    with pytest.raises(
+        VMCreationRetryConflict, match="creation_rootdisk_source_required"
+    ):
+        await store.begin_effect(
+            request_id=str(row["request_id"]),
+            claim_token=str(claim["claim_token"]),
+            carrier=next_carrier,
+        )
+
+
+def test_retained_source_cannot_claim_requested_preparation_without_proof():
+    from shared.vm_creation_issuance import validate_rootdisk_source
+    from shared.workspace_preparation import preparation_request
+
+    pvc_uid = str(uuid4())
+    request = {
+        "vm_image": "pinned:image",
+        "preparation": preparation_request(
+            {"image": "pinned:image", "prepare": []},
+            scope_kind="Project",
+            scope_uid=str(uuid4()),
+            allocation_id=str(uuid4()),
+            owner_kind="job",
+        ),
+    }
+    with pytest.raises(ValueError, match="Prepared rootdisk source is unproven"):
+        validate_rootdisk_source(
+            {"kind": "retained", "pvc_uid": pvc_uid},
+            request=request,
+            configuration={"golden_enabled": False},
+            expected_pvc_uid=pvc_uid,
+        )

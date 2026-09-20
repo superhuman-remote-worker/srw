@@ -768,6 +768,14 @@ class VMCreationRetryStore:
                         "disposition": "observe_only",
                         "effect_state": prior["state"],
                     }
+                # Historical v1 effects remain observable above and through
+                # observe/settle, but cannot mint a fresh source-less grant for
+                # modes that require a frozen clone/retained-source document.
+                if values["version"] != 2 and (
+                    row["controller_configuration"]["golden_enabled"]
+                    or row["canonical_request"].get("preparation") is not None
+                ):
+                    raise VMCreationRetryConflict("creation_rootdisk_source_required")
                 if latest and latest["state"] == "issued":
                     raise VMCreationRetryConflict("creation_effect_unresolved")
                 if latest is None:

@@ -53,6 +53,10 @@ def validate_rootdisk_source(source, *, request, configuration, expected_pvc_uid
     """Validate complete typed clone input against immutable admitted semantics."""
     if not isinstance(source, Mapping):
         raise ValueError("Rootdisk source is unproven")
+    if request.get("preparation") is not None:
+        # Prepared allocations need their own complete artifact/receipt proof;
+        # a supported registry/golden/retained document cannot stand in for it.
+        raise ValueError("Prepared rootdisk source is unproven")
     if expected_pvc_uid is not None:
         if source != {"kind": "retained", "pvc_uid": expected_pvc_uid}:
             raise ValueError("Retained rootdisk source changed")
