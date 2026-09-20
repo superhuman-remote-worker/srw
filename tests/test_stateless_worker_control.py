@@ -1256,6 +1256,10 @@ async def test_resume_retries_pinned_verb_after_vm_lane_repair(monkeypatch):
     )
     from orchestrator import main
 
+    # This fixture exercises lane fallback with an unconnected mocked store.
+    # Durable creation Resume has its own real-PostgreSQL authority tests.
+    monkeypatch.setattr(main.postgres_db, "supports_vm_creation_retry", False)
+
     job = {
         "id": JOB_ID,
         "status": "paused",
@@ -2296,3 +2300,28 @@ async def test_phase_approval_reenqueues_stateless_job(monkeypatch, tmp_path):
         fair_key="33333333-3333-3333-3333-333333333333",
         expected_status="pending_review",
     )
+
+
+@pytest.mark.asyncio
+async def test_internal_stateless_reply_forwards_exact_route_fence(monkeypatch):
+    from orchestrator import main
+
+    route_id = str(uuid4())
+    job = {
+        "id": JOB_ID,
+        "status": "waiting_for_reply",
+        "execution_lane": "stateless",
+        "priority": 2,
+        "user_id": None,
+    }
+    monkeypatch.setattr(main.postgres_db, "get_job", AsyncMock(return_value=job))
+    queued = AsyncMock(return_value=True)
+    monkeypatch.setattr(main.postgres_db, "queue_stateless_job_for_resume", queued)
+    monkeypatch.setattr(main, "_trigger_dispatch", MagicMock())
+    assert await control_seams.internal_resume_job(
+        JOB_ID,
+        "answer",
+        expected_status="waiting_for_reply",
+        expected_route_id=route_id,
+    )
+    assert queued.await_args.kwargs["expected_route_id"] == route_id

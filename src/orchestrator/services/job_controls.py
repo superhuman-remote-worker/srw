@@ -2461,6 +2461,11 @@ class JobControlOperations:
                 priority=int(job.get("priority") or 0),
                 fair_key=(str(job["user_id"]) if job.get("user_id") else None),
                 expected_status=observed_status,
+                **(
+                    {"expected_route_id": expected_route_id}
+                    if expected_route_id is not None
+                    else {}
+                ),
                 **self.dependencies.completion_control.resume_guard_kwargs(
                     completion_owner_command_id, completion_owner
                 ),
