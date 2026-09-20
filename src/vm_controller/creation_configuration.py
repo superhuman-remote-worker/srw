@@ -34,6 +34,7 @@ def _digest(value):
 
 def resolve_creation_configuration(controller, request):
     from vm_controller import controller as settings
+    from vm_controller import headscale_client
     import shared
     from shared.workspace_initialization import validate_initialization_request
     from shared.workspace_preparation import validate_request
@@ -116,6 +117,12 @@ def resolve_creation_configuration(controller, request):
         or str(payload.get("orchestrator_url") or "").strip(),
         "headscale_url": os.environ.get("HEADSCALE_URL", ""),
         "headscale_enabled": controller.headscale.is_available,
+        # The enrollment API uses import-time client settings; cloud-init's
+        # endpoint above is separately read from the rendering environment.
+        # Bind both actual sources without capturing API or generated keys.
+        "headscale_api_url": headscale_client.HEADSCALE_URL,
+        "headscale_user": headscale_client.HEADSCALE_USER,
+        "headscale_key_expiry_minutes": headscale_client.AUTH_KEY_EXPIRY_MINUTES,
         "authorized_public_key_digest": "sha256:"
         + hashlib.sha256(public_key.encode()).hexdigest(),
         "golden_enabled": settings.VM_GOLDEN_IMAGE_ENABLED,

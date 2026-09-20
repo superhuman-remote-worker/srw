@@ -147,3 +147,49 @@ async def test_effective_configuration_document_is_frozen_and_cannot_be_recaptur
             controller_configuration_digest=drift["controller_configuration_digest"],
         )
     assert db.snapshot == captured
+
+
+@pytest.mark.parametrize(
+    ("setting", "original", "changed", "field"),
+    [
+        ("HEADSCALE_USER", "original-account", "different-account", "headscale_user"),
+        ("AUTH_KEY_EXPIRY_MINUTES", 10, 30, "headscale_key_expiry_minutes"),
+        (
+            "HEADSCALE_URL",
+            "https://original-headscale.example",
+            "https://different-headscale.example",
+            "headscale_api_url",
+        ),
+    ],
+)
+def test_resolution_binds_actual_headscale_issuance_settings(
+    monkeypatch, setting, original, changed, field
+):
+    from vm_controller import headscale_client
+
+    payload = request()
+    monkeypatch.setattr(headscale_client, setting, original)
+    first = resolve_creation_configuration(controller(), payload)
+    monkeypatch.setattr(headscale_client, setting, changed)
+    second = resolve_creation_configuration(controller(), payload)
+    assert first["request_digest"] == second["request_digest"]
+    assert (
+        first["controller_configuration_digest"]
+        != second["controller_configuration_digest"]
+    )
+    assert first["controller_configuration"][field] == original
+    assert second["controller_configuration"][field] == changed
+
+
+@pytest.mark.parametrize(
+    "field", ["headscale_user", "headscale_key_expiry_minutes", "headscale_api_url"]
+)
+def test_configuration_missing_headscale_issuance_identity_is_refused(field):
+    from shared.vm_creation_issuance import canonical_configuration_digest
+
+    configuration = resolve_creation_configuration(controller(), request())[
+        "controller_configuration"
+    ]
+    configuration.pop(field, None)
+    with pytest.raises(ValueError, match="incomplete"):
+        canonical_configuration_digest(configuration)
