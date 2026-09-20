@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from datetime import timedelta
 import json
+import random
 from uuid import UUID, uuid4, uuid5, NAMESPACE_URL
 
 from orchestrator.services.vm_workspace_recovery_store import (
@@ -531,10 +532,16 @@ class VMCreationRetryStore:
         expected_revision: int,
         observation: dict,
     ) -> bool:
-        # Task 3 supplies exact issuance/admission settlement; until then only
-        # observations that retain authority may be committed here.
+        # Scheduling observations retain authority. Exact effect settlement is
+        # separate and cannot be inferred from this observer's transport reply.
         outcome = observation.get("outcome")
-        if outcome not in {"transport_unknown", "capacity_wait", "blocked"}:
+        if outcome not in {
+            "transport_unknown",
+            "capacity_wait",
+            "dependency_wait",
+            "observation_wait",
+            "blocked",
+        }:
             raise ValueError(
                 "Creation settlement requires authenticated controller integration"
             )
@@ -579,7 +586,7 @@ class VMCreationRetryStore:
                     "vm_creation_retry_blocked"
                     if attention
                     else "vm_creation_retry_pending",
-                    retry_delay_seconds(attempt),
+                    retry_delay_seconds(attempt, random.uniform(0, 0.2)),
                 )
                 return True
 

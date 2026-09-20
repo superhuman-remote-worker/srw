@@ -705,3 +705,61 @@ async def test_observation_rechecks_claim_expiry_after_retry_row_lock_wait(db):
         )
         assert current["revision"] == claim["revision"]
         assert current["backoff_attempt"] == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "outcome", ["capacity_wait", "dependency_wait", "observation_wait"]
+)
+async def test_creation_wait_after_26_hours_keeps_hold_and_clears_outage_without_attempts(
+    db, outcome
+):
+    job, generation, proposal = await admitted_job(
+        db, timeout=3 * 86400, lane="stateless"
+    )
+    # Seed the immutable creation timestamp at INSERT, with every trigger active.
+    async with db.acquire() as conn:
+        await conn.execute(
+            "ALTER TABLE vm_creation_retries ALTER COLUMN created_at SET DEFAULT clock_timestamp()-interval '26 hours'"
+        )
+    try:
+        await admit(db, job, generation, proposal)
+    finally:
+        async with db.acquire() as conn:
+            await conn.execute(
+                "ALTER TABLE vm_creation_retries ALTER COLUMN created_at SET DEFAULT clock_timestamp()"
+            )
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE run_queue SET attempts_since_completion=3 WHERE unit_id=$1", job
+        )
+        await conn.execute(
+            "UPDATE vm_creation_retries SET transport_outage_started_at=clock_timestamp()-interval '26 hours',backoff_attempt=100 WHERE job_id=$1",
+            job,
+        )
+    store = VMCreationRetryStore(db)
+    claim = (await store.claim_due(limit=1))[0]
+    assert await store.apply_observation(
+        request_id=str(claim["request_id"]),
+        claim_token=str(claim["claim_token"]),
+        expected_revision=claim["revision"],
+        observation={"outcome": outcome},
+    )
+    async with db.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT *, extract(epoch FROM next_probe_at-updated_at) AS delay FROM vm_creation_retries WHERE job_id=$1",
+            job,
+        )
+        assert row["state"] == "queued"
+        assert row["transport_outage_started_at"] is None
+        assert row["boot_counted"] is False
+        assert 299 <= row["delay"] <= 360
+        assert (
+            await conn.fetchval(
+                "SELECT attempts_since_completion FROM run_queue WHERE unit_id=$1", job
+            )
+            == 3
+        )
+        assert await conn.fetchval(
+            "SELECT context->>'_vm_creation_pending' FROM jobs WHERE id=$1", job
+        ) == str(row["request_id"])

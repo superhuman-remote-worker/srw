@@ -100,3 +100,96 @@ async def resolve_vm_creation_configuration(
     except (httpx.HTTPError, ValueError, TypeError, KeyError, AttributeError):
         # Never surface raw response bodies, URLs, credentials or exception text.
         raise CreationConfigurationUnavailable() from None
+
+
+async def replay_vm_creation(client, row: Mapping, *, secret: bytes) -> dict:
+    """Replay a claimed immutable intent only through the fenced protocol route.
+
+    Controller effect observations settle adoption in the authoritative store.
+    The reply here only schedules further observation; it never grants readiness
+    or supplies context fields to merge. Cancellation uses observation, not create.
+    """
+    from uuid import UUID
+    from shared.vm_creation_retry import VMCreationRetryIdentity
+
+    request = deepcopy(row["canonical_request"])
+    identity = VMCreationRetryIdentity(
+        request_id=str(row["request_id"]),
+        job_id=str(row["job_id"]),
+        provision_generation=str(row["provision_generation"]),
+        request_digest=row["request_digest"],
+        expected_pvc_uid=str(row["expected_pvc_uid"])
+        if row["expected_pvc_uid"]
+        else None,
+        claim_token=str(row["claim_token"]),
+    )
+    if (
+        not secret
+        or client is None
+        or row["state"] != "reconciling"
+        or canonical_request_digest(request) != identity.request_digest
+        or request["job_id"] != identity.job_id
+        or request["provision_generation"] != identity.provision_generation
+    ):
+        raise ValueError("creation replay source unproven")
+    envelope = {
+        "version": 1,
+        "request_id": identity.request_id,
+        "claim_token": identity.claim_token,
+        "request_digest": identity.request_digest,
+        "controller_configuration_digest": row["controller_configuration_digest"],
+    }
+    operation = "creation_retry_create"
+    signed = sign_payload(
+        {**request, "creation_retry": envelope},
+        direction="request",
+        operation=operation,
+        secret=secret,
+    )
+    try:
+        response = await client.post("/vm-creation/create", json=signed, timeout=30.0)
+        if response.status_code >= 500 or response.status_code == 429:
+            return {"outcome": "transport_unknown", "reason": "controller_unavailable"}
+        data = response.json()
+        if not isinstance(data, Mapping) or not verify_payload(
+            data,
+            direction="response",
+            operation=operation,
+            secret=secret,
+            expected_correlation_id=signed[AUTH_FIELD]["request_id"],
+        ):
+            raise ValueError("creation response unproven")
+        response.raise_for_status()
+        result = unsigned_payload(data)
+        if (
+            result.get("job_id") != identity.job_id
+            or result.get("provision_generation") != identity.provision_generation
+        ):
+            raise ValueError("creation owner changed")
+        status = result.get("status")
+        reason = result.get("reason")
+        if status == "created":
+            # Even an authenticated malformed result is not adoption evidence.
+            for key in ("vm_uid", "rootdisk_pvc_uid"):
+                if str(UUID(result[key])) != result[key]:
+                    raise ValueError("creation identity unproven")
+            return {"outcome": "adopted"}
+        if status == "creation_attention":
+            return {"outcome": "blocked", "reason": "creation_evidence_unproven"}
+        if status == "creation_pending":
+            if reason == "capacity_wait":
+                return {"outcome": "capacity_wait", "reason": reason}
+            if reason in {
+                "golden_wait",
+                "preparation_wait",
+                "headscale_wait",
+                "disk_wait",
+            }:
+                return {"outcome": "dependency_wait", "reason": reason}
+            if reason == "creation_observation_pending":
+                return {"outcome": "observation_wait", "reason": reason}
+        raise ValueError("creation result unsupported")
+    except httpx.RequestError:
+        return {"outcome": "transport_unknown", "reason": "controller_unavailable"}
+    except (httpx.HTTPError, ValueError, TypeError, KeyError, AttributeError):
+        return {"outcome": "blocked", "reason": "creation_evidence_unproven"}
