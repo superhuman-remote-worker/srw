@@ -1308,7 +1308,6 @@ class VMCreationRetryStore:
                     "request": row["canonical_request"],
                     "cancellation_disposition": _json(row["cancellation_disposition"]),
                     "cancellation_progress": _json(row["cancellation_progress"]),
-                    "cancellation_completion": _json(row["cancellation_completion"]),
                     **(
                         {
                             "prepared_origin": prepared_origin(
