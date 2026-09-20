@@ -71,6 +71,17 @@ class InventorySettings:
         This does not authorize observation or enable unfinished admission modes.
         Empty resource-value maps remain valid for observation alone.
         """
+        return cls._from_document_capabilities(
+            value,
+            expected=(True, False, False, True),
+            observer_disabled_returns_none=True,
+        )
+
+    @classmethod
+    def _from_document_capabilities(
+        cls, value, *, expected, observer_disabled_returns_none=False
+    ):
+        """Shared pure parser with an exact caller-selected capability profile."""
         try:
             if not isinstance(value, dict) or set(value) != {
                 "mode",
@@ -89,16 +100,23 @@ class InventorySettings:
             ):
                 if type(policy[field]) is not bool:
                     raise ValueError
-            # Later stages must implement their complete rollout gates before
-            # permitting these modes. This slice observes only.
-            if policy["shadowEnabled"] or policy["enforcementEnabled"]:
+            actual = tuple(
+                policy[field]
+                for field in (
+                    "observerEnabled",
+                    "shadowEnabled",
+                    "enforcementEnabled",
+                    "clusterWidePodReadAcknowledged",
+                )
+            )
+            if observer_disabled_returns_none:
+                if actual[1] or actual[2]:
+                    raise ValueError
+                if not actual[0]:
+                    return None
+            if actual != expected:
                 raise ValueError
-            if not policy["observerEnabled"]:
-                return None
-            if (
-                value["mode"] != "same-cluster"
-                or not policy["clusterWidePodReadAcknowledged"]
-            ):
+            if value["mode"] != "same-cluster":
                 raise ValueError
             cluster, namespace = policy["stableClusterId"], value["namespace"]
             for identifier, limit in ((cluster, 253), (namespace, 63)):

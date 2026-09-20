@@ -52,6 +52,16 @@ def test_inventory_off_requires_no_policy_or_hmac():
     value["policy"]["observerEnabled"] = False
     value["policy"]["inventory"] = {}
     assert load(value, secret="") is None
+    value.update(mode="external", namespace="")
+    value["policy"].update(
+        clusterWidePodReadAcknowledged=False,
+        stableClusterId="",
+        inventory=None,
+        hostCost=None,
+        nodeHeadroom=None,
+        fairness=None,
+    )
+    assert load(value, secret="") is None
 
 
 def test_policy_digest_is_canonical_and_covers_scope_and_label_coverage():

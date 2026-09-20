@@ -74,12 +74,18 @@ class CompleteResourcePolicySnapshot:
     priority_aging_seconds: int
 
 
-def validate_complete_resource_policy(document):
-    """Freeze a complete explicit observer policy without environment/secret I/O.
+@dataclass(frozen=True, slots=True)
+class EnforcementResourcePolicySnapshot:
+    canonical_document: bytes
+    policy_digest: str
+    inventory: InventorySettings
+    host_cost: HostCostPolicy
+    headroom: ResourceVector
+    max_bypasses: int
+    priority_aging_seconds: int
 
-    Unfinished shadow/enforcement modes remain refused by the existing parser.
-    Their eventual activation needs a separate runtime and launcher contract.
-    """
+
+def _validate_resource_policy(document, *, inventory_loader, snapshot_type):
     try:
         canonical = json.dumps(
             document,
@@ -92,11 +98,11 @@ def validate_complete_resource_policy(document):
             raise ValueError
         # Decode into an owned tree: no mutable input survives validation.
         value = json.loads(canonical)
-        inventory = InventorySettings.from_document(value)
+        inventory = inventory_loader(value)
         if inventory is None:
             raise ValueError
         cost, headroom, bypasses, aging = parse_resource_policy_values(value["policy"])
-        return CompleteResourcePolicySnapshot(
+        return snapshot_type(
             canonical,
             inventory.policy_digest,
             inventory,
@@ -107,6 +113,31 @@ def validate_complete_resource_policy(document):
         )
     except (ValueError, TypeError, KeyError, UnicodeError, RecursionError):
         raise ResourceAdmissionError("invalid_resource_policy") from None
+
+
+def validate_complete_resource_policy(document):
+    """Freeze a complete explicit observer policy without environment/secret I/O.
+
+    Unfinished shadow/enforcement modes remain refused by the existing parser.
+    Their eventual activation needs a separate runtime and launcher contract.
+    """
+    return _validate_resource_policy(
+        document,
+        inventory_loader=InventorySettings.from_document,
+        snapshot_type=CompleteResourcePolicySnapshot,
+    )
+
+
+def validate_enforcement_resource_policy(document):
+    """Freeze the complete all-capabilities policy without granting enablement."""
+
+    return _validate_resource_policy(
+        document,
+        inventory_loader=lambda value: InventorySettings._from_document_capabilities(
+            value, expected=(True, True, True, True)
+        ),
+        snapshot_type=EnforcementResourcePolicySnapshot,
+    )
 
 
 def _same_typed_value(actual, expected):
@@ -138,6 +169,26 @@ def validate_resource_policy_snapshot(snapshot):
         if len(snapshot.canonical_document) > 16384:
             raise ValueError
         rebuilt = validate_complete_resource_policy(
+            json.loads(snapshot.canonical_document)
+        )
+        if not _same_typed_value(snapshot, rebuilt):
+            raise ValueError
+        return snapshot
+    except (ValueError, TypeError, KeyError, UnicodeError, RecursionError):
+        raise ResourceAdmissionError("invalid_resource_policy") from None
+
+
+def validate_enforcement_resource_policy_snapshot(snapshot):
+    """Rebuild and compare every enforcement snapshot field with exact types."""
+    try:
+        if (
+            type(snapshot) is not EnforcementResourcePolicySnapshot
+            or type(snapshot.canonical_document) is not bytes
+        ):
+            raise ValueError
+        if len(snapshot.canonical_document) > 16384:
+            raise ValueError
+        rebuilt = validate_enforcement_resource_policy(
             json.loads(snapshot.canonical_document)
         )
         if not _same_typed_value(snapshot, rebuilt):

@@ -37,6 +37,20 @@ def snapshot(value=None):
     )
 
 
+def enforcement_policy():
+    value = complete_policy()
+    value["policy"].update(shadowEnabled=True, enforcementEnabled=True)
+    return value
+
+
+def enforcement_snapshot(value=None):
+    from shared.vm_resource_policy import validate_enforcement_resource_policy
+
+    return validate_enforcement_resource_policy(
+        enforcement_policy() if value is None else value
+    )
+
+
 def test_snapshot_freezes_canonical_whole_policy_without_secret(monkeypatch):
     monkeypatch.delenv("VM_LIFECYCLE_HMAC_SECRET", raising=False)
     value = complete_policy()
@@ -166,3 +180,63 @@ def test_snapshot_revalidation_rejects_equal_valued_wrong_types(field):
     )
     with pytest.raises(ResourceAdmissionError, match="invalid_resource_policy"):
         validate_resource_policy_snapshot(replace(value, **{field: changed}))
+
+
+def test_enforcement_snapshot_requires_all_capabilities_without_broadening_observer():
+    from shared.vm_resource_inventory import InventoryError
+    from shared.vm_resource_inventory_settings import InventorySettings
+
+    value = enforcement_policy()
+    with pytest.raises(InventoryError, match="invalid_inventory_configuration"):
+        InventorySettings.from_document(value)
+
+    result = enforcement_snapshot(value)
+    canonical = json.dumps(
+        value, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    ).encode()
+    assert result.canonical_document == canonical
+    assert result.policy_digest == "sha256:" + hashlib.sha256(canonical).hexdigest()
+    assert result.inventory.policy_digest == result.policy_digest
+    assert result.inventory.cluster_id == "test-cluster"
+    assert result.host_cost.cost(2, "4Gi").to_dict() == {
+        "cpu_millicores": 200,
+        "memory_bytes": 4 * 1024**3 + 276 * 1024**2,
+        "kvm_devices": 1,
+    }
+
+
+@pytest.mark.parametrize(
+    "flag,replacement",
+    [
+        ("observerEnabled", False),
+        ("shadowEnabled", False),
+        ("enforcementEnabled", False),
+        ("clusterWidePodReadAcknowledged", False),
+        ("shadowEnabled", 1),
+    ],
+)
+def test_enforcement_snapshot_refuses_missing_or_untyped_capability(
+    flag, replacement
+):
+    value = enforcement_policy()
+    value["policy"][flag] = replacement
+    with pytest.raises(ResourceAdmissionError, match="invalid_resource_policy"):
+        enforcement_snapshot(value)
+
+
+def test_enforcement_snapshot_is_owned_and_exactly_revalidated():
+    from shared.vm_resource_policy import validate_enforcement_resource_policy_snapshot
+
+    value = enforcement_policy()
+    result = enforcement_snapshot(value)
+    value["policy"]["fairness"]["maxBypasses"] = 99
+    assert result.max_bypasses == 2
+    assert validate_enforcement_resource_policy_snapshot(result) is result
+    for changed in (
+        replace(result, max_bypasses=2.0),
+        replace(result, policy_digest="sha256:" + "a" * 64),
+        replace(result, inventory=replace(result.inventory, max_items=1000.0)),
+        {},
+    ):
+        with pytest.raises(ResourceAdmissionError, match="invalid_resource_policy"):
+            validate_enforcement_resource_policy_snapshot(changed)
