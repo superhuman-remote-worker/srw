@@ -125,6 +125,8 @@ async def test_human_route_records_episode_with_exact_vm_and_reply_closes_it(
         "missing_probe",
         "legacy_uid",
         "shared_owner",
+        "list_status",
+        "object_status",
     ],
 )
 async def test_only_authorized_proven_human_wait_enters_policy(db, monkeypatch, case):
@@ -138,7 +140,13 @@ async def test_only_authorized_proven_human_wait_enters_policy(db, monkeypatch, 
             "UPDATE jobs SET context=jsonb_set(context,'{vm,identity_authenticated}','false') WHERE id=$1",
             UUID(seed["job_id"]),
         )
-    if case in {"missing_probe", "legacy_uid", "shared_owner"}:
+    if case in {
+        "missing_probe",
+        "legacy_uid",
+        "shared_owner",
+        "list_status",
+        "object_status",
+    }:
         context = json.loads(
             await db.fetchval(
                 "SELECT context FROM jobs WHERE id=$1", UUID(seed["job_id"])
@@ -148,6 +156,8 @@ async def test_only_authorized_proven_human_wait_enters_policy(db, monkeypatch, 
             context["vm"].pop("ssh_ready_source")
         elif case == "legacy_uid":
             context["vm"]["vm_uid"] = "legacy-name-only"
+        elif case in {"list_status", "object_status"}:
+            context["vm"]["status"] = [] if case == "list_status" else {}
         else:
             context["inherits_parent_workspace"] = True
         await db.execute(

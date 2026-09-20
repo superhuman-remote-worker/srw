@@ -38,6 +38,9 @@ async def record_human_route_wait_on_conn(conn, *, job_id, route_id):
     owner, ambiguous = _job_workspace_owner(UUID(str(job_id)), row)
     if ambiguous or owner != UUID(str(job_id)):
         return False
+    vm = row["context"].get("vm")
+    if not isinstance(vm, dict) or vm.get("status") != "ready":
+        return False
     try:
         identity = _identity_from_row(
             row, owner_kind="job", owner_id=str(job_id), operation_kind="idle_policy"
