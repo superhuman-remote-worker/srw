@@ -152,14 +152,28 @@ def validate_prepared_disposition(receipt, *, request, state, allocation_uid):
     """Match the full engine allocation/source to an externally read-back pin."""
     from shared.vm_preparation_target import creation_root_name
 
+    gone = (
+        isinstance(receipt, dict)
+        and receipt.get("kind") == "prepared_source_identity_gone"
+    )
     if (
         not isinstance(receipt, dict)
-        or set(receipt) != {"version", "kind", "plan", "source_resource_version"}
+        or set(receipt)
+        != {
+            "version",
+            "kind",
+            "plan",
+            "source_observation" if gone else "source_resource_version",
+        }
         or type(receipt["version"]) is not int
         or receipt["version"] != 1
-        or receipt["kind"] != "prepared_source_disposed"
-        or not isinstance(receipt["source_resource_version"], str)
-        or not receipt["source_resource_version"]
+        or receipt["kind"]
+        not in {"prepared_source_disposed", "prepared_source_identity_gone"}
+        or not gone
+        and (
+            not isinstance(receipt["source_resource_version"], str)
+            or not receipt["source_resource_version"]
+        )
     ):
         raise ValueError("Prepared source disposition is unproven")
     plan = receipt["plan"]
@@ -218,6 +232,14 @@ def validate_prepared_disposition(receipt, *, request, state, allocation_uid):
         )
     ):
         raise ValueError("Prepared source disposition proof changed")
+    if gone:
+        from shared.vm_creation_source_completion import validate_source_observation
+
+        if (
+            validate_source_observation(plan, receipt["source_observation"])
+            != "source_identity_gone"
+        ):
+            raise ValueError("Prepared source identity disposition is unproven")
     return receipt
 
 

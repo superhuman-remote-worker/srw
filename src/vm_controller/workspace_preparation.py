@@ -802,9 +802,12 @@ class VMWorkspacePreparation:
     async def cancel(self, value):
         return (await self.cancel_with_receipt(value))["cancelled"]
 
-    async def mark_source_disposed(self, value, *, plan, source_dv):
+    async def mark_source_disposed(
+        self, value, *, plan, source_dv=None, source_observation=None
+    ):
         """Close only an existing exact allocation after its source-DV CAS."""
         from shared.vm_creation_source_disposition import validate_prepared_disposition
+        from shared.vm_creation_source_completion import validate_source_observation
         from vm_controller.creation_sources import pins
 
         request = validate_request(value)
@@ -815,6 +818,21 @@ class VMWorkspacePreparation:
                 allocation is None
                 or allocation.request != request
                 or allocation.uid != source["allocation"]["uid"]
+            ):
+                raise PreparationConflict(
+                    "Prepared source disposition identity changed."
+                )
+            gone = source_observation is not None
+            if gone:
+                if (
+                    validate_source_observation(plan, source_observation)
+                    != "source_identity_gone"
+                ):
+                    raise PreparationConflict(
+                        "Prepared source still needs a CAS fence."
+                    )
+            elif (
+                source_dv is None
                 or source_dv["metadata"].get("uid") != source["dv_uid"]
                 or source_dv["metadata"].get("namespace") != source["namespace"]
                 or source_dv["metadata"].get("name") != source["name"]
@@ -827,9 +845,19 @@ class VMWorkspacePreparation:
             if receipt is None:
                 receipt = {
                     "version": 1,
-                    "kind": "prepared_source_disposed",
+                    "kind": "prepared_source_identity_gone"
+                    if gone
+                    else "prepared_source_disposed",
                     "plan": deepcopy(plan),
-                    "source_resource_version": source_dv["metadata"]["resourceVersion"],
+                    **(
+                        {"source_observation": deepcopy(source_observation)}
+                        if gone
+                        else {
+                            "source_resource_version": source_dv["metadata"][
+                                "resourceVersion"
+                            ]
+                        }
+                    ),
                 }
             if receipt.get("plan") != plan:
                 raise PreparationConflict("Prepared source disposition intent changed.")
@@ -1125,6 +1153,11 @@ class VMWorkspacePreparation:
                             "creation_binding" not in allocation.state
                             or allocation.state.get("workspace_source_issued") is False
                         )
+                        # Keep cancellation's logical-name fence: a delayed
+                        # original ensure/POST must still see Cancelled, even
+                        # when no source was ever delivered. Malformed evidence
+                        # preserves the hold; it never authorizes its erasure.
+                        and "creation_disposition" not in allocation.state
                         and now() > expires + 7 * 86400
                     ):
                         await self.store.delete_record(allocation)

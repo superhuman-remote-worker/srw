@@ -170,6 +170,7 @@ def source_runtime(setup, service, row, source, monkeypatch):
             "name": name,
             "namespace": settings.VM_NAMESPACE,
             "uid": source["pvc_uid"],
+            "resourceVersion": "1",
             "ownerReferences": [
                 {"kind": "DataVolume", "uid": source["dv_uid"], "controller": True}
             ],
@@ -340,7 +341,7 @@ async def test_purged_clone_source_requires_completed_exact_child_before_intent(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("fault", ["source_uid", "source_pvc_uid", "unexpected_target"])
-async def test_changed_source_or_unexpected_target_preserves_hold(
+async def test_changed_source_never_mutates_replacement_or_releases_parent(
     db, monkeypatch, setup, fault
 ):
     from vm_controller.creation_disposition_sources import DispositionSources
@@ -359,11 +360,16 @@ async def test_changed_source_or_unexpected_target_preserves_hold(
         kind = "DataVolume" if fault == "source_uid" else "PersistentVolumeClaim"
         api.objects[kind, source["name"]]["metadata"]["uid"] = str(uuid4())
     current = await service.retries.inspect(request_id=row["request_id"])
-    with pytest.raises(ValueError):
-        await DispositionSources(
-            CreationActuator(ctrl), current, carrier, disposition
-        ).run()
-    assert api.replacements == []
+    disposer = DispositionSources(CreationActuator(ctrl), current, carrier, disposition)
+    if fault == "unexpected_target":
+        with pytest.raises(ValueError):
+            await disposer.run()
+    else:
+        result = await disposer.run()
+        assert result["outcome"] == (
+            "source_identity_gone" if fault == "source_uid" else "pin_disposed"
+        )
+    assert len(api.replacements) == (1 if fault == "source_pvc_uid" else 0)
     assert (await service.retries.inspect(request_id=row["request_id"]))[
         "state"
     ] == "cancel_requested"

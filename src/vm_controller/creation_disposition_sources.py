@@ -56,6 +56,11 @@ class DispositionSources:
         }
 
     async def run(self):
+        from shared.vm_creation_source_completion import (
+            object_identity,
+            source_completion,
+        )
+
         existing = self.row["cancellation_progress"].get("source")
         source = self.disposition["source"]
         if (
@@ -125,9 +130,11 @@ class DispositionSources:
             await self.sources.service.mark_source_never_delivered(
                 self.row["request"]["preparation"], plan=plan
             )
-            return
+            return source_completion(
+                plan, allocation=await self.sources.allocation(self.row)
+            )
         if plan["tombstone"] is None:
-            return
+            return source_completion(plan)
         if plan["source"]["kind"] == "prepared":
             from vm_controller.creation_preparation import creation_binding
 
@@ -141,36 +148,46 @@ class DispositionSources:
                 raise ValueError("Prepared source disposition allocation changed")
         await self.target_safe(plan["target"])
         source_dv = await self.release_pin(plan)
+        source_pvc = await self.actuator.read("pvc", plan["source"]["name"])
+        allocation = None
         if plan["source"]["kind"] == "prepared":
+            dm = object_identity(source_dv, plan["source"])
+            gone = dm is None or dm["uid"] != plan["source"]["dv_uid"]
             await self.sources.service.mark_source_disposed(
-                self.row["request"]["preparation"], plan=plan, source_dv=source_dv
+                self.row["request"]["preparation"],
+                plan=plan,
+                source_dv=source_dv,
+                source_observation={
+                    "dv": dm,
+                    "pvc": object_identity(source_pvc, plan["source"]),
+                    "pin": None,
+                }
+                if gone
+                else None,
             )
+            allocation = await self.sources.allocation(self.row)
+
+        return source_completion(
+            plan,
+            dv=source_dv,
+            pvc=source_pvc,
+            allocation=allocation,
+        )
 
     async def release_pin(self, plan):
+        from shared.vm_creation_source_completion import object_identity
+
         source, expected = plan["source"], plan["tombstone"]
         dv = await self.actuator.read("rootdisk", source["name"])
         pvc = await self.actuator.read("pvc", source["name"])
-        if (
-            dv is None
-            or pvc is None
-            or any(
-                obj["metadata"].get(key) != value
-                for obj, uid in ((dv, source["dv_uid"]), (pvc, source["pvc_uid"]))
-                for key, value in (
-                    ("uid", uid),
-                    ("name", source["name"]),
-                    ("namespace", source["namespace"]),
-                )
-            )
-            or not dv["metadata"].get("resourceVersion")
-            or not any(
-                ref.get("kind") == "DataVolume"
-                and ref.get("uid") == source["dv_uid"]
-                and ref.get("controller") is True
-                for ref in pvc["metadata"].get("ownerReferences", [])
-            )
-        ):
-            raise ValueError("Source disposition identity changed")
+        dm = object_identity(dv, source)
+        object_identity(pvc, source)
+        if dm is None or dm["uid"] != source["dv_uid"]:
+            # The immutable plan already names the old source and SQL-proven
+            # target disposition. Its UID cannot be resurrected by any delayed
+            # old RV CAS. Preserve separate PVC facts; never mutate a new source.
+            await self.fresh(plan)
+            return dv
         current = pins(dv)
         prior = current.get(self.row["request_id"])
         if prior == expected:
@@ -190,15 +207,7 @@ class DispositionSources:
             raise ValueError("Source disposition pin changed")
         # Read source RV first, then immutable SQL intent, then CAS that same RV.
         # Even an absent pin requires CAS to fence a pre-cancellation publisher.
-        fresh = await self.actuator.authority(
-            "inspect", request_id=self.row["request_id"]
-        )
-        if (
-            fresh["state"] != "cancel_requested"
-            or fresh["cancellation_progress"].get("source") != plan
-        ):
-            raise ValueError("Source disposition authority changed")
-        await self.target_safe(plan["target"])
+        await self.fresh(plan)
         current[self.row["request_id"]] = expected
         terminal = sorted(
             key
@@ -225,3 +234,14 @@ class DispositionSources:
         ):
             raise ValueError("Source disposition CAS remains unproven")
         return observed
+
+    async def fresh(self, plan):
+        fresh = await self.actuator.authority(
+            "inspect", request_id=self.row["request_id"]
+        )
+        if (
+            fresh["state"] != "cancel_requested"
+            or fresh["cancellation_progress"].get("source") != plan
+        ):
+            raise ValueError("Source disposition authority changed")
+        await self.target_safe(plan["target"])
