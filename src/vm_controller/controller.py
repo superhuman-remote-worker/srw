@@ -928,6 +928,14 @@ class VMController:
         ).hexdigest()
 
     def _parse_workspace_cleanup_carrier(self, lease: object) -> dict[str, object]:
+        from shared.vm_creation_issuance import CREATION_INTENT_ANNOTATION
+
+        if CREATION_INTENT_ANNOTATION in (
+            _metadata_value(lease, "annotations", {}) or {}
+        ):
+            from vm_controller.creation_actuation import carrier_record
+
+            return carrier_record(lease, secret=LIFECYCLE_HMAC_SECRET)
         metadata = _object_value(lease, "metadata")
         labels = _metadata_value(lease, "labels", {}) or {}
         annotations = _metadata_value(lease, "annotations", {}) or {}
@@ -1133,6 +1141,11 @@ class VMController:
         return carrier
 
     async def _list_workspace_cleanup_carriers(self) -> tuple[dict[str, object], ...]:
+        from shared.vm_creation_issuance import (
+            CREATION_INTENT_ANNOTATION,
+            CREATION_SIGNATURE_ANNOTATION,
+        )
+
         if self.coordination_api is None:
             raise RuntimeError("workspace cleanup carrier authority is unavailable")
         response = await asyncio.to_thread(
@@ -1152,6 +1165,14 @@ class VMController:
                 not isinstance(labels, Mapping)
                 or labels.get(WORKSPACE_CLEANUP_CARRIER_LABEL) != "true"
             ):
+                continue
+            annotations = _metadata_value(item, "annotations", {}) or {}
+            if CREATION_INTENT_ANNOTATION in annotations and not annotations.get(
+                CREATION_SIGNATURE_ANNOTATION
+            ):
+                # A publication interrupted before UID sealing is not effect
+                # evidence. Its durable DB reservation still excludes cleanup;
+                # only the original authenticated create may finish sealing.
                 continue
             carrier = self._parse_workspace_cleanup_carrier(item)
             if not carrier["carrier_sealed"]:
@@ -2172,6 +2193,10 @@ class VMController:
 
     async def _do_create_serialized(self, job_config: dict) -> dict:
         """Create while holding the reusable entity-name lifecycle lock."""
+        if "creation_retry" in job_config:
+            from vm_controller.creation_actuation import CreationActuator
+
+            return await CreationActuator(self).run(job_config)
         from kubernetes.client.exceptions import ApiException
 
         job_id = job_config.get("job_id", "unknown")
@@ -3794,6 +3819,10 @@ class VMController:
     async def _reconcile_workspace_cleanup_carrier(
         self, carrier: Mapping[str, object]
     ) -> bool:
+        if carrier["source"] == "controller_vm_create":
+            from vm_controller.creation_actuation import reconcile_creation_carrier
+
+            return await reconcile_creation_carrier(self, carrier)
         async with self._workspace_lifecycle(str(carrier["owner_id"])):
             carrier = await self._refresh_workspace_cleanup_carrier(carrier)
             resumed = await self._resume_workspace_cleanup_reservation(carrier)
@@ -5150,6 +5179,15 @@ class VMController:
 
     async def http_create(self, request):
         """POST /vms — body is the create payload, returns the result dict."""
+        return await self._http_create(request, operation="create")
+
+    async def http_creation_retry(self, request):
+        """Dedicated protocol route: an older replica returns 404, never creates."""
+        return await self._http_create(
+            request, operation="creation_retry_create", require_creation_retry=True
+        )
+
+    async def _http_create(self, request, *, operation, require_creation_retry=False):
         from aiohttp import web
 
         try:
@@ -5157,15 +5195,30 @@ class VMController:
         except Exception as e:
             return web.json_response({"error": f"invalid json: {e}"}, status=400)
 
-        if not payload.get("job_id"):
+        if not isinstance(payload, Mapping) or not payload.get("job_id"):
             return web.json_response({"error": "job_id required"}, status=400)
         if not isinstance(payload, Mapping) or not await self._verify_lifecycle_request(
-            payload, "create", mutating=True
+            payload, operation, mutating=True
         ):
             return web.json_response({"error": "authentication failed"}, status=401)
         request_id = _lifecycle_request_id(payload)
         payload = unsigned_payload(payload)
         request_generation = _provision_generation(payload.get("provision_generation"))
+
+        if require_creation_retry and "creation_retry" not in payload:
+            return web.json_response(
+                sign_payload(
+                    {
+                        "status": "creation_attention",
+                        "reason": "creation_protocol_unproven",
+                    },
+                    direction="response",
+                    operation=operation,
+                    secret=LIFECYCLE_HMAC_SECRET,
+                    correlation_id=request_id,
+                ),
+                status=400,
+            )
 
         try:
             result = await self._do_create(payload)
@@ -5173,7 +5226,7 @@ class VMController:
                 sign_payload(
                     result,
                     direction="response",
-                    operation="create",
+                    operation=operation,
                     secret=LIFECYCLE_HMAC_SECRET,
                     correlation_id=request_id,
                 ),
@@ -5192,7 +5245,7 @@ class VMController:
                 sign_payload(
                     error_result,
                     direction="response",
-                    operation="create",
+                    operation=operation,
                     secret=LIFECYCLE_HMAC_SECRET,
                     correlation_id=request_id,
                 ),
@@ -5754,6 +5807,7 @@ class VMController:
 
         app = web.Application()
         app.router.add_post("/vms", self.http_create)
+        app.router.add_post("/vm-creation/create", self.http_creation_retry)
         app.router.add_post(
             "/vm-creation/configuration", self.http_resolve_creation_config
         )
