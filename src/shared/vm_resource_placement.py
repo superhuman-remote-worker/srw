@@ -140,6 +140,22 @@ def _affinity_matches(affinity, labels, name):
     return any(matches)
 
 
+def affinity_label_keys(affinity):
+    """Validate a required selector and return its declared label dependencies.
+
+    Inventory consumers must prove these keys were collected before treating a
+    missing value as absent (especially for NotIn and DoesNotExist).
+    """
+    _affinity_matches(affinity, {}, "validation-node")
+    if affinity is None:
+        return frozenset()
+    return frozenset(
+        requirement["key"]
+        for term in affinity["nodeSelectorTerms"]
+        for requirement in term.get("matchExpressions", [])
+    )
+
+
 def _unmatched_taints(node, tolerations):
     validated = []
     for raw in _list(tolerations):
