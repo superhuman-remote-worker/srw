@@ -28741,6 +28741,20 @@ class PostgresDB:
                     )
                     if updated is None:
                         raise _Abort()
+                    # A human-addressed route is semantic wait evidence. An
+                    # officer-only question is still autonomous work. Legacy
+                    # unfenced pinned publishers do not gain idle capability.
+                    if str(route.get("state")) in {
+                        "user_direct",
+                        "escalated_to_user",
+                    } and (expected_lane == "stateless" or agent_uuid is not None):
+                        from orchestrator.services.workspace_idle_events import (
+                            record_human_route_wait_on_conn,
+                        )
+
+                        await record_human_route_wait_on_conn(
+                            conn, job_id=job_uuid, route_id=route_uuid
+                        )
         except _Abort:
             return None
         return {
@@ -29291,6 +29305,15 @@ class PostgresDB:
         """
         # Fixed literals chosen by trusted booleans — never caller SQL.
         drop_decision = " - 'completion_decision'" if void_completion_decision else ""
+        # Accepted new execution closes its human-wait episode in this same
+        # guarded statement, including after the feature is switched off.
+        # Pure reprovisioning preserves the pending human decision and clock.
+        idle_exit = (
+            "workspace_idle_revision = workspace_idle_revision + CASE WHEN workspace_idle_episode IS NULL THEN 0 ELSE 1 END, "
+            "workspace_idle_episode = NULL, "
+            if void_completion_decision
+            else ""
+        )
         lane_guard = " AND execution_lane = 'stateless'" if stateless_only else ""
         lifecycle_guard = (
             " AND NOT (COALESCE(context, '{}'::jsonb) "
@@ -29366,6 +29389,7 @@ class PostgresDB:
                    status = 'paused',
                    assigned_agent_id = NULL,
                    freeze_data = NULL,
+                   {idle_exit}
                    updated_at = CURRENT_TIMESTAMP
              WHERE id = $1{lane_guard}{lifecycle_guard}{status_guard}{route_guard}{completion_guard}{control_guard}{trip_guard}
                AND NOT EXISTS (SELECT 1 FROM srw_execution_specs execution

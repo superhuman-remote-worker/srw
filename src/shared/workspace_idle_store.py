@@ -3,7 +3,7 @@
 This helper grants no owner authorization and performs no physical operation.
 Caller must first acquire its existing owner/runtime/claim locks in their normal
 order and prove the source transition. A source CAS loss must roll back the same
-transaction. No production transition adapter invokes this foundation yet.
+transaction. Transition adapters do not confer physical-release capability.
 """
 
 import json
