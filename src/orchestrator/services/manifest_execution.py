@@ -372,15 +372,25 @@ class ManifestExecutionService:
         if self.workspace:
             await self.workspace.reconcile_vm_detach()
         if self.cancel_srw:
-            overdue = await self.db.fetch("""SELECT j.id FROM srw_execution_specs s JOIN jobs j ON s.work_kind='Job' AND s.work_id=j.id
-                WHERE s.harness_adapter='srw/v1' AND s.resource_id IS NOT NULL AND j.status IN ('created','processing')
-                AND s.resolved->'spec'->>'timeoutSeconds' IS NOT NULL
-                AND s.created_at + ((s.resolved->'spec'->>'timeoutSeconds')::double precision * interval '1 second') <= now()
-                ORDER BY s.created_at LIMIT 50""")
+            from orchestrator.services.execution_deadline import (
+                ExecutionDeadline,
+                expired_srw_jobs,
+            )
+
+            overdue = await expired_srw_jobs(self.db)
             for item in overdue:
                 job = await self.db.get_job(str(item["id"]))
-                if job and job["status"] in {"created", "processing"}:
-                    await self.cancel_srw(job)
+                if job:
+                    try:
+                        await self.cancel_srw(
+                            job, expected_execution_deadline=ExecutionDeadline.from_row(item)
+                        )
+                    except HTTPException:
+                        # Control or exact retirement can remain blocked. A
+                        # failed cleanup must not starve other overdue owners.
+                        logger.warning(
+                            "SRW deadline cancellation remains pending for job %s", item["id"]
+                        )
         rows = await self.db.fetch("""SELECT s.id FROM srw_execution_specs s JOIN jobs j ON s.work_kind='Job' AND s.work_id=j.id
             WHERE s.harness_adapter='generic' AND (j.status IN ('created','processing') OR EXISTS(
               SELECT 1 FROM srw_execution_attempts a WHERE a.execution_id=s.id AND a.cleaned_at IS NULL))

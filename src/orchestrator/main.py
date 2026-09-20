@@ -14161,8 +14161,8 @@ def _manifest_execution_service():
         workspace=workspaces,
         srw_image=agent_provisioner._agent_image,
         authorize_datasources=_authorize_thread_datasource_selection,
-        cancel_srw=lambda job: _job_mutation_operations().cancel(
-            str(job["id"]), job=job
+        cancel_srw=lambda job, **guard: _job_mutation_operations().cancel(
+            str(job["id"]), job=job, **guard
         ),
         native_hosting_enabled=os.environ.get(
             "MANIFEST_NETWORK_ISOLATION_VERIFIED", "false"

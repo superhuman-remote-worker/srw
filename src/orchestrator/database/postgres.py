@@ -4637,6 +4637,7 @@ class PostgresDB:
         *,
         expected_status: str,
         completion_commands_enabled: bool = False,
+        expected_execution_deadline: Any = None,
     ) -> bool:
         """Publish pinned cancellation before external quiescence/cleanup.
 
@@ -4657,6 +4658,13 @@ class PostgresDB:
         recovery_cancellation = None
         async with self.acquire() as conn:
             async with conn.transaction():
+                if expected_execution_deadline is not None:
+                    from orchestrator.services.execution_deadline import lock_expired_execution
+
+                    if not await lock_expired_execution(
+                        conn, uuid_val, expected_execution_deadline
+                    ):
+                        return False
                 result = await conn.execute(
                     f"""
                     UPDATE jobs
@@ -4781,6 +4789,7 @@ class PostgresDB:
         job_id: str,
         *,
         completion_commands_enabled: bool = False,
+        expected_execution_deadline: Any = None,
     ) -> tuple[bool, bool]:
         """Cancel a stateless job with queue-first serialization.
 
@@ -4820,6 +4829,13 @@ class PostgresDB:
                     queue_closed = await cancel_queued_worker_batch(
                         conn, job_id=job_uuid
                     )
+                    if expected_execution_deadline is not None:
+                        from orchestrator.services.execution_deadline import lock_expired_execution
+
+                        if not await lock_expired_execution(
+                            conn, job_uuid, expected_execution_deadline
+                        ):
+                            raise _CancelCASLostError
                     row = await conn.fetchrow(
                         f"""
                         UPDATE jobs

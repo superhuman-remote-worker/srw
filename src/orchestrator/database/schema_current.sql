@@ -18513,6 +18513,19 @@ CREATE TABLE public.srw_execution_attempts (
 
 
 --
+-- Name: srw_execution_deadline_scan; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.srw_execution_deadline_scan (
+    singleton boolean DEFAULT true NOT NULL,
+    created_at timestamp with time zone,
+    job_id uuid,
+    CONSTRAINT srw_execution_deadline_scan_position CHECK (((created_at IS NULL) = (job_id IS NULL))),
+    CONSTRAINT srw_execution_deadline_scan_singleton_check CHECK (singleton)
+);
+
+
+--
 -- Name: srw_execution_spec_revisions; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -22661,6 +22674,14 @@ ALTER TABLE ONLY public.srw_execution_attempts
 
 ALTER TABLE ONLY public.srw_execution_attempts
     ADD CONSTRAINT srw_execution_attempts_pod_name_key UNIQUE (pod_name);
+
+
+--
+-- Name: srw_execution_deadline_scan srw_execution_deadline_scan_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.srw_execution_deadline_scan
+    ADD CONSTRAINT srw_execution_deadline_scan_pkey PRIMARY KEY (singleton);
 
 
 --

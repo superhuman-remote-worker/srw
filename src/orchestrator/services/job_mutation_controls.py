@@ -480,19 +480,32 @@ class JobControlOperations:
                 return False
             await asyncio.sleep(min(max(0.01, poll_seconds), remaining))
 
-    async def cancel(self, job_id: str, *, job: dict[str, Any]) -> dict[str, str]:
+    async def cancel(
+        self, job_id: str, *, job: dict[str, Any], expected_execution_deadline=None
+    ) -> dict[str, str]:
         """Cancel already-authorized work through runtime and cleanup fences."""
         d = self.dependencies
-        if getattr(d.store, "manifests_ready", False) is True:
+        deadline_guard = (
+            {"expected_execution_deadline": expected_execution_deadline}
+            if expected_execution_deadline is not None
+            else {}
+        )
+        if deadline_guard and job.get("execution_lane") not in {"pinned", "stateless"}:
+            return {"status": "unchanged"}
+        if not deadline_guard and getattr(d.store, "manifests_ready", False) is True:
             if await d.manifest_cancel(job_id):
                 return {"status": "cancelled"}
         pinned_cancel_committed = False
         try:
             if job.get("execution_lane") == "stateless":
                 success, _ = await d.store.cancel_stateless_job(
-                    job_id, **d.completion_control.dispatch_guard_kwargs()
+                    job_id,
+                    **d.completion_control.dispatch_guard_kwargs(),
+                    **deadline_guard,
                 )
                 if not success:
+                    if deadline_guard:
+                        return {"status": "unchanged"}
                     refreshed = await d.store.get_job(job_id)
                     if refreshed and refreshed.get("execution_lane") == "pinned":
                         job = refreshed
@@ -540,8 +553,11 @@ class JobControlOperations:
                     job_id,
                     expected_status=str(job.get("status") or ""),
                     completion_commands_enabled=self.commands_enabled,
+                    **deadline_guard,
                 )
                 if not pinned_cancel_committed:
+                    if deadline_guard:
+                        return {"status": "unchanged"}
                     refreshed = await d.store.get_job(job_id)
                     if (
                         self.commands_enabled
