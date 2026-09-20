@@ -272,6 +272,7 @@ _CLEANUP_ANNOTATIONS = {
     "successor_pvc_uid": "srw.io/cleanup-successor-pvc-uid",
 }
 _CLEANUP_OUTCOMES = {
+    "controller_creation_rootdisk_delete": "deleted",
     "controller_rootdisk_delete": "deleted",
     "controller_failed_dv_recreate": "recreated",
     "controller_rootdisk_adopt": "adopted",
@@ -3790,6 +3791,7 @@ class VMController:
         carrier: Mapping[str, object],
         *,
         require_failed_dv: bool,
+        before_delete=None,
     ) -> bool:
         """Delete only the carrier's old immutable DV/PVC identities."""
 
@@ -3819,10 +3821,14 @@ class VMController:
             self._validate_cleanup_carrier_pvc(pvc, carrier)
 
         if dv is not None:
+            if before_delete is not None:
+                await before_delete()
             await self._delete_dv(name, expected_uid=str(carrier["old_dv_uid"]))
         if pvc is not None:
             from kubernetes.client.exceptions import ApiException
 
+            if before_delete is not None:
+                await before_delete()
             try:
                 await asyncio.to_thread(
                     self.core_api.delete_namespaced_persistent_volume_claim,
@@ -3861,6 +3867,13 @@ class VMController:
         async with self._workspace_lifecycle(str(carrier["owner_id"])):
             carrier = await self._refresh_workspace_cleanup_carrier(carrier)
             resumed = await self._resume_workspace_cleanup_reservation(carrier)
+            if resumed.get("creation_disposition") is not None:
+                from vm_controller.creation_disposition import CreationDisposer
+
+                # A child recovered independently must use the same consumer
+                # fences as its parent, never the legacy unconditional delete.
+                await CreationDisposer(self).run(resumed["creation_disposition"])
+                return False
             if resumed.get("allowed") is not True:
                 if resumed.get("completed_outcome") == carrier["outcome"]:
                     if carrier["source"] == "controller_failed_dv_recreate":

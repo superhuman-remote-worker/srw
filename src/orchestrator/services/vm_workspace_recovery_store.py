@@ -342,6 +342,7 @@ class CleanupPermit:
     reason: str | None = None
     completed_outcome: str | None = None
     parent_cleanup: Mapping[str, Any] | None = None
+    creation_disposition: Mapping[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1402,6 +1403,13 @@ class VMWorkspaceRecoveryStore:
 
         if not isinstance(intent_digest, str) or not intent_digest:
             raise ValueError("cleanup intent digest must be nonempty")
+        if source == "controller_creation_rootdisk_delete" and (
+            not isinstance(parent_cleanup, Mapping)
+            or parent_cleanup.get("kind") != "creation_disposition"
+        ):
+            return CleanupPermit(
+                allowed=False, reason="parent_cleanup_identity_changed"
+            )
         parent_identity = None
         if parent_cleanup is not None:
             parent_identity = _parent_cleanup_identity(
@@ -1412,7 +1420,12 @@ class VMWorkspaceRecoveryStore:
                 provision_generation=parent_provision_generation,
                 expected_vm_uid=expected_vm_uid,
             )
-            if source != "controller_rootdisk_delete" or parent_identity is None:
+            expected_source = (
+                "controller_creation_rootdisk_delete"
+                if parent_cleanup.get("kind") == "creation_disposition"
+                else "controller_rootdisk_delete"
+            )
+            if source != expected_source or parent_identity is None:
                 return CleanupPermit(
                     allowed=False, reason="parent_cleanup_identity_changed"
                 )
@@ -1691,11 +1704,14 @@ class VMWorkspaceRecoveryStore:
 
         async with self.db.acquire() as conn:
             row = await conn.fetchrow(
-                "SELECT id,owner_kind,owner_id,source,request_id,intent_digest,"
-                "completed_at,outcome "
-                "FROM vm_workspace_cleanup_admissions WHERE id=$1",
+                "SELECT * FROM vm_workspace_cleanup_admissions WHERE id=$1",
                 admission_id,
             )
+            from orchestrator.services.vm_creation_disposition_cleanup import (
+                child_disposition_identity,
+            )
+
+            disposition = await child_disposition_identity(conn, row) if row else None
         if (
             row is None
             or row["owner_kind"] != owner_kind
@@ -1711,6 +1727,16 @@ class VMWorkspaceRecoveryStore:
                 admission_id=admission_id,
                 reason="cleanup_request_already_completed",
                 completed_outcome=row["outcome"],
+                creation_disposition=disposition,
+            )
+        if disposition is not None:
+            # Older controllers must stop even if they ignore the new typed
+            # disposition field. Only the dedicated actuator has consumer fences.
+            return CleanupPermit(
+                allowed=False,
+                admission_id=admission_id,
+                reason="creation_disposition_required",
+                creation_disposition=disposition,
             )
         return CleanupPermit(allowed=True, admission_id=admission_id)
 

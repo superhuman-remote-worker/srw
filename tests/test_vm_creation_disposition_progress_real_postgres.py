@@ -144,7 +144,7 @@ async def test_forged_child_parent_or_digest_cannot_borrow_disposition(db, monke
         owner_id=row["job_id"],
         pvc_uid=UUID(grant["resource"]["pvc_uid"]),
         request_id=UUID(cleanup["request_id"]),
-        source="controller_rootdisk_delete",
+        source=cleanup["source"],
         intent_digest=cleanup["intent_digest"],
         parent_cleanup=cleanup["parent_cleanup"],
         parent_provision_generation=str(row["provision_generation"]),
@@ -324,3 +324,29 @@ async def test_parent_row_and_supplied_hash_agreement_is_not_creation_authority(
     )
     assert permit.allowed is False
     assert permit.reason == "parent_cleanup_identity_changed"
+
+
+@pytest.mark.asyncio
+async def test_dedicated_disposition_source_cannot_acquire_without_creation_parent(db):
+    from tests.test_vm_creation_retry_real_postgres import admitted_job
+    from orchestrator.services.vm_creation_retry_store import VMCreationRetryStore
+
+    job, _, _ = await admitted_job(db)
+    permit = await VMCreationRetryStore(db).cleanup.acquire_cleanup_permit(
+        owner_kind="job",
+        owner_id=job,
+        pvc_uid=uuid4(),
+        request_id=uuid4(),
+        source="controller_creation_rootdisk_delete",
+        intent_digest="sha256:" + "0" * 64,
+    )
+    assert permit.allowed is False
+    assert permit.reason == "parent_cleanup_identity_changed"
+    async with db.acquire() as conn:
+        assert (
+            await conn.fetchval(
+                "SELECT count(*) FROM vm_workspace_cleanup_admissions WHERE owner_id=$1",
+                job,
+            )
+            == 0
+        )

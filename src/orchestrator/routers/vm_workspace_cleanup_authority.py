@@ -27,6 +27,7 @@ _SOURCES = frozenset(
         "controller_failed_dv_recreate",
         "controller_rootdisk_adopt",
         "controller_rootdisk_delete",
+        "controller_creation_rootdisk_delete",
     }
 )
 
@@ -249,6 +250,11 @@ async def resume(request: Request) -> JSONResponse:
                 "admission_id": str(admission_id),
                 "reason": permit.reason,
                 "completed_outcome": permit.completed_outcome,
+                **(
+                    {"creation_disposition": dict(permit.creation_disposition)}
+                    if getattr(permit, "creation_disposition", None) is not None
+                    else {}
+                ),
             },
             operation=operation,
             correlation_id=correlation_id,

@@ -1159,6 +1159,20 @@ class VMCreationRetryStore:
             request_id=request_id, carrier=carrier
         )
 
+    async def authorize_disposition(self, **payload) -> dict:
+        from orchestrator.services.vm_creation_disposition_store import (
+            VMCreationDispositionStore,
+        )
+
+        return await VMCreationDispositionStore(self).authorize(**payload)
+
+    async def record_disposition(self, **payload) -> dict:
+        from orchestrator.services.vm_creation_disposition_store import (
+            VMCreationDispositionStore,
+        )
+
+        return await VMCreationDispositionStore(self).record(**payload)
+
     async def observe_effect(
         self, *, request_id: str, carrier: dict, observation: dict
     ) -> dict:

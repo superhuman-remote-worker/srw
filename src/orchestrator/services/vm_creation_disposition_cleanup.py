@@ -36,7 +36,7 @@ def root_cleanup(disposition):
         if not isinstance(value, str) or str(UUID(value)) != value:
             raise ValueError("Cancellation identity is invalid")
     identity = {
-        "source": "controller_rootdisk_delete",
+        "source": "controller_creation_rootdisk_delete",
         "owner_kind": "job",
         "owner_id": disposition["job_id"],
         "pvc_uid": root["pvc_uid"],
@@ -177,3 +177,63 @@ async def validate_disposition_child(
         )
     except (KeyError, TypeError, ValueError):
         return False
+
+
+async def child_disposition_identity(conn, child):
+    """Classify an existing child before any generic controller resume can act."""
+    if child["parent_admission_id"] is None:
+        if child["source"] == "controller_creation_rootdisk_delete":
+            raise ValueError("Creation disposition parent is unavailable")
+        return None
+    parent = await conn.fetchrow(
+        "SELECT * FROM vm_workspace_cleanup_admissions WHERE id=$1",
+        child["parent_admission_id"],
+    )
+    if parent is None:
+        raise ValueError("Cleanup parent is unavailable")
+    if parent["source"] != "controller_vm_create":
+        if child["source"] == "controller_creation_rootdisk_delete":
+            raise ValueError("Creation disposition parent changed")
+        return None
+    row = await conn.fetchrow(
+        "SELECT * FROM vm_creation_retries WHERE creation_admission_id=$1", parent["id"]
+    )
+    if row is None:
+        raise ValueError("Creation disposition is unavailable")
+    disposition = row["cancellation_disposition"]
+    if isinstance(disposition, str):
+        disposition = json.loads(disposition)
+    if (
+        not exact_root_child(child, disposition)
+        or parent["completed_at"] is not None
+        or parent["parent_admission_id"] is not None
+        or parent["owner_kind"] != "job"
+        or parent["owner_id"] != row["job_id"]
+        or parent["pvc_uid"] != row["observed_pvc_uid"]
+    ):
+        raise ValueError("Creation disposition child changed")
+    proof = {
+        "version": 1,
+        "kind": "creation_disposition",
+        "admission_id": str(parent["id"]),
+        "request_id": str(parent["request_id"]),
+        "intent_digest": parent["intent_digest"],
+        "retry_request_id": str(row["request_id"]),
+        "disposition_id": disposition["disposition_id"],
+    }
+    if not await validate_disposition_child(
+        conn,
+        proof,
+        owner_kind=child["owner_kind"],
+        owner_id=child["owner_id"],
+        pvc_uid=child["pvc_uid"],
+        request_id=child["request_id"],
+        source=child["source"],
+        intent_digest=child["intent_digest"],
+        provision_generation=disposition["provision_generation"],
+        expected_vm_uid=None,
+    ):
+        raise ValueError("Creation disposition child changed")
+    from shared.vm_creation_disposition import disposition_identity
+
+    return disposition_identity(row)

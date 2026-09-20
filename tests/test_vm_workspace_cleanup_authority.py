@@ -218,3 +218,41 @@ def test_resume_and_complete_bind_exact_permit_identity(monkeypatch) -> None:
         request_id=request_id,
         intent_digest=digest,
     )
+
+
+def test_legacy_authority_rejects_dedicated_disposition_source_before_store(
+    monkeypatch,
+):
+    from uuid import uuid4
+
+    store = SimpleNamespace(resume_cleanup_permit=AsyncMock())
+    client = _client(monkeypatch, store)
+    monkeypatch.setattr(
+        authority,
+        "_SOURCES",
+        authority._SOURCES - {"controller_creation_rootdisk_delete"},
+    )
+    payload, correlation = _signed(
+        {
+            "admission_id": str(uuid4()),
+            "request_id": str(uuid4()),
+            "owner_kind": "job",
+            "owner_id": str(uuid4()),
+            "source": "controller_creation_rootdisk_delete",
+            "intent_digest": "sha256:" + "0" * 64,
+        },
+        operation="recovery-cleanup-resume",
+    )
+    result = client.post(
+        "/api/internal/vm-workspace-cleanup-authority/resume", json=payload
+    )
+    assert result.status_code == 400
+    assert verify_payload(
+        result.json(),
+        direction="response",
+        operation="recovery-cleanup-resume",
+        secret=SECRET,
+        expected_correlation_id=correlation,
+    )
+    assert unsigned_payload(result.json())["allowed"] is False
+    store.resume_cleanup_permit.assert_not_awaited()

@@ -1,7 +1,7 @@
 """Bounded cancellation discovery under the original SQL creation admission.
 
-Only the observation carrier may be published here. Resource teardown and
-terminal settlement remain fenced until their typed disposition protocol lands.
+Observed new per-Job resources use fixed-UID teardown and typed progress.
+Source and retained attachment release and terminal settlement remain held.
 """
 
 from collections.abc import Mapping
@@ -129,8 +129,11 @@ class CreationDisposer:
                 != disposition["disposition_id"]
             ):
                 raise ValueError("Cancellation disposition changed")
-            # Fixed-UID resource effects and typed completion are the next
-            # checkpoint. Freezing never advertises an actuation/completion grant.
+            from vm_controller.creation_disposition_resources import (
+                DispositionResources,
+            )
+
+            await DispositionResources(self.actuator, row, lease, disposition).run()
             return {**pending, "disposition_id": disposition["disposition_id"]}
         return pending
 

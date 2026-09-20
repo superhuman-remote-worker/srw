@@ -293,7 +293,8 @@ class VMCreationDispositionStore:
         """Grant repeatable exact-UID teardown, never a CREATE or terminal release.
 
         The controller must fence consumers at every destructive API boundary.
-        This method is not exposed as an HTTP operation until that actuator lands.
+        The authenticated controller actuator supplies fresh consumer checks and
+        exact readback; the grant itself is not completion evidence.
         """
         async with self.db.acquire() as conn:
             async with conn.transaction():
@@ -307,8 +308,8 @@ class VMCreationDispositionStore:
     ) -> dict:
         """Accept authenticated exact absence; a root also requires SQL completion.
 
-        No current caller or HTTP route invokes this until controller readback and
-        consumer fencing are integrated. A typed result cannot release the parent.
+        The authenticated controller records only after exact readback and fresh
+        consumer fencing. A typed result cannot release the parent.
         """
         async with self.db.acquire() as conn:
             async with conn.transaction():

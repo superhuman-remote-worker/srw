@@ -222,11 +222,13 @@ POST   /api/internal/ssh-attachments/{attachment_id}/close                      
 POST   /api/internal/ssh-keys/used                                                      internal:require_internal
 GET    /api/internal/ssh-targets/{handle}                                               gated:user_can_access_ide_entity
 POST   /api/internal/vm-creation-retries/authorize                                      internal:require_vm_cleanup_authority
+POST   /api/internal/vm-creation-retries/authorize-disposition                          internal:require_vm_cleanup_authority
 POST   /api/internal/vm-creation-retries/begin-effect                                   internal:require_vm_cleanup_authority
 POST   /api/internal/vm-creation-retries/freeze-disposition                             internal:require_vm_cleanup_authority
 POST   /api/internal/vm-creation-retries/inspect                                        internal:require_vm_cleanup_authority
 POST   /api/internal/vm-creation-retries/observe-effect                                 internal:require_vm_cleanup_authority
 POST   /api/internal/vm-creation-retries/prepare-disposition                            internal:require_vm_cleanup_authority
+POST   /api/internal/vm-creation-retries/record-disposition                             internal:require_vm_cleanup_authority
 POST   /api/internal/vm-creation-retries/settle-adopted                                 internal:require_vm_cleanup_authority
 POST   /api/internal/vm-creation-retries/settle-never-issued                            internal:require_vm_cleanup_authority
 POST   /api/internal/vm-resource-inventory/publish                                      internal:require_vm_inventory_authority

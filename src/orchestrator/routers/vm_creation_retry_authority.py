@@ -121,3 +121,17 @@ async def freeze_disposition(request: Request) -> JSONResponse:
     return await _dispatch(
         request, "creation_retry_freeze_disposition", "freeze_disposition"
     )
+
+
+@router.post("/authorize-disposition")
+async def authorize_disposition(request: Request) -> JSONResponse:
+    return await _dispatch(
+        request, "creation_retry_authorize_disposition", "authorize_disposition"
+    )
+
+
+@router.post("/record-disposition")
+async def record_disposition(request: Request) -> JSONResponse:
+    return await _dispatch(
+        request, "creation_retry_record_disposition", "record_disposition"
+    )
