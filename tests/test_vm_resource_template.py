@@ -188,3 +188,45 @@ def test_ambiguous_or_unbounded_yaml_is_refused_without_echoing_input(source):
             storage_class="local",
         )
     assert str(error.value) == "unsupported_resource_template"
+
+
+@pytest.mark.parametrize(
+    "probe",
+    [
+        {"exec": {"command": ["true"]}},
+        {"httpGet": {"path": "/", "port": 80}},
+        {"guestAgentPing": {}},
+        {
+            "tcpSocket": {"port": 22},
+            "initialDelaySeconds": 30,
+            "periodSeconds": 5,
+            "failureThreshold": 60,
+            "exec": {"command": ["true"]},
+        },
+        {
+            "tcpSocket": {"port": 23},
+            "initialDelaySeconds": 30,
+            "periodSeconds": 5,
+            "failureThreshold": 60,
+        },
+        {
+            "tcpSocket": {"port": 22},
+            "initialDelaySeconds": 31,
+            "periodSeconds": 5,
+            "failureThreshold": 60,
+        },
+        {},
+        None,
+    ],
+)
+def test_resource_profile_refuses_unprojected_readiness_probe(probe):
+    doc = template()
+    doc["spec"]["template"]["spec"]["readinessProbe"] = probe
+    with pytest.raises(ResourceAdmissionError, match="unsupported_resource_template"):
+        inspect(doc)
+
+
+def test_absent_readiness_probe_does_not_add_unprojected_probe_overhead():
+    doc = template()
+    del doc["spec"]["template"]["spec"]["readinessProbe"]
+    assert inspect(doc) == inspect()

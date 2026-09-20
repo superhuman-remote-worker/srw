@@ -125,6 +125,16 @@ def inspect_resource_template(
             },
             {"domain", "networks", "volumes"},
         )
+        # Probe semantics are not projected by this profile. In particular an
+        # exec probe adds launcher memory overhead in KubeVirt. Admit only the
+        # shipped TCP probe (or no probe), never silently erase a custom probe.
+        if "readinessProbe" in vmi and vmi["readinessProbe"] != {
+            "tcpSocket": {"port": 22},
+            "initialDelaySeconds": 30,
+            "periodSeconds": 5,
+            "failureThreshold": 60,
+        }:
+            _refuse()
         if vmi.get("schedulerName", "default-scheduler") != "default-scheduler":
             _refuse()
         # Validate even empty environment values; malformed false-like values
