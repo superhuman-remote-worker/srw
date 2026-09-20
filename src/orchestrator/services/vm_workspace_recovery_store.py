@@ -427,6 +427,12 @@ def _parent_cleanup_identity(
     expected_vm_uid: str | None,
 ) -> tuple[UUID, UUID, str, str] | None:
     try:
+        if proof.get("kind") == "creation_disposition":
+            from orchestrator.services.vm_creation_disposition_cleanup import (
+                disposition_parent_identity,
+            )
+
+            return disposition_parent_identity(proof)
         intent = proof["intent"]
         if (
             not isinstance(intent, Mapping)
@@ -1472,6 +1478,29 @@ class VMWorkspaceRecoveryStore:
                 return CleanupPermit(
                     allowed=False, reason="parent_cleanup_identity_changed"
                 )
+        if (
+            parent_cleanup is not None
+            and parent_cleanup.get("kind") == "creation_disposition"
+        ):
+            from orchestrator.services.vm_creation_disposition_cleanup import (
+                validate_disposition_child,
+            )
+
+            if not await validate_disposition_child(
+                conn,
+                parent_cleanup,
+                owner_kind=owner_kind,
+                owner_id=owner_id,
+                pvc_uid=pvc_uid,
+                request_id=request_id,
+                source=source,
+                intent_digest=intent_digest,
+                provision_generation=parent_provision_generation,
+                expected_vm_uid=expected_vm_uid,
+            ):
+                return CleanupPermit(
+                    allowed=False, reason="parent_cleanup_identity_changed"
+                )
         if prior is not None:
             if (
                 prior["pvc_uid"] != pvc_uid
@@ -1504,11 +1533,15 @@ class VMWorkspaceRecoveryStore:
                     "SELECT id FROM vm_workspace_cleanup_admissions "
                     "WHERE id<>$1 AND ((owner_kind=$2 AND owner_id=$3) "
                     "OR ($4::uuid IS NOT NULL AND pvc_uid=$4)) "
-                    "AND completed_at IS NULL FOR UPDATE",
+                    "AND completed_at IS NULL AND ($5::uuid IS NULL OR id<>$5) FOR UPDATE",
                     prior["id"],
                     owner_kind,
                     owner_id,
                     pvc_uid,
+                    parent_id
+                    if parent_cleanup is not None
+                    and parent_cleanup.get("kind") == "creation_disposition"
+                    else None,
                 )
                 if later_cleanup is not None:
                     return CleanupPermit(

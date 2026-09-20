@@ -1,8 +1,9 @@
 """Freeze partial creation cleanup evidence under the existing create authority.
 
-This store does not grant Kubernetes writes or complete an admission. An issued
-effect is possible actuation forever until exact observation/rejection settles
-it. In particular, absence and claim expiry are not non-issuance evidence.
+Fixed-UID teardown authority requires a frozen no-VM-issuance disposition; this
+store never grants creation or completes the parent admission. An issued create
+is possible actuation until exact observation/rejection settles it. In particular,
+absence and claim expiry are not non-issuance evidence.
 """
 
 import json
@@ -187,3 +188,157 @@ class VMCreationDispositionStore:
                     carrier["metadata"]["namespace"],
                 )
                 return {"frozen": True, "disposition": disposition}
+
+    async def _locked(self, conn, request_id, carrier):
+        values = self.retries._carrier(carrier)
+        row, _ = await self.retries._effect_scope(conn, request_id)
+        if row["state"] != "cancel_requested":
+            raise VMCreationRetryConflict("job_not_cancelled")
+        await self.retries._check_carrier(conn, row, carrier, values)
+        disposition = _json(row["cancellation_disposition"])
+        if disposition is None:
+            raise VMCreationRetryConflict("creation_disposition_unproven")
+        # The freeze trigger prevents new effects, but recheck possible issuance
+        # here too: no absence observation may substitute for this SQL authority.
+        if row["observed_vm_uid"] is not None or await conn.fetchval(
+            "SELECT EXISTS(SELECT 1 FROM vm_creation_effects WHERE request_id=$1 AND (state='issued' OR (effect_kind='vm' AND state<>'rejected')))",
+            row["request_id"],
+        ):
+            raise VMCreationRetryConflict("creation_effect_unresolved")
+        return row, disposition
+
+    async def _grant(self, conn, row, disposition, stage, *, create_child):
+        """Only fixed identities; source and retained attachment stay unsupported."""
+        if stage not in {"rootdisk", "cloud_init"}:
+            raise VMCreationRetryConflict("creation_disposition_stage_unavailable")
+        resource = disposition["objects"].get(stage)
+        if resource is None:
+            raise VMCreationRetryConflict("creation_disposition_stage_unavailable")
+        common = {
+            "version": 1,
+            "disposition_id": disposition["disposition_id"],
+            "namespace": resource["namespace"],
+            "name": resource["name"],
+            "uid": resource["uid"],
+        }
+        if stage == "cloud_init":
+            return {
+                "operation": "delete_secret",
+                "resource": resource,
+                "completion": {**common, "kind": "secret_absent"},
+            }
+        from orchestrator.services.vm_creation_disposition_cleanup import root_cleanup
+
+        try:
+            intent = root_cleanup(disposition)
+        except (ValueError, KeyError, TypeError) as exc:
+            raise VMCreationRetryConflict(
+                "creation_disposition_stage_unavailable"
+            ) from exc
+        parent = await self.retries._creation_permit_on_conn(conn, row)
+        proof = {
+            "version": 1,
+            "kind": "creation_disposition",
+            "admission_id": str(parent["id"]),
+            "request_id": str(parent["request_id"]),
+            "intent_digest": parent["intent_digest"],
+            "retry_request_id": str(row["request_id"]),
+            "disposition_id": disposition["disposition_id"],
+        }
+        if create_child:
+            child = await self.retries.cleanup.acquire_cleanup_permit_on_conn(
+                conn,
+                owner_kind=intent["owner_kind"],
+                owner_id=UUID(intent["owner_id"]),
+                pvc_uid=UUID(intent["pvc_uid"]),
+                request_id=UUID(intent["request_id"]),
+                source=intent["source"],
+                intent_digest=intent["intent_digest"],
+                parent_cleanup=proof,
+                parent_provision_generation=intent["provision_generation"],
+            )
+            if not child.allowed:
+                raise VMCreationRetryConflict(child.reason)
+            if child.completed_outcome not in {None, "deleted"}:
+                raise VMCreationRetryConflict("creation_disposition_incomplete")
+            child_id = child.admission_id
+        else:
+            child_id = await conn.fetchval(
+                "SELECT id FROM vm_workspace_cleanup_admissions WHERE parent_admission_id=$1 AND request_id=$2 AND owner_kind='job' AND owner_id=$3 AND pvc_uid=$4 AND source=$5 AND intent_digest=$6",
+                parent["id"],
+                UUID(intent["request_id"]),
+                row["job_id"],
+                UUID(intent["pvc_uid"]),
+                intent["source"],
+                intent["intent_digest"],
+            )
+            if child_id is None:
+                raise VMCreationRetryConflict("creation_disposition_incomplete")
+        cleanup = {**intent, "admission_id": str(child_id), "parent_cleanup": proof}
+        return {
+            "operation": "purge_rootdisk",
+            "resource": resource,
+            "cleanup": cleanup,
+            "completion": {
+                **common,
+                "kind": "rootdisk_purged",
+                "pvc_uid": resource["pvc_uid"],
+                "admission_id": str(child_id),
+                "request_id": intent["request_id"],
+                "intent_digest": intent["intent_digest"],
+            },
+        }
+
+    async def authorize(self, *, request_id: str, carrier: dict, stage: str) -> dict:
+        """Grant repeatable exact-UID teardown, never a CREATE or terminal release.
+
+        The controller must fence consumers at every destructive API boundary.
+        This method is not exposed as an HTTP operation until that actuator lands.
+        """
+        async with self.db.acquire() as conn:
+            async with conn.transaction():
+                row, disposition = await self._locked(conn, request_id, carrier)
+                return await self._grant(
+                    conn, row, disposition, stage, create_child=True
+                )
+
+    async def record(
+        self, *, request_id: str, carrier: dict, stage: str, evidence: dict
+    ) -> dict:
+        """Accept authenticated exact absence; a root also requires SQL completion.
+
+        No current caller or HTTP route invokes this until controller readback and
+        consumer fencing are integrated. A typed result cannot release the parent.
+        """
+        async with self.db.acquire() as conn:
+            async with conn.transaction():
+                row, disposition = await self._locked(conn, request_id, carrier)
+                grant = await self._grant(
+                    conn, row, disposition, stage, create_child=False
+                )
+                if (
+                    evidence != grant["completion"]
+                    or type(evidence.get("version")) is not int
+                ):
+                    raise VMCreationRetryConflict(
+                        "creation_disposition_evidence_changed"
+                    )
+                if stage == "rootdisk":
+                    child = await conn.fetchrow(
+                        "SELECT completed_at,outcome FROM vm_workspace_cleanup_admissions WHERE id=$1",
+                        UUID(grant["cleanup"]["admission_id"]),
+                    )
+                    if child["completed_at"] is None or child["outcome"] != "deleted":
+                        raise VMCreationRetryConflict("creation_disposition_incomplete")
+                progress = _json(row["cancellation_progress"])
+                if stage in progress and progress[stage] != evidence:
+                    raise VMCreationRetryConflict(
+                        "creation_disposition_evidence_changed"
+                    )
+                if stage not in progress:
+                    await conn.execute(
+                        "UPDATE vm_creation_retries SET cancellation_progress=cancellation_progress || $2::jsonb,revision=revision+1,updated_at=clock_timestamp() WHERE request_id=$1",
+                        row["request_id"],
+                        json.dumps({stage: evidence}),
+                    )
+                return {"recorded": True, "stage": stage, "evidence": evidence}

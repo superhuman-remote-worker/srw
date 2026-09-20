@@ -100,13 +100,30 @@ class VMCreationRetryStore:
             raise VMCreationRetryConflict("workspace_owner_changed")
         guard_owners = sorted(owners if lineage else {job_id})
         cleanups = await conn.fetch(
-            "SELECT id FROM vm_workspace_cleanup_admissions WHERE completed_at IS NULL "
+            "SELECT * FROM vm_workspace_cleanup_admissions WHERE completed_at IS NULL "
             "AND ((owner_kind='job' AND owner_id=ANY($1::uuid[])) OR ($2::uuid IS NOT NULL AND pvc_uid=$2)) ORDER BY id FOR UPDATE",
             guard_owners,
             pvc_uid,
         )
-        if any(row["id"] != own_admission for row in cleanups):
-            raise VMCreationRetryConflict("workspace_cleanup_already_admitted")
+        competing = [row for row in cleanups if row["id"] != own_admission]
+        if competing:
+            from orchestrator.services.vm_creation_disposition_cleanup import (
+                exact_root_child,
+            )
+
+            disposition = (
+                await conn.fetchval(
+                    "SELECT cancellation_disposition FROM vm_creation_retries WHERE creation_admission_id=$1 AND job_id=$2 AND state='cancel_requested'",
+                    own_admission,
+                    job_id,
+                )
+                if own_admission is not None
+                else None
+            )
+            if disposition is None or any(
+                not exact_root_child(row, _json(disposition)) for row in competing
+            ):
+                raise VMCreationRetryConflict("workspace_cleanup_already_admitted")
         recovery = await conn.fetchval(
             "SELECT r.id FROM vm_workspace_recoveries r LEFT JOIN vm_workspace_recovery_retention_pins p "
             "ON p.recovery_id=r.id AND p.released_at IS NULL WHERE r.resolved_at IS NULL AND "
