@@ -165,3 +165,136 @@ async def test_prepared_retained_source_requires_exact_completed_root(prepared_c
             configuration=configuration,
             expected_pvc_uid=str(uuid4()),
         )
+
+
+@pytest_asyncio.fixture
+async def bound_preparation():
+    service, request = engine(), preparation_request()
+    binding = {
+        "request_id": str(uuid4()),
+        "provision_generation": str(uuid4()),
+        "request_digest": "sha256:" + "3" * 64,
+    }
+    _, waiting = await service.prepare(request, creation=binding)
+    pod = next(name for name, pod in service.store.pods.items())
+    service.store.finish(pod)
+    for _ in range(3):
+        ready, waiting = await service.prepare(request, creation=binding)
+        if ready:
+            break
+    assert ready is not None
+    return service, request, binding, ready
+
+
+@pytest.mark.asyncio
+async def test_protocol_preparation_cancel_preserves_delivered_source_hold(
+    bound_preparation,
+):
+    service, request, binding, ready = bound_preparation
+    assert await service.cancel_with_receipt(request) == {
+        "cancelled": False,
+        "workspaceNeverIssued": False,
+    }
+    allocation = await service.store.get(allocation_name(request))
+    assert allocation.state["phase"] == "Cloning"
+    assert allocation.state["creation_binding"] == binding
+    assert not await service.delete_artifact(
+        ready["preparation"]["uid"], request["scope"]
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("disabled", [False, True])
+async def test_protocol_source_hold_survives_expiry_and_disabled_preparation(
+    bound_preparation, monkeypatch, disabled
+):
+    from dataclasses import replace
+    from vm_controller import workspace_preparation as module
+
+    service, request, binding, ready = bound_preparation
+    allocation = await service.store.get(allocation_name(request))
+    monkeypatch.setattr(
+        module, "now", lambda: allocation.state["expires_at"] + 9 * 86400
+    )
+    if disabled:
+        service.settings = replace(service.settings, enabled=False)
+    await service.reconcile()
+    allocation = await service.store.get(allocation_name(request))
+    assert allocation is not None and allocation.state["phase"] == "Cloning"
+    assert ready["name"] in service.store.disks
+
+
+@pytest.mark.asyncio
+async def test_existing_protocol_allocation_cannot_deliver_source_to_legacy_or_other_request(
+    bound_preparation,
+):
+    from vm_controller.preparation_store import PreparationConflict
+
+    service, request, binding, _ = bound_preparation
+    with pytest.raises(PreparationConflict):
+        await service.prepare(request)
+    with pytest.raises(PreparationConflict):
+        await service.prepare(request, creation={**binding, "request_id": str(uuid4())})
+
+
+@pytest.mark.asyncio
+async def test_bound_preparation_without_source_delivery_can_cancel():
+    service, request = engine(), preparation_request()
+    binding = {
+        "request_id": str(uuid4()),
+        "provision_generation": str(uuid4()),
+        "request_digest": "sha256:" + "3" * 64,
+    }
+    await service.prepare(request, creation=binding)
+    for _ in range(3):
+        result = await service.cancel_with_receipt(request)
+        if result["cancelled"]:
+            break
+        await service.reconcile()
+    assert result == {"cancelled": True, "workspaceNeverIssued": True}
+
+
+@pytest.mark.asyncio
+async def test_legacy_workspace_observation_cannot_release_protocol_hold(
+    bound_preparation,
+):
+    service, request, _, ready = bound_preparation
+    root = "agent-vm-" + request["allocationId"] + "-rootdisk"
+    await service.store.ensure_disk(
+        root,
+        owner_uid=request["allocationId"],
+        scope=request["scope"],
+        source={"pvc": {"name": ready["name"], "namespace": service.store.namespace}},
+        size="30Gi",
+    )
+    pvc_uid = (await service.store.pvc(root)).metadata.uid
+    await service.observe_workspace(
+        "job", request["allocationId"], rootdisk=root, pvc_uid=pvc_uid
+    )
+    allocation = await service.store.get(allocation_name(request))
+    assert allocation.state["phase"] == "Cloning"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("broken", [None, {}])
+async def test_unproven_existing_creation_binding_does_not_release_source(
+    bound_preparation, broken
+):
+    service, request, _, _ = bound_preparation
+    service.store.data[allocation_name(request)].state["creation_binding"] = broken
+    result = await service.cancel_with_receipt(request)
+    assert result == {"cancelled": False, "workspaceNeverIssued": False}
+
+
+@pytest.mark.asyncio
+async def test_incomplete_completion_fact_does_not_release_prepared_source(
+    bound_preparation,
+):
+    service, request, _, _ = bound_preparation
+    service.store.data[allocation_name(request)].state["creation_root"] = {
+        "authenticated": True
+    }
+    assert await service.cancel_with_receipt(request) == {
+        "cancelled": False,
+        "workspaceNeverIssued": False,
+    }

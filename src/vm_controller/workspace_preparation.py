@@ -47,6 +47,27 @@ def allocation_name(request):
     )
 
 
+def creation_held(allocation):
+    """A delivered protocol source stays held until exact clone disposition."""
+    if (
+        "creation_binding" not in allocation.state
+        or allocation.state.get("workspace_source_issued") is False
+    ):
+        return False
+    root = allocation.state.get("creation_root")
+    if (
+        not isinstance(root, dict)
+        or set(root) != {"name", "dv_uid", "pvc_uid"}
+        or root["name"]
+        != "agent-vm-" + allocation.request["allocationId"] + "-rootdisk"
+    ):
+        return True
+    try:
+        return any(str(UUID(root[key])) != root[key] for key in ("dv_uid", "pvc_uid"))
+    except (ValueError, TypeError, AttributeError):
+        return True
+
+
 class VMWorkspacePreparation:
     def __init__(
         self, controller, *, namespace, storage_class, settings, resolver=None
@@ -64,8 +85,21 @@ class VMWorkspacePreparation:
         self.builder_image = None
         self.last_allocation_sweep = 0.0
 
-    async def prepare(self, value):
+    async def prepare(self, value, *, creation=None):
         request = validate_request(value)
+        if creation is not None:
+            if (
+                not isinstance(creation, dict)
+                or set(creation)
+                != {"request_id", "provision_generation", "request_digest"}
+                or request["ownerKind"] != "job"
+                or any(
+                    str(UUID(creation[key])) != creation[key]
+                    for key in ("request_id", "provision_generation")
+                )
+                or not re.fullmatch(r"sha256:[0-9a-f]{64}", creation["request_digest"])
+            ):
+                raise PreparationConflict("Creation allocation binding is invalid.")
         if not self.settings.enabled:
             raise PreparationConflict("VM workspace preparation is not enabled.")
         self.resolver.permitted(request["image"])
@@ -80,6 +114,22 @@ class VMWorkspacePreparation:
                     "expires_at": now() + self.settings.wait_budget + 300,
                 },
             )
+            bound = allocation.state.get("creation_binding")
+            if "creation_binding" in allocation.state and (
+                bound is None or bound != creation
+            ):
+                raise PreparationConflict(
+                    "Preparation source belongs to another creation request."
+                )
+            if creation is not None and bound is None:
+                if allocation.state.get("workspace_source_issued") is not False:
+                    raise PreparationConflict(
+                        "Existing preparation delivery is unproven."
+                    )
+                await self.store.save(
+                    allocation,
+                    {**allocation.state, "creation_binding": deepcopy(creation)},
+                )
             if allocation.state["phase"] in {"Cancelled", "Failed"}:
                 return self._result(allocation, None)
             if not allocation.state.get("artifact"):
@@ -103,7 +153,9 @@ class VMWorkspacePreparation:
                     allocation,
                     {
                         **allocation.state,
-                        "phase": "Failed",
+                        "phase": allocation.state["phase"]
+                        if creation_held(allocation)
+                        else "Failed",
                         "error": "PreparedArtifactLost",
                     },
                 )
@@ -117,7 +169,9 @@ class VMWorkspacePreparation:
                     allocation,
                     {
                         **allocation.state,
-                        "phase": "Failed",
+                        "phase": allocation.state["phase"]
+                        if creation_held(allocation)
+                        else "Failed",
                         "error": artifact.state.get(
                             "error", "PreparedArtifactUnavailable"
                         ),
@@ -634,6 +688,11 @@ class VMWorkspacePreparation:
                 or allocation.state["phase"] != "Cloning"
             ):
                 return
+            if "creation_binding" in allocation.state:
+                # Legacy owner/name observation cannot release a protocol hold.
+                # Its source helper must first prove the durable effect nonce
+                # and exact completed DV/PVC identities.
+                return
             dv, pvc = await self.store.dv(rootdisk), await self.store.pvc(rootdisk)
             if (
                 not dv
@@ -723,6 +782,8 @@ class VMWorkspacePreparation:
             }
 
     async def _abandon(self, allocation, phase, error):
+        if creation_held(allocation):
+            return False
         await self.store.save(
             allocation, {**allocation.state, "phase": phase, "error": error}
         )
@@ -769,7 +830,8 @@ class VMWorkspacePreparation:
         return [
             a
             for a in await self.store.records("allocation", artifact_uid=artifact.uid)
-            if a.state.get("artifact_uid") == artifact.uid and a.state["phase"] in HELD
+            if a.state.get("artifact_uid") == artifact.uid
+            and (a.state["phase"] in HELD or creation_held(a))
         ]
 
     async def _remove(self, artifact, *, allow_failed_holders=False):
@@ -777,6 +839,8 @@ class VMWorkspacePreparation:
             return False
         holders = await self._holders(artifact)
         if holders:
+            if any(creation_held(allocation) for allocation in holders):
+                return False
             if artifact.state["phase"] != "Failed" or not allow_failed_holders:
                 return False
             for allocation in holders:
@@ -904,6 +968,10 @@ class VMWorkspacePreparation:
                     elif (
                         allocation.state["phase"]
                         in {"Allocated", "Failed", "Cancelled"}
+                        and (
+                            "creation_binding" not in allocation.state
+                            or allocation.state.get("workspace_source_issued") is False
+                        )
                         and now() > expires + 7 * 86400
                     ):
                         await self.store.delete_record(allocation)
