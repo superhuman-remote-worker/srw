@@ -243,6 +243,7 @@ class LiveScenario:
                 "slow-boot gate delay must be between 1 and 60 seconds"
             )
         self.job_id: UUID | None = None
+        self.gate_user_id: UUID | None = None
         self._core: Any = None
         self._custom: Any = None
 
@@ -332,7 +333,24 @@ class LiveScenario:
             row = await conn.fetchrow(query, *values)
         return dict(row) if row is not None else {}
 
+    async def _ensure_gate_user(self) -> UUID:
+        """Create one approved non-admin principal for the disposable gate."""
+
+        if self.gate_user_id is not None:
+            return self.gate_user_id
+        user_id = uuid4()
+        async with self.db.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO users(id,display_name,is_approved,is_admin) "
+                "VALUES ($1,$2,true,false)",
+                user_id,
+                f"VM recovery gate {self.run_id}",
+            )
+        self.gate_user_id = user_id
+        return user_id
+
     async def _create_job(self) -> tuple[UUID, int]:
+        gate_user_id = await self._ensure_gate_user()
         job_id = uuid4()
         lease_token = 27
         created = await self.db.create_job(
@@ -341,6 +359,7 @@ class LiveScenario:
             origin="lifecycle",
             status="processing",
             execution_lane="stateless",
+            user_id=str(gate_user_id),
             job_id=job_id,
         )
         if UUID(str(created["id"])) != job_id:
@@ -382,13 +401,19 @@ class LiveScenario:
         row = await self._row("SELECT context FROM jobs WHERE id=$1", job_id)
         context = _object(_object(row.get("context")).get("vm"))
         status = dict(status or {})
+        live_provisioning = _object(status.get("provisioning"))
+        stored_provisioning = _object(context.get("provisioning"))
+        stored_identity = _object(stored_provisioning.get("identity"))
+        live_vmi_uid = live_provisioning.get("vmi_uid")
+        if not live_vmi_uid or stored_identity.get("vmi_uid") != live_vmi_uid:
+            return None
         identity = {
             "owner_kind": "job",
             "owner_id": str(job_id),
             "provision_generation": context.get("provision_generation"),
             "namespace": context.get("namespace") or self.namespace,
             "vm_uid": context.get("vm_uid") or status.get("vm_uid"),
-            "prior_vmi_uid": context.get("active_vmi_uid") or status.get("vmi_uid"),
+            "prior_vmi_uid": live_vmi_uid,
             "prior_launcher_uid": context.get("active_pod_uid")
             or status.get("active_pod_uid"),
             "root_pvc_uid": context.get("rootdisk_pvc_uid")
@@ -428,9 +453,19 @@ class LiveScenario:
 
         base = os.environ.get("ORCHESTRATOR_URL", "http://127.0.0.1:8085").rstrip("/")
         key = os.environ.get("MCP_INTERNAL_KEY", "")
+        user_id = await self._ensure_gate_user()
+        owner = await self._row("SELECT user_id FROM jobs WHERE id=$1", job_id)
+        if str(owner.get("user_id") or "") != str(user_id):
+            raise AcceptanceFailure("recovery gate user does not own the fixture job")
+        if not key:
+            raise AcceptanceFailure("MCP_INTERNAL_KEY is not configured")
         async with httpx.AsyncClient(timeout=10) as client:
             response = await client.get(
-                f"{base}/api/jobs/{job_id}", headers={"X-Internal-Key": key}
+                f"{base}/api/jobs/{job_id}",
+                headers={
+                    "X-Internal-Key": key,
+                    "X-MCP-User-Id": str(user_id),
+                },
             )
         return {
             "status_code": response.status_code,

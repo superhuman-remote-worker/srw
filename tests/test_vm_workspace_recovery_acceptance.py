@@ -387,6 +387,7 @@ async def test_acceptance_fixture_uses_production_job_creation_boundary() -> Non
     scenario.db = Database()
     scenario.run_id = "fixture-boundary"
     scenario.job_id = None
+    scenario.gate_user_id = None
 
     job_id, lease_token = await scenario._create_job()
 
@@ -397,14 +398,92 @@ async def test_acceptance_fixture_uses_production_job_creation_boundary() -> Non
             "origin": "lifecycle",
             "status": "processing",
             "execution_lane": "stateless",
+            "user_id": str(scenario.gate_user_id),
             "job_id": job_id,
         }
     ]
     assert lease_token == 27
     assert scenario.job_id == job_id
-    assert ["run_queue" in query for query, _values in executed] == [True, False]
+    assert "INSERT INTO users" in executed[0][0]
+    assert "true,false" in executed[0][0]
+    assert ["run_queue" in query for query, _values in executed] == [False, True, False]
     assert ["worker_batch_attempts" in query for query, _values in executed] == [
+        False,
         False,
         True,
     ]
     assert all("INSERT INTO jobs" not in query for query, _values in executed)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stored_as_json", [False, True])
+async def test_ready_identity_uses_matching_authenticated_nested_vmi(stored_as_json):
+    import json
+    from uuid import uuid4
+    from unittest.mock import AsyncMock
+
+    job, generation, vm, vmi, launcher, pvc = [str(uuid4()) for _ in range(6)]
+    context = dict(
+        provision_generation=generation,
+        vm_uid=vm,
+        rootdisk_pvc_uid=pvc,
+        active_pod_uid=launcher,
+        namespace="agent-vms",
+        pod_ip="10.42.0.2",
+        ssh_registration_id=str(uuid4()),
+        ssh_host_key_fingerprint="SHA256:" + "A" * 43,
+        provisioning={"identity": {"vmi_uid": vmi}},
+    )
+    reply = dict(
+        ready=True,
+        provision_generation=generation,
+        vm_uid=vm,
+        rootdisk_pvc_uid=pvc,
+        active_pod_uid=launcher,
+        provisioning={"vmi_uid": vmi},
+    )
+    scenario = object.__new__(LiveScenario)
+    scenario.namespace = "agent-vms"
+    scenario.provisioner = SimpleNamespace(query_status=AsyncMock(return_value=reply))
+    body = {"vm": context}
+    scenario._row = AsyncMock(
+        return_value={"context": json.dumps(body) if stored_as_json else body}
+    )
+    result = await scenario._ready_identity(acceptance.UUID(job))
+    assert result["prior_vmi_uid"] == vmi
+    context["provisioning"]["identity"]["vmi_uid"] = str(uuid4())
+    scenario._row.return_value = {"context": {"vm": context}}
+    assert await scenario._ready_identity(acceptance.UUID(job)) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("owned", [True, False])
+async def test_job_api_probe_requires_fixture_owner_headers(monkeypatch, owned):
+    import httpx
+    from uuid import uuid4
+    from unittest.mock import AsyncMock
+
+    user, job = uuid4(), uuid4()
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        assert request.headers["X-Internal-Key"] == "gate-internal"
+        assert request.headers["X-MCP-User-Id"] == str(user)
+        return httpx.Response(200, json={"id": str(job)})
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **_kwargs: client)
+    monkeypatch.setenv("MCP_INTERNAL_KEY", "gate-internal")
+    scenario = object.__new__(LiveScenario)
+    scenario.gate_user_id = user
+    scenario._row = AsyncMock(return_value={"user_id": user if owned else uuid4()})
+    if owned:
+        result = await scenario._application_api_evidence(job)
+        assert result == {"status_code": 200, "job_visible": True}
+        assert len(calls) == 1
+    else:
+        with pytest.raises(acceptance.AcceptanceFailure, match="does not own"):
+            await scenario._application_api_evidence(job)
+        assert not calls
+        await client.aclose()
