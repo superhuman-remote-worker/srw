@@ -857,11 +857,10 @@ jobs:
             docker/cockpit-nginx.conf docker/cockpit-canvas-env.sh)
           MCP_PATHS=(src/mcp_server/ src/shared/ pyproject.toml
             .dockerignore docker/Dockerfile.mcp)
-          VM_CONTROLLER_PATHS=(src/vm_controller/ src/shared/__init__.py
-            src/shared/vm_lifecycle_auth.py src/shared/workspace_initialization.py src/shared/vm_workspace_storage.py src/shared/workspace_preparation.py
-            src/shared/workspace_preparation_settings.py src/shared/workspace_preparation_network.py pyproject.toml
+          VM_CONTROLLER_PATHS=(src/vm_controller/ src/shared/ pyproject.toml
             .dockerignore docker/Dockerfile.vm-controller
-            scripts/check_kubernetes_sdk_auth.py requirements/ scripts/lock_dependencies.py)
+            scripts/check_kubernetes_sdk_auth.py scripts/check_vm_controller_imports.py
+            requirements/ scripts/lock_dependencies.py)
           # docker/browser-exec is COPY'd into the workspace image at build time
           # (see Dockerfile.workspace §2c), so changes to it must rebuild the
           # workspace image. Missing this path caused a0ce92d2's browser-exec

@@ -22,7 +22,7 @@ RUN python scripts/lock_dependencies.py check vm-controller \
     && pip install --no-cache-dir --require-hashes -r requirements/locks/vm-controller-py312.txt
 
 COPY src/vm_controller/ ./src/vm_controller/
-COPY src/shared/__init__.py src/shared/vm_lifecycle_auth.py src/shared/vm_creation_retry.py src/shared/vm_creation_issuance.py src/shared/workspace_initialization.py src/shared/vm_workspace_storage.py src/shared/workspace_preparation.py src/shared/workspace_preparation_settings.py src/shared/workspace_preparation_network.py ./src/shared/
+COPY src/shared/ ./src/shared/
 COPY pyproject.toml ./
 RUN pip install --no-cache-dir --no-deps -e .
 RUN --network=none python -I scripts/lock_dependencies.py check vm-controller --installed \
@@ -32,6 +32,10 @@ RUN --network=none python -I scripts/lock_dependencies.py check vm-controller --
 # The bind mount is build-only; the probe never reads credentials or uses a network.
 RUN --network=none --mount=type=bind,source=scripts/check_kubernetes_sdk_auth.py,target=/tmp/check_kubernetes_sdk_auth.py \
     python -I /tmp/check_kubernetes_sdk_auth.py
+
+# Import the installed controller and deferred shared dependencies offline.
+RUN --network=none --mount=type=bind,source=scripts/check_vm_controller_imports.py,target=/tmp/check_vm_controller_imports.py \
+    python -I /tmp/check_vm_controller_imports.py
 
 # Non-root user — K8s RBAC handles authorization
 RUN useradd --create-home --no-log-init controller

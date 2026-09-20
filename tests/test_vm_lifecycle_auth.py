@@ -384,15 +384,7 @@ def _controller_source_copies():
 
 def test_controller_shared_inputs_trigger_tilt_and_ci_rebuilds():
     sources = {source for source, _ in _controller_source_copies()}
-    shared_inputs = {
-        "src/shared/__init__.py",
-        "src/shared/vm_lifecycle_auth.py",
-        "src/shared/workspace_initialization.py",
-        "src/shared/workspace_preparation.py",
-        "src/shared/workspace_preparation_settings.py",
-        "src/shared/workspace_preparation_network.py",
-        "src/shared/vm_workspace_storage.py",
-    }
+    shared_inputs = {"src/shared/"}
     assert {
         source for source in sources if source.startswith("src/shared/")
     } == shared_inputs
@@ -416,6 +408,7 @@ def test_controller_shared_inputs_trigger_tilt_and_ci_rebuilds():
         "pyproject.toml",
         ".dockerignore",
         "docker/Dockerfile.vm-controller",
+        "scripts/check_vm_controller_imports.py",
     }
     assert required <= set(watched)
 
@@ -447,15 +440,6 @@ def test_controller_copied_protocol_imports_without_other_packages(tmp_path):
         else:
             target.mkdir(parents=True, exist_ok=True)
             shutil.copy2(REPO / source, target)
-    assert sorted(path.name for path in (tmp_path / "src/shared").iterdir()) == [
-        "__init__.py",
-        "vm_lifecycle_auth.py",
-        "vm_workspace_storage.py",
-        "workspace_initialization.py",
-        "workspace_preparation.py",
-        "workspace_preparation_network.py",
-        "workspace_preparation_settings.py",
-    ]
     script = """
 import json
 from pathlib import Path
@@ -493,3 +477,33 @@ assert "shared.runtime" not in sys.modules
     assert result.returncode == 0, result.stderr
     assert result.stdout == ""
     assert result.stderr == ""
+
+
+def test_controller_packaged_modules_and_lazy_shared_imports_load(tmp_path):
+    """Import the actual copied tree, including imports deferred until startup."""
+    for source, destination in _controller_source_copies():
+        target = tmp_path / destination.removeprefix("./")
+        if (REPO / source).is_dir():
+            shutil.copytree(REPO / source, target, dirs_exist_ok=True,
+                            ignore=shutil.ignore_patterns("__pycache__"))
+        else:
+            target.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(REPO / source, target)
+    script = """
+from pathlib import Path
+import runpy
+import sys
+sys.path.insert(0, sys.argv[1])
+import shared
+assert Path(shared.__file__).is_relative_to(Path(sys.argv[1]))
+runpy.run_path(sys.argv[2], run_name="__main__")
+assert "shared.vm_resource_inventory_settings" in sys.modules
+assert "shared.kubernetes_quantities" in sys.modules
+assert "shared.runtime" not in sys.modules
+"""
+    result = subprocess.run(
+        [sys.executable, "-I", "-c", script, str(tmp_path / "src"),
+         str(REPO / "scripts/check_vm_controller_imports.py")],
+        capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stderr

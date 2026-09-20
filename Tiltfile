@@ -330,7 +330,7 @@ local(
 # `vm.mode: same-cluster`; built here unconditionally so the local k3d gate
 # always runs the controller from the working tree, not from GHCR
 # (knowledge-base/knowledge/features/single_cluster_vm_deployment.md §6 Lane D).
-# No live_update: the image is three Python files and rebuilds in seconds.
+# Rebuild the installed controller and shared package together.
 # -----------------------------------------------------------------------------
 docker_build(
     'srw-vm-controller',
@@ -338,17 +338,12 @@ docker_build(
     dockerfile='docker/Dockerfile.vm-controller',
     only=[
         'src/vm_controller/',
-        'src/shared/__init__.py',
-        'src/shared/vm_lifecycle_auth.py',
-        'src/shared/workspace_initialization.py',
-        'src/shared/vm_workspace_storage.py',
-        'src/shared/workspace_preparation.py',
-        'src/shared/workspace_preparation_settings.py',
-        'src/shared/workspace_preparation_network.py',
+        'src/shared/',
         'pyproject.toml',
         '.dockerignore',
         'docker/Dockerfile.vm-controller',
         'scripts/check_kubernetes_sdk_auth.py',
+        'scripts/check_vm_controller_imports.py',
         'requirements/',
         'scripts/lock_dependencies.py',
     ],
