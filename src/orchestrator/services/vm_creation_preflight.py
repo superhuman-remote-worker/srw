@@ -72,10 +72,8 @@ class VMCreationPreflightStore:
         vm = _object(context.get("vm"))
         prior = _preflight(vm)
         retained = _object(context.get("last_vm"))
-        pvc = (
-            prior.get("expected_pvc_uid")
-            if prior
-            else vm.get("rootdisk_pvc_uid") or retained.get("rootdisk_pvc_uid")
+        pvc = vm.get("rootdisk_pvc_uid") or (
+            prior.get("expected_pvc_uid") if prior else retained.get("rootdisk_pvc_uid")
         )
         job = await self.retry._scope(conn, job_id, UUID(pvc) if pvc else None)
         if job is None:
@@ -84,11 +82,10 @@ class VMCreationPreflightStore:
         current_vm = _object(current.get("vm"))
         current_prior = _preflight(current_vm)
         current_old = _object(current.get("last_vm"))
-        current_pvc = (
+        current_pvc = current_vm.get("rootdisk_pvc_uid") or (
             current_prior.get("expected_pvc_uid")
             if current_prior
-            else current_vm.get("rootdisk_pvc_uid")
-            or current_old.get("rootdisk_pvc_uid")
+            else current_old.get("rootdisk_pvc_uid")
         )
         if current_pvc != pvc:
             raise VMCreationRetryConflict("retained_disk_changed")
@@ -143,7 +140,14 @@ class VMCreationPreflightStore:
         async with self.db.acquire() as conn:
             async with conn.transaction():
                 job, context, old_vm, prior = await self._lock(conn, owner)
-                if prior:
+                # Completed provenance belongs to the retired generation. Its
+                # successor still needs the exact receipt and retained-disk
+                # cleanup chain below; keeping provenance must not bar it.
+                retired = (
+                    old_vm.get("status") == "deleted"
+                    and old_vm.get("retirement_cleanup_pending") is not True
+                )
+                if prior and not (retired and prior["state"] == "admitted"):
                     await self.retry._current(
                         conn, job, UUID(old_vm["provision_generation"])
                     )
@@ -224,66 +228,90 @@ class VMCreationPreflightStore:
     async def claim_due(self, *, limit):
         if type(limit) is not int or not 1 <= limit <= 100:
             raise ValueError("Invalid preflight batch size")
+        # Page past held jobs instead of letting one ineligible head consume
+        # LIMIT forever. Only scan jobs present when this pass began.
         async with self.db.acquire() as conn:
-            candidates = await conn.fetch(
-                "SELECT id FROM jobs WHERE context->'vm'->'creation_preflight'->>'state' IN ('queued','resolving') "
-                "AND status IN ('created','paused') AND NOT EXISTS(SELECT 1 FROM vm_creation_retries r "
-                "WHERE r.job_id=jobs.id AND r.provision_generation::text=context->'vm'->>'provision_generation') "
-                "AND CASE WHEN jsonb_typeof(context->'vm'->'creation_preflight'->'next_probe_at')='number' "
-                "THEN (context->'vm'->'creation_preflight'->>'next_probe_at')::double precision <= extract(epoch FROM clock_timestamp()) ELSE false END "
-                "ORDER BY created_at,id LIMIT $1",
-                limit,
-            )
+            scan_started = await conn.fetchval("SELECT clock_timestamp()")
         result = []
-        for candidate in candidates:
-            try:
-                async with self.db.acquire() as conn:
-                    async with conn.transaction():
-                        job, _, vm, value = await self._lock(conn, candidate["id"])
-                        try:
-                            await self.retry._current(
-                                conn, job, UUID(vm["provision_generation"])
-                            )
-                        except VMCreationRetryConflict as exc:
-                            if exc.reason != "job_admission_expired" or not value:
-                                raise
-                            value.update(
-                                state="attention",
-                                reason=exc.reason,
-                                revision=value["revision"] + 1,
-                                claim_token=None,
-                                claim_expires_at=None,
-                            )
-                            await self._write(conn, job["id"], value)
-                            continue
-                        now = await conn.fetchval(
-                            "SELECT extract(epoch FROM clock_timestamp())::double precision"
+        cursor_time = None
+        cursor_id = None
+        while len(result) < limit:
+            async with self.db.acquire() as conn:
+                candidates = await conn.fetch(
+                    "SELECT id,created_at FROM jobs WHERE context->'vm'->'creation_preflight'->>'state' IN ('queued','resolving') "
+                    "AND status IN ('created','paused') AND NOT EXISTS(SELECT 1 FROM vm_creation_retries r "
+                    "WHERE r.job_id=jobs.id AND r.provision_generation::text=context->'vm'->>'provision_generation') "
+                    "AND CASE WHEN jsonb_typeof(context->'vm'->'creation_preflight'->'next_probe_at')='number' "
+                    "THEN (context->'vm'->'creation_preflight'->>'next_probe_at')::double precision <= extract(epoch FROM clock_timestamp()) ELSE false END "
+                    "AND CASE WHEN context->'vm'->'creation_preflight'->>'claim_expires_at' IS NULL THEN true "
+                    "WHEN jsonb_typeof(context->'vm'->'creation_preflight'->'claim_expires_at')='number' "
+                    "THEN (context->'vm'->'creation_preflight'->>'claim_expires_at')::double precision <= extract(epoch FROM clock_timestamp()) ELSE false END "
+                    "AND created_at <= $1 AND ($2::timestamptz IS NULL OR (created_at,id)>($2,$3::uuid)) "
+                    "ORDER BY created_at,id LIMIT $4",
+                    scan_started,
+                    cursor_time,
+                    cursor_id,
+                    max(20, limit),
+                )
+            if not candidates:
+                break
+            for candidate in candidates:
+                value = await self._claim_candidate(candidate["id"])
+                if value is not None:
+                    result.append(value)
+                    if len(result) == limit:
+                        break
+            cursor_time, cursor_id = candidates[-1]["created_at"], candidates[-1]["id"]
+        return result
+
+    async def _claim_candidate(self, job_id):
+        try:
+            async with self.db.acquire() as conn:
+                async with conn.transaction():
+                    job, _, vm, value = await self._lock(conn, job_id)
+                    try:
+                        await self.retry._current(
+                            conn, job, UUID(vm["provision_generation"])
                         )
-                        if (
-                            not value
-                            or value["state"] not in {"queued", "resolving"}
-                            or value["next_probe_at"] > now
-                            or value.get("claim_expires_at") is not None
-                            and value["claim_expires_at"] > now
-                        ):
-                            continue
-                        if await conn.fetchval(
-                            "SELECT EXISTS(SELECT 1 FROM vm_creation_retries WHERE job_id=$1 AND provision_generation=$2)",
-                            job["id"],
-                            UUID(vm["provision_generation"]),
-                        ):
-                            continue
+                    except VMCreationRetryConflict as exc:
+                        if exc.reason != "job_admission_expired" or not value:
+                            raise
                         value.update(
-                            state="resolving",
+                            state="attention",
+                            reason=exc.reason,
                             revision=value["revision"] + 1,
-                            claim_token=str(uuid4()),
-                            claim_expires_at=now + 60,
+                            claim_token=None,
+                            claim_expires_at=None,
                         )
                         await self._write(conn, job["id"], value)
-                        result.append(value)
-            except VMCreationRetryConflict:
-                continue
-        return result
+                        return None
+                    now = await conn.fetchval(
+                        "SELECT extract(epoch FROM clock_timestamp())::double precision"
+                    )
+                    if (
+                        not value
+                        or value["state"] not in {"queued", "resolving"}
+                        or value["next_probe_at"] > now
+                        or value.get("claim_expires_at") is not None
+                        and value["claim_expires_at"] > now
+                    ):
+                        return None
+                    if await conn.fetchval(
+                        "SELECT EXISTS(SELECT 1 FROM vm_creation_retries WHERE job_id=$1 AND provision_generation=$2)",
+                        job["id"],
+                        UUID(vm["provision_generation"]),
+                    ):
+                        return None
+                    value.update(
+                        state="resolving",
+                        revision=value["revision"] + 1,
+                        claim_token=str(uuid4()),
+                        claim_expires_at=now + 60,
+                    )
+                    await self._write(conn, job["id"], value)
+                    return value
+        except VMCreationRetryConflict:
+            return None
 
     async def _write(self, conn, job_id, value):
         await conn.execute(

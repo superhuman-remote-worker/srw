@@ -15,6 +15,8 @@ from tests.test_vm_creation_retry_real_postgres import (
 from orchestrator.services.vm_creation_request import build_vm_creation_request
 from orchestrator.services.vm_provisioner import VMProvisioner
 from orchestrator.services.vm_creation_retry_store import VMCreationRetryConflict
+from orchestrator.services.vm_creation_preflight import VMCreationPreflightStore
+from orchestrator.services.vm_workspace_recovery_store import cleanup_intent_digest
 
 db = _retry_db_fixture
 
@@ -390,3 +392,105 @@ async def test_retired_successor_preflight_keeps_disk_proof_and_boot_history(db,
         assert context["vm"]["provision_attempts"] == 2
         assert context["vm"]["provision_generation"] != generation
         assert context["vm"]["status"] == "waiting_creation_configuration"
+
+
+@pytest.mark.asyncio
+async def test_retired_protocol_generation_can_begin_proven_successor(db, monkeypatch):
+    from tests.test_vm_creation_effects_real_postgres import observed_creation
+    from shared.vm_creation_retry import canonical_request_digest
+
+    retry, row, carrier, observations = await observed_creation(db, monkeypatch)
+    await retry.settle_adopted(
+        request_id=str(row["request_id"]), carrier=carrier, observations=observations
+    )
+    job = row["job_id"]
+    store = VMCreationPreflightStore(db)
+    generation = str(row["provision_generation"])
+    vm_uid = observations["vm"]["object"]["metadata"]["uid"]
+    pvc_uid = observations["rootdisk"]["pvc"]["metadata"]["uid"]
+    prior = {
+        "version": 1,
+        "request": row["canonical_request"],
+        "request_digest": canonical_request_digest(row["canonical_request"]),
+        "request_id": str(row["request_id"]),
+        "revision": 2,
+        "attempt": 0,
+        "state": "admitted",
+        "expected_pvc_uid": None,
+    }
+    async with db.acquire() as conn:
+        old = json.loads(
+            await conn.fetchval("SELECT context->'vm' FROM jobs WHERE id=$1", job)
+        )
+    old.update(status="deleted", creation_preflight=prior)
+    intent = {
+        "owner_kind": "job",
+        "owner_id": str(job),
+        "provision_generation": generation,
+        "vm_uid": vm_uid,
+        "pvc_uid": pvc_uid,
+        "purge_disk": False,
+        "resource": "vm_workspace",
+        "source": "dispatcher_vm_recycle",
+    }
+    async with db.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO managed_repository_process_zero_receipts(owner_kind,owner_id,scope,provisioner,runtime_incarnation) VALUES('job',$1,'vm','vm',$2)",
+            job,
+            generation,
+        )
+        await conn.execute(
+            "INSERT INTO vm_workspace_cleanup_admissions(id,owner_kind,owner_id,pvc_uid,source,request_id,intent_digest,completed_at,outcome) VALUES($1,'job',$2,$3,'dispatcher_vm_recycle',$4,$5,clock_timestamp(),'completed')",
+            uuid4(),
+            job,
+            UUID(pvc_uid),
+            uuid4(),
+            cleanup_intent_digest(intent),
+        )
+        await conn.execute(
+            "UPDATE jobs SET context=$2::jsonb WHERE id=$1",
+            job,
+            json.dumps({"vm": old}),
+        )
+    newreq, newctx = candidate(job)
+    value = await store.begin(job_id=str(job), request=newreq, fresh_context=newctx)
+    assert value["request"]["provision_generation"] == newreq["provision_generation"]
+    assert value["expected_pvc_uid"] == pvc_uid
+
+
+@pytest.mark.asyncio
+async def test_live_claim_does_not_hide_next_due_preflight(db):
+    from orchestrator.services.vm_creation_preflight import VMCreationPreflightStore
+
+    store = VMCreationPreflightStore(db)
+    jobs = []
+    for _ in range(2):
+        job = await initial_job(db)
+        req, ctx = candidate(job)
+        await store.begin(job_id=str(job), request=req, fresh_context=ctx)
+        jobs.append(str(job))
+    one = await store.claim_due(limit=1)
+    two = await store.claim_due(limit=1)
+    assert len(one) == len(two) == 1
+    assert one[0]["job_id"] != two[0]["job_id"]
+
+
+@pytest.mark.asyncio
+async def test_control_held_head_does_not_hide_next_due_preflight(db):
+    from orchestrator.services.vm_creation_preflight import VMCreationPreflightStore
+
+    store = VMCreationPreflightStore(db)
+    jobs = []
+    for _ in range(2):
+        job = await initial_job(db)
+        req, ctx = candidate(job)
+        await store.begin(job_id=str(job), request=req, fresh_context=ctx)
+        jobs.append(job)
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE jobs SET context=context || jsonb_build_object('_completion_control_claim',jsonb_build_object('version',1,'expires_epoch',extract(epoch FROM clock_timestamp())+3600)) WHERE id=$1",
+            jobs[0],
+        )
+    results = await store.claim_due(limit=1)
+    assert len(results) == 1
+    assert results[0]["job_id"] == str(jobs[1])
