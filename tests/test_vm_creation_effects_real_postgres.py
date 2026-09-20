@@ -720,7 +720,7 @@ async def test_nonpersistent_controller_configuration_cannot_grant_staged_creati
         )
 
 
-async def observed_creation(db, monkeypatch, *, timeout=3600):
+async def observed_creation(db, monkeypatch, *, timeout=3600, stop_after="vm"):
     from shared.vm_creation_issuance import (
         verify_creation_carrier,
         EFFECT_NONCE_ANNOTATION,
@@ -811,6 +811,8 @@ async def observed_creation(db, monkeypatch, *, timeout=3600):
             request_id=str(row["request_id"]), carrier=carrier, observation=observation
         )
         observations[kind] = observation
+        if kind == stop_after:
+            break
     return store, row, carrier, observations
 
 

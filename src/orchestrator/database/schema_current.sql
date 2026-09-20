@@ -7453,6 +7453,67 @@ $$;
 
 
 --
+-- Name: guard_vm_creation_disposition(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.guard_vm_creation_disposition() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    IF TG_OP='INSERT' THEN
+        IF NEW.cancellation_disposition IS NOT NULL OR NEW.cancellation_progress<>'{}'::jsonb THEN
+            RAISE EXCEPTION 'Creation disposition requires locked cancellation' USING ERRCODE='23514';
+        END IF;
+        RETURN NEW;
+    END IF;
+    IF OLD.cancellation_disposition IS NOT NULL AND
+       NEW.cancellation_disposition IS DISTINCT FROM OLD.cancellation_disposition THEN
+        RAISE EXCEPTION 'Creation cancellation disposition is immutable' USING ERRCODE='23514';
+    END IF;
+    IF NEW.cancellation_disposition IS NOT NULL AND OLD.cancellation_disposition IS NULL THEN
+        IF OLD.state<>'cancel_requested' OR NEW.state<>'cancel_requested' OR
+           NEW.creation_admission_id IS NULL OR NEW.creation_carrier_uid IS NULL OR
+           EXISTS(SELECT 1 FROM public.vm_creation_effects WHERE request_id=NEW.request_id
+                  AND (state='issued' OR (effect_kind='vm' AND state<>'rejected'))) THEN
+            RAISE EXCEPTION 'Creation disposition requires no possible VM issuance' USING ERRCODE='23514';
+        END IF;
+    END IF;
+    -- This checkpoint has no completion writer. Keep the admission held even
+    -- when every recorded create was rejected; source pins may predate grants.
+    IF NEW.cancellation_disposition IS NOT NULL AND NEW.state<>'cancel_requested' THEN
+        RAISE EXCEPTION 'Creation disposition has not completed' USING ERRCODE='23514';
+    END IF;
+    IF EXISTS(SELECT 1 FROM jsonb_each(OLD.cancellation_progress) AS p
+              WHERE NEW.cancellation_progress->p.key IS DISTINCT FROM p.value) OR
+       (NEW.cancellation_progress - ARRAY['cloud_init','rootdisk','workspace_attachment','source'])<>'{}'::jsonb THEN
+        RAISE EXCEPTION 'Creation cancellation progress is monotonic' USING ERRCODE='23514';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: guard_vm_creation_effect_disposition(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.guard_vm_creation_effect_disposition() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE
+    disposition jsonb;
+BEGIN
+    SELECT cancellation_disposition INTO disposition FROM public.vm_creation_retries
+        WHERE request_id=NEW.request_id FOR UPDATE;
+    IF disposition IS NOT NULL THEN
+        RAISE EXCEPTION 'Creation disposition forbids further create effects' USING ERRCODE='23514';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
 -- Name: guard_vm_creation_effect_identity(); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -21141,6 +21202,8 @@ CREATE TABLE public.vm_creation_retries (
     controller_configuration jsonb,
     creation_carrier_uid uuid,
     creation_carrier_namespace text,
+    cancellation_disposition jsonb,
+    cancellation_progress jsonb DEFAULT '{}'::jsonb NOT NULL,
     CONSTRAINT vm_creation_carrier_pair CHECK ((((creation_carrier_uid IS NULL) = (creation_carrier_namespace IS NULL)) AND ((creation_carrier_namespace IS NULL) OR (creation_carrier_namespace <> ''::text)))),
     CONSTRAINT vm_creation_retries_backoff_attempt_check CHECK ((backoff_attempt >= 0)),
     CONSTRAINT vm_creation_retries_canonical_request_check CHECK ((jsonb_typeof(canonical_request) = 'object'::text)),
@@ -23921,6 +23984,14 @@ ALTER TABLE ONLY public.users
 
 ALTER TABLE ONLY public.users
     ADD CONSTRAINT users_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: vm_creation_retries vm_creation_disposition_shape; Type: CHECK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE public.vm_creation_retries
+    ADD CONSTRAINT vm_creation_disposition_shape CHECK (((((cancellation_disposition IS NULL) OR ((jsonb_typeof(cancellation_disposition) = 'object'::text) AND ((cancellation_disposition -> 'version'::text) = '1'::jsonb) AND ((cancellation_disposition ->> 'request_id'::text) = (request_id)::text))) AND (jsonb_typeof(cancellation_progress) = 'object'::text) AND ((cancellation_disposition IS NOT NULL) OR (cancellation_progress = '{}'::jsonb))) IS TRUE)) NOT VALID;
 
 
 --
@@ -27591,6 +27662,20 @@ CREATE TRIGGER usage_rates_v2_referenced_range_guard BEFORE UPDATE OF effective_
 --
 
 CREATE TRIGGER vm_creation_carrier_identity BEFORE UPDATE ON public.vm_creation_retries FOR EACH ROW EXECUTE FUNCTION public.guard_vm_creation_carrier_identity();
+
+
+--
+-- Name: vm_creation_retries vm_creation_disposition; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER vm_creation_disposition BEFORE INSERT OR UPDATE ON public.vm_creation_retries FOR EACH ROW EXECUTE FUNCTION public.guard_vm_creation_disposition();
+
+
+--
+-- Name: vm_creation_effects vm_creation_effect_disposition; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER vm_creation_effect_disposition BEFORE INSERT ON public.vm_creation_effects FOR EACH ROW EXECUTE FUNCTION public.guard_vm_creation_effect_disposition();
 
 
 --

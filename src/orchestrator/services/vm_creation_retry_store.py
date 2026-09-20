@@ -1066,11 +1066,25 @@ class VMCreationRetryStore:
                     return {"settled": True, "disposition": "never_issued"}
                 if row["state"] != "cancel_requested":
                     raise VMCreationRetryConflict("job_not_cancelled")
+                if row["cancellation_disposition"] is not None:
+                    return {"settled": False, "reason": "creation_disposition_pending"}
                 if await conn.fetchval(
                     "SELECT EXISTS(SELECT 1 FROM vm_creation_effects WHERE request_id=$1 AND state IN ('issued','observed'))",
                     row["request_id"],
                 ):
                     return {"settled": False, "reason": "creation_effect_unresolved"}
+                if row["creation_admission_id"]:
+                    from orchestrator.services.vm_creation_disposition_store import (
+                        source_resolution,
+                    )
+
+                    # Source pin/allocation publication precedes the rootdisk
+                    # grant. An empty/rejected effect ledger cannot release it.
+                    if source_resolution(row, None) != "not_required":
+                        return {
+                            "settled": False,
+                            "reason": "creation_source_unresolved",
+                        }
                 if row["creation_admission_id"]:
                     permit = await conn.fetchrow(
                         "SELECT * FROM vm_workspace_cleanup_admissions WHERE id=$1",
