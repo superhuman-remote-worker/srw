@@ -100,6 +100,12 @@ def resolve_creation_configuration(controller, request):
             sources[f"{package}/{file.relative_to(root)}"] = hashlib.sha256(
                 file.read_bytes()
             ).hexdigest()
+    preparation_service = getattr(controller, "_workspace_preparation_service", None)
+    preparation_settings = (
+        preparation_service.settings
+        if preparation_service is not None
+        else PreparationSettings.from_environment()
+    )
     configuration = {
         "version": 1,
         "namespace": settings.VM_NAMESPACE,
@@ -127,7 +133,7 @@ def resolve_creation_configuration(controller, request):
         + hashlib.sha256(public_key.encode()).hexdigest(),
         "golden_enabled": settings.VM_GOLDEN_IMAGE_ENABLED,
         "golden_disk_size": settings.VM_GOLDEN_DISK_SIZE,
-        "preparation": asdict(PreparationSettings.from_environment()),
+        "preparation": asdict(preparation_settings),
     }
     # JSON-normalize tuple settings before credential validation. No credential
     # values, generated guest tokens or rendered cloud-init enter this document.

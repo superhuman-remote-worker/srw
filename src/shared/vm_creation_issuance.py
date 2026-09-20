@@ -54,9 +54,12 @@ def validate_rootdisk_source(source, *, request, configuration, expected_pvc_uid
     if not isinstance(source, Mapping):
         raise ValueError("Rootdisk source is unproven")
     if request.get("preparation") is not None:
-        # Prepared allocations need their own complete artifact/receipt proof;
-        # a supported registry/golden/retained document cannot stand in for it.
-        raise ValueError("Prepared rootdisk source is unproven")
+        return _validate_prepared_source(
+            source,
+            request=request,
+            configuration=configuration,
+            expected_pvc_uid=expected_pvc_uid,
+        )
     if expected_pvc_uid is not None:
         if source != {"kind": "retained", "pvc_uid": expected_pvc_uid}:
             raise ValueError("Retained rootdisk source changed")
@@ -92,6 +95,145 @@ def validate_rootdisk_source(source, *, request, configuration, expected_pvc_uid
         raise ValueError("Golden rootdisk source changed")
     _uuid(source["dv_uid"])
     _uuid(source["pvc_uid"])
+
+
+def _validate_prepared_source(source, *, request, configuration, expected_pvc_uid):
+    from shared.workspace_preparation import (
+        validate_request,
+        normalized_image,
+        image_reference,
+        cache_key,
+        revision,
+    )
+    from shared.workspace_preparation_settings import PreparationSettings
+
+    if source.get("kind") != "prepared":
+        raise ValueError("Prepared rootdisk source is unproven")
+    preparation = validate_request(request["preparation"])
+    settings = PreparationSettings(**configuration["preparation"])
+    mode = "retained" if expected_pvc_uid is not None else "clone"
+    fields = {
+        "kind",
+        "mode",
+        "namespace",
+        "name",
+        "dv_uid",
+        "pvc_uid",
+        "allocation",
+        "artifact",
+        "receipt",
+    }
+    if mode == "retained":
+        fields.add("retained_root")
+    if (
+        set(source) != fields
+        or source["mode"] != mode
+        or not settings.enabled
+        or source["namespace"] != configuration["namespace"]
+        or preparation["ownerKind"] != "job"
+        or preparation["allocationId"] != request["job_id"]
+        or normalized_image(request["vm_image"]) != preparation["image"]
+    ):
+        raise ValueError("Prepared source request changed")
+    allocation, artifact = source["allocation"], source["artifact"]
+    if (
+        set(allocation) != {"name", "uid", "request"}
+        or set(artifact) != {"name", "uid", "request"}
+        or allocation["request"] != preparation
+        or allocation["name"]
+        != "srw-prep-allocation-" + revision(["job", request["job_id"], None])[:32]
+    ):
+        raise ValueError("Prepared allocation identity changed")
+    for uid in (
+        allocation["uid"],
+        artifact["uid"],
+        source["dv_uid"],
+        source["pvc_uid"],
+    ):
+        _uuid(uid)
+    artifact_request = artifact["request"]
+    base, builder = artifact_request["baseImage"], artifact_request["builderImage"]
+    for resolved, requested in (
+        (base, preparation["image"]),
+        (builder, settings.builder_image),
+    ):
+        actual, requested = image_reference(resolved), image_reference(requested)
+        if (
+            not actual[2].startswith("sha256:")
+            or actual[0] not in settings.registry_hosts
+            or normalized_image(resolved) != resolved
+            or actual[:2] != requested[:2]
+            or requested[2].startswith("sha256:")
+            and actual[2] != requested[2]
+        ):
+            raise ValueError("Prepared resolved image changed")
+    network = (
+        {"revision": settings.network_policy_revision, "podFirewall": settings.firewall}
+        if settings.pod_firewall
+        else settings.network_policy_revision
+        if settings.network_enabled
+        else "offline"
+    )
+    key = cache_key(
+        preparation,
+        base_image=base,
+        builder_image=builder,
+        disk_size=settings.disk_size,
+        network_policy=network,
+    )
+    expected_artifact = {
+        "scope": preparation["scope"],
+        "baseImage": base,
+        "builderImage": builder,
+        "steps": preparation["steps"],
+        "cacheKey": key,
+        "networkEnabled": settings.network_enabled,
+        "diskSize": settings.disk_size,
+    }
+    if settings.firewall is not None:
+        expected_artifact["podFirewall"] = settings.firewall
+    if (
+        artifact_request != expected_artifact
+        or artifact["name"] != "srw-prep-artifact-" + revision(key)[:32]
+        or source["name"] != "srw-prepared-" + UUID(artifact["uid"]).hex
+    ):
+        raise ValueError("Prepared artifact semantics changed")
+    receipt = source["receipt"]
+    expected_receipt = {
+        "version": 1,
+        "buildUid": artifact["uid"],
+        "pvcUid": source["pvc_uid"],
+        "cacheKey": key,
+        "phase": "Succeeded",
+    }
+    if (
+        not isinstance(receipt, Mapping)
+        or set(receipt) != {*expected_receipt, "diskSha256", "diskBytes"}
+        or any(receipt.get(key) != value for key, value in expected_receipt.items())
+        or type(receipt["version"]) is not int
+        or type(receipt["diskBytes"]) is not int
+        or receipt["diskBytes"] <= 0
+        or not isinstance(receipt["diskSha256"], str)
+        or not re.fullmatch(r"[0-9a-f]{64}", receipt["diskSha256"])
+    ):
+        raise ValueError("Prepared artifact receipt changed")
+    if mode == "retained":
+        from shared.vm_workspace_storage import storage_name
+
+        root = source["retained_root"]
+        name = (
+            storage_name(request["workspace_storage"])
+            if request.get("workspace_storage")
+            else "agent-vm-" + request["job_id"] + "-rootdisk"
+        )
+        if (
+            set(root) != {"name", "dv_uid", "pvc_uid"}
+            or root["name"] != name
+            or root["pvc_uid"] != expected_pvc_uid
+        ):
+            raise ValueError("Prepared retained root changed")
+        _uuid(root["dv_uid"])
+        _uuid(root["pvc_uid"])
 
 
 def _values(value):
