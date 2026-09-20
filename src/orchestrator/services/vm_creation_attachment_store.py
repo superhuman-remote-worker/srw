@@ -13,15 +13,27 @@ def _object(value):
 async def attachment_instance_on_conn(conn, row, *, adoption=False):
     """Compose after existing owner/PVC, queue/job, execution and retry locks.
 
-    This bounded implementation supports the current Job as storage owner.
-    Inherited owners require the separate proven predecessor lock composition.
+    Inherited ownership additionally requires the immutable handoff proof and
+    its separately acquired sorted owner/PVC scope.
     No catalog lock or external I/O is acquired here.
     """
     from orchestrator.services.vm_creation_retry_store import VMCreationRetryConflict
 
     binding = storage_binding(row["canonical_request"]["workspace_storage"])
-    if binding["owner_kind"] != "job" or binding["owner_id"] != str(row["job_id"]):
+    if binding["owner_kind"] != "job":
         raise VMCreationRetryConflict("creation_attachment_lineage_unproven")
+    if binding["owner_id"] != str(row["job_id"]):
+        from orchestrator.services.vm_creation_lineage import prove
+
+        if row["canonical_request"].get("preparation") is not None:
+            raise VMCreationRetryConflict("creation_attachment_lineage_unproven")
+        await prove(
+            conn,
+            job_id=row["job_id"],
+            binding=binding,
+            expected=row["predecessor_evidence"],
+            adoption=adoption and row["state"] == "cancel_requested",
+        )
     link = await conn.fetchrow(
         "SELECT instance_id FROM srw_execution_workspace_bindings WHERE execution_id=$1 FOR SHARE",
         row["execution_id"],

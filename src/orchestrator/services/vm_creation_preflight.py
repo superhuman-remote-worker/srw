@@ -124,6 +124,14 @@ class VMCreationPreflightStore:
         pvc = vm.get("rootdisk_pvc_uid") or (
             prior.get("expected_pvc_uid") if prior else retained.get("rootdisk_pvc_uid")
         )
+        from orchestrator.services.vm_creation_lineage import discover
+
+        lineage = await discover(conn, job_id)
+        if lineage:
+            inherited_pvc = lineage["binding"]["pvc_uid"]
+            if pvc is not None and pvc != inherited_pvc:
+                raise VMCreationRetryConflict("retained_disk_changed")
+            pvc = inherited_pvc
         job = await self.retry._scope(conn, job_id, UUID(pvc) if pvc else None)
         if job is None:
             raise VMCreationRetryConflict("job_changed")
@@ -136,11 +144,32 @@ class VMCreationPreflightStore:
             if current_prior
             else current_old.get("rootdisk_pvc_uid")
         )
+        if lineage:
+            current_lineage = job.get("_creation_lineage_scope")
+            if current_lineage != lineage:
+                raise VMCreationRetryConflict("creation_attachment_lineage_unproven")
+            current_pvc = current_pvc or current_lineage["binding"]["pvc_uid"]
         if current_pvc != pvc:
             raise VMCreationRetryConflict("retained_disk_changed")
         return job, current, current_vm, current_prior
 
     async def _predecessor(self, conn, job, old):
+        lineage = job.get("_creation_lineage_scope")
+        if lineage:
+            if old:
+                # A new incarnation of this Job needs its own retirement proof;
+                # the previous attachment Job's detach cannot authorize it.
+                raise VMCreationRetryConflict("creation_attachment_lineage_unproven")
+            from orchestrator.services.vm_creation_lineage import prove
+
+            evidence, cleanup_id = await prove(
+                conn, job_id=job["id"], binding=lineage["binding"], scope=lineage
+            )
+            return {
+                "expected_pvc_uid": lineage["binding"]["pvc_uid"],
+                "predecessor_evidence": evidence,
+                "predecessor_cleanup_admission_id": str(cleanup_id),
+            }
         if not old:
             return {"expected_pvc_uid": None}
         pvc = old.get("rootdisk_pvc_uid")
@@ -230,6 +259,13 @@ class VMCreationPreflightStore:
                     _object(context.get("last_vm")),
                 )
                 storage = request.get("workspace_storage")
+                if job.get("_creation_lineage_scope") and (
+                    storage != job["_creation_lineage_scope"]["binding"]
+                    or request.get("preparation") is not None
+                ):
+                    raise VMCreationRetryConflict(
+                        "creation_attachment_lineage_unproven"
+                    )
                 if (
                     storage is not None
                     and _object(storage).get("pvc_uid")

@@ -530,9 +530,19 @@ def public_effect_observation(
             raise ValueError("Creation object identity changed")
         labels = metadata.get("labels") or {}
         annotations = metadata.get("annotations") or {}
+        owner = values["job_id"]
+        if kind == "rootdisk" and values["version"] == 3:
+            from shared.vm_creation_lineage import disk_owner
+
+            owner = disk_owner(
+                {
+                    "job_id": values["job_id"],
+                    "workspace_storage": values["workspace_attachment"]["binding"],
+                }
+            )
         if (
             labels.get("srw.io/owner-kind") != "job"
-            or labels.get("srw.io/owner-id") != values["job_id"]
+            or labels.get("srw.io/owner-id") != owner
         ):
             raise ValueError("Creation object owner changed")
         retained = kind == "rootdisk" and values["expected_pvc_uid"] is not None

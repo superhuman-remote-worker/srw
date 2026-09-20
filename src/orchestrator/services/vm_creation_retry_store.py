@@ -72,7 +72,12 @@ class VMCreationRetryStore:
         membership = await conn.fetchrow(
             "SELECT parent_job_id,context FROM jobs WHERE id=$1", job_id
         )
-        owners = {job_id}
+        from orchestrator.services.vm_creation_lineage import discover
+
+        lineage = await discover(conn, job_id)
+        owners = {UUID(v) for v in lineage["owners"]} if lineage else {job_id}
+        if lineage and str(pvc_uid) != lineage["binding"]["pvc_uid"]:
+            raise VMCreationRetryConflict("retained_disk_changed")
         if membership and membership["parent_job_id"]:
             owners.add(membership["parent_job_id"])
         for owner in sorted(owners):
@@ -93,10 +98,11 @@ class VMCreationRetryStore:
         owner, ambiguous = _job_workspace_owner(job_id, current)
         if ambiguous or owner != job_id:
             raise VMCreationRetryConflict("workspace_owner_changed")
+        guard_owners = sorted(owners if lineage else {job_id})
         cleanups = await conn.fetch(
             "SELECT id FROM vm_workspace_cleanup_admissions WHERE completed_at IS NULL "
-            "AND ((owner_kind='job' AND owner_id=$1) OR ($2::uuid IS NOT NULL AND pvc_uid=$2)) ORDER BY id FOR UPDATE",
-            job_id,
+            "AND ((owner_kind='job' AND owner_id=ANY($1::uuid[])) OR ($2::uuid IS NOT NULL AND pvc_uid=$2)) ORDER BY id FOR UPDATE",
+            guard_owners,
             pvc_uid,
         )
         if any(row["id"] != own_admission for row in cleanups):
@@ -104,15 +110,20 @@ class VMCreationRetryStore:
         recovery = await conn.fetchval(
             "SELECT r.id FROM vm_workspace_recoveries r LEFT JOIN vm_workspace_recovery_retention_pins p "
             "ON p.recovery_id=r.id AND p.released_at IS NULL WHERE r.resolved_at IS NULL AND "
-            "((r.owner_kind='job' AND r.owner_id=$1) OR ($2::uuid IS NOT NULL AND p.pvc_uid=$2)) LIMIT 1 FOR UPDATE OF r",
-            job_id,
+            "((r.owner_kind='job' AND r.owner_id=ANY($1::uuid[])) OR ($2::uuid IS NOT NULL AND p.pvc_uid=$2)) LIMIT 1 FOR UPDATE OF r",
+            guard_owners,
             pvc_uid,
         )
         if recovery or await conn.fetchval(
-            "SELECT EXISTS(SELECT 1 FROM vm_workspace_recovery_jobs WHERE job_id=$1 AND resolved_at IS NULL)",
-            job_id,
+            "SELECT EXISTS(SELECT 1 FROM vm_workspace_recovery_jobs WHERE job_id=ANY($1::uuid[]) AND resolved_at IS NULL)",
+            guard_owners,
         ):
             raise VMCreationRetryConflict("workspace_recovery_held")
+        if lineage:
+            await conn.fetch(
+                "SELECT unit_id FROM run_queue WHERE unit_id=ANY($1::uuid[]) ORDER BY unit_id FOR UPDATE",
+                sorted(owners),
+            )
         queue = await conn.fetchrow(
             "SELECT state FROM run_queue WHERE unit_id=$1 FOR UPDATE", job_id
         )
@@ -122,9 +133,30 @@ class VMCreationRetryStore:
             await hold_worker_batch_for_preflight(
                 conn, job_id=job_id, preserve_attempts=True
             )
-        return await conn.fetchrow(
-            "SELECT * FROM jobs WHERE id=$1 FOR UPDATE",
-            job_id,
+        if lineage:
+            await conn.fetch(
+                "SELECT id FROM jobs WHERE id=ANY($1::uuid[]) ORDER BY id FOR UPDATE",
+                sorted(owners),
+            )
+            await conn.fetch(
+                "SELECT id FROM srw_execution_specs WHERE work_kind='Job' AND work_id=ANY($1::uuid[]) ORDER BY id FOR SHARE",
+                sorted(owners),
+            )
+            if await discover(conn, job_id) != lineage:
+                raise VMCreationRetryConflict("creation_attachment_lineage_unproven")
+            if await conn.fetchval(
+                "SELECT EXISTS(SELECT 1 FROM vm_workspace_recovery_jobs WHERE job_id=ANY($1::uuid[]) AND resolved_at IS NULL)",
+                sorted(owners),
+            ):
+                raise VMCreationRetryConflict("workspace_recovery_held")
+        locked = await conn.fetchrow(
+            "SELECT * FROM jobs WHERE id=$1 FOR UPDATE", job_id
+        )
+        owner, ambiguous = _job_workspace_owner(job_id, locked)
+        if ambiguous or owner != job_id:
+            raise VMCreationRetryConflict("workspace_owner_changed")
+        return (
+            {**dict(locked), "_creation_lineage_scope": lineage} if lineage else locked
         )
 
     async def _current(self, conn, job, generation, *, retry=None):
@@ -188,6 +220,22 @@ class VMCreationRetryStore:
     async def _predecessor(self, conn, job, pvc_uid, proposal):
         evidence = proposal.get("predecessor_evidence") or {}
         old = (_json(job["context"]) or {}).get("last_vm") or {}
+        lineage = job.get("_creation_lineage_scope")
+        if lineage:
+            if old:
+                raise VMCreationRetryConflict("creation_attachment_lineage_unproven")
+            from orchestrator.services.vm_creation_lineage import prove
+
+            proof, cleanup_id = await prove(
+                conn,
+                job_id=job["id"],
+                binding=lineage["binding"],
+                scope=lineage,
+                expected=evidence,
+            )
+            if str(cleanup_id) != proposal.get("predecessor_cleanup_admission_id"):
+                raise VMCreationRetryConflict("creation_attachment_lineage_unproven")
+            return proof, cleanup_id
         if pvc_uid is None:
             if (
                 old.get("rootdisk_pvc_uid")
@@ -321,6 +369,11 @@ class VMCreationRetryStore:
         ):
             raise VMCreationRetryConflict("creation_configuration_changed")
         storage = payload.get("workspace_storage")
+        if job.get("_creation_lineage_scope") and (
+            storage != job["_creation_lineage_scope"]["binding"]
+            or payload.get("preparation") is not None
+        ):
+            raise VMCreationRetryConflict("creation_attachment_lineage_unproven")
         if storage is not None and (
             not isinstance(storage, dict)
             or storage.get("pvc_uid") != (str(pvc_uid) if pvc_uid else None)
@@ -857,9 +910,15 @@ class VMCreationRetryStore:
 
                     await attachment_instance_on_conn(conn, row)
                     prior_lease = values["workspace_attachment"]["prior"]
-                    if prior_lease and prior_lease["execution_id"] != str(
-                        row["job_id"]
-                    ):
+                    prior_job = str(row["job_id"])
+                    lineage = row["predecessor_evidence"]
+                    if lineage.get("kind") == "retained_attachment_handoff":
+                        prior_job = lineage["previous_job_id"]
+                        if values["workspace_attachment"]["action"] != "replace":
+                            raise VMCreationRetryConflict(
+                                "creation_attachment_lineage_unproven"
+                            )
+                    if prior_lease and prior_lease["execution_id"] != prior_job:
                         raise VMCreationRetryConflict(
                             "creation_attachment_lineage_unproven"
                         )

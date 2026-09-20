@@ -13,7 +13,6 @@ from pathlib import Path
 
 from shared.vm_creation_retry import canonical_request_digest, _validate_json
 from shared.vm_creation_issuance import canonical_configuration_digest
-from shared.vm_workspace_storage import storage_binding
 from shared.workspace_preparation_settings import PreparationSettings
 
 
@@ -71,9 +70,11 @@ def resolve_creation_configuration(controller, request):
     ):
         raise ValueError("Invalid resolved create options")
     if payload.get("workspace_storage") is not None:
-        binding = storage_binding(payload["workspace_storage"])
-        if binding["owner_kind"] != "job" or binding["owner_id"] != payload["job_id"]:
-            raise ValueError("Unsupported inherited creation owner")
+        from shared.vm_creation_lineage import disk_owner
+
+        # Read-only resolution binds accounting identity; SQL handoff proof is
+        # still required before any controller effect is granted.
+        disk_owner(payload)
     if payload.get("initialization") is not None:
         validate_initialization_request(payload["initialization"])
     if payload.get("preparation") is not None:

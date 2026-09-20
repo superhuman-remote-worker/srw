@@ -179,6 +179,9 @@ class CreationActuator:
     async def disk(self, row, *, expected=None, require_attachment=True):
         request = row["request"]
         binding = request.get("workspace_storage")
+        from shared.vm_creation_lineage import disk_owner
+
+        owner = disk_owner(request)
         name = (
             storage_name(binding)
             if binding
@@ -202,7 +205,7 @@ class CreationActuator:
                 meta.get("deletionTimestamp")
                 or dv.get("status", {}).get("phase") == "Failed"
                 or labels.get("srw.io/owner-kind") != "job"
-                or labels.get("srw.io/owner-id") != row["job_id"]
+                or labels.get("srw.io/owner-id") != owner
             ):
                 raise CreationUnproven("retained_disk_changed")
         expected_pvc = (expected or {}).get("pvc_uid") or row["expected_pvc_uid"]
@@ -217,7 +220,7 @@ class CreationActuator:
             if (
                 meta.get("deletionTimestamp")
                 or labels.get("srw.io/owner-kind") != "job"
-                or labels.get("srw.io/owner-id") != row["job_id"]
+                or labels.get("srw.io/owner-id") != owner
             ):
                 raise CreationUnproven("retained_disk_changed")
             if dv is None or not any(
