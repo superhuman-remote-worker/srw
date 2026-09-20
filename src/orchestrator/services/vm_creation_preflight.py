@@ -271,10 +271,17 @@ class VMCreationPreflightStore:
                     {**dict(job), "context": context},
                     _object(context.get("last_vm")),
                 )
+                if job.get("_creation_lineage_scope"):
+                    from orchestrator.services.vm_creation_prepared_lineage import (
+                        validate_prepared_request,
+                    )
+
+                    validate_prepared_request(
+                        predecessor["predecessor_evidence"], request
+                    )
                 storage = request.get("workspace_storage")
                 if job.get("_creation_lineage_scope") and (
                     storage != job["_creation_lineage_scope"]["binding"]
-                    or request.get("preparation") is not None
                 ):
                     raise VMCreationRetryConflict(
                         "creation_attachment_lineage_unproven"

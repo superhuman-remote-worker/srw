@@ -753,7 +753,9 @@ class CreationActuator:
                 if kind == "rootdisk" and row["expected_pvc_uid"]
                 else await self.body(row, values)
             )
-            if kind == "rootdisk":
+            if kind == "rootdisk" or (
+                kind != "workspace_attach" and row.get("prepared_origin") is not None
+            ):
                 await sources.validate(row, rootdisk_source)
             grant = await self.authority(
                 "begin-effect",
@@ -777,7 +779,9 @@ class CreationActuator:
             await self.require_vm_absent(row)
             if kind == "workspace_attach":
                 await CreationAttachment(self).validate(row, attachment)
-            if kind == "rootdisk":
+            if kind == "rootdisk" or (
+                kind != "workspace_attach" and row.get("prepared_origin") is not None
+            ):
                 await sources.validate(row, rootdisk_source)
             if body is not None:
                 try:

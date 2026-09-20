@@ -54,6 +54,15 @@ def validate_rootdisk_source(source, *, request, configuration, expected_pvc_uid
     if not isinstance(source, Mapping):
         raise ValueError("Rootdisk source is unproven")
     if request.get("preparation") is not None:
+        if "inherited_origin" in source:
+            from shared.vm_inherited_preparation import validate_inherited_source
+
+            return validate_inherited_source(
+                source,
+                request=request,
+                configuration=configuration,
+                expected_pvc_uid=expected_pvc_uid,
+            )
         return _validate_prepared_source(
             source,
             request=request,

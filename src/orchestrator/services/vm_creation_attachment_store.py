@@ -25,8 +25,6 @@ async def attachment_instance_on_conn(conn, row, *, adoption=False):
     if binding["owner_id"] != str(row["job_id"]):
         from orchestrator.services.vm_creation_lineage import prove
 
-        if row["canonical_request"].get("preparation") is not None:
-            raise VMCreationRetryConflict("creation_attachment_lineage_unproven")
         cancelled_adoption = adoption and row["state"] == "cancel_requested"
         if row["predecessor_evidence"].get("kind") == "retained_attachment_replacement":
             from orchestrator.services.vm_creation_replacement import prove_replacement

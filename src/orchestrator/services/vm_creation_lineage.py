@@ -209,8 +209,6 @@ async def prove(conn, *, job_id, binding, scope=None, expected=None, adoption=Fa
                     "_stateless_delete_pending",
                 )
             )
-            or vm.get("preparation") is not None
-            or vm.get("preparation_request") is not None
             or await conn.fetchval(
                 "SELECT EXISTS(SELECT 1 FROM run_queue WHERE unit_id=$1 AND state='leased')",
                 UUID(identity),
@@ -297,6 +295,11 @@ async def prove(conn, *, job_id, binding, scope=None, expected=None, adoption=Fa
         "detach_intent": detach_intent,
         "scope": discovered,
     }
+    from orchestrator.services.vm_creation_prepared_lineage import prove_prepared_origin
+
+    prepared = await prove_prepared_origin(conn, discovered)
+    if prepared is not None:
+        proof["prepared_origin"] = prepared
     if expected is not None and proof != expected:
         _refuse()
     return proof, cleanup["id"]

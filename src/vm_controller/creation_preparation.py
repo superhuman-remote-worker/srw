@@ -151,7 +151,34 @@ class PreparedSources(CreationSourcePins):
         self.check(row, source)
         return source, dv
 
+    async def inherited(self, row):
+        from shared.vm_inherited_preparation import (
+            retained_prepared_source,
+            validate_completed_target,
+            validate_inherited_preparation,
+        )
+
+        origin = row.get("prepared_origin")
+        if not isinstance(origin, dict):
+            raise ValueError("Inherited preparation origin is unproven")
+        validate_inherited_preparation(
+            origin,
+            request=row["request"],
+            configuration={
+                "namespace": self.namespace,
+                "preparation": asdict(self.service.settings),
+            },
+        )
+        source = retained_prepared_source(origin)
+        self.check(row, source)
+        _, dv, pvc = await self.reader.disk(row, require_attachment=False)
+        validate_completed_target(origin, dv, pvc)
+        return source
+
     async def retained(self, row):
+        binding = row["request"].get("workspace_storage")
+        if binding and binding["owner_id"] != row["job_id"]:
+            return await self.inherited(row)
         allocation = await self.allocation(row)
         saved = allocation.state.get("creation_source")
         root = allocation.state.get("creation_root")

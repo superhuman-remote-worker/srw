@@ -388,7 +388,6 @@ class VMCreationRetryStore:
         storage = payload.get("workspace_storage")
         if job.get("_creation_lineage_scope") and (
             storage != job["_creation_lineage_scope"]["binding"]
-            or payload.get("preparation") is not None
         ):
             raise VMCreationRetryConflict("creation_attachment_lineage_unproven")
         if storage is not None and (
@@ -436,6 +435,13 @@ class VMCreationRetryStore:
         predecessor, predecessor_id = await self._predecessor(
             conn, job, pvc_uid, proposal
         )
+        if job.get("_creation_lineage_scope"):
+            from orchestrator.services.vm_creation_prepared_lineage import (
+                validate_prepared_request,
+            )
+
+            validate_prepared_request(predecessor, payload, configuration)
+
         row = await conn.fetchrow(
             "INSERT INTO vm_creation_retries(request_id,job_id,provision_generation,origin,request_digest,canonical_request,controller_configuration_digest,execution_id,execution_revision,execution_generation,admission_deadline,expected_pvc_uid,predecessor_evidence,predecessor_cleanup_admission_id,controller_configuration) "
             "VALUES($1,$2,$3,'initial',$4,$5::jsonb,$6,$7,$8,$9,$10,$11,$12::jsonb,$13,$14::jsonb) RETURNING *",
@@ -797,6 +803,16 @@ class VMCreationRetryStore:
                     "creation_rootdisk_source_changed"
                 ) from exc
             source = values["rootdisk_source"]
+            from orchestrator.services.vm_creation_prepared_lineage import (
+                prepared_origin,
+            )
+
+            origin = prepared_origin(row["predecessor_evidence"])
+            if origin is not None or source.get("inherited_origin") is not None:
+                from shared.vm_inherited_preparation import retained_prepared_source
+
+                if origin is None or source != retained_prepared_source(origin):
+                    raise VMCreationRetryConflict("creation_rootdisk_source_changed")
             if (
                 source.get("kind") == "prepared"
                 and source.get("mode") == "retained"
@@ -1173,6 +1189,8 @@ class VMCreationRetryStore:
 
     async def inspect(self, *, request_id: str) -> dict:
         """Authenticated controller read; never returns an observer or actuation grant."""
+        from orchestrator.services.vm_creation_prepared_lineage import prepared_origin
+
         async with self.db.acquire() as conn:
             async with conn.transaction(isolation="repeatable_read", readonly=True):
                 row = _record(
@@ -1204,6 +1222,15 @@ class VMCreationRetryStore:
                         )
                     },
                     "request": row["canonical_request"],
+                    **(
+                        {
+                            "prepared_origin": prepared_origin(
+                                row["predecessor_evidence"]
+                            )
+                        }
+                        if prepared_origin(row["predecessor_evidence"]) is not None
+                        else {}
+                    ),
                     "effects": [
                         {
                             "carrier_intent": _json(effect["carrier_intent"]),

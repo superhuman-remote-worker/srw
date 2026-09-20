@@ -52,8 +52,6 @@ async def prove_replacement(
             or facts["identity_provision_generation"] != facts["provision_generation"]
             or facts["rootdisk_pvc_uid"] != binding["pvc_uid"]
             or facts["retirement_cleanup_pending"] is True
-            or facts["preparation"] is not None
-            or facts["preparation_request"] is not None
         ):
             _refuse()
         retired_generation = UUID(facts["provision_generation"])
@@ -93,7 +91,6 @@ async def prove_replacement(
         or str(previous["observed_vm_uid"]) != facts["vm_uid"]
         or str(previous["observed_pvc_uid"]) != binding["pvc_uid"]
         or previous["canonical_request"].get("workspace_storage") != binding
-        or previous["canonical_request"].get("preparation") is not None
     ):
         _refuse()
     # The retired VM's context copy is optional convenience metadata. The
@@ -127,6 +124,22 @@ async def prove_replacement(
     await prove(
         conn, job_id=job["id"], binding=binding, expected=handoff, adoption=adoption
     )
+    from orchestrator.services.vm_creation_prepared_lineage import (
+        prepared_origin,
+        validate_prepared_request,
+    )
+    from shared.vm_creation_issuance import prepared_source_metadata
+
+    origin = prepared_origin(handoff)
+    validate_prepared_request(
+        handoff, previous["canonical_request"], previous["controller_configuration"]
+    )
+    if facts["preparation"] != (
+        prepared_source_metadata(origin["source"]) if origin else None
+    ) or facts["preparation_request"] != previous["canonical_request"].get(
+        "preparation"
+    ):
+        _refuse()
     attachment_rows = await conn.fetch(
         "SELECT evidence FROM vm_creation_effects WHERE request_id=$1 AND effect_kind='workspace_attach' AND state='observed'",
         previous["request_id"],

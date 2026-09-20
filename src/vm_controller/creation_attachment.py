@@ -85,6 +85,13 @@ class CreationAttachment:
         if not await retained.unused(binding):
             raise ValueError("Attachment has an existing VM or launcher consumer")
         await self.actuator.disk(row, require_attachment=False)
+        if (
+            row["request"].get("preparation") is not None
+            and binding["owner_id"] != row["job_id"]
+        ):
+            from vm_controller.creation_preparation import PreparedSources
+
+            await PreparedSources(self.controller).inherited(row)
 
     def body(self, row, values):
         intent = values["workspace_attachment"]

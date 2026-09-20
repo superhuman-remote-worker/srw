@@ -11,11 +11,7 @@ def disk_owner(request):
     if binding["owner_kind"] != "job":
         raise ValueError("Unsupported creation storage owner")
     if binding["owner_id"] != request["job_id"] and (
-        binding["generation"] < 2
-        or binding["pvc_uid"] is None
-        or request.get("preparation") is not None
+        binding["generation"] < 2 or binding["pvc_uid"] is None
     ):
-        raise ValueError(
-            "Inherited creation requires exact nonprepared retained storage"
-        )
+        raise ValueError("Inherited creation requires exact retained storage")
     return binding["owner_id"]
