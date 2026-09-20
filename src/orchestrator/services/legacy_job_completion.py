@@ -1151,6 +1151,14 @@ async def complete_job_legacy(
                 if new_status != "failed":
                     error_message = None
 
+        from orchestrator.services.workspace_idle_completion_events import (
+            completion_wait_branch,
+        )
+
+        completion_idle_branch = completion_wait_branch(
+            getattr(_effect_runner, "command", None), new_status
+        )
+
         # 1·mem. Memory/KB-unavailable bounded retry. determine_job_status has
         # already enforced the cap (paused under MEMORY_RETRY_CAP, failed at it).
         # For the pause we must FREE the agent so the dispatcher re-dispatches the
@@ -1458,6 +1466,10 @@ async def complete_job_legacy(
                 # return the historical three-tuple. Absence means the old
                 # ordinary outcome, never an inferred blocked result.
                 "outcome_kind": getattr(gate_decision, "outcome_kind", None),
+                "preserves_human_wait": getattr(
+                    gate_decision, "preserves_human_wait", False
+                )
+                is True,
             }
 
         gate_result = await _run_completion_effect(
@@ -1470,6 +1482,13 @@ async def complete_job_legacy(
         _gate_actions = list(gate_result["actions"])
         _gate_bounced = bool(gate_result["bounced"])
         completion_outcome_kind = gate_result.get("outcome_kind")
+        if (
+            new_status != "pending_review"
+            or gate_result.get("preserves_human_wait") is not True
+            or _gate_bounced
+            or completion_outcome_kind is not None
+        ):
+            completion_idle_branch = None
         actions.extend(_gate_actions)
         if _gate_bounced:
             # Refused seal: the job is already parked paused with
@@ -1575,6 +1594,8 @@ async def complete_job_legacy(
         from orchestrator.services.project_loops import job_loop_id
 
         _completion_loop_id = job_loop_id(job)
+        if _completion_loop_id:
+            completion_idle_branch = None
         if _completion_loop_id and new_status == "completed":
 
             async def _deliver_loop_project_cloud() -> dict[str, Any]:
@@ -1735,6 +1756,8 @@ async def complete_job_legacy(
                 "delivery",
                 _capture_mode_a_diff,
             )
+            if mode_a_capture["captured"]:
+                completion_idle_branch = None
             if mode_a_capture["captured"] and new_status == "completed":
                 new_status = "pending_review"
                 actions.append("mode A diff captured -> pending_review")
@@ -1985,6 +2008,23 @@ async def complete_job_legacy(
                         current_status,
                     )
                     await _raise_completion_control_race(current_status)
+                if (
+                    _effect_runner is not None
+                    and new_status == "pending_review"
+                    and completion_idle_branch is not None
+                ):
+                    from orchestrator.services.workspace_idle_completion_events import (
+                        record_completion_wait_on_conn,
+                    )
+
+                    async with postgres_db.acquire() as conn:
+                        await record_completion_wait_on_conn(
+                            conn,
+                            job_id=job_id,
+                            command_id=_effect_runner.command_id,
+                            finalizing_by=_effect_runner.owner,
+                            branch=completion_idle_branch,
+                        )
                 return {
                     "new_status": new_status,
                     "had_assigned_agent": had_assigned_agent,

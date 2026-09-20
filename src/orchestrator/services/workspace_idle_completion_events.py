@@ -107,3 +107,110 @@ async def capture_completion_wait_on_conn(
     if authorized is None:
         return None
     return {"version": 1, "semantics": semantics, **runtime}
+
+
+def completion_wait_branch(command, status):
+    """Carry only the original server-captured branch through finalizer gates."""
+    if status != "pending_review" or not isinstance(command, dict):
+        return None
+    payload = command.get("payload")
+    source = (
+        payload.get(ACCEPTED_IDLE_WAIT_SOURCE_KEY)
+        if isinstance(payload, dict)
+        else None
+    )
+    if not isinstance(source, dict) or source.get("version") != 1:
+        return None
+    semantics = source.get("semantics")
+    branch = semantics.get("branch") if isinstance(semantics, dict) else None
+    return branch if branch in ("phase_approval", "final_human_review") else None
+
+
+async def record_completion_wait_on_conn(
+    conn, *, job_id, command_id, finalizing_by, branch
+):
+    """Publish after the successful S17 status CAS, inside its transaction.
+
+    A metadata failure rolls back the status write and effect marker. No new
+    queue/worker lock is taken after Job; source evidence was frozen at accept.
+    """
+    if (
+        os.getenv("WORKSPACE_IDLE_RELEASE_ENABLED", "false").lower() != "true"
+        or branch is None
+    ):
+        return False
+    if not conn.is_in_transaction():
+        raise RuntimeError("completion idle publication requires the S17 transaction")
+    row = await conn.fetchrow(
+        "SELECT * FROM jobs WHERE id=$1 FOR UPDATE", UUID(str(job_id))
+    )
+    if row is None or row["status"] != "pending_review":
+        return False
+    command = await conn.fetchrow(
+        "SELECT payload,report_seq FROM job_completion_commands WHERE id=$1 AND job_id=$2 "
+        "AND state='finalizing' AND finalizing_by=$3 AND lease_expires_at>clock_timestamp() "
+        "AND accepted_lease_token IS NOT NULL",
+        UUID(str(command_id)),
+        UUID(str(job_id)),
+        str(finalizing_by),
+    )
+    if command is None or command["report_seq"] != row["completion_seq_hwm"]:
+        return False
+    payload = command["payload"]
+    if isinstance(payload, str):
+        payload = json.loads(payload)
+    if not isinstance(payload, dict):
+        return False
+    source = payload.get(ACCEPTED_IDLE_WAIT_SOURCE_KEY)
+    if not isinstance(source, dict) or source.get("version") != 1:
+        return False
+    semantics = source.get("semantics")
+    if not isinstance(semantics, dict) or semantics.get("branch") != branch:
+        return False
+    job = dict(row)
+    freeze = job.get("freeze_data")
+    if isinstance(freeze, str):
+        freeze = json.loads(freeze)
+    if branch == "final_human_review":
+        context = job.get("context")
+        if isinstance(context, str):
+            context = json.loads(context)
+        decision = (
+            context.get("completion_decision") if isinstance(context, dict) else None
+        )
+        decision_id = (
+            decision.get("tool_call_id") if isinstance(decision, dict) else None
+        )
+        if not isinstance(decision_id, str) or decision_id.strip() != semantics.get(
+            "decision_tool_call_id"
+        ):
+            return False
+    current_semantics = classify_completion_wait(
+        job=job,
+        report={**payload, "freeze_data": freeze},
+        decision_tool_call_id=semantics.get("decision_tool_call_id"),
+    )
+    if current_semantics != semantics:
+        return False
+    runtime = completion_runtime_evidence(job)
+    if runtime is None or any(
+        source.get(key) != value for key, value in runtime.items()
+    ):
+        return False
+    from shared.workspace_idle_policy import RuntimeIdentity, read_episode
+    from shared.workspace_idle_store import apply_idle_transition_on_conn
+
+    document = job["workspace_idle_episode"]
+    if isinstance(document, str):
+        document = json.loads(document)
+    prior = read_episode(document, revision=job["workspace_idle_revision"])
+    await apply_idle_transition_on_conn(
+        conn,
+        runtime=RuntimeIdentity(**runtime["runtime_identity"]),
+        event="enter",
+        expected_revision=job["workspace_idle_revision"],
+        expected_episode_id=prior.episode_id if prior else None,
+        wait_kind=semantics["wait_kind"],
+        wait_key=str(command_id),
+    )
+    return True

@@ -31,10 +31,26 @@ def tracking(monkeypatch):
     monkeypatch.setenv("VM_MODE", "same-cluster")
 
 
-async def seed(pg, *, proof=True, lane="stateless"):
+async def seed(pg, *, proof=True, lane="stateless", manifest=None, repository=None):
     vm, _ = _vm_identity()
     vm["ssh_ready_source"] = "provisioner_probe"
-    context = {"vm": vm}
+    admitted_context = (
+        {"required_deliverables": manifest} if manifest is not None else {}
+    )
+    reserved_job_id = uuid4()
+    if repository is not None:
+        from tests.test_managed_repository_authority_real_postgres import _reserve
+        from tests.test_completion_finalizer_real_postgres import _pool_db
+
+        repository_db = _pool_db(pg)
+        authority = await _reserve(
+            repository_db, repo_name=repository, authority_id=reserved_job_id
+        )
+        assert await repository_db.activate_managed_repository_authority(
+            str(authority["id"]), forge_key_id=91, access_mode="write"
+        )
+        admitted_context["git_remote_url"] = authority["clean_repo_url"]
+    context = {**admitted_context, "vm": vm}
     config = {"workspace": {"backend": "vm"}}
     policy = {"agent": {"autonomy": "guided", "verification": {"enabled": True}}}
     agent = None
@@ -45,11 +61,14 @@ async def seed(pg, *, proof=True, lane="stateless"):
                 f"idle-completion-{uuid4()}",
             )
         job_id = await conn.fetchval(
-            "INSERT INTO jobs(description,status,execution_lane,assigned_agent_id,resolved_config) "
-            "VALUES('idle acceptance','processing',$1,$2,$3::jsonb) RETURNING id",
+            "INSERT INTO jobs(description,status,execution_lane,assigned_agent_id,resolved_config,context,id,repo_name) "
+            "VALUES('idle acceptance','processing',$1,$2,$3::jsonb,$4::jsonb,$5,$6) RETURNING id",
             lane,
             agent,
             json.dumps(policy),
+            json.dumps(admitted_context),
+            reserved_job_id,
+            repository,
         )
         await seed_previous_release_row(
             conn,
@@ -309,7 +328,9 @@ async def test_capture_and_acceptance_roll_back_on_command_insert_failure(pg):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("decision", [{"bad": "historical"}, True])
-async def test_final_review_never_invents_a_tool_identity_from_legacy_json(pg, decision):
+async def test_final_review_never_invents_a_tool_identity_from_legacy_json(
+    pg, decision
+):
     job_id, report, vm, _ = await seed(pg)
     report["freeze_data"]["freeze_type"] = "job_complete"
     async with pg.acquire() as conn:
@@ -317,7 +338,9 @@ async def test_final_review_never_invents_a_tool_identity_from_legacy_json(pg, d
             "UPDATE jobs SET context=$2::jsonb,resolved_config=$3::jsonb WHERE id=$1",
             job_id,
             json.dumps({"vm": vm, "completion_decision": {"tool_call_id": decision}}),
-            json.dumps({"agent": {"autonomy": "review", "verification": {"enabled": False}}}),
+            json.dumps(
+                {"agent": {"autonomy": "review", "verification": {"enabled": False}}}
+            ),
         )
     accepted = await accept(pg, job_id, report)
     assert KEY not in accepted.stored_payload

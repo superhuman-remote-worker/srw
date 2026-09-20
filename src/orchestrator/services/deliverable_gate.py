@@ -143,6 +143,8 @@ class DeliverableGateResult:
     actions: list[str]
     bounced: bool
     outcome_kind: str | None = None
+    # Typed source continuity, independent of display actions and legacy tuples.
+    preserves_human_wait: bool = False
 
     def __iter__(self) -> Iterator[Any]:
         # Existing collaborators/tests intentionally keep their historical
@@ -705,7 +707,7 @@ async def run_deliverable_gate(
     read-modify-write).
     """
     if not gate_applies(job, result, new_status):
-        return DeliverableGateResult(new_status, [], False)
+        return DeliverableGateResult(new_status, [], False, preserves_human_wait=True)
 
     job_id = str(job.get("id"))
     from orchestrator.services.completion import _parse_context
@@ -784,7 +786,9 @@ async def run_deliverable_gate(
                 f", {n_unverified} unverifiable {noun} failed open ({', '.join(kinds)})"
             )
         action += ")"
-        return DeliverableGateResult(new_status, [action], False)
+        return DeliverableGateResult(
+            new_status, [action], False, preserves_human_wait=not n_unverified
+        )
 
     missing = report.get("missing") or []
     if bounces < DELIVERABLE_GATE_BOUNCE_CAP:
