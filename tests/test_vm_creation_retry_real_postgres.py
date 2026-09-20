@@ -109,6 +109,86 @@ async def admit(db, job, generation, proposal, request_id=None):
 
 
 @pytest.mark.asyncio
+async def test_injected_waiter_refusal_rolls_back_retry_and_precedes_resume(db):
+    job, generation, proposal = await admitted_job(db)
+
+    class RefusingWriter:
+        async def _write_waiter_on_conn(self, conn, *, retry, job, create):
+            assert create is True
+            assert retry["job_id"] == job["id"]
+            assert retry["state"] == "queued"
+            context = json.loads(job["context"])
+            assert "_vm_creation_pending" not in context
+            await conn.execute(
+                "UPDATE jobs SET description='waiter-write' WHERE id=$1", job["id"]
+            )
+            raise RuntimeError("waiter-refused")
+
+    async with db.acquire() as conn:
+        with pytest.raises(RuntimeError, match="waiter-refused"):
+            async with conn.transaction():
+                await VMCreationRetryStore(
+                    db, _resource_waiter_writer=RefusingWriter()
+                ).admit_on_conn(
+                    conn,
+                    job_id=str(job),
+                    expected_generation=str(generation),
+                    request_id=str(uuid4()),
+                    proposal=proposal,
+                )
+
+    async with db.acquire() as conn:
+        saved = await conn.fetchrow(
+            "SELECT description,context FROM jobs WHERE id=$1", job
+        )
+        context = json.loads(saved["context"])
+        assert saved["description"] == "retry"
+        assert "_vm_creation_pending" not in context
+        assert await conn.fetchval(
+            "SELECT count(*) FROM vm_creation_retries WHERE job_id=$1", job
+        ) == 0
+
+
+@pytest.mark.asyncio
+async def test_injected_waiter_validates_existing_retry_without_backfill_mode(db):
+    job, generation, proposal = await admitted_job(db)
+
+    class RecordingWriter:
+        def __init__(self):
+            self.calls = []
+
+        async def _write_waiter_on_conn(self, conn, *, retry, job, create):
+            self.calls.append((retry["request_id"], job["id"], create))
+
+    writer = RecordingWriter()
+    store = VMCreationRetryStore(db, _resource_waiter_writer=writer)
+    async with db.acquire() as conn:
+        async with conn.transaction():
+            first = await store.admit_on_conn(
+                conn,
+                job_id=str(job),
+                expected_generation=str(generation),
+                request_id=str(uuid4()),
+                proposal=proposal,
+            )
+    async with db.acquire() as conn:
+        async with conn.transaction():
+            second = await store.admit_on_conn(
+                conn,
+                job_id=str(job),
+                expected_generation=str(generation),
+                request_id=str(uuid4()),
+                proposal=proposal,
+            )
+
+    assert second["request_id"] == first["request_id"]
+    assert writer.calls == [
+        (first["request_id"], job, True),
+        (first["request_id"], job, False),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_duplicate_admission_preserves_generation_context_and_one_request(db):
     job, generation, proposal = await admitted_job(db)
     first, second = await asyncio.gather(

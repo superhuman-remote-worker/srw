@@ -13,11 +13,12 @@ from tests.test_vm_creation_retry_real_postgres import (
     postgres_db_fixture,  # noqa: F401
     pg_dsn,  # noqa: F401
     _schema_applied,  # noqa: F401
-    admitted_job,
     admit,
+    admitted_job,
 )
 from tests.test_vm_resource_inventory_real_postgres import setup, publish, successor
 from tests.test_vm_resource_inventory_settings import configuration
+from tests.test_vm_resource_configuration import configuration as creation_configuration
 
 db = _db_fixture
 GIB = 1024**3
@@ -82,12 +83,33 @@ async def environment(db, *, max_bypasses=1, stale_after_seconds=60):
 
 
 async def waiter(
-    db, inventory, *, owner=None, priority=5, placement=None, conn=None, timeout=3600
+    db,
+    store,
+    inventory=None,
+    *,
+    priority=5,
+    placement=None,
+    conn=None,
+    timeout=3600,
 ):
-    # These rows are deliberately inserted only in tests. D4 must derive the
-    # projection from authenticated immutable controller configuration.
-    job, generation, proposal = await admitted_job(db, timeout=timeout)
-    request = await admit(db, job, generation, proposal)
+    from orchestrator.services.vm_creation_retry_store import VMCreationRetryStore
+    from orchestrator.services.vm_resource_reservation_store import (
+        VMResourceReservationStore,
+    )
+
+    if inventory is None:
+        inventory = store
+        policy = await db.fetchrow(
+            "SELECT document,revision FROM vm_resource_admission_policy WHERE cluster_id=$1",
+            inventory.cluster_id,
+        )
+        store = VMResourceReservationStore(
+            db,
+            inventory=inventory,
+            policy_document=json.loads(policy["document"]),
+            policy_revision=policy["revision"],
+        )
+
     placement = placement or {
         "version": 1,
         "selector": {},
@@ -96,31 +118,99 @@ async def waiter(
         "storage_class": "local",
         "retained_pvc_uid": None,
     }
-    await (conn or db).execute(
-        "INSERT INTO vm_resource_waiters(request_id,job_id,provision_generation,cluster_id,policy_digest,owner_key,priority,request_digest,"
-        "guest_vcpus,guest_memory_bytes,cpu_millicores,memory_bytes,kvm_devices,placement) "
-        "VALUES($1,$2,$3,$4,$5,$6,$7,$8,8,17179869184,4000,17179869184,1,$9::jsonb)",
-        request["request_id"],
-        job,
-        generation,
-        inventory.cluster_id,
-        inventory.policy_digest,
-        owner or "job:" + str(job),
-        priority,
-        request["request_digest"],
-        json.dumps(placement),
+    controller_configuration = resource_configuration(store, inventory, placement)
+    job, generation, proposal = await admitted_job(
+        db, timeout=timeout, controller_configuration=controller_configuration
     )
+    user = uuid4()
+    await db.execute(
+        "INSERT INTO users(id,display_name) VALUES($1,'reservation-owner')", user
+    )
+    await db.execute(
+        "UPDATE jobs SET user_id=$2,priority=$3 WHERE id=$1", job, user, priority
+    )
+
+    async def create(target):
+        return await VMCreationRetryStore(
+            db, _resource_waiter_writer=store
+        ).admit_on_conn(
+            target,
+            job_id=str(job),
+            expected_generation=str(generation),
+            request_id=str(uuid4()),
+            proposal=proposal,
+        )
+
+    if conn is not None:
+        request = await create(conn)
+    else:
+        async with db.acquire() as target, target.transaction():
+            request = await create(target)
     return request
+
+
+def resource_configuration(store, inventory, placement=None):
+    placement = placement or {
+        "version": 1,
+        "selector": {},
+        "tolerations": [],
+        "required_affinity": None,
+        "storage_class": "local",
+        "retained_pvc_uid": None,
+    }
+    value = creation_configuration()
+    value.update(
+        namespace=inventory.namespace,
+        storage_class=placement["storage_class"],
+        node_selector=deepcopy(placement["selector"]),
+        tolerations=deepcopy(placement["tolerations"]),
+    )
+    resource = value["resource_admission"]
+    resource.update(
+        cluster_id=inventory.cluster_id,
+        policy_digest=inventory.policy_digest,
+    )
+    resource["template_profile"] = {
+        "version": 1,
+        "selector": deepcopy(placement["selector"]),
+        "tolerations": deepcopy(placement["tolerations"]),
+        "required_affinity": deepcopy(placement["required_affinity"]),
+        "storage_class": placement["storage_class"],
+        "guest_vcpus": 8,
+        "guest_memory_bytes": 16 * GIB,
+    }
+    resource["host_mapping"] = {
+        "algorithm": "srw-vm-host-cost-v1",
+        "policy": deepcopy(store.policy_document["policy"]["hostCost"]),
+        "vector": store.cost.cost(8, "16Gi").to_dict(),
+    }
+    return value
 
 
 async def decide(store, request):
     return await store.admit(request_id=str(request["request_id"]))
 
 
+async def retry_without_waiter(db, store, inventory, *, priority):
+    """Create authority only for the foreign-Job lock concurrency fixture."""
+    controller_configuration = resource_configuration(store, inventory)
+    job, generation, proposal = await admitted_job(
+        db, controller_configuration=controller_configuration
+    )
+    user = uuid4()
+    await db.execute(
+        "INSERT INTO users(id,display_name) VALUES($1,'foreign-owner')", user
+    )
+    await db.execute(
+        "UPDATE jobs SET user_id=$2,priority=$3 WHERE id=$1", job, user, priority
+    )
+    return await admit(db, job, generation, proposal), user
+
+
 @pytest.mark.asyncio
 async def test_two_replicas_cannot_spend_final_vector_and_replay_keeps_sequence(db):
     store, inventory, snapshot = await environment(db)
-    first, second = await waiter(db, inventory), await waiter(db, inventory)
+    first, second = await waiter(db, store, inventory), await waiter(db, store, inventory)
     results = await asyncio.gather(decide(store, first), decide(store, second))
     assert sum(result["action"] == "admitted" for result in results) == 1
     held = await db.fetch(
@@ -145,7 +235,7 @@ async def test_duplicate_parallel_request_reserves_once_even_after_inventory_inv
     db,
 ):
     store, inventory, snapshot = await environment(db)
-    request = await waiter(db, inventory)
+    request = await waiter(db, store, inventory)
     results = await asyncio.gather(decide(store, request), decide(store, request))
     assert results[0] == results[1]
     await publish(inventory, successor(snapshot, complete=False))
@@ -164,7 +254,7 @@ async def test_duplicate_parallel_request_reserves_once_even_after_inventory_inv
 @pytest.mark.asyncio
 async def test_newer_incomplete_after_policy_wait_cannot_reserve(db):
     store, inventory, snapshot = await environment(db)
-    request = await waiter(db, inventory)
+    request = await waiter(db, store, inventory)
     async with db.acquire() as blocker, blocker.transaction():
         await blocker.fetchrow(
             "SELECT * FROM vm_resource_admission_policy WHERE cluster_id=$1 FOR UPDATE",
@@ -197,7 +287,7 @@ async def wait_for_policy_lock(db):
 @pytest.mark.asyncio
 async def test_winner_changes_while_waiting_without_locking_foreign_job(db):
     store, inventory, _ = await environment(db)
-    first = await waiter(db, inventory, priority=5)
+    first = await waiter(db, store, inventory, priority=5)
     async with db.acquire() as owner, owner.transaction():
         async with db.acquire() as blocker, blocker.transaction():
             await blocker.fetchrow(
@@ -206,7 +296,33 @@ async def test_winner_changes_while_waiting_without_locking_foreign_job(db):
             )
             task = asyncio.create_task(decide(store, first))
             await wait_for_policy_lock(db)
-            later = await waiter(db, inventory, priority=99, conn=blocker)
+            later, user = await retry_without_waiter(
+                db, store, inventory, priority=99
+            )
+            # This raw insert is deliberate: the test must publish a waiter in
+            # the policy transaction without retaining the foreign Job lock.
+            await blocker.execute(
+                "INSERT INTO vm_resource_waiters(request_id,job_id,provision_generation,cluster_id,policy_digest,owner_key,priority,request_digest,guest_vcpus,guest_memory_bytes,cpu_millicores,memory_bytes,kvm_devices,placement) "
+                "VALUES($1,$2,$3,$4,$5,$6,99,$7,8,$8,4000,$8,1,$9::jsonb)",
+                later["request_id"],
+                later["job_id"],
+                later["provision_generation"],
+                inventory.cluster_id,
+                inventory.policy_digest,
+                "user:" + str(user),
+                later["request_digest"],
+                16 * GIB,
+                json.dumps(
+                    {
+                        "version": 1,
+                        "selector": {},
+                        "tolerations": [],
+                        "required_affinity": None,
+                        "storage_class": "local",
+                        "retained_pvc_uid": None,
+                    }
+                ),
+            )
             await owner.fetchrow(
                 "SELECT id FROM jobs WHERE id=$1 FOR UPDATE", later["job_id"]
             )
@@ -227,7 +343,7 @@ async def test_winner_changes_while_waiting_without_locking_foreign_job(db):
 )
 async def test_policy_change_refuses_without_modifying_waiter_or_fairness(db, change):
     store, inventory, _ = await environment(db)
-    request = await waiter(db, inventory)
+    request = await waiter(db, store, inventory)
     await db.execute(
         "UPDATE vm_resource_admission_policy SET " + change + " WHERE cluster_id=$1",
         inventory.cluster_id,
@@ -246,7 +362,7 @@ async def test_nonfit_is_reconsidered_on_new_snapshot_without_resetting_age(db):
     snapshot = successor(snapshot)
     snapshot["nodes"][0]["allocatable"]["cpu_millicores"] = 3999
     await publish(inventory, snapshot)
-    request = await waiter(db, inventory)
+    request = await waiter(db, store, inventory)
     assert (await decide(store, request))["action"] == "nonfit"
     original = await db.fetchrow(
         "SELECT enqueued_at,revision FROM vm_resource_waiters WHERE request_id=$1",
@@ -292,7 +408,7 @@ async def test_transient_placement_evidence_is_never_permanent_nonfit(db, condit
     else:
         snapshot["storage_classes"] = []
     await publish(inventory, snapshot)
-    request = await waiter(db, inventory, placement=placement)
+    request = await waiter(db, store, inventory, placement=placement)
     assert (await decide(store, request))["action"] in {"wait", "protected"}
     assert (
         await db.fetchval(
@@ -308,6 +424,7 @@ async def test_bypass_protection_is_committed_once_and_survives_recreated_store(
     store, inventory, snapshot = await environment(db)
     blocked = await waiter(
         db,
+        store,
         inventory,
         priority=10,
         placement={
@@ -319,7 +436,7 @@ async def test_bypass_protection_is_committed_once_and_survives_recreated_store(
             "retained_pvc_uid": None,
         },
     )
-    fitting = await waiter(db, inventory)
+    fitting = await waiter(db, store, inventory)
     result = await decide(store, fitting)
     assert result["action"] == "admitted"
     state = await db.fetchrow(
@@ -328,7 +445,7 @@ async def test_bypass_protection_is_committed_once_and_survives_recreated_store(
     )
     assert state["bypasses"] == 1 and state["protected_order"] is not None
     assert await decide(store, fitting) == result
-    newcomer = await waiter(db, inventory, priority=99)
+    newcomer = await waiter(db, store, inventory, priority=99)
     result = await decide(store, newcomer)
     assert result == {"action": "nominate", "request_id": str(blocked["request_id"])}
     assert (
@@ -343,7 +460,7 @@ async def test_bypass_protection_is_committed_once_and_survives_recreated_store(
 @pytest.mark.asyncio
 async def test_original_execution_deadline_is_rechecked_after_policy_wait(db):
     store, inventory, _ = await environment(db)
-    request = await waiter(db, inventory, timeout=2)
+    request = await waiter(db, store, inventory, timeout=2)
     async with db.acquire() as blocker, blocker.transaction():
         await blocker.fetchrow(
             "SELECT * FROM vm_resource_admission_policy WHERE cluster_id=$1 FOR UPDATE",
@@ -371,7 +488,7 @@ async def test_original_execution_deadline_is_rechecked_after_policy_wait(db):
 @pytest.mark.asyncio
 async def test_inventory_freshness_is_rechecked_after_policy_wait(db):
     store, inventory, _ = await environment(db, stale_after_seconds=6)
-    request = await waiter(db, inventory)
+    request = await waiter(db, store, inventory)
     async with db.acquire() as blocker, blocker.transaction():
         await blocker.fetchrow(
             "SELECT * FROM vm_resource_admission_policy WHERE cluster_id=$1 FOR UPDATE",
@@ -393,7 +510,7 @@ async def test_old_policy_charge_survives_new_policy_and_node_name_reuse(db):
     )
 
     store, inventory, snapshot = await environment(db)
-    request = await waiter(db, inventory)
+    request = await waiter(db, store, inventory)
     first = await decide(store, request)
     config = deepcopy(store.policy_document)
     config["policy"]["fairness"]["priorityAgingSeconds"] = 120
@@ -416,7 +533,7 @@ async def test_old_policy_charge_survives_new_policy_and_node_name_reuse(db):
     store = VMResourceReservationStore(
         db, inventory=inventory, policy_document=config, policy_revision=2
     )
-    waiting = await waiter(db, inventory)
+    waiting = await waiter(db, store, inventory)
     assert (await decide(store, waiting))["action"] == "wait"
     snapshot = successor(snapshot)
     snapshot["nodes"][0]["uid"] = str(uuid4())
@@ -453,7 +570,7 @@ async def test_deleting_external_pod_still_consumes_capacity(db):
         }
     ]
     await publish(inventory, snapshot)
-    request = await waiter(db, inventory)
+    request = await waiter(db, store, inventory)
     assert (await decide(store, request))["action"] == "wait"
     newer = successor(snapshot)
     newer["pods"][0]["terminal"] = True
@@ -464,7 +581,7 @@ async def test_deleting_external_pod_still_consumes_capacity(db):
 @pytest.mark.asyncio
 async def test_teardown_reservation_replay_cannot_grant_creation(db):
     store, inventory, _ = await environment(db)
-    request = await waiter(db, inventory)
+    request = await waiter(db, store, inventory)
     first = await decide(store, request)
     await db.execute(
         "UPDATE vm_resource_reservations SET state='teardown' WHERE id=$1",
@@ -479,7 +596,7 @@ async def test_teardown_reservation_replay_cannot_grant_creation(db):
 @pytest.mark.asyncio
 async def test_locked_policy_document_compares_exact_json_types(db):
     store, inventory, _ = await environment(db)
-    request = await waiter(db, inventory)
+    request = await waiter(db, store, inventory)
     await db.execute(
         "UPDATE vm_resource_admission_policy SET document=jsonb_set(document,'{policy,hostCost,cpuMillicoresPerVcpuDenominator}','true') WHERE cluster_id=$1",
         inventory.cluster_id,

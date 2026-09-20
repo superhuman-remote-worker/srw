@@ -61,9 +61,10 @@ def _creation_intent(row):
 
 
 class VMCreationRetryStore:
-    def __init__(self, db):
+    def __init__(self, db, *, _resource_waiter_writer=None):
         self.db = db
         self.cleanup = VMWorkspaceRecoveryStore(db)
+        self._resource_waiter_writer = _resource_waiter_writer
 
     async def _scope(
         self, conn, job_id, pvc_uid, *, own_admission=None, hold_queue=True
@@ -440,6 +441,10 @@ class VMCreationRetryStore:
                     )
                 )
             if existing["state"] != "succeeded":
+                if self._resource_waiter_writer is not None:
+                    await self._resource_waiter_writer._write_waiter_on_conn(
+                        conn, retry=existing, job=job, create=False
+                    )
                 await self._resume_on_conn(conn, job, existing["request_id"])
             return existing
         if (
@@ -477,8 +482,13 @@ class VMCreationRetryStore:
             predecessor_id,
             json.dumps(configuration) if configuration is not None else None,
         )
+        retry = _record(row)
+        if self._resource_waiter_writer is not None:
+            await self._resource_waiter_writer._write_waiter_on_conn(
+                conn, retry=retry, job=job, create=True
+            )
         await self._resume_on_conn(conn, job, request_uuid)
-        return _record(row)
+        return retry
 
     async def _validate_resume_on_conn(self, conn, job, request_uuid):
         """Recheck public Resume authority after the canonical scope/job wait."""
@@ -1298,6 +1308,7 @@ class VMCreationRetryStore:
                     "request": row["canonical_request"],
                     "cancellation_disposition": _json(row["cancellation_disposition"]),
                     "cancellation_progress": _json(row["cancellation_progress"]),
+                    "cancellation_completion": _json(row["cancellation_completion"]),
                     **(
                         {
                             "prepared_origin": prepared_origin(

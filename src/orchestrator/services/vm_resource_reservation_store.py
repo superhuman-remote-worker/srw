@@ -16,6 +16,8 @@ from orchestrator.services.vm_creation_retry_store import (
     VMCreationRetryStore,
 )
 from shared.kubernetes_quantities import normalize_byte_quantity
+from shared.vm_creation_issuance import canonical_configuration_digest
+from shared.vm_creation_retry import canonical_request_digest
 from shared.vm_resource_accounting import ReservationCharge, account_inventory
 from shared.vm_resource_admission import (
     ResourceAdmissionError,
@@ -24,6 +26,7 @@ from shared.vm_resource_admission import (
 from shared.vm_resource_fairness import Waiter, choose_waiter
 from shared.vm_resource_policy import parse_resource_policy_values
 from shared.vm_resource_inventory import InventoryError, snapshot_is_fresh
+from shared.vm_resource_configuration import validate_resource_configuration
 from shared.vm_resource_placement import (
     affinity_label_keys,
     node_exclusion,
@@ -80,6 +83,104 @@ def _policy_values(document, inventory):
     if sorted(limits["nodeLabelKeys"]) != inventory.label_keys:
         raise ResourceAdmissionError("invalid_resource_policy")
     return parse_resource_policy_values(policy)
+
+
+def _expected_waiter_request_fields(
+    retry, *, inventory, policy_document, cost
+):
+    """Rebuild waiter request fields; fairness metadata is write-once separately."""
+    try:
+        request = _json(retry["canonical_request"])
+        if (
+            not isinstance(request, dict)
+            or canonical_request_digest(request) != retry["request_digest"]
+        ):
+            raise ValueError
+    except (ValueError, TypeError, KeyError, UnicodeError, RecursionError):
+        raise ResourceAdmissionError("resource_waiter_changed") from None
+
+    configuration = _json(retry.get("controller_configuration"))
+    if (
+        not isinstance(configuration, dict)
+        or type(configuration.get("version")) is not int
+        or configuration["version"] != 2
+    ):
+        raise ResourceAdmissionError("resource_configuration_unavailable")
+    try:
+        if (
+            canonical_configuration_digest(configuration)
+            != retry["controller_configuration_digest"]
+        ):
+            raise ValueError
+        resource = configuration["resource_admission"]
+        validate_resource_configuration(resource, configuration)
+        profile = resource["template_profile"]
+        mapping = resource["host_mapping"]
+        if (
+            configuration["namespace"] != inventory.namespace
+            or resource["cluster_id"] != inventory.cluster_id
+            or resource["policy_digest"] != inventory.policy_digest
+            or _encoded(mapping["policy"])
+            != _encoded(policy_document["policy"]["hostCost"])
+            or type(request["cpu_cores"]) is not int
+            or profile["guest_vcpus"] != request["cpu_cores"]
+        ):
+            raise ValueError
+        memory = normalize_byte_quantity(request["memory"]).normalized_value
+        if profile["guest_memory_bytes"] != memory:
+            raise ValueError
+        expected_vector = cost.cost(request["cpu_cores"], request["memory"])
+        frozen_vector = ResourceVector(**mapping["vector"])
+        if any(type(value) is not int for value in frozen_vector.components) or (
+            frozen_vector != expected_vector
+        ):
+            raise ValueError
+    except (
+        ValueError,
+        TypeError,
+        KeyError,
+        UnicodeError,
+        RecursionError,
+        ResourceAdmissionError,
+    ):
+        raise ResourceAdmissionError("resource_configuration_changed") from None
+
+    return {
+        "request_id": retry["request_id"],
+        "job_id": retry["job_id"],
+        "provision_generation": retry["provision_generation"],
+        "cluster_id": inventory.cluster_id,
+        "policy_digest": inventory.policy_digest,
+        "request_digest": retry["request_digest"],
+        "guest_vcpus": profile["guest_vcpus"],
+        "guest_memory_bytes": profile["guest_memory_bytes"],
+        **expected_vector.to_dict(),
+        "placement": {
+            "version": 1,
+            "selector": deepcopy(profile["selector"]),
+            "tolerations": deepcopy(profile["tolerations"]),
+            "required_affinity": deepcopy(profile["required_affinity"]),
+            "storage_class": profile["storage_class"],
+            "retained_pvc_uid": (
+                str(retry["expected_pvc_uid"])
+                if retry["expected_pvc_uid"] is not None
+                else None
+            ),
+        },
+    }
+
+
+def _waiter_request_fields_match(actual, expected):
+    for key, value in expected.items():
+        if key == "placement":
+            try:
+                if _encoded(_json(actual[key])) != _encoded(value):
+                    return False
+            except (ValueError, TypeError, KeyError, UnicodeError, RecursionError):
+                return False
+        elif type(actual[key]) is not type(value) or actual[key] != value:
+            return False
+    return True
 
 
 def _node_document(node):
@@ -254,6 +355,68 @@ class VMResourceReservationStore:
             raise ResourceAdmissionError("resource_policy_changed")
         return policy
 
+    async def _write_waiter_on_conn(self, conn, *, retry, job, create):
+        """Project one waiter inside the retry admission transaction."""
+        if (
+            type(create) is not bool
+            or retry["job_id"] != job["id"]
+            or retry["state"] not in {"queued", "reconciling"}
+        ):
+            raise ResourceAdmissionError("creation_request_ineligible")
+        await self.creation._current(
+            conn, job, retry["provision_generation"], retry=retry
+        )
+        effects = await conn.fetch(
+            "SELECT effect_number FROM vm_creation_effects WHERE request_id=$1 ORDER BY effect_number FOR UPDATE",
+            retry["request_id"],
+        )
+        if effects:
+            raise ResourceAdmissionError("creation_effect_already_issued")
+        await self._lock_policy(conn)
+        expected = _expected_waiter_request_fields(
+            retry,
+            inventory=self.inventory,
+            policy_document=self.policy_document,
+            cost=self.cost,
+        )
+        row = await conn.fetchrow(
+            "SELECT * FROM vm_resource_waiters WHERE request_id=$1 FOR UPDATE",
+            retry["request_id"],
+        )
+        if create:
+            if row is not None:
+                raise ResourceAdmissionError("resource_waiter_changed")
+            owner_key = (
+                "system"
+                if job["user_id"] is None
+                else "user:" + str(job["user_id"])
+            )
+            row = await conn.fetchrow(
+                "INSERT INTO vm_resource_waiters(request_id,job_id,provision_generation,cluster_id,policy_digest,owner_key,project_id,priority,request_digest,guest_vcpus,guest_memory_bytes,cpu_millicores,memory_bytes,kvm_devices,placement) "
+                "VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15::jsonb) RETURNING *",
+                expected["request_id"],
+                expected["job_id"],
+                expected["provision_generation"],
+                expected["cluster_id"],
+                expected["policy_digest"],
+                owner_key,
+                job["project_id"],
+                job["priority"],
+                expected["request_digest"],
+                expected["guest_vcpus"],
+                expected["guest_memory_bytes"],
+                expected["cpu_millicores"],
+                expected["memory_bytes"],
+                expected["kvm_devices"],
+                json.dumps(expected["placement"]),
+            )
+        elif row is None:
+            raise ResourceAdmissionError("resource_waiter_missing")
+        if not _waiter_request_fields_match(row, expected):
+            raise ResourceAdmissionError("resource_waiter_changed")
+        await self._deadline(conn, retry)
+        return dict(row)
+
     async def _admit(self, conn, request_id):
         retry, job = await self.creation._effect_scope(conn, request_id)
         await self.creation._current(
@@ -265,6 +428,12 @@ class VMResourceReservationStore:
         )
         inventory = self.inventory
         policy = await self._lock_policy(conn)
+        expected_waiter = _expected_waiter_request_fields(
+            retry,
+            inventory=inventory,
+            policy_document=self.policy_document,
+            cost=self.cost,
+        )
         # All legitimate writers serialize on policy before taking these rows.
         # Read idempotence before inventory, but never before request authority.
         held = await conn.fetchrow(
@@ -274,11 +443,26 @@ class VMResourceReservationStore:
         if retry["state"] not in {"queued", "reconciling", "succeeded"}:
             raise ResourceAdmissionError("creation_request_ineligible")
         if held is not None:
+            target = await conn.fetchrow(
+                "SELECT * FROM vm_resource_waiters WHERE request_id=$1 FOR UPDATE",
+                retry["request_id"],
+            )
+            if target is None:
+                raise ResourceAdmissionError("resource_waiter_missing")
+            if not _waiter_request_fields_match(target, expected_waiter):
+                raise ResourceAdmissionError("resource_waiter_changed")
             if (
                 held["cluster_id"] != inventory.cluster_id
                 or held["policy_digest"] != inventory.policy_digest
             ):
                 raise ResourceAdmissionError("resource_policy_changed")
+            if (
+                held["request_id"] != expected_waiter["request_id"]
+                or held["cpu_millicores"] != expected_waiter["cpu_millicores"]
+                or held["memory_bytes"] != expected_waiter["memory_bytes"]
+                or held["kvm_devices"] != expected_waiter["kvm_devices"]
+            ):
+                raise ResourceAdmissionError("resource_waiter_changed")
             if held["state"] == "teardown":
                 raise ResourceAdmissionError("reservation_teardown")
             await self._deadline(conn, retry)
@@ -350,21 +534,13 @@ class VMResourceReservationStore:
         )
         if target is None:
             raise ResourceAdmissionError("resource_waiter_missing")
-        request = retry["canonical_request"]
-        expected = self.cost.cost(request["cpu_cores"], request["memory"])
-        if (
-            target["job_id"] != retry["job_id"]
-            or target["provision_generation"] != retry["provision_generation"]
-            or target["request_digest"] != retry["request_digest"]
-            or target["guest_vcpus"] != request["cpu_cores"]
-            or target["guest_memory_bytes"]
-            != normalize_byte_quantity(request["memory"]).normalized_value
-            or ResourceVector(
-                target["cpu_millicores"], target["memory_bytes"], target["kvm_devices"]
-            )
-            != expected
-        ):
+        if not _waiter_request_fields_match(target, expected_waiter):
             raise ResourceAdmissionError("resource_waiter_changed")
+        expected = ResourceVector(
+            expected_waiter["cpu_millicores"],
+            expected_waiter["memory_bytes"],
+            expected_waiter["kvm_devices"],
+        )
         charges = [
             ReservationCharge(
                 reservation_id=str(row["id"]),
