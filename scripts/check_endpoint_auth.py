@@ -101,6 +101,9 @@ GATE_NAMES = {
     # Controller -> orchestrator lifecycle-HMAC boundary. The signature binds
     # operation, body, timestamp and request/correlation IDs.
     "require_vm_cleanup_authority",
+    # Bounded inventory parser precedes this fixed-purpose lifecycle HMAC gate;
+    # no inventory is published before it succeeds. HTTP tests prove behavior.
+    "require_vm_inventory_authority",
     "user_can_access_any_job",
     "user_can_access_job",
     # job-first then thread-owner resolver — gates session citations whose
@@ -913,6 +916,7 @@ def _classify(
         "require_internal": 2,
         "require_vm_guest": 2,
         "require_vm_cleanup_authority": 2,
+        "require_vm_inventory_authority": 2,
         "is_internal_call": 2,
         "require_approved_user": 3,
     }
@@ -927,6 +931,7 @@ def _classify(
         "require_internal",
         "require_vm_guest",
         "require_vm_cleanup_authority",
+        "require_vm_inventory_authority",
         "is_internal_call",
     ):
         return f"internal:{primary}"

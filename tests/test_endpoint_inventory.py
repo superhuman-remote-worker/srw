@@ -99,3 +99,15 @@ def test_no_new_unscoped_endpoints():
         "with `Depends(require_*)` / in-body `require_*`, or annotate with "
         "`# nosec: public <reason>` above the decorator."
     )
+
+
+def test_vm_resource_inventory_publish_has_its_distinct_hmac_gate():
+    endpoints = _load_script().collect_endpoints()
+    matches = [
+        e
+        for e in endpoints
+        if e.path == "/api/internal/vm-resource-inventory/publish"
+        and e.method.upper() == "POST"
+    ]
+    assert len(matches) == 1
+    assert matches[0].classification == "internal:require_vm_inventory_authority"

@@ -229,6 +229,7 @@ POST   /api/internal/vm-creation-retries/observe-effect                         
 POST   /api/internal/vm-creation-retries/prepare-disposition                            internal:require_vm_cleanup_authority
 POST   /api/internal/vm-creation-retries/settle-adopted                                 internal:require_vm_cleanup_authority
 POST   /api/internal/vm-creation-retries/settle-never-issued                            internal:require_vm_cleanup_authority
+POST   /api/internal/vm-resource-inventory/publish                                      internal:require_vm_inventory_authority
 POST   /api/internal/vm-workspace-cleanup-authority/acquire                             internal:require_vm_cleanup_authority
 POST   /api/internal/vm-workspace-cleanup-authority/complete                            internal:require_vm_cleanup_authority
 POST   /api/internal/vm-workspace-cleanup-authority/resume                              internal:require_vm_cleanup_authority

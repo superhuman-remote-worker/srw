@@ -75,6 +75,14 @@ def _plain(reason, status):
     return JSONResponse({"detail": reason}, status_code=status)
 
 
+def require_vm_inventory_authority(value, *, secret):
+    """Authenticate only the fixed inventory request purpose and direction."""
+    if not verify_payload(
+        value, direction="request", operation=OPERATION, secret=secret
+    ):
+        raise ValueError("unauthenticated")
+
+
 @router.post("/publish")
 async def publish(request: Request):
     config = _configuration
@@ -115,9 +123,9 @@ async def publish(request: Request):
             raise InventoryError("inventory_digest_changed")
     except (ValueError, TypeError, UnicodeError):
         return _plain("invalid_inventory_transport", 400)
-    if not verify_payload(
-        value, direction="request", operation=OPERATION, secret=secret
-    ):
+    try:
+        require_vm_inventory_authority(value, secret=secret)
+    except ValueError:
         return _plain("unauthenticated", 401)
     correlation = auth["request_id"]
     try:
