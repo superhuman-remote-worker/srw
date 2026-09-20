@@ -30,6 +30,8 @@ def _object(value):
 
 
 def _execution_binding(value):
+    if not isinstance(value["execution_id"], str):
+        raise ValueError("Invalid execution identity")
     execution_id = UUID(value["execution_id"])
     if str(execution_id) != value["execution_id"]:
         raise ValueError("Invalid execution identity")
@@ -67,6 +69,7 @@ def _preflight(vm):
             or value["request"]["provision_generation"]
             != vm.get("provision_generation")
             or canonical_request_digest(value["request"]) != value["request_digest"]
+            or not isinstance(value["request_id"], str)
             or str(UUID(value["request_id"])) != value["request_id"]
             or type(value["revision"]) is not int
             or value["revision"] < 0
@@ -74,6 +77,11 @@ def _preflight(vm):
             or value["attempt"] < 0
             or value["state"]
             not in {"queued", "resolving", "attention", "admitted", "settled"}
+        ):
+            raise ValueError
+        expected_pvc = value.get("expected_pvc_uid")
+        if expected_pvc is not None and (
+            not isinstance(expected_pvc, str) or str(UUID(expected_pvc)) != expected_pvc
         ):
             raise ValueError
         for field in ("next_probe_at", "claim_expires_at", "outage_started_at"):

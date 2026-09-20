@@ -156,6 +156,16 @@ def test_list_document_excludes_private_join_fields(document):
         "project_has_cloud_folder",
     }.isdisjoint(fields)
     assert "workspace_recovery" in fields
+    assert "vm_creation" in fields
+    creation = document["components"]["schemas"]["VMCreationView"]
+    assert set(creation["properties"]) == {
+        "request_id",
+        "state",
+        "stage",
+        "reason_code",
+        "message",
+        "resumable",
+    }
     recovery = document["components"]["schemas"]["WorkspaceRecoveryView"]
     assert set(recovery["properties"]) == {
         "operation_id",

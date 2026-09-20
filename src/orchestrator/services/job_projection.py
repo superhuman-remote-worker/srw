@@ -14,6 +14,7 @@ from typing import Any, Callable, Mapping, Protocol
 from uuid import UUID
 
 from orchestrator.services.cloud.handles import SessionFolderHandle
+from orchestrator.services.vm_creation_progress import vm_creation_projection
 from shared.workspace_contract import (
     WORKSPACE_CONTRACT_CONTEXT_KEY,
     WORKSPACE_DISPATCH_AUTHORITY_CONTEXT_KEY,
@@ -106,6 +107,25 @@ def _vm_phase_attention_message(vm: Mapping[str, Any]) -> str | None:
     )
 
 
+def vm_provisioning_message(vm: Any) -> str | None:
+    """Same safe startup/cleanup diagnostic for list and detail reads."""
+    if not isinstance(vm, dict):
+        return None
+    if (
+        vm.get("status") == "retiring_process_zero"
+        or vm.get("retirement_cleanup_pending") is True
+    ):
+        reason = (
+            "VM cleanup is waiting to verify that previous workspace processes have stopped. "
+            if vm.get("status") == "retiring_process_zero"
+            else "VM cleanup is waiting for the previous workspace release to finish. "
+        )
+        return reason + "The workspace disk is retained; cleanup retries automatically."
+    if not isinstance(vm.get("status"), str):
+        return None
+    return _vm_phase_attention_message(vm)
+
+
 def workspace_recovery_projection(job: Mapping[str, Any]) -> dict[str, Any] | None:
     """Return the coordinate-free public view of one unresolved recovery."""
 
@@ -164,6 +184,9 @@ def redact_job_config_override(
     recovery = workspace_recovery_projection(job)
     job.pop("_workspace_recovery", None)
     job["workspace_recovery"] = recovery
+    creation = vm_creation_projection(job)
+    job.pop("_vm_creation", None)
+    job["vm_creation"] = creation
     job = redact_nested_workspace_state(
         job, field="context", runtime_incarnation_key=runtime_incarnation_key
     )
@@ -180,26 +203,8 @@ def redact_job_config_override(
             job.get("status") in {"created", "paused"}
             and not job.get("error_message")
             and isinstance(vm, dict)
-            and (
-                vm.get("status") == "retiring_process_zero"
-                or vm.get("retirement_cleanup_pending") is True
-            )
         ):
-            reason = (
-                "VM cleanup is waiting to verify that previous workspace processes "
-                "have stopped. "
-                if vm.get("status") == "retiring_process_zero"
-                else "VM cleanup is waiting for the previous workspace release to finish. "
-            )
-            job["error_message"] = reason + (
-                "The workspace disk is retained; cleanup retries automatically."
-            )
-        if (
-            job.get("status") in {"created", "paused"}
-            and not job.get("error_message")
-            and isinstance(vm, dict)
-        ):
-            message = _vm_phase_attention_message(vm)
+            message = vm_provisioning_message(vm)
             if message:
                 job["error_message"] = message
         # The coordinate-free workspace_contract projection above is the
@@ -209,7 +214,10 @@ def redact_job_config_override(
         public_context = dict(context)
         for key in (
             "vm",
+            "last_vm",
+            "_vm_creation_pending",
             "workspace_container",
+            "last_workspace_container",
             WORKSPACE_CONTRACT_CONTEXT_KEY,
             WORKSPACE_DISPATCH_AUTHORITY_CONTEXT_KEY,
             WORKSPACE_RUNTIME_CONTEXT_KEY,
@@ -219,6 +227,13 @@ def redact_job_config_override(
         job["context"] = (
             json.dumps(public_context) if context_was_str else public_context
         )
+    if (
+        creation is not None
+        and job.get("status") in {"created", "paused", "failed"}
+        and not job.get("error_message")
+        and recovery is None
+    ):
+        job["error_message"] = creation["message"]
     co = job.get("config_override")
     if co is None:
         return job

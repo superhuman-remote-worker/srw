@@ -1004,6 +1004,43 @@ class JobControlOperations:
                     "job_id": job_id,
                 }
 
+            if (
+                getattr(self.dependencies.store, "supports_vm_creation_retry", False)
+                is True
+            ):
+                from orchestrator.services.vm_creation_resume import (
+                    resume_pending_creation,
+                )
+                from orchestrator.services.vm_creation_retry_store import (
+                    VMCreationRetryConflict,
+                )
+
+                try:
+                    creation = await resume_pending_creation(
+                        self.dependencies.store,
+                        job_id=job_id,
+                        feedback=request.feedback,
+                        feedback_reason=feedback_reason,
+                    )
+                except VMCreationRetryConflict as exc:
+                    raise HTTPException(
+                        status_code=409,
+                        detail={
+                            "code": exc.reason,
+                            "message": {
+                                "creation_request_unproven": "The original VM creation record could not be verified. This attempt needs operator inspection.",
+                                "vm_creation_retry_disabled": "VM creation retry is disabled on this deployment.",
+                                "job_admission_expired": "The original job deadline elapsed; Resume cannot extend it.",
+                            }.get(
+                                exc.reason,
+                                "VM creation cannot be resumed under its current workspace or execution authority.",
+                            ),
+                        },
+                    ) from exc
+                if creation is not None:
+                    self.dependencies.trigger_dispatch()
+                    return creation
+
             async def _queue_for_dispatch(
                 message: str,
                 *,

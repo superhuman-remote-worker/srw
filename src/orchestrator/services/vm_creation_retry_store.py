@@ -129,7 +129,11 @@ class VMCreationRetryStore:
 
     async def _current(self, conn, job, generation, *, retry=None):
         context = _json(job["context"]) or {}
+        if not isinstance(context, dict):
+            raise VMCreationRetryConflict("creation_request_unproven")
         vm = context.get("vm") or {}
+        if not isinstance(vm, dict):
+            raise VMCreationRetryConflict("creation_request_unproven")
         if vm.get("provision_generation") != str(generation):
             raise VMCreationRetryConflict("generation_changed")
         if job["status"] in {"completed", "cancelled"} or any(
@@ -280,6 +284,8 @@ class VMCreationRetryStore:
             hold_queue=not prior or prior["state"] != "succeeded",
         )
         context, vm, execution = await self._current(conn, job, generation, retry=prior)
+        if proposal.get("origin") == "resume":
+            await self._validate_resume_on_conn(conn, job, request_uuid)
         existing = _record(
             await conn.fetchrow(
                 "SELECT * FROM vm_creation_retries WHERE job_id=$1 AND provision_generation=$2 FOR UPDATE",
@@ -288,6 +294,8 @@ class VMCreationRetryStore:
             )
         )
         snapshot = vm.get("creation_request") or {}
+        if not isinstance(snapshot, dict):
+            raise VMCreationRetryConflict("creation_request_unproven")
         payload = snapshot.get("request")
         digest = proposal.get("request_digest")
         config_digest = proposal.get("controller_configuration_digest")
@@ -336,6 +344,8 @@ class VMCreationRetryStore:
                 raise VMCreationRetryConflict("creation_request_changed")
             if existing["state"] in {"cancel_requested", "settled"}:
                 raise VMCreationRetryConflict("job_cancelled")
+            if proposal.get("origin") == "resume" and existing["state"] == "succeeded":
+                raise VMCreationRetryConflict("creation_already_adopted")
             if existing["state"] == "attention":
                 existing = _record(
                     await conn.fetchrow(
@@ -376,6 +386,25 @@ class VMCreationRetryStore:
         )
         await self._resume_on_conn(conn, job, request_uuid)
         return _record(row)
+
+    async def _validate_resume_on_conn(self, conn, job, request_uuid):
+        """Recheck public Resume authority after the canonical scope/job wait."""
+        if (
+            job["status"] not in {"created", "paused", "failed"}
+            or job["assigned_agent_id"] is not None
+        ):
+            raise VMCreationRetryConflict("job_changed")
+        if (_json(job["context"]) or {}).get("_vm_creation_pending") != str(
+            request_uuid
+        ):
+            raise VMCreationRetryConflict("creation_request_unproven")
+        # A foreign owner's recovery may enroll this participant while _scope
+        # waits for its job row. Read after that wait before requeueing anything.
+        if await conn.fetchval(
+            "SELECT EXISTS(SELECT 1 FROM vm_workspace_recovery_jobs WHERE job_id=$1 AND resolved_at IS NULL)",
+            job["id"],
+        ):
+            raise VMCreationRetryConflict("workspace_recovery_held")
 
     async def _resume_on_conn(self, conn, job, request_uuid):
         queued = await self.db._queue_job_for_resume_on_conn(
@@ -577,15 +606,27 @@ class VMCreationRetryStore:
                     if attention
                     else "queued"
                 )
+                reason = {
+                    "transport_unknown": "controller_unavailable",
+                    "capacity_wait": "capacity_wait",
+                    "dependency_wait": "creation_dependency_pending",
+                    "observation_wait": "creation_observation_pending",
+                    "blocked": "vm_creation_retry_blocked",
+                }[outcome]
+                if outcome == "dependency_wait" and observation.get("reason") in (
+                    "golden_wait",
+                    "preparation_wait",
+                    "headscale_wait",
+                    "disk_wait",
+                ):
+                    reason = observation["reason"]
                 await conn.execute(
                     "UPDATE vm_creation_retries SET state=$2,revision=revision+1,claim_token=NULL,claim_expires_at=NULL,backoff_attempt=$3,transport_outage_started_at=$4,reason=$5,next_probe_at=clock_timestamp()+$6*interval '1 second',updated_at=clock_timestamp() WHERE request_id=$1",
                     row["request_id"],
                     state,
                     attempt,
                     outage,
-                    "vm_creation_retry_blocked"
-                    if attention
-                    else "vm_creation_retry_pending",
+                    reason,
                     retry_delay_seconds(attempt, random.uniform(0, 0.2)),
                 )
                 return True

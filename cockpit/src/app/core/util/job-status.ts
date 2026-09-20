@@ -72,6 +72,7 @@ export interface JobOutcomeView {
     status?: string | null;
     completion_outcome_kind?: string | null;
     workspace_recovery?: {state?: string | null} | null;
+    vm_creation?: {resumable?: boolean} | null;
 }
 
 /** Presentation status for a job whose storage status stays rolling-safe. */
@@ -88,6 +89,12 @@ export function effectiveJobStatus(job: JobOutcomeView | null | undefined): stri
 
 /** A blocked/undelivered terminal outcome is intentionally not resumable. */
 export function canResumeJob(job: JobOutcomeView | null | undefined): boolean {
+    if (job?.vm_creation) {
+        return job.completion_outcome_kind !== 'blocked_undelivered'
+            && !job.workspace_recovery
+            && job.vm_creation.resumable === true
+            && ['created', 'paused', 'failed'].includes(job.status ?? '');
+    }
     return job?.completion_outcome_kind !== 'blocked_undelivered'
         && canResumeJobStatus(job?.status);
 }

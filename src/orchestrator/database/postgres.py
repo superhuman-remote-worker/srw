@@ -3714,7 +3714,20 @@ class PostgresDB:
                        page.id AS display_root_id,
                        (page.id = j.id) AS is_display_root,
                        COALESCE(sc.n, 0) AS subjob_count,
-                       wr.workspace_recovery AS _workspace_recovery
+                       wr.workspace_recovery AS _workspace_recovery,
+                       (SELECT jsonb_build_object(
+                            'request_id', c.request_id, 'stage', 'creation',
+                            'state', c.state, 'reason', c.reason,
+                            'admission_deadline', c.admission_deadline,
+                            'ready_at', c.ready_at,
+                            'pending', COALESCE(j.context->>'_vm_creation_pending'=c.request_id::text, false),
+                            'resume_blocked', COALESCE(j.context ?| ARRAY[
+                                '_completion_control_claim','_stateless_delete_pending','_stateless_cancel_cleanup_pending'], false)
+                                OR COALESCE(j.context->'vm'->>'retirement_cleanup_pending'='true', false)
+                                OR COALESCE(j.context->'vm'->>'status' IN ('retiring_process_zero','deleting','deleted','delete_failed'), false)
+                        ) FROM vm_creation_retries c WHERE c.job_id=j.id
+                            AND c.provision_generation::text=j.context->'vm'->>'provision_generation'
+                       ) AS _vm_creation
                 FROM page
                 JOIN jobs j
                   ON j.id = page.id
@@ -3778,11 +3791,21 @@ class PostgresDB:
                     total_is_capped = True
 
         rows = [dict(row) for row in fetched]
+        from orchestrator.services.vm_creation_progress import preflight_creation_progress
+        from orchestrator.services.job_projection import vm_provisioning_message
+
         for row in rows:
+            workspace_context = row.pop("_workspace_context", None)
+            if not row.get("_vm_creation"):
+                row["_vm_creation"] = preflight_creation_progress(workspace_context)
+            if row.get("status") in {"created", "paused"} and not row.get("error_message"):
+                row["error_message"] = vm_provisioning_message(
+                    _json_object_or_empty(workspace_context).get("vm")
+                )
             row["workspace_contract"] = workspace_contract_projection(
                 {
                     "config_override": row.pop("_workspace_config_override", None),
-                    "context": row.pop("_workspace_context", None),
+                    "context": workspace_context,
                 },
                 vm_mode=vm_mode_from_env(),
             )
@@ -3852,7 +3875,20 @@ class PostgresDB:
                        j.created_by_thread_id, j.wake_on_complete,
                        j.created_at, j.updated_at, j.description, j.context,
                        (p.main_cloud_folder_handle IS NOT NULL) AS project_has_cloud_folder,
-                       wr.workspace_recovery AS _workspace_recovery
+                       wr.workspace_recovery AS _workspace_recovery,
+                       (SELECT jsonb_build_object(
+                            'request_id', c.request_id, 'stage', 'creation',
+                            'state', c.state, 'reason', c.reason,
+                            'admission_deadline', c.admission_deadline,
+                            'ready_at', c.ready_at,
+                            'pending', COALESCE(j.context->>'_vm_creation_pending'=c.request_id::text, false),
+                            'resume_blocked', COALESCE(j.context ?| ARRAY[
+                                '_completion_control_claim','_stateless_delete_pending','_stateless_cancel_cleanup_pending'], false)
+                                OR COALESCE(j.context->'vm'->>'retirement_cleanup_pending'='true', false)
+                                OR COALESCE(j.context->'vm'->>'status' IN ('retiring_process_zero','deleting','deleted','delete_failed'), false)
+                        ) FROM vm_creation_retries c WHERE c.job_id=j.id
+                            AND c.provision_generation::text=j.context->'vm'->>'provision_generation'
+                       ) AS _vm_creation
                 FROM jobs j
                 LEFT JOIN projects p ON p.id = j.project_id
                 LEFT JOIN srw_execution_specs execution
@@ -10345,7 +10381,8 @@ class PostgresDB:
             "        ELSE COALESCE(context, '{}'::jsonb) "
             "    END, "
             "    updated_at = CURRENT_TIMESTAMP "
-            "WHERE id = $1"
+            "WHERE id = $1 "
+            "AND ($2::text <> 'vm' OR NOT (COALESCE(context, '{}'::jsonb) ? '_vm_creation_pending'))"
         )
         async with self.acquire() as conn:
             result = await conn.execute(query, uuid_val, key)
@@ -29742,6 +29779,7 @@ class PostgresDB:
                          WHERE id = $1
                            AND execution_lane = 'stateless'
                            AND status = $3
+                           AND ($2::text <> 'vm' OR NOT (COALESCE(context, '{}'::jsonb) ? '_vm_creation_pending'))
                         RETURNING id
                         """,
                         job_uuid,
@@ -29820,6 +29858,7 @@ class PostgresDB:
                         WHERE id=$1::uuid
                           AND execution_lane='pinned'
                           AND status::text=$3::text
+                          AND ($2::text <> 'vm' OR NOT (COALESCE(context, '{{}}'::jsonb) ? '_vm_creation_pending'))
                           AND ({_completion_control_owned_active_sql("context", "$4")})
                         RETURNING id
                         """,

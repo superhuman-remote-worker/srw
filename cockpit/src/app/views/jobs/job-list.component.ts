@@ -344,8 +344,16 @@ export function jobCloudAction(job: JobSummary): JobCloudAction {
                       >
                         {{ row.job.workspace_recovery.message }}
                       </div>
+                    } @else if (row.job.vm_creation) {
+                      <div
+                        class="workspace-recovery vm-creation"
+                        [class.attention]="row.job.vm_creation.state === 'attention'"
+                        [style.padding-left.px]="row.isChild ? 16 : 0"
+                      >
+                        {{ row.job.error_message || row.job.vm_creation.message }}
+                      </div>
                     }
-                    @if (row.job.status === 'failed' && row.job.error_message) {
+                    @if (row.job.status === 'failed' && row.job.error_message && !row.job.vm_creation) {
                       <div class="job-error" [style.padding-left.px]="row.isChild ? 16 : 0" [title]="row.job.error_message">
                         {{ 'jobs.failureReason' | transloco }}: {{ row.job.error_message }}
                       </div>
@@ -431,7 +439,7 @@ export function jobCloudAction(job: JobSummary): JobCloudAction {
                         >
                           {{ 'jobs.action.retryRecovery' | transloco }}
                         </app-button>
-                      } @else if (!row.job.workspace_recovery && !isBlockedUndelivered(row.job) && (row.job.status === 'failed' || row.job.status === 'cancelled' || row.job.status === 'paused' || row.job.status === 'created')) {
+                      } @else if (!row.job.workspace_recovery && (!row.job.vm_creation || row.job.vm_creation.resumable) && !isBlockedUndelivered(row.job) && (row.job.status === 'failed' || row.job.status === 'cancelled' || row.job.status === 'paused' || row.job.status === 'created')) {
                         <app-button
                           variant="success"
                           size="sm"
@@ -461,7 +469,7 @@ export function jobCloudAction(job: JobSummary): JobCloudAction {
                         <app-menu-item (activated)="retryWorkspaceRecovery(row.job)">{{ 'jobs.action.retryRecovery' | transloco }}</app-menu-item>
                       } @else if (row.job.status === 'processing') {
                         <app-menu-item (activated)="pauseJob(row.job.id)">{{ 'jobs.action.pause' | transloco }}</app-menu-item>
-                      } @else if (!row.job.workspace_recovery && !isBlockedUndelivered(row.job) && (row.job.status === 'failed' || row.job.status === 'cancelled' || row.job.status === 'paused' || row.job.status === 'created')) {
+                      } @else if (!row.job.workspace_recovery && (!row.job.vm_creation || row.job.vm_creation.resumable) && !isBlockedUndelivered(row.job) && (row.job.status === 'failed' || row.job.status === 'cancelled' || row.job.status === 'paused' || row.job.status === 'created')) {
                         <app-menu-item (activated)="resumeJob(row.job.id)">{{ 'jobs.action.resume' | transloco }}</app-menu-item>
                       }
                       @if (getWorkspaceUrl(row.job)) {
@@ -2025,6 +2033,8 @@ export class JobListComponent implements OnInit, OnDestroy {
   }
 
   resumeJob(jobId: string): void {
+    const job = this.jobs().find(row => row.id === jobId);
+    if (job?.vm_creation && !job.vm_creation.resumable) return;
     this.api.resumeJob(jobId).subscribe((result) => {
       if (result) {
         this.refresh();

@@ -137,6 +137,22 @@ describe('JobListComponent — server-resolved tree', () => {
     expect(en.jobs.status.blocked_undelivered).toBe('Blocked / undelivered');
   });
 
+  it('does not send stale Resume after creation advice becomes non-resumable', () => {
+    const {fixture, component, api} = mountLogic();
+    fixture.detectChanges();
+    component.jobs.set([job('creation-job', {
+      status: 'paused', vm_creation: {
+        request_id: 'creation-id', state: 'reconciling', stage: 'creation',
+        reason_code: 'capacity_wait', message: 'Waiting for VM capacity.', resumable: false,
+      },
+    }) as JobSummary]);
+    component.resumeJob('creation-job');
+    expect(api.resumeJob).not.toHaveBeenCalled();
+    component.jobs.update(rows => rows.map(row => ({...row, vm_creation: {...row.vm_creation!, resumable: true}})));
+    component.resumeJob('creation-job');
+    expect(api.resumeJob).toHaveBeenCalledWith('creation-job');
+  });
+
   it('routes paused workspace recovery through Retry and keeps Cancel available', () => {
     const retryWorkspaceRecovery = vi
       .fn()

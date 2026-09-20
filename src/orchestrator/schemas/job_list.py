@@ -27,6 +27,17 @@ class WorkspaceRecoveryView(BaseModel):
     cleanup_pending: bool
 
 
+class VMCreationView(BaseModel):
+    """Bounded provisioning progress; Resume advice is not execution authority."""
+
+    request_id: UUID
+    state: str
+    stage: str
+    reason_code: str
+    message: str
+    resumable: bool
+
+
 class PublicJobListItem(BaseModel):
     """Current list-row projection; additional public fields remain compatible."""
 
@@ -66,6 +77,9 @@ class PublicJobListItem(BaseModel):
     )
     workspace_recovery: WorkspaceRecoveryView | None = Field(
         description="Safe unresolved VM workspace recovery state; no controller coordinates or diagnostics."
+    )
+    vm_creation: VMCreationView | None = Field(
+        description="Safe VM creation progress and advisory Resume availability."
     )
     audit_count: int | None = Field(
         description="Null when the optional audit service is unavailable; zero when available with no entries."

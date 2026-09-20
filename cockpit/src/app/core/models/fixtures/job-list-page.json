@@ -32,6 +32,7 @@
         "state": "waiting"
       },
       "workspace_recovery": null,
+      "vm_creation": null,
       "audit_count": null,
       "cloud_review_mode": "open_folder",
       "exported_folder_url": null
@@ -68,6 +69,7 @@
         "state": "waiting"
       },
       "workspace_recovery": null,
+      "vm_creation": null,
       "audit_count": null,
       "cloud_review_mode": "open_folder",
       "exported_folder_url": null

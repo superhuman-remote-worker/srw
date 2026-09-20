@@ -319,6 +319,10 @@ export function subjobBlockedKey(
             <span>{{ 'jobs.recovery.cleanupPending' | transloco }}</span>
           }
         </section>
+      } @else if (job().vm_creation; as creation) {
+        <section class="recovery-detail vm-creation" [class.attention]="creation.state === 'attention'">
+          <strong>{{ job().error_message || creation.message }}</strong>
+        </section>
       }
 
       @if (data()?.loading || (scope() === 'subtree' && data()?.loadingSubtree)) {

@@ -2200,6 +2200,15 @@ export interface WorkspaceRecoveryView {
   cleanup_pending: boolean;
 }
 
+export interface VMCreationView {
+  request_id: string;
+  state: string;
+  stage: 'configuration' | 'creation' | 'readiness';
+  reason_code: string;
+  message: string;
+  resumable: boolean;
+}
+
 export interface Job {
   id: string;
   description: string;
@@ -2278,6 +2287,7 @@ export interface Job {
   workspace_contract?: WorkspaceContractProjection;
   /** Safe recovery state; controller coordinates and raw diagnostics are never included. */
   workspace_recovery?: WorkspaceRecoveryView | null;
+  vm_creation?: VMCreationView | null;
 }
 
 /**
