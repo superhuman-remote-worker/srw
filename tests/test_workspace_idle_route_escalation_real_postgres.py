@@ -91,6 +91,39 @@ async def test_sla_two_replicas_publish_one_episode(db):
 
 
 @pytest.mark.asyncio
+async def test_sla_skips_locked_job_prefix_before_consuming_batch_limit(db):
+    seeded_routes = []
+    for index in range(3):
+        seed, _ = await seeded(db)
+        _, route = await publish(db, seed, state="pending_officer")
+        await db.execute(
+            "UPDATE job_message_routes SET officer_deadline=clock_timestamp()"
+            "-make_interval(mins=>$2) WHERE route_id=$1",
+            UUID(route["route_id"]),
+            10 - index,
+        )
+        seeded_routes.append((seed, route))
+    async with db.acquire() as blocker:
+        async with blocker.transaction():
+            await blocker.fetch(
+                "SELECT id FROM jobs WHERE id=ANY($1::uuid[]) ORDER BY id FOR UPDATE",
+                [UUID(seed["job_id"]) for seed, _ in seeded_routes[:2]],
+            )
+            claimed = await db.claim_officer_sla_escalations(limit=2)
+            assert [row["route_id"] for row in claimed] == [
+                seeded_routes[2][1]["route_id"]
+            ]
+            assert await db.claim_officer_sla_escalations(limit=2) == []
+            for seed, _ in seeded_routes[:2]:
+                assert await episode(db, seed["job_id"]) == (0, None)
+    remaining = await db.claim_officer_sla_escalations(limit=2)
+    assert len(remaining) == 2
+    for seed, route in seeded_routes:
+        revision, stored = await episode(db, seed["job_id"])
+        assert revision == 1 and stored["wait_key"] == route["route_id"]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("changed", ["question", "nonblocking", "terminal"])
 async def test_historical_route_settles_without_entering_current_idle(db, changed):
     seed, _ = await seeded(db)

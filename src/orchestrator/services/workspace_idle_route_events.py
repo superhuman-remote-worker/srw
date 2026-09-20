@@ -67,24 +67,27 @@ async def claim_human_route_sla(db, *, now, limit):
     """Bounded nominations; each accepted Job -> route CAS owns one episode."""
     if type(limit) is not int or not 1 <= limit <= 100:
         raise ValueError("route SLA limit must be between 1 and 100")
-    async with db.acquire() as conn:
-        candidates = await conn.fetch(
-            "SELECT route_id,job_id,project_id FROM job_message_routes "
-            "WHERE state='pending_officer' AND blocking AND officer_deadline <= $1 "
-            "ORDER BY officer_deadline,route_id LIMIT $2",
-            now,
-            limit,
-        )
     accepted = []
-    for candidate in candidates:
+    seen = []
+    for _ in range(limit):
         async with db.acquire() as conn:
             async with conn.transaction():
-                job = await conn.fetchrow(
-                    "SELECT id,project_id FROM jobs WHERE id=$1 FOR UPDATE SKIP LOCKED",
-                    candidate["job_id"],
+                # Skip locked and scope-ineligible Jobs before consuming the
+                # limit, so a busy prefix cannot starve unrelated questions.
+                # Lock only this one Job; no route lock or multi-Job lock set.
+                candidate = await conn.fetchrow(
+                    "SELECT r.route_id,r.job_id,r.project_id FROM job_message_routes r "
+                    "JOIN jobs j ON j.id=r.job_id AND j.project_id=r.project_id "
+                    "WHERE r.state='pending_officer' AND r.blocking "
+                    "AND r.officer_deadline <= $1 AND NOT(r.route_id=ANY($2::uuid[])) "
+                    "ORDER BY r.officer_deadline,r.route_id LIMIT 1 "
+                    "FOR UPDATE OF j SKIP LOCKED",
+                    now,
+                    seen,
                 )
-                if job is None or job["project_id"] != candidate["project_id"]:
-                    continue
+                if candidate is None:
+                    break
+                seen.append(candidate["route_id"])
                 # Recheck the complete nomination after Job acquisition. A
                 # reply may have settled the route while we waited for locks.
                 row = await conn.fetchrow(
