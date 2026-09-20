@@ -23,6 +23,10 @@ setup = _setup_fixture
 db = _db_fixture
 
 
+def consumer_metadata(name):
+    return {"name": name, "namespace": settings.VM_NAMESPACE, "uid": str(uuid4())}
+
+
 async def runtime(db, setup, monkeypatch):
     ctrl, api, _, _ = setup
     monkeypatch.setattr(settings, "LIFECYCLE_HMAC_SECRET", SECRET)
@@ -191,7 +195,7 @@ async def test_live_consumer_including_terminating_pod_holds_disposition(
         spec = {"template": {"spec": spec}}
     api.objects[kind, "foreign-consumer"] = {
         "metadata": {
-            "name": "foreign-consumer",
+            **consumer_metadata("foreign-consumer"),
             "deletionTimestamp": "2026-09-20T00:00:00Z",
         },
         "spec": spec,
@@ -226,10 +230,13 @@ async def test_restarted_child_carrier_cannot_bypass_consumer_fence(
         },
     )
     api.objects["Pod", "late-consumer"] = {
-        "metadata": {"name": "late-consumer"},
+        "metadata": consumer_metadata("late-consumer"),
         "spec": {
             "volumes": [
-                {"persistentVolumeClaim": {"claimName": grant["resource"]["name"]}}
+                {
+                    "name": "root",
+                    "persistentVolumeClaim": {"claimName": grant["resource"]["name"]},
+                }
             ]
         },
     }
@@ -317,9 +324,14 @@ async def test_pvc_consumer_after_dv_delete_prevents_pvc_delete(db, setup, monke
     def delete_dv(**kwargs):
         result = delete(**kwargs)
         api.objects["Pod", "late-pvc-consumer"] = {
-            "metadata": {"name": "late-pvc-consumer"},
+            "metadata": consumer_metadata("late-pvc-consumer"),
             "spec": {
-                "volumes": [{"persistentVolumeClaim": {"claimName": kwargs["name"]}}]
+                "volumes": [
+                    {
+                        "name": "root",
+                        "persistentVolumeClaim": {"claimName": kwargs["name"]},
+                    }
+                ]
             },
         }
         return result
@@ -335,7 +347,7 @@ async def test_secret_only_consumer_also_prevents_disk_disposition(
 ):
     ctrl, api, _, row, _ = await runtime(db, setup, monkeypatch)
     api.objects["Pod", "secret-consumer"] = {
-        "metadata": {"name": "secret-consumer"},
+        "metadata": consumer_metadata("secret-consumer"),
         "spec": {
             "containers": [
                 {
@@ -358,6 +370,7 @@ async def test_secret_only_consumer_also_prevents_disk_disposition(
         {},
         {"items": [], "metadata": {"continue": "next"}},
         {"items": [], "metadata": {"resourceVersion": "1", "remainingItemCount": 1}},
+        {"items": [{}], "metadata": {"resourceVersion": "1"}},
     ],
 )
 async def test_incomplete_consumer_list_cannot_prove_absence(
@@ -522,3 +535,67 @@ async def test_disposition_carrier_is_unreadable_to_legacy_cleanup_parser(
             api.objects["Lease", child["carrier_name"]]
         )
     assert api.deletes == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["VirtualMachine", "VirtualMachineInstance"])
+@pytest.mark.parametrize("source", ["ephemeral", "memoryDump"])
+async def test_nested_pvc_consumer_prevents_every_disposition_effect(
+    db, setup, monkeypatch, kind, source
+):
+    ctrl, api, _, row, _ = await runtime(db, setup, monkeypatch)
+    root = f"agent-vm-{row['job_id']}-rootdisk"
+    reference = {"claimName": root}
+    if source == "ephemeral":
+        reference = {"persistentVolumeClaim": reference}
+    spec = {
+        "domain": {
+            "resources": {"requests": {"memory": "64M"}},
+            "devices": {"disks": [{"name": "dependent", "disk": {"bus": "virtio"}}]},
+        },
+        "volumes": [{"name": "dependent", source: reference}],
+    }
+    if kind == "VirtualMachine":
+        spec = {"runStrategy": "Halted", "template": {"spec": spec}}
+    api.objects[kind, "foreign-consumer"] = {
+        "apiVersion": "kubevirt.io/v1",
+        "kind": kind,
+        "metadata": {
+            "name": "foreign-consumer",
+            "namespace": settings.VM_NAMESPACE,
+            "uid": str(uuid4()),
+        },
+        "spec": spec,
+    }
+    await CreationDisposer(ctrl).run(disposition_identity(row))
+    assert api.deletes == []
+    assert "authorize_disposition" not in api.calls
+
+
+@pytest.mark.asyncio
+async def test_nested_consumer_after_dv_delete_prevents_pvc_delete(
+    db, setup, monkeypatch
+):
+    ctrl, api, _, row, _ = await runtime(db, setup, monkeypatch)
+    delete = ctrl.k8s_client.delete_namespaced_custom_object
+
+    def delete_dv(**kwargs):
+        result = delete(**kwargs)
+        api.objects["VirtualMachineInstance", "late-nested-consumer"] = {
+            "metadata": consumer_metadata("late-nested-consumer"),
+            "spec": {
+                "volumes": [
+                    {
+                        "name": "root",
+                        "ephemeral": {
+                            "persistentVolumeClaim": {"claimName": kwargs["name"]}
+                        },
+                    }
+                ]
+            },
+        }
+        return result
+
+    ctrl.k8s_client.delete_namespaced_custom_object = delete_dv
+    await CreationDisposer(ctrl).run(disposition_identity(row))
+    assert [value[0] for value in api.deletes] == ["Secret", "DataVolume"]

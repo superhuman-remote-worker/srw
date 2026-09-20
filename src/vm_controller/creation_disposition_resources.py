@@ -30,6 +30,66 @@ def _secret_reference(value, name):
     return False
 
 
+def _root_reference(value, name):
+    """PVCs may be nested (ephemeral), inlined (memoryDump), or pending hotplug."""
+    if isinstance(value, Mapping):
+        if value.get("claimName") == name or (
+            value.get("kind") == "PersistentVolumeClaim" and value.get("name") == name
+        ):
+            return True
+        for key, child in value.items():
+            if (
+                key in {"dataVolume", "pvc"}
+                and isinstance(child, Mapping)
+                and child.get("name") == name
+            ) or _root_reference(child, name):
+                return True
+    elif isinstance(value, list):
+        return any(_root_reference(child, name) for child in value)
+    return False
+
+
+def _consumer_spec(item, kind, namespace):
+    if not isinstance(item, Mapping):
+        raise CreationUnproven("creation_consumers_unproven")
+    metadata, spec = item.get("metadata"), item.get("spec")
+    if (
+        not isinstance(metadata, Mapping)
+        or any(
+            not isinstance(metadata.get(key), str) or not metadata[key]
+            for key in ("name", "namespace", "uid")
+        )
+        or metadata["namespace"] != namespace
+        or not isinstance(spec, Mapping)
+        or metadata.get("labels") is not None
+        and not isinstance(metadata["labels"], Mapping)
+    ):
+        raise CreationUnproven("creation_consumers_unproven")
+    if kind == "virtualmachines":
+        template = spec.get("template")
+        if not isinstance(template, Mapping) or not isinstance(
+            template.get("spec"), Mapping
+        ):
+            raise CreationUnproven("creation_consumers_unproven")
+        spec = template["spec"]
+    volumes = spec.get("volumes")
+    if volumes is not None and (
+        not isinstance(volumes, list)
+        or any(
+            not isinstance(volume, Mapping)
+            or not isinstance(volume.get("name"), str)
+            or not volume["name"]
+            or any(
+                key != "name" and value is not None and not isinstance(value, Mapping)
+                for key, value in volume.items()
+            )
+            for volume in volumes
+        )
+    ):
+        raise CreationUnproven("creation_consumers_unproven")
+    return metadata
+
+
 def _items(value):
     value = document(value)
     if not isinstance(value, dict) or not isinstance(value.get("items"), list):
@@ -69,23 +129,20 @@ async def require_no_consumers(actuator, disposition):
     )
     documents.extend(("pods", item) for item in _items(result))
     for kind, item in documents:
-        metadata, spec = item.get("metadata", {}), item.get("spec", {})
+        metadata = _consumer_spec(item, kind, actuator.namespace)
         if (
             metadata.get("name") == job_name
             or (metadata.get("labels") or {}).get("vm.kubevirt.io/name") == job_name
         ):
             raise CreationUnproven("creation_resource_in_use")
-        if kind == "virtualmachines":
-            spec = spec.get("template", {}).get("spec", {})
+        # Scan the complete object, including pending hotplug requests/status,
+        # instead of only direct spec.volumes entries. Unknown member envelopes
+        # cannot turn a successful LIST into evidence of no consumers.
         if (
             root
-            and any(
-                volume.get("dataVolume", {}).get("name") == root
-                or volume.get("persistentVolumeClaim", {}).get("claimName") == root
-                for volume in spec.get("volumes", []) or []
-            )
+            and _root_reference(item, root)
             or secret
-            and _secret_reference(spec, secret)
+            and _secret_reference(item, secret)
         ):
             raise CreationUnproven("creation_resource_in_use")
 
