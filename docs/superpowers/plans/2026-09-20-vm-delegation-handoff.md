@@ -24,6 +24,20 @@ effort or previously paused agents automatically.
 
 ## Remaining roadmap
 
+### Login outage resolved after publication — 2026-09-20
+
+Gitea's 8Gi PVC filled (20KiB free), preventing its notification queue from
+opening. Both orchestrator replicas were blocked in `wait-for-gitea`; the public
+API returned 502 and direct ingress returned 503. The healthy Longhorn volume was
+expanded in place to 32Gi, preserving its identity and all repository data. The
+HomeLab environment override and incident record were pushed as `3d50cb7`:
+`deployments_managed/srw-config/{srw_values_configmap.yaml,README.md}`.
+At approximately 18:58 UTC, Gitea and both orchestrator replicas were Ready;
+the exact public login URL returned 302 followed by the sign-in page with 200.
+Authenticated session completion and VM job execution remain unverified.
+Follow-ups: storage alerts, repository growth/retention and removing Gitea as a
+hard startup dependency for otherwise usable login/diagnostic endpoints.
+
 | Area | Published | Remaining |
 | --- | --- | --- |
 | A1 creation retry | Frozen intent, per-effect grants, retained sources/attachment, cancellation discovery/partial disposal, guarded Resume and progress | Final durable cancellation receipts, attachment settlement and terminal transaction (0269 draft); capability and live sentinel/worker acceptance |
