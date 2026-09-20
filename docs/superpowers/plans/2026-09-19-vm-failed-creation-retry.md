@@ -23,17 +23,25 @@ reviewed configuration, per-effect issuance, golden/prepared sources and exact
 adoption; new/same-owner, inherited and prepared-target attachment now also passed
 review (`90eb9f1bc` includes inherited prepared reuse). Immutable partial-creation
 cancellation disposition and pre-grant source-hold protection (`67e56398e`,
-migration 0266) passed independent review and 94 distinct local checks. Controller
-disposition, source/attachment settlement and its typed completion writer remain.
-Controller capability remains absent and admission defaults off. Task 6 live
-acceptance is open. A2 and A3 code/review are complete locally; their live gates
-remain open. B, C and D have their own remaining work and gates.
+migration 0266) passed independent review and 94 distinct local checks. Authenticated
+controller disposition discovery now enters that frozen cancellation record through
+`a15dd4c69`; it is observation-only and grants neither deletion nor completion.
+Fixed-UID disk/Secret/source/attachment settlement and the typed completion writer
+remain. Controller capability remains absent and admission defaults off. Task 6
+live acceptance is open. A2 and A3 code/review are complete locally; their live
+gates remain open. B, C and D have their own remaining work and gates.
 
 Task 5 evidence: 107 actual-PostgreSQL tests, 86 projection/compatibility tests,
 124 focused frontend tests, production AOT build and independent reviews passed.
 A production-bundle Chromium fixture at 1440, 768 and 390 pixels verified bounded
 messages, eligible-only Resume, mobile menus, keyboard activation and zero page
 overflow; no browser exceptions. These are local results, not VM execution proof.
+
+The dedicated local-path k3d recovery run remains **0/7** at frozen image checkpoint
+`e872154b5`: it demonstrated a conservative identity-conflict pause with disk
+protection, not successful recovery. That image predates `a15dd4c69` and the other
+2026-09-20 checkpoints. No current-branch VM execution, worker execution or Longhorn
+acceptance follows from that run.
 
 ## Global Constraints
 
