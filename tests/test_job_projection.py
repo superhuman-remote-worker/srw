@@ -116,6 +116,14 @@ def test_query_failure_is_visible_even_with_an_expired_previous_boot_clock():
     assert "attention" in result["error_message"].lower()
 
 
+def test_ready_identity_conflict_is_visible_after_initialization_completed():
+    result = redact({"status": "created", "context": {"vm": {
+        "status": "ready", "initialization_started_at": 100,
+        "provisioning_attention_reason": "vm_phase_identity_conflict",
+    }}})
+    assert "attention" in result["error_message"].lower()
+
+
 def test_pending_delete_admission_remains_visible_after_delete_acceptance():
     result = redact(
         {

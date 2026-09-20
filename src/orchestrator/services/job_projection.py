@@ -85,7 +85,7 @@ def _vm_phase_attention_message(vm: Mapping[str, Any]) -> str | None:
         "ready",
     }:
         return None
-    if vm.get("initialization_started_at") is not None:
+    if vm.get("initialization_started_at") is not None and vm.get("status") != "ready":
         return None
     decision = vm_phase_decision(
         vm,
