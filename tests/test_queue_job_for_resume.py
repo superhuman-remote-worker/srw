@@ -85,6 +85,8 @@ async def db(pg_dsn):
                 repo_name text,
                 context jsonb,
                 freeze_data jsonb,
+                workspace_idle_revision bigint NOT NULL DEFAULT 0,
+                workspace_idle_episode jsonb,
                 created_at timestamptz DEFAULT now(),
                 updated_at timestamptz DEFAULT now()
             )

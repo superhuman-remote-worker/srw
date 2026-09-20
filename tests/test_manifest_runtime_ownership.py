@@ -202,6 +202,9 @@ async def runtime_db(pg_url):
         CREATE TABLE IF NOT EXISTS jobs(
             id uuid PRIMARY KEY, project_id uuid, user_id uuid, status text,
             execution_lane text DEFAULT 'pinned', assigned_agent_id uuid,
+            parent_job_id uuid, resolved_config jsonb,
+            workspace_idle_revision bigint NOT NULL DEFAULT 0,
+            workspace_idle_episode jsonb,
             lease_expires_at timestamptz, updated_at timestamptz DEFAULT now(),
             context jsonb DEFAULT '{}', freeze_data jsonb, priority integer DEFAULT 0,
             config_override jsonb DEFAULT '{"workspace":{"backend":"none"}}',

@@ -912,6 +912,7 @@ async def test_actual_create_json_keeps_row_nulls_extensions_and_serialization(
         "workspace_contract": {"state": "unassigned"},
         "existing_extension": {"nullable": None},
         "workspace_recovery": None,
+        "vm_creation": None,
     }
     wire.db.create_job.assert_awaited_once()
     wire.provision.assert_awaited_once()
