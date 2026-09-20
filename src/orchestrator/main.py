@@ -175,6 +175,7 @@ from orchestrator.routers import voice as voice_routes  # noqa: E402
 from orchestrator.routers import system_settings as system_settings_routes  # noqa: E402
 from orchestrator.routers import (  # noqa: E402
     vm_workspace_cleanup_authority as vm_workspace_cleanup_authority_routes,
+    vm_creation_retry_authority as vm_creation_retry_authority_routes,
 )
 from orchestrator.routers import capacity as capacity_routes  # noqa: E402
 from orchestrator.routers import (  # noqa: E402
@@ -223,7 +224,8 @@ from orchestrator.services import (  # noqa: E402
 from orchestrator.services.vm_workspace_recovery_store import (  # noqa: E402
     VMWorkspaceRecoveryStore,
 )
-from orchestrator.services.vm_provisioning_cleanup import recycle_provisioning_vm  # noqa: E402
+from orchestrator.services.vm_creation_retry_store import VMCreationRetryStore  # noqa: E402
+from orchestrator.services.vm_provisioning_cleanup import handle_provisioning_wait  # noqa: E402
 from orchestrator.services.vm_workspace_recovery import (  # noqa: E402
     VMWorkspaceRecoveryService,
 )
@@ -723,8 +725,7 @@ from orchestrator.services.dispatch_guards import (  # noqa: E402
     VM_PARK_HEADSCALE,
     VM_PARKED,
     VM_PROVISION,
-    VM_RECYCLE,
-    VM_WAIT,
+    VM_READY,
     preemption_blocked_reason,
     resume_lane_applies,
     vm_provisioning_decision,
@@ -3701,7 +3702,6 @@ async def _try_dispatch_pending_jobs() -> None:
                         )
                         continue
                     vm_ctx = _get_vm_context(job)
-                    vm_status = vm_ctx.get("status")
                     # Bounded provisioning retries. A VM that never reaches 'ready'
                     # (real infra failure) must park after N attempts instead of
                     # re-provisioning forever against the shared VM cluster. The
@@ -3714,6 +3714,9 @@ async def _try_dispatch_pending_jobs() -> None:
                         os.environ.get("VM_PROVISION_MAX_ATTEMPTS", "3")
                     )
                     timeout_s = int(os.environ.get("VM_PROVISION_TIMEOUT_S", "600"))
+                    rootdisk_stall_timeout_s = int(
+                        os.environ.get("VM_ROOTDISK_STALL_TIMEOUT_S", "2700")
+                    )
                     golden_timeout_s = int(
                         os.environ.get("VM_GOLDEN_WAIT_TIMEOUT_S", "2700")
                     )
@@ -3729,6 +3732,7 @@ async def _try_dispatch_pending_jobs() -> None:
                         max_provision_attempts=max_provision_attempts,
                         now=time.time(),
                         timeout_s=timeout_s,
+                        rootdisk_stall_timeout_s=rootdisk_stall_timeout_s,
                         golden_timeout_s=golden_timeout_s,
                         capacity_timeout_s=capacity_timeout_s,
                         headscale_timeout_s=headscale_timeout_s,
@@ -4027,31 +4031,15 @@ async def _try_dispatch_pending_jobs() -> None:
                         )
                         await _fail_vm_parked_job(job_id, park_error)
                         continue
-                    if vm_decision == VM_RECYCLE:
-                        # Stuck short of 'ready' past the budget — tear it down so
-                        # the next tick re-provisions (VM_PROVISION) or parks
-                        # (VM_PARK_EXHAUSTED). With the reconciler now handing off
-                        # provisioning VMs (is_reapable=False for dispatchable jobs)
-                        # nothing else would time it out.
-                        logger.warning(
-                            "Dispatcher: job %s VM stuck in '%s' — checking "
-                            "cleanup for provision attempt %d/%d",
-                            job_id,
-                            vm_status,
-                            provision_attempts,
-                            max_provision_attempts,
-                        )
-                        await recycle_provisioning_vm(
-                            job_id,
-                            vm_ctx,
-                            db=postgres_db,
-                            provisioner=vm_provisioner,
-                            recovery_store=VMWorkspaceRecoveryStore(postgres_db),
-                            now=time.time(),
-                        )
+                    if await handle_provisioning_wait(
+                        vm_decision, job_id, vm_ctx, db=postgres_db,
+                        provisioner=vm_provisioner,
+                        recovery_store=VMWorkspaceRecoveryStore(postgres_db),
+                        now=time.time(),
+                    ):
                         continue
-                    if vm_decision == VM_WAIT:
-                        # Provisioning / creating / deleting in flight — wait.
+                    if vm_decision != VM_READY:
+                        logger.warning("Dispatcher: job %s has an unhandled VM decision", job_id)
                         continue
                     # VM_READY: proceed with dispatch.
                     if provision_attempts:
@@ -8676,6 +8664,10 @@ vm_workspace_cleanup_authority_routes.configure(
     store_factory=lambda: VMWorkspaceRecoveryStore(postgres_db)
 )
 app.include_router(vm_workspace_cleanup_authority_routes.router)
+vm_creation_retry_authority_routes.configure(
+    store_factory=lambda: VMCreationRetryStore(postgres_db)
+)
+app.include_router(vm_creation_retry_authority_routes.router)
 app.include_router(capacity_routes.router)
 app.include_router(user_administration_routes.router)
 app.include_router(job_diagnostics_routes.router)

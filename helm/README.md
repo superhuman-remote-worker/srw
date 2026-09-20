@@ -861,6 +861,17 @@ matches the chart's `appVersion`, which exists only for released charts.
 
 ### Durable VM workspace recovery rollout
 
+VM startup uses separate clocks for disk preparation, placement and guest boot.
+`orchestrator.vmProvisioning.rootdiskStallTimeoutSeconds` defaults to `2700`
+(`VM_ROOTDISK_STALL_TIMEOUT_S`). It measures active disk preparation without
+forward progress; dependency/placement waits pause that clock. A stalled disk or
+unverifiable phase produces a visible attention message and retains the disk.
+The existing `VM_PROVISION_TIMEOUT_S` boot budget (default `600`) begins only
+after the first authenticated observation of the exact guest VMI as Running.
+Initialization keeps its separate deadline. Roll out the phase-aware controller
+before the orchestrator; older controller responses cannot authorize a boot
+timeout cleanup. Phase observations never bypass SSH or initialization checks.
+
 Durable recovery is installed reader-first. Its database records, job projection,
 Retry/Cancel controls, disk retention pins and cleanup guards remain active even
 when automatic recovery is disabled. The automatic reconciler and replacement

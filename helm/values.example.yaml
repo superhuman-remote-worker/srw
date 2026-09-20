@@ -64,6 +64,8 @@ orchestrator:
   kbGitAllowedHosts: "git.internal.example.com"
   kbExternalReindexConcurrency: 2
   kbReindexSweepSeconds: 900
+  vmProvisioning:
+    rootdiskStallTimeoutSeconds: 2700
   # Recovery readers, controls and cleanup guards ship in every version. These
   # switches open automatic probes only after the protocol rollout described
   # in the chart README and its disposable-cluster gate have passed.

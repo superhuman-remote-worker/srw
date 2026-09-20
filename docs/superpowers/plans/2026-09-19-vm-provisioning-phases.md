@@ -44,14 +44,14 @@ capacity clears that outage clock. No explicit deadline is extended by Resume.
 
 ## Implementation and validation
 
-- [ ] Pure validated phase reducer and decisions, with progression, stall,
+- [x] Pure validated phase reducer and decisions, with progression, stall,
   placement, once-only boot, malformed/future state and identity tests.
-- [ ] Controller exact-identity phase evidence, signed by the existing envelope;
+- [x] Controller exact-identity phase evidence, signed by the existing envelope;
   test ownership conflicts, retained PVC without DV, Pending versus Running,
   and consumer-dependent disk wait.
-- [ ] Atomic database observation CAS at the authenticated provisioner boundary;
+- [x] Atomic database observation CAS at the authenticated provisioner boundary;
   real PostgreSQL races, restart, cancellation, generation/recovery fences.
-- [ ] Dispatcher attention/boot decisions and safe legacy-controller behavior;
+- [x] Dispatcher attention/boot decisions and safe legacy-controller behavior;
   integration tests assert no deletion for clone/placement/unknown evidence.
 - [ ] A3 durable waiting, one admission count, immutable deadline enforcement;
   real PostgreSQL concurrency and lost-response tests, ordinary capacity >26h.
@@ -59,5 +59,5 @@ capacity clears that outage clock. No explicit deadline is extended by Resume.
   schema/contracts and disposable k3d acceptance; record full storage gate separately.
 
 Full implementation seams and reconnaissance evidence are retained in the local
-work report `.superpowers/a2-a3-implementation-seams.md`. Pure policy alone does
-not complete A2 or make a rollout ready.
+work report `.superpowers/a2-a3-implementation-seams.md`. A2 is integrated locally;
+final dispatcher review and live acceptance remain pending. A3 is not complete.

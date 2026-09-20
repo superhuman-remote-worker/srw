@@ -14,6 +14,34 @@ from orchestrator.services.vm_workspace_recovery_store import (
 logger = logging.getLogger(__name__)
 
 
+async def handle_provisioning_wait(
+    decision: str,
+    job_id: str,
+    vm: dict[str, Any],
+    *,
+    db: Any,
+    provisioner: Any,
+    recovery_store: Any,
+    now: float,
+) -> bool:
+    """Consume a wait/attention/cleanup decision before execution dispatch."""
+    from orchestrator.services.dispatch_guards import VM_ATTENTION, VM_RECYCLE, VM_WAIT
+
+    if decision in {VM_WAIT, VM_ATTENTION}:
+        return True
+    if decision == VM_RECYCLE:
+        await recycle_provisioning_vm(
+            job_id,
+            vm,
+            db=db,
+            provisioner=provisioner,
+            recovery_store=recovery_store,
+            now=now,
+        )
+        return True
+    return False
+
+
 async def recycle_provisioning_vm(
     job_id: str,
     vm: dict[str, Any],

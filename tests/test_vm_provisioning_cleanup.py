@@ -17,6 +17,70 @@ GENERATION = "00000000-0000-4000-8000-000000000001"
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "phase", ["clone", "stalled", "placement", "unknown", "boot_expired"]
+)
+async def test_phase_decision_to_action_keeps_disk_and_only_recycles_expired_boot(
+    phase,
+):
+    from orchestrator.services.vm_provisioning_cleanup import handle_provisioning_wait
+    from tests.test_dispatch_guards import phase_context
+    from tests.test_vm_provisioning_phases import evidence, running
+
+    observation = {
+        "clone": evidence(),
+        "stalled": evidence(),
+        "placement": evidence(disk_phase="ready", disk_progress=100),
+        "unknown": evidence(),
+        "boot_expired": running(),
+    }[phase]
+    vm = phase_context(observation)
+    if phase == "unknown":
+        vm.pop("provisioning")
+    now = 3000.0 if phase == "stalled" else 800.0
+    db = SimpleNamespace(
+        merge_vm_context_if_provision_generation=AsyncMock(return_value=True)
+    )
+    store = SimpleNamespace(
+        acquire_cleanup_permit=AsyncMock(return_value=CleanupPermit(True, UUID(int=2))),
+        complete_cleanup_permit=AsyncMock(),
+    )
+    provisioner = SimpleNamespace(
+        capture_vm_teardown_identity=AsyncMock(
+            return_value=VMTeardownIdentity(
+                vm["provision_generation"],
+                vm["vm_uid"],
+                vm["rootdisk_pvc_uid"],
+            )
+        ),
+        release_vm_captured=AsyncMock(
+            return_value=VMTeardownResult("completed", False)
+        ),
+    )
+    decision = vm_provisioning_decision(
+        vm, provision_attempts=1, max_provision_attempts=3, now=now, timeout_s=600
+    )
+    assert await handle_provisioning_wait(
+        decision,
+        "job-1",
+        vm,
+        db=db,
+        provisioner=provisioner,
+        recovery_store=store,
+        now=now,
+    )
+    if phase == "boot_expired":
+        assert decision == VM_RECYCLE
+        provisioner.release_vm_captured.assert_awaited_once()
+        assert provisioner.release_vm_captured.await_args.kwargs["purge_disk"] is False
+    else:
+        provisioner.capture_vm_teardown_identity.assert_not_awaited()
+        provisioner.release_vm_captured.assert_not_awaited()
+        store.acquire_cleanup_permit.assert_not_awaited()
+        db.merge_vm_context_if_provision_generation.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_cleanup_backoff_survives_ticks_and_does_not_spend_boot_attempts():
     from orchestrator.services.vm_provisioning_cleanup import recycle_provisioning_vm
 

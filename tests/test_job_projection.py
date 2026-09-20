@@ -55,6 +55,67 @@ def test_retirement_diagnostic_preserves_a_jobs_existing_failure():
     assert result["error_message"] == "Original failure"
 
 
+@pytest.mark.parametrize(
+    "reason",
+    ["vm_phase_unproven", "vm_phase_identity_conflict", "private-controller-body"],
+)
+def test_vm_phase_attention_is_visible_and_coordinate_free(reason):
+    source = {
+        "status": "created",
+        "context": {
+            "vm": {
+                "status": "provisioning",
+                "provisioning_attention_reason": reason,
+                "ssh_host": "synthetic-private",
+            }
+        },
+    }
+    result = redact(source)
+    assert "attention" in result["error_message"].lower()
+    assert "retained" in result["error_message"].lower()
+    assert result["status"] == "created"
+    assert "synthetic-private" not in json.dumps(result)
+    assert "private-controller-body" not in json.dumps(result)
+
+
+def test_stalled_rootdisk_message_uses_configured_active_progress_budget(monkeypatch):
+    from tests.test_dispatch_guards import phase_context
+    from tests.test_vm_provisioning_phases import evidence
+
+    monkeypatch.setenv("VM_ROOTDISK_STALL_TIMEOUT_S", "5000")
+    monkeypatch.setattr(projection.time, "time", lambda: 3000.0)
+    source = {"status": "created", "context": {"vm": phase_context(evidence())}}
+    assert redact(source).get("error_message") is None
+    monkeypatch.setenv("VM_ROOTDISK_STALL_TIMEOUT_S", "2700")
+    result = redact(source)
+    assert "disk preparation" in result["error_message"].lower()
+    assert "retained" in result["error_message"].lower()
+
+
+def test_vm_phase_attention_does_not_override_cleanup_or_existing_error():
+    source = {
+        "status": "created",
+        "context": {
+            "vm": {
+                "status": "retiring_process_zero",
+                "provisioning_attention_reason": "vm_phase_unproven",
+            }
+        },
+    }
+    assert "cleanup" in redact(source)["error_message"].lower()
+    source["error_message"] = "Specific existing failure"
+    assert redact(source)["error_message"] == "Specific existing failure"
+
+
+def test_query_failure_is_visible_even_with_an_expired_previous_boot_clock():
+    from tests.test_dispatch_guards import phase_context
+    from tests.test_vm_provisioning_phases import running
+
+    vm = phase_context(running(), status="query_failed")
+    result = redact({"status": "created", "context": {"vm": vm}})
+    assert "attention" in result["error_message"].lower()
+
+
 def test_pending_delete_admission_remains_visible_after_delete_acceptance():
     result = redact(
         {

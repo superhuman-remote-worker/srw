@@ -8,6 +8,8 @@ helpers neither construct provisioners nor perform network or database I/O.
 from __future__ import annotations
 
 import json
+import os
+import time
 from typing import Any, Callable, Mapping, Protocol
 from uuid import UUID
 
@@ -52,6 +54,50 @@ _WORKSPACE_RECOVERY_STATES = {
     "reconciling_outcome",
     "paused_attention",
 }
+
+_VM_PHASE_ATTENTION_MESSAGES = {
+    "vm_rootdisk_stalled": "VM disk preparation needs attention because progress has stopped.",
+    "vm_runtime_changed": "VM startup needs attention because its runtime changed unexpectedly.",
+    "vm_phase_identity_conflict": "VM startup needs attention because its workspace identity could not be verified.",
+}
+
+
+def _vm_phase_attention_message(vm: Mapping[str, Any]) -> str | None:
+    from orchestrator.services.dispatch_guards import vm_phase_decision
+
+    if vm.get("status") == "query_failed":
+        return "VM startup needs attention because its progress could not be verified. The workspace disk is retained."
+    # Existing cleanup, dependency and initialization handlers own their
+    # diagnostics. Only initial VM startup uses the new phase policy.
+    if vm.get("status") not in {
+        "creating",
+        "created",
+        "provisioning",
+        "starting",
+        "ssh_pending",
+        "running",
+        "query_failed",
+    }:
+        return None
+    if vm.get("initialization_started_at") is not None:
+        return None
+    decision = vm_phase_decision(
+        vm,
+        now=time.time(),
+        timeout_s=int(os.environ.get("VM_PROVISION_TIMEOUT_S", "600")),
+        rootdisk_stall_timeout_s=int(
+            os.environ.get("VM_ROOTDISK_STALL_TIMEOUT_S", "2700")
+        ),
+    )
+    if decision.action != "attention":
+        return None
+    return (
+        _VM_PHASE_ATTENTION_MESSAGES.get(
+            decision.reason,
+            "VM startup needs attention because its progress could not be verified.",
+        )
+        + " The workspace disk is retained."
+    )
 
 
 def workspace_recovery_projection(job: Mapping[str, Any]) -> dict[str, Any] | None:
@@ -142,6 +188,14 @@ def redact_job_config_override(
             job["error_message"] = reason + (
                 "The workspace disk is retained; cleanup retries automatically."
             )
+        if (
+            job.get("status") in {"created", "paused"}
+            and not job.get("error_message")
+            and isinstance(vm, dict)
+        ):
+            message = _vm_phase_attention_message(vm)
+            if message:
+                job["error_message"] = message
         # The coordinate-free workspace_contract projection above is the
         # public contract. Provisioner branches contain SSH hosts, pod/service
         # coordinates and generation authority needed only by server and

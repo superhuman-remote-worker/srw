@@ -63,6 +63,7 @@ VM_PROVISION = "provision"  # (re)create the VM (retries remain)
 VM_PARK_EXHAUSTED = "park_exhausted"  # retries used up → mark failed + park
 VM_PARKED = "parked"  # already 'failed' → leave parked (no hot-retry)
 VM_WAIT = "wait"  # provisioning/creating/deleting in flight → wait
+VM_ATTENTION = "attention"  # retain workspace; no destructive phase decision
 VM_RECYCLE = "recycle"  # stuck past budget → tear down so it re-provisions
 VM_READY = "ready"  # VM booted → proceed to claim/dispatch
 VM_GOLDEN_POLL = "golden_poll"  # golden image importing → re-poll create, free
@@ -81,7 +82,7 @@ VM_PARK_PREPARATION = "park_preparation"
 # used to match no branch and fall through to the generic not-ready arm, which
 # RECYCLEs forever — PARK_EXHAUSTED only triggers on absent-or-'deleted', so the
 # job could never reach a terminal state.
-TEARDOWN_FAILED_STATUSES = ("delete_failed", "query_failed")
+TEARDOWN_FAILED_STATUSES = ("delete_failed",)
 
 # Suspend/restore states. The suspension subsystem owns these transitions and
 # keeps the rootdisk on purpose; the dispatcher must wait rather than treat them
@@ -95,6 +96,7 @@ SUSPEND_STATUSES = ("suspending", "suspended", "restoring")
 # knowledge-history/done/golden_image_cold_import_fails_inflight_vm_jobs.md).
 DEFAULT_GOLDEN_WAIT_TIMEOUT_S = 2700.0
 DEFAULT_CAPACITY_WAIT_TIMEOUT_S = 2700.0
+DEFAULT_ROOTDISK_STALL_TIMEOUT_S = 2700.0
 
 # Bounded patience for a Headscale outage. The controller refuses to build a
 # VM it cannot hand a tailnet key to, so this budget covers "how long might
@@ -117,6 +119,45 @@ def _bounded_teardown_retry(
     return VM_RECYCLE
 
 
+def vm_phase_decision(
+    vm_ctx: dict[str, Any],
+    *,
+    now: float,
+    timeout_s: float,
+    rootdisk_stall_timeout_s: float = DEFAULT_ROOTDISK_STALL_TIMEOUT_S,
+):
+    """Use phase clocks only while their exact identity is still current."""
+    from shared.vm_provisioning_phases import (
+        ProvisioningDecision,
+        provisioning_decision,
+    )
+
+    reason = vm_ctx.get("provisioning_attention_reason")
+    if reason is not None:
+        if reason not in (
+            "vm_phase_unproven",
+            "vm_phase_identity_conflict",
+            "vm_phase_conflict",
+            "vm_runtime_changed",
+            "vm_rootdisk_stalled",
+        ):
+            reason = "vm_phase_unproven"
+        return ProvisioningDecision("attention", reason)
+    state = vm_ctx.get("provisioning")
+    identity = state.get("identity") if isinstance(state, dict) else None
+    if not isinstance(identity, dict) or any(
+        identity.get(key) != vm_ctx.get(key)
+        for key in ("provision_generation", "vm_uid", "rootdisk_pvc_uid", "namespace")
+    ):
+        return ProvisioningDecision("attention", "vm_phase_unproven")
+    return provisioning_decision(
+        state,
+        now=now,
+        boot_timeout_s=timeout_s,
+        rootdisk_stall_timeout_s=rootdisk_stall_timeout_s,
+    )
+
+
 def vm_provisioning_decision(
     vm_ctx: dict[str, Any],
     *,
@@ -127,6 +168,7 @@ def vm_provisioning_decision(
     golden_timeout_s: float = DEFAULT_GOLDEN_WAIT_TIMEOUT_S,
     capacity_timeout_s: float = DEFAULT_CAPACITY_WAIT_TIMEOUT_S,
     headscale_timeout_s: float = DEFAULT_HEADSCALE_WAIT_TIMEOUT_S,
+    rootdisk_stall_timeout_s: float = DEFAULT_ROOTDISK_STALL_TIMEOUT_S,
 ) -> str:
     """Decide what the dispatcher should do with a VM-backed job's VM.
 
@@ -152,7 +194,7 @@ def vm_provisioning_decision(
       'deleting'         → WAIT while in flight; once stuck past ``timeout_s``
                            from ``deleting_started_at``, RECYCLE to re-issue the
                            teardown, or PARK_EXHAUSTED once retries are gone
-      'delete_failed'/'query_failed'
+      'delete_failed'
                          → RECYCLE (re-issue), PARK_EXHAUSTED once retries are
                            gone — previously these reached no terminal state
       'waiting_golden'   → GOLDEN_POLL within ``golden_timeout_s`` of
@@ -180,7 +222,9 @@ def vm_provisioning_decision(
                            is down, because a VM with no tailnet pre-auth key
                            boots fine but is unreachable forever — it would
                            silently burn the whole attempt budget.
-      not-yet-'ready'    → RECYCLE if stuck past ``timeout_s``, else WAIT
+      not-yet-'ready'    → exact Running evidence starts immutable boot budget;
+                           disk preparation and placement do not. Missing or
+                           conflicting evidence/stalled disk retains attention.
       'ready'            → READY (proceed to claim)
     """
     status = vm_ctx.get("status")
@@ -202,6 +246,12 @@ def vm_provisioning_decision(
         return VM_WAIT
     if status in SUSPEND_STATUSES:
         return VM_WAIT
+    if status == "retiring_process_zero":
+        return VM_RECYCLE
+    if status == "query_failed":
+        # A failed observation is not evidence that the guest failed to boot.
+        # Pending cleanup above retains its own authority and retry policy.
+        return VM_ATTENTION
     if status == "deleting":
         # Both the delete request and the controller's answer are fire-and-forget
         # core NATS (at-most-once, no JetStream), so a dropped message strands the
@@ -254,8 +304,15 @@ def vm_provisioning_decision(
         # the disk under a live initializer using the shorter VM boot budget.
         return VM_WAIT
     if status != "ready":
-        provisioned_at = vm_ctx.get("provisioned_at")
-        if provisioned_at and (now - float(provisioned_at)) > timeout_s:
+        phase = vm_phase_decision(
+            vm_ctx,
+            now=now,
+            timeout_s=timeout_s,
+            rootdisk_stall_timeout_s=rootdisk_stall_timeout_s,
+        )
+        if phase.action == "boot_timeout":
             return VM_RECYCLE
+        if phase.action == "attention":
+            return VM_ATTENTION
         return VM_WAIT
     return VM_READY

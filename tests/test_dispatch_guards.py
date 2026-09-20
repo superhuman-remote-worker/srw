@@ -9,6 +9,7 @@ knowledge-history/done/preemption_before_first_checkpoint_replays_job_opening.md
 from __future__ import annotations
 
 from orchestrator.services.dispatch_guards import (
+    VM_ATTENTION,
     VM_CAPACITY_POLL,
     VM_GOLDEN_POLL,
     VM_HEADSCALE_POLL,
@@ -25,6 +26,19 @@ from orchestrator.services.dispatch_guards import (
     resume_lane_applies,
     vm_provisioning_decision,
 )
+from shared.vm_provisioning_phases import observe_provisioning
+from tests.test_vm_provisioning_phases import evidence, running
+
+
+def phase_context(observation, *, now=100, status="created"):
+    return {
+        "status": status,
+        "provision_generation": observation["provision_generation"],
+        "vm_uid": observation["vm_uid"],
+        "rootdisk_pvc_uid": observation["rootdisk_pvc_uid"],
+        "namespace": observation["namespace"],
+        "provisioning": observe_provisioning(None, observation, now=now),
+    }
 
 
 class TestResumeLaneApplies:
@@ -148,33 +162,55 @@ class TestVmProvisioningDecision:
         )
 
     def test_provisioning_within_budget_waits(self):
-        # 'created' 100s ago, 600s budget → still booting, wait.
-        ctx = {"status": "created", "provisioned_at": 900.0}
+        ctx = phase_context(running(), now=900)
         assert self._decide(ctx, now=1000.0, timeout_s=600.0) == VM_WAIT
 
     def test_ssh_pending_within_budget_waits(self):
         # Daemon registered, but the orchestrator has not proved SSH yet.
-        ctx = {"status": "ssh_pending", "provisioned_at": 900.0}
+        ctx = phase_context(running(), now=900, status="ssh_pending")
         assert self._decide(ctx, now=1000.0, timeout_s=600.0) == VM_WAIT
 
     def test_provisioning_past_budget_recycles(self):
-        # 'created' 700s ago, 600s budget → stuck, recycle.
-        ctx = {"status": "created", "provisioned_at": 300.0}
+        ctx = phase_context(running(), now=300)
         assert self._decide(ctx, now=1000.0, timeout_s=600.0) == VM_RECYCLE
 
     def test_ssh_pending_past_budget_recycles(self):
-        ctx = {"status": "ssh_pending", "provisioned_at": 300.0}
+        ctx = phase_context(running(), now=300, status="ssh_pending")
         assert self._decide(ctx, now=1000.0, timeout_s=600.0) == VM_RECYCLE
 
-    def test_provisioning_without_timestamp_waits_forever(self):
-        # A VM created before provisioned_at existed has no anchor → wait (old
-        # behaviour), never spuriously recycled.
-        assert self._decide({"status": "creating"}) == VM_WAIT
+    def test_missing_phase_evidence_is_visible_attention_without_recycling(self):
+        assert self._decide({"status": "creating"}) == VM_ATTENTION
+        assert self._decide({"status": "created", "provisioned_at": 1}) == VM_ATTENTION
 
     def test_recycle_needs_both_status_and_stale_timestamp(self):
         # 'ready' is never recycled even with an old timestamp.
         ctx = {"status": "ready", "provisioned_at": 1.0}
         assert self._decide(ctx, now=10_000.0, timeout_s=600.0) == VM_READY
+
+    def test_slow_clone_and_long_placement_never_recycle(self):
+        clone = phase_context(evidence())
+        assert self._decide(clone, now=701) == VM_WAIT
+        assert self._decide(clone, now=2801) == VM_ATTENTION
+        placement = phase_context(evidence(disk_phase="waiting_for_consumer"))
+        assert self._decide(placement, now=100000) == VM_WAIT
+
+    def test_phase_identity_must_still_match_current_vm_context(self):
+        context = phase_context(running())
+        context["provision_generation"] = "00000000-0000-4000-8000-000000000099"
+        assert self._decide(context, now=701) == VM_ATTENTION
+
+    def test_new_unknown_observation_cannot_reuse_old_boot_timeout(self):
+        context = phase_context(running())
+        context["provisioning_attention_reason"] = "vm_phase_unproven"
+        assert self._decide(context, now=701) == VM_ATTENTION
+
+    def test_cleanup_and_initialization_keep_precedence_over_phase_attention(self):
+        context = phase_context(evidence(disk_phase="unknown"))
+        context["retirement_cleanup_pending"] = True
+        assert self._decide(context) == VM_RECYCLE
+        context["retirement_cleanup_pending"] = False
+        context["initialization_started_at"] = 900
+        assert self._decide(context) == VM_WAIT
 
 
 class TestVmGoldenWaitDecision:
@@ -390,10 +426,12 @@ class TestVmTeardownAndSuspendDecision:
             VM_PARK_EXHAUSTED
         )
 
-    def test_query_failed_is_bounded_the_same_way(self):
+    def test_query_failed_cannot_authorize_cleanup_or_exhaust_boot_attempts(self):
         assert self._decide({"status": "query_failed"}, attempts=3, cap=3) == (
-            VM_PARK_EXHAUSTED
+            VM_ATTENTION
         )
+        context = phase_context(running(), status="query_failed")
+        assert self._decide(context, now=10000) == VM_ATTENTION
 
     # --- P1-6: never tear down a deliberately-suspended VM ------------------
 

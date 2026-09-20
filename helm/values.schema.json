@@ -1557,6 +1557,14 @@
           },
           "additionalProperties": true
         },
+        "vmProvisioning": {
+          "type": "object",
+          "required": ["rootdiskStallTimeoutSeconds"],
+          "properties": {
+            "rootdiskStallTimeoutSeconds": {"type": "integer", "minimum": 1}
+          },
+          "additionalProperties": false
+        },
         "vmWorkspaceRecovery": {
           "type": "object",
           "required": [

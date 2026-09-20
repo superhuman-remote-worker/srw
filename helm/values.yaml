@@ -189,6 +189,10 @@ orchestrator:
   # paths; mutation admission is fenced by the application + database gate.
   vmRemoteOperationProtocol:
     enabled: false
+  vmProvisioning:
+    # -- Active rootdisk preparation time without forward progress before
+    # attention. Placement waits pause this clock; the disk is retained.
+    rootdiskStallTimeoutSeconds: 2700
   # -- Durable recovery for held stateless VM workspaces. The reader, cleanup
   # guards and recovery controls remain active while automation is disabled;
   # disabling this block pauses outstanding operations without releasing data.
