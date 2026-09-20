@@ -54,6 +54,16 @@ protection, not successful recovery. That image predates `a15dd4c69` and the oth
 2026-09-20 checkpoints. No current-branch VM execution, worker execution or Longhorn
 acceptance follows from that run.
 
+The subsequent acceptance-only stop-retention control (`a4e3081f8`) passed review:
+111 gate/Helm checks, 58 final helper/PostgreSQL checks and 19 independent checks.
+It commits actual SQL stop proof before acknowledged Halted and ordered release,
+with durable abort and captured-identity purge. A separate disposable local probe
+confirmed valid native-sidecar termination under Manual and rejection after
+grace-zero deletion; its captured regression (`7fca38bf7`) passed 28 checks and
+review. Neither checkpoint establishes a successful recovery scenario. An exact
+frozen-image local-path run is the next gate; Longhorn and worker execution remain
+separate requirements.
+
 ## Global Constraints
 
 - Same-cluster Job VM creation only; preserve `provision_generation` on retry.
