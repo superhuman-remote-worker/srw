@@ -129,7 +129,7 @@ The minimum slice intentionally pins the initial VMI to one selected Node UID/na
 
 ## Database model and lock order
 
-Use the next app migration number available at implementation time. Committed local head is 0266; 0267 is reserved for waiter parking/maintenance, coordinated with A1 cancellation completion. Update `src/orchestrator/database/schema_current.sql` and the migration-head checks in the same change.
+Use the next app migration number available at implementation time. Committed local head is 0267; A1 owns the next 0268 migration for typed cancellation completion. Update `src/orchestrator/database/schema_current.sql` and the migration-head checks in the same change.
 
 Suggested tables:
 
