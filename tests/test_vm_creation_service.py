@@ -143,3 +143,16 @@ async def test_adopted_response_cannot_merge_context_or_release_worker_hold(
         instance.store.apply_observation.call_args.kwargs["observation"]["outcome"]
         == "observation_wait"
     )
+
+
+@pytest.mark.asyncio
+async def test_local_replay_validation_refusal_records_bounded_attention(monkeypatch):
+    instance, module = service(monkeypatch)
+    row = claim()
+    instance.store.claim_due.return_value = [row]
+    module.replay_vm_creation.side_effect = ValueError("private invalid authority")
+    await instance.reconcile_once()
+    assert instance.store.apply_observation.call_args.kwargs["observation"] == {
+        "outcome": "blocked",
+        "reason": "creation_evidence_unproven",
+    }

@@ -53,11 +53,19 @@ class VMCreationRetryService:
                 "reason": "creation_observation_pending",
             }
         else:
-            observation = await replay_vm_creation(
-                self.provisioner._http_client,
-                claim,
-                secret=self.provisioner._lifecycle_hmac_secret,
-            )
+            try:
+                observation = await replay_vm_creation(
+                    self.provisioner._http_client,
+                    claim,
+                    secret=self.provisioner._lifecycle_hmac_secret,
+                )
+            except (ValueError, KeyError, TypeError):
+                # Local authentication/frozen-input refusal also needs a
+                # durable bounded disposition, using this exact observer CAS.
+                observation = {
+                    "outcome": "blocked",
+                    "reason": "creation_evidence_unproven",
+                }
             if observation["outcome"] == "adopted":
                 # The controller already settled exact adoption via its store
                 # endpoint. A stale CAS is expected; no response-driven merge.
