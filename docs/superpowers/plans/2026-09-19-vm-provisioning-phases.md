@@ -59,5 +59,5 @@ capacity clears that outage clock. No explicit deadline is extended by Resume.
   schema/contracts and disposable k3d acceptance; record full storage gate separately.
 
 Full implementation seams and reconnaissance evidence are retained in the local
-work report `.superpowers/a2-a3-implementation-seams.md`. A2 is integrated locally;
-final dispatcher review and live acceptance remain pending. A3 is not complete.
+work report `.superpowers/a2-a3-implementation-seams.md`. A2 is integrated locally and its independent review passed. Live acceptance
+remains pending. A3 is not complete.

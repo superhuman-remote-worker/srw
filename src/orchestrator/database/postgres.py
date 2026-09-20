@@ -10405,6 +10405,8 @@ class PostgresDB:
         job_id: str,
         expected_generation: str,
         snapshot: Dict[str, Any] | None,
+        *,
+        _conn: Any = None,
     ) -> Dict[str, Any] | None:
         """Read or freeze the first caller-owned request for this VM generation.
 
@@ -10425,7 +10427,7 @@ class PostgresDB:
             "AND NOT EXISTS (SELECT 1 FROM vm_workspace_recovery_jobs p "
             "WHERE p.job_id=jobs.id AND p.resolved_at IS NULL)"
         )
-        async with self.acquire() as conn:
+        async def capture(conn):
             if snapshot is None:
                 value = await conn.fetchval(
                     "SELECT context->'vm'->'creation_request' FROM jobs WHERE " + guard,
@@ -10443,7 +10445,12 @@ class PostgresDB:
                     expected_generation,
                     json.dumps(snapshot),
                 )
-        return json.loads(value) if isinstance(value, str) else value
+            return json.loads(value) if isinstance(value, str) else value
+
+        if _conn is not None:
+            return await capture(_conn)
+        async with self.acquire() as conn:
+            return await capture(conn)
 
     async def merge_vm_context_if_provision_generation(
         self,

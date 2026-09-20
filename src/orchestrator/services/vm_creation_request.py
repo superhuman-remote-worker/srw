@@ -67,6 +67,7 @@ async def capture_vm_creation_request(
     initial_request: bool = True,
     controller_configuration_digest: str | None = None,
     controller_configuration: dict | None = None,
+    _conn: Any = None,
 ) -> dict | None:
     """Read or atomically freeze first inputs, returning only a validated snapshot.
 
@@ -113,7 +114,7 @@ async def capture_vm_creation_request(
         if controller_configuration is not None:
             proposal["controller_configuration"] = deepcopy(controller_configuration)
     captured = await db.capture_vm_creation_request_if_generation(
-        job_id, generation, proposal
+        job_id, generation, proposal, **({"_conn": _conn} if _conn is not None else {})
     )
     if captured is None:
         return None
