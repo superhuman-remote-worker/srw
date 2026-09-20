@@ -20908,7 +20908,7 @@ CREATE TABLE public.vm_creation_effects (
     CONSTRAINT vm_creation_effects_carrier_namespace_check CHECK ((carrier_namespace <> ''::text)),
     CONSTRAINT vm_creation_effects_check CHECK (((state = 'issued'::text) = (resolved_at IS NULL))),
     CONSTRAINT vm_creation_effects_check1 CHECK (((state = 'issued'::text) = (evidence = '{}'::jsonb))),
-    CONSTRAINT vm_creation_effects_effect_kind_check CHECK ((effect_kind = ANY (ARRAY['rootdisk'::text, 'cloud_init'::text, 'vm'::text]))),
+    CONSTRAINT vm_creation_effects_effect_kind_check CHECK ((effect_kind = ANY (ARRAY['workspace_attach'::text, 'rootdisk'::text, 'cloud_init'::text, 'vm'::text]))),
     CONSTRAINT vm_creation_effects_effect_number_check CHECK ((effect_number > 0)),
     CONSTRAINT vm_creation_effects_evidence_check CHECK ((jsonb_typeof(evidence) = 'object'::text)),
     CONSTRAINT vm_creation_effects_state_check CHECK ((state = ANY (ARRAY['issued'::text, 'observed'::text, 'rejected'::text])))

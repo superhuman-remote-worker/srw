@@ -687,7 +687,30 @@ class VMCreationRetryStore:
             or configuration["namespace"] != carrier["metadata"]["namespace"]
         ):
             raise VMCreationRetryConflict("creation_configuration_changed")
-        if values["version"] == 2:
+        if values["version"] == 3:
+            from shared.vm_creation_attachment import validate_attachment_intent
+
+            try:
+                validate_attachment_intent(
+                    values["workspace_attachment"],
+                    request=row["canonical_request"],
+                    expected_pvc_uid=str(row["expected_pvc_uid"])
+                    if row["expected_pvc_uid"]
+                    else None,
+                )
+            except (ValueError, KeyError, TypeError) as exc:
+                raise VMCreationRetryConflict("creation_attachment_changed") from exc
+            original = await conn.fetchval(
+                "SELECT carrier_intent FROM vm_creation_effects WHERE request_id=$1 ORDER BY effect_number LIMIT 1",
+                row["request_id"],
+            )
+            if (
+                original
+                and _json(original).get("workspace_attachment")
+                != values["workspace_attachment"]
+            ):
+                raise VMCreationRetryConflict("creation_attachment_changed")
+        if values["version"] in (2, 3) and values["effect_kind"] != "workspace_attach":
             from shared.vm_creation_issuance import validate_rootdisk_source
 
             try:
@@ -711,7 +734,7 @@ class VMCreationRetryStore:
             ):
                 raise VMCreationRetryConflict("creation_rootdisk_source_changed")
             original = await conn.fetchval(
-                "SELECT carrier_intent FROM vm_creation_effects WHERE request_id=$1 ORDER BY effect_number LIMIT 1",
+                "SELECT carrier_intent FROM vm_creation_effects WHERE request_id=$1 AND effect_kind='rootdisk' ORDER BY effect_number LIMIT 1",
                 row["request_id"],
             )
             if (
@@ -766,7 +789,10 @@ class VMCreationRetryStore:
         name = (
             storage_name(binding) if binding else f"agent-vm-{row['job_id']}-rootdisk"
         )
-        if values["effect_kind"] == "rootdisk" and values["object_name"] != name:
+        if (
+            values["effect_kind"] in {"rootdisk", "workspace_attach"}
+            and values["object_name"] != name
+        ):
             raise VMCreationRetryConflict("retained_disk_changed")
         return permit
 
@@ -816,6 +842,13 @@ class VMCreationRetryStore:
                         "disposition": "observe_only",
                         "effect_state": prior["state"],
                     }
+                if row["canonical_request"].get("workspace_storage") is not None:
+                    # Carrier/schema rollout precedes instance authority and the
+                    # actuator. Historical exact nonces remain observe-only;
+                    # no fresh effect may take the old root-only path meanwhile.
+                    raise VMCreationRetryConflict(
+                        "creation_attachment_authority_unproven"
+                    )
                 # Historical v1 effects remain observable above and through
                 # observe/settle, but cannot mint a fresh source-less grant for
                 # modes that require a frozen clone/retained-source document.

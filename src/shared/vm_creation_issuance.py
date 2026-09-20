@@ -237,21 +237,53 @@ def _validate_prepared_source(source, *, request, configuration, expected_pvc_ui
 
 
 def _values(value):
-    fields = (
-        _FIELDS | {"rootdisk_source"}
-        if isinstance(value, Mapping) and value.get("version") == 2
-        else _FIELDS
-    )
+    version = value.get("version") if isinstance(value, Mapping) else None
+    fields = _FIELDS
+    if version in (2, 3):
+        fields |= {"rootdisk_source"}
+    if version == 3:
+        fields |= {"workspace_attachment", "current_attachment_uid"}
     if not isinstance(value, Mapping) or set(value) != fields:
         raise ValueError("Incomplete creation carrier intent")
     value = dict(value)
     if (
         type(value["version"]) is not int
-        or value["version"] not in (1, 2)
+        or value["version"] not in (1, 2, 3)
         or value["source"] != CREATION_SOURCE
-        or value["effect_kind"] not in EFFECT_KINDS
+        or value["effect_kind"] not in (*EFFECT_KINDS, "workspace_attach")
     ):
         raise ValueError("Unsupported creation carrier source")
+    attachment = value["effect_kind"] == "workspace_attach"
+    if attachment and version != 3:
+        raise ValueError("Attachment effects require their full carrier contract")
+    if version == 3:
+        from shared.vm_creation_attachment import validate_attachment_intent
+        from shared.vm_workspace_storage import storage_name
+
+        intent = value["workspace_attachment"]
+        if not isinstance(intent, Mapping):
+            raise ValueError("Attachment intent is incomplete")
+        validate_attachment_intent(
+            intent,
+            request={
+                "workspace_storage": intent.get("binding"),
+                "job_id": value["job_id"],
+            },
+            expected_pvc_uid=value["expected_pvc_uid"],
+        )
+        if attachment:
+            if (
+                value["rootdisk_source"] is not None
+                or value["current_attachment_uid"] is not None
+                or value["object_name"] != storage_name(intent["binding"])
+            ):
+                raise ValueError("Initial attachment carrier changed")
+        elif value["current_attachment_uid"] is None or not isinstance(
+            value["rootdisk_source"], Mapping
+        ):
+            raise ValueError("Observed attachment and root source are required")
+        if value["current_attachment_uid"] is not None:
+            _uuid(value["current_attachment_uid"])
     for key in (
         "admission_id",
         "reservation_request_id",
@@ -270,7 +302,10 @@ def _values(value):
         raise ValueError("Incomplete retained disk identity")
     if (value["current_dv_uid"] is None) != (value["current_pvc_uid"] is None):
         raise ValueError("Incomplete current disk identity")
-    if value["effect_kind"] != "rootdisk" and value["current_pvc_uid"] is None:
+    if (
+        value["effect_kind"] not in {"rootdisk", "workspace_attach"}
+        and value["current_pvc_uid"] is None
+    ):
         raise ValueError("Current disk identity required before later effects")
     if value["effect_kind"] == "vm" and value["current_secret_uid"] is None:
         raise ValueError("Current Secret identity required before VM creation")
@@ -285,13 +320,16 @@ def _values(value):
     ):
         if value[key] is not None:
             _uuid(value[key])
-    suffix = {"rootdisk": "-rootdisk", "cloud_init": "-cloudinit", "vm": ""}[
-        value["effect_kind"]
-    ]
+    suffix = {
+        "rootdisk": "-rootdisk",
+        "cloud_init": "-cloudinit",
+        "vm": "",
+        "workspace_attach": "",
+    }[value["effect_kind"]]
     # Reusable workspace bindings have their own rootdisk name. Such names must
     # be checked against the frozen binding by the store before granting.
     if (
-        value["effect_kind"] != "rootdisk"
+        value["effect_kind"] not in {"rootdisk", "workspace_attach"}
         and value["object_name"] != f"agent-vm-{value['job_id']}{suffix}"
     ):
         raise ValueError("Foreign creation object name")
@@ -452,6 +490,17 @@ def public_effect_observation(
         raise ValueError("Unknown issuance cannot be settled from absence")
     try:
         kind = values["effect_kind"]
+        if kind == "workspace_attach":
+            from shared.vm_creation_attachment import attachment_observation
+
+            return attachment_observation(
+                values["workspace_attachment"],
+                observation["object"],
+                namespace=carrier["metadata"]["namespace"],
+                request_id=values["retry_request_id"],
+                effect_nonce=values["effect_nonce"],
+                provision_generation=values["provision_generation"],
+            )
         expected_kind = {
             "rootdisk": ("cdi.kubevirt.io/v1beta1", "DataVolume"),
             "cloud_init": ("v1", "Secret"),
@@ -494,7 +543,7 @@ def public_effect_observation(
             "namespace": metadata["namespace"],
         }
         if kind == "rootdisk":
-            if values["version"] == 2 and not retained:
+            if values["version"] in (2, 3) and not retained:
                 source = values["rootdisk_source"]
                 expected_source = (
                     {"pvc": {"namespace": source["namespace"], "name": source["name"]}}
