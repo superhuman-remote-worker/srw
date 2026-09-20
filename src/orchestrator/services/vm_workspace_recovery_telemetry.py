@@ -7,6 +7,8 @@ import logging
 import re
 from typing import Any
 
+from shared.workspace_recovery import WorkspaceRecoveryCode
+
 try:
     from opentelemetry import metrics
 
@@ -34,8 +36,6 @@ class _NullMeter:
 
     def create_histogram(self, *_args: Any, **_kwargs: Any) -> _NullInstrument:
         return _NullInstrument()
-
-from shared.workspace_recovery import WorkspaceRecoveryCode
 
 
 logger = logging.getLogger(__name__)
