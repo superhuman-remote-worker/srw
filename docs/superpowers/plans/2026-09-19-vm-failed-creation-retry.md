@@ -20,10 +20,14 @@ Longhorn, pytest and the existing Podman-compatible PostgreSQL test fixtures.
 progress (`5e3ef3231`) on `feat/vm-reliability-20260919`; not pushed or deployed to
 main dev. Tasks 1, 2a, 2b, 4 and 5 passed scoped independent review. Task 3 has
 reviewed configuration, per-effect issuance, golden/prepared sources and exact
-adoption; retained attachment and disk/Secret-only cancellation settlement remain.
+adoption; new/same-owner, inherited and prepared-target attachment now also passed
+review (`90eb9f1bc` includes inherited prepared reuse). Immutable partial-creation
+cancellation disposition and pre-grant source-hold protection (`67e56398e`,
+migration 0266) passed independent review and 94 distinct local checks. Controller
+disposition, source/attachment settlement and its typed completion writer remain.
 Controller capability remains absent and admission defaults off. Task 6 live
-acceptance is open. A2 code/review is complete locally; A3, B, C and D have their
-own remaining work and gates.
+acceptance is open. A2 and A3 code/review are complete locally; their live gates
+remain open. B, C and D have their own remaining work and gates.
 
 Task 5 evidence: 107 actual-PostgreSQL tests, 86 projection/compatibility tests,
 124 focused frontend tests, production AOT build and independent reviews passed.

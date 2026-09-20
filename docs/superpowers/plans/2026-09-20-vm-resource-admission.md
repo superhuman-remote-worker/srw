@@ -1,6 +1,6 @@
 # Task D: Resource-based VM admission seams and implementation plan
 
-**Status:** implementation under the owner-approved remaining roadmap. D1 resource/placement primitives (`c62177172`), D2 sanitized collector (`5b3219e07`) and immutable inventory store/migration 0263 (`24feabea8`) passed independent review. Authenticated ingestion, default-off observer runtime and shared Helm policy (`94b13145a`) passed independent review, 133 inventory/Helm checks and 23 startup/runtime compatibility tests. Direct read-only collection on dedicated k3d returned complete eight-kind inventory; no live publication or admission is claimed. D3 exact occupancy (`bb1b26daa`, 24 tests), persistent fairness nomination (`7596fd415`, 12 tests), and immutable reservation schema/evidence retention (`0e1ee5a88`, 24 PostgreSQL/head tests) passed independent review. The unconnected atomic admission store is being tested; trusted waiter projection and lifecycle integration remain next. Durable reservations/fairness, creation integration, accounting visibility and enforcement remain incomplete. Production policy values and live acceptance remain rollout prerequisites.
+**Status:** implementation under the owner-approved remaining roadmap. D1 resource/placement primitives (`c62177172`), D2 sanitized collector (`5b3219e07`) and immutable inventory store/migration 0263 (`24feabea8`) passed independent review. Authenticated ingestion, default-off observer runtime and shared Helm policy (`94b13145a`) passed independent review, 133 inventory/Helm checks and 23 startup/runtime compatibility tests. Direct read-only collection on dedicated k3d returned complete eight-kind inventory; no live publication or admission is claimed. D3 exact occupancy (`bb1b26daa`, 24 tests), persistent fairness nomination (`7596fd415`, 12 tests), and immutable reservation schema/evidence retention (`0e1ee5a88`, 24 PostgreSQL/head tests) passed independent review. The unconnected atomic admission store (`e182b1e37`) passed independent review and 32 PostgreSQL/placement checks. Invalid-head maintenance, trusted waiter projection and lifecycle integration remain next. Durable reservations/fairness, creation integration, accounting visibility and enforcement remain incomplete. Production policy values and live acceptance remain rollout prerequisites.
 
 **Snapshot inspected:** worktree HEAD `91f9971e14ade45d154bf8bff946dfaed3700b85` on 2026-09-20. The worktree also contained unrelated in-progress Task 3 changes; line numbers must be refreshed before implementation.
 
@@ -129,7 +129,7 @@ The minimum slice intentionally pins the initial VMI to one selected Node UID/na
 
 ## Database model and lock order
 
-Use the next app migration number available at implementation time (current local head is 0264; coordinate with remaining A1 cancellation work). Update `src/orchestrator/database/schema_current.sql` and the migration-head checks in the same change.
+Use the next app migration number available at implementation time. Committed local head is 0266; 0267 is reserved for waiter parking/maintenance, coordinated with A1 cancellation completion. Update `src/orchestrator/database/schema_current.sql` and the migration-head checks in the same change.
 
 Suggested tables:
 
