@@ -57,6 +57,21 @@ class InventorySettings:
             return None
         try:
             value = decode_document(raw.encode("utf-8"), max_bytes=16384)
+            settings = cls.from_document(value)
+            if settings is not None and configured_secret(env) is None:
+                raise ValueError
+            return settings
+        except (ValueError, TypeError, KeyError, UnicodeError):
+            raise InventoryError("invalid_inventory_configuration") from None
+
+    @classmethod
+    def from_document(cls, value):
+        """Pure observer-policy identity; runtime startup separately requires HMAC.
+
+        This does not authorize observation or enable unfinished admission modes.
+        Empty resource-value maps remain valid for observation alone.
+        """
+        try:
             if not isinstance(value, dict) or set(value) != {
                 "mode",
                 "namespace",
@@ -84,8 +99,6 @@ class InventorySettings:
                 value["mode"] != "same-cluster"
                 or not policy["clusterWidePodReadAcknowledged"]
             ):
-                raise ValueError
-            if configured_secret(env) is None:
                 raise ValueError
             cluster, namespace = policy["stableClusterId"], value["namespace"]
             for identifier, limit in ((cluster, 253), (namespace, 63)):

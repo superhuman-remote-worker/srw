@@ -18,11 +18,11 @@ from orchestrator.services.vm_creation_retry_store import (
 from shared.kubernetes_quantities import normalize_byte_quantity
 from shared.vm_resource_accounting import ReservationCharge, account_inventory
 from shared.vm_resource_admission import (
-    HostCostPolicy,
     ResourceAdmissionError,
     ResourceVector,
 )
 from shared.vm_resource_fairness import Waiter, choose_waiter
+from shared.vm_resource_policy import parse_resource_policy_values
 from shared.vm_resource_inventory import InventoryError, snapshot_is_fresh
 from shared.vm_resource_placement import (
     affinity_label_keys,
@@ -49,12 +49,6 @@ def _positive(value):
     if type(value) is not int or not 1 <= value < 2**63:
         raise ResourceAdmissionError("invalid_resource_policy")
     return value
-
-
-def _fields(value, fields):
-    if not isinstance(value, dict) or set(value) != set(fields):
-        raise ResourceAdmissionError("invalid_resource_policy")
-    return [value[field] for field in fields]
 
 
 def _policy_values(document, inventory):
@@ -85,29 +79,7 @@ def _policy_values(document, inventory):
             raise ResourceAdmissionError("invalid_resource_policy")
     if sorted(limits["nodeLabelKeys"]) != inventory.label_keys:
         raise ResourceAdmissionError("invalid_resource_policy")
-    cost = HostCostPolicy(
-        *_fields(
-            policy["hostCost"],
-            (
-                "cpuMillicoresPerVcpuNumerator",
-                "cpuMillicoresPerVcpuDenominator",
-                "launcherCpuOverheadMillicores",
-                "fixedMemoryOverheadBytes",
-                "perVcpuMemoryOverheadBytes",
-                "memoryOverheadBasisPoints",
-            ),
-        )
-    )
-    headroom = ResourceVector(
-        *_fields(policy["nodeHeadroom"], ("cpuMillicores", "memoryBytes", "kvmDevices"))
-    )
-    bypasses, aging = _fields(
-        policy["fairness"], ("maxBypasses", "priorityAgingSeconds")
-    )
-    _positive(aging)
-    if type(bypasses) is not int or not 0 <= bypasses < 2**63:
-        raise ResourceAdmissionError("invalid_resource_policy")
-    return cost, headroom, bypasses, aging
+    return parse_resource_policy_values(policy)
 
 
 def _node_document(node):
