@@ -96,6 +96,23 @@ async def prove_replacement(
         or previous["canonical_request"].get("preparation") is not None
     ):
         _refuse()
+    # The retired VM's context copy is optional convenience metadata. The
+    # adopted ledger remains the execution and deadline authority even if that
+    # copy disappeared. The existing scope already holds this execution lock.
+    execution = await conn.fetchrow(
+        "SELECT *,CASE WHEN resolved->'spec'->>'timeoutSeconds' IS NULL THEN NULL "
+        "ELSE created_at+((resolved->'spec'->>'timeoutSeconds')::double precision * interval '1 second') END AS deadline "
+        "FROM srw_execution_specs WHERE work_kind='Job' AND work_id=$1 FOR SHARE",
+        job["id"],
+    )
+    if (
+        not execution
+        or execution["id"] != previous["execution_id"]
+        or execution["revision"] != previous["execution_revision"]
+        or execution["generation"] != previous["execution_generation"]
+        or execution["deadline"] != previous["admission_deadline"]
+    ):
+        _refuse()
     historical = previous["predecessor_evidence"]
     handoff = (
         historical.get("handoff")

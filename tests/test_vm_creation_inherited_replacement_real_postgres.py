@@ -375,3 +375,49 @@ async def test_replacement_rechecks_own_cleanup_between_effects(db, attached):
         and "Secret" not in api.writes
         and "DataVolume" not in api.writes
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("change", ["revision", "generation", "deadline"])
+async def test_replacement_keeps_prior_execution_binding_without_context_copy(
+    db, attached, change
+):
+    _, first, (request, fresh, _, _, _) = await replacing(db, attached)
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE jobs SET context=context #- '{vm,creation_preflight}' WHERE id=$1",
+            UUID(request["job_id"]),
+        )
+        if change == "revision":
+            await conn.execute(
+                "UPDATE srw_execution_specs SET revision='changed' WHERE id=$1",
+                first["execution_id"],
+            )
+        elif change == "generation":
+            await conn.execute(
+                "UPDATE srw_execution_specs SET generation=generation+1 WHERE id=$1",
+                first["execution_id"],
+            )
+        else:
+            await conn.execute(
+                "UPDATE srw_execution_specs SET resolved=jsonb_set(resolved,'{spec,timeoutSeconds}','7200'::jsonb) WHERE id=$1",
+                first["execution_id"],
+            )
+    with pytest.raises(VMCreationRetryConflict):
+        await VMCreationPreflightStore(db).begin(
+            job_id=request["job_id"], request=request, fresh_context=fresh
+        )
+
+
+@pytest.mark.asyncio
+async def test_replacement_uses_unchanged_ledger_without_context_copy(db, attached):
+    ctrl, _, _, _ = attached
+    store, first, (request, fresh, _, _, _) = await replacing(db, attached)
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE jobs SET context=context #- '{vm,creation_preflight}' WHERE id=$1",
+            UUID(request["job_id"]),
+        )
+    _, row, payload = await admit_replacement(db, ctrl, store, request, fresh)
+    assert row["admission_deadline"] == first["admission_deadline"]
+    assert (await ctrl._do_create_serialized(payload))["status"] == "created"
