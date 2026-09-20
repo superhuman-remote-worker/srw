@@ -1,6 +1,6 @@
 # Task D: Resource-based VM admission seams and implementation plan
 
-**Status:** implementation plan under the owner-approved remaining roadmap. No resource admission code or rollout is complete. Production policy values and live acceptance remain rollout prerequisites.
+**Status:** implementation under the owner-approved remaining roadmap. The pure host-cost, Pod request and node-placement foundation has 195 passing tests and awaits independent review. Inventory ingestion, durable reservations/fairness, creation integration and rollout remain incomplete. Production policy values and live acceptance remain rollout prerequisites.
 
 **Snapshot inspected:** worktree HEAD `91f9971e14ade45d154bf8bff946dfaed3700b85` on 2026-09-20. The worktree also contained unrelated in-progress Task 3 changes; line numbers must be refreshed before implementation.
 
@@ -41,7 +41,7 @@ Storage bytes remain a separate capacity problem. This slice considers retained-
   - `host_memory_bytes = guest_memory_bytes + fixedMemoryOverheadBytes + perVcpuMemoryOverheadBytes * guest_vcpus + ceil(guest_memory_bytes * memoryOverheadBasisPoints / 10000)`
   - one `devices.kubevirt.io/kvm` device
 - Do not hard-code a main-cluster ratio, overhead, headroom, or quota. The repository README's approximate KubeVirt launcher formula is useful for an operator worksheet and shadow comparison, but it is not a discovered production policy.
-- Reuse `infrastructure_metering.collectors.quantities` for strict quantity normalization and `infrastructure_metering.collectors.pod_normalization.normalize_pod` for Kubernetes effective CPU/RAM requests. That implementation already covers normal containers, restartable/non-restartable init containers, Pod-level requests, Pod overhead, and in-place resize status. Add a focused scheduler-equivalent integer extractor for `devices.kubevirt.io/kvm`; the existing normalizer deliberately handles only CPU and memory. Admission must not create a second, subtly different CPU/RAM request algorithm.
+- Reuse the existing quantity and Pod normalization algorithms for Kubernetes effective CPU/RAM requests. The controller image has no orchestrator package, so the pure implementations move to `shared.kubernetes_quantities` and `shared.kubernetes_pod_requests`, with the original metering modules retaining compatibility exports. This implementation already covers normal containers, restartable/non-restartable init containers, Pod-level requests, Pod overhead, and in-place resize status. Add a focused integer extractor for `devices.kubevirt.io/kvm`; the existing normalizer deliberately handles only CPU and memory. Admission must not create a second, subtly different CPU/RAM request algorithm.
 
 ### Eligible-node fit and external occupancy
 
@@ -248,7 +248,9 @@ Scheduling reservations are not automatically billable usage. Existing infrastru
 
 ### 1. Pure resource and placement model
 
-**Files:** add `src/shared/vm_resource_admission.py`; add `tests/test_vm_resource_admission.py`.
+**Files:** add `src/shared/vm_resource_admission.py`, `vm_resource_placement.py` and corresponding tests; extract the pure shared normalizers with compatibility exports.
+
+Current local foundation covers arithmetic, explicit policy digests, shared Pod requests, whole KVM devices, deleting/terminal/unscheduled occupancy and static placement. The component-wise managed-charge helper requires caller-proven launcher identity; complete inventory classification and prevention of double counting remain stages 2-3.
 
 - Write RED tests for CPU rounding, memory overhead components, quantity rejection, vector add/subtract/max, KVM devices, selector matching, taints/tolerations, Ready/cordon exclusion, retained-PV node affinity, and deterministic digests.
 - Reuse the existing Pod normalizer and prove init-container, Pod-overhead, resizing, terminating, and terminal cases contribute correctly.

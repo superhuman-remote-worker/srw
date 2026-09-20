@@ -1,7 +1,7 @@
 # VM provisioning phases and resilient waiting
 
-Status (2026-09-20): A2 code and independent review passed locally; live acceptance
-is pending. A3 is in progress under the owner's overnight authorization.
+Status (2026-09-20): A2 and A3 code and independent reviews passed locally;
+live acceptance is pending. A3 checkpoints are `59dbf3e19` and `2e8a7c194`.
 This follows the VM reliability roadmap, A2 and A3. A1 owns all creation
 issuance, reservation, cancellation and frozen-request authority.
 
@@ -54,7 +54,7 @@ capacity clears that outage clock. No explicit deadline is extended by Resume.
   real PostgreSQL races, restart, cancellation, generation/recovery fences.
 - [x] Dispatcher attention/boot decisions and safe legacy-controller behavior;
   integration tests assert no deletion for clone/placement/unknown evidence.
-- [ ] A3 durable waiting, one admission count, immutable deadline enforcement;
+- [x] A3 durable waiting, one admission count, immutable deadline enforcement;
   real PostgreSQL concurrency and lost-response tests, ordinary capacity >26h.
 - [x] A2 Helm/projection documentation and independent review; focused suites and
   real-PostgreSQL phase/cleanup races passed.
@@ -62,4 +62,10 @@ capacity clears that outage clock. No explicit deadline is extended by Resume.
 
 Full implementation seams and reconnaissance evidence are retained in the local
 work report `.superpowers/a2-a3-implementation-seams.md`. A2 is integrated locally and its independent review passed. Live acceptance
-remains pending. A3 is not complete.
+remains pending. A3 removes capacity expiration, counts each authenticated legacy
+admission once while leaving protocol accounting with A1, and resets only at
+verified Ready. Paused infrastructure waits use their original execution
+deadline through the existing guarded cancellation transaction. Migration 0262
+adds a bounded persistent scan cursor so older blocked cancels cannot starve
+later expired jobs. The deadline/control/migration-head suite passed 81 tests;
+independent actual-PostgreSQL starvation and cursor-race checks passed.
