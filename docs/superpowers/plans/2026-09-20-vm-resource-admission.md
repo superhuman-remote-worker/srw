@@ -2,6 +2,8 @@
 
 **Status:** implementation under the owner-approved remaining roadmap. D1 resource/placement primitives (`c62177172`), D2 sanitized collector (`5b3219e07`) and immutable inventory store/migration 0263 (`24feabea8`) passed independent review. Authenticated ingestion, default-off observer runtime and shared Helm policy (`94b13145a`) passed independent review, 133 inventory/Helm checks and 23 startup/runtime compatibility tests. The endpoint inventory now recognizes the existing fixed-purpose publisher authentication gate (`c9a01ab52`) without changing permissions or configuration. Direct read-only collection on dedicated k3d returned complete eight-kind inventory; no live publication or admission is claimed. D3 exact occupancy (`bb1b26daa`, 24 tests), persistent fairness nomination (`7596fd415`, 12 tests), immutable reservation schema/evidence retention (`0e1ee5a88`, 24 PostgreSQL/head tests), and the unconnected atomic admission store (`e182b1e37`, 32 PostgreSQL/placement checks) passed independent review. Bounded invalid-head maintenance (`9b2c5fe00`, corrected by `be992cc33`) also passed review with 25 PostgreSQL maintenance checks: transient blockers park without losing age/protection, terminal no-effect requests can cancel, and malformed lineage quarantines only its own reservation-free waiter so unrelated owners can advance. These stores remain unconnected and all observer, shadow and enforcement modes remain off by default. Trusted waiter projection, runtime maintenance wiring, reservation binding/release, lifecycle integration, accounting visibility and enforcement remain incomplete. Production policy values and live acceptance remain rollout prerequisites.
 
+The first trusted-template prerequisite is reviewed (`5bf49d0e7`, corrected by `d862054d8`): a pure bounded parser reads the original VM YAML without credential rendering and projects only supported CPU/memory, placement and ordinary root-storage semantics. Unsupported scheduling, devices, dynamic placement and hidden PV binding/population constraints are refused. All 59 parser/placement checks and three independent storage-constraint repros passed. This helper is not wired into admission: versioned controller configuration, trusted owner/project/priority projection, measured host-cost mapping, final rendered-manifest validation and reservation binding are still required.
+
 **Snapshot inspected:** worktree HEAD `91f9971e14ade45d154bf8bff946dfaed3700b85` on 2026-09-20. The worktree also contained unrelated in-progress Task 3 changes; line numbers must be refreshed before implementation.
 
 ## Decision
@@ -129,7 +131,7 @@ The minimum slice intentionally pins the initial VMI to one selected Node UID/na
 
 ## Database model and lock order
 
-Use the next app migration number available at implementation time. Committed local head is 0267; A1 owns the next 0268 migration for typed cancellation completion. Update `src/orchestrator/database/schema_current.sql` and the migration-head checks in the same change.
+Use the next app migration number available at implementation time. Committed local head is 0268; A1 owns the next 0269 migration for typed cancellation completion. Update `src/orchestrator/database/schema_current.sql` and the migration-head checks in the same change.
 
 Suggested tables:
 
