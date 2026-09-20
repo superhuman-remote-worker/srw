@@ -49,7 +49,7 @@ def validate_attachment_intent(value, *, request, expected_pvc_uid):
             raise ValueError("Initial attachment absence is unproven")
         return dict(value)
     if (
-        action not in {"replace", "observe"}
+        action not in {"replace", "observe", "claim"}
         or not isinstance(prior, Mapping)
         or set(prior)
         != {

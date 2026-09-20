@@ -361,7 +361,12 @@ async def test_authority_rejects_prepared_retained_root_dv_disagreement(prepared
             SimpleNamespace(),
             row,
             {"metadata": {"namespace": settings.VM_NAMESPACE}},
-            {"version": 2, "rootdisk_source": source, "retained_dv_uid": str(uuid4())},
+            {
+                "version": 2,
+                "effect_kind": "rootdisk",
+                "rootdisk_source": source,
+                "retained_dv_uid": str(uuid4()),
+            },
         )
 
 

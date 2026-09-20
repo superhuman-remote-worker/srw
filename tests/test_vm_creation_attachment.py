@@ -40,7 +40,7 @@ def case(action="create"):
     return request, intent
 
 
-@pytest.mark.parametrize("action", ["create", "replace", "observe"])
+@pytest.mark.parametrize("action", ["create", "replace", "observe", "claim"])
 def test_exact_attachment_transition_facts(action):
     request, intent = case(action)
     assert (
@@ -132,7 +132,7 @@ def lease_case(action="create"):
     return intent, obj, args
 
 
-@pytest.mark.parametrize("action", ["create", "replace", "observe"])
+@pytest.mark.parametrize("action", ["create", "replace", "observe", "claim"])
 def test_attachment_observation_binds_actual_lease_identity(action):
     intent, obj, args = lease_case(action)
     observed = attachment_observation(intent, obj, **args)

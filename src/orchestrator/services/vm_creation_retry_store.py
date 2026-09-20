@@ -800,7 +800,7 @@ class VMCreationRetryStore:
         self, *, request_id: str, claim_token: str, carrier: dict
     ) -> dict:
         """One successful CAS grants one actuation; repeats only permit observation."""
-        from shared.vm_creation_issuance import EFFECT_KINDS
+        from shared.vm_creation_attachment import attachment_effect_kinds
 
         values = self._carrier(carrier)
         async with self.db.acquire() as conn:
@@ -842,17 +842,43 @@ class VMCreationRetryStore:
                         "disposition": "observe_only",
                         "effect_state": prior["state"],
                     }
+                stages = attachment_effect_kinds(row["canonical_request"])
                 if row["canonical_request"].get("workspace_storage") is not None:
-                    # Carrier/schema rollout precedes instance authority and the
-                    # actuator. Historical exact nonces remain observe-only;
-                    # no fresh effect may take the old root-only path meanwhile.
-                    raise VMCreationRetryConflict(
-                        "creation_attachment_authority_unproven"
+                    if (
+                        values["version"] != 3
+                        or values["workspace_attachment"]["action"] == "observe"
+                    ):
+                        raise VMCreationRetryConflict(
+                            "creation_attachment_authority_unproven"
+                        )
+                    from orchestrator.services.vm_creation_attachment_store import (
+                        attachment_instance_on_conn,
                     )
+
+                    await attachment_instance_on_conn(conn, row)
+                    prior_lease = values["workspace_attachment"]["prior"]
+                    if prior_lease and prior_lease["execution_id"] != str(
+                        row["job_id"]
+                    ):
+                        raise VMCreationRetryConflict(
+                            "creation_attachment_lineage_unproven"
+                        )
+                    if values["effect_kind"] != "workspace_attach":
+                        attachment = _json(
+                            await conn.fetchval(
+                                "SELECT evidence FROM vm_creation_effects WHERE request_id=$1 AND effect_kind='workspace_attach' AND state='observed' ORDER BY effect_number DESC LIMIT 1",
+                                row["request_id"],
+                            )
+                        )
+                        if (
+                            not attachment
+                            or values["current_attachment_uid"] != attachment["uid"]
+                        ):
+                            raise VMCreationRetryConflict("creation_attachment_changed")
                 # Historical v1 effects remain observable above and through
                 # observe/settle, but cannot mint a fresh source-less grant for
                 # modes that require a frozen clone/retained-source document.
-                if values["version"] != 2 and (
+                if values["version"] not in (2, 3) and (
                     row["controller_configuration"]["golden_enabled"]
                     or row["canonical_request"].get("preparation") is not None
                 ):
@@ -860,18 +886,16 @@ class VMCreationRetryStore:
                 if latest and latest["state"] == "issued":
                     raise VMCreationRetryConflict("creation_effect_unresolved")
                 if latest is None:
-                    expected_kind = "rootdisk"
+                    expected_kind = stages[0]
                 elif latest["state"] == "rejected":
                     expected_kind = latest["effect_kind"]
                 elif latest["effect_kind"] == "vm":
                     raise VMCreationRetryConflict("creation_already_admitted")
                 else:
-                    expected_kind = EFFECT_KINDS[
-                        EFFECT_KINDS.index(latest["effect_kind"]) + 1
-                    ]
+                    expected_kind = stages[stages.index(latest["effect_kind"]) + 1]
                 if values["effect_kind"] != expected_kind:
                     raise VMCreationRetryConflict("creation_effect_out_of_order")
-                if expected_kind != "rootdisk":
+                if expected_kind not in {"rootdisk", "workspace_attach"}:
                     rootdisk = _json(
                         await conn.fetchval(
                             "SELECT evidence FROM vm_creation_effects WHERE request_id=$1 AND effect_kind='rootdisk' AND state='observed' ORDER BY effect_number DESC LIMIT 1",
@@ -1090,6 +1114,7 @@ class VMCreationRetryStore:
                             "controller_configuration_digest",
                             "expected_pvc_uid",
                             "state",
+                            "reason",
                             "creation_admission_id",
                             "creation_carrier_uid",
                         )
@@ -1120,11 +1145,10 @@ class VMCreationRetryStore:
         from shared.vm_lifecycle_auth import configured_secret
 
         values = self._carrier(carrier)
-        if values["effect_kind"] != "vm" or set(observations) != {
-            "rootdisk",
-            "cloud_init",
-            "vm",
-        }:
+        expected_kinds = {"rootdisk", "cloud_init", "vm"}
+        if values["version"] == 3:
+            expected_kinds.add("workspace_attach")
+        if values["effect_kind"] != "vm" or set(observations) != expected_kinds:
             raise VMCreationRetryConflict("creation_adoption_unproven")
         async with self.db.acquire() as conn:
             async with conn.transaction():
@@ -1171,7 +1195,7 @@ class VMCreationRetryStore:
                         )
                     proven[kind] = actual
                 if (
-                    set(proven) != {"rootdisk", "cloud_init", "vm"}
+                    set(proven) != expected_kinds
                     or _json(effects[-1]["carrier_intent"]) != values
                 ):
                     raise VMCreationRetryConflict("creation_adoption_unproven")
@@ -1196,6 +1220,18 @@ class VMCreationRetryStore:
                     ):
                         raise VMCreationRetryConflict("creation_reservation_changed")
                     return result
+                if row["canonical_request"].get("workspace_storage") is not None:
+                    from orchestrator.services.vm_creation_attachment_store import (
+                        record_attachment_adoption_on_conn,
+                    )
+
+                    await record_attachment_adoption_on_conn(
+                        conn, row, pvc_uid=vm["pvc_uid"], namespace=vm["namespace"]
+                    )
+                    current["workspace_storage"] = {
+                        **row["canonical_request"]["workspace_storage"],
+                        "pvc_uid": vm["pvc_uid"],
+                    }
                 cancelled = row["state"] == "cancel_requested"
                 if row["state"] not in {
                     "queued",

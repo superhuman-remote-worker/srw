@@ -18,7 +18,6 @@ from shared.vm_creation_issuance import (
     CREATION_SIGNATURE_ANNOTATION,
     EFFECT_NONCE_ANNOTATION,
     REQUEST_ANNOTATION,
-    EFFECT_KINDS,
     seal_creation_carrier,
     verify_creation_carrier,
     public_effect_observation,
@@ -177,7 +176,7 @@ class CreationActuator:
             raise CreationUnproven("creation_carrier_changed")
         return result
 
-    async def disk(self, row, *, expected=None):
+    async def disk(self, row, *, expected=None, require_attachment=True):
         request = row["request"]
         binding = request.get("workspace_storage")
         name = (
@@ -231,7 +230,14 @@ class CreationActuator:
                 await self.controller._active_recovery_pins(), meta["uid"]
             ):
                 raise CreationUnproven("workspace_recovery_held")
-        if binding:
+        if binding and any(
+            obj["metadata"].get("labels", {}).get("srw.io/workspace-instance")
+            != binding["uid"]
+            for obj in (dv, pvc)
+            if obj is not None
+        ):
+            raise CreationUnproven("workspace_attachment_unproven")
+        if binding and require_attachment:
             from shared.vm_workspace_storage import (
                 WORKSPACE_LABEL,
                 GENERATION_LABEL,
@@ -242,20 +248,13 @@ class CreationActuator:
             labels = (lease or {}).get("metadata", {}).get("labels", {})
             annotations = (lease or {}).get("metadata", {}).get("annotations", {})
             if (
-                not dv
-                or not pvc
-                or not lease
+                not lease
                 or lease["metadata"].get("deletionTimestamp")
                 or labels.get(WORKSPACE_LABEL) != binding["uid"]
                 or labels.get(GENERATION_LABEL) != str(binding["generation"])
                 or labels.get(EXECUTION_LABEL) != row["job_id"]
                 or annotations.get("srw.io/released") == "true"
                 or annotations.get("srw.io/detached") == "true"
-                or any(
-                    obj["metadata"].get("labels", {}).get(WORKSPACE_LABEL)
-                    != binding["uid"]
-                    for obj in (dv, pvc)
-                )
             ):
                 raise CreationUnproven("workspace_attachment_unproven")
         return name, dv, pvc
@@ -263,6 +262,9 @@ class CreationActuator:
     async def observation(self, row, effect, lease):
         values = effect["carrier_intent"]
         kind = values["effect_kind"]
+        if kind == "workspace_attach":
+            obj = await self.read("lease", values["object_name"])
+            return {"outcome": "observed", "object": obj} if obj is not None else None
         disk_evidence = next(
             (
                 e["evidence"]
@@ -325,7 +327,17 @@ class CreationActuator:
             observations[effect["carrier_intent"]["effect_kind"]] = observation
         return observations
 
-    def values(self, row, reservation, kind, dv, pvc, previous, rootdisk_source):
+    def values(
+        self,
+        row,
+        reservation,
+        kind,
+        dv,
+        pvc,
+        previous,
+        rootdisk_source,
+        attachment=None,
+    ):
         prior = {
             e["carrier_intent"]["effect_kind"]: e["evidence"]
             for e in row["effects"]
@@ -336,7 +348,17 @@ class CreationActuator:
         )
         disk = prior.get("rootdisk")
         return {
-            "version": 2,
+            "version": 3 if attachment is not None else 2,
+            **(
+                {
+                    "workspace_attachment": attachment,
+                    "current_attachment_uid": prior.get("workspace_attach", {}).get(
+                        "uid"
+                    ),
+                }
+                if attachment is not None
+                else {}
+            ),
             "rootdisk_source": rootdisk_source,
             "source": "controller_vm_create",
             "admission_id": str(reservation["admission_id"]),
@@ -365,7 +387,7 @@ class CreationActuator:
                 if row["request"].get("workspace_storage")
                 else "agent-vm-" + row["job_id"] + "-rootdisk"
             )
-            if kind == "rootdisk"
+            if kind in {"rootdisk", "workspace_attach"}
             else "agent-vm-"
             + row["job_id"]
             + ("-cloudinit" if kind == "cloud_init" else ""),
@@ -373,6 +395,10 @@ class CreationActuator:
 
     async def body(self, row, values):
         request = row["request"]
+        if values["effect_kind"] == "workspace_attach":
+            from vm_controller.creation_attachment import CreationAttachment
+
+            return CreationAttachment(self).body(row, values)
         key = ""
         if (
             values["effect_kind"] == "cloud_init"
@@ -428,6 +454,7 @@ class CreationActuator:
             result["metadata"]["labels"] = {
                 "srw.io/rootdisk": "true",
                 "job-id": row["job_id"],
+                **(storage_labels(binding, row["job_id"]) if binding else {}),
             }
         elif values["effect_kind"] == "cloud_init":
             if not user_data or not self.settings._ssh_host_key_fingerprint(
@@ -553,7 +580,7 @@ class CreationActuator:
             "status": "creation_pending",
             "reason": "creation_observation_pending",
         }
-        for _ in range(7):
+        for _ in range(9):
             row = await self.authority("inspect", request_id=envelope["request_id"])
             if (
                 any(
@@ -648,9 +675,21 @@ class CreationActuator:
                 raise CreationUnproven("creation_configuration_changed")
             if await self.controller._capacity_wait("agent-vm-" + row["job_id"]):
                 return {**pending, "reason": "capacity_wait"}
-            _, dv, pvc = await self.disk(row)
+            from shared.vm_creation_attachment import attachment_effect_kinds
+            from vm_controller.creation_attachment import CreationAttachment
+
+            stages = attachment_effect_kinds(request)
+            attachment_stage = request.get("workspace_storage") is not None and not any(
+                effect["state"] == "observed"
+                and effect["carrier_intent"]["effect_kind"] == "workspace_attach"
+                for effect in effects
+            )
+            _, dv, pvc = await self.disk(row, require_attachment=not attachment_stage)
             if (
-                latest is None
+                not any(
+                    effect["carrier_intent"]["effect_kind"] == "rootdisk"
+                    for effect in effects
+                )
                 and row["expected_pvc_uid"] is None
                 and (dv is not None or pvc is not None)
             ):
@@ -678,10 +717,10 @@ class CreationActuator:
                 (
                     previous["effect_kind"]
                     if latest["state"] == "rejected"
-                    else EFFECT_KINDS[EFFECT_KINDS.index(previous["effect_kind"]) + 1]
+                    else stages[stages.index(previous["effect_kind"]) + 1]
                 )
                 if latest
-                else "rootdisk"
+                else stages[0]
             )
             from vm_controller.creation_sources import source_manager
 
@@ -690,17 +729,22 @@ class CreationActuator:
             rootdisk_source = (
                 await sources.prepare(row, frozen) if kind == "rootdisk" else frozen
             )
-            if rootdisk_source is None:
+            if rootdisk_source is None and kind != "workspace_attach":
                 raise CreationUnproven("creation_rootdisk_source_unproven")
+            attachment = previous.get("workspace_attachment") if previous else None
+            if kind == "workspace_attach":
+                attachment = await CreationAttachment(self).prepare(row, attachment)
             values = self.values(
-                row, reservation, kind, dv, pvc, previous, rootdisk_source
+                row, reservation, kind, dv, pvc, previous, rootdisk_source, attachment
             )
             carrier = await self.publish(values, prior=previous)
             if lease and carrier["metadata"]["uid"] != lease["metadata"]["uid"]:
                 raise CreationUnproven("creation_carrier_changed")
             await self.exact_previous(row, carrier)
-            await self.disk(row)
+            await self.disk(row, require_attachment=kind != "workspace_attach")
             await self.require_vm_absent(row)
+            if kind == "workspace_attach":
+                await CreationAttachment(self).validate(row, attachment)
             body = (
                 None
                 if kind == "rootdisk" and row["expected_pvc_uid"]
@@ -726,13 +770,18 @@ class CreationActuator:
             ):
                 raise CreationUnproven("creation_carrier_changed")
             await self.exact_previous(row, current)
-            await self.disk(row)
+            await self.disk(row, require_attachment=kind != "workspace_attach")
             await self.require_vm_absent(row)
+            if kind == "workspace_attach":
+                await CreationAttachment(self).validate(row, attachment)
             if kind == "rootdisk":
                 await sources.validate(row, rootdisk_source)
             if body is not None:
                 try:
-                    await self.create_object(kind, body)
+                    if kind == "workspace_attach":
+                        await CreationAttachment(self).create(body, attachment)
+                    else:
+                        await self.create_object(kind, body)
                 except ApiException as exc:
                     try:
                         status = json.loads(exc.body or "null")

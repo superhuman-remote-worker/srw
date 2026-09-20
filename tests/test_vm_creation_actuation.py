@@ -419,6 +419,18 @@ async def test_retained_exact_disk_reuses_same_permit_without_dv_write(
     binding = None
     labels = {"srw.io/owner-kind": "job", "srw.io/owner-id": job}
     if bound:
+        ctrl.k8s_client.list_namespaced_custom_object = lambda **kw: {
+            "items": [
+                deepcopy(obj)
+                for (kind, _), obj in api.objects.items()
+                if kind
+                == {
+                    "virtualmachines": "VirtualMachine",
+                    "virtualmachineinstances": "VirtualMachineInstance",
+                }[kw["plural"]]
+            ]
+        }
+        ctrl.core_api.list_namespaced_pod = lambda **kw: SimpleNamespace(items=[])
         binding = {
             "uid": str(uuid4()),
             "owner_id": job,
@@ -479,7 +491,7 @@ async def test_retained_exact_disk_reuses_same_permit_without_dv_write(
     assert result["status"] == "created"
     assert "DataVolume" not in api.writes
     assert result["rootdisk_pvc_uid"] == pvc_uid
-    assert authority.row["effects"][0]["evidence"]["uid"] == dv_uid
+    assert authority.row["effects"][1 if bound else 0]["evidence"]["uid"] == dv_uid
 
 
 @pytest.mark.asyncio

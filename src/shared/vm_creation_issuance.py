@@ -586,6 +586,21 @@ def public_effect_observation(
                 raise ValueError("Creation Secret host key identity missing")
             result["ssh_host_key_fingerprint"] = fingerprint
         else:
+            if values["version"] == 3:
+                from shared.vm_workspace_storage import storage_labels
+
+                expected_labels = storage_labels(
+                    values["workspace_attachment"]["binding"], values["job_id"]
+                )
+                for actual in (
+                    labels,
+                    obj["spec"]["template"]["metadata"].get("labels", {}),
+                ):
+                    if any(
+                        actual.get(key) != value
+                        for key, value in expected_labels.items()
+                    ):
+                        raise ValueError("VM attachment labels changed")
             source = values.get("rootdisk_source", {})
             if source.get("kind") == "prepared":
                 validate_prepared_vm_metadata(source, obj)

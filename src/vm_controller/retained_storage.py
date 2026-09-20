@@ -124,6 +124,11 @@ class RetainedStorage:
         lease = await self._lease(binding)
         labels = storage_labels(binding, job_id)
         if lease is not None:
+            from vm_controller.creation_attachment import require_legacy_attachment_idle
+
+            await require_legacy_attachment_idle(
+                self.controller, lease, allow_completed=False
+            )
             current = lease.metadata.labels or {}
             if current.get(WORKSPACE_LABEL) != binding["uid"]:
                 raise RuntimeError("Retained workspace ownership is unknown.")
@@ -160,7 +165,10 @@ class RetainedStorage:
                 "namespace": self.namespace,
                 "labels": labels,
                 **(
-                    {"resourceVersion": lease.metadata.resource_version}
+                    {
+                        "resourceVersion": lease.metadata.resource_version,
+                        **({"uid": lease.metadata.uid} if lease.metadata.uid else {}),
+                    }
                     if lease
                     else {}
                 ),
@@ -290,6 +298,12 @@ class RetainedStorage:
             async with self.lock:
                 await self._assert_not_recovery_pinned(binding)
                 lease = await self._lease(binding)
+                if lease is not None:
+                    from vm_controller.creation_attachment import (
+                        require_legacy_attachment_idle,
+                    )
+
+                    await require_legacy_attachment_idle(self.controller, lease)
                 if not lease or (lease.metadata.labels or {}).get(
                     GENERATION_LABEL
                 ) != str(binding["generation"]):
@@ -328,6 +342,12 @@ class RetainedStorage:
             async with self.lock:
                 await self._assert_not_recovery_pinned(binding)
                 lease = await self._lease(binding)
+                if lease is not None:
+                    from vm_controller.creation_attachment import (
+                        require_legacy_attachment_idle,
+                    )
+
+                    await require_legacy_attachment_idle(self.controller, lease)
                 if not await self.unused(binding):
                     raise RuntimeError("Retained workspace is still in use.")
                 if lease is None:

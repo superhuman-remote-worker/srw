@@ -7,6 +7,7 @@ This protects the asynchronous CDI consumer without holding database locks for I
 import asyncio
 from copy import deepcopy
 import json
+import re
 from uuid import UUID
 
 from kubernetes.client.exceptions import ApiException
@@ -41,9 +42,9 @@ def pins(dv):
             for item in [key, *(pin[field] for field in identities)]
         ):
             raise ValueError("Golden source hold identity is unproven")
-        if (
-            pin["dv_uid"] != dv["metadata"]["uid"]
-            or pin["rootdisk_name"] != "agent-vm-" + pin["job_id"] + "-rootdisk"
+        if pin["dv_uid"] != dv["metadata"]["uid"] or (
+            pin["rootdisk_name"] != "agent-vm-" + pin["job_id"] + "-rootdisk"
+            and not re.fullmatch(r"srw-ws-[0-9a-f]{32}", pin["rootdisk_name"])
         ):
             raise ValueError("Golden source hold association changed")
     return value
@@ -60,13 +61,18 @@ class CreationSourcePins:
         self.reader = CreationActuator(controller)
 
     def pin(self, row, source):
+        from shared.vm_workspace_storage import storage_name
+
+        binding = row["request"].get("workspace_storage")
         return {
             "state": "active",
             "job_id": row["job_id"],
             "provision_generation": row["provision_generation"],
             "pvc_uid": source["pvc_uid"],
             "dv_uid": source["dv_uid"],
-            "rootdisk_name": "agent-vm-" + row["job_id"] + "-rootdisk",
+            "rootdisk_name": storage_name(binding)
+            if binding
+            else "agent-vm-" + row["job_id"] + "-rootdisk",
         }
 
     async def replace(self, dv):
@@ -110,8 +116,14 @@ class CreationSourcePins:
         ):
             raise ValueError("Golden pin request is no longer current")
         if any(
-            effect["state"] != "rejected"
-            or effect["carrier_intent"]["effect_kind"] != "rootdisk"
+            not (
+                effect["state"] == "observed"
+                and effect["carrier_intent"]["effect_kind"] == "workspace_attach"
+            )
+            and (
+                effect["state"] != "rejected"
+                or effect["carrier_intent"]["effect_kind"] != "rootdisk"
+            )
             for effect in fresh["effects"]
         ):
             raise ValueError("Golden pin is fenced by durable issuance")
