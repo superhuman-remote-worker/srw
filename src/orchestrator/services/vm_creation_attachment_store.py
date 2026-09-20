@@ -27,13 +27,27 @@ async def attachment_instance_on_conn(conn, row, *, adoption=False):
 
         if row["canonical_request"].get("preparation") is not None:
             raise VMCreationRetryConflict("creation_attachment_lineage_unproven")
-        await prove(
-            conn,
-            job_id=row["job_id"],
-            binding=binding,
-            expected=row["predecessor_evidence"],
-            adoption=adoption and row["state"] == "cancel_requested",
-        )
+        cancelled_adoption = adoption and row["state"] == "cancel_requested"
+        if row["predecessor_evidence"].get("kind") == "retained_attachment_replacement":
+            from orchestrator.services.vm_creation_replacement import prove_replacement
+
+            job = await conn.fetchrow("SELECT * FROM jobs WHERE id=$1", row["job_id"])
+            await prove_replacement(
+                conn,
+                job=job,
+                binding=binding,
+                expected=row["predecessor_evidence"],
+                cleanup_id=str(row["predecessor_cleanup_admission_id"]),
+                adoption=cancelled_adoption,
+            )
+        else:
+            await prove(
+                conn,
+                job_id=row["job_id"],
+                binding=binding,
+                expected=row["predecessor_evidence"],
+                adoption=cancelled_adoption,
+            )
     link = await conn.fetchrow(
         "SELECT instance_id FROM srw_execution_workspace_bindings WHERE execution_id=$1 FOR SHARE",
         row["execution_id"],

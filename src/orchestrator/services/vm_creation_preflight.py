@@ -157,9 +157,19 @@ class VMCreationPreflightStore:
         lineage = job.get("_creation_lineage_scope")
         if lineage:
             if old:
-                # A new incarnation of this Job needs its own retirement proof;
-                # the previous attachment Job's detach cannot authorize it.
-                raise VMCreationRetryConflict("creation_attachment_lineage_unproven")
+                from orchestrator.services.vm_creation_replacement import (
+                    prove_replacement,
+                )
+
+                own = await self._own_predecessor(conn, job, old)
+                evidence, cleanup_id = await prove_replacement(
+                    conn, job=job, binding=lineage["binding"], own_proposal=own
+                )
+                return {
+                    "expected_pvc_uid": old["rootdisk_pvc_uid"],
+                    "predecessor_evidence": evidence,
+                    "predecessor_cleanup_admission_id": str(cleanup_id),
+                }
             from orchestrator.services.vm_creation_lineage import prove
 
             evidence, cleanup_id = await prove(
@@ -170,6 +180,9 @@ class VMCreationPreflightStore:
                 "predecessor_evidence": evidence,
                 "predecessor_cleanup_admission_id": str(cleanup_id),
             }
+        return await self._own_predecessor(conn, job, old)
+
+    async def _own_predecessor(self, conn, job, old):
         if not old:
             return {"expected_pvc_uid": None}
         pvc = old.get("rootdisk_pvc_uid")
@@ -201,7 +214,7 @@ class VMCreationPreflightStore:
             }
             if cleanup_intent_digest(intent) == cleanup["intent_digest"]:
                 proposal["predecessor_cleanup_admission_id"] = str(cleanup["id"])
-                await self.retry._predecessor(conn, job, UUID(pvc), proposal)
+                await self.retry._own_predecessor(conn, job, UUID(pvc), proposal)
                 return proposal
         raise VMCreationRetryConflict("predecessor_cleanup_pending")
 

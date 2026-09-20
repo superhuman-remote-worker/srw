@@ -223,7 +223,17 @@ class VMCreationRetryStore:
         lineage = job.get("_creation_lineage_scope")
         if lineage:
             if old:
-                raise VMCreationRetryConflict("creation_attachment_lineage_unproven")
+                from orchestrator.services.vm_creation_replacement import (
+                    prove_replacement,
+                )
+
+                return await prove_replacement(
+                    conn,
+                    job=job,
+                    binding=lineage["binding"],
+                    expected=evidence,
+                    cleanup_id=proposal.get("predecessor_cleanup_admission_id"),
+                )
             from orchestrator.services.vm_creation_lineage import prove
 
             proof, cleanup_id = await prove(
@@ -236,6 +246,13 @@ class VMCreationRetryStore:
             if str(cleanup_id) != proposal.get("predecessor_cleanup_admission_id"):
                 raise VMCreationRetryConflict("creation_attachment_lineage_unproven")
             return proof, cleanup_id
+        return await self._own_predecessor(conn, job, pvc_uid, proposal)
+
+    @staticmethod
+    async def _own_predecessor(conn, job, pvc_uid, proposal):
+        """Existing per-Job process-zero and exact retain-cleanup authority."""
+        evidence = proposal.get("predecessor_evidence") or {}
+        old = (_json(job["context"]) or {}).get("last_vm") or {}
         if pvc_uid is None:
             if (
                 old.get("rootdisk_pvc_uid")
@@ -918,6 +935,14 @@ class VMCreationRetryStore:
                             raise VMCreationRetryConflict(
                                 "creation_attachment_lineage_unproven"
                             )
+                    if lineage.get("kind") == "retained_attachment_replacement":
+                        from orchestrator.services.vm_creation_replacement import (
+                            validate_replacement_claim,
+                        )
+
+                        validate_replacement_claim(
+                            lineage, values["workspace_attachment"]
+                        )
                     if prior_lease and prior_lease["execution_id"] != prior_job:
                         raise VMCreationRetryConflict(
                             "creation_attachment_lineage_unproven"
