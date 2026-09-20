@@ -3932,11 +3932,18 @@ def _is_muse_contributor_tier(model: str) -> bool:
 
     Both tiers share the ``muse-spark-1.3`` family; only the Contributor tier
     caps reasoning at ``xhigh`` (Meta docs; pilot 9792db96 Contributor/max
-    HTTP400, xhigh succeeds). Keyed off the raw model ID so plain, ``meta/``,
-    and ``openrouter/meta/`` IDs all resolve consistently.
+    HTTP400, xhigh succeeds). Matched as a ``-contributor`` tier suffix on the
+    1.3 model (with ``$``/``-``/``:`` boundary, mirroring the family regex) so
+    plain, ``meta/``, and ``openrouter/meta/`` IDs resolve consistently while
+    ``contributor-org/muse-spark-1.3`` (contributor as org prefix) and
+    ``muse-spark-1.3-contributorish`` (no tier boundary) keep Standard options.
     """
-    name = (model or "").lower()
-    return "muse-spark-1.3" in name and "contributor" in name
+    return (
+        re.search(
+            r"(?:^|/)muse-spark-1\.3-contributor(?:$|[-:])", (model or "").lower()
+        )
+        is not None
+    )
 
 
 def reasoning_capability(model: str) -> Dict[str, Any]:

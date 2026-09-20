@@ -50,6 +50,99 @@ def test_contributor_capability_caps_at_xhigh(prefix):
     )
 
 
+@pytest.mark.parametrize(
+    "model_id,expected",
+    [
+        ("muse-spark-1.3-contributor", True),
+        ("meta/muse-spark-1.3-contributor", True),
+        ("openrouter/meta/muse-spark-1.3-contributor", True),
+        ("muse-spark-1.3-contributor:exacto", True),
+        ("muse-spark-1.3-contributor-20260902", True),
+        ("MUSE-SPARK-1.3-CONTRIBUTOR", True),
+        ("muse-spark-1.3-contributorish", False),
+        ("contributor-org/muse-spark-1.3", False),
+        ("openrouter/contributor-org/muse-spark-1.3", False),
+        ("muse-spark-1.3", False),
+        ("meta/muse-spark-1.3", False),
+        ("openrouter/meta/muse-spark-1.3", False),
+        ("muse-spark-1.3-20260902", False),
+    ],
+)
+def test_contributor_tier_matcher_negatives(model_id, expected):
+    """Tier suffix only: org-prefix or missing boundary keeps Standard options."""
+    assert loader._is_muse_contributor_tier(model_id) is expected
+    cap = loader.reasoning_capability(model_id)
+    if expected:
+        assert cap["options"] == ["minimal", "low", "medium", "high", "xhigh"]
+    else:
+        assert "max" in [str(o).lower() for o in cap["options"]]
+
+
+@pytest.mark.parametrize("order", ["std-first", "contrib-first"])
+def test_capability_lookup_order_independent(order):
+    """Both lookup orders agree; Contributor narrowing never mutates the cache."""
+    std_id = "openrouter/meta/muse-spark-1.3"
+    contrib_id = "openrouter/meta/muse-spark-1.3-contributor"
+    first, second = (
+        (std_id, contrib_id) if order == "std-first" else (contrib_id, std_id)
+    )
+    loader.reasoning_capability(first)
+    loader.reasoning_capability(second)
+    std_cap = loader.reasoning_capability(std_id)
+    contrib_cap = loader.reasoning_capability(contrib_id)
+    assert std_cap["options"] == ["minimal", "low", "medium", "high", "xhigh", "max"]
+    assert contrib_cap["options"] == ["minimal", "low", "medium", "high", "xhigh"]
+    assert std_cap is not contrib_cap
+    # Mutating the Contributor copy must not leak into Standard (cached block).
+    contrib_cap["options"].append("max")
+    assert loader.reasoning_capability(std_id)["options"] == [
+        "minimal",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max",
+    ]
+    assert loader.reasoning_capability(contrib_id)["options"] == [
+        "minimal",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+    ]
+
+
+@pytest.mark.parametrize(
+    "model_id,expected_effort",
+    [
+        ("meta/muse-spark-1.3", "max"),
+        ("meta/muse-spark-1.3-contributor", "xhigh"),
+    ],
+)
+def test_openai_compatible_serialized_reasoning_effort(
+    tmp_path, monkeypatch, model_id, expected_effort
+):
+    """Direct OpenAI-compatible transport: Contributor max -> xhigh (Standard max)."""
+    captured = {}
+
+    class _FakeChat:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(loader, "ReasoningChatOpenAI", _FakeChat)
+    config = _load(
+        tmp_path,
+        model_id,
+        provider="openai",
+        api_key="fixture-key",
+        base_url="https://muse-fixture.invalid/v1",
+        reasoning_level="max",
+        max_retries=0,
+    )
+    loader.create_llm(config.llm, limits=config.limits)
+    assert captured["model_kwargs"]["reasoning_effort"] == expected_effort
+
+
 def _load(tmp_path, model, *, role="worker_base", **overrides):
     path = tmp_path / "config.yaml"
     path.write_text(
