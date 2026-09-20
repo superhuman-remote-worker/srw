@@ -1,4 +1,4 @@
-"""Caller-owned VM create snapshots; neither effective config nor issuance proof."""
+"""Immutable VM create snapshots; callers authenticate controller resolution."""
 
 from collections.abc import Mapping
 from copy import deepcopy
@@ -6,6 +6,7 @@ import re
 from typing import Any
 
 from shared.vm_creation_retry import canonical_request_digest
+from shared.vm_creation_issuance import canonical_configuration_digest
 
 
 def build_vm_creation_request(
@@ -65,6 +66,7 @@ async def capture_vm_creation_request(
     request: Mapping[str, object] | None = None,
     initial_request: bool = True,
     controller_configuration_digest: str | None = None,
+    controller_configuration: dict | None = None,
 ) -> dict | None:
     """Read or atomically freeze first inputs, returning only a validated snapshot.
 
@@ -73,10 +75,18 @@ async def capture_vm_creation_request(
     permission to overwrite. A None result cannot authorize transport.
 
     A supplied controller digest must come from authenticated resolution; this
-    helper validates its shape, not its provenance. Without it, effective config
-    remains unproven. Original issuance is always unproven in this foundation.
+    helper validates its shape, not its provenance. The optional complete
+    configuration document is frozen with its digest; effect grants require it.
+    Without it, controller namespace/implementation remains unproven. Snapshot
+    capture alone never proves original issuance was fenced.
     """
     proposal = None
+    if (
+        controller_configuration is not None
+        and canonical_configuration_digest(controller_configuration)
+        != controller_configuration_digest
+    ):
+        raise ValueError("Controller configuration document does not match its digest.")
     if controller_configuration_digest is not None and (
         not isinstance(controller_configuration_digest, str)
         or re.fullmatch(r"sha256:[0-9a-f]{64}", controller_configuration_digest) is None
@@ -100,6 +110,8 @@ async def capture_vm_creation_request(
             is not None,
             "issuance_authority_bound": False,
         }
+        if controller_configuration is not None:
+            proposal["controller_configuration"] = deepcopy(controller_configuration)
     captured = await db.capture_vm_creation_request_if_generation(
         job_id, generation, proposal
     )
@@ -135,4 +147,12 @@ async def capture_vm_creation_request(
         or canonical_request_digest(payload) != captured.get("request_digest")
     ):
         raise ValueError("Stored creation request identity changed.")
+    document = captured.get("controller_configuration")
+    if (
+        document is not None
+        and canonical_configuration_digest(document) != configuration
+    ):
+        raise ValueError("Stored controller configuration identity changed.")
+    if controller_configuration is not None and document != controller_configuration:
+        raise ValueError("Stored controller configuration document changed.")
     return deepcopy(captured)

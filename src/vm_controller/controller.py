@@ -5573,6 +5573,43 @@ class VMController:
             status=status,
         )
 
+    async def http_resolve_creation_config(self, request):
+        """Authenticate a read-only effective configuration snapshot, without grants."""
+        from aiohttp import web
+        from vm_controller.creation_configuration import resolve_creation_configuration
+
+        operation = "creation_config_resolve"
+        try:
+            value = await request.json()
+        except (ValueError, TypeError):
+            return web.json_response({"error": "invalid_request"}, status=400)
+        if (
+            LIFECYCLE_HMAC_SECRET is None
+            or not isinstance(value, Mapping)
+            or not await self._verify_lifecycle_request(
+                value, operation, mutating=False
+            )
+        ):
+            return web.json_response({"error": "authentication_failed"}, status=401)
+        try:
+            payload = unsigned_payload(value)
+            if set(payload) != {"request"}:
+                raise ValueError("invalid resolution request")
+            result = resolve_creation_configuration(self, payload["request"])
+            status = 200
+        except (ValueError, TypeError, KeyError, AttributeError):
+            result, status = {"reason": "creation_configuration_unproven"}, 409
+        return web.json_response(
+            sign_payload(
+                result,
+                direction="response",
+                operation=operation,
+                secret=LIFECYCLE_HMAC_SECRET,
+                correlation_id=_lifecycle_request_id(value),
+            ),
+            status=status,
+        )
+
     async def http_health(self, _request):
         """GET /healthz — liveness probe target."""
         from aiohttp import web
@@ -5717,6 +5754,9 @@ class VMController:
 
         app = web.Application()
         app.router.add_post("/vms", self.http_create)
+        app.router.add_post(
+            "/vm-creation/configuration", self.http_resolve_creation_config
+        )
         app.router.add_post("/workspace-disks/release", self.http_release_workspace)
         app.router.add_post("/workspace-disks/detach", self.http_detach_workspace)
         app.router.add_post("/workspace-preparations/{action}", self.http_preparation)

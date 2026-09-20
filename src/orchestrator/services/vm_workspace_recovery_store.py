@@ -1613,10 +1613,14 @@ class VMWorkspaceRecoveryStore:
         async with self.db.acquire() as conn:
             async with conn.transaction():
                 row = await conn.fetchrow(
-                    "SELECT request_id,intent_digest,completed_at,outcome "
+                    "SELECT request_id,intent_digest,completed_at,outcome,source "
                     "FROM vm_workspace_cleanup_admissions WHERE id=$1 FOR UPDATE",
                     admission_id,
                 )
+                # VM create adoption/non-issuance is settled atomically with
+                # its retry ledger, never through generic cleanup completion.
+                if row is not None and row.get("source") == "controller_vm_create":
+                    return False
                 if row is None or (
                     request_id is not None
                     and (

@@ -22,7 +22,7 @@ RUN python scripts/lock_dependencies.py check vm-controller \
     && pip install --no-cache-dir --require-hashes -r requirements/locks/vm-controller-py312.txt
 
 COPY src/vm_controller/ ./src/vm_controller/
-COPY src/shared/__init__.py src/shared/vm_lifecycle_auth.py src/shared/workspace_initialization.py src/shared/vm_workspace_storage.py src/shared/workspace_preparation.py src/shared/workspace_preparation_settings.py src/shared/workspace_preparation_network.py ./src/shared/
+COPY src/shared/__init__.py src/shared/vm_lifecycle_auth.py src/shared/vm_creation_retry.py src/shared/vm_creation_issuance.py src/shared/workspace_initialization.py src/shared/vm_workspace_storage.py src/shared/workspace_preparation.py src/shared/workspace_preparation_settings.py src/shared/workspace_preparation_network.py ./src/shared/
 COPY pyproject.toml ./
 RUN pip install --no-cache-dir --no-deps -e .
 RUN --network=none python -I scripts/lock_dependencies.py check vm-controller --installed \

@@ -7434,6 +7434,46 @@ $$;
 
 
 --
+-- Name: guard_vm_creation_carrier_identity(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.guard_vm_creation_carrier_identity() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    IF NEW.controller_configuration IS DISTINCT FROM OLD.controller_configuration OR
+       (OLD.creation_carrier_uid IS NOT NULL AND
+        ROW(NEW.creation_carrier_uid,NEW.creation_carrier_namespace) IS DISTINCT FROM
+        ROW(OLD.creation_carrier_uid,OLD.creation_carrier_namespace)) THEN
+        RAISE EXCEPTION 'VM creation carrier identity is immutable' USING ERRCODE='23514';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: guard_vm_creation_effect_identity(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.guard_vm_creation_effect_identity() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    IF ROW(NEW.effect_nonce,NEW.request_id,NEW.effect_number,NEW.effect_kind,
+           NEW.carrier_uid,NEW.carrier_namespace,NEW.carrier_intent,NEW.issued_at)
+       IS DISTINCT FROM
+       ROW(OLD.effect_nonce,OLD.request_id,OLD.effect_number,OLD.effect_kind,
+           OLD.carrier_uid,OLD.carrier_namespace,OLD.carrier_intent,OLD.issued_at)
+       OR (OLD.state<>'issued' AND NEW IS DISTINCT FROM OLD) THEN
+        RAISE EXCEPTION 'VM creation effect identity or resolved evidence is immutable' USING ERRCODE='23514';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
 -- Name: guard_vm_creation_retry_identity(); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -20819,6 +20859,33 @@ COMMENT ON COLUMN public.users.cloud_identity IS 'Per-backend cloud identity cac
 
 
 --
+-- Name: vm_creation_effects; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.vm_creation_effects (
+    effect_nonce uuid NOT NULL,
+    request_id uuid NOT NULL,
+    effect_number integer NOT NULL,
+    effect_kind text NOT NULL,
+    carrier_uid uuid NOT NULL,
+    carrier_namespace text NOT NULL,
+    carrier_intent jsonb NOT NULL,
+    state text DEFAULT 'issued'::text NOT NULL,
+    evidence jsonb DEFAULT '{}'::jsonb NOT NULL,
+    issued_at timestamp with time zone DEFAULT clock_timestamp() NOT NULL,
+    resolved_at timestamp with time zone,
+    CONSTRAINT vm_creation_effects_carrier_intent_check CHECK ((jsonb_typeof(carrier_intent) = 'object'::text)),
+    CONSTRAINT vm_creation_effects_carrier_namespace_check CHECK ((carrier_namespace <> ''::text)),
+    CONSTRAINT vm_creation_effects_check CHECK (((state = 'issued'::text) = (resolved_at IS NULL))),
+    CONSTRAINT vm_creation_effects_check1 CHECK (((state = 'issued'::text) = (evidence = '{}'::jsonb))),
+    CONSTRAINT vm_creation_effects_effect_kind_check CHECK ((effect_kind = ANY (ARRAY['rootdisk'::text, 'cloud_init'::text, 'vm'::text]))),
+    CONSTRAINT vm_creation_effects_effect_number_check CHECK ((effect_number > 0)),
+    CONSTRAINT vm_creation_effects_evidence_check CHECK ((jsonb_typeof(evidence) = 'object'::text)),
+    CONSTRAINT vm_creation_effects_state_check CHECK ((state = ANY (ARRAY['issued'::text, 'observed'::text, 'rejected'::text])))
+);
+
+
+--
 -- Name: vm_creation_retries; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -20853,6 +20920,10 @@ CREATE TABLE public.vm_creation_retries (
     resolved_at timestamp with time zone,
     created_at timestamp with time zone DEFAULT clock_timestamp() NOT NULL,
     updated_at timestamp with time zone DEFAULT clock_timestamp() NOT NULL,
+    controller_configuration jsonb,
+    creation_carrier_uid uuid,
+    creation_carrier_namespace text,
+    CONSTRAINT vm_creation_carrier_pair CHECK ((((creation_carrier_uid IS NULL) = (creation_carrier_namespace IS NULL)) AND ((creation_carrier_namespace IS NULL) OR (creation_carrier_namespace <> ''::text)))),
     CONSTRAINT vm_creation_retries_backoff_attempt_check CHECK ((backoff_attempt >= 0)),
     CONSTRAINT vm_creation_retries_canonical_request_check CHECK ((jsonb_typeof(canonical_request) = 'object'::text)),
     CONSTRAINT vm_creation_retries_check CHECK (((claim_token IS NULL) = (claim_expires_at IS NULL))),
@@ -20862,6 +20933,7 @@ CREATE TABLE public.vm_creation_retries (
     CONSTRAINT vm_creation_retries_check4 CHECK (((ready_at IS NULL) OR (state = 'succeeded'::text))),
     CONSTRAINT vm_creation_retries_check5 CHECK (((expected_pvc_uid IS NULL) OR (observed_pvc_uid IS NULL) OR (expected_pvc_uid = observed_pvc_uid))),
     CONSTRAINT vm_creation_retries_check6 CHECK (((predecessor_cleanup_admission_id IS NULL) OR (expected_pvc_uid IS NOT NULL))),
+    CONSTRAINT vm_creation_retries_controller_configuration_check CHECK (((controller_configuration IS NULL) OR (jsonb_typeof(controller_configuration) = 'object'::text))),
     CONSTRAINT vm_creation_retries_controller_configuration_digest_check CHECK ((controller_configuration_digest ~ '^sha256:[0-9a-f]{64}$'::text)),
     CONSTRAINT vm_creation_retries_origin_check CHECK ((origin = ANY (ARRAY['initial'::text, 'resume'::text]))),
     CONSTRAINT vm_creation_retries_predecessor_evidence_check CHECK ((jsonb_typeof(predecessor_evidence) = 'object'::text)),
@@ -23433,6 +23505,22 @@ ALTER TABLE ONLY public.users
 
 
 --
+-- Name: vm_creation_effects vm_creation_effects_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_creation_effects
+    ADD CONSTRAINT vm_creation_effects_pkey PRIMARY KEY (effect_nonce);
+
+
+--
+-- Name: vm_creation_effects vm_creation_effects_request_id_effect_number_key; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_creation_effects
+    ADD CONSTRAINT vm_creation_effects_request_id_effect_number_key UNIQUE (request_id, effect_number);
+
+
+--
 -- Name: vm_creation_retries vm_creation_retries_job_id_provision_generation_key; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -25613,6 +25701,13 @@ CREATE INDEX usage_rates_v2_lookup_idx ON public.usage_rates_v2 USING btree (cos
 
 
 --
+-- Name: vm_creation_effect_one_outstanding; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX vm_creation_effect_one_outstanding ON public.vm_creation_effects USING btree (request_id) WHERE (state = 'issued'::text);
+
+
+--
 -- Name: vm_creation_retries_due; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -26891,6 +26986,20 @@ CREATE TRIGGER usage_rates_v2_immutable BEFORE DELETE OR UPDATE ON public.usage_
 --
 
 CREATE TRIGGER usage_rates_v2_referenced_range_guard BEFORE UPDATE OF effective_to ON public.usage_rates_v2 FOR EACH ROW EXECUTE FUNCTION public.protect_usage_rate_v2_referenced_range();
+
+
+--
+-- Name: vm_creation_retries vm_creation_carrier_identity; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER vm_creation_carrier_identity BEFORE UPDATE ON public.vm_creation_retries FOR EACH ROW EXECUTE FUNCTION public.guard_vm_creation_carrier_identity();
+
+
+--
+-- Name: vm_creation_effects vm_creation_effect_identity; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER vm_creation_effect_identity BEFORE UPDATE ON public.vm_creation_effects FOR EACH ROW EXECUTE FUNCTION public.guard_vm_creation_effect_identity();
 
 
 --
@@ -28783,6 +28892,14 @@ ALTER TABLE ONLY public.users
 
 ALTER TABLE ONLY public.users
     ADD CONSTRAINT users_default_project_id_fkey FOREIGN KEY (default_project_id) REFERENCES public.projects(id);
+
+
+--
+-- Name: vm_creation_effects vm_creation_effects_request_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_creation_effects
+    ADD CONSTRAINT vm_creation_effects_request_id_fkey FOREIGN KEY (request_id) REFERENCES public.vm_creation_retries(request_id);
 
 
 --

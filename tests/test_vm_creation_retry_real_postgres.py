@@ -38,7 +38,9 @@ async def db(postgres_db_fixture):
 CONFIG_DIGEST = "sha256:" + "a" * 64
 
 
-async def admitted_job(db, *, lane="pinned", timeout=3600):
+async def admitted_job(
+    db, *, lane="pinned", timeout=3600, controller_configuration=None
+):
     job, generation, execution = uuid4(), uuid4(), uuid4()
     async with db.acquire() as conn:
         await conn.execute(
@@ -69,18 +71,26 @@ async def admitted_job(db, *, lane="pinned", timeout=3600):
         network_tier="restricted",
         provision_generation=str(generation),
     )
+    from shared.vm_creation_issuance import canonical_configuration_digest
+
+    config_digest = (
+        canonical_configuration_digest(controller_configuration)
+        if controller_configuration is not None
+        else CONFIG_DIGEST
+    )
     snapshot = await capture_vm_creation_request(
         db,
         job_id=str(job),
         generation=str(generation),
         request=request,
-        controller_configuration_digest=CONFIG_DIGEST,
+        controller_configuration_digest=config_digest,
+        controller_configuration=controller_configuration,
     )
     proposal = {
         "origin": "initial",
         "expected_status": "paused",
         "request_digest": snapshot["request_digest"],
-        "controller_configuration_digest": CONFIG_DIGEST,
+        "controller_configuration_digest": config_digest,
         "expected_pvc_uid": None,
     }
     return job, generation, proposal
@@ -291,7 +301,7 @@ def observed(job, generation, proposal):
         "job_id": str(job),
         "provision_generation": str(generation),
         "request_digest": proposal["request_digest"],
-        "controller_configuration_digest": CONFIG_DIGEST,
+        "controller_configuration_digest": proposal["controller_configuration_digest"],
         "expected_pvc_uid": proposal["expected_pvc_uid"],
     }
 
