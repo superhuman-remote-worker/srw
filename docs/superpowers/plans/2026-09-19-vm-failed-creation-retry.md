@@ -32,9 +32,13 @@ is now also reviewed: immutable source-disposition intent, exact golden/prepared
 pin CAS, prepared-allocation receipts, completed retained-clone checks, lost replies
 and delayed-publisher fencing. Final source/progress checks: 39 passed; legacy
 source/preparation checks: 125 passed; independent concurrency checks: two passed.
-The source stage remains a plan and cannot complete the parent. Attachment
-settlement and durable typed completion, including source evidence before cache
-collection, remain. Controller capability remains absent and admission defaults off. Task 6
+Typed actual source readback (`0ede4a7a5`) is now independently reviewed: exact
+old-source disappearance/replacement, prepared allocation receipts, lost saves,
+and durable cancelled-allocation tombstones; 54 source and 163 compatibility
+checks plus three independent interleavings passed. This returned evidence is
+separate from planned progress and does not complete the parent. Persisting the
+completion receipt, exact attachment settlement, and the native terminal
+transaction remain. Controller capability remains absent and admission defaults off. Task 6
 live acceptance is open. A2 and A3 code/review are complete locally; their live
 gates remain open. B, C and D have their own remaining work and gates.
 
