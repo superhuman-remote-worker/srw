@@ -842,6 +842,33 @@ class VMCreationRetryStore:
             "admission_id"
         ] != str(row["creation_admission_id"]):
             raise VMCreationRetryConflict("creation_carrier_changed")
+        permit = await self._creation_permit_on_conn(
+            conn, row, allow_completed=allow_completed
+        )
+        if (
+            values["reservation_request_id"] != str(permit["request_id"])
+            or values["intent_digest"] != permit["intent_digest"]
+        ):
+            raise VMCreationRetryConflict("creation_reservation_changed")
+        metadata = carrier["metadata"]
+        if row["creation_carrier_uid"] is not None and (
+            str(row["creation_carrier_uid"]) != metadata["uid"]
+            or row["creation_carrier_namespace"] != metadata["namespace"]
+        ):
+            raise VMCreationRetryConflict("creation_carrier_changed")
+        binding = row["canonical_request"].get("workspace_storage")
+        name = (
+            storage_name(binding) if binding else f"agent-vm-{row['job_id']}-rootdisk"
+        )
+        if (
+            values["effect_kind"] in {"rootdisk", "workspace_attach"}
+            and values["object_name"] != name
+        ):
+            raise VMCreationRetryConflict("retained_disk_changed")
+        return permit
+
+    async def _creation_permit_on_conn(self, conn, row, *, allow_completed=False):
+        """Validate the original source admission; never allocate another permit."""
         permit = await conn.fetchrow(
             "SELECT * FROM vm_workspace_cleanup_admissions WHERE id=$1",
             row["creation_admission_id"],
@@ -861,25 +888,8 @@ class VMCreationRetryStore:
             or permit["pvc_uid"] != (row["expected_pvc_uid"] or row["observed_pvc_uid"])
             or permit["request_id"] != reservation_request
             or permit["intent_digest"] != cleanup_intent_digest(intent)
-            or values["reservation_request_id"] != str(permit["request_id"])
-            or values["intent_digest"] != permit["intent_digest"]
         ):
             raise VMCreationRetryConflict("creation_reservation_changed")
-        metadata = carrier["metadata"]
-        if row["creation_carrier_uid"] is not None and (
-            str(row["creation_carrier_uid"]) != metadata["uid"]
-            or row["creation_carrier_namespace"] != metadata["namespace"]
-        ):
-            raise VMCreationRetryConflict("creation_carrier_changed")
-        binding = row["canonical_request"].get("workspace_storage")
-        name = (
-            storage_name(binding) if binding else f"agent-vm-{row['job_id']}-rootdisk"
-        )
-        if (
-            values["effect_kind"] in {"rootdisk", "workspace_attach"}
-            and values["object_name"] != name
-        ):
-            raise VMCreationRetryConflict("retained_disk_changed")
         return permit
 
     async def begin_effect(
@@ -1066,7 +1076,10 @@ class VMCreationRetryStore:
                     return {"settled": True, "disposition": "never_issued"}
                 if row["state"] != "cancel_requested":
                     raise VMCreationRetryConflict("job_not_cancelled")
-                if row["cancellation_disposition"] is not None:
+                if (
+                    row["cancellation_disposition"] is not None
+                    or row["canonical_request"].get("workspace_storage") is not None
+                ):
                     return {"settled": False, "reason": "creation_disposition_pending"}
                 if await conn.fetchval(
                     "SELECT EXISTS(SELECT 1 FROM vm_creation_effects WHERE request_id=$1 AND state IN ('issued','observed'))",
@@ -1112,6 +1125,22 @@ class VMCreationRetryStore:
                     row["request_id"],
                 )
                 return {"settled": True, "disposition": "never_issued"}
+
+    async def prepare_disposition(self, *, request_id: str) -> dict:
+        from orchestrator.services.vm_creation_disposition_store import (
+            VMCreationDispositionStore,
+        )
+
+        return await VMCreationDispositionStore(self).prepare(request_id=request_id)
+
+    async def freeze_disposition(self, *, request_id: str, carrier: dict) -> dict:
+        from orchestrator.services.vm_creation_disposition_store import (
+            VMCreationDispositionStore,
+        )
+
+        return await VMCreationDispositionStore(self).freeze(
+            request_id=request_id, carrier=carrier
+        )
 
     async def observe_effect(
         self, *, request_id: str, carrier: dict, observation: dict
@@ -1236,6 +1265,8 @@ class VMCreationRetryStore:
                         )
                     },
                     "request": row["canonical_request"],
+                    "cancellation_disposition": _json(row["cancellation_disposition"]),
+                    "cancellation_progress": _json(row["cancellation_progress"]),
                     **(
                         {
                             "prepared_origin": prepared_origin(

@@ -521,3 +521,60 @@ async def test_definitively_rejected_clone_still_preserves_exact_source_hold(
     assert intent["source"] == source
     assert intent["source_resolution"] == "required"
     assert intent["objects"] == {}
+
+
+@pytest.mark.asyncio
+async def test_zero_effect_workspace_requires_instance_disposition(db, monkeypatch):
+    from tests.test_vm_creation_attachment_authority_real_postgres import admitted
+
+    store, row, _, _, _ = await admitted(db, monkeypatch)
+    await db.linearize_pinned_cancel(str(row["job_id"]), expected_status="paused")
+    assert await store.settle_never_issued(request_id=str(row["request_id"])) == {
+        "settled": False,
+        "reason": "creation_disposition_pending",
+    }
+
+
+@pytest.mark.asyncio
+async def test_prepare_disposition_only_returns_existing_cancelled_admission(
+    db, monkeypatch
+):
+    store, row, _, carrier = await reserved(db, monkeypatch)
+    with pytest.raises(VMCreationRetryConflict, match="job_not_cancelled"):
+        await store.prepare_disposition(request_id=str(row["request_id"]))
+    await db.linearize_pinned_cancel(str(row["job_id"]), expected_status="paused")
+    result = await store.prepare_disposition(request_id=str(row["request_id"]))
+    assert result["actuation_allowed"] is False
+    assert result["carrier_intent"]["admission_id"] == carrier["spec"]["holderIdentity"]
+    assert result == await store.prepare_disposition(request_id=str(row["request_id"]))
+    assert "claim_token" not in str(result)
+    async with db.acquire() as conn:
+        assert (
+            await conn.fetchval(
+                "SELECT count(*) FROM vm_creation_effects WHERE request_id=$1",
+                row["request_id"],
+            )
+            == 0
+        )
+
+
+@pytest.mark.asyncio
+async def test_prepare_disposition_never_acquires_missing_admission(db):
+    from tests.test_vm_creation_retry_real_postgres import admitted_job, admit
+    from orchestrator.services.vm_creation_retry_store import VMCreationRetryStore
+
+    job, generation, proposal = await admitted_job(db)
+    row = await admit(db, job, generation, proposal)
+    await db.linearize_pinned_cancel(str(job), expected_status="paused")
+    with pytest.raises(VMCreationRetryConflict, match="creation_reservation_changed"):
+        await VMCreationRetryStore(db).prepare_disposition(
+            request_id=str(row["request_id"])
+        )
+    async with db.acquire() as conn:
+        assert (
+            await conn.fetchval(
+                "SELECT count(*) FROM vm_workspace_cleanup_admissions WHERE owner_kind='job' AND owner_id=$1",
+                job,
+            )
+            == 0
+        )

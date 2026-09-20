@@ -10,6 +10,7 @@ from orchestrator.services.vm_creation_retry_store import (
 )
 from orchestrator.services.vm_creation_transport import (
     CreationConfigurationUnavailable,
+    dispose_vm_creation,
     replay_vm_creation,
     resolve_vm_creation_configuration,
 )
@@ -45,13 +46,19 @@ class VMCreationRetryService:
             )
             if result.get("settled") is True:
                 return
-            # Controller carrier reconciliation is observe-only and continues
-            # through cancellation/restarts. An issued effect cannot be erased
-            # because this observer's lease expired or a VM was not listed.
-            observation = {
-                "outcome": "observation_wait",
-                "reason": "creation_observation_pending",
-            }
+            # Preparation can publish a source before a carrier exists. Poll
+            # cancellation directly; never resume create from this branch.
+            try:
+                observation = await dispose_vm_creation(
+                    self.provisioner._http_client,
+                    claim,
+                    secret=self.provisioner._lifecycle_hmac_secret,
+                )
+            except (ValueError, KeyError, TypeError):
+                observation = {
+                    "outcome": "blocked",
+                    "reason": "creation_evidence_unproven",
+                }
         else:
             try:
                 observation = await replay_vm_creation(

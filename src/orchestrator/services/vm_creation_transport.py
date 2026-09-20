@@ -193,3 +193,58 @@ async def replay_vm_creation(client, row: Mapping, *, secret: bytes) -> dict:
         return {"outcome": "transport_unknown", "reason": "controller_unavailable"}
     except (httpx.HTTPError, ValueError, TypeError, KeyError, AttributeError):
         return {"outcome": "blocked", "reason": "creation_evidence_unproven"}
+
+
+async def dispose_vm_creation(client, row: Mapping, *, secret: bytes) -> dict:
+    """Poll cancelled intent on a dedicated route; never replay a create request."""
+    from shared.vm_creation_disposition import disposition_identity
+
+    identity = disposition_identity(row)
+    request = row["canonical_request"]
+    if (
+        not secret
+        or client is None
+        or row["state"] != "cancel_requested"
+        or canonical_request_digest(request) != identity["request_digest"]
+        or any(
+            request[key] != identity[key] for key in ("job_id", "provision_generation")
+        )
+    ):
+        raise ValueError("Cancellation source is unproven")
+    operation = "creation_retry_dispose"
+    signed = sign_payload(
+        identity, direction="request", operation=operation, secret=secret
+    )
+    try:
+        response = await client.post("/vm-creation/dispose", json=signed, timeout=30.0)
+        if response.status_code >= 500 or response.status_code == 429:
+            return {"outcome": "transport_unknown", "reason": "controller_unavailable"}
+        data = response.json()
+        if not isinstance(data, Mapping) or not verify_payload(
+            data,
+            direction="response",
+            operation=operation,
+            secret=secret,
+            expected_correlation_id=signed[AUTH_FIELD]["request_id"],
+        ):
+            raise ValueError("Cancellation reply is unproven")
+        response.raise_for_status()
+        result = unsigned_payload(data)
+        if any(result.get(key) != value for key, value in identity.items()):
+            raise ValueError("Cancellation identity changed")
+        if result.get("status") in {
+            "creation_disposition_pending",
+            "creation_disposed",
+            "creation_adopted",
+        }:
+            # Completion/adoption must already be committed by the controller's
+            # authority call. This transport never merges context or releases holds.
+            return {
+                "outcome": "observation_wait",
+                "reason": "creation_observation_pending",
+            }
+        raise ValueError("Cancellation evidence is unproven")
+    except httpx.RequestError:
+        return {"outcome": "transport_unknown", "reason": "controller_unavailable"}
+    except (httpx.HTTPError, ValueError, TypeError, KeyError, AttributeError):
+        return {"outcome": "blocked", "reason": "creation_evidence_unproven"}

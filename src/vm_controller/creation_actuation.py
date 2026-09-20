@@ -814,8 +814,8 @@ class CreationActuator:
         return pending
 
 
-async def reconcile_creation_carrier(controller, carrier):
-    """Restart observer: never grants or performs another Kubernetes effect."""
+async def reconcile_creation_carrier(controller, carrier, *, _observe_only=False):
+    """Restart observation/cancellation entry; never grants another create."""
     actuator = CreationActuator(controller)
     lease = carrier["creation_lease"]
     values = verify_creation_carrier(lease, secret=actuator.secret)
@@ -826,6 +826,12 @@ async def reconcile_creation_carrier(controller, carrier):
     row = await actuator.authority("inspect", request_id=values["retry_request_id"])
     if row.get("creation_carrier_uid") != current["metadata"]["uid"]:
         raise CreationUnproven("creation_carrier_changed")
+    if row["state"] == "cancel_requested" and not _observe_only:
+        from shared.vm_creation_disposition import disposition_identity
+        from vm_controller.creation_disposition import CreationDisposer
+
+        await CreationDisposer(controller).run(disposition_identity(row))
+        return False
     observations = await actuator.exact_previous(row, current)
     from vm_controller.creation_sources import source_manager
 

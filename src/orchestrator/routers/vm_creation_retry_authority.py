@@ -107,3 +107,17 @@ async def inspect(request: Request) -> JSONResponse:
 @router.post("/settle-adopted")
 async def settle_adopted(request: Request) -> JSONResponse:
     return await _dispatch(request, "creation_retry_settle_adopted", "settle_adopted")
+
+
+@router.post("/prepare-disposition")
+async def prepare_disposition(request: Request) -> JSONResponse:
+    return await _dispatch(
+        request, "creation_retry_prepare_disposition", "prepare_disposition"
+    )
+
+
+@router.post("/freeze-disposition")
+async def freeze_disposition(request: Request) -> JSONResponse:
+    return await _dispatch(
+        request, "creation_retry_freeze_disposition", "freeze_disposition"
+    )

@@ -71,6 +71,16 @@ def test_authorize_is_reservation_only_and_correlated(monkeypatch):
         ("inspect", "creation_retry_inspect", "inspect"),
         ("settle-adopted", "creation_retry_settle_adopted", "settle_adopted"),
         (
+            "prepare-disposition",
+            "creation_retry_prepare_disposition",
+            "prepare_disposition",
+        ),
+        (
+            "freeze-disposition",
+            "creation_retry_freeze_disposition",
+            "freeze_disposition",
+        ),
+        (
             "settle-never-issued",
             "creation_retry_settle_never_issued",
             "settle_never_issued",

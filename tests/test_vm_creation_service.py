@@ -35,6 +35,16 @@ def service(monkeypatch):
         "replay_vm_creation",
         AsyncMock(return_value={"outcome": "capacity_wait", "reason": "capacity_wait"}),
     )
+    monkeypatch.setattr(
+        module,
+        "dispose_vm_creation",
+        AsyncMock(
+            return_value={
+                "outcome": "observation_wait",
+                "reason": "creation_observation_pending",
+            }
+        ),
+    )
     return instance, module
 
 
@@ -109,7 +119,7 @@ async def test_failed_resolution_handoff_never_sends_uncommitted_create(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("settled", [False, True])
-async def test_cancellation_only_settles_database_proven_nonissuance_or_waits_for_observer(
+async def test_cancellation_uses_disposition_transport_unless_sql_nonissuance_settles(
     monkeypatch, settled
 ):
     instance, module = service(monkeypatch)
@@ -122,8 +132,12 @@ async def test_cancellation_only_settles_database_proven_nonissuance_or_waits_fo
         request_id=str(row["request_id"])
     )
     if settled:
+        module.dispose_vm_creation.assert_not_awaited()
         instance.store.apply_observation.assert_not_awaited()
     else:
+        module.dispose_vm_creation.assert_awaited_once_with(
+            instance.provisioner._http_client, row, secret=b"secret"
+        )
         assert (
             instance.store.apply_observation.call_args.kwargs["observation"]["outcome"]
             == "observation_wait"

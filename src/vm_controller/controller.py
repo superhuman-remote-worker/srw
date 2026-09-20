@@ -5226,6 +5226,12 @@ class VMController:
             request, operation="creation_retry_create", require_creation_retry=True
         )
 
+    async def http_creation_dispose(self, request):
+        """Authenticated cancellation of an existing immutable create request."""
+        from vm_controller.creation_disposition import http_dispose
+
+        return await http_dispose(self, request)
+
     async def _http_create(self, request, *, operation, require_creation_retry=False):
         from aiohttp import web
 
@@ -5847,6 +5853,7 @@ class VMController:
         app = web.Application()
         app.router.add_post("/vms", self.http_create)
         app.router.add_post("/vm-creation/create", self.http_creation_retry)
+        app.router.add_post("/vm-creation/dispose", self.http_creation_dispose)
         app.router.add_post(
             "/vm-creation/configuration", self.http_resolve_creation_config
         )

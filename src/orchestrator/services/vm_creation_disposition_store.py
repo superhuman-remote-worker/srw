@@ -6,7 +6,7 @@ it. In particular, absence and claim expiry are not non-issuance evidence.
 """
 
 import json
-from uuid import UUID, uuid4
+from uuid import UUID, uuid4, uuid5, NAMESPACE_URL
 
 from orchestrator.services.vm_creation_retry_store import (
     VMCreationRetryConflict,
@@ -34,6 +34,71 @@ class VMCreationDispositionStore:
     def __init__(self, retries):
         self.retries = retries
         self.db = retries.db
+
+    async def prepare(self, *, request_id: str) -> dict:
+        """Identify a cancellation-only carrier under an already held admission.
+
+        This never inserts an effect or grants creation. Deterministic proposal
+        identity lets an interrupted initial Lease publication be resumed.
+        """
+        from shared.vm_creation_issuance import canonical_configuration_digest
+        from shared.vm_workspace_storage import storage_name
+
+        async with self.db.acquire() as conn:
+            async with conn.transaction():
+                row, _ = await self.retries._effect_scope(conn, request_id)
+                if row["state"] != "cancel_requested":
+                    raise VMCreationRetryConflict("job_not_cancelled")
+                permit = await self.retries._creation_permit_on_conn(conn, row)
+                configuration = row["controller_configuration"]
+                if (
+                    configuration is None
+                    or configuration.get("persistent_rootdisk") is not True
+                    or canonical_configuration_digest(configuration)
+                    != row["controller_configuration_digest"]
+                ):
+                    raise VMCreationRetryConflict("creation_configuration_unproven")
+                if (
+                    row["creation_carrier_uid"] is not None
+                    or row["expected_pvc_uid"] is not None
+                    or row["observed_pvc_uid"] is not None
+                    or await conn.fetchval(
+                        "SELECT EXISTS(SELECT 1 FROM vm_creation_effects WHERE request_id=$1)",
+                        row["request_id"],
+                    )
+                ):
+                    raise VMCreationRetryConflict("creation_carrier_required")
+                binding = row["canonical_request"].get("workspace_storage")
+                return {
+                    "actuation_allowed": False,
+                    "namespace": configuration["namespace"],
+                    "carrier_intent": {
+                        "version": 1,
+                        "source": "controller_vm_create",
+                        "admission_id": str(permit["id"]),
+                        "reservation_request_id": str(permit["request_id"]),
+                        "intent_digest": permit["intent_digest"],
+                        "retry_request_id": str(row["request_id"]),
+                        "job_id": str(row["job_id"]),
+                        "provision_generation": str(row["provision_generation"]),
+                        "request_digest": row["request_digest"],
+                        "controller_configuration_digest": row[
+                            "controller_configuration_digest"
+                        ],
+                        "expected_pvc_uid": None,
+                        "retained_dv_uid": None,
+                        "current_dv_uid": None,
+                        "current_pvc_uid": None,
+                        "current_secret_uid": None,
+                        "effect_kind": "rootdisk",
+                        "effect_nonce": str(
+                            uuid5(NAMESPACE_URL, "vm-cancel-carrier:" + request_id)
+                        ),
+                        "object_name": storage_name(binding)
+                        if binding
+                        else f"agent-vm-{row['job_id']}-rootdisk",
+                    },
+                }
 
     async def freeze(self, *, request_id: str, carrier: dict) -> dict:
         values = self.retries._carrier(carrier)
