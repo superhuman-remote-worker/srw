@@ -382,6 +382,25 @@ class LiveScenario:
         self.job_id = job_id
         return job_id, lease_token
 
+    async def _refresh_fixture_lease(
+        self, job_id: UUID, lease_token: int
+    ) -> None:
+        """Refresh the synthetic lease after cold boot and before admission."""
+
+        async with self.db.acquire() as conn:
+            refreshed = await conn.fetchval(
+                "UPDATE run_queue SET leased_until=clock_timestamp()+interval '5 minutes' "
+                "WHERE unit_id=$1 AND unit_kind='worker_batch' AND state='leased' "
+                "AND lease_token=$2 AND leased_by=$3 RETURNING lease_token",
+                job_id,
+                lease_token,
+                f"vm-recovery-gate:{self.run_id}",
+            )
+        if refreshed != lease_token:
+            raise AcceptanceFailure(
+                "synthetic worker lease could not be refreshed before admission"
+            )
+
     async def _wait(self, label: str, probe: Any, timeout: float = 900) -> Any:
         stop = time.monotonic() + timeout
         last_error: Exception | None = None
@@ -1306,6 +1325,7 @@ class LiveScenario:
         await self._ssh_file(identity, marker_path, marker)
         await self._ssh_file(identity, checkpoint_path, checkpoint)
 
+        await self._refresh_fixture_lease(job_id, lease_token)
         request_id = uuid4()
         disposition = await self._admit(
             identity=identity,

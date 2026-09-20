@@ -487,3 +487,114 @@ async def test_job_api_probe_requires_fixture_owner_headers(monkeypatch, owned):
             await scenario._application_api_evidence(job)
         assert not calls
         await client.aclose()
+
+
+# The lease refresh is operator-fixture SQL: use real PostgreSQL to prove its
+# predicate instead of teaching a fake database the same conditional update.
+from tests.test_non_pinned_workspace_lifecycle_real_postgres import (  # noqa: E402
+    _schema_applied,  # noqa: F401
+    db as _gate_lease_db,
+    pg_dsn,  # noqa: F401
+)
+
+
+gate_lease_db = _gate_lease_db
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "changed", [None, "token", "owner", "parked", "queued", "done", "unit_kind"]
+)
+async def test_fixture_lease_refresh_requires_exact_current_synthetic_owner(
+    gate_lease_db, changed
+):
+    from uuid import uuid4
+
+    db = gate_lease_db
+    job, run_id, token = uuid4(), "lease-refresh-review", 27
+    owner = f"vm-recovery-gate:{run_id}"
+    state = changed if changed in {"parked", "queued", "done"} else "leased"
+    async with db.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO jobs(id,description,status,execution_lane) "
+            "VALUES($1,'gate lease test','created','stateless')",
+            job,
+        )
+        await conn.execute(
+            "INSERT INTO run_queue(unit_id,unit_kind,state,lease_token,leased_by,"
+            "leased_until,input_seq,consumed_seq,attempts_since_completion) "
+            "VALUES($1,$2,$3,$4,$5,clock_timestamp()-interval '1 minute',1,0,3)",
+            job,
+            "session_turn" if changed == "unit_kind" else "worker_batch",
+            state,
+            token + 1 if changed == "token" else token,
+            "another-worker" if changed == "owner" else owner,
+        )
+        before = dict(
+            await conn.fetchrow("SELECT * FROM run_queue WHERE unit_id=$1", job)
+        )
+    scenario = object.__new__(LiveScenario)
+    scenario.db, scenario.run_id = db, run_id
+    if changed is None:
+        await scenario._refresh_fixture_lease(job, token)
+    else:
+        with pytest.raises(
+            acceptance.AcceptanceFailure, match="could not be refreshed"
+        ):
+            await scenario._refresh_fixture_lease(job, token)
+    async with db.acquire() as conn:
+        after = dict(
+            await conn.fetchrow("SELECT * FROM run_queue WHERE unit_id=$1", job)
+        )
+        now = await conn.fetchval("SELECT clock_timestamp()")
+    if changed is None:
+        assert before["leased_until"] < now < after["leased_until"]
+        assert after["leased_until"] <= now + timedelta(minutes=5)
+        after["leased_until"] = before["leased_until"]
+    assert after == before  # Includes token, claimant, state and attempt count.
+
+
+@pytest.mark.asyncio
+async def test_fixture_refresh_occurs_once_after_ssh_setup_not_on_admission_replay(
+    monkeypatch,
+):
+    from uuid import uuid4
+    from unittest.mock import AsyncMock
+
+    class ReplayReached(Exception):
+        pass
+
+    job, token, identity = uuid4(), 27, {"fixture": "ready"}
+    events = []
+    scenario = object.__new__(LiveScenario)
+    scenario.run_id = "lease-refresh-placement"
+    scenario._create_job = AsyncMock(return_value=(job, token))
+    scenario.provisioner = SimpleNamespace(create_vm=AsyncMock(return_value=True))
+    scenario._wait = AsyncMock(return_value=identity)
+    scenario._application_api_evidence = AsyncMock(return_value={"job_visible": True})
+    scenario._row = AsyncMock(return_value={})
+
+    async def ssh(_identity, path, value):
+        assert _identity is identity and value
+        events.append(path.rsplit("/", 1)[1])
+
+    async def refresh(actual_job, actual_token):
+        assert (actual_job, actual_token) == (job, token)
+        events.append("refresh")
+
+    admissions = []
+
+    async def admit(**kwargs):
+        admissions.append(kwargs)
+        events.append("admit")
+        if len(admissions) == 2:
+            raise ReplayReached
+        return SimpleNamespace(operation_id=uuid4())
+
+    scenario._ssh_file = ssh
+    monkeypatch.setattr(scenario, "_refresh_fixture_lease", refresh, raising=False)
+    scenario._admit = admit
+    with pytest.raises(ReplayReached):
+        await scenario.execute()
+    assert events == ["marker", "checkpoint", "refresh", "admit", "admit"]
+    assert admissions[0] == admissions[1]
