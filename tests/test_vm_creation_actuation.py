@@ -595,3 +595,89 @@ async def test_unsealed_creation_carrier_does_not_break_other_cleanup_inventory(
     # its database reservation still excludes conflicting owner/PVC cleanup.
     assert await ctrl._list_workspace_cleanup_carriers() == ()
     assert api.writes == []
+
+
+def foreign_vm(payload):
+    return {
+        "apiVersion": "kubevirt.io/v1",
+        "kind": "VirtualMachine",
+        "metadata": {
+            "name": "agent-vm-" + payload["job_id"],
+            "namespace": settings.VM_NAMESPACE,
+            "uid": str(uuid4()),
+            "labels": {
+                "srw.io/owner-kind": "job",
+                "srw.io/owner-id": payload["job_id"],
+            },
+            "annotations": {"srw.io/provision-generation": str(uuid4())},
+        },
+        "spec": {
+            "template": {
+                "spec": {
+                    "volumes": [
+                        {
+                            "name": "rootdisk",
+                            "dataVolume": {
+                                "name": "agent-vm-" + payload["job_id"] + "-rootdisk"
+                            },
+                        },
+                        {
+                            "name": "cloud-init",
+                            "cloudInitNoCloud": {
+                                "secretRef": {
+                                    "name": "agent-vm-"
+                                    + payload["job_id"]
+                                    + "-cloudinit"
+                                }
+                            },
+                        },
+                    ]
+                }
+            }
+        },
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("same_generation", [False, True])
+async def test_unproven_existing_vm_receives_no_new_dependencies(
+    setup, same_generation
+):
+    ctrl, api, authority, payload = setup
+    vm = foreign_vm(payload)
+    if same_generation:
+        vm["metadata"]["annotations"]["srw.io/provision-generation"] = payload[
+            "provision_generation"
+        ]
+    api.objects["VirtualMachine", vm["metadata"]["name"]] = vm
+    result = await ctrl._do_create_serialized(payload)
+    assert result["status"] == "creation_attention"
+    assert api.writes == []
+    assert authority.row["effects"] == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "stage,forbidden",
+    [("rootdisk", "DataVolume"), ("cloud_init", "Secret"), ("vm", "VirtualMachine")],
+)
+async def test_unexpected_vm_after_grant_prevents_fresh_effect(setup, stage, forbidden):
+    ctrl, api, authority, payload = setup
+    original = authority.call
+
+    async def appear_after_grant(path, body, *, operation):
+        result = await original(path, body, operation=operation)
+        if (
+            path.endswith("begin-effect")
+            and verify_creation_carrier(body["carrier"], secret=SECRET)["effect_kind"]
+            == stage
+        ):
+            vm = foreign_vm(payload)
+            api.objects["VirtualMachine", vm["metadata"]["name"]] = vm
+        return result
+
+    ctrl._workspace_cleanup_authority_request = appear_after_grant
+    result = await ctrl._do_create_serialized(payload)
+    assert result["status"] == "creation_attention"
+    assert forbidden not in api.writes
+    assert authority.row["effects"][-1]["state"] == "issued"

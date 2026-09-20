@@ -466,6 +466,13 @@ class CreationActuator:
             )
         return await asyncio.to_thread(method, **kwargs)
 
+    async def require_vm_absent(self, row):
+        # A same-name VM without this ledger's issued VM effect is not an
+        # adoption candidate, even when its generation matches. Creating its
+        # missing disk or Secret could make that unproven guest executable.
+        if await self.read("vm", "agent-vm-" + row["job_id"]) is not None:
+            raise CreationUnproven("creation_existing_vm_unproven")
+
     async def run(self, payload):
         base = {
             "job_id": payload.get("job_id"),
@@ -590,6 +597,9 @@ class CreationActuator:
                 "attention",
             }:
                 raise CreationUnproven("creation_source_not_active")
+            # Already-issued VM observation/adoption returned above. All paths
+            # below would grant a fresh effect and require authoritative absence.
+            await self.require_vm_absent(row)
             resolved = resolve_creation_configuration(self.controller, request)
             if (
                 resolved["request_digest"] != row["request_digest"]
@@ -647,6 +657,7 @@ class CreationActuator:
                 raise CreationUnproven("creation_carrier_changed")
             await self.exact_previous(row, carrier)
             await self.disk(row)
+            await self.require_vm_absent(row)
             body = (
                 None
                 if kind == "rootdisk" and row["expected_pvc_uid"]
@@ -671,6 +682,7 @@ class CreationActuator:
                 raise CreationUnproven("creation_carrier_changed")
             await self.exact_previous(row, current)
             await self.disk(row)
+            await self.require_vm_absent(row)
             if body is not None:
                 try:
                     await self.create_object(kind, body)
