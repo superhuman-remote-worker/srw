@@ -30,6 +30,26 @@ def test_detectors_agree(prefix, model, family):
     assert detect_family(prefix + model).family == family
 
 
+@pytest.mark.parametrize("prefix", ["", "meta/", "openrouter/meta/"])
+def test_contributor_capability_caps_at_xhigh(prefix):
+    """Contributor advertises xhigh max; Standard keeps max (all ID prefixes)."""
+    std_cap = loader.reasoning_capability(prefix + "muse-spark-1.3")
+    contrib_cap = loader.reasoning_capability(prefix + "muse-spark-1.3-contributor")
+    assert std_cap["options"] == ["minimal", "low", "medium", "high", "xhigh", "max"]
+    assert contrib_cap["options"] == ["minimal", "low", "medium", "high", "xhigh"]
+    assert std_cap["default"] == "medium"
+    assert contrib_cap["default"] == "medium"
+    # Existing runtime clamp: Contributor legacy max -> xhigh; Standard unchanged.
+    assert (
+        loader._clamp_reasoning_level("max", loader._supported_efforts(contrib_cap))
+        == "xhigh"
+    )
+    assert (
+        loader._clamp_reasoning_level("max", loader._supported_efforts(std_cap))
+        == "max"
+    )
+
+
 def _load(tmp_path, model, *, role="worker_base", **overrides):
     path = tmp_path / "config.yaml"
     path.write_text(
@@ -61,7 +81,10 @@ def test_loaded_defaults_and_prompts(tmp_path, model, role):
     assert config.limits.model_max_context_tokens == 1048576
     assert config.limits.context_threshold_tokens == int(1048576 * 0.8)
     cap = loader.reasoning_capability(config.llm.model)
-    assert cap["options"] == ["minimal", "low", "medium", "high", "xhigh", "max"]
+    if "contributor" in config.llm.model.lower():
+        assert cap["options"] == ["minimal", "low", "medium", "high", "xhigh"]
+    else:
+        assert cap["options"] == ["minimal", "low", "medium", "high", "xhigh", "max"]
     assert cap["default"] == config.llm.reasoning_level
 
     prompt = loader.get_phase_system_prompt(
@@ -204,8 +227,13 @@ async def test_openrouter_serialized_request(
         assert body["parallel_tool_calls"] is False
         assert body.get("max_tokens", body.get("max_completion_tokens")) == 131072
         # A stale 'none' setting omits control; it never sends a disable request.
+        # Contributor tier caps at xhigh: legacy max clamps to xhigh (Meta docs;
+        # pilot 9792db96 Contributor/max HTTP400, xhigh succeeds). Standard keeps max.
+        expected = requested
+        if requested == "max" and "contributor" in model.lower():
+            expected = "xhigh"
         assert body.get("reasoning") == (
-            None if requested == "none" else {"effort": requested}
+            None if requested == "none" else {"effort": expected}
         )
         assert "reasoning_effort" not in body
         assert "thinking" not in body
