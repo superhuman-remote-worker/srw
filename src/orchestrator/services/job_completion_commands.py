@@ -23,6 +23,10 @@ from dataclasses import dataclass
 from typing import Any, AsyncIterator, Mapping
 from uuid import UUID, uuid5
 
+from orchestrator.services.workspace_idle_completion_events import (
+    ACCEPTED_IDLE_WAIT_SOURCE_KEY,
+    capture_completion_wait_on_conn,
+)
 from shared.run_queue import complete_unit
 
 # ``v1`` is the already-shipped status-first workflow.  A reordered command
@@ -148,6 +152,7 @@ def canonical_completion_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
             "agent_id",
             "client_report_id",
             ACCEPTED_COMPLETION_DECISION_KEY,
+            ACCEPTED_IDLE_WAIT_SOURCE_KEY,
         }
     }
 
@@ -346,6 +351,7 @@ async def accept_completion_command(
                 """
                 SELECT id, status::text AS status, execution_lane,
                        assigned_agent_id, completion_seq_hwm, context,
+                       parent_job_id, config_override, resolved_config,
                        (SELECT execution.harness_adapter FROM srw_execution_specs execution
                         WHERE execution.work_kind='Job' AND execution.work_id=jobs.id)
                        AS execution_harness_adapter,
@@ -497,6 +503,17 @@ async def accept_completion_command(
                     stored_payload[ACCEPTED_COMPLETION_DECISION_KEY] = {
                         "tool_call_id": tool_call_id,
                     }
+            idle_source = await capture_completion_wait_on_conn(
+                conn, job=job, report=canonical_payload, lease_token=accepted_token,
+                # Preserve legacy marker behavior above, but never invent new
+                # idle evidence by stringifying malformed historical JSON.
+                decision_tool_call_id=(
+                    completion_decision.get("tool_call_id")
+                    if isinstance(completion_decision, Mapping) else None
+                ),
+            )
+            if idle_source is not None:
+                stored_payload[ACCEPTED_IDLE_WAIT_SOURCE_KEY] = idle_source
             payload_json = _canonical_json(stored_payload)
 
             # FIRST database write of the handler.  Cursor and queue writes
