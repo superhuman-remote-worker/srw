@@ -359,7 +359,10 @@ class PreparationStore:
 
             if not dv["metadata"].get("resourceVersion"):
                 raise PreparationConflict("Preparation source revision is unproven.")
-            if any(pin["state"] != "released" for pin in pins(dv).values()):
+            if any(
+                pin["state"] not in {"released", "disposed"}
+                for pin in pins(dv).values()
+            ):
                 return False
             await self.call(
                 self.custom.delete_namespaced_custom_object,

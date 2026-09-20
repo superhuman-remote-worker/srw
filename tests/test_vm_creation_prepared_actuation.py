@@ -352,6 +352,7 @@ async def test_authority_rejects_prepared_retained_root_dv_disagreement(prepared
     row = {
         **authority.row,
         "canonical_request": authority.row["request"],
+        "predecessor_evidence": {},
         "expected_pvc_uid": UUID(source["retained_root"]["pvc_uid"]),
     }
     with pytest.raises(

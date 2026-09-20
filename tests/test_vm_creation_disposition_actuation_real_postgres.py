@@ -143,7 +143,7 @@ async def test_fixed_partial_resources_are_disposed_once_while_parent_stays_held
         result = await CreationDisposer(ctrl).run(disposition_identity(row))
         assert result["status"] == "creation_disposition_pending"
     state = await store.inspect(request_id=str(row["request_id"]))
-    assert set(state["cancellation_progress"]) == {"cloud_init", "rootdisk"}
+    assert set(state["cancellation_progress"]) == {"cloud_init", "rootdisk", "source"}
     assert state["state"] == "cancel_requested"
     assert [item[0] for item in api.deletes if item[0] != "Lease"] == [
         "Secret",
@@ -273,7 +273,7 @@ async def test_lost_root_grant_progress_or_carrier_reply_replays_one_child(
     for _ in range(3):
         await CreationDisposer(ctrl).run(disposition_identity(row))
     current = await store.inspect(request_id=str(row["request_id"]))
-    assert set(current["cancellation_progress"]) == {"cloud_init", "rootdisk"}
+    assert set(current["cancellation_progress"]) == {"cloud_init", "rootdisk", "source"}
     assert len([value for value in api.deletes if value[0] != "Lease"]) == 3
     async with db.acquire() as conn:
         assert (

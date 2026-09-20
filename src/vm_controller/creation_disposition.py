@@ -134,6 +134,11 @@ class CreationDisposer:
             )
 
             await DispositionResources(self.actuator, row, lease, disposition).run()
+            from vm_controller.creation_disposition_sources import DispositionSources
+
+            # A stored source intent is a replay instruction, never completion.
+            # Always inspect/reconcile its exact external CAS and allocation.
+            await DispositionSources(self.actuator, row, lease, disposition).run()
             return {**pending, "disposition_id": disposition["disposition_id"]}
         return pending
 

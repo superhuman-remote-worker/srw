@@ -30,6 +30,11 @@ def pins(dv):
     if not isinstance(value, dict):
         raise ValueError("Golden source holds are unproven")
     for key, pin in value.items():
+        if isinstance(pin, dict) and pin.get("state") == "disposed":
+            from shared.vm_creation_source_disposition import validate_disposed_pin
+
+            validate_disposed_pin(key, pin, dv["metadata"]["uid"])
+            continue
         if not isinstance(pin, dict) or pin.get("state") not in {"active", "released"}:
             raise ValueError("Golden source hold identity is unproven")
         identities = {"job_id", "provision_generation", "pvc_uid", "dv_uid"}
@@ -217,7 +222,7 @@ class CreationSourcePins:
         tombstones = sorted(
             key
             for key, pin in current.items()
-            if pin["state"] == "released" and key != row["request_id"]
+            if pin["state"] in {"released", "disposed"} and key != row["request_id"]
         )
         for key in tombstones[: max(0, len(tombstones) + 1 - RELEASED_PIN_LIMIT)]:
             del current[key]
@@ -237,7 +242,10 @@ class CreationSourcePins:
         if (
             not meta.get("uid")
             or not meta.get("resourceVersion")
-            or any(pin["state"] != "released" for pin in pins(dv).values())
+            or any(
+                pin["state"] not in {"released", "disposed"}
+                for pin in pins(dv).values()
+            )
         ):
             raise ValueError("Golden source is held or unproven")
         roots = await asyncio.to_thread(

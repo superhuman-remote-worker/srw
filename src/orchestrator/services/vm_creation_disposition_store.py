@@ -289,7 +289,105 @@ class VMCreationDispositionStore:
             },
         }
 
-    async def authorize(self, *, request_id: str, carrier: dict, stage: str) -> dict:
+    async def _source_intent(self, conn, row, disposition, source, target_observation):
+        """Freeze resolution before I/O; this immutable stage is NOT completion."""
+        from shared.vm_creation_source_disposition import source_disposition_plan
+        from shared.vm_workspace_storage import storage_name
+
+        if source is not None and not isinstance(source, dict):
+            raise VMCreationRetryConflict("creation_disposition_source_unproven")
+        progress = _json(row["cancellation_progress"])
+        prior = progress.get("source")
+        if prior is not None:
+            if prior.get("kind") != "source_disposition_planned" or (
+                source is not None and source != prior["source"]
+            ):
+                raise VMCreationRetryConflict("creation_disposition_evidence_changed")
+            return {"operation": "dispose_source", "plan": prior}
+        frozen_source = disposition["source"]
+        if frozen_source is not None:
+            if source is not None and source != frozen_source:
+                raise VMCreationRetryConflict("creation_disposition_evidence_changed")
+            source = frozen_source
+        if source is None and disposition["source_resolution"] != "not_required":
+            raise VMCreationRetryConflict("creation_disposition_source_unproven")
+        target = None
+        if (
+            source
+            and source.get("kind")
+            in {"golden", "prepared", "preparation_never_delivered"}
+            and source.get("mode") != "retained"
+        ):
+            root = disposition["objects"].get("rootdisk")
+            if root is not None and disposition["disk_policy"] == "retain":
+                from shared.vm_creation_source_disposition import (
+                    completed_source_target,
+                )
+
+                try:
+                    target = completed_source_target(disposition, target_observation)
+                except (ValueError, TypeError, KeyError, StopIteration) as exc:
+                    raise VMCreationRetryConflict(
+                        "creation_disposition_incomplete"
+                    ) from exc
+            elif root is not None:
+                grant = await self._grant(
+                    conn, row, disposition, "rootdisk", create_child=False
+                )
+                target = grant["completion"]
+                child = await conn.fetchrow(
+                    "SELECT completed_at,outcome FROM vm_workspace_cleanup_admissions WHERE id=$1",
+                    UUID(grant["cleanup"]["admission_id"]),
+                )
+                if (
+                    progress.get("rootdisk") != target
+                    or child["completed_at"] is None
+                    or child["outcome"] != "deleted"
+                ):
+                    raise VMCreationRetryConflict("creation_disposition_incomplete")
+            else:
+                if (
+                    row["expected_pvc_uid"] is not None
+                    or row["observed_pvc_uid"] is not None
+                    or any(
+                        effect["effect_kind"] == "rootdisk"
+                        and effect["state"] != "rejected"
+                        for effect in disposition["effects"]
+                    )
+                ):
+                    raise VMCreationRetryConflict(
+                        "creation_disposition_source_unproven"
+                    )
+                binding = row["canonical_request"].get("workspace_storage")
+                target = {
+                    "kind": "rootdisk_never_issued",
+                    "namespace": disposition["namespace"],
+                    "name": storage_name(binding)
+                    if binding
+                    else f"agent-vm-{row['job_id']}-rootdisk",
+                }
+        try:
+            plan = source_disposition_plan(row, disposition, source, target)
+        except (ValueError, KeyError, TypeError) as exc:
+            raise VMCreationRetryConflict(
+                "creation_disposition_source_unproven"
+            ) from exc
+        await conn.execute(
+            "UPDATE vm_creation_retries SET cancellation_progress=cancellation_progress || $2::jsonb,revision=revision+1,updated_at=clock_timestamp() WHERE request_id=$1",
+            row["request_id"],
+            json.dumps({"source": plan}),
+        )
+        return {"operation": "dispose_source", "plan": plan}
+
+    async def authorize(
+        self,
+        *,
+        request_id: str,
+        carrier: dict,
+        stage: str,
+        source: dict | None = None,
+        target: dict | None = None,
+    ) -> dict:
         """Grant repeatable exact-UID teardown, never a CREATE or terminal release.
 
         The controller must fence consumers at every destructive API boundary.
@@ -299,6 +397,14 @@ class VMCreationDispositionStore:
         async with self.db.acquire() as conn:
             async with conn.transaction():
                 row, disposition = await self._locked(conn, request_id, carrier)
+                if stage == "source":
+                    return await self._source_intent(
+                        conn, row, disposition, source, target
+                    )
+                if source is not None or target is not None:
+                    raise VMCreationRetryConflict(
+                        "creation_disposition_stage_unavailable"
+                    )
                 return await self._grant(
                     conn, row, disposition, stage, create_child=True
                 )

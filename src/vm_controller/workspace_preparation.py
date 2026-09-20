@@ -61,6 +61,19 @@ def creation_held(allocation):
         binding_has_target and binding["target"] != source["target"]
     ):
         return True
+    if "creation_disposition" in allocation.state:
+        from shared.vm_creation_source_disposition import validate_prepared_disposition
+
+        try:
+            validate_prepared_disposition(
+                allocation.state["creation_disposition"],
+                request=allocation.request,
+                state=allocation.state,
+                allocation_uid=allocation.uid,
+            )
+            return False
+        except (ValueError, TypeError, KeyError, AttributeError):
+            return True
     if "creation_binding" not in allocation.state:
         return False
     from shared.vm_preparation_target import creation_root_name
@@ -788,6 +801,93 @@ class VMWorkspacePreparation:
 
     async def cancel(self, value):
         return (await self.cancel_with_receipt(value))["cancelled"]
+
+    async def mark_source_disposed(self, value, *, plan, source_dv):
+        """Close only an existing exact allocation after its source-DV CAS."""
+        from shared.vm_creation_source_disposition import validate_prepared_disposition
+        from vm_controller.creation_sources import pins
+
+        request = validate_request(value)
+        async with self.lock:
+            allocation = await self.store.get(allocation_name(request))
+            source = plan["source"]
+            if (
+                allocation is None
+                or allocation.request != request
+                or allocation.uid != source["allocation"]["uid"]
+                or source_dv["metadata"].get("uid") != source["dv_uid"]
+                or source_dv["metadata"].get("namespace") != source["namespace"]
+                or source_dv["metadata"].get("name") != source["name"]
+                or pins(source_dv).get(plan["request_id"]) != plan["tombstone"]
+            ):
+                raise PreparationConflict(
+                    "Prepared source disposition identity changed."
+                )
+            receipt = allocation.state.get("creation_disposition")
+            if receipt is None:
+                receipt = {
+                    "version": 1,
+                    "kind": "prepared_source_disposed",
+                    "plan": deepcopy(plan),
+                    "source_resource_version": source_dv["metadata"]["resourceVersion"],
+                }
+            if receipt.get("plan") != plan:
+                raise PreparationConflict("Prepared source disposition intent changed.")
+            validate_prepared_disposition(
+                receipt,
+                request=request,
+                state=allocation.state,
+                allocation_uid=allocation.uid,
+            )
+            if "creation_disposition" not in allocation.state:
+                await self.store.save(
+                    allocation, {**allocation.state, "creation_disposition": receipt}
+                )
+            return await self._abandon(allocation, "Cancelled", "BuildCancelled")
+
+    async def mark_source_never_delivered(self, value, *, plan):
+        """Fence an existing undelivered allocation; never recreate one as proof."""
+        request = validate_request(value)
+        expected = plan["source"]["allocation"]
+        async with self.lock:
+            allocation = await self.store.get(allocation_name(request))
+            if (
+                allocation is None
+                or allocation.uid != expected["uid"]
+                or allocation.request != request
+                or request != expected["request"]
+                or allocation.state.get("workspace_source_issued") is not False
+                or allocation.state.get("creation_binding")
+                != expected["state"].get("creation_binding")
+                or any(
+                    allocation.state.get(key) is not None
+                    for key in (
+                        "creation_source",
+                        "creation_root",
+                        "rootdisk",
+                        "rootdisk_uid",
+                    )
+                )
+            ):
+                raise PreparationConflict("Preparation non-delivery evidence changed.")
+            receipt = {
+                "version": 1,
+                "kind": "prepared_source_never_delivered",
+                "plan": deepcopy(plan),
+            }
+            if allocation.state.get("creation_disposition") not in (None, receipt):
+                raise PreparationConflict("Preparation disposition receipt changed.")
+            if allocation.state.get("creation_disposition") is None:
+                await self.store.save(
+                    allocation,
+                    {
+                        **allocation.state,
+                        "creation_disposition": receipt,
+                        "phase": "Cancelled",
+                        "error": "BuildCancelled",
+                    },
+                )
+            return await self._abandon(allocation, "Cancelled", "BuildCancelled")
 
     async def cancel_with_receipt(self, value):
         """Fence future source delivery and report durable non-issuance proof."""
