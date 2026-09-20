@@ -5,9 +5,41 @@ Job, and route locks in publication order. Delivery is always after commit.
 """
 
 import json
+import os
 from uuid import UUID
 
 from orchestrator.services.workspace_idle_events import record_human_route_wait_on_conn
+
+
+async def lock_officer_drain_jobs_on_conn(conn, *, project_id, officer_thread_id):
+    """Post/thread owner locks every affected Job before wake/route mutation.
+
+    The stable post lock fences new pending-officer publishers. Constrain the
+    later bulk route CAS to this exact set; never append Job locks after it.
+    None preserves the legacy default-off bulk writer.
+    """
+    if os.getenv("WORKSPACE_IDLE_RELEASE_ENABLED", "false").lower() != "true":
+        return None
+    rows = await conn.fetch(
+        "SELECT j.id FROM jobs j WHERE j.id IN ("
+        "SELECT r.job_id FROM job_message_routes r WHERE r.project_id=$1 "
+        "AND r.officer_thread_id=$2 AND r.state='pending_officer' AND r.blocking) "
+        "ORDER BY j.id FOR UPDATE OF j",
+        project_id,
+        officer_thread_id,
+    )
+    return [row["id"] for row in rows]
+
+
+async def record_officer_drain_on_conn(conn, *, rows, locked_job_ids):
+    if locked_job_ids is None:
+        return
+    for row in rows:
+        if row["job_id"] not in locked_job_ids:
+            raise RuntimeError("officer drain Job scope changed")
+        await record_human_route_wait_on_conn(
+            conn, job_id=row["job_id"], route_id=row["route_id"]
+        )
 
 
 async def lock_handoff_source_on_conn(

@@ -26717,6 +26717,14 @@ class PostgresDB:
 
                 route_rows = []
                 if hold is not None and route_reason:
+                    from orchestrator.services.workspace_idle_route_events import (
+                        lock_officer_drain_jobs_on_conn,
+                        record_officer_drain_on_conn,
+                    )
+
+                    drain_jobs = await lock_officer_drain_jobs_on_conn(
+                        conn, project_id=project_uuid, officer_thread_id=thread_uuid
+                    )
                     route_rows = await conn.fetch(
                         """
                         UPDATE job_message_routes
@@ -26734,12 +26742,17 @@ class PostgresDB:
                            AND officer_thread_id = $4
                            AND state = 'pending_officer'
                            AND blocking
+                           AND ($5::uuid[] IS NULL OR job_id=ANY($5::uuid[]))
                         RETURNING *
                         """,
                         project_uuid,
                         route_reason,
                         f"drain:{route_reason}",
                         thread_uuid,
+                        drain_jobs,
+                    )
+                    await record_officer_drain_on_conn(
+                        conn, rows=route_rows, locked_job_ids=drain_jobs
                     )
 
         return {
@@ -27053,6 +27066,15 @@ class PostgresDB:
                         "incarnation": None,
                     }
 
+                from orchestrator.services.workspace_idle_route_events import (
+                    lock_officer_drain_jobs_on_conn,
+                    record_officer_drain_on_conn,
+                )
+
+                drain_jobs = await lock_officer_drain_jobs_on_conn(
+                    conn, project_id=project_uuid, officer_thread_id=thread_uuid
+                )
+
                 # Linearization edge: the in-flight refusal above is still an
                 # observational no-op. Every decommission mutation below is
                 # owned by an append-only retirement authorization in this
@@ -27219,10 +27241,15 @@ class PostgresDB:
                        AND officer_thread_id = $2
                        AND state = 'pending_officer'
                        AND blocking
+                       AND ($3::uuid[] IS NULL OR job_id=ANY($3::uuid[]))
                     RETURNING *
                     """,
                     project_uuid,
                     thread_uuid,
+                    drain_jobs,
+                )
+                await record_officer_drain_on_conn(
+                    conn, rows=route_rows, locked_job_ids=drain_jobs
                 )
                 await _fault("routes_fallback_staged")
 
