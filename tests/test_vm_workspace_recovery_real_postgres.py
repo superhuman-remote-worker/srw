@@ -1927,10 +1927,16 @@ async def test_disabled_bundle_then_enabled_hold_never_refunds_executable_attemp
             "INSERT INTO worker_batch_attempts (job_id,lease_token,claimed_attempt) VALUES ($1,7,1)",
             job_id,
         )
-        await conn.execute(
-            "INSERT INTO agents (config_name,hostname,pod_uid) VALUES ('test',$1,$2)",
-            POD_NAME,
-            POD_UID,
+        # Live stateless contract: pooled executors never register. The
+        # bundle must authorize without an agents row; assert its absence
+        # before exercising disabled-then-enabled accounting.
+        assert (
+            await conn.fetchval(
+                "SELECT count(*) FROM agents WHERE hostname=$1 AND pod_uid=$2",
+                POD_NAME,
+                POD_UID,
+            )
+            == 0
         )
     monkeypatch.setenv("VM_WORKSPACE_RECOVERY_ENABLED", "false")
     async with httpx.AsyncClient(
@@ -1967,6 +1973,15 @@ async def test_disabled_bundle_then_enabled_hold_never_refunds_executable_attemp
                 job_id,
             )
             == 1
+        )
+        # No registration was created as a side effect of the repair.
+        assert (
+            await conn.fetchval(
+                "SELECT count(*) FROM agents WHERE hostname=$1 AND pod_uid=$2",
+                POD_NAME,
+                POD_UID,
+            )
+            == 0
         )
 
 

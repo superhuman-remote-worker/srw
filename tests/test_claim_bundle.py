@@ -87,7 +87,27 @@ class FakeDB:
             raise AssertionError(f"unexpected fetchrow SQL: {sql}")
 
         self.conn.fetchrow = AsyncMock(side_effect=_fetchrow)
-        self.conn.fetchval = AsyncMock(return_value=True)
+
+        async def _fetchval(sql, *_args):
+            if "SELECT EXISTS (SELECT 1 FROM agents WHERE hostname" in sql:
+                raise AssertionError(
+                    "agents registration lookup must not be used for stateless "
+                    "worker admission (claimant attestation replaces it)"
+                )
+            if "SELECT EXISTS (SELECT 1 FROM run_queue" in sql:
+                # Final exact-token recheck: the live lease is still ours.
+                return True
+            if "SELECT 1 FROM run_queue WHERE unit_id" in sql:
+                # record_bundle_authorized queue lock: lease still current.
+                return 1
+            if "UPDATE worker_batch_attempts SET bundle_authorized_at" in sql:
+                return 1
+            if sql.strip().startswith("UPDATE threads"):
+                # Session-turn credential-bound stamp.
+                return UNIT_ID
+            raise AssertionError(f"unexpected fetchval SQL: {sql}")
+
+        self.conn.fetchval = AsyncMock(side_effect=_fetchval)
         self.datasource_lock_calls = []
         # Bundle assembly rechecks repository authority the same way it
         # rechecks the lease: nothing current here, so nothing to invalidate.
@@ -250,6 +270,10 @@ def _patch_worker_attestation(monkeypatch, orch_main, *attestations):
         "attest_workspace_runtime",
         attest,
     )
+    # Every pooled sandbox bundle also needs executor-Pod attestation; default
+    # it to success so workspace-focused tests isolate their own refusal.
+    # Failure-matrix tests override the claimant mock afterwards.
+    _patch_worker_claimant(monkeypatch, orch_main)
     return attest
 
 
@@ -274,7 +298,28 @@ def _patch_vm_worker_attestation(monkeypatch, orch_main, *attestations):
         "attest_workspace_runtime",
         attest,
     )
+    _patch_worker_claimant(monkeypatch, orch_main)
     return attest
+
+
+def _patch_worker_claimant(monkeypatch, orch_main, attest=None):
+    """Inject a successful pooled-executor attestation for worker tests.
+
+    Returns the mock so failure cases can override its side effect to a
+    403/503 refusal. The mock is installed through the dependencies factory
+    so both direct service calls and route-level apps observe it.
+    """
+    import dataclasses
+
+    mock = attest if attest is not None else AsyncMock(return_value=None)
+    original = orch_main._unit_claim_bundle_dependencies
+
+    def _factory():
+        deps = original()
+        return dataclasses.replace(deps, attest_stateless_claimant=mock)
+
+    monkeypatch.setattr(orch_main, "_unit_claim_bundle_dependencies", _factory)
+    return mock
 
 
 def _worker_job_context(container, **extra):
@@ -410,8 +455,12 @@ async def test_session_bundle_stolen_during_slow_assembly_is_rejected(monkeypatc
         )
     )
     await asyncio.wait_for(entered.wait(), timeout=2)
+
     # The reaper/successor owns a newer token by the time assembly returns.
-    db.conn.fetchval.return_value = False
+    async def _stolen_fetchval(sql, *_args):
+        return None
+
+    db.conn.fetchval.side_effect = _stolen_fetchval
     release.set()
 
     with pytest.raises(HTTPException) as exc:
@@ -889,6 +938,7 @@ async def test_worker_vm_bundle_refuses_external_topology(monkeypatch):
     db = FakeDB(run_queue_row=row, thread=None, job=job)
     monkeypatch.setattr(orch_main, "require_internal", AsyncMock())
     monkeypatch.setattr(orch_main, "postgres_db", db)
+    _patch_worker_claimant(monkeypatch, orch_main)
     builder = AsyncMock()
     monkeypatch.setattr(job_start_bundle, "build_job_start_request", builder)
 
@@ -973,7 +1023,17 @@ async def test_worker_bundle_stolen_during_assembly_is_rejected(monkeypatch):
         ),
     }
     db = FakeDB(run_queue_row=row, thread=None, job=job)
-    db.conn.fetchval.return_value = False
+
+    async def _stolen_worker_fetchval(sql, *_args):
+        if "SELECT EXISTS (SELECT 1 FROM run_queue" in sql:
+            return False
+        if "SELECT 1 FROM run_queue WHERE unit_id" in sql:
+            return None
+        if "UPDATE worker_batch_attempts SET bundle_authorized_at" in sql:
+            return None
+        raise AssertionError(f"unexpected fetchval SQL: {sql}")
+
+    db.conn.fetchval.side_effect = _stolen_worker_fetchval
     monkeypatch.setattr(orch_main, "require_internal", AsyncMock())
     monkeypatch.setattr(orch_main, "postgres_db", db)
     monkeypatch.setattr(
@@ -1359,6 +1419,7 @@ async def test_inherited_worker_rejects_parent_change_after_assembly(
         "attest_workspace_runtime",
         AsyncMock(side_effect=attest),
     )
+    _patch_worker_claimant(monkeypatch, orch_main)
 
     with pytest.raises(HTTPException) as exc:
         await unit_claim_bundle.claim_bundle_for_unit(
@@ -1645,6 +1706,8 @@ def recovery_protocol_app(monkeypatch, *, ready=False, complete_identity=True):
         ),
     )
     _patch_vm_worker_attestation(monkeypatch, orch_main)
+    claimant = _patch_worker_claimant(monkeypatch, orch_main)
+    db.claimant_mock = claimant
     app = FastAPI()
     app.include_router(router)
     app.state.unit_claim_bundle_dependencies_factory = (
@@ -1726,6 +1789,79 @@ async def test_hold_post_response_loss_replays_and_rejects_changed_intent(monkey
             url, json={**report, "stop_proof": {"stopped": True}}
         )
         assert forged.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_accepted_replay_survives_pod_disappearance_without_second_hold(
+    monkeypatch,
+):
+    """Accepted exact replay returns its disposition after rotation/Pod loss.
+
+    The fresh-report path validates live Pod authority, but matching accepted
+    replay is idempotent and must not demand a current lease or live Pod:
+    admission already rotated the token and the original response may be lost.
+    A conflicting replay or a stale new request must still be refused without
+    a second hold.
+    """
+    import httpx
+    from fastapi import HTTPException as _HTTPException
+
+    app, db, store = recovery_protocol_app(monkeypatch)
+    report = {
+        "lease_token": 7,
+        "pod_name": POD_NAME,
+        "pod_uid": POD_UID,
+        "code": "workspace_transport_unavailable",
+        "request_id": "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+    }
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        url = f"/internal/units/{UNIT_ID}/workspace-recovery"
+        first = await client.post(url, json=report)
+        assert first.status_code == 200
+        holds_before = len(
+            [key for key in store.requests if store.requests[key][1] is not None]
+        )
+        # The Pod disappears (and the lease rotated to the hold token) after
+        # admission. Exact replay must still return the stored disposition.
+        db.claimant_mock.side_effect = _HTTPException(403, "Lease validation failed")
+        replay = await client.post(url, json=report)
+        assert replay.status_code == 200
+        assert replay.json() == first.json()
+        assert len(store.requests) == holds_before
+        # A stale new recovery request for the rotated lease must not admit a
+        # second hold for a stale claimant.
+        stale = await client.post(
+            url,
+            json={**report, "request_id": "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"},
+        )
+        assert stale.status_code in {403, 409}
+        assert len(store.requests) == holds_before
+
+
+@pytest.mark.asyncio
+async def test_fresh_recovery_report_without_live_claimant_refused(monkeypatch):
+    import httpx
+    from fastapi import HTTPException as _HTTPException
+
+    app, db, store = recovery_protocol_app(monkeypatch)
+    db.claimant_mock.side_effect = _HTTPException(403, "Lease validation failed")
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.post(
+            f"/internal/units/{UNIT_ID}/workspace-recovery",
+            json={
+                "lease_token": 7,
+                "pod_name": POD_NAME,
+                "pod_uid": POD_UID,
+                "code": "workspace_transport_unavailable",
+                "request_id": "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+            },
+        )
+    assert response.status_code == 403
+    assert store.receipt is None
 
 
 @pytest.mark.asyncio
@@ -1916,9 +2052,11 @@ async def test_bundle_fails_closed_without_recovering_unrelated_refusals(
 ):
     import httpx
 
+    from fastapi import HTTPException as _HTTPException
+
     app, db, store = recovery_protocol_app(monkeypatch, ready=True)
     if refusal == "pod":
-        db.conn.fetchval = AsyncMock(return_value=False)
+        db.claimant_mock.side_effect = _HTTPException(403, "Lease validation failed")
     elif refusal == "authorization":
         store.record_bundle_authorized = AsyncMock(return_value=False)
     else:

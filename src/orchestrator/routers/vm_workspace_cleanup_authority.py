@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping
 import json
+import logging
 from typing import Any
 from uuid import UUID
 
@@ -20,6 +21,7 @@ from orchestrator.services.vm_lifecycle_auth import (
 from orchestrator.services.vm_workspace_recovery_store import cleanup_intent_digest
 
 
+logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/internal/vm-workspace-cleanup-authority")
 _store_factory: Callable[[], Any] | None = None
 _SOURCES = frozenset(
@@ -151,9 +153,15 @@ async def acquire(request: Request) -> JSONResponse:
             operation=operation,
             correlation_id=correlation_id,
         )
-    except (KeyError, TypeError, ValueError) as exc:
+    except (KeyError, TypeError, ValueError):
+        logger.warning(
+            "Invalid cleanup authority request (operation=%s, correlation_id=%s)",
+            operation,
+            correlation_id,
+            exc_info=True,
+        )
         return _response(
-            {"allowed": False, "reason": str(exc)},
+            {"allowed": False, "reason": "invalid cleanup authority request"},
             operation=operation,
             correlation_id=correlation_id,
             status=400,
@@ -196,9 +204,15 @@ async def complete(request: Request) -> JSONResponse:
             operation=operation,
             correlation_id=correlation_id,
         )
-    except (KeyError, TypeError, ValueError) as exc:
+    except (KeyError, TypeError, ValueError):
+        logger.warning(
+            "Invalid cleanup authority request (operation=%s, correlation_id=%s)",
+            operation,
+            correlation_id,
+            exc_info=True,
+        )
         return _response(
-            {"completed": False, "reason": str(exc)},
+            {"completed": False, "reason": "invalid cleanup authority request"},
             operation=operation,
             correlation_id=correlation_id,
             status=400,
@@ -259,9 +273,15 @@ async def resume(request: Request) -> JSONResponse:
             operation=operation,
             correlation_id=correlation_id,
         )
-    except (KeyError, TypeError, ValueError) as exc:
+    except (KeyError, TypeError, ValueError):
+        logger.warning(
+            "Invalid cleanup authority request (operation=%s, correlation_id=%s)",
+            operation,
+            correlation_id,
+            exc_info=True,
+        )
         return _response(
-            {"allowed": False, "reason": str(exc)},
+            {"allowed": False, "reason": "invalid cleanup authority request"},
             operation=operation,
             correlation_id=correlation_id,
             status=400,

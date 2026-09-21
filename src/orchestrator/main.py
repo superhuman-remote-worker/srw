@@ -222,6 +222,9 @@ from orchestrator.services import (  # noqa: E402
     run_queue_admin as run_queue_admin_service,
     unit_claim_bundle as unit_claim_bundle_service,
 )
+from orchestrator.services.stateless_claimant_attestation import (  # noqa: E402
+    build_claimant_attestor as _build_stateless_claimant_attestor,
+)
 from orchestrator.services.vm_workspace_recovery_store import (  # noqa: E402
     VMWorkspaceRecoveryStore,
 )
@@ -7072,6 +7075,7 @@ def _unit_claim_bundle_dependencies() -> (
         job_start_bundle_dependencies=_job_start_bundle_dependencies,
         dispatch_credential_dependencies=_dispatch_credential_dependencies,
         recovery_store=VMWorkspaceRecoveryStore(postgres_db),
+        attest_stateless_claimant=_build_stateless_claimant_attestor(),
     )
 
 

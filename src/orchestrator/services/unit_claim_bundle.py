@@ -102,6 +102,10 @@ class UnitClaimBundleDependencies:
     job_start_bundle_dependencies: Callable[[], Any]
     dispatch_credential_dependencies: Callable[[], Any]
     recovery_store: Any = None
+    #: Read-only pooled-executor attestation (K8s Pod UID + pool membership).
+    #: Injected so routes/services stay testable without a cluster. ``None``
+    #: is unknown authority (503), never success.
+    attest_stateless_claimant: Callable[[str, str], Awaitable[None]] | None = None
 
 
 class _WorkspaceRecoveryRefusal(HTTPException):
@@ -166,11 +170,20 @@ async def get_workspace_recovery_disposition(
     )
 
 
-async def _validate_worker_identity(
+async def _validate_worker_lease(
     conn: Any, *, unit_id: str, lease_token: int, pod_name: str, pod_uid: str
 ) -> None:
+    """Exact database lease proof for a pooled worker claimant.
+
+    Checks a valid UID shape, the exact leased queue token, and the matching
+    ``leased_by`` pod name in one short read. This is the database half of
+    worker admission; the Kubernetes executor-Pod observation is separate
+    (``_attest_worker_claimant``) and always happens outside write-lock
+    transactions. No ``agents`` registration is required: pooled executors
+    intentionally never create one.
+    """
     try:
-        UUID(pod_uid)
+        UUID(str(pod_uid))
     except (ValueError, TypeError, AttributeError):
         raise HTTPException(403, "Lease validation failed") from None
     row = await conn.fetchrow(
@@ -186,12 +199,36 @@ async def _validate_worker_identity(
         and row["leased_by"] == pod_name
     ):
         raise HTTPException(403, "Lease validation failed")
-    if not await conn.fetchval(
-        "SELECT EXISTS (SELECT 1 FROM agents WHERE hostname=$1 AND pod_uid=$2)",
-        pod_name,
-        pod_uid,
-    ):
-        raise HTTPException(403, "Lease validation failed")
+
+
+async def _attest_worker_claimant(
+    *, pod_name: str, pod_uid: str, dependencies: UnitClaimBundleDependencies
+) -> None:
+    """Read-only executor-Pod attestation for a pooled worker claimant.
+
+    The slow Kubernetes read stays outside database transactions; callers
+    re-read the exact lease under the existing short transactional boundary
+    after it returns. ``None`` (unwired collaborator) is unknown authority,
+    never success.
+    """
+    attestor = getattr(dependencies, "attest_stateless_claimant", None)
+    if attestor is None:
+        raise HTTPException(503, "Claimant authority unavailable")
+    await attestor(str(pod_name or ""), str(pod_uid or ""))
+
+
+# Retained alias for suites that still resolve the pre-fix validator name.
+# It now performs only the database lease half; attestation is separate.
+async def _validate_worker_identity(
+    conn: Any, *, unit_id: str, lease_token: int, pod_name: str, pod_uid: str
+) -> None:
+    await _validate_worker_lease(
+        conn,
+        unit_id=unit_id,
+        lease_token=lease_token,
+        pod_name=pod_name,
+        pod_uid=pod_uid,
+    )
 
 
 async def report_workspace_recovery(
@@ -206,6 +243,8 @@ async def report_workspace_recovery(
     intent_digest = _digest({"unit_id": unit_id, **report.model_dump(mode="json")})
     # The accepted request is checked before current authority: admission
     # rotates the token and the response can be lost after that commit.
+    # Matching accepted replay is idempotent and must not demand a current
+    # lease or a live Pod; conflicting intent stays refused.
     async with dependencies.db.acquire() as conn:
         try:
             prior = await store._accepted_request(
@@ -220,13 +259,21 @@ async def report_workspace_recovery(
             return prior
         if not workspace_recovery_enabled():
             raise HTTPException(409, "Workspace recovery is unavailable")
-        await _validate_worker_identity(
+        await _validate_worker_lease(
             conn,
             unit_id=unit_id,
             lease_token=report.lease_token,
             pod_name=report.pod_name,
             pod_uid=str(report.pod_uid),
         )
+    # Slow executor-Pod observation outside the database connection. The
+    # locked lease CAS inside ``admit_hold`` rechecks exact currency before
+    # any hold commits, so a lease stolen during this read cannot admit.
+    await _attest_worker_claimant(
+        pod_name=report.pod_name,
+        pod_uid=str(report.pod_uid),
+        dependencies=dependencies,
+    )
     job = await dependencies.db.get_job(unit_id)
     try:
         contract = resolve_workspace_contract(job) if job else None
@@ -415,15 +462,22 @@ async def _assemble_claim_bundle(
                 status_code=403, detail="Lease validation failed"
             ) from None
     if row["unit_kind"] == UNIT_KIND_WORKER_BATCH:
-        if workspace_recovery_enabled():
-            async with dependencies.db.acquire() as conn:
-                await _validate_worker_identity(
-                    conn,
-                    unit_id=unit_id,
-                    lease_token=lease_token,
-                    pod_name=pod_name,
-                    pod_uid=pod_uid,
-                )
+        # Initial worker admission before expensive credential assembly.
+        # Unconditional with respect to VM_WORKSPACE_RECOVERY_ENABLED: lease
+        # plus pooled-executor attestation admits the bundle in both flag
+        # states. The slow Pod observation stays outside any write lock; the
+        # final authorization below re-observes both claimant and lease.
+        async with dependencies.db.acquire() as conn:
+            await _validate_worker_lease(
+                conn,
+                unit_id=unit_id,
+                lease_token=lease_token,
+                pod_name=pod_name,
+                pod_uid=pod_uid,
+            )
+        await _attest_worker_claimant(
+            pod_name=pod_name, pod_uid=pod_uid, dependencies=dependencies
+        )
         job = await dependencies.db.get_job(unit_id)
         if not job or job.get("execution_lane") != LANE_STATELESS:
             raise HTTPException(
@@ -617,10 +671,22 @@ async def _assemble_claim_bundle(
             }
         )
 
-        # Credential/config assembly above can take seconds. Repeat the full
-        # control-plane + host-key attestation so a Pod/PVC/Service replacement
-        # during that window never crosses the response boundary under stale
-        # workspace authority.
+        # Credential/config assembly above can take seconds, and the final
+        # claimant observation below is itself a slow external wait. Run that
+        # observation FIRST so the workspace/job/lease/repository revalidation
+        # after it is fresh: an authority change landing mid-claimant-wait
+        # must not ride through on checks that already ran. The residual
+        # cross-system window (claimant replaced during the revalidation reads
+        # themselves) is unavoidable — Kubernetes and Postgres are not one
+        # atomic transaction — and is documented, not hidden; the short
+        # transactional lease recheck before authorization narrows it to
+        # milliseconds for the lease half.
+        await _attest_worker_claimant(
+            pod_name=pod_name, pod_uid=pod_uid, dependencies=dependencies
+        )
+        # Repeat the full control-plane + host-key attestation so a
+        # Pod/PVC/Service replacement during assembly or the claimant wait
+        # never crosses the response boundary under stale workspace authority.
         if assigned_backend == "vm":
             confirmed_attestation = await _attest_recoverable_vm(
                 workspace_owner,
@@ -750,11 +816,20 @@ async def _assemble_claim_bundle(
 
         # Execution evidence is independent of admission policy: a later flag
         # change must never turn an issued bundle into pre-bundle refund debt.
+        # Authorization accounting stays unconditional with respect to
+        # VM_WORKSPACE_RECOVERY_ENABLED.
         if dependencies.recovery_store is None:
             raise HTTPException(503, "Worker bundle authorization is unavailable")
+        # The fresh claimant observation already ran above, before the final
+        # workspace/job/lease/repository revalidation. Recheck the exact lease
+        # once more under the short transactional boundary below before any
+        # authorization writes: a successful observation before slow work must
+        # not authorize a later stolen lease, and the transactional recheck
+        # keeps that window to milliseconds. The Kubernetes/DB observations
+        # are not one atomic transaction.
         async with dependencies.db.acquire() as conn:
             async with conn.transaction():
-                await _validate_worker_identity(
+                await _validate_worker_lease(
                     conn,
                     unit_id=unit_id,
                     lease_token=lease_token,
