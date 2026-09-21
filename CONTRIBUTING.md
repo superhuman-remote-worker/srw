@@ -107,5 +107,13 @@ architecture, and development material belongs under [`docs/`](docs/README.md)
 or the relevant component README. Do not link public instructions to a private
 working copy or deployment-specific runbook.
 
+Internal design drafts, implementation plans, investigations, validation records,
+and development handoffs belong in the separate knowledge-base repository.
+Follow its existing taxonomy and keep note filename stems unique across the
+vault. This project convention overrides agent workflow defaults such as
+`docs/superpowers/`; do not recreate that directory in the application repository.
+Public changes must still include enough context for review in the issue, pull
+request, stable public documentation, tests, or code comments.
+
 If code and documentation disagree, update both in the same pull request when
 the correct behavior is known.
