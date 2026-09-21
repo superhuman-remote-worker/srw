@@ -3927,6 +3927,22 @@ def _set_nested(d: dict, dotted: str, value: Any) -> None:
     node[parts[-1]] = value
 
 
+def _is_muse_contributor_tier(model: str) -> bool:
+    """Whether a model ID is the Muse Spark 1.3 Contributor tier.
+
+    Both tiers share the ``muse-spark-1.3`` family; only the Contributor tier
+    caps reasoning at ``xhigh`` (Meta docs; pilot 9792db96 Contributor/max
+    HTTP400, xhigh succeeds; https://dev.meta.ai/docs/reasoning). Matched on
+    the final slash-delimited model component as a ``-contributor`` suffix on the
+    1.3 model (with ``$``/``-``/``:`` boundary, mirroring the family regex) so
+    plain, ``meta/``, and ``openrouter/meta/`` IDs resolve consistently while
+    ``contributor-org/muse-spark-1.3`` (contributor as org prefix) and
+    ``muse-spark-1.3-contributorish`` (no tier boundary) keep Standard options.
+    """
+    name = (model or "").lower().rsplit("/", 1)[-1]
+    return re.match(r"muse-spark-1\.3-contributor(?:$|[-:])", name) is not None
+
+
 def reasoning_capability(model: str) -> Dict[str, Any]:
     """Return the ``reasoning`` capability block for a model's family.
 
@@ -3942,6 +3958,12 @@ def reasoning_capability(model: str) -> Dict[str, Any]:
 
     Deployment-overlay reasoning overrides are not applied yet (v1).
     See knowledge-base/knowledge/features/family_centered_reasoning.md.
+
+    Muse Spark 1.3 Contributor tier shares the ``muse-spark-1.3`` family but
+    caps at ``xhigh`` (Meta docs; pilot 9792db96 Contributor/max HTTP400,
+    xhigh succeeds). Filter legacy ``max`` from the advertised options so the
+    existing factory clamp (``_clamp_reasoning_level`` walks max -> xhigh)
+    applies consistently; Standard keeps ``max``.
     """
     base_path = get_project_root() / "config" / "model_config_matrix.yaml"
     matrix = _load_model_config_matrix_file(base_path)
@@ -3949,7 +3971,17 @@ def reasoning_capability(model: str) -> Dict[str, Any]:
     block = (matrix.get(fam) or {}).get("reasoning")
     if not isinstance(block, dict):
         block = (matrix.get("default") or {}).get("reasoning")
-    return block if isinstance(block, dict) else {"method": "none"}
+    if not isinstance(block, dict):
+        return {"method": "none"}
+    if fam == "muse-spark-1.3" and _is_muse_contributor_tier(model):
+        options = block.get("options")
+        if isinstance(options, (list, tuple)) and any(
+            str(o).lower() == "max" for o in options
+        ):
+            narrowed = dict(block)
+            narrowed["options"] = [o for o in options if str(o).lower() != "max"]
+            return narrowed
+    return block
 
 
 def resolve_reasoning_plan(config: "LLMConfig") -> Dict[str, Any]:
