@@ -1,0 +1,288 @@
+{
+  "observedAt": "2026-09-15T05:56:26.110268+00:00",
+  "scope": "Read-only post-merge rollout verification; no new execution acceptance run.",
+  "release": {
+    "name": "superhuman-remote-worker-deployment",
+    "namespace": "superhuman-remote-worker",
+    "revision": "981",
+    "updated": "2026-09-14 18:52:44.453348032 +0000 UTC",
+    "status": "deployed",
+    "chart": "srw-dev-0.0.1037",
+    "app_version": "sha-6b9a1ad"
+  },
+  "settings": {
+    "vmController.preparation.enabled": true,
+    "vmController.preparation.network.enabled": true,
+    "vmController.preparation.network.enforcementVerified": true,
+    "vmController.preparation.network.podFirewall": true,
+    "orchestrator.vmRemoteOperationProtocol.enabled": true,
+    "manifestHosting.networkIsolationVerified": false
+  },
+  "pr": {
+    "headRefOid": "a31fc20ad72414821d84bac2ed68430bc1b1742d",
+    "mergeCommit": {
+      "oid": "8ec9514988c294949edad76fe33694925769c33e"
+    },
+    "mergedAt": "2026-09-14T12:25:16Z",
+    "state": "MERGED",
+    "url": "https://github.com/superhuman-remote-worker/srw/pull/131"
+  },
+  "localDevelop": "8e2a18b7743ed908965b55a93e200570a4110e26",
+  "prMergeIsAncestorOfDeployedSource": true,
+  "latestDevelopChartPublication": "Run 34882694050 succeeded; Package and push dev chart was skipped. Live chart remains 0.0.1037 from 6b9a1ad24.",
+  "ci": {
+    "8ec9514988c294949edad76fe33694925769c33e": [
+      {
+        "conclusion": "success",
+        "databaseId": 34849659792,
+        "headSha": "8ec9514988c294949edad76fe33694925769c33e",
+        "name": "main",
+        "status": "completed",
+        "url": "https://github.com/superhuman-remote-worker/srw/actions/runs/34849659792"
+      },
+      {
+        "conclusion": "success",
+        "databaseId": 34849659576,
+        "headSha": "8ec9514988c294949edad76fe33694925769c33e",
+        "name": "ci-policy",
+        "status": "completed",
+        "url": "https://github.com/superhuman-remote-worker/srw/actions/runs/34849659576"
+      },
+      {
+        "conclusion": "success",
+        "databaseId": 34849659699,
+        "headSha": "8ec9514988c294949edad76fe33694925769c33e",
+        "name": "db-migrations",
+        "status": "completed",
+        "url": "https://github.com/superhuman-remote-worker/srw/actions/runs/34849659699"
+      },
+      {
+        "conclusion": "success",
+        "databaseId": 34843332193,
+        "headSha": "8ec9514988c294949edad76fe33694925769c33e",
+        "name": "ci-policy",
+        "status": "completed",
+        "url": "https://github.com/superhuman-remote-worker/srw/actions/runs/34843332193"
+      },
+      {
+        "conclusion": "success",
+        "databaseId": 34843332169,
+        "headSha": "8ec9514988c294949edad76fe33694925769c33e",
+        "name": "develop",
+        "status": "completed",
+        "url": "https://github.com/superhuman-remote-worker/srw/actions/runs/34843332169"
+      },
+      {
+        "conclusion": "success",
+        "databaseId": 34843332224,
+        "headSha": "8ec9514988c294949edad76fe33694925769c33e",
+        "name": "application-e2e-observation",
+        "status": "completed",
+        "url": "https://github.com/superhuman-remote-worker/srw/actions/runs/34843332224"
+      }
+    ],
+    "6b9a1ad2455e2976c3f065a79d2a7002928576fc": [
+      {
+        "conclusion": "success",
+        "databaseId": 34878120036,
+        "headSha": "6b9a1ad2455e2976c3f065a79d2a7002928576fc",
+        "name": "ci-policy",
+        "status": "completed",
+        "url": "https://github.com/superhuman-remote-worker/srw/actions/runs/34878120036"
+      },
+      {
+        "conclusion": "success",
+        "databaseId": 34878120180,
+        "headSha": "6b9a1ad2455e2976c3f065a79d2a7002928576fc",
+        "name": "application-e2e-observation",
+        "status": "completed",
+        "url": "https://github.com/superhuman-remote-worker/srw/actions/runs/34878120180"
+      },
+      {
+        "conclusion": "success",
+        "databaseId": 34878120283,
+        "headSha": "6b9a1ad2455e2976c3f065a79d2a7002928576fc",
+        "name": "develop",
+        "status": "completed",
+        "url": "https://github.com/superhuman-remote-worker/srw/actions/runs/34878120283"
+      }
+    ],
+    "8e2a18b7743ed908965b55a93e200570a4110e26": [
+      {
+        "conclusion": "success",
+        "databaseId": 34882694050,
+        "headSha": "8e2a18b7743ed908965b55a93e200570a4110e26",
+        "name": "develop",
+        "status": "completed",
+        "url": "https://github.com/superhuman-remote-worker/srw/actions/runs/34882694050"
+      },
+      {
+        "conclusion": "success",
+        "databaseId": 34882694087,
+        "headSha": "8e2a18b7743ed908965b55a93e200570a4110e26",
+        "name": "application-e2e-observation",
+        "status": "completed",
+        "url": "https://github.com/superhuman-remote-worker/srw/actions/runs/34882694087"
+      },
+      {
+        "conclusion": "success",
+        "databaseId": 34882693977,
+        "headSha": "8e2a18b7743ed908965b55a93e200570a4110e26",
+        "name": "ci-policy",
+        "status": "completed",
+        "url": "https://github.com/superhuman-remote-worker/srw/actions/runs/34882693977"
+      }
+    ]
+  },
+  "deployments": [
+    {
+      "name": "srw-agent-stateless",
+      "desired": 6,
+      "ready": 6,
+      "updated": 6,
+      "available": 6,
+      "generationObserved": true
+    },
+    {
+      "name": "srw-canvas-gateway",
+      "desired": 1,
+      "ready": 1,
+      "updated": 1,
+      "available": 1,
+      "generationObserved": true
+    },
+    {
+      "name": "srw-cockpit",
+      "desired": 1,
+      "ready": 1,
+      "updated": 1,
+      "available": 1,
+      "generationObserved": true
+    },
+    {
+      "name": "srw-codex-proxy",
+      "desired": 1,
+      "ready": 1,
+      "updated": 1,
+      "available": 1,
+      "generationObserved": true
+    },
+    {
+      "name": "srw-dozzle",
+      "desired": 1,
+      "ready": 1,
+      "updated": 1,
+      "available": 1,
+      "generationObserved": true
+    },
+    {
+      "name": "srw-infra-collector",
+      "desired": 1,
+      "ready": 1,
+      "updated": 1,
+      "available": 1,
+      "generationObserved": true
+    },
+    {
+      "name": "srw-keycloak",
+      "desired": 2,
+      "ready": 2,
+      "updated": 2,
+      "available": 2,
+      "generationObserved": true
+    },
+    {
+      "name": "srw-mcp",
+      "desired": 1,
+      "ready": 1,
+      "updated": 1,
+      "available": 1,
+      "generationObserved": true
+    },
+    {
+      "name": "srw-nextcloud",
+      "desired": 1,
+      "ready": 1,
+      "updated": 1,
+      "available": 1,
+      "generationObserved": true
+    },
+    {
+      "name": "srw-orchestrator",
+      "desired": 2,
+      "ready": 2,
+      "updated": 2,
+      "available": 2,
+      "generationObserved": true
+    },
+    {
+      "name": "srw-pgadmin",
+      "desired": 1,
+      "ready": 1,
+      "updated": 1,
+      "available": 1,
+      "generationObserved": true
+    },
+    {
+      "name": "srw-reloader",
+      "desired": 1,
+      "ready": 1,
+      "updated": 1,
+      "available": 1,
+      "generationObserved": true
+    },
+    {
+      "name": "srw-searxng",
+      "desired": 1,
+      "ready": 1,
+      "updated": 1,
+      "available": 1,
+      "generationObserved": true
+    },
+    {
+      "name": "srw-ssh-gateway",
+      "desired": 1,
+      "ready": 1,
+      "updated": 1,
+      "available": 1,
+      "generationObserved": true
+    },
+    {
+      "name": "srw-vm-controller",
+      "desired": 1,
+      "ready": 1,
+      "updated": 1,
+      "available": 1,
+      "generationObserved": true
+    }
+  ],
+  "health": [
+    {
+      "service": "cockpit",
+      "status": 200,
+      "tlsVerified": true
+    },
+    {
+      "service": "mcp",
+      "status": 200,
+      "tlsVerified": true
+    },
+    {
+      "service": "api",
+      "status": 200,
+      "tlsVerified": true
+    }
+  ],
+  "previousAcceptance": {
+    "source": "4fdd15215e4ec66b56b340ede7b5f21e8a9aa186",
+    "releaseRevision": 977,
+    "completedAt": "2026-09-14T11:58:17Z",
+    "preparedVmCases": 6,
+    "passed": true,
+    "scopedCleanupPassed": true,
+    "firewallProbes": 55,
+    "firewallNodes": 5,
+    "scopeLocalBaseImport": "Retained under installed TTL",
+    "verificationLimit": "Historical six-case MCP/harness acceptance; not repeated on the merge or current deployed source. Does not establish positive main v1 remote-I/O acceptance."
+  }
+}

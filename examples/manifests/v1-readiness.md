@@ -17,9 +17,49 @@ Its portable alpha fixtures preserve resolution behavior from published develop.
 | Tags and labels | Common metadata on all five kinds, including version-checked metadata edits on admitted Jobs | Metadata does not grant permissions, select resources or trigger execution. A Job metadata edit preserves its admitted specification, dependencies and execution identity. |
 | Clients | Canonical API, thin resource CLI and MCP operations, including workspace-cache management | The broader operational CLI and distributable team packages remain extensions. |
 
-## Release-contract candidate — 2026-09-14
+## Merged release checkpoint — 2026-09-15
 
-The next candidate builds on published `develop` at `5809c97f5`. It adds the
+PRs [#128](https://github.com/superhuman-remote-worker/srw/pull/128),
+[#129](https://github.com/superhuman-remote-worker/srw/pull/129) and
+[#131](https://github.com/superhuman-remote-worker/srw/pull/131) are merged.
+PR #131 includes the 36 B09 lifecycle-control commits and a tempfile security
+fix; merge commit `8ec951498` passed its develop, policy and application E2E
+workflows. Its reviewed source `a31fc20ad` passed **31,296 Python tests, 180
+skipped**, in [CI](https://github.com/superhuman-remote-worker/srw/actions/runs/34836420214).
+
+At September 15 05:56 UTC, main dev ran chart **0.0.1037**, app **`sha-6b9a1ad`**,
+release **981**, which included that merge. All 15 Deployments were current and
+ready and Cockpit/API/MCP health returned HTTP 200. Preparation,
+its network/enforcement/Pod-firewall settings and the separate VM remote-operation
+protocol flag were enabled. Generic hosting's `networkIsolationVerified`
+was false. The latest develop change at that observation, `8e2a18b77`, passed CI
+but skipped chart publication; a source-only example-image update does not imply
+a new deployment.
+The [rollout receipt](verification/manifest-post-merge-2026-09-15.json) records
+these dated observations and their scope, not the current deployment state.
+
+Online preparation was accepted on main dev at source `4fdd15215`, release 977,
+on September 14 at 11:58 UTC: cold package installation, independent cache reuse,
+retained allocation/handoff, failed build, running-builder cancellation and scoped
+cleanup all passed. Four positive Jobs each executed 13 real harness tool steps,
+including the installed `hello` package and `sudo --version`. The published
+preparer passed 55 firewall probes across five nodes. Pre-existing resources
+were preserved; the scoped base import was left under cache TTL. This earlier
+execution acceptance is separate from the September 15 read-only rollout
+verification.
+
+Remaining release-hardening work includes supported recovery and fault-injection
+acceptance for the older retained-workspace cases from the supervised development
+exercise below. Publication does not close them. Enabling the VM-operation flag
+also does not establish positive main-cluster v1 remote-I/O lease acceptance;
+the preparation gate did not exercise that path. Broader team commissioning,
+operational CLI, authored network profiles, additional adapters, OCI/S3 cache
+distribution and cross-execution retained Session selection remain extensions.
+The API stays **`srw/v1alpha1`**.
+
+## Historical release-contract candidate — 2026-09-14
+
+The candidate built on published `develop` at `5809c97f5`. It adds the
 alpha compatibility contract and frozen fixtures, rejects unsupported Connector
 drivers before SRW Job admission, and checks reap eligibility before acquiring
 cleanup authority for a preparing workspace. Its optional preparation Pod
@@ -63,13 +103,13 @@ captures these candidate checks:
   containment. A separate online libguestfs package install and independent
   read-only disk inspection passed. These checks do not certify generic hosting.
 
-These are candidate results, not a main-dev rollout. Main dev still runs chart
+These were candidate results before main-dev rollout. At that observation main ran chart
 `0.0.999`, revision 971, with offline preparation. That revision only increased
 the VM-controller memory limit after an observed OOM. PRs
 [#127](https://github.com/superhuman-remote-worker/srw/pull/127) and
-[#128](https://github.com/superhuman-remote-worker/srw/pull/128) require
-the normal review and release process before the new profile can be enabled
-there.
+[#128](https://github.com/superhuman-remote-worker/srw/pull/128) still required
+the normal review and release process. The September 15 checkpoint above supersedes
+that rollout status while preserving each test's original source revision.
 
 The [real-provider development exercise](verification/srw-development-2026-09-14.json)
 produced [PR #129](https://github.com/superhuman-remote-worker/srw/pull/129):
@@ -176,12 +216,13 @@ original identities, and the unrelated scratch database remained running. The
 primary checkout's Tilt watcher remains paused; local k3d retains the integrated
 deployment.
 
-## Release decisions still required
+## Historical deployment gate — 2026-09-13
 
 Develop publication uses CI-built component images and a versioned Helm chart;
 [GitHub Actions](https://github.com/superhuman-remote-worker/srw/actions?query=branch%3Adevelop)
 records those publication checks. Preparation remains disabled by default in the
-chart. Main dev enables offline preparation through Fleet. Its
+chart. At this historical checkpoint, main dev enabled offline preparation through
+Fleet. Its
 [six-case acceptance](verification/main-dev-prepared-srw-2026-09-13.json) passed
 on chart `0.0.999`, release revision 970: cold build, a fresh cache-hit disk,
 retained allocation and handoff, failed preparation, running-builder cancellation
@@ -189,9 +230,13 @@ and exact cleanup. The four successful Jobs required real harness/guest shell
 output. The sample cold Job took 16m43s; its cache-hit counterpart took 4m29s.
 All 15 deployments and public health checks passed after cleanup.
 The policy-only main-cluster startup test failed. The newer preparation Pod
-firewall passed the candidate checks above, but online preparation stays disabled
-on main until its chart, orchestrator, controller and builder are deployed
-together and the installation settings are updated through Fleet.
+firewall later passed the candidate checks above. Online preparation remained
+disabled at this checkpoint pending deployment of the chart, orchestrator,
+controller and builder together and installation settings updates through Fleet.
+The September 15 checkpoint above records the subsequent deployment, enablement
+and separately attributed online execution acceptance.
+
+## Release decisions still required
 
 Keep `srw/v1alpha1` until supported backend behavior, migration/rollback handling
 and version compatibility guarantees have been reviewed. Changing a version
