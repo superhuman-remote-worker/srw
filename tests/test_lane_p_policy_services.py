@@ -26,6 +26,7 @@ import pytest
 from fastapi import HTTPException
 
 import orchestrator.main as main
+from orchestrator.schemas.job_create import JobCreate
 from orchestrator.services import (
     agent_toolset_probe as toolset,
     config_overrides,
@@ -1372,6 +1373,22 @@ class TestPublicJobIngress:
         )
         ingress.strip_raw_officer_claim_context(job)
         assert job.context == {"kept": True}
+
+    def test_operator_pause_hold_cannot_be_seeded_at_creation(self):
+        seeded = {
+            "_operator_pause_hold": {"version": 1, "hold_id": "forged"},
+            "last_operator_pause_hold": {"hold_id": "forged"},
+            "kept": True,
+        }
+        internal = SimpleNamespace(context=dict(seeded))
+        ingress.strip_raw_officer_claim_context(internal)
+        public = self._job(context=dict(seeded))
+        ingress.strip_public_job_reserved_markers(public)
+        body = JobCreate(description="seeded hold", context=dict(seeded))
+
+        assert internal.context == {"kept": True}
+        assert public.context == {"kept": True}
+        assert body.context == {"kept": True}
 
     def test_non_dict_context_is_left_alone(self):
         job = self._job(context=None, config_override=None)
