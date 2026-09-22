@@ -220,8 +220,12 @@ async def test_batch_insert_if_absent_rows_never_update_and_keep_row_order():
     sqls = [" ".join(call.args[0].split()) for call in calls]
     assert [len(call.args[1]) for call in calls] == [1, 2, 1]
     assert "ON CONFLICT (id) DO UPDATE" in sqls[0]
-    assert sqls[1].endswith("ON CONFLICT (id) DO NOTHING")
-    assert "DO UPDATE" not in sqls[1]
+    # A view only inserts: on conflict the tool link alone follows the AI
+    # row's (possibly remapped) id; content and every other column never do.
+    conflict_clause = sqls[1].partition("ON CONFLICT (id)")[2]
+    assert conflict_clause.strip() == (
+        "DO UPDATE SET tool_call_id = EXCLUDED.tool_call_id"
+    )
     assert "ON CONFLICT (id) DO UPDATE" in sqls[2]
     ids = [args[0] for call in calls for args in call.args[1]]
     assert ids == [_coerce_row_id(f"m{i}") for i in range(4)]

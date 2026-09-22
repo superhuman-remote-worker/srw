@@ -2011,10 +2011,14 @@ class PostgresDB:
     )
     # Same columns, insert-if-absent: a batch row flagged ``insert_if_absent``
     # (a lossy compaction view the reconcile still owes when the incremental
-    # write was lost) fills a missing row but never rewrites an existing one.
+    # write was lost) fills a missing row but never rewrites an existing one's
+    # content. Only the tool link follows: a mid-turn cross-family model switch
+    # remaps tool-call ids in memory on the AI message and its result alike,
+    # the AI row upserts the new id, and a result left on the old one would
+    # split the stored pair (restore then prunes both halves as orphans).
     _THREAD_MESSAGE_INSERT_IF_ABSENT_BATCH_SQL = (
         _THREAD_MESSAGE_UPSERT_SQL.partition("ON CONFLICT (id)")[0]
-        + "ON CONFLICT (id) DO NOTHING"
+        + "ON CONFLICT (id) DO UPDATE SET tool_call_id = EXCLUDED.tool_call_id"
     )
     _THREAD_ACTIVITY_BUMP_SQL = """
         UPDATE threads
@@ -2481,9 +2485,10 @@ class PostgresDB:
         ``ON CONFLICT (id)``, and ``seq`` is preserved (assigned once on first
         insert). No ``RETURNING`` — the reconcile never reads ``seq`` back, and
         ``executemany`` discards results anyway. A dict flagged
-        ``insert_if_absent`` (a lossy compaction view of its row) is written
-        ``ON CONFLICT (id) DO NOTHING`` instead: it fills a row whose
-        incremental write was lost and never rewrites one that landed.
+        ``insert_if_absent`` (a lossy compaction view of its row) only
+        inserts: it fills a row whose incremental write was lost and never
+        rewrites the content of one that landed (its ``tool_call_id`` alone
+        follows, so a remapped pair stays paired).
 
         The upsert runs inside a transaction so the whole turn reconciles
         atomically. This batches ONLY the reconcile; the incremental mid-turn

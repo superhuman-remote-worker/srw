@@ -398,6 +398,57 @@ async def test_compaction_view_fills_a_lost_row_but_never_rewrites_a_landed_one(
 
 
 @pytest.mark.asyncio
+async def test_compaction_view_keeps_its_tool_link_in_step_with_the_ai_row(db):
+    """A mid-turn cross-family model switch remaps tool-call ids in memory
+    (sanitize_history_for_provider_boundary) on the AI message AND its tool
+    result. The AI row upserts the new id; the view row must follow it, or
+    the stored pair splits and restore prunes both halves as orphans. The
+    link moves, the landed full content still never does."""
+    await _seed_turn_boundary(db, "link-boundary", 9)
+    await db.save_thread_message(
+        thread_id=_TID,
+        role="tool",
+        content="full result",
+        turn_number=9,
+        tool_call_id="toolu_01ABCDEF",
+        id="link-landed",
+    )
+    rows = [
+        _row(
+            "link-landed",
+            "tool",
+            "capped view",
+            9,
+            tool_call_id="7aec07fb2",
+            insert_if_absent=True,
+        ),
+        _row("link-final", "ai", "answer", 9),
+    ]
+    lease = LeaseHandle()
+    lease.update(_TID, 17)
+    context_token = current_lease.set(lease)
+    try:
+        await db.save_thread_messages(
+            _TID,
+            rows,
+            turn_input_message_id="link-boundary",
+            turn_number=9,
+            memory_scope_kind="thread",
+            memory_scope_id=_TID,
+        )
+    finally:
+        current_lease.reset(context_token)
+
+    async with db.acquire() as conn:
+        landed = await conn.fetchrow(
+            "SELECT content, tool_call_id FROM thread_messages WHERE id = $1",
+            _coerce_row_id("link-landed"),
+        )
+    assert landed["content"] == "full result"
+    assert landed["tool_call_id"] == "7aec07fb2"
+
+
+@pytest.mark.asyncio
 async def test_reconcile_bumps_thread_turn_count(db):
     await db.save_thread_messages(
         _TID,
