@@ -23,6 +23,8 @@ import {TranslocoService} from '@jsverse/transloco';
 import {Router} from '@angular/router';
 import {SubscriptionLogin, SubscriptionsStatus} from '../../core/models/api.model';
 import {environment} from '../../core/environment';
+import de from '../../../assets/i18n/de-DE.json';
+import en from '../../../assets/i18n/en.json';
 
 function status(overrides: Partial<SubscriptionsStatus> = {}): SubscriptionsStatus {
   return {
@@ -170,7 +172,7 @@ function setup(service: ReturnType<typeof makeSettingsService>, renderTemplate =
         provide: TranslocoService,
         // Echo the key back: the component treats "translation === key" as
         // "no translation", which is exactly the fallback path we want here.
-        useValue: {translate: (key: string) => key},
+        useValue: {translate: (key: string) => key, getActiveLang: () => 'en'},
       },
       {provide: Router, useValue: {navigate: vi.fn()}},
     ],
@@ -405,5 +407,54 @@ describe('SettingsComponent — AI Subscriptions', () => {
     expect(component.formatResetIn(720)).toBe('12m');
     expect(component.formatResetIn(9120)).toBe('2h 32m');
     expect(component.formatResetIn(360000)).toBe('4d 4h');
+  });
+});
+
+// The provider-key card used to borrow the PAT page's settings.apiKeys.title /
+// .desc / .empty and reference seven settings.apiKeys.* keys that no longer
+// existed, so /settings showed "Personal Access Tokens" twice and never named
+// the LLM-provider card (issues/settings_menu_dead_and_unwired_controls.md §9).
+describe('SettingsComponent — LLM provider key card', () => {
+  beforeAll(async () => {
+    await ɵresolveComponentResources(() => Promise.resolve(''));
+  });
+
+  it('names itself rather than the PAT page and renders its own column and form keys', () => {
+    const service = makeSettingsService();
+    service.apiKeys.set([
+      {id: 'k1', provider: 'openai', key_prefix: 'sk-ab', label: null, updated_at: '2026-09-01T00:00:00Z'},
+    ] as never);
+    const fixture = setup(service, true);
+    const el = fixture.nativeElement as HTMLElement;
+    const text = (root: Element, sel: string) =>
+      [...root.querySelectorAll(sel)].map((node) => node.textContent!.trim()).filter(Boolean);
+
+    const headings = text(el, 'h2');
+    expect(headings).toContain('settings.providerKeys.title');
+    // The PAT heading belongs to the PAT link card alone.
+    expect(headings).not.toContain('settings.apiKeys.title');
+    expect(headings).toContain('settings.apiKeys.linkTitle');
+    const card = [...el.querySelectorAll('section')].find(
+      (section) => section.querySelector('h2')?.textContent?.trim() === 'settings.providerKeys.title',
+    )!;
+    expect(text(card, '.section-desc')).toEqual(['settings.providerKeys.desc']);
+    expect(text(card, '.key-header span')).toEqual([
+      'settings.providerKeys.colProvider',
+      'settings.providerKeys.colKey',
+      'settings.providerKeys.colLabel',
+      'settings.providerKeys.colUpdated',
+    ]);
+    expect(text(card, '.form-title')).toEqual(['settings.providerKeys.addTitle']);
+    fixture.destroy();
+  });
+
+  it('carries copy distinct from the PAT card in both locales', () => {
+    for (const locale of [en, de]) {
+      const {providerKeys, apiKeys} = locale.settings;
+      expect(providerKeys.title).not.toBe(apiKeys.title);
+      expect(providerKeys.title).not.toBe(apiKeys.linkTitle);
+      expect(providerKeys.desc).not.toBe(apiKeys.desc);
+      expect(providerKeys.empty).not.toBe(apiKeys.empty);
+    }
   });
 });

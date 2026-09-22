@@ -432,19 +432,20 @@ const EXPIRY_OPTIONS = [
           </section>
         }
 
-        <!-- API Keys Section -->
+        <!-- LLM provider keys: the user's own, used ahead of the system keys.
+             Not the PAT page (settings.apiKeys.*, linked further down). -->
         <section class="settings-section">
-          <h2 class="section-title">{{ 'settings.apiKeys.title' | transloco }}</h2>
-          <p class="section-desc">{{ 'settings.apiKeys.desc' | transloco }}</p>
+          <h2 class="section-title">{{ 'settings.providerKeys.title' | transloco }}</h2>
+          <p class="section-desc">{{ 'settings.providerKeys.desc' | transloco }}</p>
 
           <!-- Key List -->
           @if (settingsService.apiKeys().length > 0) {
             <div class="key-table">
               <div class="key-header">
-                <span class="col-provider">{{ 'settings.apiKeys.colProvider' | transloco }}</span>
-                <span class="col-prefix">{{ 'settings.apiKeys.colKey' | transloco }}</span>
-                <span class="col-label">{{ 'settings.apiKeys.colLabel' | transloco }}</span>
-                <span class="col-updated">{{ 'settings.apiKeys.colUpdated' | transloco }}</span>
+                <span class="col-provider">{{ 'settings.providerKeys.colProvider' | transloco }}</span>
+                <span class="col-prefix">{{ 'settings.providerKeys.colKey' | transloco }}</span>
+                <span class="col-label">{{ 'settings.providerKeys.colLabel' | transloco }}</span>
+                <span class="col-updated">{{ 'settings.providerKeys.colUpdated' | transloco }}</span>
                 <span class="col-action"></span>
               </div>
               @for (key of settingsService.apiKeys(); track key.id) {
@@ -462,12 +463,12 @@ const EXPIRY_OPTIONS = [
               }
             </div>
           } @else {
-            <p class="empty-state">{{ 'settings.apiKeys.empty' | transloco }}</p>
+            <p class="empty-state">{{ 'settings.providerKeys.empty' | transloco }}</p>
           }
 
           <!-- Set Key Form -->
           <div class="create-form">
-            <h3 class="form-title">{{ 'settings.apiKeys.addTitle' | transloco }}</h3>
+            <h3 class="form-title">{{ 'settings.providerKeys.addTitle' | transloco }}</h3>
             <div class="form-row two-col">
               <app-select
                 [value]="keyProvider()"
@@ -480,7 +481,7 @@ const EXPIRY_OPTIONS = [
               </app-select>
               <app-input
                 [value]="keyLabel()"
-                [placeholder]="'settings.apiKeys.labelPlaceholder' | transloco"
+                [placeholder]="'settings.providerKeys.labelPlaceholder' | transloco"
                 [disabled]="settingKey()"
                 (changed)="keyLabel.set($event)"
               />
@@ -489,7 +490,7 @@ const EXPIRY_OPTIONS = [
               <app-input
                 type="password"
                 [value]="keyValue()"
-                [placeholder]="'settings.apiKeys.keyPlaceholder' | transloco"
+                [placeholder]="'settings.providerKeys.keyPlaceholder' | transloco"
                 [disabled]="settingKey()"
                 (changed)="keyValue.set($event)"
               />
@@ -504,7 +505,7 @@ const EXPIRY_OPTIONS = [
               {{
                 settingKey()
                   ? ('common.saving' | transloco)
-                  : ('settings.apiKeys.saveButton' | transloco)
+                  : ('settings.providerKeys.saveButton' | transloco)
               }}
             </app-button>
           </div>
@@ -2456,7 +2457,7 @@ const EXPIRY_OPTIONS = [
         }
         /* Re-label the now-headerless value cells. CSS content: is not scanned by
          the i18n hardcoded-string check and matches the admin-users card
-         precedent; it also sidesteps the missing settings.apiKeys.* keys. */
+         precedent. */
         .key-row .col-prefix::before {
           content: 'Key: ';
         }

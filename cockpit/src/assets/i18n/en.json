@@ -342,9 +342,11 @@
     "saving": "Saving...",
     "saved": "Saved",
     "delete": "Delete",
+    "back": "Back",
     "cancel": "Cancel",
     "dismiss": "Dismiss",
     "edit": "Edit",
+    "refresh": "Refresh",
     "rename": "Rename",
     "copy": "Copy",
     "copied": "Copied",
@@ -855,7 +857,8 @@
       "reset": "Reset",
       "submit": "Create Job",
       "creating": "Creating...",
-      "uploading": "Uploading..."
+      "uploading": "Uploading...",
+      "removeFile": "Remove file"
     },
     "detail": {
       "auditSteps": "Audit steps",
@@ -1064,6 +1067,9 @@
           "search_fallback": "Search fallback",
           "rerank": "Rerank (memory recall ordering)"
         }
+      },
+      "discovery": {
+        "timeout": "Discovery is taking longer than expected. Try Rediscover."
       }
     },
     "viewMode": {
@@ -1146,6 +1152,19 @@
       "label": "Show",
       "optionAll": "All data",
       "optionMe": "Only my data"
+    },
+    "providerKeys": {
+      "title": "LLM Provider Keys",
+      "desc": "Set your own API keys for LLM providers and tools. These take priority over system-wide keys when running jobs.",
+      "empty": "No API keys configured. Add one to use your own provider keys.",
+      "colProvider": "Provider",
+      "colKey": "Key",
+      "colLabel": "Label",
+      "colUpdated": "Updated",
+      "addTitle": "Add / Update Key",
+      "labelPlaceholder": "Label (optional)",
+      "keyPlaceholder": "API key (e.g. sk-...)",
+      "saveButton": "Save Key"
     },
     "apiKeys": {
       "linkTitle": "Personal Access Tokens",
@@ -1274,7 +1293,6 @@
       "permissionAutoAccept": "Auto-accept",
       "permissionAutonomous": "Autonomous",
       "workspaceBackend": "Default Workspace",
-      "workspaceRecommendation": "This Expert recommends {{tier}}. You can choose another workspace.",
       "workspaceBackendHint": "Where new sessions keep their files. Virtual starts in seconds and can be upgraded to a container mid-session; Container has full shell and git from the start but takes longer to provision.",
       "workspaceVirtual": "Virtual — instant, cloud file storage",
       "workspaceSandbox": "Container — full shell & git, slower start",
@@ -1463,6 +1481,7 @@
   },
   "projectDetail": {
     "loading": "Loading project...",
+    "back": "Back to projects",
     "badgePersonal": "Personal",
     "tabs": {
       "overview": "Overview",
@@ -1981,6 +2000,10 @@
         "bootingVm": "Booting VM (this can take a few minutes)",
         "connecting": "Establishing connection"
       }
+    },
+    "stream": {
+      "running": "Running {{tool}}",
+      "waitingForCommand": "Waiting for the command to finish…"
     },
     "thinking": {
       "past": "Thought for a moment",
@@ -2634,7 +2657,8 @@
       "emailUnattendedSendHint": "Requires the admin-granted email_autonomous_send permission — the server rejects this otherwise. When off, direct sending is refused; the planned human-approval queue is not available yet, so use Draft.",
       "emailNotPublishableHint": "Email connectors cannot be published — mailboxes stay private to their owner.",
       "optCredentials": "Credentials (environment variables)",
-      "credentialsEnvHint": "Available to workspace scripts and browser login forms. Add or replace variables; blank values keep existing credentials. Once attached, this connector stays for the session. Agent output is not filtered. Expiration is controlled by your provider."
+      "credentialsEnvHint": "Available to workspace scripts and browser login forms. Add or replace variables; blank values keep existing credentials. Once attached, this connector stays for the session. Agent output is not filtered. Expiration is controlled by your provider.",
+      "close": "Close"
     },
     "publishDialog": {
       "title": "Publish connector?",
@@ -3222,6 +3246,7 @@
       "projectMemory": "Project memory",
       "imageQuality": "Image Quality",
       "workspaceBackend": "Workspace",
+      "workspaceRecommendation": "This Expert recommends {{tier}}. You can choose another workspace.",
       "autonomyDefaultHint": "Controls when the agent pauses for human review",
       "tierCurrent": "current",
       "tierHint": "Upgrades carry your files over and cannot be reversed within the session.",

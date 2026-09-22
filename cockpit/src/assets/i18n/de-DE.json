@@ -342,9 +342,11 @@
     "saving": "Wird gespeichert...",
     "saved": "Gespeichert",
     "delete": "Löschen",
+    "back": "Zurück",
     "cancel": "Abbrechen",
     "dismiss": "Schließen",
     "edit": "Bearbeiten",
+    "refresh": "Aktualisieren",
     "rename": "Umbenennen",
     "copy": "Kopieren",
     "copied": "Kopiert",
@@ -855,7 +857,8 @@
       "reset": "Zurücksetzen",
       "submit": "Auftrag erstellen",
       "creating": "Wird erstellt...",
-      "uploading": "Wird hochgeladen..."
+      "uploading": "Wird hochgeladen...",
+      "removeFile": "Datei entfernen"
     },
     "detail": {
       "auditSteps": "Audit-Schritte",
@@ -1064,6 +1067,9 @@
           "search_fallback": "Such-Fallback",
           "rerank": "Rerank (Sortierung der Memory-Treffer)"
         }
+      },
+      "discovery": {
+        "timeout": "Die Discovery dauert länger als erwartet. Versuche es mit „Rediscover“."
       }
     },
     "viewMode": {
@@ -1146,6 +1152,19 @@
       "label": "Anzeigen",
       "optionAll": "Alle Daten",
       "optionMe": "Nur eigene Daten"
+    },
+    "providerKeys": {
+      "title": "API-Keys für LLM-Anbieter",
+      "desc": "Hinterlege eigene API-Keys für LLM-Anbieter und Tools. Diese haben bei der Ausführung von Aufträgen Vorrang vor den systemweiten Keys.",
+      "empty": "Keine API-Keys hinterlegt. Füge einen hinzu, um eigene Anbieter-Keys zu verwenden.",
+      "colProvider": "Anbieter",
+      "colKey": "Key",
+      "colLabel": "Label",
+      "colUpdated": "Aktualisiert",
+      "addTitle": "Key hinzufügen / aktualisieren",
+      "labelPlaceholder": "Label (optional)",
+      "keyPlaceholder": "API-Key (z. B. sk-...)",
+      "saveButton": "Key speichern"
     },
     "apiKeys": {
       "linkTitle": "Personal Access Tokens",
@@ -1274,7 +1293,6 @@
       "permissionAutoAccept": "Auto-akzeptieren",
       "permissionAutonomous": "Autonom",
       "workspaceBackend": "Standard-Arbeitsbereich",
-      "workspaceRecommendation": "Dieser Experte empfiehlt {{tier}}. Du kannst einen anderen Workspace wählen.",
       "workspaceBackendHint": "Wo neue Sitzungen ihre Dateien ablegen. Virtuell startet in Sekunden und kann während der Sitzung auf einen Container aufgerüstet werden; Container bietet von Anfang an Shell und Git, braucht aber länger zum Bereitstellen.",
       "workspaceVirtual": "Virtuell — sofort, Dateien im Cloud-Speicher",
       "workspaceSandbox": "Container — volle Shell & Git, langsamerer Start",
@@ -1463,6 +1481,7 @@
   },
   "projectDetail": {
     "loading": "Projekt wird geladen...",
+    "back": "Zurück zu den Projekten",
     "badgePersonal": "Persönlich",
     "tabs": {
       "overview": "Übersicht",
@@ -1981,6 +2000,10 @@
         "bootingVm": "VM startet (dies kann einige Minuten dauern)",
         "connecting": "Verbindung wird hergestellt"
       }
+    },
+    "stream": {
+      "running": "{{tool}} läuft",
+      "waitingForCommand": "Wartet, bis der Befehl abgeschlossen ist…"
     },
     "thinking": {
       "past": "Hat einen Moment nachgedacht",
@@ -2634,7 +2657,8 @@
       "emailUnattendedSendHint": "Erfordert die vom Admin vergebene Berechtigung email_autonomous_send — andernfalls lehnt der Server dies ab. Ist die Option aus, wird der Direktversand abgelehnt; die geplante Freigabe-Warteschlange ist noch nicht verfügbar, daher sollte ein Entwurf verwendet werden.",
       "emailNotPublishableHint": "E-Mail-Konnektoren können nicht veröffentlicht werden — Postfächer bleiben privat.",
       "optCredentials": "Zugangsdaten (Umgebungsvariablen)",
-      "credentialsEnvHint": "Für Skripte im Workspace und Browser-Anmeldungen. Variablen hinzufügen oder ersetzen; leere Werte behalten vorhandene Zugangsdaten. Nach dem Anhängen bleibt dieser Connector für die Sitzung verbunden. Agent-Ausgaben werden nicht gefiltert. Die Gültigkeitsdauer bestimmt dein Anbieter."
+      "credentialsEnvHint": "Für Skripte im Workspace und Browser-Anmeldungen. Variablen hinzufügen oder ersetzen; leere Werte behalten vorhandene Zugangsdaten. Nach dem Anhängen bleibt dieser Connector für die Sitzung verbunden. Agent-Ausgaben werden nicht gefiltert. Die Gültigkeitsdauer bestimmt dein Anbieter.",
+      "close": "Schließen"
     },
     "publishDialog": {
       "title": "Konnektor veröffentlichen?",
@@ -3221,6 +3245,7 @@
       "projectMemory": "Projektgedächtnis",
       "imageQuality": "Bildqualität",
       "workspaceBackend": "Arbeitsbereich",
+      "workspaceRecommendation": "Dieser Experte empfiehlt {{tier}}. Du kannst einen anderen Workspace wählen.",
       "autonomyDefaultHint": "Legt fest, wann der Agent für eine manuelle Prüfung pausiert",
       "narration": "Erzählmodus",
       "tierCurrent": "aktuell",
