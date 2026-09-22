@@ -286,3 +286,222 @@ async def test_main_mount_uses_the_real_approved_user_dependency(monkeypatch):
     assert response.json()["valid"] is True
     guard.assert_awaited_once()
     assert guard.await_args.args[1] is main.postgres_db
+
+
+def _secret_project_rows(project_id, owner_id):
+    """A migrated Project resource and its managed child Expert, as stored:
+    both documents carry the project override verbatim in the Expert's
+    ``runtime.config.layers``."""
+    from uuid import UUID, uuid4
+
+    from orchestrator.services.manifest_experts import (
+        expert_manifest,
+        project_expert_resource,
+    )
+    from orchestrator.services.manifest_projects import project_document
+    from shared.manifests.resolution import content_revision
+
+    raw = {
+        "id": uuid4(),
+        "name": "builder",
+        "display_name": "Builder",
+        "expert_type": "worker",
+        "owner_id": UUID(owner_id),
+        "is_global": False,
+        "icon": "build",
+        "color": "#123456",
+        "tags": ["worker"],
+        "config": {"settings": {"expert": True}},
+        "prompts": {},
+        "default_for": "worker",
+        "config_override": {"llm": {"api_key": "sk-link-secret"}},
+    }
+    document = expert_manifest(raw, image="trusted/srw:v1")
+    source = project_expert_resource(
+        raw,
+        {
+            "id": uuid4(),
+            "document": document,
+            "revision": content_revision(document["spec"]),
+            "resource_version": 1,
+        },
+    )
+    shared = {
+        "llm": {"model": "m", "api_key": "sk-project-secret"},
+        "workspace": {"remote": {"host": "10.0.0.7"}},
+    }
+    project_doc, _ = project_document(
+        {"id": project_id, "name": "P", "default_config_override": shared},
+        owner_id=owner_id,
+        experts=[source],
+    )
+    alias, entry = next(iter(project_doc["spec"]["resources"]["experts"].items()))
+    child_doc = {
+        "apiVersion": project_doc["apiVersion"],
+        "kind": "Expert",
+        "metadata": {"name": alias, "scope": {"kind": "Project", "name": project_id}},
+        "spec": entry["inline"],
+    }
+
+    def row(kind, document, linked_id):
+        return {
+            "id": uuid4(),
+            "kind": kind,
+            "name": document["metadata"]["name"],
+            "linked_id": linked_id,
+            "document": document,
+            "resource_version": 1,
+            "revision": "r1",
+            "active_revision": "r1",
+        }
+
+    return row("Project", project_doc, project_id), row("Expert", child_doc, raw["id"])
+
+
+RESOURCE_SECRETS = ("sk-project-secret", "sk-link-secret", "10.0.0.7")
+
+
+class TestResourceReadRedaction:
+    """``/api/resources`` grants a Project viewer a read, and served the stored
+    document whole — the same override layers ``GET /api/projects`` redacts.
+    Below owner (and admin) a reader now gets that same redaction."""
+
+    PROJECT_ID = "00000000-0000-0000-0000-00000000aa01"
+    OWNER_ID = "00000000-0000-0000-0000-00000000aa02"
+    VIEWER_ID = "00000000-0000-0000-0000-00000000aa03"
+
+    def _app(self, caller_id, role):
+        from orchestrator.services.manifest_resources import ManifestResourceService
+
+        project_row, child_row = _secret_project_rows(self.PROJECT_ID, self.OWNER_ID)
+        db = Mock()
+        db.get_project = AsyncMock(
+            return_value={"id": self.PROJECT_ID, "status": "active"}
+        )
+        db.get_user_role_in_project = AsyncMock(return_value=role)
+        db.get_projects_for_user = AsyncMock(return_value=[{"id": self.PROJECT_ID}])
+        db.get_expert_visible_by_id = AsyncMock(return_value={"is_global": False})
+        service = ManifestResourceService(db)
+        rows = {str(project_row["id"]): project_row, str(child_row["id"]): child_row}
+        service.store.by_id = AsyncMock(side_effect=lambda uid: rows.get(str(uid)))
+        service.store.list_scope = AsyncMock(return_value=[project_row, child_row])
+        app = make_app(
+            resources=service,
+            guard=AsyncMock(return_value={"id": caller_id, "is_admin": False}),
+        )
+        return app, project_row, child_row
+
+    async def _get(self, app, path):
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            return await client.get(path)
+
+    @pytest.mark.asyncio
+    async def test_a_viewer_reads_the_project_and_child_redacted(self):
+        from orchestrator.security.access import redact_public_config_override
+
+        app, project_row, child_row = self._app(self.VIEWER_ID, "viewer")
+        for row in (project_row, child_row):
+            response = await self._get(app, f"/api/resources/{row['id']}")
+            assert response.status_code == 200
+            for secret in RESOURCE_SECRETS:
+                assert secret not in response.text
+            # Byte-identical to what public_project serves the same reader.
+            assert response.json()["resource"] == redact_public_config_override(
+                row["document"]
+            )
+        listing = await self._get(
+            app, f"/api/resources?scope_kind=Project&scope_name={self.PROJECT_ID}"
+        )
+        assert listing.status_code == 200
+        assert len(listing.json()["resources"]) == 2
+        for secret in RESOURCE_SECRETS:
+            assert secret not in listing.text
+
+    @pytest.mark.asyncio
+    async def test_stored_preview_redacts_what_resolution_inlined(self):
+        """Resolution inlines referenced stored resources after a READ check,
+        so a viewer's stored preview could carry the project's layers."""
+        from types import SimpleNamespace
+
+        from orchestrator.services.manifest_store import resource_key
+
+        app, _project_row, child_row = self._app(self.VIEWER_ID, "viewer")
+        service = app.state.manifest_dependencies_factory().resources
+        doc = child_row["document"]
+        service.resolve = AsyncMock(
+            return_value=SimpleNamespace(
+                documents=[doc],
+                prepared={resource_key(doc): {"resolved": doc}},
+                observed=[],
+                plan_revision=lambda _scope: "plan",
+            )
+        )
+        async with AsyncClient(
+            transport=ASGITransport(app=app), base_url="http://test"
+        ) as client:
+            response = await client.post(
+                "/api/manifests/preview",
+                json={
+                    "source": json.dumps(doc),
+                    "format": "json",
+                    "resolution": "stored",
+                },
+            )
+        assert response.status_code == 200
+        resolved = json.dumps(response.json()["resolved"])
+        for secret in RESOURCE_SECRETS:
+            assert secret not in resolved
+
+    @pytest.mark.asyncio
+    async def test_an_apply_replay_echo_is_redacted_below_owner(self):
+        from contextlib import asynccontextmanager
+
+        from shared.manifests.resolution import content_revision
+
+        app, project_row, _child = self._app(self.VIEWER_ID, "viewer")
+        service = app.state.manifest_dependencies_factory().resources
+        doc = project_row["document"]
+
+        @asynccontextmanager
+        async def transaction_scope():
+            yield
+
+        service.db.transaction_scope = transaction_scope
+        service.store.lock_catalog = AsyncMock()
+        revision = content_revision(
+            {
+                "documents": [doc],
+                "scope": None,
+                "expectedVersions": {},
+                "planRevision": None,
+            }
+        )
+        service.db.fetchrow = AsyncMock(
+            return_value={
+                "request_revision": revision,
+                "result": {
+                    "resources": [{"uid": str(project_row["id"]), "resource": doc}]
+                },
+            }
+        )
+        result = await service.apply(
+            json.dumps(doc),
+            {"id": self.VIEWER_ID, "is_admin": False},
+            format="json",
+            idempotency_key="replayed",
+        )
+        echoed = json.dumps(result)
+        for secret in RESOURCE_SECRETS:
+            assert secret not in echoed
+
+    @pytest.mark.asyncio
+    async def test_the_owner_keeps_full_fidelity_for_export(self):
+        app, project_row, child_row = self._app(self.OWNER_ID, "owner")
+        for row in (project_row, child_row):
+            response = await self._get(app, f"/api/resources/{row['id']}")
+            assert response.status_code == 200
+            assert response.json()["resource"] == json.loads(
+                json.dumps(row["document"])
+            )

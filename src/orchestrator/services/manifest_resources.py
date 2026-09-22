@@ -6,6 +6,7 @@ from uuid import UUID, uuid4
 
 from fastapi import HTTPException
 
+from orchestrator.security.access import redact_public_config_override
 from orchestrator.security.crypto import encrypt
 from orchestrator.services.datasource_policy_errors import (
     DatasourceMaterializationAuthorizationError,
@@ -32,6 +33,38 @@ class ManifestResourceService:
         self.admit_job = admit_job
         self.project_activation = project_activation
 
+    async def full_fidelity(self, row, user):
+        """Whether ``user`` reads ``row``'s stored document unredacted.
+
+        An admin, or the owner of the scope the resource lives in: the Account
+        itself, or the Project's owner role (a Project row answers to its
+        linked project, not the Account scope its document was authored in).
+        Export and re-apply need that fidelity. Every reader below owner — a
+        Project viewer or editor, a caller who only sees an Expert — gets the
+        view ``public_project`` serves, through the same redactor, because a
+        migrated project's documents carry its config override verbatim.
+        """
+        if user.get("is_admin"):
+            return True
+        if row["kind"] == "Project" and row.get("linked_id"):
+            scope = {"kind": "Project", "name": str(row["linked_id"])}
+        else:
+            scope = row["document"]["metadata"].get("scope") or {}
+        if scope.get("kind") == "Account":
+            return str(scope.get("name")) == str(user["id"])
+        if scope.get("kind") == "Project":
+            role = await self.db.get_user_role_in_project(
+                str(scope["name"]), str(user["id"])
+            )
+            return role == "owner"
+        return False
+
+    async def reader_view(self, row, user, **extra):
+        view = {**resource_view(row), **extra}
+        if not await self.full_fidelity(row, user):
+            view["resource"] = redact_public_config_override(view["resource"])
+        return view
+
     async def resolve(self, documents, user, *, request=None, default_scope=None):
         authority = ManifestAuthority(self.db, user, request=request)
         resolver = LiveManifestResolver(self.store, authority)
@@ -46,16 +79,22 @@ class ManifestResourceService:
             request=request,
             default_scope=default_scope,
         )
+        resolved = [
+            resolver.prepared[resource_key(doc)]["resolved"]
+            for doc in resolver.documents
+        ]
+        if not user.get("is_admin"):
+            # Resolution inlines every referenced stored resource after only a
+            # READ check, so a viewer's preview could carry another scope's
+            # override layers. The caller's own ``documents`` are unchanged.
+            resolved = [redact_public_config_override(doc) for doc in resolved]
         return {
             "apiVersion": API_VERSION,
             "operation": "preview",
             "resolution": "stored",
             "admissionReady": False,
             "documents": resolver.documents,
-            "resolved": [
-                resolver.prepared[resource_key(doc)]["resolved"]
-                for doc in resolver.documents
-            ],
+            "resolved": resolved,
             "dependencies": resolver.observed,
             "planRevision": resolver.plan_revision(default_scope),
             "pendingChecks": [
@@ -116,6 +155,10 @@ class ManifestResourceService:
                                 409, "An operation resource has since been deleted."
                             )
                         await authority.resource(current)
+                        if not await self.full_fidelity(current, user):
+                            item["resource"] = redact_public_config_override(
+                                item["resource"]
+                            )
                     return result
             resolver = await self.resolve(
                 documents, user, request=request, default_scope=default_scope
@@ -321,14 +364,20 @@ class ManifestResourceService:
                 request_revision,
                 json.dumps(result),
             )
-            return result
+            return {
+                **result,
+                "resources": [
+                    await self.reader_view(row, user, changed=changed)
+                    for row, changed in saved.values()
+                ],
+            }
 
     async def get(self, resource_id, user, *, request=None):
         row = await self.store.by_id(resource_id)
         if not row:
             raise HTTPException(404, "Resource does not exist.")
         await ManifestAuthority(self.db, user, request=request).resource(row)
-        result = resource_view(row)
+        result = await self.reader_view(row, user)
         if row["kind"] == "Job":
             job = await self.db.fetchrow(
                 "SELECT j.id,j.status,j.error_message FROM srw_execution_specs s JOIN jobs j ON s.work_id=j.id WHERE s.resource_id=$1",
@@ -379,7 +428,7 @@ class ManifestResourceService:
                 if error.status_code in (403, 404):
                     continue
                 raise
-            visible.append(resource_view(row))
+            visible.append(await self.reader_view(row, user))
         return {"resources": visible}
 
     async def delete(self, resource_id, user, *, expected_version, request=None):
