@@ -63,6 +63,144 @@ STATELESS_CLAIMANT_EVICTION_GRACE_SECONDS = int(
     os.environ.get("STATELESS_CLAIMANT_EVICTION_GRACE_SECONDS", "180")
 )
 
+# Retention boundary for pooled stateless executor Pods, stamped by the chart
+# (helm/templates/agent/stateless-deployment.yaml). Claimant-loss debt settles
+# only on an observed exact UID with every container terminated; without this
+# finalizer the kubelet removes the object ~0.7 s after the containers stop and
+# the debt becomes unsettleable (a 404 is never process-zero proof). The
+# run_queue reaper releases it once the Pod is process-zero and no durable
+# claimant authority still names the UID.
+STATELESS_EXECUTOR_PROCESS_ZERO_FINALIZER = (
+    "lifecycle.srw.dev/stateless-executor-process-zero"
+)
+STATELESS_EXECUTOR_LABEL_SELECTOR = (
+    "srw/class=agent-stateless,app.kubernetes.io/component=agent-stateless"
+)
+STATELESS_EXECUTOR_READ_TIMEOUT = (5.0, 15.0)
+
+
+def _executor_statuses(status: Any, field: str) -> list[Any] | None:
+    raw = getattr(status, field, None)
+    if raw is None:
+        return []
+    return list(raw) if isinstance(raw, (list, tuple)) else None
+
+
+def _executor_status_started(container: Any) -> bool:
+    state = getattr(container, "state", None)
+    last = getattr(container, "last_state", None)
+    return bool(
+        getattr(state, "running", None) is not None
+        or getattr(state, "terminated", None) is not None
+        or getattr(last, "running", None) is not None
+        or getattr(last, "terminated", None) is not None
+        or getattr(container, "container_id", None)
+        or getattr(container, "started", None) is True
+        or getattr(container, "ready", None) is True
+        or int(getattr(container, "restart_count", 0) or 0) != 0
+    )
+
+
+def _deleting_executor_never_scheduled(pod: Any) -> bool:
+    """A deleting Pending Pod without ``nodeName`` never ran any process.
+
+    Mirrors the workspace rule (container_provisioner.
+    ``_deleting_pod_was_never_scheduled``; duplicated rather than imported to
+    keep this module free of a provisioner-to-provisioner import): the binding
+    subresource refuses a Pod that is being deleted, so no kubelet can ever
+    start its containers. Any contradictory status is ambiguous.
+    """
+
+    spec = getattr(pod, "spec", None)
+    status = getattr(pod, "status", None)
+    if getattr(status, "phase", None) != "Pending" or getattr(spec, "node_name", None):
+        return False
+    for field in (
+        "container_statuses",
+        "init_container_statuses",
+        "ephemeral_container_statuses",
+    ):
+        statuses = _executor_statuses(status, field)
+        if statuses is None or any(_executor_status_started(s) for s in statuses):
+            return False
+    return True
+
+
+def _deleting_executor_never_initialized(pod: Any) -> bool:
+    """A Pod killed inside ``wait-for-orchestrator`` never ran the executor.
+
+    The kubelet's terminal status rewrite marks only initialized Pods' waiting
+    containers terminated; a Pod deleted during init keeps its regular
+    containers ``waiting: PodInitializing`` forever, so the strict all-terminal
+    rule would retain it indefinitely. Require the kubelet's own terminal
+    phase, every init container terminated with at least one failure (a
+    successful init would have initialized the Pod and moved the containers
+    past ``PodInitializing``), and no start evidence on any regular container.
+    """
+
+    spec = getattr(pod, "spec", None)
+    status = getattr(pod, "status", None)
+    if getattr(status, "phase", None) not in {"Failed", "Succeeded"}:
+        return False
+    # PodGC writes a terminal phase for Pods on lost/out-of-service nodes
+    # without any kubelet having stopped them; their statuses are frozen.
+    if any(
+        getattr(condition, "type", None) == "DisruptionTarget"
+        and getattr(condition, "reason", None) == "DeletionByPodGC"
+        for condition in getattr(status, "conditions", None) or []
+    ):
+        return False
+    init_statuses = _executor_statuses(status, "init_container_statuses")
+    statuses = _executor_statuses(status, "container_statuses")
+    ephemeral = _executor_statuses(status, "ephemeral_container_statuses")
+    if not init_statuses or not statuses or ephemeral is None:
+        return False
+    for declared_field, observed in (
+        ("init_containers", init_statuses),
+        ("containers", statuses),
+    ):
+        declared = {str(c.name) for c in getattr(spec, declared_field, None) or []}
+        if not declared.issubset({str(getattr(s, "name", "")) for s in observed}):
+            return False
+    init_terminal = [
+        getattr(getattr(s, "state", None), "terminated", None) for s in init_statuses
+    ]
+    if any(item is None for item in init_terminal) or all(
+        int(getattr(item, "exit_code", 0) or 0) == 0 for item in init_terminal
+    ):
+        return False
+    for container in statuses:
+        state = getattr(container, "state", None)
+        if getattr(state, "terminated", None) is not None:
+            continue
+        waiting = getattr(state, "waiting", None)
+        if getattr(
+            waiting, "reason", None
+        ) != "PodInitializing" or _executor_status_started(container):
+            return False
+    return all(
+        getattr(getattr(s, "state", None), "terminated", None) is not None
+        for s in ephemeral
+    )
+
+
+def stateless_executor_process_zero(pod: Any) -> bool:
+    """Whether one deleting executor Pod can never run a process again.
+
+    The finalizer-release predicate: every declared container observed
+    terminated (the exact-terminal proof the claimant-loss reconciler settles
+    on), or the Pod provably never started its executor. Running or frozen
+    statuses on a lost node are never evidence; an operator attestation is.
+    """
+
+    if getattr(getattr(pod, "metadata", None), "deletion_timestamp", None) is None:
+        return False
+    return (
+        pod_containers_are_terminal(pod)
+        or _deleting_executor_never_scheduled(pod)
+        or _deleting_executor_never_initialized(pod)
+    )
+
 
 def _env_flag(name: str, default: bool) -> bool:
     """Parse a boolean env var exactly the way ContainerProvisioner does.
@@ -1631,6 +1769,159 @@ class AgentProvisioner:
             return True
         except Exception as exc:
             return getattr(exc, "status", None) == 404
+
+    @staticmethod
+    def _stateless_executor_identity(pod: Any) -> tuple[str, str, str] | None:
+        """``(name, uid, resourceVersion)`` of a pool-member executor Pod.
+
+        The pool identity comes from the server-owned chart env (the same
+        source as claim-bundle attestation), never from the Pod: a second
+        release sharing the namespace must never have its retained executors
+        released against this orchestrator's database.
+        """
+
+        from orchestrator.services.stateless_claimant_attestation import (
+            claimant_pool_mismatch_reason,
+            pool_identity,
+        )
+
+        expected_name, expected_instance = pool_identity()
+        metadata = getattr(pod, "metadata", None)
+        name = str(getattr(metadata, "name", "") or "")
+        uid = str(getattr(metadata, "uid", "") or "")
+        resource_version = str(getattr(metadata, "resource_version", "") or "")
+        if not (expected_name and expected_instance and name and uid):
+            return None
+        if not resource_version:
+            return None
+        if claimant_pool_mismatch_reason(
+            pod, expected_name=expected_name, expected_instance=expected_instance
+        ):
+            return None
+        return name, uid, resource_version
+
+    async def list_retained_stateless_executor_pods(self) -> list[Any] | None:
+        """Deleting pool executor Pods still held by the process-zero finalizer.
+
+        ``None`` means unknown (no client, no pool identity, API failure) and
+        callers release nothing; an empty list means nothing is retained.
+        """
+
+        from orchestrator.services.stateless_claimant_attestation import (
+            pool_identity,
+        )
+
+        expected_name, expected_instance = pool_identity()
+        if not self._k8s_available or not expected_name or not expected_instance:
+            return None
+        selector = ",".join(
+            (
+                STATELESS_EXECUTOR_LABEL_SELECTOR,
+                f"app.kubernetes.io/name={expected_name}",
+                f"app.kubernetes.io/instance={expected_instance}",
+            )
+        )
+        try:
+            # Runs on the reaper's serial loop: a slow API must not delay steals.
+            listed = await run_bounded_k8s_call(
+                self._core_api.list_namespaced_pod,
+                namespace=self._namespace,
+                label_selector=selector,
+                request_timeout=STATELESS_EXECUTOR_READ_TIMEOUT,
+            )
+        except Exception as exc:
+            logger.warning("Stateless executor retention list failed: %s", exc)
+            return None
+        retained = []
+        for pod in getattr(listed, "items", None) or []:
+            metadata = getattr(pod, "metadata", None)
+            finalizers = getattr(metadata, "finalizers", None) or []
+            if (
+                getattr(metadata, "deletion_timestamp", None) is not None
+                and STATELESS_EXECUTOR_PROCESS_ZERO_FINALIZER in finalizers
+                and self._stateless_executor_identity(pod) is not None
+            ):
+                retained.append(pod)
+        return retained
+
+    async def read_stateless_executor_pod(
+        self, pod_name: str, *, expected_pod_uid: str
+    ) -> Any | None:
+        """Read one exact pool executor Pod; ``None`` for absent/other/unknown."""
+
+        name = str(pod_name or "").strip()
+        uid = str(expected_pod_uid or "").strip()
+        if not self._k8s_available or not name or not uid:
+            return None
+        try:
+            pod = await run_bounded_k8s_call(
+                self._core_api.read_namespaced_pod,
+                name=name,
+                namespace=self._namespace,
+                request_timeout=STATELESS_EXECUTOR_READ_TIMEOUT,
+            )
+        except Exception:
+            return None
+        identity = self._stateless_executor_identity(pod)
+        if identity is None or identity[1] != uid:
+            return None
+        return pod
+
+    async def release_stateless_executor_finalizer_exact(
+        self, pod: Any, *, require_process_zero: bool = True
+    ) -> bool:
+        """Remove only the process-zero finalizer from one observed executor.
+
+        The JSON Patch tests the UID, the observed resourceVersion and the
+        exact finalizer list, so the release applies to precisely the object
+        state the caller evaluated; any intervening write is a retryable 422.
+        A live (non-deleting) executor is never unprotected.
+        ``require_process_zero=False`` is reserved for an audited operator
+        attestation that the claimant process is gone.
+        """
+
+        if not self._k8s_available:
+            return False
+        identity = self._stateless_executor_identity(pod)
+        metadata = getattr(pod, "metadata", None)
+        if identity is None or getattr(metadata, "deletion_timestamp", None) is None:
+            return False
+        if require_process_zero and not stateless_executor_process_zero(pod):
+            return False
+        name, uid, resource_version = identity
+        patch = finalizer_release_patch(
+            uid=uid,
+            resource_version=resource_version,
+            finalizers=[
+                str(value) for value in getattr(metadata, "finalizers", None) or []
+            ],
+            finalizer=STATELESS_EXECUTOR_PROCESS_ZERO_FINALIZER,
+        )
+        if patch is None:
+            return False
+        try:
+            await run_bounded_k8s_mutation(
+                self._core_api.patch_namespaced_pod,
+                name=name,
+                namespace=self._namespace,
+                body=patch,
+            )
+        except Exception as exc:
+            if getattr(exc, "status", None) == 404:
+                return True
+            logger.info(
+                "Stateless executor finalizer release deferred for %s uid=%s: %s",
+                name,
+                uid,
+                exc,
+            )
+            return False
+        logger.info(
+            "Stateless executor process-zero finalizer released: pod=%s uid=%s",
+            name,
+            uid,
+        )
+        return True
 
     async def retire_historical_claimant_pod_exact(self, **identity: Any) -> bool:
         """Release an exact terminal Pod under historical settlement authority."""

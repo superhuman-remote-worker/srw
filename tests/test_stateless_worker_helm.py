@@ -302,6 +302,35 @@ def test_stateless_executor_grace_exceeds_shutdown_and_abort_budget() -> None:
 
 
 @pytest.mark.skipif(shutil.which("helm") is None, reason="Helm is not installed")
+def test_stateless_executor_pods_are_born_with_the_process_zero_finalizer() -> None:
+    """Without it the claimant-loss hold is a race the reconciler loses.
+
+    The kubelet removes a finalizer-free Pod object ~0.7 s after its
+    containers terminate; the reconciler ticks every 15 s and (by design)
+    never accepts a 404 as process-zero proof, so a stolen claim's debt
+    became unsettleable. The finalizer keeps the exact terminal UID
+    readable until the orchestrator has recorded proof and releases it.
+    """
+    from orchestrator.services.agent_provisioner import (
+        STATELESS_EXECUTOR_PROCESS_ZERO_FINALIZER,
+    )
+
+    def finalizers(*settings: str) -> list[str] | None:
+        deployment = _only_kind(
+            _render(
+                "agent.stateless.enabled=true",
+                *settings,
+                show_only="templates/agent/stateless-deployment.yaml",
+            ),
+            "Deployment",
+        )
+        return deployment["spec"]["template"]["metadata"].get("finalizers")
+
+    assert finalizers() == [STATELESS_EXECUTOR_PROCESS_ZERO_FINALIZER]
+    assert finalizers("agent.stateless.processZeroFinalizer=false") is None
+
+
+@pytest.mark.skipif(shutil.which("helm") is None, reason="Helm is not installed")
 def test_stateless_executor_execs_python_as_pid1() -> None:
     deployment = _only_kind(
         _render(

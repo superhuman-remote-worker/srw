@@ -95,13 +95,17 @@ def with_authority_finalizer(metadata: dict[str, Any]) -> dict[str, Any]:
 
 
 def finalizer_release_patch(
-    *, uid: str, resource_version: str, finalizers: list[str]
+    *,
+    uid: str,
+    resource_version: str,
+    finalizers: list[str],
+    finalizer: str = PINNED_AUTHORITY_FINALIZER,
 ) -> list[dict[str, Any]] | None:
-    """Build an exact JSON Patch that removes only SRW's finalizer."""
+    """Build an exact JSON Patch that removes only one SRW finalizer."""
 
-    if PINNED_AUTHORITY_FINALIZER not in finalizers:
+    if finalizer not in finalizers:
         return None
-    retained = [value for value in finalizers if value != PINNED_AUTHORITY_FINALIZER]
+    retained = [value for value in finalizers if value != finalizer]
     return [
         {"op": "test", "path": "/metadata/uid", "value": uid},
         {

@@ -79,6 +79,18 @@ spec:
       # drains and replaces executors with the same gate as the orchestrator.
       annotations:
         checksum/vm-workspace-recovery: {{ toJson .Values.orchestrator.vmWorkspaceRecovery | sha256sum | quote }}
+      {{- if .Values.agent.stateless.processZeroFinalizer }}
+      # Retention boundary for claimant-loss settlement. A stolen claim's debt
+      # settles only on the exact Pod UID observed with every container
+      # terminated (a 404 is never process-zero proof); without this the
+      # kubelet removes the object ~0.7 s after the containers stop and the
+      # held turn can never resume. The orchestrator's run_queue reaper
+      # releases it (UID/resourceVersion-tested) once the Pod is process-zero
+      # and no claim still names it — rollouts and scale-downs included. Keep
+      # the string equal to agent_provisioner.STATELESS_EXECUTOR_PROCESS_ZERO_FINALIZER.
+      finalizers:
+        - lifecycle.srw.dev/stateless-executor-process-zero
+      {{- end }}
       labels:
         {{- include "srw.componentSelectorLabels" (dict "context" . "component" "agent-stateless") | nindent 8 }}
         # `app` keys the agent egress NetworkPolicy (agent/network-policy.yaml

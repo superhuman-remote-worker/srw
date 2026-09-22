@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, AsyncIterator
 from uuid import UUID
 
@@ -21,6 +22,11 @@ WORKSPACE_RETIREMENT_PENDING_KEY = "_stateless_workspace_retirement_pending"
 WORKSPACE_RETIREMENT_SETTLED_KEY = "_stateless_workspace_retirement_settled"
 CLAIM_LOSS_LEDGER_KEY = "_stateless_claim_losses"
 CLAIM_LOSS_HOLD_KEY = "_stateless_claim_loss_hold"
+# Bounded, diagnostic-only trail of how claimant-loss debt was settled
+# (Kubernetes exact-terminal proof or an operator attestation). Never
+# authority: nothing reads it to decide anything.
+CLAIM_LOSS_RECEIPTS_KEY = "_stateless_claim_loss_receipts"
+CLAIM_LOSS_RECEIPT_LIMIT = 8
 ACTIVE_CLAIM_KEY = "_stateless_active_claim"
 RESIDENT_RETIREMENT_ACK_KEY = "_stateless_resident_retirement_ack"
 SHELL_RETIREMENT_ACK_KEY = "_stateless_shell_retirement_ack"
@@ -437,6 +443,7 @@ async def acknowledge_session_claim_quiesced(
     pod_uid: str,
     quiesced_by: str = "claimant",
     expected_terminal_token: int | None = None,
+    receipt: dict[str, Any] | None = None,
 ) -> bool:
     """ACK one terminally fenced claimant after all local I/O has drained.
 
@@ -445,6 +452,11 @@ async def acknowledge_session_claim_quiesced(
     unresolved-only ledger keeps every stolen generation until an exact
     claimant/pod proof removes it; a later End cannot mistake queued/parked for
     local-I/O quiescence.
+
+    ``receipt`` (optional evidence fields) is appended, in the same metadata
+    write that removes the debt, to the bounded ``CLAIM_LOSS_RECEIPTS_KEY``
+    trail, so the proof that settled a hold is durable before anything that
+    depended on it (the executor Pod's retention finalizer) is released.
     """
 
     tid = thread_id if isinstance(thread_id, UUID) else UUID(str(thread_id))
@@ -547,6 +559,26 @@ async def acknowledge_session_claim_quiesced(
                 next_metadata.pop(CLAIM_LOSS_HOLD_KEY, None)
             if retirement_pending:
                 next_metadata[CLAIM_RETIREMENT_KEY] = retirement
+            if receipt is not None:
+                prior = next_metadata.get(CLAIM_LOSS_RECEIPTS_KEY)
+                receipts = (
+                    [item for item in prior if isinstance(item, dict)]
+                    if isinstance(prior, list)
+                    else []
+                )
+                receipts.append(
+                    {
+                        **receipt,
+                        "lease_token": token,
+                        "pod": owner,
+                        "pod_uid": owner_uid,
+                        "quiesced_by": quiesced_by,
+                        "settled_at": datetime.now(timezone.utc).isoformat(),
+                    }
+                )
+                next_metadata[CLAIM_LOSS_RECEIPTS_KEY] = receipts[
+                    -CLAIM_LOSS_RECEIPT_LIMIT:
+                ]
             updated = await conn.fetchval(
                 """
                 UPDATE threads
@@ -785,6 +817,8 @@ __all__ = [
     "ACTIVE_CLAIM_KEY",
     "CLAIM_LOSS_HOLD_KEY",
     "CLAIM_LOSS_LEDGER_KEY",
+    "CLAIM_LOSS_RECEIPTS_KEY",
+    "CLAIM_LOSS_RECEIPT_LIMIT",
     "CLAIM_RETIREMENT_KEY",
     "RESIDENT_RETIREMENT_ACK_KEY",
     "SHELL_RETIREMENT_ACK_KEY",

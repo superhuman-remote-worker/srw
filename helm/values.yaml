@@ -663,6 +663,18 @@ agent:
     # this budget covers model execution and local staging. Worker batches run at least
     # worker.batchMinWallSeconds and rotate at the batch edge regardless.
     shutdownTimeoutSeconds: 300
+    # -- Stamp executor Pods with the `lifecycle.srw.dev/stateless-executor-
+    # process-zero` finalizer so a stolen claim's exact Pod UID stays readable
+    # until its containers are observed terminated and the orchestrator has
+    # recorded that proof (claimant-loss holds cannot settle otherwise). The
+    # orchestrator's run_queue reaper releases it, so the pool leaves no
+    # `Terminating` Pods behind on rollouts or scale-downs while the
+    # orchestrator runs. Without a running orchestrator (helm uninstall, or a
+    # rollback to a chart older than the release that added it) deleted
+    # executors stay `Terminating` with their containers already stopped;
+    # a reinstall's orchestrator releases them, otherwise remove it by hand:
+    # kubectl patch pod <pod> --type=json -p '[{"op":"remove","path":"/metadata/finalizers"}]'
+    processZeroFinalizer: true
     # -- Recover an idle thread's stale cloud push through a low-priority
     # bg_task. Default off; requires migration 0233 and matching executors.
     cloudPushRecoveryEnabled: false

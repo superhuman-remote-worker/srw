@@ -76,6 +76,12 @@ logger = logging.getLogger(__name__)
 STALE_INTERRUPT_RETRY_MAX_THREADS = 25
 STALE_PERMISSION_RETRY_MAX_THREADS = 25
 CLAIM_LOSS_RECONCILE_MAX_THREADS = 25
+RETAINED_EXECUTOR_RELEASE_MAX_PODS = 50
+
+# (thread, token, pod uid) debts already reported as absent-without-proof, so a
+# wedged hold is loud once per orchestrator process rather than every tick.
+_ABSENT_CLAIMANT_ANOMALIES: set[tuple[str, int, str]] = set()
+_ABSENT_CLAIMANT_ANOMALY_LIMIT = 4096
 
 
 class JournalStealResult(str, Enum):
@@ -329,6 +335,32 @@ WHERE execution_lane = 'stateless'
   AND COALESCE(metadata, '{}'::jsonb) ? '_stateless_claim_losses'
 ORDER BY last_activity, id
 LIMIT $1::integer
+"""
+
+# One statement, one snapshot. The steal and End convert "leased by pod" into
+# "ledger names uid" atomically, so reading the two predicates in separate
+# statements could observe neither. A malformed ledger that merely mentions the
+# UID still blocks release: unparseable authority is never absence. Each source
+# is scanned once however many candidates a rollout produces.
+_UNREFERENCED_EXECUTOR_UIDS_SQL = """
+WITH leased AS MATERIALIZED (
+    SELECT DISTINCT leased_by
+    FROM run_queue
+    WHERE unit_kind = 'session_turn'
+      AND leased_by IS NOT NULL
+), ledgers AS MATERIALIZED (
+    SELECT (metadata -> '_stateless_claim_losses')::text AS ledger
+    FROM threads
+    WHERE COALESCE(metadata, '{}'::jsonb) ? '_stateless_claim_losses'
+)
+SELECT candidate.pod_uid
+FROM unnest($1::text[], $2::text[]) AS candidate(pod_uid, pod_name)
+WHERE NOT EXISTS (
+        SELECT 1 FROM leased WHERE leased.leased_by = candidate.pod_name
+      )
+  AND NOT EXISTS (
+        SELECT 1 FROM ledgers WHERE strpos(ledgers.ledger, candidate.pod_uid) > 0
+      )
 """
 
 _TERMINALIZE_STOLEN_INTERRUPT_SQL = """
@@ -827,7 +859,8 @@ async def _steal_session_with_claim_loss(
     unresolved-only thread ledger therefore commits in the same
     ``threads -> run_queue`` transaction as the token bump.  End must drain
     every ledger entry before touching workspace bytes; the exact old claimant
-    (or a Kubernetes absence proof) removes its own entry later.
+    (or the reconciler observing its finalizer-retained Pod UID with every
+    container terminated) removes its own entry later.
     """
 
     thread_id = str(candidate["unit_id"])
@@ -1356,14 +1389,20 @@ async def reconcile_claim_loss_holds(
                     # stopped the old credential-bearing process.  Only the
                     # claimant's local drain ACK or an observed exact UID with
                     # all containers terminated may clear this debt.
+                    if pod_state in {"exact_absent", "replacement"}:
+                        _report_absent_claimant(thread_id, token, authority, pod_state)
                     continue
+                # The executor's process-zero finalizer keeps this exact
+                # terminal object readable; the ACK and its receipt commit
+                # before release_retained_executor_pods may let it go.
                 if await acknowledge_session_claim_quiesced(
                     conn,
                     thread_id=thread_id,
                     previous_lease_token=token,
                     leased_by=authority.pod,
                     pod_uid=authority.pod_uid,
-                    quiesced_by="pod_absent",
+                    quiesced_by="pod_terminal",
+                    receipt={"evidence": "exact_terminal"},
                 ):
                     settled += 1
         except asyncio.CancelledError:
@@ -1375,6 +1414,110 @@ async def reconcile_claim_loss_holds(
                 thread_id,
             )
     return settled
+
+
+def _report_absent_claimant(
+    thread_id: str, token: int, authority: ClaimantAuthority, pod_state: str
+) -> None:
+    """Log, once, a claimant debt whose exact Pod vanished without proof.
+
+    With the executor process-zero finalizer the object outlives its
+    containers, so a 404 means a force delete, node GC or a pre-finalizer
+    Pod, never the steady state. Only an operator can settle it.
+    """
+
+    key = (thread_id, int(token), authority.pod_uid)
+    if key in _ABSENT_CLAIMANT_ANOMALIES:
+        return
+    if len(_ABSENT_CLAIMANT_ANOMALIES) >= _ABSENT_CLAIMANT_ANOMALY_LIMIT:
+        _ABSENT_CLAIMANT_ANOMALIES.clear()
+    _ABSENT_CLAIMANT_ANOMALIES.add(key)
+    logger.error(
+        "run_queue reaper: claimant pod %s uid=%s of unit %s (token %d) is %s "
+        "without process-zero proof; the claim-loss hold cannot settle "
+        "automatically. Once the process is confirmed gone: POST "
+        "/api/admin/run-queue/%s/attest-claimant-gone",
+        authority.pod,
+        authority.pod_uid,
+        thread_id,
+        int(token),
+        pod_state,
+        thread_id,
+    )
+
+
+async def unreferenced_executor_uids(conn: Any, pods: dict[str, str]) -> set[str]:
+    """Return the ``{uid: name}`` candidates no claimant authority names.
+
+    Callers must observe the Pods BEFORE this read. A durable reference is
+    created only by a live claimant process holding a session lease (the
+    claim-bundle stamp, then the steal/End conversion into ledger debt), so a
+    process already observed stopped cannot create one after this snapshot.
+    """
+
+    if not pods:
+        return set()
+    uids = sorted(pods)
+    rows = await conn.fetch(
+        _UNREFERENCED_EXECUTOR_UIDS_SQL,
+        uids,
+        [pods[uid] for uid in uids],
+    )
+    return {str(row["pod_uid"]) for row in rows}
+
+
+async def release_retained_executor_pods(
+    conn: Any,
+    *,
+    max_pods: int = RETAINED_EXECUTOR_RELEASE_MAX_PODS,
+) -> int:
+    """Release the process-zero finalizer from settled executor Pods.
+
+    Every pool executor is born with the chart's retention finalizer so the
+    claimant-loss reconciler can observe its exact terminal UID. Release
+    requires, in order: one Kubernetes LIST (process-zero evaluated on that
+    snapshot), one database snapshot proving no session lease is held by the
+    Pod's name and no claim-loss ledger names its UID, then a
+    UID/resourceVersion-tested patch. Rollouts, scale-downs, crash
+    replacements and never-claimed Pods therefore leave nothing behind, while
+    a Pod whose debt is unsettled stays readable. Stateless by design: an
+    orchestrator restart or a missed tick defers release to the next pass.
+    """
+
+    from orchestrator.services.agent_provisioner import (
+        agent_provisioner,
+        stateless_executor_process_zero,
+    )
+
+    try:
+        retained = await agent_provisioner.list_retained_stateless_executor_pods()
+        if not retained:
+            return 0
+        candidates: dict[str, Any] = {}
+        names: dict[str, str] = {}
+        for pod in retained:
+            if len(candidates) >= max_pods:
+                break
+            if not stateless_executor_process_zero(pod):
+                continue
+            uid = str(pod.metadata.uid)
+            candidates[uid] = pod
+            names[uid] = str(pod.metadata.name)
+        released = 0
+        for uid in sorted(await unreferenced_executor_uids(conn, names)):
+            if await agent_provisioner.release_stateless_executor_finalizer_exact(
+                candidates[uid]
+            ):
+                released += 1
+        return released
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception(
+            "run_queue reaper: retained executor finalizer release failed "
+            "(contained; retried next cycle)"
+        )
+        return 0
 
 
 async def _try_steal_worker_with_recovery(
@@ -1484,6 +1627,9 @@ async def reap_cycle(
     await retry_stale_interrupt_requests(conn)
     await retry_stale_permission_requests(conn)
     await reconcile_claim_loss_holds(conn)
+    # After settlement, so a UID the reconciler just proved terminal is
+    # released in the same cycle and never before its receipt is durable.
+    await release_retained_executor_pods(conn)
     return len(stolen)
 
 
