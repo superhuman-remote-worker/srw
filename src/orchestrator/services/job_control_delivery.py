@@ -236,12 +236,21 @@ async def dispatch_job_to_agent(
                     job_id,
                 )
                 return False
-        else:
-            await dependencies.store.update_job_status(
-                job_id=job_id,
-                status="processing",
-                assigned_agent_id=agent_id,
+        elif not await dependencies.store.update_job_status(
+            job_id=job_id,
+            status="processing",
+            assigned_agent_id=agent_id,
+            # The pre-POST claim already wrote this. A pause or cancel that
+            # won while the start was in flight must not be overwritten.
+            expected_status="processing",
+        ):
+            dependencies.logger.warning(
+                "Dispatch: job %s changed while agent %s accepted it; not "
+                "reasserting processing",
+                job_id,
+                agent_id,
             )
+            return False
         await dependencies.store.heartbeat(
             agent_id=agent_id,
             status="working",
@@ -825,9 +834,10 @@ async def resume_job_on_agent(
                     )
             return False
 
-        # Agent accepted — now atomically drop the keys we consumed so a future
-        # resume won't re-inject them. `context - text[]` (not a full-dict
-        # rewrite) preserves any concurrent merge into other context keys.
+        # Agent accepted — drop the keys we consumed, once ownership is
+        # confirmed below, so a future resume won't re-inject them.
+        # `context - text[]` (not a full-dict rewrite) preserves any concurrent
+        # merge into other context keys.
         consumed_keys = [
             key
             for key, value in (
@@ -837,9 +847,6 @@ async def resume_job_on_agent(
             )
             if value
         ]
-        if consumed_keys and not dependencies.completion_commands_enabled():
-            await dependencies.store.delete_job_context_keys(job_id, consumed_keys)
-
         if dependencies.completion_commands_enabled():
             if not await dependencies.store.confirm_pinned_job_dispatch(
                 job_id,
@@ -853,13 +860,25 @@ async def resume_job_on_agent(
                     job_id,
                 )
                 return False
-        else:
-            # Update job status and assign to agent
-            await dependencies.store.update_job_status(
-                job_id=job_id,
-                status="processing",
-                assigned_agent_id=agent_id,
+        elif not await dependencies.store.update_job_status(
+            job_id=job_id,
+            status="processing",
+            assigned_agent_id=agent_id,
+            # The pre-POST claim already wrote this. An operator pause (or a
+            # cancel) that won while the resume was in flight keeps its row.
+            expected_status="processing",
+        ):
+            dependencies.logger.warning(
+                "Resume dispatch: job %s changed while agent %s accepted it; "
+                "not reasserting processing",
+                job_id,
+                agent_id,
             )
+            return False
+        elif consumed_keys:
+            # Consumed only once ownership is confirmed, like the command
+            # path: a lost CAS leaves the feedback for the next resume.
+            await dependencies.store.delete_job_context_keys(job_id, consumed_keys)
 
         await dependencies.store.heartbeat(
             agent_id=agent_id,

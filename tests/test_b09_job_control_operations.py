@@ -281,6 +281,53 @@ async def test_dispatch_confirms_command_owner_after_exact_recipient_accepts():
 
 
 @pytest.mark.asyncio
+async def test_legacy_dispatch_does_not_resurrect_a_control_that_won_after_claim():
+    """Flag off: a pause/cancel landing during delivery must keep its row."""
+    recipient = SimpleNamespace(model_dump=MagicMock(return_value={}))
+    target = SimpleNamespace(
+        agent={"pod_ip": "10.0.0.2", "pod_port": 8001}, recipient=recipient
+    )
+    client = SimpleNamespace(
+        post=AsyncMock(return_value=SimpleNamespace(status_code=202))
+    )
+    store = SimpleNamespace(
+        managed_repository_authorities_are_current=AsyncMock(return_value=True),
+        # The row is no longer processing: the status CAS loses.
+        update_job_status=AsyncMock(return_value=False),
+        heartbeat=AsyncMock(),
+    )
+    dependencies = _delivery(
+        store=store,
+        completion_commands_enabled=lambda: False,
+        prepare_job_workspace_runtime=AsyncMock(
+            side_effect=lambda job: ("proceed", job, None)
+        ),
+        attest_pinned_k8s_job_workspace=AsyncMock(side_effect=lambda job: (job, None)),
+        build_job_start_request=AsyncMock(return_value=_Payload()),
+        pinned_k8s_job_workspace_authority_is_current=AsyncMock(return_value=True),
+        prepare_pinned_job_mutation_target=AsyncMock(return_value=target),
+        redispatch_livelock_trip=MagicMock(return_value=None),
+        bind_log_context=MagicMock(return_value="token"),
+        reset_log_context=MagicMock(),
+        http_client_factory=MagicMock(return_value=_AsyncContext(client)),
+    )
+
+    assert not await dispatch_job_to_agent(
+        {"id": "job-1", "runtime_kind": "srw", "execution_lane": "pinned"},
+        {"id": "agent-1", "pod_ip": "10.0.0.1"},
+        dependencies=dependencies,
+    )
+
+    store.update_job_status.assert_awaited_once_with(
+        job_id="job-1",
+        status="processing",
+        assigned_agent_id="agent-1",
+        expected_status="processing",
+    )
+    store.heartbeat.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_dispatcher_pause_always_releases_in_memory_pending_marker():
     pending = {"job-1"}
     dependencies = _delivery(

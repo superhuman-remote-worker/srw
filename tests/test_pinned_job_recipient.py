@@ -384,6 +384,7 @@ async def test_fresh_start_delivers_hidden_recipient_before_existing_db_cas():
         job_id=JOB_ID,
         status="processing",
         assigned_agent_id=AGENT_ID,
+        expected_status="processing",
     )
     heartbeat.assert_awaited_once_with(
         agent_id=AGENT_ID,

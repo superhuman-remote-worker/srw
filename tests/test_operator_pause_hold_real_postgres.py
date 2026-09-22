@@ -355,6 +355,27 @@ async def test_pause_racing_dispatch_delivery(db):
 
 
 @pytest.mark.asyncio
+async def test_legacy_post_delivery_write_cannot_resurrect_the_pause(db):
+    """Flag off: the delivery's processing write is a CAS on the claimed row.
+
+    The 0175 fence accepts the unconditional write (the claim's authority
+    marker and lease are still on the row), so only the CAS keeps the pause.
+    """
+    job_id, agent_id = await _dispatched_job(db)
+    await _public_pause(db, job_id, commands_enabled=False)
+
+    assert not await db.update_job_status(
+        job_id=job_id,
+        status="processing",
+        assigned_agent_id=agent_id,
+        expected_status="processing",
+    )
+    row = await _row(db, job_id)
+    assert row["status"] == "paused"
+    assert row["assigned_agent_id"] is None
+
+
+@pytest.mark.asyncio
 async def test_duplicate_pause_keeps_the_first_hold(db):
     job_id, _agent_id = await _dispatched_job(db)
     await _public_pause(db, job_id, commands_enabled=True)

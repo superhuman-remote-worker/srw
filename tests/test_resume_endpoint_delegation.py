@@ -365,8 +365,23 @@ class TestResumeJobOnAgentInjection:
         assert payload["runtime_actor"]["caller_kind"] == "worker"
         assert payload["runtime_actor"]["project_id"] == PROJECT_ID
         orchestrator.main.postgres_db.update_job_status.assert_awaited_once_with(
-            job_id=JOB_ID, status="processing", assigned_agent_id=AGENT_ID
+            job_id=JOB_ID,
+            status="processing",
+            assigned_agent_id=AGENT_ID,
+            expected_status="processing",
         )
+
+    @pytest.mark.asyncio
+    async def test_accepted_resume_does_not_resurrect_a_pause_that_won(
+        self, resume_collaborators
+    ):
+        """Flag off: an operator pause landing mid-delivery keeps its row."""
+        orchestrator.main.postgres_db.update_job_status.return_value = False
+
+        ok = await control_seams.resume_job_on_agent(_job(), _agent())
+
+        assert ok is False
+        orchestrator.main.postgres_db.heartbeat.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_kb_profile_follows_project_scope(self, resume_collaborators):
