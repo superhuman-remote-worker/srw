@@ -574,15 +574,33 @@ class TestDefaultConfigOverrideRedaction:
         ]
         assert written == {**SECRET_OVERRIDE, "memory": {"project_scoped": False}}
 
-    def test_editing_a_section_drops_the_hidden_values_in_it(self):
-        """Stricter than connector credentials on purpose: an override has
-        several writers (any co-owner), and one who cannot read ``llm.api_key``
-        must not be able to re-point ``llm.base_url`` at a host they control
-        and have every job in the project send the key there."""
+    def test_a_redirected_endpoint_restores_nothing_anywhere(self):
+        """An override has several writers (any co-owner), and one who cannot
+        read ``llm.api_key`` must not be able to re-point ``llm.base_url`` at a
+        host they control and have every job in the project send it there —
+        nor any other stored key, which might ride the same request."""
         gate = _stored_project_gate(SECRET_OVERRIDE)
         wired = _wire(project_owner=gate)
         override = json.loads(json.dumps(PUBLIC_OVERRIDE))
         override["llm"]["base_url"] = "https://attacker.example/v1"
+
+        response = wired.client.patch(
+            f"/api/projects/{PROJECT_ID}", json={"default_config_override": override}
+        )
+
+        assert response.status_code == 200
+        written = wired.store.update_project.await_args.kwargs[
+            "default_config_override"
+        ]
+        assert written == override
+
+    def test_editing_a_section_drops_the_hidden_values_in_it(self):
+        """Without an endpoint change, only the sections the write touched lose
+        their hidden values."""
+        gate = _stored_project_gate(SECRET_OVERRIDE)
+        wired = _wire(project_owner=gate)
+        override = json.loads(json.dumps(PUBLIC_OVERRIDE))
+        override["llm"]["model"] = "openrouter/another-model"
         override["workspace"]["mounts"][0]["path"] = "/mnt/elsewhere"
 
         response = wired.client.patch(
@@ -632,6 +650,125 @@ class TestDefaultConfigOverrideRedaction:
         ]
         assert written["llm"]["api_key"] is None
         assert written["env_keys"]["EMBEDDING_API_KEY"] == "sk-rotated"
+
+
+def _round_trip(stored: dict[str, Any], edit) -> dict[str, Any]:
+    """Serve ``stored`` redacted, apply ``edit`` to that view the way a client
+    would, and return what the write path would persist."""
+    from orchestrator.security.access import (
+        redact_public_config_override,
+        restore_hidden_config_values,
+    )
+
+    view = redact_public_config_override(json.dumps(stored))
+    return restore_hidden_config_values(
+        edit(json.loads(json.dumps(view))), json.dumps(stored)
+    )
+
+
+class TestRestoreEndpointGuard:
+    """No hidden value is restored anywhere once any endpoint-shaped key in the
+    override differs from the stored one. The per-section rule alone restored a
+    nested or neighbouring section's key under a redirected endpoint."""
+
+    def test_nested_summarization_key_is_not_restored_under_a_new_base_url(self):
+        stored = {
+            "llm": {
+                "model": "m",
+                "base_url": "https://good",
+                "api_key": "K",
+                "summarization": {"model": "s", "api_key": "S"},
+            }
+        }
+
+        saved = _round_trip(
+            stored, lambda v: {**v, "llm": {**v["llm"], "base_url": "https://evil"}}
+        )
+
+        assert "api_key" not in saved["llm"]["summarization"]
+        assert "api_key" not in saved["llm"]
+
+    def test_legacy_tier_and_roster_keys_are_not_restored(self):
+        stored = {
+            "llm": {
+                "base_url": "https://good",
+                "strategic": {"model": "m", "api_key": "K"},
+            },
+            "subagents": {"roster": {"r": {"llm": {"model": "x", "api_key": "R"}}}},
+        }
+
+        saved = _round_trip(
+            stored, lambda v: {**v, "llm": {**v["llm"], "base_url": "https://evil"}}
+        )
+
+        assert "api_key" not in saved["llm"]["strategic"]
+        assert "api_key" not in saved["subagents"]["roster"]["r"]["llm"]
+
+    def test_a_new_endpoint_in_another_section_restores_nothing(self):
+        """The memory reranker rides the embedding transport: a new
+        ``memory.reranker.base_url`` would receive ``EMBEDDING_API_KEY``."""
+        stored = {
+            "env_keys": {
+                "EMBEDDING_API_KEY": "E",
+                "EMBEDDING_BASE_URL": "https://good",
+            }
+        }
+
+        saved = _round_trip(
+            stored,
+            lambda v: {**v, "memory": {"reranker": {"base_url": "https://evil"}}},
+        )
+
+        assert saved["env_keys"] == {"EMBEDDING_BASE_URL": "https://good"}
+
+    @pytest.mark.parametrize(
+        "key",
+        [
+            "EMBEDDING_BASE_URL",
+            "provider",
+            "endpoint",
+            "endpoint_id",
+            "SEARXNG_URL",
+            "baseUrl",
+            "http_proxy",
+            "api_base",
+        ],
+    )
+    def test_every_endpoint_shape_counts(self, key):
+        stored = {
+            "llm": {"model": "m", "api_key": "K"},
+            "env_keys": {"EMBEDDING_API_KEY": "E"},
+        }
+
+        saved = _round_trip(stored, lambda v: {**v, "search": {key: "https://evil"}})
+
+        assert "api_key" not in saved["llm"]
+        assert "EMBEDDING_API_KEY" not in saved["env_keys"]
+
+    def test_an_explicit_transport_block_counts_as_an_endpoint_change(self):
+        stored = {
+            "llm": {"model": "m", "api_key": "K"},
+            "workspace": {"backend": "sandbox", "remote": {"host": "good"}},
+        }
+
+        saved = _round_trip(
+            stored,
+            lambda v: {
+                **v,
+                "workspace": {**v["workspace"], "remote": {"host": "evil"}},
+            },
+        )
+
+        assert "api_key" not in saved["llm"]
+
+    def test_a_case_variant_of_a_hidden_key_counts_as_sent(self):
+        stored = {"llm": {"model": "m", "api_key": "K"}}
+
+        saved = _round_trip(
+            stored, lambda v: {**v, "llm": {**v["llm"], "API_KEY": None}}
+        )
+
+        assert saved["llm"] == {"model": "m", "API_KEY": None}
 
 
 def _composed_project() -> dict[str, Any]:

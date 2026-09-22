@@ -1231,27 +1231,83 @@ def redact_public_config_override(co: Any) -> Any:
     return _public_config_view(co)
 
 
+# Name parts that say WHERE a request goes (``base_url``, ``EMBEDDING_BASE_URL``,
+# ``endpoint_id``, ``provider``, ``http_proxy``, ``mcp_servers`` ...). A restored
+# key must never ride to an endpoint its writer could not see it bound to, so a
+# change to any such key anywhere in an override restores nothing. Deliberately
+# broad: a false match only means a secret has to be re-entered.
+_ENDPOINT_KEY_TOKENS = frozenset(
+    {
+        "url",
+        "urls",
+        "uri",
+        "host",
+        "hostname",
+        "endpoint",
+        "endpoints",
+        "proxy",
+        "provider",
+        "server",
+        "servers",
+        "address",
+    }
+)
+
+
+def _is_endpoint_key(key: str) -> bool:
+    k = key.lower()
+    return not _ENDPOINT_KEY_TOKENS.isdisjoint(
+        re.split(r"[^a-z0-9]+", k)
+    ) or k.endswith(("url", "uri", "host", "endpoint", "api_base"))
+
+
+def _endpoint_values(value: Any, path: tuple[Any, ...] = ()) -> dict[Any, Any]:
+    """Every endpoint-shaped key in ``value``, by full path (list index
+    included, so a reordered list of endpoints counts as a change)."""
+    found: dict[Any, Any] = {}
+    if isinstance(value, dict):
+        for k, v in value.items():
+            if _is_endpoint_key(k):
+                found[(*path, k)] = v
+            found.update(_endpoint_values(v, (*path, k)))
+    elif isinstance(value, list):
+        for i, v in enumerate(value):
+            found.update(_endpoint_values(v, (*path, i)))
+    return found
+
+
 def restore_hidden_config_values(incoming: Any, stored: Any) -> Any:
     """Put back what :func:`redact_public_config_override` hid, for a client
     that writes the redacted view back whole (read, flip one key, PATCH the
     override — the cockpit's project-memory toggle does exactly this).
 
-    A hidden value is restored only into a section the write left unchanged: a
-    dict whose public view equals the stored one's, or a list element equal to
-    a stored element's public view. Editing anything in a section (say
-    ``llm.base_url``) drops the hidden values in it, which the writer must then
-    send again. That is stricter than connector credentials' "leave it out to
-    keep it" (F3), and on purpose: a connector's writer is its creator, while a
-    project override has several — any co-owner — and one who cannot read a key
-    must not be able to re-point it at a host they control. A value the write
-    sends explicitly (``null`` included) always wins. ``stored`` may be JSONB
-    text.
+    What it guarantees, and nothing more:
+
+    * A hidden value is only ever put back at the exact path it was stored at.
+    * Nothing is restored anywhere if any endpoint-shaped key (a name with a
+      ``url`` / ``host`` / ``endpoint`` / ``provider`` / ``proxy`` / ``server``
+      / ``address`` part, e.g. ``base_url``, ``EMBEDDING_BASE_URL``,
+      ``endpoint_id``) anywhere in the written override differs from the stored
+      one — added, removed or changed, including inside an explicitly sent
+      ``workspace.remote``. The writer re-enters its secrets.
+    * Otherwise a hidden value comes back only into a dict whose public view is
+      unchanged, or a list element equal to a stored element's public view.
+    * A hidden key the write sends itself, in any letter case and ``null``
+      included, is never overwritten.
+
+    It does not make a restored key safe against every edit: a change that is
+    not an endpoint (a model, a tool list) keeps the keys of sections it did not
+    touch. A project override has several writers — any co-owner — so the guard
+    is what stops one who cannot read a key from re-pointing it at a host they
+    control. ``stored`` may be JSONB text.
     """
     if isinstance(stored, str):
         try:
             stored = json.loads(stored)
         except (json.JSONDecodeError, TypeError):
             return incoming
+    if _endpoint_values(incoming) != _endpoint_values(_public_config_view(stored)):
+        return incoming
     return _restore_hidden(incoming, stored, ())
 
 
@@ -1262,8 +1318,9 @@ def _restore_hidden(incoming: Any, stored: Any, path: tuple[str, ...]) -> Any:
             for k, v in incoming.items()
         }
         if _public_config_view(incoming, path) == _public_config_view(stored, path):
+            sent = {k.lower() for k in incoming}
             for k, v in stored.items():
-                if k not in incoming and _hidden_config_key(path, k):
+                if k.lower() not in sent and _hidden_config_key(path, k):
                     out[k] = copy.deepcopy(v)
         return out
     if isinstance(incoming, list) and isinstance(stored, list):
