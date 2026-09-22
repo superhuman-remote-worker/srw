@@ -53,6 +53,37 @@ function sessionState() {
   };
 }
 
+/** Mount the real chat component over a stubbed service `chat`. `withMenu`
+ *  renders the real header menu; left shallow, its unpopulated JIT view query
+ *  cannot throw on destroy (see the panelRef note below). */
+async function mountChat(chat: ReturnType<typeof sessionState>, api: Record<string, unknown>, withMenu = true) {
+  TestBed.resetTestingModule();
+  TestBed.configureTestingModule({imports: [PersistentChatComponent], providers: [
+    {provide: PersistentChatService, useValue: chat},
+    {provide: ApiService, useValue: api},
+    {provide: HttpClient, useValue: {get: () => of([])}},
+    {provide: TranslocoService, useValue: {translate: (key: string) => key}},
+    {provide: I18nService, useValue: {activeLang: signal('en')}},
+    {provide: ViewportService, useValue: {isMobile: signal(false)}},
+    {provide: ChatPreferencesService, useValue: {readingWidth: signal('comfortable'), textSize: signal('medium'), officerLensFolded: signal(false)}},
+    {provide: DeviceCapabilitiesService, useValue: {getCapabilities: () => of({hasCamera: false, hasAudioInput: false, isMobile: false})}},
+    {provide: VoiceRecordingService, useValue: {getRecordingState: () => of({isRecording: false, duration: 0})}},
+    {provide: VoiceCapabilitiesService, useValue: {canTranscribe: signal(false)}},
+    ...[FileHandlingService, Router, AppToastService, ErrorMessageService, SessionListService].map(provide => ({provide, useValue: {}})),
+    CapabilitiesService,
+  ]});
+  TestBed.overrideComponent(PersistentChatComponent, {set: {
+    styles: [], styleUrls: [],
+    imports: [CommonModule, FormsModule, TestTranslocoPipe, ...(withMenu ? [AppMenuComponent, AppMenuItemComponent] : [])],
+    schemas: [CUSTOM_ELEMENTS_SCHEMA],
+  }});
+  const fixture = TestBed.createComponent(PersistentChatComponent);
+  fixture.detectChanges();
+  await fixture.whenStable();
+  fixture.detectChanges();
+  return fixture;
+}
+
 describe('single-origin session capabilities', () => {
   beforeAll(async () => {
     HTMLElement.prototype.scrollTo = vi.fn();
@@ -72,29 +103,7 @@ describe('single-origin session capabilities', () => {
       getSshHostKeys: vi.fn(() => of({hostname: 'ssh.example.test', host_keys: [{fingerprint: 'test', key_type: 'ssh-ed25519', public_key: 'test'}]})),
     };
     try {
-      TestBed.resetTestingModule();
-      TestBed.configureTestingModule({imports: [PersistentChatComponent], providers: [
-        {provide: PersistentChatService, useValue: sessionState()},
-        {provide: ApiService, useValue: api},
-        {provide: HttpClient, useValue: {get: () => of([])}},
-        {provide: TranslocoService, useValue: {translate: (key: string) => key}},
-        {provide: I18nService, useValue: {activeLang: signal('en')}},
-        {provide: ViewportService, useValue: {isMobile: signal(false)}},
-        {provide: ChatPreferencesService, useValue: {readingWidth: signal('comfortable'), textSize: signal('medium'), officerLensFolded: signal(false)}},
-        {provide: DeviceCapabilitiesService, useValue: {getCapabilities: () => of({hasCamera: false, hasAudioInput: false, isMobile: false})}},
-        {provide: VoiceRecordingService, useValue: {getRecordingState: () => of({isRecording: false, duration: 0})}},
-        {provide: VoiceCapabilitiesService, useValue: {canTranscribe: signal(false)}},
-        ...[FileHandlingService, Router, AppToastService, ErrorMessageService, SessionListService].map(provide => ({provide, useValue: {}})),
-        CapabilitiesService,
-      ]});
-      TestBed.overrideComponent(PersistentChatComponent, {set: {
-        styles: [], styleUrls: [],
-        imports: [CommonModule, FormsModule, TestTranslocoPipe, AppMenuComponent, AppMenuItemComponent], schemas: [CUSTOM_ELEMENTS_SCHEMA],
-      }});
-      const fixture = TestBed.createComponent(PersistentChatComponent);
-      fixture.detectChanges();
-      await fixture.whenStable();
-      fixture.detectChanges();
+      const fixture = await mountChat(sessionState(), api);
 
       const menuDebug = fixture.debugElement.query(By.directive(AppMenuComponent));
       const menu = menuDebug.componentInstance as AppMenuComponent;
@@ -121,6 +130,113 @@ describe('single-origin session capabilities', () => {
     } finally {
       TestBed.resetTestingModule();
       environment.externalClientsEnabled = previous;
+    }
+  });
+});
+
+describe('parked unit composer', () => {
+  beforeAll(async () => {
+    HTMLElement.prototype.scrollTo = vi.fn();
+    await ɵresolveComponentResources(() => Promise.resolve(''));
+  });
+
+  const api = {
+    getThreadIdeStatus: () => of(null),
+    getMyCapabilities: () => of(null),
+    getSshHostKeys: () => of({hostname: 'ssh.example.test', host_keys: []}),
+  };
+
+  // Input recorded into a parked unit is never claimed until an owner Retry or
+  // an operator unpark revives it, so an open composer only swallowed it. The
+  // closed box names the way out instead: Retry when the owner may revive the
+  // unit, the administrator release when only an operator can.
+  it.each([
+    ['live', true, 'chat.input.parked'],
+    ['live', false, 'chat.input.parkedBlocked'],
+    // A reload of a parked session stays "starting" (a park is no readiness
+    // evidence); the closed box must still say why, not "type while it starts".
+    ['starting', true, 'chat.input.parked'],
+    ['starting', false, 'chat.input.parkedBlocked'],
+  ])('closes the composer on a %s session and points at the way out (retryable=%s)', async (phase, retryable, placeholder) => {
+    const chat = sessionState() as any;
+    if (phase === 'starting') {
+      chat.sessionReady.set(false);
+      chat.isStartingSession.set(true);
+    }
+    chat.isParked.set(true);
+    chat.queueState.set({
+      state: 'parked', park_reason: retryable ? 'attach_failed' : 'claim_loss_hold', parked_at: null,
+      retryable, attempts: 3, pending_input: true,
+    });
+    chat.sendMessage = vi.fn(async () => true);
+    const fixture = await mountChat(chat, api, false);
+    try {
+      const el = fixture.nativeElement as HTMLElement;
+      const composer = el.querySelector<HTMLTextAreaElement>('[data-testid="chat-composer"]')!;
+      expect(composer.disabled).toBe(true);
+      expect(composer.placeholder).toBe(placeholder);
+      // No half-open composer: an attachment chip could never be sent either.
+      expect(el.querySelector<HTMLButtonElement>('.attach-wrap button')!.disabled).toBe(true);
+      // The way out stays on screen: Retry only when the owner may revive it.
+      expect(el.querySelector('[data-testid="chat-parked"]')).not.toBeNull();
+      expect(el.querySelector('[data-testid="chat-parked-retry"]') !== null).toBe(retryable);
+
+      fixture.componentInstance.inputText = 'are you there?';
+      expect(fixture.componentInstance.canSend()).toBe(false);
+      fixture.componentInstance.send();
+      expect(chat.sendMessage).not.toHaveBeenCalled();
+    } finally {
+      fixture.destroy();
+      TestBed.resetTestingModule();
+    }
+  });
+
+  // End and suspension settle the unit (the End funnel closes a parked one to
+  // `done`), so a parked block that outlived an in-tab End is stale: the box
+  // stays the resume path it always was.
+  it.each([
+    ['ended', 'chat.input.endedSendResumes'],
+    ['suspended', 'chat.input.suspendedSendResumes'],
+  ])('keeps an %s session composable despite a stale parked block', async (status, placeholder) => {
+    const chat = sessionState() as any;
+    chat.threadStatus.set(status);
+    chat.isConnected.set(false);
+    chat.connectionState.set('disconnected');
+    chat.isParked.set(true);
+    chat.queueState.set({state: 'parked', park_reason: 'attach_failed', parked_at: null, retryable: true, attempts: 3, pending_input: true});
+    const fixture = await mountChat(chat, api, false);
+    try {
+      const composer = (fixture.nativeElement as HTMLElement)
+        .querySelector<HTMLTextAreaElement>('[data-testid="chat-composer"]')!;
+      expect(composer.disabled).toBe(false);
+      expect(composer.placeholder).toBe(placeholder);
+    } finally {
+      fixture.destroy();
+      TestBed.resetTestingModule();
+    }
+  });
+
+  it('reopens the composer once the unit is no longer parked', async () => {
+    const chat = sessionState() as any;
+    chat.isParked.set(true);
+    chat.queueState.set({state: 'parked', park_reason: 'attach_failed', parked_at: null, retryable: true, attempts: 3, pending_input: true});
+    const fixture = await mountChat(chat, api, false);
+    try {
+      const composer = () =>
+        (fixture.nativeElement as HTMLElement).querySelector<HTMLTextAreaElement>('[data-testid="chat-composer"]')!;
+      expect(composer().disabled).toBe(true);
+
+      // What a successful Retry (or turn.started after an operator unpark) leaves.
+      chat.isParked.set(false);
+      chat.queueState.set({state: 'queued', park_reason: null, parked_at: null, retryable: false, attempts: 0, pending_input: true});
+      fixture.detectChanges();
+      await fixture.whenStable();
+      fixture.detectChanges();
+      expect(composer().disabled).toBe(false);
+      expect(composer().placeholder).toBe('chat.input.default');
+    } finally {
+      fixture.destroy();
+      TestBed.resetTestingModule();
     }
   });
 });

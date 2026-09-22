@@ -157,6 +157,22 @@ describe('canComposeDuringSession', () => {
         // Guard against the new params quietly turning the reconnect gate off.
         expect(canComposeDuringSession(false, false, false, false, false)).toBe(false);
     });
+
+    it('closes the composer on a live session whose unit is parked', () => {
+        // Input into a parked unit is recorded but never claimed until a Retry
+        // or an operator unpark revives it: an open box only swallowed it.
+        expect(canComposeDuringSession(true, false, false, false, false, true)).toBe(false);
+        expect(canComposeDuringSession(false, true, false, false, false, true)).toBe(false);
+        expect(canComposeDuringSession(true, false, false, false, false, false)).toBe(true);
+    });
+
+    it('leaves an ended or resuming session open despite a parked block', () => {
+        // End and suspension settle the unit (the End funnel closes a parked
+        // one to done), so the block is stale there and sending still resumes;
+        // mid-resume /connection is about to re-derive it.
+        expect(canComposeDuringSession(false, false, false, true, false, true)).toBe(true);
+        expect(canComposeDuringSession(false, false, false, false, true, true)).toBe(true);
+    });
 });
 
 describe('canSendMessage', () => {

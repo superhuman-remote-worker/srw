@@ -366,7 +366,15 @@ export function canComposeDuringSession(
     isDraftSession = false,
     isEnded = false,
     isResuming = false,
+    isParked = false,
 ): boolean {
+    // A parked unit records new input without reviving it (only an owner
+    // Retry or an operator unpark does), so an open box just swallowed the
+    // message; the parked bubble carries the way out. Not on an ended or
+    // suspended thread: the End funnel settles its unit (a parked one closes
+    // to `done`), so a parked block there is stale and sending still resumes;
+    // likewise mid-resume, where /connection is about to re-derive it.
+    if (isParked && !isEnded && !isResuming) return false;
     // `isEnded` keeps the box live on a resumable session so a user can draft
     // before bringing the agent back. Composing costs nothing; only SENDING
     // resumes (persistent-chat.service.sendMessage), so a half-written message
@@ -2215,7 +2223,7 @@ export function clearDraft(threadId: string | null): void {
               <button
                 type="button"
                 class="ctrl"
-                [disabled]="!chat.isConnected()"
+                [disabled]="!chat.isConnected() || chat.isParked()"
                 [title]="'chat.composer.attach' | transloco"
                 [class.active]="attachmentMenuOpen()"
                 (click)="attachmentMenuOpen() ? closeAttachmentMenu() : openAttachmentMenu()"
@@ -2245,7 +2253,7 @@ export function clearDraft(threadId: string | null): void {
               <button
                 type="button"
                 class="ctrl"
-                [disabled]="!chat.isConnected()"
+                [disabled]="!chat.isConnected() || chat.isParked()"
                 [title]="'chat.composer.takePhoto' | transloco"
                 (click)="pickCamera()"
               >
@@ -2265,7 +2273,7 @@ export function clearDraft(threadId: string | null): void {
               <button
                 type="button"
                 class="send mic"
-                [disabled]="!chat.isConnected() || isTranscribing() || sttUnavailable()"
+                [disabled]="!chat.isConnected() || chat.isParked() || isTranscribing() || sttUnavailable()"
                 [title]="(sttUnavailable() ? 'chat.composer.sttNotConfigured' : 'chat.composer.recordVoice') | transloco"
                 (pointerdown)="$event.preventDefault()"
                 (click)="startRecording()"
@@ -2808,7 +2816,8 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     /**
      * Whether the composer accepts input: during startup (type + queue +
      * flush on ready), while connected, and in the landing draft (type first,
-     * session created on send); false during a mid-session reconnect.
+     * session created on send); false during a mid-session reconnect and
+     * while the session's unit is parked.
      */
     readonly canCompose = computed(() =>
         canComposeDuringSession(
@@ -2817,6 +2826,7 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
             this.chat.isDraftSession(),
             this.chat.threadStatus() === 'ended' || this.chat.threadStatus() === 'suspended',
             this.chat.isResuming(),
+            this.chat.isParked(),
         ),
     );
 
@@ -3185,19 +3195,22 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         if (this.chat.threadStatus() === 'suspended') {
             return this.transloco.translate('chat.input.suspendedSendResumes');
         }
-        if (this.chat.isStartingSession()) return this.transloco.translate('chat.input.sessionStarting');
-        if (!this.chat.isConnected()) return this.transloco.translate('chat.input.connect');
-        if (this.chat.isInterrupting()) return this.transloco.translate('chat.input.stopping');
-        if (this.chat.isStreaming()) return this.transloco.translate('chat.input.working');
         // A parked unit needs a retry — say so, not "waiting". A park an owner
         // may NOT revive (claim-loss hold, stop markers, a non-retryable
         // reason) renders no Retry button, so it must not name a retry either:
-        // only an operator's admin unpark clears it.
+        // only an operator's admin unpark clears it. Ahead of the starting/
+        // connecting copy — a reloaded parked session is still "starting",
+        // since a park is no readiness evidence — because the composer is
+        // closed while parked (canComposeDuringSession) and this line says why.
         if (this.chat.isParked()) {
             return this.transloco.translate(
                 this.chat.queueState()?.retryable ? 'chat.input.parked' : 'chat.input.parkedBlocked',
             );
         }
+        if (this.chat.isStartingSession()) return this.transloco.translate('chat.input.sessionStarting');
+        if (!this.chat.isConnected()) return this.transloco.translate('chat.input.connect');
+        if (this.chat.isInterrupting()) return this.transloco.translate('chat.input.stopping');
+        if (this.chat.isStreaming()) return this.transloco.translate('chat.input.working');
         // isAwaitingTurn: the send is accepted but no agent has picked it up
         // yet — say "waiting", not "working"; the queued bubble carries the
         // escalation copy.
@@ -3658,8 +3671,9 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         const files = event.dataTransfer?.files;
         if (!files || files.length === 0) return;
         // Honour the same gating as the file picker — if the session is
-        // disconnected, the upload would fail anyway.
-        if (!this.chat.isConnected()) return;
+        // disconnected, the upload would fail anyway; if its unit is parked,
+        // the chip could never be sent.
+        if (!this.chat.isConnected() || this.chat.isParked()) return;
 
         this.applyFilePreviews(await this.fileHandling.createFilePreviews(Array.from(files)));
     }
