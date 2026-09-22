@@ -68,6 +68,7 @@ async def _resolve_worker_selection(
     owner_id: str,
     project_id: str | None,
     explicit_expert_id: str | None = None,
+    caller_is_admin: bool = True,
 ):
     owner = await db.get_user(owner_id)
     return await resolve_root_expert(
@@ -76,7 +77,7 @@ async def _resolve_worker_selection(
         user_id=owner_id,
         project_id=project_id,
         explicit_expert_id=explicit_expert_id,
-        is_admin=bool((owner or {}).get("is_admin")),
+        is_admin=bool((owner or {}).get("is_admin")) and caller_is_admin,
     )
 
 
@@ -87,13 +88,17 @@ async def validate_automation_expert_selection(
     project_id: str | None,
     expert: str,
     expert_id: str | None,
+    caller_is_admin: bool,
 ) -> str:
     """Validate and normalize an automation's persisted expert source.
 
     Bundled experts live in ``expert``. A DB-backed worker expert must use
     ``expert_id`` while ``expert`` stays at the structural ``worker_base``.
     The visibility check runs as the automation owner because that is the
-    identity used when a future scheduled fire creates its job.
+    identity used when a future scheduled fire creates its job — bounded by
+    the storing request's own ``caller_is_admin``, which is already narrowed
+    (a PAT without the ``admin`` scope, the view-as shadow), so a request
+    cannot pin an expert only the owner's unrestricted admin flag could see.
 
     The bundled selector also gets the pod entrypoint's allow-list here: this
     is the write boundary for a value that is copied into ``jobs.config_name``
@@ -121,6 +126,7 @@ async def validate_automation_expert_selection(
         owner_id=owner_id,
         project_id=project_id,
         explicit_expert_id=normalized_id,
+        caller_is_admin=caller_is_admin,
     )
     return config_name
 

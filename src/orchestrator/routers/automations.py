@@ -215,6 +215,7 @@ async def create_automation(
             project_id=body.project_id,
             expert=body.expert,
             expert_id=body.expert_id,
+            caller_is_admin=bool(caller.get("is_admin")),
         )
     except ExpertSelectionError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
@@ -345,6 +346,7 @@ async def update_automation(
                 project_id=str(row["project_id"]) if row.get("project_id") else None,
                 expert=effective_expert,
                 expert_id=effective_expert_id,
+                caller_is_admin=bool(caller.get("is_admin")),
             )
         except ExpertSelectionError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc

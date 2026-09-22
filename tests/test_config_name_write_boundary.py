@@ -344,6 +344,7 @@ class TestAutomationExpertWriteBoundary:
                 project_id=None,
                 expert="scholar; id",
                 expert_id=None,
+                caller_is_admin=False,
             )
         assert "config_name" in str(exc.value)
 
@@ -360,6 +361,7 @@ class TestAutomationExpertWriteBoundary:
                 project_id=None,
                 expert="defaults",
                 expert_id=None,
+                caller_is_admin=False,
             )
             == "worker_base"
         )

@@ -311,6 +311,7 @@ async def test_automation_expert_validation_rejects_ambiguous_sources(
             project_id=None,
             expert="scholar",
             expert_id="dddddddd-dddd-dddd-dddd-dddddddddddd",
+            caller_is_admin=False,
         )
 
 

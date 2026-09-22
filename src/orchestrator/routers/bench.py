@@ -286,6 +286,7 @@ async def create_run(request: Request, body: BenchRunCreate) -> dict[str, Any]:
                     project_id=requested_project,
                     expert="worker_base",
                     expert_id=str(arm["expert_id"]),
+                    caller_is_admin=bool(caller.get("is_admin")),
                 )
             except ExpertSelectionError as exc:
                 raise HTTPException(status_code=422, detail=str(exc)) from exc
