@@ -15,8 +15,12 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 
+from orchestrator.routers import run_queue_admin as run_queue_admin_router
 from orchestrator.services import agent_provisioner as provisioner_module
+from orchestrator.services import run_queue_admin
 from orchestrator.services import run_queue_reaper as reaper
 from orchestrator.services.agent_provisioner import (
     STATELESS_EXECUTOR_PROCESS_ZERO_FINALIZER as FINALIZER,
@@ -398,3 +402,45 @@ async def test_absent_claimant_anomaly_is_reported_once(monkeypatch, caplog):
     messages = [record.getMessage() for record in caplog.records]
     assert len(messages) == 2
     assert "/api/admin/run-queue/t-1/attest-claimant-gone" in messages[0]
+
+
+# --------------------------------------------------------------------------- #
+# Admin route
+# --------------------------------------------------------------------------- #
+
+
+def test_attest_route_is_admin_gated_and_forwards_the_exact_identity(monkeypatch):
+    admin = {"id": "admin-7"}
+    require_admin = AsyncMock(return_value=admin)
+    dependencies = run_queue_admin.RunQueueAdminDependencies(
+        db=MagicMock(),
+        require_admin=require_admin,
+        completion_commands_enabled=lambda: False,
+        get_completion_command_resolution=lambda: None,
+    )
+    attest = AsyncMock(return_value={"settled_lease_tokens": [1]})
+    monkeypatch.setattr(run_queue_admin, "attest_claimant_gone", attest)
+    app = FastAPI()
+    app.include_router(run_queue_admin_router.router)
+    app.state.run_queue_admin_dependencies_factory = lambda: dependencies
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/admin/run-queue/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa/attest-claimant-gone",
+        json={"pod": "srw-agent-stateless-x", "pod_uid": "uid-1", "reason": "gone"},
+    )
+
+    assert response.status_code == 200
+    require_admin.assert_awaited_once()
+    assert attest.await_args.kwargs == {
+        "pod": "srw-agent-stateless-x",
+        "pod_uid": "uid-1",
+        "reason": "gone",
+        "admin": admin,
+        "dependencies": dependencies,
+    }
+    missing_reason = client.post(
+        "/api/admin/run-queue/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa/attest-claimant-gone",
+        json={"pod": "p", "pod_uid": "u", "reason": ""},
+    )
+    assert missing_reason.status_code == 422

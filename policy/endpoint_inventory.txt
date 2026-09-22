@@ -63,6 +63,7 @@ PATCH  /api/admin/providers/models/{catalog_id}                                 
 POST   /api/admin/providers/models/{catalog_id}/test                                    pat=admin           admin:_require_admin
 GET    /api/admin/providers/subscriptions/availability                                  pat=admin           admin:_require_admin
 GET    /api/admin/run-queue                                                             pat=admin           admin:_require_admin
+POST   /api/admin/run-queue/{unit_id}/attest-claimant-gone                              pat=admin           admin:_require_admin
 POST   /api/admin/run-queue/{unit_id}/unpark                                            pat=admin           admin:_require_admin
 GET    /api/admin/security-events                                                       pat=admin           admin:_require_admin
 DELETE /api/admin/system-settings/main_cloud                                            pat=admin           admin:_require_admin

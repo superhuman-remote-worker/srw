@@ -1,9 +1,10 @@
 """Operator routes over the run queue and completion commands.
 
-Extracted from ``orchestrator.main`` (R1.B06, root lane). Four admin routes.
-The guard runs here and returns the acting administrator, whose id the service
-records as the actor on every completion-command disposition — so the audit
-trail keeps naming a person, not the process.
+Extracted from ``orchestrator.main`` (R1.B06, root lane), plus the claimant
+attestation verb. The guard runs here and returns the acting administrator,
+whose id the service records as the actor on every completion-command
+disposition and claimant attestation — so the audit trail keeps naming a
+person, not the process.
 """
 
 from __future__ import annotations
@@ -12,7 +13,10 @@ from typing import Any
 
 from fastapi import APIRouter, Request
 
-from orchestrator.schemas.run_queue_admin import CompletionCommandForceResolveRequest
+from orchestrator.schemas.run_queue_admin import (
+    ClaimantGoneAttestationRequest,
+    CompletionCommandForceResolveRequest,
+)
 from orchestrator.services import run_queue_admin
 
 # No `tags=`: the declarations this replaces carried none, and a tag would
@@ -52,6 +56,29 @@ async def admin_run_queue_unpark(unit_id: str, request: Request) -> dict[str, An
     await dependencies.require_admin(request)
     return await run_queue_admin.unpark_run_queue_unit(
         unit_id, dependencies=dependencies
+    )
+
+
+@router.post("/api/admin/run-queue/{unit_id}/attest-claimant-gone")
+async def admin_run_queue_attest_claimant_gone(
+    unit_id: str,
+    body: ClaimantGoneAttestationRequest,
+    request: Request,
+) -> dict[str, Any]:
+    """Operator verb: settle a claim-loss hold whose exact claimant pod the
+    administrator confirmed gone (admin only, audited receipt). 404 when no
+    unresolved debt names that pod+UID; 409 while Kubernetes still shows it
+    running or inside its termination grace.
+    """
+    dependencies = get_run_queue_admin_dependencies(request)
+    admin = await dependencies.require_admin(request)
+    return await run_queue_admin.attest_claimant_gone(
+        unit_id,
+        pod=body.pod,
+        pod_uid=body.pod_uid,
+        reason=body.reason,
+        admin=admin,
+        dependencies=dependencies,
     )
 
 

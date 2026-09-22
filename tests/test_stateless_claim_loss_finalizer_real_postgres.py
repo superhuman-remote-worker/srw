@@ -16,18 +16,23 @@ chart renders, so the chart and the reconciler are proven together.
 from __future__ import annotations
 
 import json
+import logging
 import shutil
 import subprocess
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import AsyncMock
 from uuid import uuid4
 
 import asyncpg
 import pytest
 import pytest_asyncio
 import yaml
+from fastapi import HTTPException
 from testcontainers.postgres import PostgresContainer
 
 from orchestrator.services import agent_provisioner as provisioner_module
+from orchestrator.services import run_queue_admin
 from orchestrator.services import run_queue_reaper as reaper
 from orchestrator.services.agent_provisioner import AgentProvisioner, agent_provisioner
 from tests._fake_executor_k8s import (
@@ -170,6 +175,42 @@ async def _insert_expired_claim(conn, thread_id, *, pod=POD, pod_uid=POD_UID):
         """,
         thread_id,
         pod,
+    )
+
+
+async def _insert_held_unit(conn, thread_id, *, pod=POD, pod_uid=POD_UID):
+    """A thread already parked behind an unsettled claimant-loss hold."""
+
+    await _insert_thread(
+        conn,
+        thread_id,
+        {
+            "_stateless_claim_losses": {
+                "1": {
+                    "pod": pod,
+                    "pod_uid": pod_uid,
+                    "quiesced": False,
+                    "eviction_requested_at": "2026-09-03T05:39:48+00:00",
+                }
+            },
+            "_stateless_claim_loss_hold": {
+                "lease_token": 2,
+                "intended_state": "queued",
+                "attempts_since_completion": 1,
+                "queued_at": "2026-09-03T05:39:48+00:00",
+                "run_after": "2026-09-03T05:39:48+00:00",
+            },
+        },
+    )
+    await conn.execute(
+        """
+        INSERT INTO run_queue (
+            unit_id, unit_kind, state, lease_token, input_seq, consumed_seq,
+            attempts_since_completion, park_reason, parked_at
+        ) VALUES ($1, 'session_turn', 'parked', 2, 70804, 70803, 1,
+                  'claim_loss_hold', now())
+        """,
+        thread_id,
     )
 
 
@@ -351,3 +392,156 @@ async def test_retained_pod_waits_for_every_reference_to_its_identity(pool, fake
 
     assert sorted(fake_k8s.removed) == ["exec-idle", "exec-worker"]
     assert {"exec-ledger", "exec-session", "exec-malformed"} <= set(fake_k8s.pods)
+
+
+@pytest.mark.asyncio
+async def test_pre_finalizer_404_stays_held_until_an_operator_attests(
+    pool, fake_k8s, caplog
+):
+    thread_id = uuid4()
+    async with pool.acquire() as conn:
+        await _insert_held_unit(conn, thread_id)
+
+        with caplog.at_level(logging.ERROR, logger=reaper.logger.name):
+            await reaper.reap_cycle(conn, grace_seconds=30)
+            await reaper.reap_cycle(conn, grace_seconds=30)
+        assert (await _queue(conn, thread_id))["state"] == "parked"
+        anomalies = [
+            record
+            for record in caplog.records
+            if "attest-claimant-gone" in record.message
+        ]
+        assert len(anomalies) == 1, "the 404 anomaly is loud but logged once"
+
+    dependencies = run_queue_admin.RunQueueAdminDependencies(
+        db=pool,
+        require_admin=AsyncMock(return_value={"id": "admin-7"}),
+        completion_commands_enabled=lambda: False,
+        get_completion_command_resolution=lambda: None,
+    )
+    with pytest.raises(HTTPException) as unpark:
+        await run_queue_admin.unpark_run_queue_unit(
+            str(thread_id), dependencies=dependencies
+        )
+    assert unpark.value.status_code == 409
+    assert "attest-claimant-gone" in unpark.value.detail
+
+    with pytest.raises(HTTPException) as wrong_uid:
+        await run_queue_admin.attest_claimant_gone(
+            str(thread_id),
+            pod=POD,
+            pod_uid=str(uuid4()),
+            reason="wrong pod",
+            admin={"id": "admin-7"},
+            dependencies=dependencies,
+        )
+    assert wrong_uid.value.status_code == 404
+
+    result = await run_queue_admin.attest_claimant_gone(
+        str(thread_id),
+        pod=POD,
+        pod_uid=POD_UID,
+        reason="node-3 powered off; pod 404 since 09-03",
+        admin={"id": "admin-7"},
+        dependencies=dependencies,
+    )
+    assert result["settled_lease_tokens"] == [1]
+    assert result["kubernetes_authority"] == "exact_absent"
+    assert result["hold_released"] is True
+
+    async with pool.acquire() as conn:
+        assert (await _queue(conn, thread_id))["state"] == "queued"
+        metadata = await _metadata(conn, thread_id)
+    assert "_stateless_claim_losses" not in metadata
+    [receipt] = metadata["_stateless_claim_loss_receipts"]
+    assert receipt["quiesced_by"] == "operator:admin-7"
+    assert receipt["evidence"] == "operator_attestation"
+    assert receipt["reason"] == "node-3 powered off; pod 404 since 09-03"
+    assert (receipt["pod"], receipt["pod_uid"]) == (POD, POD_UID)
+
+
+@pytest.mark.asyncio
+async def test_attest_refuses_a_claimant_the_api_still_shows_running(pool, fake_k8s):
+    thread_id = uuid4()
+    fake_k8s.pods[POD] = executor_pod(
+        name=POD, uid=POD_UID, finalizers=_rendered_executor_finalizers()
+    )
+    async with pool.acquire() as conn:
+        await _insert_held_unit(conn, thread_id)
+    dependencies = run_queue_admin.RunQueueAdminDependencies(
+        db=pool,
+        require_admin=AsyncMock(return_value={"id": "admin-7"}),
+        completion_commands_enabled=lambda: False,
+        get_completion_command_resolution=lambda: None,
+    )
+
+    with pytest.raises(HTTPException) as live:
+        await run_queue_admin.attest_claimant_gone(
+            str(thread_id),
+            pod=POD,
+            pod_uid=POD_UID,
+            reason="premature",
+            admin={"id": "admin-7"},
+            dependencies=dependencies,
+        )
+    assert live.value.status_code == 409
+
+    # Deleting but still inside its termination grace: the kubelet may yet
+    # report terminal containers, so a human assertion is premature.
+    fake_k8s.delete_namespaced_pod(POD, EXECUTOR_NAMESPACE, grace_period_seconds=180)
+    with pytest.raises(HTTPException) as in_grace:
+        await run_queue_admin.attest_claimant_gone(
+            str(thread_id),
+            pod=POD,
+            pod_uid=POD_UID,
+            reason="premature",
+            admin={"id": "admin-7"},
+            dependencies=dependencies,
+        )
+    assert in_grace.value.status_code == 409
+    async with pool.acquire() as conn:
+        assert (await _queue(conn, thread_id))["state"] == "parked"
+        assert "_stateless_claim_losses" in await _metadata(conn, thread_id)
+
+
+@pytest.mark.asyncio
+async def test_attest_releases_a_lost_node_claimant_the_kubelet_never_finished(
+    pool, fake_k8s
+):
+    """Grace long past, statuses frozen at running: only a human can settle."""
+
+    thread_id = uuid4()
+    lost = executor_pod(
+        name=POD,
+        uid=POD_UID,
+        finalizers=_rendered_executor_finalizers(),
+        deleting=True,
+    )
+    lost.metadata.deletion_timestamp = datetime.now(timezone.utc) - timedelta(hours=2)
+    fake_k8s.pods[POD] = lost
+    async with pool.acquire() as conn:
+        await _insert_held_unit(conn, thread_id)
+        await reaper.reap_cycle(conn, grace_seconds=30)
+        assert (await _queue(conn, thread_id))["state"] == "parked"
+    assert POD in fake_k8s.pods, "running statuses are never process-zero evidence"
+
+    dependencies = run_queue_admin.RunQueueAdminDependencies(
+        db=pool,
+        require_admin=AsyncMock(return_value={"id": "admin-7"}),
+        completion_commands_enabled=lambda: False,
+        get_completion_command_resolution=lambda: None,
+    )
+    result = await run_queue_admin.attest_claimant_gone(
+        str(thread_id),
+        pod=POD,
+        pod_uid=POD_UID,
+        reason="node-3 out-of-service",
+        admin={"id": "admin-7"},
+        dependencies=dependencies,
+    )
+
+    assert result["kubernetes_authority"] == "unknown"
+    assert result["finalizer_released"] is True
+    assert fake_k8s.removed == [POD]
+    async with pool.acquire() as conn:
+        assert (await _queue(conn, thread_id))["state"] == "queued"
