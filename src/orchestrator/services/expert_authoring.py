@@ -732,6 +732,13 @@ class ExpertAuthoringService:
                 ),
             )
         fields = body.model_dump(exclude_unset=True, exclude={"files"})
+        if fields.get("is_global") is True and not user.get("is_admin"):
+            # A global skill outranks the bundled one of the same name in every
+            # user's menu (resolve_skill_menu), so publishing is an admin act.
+            # Un-publishing your own stays open.
+            raise HTTPException(
+                status_code=403, detail="Only an admin may publish a skill globally"
+            )
         files = body.files
         if files is not None:
             name, description, files = parse_skill_bundle(files)

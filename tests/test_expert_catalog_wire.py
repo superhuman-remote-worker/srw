@@ -474,6 +474,55 @@ class TestSkillByIdVisibility:
         env.store.get_skill_by_id.assert_not_awaited()
 
 
+class TestSkillGlobalPublication:
+    """A global skill outranks a bundled one of the same name in EVERY user's
+    menu (``resolve_skill_menu``), so publishing one is an admin act. Before
+    this, any owner could PUT ``is_global: true`` onto their own skill."""
+
+    @pytest.fixture
+    def env(self, catalogue_wire):
+        catalogue_wire.store.get_skill_by_id.return_value = skill_row(
+            owner_id=UUID(USER_ID)
+        )
+        catalogue_wire.store.update_skill.return_value = skill_row(
+            owner_id=UUID(USER_ID)
+        )
+        return catalogue_wire
+
+    def test_an_owner_cannot_publish_their_skill_globally(self, env):
+        response = env.client.put(f"/api/skills/{SKILL_ID}", json={"is_global": True})
+        assert response.status_code == 403
+        assert "admin" in response.json()["detail"]
+        env.store.update_skill.assert_not_awaited()
+
+    def test_an_admin_can_publish_a_skill_globally(self, env):
+        env.user["is_admin"] = True
+        response = env.client.put(f"/api/skills/{SKILL_ID}", json={"is_global": True})
+        assert response.status_code == 200
+        assert env.store.update_skill.await_args.kwargs["is_global"] is True
+
+    def test_an_owner_may_still_unpublish_and_edit(self, env):
+        env.store.get_skill_by_id.return_value = skill_row(
+            owner_id=UUID(USER_ID), is_global=True
+        )
+        response = env.client.put(
+            f"/api/skills/{SKILL_ID}", json={"is_global": False, "tags": ["x"]}
+        )
+        assert response.status_code == 200
+        kwargs = env.store.update_skill.await_args.kwargs
+        assert kwargs["is_global"] is False
+        assert kwargs["tags"] == ["x"]
+
+    def test_create_cannot_publish_at_all(self, env):
+        """``SkillCreate`` has no ``is_global``: the flag is dropped, not honoured."""
+        env.store.create_skill.return_value = {"id": SKILL_ID, "name": "quiet-helper"}
+        response = env.client.post(
+            "/api/skills", json={"files": {"SKILL.md": SKILL_TEXT}, "is_global": True}
+        )
+        assert response.status_code == 200
+        assert "is_global" not in env.store.create_skill.await_args.kwargs
+
+
 def test_two_mounted_apps_keep_store_identity_and_reload_cache_separate(
     catalogue_wire, monkeypatch
 ):
