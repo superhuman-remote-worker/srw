@@ -146,29 +146,80 @@ def assert_all_calls_targeted(entries):
 def test_disallowed_expect_context_rejected_before_cluster_calls(tmp_path, bad_context):
     result = run_apply(tmp_path, env_extra={"SRW_HELM_EXPECT_CONTEXT": bad_context})
     assert result.returncode != 0
-    assert "disallowed" in result.stderr
+    assert "refusing disallowed SRW_HELM_EXPECT_CONTEXT value" in result.stderr
+    assert bad_context not in result.stderr + result.stdout
     assert calls(tmp_path) == [], "no Helm/kubectl call may precede rejection"
 
 
 @pytest.mark.parametrize(
     "selector",
     [
-        ["--kube-context", "main"],
-        ["--kube-context=main"],
-        ["--context", "main"],
-        ["--context=main"],
+        ["--kube-context", "s3cr3t-ctx-main"],
+        ["--kube-context=s3cr3t-ctx-main"],
+        ["--context", "s3cr3t-ctx-main"],
+        ["--context=s3cr3t-ctx-main"],
         ["--cluster", "other"],
         ["--server", "https://other:6443"],
         ["--kubeconfig", "/tmp/evil-config"],
+        ["--kubeconfig=/tmp/evil-config"],
         ["--namespace", "other"],
         ["-n", "other"],
         ["--as", "admin"],
+        # Native Helm connection family (installed `helm upgrade --help`):
+        # an explicit --kube-context elsewhere does not neutralize these.
+        ["--kube-apiserver", "https://s3cr3t-endpoint:6443"],
+        ["--kube-apiserver=https://s3cr3t-endpoint:6443"],
+        ["--kube-token", "s3cr3t-tok-value"],
+        ["--kube-token=s3cr3t-tok-value"],
+        ["--kube-as-user", "s3cr3t-user"],
+        ["--kube-as-user=s3cr3t-user"],
+        ["--kube-as-group", "s3cr3t-group"],
+        ["--kube-ca-file", "/s3cr3t-ca"],
+        ["--kube-ca-file=/s3cr3t-ca"],
+        ["--kube-insecure-skip-tls-verify"],
+        ["--kube-insecure-skip-tls-verify=true"],
+        ["--kube-tls-server-name", "s3cr3t-name"],
+        ["--kube-tls-server-name=s3cr3t-name"],
     ],
 )
 def test_forwarded_cluster_selector_rejected_before_cluster_calls(tmp_path, selector):
     result = run_apply(tmp_path, argv=selector)
     assert result.returncode != 0
     assert "cluster-selecting argument" in result.stderr
+    combined = result.stderr + result.stdout
+    assert "s3cr3t" not in combined, "rejected values must never be echoed"
+    assert calls(tmp_path) == [], "no Helm/kubectl call may precede rejection"
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        "HELM_KUBECONTEXT",
+        "HELM_KUBEAPISERVER",
+        "HELM_KUBECAFILE",
+        "HELM_KUBEASGROUPS",
+        "HELM_KUBEASUSER",
+        "HELM_KUBETOKEN",
+        "HELM_KUBEINSECURE_SKIP_TLS_VERIFY",
+        "HELM_KUBETLS_SERVER_NAME",
+        "HELM_NAMESPACE",
+    ],
+)
+def test_inherited_helm_connection_override_rejected(tmp_path, override):
+    marker = f"s3cr3t-{override.lower()}-value"
+    result = run_apply(tmp_path, env_extra={override: marker})
+    assert result.returncode != 0
+    assert f"refusing environment override '{override}'" in result.stderr
+    assert marker not in result.stderr + result.stdout
+    assert calls(tmp_path) == [], "no Helm/kubectl call may precede rejection"
+
+
+def test_matching_helm_context_env_still_rejected(tmp_path):
+    # Even a matching value claims a selection role the script owns: the
+    # explicit flags below are the single source of targeting.
+    result = run_apply(tmp_path, env_extra={"HELM_KUBECONTEXT": "k3d-srw"})
+    assert result.returncode != 0
+    assert "refusing environment override 'HELM_KUBECONTEXT'" in result.stderr
     assert calls(tmp_path) == [], "no Helm/kubectl call may precede rejection"
 
 

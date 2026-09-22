@@ -52,11 +52,28 @@ EXPECT_CONTEXT="${SRW_HELM_EXPECT_CONTEXT:-k3d-srw}"
 case "$EXPECT_CONTEXT" in
 k3d-srw) ;;
 *)
-    echo "srw-preflight: refusing disallowed target '$EXPECT_CONTEXT' (SRW_HELM_EXPECT_CONTEXT)." >&2
-    echo "srw-preflight: only 'k3d-srw' is permitted for this inner-loop apply." >&2
+    echo "srw-preflight: refusing disallowed SRW_HELM_EXPECT_CONTEXT value (only 'k3d-srw' is permitted)." >&2
     exit 1
     ;;
 esac
+
+# Inherited Helm connection overrides: reject, do not sanitize. Installed
+# `helm --help` documents HELM_KUBEAPISERVER/HELM_KUBECAFILE/HELM_KUBEASGROUPS/
+# HELM_KUBEASUSER/HELM_KUBECONTEXT/HELM_KUBETOKEN/
+# HELM_KUBEINSECURE_SKIP_TLS_VERIFY/HELM_KUBETLS_SERVER_NAME (endpoint, auth,
+# TLS) plus HELM_NAMESPACE (namespace): any of them set would fight the
+# explicit --kube-context/--namespace flags below or, when NAMESPACE is
+# empty, silently redirect release state. KUBECONFIG is the deliberate
+# exception — the script needs it for credential chaining and always selects
+# within it explicitly, failing loudly if k3d-srw is absent. Only the
+# variable NAME is reported here, never its value.
+for _srw_helm_override in HELM_KUBECONTEXT HELM_KUBEAPISERVER HELM_KUBECAFILE HELM_KUBEASGROUPS HELM_KUBEASUSER HELM_KUBETOKEN HELM_KUBEINSECURE_SKIP_TLS_VERIFY HELM_KUBETLS_SERVER_NAME HELM_NAMESPACE; do
+    if [[ -n "${!_srw_helm_override:-}" ]]; then
+        echo "srw-preflight: refusing environment override '$_srw_helm_override' (connection targeting is fixed to k3d-srw via explicit flags)." >&2
+        exit 1
+    fi
+done
+unset _srw_helm_override
 
 # Forwarded Tilt/CLI arguments (Tilt passes --take-ownership, --wait,
 # --timeout, --values, --set/--set-string) must not smuggle cluster
@@ -66,18 +83,22 @@ esac
 # NAMESPACE env, never argv; reject them outright (even redundant ones, since
 # this script appends its own).
 for _srw_forwarded_arg in "$@"; do
-    case "$_srw_forwarded_arg" in
-    --kube-context* | --context | --context=* | --cluster* | --server | -s | \
-    --kubeconfig* | --namespace | --namespace=* | -n | --as* | --token* | \
-    --username* | --password* | --client-certificate* | --client-key* | \
-    --certificate-authority* | --insecure-skip-tls-verify* | --tls-server-name*)
-        echo "srw-preflight: refusing cluster-selecting argument '$_srw_forwarded_arg'." >&2
+    # Strip any =value before matching or reporting: a rejected token like
+    # --kube-token=<secret> must never have its value printed, stderr
+    # included. Only the bare option name is ever reported below.
+    _srw_forwarded_opt="${_srw_forwarded_arg%%=*}"
+    case "$_srw_forwarded_opt" in
+    --kube-* | --kubeconfig | --context | --cluster* | --server | -s | \
+    --namespace | -n | --as* | --token* | --username* | --password* | \
+    --client-certificate* | --client-key* | --certificate-authority* | \
+    --insecure-skip-tls-verify* | --tls-server-name*)
+        echo "srw-preflight: refusing cluster-selecting argument '$_srw_forwarded_opt'." >&2
         echo "srw-preflight: cluster targeting is fixed to '$EXPECT_CONTEXT' via env, not argv." >&2
         exit 1
         ;;
     esac
 done
-unset _srw_forwarded_arg
+unset _srw_forwarded_arg _srw_forwarded_opt
 
 ns_args=()
 if [[ -n "$NS" ]]; then
