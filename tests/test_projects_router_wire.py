@@ -25,6 +25,7 @@ direct call cannot see:
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
@@ -474,6 +475,163 @@ class TestResponseRedaction:
 
         assert page["next_cursor"] is None
         assert "credentials" not in page["items"][0]
+
+
+# The shapes the loader honours in a project override (merged under every job
+# in the project): a BYO provider key, a capability key in ``env_keys``, an
+# rclone remote with its token, and the SSH transport block.
+SECRET_OVERRIDE = {
+    "memory": {"project_scoped": True},
+    "llm": {
+        "model": "openrouter/some-model",
+        "base_url": "https://openrouter.ai/api/v1",
+        "api_key": "sk-project-secret",
+    },
+    "env_keys": {"EMBEDDING_API_KEY": "sk-embed-secret", "EMBEDDING_MODEL": "e5"},
+    "workspace": {
+        "backend": "sandbox",
+        "remote": {"host": "10.0.0.7", "port": 2222, "user": "ws"},
+        "mounts": [
+            {"name": "drive", "path": "/mnt/d", "rclone_spec": "drive:token=rc-secret"}
+        ],
+    },
+}
+PUBLIC_OVERRIDE = {
+    "memory": {"project_scoped": True},
+    "llm": {
+        "model": "openrouter/some-model",
+        "base_url": "https://openrouter.ai/api/v1",
+    },
+    "env_keys": {"EMBEDDING_MODEL": "e5"},
+    "workspace": {
+        "backend": "sandbox",
+        "mounts": [{"name": "drive", "path": "/mnt/d"}],
+    },
+}
+SECRETS = ("sk-project-secret", "sk-embed-secret", "rc-secret", "10.0.0.7")
+
+
+def _stored_project_gate(override):
+    """Member/owner gate returning the project as asyncpg does: JSONB as text."""
+
+    async def gate(_request, _store, _project_id, **_kwargs):
+        return OWNER, {**PROJECT, "default_config_override": json.dumps(override)}
+
+    return gate
+
+
+class TestDefaultConfigOverrideRedaction:
+    """``default_config_override`` leaves by the job API's policy
+    (``redact_config_override`` + ``workspace.remote``): every project MEMBER
+    reads it, and before this they read the stored keys verbatim."""
+
+    def test_project_detail_hides_secrets_and_keeps_the_rest(self):
+        wired = _wire(project_member=_stored_project_gate(SECRET_OVERRIDE))
+
+        response = wired.client.get(f"/api/projects/{PROJECT_ID}")
+
+        assert response.status_code == 200
+        assert response.json()["default_config_override"] == PUBLIC_OVERRIDE
+        for secret in SECRETS:
+            assert secret not in response.text
+
+    def test_project_list_hides_secrets(self):
+        store = _store(
+            get_projects_for_user=AsyncMock(
+                return_value=[{**PROJECT, "default_config_override": SECRET_OVERRIDE}]
+            )
+        )
+        wired = _wire(store=store)
+
+        response = wired.client.get("/api/projects")
+
+        assert response.status_code == 200
+        assert response.json()[0]["default_config_override"] == PUBLIC_OVERRIDE
+        for secret in SECRETS:
+            assert secret not in response.text
+
+    def test_cockpit_memory_toggle_round_trip_keeps_the_stored_secrets(self):
+        """project-detail ``toggleProjectMemory`` spreads the override it READ
+        and PATCHes the whole thing back. Redacting the read without restoring
+        on write would make that click delete every stored key."""
+        gate = _stored_project_gate(SECRET_OVERRIDE)
+        wired = _wire(project_member=gate, project_owner=gate)
+        existing = wired.client.get(f"/api/projects/{PROJECT_ID}").json()[
+            "default_config_override"
+        ]
+        override = {
+            **existing,
+            "memory": {**existing["memory"], "project_scoped": False},
+        }
+
+        response = wired.client.patch(
+            f"/api/projects/{PROJECT_ID}", json={"default_config_override": override}
+        )
+
+        assert response.status_code == 200
+        written = wired.store.update_project.await_args.kwargs[
+            "default_config_override"
+        ]
+        assert written == {**SECRET_OVERRIDE, "memory": {"project_scoped": False}}
+
+    def test_editing_a_section_drops_the_hidden_values_in_it(self):
+        """Stricter than connector credentials on purpose: an override has
+        several writers (any co-owner), and one who cannot read ``llm.api_key``
+        must not be able to re-point ``llm.base_url`` at a host they control
+        and have every job in the project send the key there."""
+        gate = _stored_project_gate(SECRET_OVERRIDE)
+        wired = _wire(project_owner=gate)
+        override = json.loads(json.dumps(PUBLIC_OVERRIDE))
+        override["llm"]["base_url"] = "https://attacker.example/v1"
+        override["workspace"]["mounts"][0]["path"] = "/mnt/elsewhere"
+
+        response = wired.client.patch(
+            f"/api/projects/{PROJECT_ID}", json={"default_config_override": override}
+        )
+
+        assert response.status_code == 200
+        written = wired.store.update_project.await_args.kwargs[
+            "default_config_override"
+        ]
+        assert written["llm"] == override["llm"]
+        # The workspace section changed (a mount moved), so its transport block
+        # and the moved mount's rclone_spec go too.
+        assert written["workspace"] == override["workspace"]
+        # The untouched section keeps its key.
+        assert written["env_keys"] == SECRET_OVERRIDE["env_keys"]
+
+    def test_dropping_a_section_drops_its_hidden_values(self):
+        gate = _stored_project_gate(SECRET_OVERRIDE)
+        wired = _wire(project_owner=gate)
+        override = {"memory": {"project_scoped": True}}
+
+        response = wired.client.patch(
+            f"/api/projects/{PROJECT_ID}", json={"default_config_override": override}
+        )
+
+        assert response.status_code == 200
+        written = wired.store.update_project.await_args.kwargs[
+            "default_config_override"
+        ]
+        assert written == override
+
+    def test_an_explicit_value_always_wins_over_the_stored_one(self):
+        gate = _stored_project_gate(SECRET_OVERRIDE)
+        wired = _wire(project_owner=gate)
+        override = json.loads(json.dumps(PUBLIC_OVERRIDE))
+        override["llm"]["api_key"] = None
+        override["env_keys"]["EMBEDDING_API_KEY"] = "sk-rotated"
+
+        response = wired.client.patch(
+            f"/api/projects/{PROJECT_ID}", json={"default_config_override": override}
+        )
+
+        assert response.status_code == 200
+        written = wired.store.update_project.await_args.kwargs[
+            "default_config_override"
+        ]
+        assert written["llm"]["api_key"] is None
+        assert written["env_keys"]["EMBEDDING_API_KEY"] == "sk-rotated"
 
 
 # =============================================================================

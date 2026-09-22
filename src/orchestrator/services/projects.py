@@ -44,8 +44,10 @@ from orchestrator.security.access import (
     project_status_filter_sql,
     redact_datasource,
     redact_datasources,
+    redact_public_config_override,
     redact_repositories,
     redact_repository,
+    restore_hidden_config_values,
     user_can_access_datasource,
 )
 from orchestrator.services import project_provisioning
@@ -95,6 +97,26 @@ class ProjectDependencies:
     with_validated_tool_overrides: Callable[
         [dict[str, Any] | None], dict[str, Any] | None
     ]
+
+
+def public_project(project: dict[str, Any]) -> dict[str, Any]:
+    """A project row as it may leave the orchestrator.
+
+    ``default_config_override`` is merged under every job in the project, so it
+    can hold what a job override holds — a BYO ``llm.api_key``, capability keys
+    in ``env_keys``, a mount's ``rclone_spec``, the ``workspace.remote``
+    transport — and every project MEMBER reads this row. It leaves by the job
+    API's policy (:func:`redact_public_config_override`); ``update_project``
+    restores the hidden values when the redacted view is written back.
+    """
+    if project.get("default_config_override") is None:
+        return project
+    return {
+        **project,
+        "default_config_override": redact_public_config_override(
+            project["default_config_override"]
+        ),
+    }
 
 
 # =============================================================================
@@ -205,7 +227,7 @@ async def create_project(
             project, dependencies=dependencies.provisioning
         )
 
-        return project
+        return public_project(project)
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
 
@@ -322,7 +344,7 @@ async def list_projects(
         if scope_pid:
             projects = [p for p in projects if str(p.get("id", "")) == str(scope_pid)]
 
-        return projects
+        return [public_project(p) for p in projects]
     except HTTPException:
         raise
     except Exception as e:
@@ -431,7 +453,7 @@ async def get_project(
                     handle
                 )
 
-    return project
+    return public_project(project)
 
 
 async def quiesce_archived_project(
@@ -561,6 +583,12 @@ async def update_project(
     # already holding an invalid tools block surfaces it here instead of
     # quietly binding foreign tools on every job.
     if "default_config_override" in kwargs:
+        # Reads serve the redacted view (public_project) and the cockpit writes
+        # that view back whole, so without this, flipping one key would delete
+        # every stored secret in the override.
+        kwargs["default_config_override"] = restore_hidden_config_values(
+            kwargs["default_config_override"], project.get("default_config_override")
+        )
         kwargs["default_config_override"] = dependencies.with_validated_tool_overrides(
             kwargs["default_config_override"]
         )

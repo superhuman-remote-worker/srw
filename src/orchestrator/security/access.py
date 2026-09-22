@@ -31,6 +31,8 @@ just the home for the next four bundles of work.
 
 from __future__ import annotations
 
+import copy
+import json
 import logging
 import os
 import re
@@ -1183,6 +1185,95 @@ def redact_config_override(co: Any) -> Any:
     if isinstance(co, list):
         return [redact_config_override(v) for v in co]
     return co
+
+
+def _hidden_config_key(path: tuple[str, ...], key: str) -> bool:
+    """A key :func:`redact_public_config_override` removes at ``path``."""
+    return _is_secret_key(key) or (path == ("workspace",) and key == "remote")
+
+
+def _public_config_view(value: Any, path: tuple[str, ...] = ()) -> Any:
+    if isinstance(value, dict):
+        return {
+            k: _public_config_view(v, (*path, k))
+            for k, v in value.items()
+            if not _hidden_config_key(path, k)
+        }
+    if isinstance(value, list):
+        return [_public_config_view(v, (*path, "[]")) for v in value]
+    return value
+
+
+def redact_public_config_override(co: Any) -> Any:
+    """The browser-facing view of a stored config override.
+
+    The job API's policy (``job_projection.redact_job_config_override``):
+    :func:`redact_config_override` plus the ``workspace.remote`` transport block
+    (SSH coordinates injected at dispatch). JSONB arrives from asyncpg as text,
+    so a string is parsed and returned as an object; one that does not parse is
+    dropped rather than risk returning a raw secret.
+    """
+    if isinstance(co, str):
+        try:
+            co = json.loads(co)
+        except (json.JSONDecodeError, TypeError):
+            return None
+    return _public_config_view(co)
+
+
+def restore_hidden_config_values(incoming: Any, stored: Any) -> Any:
+    """Put back what :func:`redact_public_config_override` hid, for a client
+    that writes the redacted view back whole (read, flip one key, PATCH the
+    override — the cockpit's project-memory toggle does exactly this).
+
+    A hidden value is restored only into a section the write left unchanged: a
+    dict whose public view equals the stored one's, or a list element equal to
+    a stored element's public view. Editing anything in a section (say
+    ``llm.base_url``) drops the hidden values in it, which the writer must then
+    send again. That is stricter than connector credentials' "leave it out to
+    keep it" (F3), and on purpose: a connector's writer is its creator, while a
+    project override has several — any co-owner — and one who cannot read a key
+    must not be able to re-point it at a host they control. A value the write
+    sends explicitly (``null`` included) always wins. ``stored`` may be JSONB
+    text.
+    """
+    if isinstance(stored, str):
+        try:
+            stored = json.loads(stored)
+        except (json.JSONDecodeError, TypeError):
+            return incoming
+    return _restore_hidden(incoming, stored, ())
+
+
+def _restore_hidden(incoming: Any, stored: Any, path: tuple[str, ...]) -> Any:
+    if isinstance(incoming, dict) and isinstance(stored, dict):
+        out = {
+            k: _restore_hidden(v, stored[k], (*path, k)) if k in stored else v
+            for k, v in incoming.items()
+        }
+        if _public_config_view(incoming, path) == _public_config_view(stored, path):
+            for k, v in stored.items():
+                if k not in incoming and _hidden_config_key(path, k):
+                    out[k] = copy.deepcopy(v)
+        return out
+    if isinstance(incoming, list) and isinstance(stored, list):
+        element_path = (*path, "[]")
+        unmatched = list(stored)
+        out_list = []
+        for item in incoming:
+            match = next(
+                (
+                    i
+                    for i, candidate in enumerate(unmatched)
+                    if _public_config_view(candidate, element_path) == item
+                ),
+                None,
+            )
+            out_list.append(
+                item if match is None else copy.deepcopy(unmatched.pop(match))
+            )
+        return out_list
+    return incoming
 
 
 async def user_can_access_datasource(

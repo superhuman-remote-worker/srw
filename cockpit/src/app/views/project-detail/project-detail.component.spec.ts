@@ -559,3 +559,34 @@ describe('ProjectDetailPageComponent archived read-only settings', () => {
     expect(component.editError()).toBe('refused');
   });
 });
+
+describe('ProjectDetailPageComponent project-memory toggle', () => {
+  it('writes back the override it read with only memory.project_scoped changed', () => {
+    // GET /api/projects/{id} serves default_config_override redacted (no
+    // api_key, rclone_spec or workspace.remote) and the PATCH restores those
+    // values only into sections the write leaves unchanged. So the toggle must
+    // send every section it read, as read: dropping or reshaping one deletes
+    // the stored secrets under it.
+    const {api, component} = createComponent();
+    const override = {
+      memory: {project_scoped: true, recall_limit: 5},
+      llm: {model: 'openrouter/some-model', base_url: 'https://openrouter.ai/api/v1'},
+      workspace: {backend: 'sandbox', mounts: [{name: 'drive', path: '/mnt/d'}]},
+    };
+    component.project.set({
+      id: 'project-a',
+      name: 'P',
+      status: 'active',
+      default_config_override: override,
+    } as never);
+
+    component.toggleProjectMemory(false);
+
+    expect(api.updateProjectFields).toHaveBeenCalledWith('project-a', {
+      default_config_override: {
+        ...override,
+        memory: {project_scoped: false, recall_limit: 5},
+      },
+    });
+  });
+});
