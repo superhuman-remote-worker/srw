@@ -265,6 +265,32 @@ class TestUrgentReplyRoutesToGuidance:
         assert resume.await_args.kwargs["reason"] == inbound_reply.URGENT_RESUME_REASON
 
     @pytest.mark.asyncio
+    async def test_urgent_on_operator_paused_job_reports_queued(self):
+        """The hold keeps the job parked: the message waits for the resume."""
+        import orchestrator.main as om
+
+        held = {
+            **_job(status="paused"),
+            "context": {"_operator_pause_hold": {"version": 1, "hold_id": "h1"}},
+        }
+        db = _routing_db(held)
+        resume = AsyncMock(return_value=True)
+        with (
+            patch.object(om, "postgres_db", db),
+            patch.object(
+                om.job_control_operations.JobControlOperations,
+                "internal_resume_job",
+                resume,
+            ),
+        ):
+            strategy, _ = await _route_inbound_reply(
+                om, JOB_ID, "officer", "wake up and do Y", urgent=True
+            )
+
+        assert strategy == "queued_until_resume"
+        resume.assert_awaited_once()
+
+    @pytest.mark.asyncio
     async def test_blocking_reply_still_resumes_with_honest_reason(self):
         """A reply the job froze waiting for keeps resuming — that is the
         correct verb there — and now carries the actual cause."""
