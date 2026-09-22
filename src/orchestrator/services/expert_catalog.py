@@ -1189,12 +1189,21 @@ class ExpertCatalogService:
     def bundled_skill_bundle(self, skill_name: str) -> dict[str, Any] | None:
         """Read a bundled skill's full directory into a metadata + files dict."""
         from shared.runtime.core.skill_format import (
+            SkillFormatError,
             parse_skill_md,
+            skill_dir_under,
             skill_identity,
             validate_skill_path,
         )
 
-        skill_dir = self.deps.get_config_dir() / "skills" / skill_name
+        # ``skill_name`` is a route's non-UUID skill id: a name that is no
+        # skill slug is simply not a bundled skill.
+        try:
+            skill_dir = skill_dir_under(
+                self.deps.get_config_dir() / "skills", skill_name
+            )
+        except SkillFormatError:
+            return None
         skill_md = skill_dir / "SKILL.md"
         if not skill_dir.is_dir() or not skill_md.exists():
             return None

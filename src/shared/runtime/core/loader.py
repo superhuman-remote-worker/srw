@@ -5095,12 +5095,21 @@ def resolve_bound_skill_dir(skill: str, deployment_dir: Optional[str]) -> Path:
     (``skills/strategic-phase/SKILL.md``) do not change; only the body the
     freeze reads does. Used by ``serialize_resolved_config`` and the prompt
     render gate.
+
+    ``skill`` arrives through merged config (a bundled expert, a DB expert
+    row, a job/thread ``config_override``), so it is validated as one skill
+    name and the directory confined to its skills root on both branches: an
+    unchecked ``../..`` walks out of the root and an absolute value discards
+    the left side of the join, turning the ``SKILL.md`` read into a read of
+    any file by that name. Raises :class:`SkillFormatError` for such a name.
     """
+    from shared.runtime.core.skill_format import skill_dir_under
+
     if deployment_dir:
-        local = Path(deployment_dir) / "skills" / skill
+        local = skill_dir_under(Path(deployment_dir) / "skills", skill)
         if (local / "SKILL.md").is_file():
             return local
-    return get_project_root() / "config" / "skills" / skill
+    return skill_dir_under(get_project_root() / "config" / "skills", skill)
 
 
 def expert_phase_prompt_bodies(expert_dir: Union[str, Path]) -> Dict[str, str]:
@@ -6674,12 +6683,19 @@ def serialize_resolved_config(config: AgentConfig, model: str = "") -> dict:
                 # Location-primary: an expert-local skills/<name>/SKILL.md next
                 # to the expert's config.yaml outranks the bundled one (U2).
                 if entry.skill not in instructions:
-                    skill_md = (
-                        resolve_bound_skill_dir(entry.skill, config._deployment_dir)
-                        / "SKILL.md"
-                    )
+                    from shared.runtime.core.skill_format import SkillFormatError
+
                     try:
+                        skill_md = (
+                            resolve_bound_skill_dir(entry.skill, config._deployment_dir)
+                            / "SKILL.md"
+                        )
                         instructions[entry.skill] = skill_md.read_text(encoding="utf-8")
+                    except SkillFormatError as exc:
+                        # A name that is no skill slug names no skill, bundled
+                        # or DB: skip it loudly instead of raising, which would
+                        # abort config resolution for the whole job.
+                        logger.warning("Refused bound skill binding: %s", exc)
                     except OSError:
                         pass  # non-bundled bound skill (out of scope this slice)
                 continue

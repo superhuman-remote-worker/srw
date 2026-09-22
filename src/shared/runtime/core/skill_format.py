@@ -14,6 +14,7 @@ from __future__ import annotations
 import io
 import re
 import zipfile
+from pathlib import Path
 from typing import Any
 
 import yaml
@@ -79,6 +80,45 @@ def skill_identity(frontmatter: dict[str, Any]) -> tuple[str, str]:
         )
     description = str(frontmatter.get("description", "") or "").strip()
     return name, description
+
+
+#: ``skills.name`` is VARCHAR(100) (migration 0031): no longer name was ever
+#: stored or bundled.
+MAX_SKILL_NAME_LENGTH = 100
+
+
+def validate_skill_name(name: str) -> str:
+    """Return ``name`` if it is a usable skill name, else raise.
+
+    A skill name is exactly one path segment (``config/skills/<name>``,
+    ``skills/<name>/SKILL.md`` in the workspace), so it must be the same slug
+    :func:`skill_identity` enforces on a SKILL.md, at most
+    :data:`MAX_SKILL_NAME_LENGTH` characters. That charset has no ``.``,
+    ``/``, ``\\``, ``%``, ``?``, ``#`` or control character: a validated name
+    can neither traverse nor carry an encoded or URL-significant byte.
+    """
+    if not isinstance(name, str):
+        raise SkillFormatError(
+            f"skill name must be a string, not {type(name).__name__}"
+        )
+    if len(name) > MAX_SKILL_NAME_LENGTH or not _NAME_RE.fullmatch(name):
+        raise SkillFormatError(f"illegal skill name: {name[:60]!r}")
+    return name
+
+
+def skill_dir_under(root: Path, name: str) -> Path:
+    """``root / name`` for a validated skill ``name``, confined to ``root``.
+
+    The name check alone keeps the join one segment deep; the resolve check
+    also refuses a skill directory that is a symlink out of ``root``, so
+    whatever ``SKILL.md`` is read from the result lives under the skills root.
+    The unresolved join is returned (the directory need not exist: a bound
+    DB-only skill has no bundled one, and its read miss is the caller's).
+    """
+    candidate = Path(root) / validate_skill_name(name)
+    if not candidate.resolve().is_relative_to(Path(root).resolve()):
+        raise SkillFormatError(f"skill {name!r} resolves outside its skills root")
+    return candidate
 
 
 def validate_skill_path(path: str) -> str:
