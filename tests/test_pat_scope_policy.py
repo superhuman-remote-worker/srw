@@ -40,7 +40,9 @@ from orchestrator.security.token_scopes import (
     UNMAPPED,
     classify_route,
     enforce_route_scopes,
+    holds_scopes,
     require_scopes,
+    tethers_session,
 )
 from tests.test_endpoint_inventory import _load_script
 
@@ -123,8 +125,11 @@ _BOOKKEEPING_READS = {
         "handle; connecting still needs a registered key and an attach token"
     ),
     "/api/persistent/threads/{thread_id}/stream": (
-        "records the viewer's presence (stateless lane), which can flip an "
-        "awaiting_user thread to active; answering it still needs chat:write"
+        "records viewer presence on the stateless lane — which holds permission "
+        "prompts (and the turn's executor slot) open, blocks the natural pause "
+        "and flips awaiting_user to active — but only for a caller who could "
+        "answer (token_scopes.tethers_session: chat:write or a non-PAT); a "
+        "read-only token streams without tethering"
     ),
     "/api/persistent/threads/{thread_id}/canvases/main": (
         "re-pins an unchanged canvas to the current workspace generation"
@@ -258,6 +263,22 @@ class TestClassifyRoute:
     )
     def test_decision(self, method, path, expected):
         assert classify_route(method, path) == expected
+
+
+@pytest.mark.parametrize(
+    ("user", "tethers"),
+    [
+        ({"id": "cookie-or-oidc"}, True),
+        ({"auth_method": "mcp", "scopes": ["project:x"]}, True),
+        ({"auth_method": "pat", "scopes": ["chat:write"]}, True),
+        ({"auth_method": "pat", "scopes": ["admin"]}, True),
+        ({"auth_method": "pat", "scopes": ["chat:read", "jobs:write"]}, False),
+        ({"auth_method": "pat", "scopes": []}, False),
+    ],
+)
+def test_only_a_caller_who_could_answer_tethers_a_session(user, tethers):
+    assert tethers_session(user) is tethers
+    assert holds_scopes(user, "chat:write") is tethers
 
 
 class TestRequireScopes:

@@ -117,6 +117,7 @@ from orchestrator.security.access import (  # noqa: E402
     user_visible_project_ids,
 )
 from orchestrator.security.csrf import CSRFMiddleware  # noqa: E402
+from orchestrator.security.token_scopes import tethers_session  # noqa: E402
 from shared.anti_framing import (  # noqa: E402
     TrustedParentAntiFramingMiddleware,
 )
@@ -11962,8 +11963,11 @@ async def thread_event_stream(thread_id: str, request: Request) -> StreamingResp
     # The existing owner-gated SSE connection is the lane-agnostic client
     # attachment signal. No lane field crosses the wire. Pinned streams keep
     # their exact behavior; a stateless stream must establish its durable TTL
-    # before the browser can believe it is attached.
-    track_presence = thread.get("execution_lane") == "stateless"
+    # before the browser can believe it is attached. Only a caller who could
+    # answer tethers (tethers_session): a read-only token still streams and is
+    # re-authorized on the renewal cadence, but records no presence.
+    stateless_stream = thread.get("execution_lane") == "stateless"
+    track_presence = stateless_stream and tethers_session(user)
     if track_presence:
         try:
             presence = await refresh_thread_presence(
@@ -12102,26 +12106,28 @@ async def thread_event_stream(thread_id: str, request: Request) -> StreamingResp
             while not cancelled:
                 if await request.is_disconnected():
                     break
-                if track_presence and time.monotonic() >= next_presence_renew:
+                if stateless_stream and time.monotonic() >= next_presence_renew:
                     # A long-lived stream does not retain authorization from
                     # its opening handshake forever. Re-run the same BFF-cookie
                     # owner gate before every attested renewal; expiry or an
                     # ownership change closes the stream and writes no TTL.
-                    _renew_user, renew_thread = await require_thread_owner(
+                    renew_user, renew_thread = await require_thread_owner(
                         request, postgres_db, thread_id
                     )
                     if renew_thread.get("execution_lane") != "stateless":
                         return
-                    presence = await refresh_thread_presence(
-                        postgres_db,
-                        thread_id=thread_id,
-                        ttl_seconds=THREAD_CLIENT_PRESENCE_TTL_S,
-                        establish=False,
-                    )
-                    if not presence.served:
-                        # Lane change/deletion: close. EventSource reconnects
-                        # through require_thread_owner and current DB truth.
-                        return
+                    if track_presence and tethers_session(renew_user):
+                        presence = await refresh_thread_presence(
+                            postgres_db,
+                            thread_id=thread_id,
+                            ttl_seconds=THREAD_CLIENT_PRESENCE_TTL_S,
+                            establish=False,
+                        )
+                        if not presence.served:
+                            # Lane change/deletion: close. EventSource
+                            # reconnects through require_thread_owner and
+                            # current DB truth.
+                            return
                     next_presence_renew = (
                         time.monotonic() + THREAD_CLIENT_PRESENCE_RENEW_S
                     )

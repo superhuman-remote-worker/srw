@@ -1575,6 +1575,70 @@ class TestThreadEventStreamPresence:
         assert refresh.await_count == 1
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("caller", "tethers"),
+        [
+            ({"id": "user-x"}, True),  # cookie / OIDC session
+            ({"id": "user-x", "auth_method": "mcp", "scopes": ["user"]}, True),
+            ({"id": "user-x", "auth_method": "pat", "scopes": ["chat:write"]}, True),
+            ({"id": "user-x", "auth_method": "pat", "scopes": ["admin"]}, True),
+            (
+                {"id": "user-x", "auth_method": "pat", "scopes": ["chat:read"]},
+                False,
+            ),
+            (
+                {
+                    "id": "user-x",
+                    "auth_method": "pat",
+                    "scopes": ["chat:read", "jobs:write"],
+                },
+                False,
+            ),
+        ],
+    )
+    async def test_only_a_caller_who_could_answer_records_presence(
+        self, monkeypatch, caller, tethers
+    ):
+        """Presence keeps permission prompts open (and the turn's executor
+        slot leased) and blocks the natural pause, so it is a claim that
+        someone attached can answer. A read-only token still streams — it
+        is re-authorized on the renewal cadence — but never tethers."""
+        import orchestrator.main as om
+        from shared.thread_presence import PresenceRefresh
+
+        thread = {"events_epoch": 3, "execution_lane": "stateless"}
+        auth = AsyncMock(return_value=(caller, thread))
+        refresh = AsyncMock(return_value=PresenceRefresh(True, True))
+        monkeypatch.setattr(om, "require_thread_owner", auth)
+        monkeypatch.setattr(om, "refresh_thread_presence", refresh)
+        monkeypatch.setattr(om, "THREAD_CLIENT_PRESENCE_RENEW_S", 0.0)
+        monkeypatch.setattr(om, "THREAD_EVENTS_EPOCH_RECHECK_S", 999.0)
+        monkeypatch.setattr(asyncio, "sleep", AsyncMock(return_value=None))
+        rows = [{"seq": 1, "kind": "token", "payload": {"content": "a"}}]
+        conn = _ScriptedConn(epochs=[3], rows_script=[rows], min_seq=0)
+        fake_db = MagicMock()
+        fake_db.acquire = lambda: _Acquire(conn)
+        monkeypatch.setattr(om, "postgres_db", fake_db)
+
+        response = await om.thread_event_stream(
+            "thread-x", _FakeRequest(last_event_id="3:0")
+        )
+        iterator = response.body_iterator
+        assert await iterator.__anext__() == ": open\n\n"
+        # The first loop pass runs the renewal before it streams the row:
+        # every stateless stream is re-authorized, only a tethering caller
+        # writes presence.
+        assert "id: 3:1\n" in await iterator.__anext__()
+        await iterator.aclose()
+
+        assert auth.await_count >= 2
+        if tethers:
+            assert refresh.await_args_list[0].kwargs["establish"] is True
+            assert refresh.await_count >= 2
+        else:
+            refresh.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_pinned_stream_never_touches_presence(self, monkeypatch):
         import orchestrator.main as om
 

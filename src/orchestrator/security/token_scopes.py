@@ -294,7 +294,7 @@ def require_scopes(user: dict[str, Any], *needed: str) -> None:
     """
     if user.get("auth_method") != PAT_AUTH_METHOD:
         return
-    held = {scope for scope in user.get("scopes") or [] if isinstance(scope, str)}
+    held = _held_scopes(user)
     if not held:
         raise HTTPException(status_code=403, detail=f"{INSUFFICIENT_SCOPE}: none")
     if ADMIN_SCOPE in held:
@@ -305,6 +305,31 @@ def require_scopes(user: dict[str, Any], *needed: str) -> None:
             status_code=403,
             detail=f"{INSUFFICIENT_SCOPE}: requires {', '.join(missing)}",
         )
+
+
+def _held_scopes(user: dict[str, Any]) -> set[str]:
+    return {scope for scope in user.get("scopes") or [] if isinstance(scope, str)}
+
+
+def holds_scopes(user: dict[str, Any], *needed: str) -> bool:
+    """Whether :func:`require_scopes` would admit ``user`` for ``needed``."""
+    if user.get("auth_method") != PAT_AUTH_METHOD:
+        return True
+    held = _held_scopes(user)
+    return bool(held) and (ADMIN_SCOPE in held or set(needed) <= held)
+
+
+def tethers_session(user: dict[str, Any]) -> bool:
+    """Whether this caller's attached stream may count as a present user.
+
+    Presence on a stateless session is a claim that someone attached can
+    answer: it keeps a pending permission prompt open (and the blocked turn's
+    run-queue lease, with its executor slot), blocks the natural pause, and
+    turns an ``awaiting_user`` thread back to ``active``. A read-only token can
+    watch the stream but not answer, so only a caller who could — any non-PAT
+    credential, or a PAT holding ``chat:write`` — tethers.
+    """
+    return holds_scopes(user, "chat:write")
 
 
 def route_identity(request: Any) -> tuple[str, str] | None:
@@ -369,6 +394,8 @@ __all__ = [
     "UNMAPPED",
     "classify_route",
     "enforce_route_scopes",
+    "holds_scopes",
     "require_scopes",
     "route_identity",
+    "tethers_session",
 ]

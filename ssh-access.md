@@ -64,7 +64,10 @@ easy to register a key, paste the config, and get an opaque failure — do this 
    (the default `jobs:read` + `chat:read` is not enough — an interactive shell is
    a write), and copy it. It looks like `ak_…` and is shown exactly once. A token
    without `chat:write` fails the exchange with
-   `token exchange refused (403): PAT lacks the chat:write scope`.
+   `token exchange refused (403): PAT lacks the chat:write scope`. The shell you
+   get runs with your SSH key's authority, not the token's: for an admin's
+   account, a `chat:write` token (even without the `admin` scope) opens every
+   workspace an admin's registered key can reach.
 2. Save it to `~/.config/srw/token` (create the file with mode `0600` — the helper
    warns on stderr if it's group- or world-readable, since it holds a bearer
    credential), **or** export it as `$SRW_TOKEN` in your shell.
