@@ -55,12 +55,20 @@ todo decide whether to close or continue without rerunning unchanged checks.
 **1. Define "done", pick the check.** Write the concrete, observable criteria
 that prove this task is finished, then choose the smallest set of available
 checks that produces that evidence:
+{% if has_tool("run_command") or has_tool("shell_execute") %}
 {% if has_tool("run_command") %}
 - Code → `run_command` with the test/build/lint command — done = exit 0, 0 failures.
 - Writing → `run_command`: `wc -w`, `grep` for required headers — structure and
   length match the spec.
 - Data/analysis → `run_command` with a check script or query — numbers reconcile,
   row counts match.
+{% else %}
+- Code → `shell_execute` with the test/build/lint command — done = exit 0, 0 failures.
+- Writing → `shell_execute`: `wc -w`, `grep` for required headers — structure and
+  length match the spec.
+- Data/analysis → `shell_execute` with a check script or query — numbers reconcile,
+  row counts match.
+{% endif %}
 {% else %}
 This workspace has no command runner. Use the file and domain tools that are
 actually available; do not invent a shell tool or emulate one with repeated

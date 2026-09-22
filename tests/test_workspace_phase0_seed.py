@@ -133,6 +133,209 @@ class TestBoundSkillCapabilityRendering:
         assert excluded not in rendered
         assert "{%" not in rendered
 
+    def test_verify_skill_shell_execute_only_names_admitted_tool(self, tmp_path):
+        """shell_execute-only palettes must not claim 'no command runner'.
+
+        Regression for worker_verification_skill_tool_contract_mismatch: the
+        shipped template tested only has_tool("run_command"), so a VM worker
+        whose admitted shell tool is shell_execute materialized guidance
+        saying no runner exists while shell_execute actually worked. Uses the
+        real renderer + workspace delivery path, not source inspection.
+        """
+        from pathlib import Path
+
+        from shared.runtime.core.loader import InstructionFileEntry
+
+        raw_skill = Path("config/skills/verify-before-done/SKILL.md").read_text(
+            encoding="utf-8"
+        )
+        config = SimpleNamespace(
+            llm=SimpleNamespace(model="test-model"),
+            instruction_files=[
+                InstructionFileEntry(
+                    trigger="phase_start:tactical",
+                    skill="verify-before-done",
+                    enforce=False,
+                )
+            ],
+            extra={
+                "_resolved_instructions": {"verify-before-done": raw_skill},
+                "_resolved_skills": {"files": {}},
+            },
+            _deployment_dir=None,
+        )
+        ws = WorkspaceManager(job_id="t", backend=RemoteLikeBackend(tmp_path))
+        agent = _bare_agent(ws, config)
+
+        agent._deploy_instruction_files(["shell_execute", "read_file"])
+
+        rendered = ws.read_file("skills/verify-before-done/SKILL.md")
+        assert "no command runner" not in rendered.lower()
+        assert "shell_execute" in rendered
+        assert "run_command" not in rendered
+        assert "{%" not in rendered
+
+    def test_verify_skill_shell_helpers_alone_have_no_runner(self, tmp_path):
+        """A shell-category member alone need not provide command execution.
+
+        shell_read/cancel_command share the shell category but cannot run a
+        check, so the no-runner fallback must stay for such palettes. Guards
+        the shell_execute fix against over-broadening to has_shell.
+        """
+        from pathlib import Path
+
+        from shared.runtime.core.loader import InstructionFileEntry
+
+        raw_skill = Path("config/skills/verify-before-done/SKILL.md").read_text(
+            encoding="utf-8"
+        )
+        config = SimpleNamespace(
+            llm=SimpleNamespace(model="test-model"),
+            instruction_files=[
+                InstructionFileEntry(
+                    trigger="phase_start:tactical",
+                    skill="verify-before-done",
+                    enforce=False,
+                )
+            ],
+            extra={
+                "_resolved_instructions": {"verify-before-done": raw_skill},
+                "_resolved_skills": {"files": {}},
+            },
+            _deployment_dir=None,
+        )
+        ws = WorkspaceManager(job_id="t", backend=RemoteLikeBackend(tmp_path))
+        agent = _bare_agent(ws, config)
+
+        agent._deploy_instruction_files(["shell_read", "cancel_command", "read_file"])
+
+        rendered = ws.read_file("skills/verify-before-done/SKILL.md")
+        assert "no command runner" in rendered.lower()
+        assert "shell_execute" not in rendered
+        assert "run_command" not in rendered
+
+    def test_bound_skill_missing_frozen_content_fails_closed(self, tmp_path):
+        """Absent frozen bound content must not silently skip delivery.
+
+        Regression for worker_verification_skill_tool_contract_mismatch: the
+        worker logged and skipped, leaving no file while the gate still
+        demanded a read of it — an endless missing-file loop. Exercised on an
+        empty workspace so retained files cannot hide the delivery failure.
+        """
+        from shared.runtime.core.loader import InstructionFileEntry
+
+        config = SimpleNamespace(
+            llm=SimpleNamespace(model="test-model"),
+            instruction_files=[
+                InstructionFileEntry(
+                    trigger="before_tool:todo_complete",
+                    skill="verify-before-done",
+                    enforce=True,
+                )
+            ],
+            extra={
+                "_resolved_instructions": {},
+                "_resolved_skills": {"files": {}},
+            },
+            _deployment_dir=None,
+        )
+        ws = WorkspaceManager(job_id="t", backend=RemoteLikeBackend(tmp_path))
+        agent = _bare_agent(ws, config)
+
+        with pytest.raises(RuntimeError, match="verify-before-done"):
+            agent._deploy_instruction_files(["read_file", "todo_complete"])
+        assert not ws.exists("skills/verify-before-done/SKILL.md")
+
+    def test_changed_tools_invalidate_prior_receipt(self, tmp_path):
+        """Narrowed tools on resume must not inherit a stale shell receipt.
+
+        Materialize with run_command, read it, then re-materialize with a
+        shell_execute-only palette (simulating resume with a different tool
+        set). The bytes differ, so restoring the old receipt against the new
+        file fails closed and a fresh read is required.
+        """
+        from pathlib import Path
+
+        from agent.tools.context import ToolContext
+        from shared.runtime.core.loader import InstructionFileEntry
+
+        raw_skill = Path("config/skills/verify-before-done/SKILL.md").read_text(
+            encoding="utf-8"
+        )
+        entry = InstructionFileEntry(
+            trigger="before_tool:todo_complete",
+            skill="verify-before-done",
+            enforce=True,
+        )
+        config = SimpleNamespace(
+            llm=SimpleNamespace(model="test-model"),
+            instruction_files=[entry],
+            extra={
+                "_resolved_instructions": {"verify-before-done": raw_skill},
+                "_resolved_skills": {"files": {}},
+            },
+            _deployment_dir=None,
+        )
+        ws = WorkspaceManager(job_id="t", backend=RemoteLikeBackend(tmp_path))
+        agent = _bare_agent(ws, config)
+
+        agent._deploy_instruction_files(["run_command", "read_file"])
+        first_body = ws.read_file("skills/verify-before-done/SKILL.md")
+        assert "run_command" in first_body
+
+        ctx = ToolContext(workspace_manager=ws)
+        ctx._instruction_files = [entry]
+        ctx._llm_config = None
+        ctx.record_file_read(entry.path, first_body)
+        receipts = ctx.export_instruction_read_receipts()
+        assert entry.path in receipts
+
+        agent._deploy_instruction_files(["shell_execute", "read_file"])
+        second_body = ws.read_file("skills/verify-before-done/SKILL.md")
+        assert "shell_execute" in second_body
+        assert second_body != first_body
+
+        successor = ToolContext(workspace_manager=ws)
+        successor._instruction_files = [entry]
+        assert successor.restore_instruction_read_receipts(receipts) == 0
+        assert successor.check_tool_enforcement("todo_complete") is not None
+
+        successor.record_file_read(entry.path, second_body)
+        assert successor.check_tool_enforcement("todo_complete") is None
+
+    def test_freeze_hydrate_deploy_restores_bound_skill_on_empty_workspace(
+        self, tmp_path
+    ):
+        """The frozen blob must carry bound content to an empty resume target.
+
+        Full resolve → freeze → hydrate → materialize cycle with the real
+        worker_base bindings: an empty workspace (no retained files) still
+        receives the authorized verify-before-done body. Guards against
+        hydration losing content, distinct from the missing-blob failure above.
+        """
+        from shared.runtime.core.loader import (
+            load_agent_config,
+            load_config_from_resolved,
+            resolve_config_path,
+            serialize_resolved_config,
+        )
+
+        config_path, deployment_dir = resolve_config_path("developer")
+        cfg = load_agent_config(config_path, deployment_dir)
+        blob = serialize_resolved_config(cfg, model=cfg.llm.model)
+        assert "verify-before-done" in blob["instructions"]
+
+        hydrated = load_config_from_resolved(blob)
+        ws = WorkspaceManager(job_id="t", backend=RemoteLikeBackend(tmp_path))
+        agent = _bare_agent(ws, hydrated)
+        assert not ws.exists("skills/verify-before-done/SKILL.md")
+
+        agent._deploy_instruction_files(["run_command", "read_file", "todo_complete"])
+
+        body = ws.read_file("skills/verify-before-done/SKILL.md")
+        assert "Verify Before Done" in body
+        assert "{%" not in body
+
 
 class TestLegacyManifestCleanup:
     def test_removes_retired_status_file_before_agent_can_read_it(self, tmp_path):

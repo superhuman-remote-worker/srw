@@ -1714,6 +1714,7 @@ class PersistentSession:
                 deployment_dir=self.config._deployment_dir,
                 framework_dir=templates_dir,
             )
+        missing_bound_skills: list[str] = []
         for entry in self.config.instruction_files:
             try:
                 if entry.skill:
@@ -1723,13 +1724,15 @@ class PersistentSession:
                     # workspaces, which would redeploy (clobber) on resume.
                     if self.workspace_manager.exists(entry.path):
                         continue  # don't overwrite on session resume
-                    content = self.config.extra.get("_resolved_instructions", {}).get(
-                        entry.skill
-                    )
+                    content = (
+                        self.config.extra.get("_resolved_instructions", {}) or {}
+                    ).get(entry.skill)
                     if not content:
                         logger.warning(
                             f"Bound skill content missing from blob: {entry.skill}"
                         )
+                        if entry.skill not in missing_bound_skills:
+                            missing_bound_skills.append(entry.skill)
                         continue
                     content = render_instruction_content(
                         content, [], origin=f"bound skill {entry.skill!r}"
@@ -1764,6 +1767,18 @@ class PersistentSession:
                 logger.warning(f"Instruction file not found: {entry.file}")
             except Exception as e:
                 logger.warning(f"Failed to deploy instruction file {entry.file}: {e}")
+
+        if missing_bound_skills:
+            # Fail closed when a fresh session needs a bound skill the frozen
+            # blob cannot supply. Otherwise the gate bricks the tool while
+            # read_file can only report "not found" — an unbounded loop.
+            # Retained files on resume keep their historical skip above.
+            raise RuntimeError(
+                "Bound skill content missing from frozen blob: "
+                f"{sorted(missing_bound_skills)}. The session's mandatory "
+                "instruction gate cannot be satisfied without it; failing "
+                "closed rather than demanding an impossible read."
+            )
 
     def _enforce_officer_knowledge_invariant(self) -> None:
         """Fail the attach when a background officer is mis-bound (K1, §3.1).

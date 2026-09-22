@@ -4882,8 +4882,11 @@ class UniversalAgent:
                 deployment_dir=self.config._deployment_dir,
                 framework_dir=templates_dir,
             )
-            resolved_instructions = self.config.extra.get("_resolved_instructions", {})
+            resolved_instructions = (
+                self.config.extra.get("_resolved_instructions", {}) or {}
+            )
             deployed_paths: set[str] = set()
+            missing_bound_skills: list[str] = []
             for entry in self.config.instruction_files:
                 if entry.path in deployed_paths:
                     continue
@@ -4898,6 +4901,8 @@ class UniversalAgent:
                             logger.warning(
                                 f"Bound skill content missing from blob: {entry.skill}"
                             )
+                            if entry.skill not in missing_bound_skills:
+                                missing_bound_skills.append(entry.skill)
                             continue
                         content = render_instruction_content(
                             content,
@@ -4933,6 +4938,21 @@ class UniversalAgent:
                     )
                 except FileNotFoundError:
                     logger.warning(f"Instruction file not found: {entry.file}")
+
+            if missing_bound_skills:
+                # Fail closed with an actionable bounded error, not an endless
+                # missing-file loop. The gate would otherwise demand a read of
+                # a path that can never appear, while read_file can only ever
+                # report "not found". Surfaces as a terminal job_error via the
+                # existing completion payload; never silent completion.
+                raise RuntimeError(
+                    "Bound skill content missing from frozen blob: "
+                    f"{sorted(missing_bound_skills)}. The job's mandatory "
+                    "instruction gate cannot be satisfied without it; failing "
+                    "closed rather than demanding an impossible read. "
+                    "Re-dispatch with a frozen config that includes the skill, "
+                    "or remove the binding."
+                )
 
         # Skill directories (Slice 2): materialize in-scope skills into
         # skills/<name>/<path> so use_skill (L2) and read_file/run_command (L3)

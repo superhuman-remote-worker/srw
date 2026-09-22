@@ -67,12 +67,16 @@ def create_skill_tools(context: ToolContext) -> List[Any]:
         Skills are reusable "how to do X well" procedures listed in your system
         prompt under available_skills. Call this when a listed skill matches the
         task at hand; the body will appear in your context and walk you through
-        the procedure. If the skill bundles references/ files, read them with
-        read_file as the body directs.
+        the procedure. Skills bound as mandatory instruction gates (for example
+        verify-before-done) are intentionally absent from that optional menu —
+        they ride the frozen instructions channel to skills/<name>/SKILL.md and
+        are equally loadable here or with read_file at that path. If the skill
+        bundles references/ files, read them with read_file as the body directs.
 
         Args:
             skill_name: The skill's name exactly as shown in the available_skills
-                menu (e.g. "verify-before-done").
+                menu, or a gate-required bound skill name (e.g.
+                "verify-before-done").
 
         Returns:
             The SKILL.md body, or a friendly message if the skill is not present.
@@ -88,11 +92,47 @@ def create_skill_tools(context: ToolContext) -> List[Any]:
             None,
         )
         if entry is None:
-            return (
-                f"Skill '{skill_name}' is not available for the current session "
-                "capabilities. Use only skills listed in the current "
-                "available_skills menu, by their exact name."
-            )
+            # Bound instruction skills are deliberately absent from the optional
+            # menu (filter_bound_skills) and travel via the frozen instructions
+            # channel instead. Serving the currently bound names here keeps the
+            # advertised loading route satisfiable: the gate nudge directs the
+            # model to read_file at the same path, and both record the same
+            # versioned read. Anything without a menu entry AND without a live
+            # binding stays refused — workspace bytes alone grant nothing.
+            bound_names = {
+                getattr(item, "skill", None)
+                for item in (getattr(context, "_instruction_files", None) or [])
+            }
+            if skill_name not in bound_names:
+                return (
+                    f"Skill '{skill_name}' is not available for the current session "
+                    "capabilities. Use only skills listed in the current "
+                    "available_skills menu, by their exact name."
+                )
+            if skill_name == "app-guide":
+                return (
+                    "Skill 'app-guide' is managed by the running SRW product and is "
+                    "not loaded from mutable workspace files. Call "
+                    "read_product_guide(topic_id='index'), then read the relevant "
+                    "logical topic ID it returns."
+                )
+            skill_md = f"skills/{skill_name}/SKILL.md"
+            try:
+                if not workspace.exists(skill_md):
+                    return (
+                        f"Skill '{skill_name}' is required by an instruction gate "
+                        f"but was not found in this workspace at '{skill_md}'. It "
+                        "is delivered via the instructions channel, not the "
+                        "available_skills menu — read it with "
+                        f"read_file('{skill_md}') once deployed. If it stays "
+                        "missing, report blocked rather than retrying."
+                    )
+                body = workspace.read_file(skill_md)
+                context.record_file_read(skill_md, body)
+                return f"[skill: {skill_name}]\n\n{body}{_script_availability_note(skill_name)}"
+            except Exception as e:  # never raise to the model
+                logger.warning("use_skill(%s) failed: %s", skill_name, e)
+                return f"Error loading skill '{skill_name}': {e}"
         if (
             entry.get("system_managed") is True
             and entry.get("loader_tool") == "read_product_guide"
