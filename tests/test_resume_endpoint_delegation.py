@@ -711,7 +711,7 @@ class TestResumeEndpointDelegation:
 
         assert result["status"] == "queued"
         endpoint_collaborators.queue_for_resume.assert_awaited_once_with(
-            JOB_ID, None, expected_status="paused"
+            JOB_ID, None, expected_status="paused", lift_operator_pause_hold=""
         )
         endpoint_collaborators.delegate.assert_not_awaited()
         orchestrator.main.postgres_db.get_agent.assert_not_awaited()
@@ -791,6 +791,7 @@ class TestResumeEndpointDelegation:
             JOB_ID,
             AGENT_ID,
             allow_failed=True,
+            lift_operator_pause_hold="",
         )
         orchestrator.main.postgres_db.merge_job_context.assert_not_awaited()
 
@@ -837,6 +838,7 @@ class TestResumeEndpointDelegation:
             JOB_ID,
             None,
             expected_status="processing",
+            lift_operator_pause_hold="",
         )
 
 
@@ -1054,6 +1056,7 @@ class TestResumeEndpointWorkspacelessJob:
                 ),
             },
             expected_status="paused",
+            lift_operator_pause_hold="",
         )
 
     @pytest.mark.asyncio

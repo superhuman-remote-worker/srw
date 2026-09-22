@@ -115,6 +115,13 @@ from orchestrator.services.cloud.protected_reader_authority import (
 from orchestrator.services.cloud_staging.source_identity import (
     ProtectedMountSourceIdentity,
 )
+from orchestrator.services.operator_pause_hold import (
+    OPERATOR_PAUSE_HOLD_CONTEXT_KEY,
+    operator_pause_hold_jsonb_sql,
+    operator_pause_hold_lift_sql,
+    operator_pause_hold_matches_sql,
+    operator_pause_hold_present_sql,
+)
 from orchestrator.services.ssh_handles import is_valid_handle, mint_ssh_handle
 
 logger = logging.getLogger(__name__)
@@ -5295,11 +5302,16 @@ class PostgresDB:
         *,
         completion_commands_enabled: bool = False,
         expected_agent_id: str | None = None,
+        operator_hold: bool = False,
+        paused_by: str | None = None,
     ) -> bool:
         """Pause a running job. Clears assigned_agent_id so the agent is freed.
 
-        The job enters 'paused' status and will be auto-resumed by the dispatcher
-        when an agent becomes available.
+        By default the job enters 'paused' status and will be auto-resumed by
+        the dispatcher when an agent becomes available (preemption, agent
+        release). ``operator_hold`` is the public pause: the same write stamps
+        the durable operator pause hold, so the job stays paused until an
+        explicit resume lifts it (see ``services/operator_pause_hold.py``).
 
         Args:
             job_id: Job UUID as string
@@ -5319,20 +5331,38 @@ class PostgresDB:
             except ValueError:
                 return False
 
+        values: list[Any] = [uuid_val]
+        if completion_commands_enabled and expected_agent_uuid is not None:
+            values.append(expected_agent_uuid)
+        hold_set = ""
+        if operator_hold:
+            values.extend([str(uuid4()), "public_pause", paused_by])
+            hold_set = (
+                "context = jsonb_set(COALESCE(context, '{}'::jsonb), "
+                f"'{{{OPERATOR_PAUSE_HOLD_CONTEXT_KEY}}}', "
+                + operator_pause_hold_jsonb_sql(
+                    hold_id_parameter=f"${len(values) - 2}",
+                    source_parameter=f"${len(values) - 1}",
+                    paused_by_parameter=f"${len(values)}",
+                )
+                + ", true),"
+            )
+
         async with self.acquire() as conn:
             if not completion_commands_enabled:
                 result = await conn.execute(
-                    """
+                    f"""
                     UPDATE jobs
                     SET status = 'paused',
                         assigned_agent_id = NULL,
+                        {hold_set}
                         updated_at = CURRENT_TIMESTAMP
                     WHERE id = $1 AND status = 'processing'
                       AND NOT EXISTS (SELECT 1 FROM srw_execution_specs execution
                           WHERE execution.work_kind='Job' AND execution.work_id=jobs.id
                             AND execution.harness_adapter <> 'srw/v1')
                     """,
-                    uuid_val,
+                    *values,
                 )
             else:
                 owner_guard = (
@@ -5345,6 +5375,7 @@ class PostgresDB:
                 UPDATE jobs
                 SET status = 'paused',
                     assigned_agent_id = NULL,
+                    {hold_set}
                     updated_at = CURRENT_TIMESTAMP
                 WHERE id = $1 AND status = 'processing'
                   AND NOT EXISTS (SELECT 1 FROM srw_execution_specs execution
@@ -5354,8 +5385,7 @@ class PostgresDB:
                   {owner_guard}
                   AND NOT ({_completion_control_active_sql("context")})
                 """,
-                    uuid_val,
-                    *([expected_agent_uuid] if expected_agent_uuid is not None else []),
+                    *values,
                 )
 
         return result == "UPDATE 1"
@@ -23697,6 +23727,7 @@ class PostgresDB:
         *,
         completion_commands_enabled: bool = False,
         allow_failed: bool = False,
+        lift_operator_pause_hold: str | None = None,
     ) -> bool:
         """Atomically claim a dispatchable job for an agent (M1 — HA dispatch).
 
@@ -23705,6 +23736,12 @@ class PostgresDB:
         the assignment safe against concurrent dispatchers and the transient
         dual-leader window that leader election cannot fence — a job can never
         be handed to two agents. Callers MUST claim before notifying the agent.
+
+        A row carrying an operator pause hold is refused, including by a
+        dispatcher pass that selected it before the pause landed. An explicit
+        resume or admin assignment passes ``lift_operator_pause_hold`` (the
+        :func:`operator_pause_lift_token` it authorized) to lift that exact
+        hold in this same CAS.
 
         Also clears any failure record left by a previous run. update_job_status()
         builds its SET list dynamically and only writes ``error_message`` when the
@@ -23735,6 +23772,14 @@ class PostgresDB:
             agent_expr="$2::uuid",
             lease_expr="NOW() + make_interval(secs => $3::int)",
         )
+        hold_args: tuple[Any, ...] = ()
+        if lift_operator_pause_hold is None:
+            claim_context = "COALESCE(context, '{}'::jsonb)"
+            hold_guard = f"AND NOT {operator_pause_hold_present_sql('context')}"
+        else:
+            hold_args = (str(lift_operator_pause_hold),)
+            claim_context = operator_pause_hold_lift_sql("context")
+            hold_guard = "AND " + operator_pause_hold_matches_sql("context", "$4")
         async with self.acquire() as conn:
             query = f"""
                     UPDATE jobs
@@ -23744,7 +23789,7 @@ class PostgresDB:
                                secs => $3::int
                            ),
                            context = jsonb_set(
-                               COALESCE(context, '{{}}'::jsonb),
+                               {claim_context},
                                '{{{WORKSPACE_DISPATCH_AUTHORITY_CONTEXT_KEY}}}',
                                {dispatch_authority_sql},
                                true
@@ -23802,6 +23847,7 @@ class PostgresDB:
                        )
                        {status_guard}
                        {control_guard}
+                       {hold_guard}
                     RETURNING id
                     """
             if not completion_commands_enabled:
@@ -23810,6 +23856,7 @@ class PostgresDB:
                     job_uuid,
                     agent_uuid,
                     JOB_LEASE_PICKUP_SECONDS,
+                    *hold_args,
                 )
             else:
                 async with conn.transaction():
@@ -23832,6 +23879,7 @@ class PostgresDB:
                         job_uuid,
                         agent_uuid,
                         JOB_LEASE_PICKUP_SECONDS,
+                        *hold_args,
                     )
             return row is not None
 
@@ -29369,6 +29417,7 @@ class PostgresDB:
         completion_owner_command_id: str | None = None,
         completion_owner: str | None = None,
         completion_control_claim_id: str | None = None,
+        lift_operator_pause_hold: str | None = None,
     ):
         """The Class-A resume write, reusable inside a caller transaction.
 
@@ -29380,6 +29429,12 @@ class PostgresDB:
         resolve a specific route pass its id, and the CAS then requires the
         job to still be frozen on THAT route — the check the docstrings used
         to claim and the SQL did not make.
+
+        An operator pause hold is preserved by default: internal resumes
+        (queued feedback, urgent replies, completion bounces) re-queue the job
+        behind it. Only an explicit resume passes ``lift_operator_pause_hold``
+        (the token of the row it authorized); the CAS then also requires that
+        exact hold, so a stale resume cannot lift a newer pause.
         """
         # Fixed literals chosen by trusted booleans — never caller SQL.
         drop_decision = " - 'completion_decision'" if void_completion_decision else ""
@@ -29453,10 +29508,18 @@ class PostgresDB:
             f" AND COALESCE(context->'{_LEASE_RECOVERY_CONTEXT_KEY}'->>'state', '')"
             " <> 'tripped'"
         )
+        context_base = "COALESCE(context, '{}'::jsonb)"
+        hold_guard = ""
+        if lift_operator_pause_hold is not None:
+            args += (str(lift_operator_pause_hold),)
+            context_base = operator_pause_hold_lift_sql("context")
+            hold_guard = " AND " + operator_pause_hold_matches_sql(
+                "context", f"${len(args)}"
+            )
         return await conn.fetchrow(
             f"""
             UPDATE jobs
-               SET context = (COALESCE(context, '{{}}'::jsonb){drop_decision}{control_drop})
+               SET context = ({context_base}{drop_decision}{control_drop})
                              || $2::jsonb
                              || CASE
                                     WHEN freeze_data IS NULL THEN '{{}}'::jsonb
@@ -29469,7 +29532,7 @@ class PostgresDB:
                    freeze_data = NULL,
                    {idle_exit}
                    updated_at = CURRENT_TIMESTAMP
-             WHERE id = $1{lane_guard}{lifecycle_guard}{status_guard}{route_guard}{completion_guard}{control_guard}{trip_guard}
+             WHERE id = $1{lane_guard}{lifecycle_guard}{status_guard}{route_guard}{completion_guard}{control_guard}{trip_guard}{hold_guard}
                AND NOT EXISTS (SELECT 1 FROM srw_execution_specs execution
                    WHERE execution.work_kind='Job' AND execution.work_id=jobs.id
                      AND execution.harness_adapter <> 'srw/v1')
@@ -29580,6 +29643,7 @@ class PostgresDB:
         completion_owner_command_id: str | None = None,
         completion_owner: str | None = None,
         completion_control_claim_id: str | None = None,
+        lift_operator_pause_hold: str | None = None,
     ) -> bool:
         """Park a job as 'paused' (dispatchable) in ONE statement.
 
@@ -29611,6 +29675,11 @@ class PostgresDB:
         which wedged every reply to a blocking agent message.
         See knowledge-base/knowledge/issues/blocking_message_reply_keeps_freeze_data.md.
 
+        An operator pause hold survives this write unless the caller is an
+        explicit resume passing ``lift_operator_pause_hold`` (see
+        :meth:`_queue_job_for_resume_on_conn`); a held job stays out of
+        dispatch with its queued feedback until then.
+
         Returns True iff a row was updated.
         """
         try:
@@ -29638,6 +29707,7 @@ class PostgresDB:
                         completion_owner_command_id=completion_owner_command_id,
                         completion_owner=completion_owner,
                         completion_control_claim_id=completion_control_claim_id,
+                        lift_operator_pause_hold=lift_operator_pause_hold,
                     )
             else:
                 row = await self._queue_job_for_resume_on_conn(
@@ -29648,6 +29718,7 @@ class PostgresDB:
                     expected_status=expected_status,
                     expected_route_id=expected_route_id,
                     completion_control_claim_id=completion_control_claim_id,
+                    lift_operator_pause_hold=lift_operator_pause_hold,
                 )
             return row is not None
 
@@ -29934,6 +30005,7 @@ class PostgresDB:
         *,
         expected_status: str,
         completion_control_claim_id: str,
+        lift_operator_pause_hold: str | None = None,
     ) -> bool:
         """Atomically shed stale workspace state and consume a control claim.
 
@@ -30000,6 +30072,7 @@ class PostgresDB:
                         expected_status=expected_status,
                         completion_commands_enabled=True,
                         completion_control_claim_id=claim_id,
+                        lift_operator_pause_hold=lift_operator_pause_hold,
                     )
                     if queued is None:
                         raise _ResumeCASLostError
@@ -30288,6 +30361,9 @@ class PostgresDB:
                   AND COALESCE(
                       j.context->'{_LEASE_RECOVERY_CONTEXT_KEY}'->>'state', ''
                   ) <> 'tripped'
+                  -- An operator pause parks the same shape as a preemption;
+                  -- only an explicit resume lifts its durable hold.
+                  AND NOT {operator_pause_hold_present_sql("j.context")}
                   {completion_exclusion}
                   {control_guard}
                   -- Mode A: skip jobs whose cloud-folder baseline is still

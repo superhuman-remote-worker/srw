@@ -1341,6 +1341,8 @@ class VMInstanceManager:
             # Mirror get_dispatchable_jobs: created/paused + unassigned +
             # freeze-free == the dispatcher owns this VM's bring-up. Carried to
             # is_reapable so the reaper hands off a resuming VM (see there).
+            # Deliberately NOT mirrored: the operator pause hold. A held job
+            # is waiting for its explicit resume, which must land on this VM.
             dispatchable = (
                 r.get("status") in ("created", "paused")
                 and bool(r.get("unassigned"))

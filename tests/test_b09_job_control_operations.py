@@ -130,6 +130,63 @@ async def test_pause_retains_claim_without_positive_recipient_quiescence():
 
 
 @pytest.mark.asyncio
+async def test_public_pause_holds_the_job_but_cascaded_children_stay_dispatchable():
+    child = {
+        "id": "child-1",
+        "status": "processing",
+        "execution_lane": "pinned",
+        "assigned_agent_id": "agent-child",
+    }
+    store = SimpleNamespace(get_descendant_jobs=AsyncMock(return_value=[child]))
+    operations = _controls(store)
+
+    await operations.pause(
+        "job-1",
+        job={
+            "id": "job-1",
+            "execution_lane": "pinned",
+            "status": "processing",
+            "assigned_agent_id": "agent-old",
+        },
+        paused_by="user-a",
+    )
+
+    claims = operations.dependencies.completion_control.claim_pause.await_args_list
+    assert claims[0].args == ("job-1",)
+    assert claims[0].kwargs == {
+        "source": "public_pause",
+        "expected_agent_id": "agent-old",
+        "operator_hold": True,
+        "paused_by": "user-a",
+    }
+    # Children wait behind the paused parent's ancestor guard and must run
+    # again when the parent is resumed, so they never get their own hold.
+    assert claims[1].kwargs == {
+        "source": "cascade_pause",
+        "expected_agent_id": "agent-child",
+    }
+
+
+@pytest.mark.asyncio
+async def test_legacy_public_pause_writes_the_hold_with_the_status_flip():
+    store = SimpleNamespace(
+        get_descendant_jobs=AsyncMock(return_value=[]),
+        pause_job=AsyncMock(return_value=True),
+    )
+    operations = _controls(store, completion_commands_enabled=lambda: False)
+
+    result = await operations.pause(
+        "job-1",
+        job={"id": "job-1", "execution_lane": "pinned", "status": "processing"},
+    )
+
+    assert result == {"status": "paused", "job_id": "job-1"}
+    store.pause_job.assert_awaited_once_with(
+        "job-1", operator_hold=True, paused_by=None
+    )
+
+
+@pytest.mark.asyncio
 async def test_delete_refuses_non_owner_before_any_retirement_effect():
     store = SimpleNamespace(get_user_role_in_project=AsyncMock(return_value="viewer"))
     cleanup = AsyncMock()

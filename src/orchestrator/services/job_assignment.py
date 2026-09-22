@@ -11,6 +11,7 @@ from fastapi import HTTPException
 from orchestrator.services.dispatch_guards import resume_lane_applies
 from orchestrator.services.job_workspace_runtime import WORKSPACE_CONTEXT_KEYS
 from orchestrator.services.manifest_runtime_ownership import require_srw_runtime
+from orchestrator.services.operator_pause_hold import operator_pause_lift_token
 from shared.workspace_contract import resolve_workspace_runtime
 
 
@@ -90,6 +91,9 @@ class JobAssignmentOperations:
                 )
 
             await dependencies.guard_completion_control(job_id, source="manual_assign")
+            # An admin assignment is an explicit resume: it may lift the
+            # operator pause hold it observed here, and only that one.
+            operator_pause_lift = operator_pause_lift_token(job)
             (
                 workspace_action,
                 job,
@@ -140,6 +144,7 @@ class JobAssignmentOperations:
                             WORKSPACE_CONTEXT_KEYS[missing_workspace],
                             expected_status=str(job["status"]),
                             completion_control_claim_id=str(control_claim.claim_id),
+                            lift_operator_pause_hold=operator_pause_lift,
                         )
                     except Exception:
                         await dependencies.abort_completion_control_claim(control_claim)
@@ -162,6 +167,7 @@ class JobAssignmentOperations:
                 ):
                     queued = await store.queue_job_for_resume(
                         job_id,
+                        lift_operator_pause_hold=operator_pause_lift,
                         **dependencies.completion_resume_guard_kwargs(),
                     )
                     if not queued:
@@ -205,6 +211,7 @@ class JobAssignmentOperations:
                 agent_id,
                 completion_commands_enabled=dependencies.completion_commands_enabled(),
                 allow_failed=True,
+                lift_operator_pause_hold=operator_pause_lift,
             ):
                 raise HTTPException(
                     status_code=409, detail="Job changed while it was being assigned"

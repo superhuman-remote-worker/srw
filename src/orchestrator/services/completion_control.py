@@ -16,6 +16,11 @@ import math
 from typing import Any
 from uuid import UUID, uuid4
 
+from orchestrator.services.operator_pause_hold import (
+    OPERATOR_PAUSE_HOLD_CONTEXT_KEY,
+    operator_pause_hold_jsonb_sql,
+)
+
 
 COMPLETION_FINALIZING_DETAIL = "completion finalizing"
 COMPLETION_CONTROL_CLAIM_KEY = "_completion_control_claim"
@@ -424,6 +429,8 @@ class CompletionControl:
         *,
         source: str,
         expected_agent_id: str | None,
+        operator_hold: bool = False,
+        paused_by: str | None = None,
     ) -> CompletionControlClaim:
         """Publish a pinned pause and retain an external-I/O exclusion marker.
 
@@ -431,6 +438,10 @@ class CompletionControl:
         command: whichever jobs-row status write wins is authoritative. The
         marker only spans the subsequent old-agent/VM pause calls, preventing
         a dispatcher or another control from exposing a successor to stale I/O.
+
+        ``operator_hold`` also stamps the durable operator pause hold in the
+        same write (see :mod:`orchestrator.services.operator_pause_hold`); it
+        outlives this claim so the released row is not redispatched.
         """
 
         canonical = UUID(str(job_id))
@@ -440,6 +451,37 @@ class CompletionControl:
         expected_agent = (
             UUID(str(expected_agent_id)) if expected_agent_id is not None else None
         )
+        claim_context = f"""jsonb_set(
+                            COALESCE(context, '{{}}'::jsonb),
+                            '{{{COMPLETION_CONTROL_CLAIM_KEY}}}',
+                            jsonb_build_object(
+                                'version', $2::int,
+                                'claim_id', $3::text,
+                                'source', $4::text,
+                                'expected_status', 'paused',
+                                'expected_lane', 'pinned',
+                                'fence_kind', 'assigned_agent',
+                                'fence_value', $5::text,
+                                'claimed_at', to_jsonb(now()),
+                                'expires_epoch', to_jsonb(
+                                    extract(epoch FROM now()) + $6::float8
+                                )
+                            ),
+                            true
+                        )"""
+        hold_args: tuple[Any, ...] = ()
+        if operator_hold:
+            claim_context = (
+                f"jsonb_set({claim_context}, "
+                f"'{{{OPERATOR_PAUSE_HOLD_CONTEXT_KEY}}}', "
+                + operator_pause_hold_jsonb_sql(
+                    hold_id_parameter="$8",
+                    source_parameter="$4",
+                    paused_by_parameter="$9",
+                )
+                + ", true)"
+            )
+            hold_args = (str(uuid4()), paused_by)
 
         async with self.db.acquire() as conn:
             async with conn.transaction():
@@ -488,24 +530,7 @@ class CompletionControl:
                     f"""
                     UPDATE jobs
                     SET status='paused', assigned_agent_id=NULL,
-                        context=jsonb_set(
-                            COALESCE(context, '{{}}'::jsonb),
-                            '{{{COMPLETION_CONTROL_CLAIM_KEY}}}',
-                            jsonb_build_object(
-                                'version', $2::int,
-                                'claim_id', $3::text,
-                                'source', $4::text,
-                                'expected_status', 'paused',
-                                'expected_lane', 'pinned',
-                                'fence_kind', 'assigned_agent',
-                                'fence_value', $5::text,
-                                'claimed_at', to_jsonb(now()),
-                                'expires_epoch', to_jsonb(
-                                    extract(epoch FROM now()) + $6::float8
-                                )
-                            ),
-                            true
-                        ),
+                        context={claim_context},
                         updated_at=CURRENT_TIMESTAMP
                     WHERE id=$1::uuid
                       AND status='processing'
@@ -520,6 +545,7 @@ class CompletionControl:
                     fence_value,
                     float(COMPLETION_CONTROL_CLAIM_SECONDS),
                     expected_agent,
+                    *hold_args,
                 )
                 if updated is None:
                     raise CompletionControlClaimConflict(

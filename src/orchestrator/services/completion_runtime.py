@@ -242,6 +242,8 @@ class CompletionControlBoundary:
         *,
         source: str,
         expected_agent_id: str | None,
+        operator_hold: bool = False,
+        paused_by: str | None = None,
     ) -> Any:
         if not self._enabled:
             return None
@@ -254,6 +256,8 @@ class CompletionControlBoundary:
                 job_id,
                 source=source,
                 expected_agent_id=expected_agent_id,
+                operator_hold=operator_hold,
+                paused_by=paused_by,
             )
         except CompletionControlClaimConflict as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc

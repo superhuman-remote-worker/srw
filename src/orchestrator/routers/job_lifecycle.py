@@ -215,13 +215,19 @@ async def pause_job(
     to the agent pod. The agent finishes its current graph node, saves
     the checkpoint, and becomes available for new work.
 
-    The paused job re-enters the dispatch queue and will be auto-resumed
-    when an agent becomes available.
+    A paused pinned job stays paused: it carries a durable operator pause
+    hold that the dispatcher will not cross, so it runs again only after an
+    explicit ``POST /api/jobs/{job_id}/resume`` (or an admin assignment).
+    Stateless jobs keep the historical re-admission behavior.
     """
-    _, job = await dependencies.require_internal_or_job_access(
+    user, job = await dependencies.require_internal_or_job_access(
         request, dependencies.store, job_id
     )
-    return await dependencies.operations.pause(job_id, job=job)
+    return await dependencies.operations.pause(
+        job_id,
+        job=job,
+        paused_by=str(user["id"]) if user and user.get("id") else None,
+    )
 
 
 @router.put("/api/jobs/{job_id}/agent-release")

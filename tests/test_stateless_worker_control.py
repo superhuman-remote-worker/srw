@@ -1303,6 +1303,7 @@ async def test_resume_retries_pinned_verb_after_vm_lane_repair(monkeypatch):
         JOB_ID,
         None,
         expected_status="paused",
+        lift_operator_pause_hold="",
     )
 
 

@@ -311,6 +311,65 @@ async def test_command_mode_resume_queues_stateless_before_agent_delivery(
     operations.dependencies.trigger_dispatch.assert_called_once_with()
 
 
+def _operator_paused_job() -> dict:
+    return {
+        "id": JOB_ID,
+        "status": "paused",
+        "execution_lane": "pinned",
+        "assigned_agent_id": None,
+        "context": {"_operator_pause_hold": {"version": 1, "hold_id": "hold-1"}},
+    }
+
+
+@pytest.mark.asyncio
+async def test_command_mode_resume_lifts_only_the_observed_operator_pause_hold(
+    tmp_path: Path,
+) -> None:
+    store = MagicMock()
+    store.queue_job_for_resume = AsyncMock(return_value=True)
+    operations = _operations(tmp_path, store=store, completion_commands_enabled=True)
+
+    result = await operations.resume_job_internal(
+        JOB_ID, user={"id": "user-a"}, job=_operator_paused_job()
+    )
+
+    assert result["status"] == "queued"
+    store.queue_job_for_resume.assert_awaited_once_with(
+        JOB_ID, None, expected_status="paused", lift_operator_pause_hold="hold-1"
+    )
+
+
+@pytest.mark.asyncio
+async def test_direct_resume_lifts_the_hold_in_its_claim_then_requeues_unheld(
+    tmp_path: Path,
+) -> None:
+    store = MagicMock()
+    store.get_agent = AsyncMock(
+        return_value={"id": "agent-a", "status": "ready", "pod_ip": "10.0.0.1"}
+    )
+    store.claim_job_for_agent = AsyncMock(return_value=True)
+    store.queue_job_for_resume = AsyncMock(return_value=True)
+    operations = _operations(tmp_path, store=store)
+    operations.dependencies.resume_job_on_agent.return_value = False
+
+    result = await operations.resume_job_internal(
+        JOB_ID,
+        user={"id": "user-a"},
+        job=_operator_paused_job(),
+        request=main.JobResumeRequest(agent_id="agent-a"),
+    )
+
+    assert result["status"] == "queued"
+    store.claim_job_for_agent.assert_awaited_once_with(
+        JOB_ID, "agent-a", allow_failed=True, lift_operator_pause_hold="hold-1"
+    )
+    # The claim consumed the hold; the fallback re-queue must find none, so
+    # a pause that lands in between still wins that CAS.
+    store.queue_job_for_resume.assert_awaited_once_with(
+        JOB_ID, None, expected_status="processing", lift_operator_pause_hold=""
+    )
+
+
 @pytest.mark.asyncio
 async def test_generic_resume_routes_unresolved_workspace_recovery_without_unparking(
     tmp_path: Path,

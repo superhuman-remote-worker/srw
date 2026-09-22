@@ -29,6 +29,8 @@ class CompletionControlPort(Protocol):
         *,
         source: str,
         expected_agent_id: str | None,
+        operator_hold: bool = False,
+        paused_by: str | None = None,
     ) -> Any: ...
 
     async def abort(self, claim: Any) -> None: ...
@@ -641,8 +643,18 @@ class JobControlOperations:
         d.trigger_dispatch()
         await d.resolve_job_notifications(job_id, user=None, hook="cancel")
 
-    async def pause(self, job_id: str, *, job: dict[str, Any]) -> dict[str, str]:
-        """Pause already-authorized work, retaining ambiguous control holds."""
+    async def pause(
+        self,
+        job_id: str,
+        *,
+        job: dict[str, Any],
+        paused_by: str | None = None,
+    ) -> dict[str, str]:
+        """Pause already-authorized work, retaining ambiguous control holds.
+
+        A pinned pause also writes the durable operator pause hold, so the
+        parked row stays out of dispatch until an explicit resume lifts it.
+        """
         d = self.dependencies
         require_srw_runtime(job)
         try:
@@ -679,6 +691,8 @@ class JobControlOperations:
                         if job.get("assigned_agent_id")
                         else None
                     ),
+                    operator_hold=True,
+                    paused_by=paused_by,
                 )
                 if self.commands_enabled
                 else None
@@ -693,11 +707,19 @@ class JobControlOperations:
                         d.logger.warning(
                             "Pause timed out for job %s; retaining control hold", job_id
                         )
-                if claim is None and not await d.store.pause_job(job_id):
+                if claim is None and not await d.store.pause_job(
+                    job_id, operator_hold=True, paused_by=paused_by
+                ):
                     raise HTTPException(
                         status_code=400,
                         detail="Job cannot be paused (status may have changed)",
                     )
+                d.logger.info(
+                    "Operator pause hold set for job %s (paused_by=%s); held until "
+                    "an explicit resume",
+                    job_id,
+                    paused_by or "internal",
+                )
             finally:
                 if claim is not None and quiescent:
                     await d.completion_control.abort(claim)

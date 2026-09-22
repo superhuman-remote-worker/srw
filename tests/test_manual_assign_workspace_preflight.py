@@ -122,6 +122,7 @@ async def test_flag_on_missing_workspace_uses_claimed_atomic_preflight(
         "workspace_container",
         expected_status="failed",
         completion_control_claim_id=claim.claim_id,
+        lift_operator_pause_hold="",
     )
     main.postgres_db.shed_workspace_context.assert_not_awaited()
     main.postgres_db.queue_job_for_resume.assert_not_awaited()
@@ -154,6 +155,7 @@ async def test_flag_on_live_workspace_claims_before_agent_post(
         AGENT_ID,
         completion_commands_enabled=True,
         allow_failed=True,
+        lift_operator_pause_hold="",
     )
 
 
@@ -227,7 +229,9 @@ class TestManualAssignWorkspacePreflight:
         result = await control_seams.assign_job_to_agent(MagicMock(), JOB_ID, AGENT_ID)
 
         assert result["status"] == "queued"
-        main.postgres_db.queue_job_for_resume.assert_awaited_once_with(JOB_ID)
+        main.postgres_db.queue_job_for_resume.assert_awaited_once_with(
+            JOB_ID, lift_operator_pause_hold=""
+        )
         main.postgres_db.get_agent.assert_not_awaited()
         main._trigger_dispatch.assert_called_once_with()
 
@@ -253,6 +257,7 @@ class TestManualAssignWorkspacePreflight:
             AGENT_ID,
             completion_commands_enabled=False,
             allow_failed=True,
+            lift_operator_pause_hold="",
         )
         collaborators.dispatch.assert_awaited_once()
         main._trigger_dispatch.assert_not_called()

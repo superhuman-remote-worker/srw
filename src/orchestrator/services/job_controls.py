@@ -30,6 +30,7 @@ from orchestrator.services.manifest_runtime_ownership import (
     require_srw_runtime,
     uses_srw_runtime,
 )
+from orchestrator.services.operator_pause_hold import operator_pause_lift_token
 from orchestrator.services.vm_workspace_recovery_store import (
     acquire_vm_cleanup_permit,
     vm_cleanup_kwargs,
@@ -716,6 +717,12 @@ class JobControlOperations:
         can call it directly. ``req`` is only needed on the internal-actor branch
         (no ``user``), which a notification action never takes."""
         require_srw_runtime(job)
+        # An explicit resume is the authority that lifts an operator pause
+        # hold, but only the hold on the row this request was authorized
+        # against: every pinned re-queue/claim below CASes on it, so a pause
+        # that lands after this read makes the resume lose instead of being
+        # crossed.
+        operator_pause_lift = operator_pause_lift_token(job)
         recovery = await self.dependencies.recovery_store.unresolved_participation(
             UUID(job_id)
         )
@@ -1101,6 +1108,7 @@ class JobControlOperations:
                             context_merge,
                             expected_status=expected_status,
                             completion_control_claim_id=str(control_claim.claim_id),
+                            lift_operator_pause_hold=operator_pause_lift,
                         )
                     except Exception:
                         await self.dependencies.completion_control.abort(control_claim)
@@ -1112,6 +1120,7 @@ class JobControlOperations:
                         job_id,
                         context_merge,
                         expected_status=expected_status,
+                        lift_operator_pause_hold=operator_pause_lift,
                         **self.dependencies.completion_control.resume_guard_kwargs(),
                     )
                 if not queued and job.get("execution_lane") == "stateless":
@@ -1149,6 +1158,7 @@ class JobControlOperations:
                                     completion_control_claim_id=str(
                                         fallback_claim.claim_id
                                     ),
+                                    lift_operator_pause_hold=operator_pause_lift,
                                 )
                             except Exception:
                                 await self.dependencies.completion_control.abort(
@@ -1172,6 +1182,7 @@ class JobControlOperations:
                                 job_id,
                                 context_merge,
                                 expected_status=expected_status,
+                                lift_operator_pause_hold=operator_pause_lift,
                                 **self.dependencies.completion_control.resume_guard_kwargs(),
                             )
                         if queued:
@@ -1383,10 +1394,13 @@ class JobControlOperations:
                 job_id,
                 str(agent_id),
                 allow_failed=True,
+                lift_operator_pause_hold=operator_pause_lift,
             ):
                 return await _queue_for_dispatch(
                     "Job queued for authoritative resume dispatch"
                 )
+            # The claim consumed the hold; a re-queue below must now find none.
+            operator_pause_lift = ""
 
             # Delegate payload build + delivery to the dispatcher's resume path so
             # a user-triggered resume ships exactly what an auto re-dispatch ships:
@@ -2509,6 +2523,14 @@ class JobControlOperations:
             job_id,
             job.get("execution_lane", "pinned"),
         )
+        if operator_pause_lift_token(job):
+            # The write merged around the hold: the feedback waits for the
+            # operator's explicit resume instead of redispatching the job.
+            self.dependencies.logger.info(
+                "Job %s is held by an operator pause; queued feedback waits for "
+                "an explicit resume",
+                job_id,
+            )
         self.dependencies.trigger_dispatch()
         return True
 
