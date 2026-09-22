@@ -693,8 +693,10 @@ def load_tools(tool_names: List[str], context: ToolContext) -> List[Any]:
             logger.warning("Shell tools require workspace_manager in ToolContext")
         else:
             try:
-                shell_tools = create_shell_tools(context)
                 requested = set(tools_by_category["shell"])
+                # The resolved names already chose the shell mode; the factory
+                # must not re-derive it from a second config read.
+                shell_tools = create_shell_tools(context, requested)
                 for tool in shell_tools:
                     if tool.name in requested:
                         all_tools.append(tool)
