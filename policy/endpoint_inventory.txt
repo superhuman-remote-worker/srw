@@ -7,6 +7,10 @@
 # Other mounted paths are reported separately; unsupported composition fails.
 # Gate labels are static source evidence, not authorization/control-flow proof.
 #
+# pat=<decision> — personal access token scope the route needs, from
+#   orchestrator/security/token_scopes.py: a scope, `any` (any scoped token),
+#   `refused`, or `unmapped` (refused until classified; a test fails).
+#
 # Classifications:
 #   gated:<gate>           — protected by a require_* / user_can_access_* helper
 #   admin:<gate>           — admin-only; the fleet-scoped variant also
@@ -15,534 +19,534 @@
 #   public:<reason>        — opt-out via `# nosec: public <reason>` on line above decorator
 #   unscoped               — no gate detected; CI snapshot test will fail
 
-GET    /api/actions/pending                                                             gated:require_approved_user
-GET    /api/admin/capacity                                                              admin:_require_admin
-POST   /api/admin/completion-commands/{command_id}/force-resolve                        admin:_require_admin
-POST   /api/admin/completion-commands/{command_id}/unpark                               admin:_require_admin
-GET    /api/admin/config/bundled/{family}/{kind}/{name}                                 admin:_require_admin
-GET    /api/admin/config/catalog                                                        admin:_require_admin
-GET    /api/admin/config/overrides                                                      admin:_require_admin
-POST   /api/admin/config/overrides                                                      admin:_require_admin
-DELETE /api/admin/config/overrides/{override_id}                                        admin:_require_admin
-GET    /api/admin/config/overrides/{override_id}                                        admin:_require_admin
-PUT    /api/admin/config/overrides/{override_id}                                        admin:_require_admin
-GET    /api/admin/expert-defaults                                                       admin:_require_admin
-PUT    /api/admin/expert-defaults/{expert_type}                                         admin:_require_admin
-GET    /api/admin/families                                                              admin:_require_admin
-GET    /api/admin/families/detect                                                       admin:_require_admin
-GET    /api/admin/grants                                                                admin:_require_admin
-DELETE /api/admin/grants/{scope_kind}/{scope_id}/{key}                                  admin:_require_admin
-PUT    /api/admin/grants/{scope_kind}/{scope_id}/{key}                                  admin:_require_admin
-GET    /api/admin/helm-managed                                                          admin:_require_admin
-GET    /api/admin/projects/{project_id}/officer/runtime-verification                    admin:_require_admin
-POST   /api/admin/projects/{project_id}/officer/runtime-verification                    admin:_require_admin
-POST   /api/admin/projects/{project_id}/officer/runtime-verification/{plan_id}/{action} admin:_require_admin
-GET    /api/admin/providers/codex/availability                                          admin:_require_admin
-GET    /api/admin/providers/defaults                                                    admin:_require_admin
-PUT    /api/admin/providers/defaults/{kind}                                             admin:_require_admin
-GET    /api/admin/providers/endpoints                                                   admin:_require_admin
-POST   /api/admin/providers/endpoints                                                   admin:_require_admin
-DELETE /api/admin/providers/endpoints/{endpoint_id}                                     admin:_require_admin
-PATCH  /api/admin/providers/endpoints/{endpoint_id}                                     admin:_require_admin
-POST   /api/admin/providers/endpoints/{endpoint_id}/discover                            admin:_require_admin
-POST   /api/admin/providers/endpoints/{endpoint_id}/models/import                       admin:_require_admin
-POST   /api/admin/providers/endpoints/{endpoint_id}/test                                admin:_require_admin
-GET    /api/admin/providers/keys                                                        admin:_require_admin
-DELETE /api/admin/providers/keys/{provider}                                             admin:_require_admin
-PUT    /api/admin/providers/keys/{provider}                                             admin:_require_admin
-GET    /api/admin/providers/keys/{provider}/discovery                                   admin:_require_admin
-POST   /api/admin/providers/keys/{provider}/rediscover                                  admin:_require_admin
-GET    /api/admin/providers/models                                                      admin:_require_admin
-POST   /api/admin/providers/models                                                      admin:_require_admin
-DELETE /api/admin/providers/models/{catalog_id}                                         admin:_require_admin
-PATCH  /api/admin/providers/models/{catalog_id}                                         admin:_require_admin
-POST   /api/admin/providers/models/{catalog_id}/test                                    admin:_require_admin
-GET    /api/admin/providers/subscriptions/availability                                  admin:_require_admin
-GET    /api/admin/run-queue                                                             admin:_require_admin
-POST   /api/admin/run-queue/{unit_id}/unpark                                            admin:_require_admin
-GET    /api/admin/security-events                                                       admin:_require_admin
-DELETE /api/admin/system-settings/main_cloud                                            admin:_require_admin
-GET    /api/admin/system-settings/main_cloud                                            admin:_require_admin
-PUT    /api/admin/system-settings/main_cloud                                            admin:_require_admin
-POST   /api/admin/system-settings/main_cloud/backfill-instance-authority                admin:_require_admin
-POST   /api/admin/system-settings/main_cloud/reload                                     admin:_require_admin
-POST   /api/admin/system-settings/main_cloud/repair-thread-mounts                       admin:_require_admin
-POST   /api/admin/system-settings/main_cloud/test                                       admin:_require_admin
-GET    /api/admin/system-settings/tts_library                                           admin:_require_admin
-PUT    /api/admin/system-settings/tts_library                                           admin:_require_admin
-GET    /api/admin/system-settings/user_experts                                          admin:_require_admin
-PUT    /api/admin/system-settings/user_experts                                          admin:_require_admin
-GET    /api/admin/system-settings/vm_workspaces                                         admin:_require_admin
-PUT    /api/admin/system-settings/vm_workspaces                                         admin:_require_admin
-GET    /api/admin/usage/v2/compute-activation                                           admin:_require_infrastructure_fleet_admin
-POST   /api/admin/usage/v2/compute-activation/{activation_key}/rollover                 admin:_require_infrastructure_fleet_admin
-POST   /api/admin/usage/v2/compute-activation/{activation_key}/schedule                 admin:_require_infrastructure_fleet_admin
-POST   /api/admin/usage/v2/compute-activation/{activation_key}/shadow                   admin:_require_infrastructure_fleet_admin
-POST   /api/admin/usage/v2/coverage-gaps/{gap_id}/waive                                 admin:_require_infrastructure_fleet_admin
-POST   /api/admin/usage/v2/infrastructure-corrections                                   admin:_require_infrastructure_fleet_admin
-GET    /api/admin/usage/v2/infrastructure-cutover                                       admin:_require_infrastructure_fleet_admin
-POST   /api/admin/usage/v2/infrastructure-cutover/prepare                               admin:_require_infrastructure_fleet_admin
-GET    /api/admin/usage/v2/storage-activation                                           admin:_require_infrastructure_fleet_admin
-POST   /api/admin/usage/v2/storage-activation/{measurement_basis}/schedule              admin:_require_infrastructure_fleet_admin
-POST   /api/admin/usage/v2/storage-activation/{measurement_basis}/shadow                admin:_require_infrastructure_fleet_admin
-GET    /api/admin/usage/v2/storage-assets/backend-unverified                            admin:_require_infrastructure_fleet_admin
-GET    /api/admin/usage/v2/storage-assets/{asset_id}                                    admin:_require_infrastructure_fleet_admin
-POST   /api/admin/usage/v2/storage-assets/{asset_id}/destroy                            admin:_require_infrastructure_fleet_admin
-POST   /api/admin/usage/v2/storage-source-activation/{source}/{measurement_basis}/schedule admin:_require_infrastructure_fleet_admin
-POST   /api/admin/usage/v2/storage-source-activation/{source}/{measurement_basis}/shadow admin:_require_infrastructure_fleet_admin
-GET    /api/admin/users                                                                 admin:_require_admin
-POST   /api/admin/users/approve                                                         admin:_require_admin
-PATCH  /api/admin/users/{user_id}                                                       admin:_require_admin
-GET    /api/agents                                                                      admin:_require_admin
-POST   /api/agents/jobs/{job_id}/subagents                                              internal:require_internal
-POST   /api/agents/jobs/{job_id}/subagents/live                                         internal:require_internal
-POST   /api/agents/jobs/{job_id}/subagents/{thread_id}                                  internal:require_internal
-POST   /api/agents/jobs/{job_id}/subagents/{thread_id}/reopen                           internal:require_internal
-POST   /api/agents/jobs/{job_id}/subagents/{thread_id}/terminal                         internal:require_internal
-POST   /api/agents/register                                                             internal:require_internal
-POST   /api/agents/threads                                                              internal:require_internal
-POST   /api/agents/threads/{parent_thread_id}/subagents                                 internal:require_internal
-POST   /api/agents/threads/{parent_thread_id}/subagents/by-call                         internal:require_internal
-POST   /api/agents/threads/{parent_thread_id}/subagents/live                            internal:require_internal
-POST   /api/agents/threads/{parent_thread_id}/subagents/{thread_id}                     internal:require_internal
-POST   /api/agents/threads/{parent_thread_id}/subagents/{thread_id}/reopen              internal:require_internal
-POST   /api/agents/threads/{parent_thread_id}/subagents/{thread_id}/terminal            internal:require_internal
-POST   /api/agents/threads/{thread_id}/abort-vm-upgrade                                 internal:require_internal
-GET    /api/agents/threads/{thread_id}/cloud-diff                                       gated:require_thread_owner
-POST   /api/agents/threads/{thread_id}/cloud-diff/apply                                 gated:require_thread_owner
-POST   /api/agents/threads/{thread_id}/cloud-diff/reject                                gated:require_thread_owner
-POST   /api/agents/threads/{thread_id}/cloud-diff/restage                               gated:require_thread_owner
-GET    /api/agents/threads/{thread_id}/cloud-diff/{file_path:path}                      gated:require_thread_owner
-POST   /api/agents/threads/{thread_id}/cloud-stage                                      internal:require_internal
-PATCH  /api/agents/threads/{thread_id}/config                                           internal:require_internal
-GET    /api/agents/threads/{thread_id}/lifecycle                                        internal:require_internal
-POST   /api/agents/threads/{thread_id}/messages                                         internal:require_internal
-POST   /api/agents/threads/{thread_id}/officer/notify                                   internal:require_internal
-POST   /api/agents/threads/{thread_id}/officer/wake                                     internal:require_internal
-POST   /api/agents/threads/{thread_id}/release-agent                                    internal:require_internal
-GET    /api/agents/threads/{thread_id}/retirement-outcome                               internal:require_internal
-POST   /api/agents/threads/{thread_id}/rewind                                           gated:require_thread_owner
-PUT    /api/agents/threads/{thread_id}/status                                           internal:require_internal
-POST   /api/agents/threads/{thread_id}/suspend                                          internal:require_internal
-POST   /api/agents/threads/{thread_id}/upgrade-to-vm                                    internal:require_internal
-POST   /api/agents/threads/{thread_id}/upgrade-to-workspace                             internal:require_internal
-GET    /api/agents/threads/{thread_id}/workspace                                        internal:require_internal
-DELETE /api/agents/{agent_id}                                                           internal:is_internal_call
-GET    /api/agents/{agent_id}                                                           admin:_require_admin
-POST   /api/agents/{agent_id}/heartbeat                                                 internal:require_internal
-POST   /api/agents/{agent_id}/runtime-actor/session                                     internal:require_internal
-GET    /api/agents/{agent_id}/system-info                                               admin:_require_admin
-GET    /api/api-keys                                                                    gated:require_approved_user
-POST   /api/api-keys                                                                    gated:require_approved_user
-DELETE /api/api-keys/{token_id}                                                         gated:require_approved_user
-POST   /api/api-keys/{token_id}/rotate                                                  gated:require_approved_user
-GET    /api/auth/me                                                                     public:auth-bootstrap (Bearer-required, intentionally serves pending-approval users)
-GET    /api/automations                                                                 gated:require_project_member
-POST   /api/automations                                                                 gated:require_project_member
-DELETE /api/automations/{automation_id}                                                 gated:require_project_member
-GET    /api/automations/{automation_id}                                                 gated:require_project_member
-PATCH  /api/automations/{automation_id}                                                 gated:require_project_member
-POST   /api/automations/{automation_id}/pause                                           gated:require_project_member
-POST   /api/automations/{automation_id}/resume                                          gated:require_project_member
-POST   /api/automations/{automation_id}/run-now                                         gated:require_project_member
-GET    /api/automations/{automation_id}/runs                                            gated:require_project_member
-GET    /api/bench/runs                                                                  gated:require_approved_user
-POST   /api/bench/runs                                                                  gated:require_project_member
-GET    /api/bench/runs/{run_id}                                                         gated:require_approved_user
-POST   /api/bench/runs/{run_id}/cancel                                                  gated:require_approved_user
-GET    /api/bench/runs/{run_id}/report                                                  gated:require_approved_user
-POST   /api/citations/snapshot                                                          internal:require_internal
-GET    /api/citations/{citation_id}                                                     gated:user_can_access_job_or_thread
-GET    /api/citations/{citation_id}/drift                                               gated:user_can_access_job_or_thread
-GET    /api/citations/{citation_id}/snapshot                                            gated:user_can_access_job_or_thread
-POST   /api/codex/callback                                                              admin:_require_admin
-DELETE /api/codex/credentials/{name}                                                    admin:_require_admin
-POST   /api/codex/login                                                                 admin:_require_admin
-GET    /api/codex/login/poll                                                            admin:_require_admin
-GET    /api/codex/models                                                                admin:_require_admin
-GET    /api/codex/status                                                                admin:_require_admin
-GET    /api/codex/usage                                                                 admin:_require_admin
-GET    /api/contacts                                                                    gated:require_approved_user
-POST   /api/contacts                                                                    gated:require_approved_user
-DELETE /api/contacts/addresses/{address_id}                                             gated:require_approved_user
-PATCH  /api/contacts/addresses/{address_id}                                             gated:require_approved_user
-GET    /api/contacts/internal/list                                                      internal:require_internal
-DELETE /api/contacts/{contact_id}                                                       gated:require_approved_user
-PATCH  /api/contacts/{contact_id}                                                       gated:require_approved_user
-POST   /api/contacts/{contact_id}/addresses                                             gated:require_approved_user
-DELETE /api/contacts/{contact_id}/projects/{project_id}                                 gated:require_project_member
-POST   /api/contacts/{contact_id}/projects/{project_id}                                 gated:require_project_member
-GET    /api/datasources                                                                 gated:require_approved_user
-POST   /api/datasources                                                                 gated:require_project_owner
-GET    /api/datasources/catalog                                                         gated:require_project_member
-GET    /api/datasources/eligible                                                        gated:require_project_member
-POST   /api/datasources/ssh-keys/generate                                               gated:require_approved_user
-DELETE /api/datasources/{datasource_id}                                                 gated:require_datasource_owner
-GET    /api/datasources/{datasource_id}                                                 gated:require_datasource_access
-PUT    /api/datasources/{datasource_id}                                                 gated:require_datasource_owner
-GET    /api/datasources/{datasource_id}/index-status                                    gated:require_datasource_access
-POST   /api/datasources/{datasource_id}/reindex                                         gated:require_datasource_owner
-POST   /api/datasources/{datasource_id}/test                                            gated:require_datasource_owner
-GET    /api/expert-defaults                                                             gated:require_project_member
-DELETE /api/expert-defaults/{expert_type}                                               gated:require_approved_user
-PUT    /api/expert-defaults/{expert_type}                                               gated:require_approved_user
-POST   /api/expert-defaults/{expert_type}/fork                                          gated:require_approved_user
-GET    /api/experts                                                                     gated:require_approved_user
-POST   /api/experts                                                                     gated:require_approved_user
-POST   /api/experts/import                                                              gated:require_approved_user
-POST   /api/experts/reload                                                              admin:_require_admin
-DELETE /api/experts/{expert_id}                                                         gated:require_approved_user
-GET    /api/experts/{expert_id}                                                         gated:require_approved_user
-PUT    /api/experts/{expert_id}                                                         gated:require_approved_user
-POST   /api/experts/{expert_id}/duplicate                                               gated:require_approved_user
-GET    /api/experts/{expert_id}/export                                                  gated:require_approved_user
-GET    /api/graph/changes/{job_id}                                                      gated:require_job_access
-GET    /api/health                                                                      public:k8s-liveness-probe
-DELETE /api/ide/{job_id}/proxy/{path:path}                                              gated:user_can_access_ide_entity
-GET    /api/ide/{job_id}/proxy/{path:path}                                              gated:user_can_access_ide_entity
-HEAD   /api/ide/{job_id}/proxy/{path:path}                                              gated:user_can_access_ide_entity
-OPTIONS /api/ide/{job_id}/proxy/{path:path}                                              gated:user_can_access_ide_entity
-PATCH  /api/ide/{job_id}/proxy/{path:path}                                              gated:user_can_access_ide_entity
-POST   /api/ide/{job_id}/proxy/{path:path}                                              gated:user_can_access_ide_entity
-PUT    /api/ide/{job_id}/proxy/{path:path}                                              gated:user_can_access_ide_entity
-WS     /api/ide/{job_id}/proxy/{path:path}                                              gated:user_can_access_ide_entity
-POST   /api/internal/infrastructure-metering/v1/snapshots/begin                         internal:_dispatch_infrastructure_ingestion
-POST   /api/internal/infrastructure-metering/v1/snapshots/finalize                      internal:_dispatch_infrastructure_ingestion
-POST   /api/internal/infrastructure-metering/v1/snapshots/items                         internal:_dispatch_infrastructure_ingestion
-POST   /api/internal/infrastructure-metering/v1/tickets                                 internal:_dispatch_infrastructure_ingestion
-POST   /api/internal/infrastructure-metering/v1/watch/apply                             internal:_dispatch_infrastructure_ingestion
-POST   /api/internal/infrastructure-metering/v1/watch/finish                            internal:_dispatch_infrastructure_ingestion
-POST   /api/internal/mcp-token-create                                                   internal:require_internal
-POST   /api/internal/mcp-token-verify                                                   internal:require_internal
-DELETE /api/internal/persistent/threads/{thread_id}/canvases/main                       gated:require_thread_owner
-GET    /api/internal/persistent/threads/{thread_id}/canvases/main                       gated:require_thread_owner
-POST   /api/internal/persistent/threads/{thread_id}/canvases/main/set                   gated:require_thread_owner
-POST   /api/internal/ssh-attachments                                                    gated:user_can_access_ide_entity
-POST   /api/internal/ssh-attachments/{attachment_id}/close                              gated:user_can_access_ide_entity
-POST   /api/internal/ssh-keys/used                                                      internal:require_internal
-GET    /api/internal/ssh-targets/{handle}                                               gated:user_can_access_ide_entity
-POST   /api/internal/vm-creation-retries/authorize                                      internal:require_vm_cleanup_authority
-POST   /api/internal/vm-creation-retries/authorize-disposition                          internal:require_vm_cleanup_authority
-POST   /api/internal/vm-creation-retries/begin-effect                                   internal:require_vm_cleanup_authority
-POST   /api/internal/vm-creation-retries/freeze-disposition                             internal:require_vm_cleanup_authority
-POST   /api/internal/vm-creation-retries/inspect                                        internal:require_vm_cleanup_authority
-POST   /api/internal/vm-creation-retries/observe-effect                                 internal:require_vm_cleanup_authority
-POST   /api/internal/vm-creation-retries/prepare-disposition                            internal:require_vm_cleanup_authority
-POST   /api/internal/vm-creation-retries/record-disposition                             internal:require_vm_cleanup_authority
-POST   /api/internal/vm-creation-retries/settle-adopted                                 internal:require_vm_cleanup_authority
-POST   /api/internal/vm-creation-retries/settle-never-issued                            internal:require_vm_cleanup_authority
-POST   /api/internal/vm-resource-inventory/publish                                      internal:require_vm_inventory_authority
-POST   /api/internal/vm-workspace-cleanup-authority/acquire                             internal:require_vm_cleanup_authority
-POST   /api/internal/vm-workspace-cleanup-authority/complete                            internal:require_vm_cleanup_authority
-POST   /api/internal/vm-workspace-cleanup-authority/resume                              internal:require_vm_cleanup_authority
-POST   /api/internal/vm/{entity_id}/heartbeat                                           internal:require_vm_guest
-POST   /api/internal/vm/{entity_id}/register                                            internal:require_vm_guest
-POST   /api/internal/vm/{entity_id}/sudo                                                internal:require_vm_guest
-GET    /api/internal/vm/{entity_id}/sudo/{request_id}                                   internal:require_vm_guest
-GET    /api/jobs                                                                        gated:require_approved_user
-POST   /api/jobs                                                                        gated:require_project_member
-DELETE /api/jobs/{job_id}                                                               gated:require_job_access
-GET    /api/jobs/{job_id}                                                               gated:require_job_access
-POST   /api/jobs/{job_id}/accept                                                        gated:require_job_access
-PUT    /api/jobs/{job_id}/agent-release                                                 internal:require_internal
-POST   /api/jobs/{job_id}/approve                                                       gated:require_internal_or_job_access
-POST   /api/jobs/{job_id}/assign/{agent_id}                                             admin:_require_admin
-GET    /api/jobs/{job_id}/audit                                                         gated:require_job_access
-GET    /api/jobs/{job_id}/audit/step/{step_id}                                          gated:require_job_access
-GET    /api/jobs/{job_id}/audit/timerange                                               gated:require_job_access
-GET    /api/jobs/{job_id}/brief                                                         internal:require_internal
-PUT    /api/jobs/{job_id}/cancel                                                        gated:require_internal_or_job_access
-GET    /api/jobs/{job_id}/change-record                                                 gated:require_job_access
-GET    /api/jobs/{job_id}/chat                                                          gated:require_job_access
-GET    /api/jobs/{job_id}/chat/entry/{entry_id}                                         gated:require_job_access
-GET    /api/jobs/{job_id}/citations                                                     gated:require_job_access
-GET    /api/jobs/{job_id}/citations/stats                                               gated:require_job_access
-POST   /api/jobs/{job_id}/complete                                                      internal:require_internal
-GET    /api/jobs/{job_id}/completion-decision                                           internal:require_internal
-POST   /api/jobs/{job_id}/completion-decision                                           internal:require_internal
-GET    /api/jobs/{job_id}/completion-report                                             gated:require_job_access
-GET    /api/jobs/{job_id}/datasources                                                   gated:require_job_access
-GET    /api/jobs/{job_id}/diff                                                          gated:require_job_access
-GET    /api/jobs/{job_id}/diff/{file_path:path}                                         gated:require_job_access
-POST   /api/jobs/{job_id}/ensure-workspace-access                                       gated:require_approved_user
-GET    /api/jobs/{job_id}/evidence                                                      gated:require_job_access
-GET    /api/jobs/{job_id}/evidence/{evidence_id}                                        gated:require_job_access
-POST   /api/jobs/{job_id}/export-to-shared-folder                                       gated:require_job_access
-GET    /api/jobs/{job_id}/frozen                                                        gated:require_job_access
-POST   /api/jobs/{job_id}/guidance/ack                                                  internal:require_internal
-DELETE /api/jobs/{job_id}/ide                                                           gated:require_job_access
-GET    /api/jobs/{job_id}/ide                                                           gated:require_job_access
-POST   /api/jobs/{job_id}/ide                                                           gated:require_job_access
-GET    /api/jobs/{job_id}/llm-requests                                                  gated:require_job_access
-GET    /api/jobs/{job_id}/logs                                                          gated:require_job_access
-POST   /api/jobs/{job_id}/loop-plan                                                     internal:require_internal
-GET    /api/jobs/{job_id}/memories                                                      gated:require_job_access
-GET    /api/jobs/{job_id}/memory/stats                                                  gated:require_job_access
-GET    /api/jobs/{job_id}/messages                                                      gated:require_job_access
-POST   /api/jobs/{job_id}/messages/send                                                 internal:require_internal
-GET    /api/jobs/{job_id}/messages/{thread_id}                                          gated:require_job_access
-POST   /api/jobs/{job_id}/messages/{thread_id}/officer-ack                              internal:require_internal
-POST   /api/jobs/{job_id}/messages/{thread_id}/officer-escalate                         internal:require_internal
-POST   /api/jobs/{job_id}/messages/{thread_id}/officer-reply                            internal:require_internal
-POST   /api/jobs/{job_id}/messages/{thread_id}/reply                                    gated:require_job_access
-PUT    /api/jobs/{job_id}/pause                                                         gated:require_internal_or_job_access
-GET    /api/jobs/{job_id}/progress                                                      gated:require_job_access
-POST   /api/jobs/{job_id}/promote                                                       gated:require_job_access
-POST   /api/jobs/{job_id}/provision-workspace                                           internal:require_internal
-GET    /api/jobs/{job_id}/pull-request                                                  gated:require_job_access
-POST   /api/jobs/{job_id}/reject                                                        gated:require_job_access
-GET    /api/jobs/{job_id}/repo/commits                                                  gated:require_job_access
-GET    /api/jobs/{job_id}/repo/contents                                                 gated:require_job_access
-GET    /api/jobs/{job_id}/repo/diff                                                     gated:require_job_access
-GET    /api/jobs/{job_id}/repo/file                                                     gated:require_job_access
-GET    /api/jobs/{job_id}/repo/tags                                                     gated:require_job_access
-POST   /api/jobs/{job_id}/resume                                                        gated:require_internal_or_job_access
-POST   /api/jobs/{job_id}/review-session                                                gated:require_job_access
-GET    /api/jobs/{job_id}/shell-state                                                   gated:require_job_access
-DELETE /api/jobs/{job_id}/snapshot                                                      gated:require_job_access
-GET    /api/jobs/{job_id}/snapshot                                                      gated:require_job_access
-PUT    /api/jobs/{job_id}/snapshot/pin                                                  gated:require_job_access
-GET    /api/jobs/{job_id}/sources/search                                                gated:require_job_access
-GET    /api/jobs/{job_id}/sources/{source_id}/annotations                               gated:require_job_access
-GET    /api/jobs/{job_id}/sources/{source_id}/tags                                      gated:require_job_access
-GET    /api/jobs/{job_id}/subagents                                                     gated:require_job_access
-POST   /api/jobs/{job_id}/subjob-merge                                                  internal:require_internal
-GET    /api/jobs/{job_id}/subjobs                                                       gated:require_job_access
-GET    /api/jobs/{job_id}/todos                                                         gated:require_job_access
-GET    /api/jobs/{job_id}/todos/archives                                                gated:require_job_access
-GET    /api/jobs/{job_id}/todos/archives/{filename}                                     gated:require_job_access
-GET    /api/jobs/{job_id}/todos/current                                                 gated:require_job_access
-POST   /api/jobs/{job_id}/upgrade-to-vm                                                 gated:require_job_access
-GET    /api/jobs/{job_id}/usage                                                         gated:require_job_access
-GET    /api/jobs/{job_id}/version                                                       gated:require_job_access
-POST   /api/jobs/{job_id}/workspace-recovery/retry                                      gated:require_job_access
-GET    /api/jobs/{job_id}/workspace-status                                              internal:require_internal
-POST   /api/jobs/{target_job_id}/verification/rounds                                    internal:require_internal
-POST   /api/manifests/apply                                                             gated:require_approved_user
-POST   /api/manifests/export                                                            gated:require_approved_user
-POST   /api/manifests/preview                                                           gated:require_approved_user
-GET    /api/manifests/schema                                                            gated:require_approved_user
-POST   /api/manifests/validate                                                          gated:require_approved_user
-GET    /api/mcp-tokens                                                                  gated:require_approved_user
-POST   /api/mcp-tokens                                                                  gated:require_approved_user
-DELETE /api/mcp-tokens/{token_id}                                                       gated:require_approved_user
-GET    /api/me/active-jobs                                                              gated:require_approved_user
-POST   /api/media/remote-image                                                          gated:require_approved_user
-GET    /api/models                                                                      gated:require_approved_user
-POST   /api/models/reload                                                               admin:_require_admin
-GET    /api/notifications                                                               gated:require_approved_user
-GET    /api/notifications/events                                                        gated:require_approved_user
-POST   /api/notifications/seen                                                          gated:require_approved_user
-GET    /api/notifications/{notification_id}                                             gated:require_approved_user
-POST   /api/notifications/{notification_id}/act                                         gated:require_approved_user
-PATCH  /api/notifications/{notification_id}/archive                                     gated:require_approved_user
-PATCH  /api/notifications/{notification_id}/read                                        gated:require_approved_user
-GET    /api/officers                                                                    gated:require_approved_user
-GET    /api/persistent/threads                                                          gated:require_approved_user
-POST   /api/persistent/threads                                                          gated:require_approved_user
-POST   /api/persistent/threads/preview                                                  gated:require_approved_user
-DELETE /api/persistent/threads/{thread_id}                                              gated:require_thread_owner
-GET    /api/persistent/threads/{thread_id}                                              gated:require_thread_owner
-PATCH  /api/persistent/threads/{thread_id}                                              gated:require_thread_owner
-POST   /api/persistent/threads/{thread_id}/approve/{approval_id}                        gated:require_thread_owner
-GET    /api/persistent/threads/{thread_id}/browser/capability                           gated:require_thread_owner
-POST   /api/persistent/threads/{thread_id}/browser/open                                 gated:require_thread_owner
-WS     /api/persistent/threads/{thread_id}/browser/stream                               gated:relay_browser_stream
-DELETE /api/persistent/threads/{thread_id}/canvases/main                                gated:require_thread_owner
-GET    /api/persistent/threads/{thread_id}/canvases/main                                gated:require_thread_owner
-GET    /api/persistent/threads/{thread_id}/canvases/main/awareness/stream               gated:require_thread_owner
-PUT    /api/persistent/threads/{thread_id}/canvases/main/awareness/{editing_session_id} gated:require_thread_owner
-GET    /api/persistent/threads/{thread_id}/canvases/main/content                        gated:require_thread_owner
-HEAD   /api/persistent/threads/{thread_id}/canvases/main/content                        gated:require_thread_owner
-PUT    /api/persistent/threads/{thread_id}/canvases/main/content                        gated:require_thread_owner
-POST   /api/persistent/threads/{thread_id}/canvases/main/office-session                 gated:require_thread_owner
-POST   /api/persistent/threads/{thread_id}/canvases/main/refresh                        gated:require_thread_owner
-POST   /api/persistent/threads/{thread_id}/canvases/main/reset-origin                   gated:require_thread_owner
-POST   /api/persistent/threads/{thread_id}/canvases/main/view-attachments               gated:require_thread_owner
-DELETE /api/persistent/threads/{thread_id}/canvases/main/view-attachments/{attachment_id} gated:require_thread_owner
-POST   /api/persistent/threads/{thread_id}/canvases/main/view-attachments/{attachment_id}/authorize gated:require_thread_owner
-POST   /api/persistent/threads/{thread_id}/canvases/main/view-attachments/{attachment_id}/renew gated:require_thread_owner
-GET    /api/persistent/threads/{thread_id}/citations                                    gated:require_thread_owner
-PATCH  /api/persistent/threads/{thread_id}/config                                       gated:require_thread_owner
-POST   /api/persistent/threads/{thread_id}/controls                                     gated:require_thread_owner
-GET    /api/persistent/threads/{thread_id}/ide                                          gated:require_thread_owner
-POST   /api/persistent/threads/{thread_id}/input                                        gated:require_approved_user
-POST   /api/persistent/threads/{thread_id}/interrupt                                    gated:require_thread_owner
-GET    /api/persistent/threads/{thread_id}/logs                                         gated:require_thread_owner
-GET    /api/persistent/threads/{thread_id}/messages                                     gated:require_thread_owner
-GET    /api/persistent/threads/{thread_id}/queue                                        gated:require_thread_owner
-POST   /api/persistent/threads/{thread_id}/queue/retry                                  gated:require_thread_owner
-POST   /api/persistent/threads/{thread_id}/resume                                       gated:require_thread_owner
-POST   /api/persistent/threads/{thread_id}/rewinds                                      gated:require_thread_owner
-GET    /api/persistent/threads/{thread_id}/rewinds/by-client-request/{client_request_id} gated:require_thread_owner
-GET    /api/persistent/threads/{thread_id}/rewinds/preview                              gated:require_thread_owner
-GET    /api/persistent/threads/{thread_id}/state                                        gated:require_thread_owner
-GET    /api/persistent/threads/{thread_id}/stream                                       gated:require_thread_owner
-GET    /api/persistent/threads/{thread_id}/subagents                                    gated:require_thread_owner
-GET    /api/persistent/threads/{thread_id}/tool-groups                                  gated:require_thread_owner
-POST   /api/persistent/threads/{thread_id}/transcribe                                   gated:require_thread_owner
-POST   /api/persistent/threads/{thread_id}/tts                                          gated:require_thread_owner
-POST   /api/persistent/threads/{thread_id}/tts/plan                                     gated:require_thread_owner
-POST   /api/persistent/threads/{thread_id}/tts/plan/stream                              gated:require_thread_owner
-POST   /api/persistent/threads/{thread_id}/uploads                                      gated:require_thread_owner
-DELETE /api/persistent/threads/{thread_id}/uploads/{path:path}                          gated:require_thread_owner
-POST   /api/persistent/tool-groups/preview                                              gated:require_approved_user
-GET    /api/projects                                                                    gated:require_approved_user
-POST   /api/projects                                                                    gated:require_approved_user
-GET    /api/projects/linkable-datasource-targets                                        gated:require_datasource_owner
-DELETE /api/projects/{project_id}                                                       gated:require_project_owner
-GET    /api/projects/{project_id}                                                       gated:require_project_member
-PATCH  /api/projects/{project_id}                                                       gated:require_project_owner
-GET    /api/projects/{project_id}/api-keys                                              gated:require_approved_user
-DELETE /api/projects/{project_id}/api-keys/{provider}                                   gated:require_approved_user
-PUT    /api/projects/{project_id}/api-keys/{provider}                                   gated:require_approved_user
-GET    /api/projects/{project_id}/backlog                                               gated:require_project_member
-GET    /api/projects/{project_id}/contacts                                              gated:require_project_member
-POST   /api/projects/{project_id}/contacts                                              gated:require_project_member
-GET    /api/projects/{project_id}/datasources                                           gated:require_project_member
-DELETE /api/projects/{project_id}/datasources/{datasource_id}                           gated:require_project_owner
-PATCH  /api/projects/{project_id}/datasources/{datasource_id}                           gated:require_project_owner
-POST   /api/projects/{project_id}/datasources/{datasource_id}                           gated:require_project_owner
-DELETE /api/projects/{project_id}/expert-defaults/{expert_type}                         gated:require_project_owner
-PUT    /api/projects/{project_id}/expert-defaults/{expert_type}                         gated:require_project_owner
-GET    /api/projects/{project_id}/experts                                               gated:require_project_member
-GET    /api/projects/{project_id}/experts/{expert_name}                                 gated:require_project_member
-GET    /api/projects/{project_id}/job-records                                           gated:require_project_member
-GET    /api/projects/{project_id}/jobs                                                  gated:require_project_member
-POST   /api/projects/{project_id}/jobs                                                  gated:require_project_member
-GET    /api/projects/{project_id}/knowledge                                             gated:require_project_member
-POST   /api/projects/{project_id}/knowledge/delete                                      internal:require_internal
-POST   /api/projects/{project_id}/knowledge/export                                      gated:require_project_member
-POST   /api/projects/{project_id}/knowledge/materialize                                 internal:require_internal
-POST   /api/projects/{project_id}/knowledge/materialize/{intent_id}/projection          internal:require_internal
-POST   /api/projects/{project_id}/knowledge/reindex                                     gated:require_project_member
-POST   /api/projects/{project_id}/knowledge/repository                                  gated:require_project_owner
-POST   /api/projects/{project_id}/knowledge/search                                      gated:require_project_member
-GET    /api/projects/{project_id}/knowledge/summary                                     gated:require_project_member
-DELETE /api/projects/{project_id}/knowledge/{note_id}                                   gated:require_project_member
-GET    /api/projects/{project_id}/knowledge/{note_id}                                   gated:require_project_member
-PATCH  /api/projects/{project_id}/knowledge/{note_id}                                   gated:require_project_member
-GET    /api/projects/{project_id}/linkable-datasources                                  gated:require_project_owner
-GET    /api/projects/{project_id}/loop                                                  gated:require_project_member
-POST   /api/projects/{project_id}/loop                                                  gated:require_project_member
-GET    /api/projects/{project_id}/loop/jobs                                             gated:require_project_member
-POST   /api/projects/{project_id}/loop/pause                                            gated:require_project_member
-POST   /api/projects/{project_id}/loop/resume                                           gated:require_project_member
-POST   /api/projects/{project_id}/loop/scheduling                                       gated:require_project_member
-POST   /api/projects/{project_id}/loop/stop                                             gated:require_project_member
-GET    /api/projects/{project_id}/members                                               gated:require_project_member
-POST   /api/projects/{project_id}/members                                               gated:require_project_owner
-DELETE /api/projects/{project_id}/members/{user_id}                                     gated:require_approved_user
-PATCH  /api/projects/{project_id}/members/{user_id}                                     gated:require_project_owner
-GET    /api/projects/{project_id}/memory/stats                                          gated:require_project_member
-GET    /api/projects/{project_id}/officer                                               gated:require_project_member
-PATCH  /api/projects/{project_id}/officer                                               gated:require_project_owner
-POST   /api/projects/{project_id}/officer/commission                                    gated:require_project_owner
-POST   /api/projects/{project_id}/officer/decommission                                  gated:require_project_owner
-POST   /api/projects/{project_id}/officer/hold                                          gated:require_project_owner
-POST   /api/projects/{project_id}/officer/note                                          gated:require_project_owner
-POST   /api/projects/{project_id}/officer/recycle                                       gated:require_project_owner
-POST   /api/projects/{project_id}/officer/release                                       gated:require_project_owner
-GET    /api/projects/{project_id}/repositories                                          gated:require_project_member
-POST   /api/projects/{project_id}/repositories                                          gated:require_project_owner
-DELETE /api/projects/{project_id}/repositories/{repo_id}                                gated:require_project_owner
-PATCH  /api/projects/{project_id}/repositories/{repo_id}                                gated:require_project_owner
-GET    /api/requests/{doc_id}                                                           gated:require_job_access
-PUT    /api/resource-secrets/{name}                                                     gated:require_approved_user
-GET    /api/resources                                                                   gated:require_approved_user
-DELETE /api/resources/{resource_id}                                                     gated:require_approved_user
-GET    /api/resources/{resource_id}                                                     gated:require_approved_user
-POST   /api/resources/{resource_id}/outcome                                             gated:require_approved_user
-POST   /api/runtime-actors/authorize                                                    internal:require_internal
-POST   /api/runtime-actors/refresh                                                      internal:require_internal
-GET    /api/sessions/{thread_id}/connection                                             gated:require_approved_user
-POST   /api/sessions/{thread_id}/prepare                                                gated:require_approved_user
-GET    /api/settings/api-keys                                                           gated:require_approved_user
-DELETE /api/settings/api-keys/{provider}                                                gated:require_approved_user
-PUT    /api/settings/api-keys/{provider}                                                gated:require_approved_user
-GET    /api/settings/preferences                                                        gated:require_approved_user
-PATCH  /api/settings/preferences                                                        gated:require_approved_user
-GET    /api/settings/tts/library                                                        gated:require_approved_user
-POST   /api/settings/tts/library/add                                                    gated:require_approved_user
-POST   /api/settings/tts/preview                                                        gated:require_approved_user
-GET    /api/settings/tts/voices                                                         gated:require_approved_user
-GET    /api/skills                                                                      gated:require_approved_user
-POST   /api/skills                                                                      gated:require_approved_user
-POST   /api/skills/import                                                               gated:require_approved_user
-POST   /api/skills/reload                                                               admin:_require_admin
-DELETE /api/skills/{skill_id}                                                           gated:require_approved_user
-GET    /api/skills/{skill_id}                                                           gated:require_approved_user
-PUT    /api/skills/{skill_id}                                                           gated:require_approved_user
-POST   /api/skills/{skill_id}/duplicate                                                 gated:require_approved_user
-GET    /api/skills/{skill_id}/export                                                    gated:require_approved_user
-GET    /api/snapshots/stats                                                             admin:_require_admin
-GET    /api/sources                                                                     gated:require_job_access
-GET    /api/sources/{source_id}                                                         gated:user_can_access_any_job
-GET    /api/ssh-keys                                                                    gated:require_approved_user
-POST   /api/ssh-keys                                                                    gated:require_approved_user
-POST   /api/ssh-keys/challenge                                                          gated:require_approved_user
-DELETE /api/ssh-keys/{key_id}                                                           gated:require_approved_user
-POST   /api/ssh/attach-token                                                            gated:require_approved_user
-GET    /api/ssh/host-keys                                                               public:ssh-host-key-pinning (host keys are public material; client needs them before it can authenticate anything)
-GET    /api/stats/agents                                                                admin:_require_admin
-GET    /api/stats/daily                                                                 gated:require_approved_user
-GET    /api/stats/jobs                                                                  gated:require_approved_user
-GET    /api/stats/session-wakes                                                         admin:_require_admin
-GET    /api/stats/stuck                                                                 gated:require_approved_user
-GET    /api/subscriptions/accounts                                                      admin:_require_admin
-DELETE /api/subscriptions/accounts/{account_id}                                         admin:_require_admin
-GET    /api/subscriptions/accounts/{account_id}/usage                                   admin:_require_admin
-POST   /api/subscriptions/logins                                                        admin:_require_admin
-DELETE /api/subscriptions/logins/{login_id}                                             admin:_require_admin
-GET    /api/subscriptions/logins/{login_id}                                             admin:_require_admin
-POST   /api/subscriptions/logins/{login_id}/callback                                    admin:_require_admin
-GET    /api/subscriptions/status                                                        admin:_require_admin
-GET    /api/sudo/events                                                                 gated:user_can_access_job_or_thread
-GET    /api/sudo/requests                                                               gated:require_job_access
-GET    /api/sudo/requests/{request_id}                                                  gated:user_can_access_job_or_thread
-POST   /api/sudo/requests/{request_id}/approve                                          gated:require_sudo_request_authority
-POST   /api/sudo/requests/{request_id}/approve-upgrade                                  gated:require_sudo_request_authority
-POST   /api/sudo/requests/{request_id}/deny                                             gated:require_sudo_request_authority
-POST   /api/sudo/requests/{request_id}/resume-without-vm                                gated:require_sudo_request_authority
-GET    /api/sudo/rules                                                                  admin:_require_admin
-POST   /api/sudo/rules                                                                  admin:_require_admin
-DELETE /api/sudo/rules/{rule_id}                                                        admin:_require_admin
-GET    /api/system/readiness                                                            public:auth-bootstrap (Bearer-required, intentionally pre-approval — onboarding first paint)
-GET    /api/tables                                                                      admin:_require_admin
-GET    /api/tables/{table_name}                                                         admin:_require_admin
-GET    /api/tables/{table_name}/schema                                                  admin:_require_admin
-POST   /api/uploads                                                                     internal:is_internal_call
-DELETE /api/uploads/{upload_id}                                                         internal:is_internal_call
-GET    /api/uploads/{upload_id}                                                         internal:is_internal_call
-GET    /api/uploads/{upload_id}/files                                                   internal:is_internal_call
-GET    /api/uploads/{upload_id}/files/{filename}                                        internal:is_internal_call
-GET    /api/usage                                                                       gated:require_approved_user
-GET    /api/usage/breakdown                                                             gated:require_approved_user
-GET    /api/usage/timeseries                                                            gated:require_approved_user
-GET    /api/usage/v2                                                                    gated:user_can_access_job_or_thread
-GET    /api/users                                                                       gated:require_approved_user
-POST   /api/users                                                                       admin:_require_admin
-GET    /api/users/me/capabilities                                                       gated:require_approved_user
-GET    /api/users/me/product-capabilities                                               gated:require_thread_owner
-DELETE /api/users/{user_id}                                                             admin:_require_admin
-GET    /api/users/{user_id}                                                             gated:require_approved_user
-PUT    /api/users/{user_id}                                                             gated:require_approved_user
-GET    /api/vms                                                                         admin:_require_admin
-POST   /api/vms                                                                         gated:require_job_access
-DELETE /api/vms/{job_id}                                                                gated:require_job_access
-GET    /api/vms/{job_id}                                                                gated:require_job_access
-GET    /api/voice/capabilities                                                          gated:require_approved_user
-GET    /api/workspace-cache                                                             gated:require_approved_user
-DELETE /api/workspace-cache/{artifact_id}                                               gated:require_approved_user
-DELETE /api/workspace-instances/{instance_id}                                           gated:require_approved_user
-GET    /api/workspace-instances/{instance_id}                                           gated:require_approved_user
-GET    /api/workspace/status                                                            admin:_require_admin
-POST   /auth/backchannel-logout                                                         public:OIDC back-channel logout — authenticated by Keycloak's signed logout_token
-GET    /auth/callback                                                                   public:OIDC redirect_uri — authenticates by exchanging the Keycloak code
-GET    /auth/login                                                                      public:OIDC handshake entry — redirects to Keycloak, no session exists yet
-POST   /auth/logout                                                                     public:revokes whatever session the cookie names; a no-op without one
-GET    /auth/me                                                                         gated:get_current_user
-POST   /auth/refresh                                                                    public:BFF session cookie is validated in-handler (401 without one)
-GET    /wopi/files/{file_id}                                                            public:WOPI CheckFileInfo — access_token gate validated in-handler
-GET    /wopi/files/{file_id}/contents                                                   public:WOPI GetFile — same access_token gate as CheckFileInfo
-POST   /wopi/files/{file_id}/contents                                                   public:WOPI PutFile — access_token gate, write scope checked in-handler
+GET    /api/actions/pending                                                             pat=jobs:read       gated:require_approved_user
+GET    /api/admin/capacity                                                              pat=admin           admin:_require_admin
+POST   /api/admin/completion-commands/{command_id}/force-resolve                        pat=admin           admin:_require_admin
+POST   /api/admin/completion-commands/{command_id}/unpark                               pat=admin           admin:_require_admin
+GET    /api/admin/config/bundled/{family}/{kind}/{name}                                 pat=admin           admin:_require_admin
+GET    /api/admin/config/catalog                                                        pat=admin           admin:_require_admin
+GET    /api/admin/config/overrides                                                      pat=admin           admin:_require_admin
+POST   /api/admin/config/overrides                                                      pat=admin           admin:_require_admin
+DELETE /api/admin/config/overrides/{override_id}                                        pat=admin           admin:_require_admin
+GET    /api/admin/config/overrides/{override_id}                                        pat=admin           admin:_require_admin
+PUT    /api/admin/config/overrides/{override_id}                                        pat=admin           admin:_require_admin
+GET    /api/admin/expert-defaults                                                       pat=admin           admin:_require_admin
+PUT    /api/admin/expert-defaults/{expert_type}                                         pat=admin           admin:_require_admin
+GET    /api/admin/families                                                              pat=admin           admin:_require_admin
+GET    /api/admin/families/detect                                                       pat=admin           admin:_require_admin
+GET    /api/admin/grants                                                                pat=admin           admin:_require_admin
+DELETE /api/admin/grants/{scope_kind}/{scope_id}/{key}                                  pat=admin           admin:_require_admin
+PUT    /api/admin/grants/{scope_kind}/{scope_id}/{key}                                  pat=admin           admin:_require_admin
+GET    /api/admin/helm-managed                                                          pat=admin           admin:_require_admin
+GET    /api/admin/projects/{project_id}/officer/runtime-verification                    pat=admin           admin:_require_admin
+POST   /api/admin/projects/{project_id}/officer/runtime-verification                    pat=admin           admin:_require_admin
+POST   /api/admin/projects/{project_id}/officer/runtime-verification/{plan_id}/{action} pat=admin           admin:_require_admin
+GET    /api/admin/providers/codex/availability                                          pat=admin           admin:_require_admin
+GET    /api/admin/providers/defaults                                                    pat=admin           admin:_require_admin
+PUT    /api/admin/providers/defaults/{kind}                                             pat=admin           admin:_require_admin
+GET    /api/admin/providers/endpoints                                                   pat=admin           admin:_require_admin
+POST   /api/admin/providers/endpoints                                                   pat=admin           admin:_require_admin
+DELETE /api/admin/providers/endpoints/{endpoint_id}                                     pat=admin           admin:_require_admin
+PATCH  /api/admin/providers/endpoints/{endpoint_id}                                     pat=admin           admin:_require_admin
+POST   /api/admin/providers/endpoints/{endpoint_id}/discover                            pat=admin           admin:_require_admin
+POST   /api/admin/providers/endpoints/{endpoint_id}/models/import                       pat=admin           admin:_require_admin
+POST   /api/admin/providers/endpoints/{endpoint_id}/test                                pat=admin           admin:_require_admin
+GET    /api/admin/providers/keys                                                        pat=admin           admin:_require_admin
+DELETE /api/admin/providers/keys/{provider}                                             pat=admin           admin:_require_admin
+PUT    /api/admin/providers/keys/{provider}                                             pat=admin           admin:_require_admin
+GET    /api/admin/providers/keys/{provider}/discovery                                   pat=admin           admin:_require_admin
+POST   /api/admin/providers/keys/{provider}/rediscover                                  pat=admin           admin:_require_admin
+GET    /api/admin/providers/models                                                      pat=admin           admin:_require_admin
+POST   /api/admin/providers/models                                                      pat=admin           admin:_require_admin
+DELETE /api/admin/providers/models/{catalog_id}                                         pat=admin           admin:_require_admin
+PATCH  /api/admin/providers/models/{catalog_id}                                         pat=admin           admin:_require_admin
+POST   /api/admin/providers/models/{catalog_id}/test                                    pat=admin           admin:_require_admin
+GET    /api/admin/providers/subscriptions/availability                                  pat=admin           admin:_require_admin
+GET    /api/admin/run-queue                                                             pat=admin           admin:_require_admin
+POST   /api/admin/run-queue/{unit_id}/unpark                                            pat=admin           admin:_require_admin
+GET    /api/admin/security-events                                                       pat=admin           admin:_require_admin
+DELETE /api/admin/system-settings/main_cloud                                            pat=admin           admin:_require_admin
+GET    /api/admin/system-settings/main_cloud                                            pat=admin           admin:_require_admin
+PUT    /api/admin/system-settings/main_cloud                                            pat=admin           admin:_require_admin
+POST   /api/admin/system-settings/main_cloud/backfill-instance-authority                pat=admin           admin:_require_admin
+POST   /api/admin/system-settings/main_cloud/reload                                     pat=admin           admin:_require_admin
+POST   /api/admin/system-settings/main_cloud/repair-thread-mounts                       pat=admin           admin:_require_admin
+POST   /api/admin/system-settings/main_cloud/test                                       pat=admin           admin:_require_admin
+GET    /api/admin/system-settings/tts_library                                           pat=admin           admin:_require_admin
+PUT    /api/admin/system-settings/tts_library                                           pat=admin           admin:_require_admin
+GET    /api/admin/system-settings/user_experts                                          pat=admin           admin:_require_admin
+PUT    /api/admin/system-settings/user_experts                                          pat=admin           admin:_require_admin
+GET    /api/admin/system-settings/vm_workspaces                                         pat=admin           admin:_require_admin
+PUT    /api/admin/system-settings/vm_workspaces                                         pat=admin           admin:_require_admin
+GET    /api/admin/usage/v2/compute-activation                                           pat=admin           admin:_require_infrastructure_fleet_admin
+POST   /api/admin/usage/v2/compute-activation/{activation_key}/rollover                 pat=admin           admin:_require_infrastructure_fleet_admin
+POST   /api/admin/usage/v2/compute-activation/{activation_key}/schedule                 pat=admin           admin:_require_infrastructure_fleet_admin
+POST   /api/admin/usage/v2/compute-activation/{activation_key}/shadow                   pat=admin           admin:_require_infrastructure_fleet_admin
+POST   /api/admin/usage/v2/coverage-gaps/{gap_id}/waive                                 pat=admin           admin:_require_infrastructure_fleet_admin
+POST   /api/admin/usage/v2/infrastructure-corrections                                   pat=admin           admin:_require_infrastructure_fleet_admin
+GET    /api/admin/usage/v2/infrastructure-cutover                                       pat=admin           admin:_require_infrastructure_fleet_admin
+POST   /api/admin/usage/v2/infrastructure-cutover/prepare                               pat=admin           admin:_require_infrastructure_fleet_admin
+GET    /api/admin/usage/v2/storage-activation                                           pat=admin           admin:_require_infrastructure_fleet_admin
+POST   /api/admin/usage/v2/storage-activation/{measurement_basis}/schedule              pat=admin           admin:_require_infrastructure_fleet_admin
+POST   /api/admin/usage/v2/storage-activation/{measurement_basis}/shadow                pat=admin           admin:_require_infrastructure_fleet_admin
+GET    /api/admin/usage/v2/storage-assets/backend-unverified                            pat=admin           admin:_require_infrastructure_fleet_admin
+GET    /api/admin/usage/v2/storage-assets/{asset_id}                                    pat=admin           admin:_require_infrastructure_fleet_admin
+POST   /api/admin/usage/v2/storage-assets/{asset_id}/destroy                            pat=admin           admin:_require_infrastructure_fleet_admin
+POST   /api/admin/usage/v2/storage-source-activation/{source}/{measurement_basis}/schedule pat=admin           admin:_require_infrastructure_fleet_admin
+POST   /api/admin/usage/v2/storage-source-activation/{source}/{measurement_basis}/shadow pat=admin           admin:_require_infrastructure_fleet_admin
+GET    /api/admin/users                                                                 pat=admin           admin:_require_admin
+POST   /api/admin/users/approve                                                         pat=admin           admin:_require_admin
+PATCH  /api/admin/users/{user_id}                                                       pat=admin           admin:_require_admin
+GET    /api/agents                                                                      pat=admin           admin:_require_admin
+POST   /api/agents/jobs/{job_id}/subagents                                              pat=refused         internal:require_internal
+POST   /api/agents/jobs/{job_id}/subagents/live                                         pat=refused         internal:require_internal
+POST   /api/agents/jobs/{job_id}/subagents/{thread_id}                                  pat=refused         internal:require_internal
+POST   /api/agents/jobs/{job_id}/subagents/{thread_id}/reopen                           pat=refused         internal:require_internal
+POST   /api/agents/jobs/{job_id}/subagents/{thread_id}/terminal                         pat=refused         internal:require_internal
+POST   /api/agents/register                                                             pat=refused         internal:require_internal
+POST   /api/agents/threads                                                              pat=refused         internal:require_internal
+POST   /api/agents/threads/{parent_thread_id}/subagents                                 pat=refused         internal:require_internal
+POST   /api/agents/threads/{parent_thread_id}/subagents/by-call                         pat=refused         internal:require_internal
+POST   /api/agents/threads/{parent_thread_id}/subagents/live                            pat=refused         internal:require_internal
+POST   /api/agents/threads/{parent_thread_id}/subagents/{thread_id}                     pat=refused         internal:require_internal
+POST   /api/agents/threads/{parent_thread_id}/subagents/{thread_id}/reopen              pat=refused         internal:require_internal
+POST   /api/agents/threads/{parent_thread_id}/subagents/{thread_id}/terminal            pat=refused         internal:require_internal
+POST   /api/agents/threads/{thread_id}/abort-vm-upgrade                                 pat=refused         internal:require_internal
+GET    /api/agents/threads/{thread_id}/cloud-diff                                       pat=chat:read       gated:require_thread_owner
+POST   /api/agents/threads/{thread_id}/cloud-diff/apply                                 pat=chat:write      gated:require_thread_owner
+POST   /api/agents/threads/{thread_id}/cloud-diff/reject                                pat=chat:write      gated:require_thread_owner
+POST   /api/agents/threads/{thread_id}/cloud-diff/restage                               pat=chat:write      gated:require_thread_owner
+GET    /api/agents/threads/{thread_id}/cloud-diff/{file_path:path}                      pat=chat:read       gated:require_thread_owner
+POST   /api/agents/threads/{thread_id}/cloud-stage                                      pat=refused         internal:require_internal
+PATCH  /api/agents/threads/{thread_id}/config                                           pat=refused         internal:require_internal
+GET    /api/agents/threads/{thread_id}/lifecycle                                        pat=refused         internal:require_internal
+POST   /api/agents/threads/{thread_id}/messages                                         pat=refused         internal:require_internal
+POST   /api/agents/threads/{thread_id}/officer/notify                                   pat=refused         internal:require_internal
+POST   /api/agents/threads/{thread_id}/officer/wake                                     pat=refused         internal:require_internal
+POST   /api/agents/threads/{thread_id}/release-agent                                    pat=refused         internal:require_internal
+GET    /api/agents/threads/{thread_id}/retirement-outcome                               pat=refused         internal:require_internal
+POST   /api/agents/threads/{thread_id}/rewind                                           pat=chat:write      gated:require_thread_owner
+PUT    /api/agents/threads/{thread_id}/status                                           pat=refused         internal:require_internal
+POST   /api/agents/threads/{thread_id}/suspend                                          pat=refused         internal:require_internal
+POST   /api/agents/threads/{thread_id}/upgrade-to-vm                                    pat=refused         internal:require_internal
+POST   /api/agents/threads/{thread_id}/upgrade-to-workspace                             pat=refused         internal:require_internal
+GET    /api/agents/threads/{thread_id}/workspace                                        pat=refused         internal:require_internal
+DELETE /api/agents/{agent_id}                                                           pat=admin           internal:is_internal_call
+GET    /api/agents/{agent_id}                                                           pat=admin           admin:_require_admin
+POST   /api/agents/{agent_id}/heartbeat                                                 pat=refused         internal:require_internal
+POST   /api/agents/{agent_id}/runtime-actor/session                                     pat=refused         internal:require_internal
+GET    /api/agents/{agent_id}/system-info                                               pat=admin           admin:_require_admin
+GET    /api/api-keys                                                                    pat=refused         gated:require_approved_user
+POST   /api/api-keys                                                                    pat=refused         gated:require_approved_user
+DELETE /api/api-keys/{token_id}                                                         pat=refused         gated:require_approved_user
+POST   /api/api-keys/{token_id}/rotate                                                  pat=refused         gated:require_approved_user
+GET    /api/auth/me                                                                     pat=any             public:auth-bootstrap (Bearer-required, intentionally serves pending-approval users)
+GET    /api/automations                                                                 pat=jobs:read       gated:require_project_member
+POST   /api/automations                                                                 pat=jobs:write      gated:require_project_member
+DELETE /api/automations/{automation_id}                                                 pat=jobs:write      gated:require_project_member
+GET    /api/automations/{automation_id}                                                 pat=jobs:read       gated:require_project_member
+PATCH  /api/automations/{automation_id}                                                 pat=jobs:write      gated:require_project_member
+POST   /api/automations/{automation_id}/pause                                           pat=jobs:write      gated:require_project_member
+POST   /api/automations/{automation_id}/resume                                          pat=jobs:write      gated:require_project_member
+POST   /api/automations/{automation_id}/run-now                                         pat=jobs:write      gated:require_project_member
+GET    /api/automations/{automation_id}/runs                                            pat=jobs:read       gated:require_project_member
+GET    /api/bench/runs                                                                  pat=jobs:read       gated:require_approved_user
+POST   /api/bench/runs                                                                  pat=jobs:write      gated:require_project_member
+GET    /api/bench/runs/{run_id}                                                         pat=jobs:read       gated:require_approved_user
+POST   /api/bench/runs/{run_id}/cancel                                                  pat=jobs:write      gated:require_approved_user
+GET    /api/bench/runs/{run_id}/report                                                  pat=jobs:read       gated:require_approved_user
+POST   /api/citations/snapshot                                                          pat=refused         internal:require_internal
+GET    /api/citations/{citation_id}                                                     pat=knowledge:read  gated:user_can_access_job_or_thread
+GET    /api/citations/{citation_id}/drift                                               pat=knowledge:read  gated:user_can_access_job_or_thread
+GET    /api/citations/{citation_id}/snapshot                                            pat=knowledge:read  gated:user_can_access_job_or_thread
+POST   /api/codex/callback                                                              pat=admin           admin:_require_admin
+DELETE /api/codex/credentials/{name}                                                    pat=admin           admin:_require_admin
+POST   /api/codex/login                                                                 pat=admin           admin:_require_admin
+GET    /api/codex/login/poll                                                            pat=admin           admin:_require_admin
+GET    /api/codex/models                                                                pat=admin           admin:_require_admin
+GET    /api/codex/status                                                                pat=admin           admin:_require_admin
+GET    /api/codex/usage                                                                 pat=admin           admin:_require_admin
+GET    /api/contacts                                                                    pat=admin           gated:require_approved_user
+POST   /api/contacts                                                                    pat=admin           gated:require_approved_user
+DELETE /api/contacts/addresses/{address_id}                                             pat=admin           gated:require_approved_user
+PATCH  /api/contacts/addresses/{address_id}                                             pat=admin           gated:require_approved_user
+GET    /api/contacts/internal/list                                                      pat=refused         internal:require_internal
+DELETE /api/contacts/{contact_id}                                                       pat=admin           gated:require_approved_user
+PATCH  /api/contacts/{contact_id}                                                       pat=admin           gated:require_approved_user
+POST   /api/contacts/{contact_id}/addresses                                             pat=admin           gated:require_approved_user
+DELETE /api/contacts/{contact_id}/projects/{project_id}                                 pat=admin           gated:require_project_member
+POST   /api/contacts/{contact_id}/projects/{project_id}                                 pat=admin           gated:require_project_member
+GET    /api/datasources                                                                 pat=jobs:read       gated:require_approved_user
+POST   /api/datasources                                                                 pat=admin           gated:require_project_owner
+GET    /api/datasources/catalog                                                         pat=jobs:read       gated:require_project_member
+GET    /api/datasources/eligible                                                        pat=jobs:read       gated:require_project_member
+POST   /api/datasources/ssh-keys/generate                                               pat=admin           gated:require_approved_user
+DELETE /api/datasources/{datasource_id}                                                 pat=admin           gated:require_datasource_owner
+GET    /api/datasources/{datasource_id}                                                 pat=jobs:read       gated:require_datasource_access
+PUT    /api/datasources/{datasource_id}                                                 pat=admin           gated:require_datasource_owner
+GET    /api/datasources/{datasource_id}/index-status                                    pat=jobs:read       gated:require_datasource_access
+POST   /api/datasources/{datasource_id}/reindex                                         pat=admin           gated:require_datasource_owner
+POST   /api/datasources/{datasource_id}/test                                            pat=admin           gated:require_datasource_owner
+GET    /api/expert-defaults                                                             pat=jobs:read       gated:require_project_member
+DELETE /api/expert-defaults/{expert_type}                                               pat=admin           gated:require_approved_user
+PUT    /api/expert-defaults/{expert_type}                                               pat=admin           gated:require_approved_user
+POST   /api/expert-defaults/{expert_type}/fork                                          pat=admin           gated:require_approved_user
+GET    /api/experts                                                                     pat=jobs:read       gated:require_approved_user
+POST   /api/experts                                                                     pat=admin           gated:require_approved_user
+POST   /api/experts/import                                                              pat=admin           gated:require_approved_user
+POST   /api/experts/reload                                                              pat=admin           admin:_require_admin
+DELETE /api/experts/{expert_id}                                                         pat=admin           gated:require_approved_user
+GET    /api/experts/{expert_id}                                                         pat=jobs:read       gated:require_approved_user
+PUT    /api/experts/{expert_id}                                                         pat=admin           gated:require_approved_user
+POST   /api/experts/{expert_id}/duplicate                                               pat=admin           gated:require_approved_user
+GET    /api/experts/{expert_id}/export                                                  pat=jobs:read       gated:require_approved_user
+GET    /api/graph/changes/{job_id}                                                      pat=knowledge:read  gated:require_job_access
+GET    /api/health                                                                      pat=any             public:k8s-liveness-probe
+DELETE /api/ide/{job_id}/proxy/{path:path}                                              pat=refused         gated:user_can_access_ide_entity
+GET    /api/ide/{job_id}/proxy/{path:path}                                              pat=refused         gated:user_can_access_ide_entity
+HEAD   /api/ide/{job_id}/proxy/{path:path}                                              pat=refused         gated:user_can_access_ide_entity
+OPTIONS /api/ide/{job_id}/proxy/{path:path}                                              pat=refused         gated:user_can_access_ide_entity
+PATCH  /api/ide/{job_id}/proxy/{path:path}                                              pat=refused         gated:user_can_access_ide_entity
+POST   /api/ide/{job_id}/proxy/{path:path}                                              pat=refused         gated:user_can_access_ide_entity
+PUT    /api/ide/{job_id}/proxy/{path:path}                                              pat=refused         gated:user_can_access_ide_entity
+WS     /api/ide/{job_id}/proxy/{path:path}                                              pat=refused         gated:user_can_access_ide_entity
+POST   /api/internal/infrastructure-metering/v1/snapshots/begin                         pat=refused         internal:_dispatch_infrastructure_ingestion
+POST   /api/internal/infrastructure-metering/v1/snapshots/finalize                      pat=refused         internal:_dispatch_infrastructure_ingestion
+POST   /api/internal/infrastructure-metering/v1/snapshots/items                         pat=refused         internal:_dispatch_infrastructure_ingestion
+POST   /api/internal/infrastructure-metering/v1/tickets                                 pat=refused         internal:_dispatch_infrastructure_ingestion
+POST   /api/internal/infrastructure-metering/v1/watch/apply                             pat=refused         internal:_dispatch_infrastructure_ingestion
+POST   /api/internal/infrastructure-metering/v1/watch/finish                            pat=refused         internal:_dispatch_infrastructure_ingestion
+POST   /api/internal/mcp-token-create                                                   pat=refused         internal:require_internal
+POST   /api/internal/mcp-token-verify                                                   pat=refused         internal:require_internal
+DELETE /api/internal/persistent/threads/{thread_id}/canvases/main                       pat=refused         gated:require_thread_owner
+GET    /api/internal/persistent/threads/{thread_id}/canvases/main                       pat=refused         gated:require_thread_owner
+POST   /api/internal/persistent/threads/{thread_id}/canvases/main/set                   pat=refused         gated:require_thread_owner
+POST   /api/internal/ssh-attachments                                                    pat=refused         gated:user_can_access_ide_entity
+POST   /api/internal/ssh-attachments/{attachment_id}/close                              pat=refused         gated:user_can_access_ide_entity
+POST   /api/internal/ssh-keys/used                                                      pat=refused         internal:require_internal
+GET    /api/internal/ssh-targets/{handle}                                               pat=refused         gated:user_can_access_ide_entity
+POST   /api/internal/vm-creation-retries/authorize                                      pat=refused         internal:require_vm_cleanup_authority
+POST   /api/internal/vm-creation-retries/authorize-disposition                          pat=refused         internal:require_vm_cleanup_authority
+POST   /api/internal/vm-creation-retries/begin-effect                                   pat=refused         internal:require_vm_cleanup_authority
+POST   /api/internal/vm-creation-retries/freeze-disposition                             pat=refused         internal:require_vm_cleanup_authority
+POST   /api/internal/vm-creation-retries/inspect                                        pat=refused         internal:require_vm_cleanup_authority
+POST   /api/internal/vm-creation-retries/observe-effect                                 pat=refused         internal:require_vm_cleanup_authority
+POST   /api/internal/vm-creation-retries/prepare-disposition                            pat=refused         internal:require_vm_cleanup_authority
+POST   /api/internal/vm-creation-retries/record-disposition                             pat=refused         internal:require_vm_cleanup_authority
+POST   /api/internal/vm-creation-retries/settle-adopted                                 pat=refused         internal:require_vm_cleanup_authority
+POST   /api/internal/vm-creation-retries/settle-never-issued                            pat=refused         internal:require_vm_cleanup_authority
+POST   /api/internal/vm-resource-inventory/publish                                      pat=refused         internal:require_vm_inventory_authority
+POST   /api/internal/vm-workspace-cleanup-authority/acquire                             pat=refused         internal:require_vm_cleanup_authority
+POST   /api/internal/vm-workspace-cleanup-authority/complete                            pat=refused         internal:require_vm_cleanup_authority
+POST   /api/internal/vm-workspace-cleanup-authority/resume                              pat=refused         internal:require_vm_cleanup_authority
+POST   /api/internal/vm/{entity_id}/heartbeat                                           pat=refused         internal:require_vm_guest
+POST   /api/internal/vm/{entity_id}/register                                            pat=refused         internal:require_vm_guest
+POST   /api/internal/vm/{entity_id}/sudo                                                pat=refused         internal:require_vm_guest
+GET    /api/internal/vm/{entity_id}/sudo/{request_id}                                   pat=refused         internal:require_vm_guest
+GET    /api/jobs                                                                        pat=jobs:read       gated:require_approved_user
+POST   /api/jobs                                                                        pat=jobs:write      gated:require_project_member
+DELETE /api/jobs/{job_id}                                                               pat=jobs:write      gated:require_job_access
+GET    /api/jobs/{job_id}                                                               pat=jobs:read       gated:require_job_access
+POST   /api/jobs/{job_id}/accept                                                        pat=jobs:write      gated:require_job_access
+PUT    /api/jobs/{job_id}/agent-release                                                 pat=refused         internal:require_internal
+POST   /api/jobs/{job_id}/approve                                                       pat=jobs:write      gated:require_internal_or_job_access
+POST   /api/jobs/{job_id}/assign/{agent_id}                                             pat=admin           admin:_require_admin
+GET    /api/jobs/{job_id}/audit                                                         pat=jobs:read       gated:require_job_access
+GET    /api/jobs/{job_id}/audit/step/{step_id}                                          pat=jobs:read       gated:require_job_access
+GET    /api/jobs/{job_id}/audit/timerange                                               pat=jobs:read       gated:require_job_access
+GET    /api/jobs/{job_id}/brief                                                         pat=refused         internal:require_internal
+PUT    /api/jobs/{job_id}/cancel                                                        pat=jobs:write      gated:require_internal_or_job_access
+GET    /api/jobs/{job_id}/change-record                                                 pat=jobs:read       gated:require_job_access
+GET    /api/jobs/{job_id}/chat                                                          pat=jobs:read       gated:require_job_access
+GET    /api/jobs/{job_id}/chat/entry/{entry_id}                                         pat=jobs:read       gated:require_job_access
+GET    /api/jobs/{job_id}/citations                                                     pat=knowledge:read  gated:require_job_access
+GET    /api/jobs/{job_id}/citations/stats                                               pat=knowledge:read  gated:require_job_access
+POST   /api/jobs/{job_id}/complete                                                      pat=refused         internal:require_internal
+GET    /api/jobs/{job_id}/completion-decision                                           pat=refused         internal:require_internal
+POST   /api/jobs/{job_id}/completion-decision                                           pat=refused         internal:require_internal
+GET    /api/jobs/{job_id}/completion-report                                             pat=jobs:read       gated:require_job_access
+GET    /api/jobs/{job_id}/datasources                                                   pat=jobs:read       gated:require_job_access
+GET    /api/jobs/{job_id}/diff                                                          pat=jobs:read       gated:require_job_access
+GET    /api/jobs/{job_id}/diff/{file_path:path}                                         pat=jobs:read       gated:require_job_access
+POST   /api/jobs/{job_id}/ensure-workspace-access                                       pat=jobs:write      gated:require_approved_user
+GET    /api/jobs/{job_id}/evidence                                                      pat=jobs:read       gated:require_job_access
+GET    /api/jobs/{job_id}/evidence/{evidence_id}                                        pat=jobs:read       gated:require_job_access
+POST   /api/jobs/{job_id}/export-to-shared-folder                                       pat=jobs:write      gated:require_job_access
+GET    /api/jobs/{job_id}/frozen                                                        pat=jobs:read       gated:require_job_access
+POST   /api/jobs/{job_id}/guidance/ack                                                  pat=refused         internal:require_internal
+DELETE /api/jobs/{job_id}/ide                                                           pat=jobs:write      gated:require_job_access
+GET    /api/jobs/{job_id}/ide                                                           pat=jobs:read       gated:require_job_access
+POST   /api/jobs/{job_id}/ide                                                           pat=jobs:write      gated:require_job_access
+GET    /api/jobs/{job_id}/llm-requests                                                  pat=jobs:read       gated:require_job_access
+GET    /api/jobs/{job_id}/logs                                                          pat=jobs:read       gated:require_job_access
+POST   /api/jobs/{job_id}/loop-plan                                                     pat=refused         internal:require_internal
+GET    /api/jobs/{job_id}/memories                                                      pat=knowledge:read  gated:require_job_access
+GET    /api/jobs/{job_id}/memory/stats                                                  pat=knowledge:read  gated:require_job_access
+GET    /api/jobs/{job_id}/messages                                                      pat=jobs:read       gated:require_job_access
+POST   /api/jobs/{job_id}/messages/send                                                 pat=refused         internal:require_internal
+GET    /api/jobs/{job_id}/messages/{thread_id}                                          pat=jobs:read       gated:require_job_access
+POST   /api/jobs/{job_id}/messages/{thread_id}/officer-ack                              pat=refused         internal:require_internal
+POST   /api/jobs/{job_id}/messages/{thread_id}/officer-escalate                         pat=refused         internal:require_internal
+POST   /api/jobs/{job_id}/messages/{thread_id}/officer-reply                            pat=refused         internal:require_internal
+POST   /api/jobs/{job_id}/messages/{thread_id}/reply                                    pat=jobs:write      gated:require_job_access
+PUT    /api/jobs/{job_id}/pause                                                         pat=jobs:write      gated:require_internal_or_job_access
+GET    /api/jobs/{job_id}/progress                                                      pat=jobs:read       gated:require_job_access
+POST   /api/jobs/{job_id}/promote                                                       pat=jobs:write      gated:require_job_access
+POST   /api/jobs/{job_id}/provision-workspace                                           pat=refused         internal:require_internal
+GET    /api/jobs/{job_id}/pull-request                                                  pat=jobs:read       gated:require_job_access
+POST   /api/jobs/{job_id}/reject                                                        pat=jobs:write      gated:require_job_access
+GET    /api/jobs/{job_id}/repo/commits                                                  pat=jobs:read       gated:require_job_access
+GET    /api/jobs/{job_id}/repo/contents                                                 pat=jobs:read       gated:require_job_access
+GET    /api/jobs/{job_id}/repo/diff                                                     pat=jobs:read       gated:require_job_access
+GET    /api/jobs/{job_id}/repo/file                                                     pat=jobs:read       gated:require_job_access
+GET    /api/jobs/{job_id}/repo/tags                                                     pat=jobs:read       gated:require_job_access
+POST   /api/jobs/{job_id}/resume                                                        pat=jobs:write      gated:require_internal_or_job_access
+POST   /api/jobs/{job_id}/review-session                                                pat=jobs:write      gated:require_job_access
+GET    /api/jobs/{job_id}/shell-state                                                   pat=jobs:read       gated:require_job_access
+DELETE /api/jobs/{job_id}/snapshot                                                      pat=jobs:write      gated:require_job_access
+GET    /api/jobs/{job_id}/snapshot                                                      pat=jobs:read       gated:require_job_access
+PUT    /api/jobs/{job_id}/snapshot/pin                                                  pat=jobs:write      gated:require_job_access
+GET    /api/jobs/{job_id}/sources/search                                                pat=knowledge:read  gated:require_job_access
+GET    /api/jobs/{job_id}/sources/{source_id}/annotations                               pat=knowledge:read  gated:require_job_access
+GET    /api/jobs/{job_id}/sources/{source_id}/tags                                      pat=knowledge:read  gated:require_job_access
+GET    /api/jobs/{job_id}/subagents                                                     pat=jobs:read       gated:require_job_access
+POST   /api/jobs/{job_id}/subjob-merge                                                  pat=refused         internal:require_internal
+GET    /api/jobs/{job_id}/subjobs                                                       pat=jobs:read       gated:require_job_access
+GET    /api/jobs/{job_id}/todos                                                         pat=jobs:read       gated:require_job_access
+GET    /api/jobs/{job_id}/todos/archives                                                pat=jobs:read       gated:require_job_access
+GET    /api/jobs/{job_id}/todos/archives/{filename}                                     pat=jobs:read       gated:require_job_access
+GET    /api/jobs/{job_id}/todos/current                                                 pat=jobs:read       gated:require_job_access
+POST   /api/jobs/{job_id}/upgrade-to-vm                                                 pat=jobs:write      gated:require_job_access
+GET    /api/jobs/{job_id}/usage                                                         pat=jobs:read       gated:require_job_access
+GET    /api/jobs/{job_id}/version                                                       pat=jobs:read       gated:require_job_access
+POST   /api/jobs/{job_id}/workspace-recovery/retry                                      pat=jobs:write      gated:require_job_access
+GET    /api/jobs/{job_id}/workspace-status                                              pat=refused         internal:require_internal
+POST   /api/jobs/{target_job_id}/verification/rounds                                    pat=refused         internal:require_internal
+POST   /api/manifests/apply                                                             pat=admin           gated:require_approved_user
+POST   /api/manifests/export                                                            pat=admin           gated:require_approved_user
+POST   /api/manifests/preview                                                           pat=admin           gated:require_approved_user
+GET    /api/manifests/schema                                                            pat=jobs:read       gated:require_approved_user
+POST   /api/manifests/validate                                                          pat=admin           gated:require_approved_user
+GET    /api/mcp-tokens                                                                  pat=refused         gated:require_approved_user
+POST   /api/mcp-tokens                                                                  pat=refused         gated:require_approved_user
+DELETE /api/mcp-tokens/{token_id}                                                       pat=refused         gated:require_approved_user
+GET    /api/me/active-jobs                                                              pat=jobs:read       gated:require_approved_user
+POST   /api/media/remote-image                                                          pat=admin           gated:require_approved_user
+GET    /api/models                                                                      pat=jobs:read       gated:require_approved_user
+POST   /api/models/reload                                                               pat=admin           admin:_require_admin
+GET    /api/notifications                                                               pat=admin           gated:require_approved_user
+GET    /api/notifications/events                                                        pat=admin           gated:require_approved_user
+POST   /api/notifications/seen                                                          pat=admin           gated:require_approved_user
+GET    /api/notifications/{notification_id}                                             pat=admin           gated:require_approved_user
+POST   /api/notifications/{notification_id}/act                                         pat=admin           gated:require_approved_user
+PATCH  /api/notifications/{notification_id}/archive                                     pat=admin           gated:require_approved_user
+PATCH  /api/notifications/{notification_id}/read                                        pat=admin           gated:require_approved_user
+GET    /api/officers                                                                    pat=jobs:read       gated:require_approved_user
+GET    /api/persistent/threads                                                          pat=chat:read       gated:require_approved_user
+POST   /api/persistent/threads                                                          pat=chat:write      gated:require_approved_user
+POST   /api/persistent/threads/preview                                                  pat=chat:write      gated:require_approved_user
+DELETE /api/persistent/threads/{thread_id}                                              pat=chat:write      gated:require_thread_owner
+GET    /api/persistent/threads/{thread_id}                                              pat=chat:read       gated:require_thread_owner
+PATCH  /api/persistent/threads/{thread_id}                                              pat=chat:write      gated:require_thread_owner
+POST   /api/persistent/threads/{thread_id}/approve/{approval_id}                        pat=chat:write      gated:require_thread_owner
+GET    /api/persistent/threads/{thread_id}/browser/capability                           pat=chat:read       gated:require_thread_owner
+POST   /api/persistent/threads/{thread_id}/browser/open                                 pat=chat:write      gated:require_thread_owner
+WS     /api/persistent/threads/{thread_id}/browser/stream                               pat=refused         gated:relay_browser_stream
+DELETE /api/persistent/threads/{thread_id}/canvases/main                                pat=chat:write      gated:require_thread_owner
+GET    /api/persistent/threads/{thread_id}/canvases/main                                pat=chat:read       gated:require_thread_owner
+GET    /api/persistent/threads/{thread_id}/canvases/main/awareness/stream               pat=chat:read       gated:require_thread_owner
+PUT    /api/persistent/threads/{thread_id}/canvases/main/awareness/{editing_session_id} pat=chat:write      gated:require_thread_owner
+GET    /api/persistent/threads/{thread_id}/canvases/main/content                        pat=chat:read       gated:require_thread_owner
+HEAD   /api/persistent/threads/{thread_id}/canvases/main/content                        pat=chat:read       gated:require_thread_owner
+PUT    /api/persistent/threads/{thread_id}/canvases/main/content                        pat=chat:write      gated:require_thread_owner
+POST   /api/persistent/threads/{thread_id}/canvases/main/office-session                 pat=chat:write      gated:require_thread_owner
+POST   /api/persistent/threads/{thread_id}/canvases/main/refresh                        pat=chat:write      gated:require_thread_owner
+POST   /api/persistent/threads/{thread_id}/canvases/main/reset-origin                   pat=chat:write      gated:require_thread_owner
+POST   /api/persistent/threads/{thread_id}/canvases/main/view-attachments               pat=chat:write      gated:require_thread_owner
+DELETE /api/persistent/threads/{thread_id}/canvases/main/view-attachments/{attachment_id} pat=chat:write      gated:require_thread_owner
+POST   /api/persistent/threads/{thread_id}/canvases/main/view-attachments/{attachment_id}/authorize pat=chat:write      gated:require_thread_owner
+POST   /api/persistent/threads/{thread_id}/canvases/main/view-attachments/{attachment_id}/renew pat=chat:write      gated:require_thread_owner
+GET    /api/persistent/threads/{thread_id}/citations                                    pat=chat:read       gated:require_thread_owner
+PATCH  /api/persistent/threads/{thread_id}/config                                       pat=chat:write      gated:require_thread_owner
+POST   /api/persistent/threads/{thread_id}/controls                                     pat=chat:write      gated:require_thread_owner
+GET    /api/persistent/threads/{thread_id}/ide                                          pat=chat:read       gated:require_thread_owner
+POST   /api/persistent/threads/{thread_id}/input                                        pat=chat:write      gated:require_approved_user
+POST   /api/persistent/threads/{thread_id}/interrupt                                    pat=chat:write      gated:require_thread_owner
+GET    /api/persistent/threads/{thread_id}/logs                                         pat=chat:read       gated:require_thread_owner
+GET    /api/persistent/threads/{thread_id}/messages                                     pat=chat:read       gated:require_thread_owner
+GET    /api/persistent/threads/{thread_id}/queue                                        pat=chat:read       gated:require_thread_owner
+POST   /api/persistent/threads/{thread_id}/queue/retry                                  pat=chat:write      gated:require_thread_owner
+POST   /api/persistent/threads/{thread_id}/resume                                       pat=chat:write      gated:require_thread_owner
+POST   /api/persistent/threads/{thread_id}/rewinds                                      pat=chat:write      gated:require_thread_owner
+GET    /api/persistent/threads/{thread_id}/rewinds/by-client-request/{client_request_id} pat=chat:read       gated:require_thread_owner
+GET    /api/persistent/threads/{thread_id}/rewinds/preview                              pat=chat:read       gated:require_thread_owner
+GET    /api/persistent/threads/{thread_id}/state                                        pat=chat:read       gated:require_thread_owner
+GET    /api/persistent/threads/{thread_id}/stream                                       pat=chat:read       gated:require_thread_owner
+GET    /api/persistent/threads/{thread_id}/subagents                                    pat=chat:read       gated:require_thread_owner
+GET    /api/persistent/threads/{thread_id}/tool-groups                                  pat=chat:read       gated:require_thread_owner
+POST   /api/persistent/threads/{thread_id}/transcribe                                   pat=chat:write      gated:require_thread_owner
+POST   /api/persistent/threads/{thread_id}/tts                                          pat=chat:write      gated:require_thread_owner
+POST   /api/persistent/threads/{thread_id}/tts/plan                                     pat=chat:write      gated:require_thread_owner
+POST   /api/persistent/threads/{thread_id}/tts/plan/stream                              pat=chat:write      gated:require_thread_owner
+POST   /api/persistent/threads/{thread_id}/uploads                                      pat=chat:write      gated:require_thread_owner
+DELETE /api/persistent/threads/{thread_id}/uploads/{path:path}                          pat=chat:write      gated:require_thread_owner
+POST   /api/persistent/tool-groups/preview                                              pat=chat:write      gated:require_approved_user
+GET    /api/projects                                                                    pat=jobs:read       gated:require_approved_user
+POST   /api/projects                                                                    pat=admin           gated:require_approved_user
+GET    /api/projects/linkable-datasource-targets                                        pat=jobs:read       gated:require_datasource_owner
+DELETE /api/projects/{project_id}                                                       pat=admin           gated:require_project_owner
+GET    /api/projects/{project_id}                                                       pat=jobs:read       gated:require_project_member
+PATCH  /api/projects/{project_id}                                                       pat=admin           gated:require_project_owner
+GET    /api/projects/{project_id}/api-keys                                              pat=admin           gated:require_approved_user
+DELETE /api/projects/{project_id}/api-keys/{provider}                                   pat=admin           gated:require_approved_user
+PUT    /api/projects/{project_id}/api-keys/{provider}                                   pat=admin           gated:require_approved_user
+GET    /api/projects/{project_id}/backlog                                               pat=jobs:read       gated:require_project_member
+GET    /api/projects/{project_id}/contacts                                              pat=admin           gated:require_project_member
+POST   /api/projects/{project_id}/contacts                                              pat=admin           gated:require_project_member
+GET    /api/projects/{project_id}/datasources                                           pat=jobs:read       gated:require_project_member
+DELETE /api/projects/{project_id}/datasources/{datasource_id}                           pat=admin           gated:require_project_owner
+PATCH  /api/projects/{project_id}/datasources/{datasource_id}                           pat=admin           gated:require_project_owner
+POST   /api/projects/{project_id}/datasources/{datasource_id}                           pat=admin           gated:require_project_owner
+DELETE /api/projects/{project_id}/expert-defaults/{expert_type}                         pat=admin           gated:require_project_owner
+PUT    /api/projects/{project_id}/expert-defaults/{expert_type}                         pat=admin           gated:require_project_owner
+GET    /api/projects/{project_id}/experts                                               pat=jobs:read       gated:require_project_member
+GET    /api/projects/{project_id}/experts/{expert_name}                                 pat=jobs:read       gated:require_project_member
+GET    /api/projects/{project_id}/job-records                                           pat=jobs:read       gated:require_project_member
+GET    /api/projects/{project_id}/jobs                                                  pat=jobs:read       gated:require_project_member
+POST   /api/projects/{project_id}/jobs                                                  pat=jobs:write      gated:require_project_member
+GET    /api/projects/{project_id}/knowledge                                             pat=knowledge:read  gated:require_project_member
+POST   /api/projects/{project_id}/knowledge/delete                                      pat=refused         internal:require_internal
+POST   /api/projects/{project_id}/knowledge/export                                      pat=knowledge:read  gated:require_project_member
+POST   /api/projects/{project_id}/knowledge/materialize                                 pat=refused         internal:require_internal
+POST   /api/projects/{project_id}/knowledge/materialize/{intent_id}/projection          pat=refused         internal:require_internal
+POST   /api/projects/{project_id}/knowledge/reindex                                     pat=knowledge:write gated:require_project_member
+POST   /api/projects/{project_id}/knowledge/repository                                  pat=knowledge:write gated:require_project_owner
+POST   /api/projects/{project_id}/knowledge/search                                      pat=knowledge:read  gated:require_project_member
+GET    /api/projects/{project_id}/knowledge/summary                                     pat=knowledge:read  gated:require_project_member
+DELETE /api/projects/{project_id}/knowledge/{note_id}                                   pat=knowledge:write gated:require_project_member
+GET    /api/projects/{project_id}/knowledge/{note_id}                                   pat=knowledge:read  gated:require_project_member
+PATCH  /api/projects/{project_id}/knowledge/{note_id}                                   pat=knowledge:write gated:require_project_member
+GET    /api/projects/{project_id}/linkable-datasources                                  pat=jobs:read       gated:require_project_owner
+GET    /api/projects/{project_id}/loop                                                  pat=jobs:read       gated:require_project_member
+POST   /api/projects/{project_id}/loop                                                  pat=jobs:write      gated:require_project_member
+GET    /api/projects/{project_id}/loop/jobs                                             pat=jobs:read       gated:require_project_member
+POST   /api/projects/{project_id}/loop/pause                                            pat=jobs:write      gated:require_project_member
+POST   /api/projects/{project_id}/loop/resume                                           pat=jobs:write      gated:require_project_member
+POST   /api/projects/{project_id}/loop/scheduling                                       pat=jobs:write      gated:require_project_member
+POST   /api/projects/{project_id}/loop/stop                                             pat=jobs:write      gated:require_project_member
+GET    /api/projects/{project_id}/members                                               pat=jobs:read       gated:require_project_member
+POST   /api/projects/{project_id}/members                                               pat=admin           gated:require_project_owner
+DELETE /api/projects/{project_id}/members/{user_id}                                     pat=admin           gated:require_approved_user
+PATCH  /api/projects/{project_id}/members/{user_id}                                     pat=admin           gated:require_project_owner
+GET    /api/projects/{project_id}/memory/stats                                          pat=knowledge:read  gated:require_project_member
+GET    /api/projects/{project_id}/officer                                               pat=jobs:read       gated:require_project_member
+PATCH  /api/projects/{project_id}/officer                                               pat=admin           gated:require_project_owner
+POST   /api/projects/{project_id}/officer/commission                                    pat=admin           gated:require_project_owner
+POST   /api/projects/{project_id}/officer/decommission                                  pat=admin           gated:require_project_owner
+POST   /api/projects/{project_id}/officer/hold                                          pat=admin           gated:require_project_owner
+POST   /api/projects/{project_id}/officer/note                                          pat=admin           gated:require_project_owner
+POST   /api/projects/{project_id}/officer/recycle                                       pat=admin           gated:require_project_owner
+POST   /api/projects/{project_id}/officer/release                                       pat=admin           gated:require_project_owner
+GET    /api/projects/{project_id}/repositories                                          pat=jobs:read       gated:require_project_member
+POST   /api/projects/{project_id}/repositories                                          pat=admin           gated:require_project_owner
+DELETE /api/projects/{project_id}/repositories/{repo_id}                                pat=admin           gated:require_project_owner
+PATCH  /api/projects/{project_id}/repositories/{repo_id}                                pat=admin           gated:require_project_owner
+GET    /api/requests/{doc_id}                                                           pat=jobs:read       gated:require_job_access
+PUT    /api/resource-secrets/{name}                                                     pat=admin           gated:require_approved_user
+GET    /api/resources                                                                   pat=jobs:read       gated:require_approved_user
+DELETE /api/resources/{resource_id}                                                     pat=admin           gated:require_approved_user
+GET    /api/resources/{resource_id}                                                     pat=jobs:read       gated:require_approved_user
+POST   /api/resources/{resource_id}/outcome                                             pat=admin           gated:require_approved_user
+POST   /api/runtime-actors/authorize                                                    pat=refused         internal:require_internal
+POST   /api/runtime-actors/refresh                                                      pat=refused         internal:require_internal
+GET    /api/sessions/{thread_id}/connection                                             pat=chat:read       gated:require_approved_user
+POST   /api/sessions/{thread_id}/prepare                                                pat=chat:write      gated:require_approved_user
+GET    /api/settings/api-keys                                                           pat=admin           gated:require_approved_user
+DELETE /api/settings/api-keys/{provider}                                                pat=admin           gated:require_approved_user
+PUT    /api/settings/api-keys/{provider}                                                pat=admin           gated:require_approved_user
+GET    /api/settings/preferences                                                        pat=admin           gated:require_approved_user
+PATCH  /api/settings/preferences                                                        pat=admin           gated:require_approved_user
+GET    /api/settings/tts/library                                                        pat=admin           gated:require_approved_user
+POST   /api/settings/tts/library/add                                                    pat=admin           gated:require_approved_user
+POST   /api/settings/tts/preview                                                        pat=admin           gated:require_approved_user
+GET    /api/settings/tts/voices                                                         pat=admin           gated:require_approved_user
+GET    /api/skills                                                                      pat=jobs:read       gated:require_approved_user
+POST   /api/skills                                                                      pat=admin           gated:require_approved_user
+POST   /api/skills/import                                                               pat=admin           gated:require_approved_user
+POST   /api/skills/reload                                                               pat=admin           admin:_require_admin
+DELETE /api/skills/{skill_id}                                                           pat=admin           gated:require_approved_user
+GET    /api/skills/{skill_id}                                                           pat=jobs:read       gated:require_approved_user
+PUT    /api/skills/{skill_id}                                                           pat=admin           gated:require_approved_user
+POST   /api/skills/{skill_id}/duplicate                                                 pat=admin           gated:require_approved_user
+GET    /api/skills/{skill_id}/export                                                    pat=jobs:read       gated:require_approved_user
+GET    /api/snapshots/stats                                                             pat=admin           admin:_require_admin
+GET    /api/sources                                                                     pat=knowledge:read  gated:require_job_access
+GET    /api/sources/{source_id}                                                         pat=knowledge:read  gated:user_can_access_any_job
+GET    /api/ssh-keys                                                                    pat=refused         gated:require_approved_user
+POST   /api/ssh-keys                                                                    pat=refused         gated:require_approved_user
+POST   /api/ssh-keys/challenge                                                          pat=refused         gated:require_approved_user
+DELETE /api/ssh-keys/{key_id}                                                           pat=refused         gated:require_approved_user
+POST   /api/ssh/attach-token                                                            pat=refused         gated:require_approved_user
+GET    /api/ssh/host-keys                                                               pat=any             public:ssh-host-key-pinning (host keys are public material; client needs them before it can authenticate anything)
+GET    /api/stats/agents                                                                pat=admin           admin:_require_admin
+GET    /api/stats/daily                                                                 pat=jobs:read       gated:require_approved_user
+GET    /api/stats/jobs                                                                  pat=jobs:read       gated:require_approved_user
+GET    /api/stats/session-wakes                                                         pat=admin           admin:_require_admin
+GET    /api/stats/stuck                                                                 pat=jobs:read       gated:require_approved_user
+GET    /api/subscriptions/accounts                                                      pat=admin           admin:_require_admin
+DELETE /api/subscriptions/accounts/{account_id}                                         pat=admin           admin:_require_admin
+GET    /api/subscriptions/accounts/{account_id}/usage                                   pat=admin           admin:_require_admin
+POST   /api/subscriptions/logins                                                        pat=admin           admin:_require_admin
+DELETE /api/subscriptions/logins/{login_id}                                             pat=admin           admin:_require_admin
+GET    /api/subscriptions/logins/{login_id}                                             pat=admin           admin:_require_admin
+POST   /api/subscriptions/logins/{login_id}/callback                                    pat=admin           admin:_require_admin
+GET    /api/subscriptions/status                                                        pat=admin           admin:_require_admin
+GET    /api/sudo/events                                                                 pat=jobs:read       gated:user_can_access_job_or_thread
+GET    /api/sudo/requests                                                               pat=jobs:read       gated:require_job_access
+GET    /api/sudo/requests/{request_id}                                                  pat=jobs:read       gated:user_can_access_job_or_thread
+POST   /api/sudo/requests/{request_id}/approve                                          pat=admin           gated:require_sudo_request_authority
+POST   /api/sudo/requests/{request_id}/approve-upgrade                                  pat=admin           gated:require_sudo_request_authority
+POST   /api/sudo/requests/{request_id}/deny                                             pat=admin           gated:require_sudo_request_authority
+POST   /api/sudo/requests/{request_id}/resume-without-vm                                pat=admin           gated:require_sudo_request_authority
+GET    /api/sudo/rules                                                                  pat=admin           admin:_require_admin
+POST   /api/sudo/rules                                                                  pat=admin           admin:_require_admin
+DELETE /api/sudo/rules/{rule_id}                                                        pat=admin           admin:_require_admin
+GET    /api/system/readiness                                                            pat=any             public:auth-bootstrap (Bearer-required, intentionally pre-approval — onboarding first paint)
+GET    /api/tables                                                                      pat=admin           admin:_require_admin
+GET    /api/tables/{table_name}                                                         pat=admin           admin:_require_admin
+GET    /api/tables/{table_name}/schema                                                  pat=admin           admin:_require_admin
+POST   /api/uploads                                                                     pat=jobs:write      internal:is_internal_call
+DELETE /api/uploads/{upload_id}                                                         pat=jobs:write      internal:is_internal_call
+GET    /api/uploads/{upload_id}                                                         pat=jobs:read       internal:is_internal_call
+GET    /api/uploads/{upload_id}/files                                                   pat=jobs:read       internal:is_internal_call
+GET    /api/uploads/{upload_id}/files/{filename}                                        pat=jobs:read       internal:is_internal_call
+GET    /api/usage                                                                       pat=jobs:read       gated:require_approved_user
+GET    /api/usage/breakdown                                                             pat=jobs:read       gated:require_approved_user
+GET    /api/usage/timeseries                                                            pat=jobs:read       gated:require_approved_user
+GET    /api/usage/v2                                                                    pat=jobs:read       gated:user_can_access_job_or_thread
+GET    /api/users                                                                       pat=admin           gated:require_approved_user
+POST   /api/users                                                                       pat=admin           admin:_require_admin
+GET    /api/users/me/capabilities                                                       pat=admin           gated:require_approved_user
+GET    /api/users/me/product-capabilities                                               pat=admin           gated:require_thread_owner
+DELETE /api/users/{user_id}                                                             pat=admin           admin:_require_admin
+GET    /api/users/{user_id}                                                             pat=admin           gated:require_approved_user
+PUT    /api/users/{user_id}                                                             pat=admin           gated:require_approved_user
+GET    /api/vms                                                                         pat=admin           admin:_require_admin
+POST   /api/vms                                                                         pat=jobs:write      gated:require_job_access
+DELETE /api/vms/{job_id}                                                                pat=jobs:write      gated:require_job_access
+GET    /api/vms/{job_id}                                                                pat=jobs:read       gated:require_job_access
+GET    /api/voice/capabilities                                                          pat=chat:read       gated:require_approved_user
+GET    /api/workspace-cache                                                             pat=jobs:read       gated:require_approved_user
+DELETE /api/workspace-cache/{artifact_id}                                               pat=admin           gated:require_approved_user
+DELETE /api/workspace-instances/{instance_id}                                           pat=admin           gated:require_approved_user
+GET    /api/workspace-instances/{instance_id}                                           pat=jobs:read       gated:require_approved_user
+GET    /api/workspace/status                                                            pat=admin           admin:_require_admin
+POST   /auth/backchannel-logout                                                         pat=refused         public:OIDC back-channel logout — authenticated by Keycloak's signed logout_token
+GET    /auth/callback                                                                   pat=refused         public:OIDC redirect_uri — authenticates by exchanging the Keycloak code
+GET    /auth/login                                                                      pat=refused         public:OIDC handshake entry — redirects to Keycloak, no session exists yet
+POST   /auth/logout                                                                     pat=refused         public:revokes whatever session the cookie names; a no-op without one
+GET    /auth/me                                                                         pat=any             gated:get_current_user
+POST   /auth/refresh                                                                    pat=refused         public:BFF session cookie is validated in-handler (401 without one)
+GET    /wopi/files/{file_id}                                                            pat=refused         public:WOPI CheckFileInfo — access_token gate validated in-handler
+GET    /wopi/files/{file_id}/contents                                                   pat=refused         public:WOPI GetFile — same access_token gate as CheckFileInfo
+POST   /wopi/files/{file_id}/contents                                                   pat=refused         public:WOPI PutFile — access_token gate, write scope checked in-handler

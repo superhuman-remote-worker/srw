@@ -1394,7 +1394,8 @@ def apply_mcp_scope(
     # Legacy MCP rows carry exactly one scope string; PAT rows have a list
     # of action scopes (not the legacy 'user'/'all'/'project:<uuid>' shape).
     # Treat anything that doesn't look like a legacy MCP scope as a no-op
-    # here — PAT scopes are checked by the action-scope decorator, not by
+    # here — PAT action scopes are enforced per route when the token is
+    # resolved (security.token_scopes via auth._resolve_pat), not by
     # row-level visibility.
     scope = scopes[0]
     if scope in ("", "all", "user"):

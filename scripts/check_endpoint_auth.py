@@ -3,7 +3,12 @@
 
 Output: one line per endpoint in stable sort order:
 
-    METHOD  /api/path/{param}  classification[:detail]
+    METHOD  /api/path/{param}  pat=<decision>  classification[:detail]
+
+``pat=`` is the personal-access-token scope the route needs, read from the
+runtime table itself (``orchestrator.security.token_scopes.classify_route``) on
+the composed template: a scope, ``any`` (any scoped token), ``refused``, or
+``unmapped`` (PATs refused until the route is classified).
 
 Classifications:
   gated:<gate>     — at least one known gate call in the body or signature
@@ -147,8 +152,17 @@ class Endpoint:
         str  # "gated:<name>" | "admin:_require_admin" | "public:<reason>" | "unscoped"
     )
 
+    @property
+    def pat_scope(self) -> str:
+        from orchestrator.security.token_scopes import classify_route
+
+        return classify_route(self.method, self.path)
+
     def render(self) -> str:
-        return f"{self.method.upper():<6} {self.path:<80} {self.classification}"
+        pat = f"pat={self.pat_scope}"
+        return (
+            f"{self.method.upper():<6} {self.path:<80} {pat:<19} {self.classification}"
+        )
 
 
 @dataclass(frozen=True)
@@ -1023,6 +1037,10 @@ def render_manifest(endpoints: list[Endpoint]) -> str:
         "# unmounted routers and framework-generated docs/OpenAPI routes are excluded.\n"
         "# Other mounted paths are reported separately; unsupported composition fails.\n"
         "# Gate labels are static source evidence, not authorization/control-flow proof.\n"
+        "#\n"
+        "# pat=<decision> — personal access token scope the route needs, from\n"
+        "#   orchestrator/security/token_scopes.py: a scope, `any` (any scoped token),\n"
+        "#   `refused`, or `unmapped` (refused until classified; a test fails).\n"
         "#\n"
         "# Classifications:\n"
         "#   gated:<gate>           — protected by a require_* / user_can_access_* helper\n"

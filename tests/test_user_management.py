@@ -382,16 +382,14 @@ class TestAppSideAdmission:
                 "id": uuid4(),
                 "user_id": uuid4(),
                 "kind": "api",
-                "scopes": [],
+                "scopes": ["jobs:read"],
             }
         )
         db.get_user = AsyncMock(
             return_value={"id": uuid4(), "display_name": "x", "is_approved": False}
         )
         db.touch_auth_token = AsyncMock()
-        request = MagicMock()
-        request.headers = {}
-        request.client = MagicMock(host="127.0.0.1")
+        request = self._pat_request()
 
         result = await _resolve_pat("ak_token", request, db)
         # A suspended owner's PAT now reflects the row → denied downstream.
@@ -407,19 +405,31 @@ class TestAppSideAdmission:
                 "id": uuid4(),
                 "user_id": uuid4(),
                 "kind": "api",
-                "scopes": [],
+                "scopes": ["jobs:read"],
             }
         )
         db.get_user = AsyncMock(
             return_value={"id": uuid4(), "display_name": "x", "is_approved": True}
         )
         db.touch_auth_token = AsyncMock()
-        request = MagicMock()
-        request.headers = {}
-        request.client = MagicMock(host="127.0.0.1")
+        request = self._pat_request()
 
         result = await _resolve_pat("ak_token", request, db)
         assert result["is_approved"] is True
+
+    @staticmethod
+    def _pat_request():
+        """A request matched to a route the ``jobs:read`` token may call —
+        the resolver checks the token's scopes against the matched route."""
+        request = MagicMock()
+        request.headers = {}
+        request.client = MagicMock(host="127.0.0.1")
+        request.scope = {
+            "type": "http",
+            "method": "GET",
+            "route": MagicMock(path="/api/jobs"),
+        }
+        return request
 
     @pytest.mark.asyncio
     async def test_ensure_user_provisioned_skips_without_sub(self):

@@ -23,6 +23,7 @@ from datetime import datetime, timedelta, UTC
 from typing import Any
 
 from fastapi import HTTPException, Request
+from orchestrator.security import token_scopes
 from orchestrator.security.account_approval import require_account_approved
 from orchestrator.security.kc_client import KeycloakClientError, kc_bff_client
 from orchestrator.security.oidc import oidc_validator
@@ -477,6 +478,12 @@ async def _resolve_pat(token: str, request: Request, db) -> dict:
     introspection. Admission flows from the user row (``is_approved``): the
     force-True is gone so that suspending a user also kills their PATs — if
     the owner is no longer approved, the token stops working on the next call.
+
+    Action scopes are enforced here, against the route FastAPI matched, so
+    every PAT request passes the check whichever gate its handler calls (see
+    ``security.token_scopes``). Admin reach is itself a scope: without
+    ``admin`` the owner's admin flag is dropped for this request, so admin-only
+    gates refuse and admin visibility narrows to the owner's own rows.
     """
     digest = hashlib.sha256(token.encode("ascii")).hexdigest()
     row = await db.get_auth_token_by_hash(digest)
@@ -488,9 +495,28 @@ async def _resolve_pat(token: str, request: Request, db) -> dict:
     asyncio.create_task(
         db.touch_auth_token(str(row["id"]), _client_ip(request)),
     )
-    user["auth_method"] = "pat"
+    user["auth_method"] = token_scopes.PAT_AUTH_METHOD
     user["scopes"] = list(row.get("scopes") or [])
     user["token_id"] = str(row["id"])
+    if token_scopes.ADMIN_SCOPE not in user["scopes"]:
+        user["is_admin"] = False
+    try:
+        token_scopes.enforce_route_scopes(request, user)
+    except HTTPException as exc:
+        # Lazy: security.access imports this module.
+        from orchestrator.security.access import log_security_event
+
+        route = token_scopes.route_identity(request)
+        await log_security_event(
+            db,
+            event_type="token_scope_denied",
+            user=user,
+            resource_type="api_route",
+            resource_id=route[1] if route else None,
+            detail=f"{exc.detail} (token scopes: {sorted(map(str, user['scopes']))})",
+            request=request,
+        )
+        raise
     return user
 
 
