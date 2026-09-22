@@ -14,6 +14,7 @@ from typing import Any, Literal
 from fastapi import HTTPException
 import yaml
 
+from orchestrator.security.access import redact_public_config_override
 from orchestrator.schemas.expert_catalog import (
     ExpertInfo,
     SkillInfo,
@@ -582,7 +583,7 @@ class ExpertCatalogService:
             ):
                 return {
                     "id": str(row["id"]),
-                    "manifest": row["manifest"],
+                    "manifest": redact_public_config_override(row["manifest"]),
                     "harness_adapter": row["harness_adapter"],
                     "config": {},
                     "settings_matrix": {},
@@ -694,9 +695,12 @@ class ExpertCatalogService:
                 "workspace_preference": (row.get("manifest") or {})
                 .get("spec", {})
                 .get("workspacePreference"),
-                "manifest": row.get("manifest"),
+                # A Project's managed child carries the project's override and
+                # its link override verbatim as layers — merged into ``config``
+                # and inside ``manifest`` — and every project member reads this.
+                "manifest": redact_public_config_override(row.get("manifest")),
                 "harness_adapter": row.get("harness_adapter", SRW_HARNESS_ADAPTER),
-                "config": merged,
+                "config": redact_public_config_override(merged),
                 "instructions": asset_prompts.get("instructions"),
                 "persona": asset_prompts.get("persona"),
                 "enumerate_only": enumerate_only_members(),
@@ -1539,8 +1543,8 @@ class ExpertCatalogService:
                 except (json.JSONDecodeError, TypeError):
                     project_override = {}
             if isinstance(project_override, dict) and project_override:
-                detail["config"] = deep_merge_dicts(
-                    detail.get("config") or {}, project_override
+                detail["config"] = redact_public_config_override(
+                    deep_merge_dicts(detail.get("config") or {}, project_override)
                 )
             detail["name"] = linked["name"]
             detail["source"] = "project"

@@ -108,15 +108,18 @@ def public_project(project: dict[str, Any]) -> dict[str, Any]:
     transport — and every project MEMBER reads this row. It leaves by the job
     API's policy (:func:`redact_public_config_override`); ``update_project``
     restores the hidden values when the redacted view is written back.
+
+    A manifest-composed row (every project after ``migrate_projects``) also
+    carries the Project ``manifest``, whose Expert ``layers`` hold that override
+    and each link override verbatim, and whose team controller holds the
+    officer's config; it leaves by the same policy. The document keeps its
+    shape, so a reader comparing it to its resource still can.
     """
-    if project.get("default_config_override") is None:
-        return project
-    return {
-        **project,
-        "default_config_override": redact_public_config_override(
-            project["default_config_override"]
-        ),
-    }
+    out = dict(project)
+    for key in ("default_config_override", "manifest"):
+        if out.get(key) is not None:
+            out[key] = redact_public_config_override(out[key])
+    return out
 
 
 # =============================================================================

@@ -523,6 +523,87 @@ class TestSkillGlobalPublication:
         assert "is_global" not in env.store.create_skill.await_args.kwargs
 
 
+PROJECT_SHARED = {
+    "llm": {"api_key": "sk-project-shared"},
+    "env_keys": {"EMBEDDING_API_KEY": "sk-embed-shared", "EMBEDDING_MODEL": "e5"},
+    "workspace": {"remote": {"host": "10.0.0.7"}},
+}
+PROJECT_LINK = {"llm": {"api_key": "sk-link-override"}, "settings": {"last": True}}
+LAYER_SECRETS = ("sk-project-shared", "sk-embed-shared", "10.0.0.7", "sk-link-override")
+
+
+def managed_child_row():
+    """A Project's managed child Expert as ``hydrate_expert_row`` serves it:
+    the composed spec's ``runtime.config.layers`` are the project's shared
+    override and the link override, verbatim, on both ``manifest`` and
+    ``harness_config_layers``. It is linked to the project, so every member
+    sees it by id."""
+    from orchestrator.services.manifest_experts import (
+        expert_manifest,
+        project_expert_resource,
+    )
+    from orchestrator.services.manifest_projects import compose_srw_expert
+    from shared.manifests.resolution import content_revision
+
+    raw = expert_row(config={"settings": {"expert": True}}, tags=["worker"])
+    document = compose_srw_expert(
+        expert_manifest(raw, image="trusted/srw:v1"),
+        shared=PROJECT_SHARED,
+        linked=PROJECT_LINK,
+    )
+    return project_expert_resource(
+        raw,
+        {
+            "id": UUID(int=7),
+            "document": document,
+            "revision": content_revision(document["spec"]),
+            "resource_version": 1,
+        },
+    )
+
+
+class TestLinkedExpertDetailRedaction:
+    """The expert detail a project member reads carries the project's
+    override layers twice — merged into ``config`` and inside ``manifest`` —
+    and ``/api/projects/{id}/experts/{name}`` merges the link override on top.
+    They leave by the job API's policy, like the project row itself."""
+
+    @pytest.fixture
+    def env(self, catalogue_wire):
+        row = managed_child_row()
+        store = catalogue_wire.store
+        store.get_expert_visible_by_id.return_value = row
+        store.get_expert_by_id.return_value = row
+        store.get_project_linked_expert = AsyncMock(
+            return_value={
+                **row,
+                "default_for": "worker",
+                "project_config_override": {"llm": {"api_key": "sk-link-override"}},
+            }
+        )
+        store.get_user_settings = AsyncMock(return_value={})
+        store.resolve_default_for_capability = AsyncMock(return_value=None)
+        return catalogue_wire
+
+    def test_expert_detail_hides_the_project_layers(self, env):
+        response = env.client.get(f"/api/experts/{EXPERT_ID}")
+        assert response.status_code == 200
+        for secret in LAYER_SECRETS:
+            assert secret not in response.text
+        body = response.json()
+        assert body["config"]["settings"] == {"expert": True, "last": True}
+        assert body["config"]["env_keys"]["EMBEDDING_MODEL"] == "e5"
+        layers = body["manifest"]["spec"]["runtime"]["config"]["layers"]
+        assert layers[1] == {"llm": {}, "settings": {"last": True}}
+
+    def test_project_expert_detail_hides_layers_and_link_override(self, env):
+        response = env.client.get(f"/api/projects/{PROJECT_ID}/experts/quiet-worker")
+        assert response.status_code == 200
+        for secret in LAYER_SECRETS:
+            assert secret not in response.text
+        assert response.json()["source"] == "project"
+
+
 def test_two_mounted_apps_keep_store_identity_and_reload_cache_separate(
     catalogue_wire, monkeypatch
 ):

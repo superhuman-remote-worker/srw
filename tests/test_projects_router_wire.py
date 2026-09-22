@@ -634,6 +634,139 @@ class TestDefaultConfigOverrideRedaction:
         assert written["env_keys"]["EMBEDDING_API_KEY"] == "sk-rotated"
 
 
+def _composed_project() -> dict[str, Any]:
+    """A project the way ``hydrate_project_row`` serves it after
+    ``migrate_projects``: the whole Project manifest rides on the row, and each
+    linked Expert's inline spec carries the shared override (and the link
+    override) VERBATIM as ``runtime.config.layers``. The officer's config rides
+    at ``spec.team.controller.config.config``."""
+    from orchestrator.services.manifest_experts import (
+        expert_manifest,
+        project_expert_resource,
+    )
+    from orchestrator.services.manifest_projects import project_document
+    from shared.manifests.resolution import content_revision
+
+    expert_id = str(uuid4())
+    raw = {
+        "id": expert_id,
+        "name": "builder",
+        "display_name": "Builder",
+        "expert_type": "worker",
+        "owner_id": OWNER_ID,
+        "is_global": False,
+        "icon": "build",
+        "color": "#123456",
+        "tags": ["worker"],
+        "config": {"settings": {"expert": True}},
+        "prompts": {"persona": "Keep this persona."},
+        "default_for": "worker",
+        "config_override": {"llm": {"api_key": "sk-link-secret"}},
+    }
+    document = expert_manifest(raw, image="trusted/srw:v1")
+    source = project_expert_resource(
+        raw,
+        {
+            "id": uuid4(),
+            "document": document,
+            "revision": content_revision(document["spec"]),
+            "resource_version": 1,
+        },
+    )
+    project = {**PROJECT, "default_config_override": SECRET_OVERRIDE}
+    post = {
+        "config_override": {
+            "officer": {"enabled": True},
+            "llm": {"api_key": "sk-officer-secret"},
+        },
+        "communication_policy": {},
+        "is_active": True,
+    }
+    manifest, recipe = project_document(
+        project, owner_id=OWNER_ID, experts=[source], post=post
+    )
+    return {
+        **PROJECT,
+        "manifest": manifest,
+        "manifest_uid": str(uuid4()),
+        "manifest_revision": "r1",
+        "manifest_composed": True,
+        "default_config_override": recipe["sharedConfig"],
+    }
+
+
+COMPOSED_SECRETS = (*SECRETS, "sk-link-secret", "sk-officer-secret")
+
+
+class TestManifestComposedProjectRedaction:
+    """``migrate_projects`` makes every project manifest-composed, so the row
+    both reads serve carries the Project manifest — and the manifest holds the
+    override verbatim in each Expert's ``layers``. Redacting only the
+    ``default_config_override`` column projection left all of it readable."""
+
+    def test_project_detail_redacts_every_layer_of_the_manifest(self):
+        row = _composed_project()
+
+        async def member(_request, _store, _project_id, **_kwargs):
+            return OWNER, row
+
+        wired = _wire(project_member=member)
+
+        response = wired.client.get(f"/api/projects/{PROJECT_ID}")
+
+        assert response.status_code == 200
+        for secret in COMPOSED_SECRETS:
+            assert secret not in response.text
+        body = response.json()
+        assert body["default_config_override"] == PUBLIC_OVERRIDE
+        # The document keeps its shape: consumers compare it to the resource.
+        experts = body["manifest"]["spec"]["resources"]["experts"]
+        worker = next(v for k, v in experts.items() if k.endswith("-worker"))
+        layers = worker["inline"]["runtime"]["config"]["layers"]
+        assert layers[0] == PUBLIC_OVERRIDE
+        assert layers[1] == {"llm": {}}
+        assert body["manifest"]["spec"]["team"]["controller"]["config"]["config"] == {
+            "officer": {"enabled": True},
+            "llm": {},
+        }
+
+    def test_project_list_redacts_the_manifest(self):
+        store = _store(
+            get_projects_for_user=AsyncMock(return_value=[_composed_project()])
+        )
+        wired = _wire(store=store)
+
+        response = wired.client.get("/api/projects")
+
+        assert response.status_code == 200
+        for secret in COMPOSED_SECRETS:
+            assert secret not in response.text
+        assert response.json()[0]["manifest"]["kind"] == "Project"
+
+    def test_a_manifest_without_secrets_is_served_unchanged(self):
+        """The k3d cutover gate asserts the list's ``manifest`` equals the
+        resource document; redaction must be the identity when there is
+        nothing to hide."""
+        row = _composed_project()
+        clean = json.loads(
+            json.dumps(row["manifest"])
+            .replace('"api_key": "sk-link-secret"', '"model": "m"')
+            .replace('"api_key": "sk-officer-secret"', '"model": "m"')
+        )
+        clean_row = {**row, "manifest": clean, "default_config_override": {}}
+        for layer_holder in clean["spec"]["resources"]["experts"].values():
+            config = layer_holder["inline"]["runtime"]["config"]
+            config["layers"] = [
+                layer for layer in config.get("layers", []) if "workspace" not in layer
+            ]
+        store = _store(get_projects_for_user=AsyncMock(return_value=[clean_row]))
+        wired = _wire(store=store)
+
+        response = wired.client.get("/api/projects")
+
+        assert response.json()[0]["manifest"] == clean
+
+
 # =============================================================================
 # The conditional owner escalation on unlink
 # =============================================================================

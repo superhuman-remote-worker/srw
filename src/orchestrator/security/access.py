@@ -1188,8 +1188,13 @@ def redact_config_override(co: Any) -> Any:
 
 
 def _hidden_config_key(path: tuple[str, ...], key: str) -> bool:
-    """A key :func:`redact_public_config_override` removes at ``path``."""
-    return _is_secret_key(key) or (path == ("workspace",) and key == "remote")
+    """A key :func:`redact_public_config_override` removes at ``path``.
+
+    ``remote`` is hidden under ANY ``workspace`` dict, not only the override's
+    root one: the same override also rides nested — as a manifest layer, a
+    merged expert config — and the transport block is the same thing there.
+    """
+    return _is_secret_key(key) or (key == "remote" and path[-1:] == ("workspace",))
 
 
 def _public_config_view(value: Any, path: tuple[str, ...] = ()) -> Any:
@@ -1212,6 +1217,11 @@ def redact_public_config_override(co: Any) -> Any:
     (SSH coordinates injected at dispatch). JSONB arrives from asyncpg as text,
     so a string is parsed and returned as an object; one that does not parse is
     dropped rather than risk returning a raw secret.
+
+    It walks the whole value, so it also serves for a document that EMBEDS
+    overrides — a Project manifest carries the project's override verbatim in
+    each Expert's ``runtime.config.layers`` — and is the identity on one with
+    nothing to hide.
     """
     if isinstance(co, str):
         try:
