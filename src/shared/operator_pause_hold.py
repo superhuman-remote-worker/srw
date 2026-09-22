@@ -1,24 +1,28 @@
-"""Durable operator-pause boundary for pinned jobs.
+"""Durable operator-pause boundary shared by the pinned and stateless lanes.
 
 A public pause parks the job as ``paused``, unassigned and freeze-free. That
-is also the dispatchable shape every system-initiated pause (dispatcher
+is also the runnable shape every system-initiated pause (dispatcher
 preemption, agent release, orphan and lease recovery, backoff redispatch)
 relies on to be picked up again, so without a marker the dispatcher resumed an
 operator-paused job on its next pass (job 65e8729d, 2026-09-20).
 
 The public pause therefore stamps ``context._operator_pause_hold`` in the same
-jobs-row write that parks the job. The dispatcher's candidate query and its
-claim CAS refuse a row carrying it, so neither a later poll nor a dispatcher
-pass that selected the row before the pause landed can run it. Internal resume
-writes (queued feedback, urgent replies, completion bounces) merge around the
-marker and leave the job held. Only an explicit authorized resume (or an admin
-assignment) removes it, in the same write that re-queues or claims the job, and
-only while the marker is still the one that request observed: the caller
-passes :func:`operator_pause_lift_token` of the row it authorized, and a newer
-pause makes the write lose its CAS instead of being crossed.
+jobs-row write that parks the job. Everything that re-admits a paused job
+refuses a row carrying it: the pinned dispatcher's candidate query and claim
+CAS, the stateless admission query and enqueue CAS, and the stateless worker
+claim's jobs-row CAS. A pass that selected the row before the pause landed
+therefore still cannot run it. Internal resume writes (queued feedback, urgent
+replies, completion bounces) merge around the marker and leave the job held;
+on the stateless lane they expose no runnable queue unit. Only an explicit
+authorized resume (or an admin assignment) removes it, in the same write that
+re-queues or claims the job, and only while the marker is still the one that
+request observed: the caller passes :func:`operator_pause_lift_token` of the
+row it authorized, and a newer pause makes the write lose its CAS instead of
+being crossed.
 
 Presence alone holds, whatever the value's shape (fail-closed). The marker is
-jobs-row state, so it survives orchestrator restarts.
+jobs-row state, so it survives orchestrator and worker restarts. Stdlib-only:
+both the orchestrator and the stateless worker (agent image) import it.
 """
 
 from __future__ import annotations
@@ -85,18 +89,27 @@ def operator_pause_hold_jsonb_sql(
     )
 
 
+def _context(value: Any) -> Mapping[str, Any]:
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (TypeError, ValueError):
+            return {}
+    return value if isinstance(value, Mapping) else {}
+
+
+def operator_pause_hold_present(context: Any) -> bool:
+    """Python mirror of :func:`operator_pause_hold_present_sql` for a context."""
+
+    return OPERATOR_PAUSE_HOLD_CONTEXT_KEY in _context(context)
+
+
 def operator_pause_lift_token(job: Mapping[str, Any] | None) -> str:
     """Hold id an explicit resume observed on ``job``; ``''`` when unheld."""
 
-    context: Any = job.get("context") if job else None
-    if isinstance(context, str):
-        try:
-            context = json.loads(context)
-        except (TypeError, ValueError):
-            return ""
-    if not isinstance(context, Mapping):
-        return ""
-    marker = context.get(OPERATOR_PAUSE_HOLD_CONTEXT_KEY)
+    marker = _context(job.get("context") if job else None).get(
+        OPERATOR_PAUSE_HOLD_CONTEXT_KEY
+    )
     hold_id = marker.get("hold_id") if isinstance(marker, Mapping) else None
     return hold_id if isinstance(hold_id, str) else ""
 
@@ -108,6 +121,7 @@ __all__ = [
     "operator_pause_hold_jsonb_sql",
     "operator_pause_hold_lift_sql",
     "operator_pause_hold_matches_sql",
+    "operator_pause_hold_present",
     "operator_pause_hold_present_sql",
     "operator_pause_lift_token",
 ]

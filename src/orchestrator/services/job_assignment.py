@@ -11,7 +11,7 @@ from fastapi import HTTPException
 from orchestrator.services.dispatch_guards import resume_lane_applies
 from orchestrator.services.job_workspace_runtime import WORKSPACE_CONTEXT_KEYS
 from orchestrator.services.manifest_runtime_ownership import require_srw_runtime
-from orchestrator.services.operator_pause_hold import operator_pause_lift_token
+from shared.operator_pause_hold import operator_pause_lift_token
 from shared.workspace_contract import resolve_workspace_runtime
 
 

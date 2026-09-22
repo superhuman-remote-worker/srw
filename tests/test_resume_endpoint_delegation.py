@@ -782,6 +782,7 @@ class TestResumeEndpointDelegation:
             priority=1,
             fair_key=None,
             expected_status="pending_review",
+            lift_operator_pause_hold="",
         )
         endpoint_collaborators.delegate.assert_not_awaited()
         orchestrator.main.postgres_db.get_agent.assert_not_awaited()
@@ -1105,6 +1106,7 @@ class TestResumeEndpointWorkspacelessJob:
                 ),
             },
             expected_status="pending_review",
+            lift_operator_pause_hold="",
         )
         workspaceless.shed.assert_not_awaited()
         workspaceless.queue_for_resume.assert_not_awaited()

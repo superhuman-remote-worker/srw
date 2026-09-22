@@ -168,6 +168,30 @@ async def test_public_pause_holds_the_job_but_cascaded_children_stay_dispatchabl
 
 
 @pytest.mark.asyncio
+async def test_stateless_public_pause_holds_but_worker_release_does_not():
+    store = SimpleNamespace(
+        get_descendant_jobs=AsyncMock(return_value=[]),
+        pause_stateless_job=AsyncMock(return_value=True),
+        get_job=AsyncMock(return_value={"id": "job-1", "execution_lane": "stateless"}),
+    )
+    operations = _controls(store)
+
+    await operations.pause(
+        "job-1",
+        job={"id": "job-1", "execution_lane": "stateless", "status": "processing"},
+        paused_by="user-a",
+    )
+    await operations.release("job-1", lease_token=7)
+
+    public, release = store.pause_stateless_job.await_args_list
+    assert public.kwargs == {"operator_hold": True, "paused_by": "user-a"}
+    assert release.kwargs == {
+        "completion_commands_enabled": True,
+        "expected_lease_token": 7,
+    }
+
+
+@pytest.mark.asyncio
 async def test_legacy_public_pause_writes_the_hold_with_the_status_flip():
     store = SimpleNamespace(
         get_descendant_jobs=AsyncMock(return_value=[]),

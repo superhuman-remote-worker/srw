@@ -30,7 +30,7 @@ from orchestrator.services.manifest_runtime_ownership import (
     require_srw_runtime,
     uses_srw_runtime,
 )
-from orchestrator.services.operator_pause_hold import operator_pause_lift_token
+from shared.operator_pause_hold import operator_pause_lift_token
 from orchestrator.services.vm_workspace_recovery_store import (
     acquire_vm_cleanup_permit,
     vm_cleanup_kwargs,
@@ -1087,6 +1087,7 @@ class JobControlOperations:
                         workspace_context_key,
                         context_merge,
                         expected_status=expected_status,
+                        lift_operator_pause_hold=operator_pause_lift,
                         **self.dependencies.completion_control.resume_guard_kwargs(),
                     )
                 elif job.get("execution_lane") == "stateless":
@@ -1096,6 +1097,7 @@ class JobControlOperations:
                         priority=int(job.get("priority") or 0),
                         fair_key=(str(job["user_id"]) if job.get("user_id") else None),
                         expected_status=expected_status,
+                        lift_operator_pause_hold=operator_pause_lift,
                         **self.dependencies.completion_control.resume_guard_kwargs(),
                     )
                 elif workspace_preflight_required and control_claim is not None:

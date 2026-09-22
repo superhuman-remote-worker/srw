@@ -215,10 +215,10 @@ async def pause_job(
     to the agent pod. The agent finishes its current graph node, saves
     the checkpoint, and becomes available for new work.
 
-    A paused pinned job stays paused: it carries a durable operator pause
-    hold that the dispatcher will not cross, so it runs again only after an
+    The paused job stays paused on either lane: it carries a durable operator
+    pause hold that neither the dispatcher, the stateless admission and worker
+    claim, nor an internal resume will cross, so it runs again only after an
     explicit ``POST /api/jobs/{job_id}/resume`` (or an admin assignment).
-    Stateless jobs keep the historical re-admission behavior.
     """
     user, job = await dependencies.require_internal_or_job_access(
         request, dependencies.store, job_id

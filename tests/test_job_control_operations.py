@@ -306,6 +306,7 @@ async def test_command_mode_resume_queues_stateless_before_agent_delivery(
         priority=7,
         fair_key="user-a",
         expected_status="paused",
+        lift_operator_pause_hold="",
     )
     operations.dependencies.resume_job_on_agent.assert_not_awaited()
     operations.dependencies.trigger_dispatch.assert_called_once_with()

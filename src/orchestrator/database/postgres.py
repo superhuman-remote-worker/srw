@@ -115,7 +115,7 @@ from orchestrator.services.cloud.protected_reader_authority import (
 from orchestrator.services.cloud_staging.source_identity import (
     ProtectedMountSourceIdentity,
 )
-from orchestrator.services.operator_pause_hold import (
+from shared.operator_pause_hold import (
     OPERATOR_PAUSE_HOLD_CONTEXT_KEY,
     operator_pause_hold_jsonb_sql,
     operator_pause_hold_lift_sql,
@@ -5311,7 +5311,7 @@ class PostgresDB:
         the dispatcher when an agent becomes available (preemption, agent
         release). ``operator_hold`` is the public pause: the same write stamps
         the durable operator pause hold, so the job stays paused until an
-        explicit resume lifts it (see ``services/operator_pause_hold.py``).
+        explicit resume lifts it (see ``shared/operator_pause_hold.py``).
 
         Args:
             job_id: Job UUID as string
@@ -5459,6 +5459,8 @@ class PostgresDB:
         *,
         completion_commands_enabled: bool = False,
         expected_lease_token: int | None = None,
+        operator_hold: bool = False,
+        paused_by: str | None = None,
     ) -> bool:
         """Publish a stateless preemption under the queue-first lock order.
 
@@ -5466,11 +5468,30 @@ class PostgresDB:
         perform exact-token teardown. Between batches there is no holder: close
         a queued/parked row in this same transaction so it cannot be reclaimed
         before the dispatcher observes the pause and deliberately re-admits it.
+
+        ``operator_hold`` is the public pause: the same write stamps the
+        durable operator pause hold, which the dispatcher's admission, the
+        worker claim and internal resumes all respect, so the job is not
+        re-admitted until an explicit resume lifts it.
         """
         try:
             job_uuid = UUID(job_id)
         except ValueError:
             return False
+        hold_set = ""
+        hold_args: tuple[Any, ...] = ()
+        if operator_hold:
+            hold_args = (str(uuid4()), "public_pause", paused_by)
+            hold_set = (
+                "context = jsonb_set(COALESCE(context, '{}'::jsonb), "
+                f"'{{{OPERATOR_PAUSE_HOLD_CONTEXT_KEY}}}', "
+                + operator_pause_hold_jsonb_sql(
+                    hold_id_parameter="$2",
+                    source_parameter="$3",
+                    paused_by_parameter="$4",
+                )
+                + ", true),"
+            )
 
         async with self.acquire() as conn:
             async with conn.transaction():
@@ -5519,10 +5540,11 @@ class PostgresDB:
 
                     await cancel_queued_worker_batch(conn, job_id=job_uuid)
                 row = await conn.fetchrow(
-                    """
+                    f"""
                     UPDATE jobs
                        SET status = 'paused',
                            assigned_agent_id = NULL,
+                           {hold_set}
                            updated_at = CURRENT_TIMESTAMP
                      WHERE id = $1
                        AND execution_lane = 'stateless'
@@ -5530,6 +5552,7 @@ class PostgresDB:
                     RETURNING id
                     """,
                     job_uuid,
+                    *hold_args,
                 )
         return row is not None
 
@@ -29536,7 +29559,9 @@ class PostgresDB:
                AND NOT EXISTS (SELECT 1 FROM srw_execution_specs execution
                    WHERE execution.work_kind='Job' AND execution.work_id=jobs.id
                      AND execution.harness_adapter <> 'srw/v1')
-            RETURNING id, priority, user_id
+            RETURNING id, priority, user_id,
+                      {operator_pause_hold_present_sql("context")}
+                          AS operator_pause_held
             """,
             *args,
         )
@@ -29838,11 +29863,19 @@ class PostgresDB:
         completion_owner_command_id: str | None = None,
         completion_owner: str | None = None,
         completion_control_claim_id: str | None = None,
+        lift_operator_pause_hold: str | None = None,
     ) -> bool:
         """Atomically shed a stateless freeze and revive its worker unit.
 
         Queue-first lock ordering matches worker claim/renewal. If the jobs-row
         CAS loses (deleted or lane changed), the enqueue is rolled back with it.
+
+        An operator-paused job is revived only by an explicit resume passing
+        ``lift_operator_pause_hold`` (see :meth:`_queue_job_for_resume_on_conn`).
+        Any other caller (urgent reply, completion bounce, delegation result)
+        records its resume intent and feedback behind the hold, and the wake is
+        closed before commit so no runnable unit is exposed; the worker claim
+        refuses held rows as a backstop.
         """
         try:
             job_uuid = UUID(job_id)
@@ -29862,6 +29895,7 @@ class PostgresDB:
 
         from shared.run_queue import unpark_unit
         from shared.worker_queue import (
+            cancel_queued_worker_batch,
             enqueue_worker_batch_wake,
             reset_worker_batch_attempts,
         )
@@ -29908,9 +29942,17 @@ class PostgresDB:
                         completion_owner_command_id=completion_owner_command_id,
                         completion_owner=completion_owner,
                         completion_control_claim_id=completion_control_claim_id,
+                        lift_operator_pause_hold=lift_operator_pause_hold,
                     )
                     if row is None:
                         raise _ResumeCASLostError
+                    if row.get("operator_pause_held"):
+                        # The hold survived this (non-explicit) resume, decided
+                        # under the jobs-row lock this CAS took. Close the wake
+                        # it just enqueued in the same transaction so no worker
+                        # ever sees it; a live holder keeps its lease and stops
+                        # on renewal. The lifting resume enqueues a fresh wake.
+                        await cancel_queued_worker_batch(conn, job_id=job_uuid)
             return True
         except _ResumeCASLostError:
             return False
@@ -29923,6 +29965,7 @@ class PostgresDB:
         *,
         expected_status: str,
         completion_commands_enabled: bool = False,
+        lift_operator_pause_hold: str | None = None,
     ) -> bool:
         """Prepare an explicit worker resume that needs K8s reprovisioning.
 
@@ -29990,6 +30033,7 @@ class PostgresDB:
                         stateless_only=True,
                         expected_status=expected_status,
                         completion_commands_enabled=completion_commands_enabled,
+                        lift_operator_pause_hold=lift_operator_pause_hold,
                     )
                     if queued is None:
                         raise _ResumeCASLostError
@@ -30449,6 +30493,9 @@ class PostgresDB:
                   AND j.execution_lane = 'stateless'
                   AND j.assigned_agent_id IS NULL
                   AND j.freeze_data IS NULL
+                  -- Same boundary as the pinned lane: an operator pause is
+                  -- re-admitted only after an explicit resume lifts its hold.
+                  AND NOT {operator_pause_hold_present_sql("j.context")}
                   {completion_exclusion}
                   {control_guard}
                   AND COALESCE(
@@ -30611,6 +30658,7 @@ class PostgresDB:
                            )
                            {completion_exclusion}
                            {control_guard}
+                           AND NOT {operator_pause_hold_present_sql("context")}
                            AND (
                            (
                            CASE

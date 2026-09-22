@@ -44,6 +44,10 @@ from shared.workspace_contract import (
     stateless_worker_backend_admissible,
     vm_mode_from_env,
 )
+from shared.operator_pause_hold import (
+    operator_pause_hold_present,
+    operator_pause_hold_present_sql,
+)
 from shared.workspace_recovery import RecoveryAttemptDisposition
 
 logger = logging.getLogger(__name__)
@@ -126,6 +130,9 @@ WHERE id = $1::uuid
   AND execution_lane = 'stateless'
   AND assigned_agent_id IS NULL
   AND ($2::text <> 'paused' OR freeze_data IS NULL)
+  -- An operator-paused job runs again only after an explicit resume lifts
+  -- the hold; no stale wake, rotation or recovery requeue may cross it.
+  AND NOT {operator_pause_hold_present_sql("context")}
 RETURNING id
 """
 
@@ -959,6 +966,12 @@ async def claim_worker_batch(
                 # freeze before enqueueing, matching the existing partial
                 # dispatch-index contract.
                 and (prior_status != "paused" or job.get("freeze_data") is None)
+                # An operator pause hold outlives the pause itself. A unit
+                # requeued behind it (a wake during the stopped turn, a
+                # rotation, a recovery release) is consumed below instead of
+                # resuming the job or lingering as runnable-looking queue
+                # depth; the explicit resume that lifts the hold enqueues anew.
+                and not operator_pause_hold_present(job_context)
                 # A worker claimant may beat the defensive dispatcher repair
                 # to the queue lock. Reject the explicit VM marker before the
                 # jobs CAS so the row never becomes a processing worker loop.
@@ -1008,6 +1021,17 @@ async def claim_worker_batch(
                 lease_token=unit.lease_token,
                 consumed_seq=unit.input_seq,
             )
+            if operator_pause_hold_present(job_context):
+                # Expected, not an anomaly: the job waits for its resume.
+                logger.info(
+                    "worker_batch unit closed behind an operator pause hold: "
+                    "unit=%s token=%d job_status=%s queue_state=%s",
+                    unit.unit_id,
+                    unit.lease_token,
+                    prior_status,
+                    discarded,
+                )
+                return None
             logger.error(
                 "worker_batch claim rejected and reconciled: unit=%s token=%d "
                 "job_status=%s lane=%s assigned=%s queue_state=%s",

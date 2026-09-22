@@ -652,8 +652,9 @@ class JobControlOperations:
     ) -> dict[str, str]:
         """Pause already-authorized work, retaining ambiguous control holds.
 
-        A pinned pause also writes the durable operator pause hold, so the
-        parked row stays out of dispatch until an explicit resume lifts it.
+        Both lanes also write the durable operator pause hold, so the parked
+        row is not redispatched or re-admitted until an explicit resume lifts
+        it. Cascaded children and system pauses never write one.
         """
         d = self.dependencies
         require_srw_runtime(job)
@@ -665,7 +666,10 @@ class JobControlOperations:
                 )
             if job.get("execution_lane") == "stateless":
                 success = await d.store.pause_stateless_job(
-                    job_id, **d.completion_control.dispatch_guard_kwargs()
+                    job_id,
+                    operator_hold=True,
+                    paused_by=paused_by,
+                    **d.completion_control.dispatch_guard_kwargs(),
                 )
                 if not success:
                     refreshed = await d.store.get_job(job_id)

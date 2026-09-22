@@ -16,7 +16,7 @@ import math
 from typing import Any
 from uuid import UUID, uuid4
 
-from orchestrator.services.operator_pause_hold import (
+from shared.operator_pause_hold import (
     OPERATOR_PAUSE_HOLD_CONTEXT_KEY,
     operator_pause_hold_jsonb_sql,
 )
@@ -440,7 +440,7 @@ class CompletionControl:
         a dispatcher or another control from exposing a successor to stale I/O.
 
         ``operator_hold`` also stamps the durable operator pause hold in the
-        same write (see :mod:`orchestrator.services.operator_pause_hold`); it
+        same write (see :mod:`shared.operator_pause_hold`); it
         outlives this claim so the released row is not redispatched.
         """
 
