@@ -15798,6 +15798,9 @@ async def _handle_config_update(
         # response" once the history exceeds the new model's window. See
         # knowledge-history/done/session_model_switch_stale_context_manager_empty_response.md.
         _session.refresh_context_limits()
+        # Same for what tools read at call time (multimodal, the model window,
+        # delegation settings): an llm-only update rebinds without a reload.
+        _session.refresh_tool_context_config()
 
         # Rebuild auxiliary LLM if auxiliary settings changed. Symmetric to
         # the chat-side rebuild — the boot-time singleton on _agent doesn't

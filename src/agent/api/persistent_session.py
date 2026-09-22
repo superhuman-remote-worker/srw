@@ -1447,11 +1447,10 @@ class PersistentSession:
         else:  # Lightweight test/config adapters may not be real dataclasses.
             self.config.extra = next_extra
             self.config.instruction_files = instruction_files
-        if self.tool_context is not None:
-            # use_skill authorizes by the CURRENT scoped menu, not by stale
-            # workspace bytes. Keep its long-lived ToolContext synchronized on
-            # every backend/config rebind.
-            self.tool_context.config["_resolved_skills"] = scoped
+        # use_skill authorizes by the CURRENT scoped menu, not by stale
+        # workspace bytes. Keep its long-lived ToolContext synchronized on
+        # every backend/config rebind — the whole dict, not just the menu.
+        self.refresh_tool_context_config()
 
     def _deploy_catalog_skill_files(
         self, only_names: Optional[set[str]] = None
@@ -1920,11 +1919,15 @@ class PersistentSession:
             # Neo4j is optional: do not mark vector search/read as degraded.
             logger.warning(f"Failed to initialize Neo4j Graph tier (non-fatal): {e}")
 
-    def _setup_tools(self, postgres_conn: Optional[Any]) -> None:
-        """Load tools from config, excluding phase-specific ones."""
+    def _tool_config(self) -> Dict[str, Any]:
+        """The plain dict tools read through ``ToolContext.get_config``.
+
+        Derived from the CURRENT ``self.config`` and runtime managers, so
+        ``refresh_tool_context_config`` can re-derive it after a live update.
+        """
         from agent.tools.registry import officer_ceiling_active
 
-        tool_config = {
+        return {
             **self.config.extra,
             # Background-officer runtime fact (officer_knowledge_plane.md §4):
             # lets tools that survive the capability ceiling trim object-plane
@@ -1962,6 +1965,33 @@ class PersistentSession:
                 "_overlay_manager": self.overlay_mount_manager,
             },
         }
+
+    def refresh_tool_context_config(self) -> None:
+        """Re-derive ``tool_context.config`` from the CURRENT ``self.config``.
+
+        A live update replaces ``self.config``, but ``_setup_tools`` built this
+        dict once. The bind is the intersection of the name list (read from
+        ``self.config``) and what each factory builds (read from this dict), so
+        a stale copy silently empties a category — a persistent-mode name list
+        against a stateless shell factory binds no executor, and a ticked
+        Delegation binds nothing because ``delegation.enabled`` is still the
+        boot value. See
+        knowledge-base/knowledge/issues/live_config_update_buries_extra_and_empties_the_shell_group.md.
+
+        Updated in place without dropping a key that survives: tools share the
+        dict by reference and one may be reading it mid-turn.
+        """
+        if self.tool_context is None:
+            return
+        fresh = self._tool_config()
+        current = self.tool_context.config
+        current.update(fresh)
+        for key in [key for key in current if key not in fresh]:
+            del current[key]
+
+    def _setup_tools(self, postgres_conn: Optional[Any]) -> None:
+        """Load tools from config, excluding phase-specific ones."""
+        tool_config = self._tool_config()
         # Initialize session task manager
         from agent.managers.session_tasks import SessionTaskManager
 
@@ -2741,6 +2771,9 @@ class PersistentSession:
         self.tool_context.shell_manager = self.shell_manager
         # The WorkspaceManager object is unchanged by swap_backend (only its
         # ._backend flips), so tool_context.workspace_manager stays valid.
+        # The factories must read the config the name list is about to be
+        # derived from (a live update or remounted cloud replaced it).
+        self.refresh_tool_context_config()
         self._load_tools_for_backend()
         self._bind_tools()
         if self.system_prompt:
