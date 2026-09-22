@@ -240,6 +240,38 @@ async def _resolve_repo_ref(
     return str(repo_name), str(ref)
 
 
+def _seal_names_no_revision(job: dict[str, Any], freeze: dict[str, Any]) -> bool:
+    """True for a completion seal whose worker could not read its own HEAD.
+
+    Only an explicit ``head_commit: null`` counts — an ABSENT key comes from a
+    writer that never carried it and is judged on the tree as before — and a
+    ``delivered_commit`` (the agent's post-push proof) outranks it. Lite tiers
+    have no git, so a null HEAD is their normal state, not a failure.
+    """
+    if "head_commit" not in freeze or freeze.get("head_commit") is not None:
+        return False
+    if freeze.get("delivered_commit"):
+        return False
+    if not (
+        freeze.get("freeze_type") == "job_complete"
+        or freeze.get("status") == "job_completed"
+    ):
+        return False
+    from orchestrator.services.completion import _parse_resolved_config
+    from shared.backend_kinds import LITE_BACKENDS
+    from shared.workspace_contract import configured_workspace_backend
+
+    for config in (job.get("config_override"), _parse_resolved_config(job)):
+        try:
+            backend = configured_workspace_backend(config)
+        except Exception:  # noqa: BLE001 — an unreadable tier: cannot tell
+            # Judge on the tree alone, the pre-existing behavior.
+            return False
+        if backend in LITE_BACKENDS:
+            return False
+    return True
+
+
 async def _kb_note_exists(
     vector_db: Any, project_id: str | None, slug: str
 ) -> bool | None:
@@ -509,9 +541,10 @@ async def evaluate_deliverable_gate(
 
     # Nothing reached the repository, so "missing from the repository" says
     # nothing about what the agent produced. The agent sets this when its
-    # job-ending push does not land (src/core/phase.py,
-    # _push_job_ending_state): the deliverables exist, on a workspace pod about
-    # to be reclaimed, and Gitea is empty or stale.
+    # job-ending push does not land, or its final commit did not
+    # (src/agent/core/phase.py, _push_job_ending_state and
+    # _verify_job_ending_delivery): the deliverables exist, on a workspace pod
+    # about to be reclaimed, and Gitea is empty or stale.
     #
     # Without this the gate reads every manifest entry as missing and BOUNCES —
     # resuming the agent to produce files it already produced, onto a workspace
@@ -525,15 +558,29 @@ async def evaluate_deliverable_gate(
     # the one infrastructure failure that looks like a CLEAN read — the tree is
     # readable, it is merely empty.
     # knowledge-history/done/git_push_fails_silently_via_workspace_backend.md
+    #
+    # Skipping the tree check is not accepting the delivery, though: when the
+    # manifest names paths in the job's own tree, the report is also marked
+    # ``undelivered`` and run_deliverable_gate holds a ``completed`` seal for
+    # review rather than merging a branch the agent says lacks its work.
     freeze = _parse_freeze_data(job) or {}
-    if isinstance(freeze, dict) and freeze.get("delivery_failed"):
-        return {
+    if not isinstance(freeze, dict):
+        freeze = {}
+    names_repo_paths = any(
+        not path.startswith((PR_DELIVERABLE_PREFIX, KB_DELIVERABLE_PREFIX))
+        for path in manifest
+    )
+    if freeze.get("delivery_failed"):
+        report = {
             "skipped": True,
             "reason": str(
                 freeze.get("delivery_error")
                 or "the job-ending push failed; deliverables were not delivered"
             ),
         }
+        if names_repo_paths:
+            report["undelivered"] = True
+        return report
 
     if gitea is None or not getattr(gitea, "is_initialized", False):
         return {"skipped": True, "reason": "gitea unavailable"}
@@ -541,6 +588,26 @@ async def evaluate_deliverable_gate(
     repo_name, ref = await _resolve_repo_ref(job, db)
     if not repo_name or not ref:
         return {"skipped": True, "reason": "job repo unresolvable"}
+
+    # The same verdict for a seal that cannot name the revision it delivered.
+    # Existence at the branch tip proves nothing when the worker could not read
+    # its own HEAD: on VM job afa0004b the tip was a two-hour-old revision
+    # holding the deliverable SCAFFOLDS, so every manifest entry was "present"
+    # and the gate passed work nobody had delivered. Current agents prove
+    # delivery with ``delivered_commit`` or refuse with ``delivery_failed``
+    # (src/agent/core/phase.py, _verify_job_ending_delivery); this also covers
+    # records from agents that predate that proof.
+    # knowledge-base/knowledge/issues/worker_git_versioning_stops_midjob_seal_pins_stale_revision.md
+    if names_repo_paths and _seal_names_no_revision(job, freeze):
+        return {
+            "skipped": True,
+            "undelivered": True,
+            "reason": (
+                "the worker could not read its workspace HEAD when it sealed "
+                "(head_commit is null), so the job branch cannot be shown to "
+                "hold the delivered work — its tip may be a stale revision"
+            ),
+        }
 
     try:
         tree = await gitea.list_tree(repo_name, ref)
@@ -728,6 +795,45 @@ async def run_deliverable_gate(
             logger.warning(
                 "Deliverable gate: failed to stamp context for %s: %s", job_id, e
             )
+
+    if report.get("undelivered"):
+        # The repository does not provably hold the work. Never a bounce:
+        # resuming the worker cannot repair its transport, and a bounce
+        # early-returns past the verification escalation that reports the real
+        # reason. Never a pass either: a ``completed`` seal merges the stale
+        # branch, so it is held the way the bounce cap holds an unmet manifest.
+        # Review-bound seals keep their lane (verification escalates
+        # ``delivery_failed`` to a human; a critic reads this stamp).
+        reason = str(report.get("reason"))
+        final_status = new_status
+        if new_status == "completed":
+            from orchestrator.services.project_loops import job_loop_id
+            from orchestrator.services.verification_ledger import escalation_status
+
+            final_status = escalation_status(is_loop_job=bool(job_loop_id(job)))
+        logger.error(
+            "Deliverable gate: delivery UNPROVEN for job %s: %s — sealing as %s",
+            job_id,
+            reason,
+            final_status,
+        )
+        await _stamp(
+            {
+                "skipped": True,
+                "undelivered": True,
+                "reason": reason,
+                "checked_at": checked_at,
+                "bounces": bounces,
+            }
+        )
+        return DeliverableGateResult(
+            final_status,
+            [
+                f"deliverable gate: delivery unproven ({reason}) — not bounced, "
+                f"sealing as {final_status}"
+            ],
+            False,
+        )
 
     if report.get("skipped"):
         # Fail-open (graceful-degradation house rule): never block a seal on

@@ -669,6 +669,11 @@ class TestRunGate:
 
         Asserting only ``report["skipped"]`` at the evaluate level would leave
         that ordering unproven.
+
+        Not bouncing is not the same as accepting: the repository does not
+        hold the work, so a ``completed`` seal (which merges that branch) is
+        held for review instead, like the bounce cap does
+        (worker_git_versioning_stops_midjob_seal_pins_stale_revision.md).
         """
         job = make_job(
             manifest=["output/a.md", "output/b.md"],
@@ -691,10 +696,12 @@ class TestRunGate:
         )
 
         assert bounced is False
-        assert new_status == "completed"
+        assert new_status == "pending_review"
         queue_resume.assert_not_awaited()
         stamp = stamped(db)
         assert stamp["skipped"] is True
+        assert stamp["undelivered"] is True
+        assert stamp["reason"] == "The job-ending git push failed at job completion."
 
     @pytest.mark.asyncio
     async def test_pass_seals_and_stamps(self):
@@ -933,6 +940,192 @@ class TestRunGate:
         )
         assert (new_status, bounced) == ("completed", False)
         assert stamped(db)["passed"] is True
+
+
+# =============================================================================
+# A seal that cannot name its revision is not a delivery
+# =============================================================================
+
+
+class TestUnprovenDeliveryIsNotAccepted:
+    """knowledge-base/knowledge/issues/worker_git_versioning_stops_midjob_seal_pins_stale_revision.md
+
+    VM job afa0004b sealed with ``head_commit: None``: the worker could not
+    read its own HEAD, because its git had stopped working two hours earlier.
+    The gate then found all three manifest files at the branch tip — the
+    phase-3 scaffolds — and passed. Existence at the tip proves nothing when
+    the worker cannot say the tip is what it delivered.
+    """
+
+    MANIFEST = ["output/environment.md", "output/obstacles.md"]
+    # The stale tip really does hold the files: that is what made it pass.
+    STALE_TIP = ["output/environment.md", "output/obstacles.md", "plan.md"]
+
+    @staticmethod
+    def _freeze(**extra) -> dict:
+        return {
+            "freeze_type": "job_complete",
+            "summary": "done",
+            "head_commit": None,
+            "content_tree": None,
+            **extra,
+        }
+
+    @pytest.mark.asyncio
+    async def test_null_head_commit_is_not_accepted_as_delivered(self):
+        job = make_job(manifest=self.MANIFEST, freeze_data=self._freeze())
+
+        report = await evaluate_deliverable_gate(
+            job, db=make_db(), gitea=make_gitea(self.STALE_TIP)
+        )
+
+        assert report.get("passed") is not True
+        assert report["undelivered"] is True
+        assert "head_commit" in report["reason"]
+
+    @pytest.mark.asyncio
+    async def test_null_head_commit_holds_a_completed_seal_for_review(self):
+        """Not bounced (resuming the worker cannot repair its git), and not
+        sealed ``completed`` either — that would merge the stale branch."""
+        job = make_job(manifest=self.MANIFEST, freeze_data=self._freeze())
+        db = make_db()
+        queue_resume = AsyncMock()
+
+        new_status, actions, bounced = await run_deliverable_gate(
+            job,
+            completion_result(),
+            "completed",
+            db=db,
+            gitea=make_gitea(self.STALE_TIP),
+            queue_resume=queue_resume,
+        )
+
+        assert (new_status, bounced) == ("pending_review", False)
+        queue_resume.assert_not_awaited()
+        stamp = stamped(db)
+        assert stamp.get("passed") is not True
+        assert stamp["undelivered"] is True
+        assert not any("gate passed" in a for a in actions)
+        assert any("delivery unproven" in a for a in actions)
+
+    @pytest.mark.asyncio
+    async def test_null_head_commit_keeps_a_loop_job_terminal(self):
+        """Same escalation rule as the bounce cap: a parked loop job would
+        wedge its loop, so it resolves terminally with the report stamped."""
+        job = make_job(
+            manifest=self.MANIFEST,
+            context_extra={"loop_id": "some-loop"},
+            freeze_data=self._freeze(),
+        )
+        db = make_db()
+
+        new_status, _, bounced = await run_deliverable_gate(
+            job,
+            completion_result(),
+            "completed",
+            db=db,
+            gitea=make_gitea(self.STALE_TIP),
+            queue_resume=AsyncMock(),
+        )
+
+        assert (new_status, bounced) == ("completed", False)
+        assert stamped(db)["undelivered"] is True
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status", ["pending_review", "reviewing"])
+    async def test_a_review_bound_seal_keeps_its_lane_but_not_a_pass(self, status):
+        job = make_job(manifest=self.MANIFEST, freeze_data=self._freeze())
+        db = make_db()
+
+        new_status, _, bounced = await run_deliverable_gate(
+            job,
+            completion_result(goal_achieved=False),
+            status,
+            db=db,
+            gitea=make_gitea(self.STALE_TIP),
+            queue_resume=AsyncMock(),
+        )
+
+        assert (new_status, bounced) == (status, False)
+        assert stamped(db).get("passed") is not True
+
+    @pytest.mark.asyncio
+    async def test_a_verified_delivered_commit_is_evaluated_normally(self):
+        """``delivered_commit`` is the worker's positive proof (clean tree,
+        nothing unpushed, HEAD read after the final commit) — a failed
+        pre-commit HEAD read alongside it is only a diagnostic gap."""
+        job = make_job(
+            manifest=self.MANIFEST,
+            freeze_data=self._freeze(delivered_commit="f" * 40),
+        )
+
+        report = await evaluate_deliverable_gate(
+            job, db=make_db(), gitea=make_gitea(self.STALE_TIP)
+        )
+
+        assert report["passed"] is True
+
+    @pytest.mark.asyncio
+    async def test_a_freeze_without_the_key_is_evaluated_normally(self):
+        """Absent is not null: records from writers that never carried the
+        key are judged on the tree alone, as before."""
+        job = make_job(
+            manifest=self.MANIFEST,
+            freeze_data={"freeze_type": "job_complete", "summary": "done"},
+        )
+
+        report = await evaluate_deliverable_gate(
+            job, db=make_db(), gitea=make_gitea(self.STALE_TIP)
+        )
+
+        assert report["passed"] is True
+
+    @pytest.mark.asyncio
+    async def test_a_lite_job_without_git_is_evaluated_normally(self):
+        """Lite tiers have no git at all; a null HEAD is their normal state."""
+        job = make_job(manifest=self.MANIFEST, freeze_data=self._freeze())
+        job["config_override"] = {"workspace": {"backend": "virtual"}}
+
+        report = await evaluate_deliverable_gate(
+            job, db=make_db(), gitea=make_gitea(self.STALE_TIP)
+        )
+
+        assert report["passed"] is True
+
+    @pytest.mark.asyncio
+    async def test_a_job_without_a_repository_still_skips(self):
+        """No repository means nothing was supposed to be pushed; the
+        unresolvable-repo fail-open stands."""
+        job = make_job(
+            manifest=self.MANIFEST, repo_name=None, freeze_data=self._freeze()
+        )
+
+        report = await evaluate_deliverable_gate(
+            job, db=make_db(), gitea=make_gitea(self.STALE_TIP)
+        )
+
+        assert report["skipped"] is True
+        assert report.get("undelivered") is not True
+
+    @pytest.mark.asyncio
+    async def test_a_manifest_outside_the_job_tree_keeps_its_old_handling(self):
+        """Only a manifest naming paths in the job's own tree is a repository
+        deliverable; a KB-only contract never depended on the branch tip."""
+        job = make_job(
+            manifest=["kb:findings"],
+            freeze_data=self._freeze(delivery_failed=True),
+        )
+
+        new_status, _, bounced = await run_deliverable_gate(
+            job,
+            completion_result(),
+            "completed",
+            db=make_db(),
+            gitea=make_gitea(self.STALE_TIP),
+            queue_resume=AsyncMock(),
+        )
+
+        assert (new_status, bounced) == ("completed", False)
 
 
 # =============================================================================
