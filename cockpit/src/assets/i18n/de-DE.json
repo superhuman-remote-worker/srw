@@ -1815,6 +1815,7 @@
         "attachFailed": "Der Agent konnte diese Sitzung nicht wieder aufnehmen.",
         "shutdownCancelled": "Die Antwort wurde durch Wartungsarbeiten unterbrochen.",
         "stopped": "Die Sitzung wurde beendet, bevor diese Nachricht verarbeitet wurde.",
+        "retryExhausted": "Diese Nachricht ist wiederholt auf dieselbe Weise fehlgeschlagen und wurde zurückgestellt.",
         "generic": "Die Sitzung ist auf ein Problem gestoßen, das sie nicht selbst beheben kann — ein Administrator muss sie freigeben, bevor diese Nachricht ausgeführt werden kann."
       }
     },

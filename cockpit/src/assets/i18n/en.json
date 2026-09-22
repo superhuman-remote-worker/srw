@@ -1815,6 +1815,7 @@
         "attachFailed": "The agent couldn't pick this session back up.",
         "shutdownCancelled": "The reply was interrupted by maintenance.",
         "stopped": "The session stopped before this message was handled.",
+        "retryExhausted": "This message kept failing the same way, so it was set aside.",
         "generic": "The session hit a problem it can't clear on its own — an administrator has to release it before this message can run."
       }
     },

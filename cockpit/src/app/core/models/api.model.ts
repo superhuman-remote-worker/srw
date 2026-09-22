@@ -2920,6 +2920,7 @@ export type SessionQueueParkReason =
   | 'shutdown_cancelled'
   | 'completion_cas_failed'
   | 'reaper_max_attempts'
+  | 'retry_exhausted'
   | string;
 
 /**
