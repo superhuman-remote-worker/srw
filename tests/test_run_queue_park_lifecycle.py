@@ -193,20 +193,71 @@ def test_record_attach_failure_sql_contract():
     assert "RETURNING queue.state, queue.attempts_since_completion" in sql
 
 
-def test_bounded_release_sql_parks_at_the_rows_own_budget():
-    sql = q._RELEASE_BOUNDED_SQL
+def test_deterministic_release_sql_parks_at_the_rows_own_budget():
+    sql = q._RELEASE_DETERMINISTIC_SQL
     # Same exact-lease fence as every other disposition CAS.
     assert "lease_token = $2::bigint AND state = 'leased'" in sql
-    # The claim already counted the attempt; the row's own budget decides.
-    assert "attempts_since_completion + 1" not in sql
-    assert sql.count("WHEN attempts_since_completion >= max_attempts") == 3
+    # The budget is deterministic FAILURES, never claims: attempts (which
+    # hand-backs and transient releases also bump) neither park nor count.
+    assert "attempts_since_completion" not in sql
+    assert "last_error_signature IS NOT DISTINCT FROM $8::text" in sql
+    assert "THEN attach_failures + 1 ELSE 1 END AS failures" in sql
+    assert sql.count("WHEN cur.failures >= cur.max_attempts") == 3
     assert "THEN 'parked' ELSE 'queued' END" in sql
-    assert "THEN $6::text ELSE park_reason END" in sql
-    assert "last_error = COALESCE($7::text, last_error)" in sql
-    # The ordinary error backoff is unchanged.
-    assert "THEN $5::float8 * attempts_since_completion" in sql
-    # The unbounded statement stays for shutdown / stop-boundary hand-backs.
-    assert "max_attempts" not in q._RELEASE_SQL
+    assert "THEN $6::text ELSE queue.park_reason END" in sql
+    assert "last_error = COALESCE($7::text, queue.last_error)" in sql
+    # The attach-failure spacing (5/15/45/135 s): a fail-closed 409 streak
+    # behind a dependency blip must outlast it before it parks.
+    assert "$5::float8 * power(3::float8, cur.failures - 1))" in sql
+    assert "LEAST($9::float8," in sql
+    # The unbounded statement stays for transients and shutdown hand-backs,
+    # and never touches the failure record the budget reads.
+    for untouched in ("max_attempts", "attach_failures", "last_error_signature"):
+        assert untouched not in q._RELEASE_SQL
+
+
+def test_transient_release_backoff_doubles_and_caps():
+    assert [q.transient_release_backoff_seconds(n) for n in range(1, 8)] == [
+        5.0,
+        10.0,
+        20.0,
+        40.0,
+        60.0,
+        60.0,
+        60.0,
+    ]
+    assert q.transient_release_backoff_seconds(0) == 5.0
+    assert q.transient_release_backoff_seconds(10_000) == 60.0
+
+
+def test_every_release_site_reason_is_classified():
+    """A new ``_release`` reason must choose: deterministic (counts toward the
+    park budget) or transient (re-queues forever with backoff)."""
+    import inspect
+    import re
+
+    source = inspect.getsource(te)
+    sites = re.findall(r"self\._release\(", source)
+    calls = re.findall(r'self\._release\(\s*\w+,\s*reason=(f?)"([^"]+)"\s*\)', source)
+    # Every site must pass a string reason this test can read; a reason held
+    # in a variable would escape classification, so it fails here instead.
+    assert len(calls) == len(sites) > 0
+    literal = {reason for prefix, reason in calls if not prefix}
+    templated = {reason for prefix, reason in calls if prefix}
+    assert templated == {"bundle_{e.status_code}"}
+    classified = te._DETERMINISTIC_RELEASE_REASONS | te._TRANSIENT_RELEASE_REASONS
+    assert not te._DETERMINISTIC_RELEASE_REASONS & te._TRANSIENT_RELEASE_REASONS
+    assert literal - classified == set()
+    assert classified - literal == set()  # no stale entries either
+    # The templated bundle reason is classified by status.
+    assert te._release_is_deterministic("bundle_409")
+    assert te._release_is_deterministic("bundle_403")
+    assert te._release_is_deterministic("bundle_401")
+    for transient in ("bundle_500", "bundle_502", "bundle_503", "bundle_429"):
+        assert not te._release_is_deterministic(transient), transient
+    assert not te._release_is_deterministic("bundle_error")
+    assert te._release_is_deterministic("loop_died")
+    assert not te._release_is_deterministic("some_future_reason")
 
 
 @pytest.mark.asyncio
@@ -231,8 +282,18 @@ async def test_release_unit_routes_only_budgeted_callers_to_the_bounded_sql():
     )
     assert conn.calls[0] == (q._RELEASE_SQL, (UNIT, 7, 0.0, True, 5.0))
     assert conn.calls[1] == (
-        q._RELEASE_BOUNDED_SQL,
-        (UNIT, 7, 0.0, True, 5.0, PARK_REASON_RETRY_EXHAUSTED, "bundle_409"),
+        q._RELEASE_DETERMINISTIC_SQL,
+        (
+            UNIT,
+            7,
+            0.0,
+            True,
+            5.0,
+            PARK_REASON_RETRY_EXHAUSTED,
+            "bundle_409",
+            q.DETERMINISTIC_RELEASE_SIGNATURE,
+            ATTACH_FAILURE_BACKOFF_CAP_SECONDS,
+        ),
     )
 
 
@@ -538,13 +599,18 @@ async def test_exhausted_error_release_parks_and_journals_retry_exhausted(
 
 
 @pytest.mark.asyncio
-async def test_under_budget_error_release_requeues_silently(executor, monkeypatch):
-    monkeypatch.setattr(te, "release_unit", AsyncMock(return_value="queued"))
+async def test_transient_error_release_never_asks_to_park(executor, monkeypatch):
+    release = AsyncMock(return_value="queued")
+    monkeypatch.setattr(te, "release_unit", release)
     journal = AsyncMock()
     monkeypatch.setattr(te, "append_system_frame", journal)
 
-    await executor._release(_claim(attempts=2), reason="loop_not_ready")
+    await executor._release(_claim(attempts=3), reason="bundle_503")
 
+    kwargs = release.await_args.kwargs
+    assert "park_reason" not in kwargs
+    assert kwargs["error"] is True
+    assert kwargs["backoff_seconds"] == 20.0  # 5 s x 2^(3-1)
     journal.assert_not_awaited()
     assert executor.test_conn.bumped == 0
     executor._clear_claim_tool_effect.assert_called_once()

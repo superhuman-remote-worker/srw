@@ -170,6 +170,36 @@ def attach_failure_backoff_seconds(
     return float(min(schedule[index], cap))
 
 
+# Error releases split by whether a retry can succeed without a change
+# (voluntary_session_release_bypasses_retry_budget). A deterministic failure
+# counts toward the park budget under this failure-record signature; a
+# transient one (DB, transport, an orchestrator restarting mid-deploy) never
+# parks and backs off exponentially instead — capped, so a recovered
+# orchestrator is retried within a minute. (Input admission records a
+# watermark only; it does not shorten either wait.)
+DETERMINISTIC_RELEASE_SIGNATURE = "release:deterministic"
+TRANSIENT_RELEASE_BACKOFF_BASE_SECONDS = 5.0
+TRANSIENT_RELEASE_BACKOFF_CAP_SECONDS = 60.0
+
+
+def transient_release_backoff_seconds(
+    attempts: int,
+    *,
+    base: float = TRANSIENT_RELEASE_BACKOFF_BASE_SECONDS,
+    cap: float = TRANSIENT_RELEASE_BACKOFF_CAP_SECONDS,
+) -> float:
+    """Backoff before re-claiming after a transient error release.
+
+    ``attempts`` is the claim's ``attempts_since_completion`` (1 on the first
+    claim): ``base × 2^(attempts-1)``, capped. It grows through an outage and
+    resets with the unit's next completion.
+    """
+    exponent = max(0, int(attempts) - 1)
+    if exponent >= 32:
+        return float(cap)
+    return float(min(cap, base * (2**exponent)))
+
+
 # =============================================================================
 # SQL
 # =============================================================================
@@ -521,22 +551,42 @@ WHERE unit_id = $1::uuid AND lease_token = $2::bigint AND state = 'leased'
 RETURNING state
 """
 
-# Bounded error release (voluntary_session_release_bypasses_retry_budget).
-# Same transition as _RELEASE_SQL, except that a claim whose count already
-# reached the row's OWN max_attempts parks with reason $6 instead of
-# re-queueing. The reaper cannot bound a release loop — a voluntarily released
-# row is never an expired lease — so this CASE is the only budget check such a
-# loop meets. The claim already counted this attempt: nothing is incremented.
-# $7 records the release reason for operators (NULL keeps the previous one).
-_RELEASE_BOUNDED_SQL = """
-UPDATE run_queue SET
-    state = CASE WHEN attempts_since_completion >= max_attempts
+# Deterministic error release (voluntary_session_release_bypasses_retry_budget).
+# The reaper cannot bound a release loop — a voluntarily released row is never
+# an expired lease — so this statement is the only budget check such a loop
+# meets. It counts DETERMINISTIC failures only, in the unit's existing failure
+# record (last_error_signature / attach_failures; completion and unpark reset
+# it): while the signature $8 repeats the count advances, and another failure
+# class in between (an attach failure) restarts it at 1. Transient releases and
+# shutdown / stop-boundary hand-backs use _RELEASE_SQL and never touch the
+# record, so they neither consume this budget nor reset it — attempts_since_
+# completion, which every claim bumps, is deliberately not the measure here.
+# Parks with reason $6 once the count reaches the row's OWN max_attempts;
+# otherwise backs off on the attach-failure schedule, $5 x 3^(failures-1)
+# capped at $9 (5 / 15 / 45 / 135 s), unless an explicit $3 is given. The
+# spacing matters: the claim bundle answers 409 both for a genuine refusal
+# and for a fail-closed exception behind it (DB, config resolution), so a
+# budgeted streak must outlast a dependency blip before it parks. $7 is the
+# operator-facing reason (NULL keeps the previous one).
+_RELEASE_DETERMINISTIC_SQL = """
+WITH cur AS (
+    SELECT unit_id, max_attempts,
+           CASE WHEN last_error_signature IS NOT DISTINCT FROM $8::text
+                THEN attach_failures + 1 ELSE 1 END AS failures
+    FROM run_queue
+    WHERE unit_id = $1::uuid AND lease_token = $2::bigint AND state = 'leased'
+    FOR UPDATE
+)
+UPDATE run_queue AS queue SET
+    attach_failures = cur.failures,
+    last_error_signature = $8::text,
+    last_error = COALESCE($7::text, queue.last_error),
+    state = CASE WHEN cur.failures >= cur.max_attempts
                  THEN 'parked' ELSE 'queued' END,
-    park_reason = CASE WHEN attempts_since_completion >= max_attempts
-                       THEN $6::text ELSE park_reason END,
-    parked_at = CASE WHEN attempts_since_completion >= max_attempts
-                     THEN now() ELSE parked_at END,
-    last_error = COALESCE($7::text, last_error),
+    park_reason = CASE WHEN cur.failures >= cur.max_attempts
+                       THEN $6::text ELSE queue.park_reason END,
+    parked_at = CASE WHEN cur.failures >= cur.max_attempts
+                     THEN now() ELSE queue.parked_at END,
     leased_by = NULL,
     last_leased_by = NULL,
     leased_until = NULL,
@@ -545,10 +595,12 @@ UPDATE run_queue SET
     queued_at = now(),
     run_after = now() + make_interval(secs =>
         CASE WHEN $4::boolean AND $3::float8 <= 0
-             THEN $5::float8 * attempts_since_completion
+             THEN LEAST($9::float8,
+                        $5::float8 * power(3::float8, cur.failures - 1))
              ELSE $3::float8 END)
-WHERE unit_id = $1::uuid AND lease_token = $2::bigint AND state = 'leased'
-RETURNING state
+FROM cur
+WHERE queue.unit_id = cur.unit_id
+RETURNING queue.state
 """
 
 # Fail-closed disposition for a leased unit whose executor crossed an
@@ -1224,12 +1276,17 @@ async def release_unit(
 
     The reaper never sees a voluntarily released row (it is no longer an
     expired lease), so a plain release cannot bound a unit that fails the
-    same way on every claim. A caller that owes the retry budget passes
-    ``park_reason``: once the claim count reached the row's own
-    ``max_attempts`` the release parks with that reason instead of
-    re-queueing (and records ``last_error``). Parking is only the queue half
-    of that disposition; a session caller journals the visible outcome in
-    the same transaction.
+    same way on every claim. A caller releasing for a DETERMINISTIC failure
+    passes ``park_reason``: the failure is counted in the unit's failure
+    record (see ``_RELEASE_DETERMINISTIC_SQL``) and, once that count reaches
+    the row's own ``max_attempts``, the release parks with that reason
+    instead of re-queueing (recording ``last_error``); its default backoff is
+    the attach-failure schedule by that count. A plain release — transient
+    failures with their
+    :func:`transient_release_backoff_seconds`, shutdown hand-backs — never
+    parks and never touches that record. Parking is only the queue half of
+    the disposition; a session caller journals the visible outcome in the
+    same transaction.
 
     ``run_after`` moves to ``now() + backoff_seconds``. With ``error=True``
     and no explicit backoff, a linear default backoff is applied instead
@@ -1250,7 +1307,7 @@ async def release_unit(
             _RELEASE_BACKOFF_BASE_SECONDS,
         )
     return await conn.fetchval(
-        _RELEASE_BOUNDED_SQL,
+        _RELEASE_DETERMINISTIC_SQL,
         _uuid(unit_id),
         lease_token,
         float(backoff_seconds),
@@ -1258,6 +1315,8 @@ async def release_unit(
         _RELEASE_BACKOFF_BASE_SECONDS,
         str(park_reason),
         last_error,
+        DETERMINISTIC_RELEASE_SIGNATURE,
+        ATTACH_FAILURE_BACKOFF_CAP_SECONDS,
     )
 
 

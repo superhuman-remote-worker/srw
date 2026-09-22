@@ -1883,14 +1883,16 @@ class TestShutdownCancellation:
             consumed_seq=4,
         )
         assert not harness.calls["park"]
+        # completion_cas_failed is transient: first-attempt exponential backoff.
         assert harness.calls["release"] == [
             {
                 "unit_id": claim.unit_id,
                 "lease_token": 47,
-                "backoff_seconds": 0.0,
+                "backoff_seconds": 5.0,
                 "error": True,
             }
         ]
+        assert harness.release_budget == [{}]
         assert not harness.has_tool_effect(claim)
         assert harness.disposition_order[-2:] == ["terminate", "release"]
 
@@ -1940,10 +1942,11 @@ class TestShutdownCancellation:
             {
                 "unit_id": claim.unit_id,
                 "lease_token": 471,
-                "backoff_seconds": 0.0,
+                "backoff_seconds": 5.0,  # transient: never budgeted
                 "error": True,
             }
         ]
+        assert harness.release_budget == [{}]
         assert not harness.calls["park"]
         assert harness.calls["terminate"][-1]["reason"] == (
             "release_completion_cas_failed"
@@ -2296,6 +2299,29 @@ class TestShutdownCancellation:
         ]
         assert harness.db.transactions == 1
         assert not harness.calls["journal"]  # re-queued: nothing to tell yet
+
+    @pytest.mark.asyncio
+    async def test_bundle_5xx_release_is_transient_with_exponential_backoff(
+        self, harness
+    ):
+        # An orchestrator restarting mid-deploy answers 503: never budgeted,
+        # re-queued after 5 s x 2^(attempts-1), capped at 60 s.
+        harness.bundle_error = ClaimBundleError(503, "starting")
+        claim = make_claim(token=4, attempts=4)
+
+        await harness.executor._serve_claim(claim)
+        await _finish(harness)
+
+        assert harness.calls["release"] == [
+            {
+                "unit_id": claim.unit_id,
+                "lease_token": 4,
+                "backoff_seconds": 40.0,
+                "error": True,
+            }
+        ]
+        assert harness.release_budget == [{}]
+        assert not harness.calls["journal"]
 
 
 # ---------------------------------------------------------------------------

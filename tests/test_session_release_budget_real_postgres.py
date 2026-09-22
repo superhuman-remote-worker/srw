@@ -9,10 +9,12 @@ therefore claimed and released forever (observed at 16 attempts, budget 5)
 while Cockpit generated indefinitely.
 
 These tests drive the executor's real release paths against the real queue
-SQL and prove the exhausted disposition: it parks at the row's OWN
-``max_attempts``, and the queue state, the epoch bump, the settled claimant
-authority and the ``turn.parked`` frame commit as one fact — a failed journal
-write leaves the lease untouched instead of splitting them.
+SQL and prove the exhausted disposition: a DETERMINISTIC failure parks at the
+row's OWN ``max_attempts``, and the queue state, the epoch bump, the settled
+claimant authority and the ``turn.parked`` frame commit as one fact — a failed
+journal write leaves the lease untouched instead of splitting them. TRANSIENT
+failures (an orchestrator deploy blackout) never park and back off
+exponentially, and neither they nor shutdown hand-backs spend the budget.
 """
 
 from __future__ import annotations
@@ -190,6 +192,18 @@ async def _thread(pool, thread_id: UUID):
         return await conn.fetchrow("SELECT * FROM threads WHERE id = $1", thread_id)
 
 
+async def _backoff(pool, thread_id: UUID) -> float:
+    """Seconds between the release and the next claimable instant."""
+    async with pool.acquire() as conn:
+        return float(
+            await conn.fetchval(
+                "SELECT EXTRACT(EPOCH FROM run_after - queued_at) FROM run_queue "
+                "WHERE unit_id = $1",
+                thread_id,
+            )
+        )
+
+
 async def _frames(pool, thread_id: UUID):
     async with pool.acquire() as conn:
         rows = await conn.fetch(
@@ -227,15 +241,19 @@ async def test_release_loop_parks_at_the_rows_own_budget(executor, pool):
     epoch_before = (await _thread(pool, thread_id))["events_epoch"]
 
     claims = []
+    delays = []
     for _ in range(8):
         claim = await _claim(pool, thread_id)
         if claim is None:
             break
         claims.append(claim)
         await executor._release(claim, reason="bundle_409")
+        delays.append(round(await _backoff(pool, thread_id)))
 
-    # Three claims (a non-default budget), then nothing more to claim.
+    # Three claims (a non-default budget), then nothing more to claim; the
+    # budgeted retries are spaced on the attach-failure schedule.
     assert [claim.attempts_since_completion for claim in claims] == [1, 2, 3]
+    assert delays[:2] == [5, 15]
     row = await _queue(pool, thread_id)
     assert row["state"] == "parked"
     assert row["park_reason"] == PARK_REASON_RETRY_EXHAUSTED
@@ -255,6 +273,7 @@ async def test_release_loop_parks_at_the_rows_own_budget(executor, pool):
         "reason": PARK_REASON_RETRY_EXHAUSTED,
         "release_reason": "bundle_409",
         "attempts": 3,
+        "failures": 3,
         "max_attempts": 3,
         "retryable": True,
         "parked_by": POD,
@@ -272,27 +291,99 @@ async def test_release_loop_parks_at_the_rows_own_budget(executor, pool):
 
 
 @pytest.mark.asyncio
-async def test_releases_under_budget_requeue_without_a_lifecycle_frame(executor, pool):
+async def test_deterministic_release_under_budget_requeues_without_a_frame(
+    executor, pool
+):
     thread_id = await _seed(pool, max_attempts=5)
     epoch_before = (await _thread(pool, thread_id))["events_epoch"]
 
     claim = await _claim(pool, thread_id)
-    await executor._release(claim, reason="loop_not_ready")
+    await executor._release(claim, reason="loop_died")
 
     row = await _queue(pool, thread_id)
     assert row["state"] == "queued"
     assert row["park_reason"] is None
-    assert row["last_error"] == "loop_not_ready"
-    # Linear error backoff (5 s x attempts) is unchanged for an ordinary retry.
-    async with pool.acquire() as conn:
-        delay = await conn.fetchval(
-            "SELECT EXTRACT(EPOCH FROM run_after - queued_at) FROM run_queue "
-            "WHERE unit_id = $1",
-            thread_id,
-        )
-    assert 4.0 <= float(delay) <= 6.0
+    assert row["last_error"] == "loop_died"
+    assert row["attach_failures"] == 1
+    # Linear error backoff (5 s x failures) for a deterministic retry.
+    assert round(await _backoff(pool, thread_id)) == 5
     assert (await _thread(pool, thread_id))["events_epoch"] == epoch_before
     assert await _frames(pool, thread_id) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reason", ["bundle_503", "bundle_error"])
+async def test_orchestrator_outage_never_parks_and_backs_off(executor, pool, reason):
+    """A deploy blackout (single-replica orchestrator, Recreate) fails every
+    claim bundle with a 5xx or a connection error for a minute or more. The
+    old unbounded release healed by itself afterwards; a bounded one would
+    have parked every such session for a manual Retry."""
+    thread_id = await _seed(pool, max_attempts=5)
+    epoch_before = (await _thread(pool, thread_id))["events_epoch"]
+
+    delays = []
+    for _ in range(8):  # 5+10+20+40+60+60+60 s of backoff: well past 90 s
+        claim = await _claim(pool, thread_id)
+        assert claim is not None
+        await executor._release(claim, reason=reason)
+        row = await _queue(pool, thread_id)
+        assert row["state"] == "queued" and row["park_reason"] is None
+        delays.append(round(await _backoff(pool, thread_id)))
+
+    assert delays == [5, 10, 20, 40, 60, 60, 60, 60]
+    row = await _queue(pool, thread_id)
+    assert row["attempts_since_completion"] == 8  # every claim still counted
+    assert row["attach_failures"] == 0  # none of them against the budget
+    assert (await _thread(pool, thread_id))["events_epoch"] == epoch_before
+    assert await _frames(pool, thread_id) == []
+
+    # The orchestrator is back: the unit is claimed again, and a genuinely
+    # deterministic failure now starts its own budget from one.
+    recovered = await _claim(pool, thread_id, pod="stateless-pod-b")
+    assert recovered is not None
+    await executor._release(recovered, reason="bundle_409")
+    row = await _queue(pool, thread_id)
+    assert row["state"] == "queued" and row["attach_failures"] == 1
+
+
+@pytest.mark.asyncio
+async def test_hand_backs_and_transients_neither_consume_nor_reset_the_budget(
+    executor, pool
+):
+    thread_id = await _seed(pool, max_attempts=3)
+
+    async def hand_back(**kwargs):
+        claim = await _claim(pool, thread_id)
+        async with pool.acquire() as conn:
+            await release_unit(
+                conn, unit_id=thread_id, lease_token=claim.lease_token, **kwargs
+            )
+
+    for step in (
+        "bundle_409",
+        "stop_boundary",  # claimed on the stop boundary: plain, no backoff
+        "bundle_error",
+        "bundle_409",
+        "shutdown_cancelled",  # the shutdown path's plain error release
+        "serve_crash",
+    ):
+        if step == "stop_boundary":
+            await hand_back(backoff_seconds=0.0)
+        elif step == "shutdown_cancelled":
+            await hand_back(error=True)
+        else:
+            await executor._release(await _claim(pool, thread_id), reason=step)
+        assert (await _queue(pool, thread_id))["state"] == "queued", step
+
+    row = await _queue(pool, thread_id)
+    assert row["attempts_since_completion"] == 6
+    assert row["attach_failures"] == 2
+
+    await executor._release(await _claim(pool, thread_id), reason="bundle_409")
+    row = await _queue(pool, thread_id)
+    assert row["state"] == "parked" and row["attach_failures"] == 3
+    payload = (await _frames(pool, thread_id))[-1]["payload"]
+    assert payload["failures"] == 3 and payload["attempts"] == 7
 
 
 @pytest.mark.asyncio

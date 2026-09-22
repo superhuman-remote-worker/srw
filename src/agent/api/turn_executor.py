@@ -113,6 +113,7 @@ from shared.run_queue import (
     park_unit,
     record_attach_failure,
     release_unit,
+    transient_release_backoff_seconds,
 )
 from shared.session_permission_retirement import retire_stale_stateless_permissions
 from shared.session_retirement import (
@@ -601,6 +602,64 @@ def _park_reason_for(executor_reason: str) -> str:
 # Global per-thread lock order is threads -> run_queue (REST admission, End and
 # the reaper take the same order); the CAS takes the second lock.
 
+# Every ``_release`` reason, classified. Only a DETERMINISTIC pre-effect
+# failure — one a retry cannot fix without something changing — counts toward
+# the park budget. A TRANSIENT one (DB, transport, the orchestrator restarting
+# mid-deploy, a lost race, shutdown or drain) re-queues without limit under a
+# capped exponential backoff: such claims always recovered on their own, and
+# parking them turns every deploy blackout into manual Retries. When a site
+# cannot tell the two apart it is transient. tests/test_run_queue_park_
+# lifecycle.py fails on a release site whose reason is in neither table.
+_DETERMINISTIC_RELEASE_REASONS = frozenset(
+    {
+        # The durable input row cannot be run as it stands.
+        "empty_event_input",
+        "pending_turn_identity_invalid",
+        # The persistent loop ended on its own while this executor was
+        # healthy — a crash on this input, or the strict-pairing halt that
+        # exists to stop repeated provider spend. Shutdown never lands here:
+        # stop() marks the lease lost before aborting, and a cancelled claim
+        # takes the shutdown release. A DB blip can end the loop too, which is
+        # why the budget is max_attempts such failures, not one.
+        "loop_died",
+    }
+)
+_TRANSIENT_RELEASE_REASONS = frozenset(
+    {
+        "bundle_error",  # transport: the orchestrator is unreachable
+        "pending_query_failed",  # DB
+        "pending_event_query_failed",  # DB
+        "event_delivery_claim_failed",  # DB
+        "event_delivery_claim_lost",  # lost a race for the delivery
+        "control_inbox_failed",  # DB / owner fence
+        # DB or lease loss; a corrupt receipt cannot be told apart here.
+        "stale_interrupt_recovery_failed",
+        # Warm reuse only: the detach makes the next claim's attach fresh.
+        "pending_turn_identity_mismatch",
+        "loop_not_ready",  # includes runtime admission closed (shutdown/drain)
+        # An unclassified exception: a bug and a DB error look the same.
+        "serve_crash",
+        "completion_cas_failed",  # the answer is durable and checkpointed
+    }
+)
+# Claim-bundle HTTP refusals: a 4xx is the orchestrator refusing THIS claim
+# (409 attach assembly refused, 403 lease validation, 401/400/422), so it is
+# deterministic; a 5xx, a timeout or a rate limit is the orchestrator unwell.
+_TRANSIENT_BUNDLE_STATUSES = frozenset({408, 425, 429})
+
+
+def _release_is_deterministic(reason: str) -> bool:
+    status = reason.removeprefix("bundle_")
+    if status != reason and status.isdigit():
+        code = int(status)
+        return 400 <= code < 500 and code not in _TRANSIENT_BUNDLE_STATUSES
+    if reason in _DETERMINISTIC_RELEASE_REASONS:
+        return True
+    if reason not in _TRANSIENT_RELEASE_REASONS:
+        logger.warning("unclassified release reason %r treated as transient", reason)
+    return False
+
+
 _LOCK_RELEASE_THREAD_SQL = """
 SELECT execution_lane, agent_id, metadata
   FROM threads
@@ -610,7 +669,7 @@ SELECT execution_lane, agent_id, metadata
 
 _RELEASED_QUEUE_ROW_SQL = """
 SELECT state, lease_token, leased_by, park_reason,
-       attempts_since_completion, max_attempts
+       attempts_since_completion, max_attempts, attach_failures
   FROM run_queue
  WHERE unit_id = $1::uuid
 """
@@ -786,9 +845,11 @@ async def _settle_session_release(
             reason="lease_expired",
             epoch_already_bumped=True,
         )
-        # A pre-effect failure never reached turn.started, so there is no turn
-        # to correlate; the client clears generating state from the queue
-        # block its re-anchor fetches, and this frame names why.
+        # No target turn id: bundle, attach and pre-injection failures never
+        # reached turn.started, and when a loop died mid-turn the client's
+        # active-turn fallback for an uncorrelated frame is exactly that turn.
+        # Either way the queue block the client re-anchors to shows the park;
+        # this frame names why.
         payload: dict[str, Any] = {
             "reason": reason,
             "release_reason": release_reason,
@@ -798,6 +859,9 @@ async def _settle_session_release(
             "lease_token": token,
         }
         if queue is not None:
+            # The budget counts failures, not claims (hand-backs and
+            # transient releases bump attempts too), so name both.
+            payload["failures"] = int(queue["attach_failures"])
             payload["max_attempts"] = int(queue["max_attempts"])
         if error:
             payload["error"] = error[: _ERROR_SIGNATURE_MESSAGE_CHARS * 4]
@@ -4992,11 +5056,13 @@ class StatelessTurnExecutor:
         """Voluntary error release (§5.1): default linear backoff, token-
         guarded (a genuinely lost lease makes this a recorded no-op).
 
-        Every caller is pre-effect (post-effect failures park fail-closed), so
-        the release honours the row's retry budget: the claim that reaches
+        Every caller is pre-effect (post-effect failures park fail-closed).
+        A deterministic reason (``_release_is_deterministic``) is counted
+        against the row's retry budget: the failure that reaches
         ``max_attempts`` parks as ``retry_exhausted`` — owner-retryable — and
-        journals ``turn.parked`` in the same commit, instead of re-queueing a
-        deterministic failure forever."""
+        journals ``turn.parked`` in the same commit, instead of re-queueing
+        forever. A transient reason never parks and backs off exponentially
+        (capped), so an orchestrator or DB outage heals by itself."""
         pa = _pa()
         # Warm affinity is valid only after successful completion. Every
         # leased->queued error transition retires the cached loop/session so a
@@ -5018,20 +5084,32 @@ class StatelessTurnExecutor:
                 await self._ack_terminal_claim_loss(claim)
             return
 
-        async def bounded_release(conn: Any) -> Optional[str]:
+        deterministic = _release_is_deterministic(reason)
+
+        async def error_release(conn: Any) -> Optional[str]:
+            if deterministic:
+                return await release_unit(
+                    conn,
+                    unit_id=claim.unit_id,
+                    lease_token=claim.lease_token,
+                    error=True,
+                    park_reason=PARK_REASON_RETRY_EXHAUSTED,
+                    last_error=reason,
+                )
             return await release_unit(
                 conn,
                 unit_id=claim.unit_id,
                 lease_token=claim.lease_token,
+                backoff_seconds=transient_release_backoff_seconds(
+                    claim.attempts_since_completion
+                ),
                 error=True,
-                park_reason=PARK_REASON_RETRY_EXHAUSTED,
-                last_error=reason,
             )
 
         try:
             outcome = await self._settle_release(
                 claim,
-                cas=bounded_release,
+                cas=error_release,
                 park_reason=PARK_REASON_RETRY_EXHAUSTED,
                 release_reason=reason,
             )
@@ -5057,10 +5135,12 @@ class StatelessTurnExecutor:
         else:
             log = logger.warning if outcome.state == STATE_PARKED else logger.info
             log(
-                "run_queue release: unit=%s token=%d reason=%s state=%s attempts=%d%s",
+                "run_queue release: unit=%s token=%d reason=%s (%s) state=%s "
+                "attempts=%d%s",
                 claim.unit_id,
                 claim.lease_token,
                 reason,
+                "deterministic" if deterministic else "transient",
                 outcome.state,
                 outcome.attempts,
                 " (retry budget exhausted)" if outcome.state == STATE_PARKED else "",
