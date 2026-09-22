@@ -1,18 +1,22 @@
 import { Component, inject } from '@angular/core';
 import { Router } from '@angular/router';
-import { TranslocoService } from '@jsverse/transloco';
+import { TranslocoDirective } from '@jsverse/transloco';
 import { ActionCenterService } from '../../core/services/action-center.service';
 import { AppIconComponent } from '../../ui/icon';
+
+/** The `*transloco` directive's translate function. */
+type Translate = (key: string, params?: Record<string, unknown>) => string;
 
 @Component({
   selector: 'app-notification-bell',
   standalone: true,
-  imports: [AppIconComponent],
+  imports: [AppIconComponent, TranslocoDirective],
   template: `
     <button
+      *transloco="let t"
       class="bell-btn"
       (click)="goToInbox()"
-      [title]="tooltipText()"
+      [title]="tooltipText(t)"
     >
       <app-icon size="lg">notifications</app-icon>
       @if (actionCenter.badgeCount() > 0) {
@@ -85,24 +89,26 @@ import { AppIconComponent } from '../../ui/icon';
 export class NotificationBellComponent {
   readonly actionCenter = inject(ActionCenterService);
   private readonly router = inject(Router);
-  private readonly transloco = inject(TranslocoService);
 
   goToInbox(): void {
     this.router.navigate(['/inbox']);
   }
 
   /** "N new notifications" (server `unseen`), plus how many still need
-   *  someone when that differs. */
-  tooltipText(): string {
+   *  someone when that differs. Translates through the `*transloco`
+   *  directive's `t`, not the service's synchronous translate(): the rail
+   *  renders the bell before the locale file has loaded, and the directive
+   *  holds the button back until it has (and re-renders it on a language
+   *  switch). */
+  tooltipText(t: Translate): string {
     const c = this.actionCenter.counts();
-    const t = this.transloco;
-    if (this.actionCenter.badgeCount() === 0) return t.translate('notificationBell.title');
+    if (this.actionCenter.badgeCount() === 0) return t('notificationBell.title');
     const parts: string[] = [];
     if (c.unseen > 0) {
-      parts.push(t.translate(c.unseen === 1 ? 'notificationBell.unseenSingle' : 'notificationBell.unseenPlural', {n: c.unseen}));
+      parts.push(t(c.unseen === 1 ? 'notificationBell.unseenSingle' : 'notificationBell.unseenPlural', {n: c.unseen}));
     }
     if (c.total > 0 && c.total !== c.unseen) {
-      parts.push(t.translate(c.total === 1 ? 'notificationBell.pendingSingle' : 'notificationBell.pendingPlural', {n: c.total}));
+      parts.push(t(c.total === 1 ? 'notificationBell.pendingSingle' : 'notificationBell.pendingPlural', {n: c.total}));
     }
     return parts.join(', ');
   }
