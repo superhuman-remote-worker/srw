@@ -372,6 +372,18 @@ def applies_codex_context_cap(
 # ``internal/runtime/executor/claude_executor_request.go`` at
 # ``docker.io/eceasy/cli-proxy-api:v7.2.110``. Re-check it when the proxy pin
 # moves — a beta added upstream is one this header would suppress.
+#
+# Re-checked at v7.3.13 (2026-09-22): the header no longer *replaces* the list.
+# The executor assembles Claude Code 2.1.258's per-request betas itself, drops
+# every beta it manages from an inbound header, and forwards only unmanaged
+# ones — here just ``token-efficient-tools-2026-03-28``. It also sets
+# ``thinking.display: summarized`` whenever ``reasoning_effort`` is present and
+# omits the redaction beta once a display is set, so it should produce visible
+# thinking with no header at all. The header stays because deployments still
+# pin older proxies separately (prod-private is on v7.1.39), and there it is
+# the only thing between SRW and signature-only thinking. Retire it once no
+# supported deployment runs below v7.3.x and
+# ``scripts/subscription-proxy-probe.py opus-5-noheader`` reports VISIBLE.
 CLAUDE_VISIBLE_THINKING_BETAS: tuple[str, ...] = (
     "claude-code-20250219",
     "oauth-2025-04-20",

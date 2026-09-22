@@ -312,13 +312,13 @@ databases:
 # Post-deploy needs a one-time sign-in via Settings → AI Subscriptions; tokens
 # persist in the codex-proxy-auth PVC.
 #
-# Pin the image: the chart default is the verified v7.2.110, and this file must
-# not silently drift below it (see helm/values.yaml for why v7.2.110 is a
-# floor, not a preference).
+# Pin the image to the chart default (v7.3.13), and never let this file drift
+# below v7.2.110 (see helm/values.yaml for why that is a floor, not a
+# preference). After changing it, run scripts/subscription-proxy-probe.py once.
 # -----------------------------------------------------------------------------
 codexProxy:
   enabled: false
-  image: docker.io/eceasy/cli-proxy-api:v7.2.110
+  image: docker.io/eceasy/cli-proxy-api:v7.3.13
 
 # -----------------------------------------------------------------------------
 # GreenMail — test-only IMAP/SMTP server for the `email` datasource. OFF by

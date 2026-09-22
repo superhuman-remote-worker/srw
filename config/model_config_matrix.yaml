@@ -468,6 +468,8 @@ claude-haiku:
 # and 5.1 requires >= 2.1.251. `claude-fable-5` works today (verified 200 at
 # low/xhigh/max, with reasoning text scaling by level). The family is right
 # either way; 5.1 needs the proxy pin to move, not a matrix change.
+# The chart pin moved to v7.3.13 on 2026-09-22, which presents Claude Code
+# 2.1.258; `scripts/subscription-proxy-probe.py fable-5-1` confirms it on the wire.
 claude-fable:
   reasoning: { method: effort_enum, delivery: native, default: high, options: [low, medium, high, xhigh, max] }
   settings:

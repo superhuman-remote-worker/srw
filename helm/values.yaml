@@ -2907,7 +2907,15 @@ codexProxy:
   # unrelated jobs on the same proxy. v7.2.110 adds IsRequestScoped() and is a
   # strict descendant of that fix. Dev has run it since 2026-07-30.
   # knowledge-history/done/codex_stream_disconnect_shape_nudge.md
-  image: docker.io/eceasy/cli-proxy-api:v7.2.110
+  #
+  # Pinned at v7.3.13 (2026-09-22), a strict descendant of that fix. It is the
+  # first build that lists `claude-opus-5-5`, and its Claude executor presents
+  # the Claude Code 2.1.258 profile, clearing the 2.1.251 gate v7.2.110 hit on
+  # `claude-fable-5-1`. It also drops `gpt-5.3-codex-spark`, `gpt-5.4` and
+  # `gpt-5.4-mini` from its Codex catalog (upstream stopped publishing them):
+  # disable those catalog rows before rolling it. After ANY move of this pin,
+  # run scripts/subscription-proxy-probe.py ONCE against the new proxy.
+  image: docker.io/eceasy/cli-proxy-api:v7.3.13
   storageSize: "1Gi"
   # Retries INSIDE the proxy, on 403/408/500/502/503/504. An unset key yields 0
   # (Go zero value) despite upstream's config.example.yaml documenting 3.
@@ -2916,6 +2924,7 @@ codexProxy:
   # is what burns credentials — the upstream reporter watched it take out 4 of
   # 6, then 5 of 6 — so on an older image this value is an amplifier, not a
   # cure. If you ever pin the image back below v7.2.110, set this to 0.
+  # (v7.3.13 keeps IsRequestScoped(), so 3 stays safe on the current pin.)
   requestRetry: 3
   # Body-level request/response logging to the pod log. OFF by default: it emits
   # full prompts AND auth headers. Flip to true only while actively catching an

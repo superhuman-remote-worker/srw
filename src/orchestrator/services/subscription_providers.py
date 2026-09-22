@@ -13,7 +13,8 @@ deliberately *not* the same string:
     that flow. Verified against the pinned image
     (``docker.io/eceasy/cli-proxy-api:v7.2.110``) on 2026-09-07 —
     ``internal/api/server_management.go`` registers exactly five built-in
-    provider handlers, and
+    provider handlers (v7.3.13 adds Devin, Meta and a second Kimi route that
+    SRW does not wire; the five below are unchanged), and
     ``internal/api/handlers/management/auth_files_provider_oauth.go`` shows
     which of them wait on a browser callback (Codex, Claude, Antigravity) and
     which run a device-authorization poll (Grok Build, Kimi Code).
