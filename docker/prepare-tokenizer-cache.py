@@ -1,9 +1,13 @@
-"""Prepare agent tokenizer assets; verify final images without network or fallbacks.
+"""Prepare image tokenizer assets; verify final images without network or fallbacks.
 
 Builds run ``prepare`` as root before copying application source, then ``verify``
 after USER srw with Docker's RUN --network=none. The installed tiktoken library
 owns asset URLs, download hash checks, and model selection. Runtime callers and
 their unknown-model fallbacks are not changed by this build-only contract.
+
+``--component`` names the image's application package. The agent image checks
+every token counter; the orchestrator image has no agent package, so it checks
+the shared ones it does run: KB chunking and the LLM request preflight.
 
 The explicit seven-name set covers the installed library's built-in model map,
 including legacy names accepted by SRW's open model-ID configuration. This does
@@ -15,8 +19,9 @@ tokenizer assets: installed library version, encoding names, sizes, and hashes.
 from __future__ import annotations
 
 import argparse
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 import hashlib
+import importlib
 from importlib.metadata import version
 import json
 import os
@@ -44,6 +49,7 @@ ENCODINGS = (
     "gpt2",
 )
 MANIFEST = "srw-tokenizer-assets.json"
+COMPONENTS = ("agent", "orchestrator")
 TEXT = "Guten Tag, Welt! 日本語の文章。\ndef answer(value):\n    return value + 42\n"
 # Expected context/shared selections intentionally preserve the existing prefix
 # difference. Unknown model IDs still use cl100k_base in all three helpers.
@@ -183,41 +189,55 @@ def verify_assets(cache: Path) -> dict:
     return manifest
 
 
-def verify_helpers() -> int:
-    from langchain_core.messages import HumanMessage
-
-    from agent.core import context
+def verify_helpers(component: str = "agent") -> int:
     from shared.runtime.core import chunk_planner
     from shared.runtime.llm import reasoning_chat
 
+    # The orchestrator image ships no agent package, so no context counter.
+    context = None
+    if component == "agent":
+        from langchain_core.messages import HumanMessage
+
+        from agent.core import context
+
     require(
-        context.TIKTOKEN_AVAILABLE
+        (context is None or context.TIKTOKEN_AVAILABLE)
         and chunk_planner.TIKTOKEN_AVAILABLE
         and reasoning_chat.TIKTOKEN_AVAILABLE,
         "Token counting uses an unavailable-dependency fallback",
     )
     body = {"messages": [{"role": "user", "content": TEXT}]}
     checks = 0
-    with (
-        forbid_downloads(),
-        patch.object(
-            context,
-            "count_tokens_approximate",
-            side_effect=RuntimeError("Context counting used its approximate fallback"),
-        ),
-    ):
+    with ExitStack() as stack:
+        stack.enter_context(forbid_downloads())
+        if context is not None:
+            stack.enter_context(
+                patch.object(
+                    context,
+                    "count_tokens_approximate",
+                    side_effect=RuntimeError(
+                        "Context counting used its approximate fallback"
+                    ),
+                )
+            )
         for model, context_name, shared_name in MODEL_CASES:
-            context_encoding = cold_encoding(context_name)
             shared_encoding = cold_encoding(shared_name)
             expected_text = len(shared_encoding.encode(TEXT, disallowed_special=()))
-            expected_context = (
-                len(context_encoding.encode(TEXT, disallowed_special=())) + 4
-            )
             expected_request = expected_text + len(shared_encoding.encode("user")) + 14
 
-            tiktoken.registry.ENCODINGS.clear()
-            actual = context.count_tokens_tiktoken([HumanMessage(content=TEXT)], model)
-            require(actual == expected_context, f"Context count changed for {model}")
+            if context is not None:
+                context_encoding = cold_encoding(context_name)
+                expected_context = (
+                    len(context_encoding.encode(TEXT, disallowed_special=())) + 4
+                )
+                tiktoken.registry.ENCODINGS.clear()
+                actual = context.count_tokens_tiktoken(
+                    [HumanMessage(content=TEXT)], model
+                )
+                require(
+                    actual == expected_context, f"Context count changed for {model}"
+                )
+                checks += 1
             tiktoken.registry.ENCODINGS.clear()
             chunk_planner._ENCODING_CACHE.clear()
             actual = chunk_planner.count_text_tokens(TEXT, model)
@@ -225,7 +245,7 @@ def verify_helpers() -> int:
             tiktoken.registry.ENCODINGS.clear()
             actual = reasoning_chat.count_request_tokens(body, model)
             require(actual == expected_request, f"Request count changed for {model}")
-            checks += 3
+            checks += 2
 
         expected = len(cold_encoding("cl100k_base").encode(TEXT, disallowed_special=()))
         tiktoken.registry.ENCODINGS.clear()
@@ -237,7 +257,8 @@ def verify_helpers() -> int:
     return checks + 1
 
 
-def verify(cache: Path) -> dict:
+def verify(cache: Path, component: str = "agent") -> dict:
+    require(component in COMPONENTS, f"Unknown image component: {component}")
     require(
         os.getuid() != 0, "Run offline verification as the final non-root image user"
     )
@@ -246,11 +267,12 @@ def verify(cache: Path) -> dict:
         not os.environ.get("PYTHONPATH"),
         "Offline verification must use installed packages",
     )
-    import agent
+    package = importlib.import_module(component)
 
     require(
-        Path(agent.__file__).resolve() == Path("/app/src/agent/__init__.py"),
-        "Agent import does not resolve to the image's canonical source package",
+        Path(package.__file__).resolve() == Path(f"/app/src/{component}/__init__.py"),
+        f"{component.capitalize()} import does not resolve to the image's "
+        "canonical source package",
     )
     require(
         cache.stat().st_uid == 0 and cache.stat().st_mode & 0o777 == 0o755,
@@ -262,7 +284,7 @@ def verify(cache: Path) -> dict:
             "Cache file permissions changed",
         )
     manifest = verify_assets(cache)
-    checks = verify_helpers()
+    checks = verify_helpers(component)
     require(
         manifest["assets"] == asset_inventory(cache),
         "Helper check changed tokenizer assets",
@@ -280,9 +302,10 @@ def verify(cache: Path) -> dict:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("mode", choices=("prepare", "verify"))
+    parser.add_argument("--component", choices=COMPONENTS, default="agent")
     args = parser.parse_args()
     cache = cache_directory()
-    result = prepare(cache) if args.mode == "prepare" else verify(cache)
+    result = prepare(cache) if args.mode == "prepare" else verify(cache, args.component)
     print(json.dumps(result, sort_keys=True))
 
 

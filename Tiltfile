@@ -91,6 +91,7 @@ docker_build(
         'pyproject.toml',
         '.dockerignore',
         'docker/Dockerfile.orchestrator.dev',
+        'docker/prepare-tokenizer-cache.py',
         'scripts/check_kubernetes_sdk_auth.py',
         'requirements/',
         'scripts/lock_dependencies.py',
@@ -98,6 +99,7 @@ docker_build(
     live_update=[
         fall_back_on([
             'docker/Dockerfile.orchestrator.dev',
+            'docker/prepare-tokenizer-cache.py',
             'scripts/check_kubernetes_sdk_auth.py',
             'requirements/',
             'scripts/lock_dependencies.py',

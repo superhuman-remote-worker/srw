@@ -249,3 +249,82 @@ def test_image_verification_rejects_root_even_if_cache_is_present(
     monkeypatch.setattr(cache_build.os, "getuid", lambda: 0)
     with pytest.raises(RuntimeError, match="non-root"):
         cache_build.verify(cache)
+
+
+def _recipe_steps(recipe):
+    text = (ROOT / "docker" / recipe).read_text(encoding="utf-8")
+    instructions = text.replace("\\\n", "").splitlines()
+    script = SCRIPT.relative_to(ROOT).as_posix()
+    copies = [
+        shlex.split(line)
+        for line in instructions
+        if line.startswith("COPY ") and script in line
+    ]
+    assert len(copies) == 1
+    assert copies[0][-2] == script
+    return text, instructions, copies[0][-1]
+
+
+def test_orchestrator_recipe_prepares_cache_and_verifies_as_nonroot_offline():
+    # KB chunking runs in the orchestrator: without a baked vocab its first
+    # token count is a synchronous download (the 2026-08-07 liveness kill).
+    text, instructions, target = _recipe_steps("Dockerfile.orchestrator")
+    preparation = instructions.index(f"RUN python {target} prepare")
+    verification = instructions.index(
+        f"RUN --network=none python {target} verify --component orchestrator"
+    )
+    runtime_user = instructions.index("USER srw")
+    assert (
+        instructions.index("ENV TIKTOKEN_CACHE_DIR=/opt/tiktoken-cache") < preparation
+    )
+    assert preparation < instructions.index(
+        "COPY --chown=srw:srw src/orchestrator/ ./src/orchestrator/"
+    )
+    assert preparation < runtime_user < verification
+    assert "PYTHONSAFEPATH=1" in text
+
+
+def test_orchestrator_dev_recipe_bakes_the_same_cache():
+    # The dev image runs as root, so it cannot host the non-root verification;
+    # it must still ship the assets, because k3d is where the vocab host fails.
+    _, instructions, target = _recipe_steps("Dockerfile.orchestrator.dev")
+    preparation = instructions.index(f"RUN python {target} prepare")
+    assert (
+        instructions.index("ENV TIKTOKEN_CACHE_DIR=/opt/tiktoken-cache") < preparation
+    )
+    assert preparation < instructions.index(
+        "COPY src/orchestrator/ /app/src/orchestrator/"
+    )
+
+
+def test_tokenizer_script_change_rebuilds_the_tilt_orchestrator_image():
+    script = SCRIPT.relative_to(ROOT).as_posix()
+    tree = ast.parse((ROOT / "Tiltfile").read_text(encoding="utf-8"))
+    builds = [
+        call
+        for call in ast.walk(tree)
+        if isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Name)
+        and call.func.id == "docker_build"
+        and call.args
+        and isinstance(call.args[0], ast.Constant)
+        and call.args[0].value == "srw-orchestrator"
+    ]
+    assert len(builds) == 1
+    inputs = next(item.value for item in builds[0].keywords if item.arg == "only")
+    assert script in ast.literal_eval(inputs)
+    # A script edit must rebuild the image, not live-sync into a running Pod.
+    fallbacks = [
+        call
+        for call in ast.walk(builds[0])
+        if isinstance(call, ast.Call)
+        and isinstance(call.func, ast.Name)
+        and call.func.id == "fall_back_on"
+    ]
+    assert len(fallbacks) == 1
+    assert script in ast.literal_eval(fallbacks[0].args[0])
+
+
+def test_unknown_component_is_rejected_before_any_import():
+    with pytest.raises(RuntimeError, match="Unknown image component"):
+        cache_build.verify(Path("/nonexistent"), "workspace")
