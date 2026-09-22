@@ -155,12 +155,36 @@ async def inject_dispatch_credentials(
         factory_provider = meta.provider if meta is not None else provider_for_key
         if factory_provider:
             llm_over.setdefault("provider", factory_provider)
+        # A provider-key row has no endpoint of its own, so the resolved key
+        # belongs to that provider's canonical endpoint — never to a base_url
+        # the caller pinned in the override. Injecting a system/project/user
+        # key next to a caller-chosen ``base_url`` would ship the deployment's
+        # credential to whatever host the caller named. REST admission refuses
+        # a caller transport key up front (routers/job_lifecycle), but hold the
+        # sink to the same contract for a project-override base_url and the
+        # resume / legacy / blob paths: skip the injection when the section
+        # carries a base_url this branch did not set.
         if (
             provider_for_key
             and provider_for_key in resolved_keys
             and "api_key" not in llm_over
+            and "base_url" not in llm_over
         ):
             llm_over["api_key"] = resolved_keys[provider_for_key]
+        elif (
+            provider_for_key
+            and provider_for_key in resolved_keys
+            and "api_key" not in llm_over
+            and "base_url" in llm_over
+        ):
+            logger.warning(
+                "Dispatch: job %s pinned a base_url with a provider-key model "
+                "(%s); withholding the resolved %s key so a stored credential "
+                "is not sent to a caller-chosen endpoint.",
+                job_id,
+                model_id,
+                provider_for_key,
+            )
 
     # Per-model context window: drive the agent's working window from the
     # catalog/admin value. Lands in llm.model_max_context_tokens (a flat llm

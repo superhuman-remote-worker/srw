@@ -335,11 +335,17 @@ async def inject_model_credentials(
     provider = meta.api_key_ref if meta is not None else provider_of_model(model_id)
     if meta is None and provider:
         section.setdefault("provider", provider)
+    # A provider-key row carries no endpoint of its own: the resolved key
+    # belongs to the provider's canonical endpoint, not to a ``base_url`` the
+    # caller pinned in this section. Withhold the stored key when a caller
+    # base_url is present so a system/project/user credential is never sent to
+    # a caller-chosen host (the exfiltration in the credential-leak review).
     if (
         provider
         and resolved_keys
         and provider in resolved_keys
         and "api_key" not in section
+        and "base_url" not in section
     ):
         section["api_key"] = resolved_keys[provider]
 
@@ -406,7 +412,18 @@ async def inject_env_key_credentials(
         return
 
     provider = meta.api_key_ref if meta is not None else provider_of_model(model_id)
-    if provider and resolved_keys and provider in resolved_keys:
+    # Same contract as the model-section injector: a provider-key row has no
+    # endpoint of its own, so the resolved key belongs to the provider's
+    # canonical endpoint. If a caller pinned ``{prefix}_BASE_URL`` (the
+    # endpoint-backed branch above already returned for real endpoint rows),
+    # withhold the key so a stored credential is not sent to a caller-chosen
+    # host.
+    if (
+        provider
+        and resolved_keys
+        and provider in resolved_keys
+        and f"{prefix}_BASE_URL" not in env_keys
+    ):
         env_keys.setdefault(f"{prefix}_API_KEY", resolved_keys[provider])
 
 

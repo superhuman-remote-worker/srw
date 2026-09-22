@@ -1640,3 +1640,54 @@ async def test_bench_readiness_refusal_precedes_fresh_creator_lookup(wire, monke
     wire.db.create_job.assert_not_awaited()
     wire.provision.assert_not_awaited()
     wire.dispatch.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "override, offending",
+    [
+        (
+            {"llm": {"model": "m", "base_url": "https://evil.example/v1"}},
+            "llm.base_url",
+        ),
+        ({"llm": {"model": "m", "api_key": "sk-caller"}}, "llm.api_key"),
+        ({"env_keys": {"EMBEDDING_BASE_URL": "https://evil.example/v1"}}, "env_keys"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_caller_transport_keys_are_refused_at_admission(
+    wire, override, offending
+):
+    """A caller may not pin transport in ``config_override``: routing is server-
+    resolved from the model ID and credentials are injected only at dispatch, so
+    a pinned base_url/api_key/env_keys would otherwise have the deployment's
+    stored key paired with a caller-chosen endpoint. Refuse loudly (422), name
+    the offending path, and write nothing."""
+    response = await submit(wire, body(config_override=override))
+    assert response.status_code == 422, response.text
+    assert offending in response.json()["detail"]
+    wire.db.create_job.assert_not_awaited()
+    wire.provision.assert_not_awaited()
+    wire.dispatch.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_transport_fence_also_covers_the_internal_rest_path(wire):
+    """The internal (X-Internal-Key) create route holds the same line — the
+    MCP create tool already strips these before POSTing, so a body that still
+    carries one is refused rather than trusted."""
+    response = await submit(
+        wire,
+        body(config_override={"llm": {"model": "m", "base_url": "https://evil/v1"}}),
+        **{"x-test-internal": "1"},
+    )
+    assert response.status_code == 422, response.text
+    wire.db.create_job.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_model_only_override_is_still_admitted(wire):
+    """The fence rejects transport, never the routing selector itself."""
+    response = await submit(wire, body(config_override={"llm": {"model": "fixture"}}))
+    assert response.status_code == 200, response.text
+    args = wire.db.create_job.await_args.kwargs
+    assert args["config_override"]["llm"]["model"] == "fixture"
