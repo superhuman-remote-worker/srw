@@ -22,6 +22,8 @@ from uuid import UUID
 
 import httpx
 
+from shared.repo_path_safety import REPO_NAME_RE, check_repo_path_shape
+
 logger = logging.getLogger(__name__)
 
 
@@ -39,40 +41,21 @@ class GiteaPathError(ValueError):
     """
 
 
-# Gitea's own name charset (``validation.AlphaDashDotPattern``): ASCII
-# letters, digits, ``.``, ``-``, ``_``. A validated name is therefore already
-# one safe URL path segment and needs no further encoding.
-_GITEA_NAME_RE = re.compile(r"[A-Za-z0-9._-]+")
-_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
-
-
 def validate_gitea_name(name: str, *, kind: str = "repository") -> str:
     """Return ``name`` unchanged if it is a usable Gitea owner/repo/user name.
 
-    ``kind`` only labels the error. ``.``, ``..`` and any name containing
-    ``..`` are refused outright: Gitea reserves the first two and nothing
-    the orchestrator manages is ever named with the third.
+    Gitea's own name charset (``validation.AlphaDashDotPattern``, the shared
+    :data:`~shared.repo_path_safety.REPO_NAME_RE`), so a validated name is
+    already one safe URL path segment. ``kind`` only labels the error. ``.``,
+    ``..`` and any name containing ``..`` are refused outright: Gitea reserves
+    the first two and nothing the orchestrator manages is ever named with the
+    third.
     """
     if not isinstance(name, str) or not name:
         raise GiteaPathError(f"Gitea {kind} name must be a non-empty string")
-    if not _GITEA_NAME_RE.fullmatch(name) or ".." in name or name == ".":
+    if not REPO_NAME_RE.fullmatch(name) or ".." in name or name == ".":
         raise GiteaPathError(f"Gitea {kind} name {name!r} is not allowed")
     return name
-
-
-def _check_path_shape(value: str, *, what: str) -> None:
-    """Refuse every shape that lets a repo-relative path leave its repository."""
-    if _CONTROL_CHARS_RE.search(value):
-        raise GiteaPathError(f"{what} contains a control character")
-    if "\\" in value:
-        raise GiteaPathError(f"{what} contains a backslash")
-    if value.startswith("/"):
-        raise GiteaPathError(f"{what} must be repository-relative, not absolute")
-    for segment in value.split("/"):
-        if segment == "":
-            raise GiteaPathError(f"{what} contains an empty segment")
-        if segment in (".", ".."):
-            raise GiteaPathError(f"{what} contains a dot segment")
 
 
 def _validated_repo_path(value: str, *, what: str, allow_empty: bool) -> str:
@@ -86,10 +69,9 @@ def _validated_repo_path(value: str, *, what: str, allow_empty: bool) -> str:
         if allow_empty:
             return ""
         raise GiteaPathError(f"{what} must not be empty")
-    _check_path_shape(value, what=what)
-    # ``..%2F`` is one decode away from the same traversal, so the decoded
-    # form has to satisfy the same rules before the raw form is encoded.
-    _check_path_shape(unquote(value), what=what)
+    # Raw and percent-decoded form alike: ``..%2F`` is one decode away from
+    # the same traversal, so both must pass before the raw form is encoded.
+    check_repo_path_shape(value, what=what, error=GiteaPathError)
     return value
 
 
