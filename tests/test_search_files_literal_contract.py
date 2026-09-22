@@ -58,7 +58,11 @@ def _write_local(root: Path, rel: str, text: str) -> None:
 
 
 def _remote_backend(root: Path, monkeypatch) -> RemoteBackend:
-    """A RemoteBackend whose server-side command runs locally under /bin/sh."""
+    """A RemoteBackend whose server-side command runs locally under /bin/sh.
+
+    The command runs from ``root``'s parent, standing in for the SSH user's
+    home directory -- the cwd a real workspace command starts in.
+    """
     backend = RemoteBackend(
         host="127.0.0.1",
         port=22,
@@ -72,7 +76,12 @@ def _remote_backend(root: Path, monkeypatch) -> RemoteBackend:
         backend,
         "_exec",
         lambda command, timeout=30: subprocess.run(
-            command, shell=True, capture_output=True, text=True, timeout=timeout
+            command,
+            shell=True,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            cwd=root.parent,
         ).stdout,
     )
     return backend
@@ -156,6 +165,45 @@ def test_exclude_dirs_skips_directory_names_at_any_depth(seeded):
     assert _paths(seeded.search_files("foo", exclude_dirs=["node_*"])) == {
         "notes/a.txt"
     }
+
+
+# ---------------------------------------------------------------------------
+# The SSH command treats a model-supplied path as one word of data
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def home(tmp_path, monkeypatch):
+    """A 'home' holding the workspace plus a file the workspace must not reach."""
+    if shutil.which("grep") is None:  # pragma: no cover
+        pytest.skip("grep is not installed")
+    root = tmp_path / "ws"
+    _write_local(root, "my notes/a.txt", "needle inside the workspace")
+    _write_local(tmp_path, "outside/secret.txt", "needle outside the workspace")
+    return tmp_path, _remote_backend(root, monkeypatch)
+
+
+def test_remote_path_with_spaces_is_one_argument(home):
+    _, backend = home
+    hits = backend.search_files("needle", path="my notes")
+    assert _paths(hits) == {"my notes/a.txt"}
+
+
+def test_remote_path_cannot_reach_outside_the_workspace(home):
+    """Unquoted, "x outside" split into a second grep operand resolved from
+    the user's home directory -- outside the workspace root."""
+    _, backend = home
+    assert backend.search_files("needle", path="x outside") == []
+
+
+def test_remote_path_is_never_shell_syntax(home):
+    """search_files is bound on shell-less tiers too; its path must not run
+    commands."""
+    tmp_path, backend = home
+    marker = tmp_path / "injected"
+    for path in (f"x; touch {marker}; true", f"x$(touch {marker})", "x`true`"):
+        assert backend.search_files("needle", path=path) == []
+    assert not marker.exists()
 
 
 # ---------------------------------------------------------------------------

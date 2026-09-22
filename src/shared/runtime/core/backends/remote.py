@@ -2188,9 +2188,13 @@ __SRW_WORKSPACE_UID_ZERO_PY__
                 for d in exclude_dirs
             )
 
+        # The path is model-supplied: quote it as ONE word. Unquoted, a space
+        # split it into extra operands resolved from the SSH user's home
+        # (outside the workspace root), and ; $() ` ran commands — on tiers
+        # whose experts are granted no shell tool at all.
         cmd = (
-            f"grep {flags} {excludes} {exclude_dir_flags} -- '{safe_query}' {remote_path} "
-            "2>/dev/null "
+            f"grep {flags} {excludes} {exclude_dir_flags} -- '{safe_query}' "
+            f"{shlex.quote(remote_path)} 2>/dev/null "
             f"| head -n {SEARCH_RESULT_HARD_CAP} || true"
         )
         output = self._exec(cmd, timeout=60)
