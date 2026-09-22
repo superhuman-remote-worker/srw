@@ -25,7 +25,7 @@ import shutil
 import tempfile
 from pathlib import Path
 
-from shared.runtime.core.workspace_backend import WorkspaceBackend
+from shared.runtime.core.workspace_backend import WorkspaceBackend, search_excludes
 
 logger = logging.getLogger(__name__)
 
@@ -154,6 +154,10 @@ class ScratchBackend(WorkspaceBackend):
             if not file_path.is_file():
                 continue
             if file_path.suffix in [".pdf", ".docx", ".png", ".jpg", ".gif", ".zip"]:
+                continue
+            if search_excludes(
+                file_path.relative_to(search_path).as_posix(), exclude_dirs
+            ):
                 continue
             try:
                 content = file_path.read_text(encoding="utf-8")

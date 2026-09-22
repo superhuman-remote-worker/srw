@@ -1502,7 +1502,7 @@ FILESYSTEM_TOOLS_METADATA: Dict[str, Dict[str, Any]] = {
     "search_files": {
         "module": "workspace.filesystem",
         "function": "search_files",
-        "description": "Search for text content in workspace files",
+        "description": "Search workspace files for literal text (not a regex)",
         "category": "workspace",
         "phases": ["strategic", "tactical"],
     },

@@ -8,6 +8,8 @@ See knowledge-base/knowledge/features/vm_backend.md for the full design.
 """
 
 from abc import ABC, abstractmethod
+from fnmatch import fnmatchcase
+from pathlib import PurePosixPath
 from typing import Any, Dict, List, Optional, Tuple
 
 
@@ -215,6 +217,22 @@ class RemoteChannelBusyError(Exception):
 SEARCH_RESULT_HARD_CAP = 2000
 
 
+def search_excludes(rel_to_search_root: str, exclude_dirs: Optional[List[str]]) -> bool:
+    """True if a search hit lies inside one of ``exclude_dirs``.
+
+    The in-process backends' half of ``grep -r --exclude-dir=GLOB`` (the SSH
+    backend passes the flag straight to grep): every directory component below
+    the search root is matched against each glob by name, so ``node_modules``
+    skips a ``node_modules/`` at any depth. ``rel_to_search_root`` is the hit's
+    path relative to the directory being searched; its last component is the
+    file itself and never matches.
+    """
+    if not exclude_dirs:
+        return False
+    parts = PurePosixPath(rel_to_search_root).parts[:-1]
+    return any(fnmatchcase(part, glob) for part in parts for glob in exclude_dirs)
+
+
 class WorkspaceBackend(ABC):
     """Abstraction over workspace file storage and shell execution.
 
@@ -389,13 +407,18 @@ class WorkspaceBackend(ABC):
         case_sensitive: bool = False,
         exclude_dirs: list[str] | None = None,
     ) -> list[dict]:
-        """Search for text in workspace files.
+        """Search for literal text in workspace files.
+
+        One contract for every backend (the search_files tool promises it):
+        ``query`` is a plain substring matched within single lines, never a
+        regex or glob.
 
         Args:
-            query: Text to search for.
-            path: Directory to search in (default: entire workspace).
+            query: Literal text to search for.
+            path: Directory or single file to search (default: entire workspace).
             case_sensitive: Whether search is case-sensitive.
-            exclude_dirs: Optional list of directory names to skip with grep.
+            exclude_dirs: Directory-name globs to skip at any depth below
+                ``path`` (see :func:`search_excludes`).
 
         Returns:
             List of dicts with 'path', 'line_number', and 'line'.

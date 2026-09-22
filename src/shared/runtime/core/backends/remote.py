@@ -2160,10 +2160,16 @@ __SRW_WORKSPACE_UID_ZERO_PY__
         self._ensure_connected()
         remote_path = self._resolve(path)
 
-        # Build grep command
+        # Build grep command. -F: the query is literal text, as on every other
+        # backend — without it grep read a basic regex, so ``x[0]`` never found
+        # ``x[0]`` and ``a.c`` also hit ``abc``. -H: GNU grep prints no filename
+        # for a single-file ``path`` even with -r, which the ``file:line:``
+        # parser below silently dropped as malformed.
+        # knowledge-base/knowledge/issues/search_files_literal_query_contract.md
         flags = "-rn"
         if not case_sensitive:
             flags += "i"
+        flags += " -F -H"
 
         # Escape single quotes in query
         safe_query = query.replace("'", "'\\''")

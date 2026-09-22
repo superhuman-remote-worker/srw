@@ -78,6 +78,32 @@ def _infer_file_purpose(filename: str) -> str:
     return "Working file"
 
 
+# Operators of the regex dialects models reach for ("foo|bar", "\bword\b",
+# "a.*b", "(x|y)+") that search_files matches as plain text. A dot is left out:
+# it is far more common in literal queries ("config.yaml") than as a wildcard.
+_REGEX_SHAPED_CHARS = frozenset("|*+?()[]{}^$\\")
+
+
+def _literal_query_note(query: str, has_shell: bool) -> str:
+    """Why a regex-shaped query found nothing, and what to do instead.
+
+    Offers the shell only when one is actually bound, so a shell-less
+    (virtual) workspace is never told to use a capability it lacks.
+    knowledge-base/knowledge/issues/search_files_literal_query_contract.md
+    """
+    if not any(ch in _REGEX_SHAPED_CHARS for ch in query):
+        return ""
+    alternative = (
+        "For a regular expression, run rg or grep -E with your shell tool."
+        if has_shell
+        else "To find any of several words, search for each one separately."
+    )
+    return (
+        "\n(The query was matched literally, as plain text: characters such as "
+        f"| * ( ) [ ] ^ $ and backslash are not regex operators here. {alternative})"
+    )
+
+
 # Tool metadata for registry
 # Phase availability: filesystem tools are available in both strategic and tactical modes
 
@@ -268,21 +294,35 @@ def create_filesystem_tools(context: ToolContext) -> List[Any]:
         case_sensitive: bool = False,
         exclude_dirs: list[str] | None = None,
     ) -> str:
-        """Search for text content in workspace files.
+        """Find lines that contain a literal piece of text in workspace files.
 
-        Searches through all text files and returns matching lines
-        with file paths and line numbers.
+        The query is plain text, not a regex or glob: every character is
+        matched as written, so "foo|bar" finds only lines containing the exact
+        text "foo|bar" (not lines with foo or bar), and characters such as
+        . * ( ) [ ] ^ $ and backslash have no special meaning. To find any of
+        several words, search once per word. For a regular expression, use
+        rg or grep -E through a shell tool if one is available to you.
 
         Args:
-            query: Text or pattern to search for
-            path: Directory to search in (empty for entire workspace)
-            case_sensitive: Whether to match case exactly
-            exclude_dirs: Optional list of directory names to skip with grep
-                --exclude-dir
+            query: Literal text to find within a single line, e.g.
+                "def search_files" or "TODO(auth)"
+            path: Workspace-relative directory or single file to search
+                (empty for the entire workspace)
+            case_sensitive: Match letter case exactly (default: case-insensitive)
+            exclude_dirs: Directory names to skip at any depth, e.g.
+                ["node_modules", ".git"] (glob patterns allowed)
 
         Returns:
-            Search results with file paths, line numbers, and matching lines
+            Matching lines grouped by file, with line numbers. Binary files
+            (PDF, Word, images, archives) are not searched.
         """
+        if not query:
+            return "Error: query is empty — pass the literal text to find."
+        if "\n" in query or "\r" in query:
+            return (
+                "Error: query spans several lines, but matching happens within "
+                "one line. Search for a single line of it."
+            )
         try:
             cloud_mount_cfg = context.get_config("cloud_mount", {})
             if (
@@ -300,7 +340,14 @@ def create_filesystem_tools(context: ToolContext) -> List[Any]:
             )
 
             if not results:
-                return f"No matches found for: {query}"
+                # An empty result must not read as "the text is absent" when
+                # the search itself was off: a path that does not exist, or a
+                # regex-shaped query that was (by contract) matched literally.
+                if path and not workspace.exists(path):
+                    return f"Error: path not found: {path}"
+                return f"No matches found for: {query}" + _literal_query_note(
+                    query, context.has_shell()
+                )
 
             # Limit results
             total = len(results)
