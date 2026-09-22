@@ -901,14 +901,21 @@ export class PersistentChatService {
         if (e.persisted) revalidate(true);
       };
       const onResume = () => revalidate(true);
+      // `offline` means no network interface at all (unlike `online`, which
+      // can be wrong in the hopeful direction), so neither link survives it:
+      // leave "Connected" now rather than when the watchdog notices ~45s on.
+      // The reopened stream sits in the browser's retry loop until `online`.
+      const onOffline = () => revalidate(true);
       document.addEventListener('visibilitychange', onVisible);
       window.addEventListener('online', onUnforced);
+      window.addEventListener('offline', onOffline);
       window.addEventListener('focus', onUnforced);
       window.addEventListener('pageshow', onPageShow);
       document.addEventListener('resume', onResume);
       this.destroyRef.onDestroy(() => {
         document.removeEventListener('visibilitychange', onVisible);
         window.removeEventListener('online', onUnforced);
+        window.removeEventListener('offline', onOffline);
         window.removeEventListener('focus', onUnforced);
         window.removeEventListener('pageshow', onPageShow);
         document.removeEventListener('resume', onResume);
@@ -3054,10 +3061,10 @@ export class PersistentChatService {
         // loop_crash even though the title was generated and persisted.
         if (wasReconnecting && this.threadId() === threadId) {
           void this.loadThreadMeta(threadId, connectGeneration);
-          // Slave the control WS to SSE recovery: the WS has no
-          // liveness probe of its own, so re-establish it whenever
-          // the (monitored) SSE recovers. Idempotent — bails if the
-          // WS is already open/connecting.
+          // Slave the control WS to SSE recovery: whatever took the
+          // stream down may have taken the WS too, so re-establish it
+          // whenever the SSE recovers. Idempotent — bails if the WS is
+          // already open (and not silent) or connecting.
           if (!controlUnavailable) this._ensureControlWs();
         }
       });
@@ -3169,11 +3176,12 @@ export class PersistentChatService {
   }
 
   /**
-   * Re-validate liveness on tab resume (visibilitychange / online / focus).
-   * The SSE is the single liveness authority: if it isn't OPEN or has gone
-   * silent past the watchdog timeout, force a reopen (replay-from-cursor);
-   * then ensure the control WS — which has no probe of its own — is back.
-   * No-op when there's no active, live session.
+   * Re-validate liveness on tab resume (visibilitychange / online / offline /
+   * focus). The SSE is the single liveness authority for "Connected": if it
+   * isn't OPEN or has gone silent past the watchdog timeout, force a reopen
+   * (replay-from-cursor). The control WS is judged by the same rules against
+   * its own clock — its readyState can't vouch for it any more than the
+   * stream's can — and re-ensured. No-op when there's no active, live session.
    */
   private _revalidateConnection(force = false): void {
     if (this.intentionalClose) return;
@@ -3191,12 +3199,14 @@ export class PersistentChatService {
       this.sse.readyState !== EventSource.OPEN ||
       Date.now() - this.sseLastEventAt > SSE_WATCHDOG_TIMEOUT_MS;
     if (sseStale) {
-      // Closes + reopens the SSE and sets connectionState='connecting';
-      // the reopen's onopen also re-ensures the control WS (Change 2).
+      // A dead WS is retired now, so nothing is written into it while the
+      // stream reconnects; the reopen's onopen then re-ensures it (Change 2).
+      if (!terminalControl && (force || this._controlWsSilent())) this._dropControlWs();
+      // Closes + reopens the SSE and sets connectionState='connecting'.
       this.reconnectNow();
     } else if (!terminalControl) {
       // SSE healthy but the WS may have silently dropped — re-ensure it.
-      this._ensureControlWs();
+      this._ensureControlWs(force);
     }
   }
 
@@ -3900,10 +3910,8 @@ export class PersistentChatService {
     }
   }
 
-  /** Force-close a half-open control WS that stopped delivering frames.
-   *  close() fires onclose locally even when the peer is unreachable, so
-   *  the regular reconnect ladder (with a fresh /connection token) takes
-   *  over from there. */
+  /** Replace a half-open control WS that stopped delivering frames, via the
+   *  regular reconnect ladder (with a fresh /connection token). */
   private _startControlWsWatchdog(threadId: string): void {
     this._stopControlWsWatchdog();
     this.controlWsWatchdogTimer = setInterval(() => {
@@ -3911,13 +3919,48 @@ export class PersistentChatService {
         this._stopControlWsWatchdog();
         return;
       }
-      const ws = this.controlWs;
-      if (!ws || ws.readyState !== WebSocket.OPEN) return;
-      if (Date.now() - this.controlWsLastMessageAt > CONTROL_WS_WATCHDOG_TIMEOUT_MS) {
+      if (this._controlWsSilent()) {
         console.warn('[persistent-chat] control WS silent past watchdog — forcing reconnect');
-        ws.close(4002, 'heartbeat timeout');
+        this._dropControlWs();
+        this._scheduleControlWsReconnect(threadId);
       }
     }, CONTROL_WS_WATCHDOG_INTERVAL_MS);
+  }
+
+  /** The watchdog's verdict, taken now instead of on its next tick: the
+   *  control WS it monitors still reports OPEN, yet nothing — not even the
+   *  agent's idle `ws.ping` — has arrived within the deadline. That socket
+   *  is half-open (laptop sleep, dropped link) and `send()` on it writes
+   *  into the void. Timers stop while a machine sleeps but the wall clock
+   *  does not, so right after a wake this holds before any tick has run. */
+  private _controlWsSilent(): boolean {
+    return (
+      this.controlWsWatchdogTimer !== null &&
+      this.controlWs?.readyState === WebSocket.OPEN &&
+      Date.now() - this.controlWsLastMessageAt > CONTROL_WS_WATCHDOG_TIMEOUT_MS
+    );
+  }
+
+  /** Retire the control WS without waiting for its close event. close() on
+   *  a socket whose peer is unreachable starts a closing handshake that
+   *  cannot complete, so `onclose` only fires once the browser's handshake
+   *  timeout gives up on it (about a minute in Chromium) — a reconnect keyed
+   *  off it would keep the dead socket installed that long. The caller
+   *  starts the replacement. */
+  private _dropControlWs(): void {
+    const ws = this.controlWs;
+    if (!ws) return;
+    this.controlWs = null;
+    this._stopControlWsWatchdog();
+    ws.onopen = null;
+    ws.onmessage = null;
+    ws.onerror = null;
+    ws.onclose = null;
+    try {
+      ws.close(4002, 'heartbeat timeout');
+    } catch {
+      // Already closed.
+    }
   }
 
   private _stopControlWsWatchdog(): void {
@@ -3948,13 +3991,18 @@ export class PersistentChatService {
 
   /** Open a control WS on demand if one isn't already open. Used by
    *  slash-command and permission paths when the user clicks during a
-   *  brief reconnect window. */
-  private _ensureControlWs(): void {
+   *  brief reconnect window. An OPEN socket that has gone silent — or any
+   *  OPEN socket, when `force` (a wake the page can't vouch for) — is
+   *  replaced rather than trusted. */
+  private _ensureControlWs(force = false): void {
     const tid = this.threadId();
     if (!tid) return;
     if (!this._controlPlaneAllowed(tid)) return;
     if (this.controlSocket === 'none') return;
-    if (this.controlWs?.readyState === WebSocket.OPEN) return;
+    if (this.controlWs?.readyState === WebSocket.OPEN) {
+      if (!force && !this._controlWsSilent()) return;
+      this._dropControlWs();
+    }
     if (this.controlWs?.readyState === WebSocket.CONNECTING) return;
     if (this.controlWsOpening) return;
     this.controlWsReconnectAttempt = 0;
@@ -4207,7 +4255,9 @@ export class PersistentChatService {
       return false;
     }
     const frame = JSON.stringify(data);
-    if (this.controlWs?.readyState === WebSocket.OPEN) {
+    // A silent OPEN socket is dead (see _controlWsSilent); queue instead,
+    // and the _ensureControlWs below replaces it.
+    if (this.controlWs?.readyState === WebSocket.OPEN && !this._controlWsSilent()) {
       try {
         this.controlWs.send(frame);
         return true;
@@ -4241,6 +4291,9 @@ export class PersistentChatService {
       this.error.set(this.transloco.translate('chat.control.unavailable'));
       return false;
     }
+    // Refused like any down socket (destructive controls never queue), but
+    // start the replacement so a retry can land.
+    if (this._controlWsSilent()) this._ensureControlWs();
     const ws = this.controlWs;
     if (!ws || ws.readyState !== WebSocket.OPEN) {
       this.error.set(this.transloco.translate('chat.rewind.connectionDown'));
@@ -4290,7 +4343,7 @@ export class PersistentChatService {
   private _sendCanvasControl(threadId: string, data: CanvasControl): boolean {
     if (!this._controlPlaneAllowed(threadId)) return false;
     const ws = this.controlWs;
-    if (!ws || ws.readyState !== WebSocket.OPEN) {
+    if (!ws || ws.readyState !== WebSocket.OPEN || this._controlWsSilent()) {
       if (isCommittedCanvasControl(data)) {
         this._queueCanvasSourceUpdate(threadId, data);
       }

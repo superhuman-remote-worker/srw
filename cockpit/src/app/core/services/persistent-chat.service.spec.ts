@@ -9755,6 +9755,182 @@ describe('PersistentChatService — Phase 2: wake recovery', () => {
   });
 });
 
+// knowledge-base/knowledge/issues/persistent_chat_silent_disconnect.md: a
+// laptop sleep kills both links underneath the page without a close frame,
+// so the EventSource and the pinned control WS keep reporting OPEN.
+describe('PersistentChatService — waking from sleep with silently dead transports', () => {
+  let originalEs: any;
+  let originalWs: any;
+
+  function setVisibility(state: string): void {
+    Object.defineProperty(document, 'visibilityState', {
+      value: state,
+      configurable: true,
+    });
+  }
+
+  function framesOn(ws: any) {
+    return ws.send.mock.calls.map((c: any) => JSON.parse(c[0]));
+  }
+
+  beforeEach(() => {
+    originalEs = (globalThis as any).EventSource;
+    originalWs = (globalThis as any).WebSocket;
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    (globalThis as any).EventSource = originalEs;
+    (globalThis as any).WebSocket = originalWs;
+    setVisibility('visible');
+    vi.clearAllMocks();
+  });
+
+  /** A pinned session with the stream and the control WS both up. */
+  async function connectPinned(threadId: string) {
+    const ctx = createService();
+    ctx.mockHttp.get.mockImplementation(activeSessionGet);
+    await ctx.service.connect(threadId);
+    await vi.advanceTimersByTimeAsync(0);
+    fireSseOpen(ctx.sseInstances[0]);
+    expect(ctx.service.connectionState()).toBe('connected');
+    expect(ctx.wsInstances).toHaveLength(1);
+    return { ...ctx, zombieWs: ctx.wsInstances[0] };
+  }
+
+  /** Suspend the machine: the wall clock jumps, but no timer fires and no
+   *  frame arrives. Pending timers keep their remaining delay, as browser
+   *  timers on a monotonic clock that stops while suspended do. */
+  function sleepFor(ms: number): void {
+    vi.setSystemTime(Date.now() + ms);
+  }
+
+  const TWO_HOURS = 2 * 60 * 60_000;
+
+  it('leaves Connected on the first watchdog tick after waking, with no wake event at all', async () => {
+    const ctx = await connectPinned('thread-sleep-tick');
+
+    sleepFor(TWO_HOURS);
+    await vi.advanceTimersByTimeAsync(5_000);
+
+    expect(ctx.sseInstances[0].close).toHaveBeenCalled();
+    expect(ctx.sseInstances).toHaveLength(2);
+    expect(ctx.service.connectionState()).toBe('connecting');
+  });
+
+  it('a wake event retires the dead control WS too, instead of trusting its OPEN readyState', async () => {
+    const ctx = await connectPinned('thread-sleep-wake');
+
+    setVisibility('hidden');
+    document.dispatchEvent(new Event('visibilitychange'));
+    sleepFor(TWO_HOURS);
+    setVisibility('visible');
+    document.dispatchEvent(new Event('visibilitychange'));
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(ctx.service.connectionState()).toBe('connecting');
+    expect(ctx.sseInstances).toHaveLength(2);
+    expect(ctx.zombieWs.close).toHaveBeenCalled();
+
+    // The stream recovers and brings a fresh control socket with it.
+    fireSseOpen(ctx.sseInstances[1]);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ctx.service.connectionState()).toBe('connected');
+    expect(ctx.wsInstances).toHaveLength(2);
+
+    // Commands now go out on the fresh socket, never into the dead one.
+    const fresh = ctx.wsInstances[1];
+    (ctx.service as any)._sendControl({ method: 'approve' });
+    expect(framesOn(fresh)).toContainEqual({ method: 'approve' });
+    expect(framesOn(ctx.zombieWs)).not.toContainEqual({ method: 'approve' });
+  });
+
+  it('a command issued right after waking, before any tick or wake event, is not written into the dead socket', async () => {
+    const ctx = await connectPinned('thread-sleep-click');
+
+    sleepFor(TWO_HOURS);
+    (ctx.service as any)._sendControl({ method: 'approve' });
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(framesOn(ctx.zombieWs)).not.toContainEqual({ method: 'approve' });
+    expect(ctx.zombieWs.close).toHaveBeenCalled();
+    // It rides the replacement socket once that opens.
+    expect(ctx.wsInstances).toHaveLength(2);
+    const fresh = ctx.wsInstances[1];
+    fresh.onopen();
+    expect(framesOn(fresh)).toContainEqual({ method: 'approve' });
+  });
+
+  it('a destructive control right after waking is refused, not lost, and its retry has a socket to use', async () => {
+    const ctx = await connectPinned('thread-sleep-rewind');
+
+    sleepFor(TWO_HOURS);
+    const sent = (ctx.service as any)._sendImmediateControl({ method: 'rewind', mode: 'both' });
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(sent).toBe(false);
+    expect(ctx.service.error()).toBe('chat.rewind.connectionDown');
+    expect(ctx.zombieWs.send).not.toHaveBeenCalled();
+    expect(ctx.wsInstances).toHaveLength(2);
+  });
+
+  it('going offline leaves Connected at once; coming back online reopens both transports', async () => {
+    const ctx = await connectPinned('thread-offline');
+
+    window.dispatchEvent(new Event('offline'));
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(ctx.service.connectionState()).toBe('connecting');
+    expect(ctx.sseInstances[0].close).toHaveBeenCalled();
+    expect(ctx.zombieWs.close).toHaveBeenCalled();
+
+    // Offline, the reopened stream cannot connect (the browser keeps
+    // retrying); `online` makes the next attempt immediately.
+    fireSseTransientError(ctx.sseInstances[1]);
+    window.dispatchEvent(new Event('online'));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ctx.sseInstances).toHaveLength(3);
+    fireSseOpen(ctx.sseInstances[2]);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(ctx.service.connectionState()).toBe('connected');
+    expect(ctx.wsInstances).toHaveLength(2);
+  });
+
+  it('the control WS watchdog replaces a half-open socket without waiting for its close event', async () => {
+    const ctx = await connectPinned('thread-ws-halfopen');
+
+    // The stream stays healthy; only the control socket goes quiet.
+    for (let i = 0; i < 3; i++) {
+      await vi.advanceTimersByTimeAsync(20_000);
+      fireSseNamedEvent(ctx.sseInstances[0], 'ping', {});
+    }
+    expect(ctx.zombieWs.close).toHaveBeenCalledWith(4002, 'heartbeat timeout');
+
+    // close() on an unreachable peer starts a closing handshake that cannot
+    // complete, so no close event arrives (the mock never fires one). The
+    // replacement must not wait for it.
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(ctx.wsInstances).toHaveLength(2);
+    expect(ctx.sseInstances).toHaveLength(1);
+    expect(ctx.service.connectionState()).toBe('connected');
+  });
+
+  it('a healthy control WS survives a focus revalidate', async () => {
+    const ctx = await connectPinned('thread-ws-healthy');
+
+    await vi.advanceTimersByTimeAsync(20_000);
+    fireSseNamedEvent(ctx.sseInstances[0], 'ping', {});
+    ctx.zombieWs.onmessage({ data: JSON.stringify({ method: 'ws.ping', params: {} }) });
+    window.dispatchEvent(new Event('focus'));
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(ctx.zombieWs.close).not.toHaveBeenCalled();
+    expect(ctx.wsInstances).toHaveLength(1);
+    expect(ctx.sseInstances).toHaveLength(1);
+  });
+});
+
 describe('PersistentChatService — Phase 2: _openSse single-flight guard', () => {
   let originalEs: any;
   let originalWs: any;
