@@ -130,6 +130,32 @@ def _build_app(store: _Store) -> FastAPI:
     async def unclassified(request: Request):
         return await _as_user(request)
 
+    # A GET that mints a write-capable session websocket credential.
+    @app.get("/api/sessions/{thread_id}/connection")
+    async def session_connection(request: Request, thread_id: str):
+        return await _as_user(request)
+
+    # The srw-ssh-proxy exchange: a PAT buys a 300 s attach token.
+    @app.post("/api/ssh/attach-token")
+    async def ssh_attach_token(request: Request):
+        return await _as_user(request)
+
+    @app.post("/api/ssh-keys")
+    async def register_ssh_key(request: Request):
+        return await _as_user(request)
+
+    # Accepts an inline repo URL + GitHub token and creates a connector.
+    @app.post("/api/projects/{project_id}/knowledge/repository")
+    async def attach_vault(request: Request, project_id: str):
+        return await _as_user(request)
+
+    # Admin-only list. FastAPI answers HEAD only where a route declares it
+    # (as /api/ide and the canvas content routes do); when one does, a rule
+    # that names GET must hold for HEAD too.
+    @app.api_route("/api/vms", methods=["GET", "HEAD"])
+    async def list_vms(request: Request):
+        return await _as_user(request)
+
     # Include-prefixed: newer FastAPI hands the resolver the router-local
     # route ("/{job_id}") and keeps the prefixed template elsewhere.
     jobs = APIRouter()
@@ -277,6 +303,49 @@ class TestFailClosed:
         assert response.status_code == 200
 
 
+CONNECTION = "/api/sessions/t-1/connection"
+ATTACH = "/api/ssh/attach-token"
+VAULT = "/api/projects/p-1/knowledge/repository"
+
+
+class TestRoutesWhoseMethodUndersellsThem:
+    """A read method is not proof of a read: these routes mint a credential
+    or reconfigure a project, so their scope follows what they do."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("scopes", "method", "path", "status"),
+        [
+            # The session connection GET creates the route and mints a session
+            # JWT whose websocket accepts messages and approvals. chat:read is
+            # in every new token's default set.
+            (["chat:read"], "GET", CONNECTION, 403),
+            (["chat:read", "jobs:read", "knowledge:read"], "GET", CONNECTION, 403),
+            (["chat:write"], "GET", CONNECTION, 200),
+            # srw-ssh-proxy's exchange: interactive shell is at least chat:write.
+            (["chat:write"], "POST", ATTACH, 200),
+            (["chat:read"], "POST", ATTACH, 403),
+            (["jobs:write"], "POST", ATTACH, 403),
+            (["admin"], "POST", ATTACH, 200),
+            # Key management stays out of every token's reach.
+            (["admin"], "POST", "/api/ssh-keys", 403),
+            # An inline repo URL + GitHub token creates a connector: admin,
+            # like the datasource and repository routes beside it.
+            (["knowledge:write"], "POST", VAULT, 403),
+            (["admin"], "POST", VAULT, 200),
+            # HEAD is served by the GET route and must be gated like it.
+            (["jobs:read"], "HEAD", "/api/vms", 403),
+            (["jobs:read"], "GET", "/api/vms", 403),
+            (["admin"], "HEAD", "/api/vms", 200),
+        ],
+    )
+    async def test_scope(self, store, client, scopes, method, path, status):
+        token = store.mint("api", scopes=scopes)
+        async with client:
+            response = await client.request(method, path, headers=_bearer(token))
+        assert response.status_code == status, response.text
+
+
 ALL_ROUTES = [
     ("GET", JOBS),
     ("POST", JOBS),
@@ -287,6 +356,9 @@ ALL_ROUTES = [
     ("GET", ADMIN),
     ("POST", "/api/api-keys"),
     ("GET", "/api/brand-new-surface"),
+    ("GET", CONNECTION),
+    ("POST", ATTACH),
+    ("POST", VAULT),
 ]
 
 

@@ -11,13 +11,20 @@ so this suite walks the same mounted-route inventory the endpoint snapshot uses
 * every admin-gated route needs ``admin``, and every internal-only route
   refuses PATs, so the table never advertises less than the gate enforces;
 * the vocabulary the table uses is exactly the one tokens are minted with and
-  the Cockpit offers.
+  the Cockpit offers;
+* a GET that writes or mints is gated as its write (``READS_THAT_WRITE``) or
+  acknowledged here as bookkeeping — a new GET handler that visibly calls a
+  write- or mint-shaped function fails until someone decides which.
 
 Behaviour through real requests: ``tests/test_pat_scope_enforcement.py``.
 """
 
 from __future__ import annotations
 
+import ast
+import importlib.machinery
+import importlib.util
+import json
 import re
 from pathlib import Path
 from types import SimpleNamespace
@@ -28,6 +35,7 @@ from fastapi import HTTPException
 from orchestrator.schemas.tokens import VALID_PAT_SCOPES
 from orchestrator.security.token_scopes import (
     ANY,
+    READS_THAT_WRITE,
     REFUSED,
     UNMAPPED,
     classify_route,
@@ -102,6 +110,121 @@ class TestEveryMountedRouteIsClassified:
     def test_decisions_use_exactly_the_minted_vocabulary(self, endpoints):
         decisions = {classify_route(e.method, e.path) for e in endpoints}
         assert decisions - {ANY, REFUSED} == VALID_PAT_SCOPES
+
+
+# GET routes a `:read` token keeps although serving them writes. Every GET a
+# `:read` scope reaches was traced into its services (2026-09-22); these are
+# the ones that write, and each writes only bookkeeping or server-side repair
+# the caller cannot steer. A GET that mints a credential, or performs a write
+# whose content the caller chooses, belongs in token_scopes.READS_THAT_WRITE.
+_BOOKKEEPING_READS = {
+    "/api/persistent/threads/{thread_id}": (
+        "ensure_thread_ssh_handle backfills the thread's opaque SSH routing "
+        "handle; connecting still needs a registered key and an attach token"
+    ),
+    "/api/persistent/threads/{thread_id}/stream": (
+        "records the viewer's presence (stateless lane), which can flip an "
+        "awaiting_user thread to active; answering it still needs chat:write"
+    ),
+    "/api/persistent/threads/{thread_id}/canvases/main": (
+        "re-pins an unchanged canvas to the current workspace generation"
+    ),
+    "/api/persistent/threads/{thread_id}/canvases/main/awareness/stream": (
+        "sweeps expired editor-awareness rows"
+    ),
+    "/api/persistent/threads/{thread_id}/canvases/main/content": (
+        "purges a stored snapshot whose bytes fail their hash"
+    ),
+    "/api/projects/{project_id}": (
+        "kicks the hourly, service-authored cloud/Keycloak reconciliation any "
+        "project view triggers; the caller supplies no content"
+    ),
+    "/api/projects/{project_id}/officer": (
+        "materialises the vacant default officer row (INSERT … ON CONFLICT DO NOTHING)"
+    ),
+    "/api/citations/{citation_id}/drift": (
+        "caches the caller's own cloud account id on a lookup miss"
+    ),
+    "/api/resources": (
+        "audits each stored resource it skips as invisible (security_events)"
+    ),
+}
+
+# Call names that, made directly from a GET handler, look like a write or a
+# mint. Deliberately broad: a false hit costs one line above.
+_WRITE_VERBS = re.compile(
+    r"^(create|update|delete|mint|sign|insert|ensure|start|stop|cancel|revoke|"
+    r"approve|deny|set|write|put|post|patch|record|grant|issue|provision|spawn|"
+    r"dispatch|remove|upsert|rotate|attach|detach|enqueue|submit)(_|$)"
+)
+
+
+def _safe_method_handler_verbs():
+    """``(route, {verb calls})`` for every mounted GET/HEAD handler."""
+    script = _load_script()
+    functions: dict[Path, dict[int, ast.AST]] = {}
+    for route in script.discover_routes():
+        if not script.in_inventory_scope(route):
+            continue
+        if route.method.upper() not in {"GET", "HEAD"}:
+            continue
+        if route.source_path not in functions:
+            tree = ast.parse(route.source_path.read_text())
+            functions[route.source_path] = {
+                node.lineno: node
+                for node in ast.walk(tree)
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            }
+        handler = functions[route.source_path][route.function_lineno]
+        verbs = set()
+        for node in ast.walk(handler):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            name = getattr(func, "attr", None) or getattr(func, "id", None)
+            if name and _WRITE_VERBS.match(name):
+                verbs.add(name)
+        yield route, verbs
+
+
+class TestReadsThatWrite:
+    """A read method is not proof of a read: a GET that mints a credential or
+    writes would hand a `:read` token write power."""
+
+    def test_each_listed_read_is_gated_as_its_write(self, endpoints):
+        mounted = {(e.method, e.path) for e in endpoints}
+        for path, scope in READS_THAT_WRITE.items():
+            assert ("GET", path) in mounted, f"stale entry: {path}"
+            assert scope in VALID_PAT_SCOPES and not scope.endswith(":read")
+            assert classify_route("GET", path) == scope
+            assert classify_route("HEAD", path) == scope
+
+    def test_bookkeeping_reads_are_still_mounted_reads(self, endpoints):
+        mounted = {(e.method, e.path) for e in endpoints}
+        for path in _BOOKKEEPING_READS:
+            assert ("GET", path) in mounted, f"stale entry: {path}"
+            assert classify_route("GET", path).endswith(":read")
+            assert path not in READS_THAT_WRITE
+
+    def test_a_get_that_visibly_writes_is_classified_consciously(self):
+        unexplained = [
+            f"{route.method} {route.path}: {sorted(verbs)}"
+            for route, verbs in _safe_method_handler_verbs()
+            if verbs
+            and (
+                classify_route(route.method, route.path).endswith(":read")
+                or classify_route(route.method, route.path) == ANY
+            )
+            and route.path not in READS_THAT_WRITE
+            and route.path not in _BOOKKEEPING_READS
+        ]
+        assert not unexplained, (
+            "GET handler(s) that call a write/mint-shaped function while a "
+            "`:read` token may call them. Gate the route as its write in "
+            "token_scopes.READS_THAT_WRITE, or — if the write is bookkeeping "
+            "the caller cannot steer — acknowledge it in _BOOKKEEPING_READS "
+            "here:\n  " + "\n  ".join(unexplained)
+        )
 
 
 class TestClassifyRoute:
@@ -228,3 +351,26 @@ def test_cockpit_offers_exactly_the_enforced_vocabulary():
     offered = set(re.findall(r"value:\s*'([^']+)'", block.group(1)))
     assert offered == VALID_PAT_SCOPES
     assert re.search(r"\{[^}]*value:\s*'admin'[^}]*adminOnly:\s*true", block.group(1))
+
+
+def test_the_ssh_attach_exchange_needs_chat_write_and_the_helper_says_so():
+    """``scripts/srw-ssh-proxy`` exchanges a PAT at this route on every
+    connection. It must be admitted for chat:write (ssh-access.md), stay
+    refused for the key-management routes beside it, and the helper must turn
+    the resolver's refusal into the scope it names — a contract between the
+    403 detail format here and the parser there."""
+    assert classify_route("POST", "/api/ssh/attach-token") == "chat:write"
+    assert classify_route("POST", "/api/ssh-keys") == REFUSED
+    assert classify_route("POST", "/api/ssh-keys/challenge") == REFUSED
+
+    with pytest.raises(HTTPException) as exc:
+        require_scopes({"auth_method": "pat", "scopes": ["chat:read"]}, "chat:write")
+
+    loader = importlib.machinery.SourceFileLoader(
+        "srw_ssh_proxy_contract", str(REPO_ROOT / "scripts" / "srw-ssh-proxy")
+    )
+    spec = importlib.util.spec_from_loader(loader.name, loader)
+    proxy = importlib.util.module_from_spec(spec)
+    loader.exec_module(proxy)
+    reason = proxy._refusal_reason(json.dumps({"detail": exc.value.detail}).encode())
+    assert reason.startswith("PAT lacks the chat:write scope")

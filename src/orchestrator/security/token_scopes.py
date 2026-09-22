@@ -21,9 +21,12 @@ inventory records each route's decision in its ``pat=`` column.
 The mapping follows the vocabulary the Cockpit advertises
 (knowledge-base/knowledge/features/auth_bff_and_api_tokens.md §3.3): a family
 of routes has a ``:read`` scope for GET/HEAD/OPTIONS and a ``:write`` scope for
-everything else. Surfaces outside jobs/chat/knowledge need ``admin``, which is
-also a superset of every other scope. Internal agent routes, credential
-minting, browser-only surfaces and WebSockets refuse PATs outright.
+everything else — unless the route's effect says otherwise: a GET that mints
+a credential or writes is gated as that write (:data:`READS_THAT_WRITE`).
+Surfaces outside jobs/chat/knowledge need ``admin``, which is also a superset
+of every other scope. Internal agent routes, credential management (SRW API
+keys, MCP tokens, SSH keys — the short-lived SSH attach exchange aside),
+browser-only surfaces and WebSockets refuse PATs outright.
 """
 
 from __future__ import annotations
@@ -86,12 +89,20 @@ class _Rule:
         return path == self.path or path.startswith(self.path + "/")
 
 
+def _methods(methods: tuple[str, ...]) -> frozenset[str] | None:
+    # A route that declares HEAD beside GET (``api_route``, the canvas content
+    # and IDE proxy routes) serves both from one handler, so a rule that names
+    # GET must gate HEAD too — otherwise HEAD falls through to a laxer rule.
+    named = frozenset(methods)
+    return (named | {"HEAD"} if "GET" in named else named) or None
+
+
 def _exact(path: str, policy: _Family, *methods: str) -> _Rule:
-    return _Rule(path, policy, exact=True, methods=frozenset(methods) or None)
+    return _Rule(path, policy, exact=True, methods=_methods(methods))
 
 
 def _prefix(path: str, policy: _Family, *methods: str) -> _Rule:
-    return _Rule(path, policy, methods=frozenset(methods) or None)
+    return _Rule(path, policy, methods=_methods(methods))
 
 
 _JOB = "/api/jobs/{job_id}"
@@ -122,17 +133,44 @@ _INTERNAL_ROUTES = (
     "/api/contacts/internal/list",
 )
 
+#: Safe-method routes that nonetheless write or hand out a credential, mapped
+#: to the scope their effect needs. A read method is not proof of a read: a
+#: `:read` token reaching one of these could write, so each is gated as the
+#: write it performs. ``tests/test_pat_scope_policy.py`` pins every entry and
+#: fails on a new GET handler that visibly mints or mutates until it is either
+#: listed here or acknowledged there as bookkeeping.
+READS_THAT_WRITE: dict[str, str] = {
+    # Creates the session's Service/Ingress and mints a session JWT into the
+    # returned ws_url (that websocket accepts messages and approvals), and may
+    # start a protected-cloud reader grant before answering 425.
+    "/api/sessions/{thread_id}/connection": "chat:write",
+    # ?live=true persists the controller's report into jobs.context.vm —
+    # bumping the provisioning CAS revision the readiness poller relies on —
+    # and binds the workspace PVC row.
+    "/api/vms/{job_id}": "jobs:write",
+}
+
 # First match wins: exact and narrow rules precede the prefix they refine.
 _RULES: tuple[_Rule, ...] = (
     # -- PATs never ---------------------------------------------------------
     *(_prefix(path, _REFUSED) for path in _INTERNAL_ROUTES),
     _prefix("/api/internal", _REFUSED),
     _prefix("/api/runtime-actors", _REFUSED),
+    # -- Reads that write -----------------------------------------------------
+    *(
+        _exact(path, _Family(scope, scope), "GET")
+        for path, scope in READS_THAT_WRITE.items()
+    ),
     # Credentials that authenticate to SRW: a PAT must not mint its successor.
     _prefix("/api/api-keys", _REFUSED),
     _prefix("/api/mcp-tokens", _REFUSED),
     _prefix("/api/ssh-keys", _REFUSED),
     _exact("/api/ssh/host-keys", _ANY),  # public host-key pinning
+    # srw-ssh-proxy exchanges a PAT here on every connection for a 300 s,
+    # single-purpose attach token. Interactive shell access into the owner's
+    # workspaces is at least chat:write; everything else under /api/ssh stays
+    # refused.
+    _exact("/api/ssh/attach-token", _Family("chat:write", "chat:write"), "POST"),
     _prefix("/api/ssh", _REFUSED),
     # Browser-only: code-server proxy, BFF cookie flow, WOPI office tokens.
     _prefix("/api/ide", _REFUSED),
@@ -158,6 +196,10 @@ _RULES: tuple[_Rule, ...] = (
     _prefix("/api/sudo/rules", _ADMIN),
     # Sudo decisions are the design's first `admin` grant.
     _prefix("/api/sudo/requests/{request_id}", _ADMIN, "POST"),
+    # Attaching the project's vault takes an inline repo URL + GitHub token
+    # (or adopts a connector) and reconfigures the project's repositories —
+    # admin, like POST /api/datasources and .../repositories beside it.
+    _exact(f"{_PROJECT}/knowledge/repository", _ADMIN),
     # -- Knowledge ----------------------------------------------------------
     _exact(f"{_PROJECT}/knowledge/search", _KNOWLEDGE_READ),
     _exact(f"{_PROJECT}/knowledge/export", _KNOWLEDGE_READ),
@@ -322,6 +364,7 @@ __all__ = [
     "ANY",
     "INSUFFICIENT_SCOPE",
     "PAT_AUTH_METHOD",
+    "READS_THAT_WRITE",
     "REFUSED",
     "UNMAPPED",
     "classify_route",

@@ -60,9 +60,11 @@ talking to an authenticated API, and the helper needs something to authenticate
 that first hop with. The plan's own config block doesn't mention this step, so it's
 easy to register a key, paste the config, and get an opaque failure — do this first:
 
-1. Go to **Settings → API Keys**, create a token (any name, any scopes — the SSH
-   endpoints aren't gated by the scope checkboxes), and copy it. It looks like
-   `ak_…` and is shown exactly once.
+1. Go to **Settings → API Keys**, create a token with the **`chat:write`** scope
+   (the default `jobs:read` + `chat:read` is not enough — an interactive shell is
+   a write), and copy it. It looks like `ak_…` and is shown exactly once. A token
+   without `chat:write` fails the exchange with
+   `token exchange refused (403): PAT lacks the chat:write scope`.
 2. Save it to `~/.config/srw/token` (create the file with mode `0600` — the helper
    warns on stderr if it's group- or world-readable, since it holds a bearer
    credential), **or** export it as `$SRW_TOKEN` in your shell.
@@ -272,6 +274,14 @@ teammate's uncommitted branch: coordinate, or expect your changes to become "age
 changes" in the diff.
 
 ## 7. Troubleshooting
+
+**`token exchange refused (403): PAT lacks the chat:write scope`.** The PAT is
+valid but was created without `chat:write` — the default `jobs:read` + `chat:read`
+set cannot open a shell. Create a new token with `chat:write` in **Settings → API
+Keys** and replace `~/.config/srw/token` (or `$SRW_TOKEN`). A plain
+`token exchange refused (401|403): bad or unscoped PAT` instead means the token
+itself was rejected — revoked, expired, mistyped, or its owner is no longer
+approved.
 
 **403 at the WebSocket upgrade, before any SSH banner at all.** This is an Origin
 problem, not a credential problem. The gateway enforces an exact-match allow-list

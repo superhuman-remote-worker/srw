@@ -420,7 +420,7 @@ POST   /api/projects/{project_id}/knowledge/export                              
 POST   /api/projects/{project_id}/knowledge/materialize                                 pat=refused         internal:require_internal
 POST   /api/projects/{project_id}/knowledge/materialize/{intent_id}/projection          pat=refused         internal:require_internal
 POST   /api/projects/{project_id}/knowledge/reindex                                     pat=knowledge:write gated:require_project_member
-POST   /api/projects/{project_id}/knowledge/repository                                  pat=knowledge:write gated:require_project_owner
+POST   /api/projects/{project_id}/knowledge/repository                                  pat=admin           gated:require_project_owner
 POST   /api/projects/{project_id}/knowledge/search                                      pat=knowledge:read  gated:require_project_member
 GET    /api/projects/{project_id}/knowledge/summary                                     pat=knowledge:read  gated:require_project_member
 DELETE /api/projects/{project_id}/knowledge/{note_id}                                   pat=knowledge:write gated:require_project_member
@@ -459,7 +459,7 @@ GET    /api/resources/{resource_id}                                             
 POST   /api/resources/{resource_id}/outcome                                             pat=admin           gated:require_approved_user
 POST   /api/runtime-actors/authorize                                                    pat=refused         internal:require_internal
 POST   /api/runtime-actors/refresh                                                      pat=refused         internal:require_internal
-GET    /api/sessions/{thread_id}/connection                                             pat=chat:read       gated:require_approved_user
+GET    /api/sessions/{thread_id}/connection                                             pat=chat:write      gated:require_approved_user
 POST   /api/sessions/{thread_id}/prepare                                                pat=chat:write      gated:require_approved_user
 GET    /api/settings/api-keys                                                           pat=admin           gated:require_approved_user
 DELETE /api/settings/api-keys/{provider}                                                pat=admin           gated:require_approved_user
@@ -486,7 +486,7 @@ GET    /api/ssh-keys                                                            
 POST   /api/ssh-keys                                                                    pat=refused         gated:require_approved_user
 POST   /api/ssh-keys/challenge                                                          pat=refused         gated:require_approved_user
 DELETE /api/ssh-keys/{key_id}                                                           pat=refused         gated:require_approved_user
-POST   /api/ssh/attach-token                                                            pat=refused         gated:require_approved_user
+POST   /api/ssh/attach-token                                                            pat=chat:write      gated:require_approved_user
 GET    /api/ssh/host-keys                                                               pat=any             public:ssh-host-key-pinning (host keys are public material; client needs them before it can authenticate anything)
 GET    /api/stats/agents                                                                pat=admin           admin:_require_admin
 GET    /api/stats/daily                                                                 pat=jobs:read       gated:require_approved_user
@@ -534,7 +534,7 @@ PUT    /api/users/{user_id}                                                     
 GET    /api/vms                                                                         pat=admin           admin:_require_admin
 POST   /api/vms                                                                         pat=jobs:write      gated:require_job_access
 DELETE /api/vms/{job_id}                                                                pat=jobs:write      gated:require_job_access
-GET    /api/vms/{job_id}                                                                pat=jobs:read       gated:require_job_access
+GET    /api/vms/{job_id}                                                                pat=jobs:write      gated:require_job_access
 GET    /api/voice/capabilities                                                          pat=chat:read       gated:require_approved_user
 GET    /api/workspace-cache                                                             pat=jobs:read       gated:require_approved_user
 DELETE /api/workspace-cache/{artifact_id}                                               pat=admin           gated:require_approved_user

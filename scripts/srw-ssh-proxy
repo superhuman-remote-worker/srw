@@ -292,6 +292,27 @@ def _load_pat() -> str:
     return content
 
 
+def _refusal_reason(raw: bytes) -> str:
+    """Why the orchestrator refused the PAT, as far as its answer says.
+
+    A scope refusal (``Insufficient token scope: requires chat:write``) is a
+    valid token created without the scope the exchange needs, which wants a
+    different fix from a revoked or mistyped token — so it gets its own line.
+    """
+    try:
+        detail = json.loads(raw).get("detail")
+    except (ValueError, AttributeError):
+        detail = None
+    if isinstance(detail, str) and detail.startswith("Insufficient token scope"):
+        scope = detail.partition("requires ")[2].split(",")[0].strip()
+        if scope:
+            return (
+                f"PAT lacks the {scope} scope; create a token with {scope} "
+                "in Settings -> API Keys"
+            )
+    return "bad or unscoped PAT; check $SRW_TOKEN or ~/.config/srw/token"
+
+
 def fetch_attach_token(
     host: str,
     pat: str,
@@ -335,7 +356,7 @@ def fetch_attach_token(
         if response.status in (401, 403):
             raise SystemExit(
                 f"srw-ssh-proxy: token exchange refused ({response.status}): "
-                "bad or unscoped PAT; check $SRW_TOKEN or ~/.config/srw/token"
+                f"{_refusal_reason(raw)}"
             )
         raise SystemExit(
             f"srw-ssh-proxy: token exchange failed ({response.status}): "
