@@ -254,6 +254,20 @@ def skill_row_to_meta(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def skill_row_visible(row: dict[str, Any], user: dict[str, Any]) -> bool:
+    """Whether ``user`` may read a DB skill row by id.
+
+    The listing's rule (``list_skills_visible``: owned or global) plus admins,
+    who may already edit and delete any row. Skills have no project junction
+    (0031), so project membership grants nothing here.
+    """
+    return (
+        bool(user.get("is_admin"))
+        or row.get("is_global") is True
+        or str(row.get("owner_id") or "") == str(user["id"])
+    )
+
+
 def db_expert_to_bundle_src(row: dict[str, Any]) -> dict[str, Any]:
     """Normalize a DB expert row into the bundle-source shape (JSONB str-tolerant)."""
     if "harness_adapter" in row and row["harness_adapter"] != SRW_HARNESS_ADAPTER:
@@ -1393,10 +1407,20 @@ class ExpertCatalogService:
         self.state.skills = self.scan_skills()
         return {"status": "reloaded", "count": len(self.state.skills)}
 
-    async def get_skill(self, skill_id: str) -> dict[str, Any]:
+    async def get_visible_skill_row(
+        self, skill_id: str, *, user: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """A DB skill row by UUID, or None when it is missing OR invisible to
+        ``user``. The two are deliberately indistinguishable — every by-id skill
+        route answers 404 for both, as expert reads by id do — so holding a UUID
+        is neither a read grant nor an existence oracle."""
+        row = await self.store.get_skill_by_id(skill_id)
+        return row if row and skill_row_visible(row, user) else None
+
+    async def get_skill(self, skill_id: str, *, user: dict[str, Any]) -> dict[str, Any]:
         """Full skill detail (metadata + file tree). DB skill by UUID, else bundled."""
         if self.deps.skills_enabled() and self.deps.looks_like_uuid(skill_id):
-            row = await self.store.get_skill_by_id(skill_id)
+            row = await self.get_visible_skill_row(skill_id, user=user)
             if not row:
                 raise HTTPException(
                     status_code=404, detail=f"Skill not found: {skill_id}"

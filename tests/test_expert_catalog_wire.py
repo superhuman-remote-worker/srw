@@ -332,7 +332,11 @@ def test_skill_import_then_export_preserves_archive_payload(catalogue_wire):
     )
     assert imported.status_code == 200
     assert env.store.create_skill.await_args.kwargs["files"] == files
-    env.store.get_skill_by_id.return_value = {"id": SKILL_ID, "name": "quiet-helper"}
+    env.store.get_skill_by_id.return_value = {
+        "id": SKILL_ID,
+        "name": "quiet-helper",
+        "owner_id": USER_ID,
+    }
     env.store.get_skill_files.return_value = deepcopy(files)
     exported = env.client.get(f"/api/skills/{SKILL_ID}/export")
     assert exported.status_code == 200
@@ -362,9 +366,11 @@ def test_skill_bad_archive_is_422_after_identity_without_write(catalogue_wire):
 
 def test_skill_owner_refusal_precedes_bundle_parse(catalogue_wire):
     env = catalogue_wire
+    # Global, so visible to the caller: the refusal under test is ownership.
     env.store.get_skill_by_id.return_value = {
         "id": SKILL_ID,
         "owner_id": "other",
+        "is_global": True,
         "name": "quiet-helper",
     }
     response = env.client.put(
@@ -372,6 +378,100 @@ def test_skill_owner_refusal_precedes_bundle_parse(catalogue_wire):
     )
     assert response.status_code == 403
     env.store.update_skill.assert_not_awaited()
+
+
+OTHER_USER_ID = "00000000-0000-0000-0000-000000000102"
+SKILL_FILES = {"SKILL.md": SKILL_TEXT, "references/private.md": "owner's notes\n"}
+
+
+def skill_row(**extra):
+    return {
+        "id": UUID(SKILL_ID),
+        "name": "quiet-helper",
+        "display_name": "Quiet helper",
+        "description": "A local helper.",
+        "owner_id": UUID(OTHER_USER_ID),
+        "is_global": False,
+        "icon": "extension",
+        "color": "#6B7280",
+        "tags": [],
+        **extra,
+    }
+
+
+class TestSkillByIdVisibility:
+    """A DB skill read by UUID follows the listing's visibility rule (owned or
+    global) plus admins; anything else is 404, the way experts-by-id are. Before
+    this, every by-id read served any row to any approved caller who held the
+    UUID — cookie sessions and tokens alike."""
+
+    @pytest.fixture
+    def env(self, catalogue_wire):
+        catalogue_wire.store.get_skill_by_id.return_value = skill_row()
+        catalogue_wire.store.get_skill_files.return_value = deepcopy(SKILL_FILES)
+        return catalogue_wire
+
+    @pytest.mark.parametrize(
+        ("method", "suffix"),
+        [
+            ("get", ""),
+            ("get", "/export"),
+            ("post", "/duplicate"),
+            ("put", ""),
+            ("delete", ""),
+        ],
+    )
+    def test_another_users_private_skill_is_404_on_every_by_id_route(
+        self, env, method, suffix
+    ):
+        kwargs = {"json": {"description": "hijack"}} if method == "put" else {}
+        response = getattr(env.client, method)(
+            f"/api/skills/{SKILL_ID}{suffix}", **kwargs
+        )
+        assert response.status_code == 404
+        assert "owner's notes" not in response.text
+        env.store.get_skill_files.assert_not_awaited()
+        env.store.create_skill.assert_not_awaited()
+        env.store.update_skill.assert_not_awaited()
+        env.store.delete_skill.assert_not_awaited()
+
+    def test_owner_reads_and_exports_own_private_skill(self, env):
+        env.store.get_skill_by_id.return_value = skill_row(owner_id=UUID(USER_ID))
+        detail = env.client.get(f"/api/skills/{SKILL_ID}")
+        assert detail.status_code == 200
+        assert detail.json()["files"] == SKILL_FILES
+        assert detail.json()["source"] == "user"
+        exported = env.client.get(f"/api/skills/{SKILL_ID}/export")
+        assert exported.status_code == 200
+        with ZipFile(BytesIO(exported.content)) as packed:
+            assert (
+                packed.read("quiet-helper/references/private.md") == b"owner's notes\n"
+            )
+
+    def test_admin_reads_another_users_private_skill(self, env):
+        env.user["is_admin"] = True
+        assert env.client.get(f"/api/skills/{SKILL_ID}").status_code == 200
+        assert env.client.get(f"/api/skills/{SKILL_ID}/export").status_code == 200
+
+    def test_global_skill_stays_visible_but_not_editable(self, env):
+        env.store.get_skill_by_id.return_value = skill_row(is_global=True)
+        detail = env.client.get(f"/api/skills/{SKILL_ID}")
+        assert detail.status_code == 200
+        assert detail.json()["source"] == "global"
+        assert env.client.get(f"/api/skills/{SKILL_ID}/export").status_code == 200
+        # Visible, so the refusal is the ownership one, not a 404.
+        response = env.client.put(
+            f"/api/skills/{SKILL_ID}", json={"description": "hijack"}
+        )
+        assert response.status_code == 403
+        env.store.update_skill.assert_not_awaited()
+
+    def test_bundled_skill_stays_visible(self, env):
+        detail = env.client.get("/api/skills/word-count")
+        assert detail.status_code == 200
+        assert detail.json()["source"] == "bundled"
+        assert env.client.get("/api/skills/word-count/export").status_code == 200
+        env.store.get_skill_by_id.assert_not_awaited()
 
 
 def test_two_mounted_apps_keep_store_identity_and_reload_cache_separate(

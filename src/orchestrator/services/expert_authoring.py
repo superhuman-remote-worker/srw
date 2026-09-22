@@ -714,7 +714,7 @@ class ExpertAuthoringService:
         rejected (rename = create a new skill)."""
         if not self.catalog.deps.looks_like_uuid(skill_id):
             raise HTTPException(status_code=403, detail="Bundled skills are read-only")
-        existing = await self.store.get_skill_by_id(skill_id)
+        existing = await self.catalog.get_visible_skill_row(skill_id, user=user)
         if not existing:
             raise HTTPException(status_code=404, detail="Skill not found")
         if str(existing["owner_id"]) != str(user["id"]) and not user.get("is_admin"):
@@ -754,7 +754,7 @@ class ExpertAuthoringService:
             raise HTTPException(
                 status_code=403, detail="Bundled skills cannot be deleted"
             )
-        existing = await self.store.get_skill_by_id(skill_id)
+        existing = await self.catalog.get_visible_skill_row(skill_id, user=user)
         if not existing:
             raise HTTPException(status_code=404, detail="Skill not found")
         if str(existing["owner_id"]) != str(user["id"]) and not user.get("is_admin"):
@@ -769,7 +769,7 @@ class ExpertAuthoringService:
     ) -> dict[str, Any]:
         """Fork any visible skill (bundled or DB) into an owned copy."""
         if self.catalog.deps.looks_like_uuid(skill_id):
-            row = await self.store.get_skill_by_id(skill_id)
+            row = await self.catalog.get_visible_skill_row(skill_id, user=user)
             if not row:
                 raise HTTPException(status_code=404, detail="Skill not found")
             src = {
@@ -782,12 +782,14 @@ class ExpertAuthoringService:
                 raise HTTPException(status_code=404, detail="Skill not found")
         return await self.create_forked_skill(src, str(user["id"]))
 
-    async def export_skill(self, skill_id: str) -> SkillArchive:
+    async def export_skill(
+        self, skill_id: str, *, user: dict[str, Any]
+    ) -> SkillArchive:
         """Serialize a skill to a native zipped directory (drops into .claude/skills)."""
         from shared.runtime.core.skill_format import pack_skill_zip
 
         if self.catalog.deps.looks_like_uuid(skill_id):
-            row = await self.store.get_skill_by_id(skill_id)
+            row = await self.catalog.get_visible_skill_row(skill_id, user=user)
             if not row:
                 raise HTTPException(status_code=404, detail="Skill not found")
             name, files = row["name"], await self.store.get_skill_files(skill_id)
