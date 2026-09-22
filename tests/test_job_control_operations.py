@@ -605,6 +605,98 @@ async def test_upgrade_to_vm_commits_contract_before_dispatch(tmp_path: Path) ->
     assert result["status"] == "approved_vm_upgrade"
 
 
+# What the provisioner and the controller actually record: SSH transport,
+# pod/VM coordinates and identities, generation authority, host-key pin.
+_VM_CONTEXT = {
+    "status": "ready",
+    "provisioner": "http",
+    "provision_generation": "7d5c6a0e-2f7e-4d55-9d1e-0c6f0b3f1a11",
+    "vm_name": "srw-vm-aaaaaaaa",
+    "namespace": "srw-vms",
+    "ssh_host": "10.42.0.17",
+    "ssh_port": 2222,
+    "ssh_host_key_fingerprint": "SHA256:hostkeypin",
+    "ssh_registration_id": "reg-1",
+    "vm_uid": "vm-uid-1",
+    "rootdisk_pvc_uid": "pvc-uid-1",
+}
+_LIVE_STATUS = {
+    "job_id": JOB_ID,
+    "vm_name": "srw-vm-aaaaaaaa",
+    "namespace": "srw-vms",
+    "ready": True,
+    "phase": "Running",
+    "created": True,
+    "vm_uid": "vm-uid-1",
+    "provision_generation": "7d5c6a0e-2f7e-4d55-9d1e-0c6f0b3f1a11",
+    "vmi_phase": "Running",
+    "pod_ip": "10.42.0.17",
+    "active_pod_uid": "pod-uid-1",
+    "credential_runtime_started": True,
+}
+_VM_COORDINATES = (
+    "10.42.0.17",
+    "2222",
+    "SHA256:hostkeypin",
+    "srw-vm-aaaaaaaa",
+    "srw-vms",
+    "vm-uid-1",
+    "pod-uid-1",
+    "pvc-uid-1",
+    "reg-1",
+    "7d5c6a0e",
+)
+
+
+@pytest.mark.asyncio
+async def test_vm_status_returns_the_job_apis_coordinate_free_view(
+    tmp_path: Path,
+) -> None:
+    """``GET /api/vms/{job_id}`` is gated by ``require_job_access`` — any
+    project member — and the job API deliberately strips ``context.vm`` from
+    that audience (``redact_job_config_override``). This route handed the raw
+    branch and the raw controller reply to the same callers."""
+    operations = _operations(tmp_path)
+    provisioner = operations.dependencies.vm_provisioner
+    provisioner.lifecycle_available = True
+    provisioner.query_status = AsyncMock(return_value=dict(_LIVE_STATUS))
+    job = {"id": JOB_ID, "status": "processing", "context": {"vm": _VM_CONTEXT}}
+
+    result = await operations.get_vm_status(JOB_ID, job, live=True)
+
+    assert result == {
+        "job_id": JOB_ID,
+        "vm": {"status": "ready"},
+        "live": {
+            "status": None,
+            "ready": True,
+            "phase": "Running",
+            "vmi_phase": "Running",
+            "created": True,
+        },
+    }
+    rendered = json.dumps(result)
+    for coordinate in _VM_COORDINATES:
+        assert coordinate not in rendered
+    provisioner.query_status.assert_awaited_once_with(JOB_ID)
+
+
+@pytest.mark.asyncio
+async def test_vm_status_carries_the_job_apis_attention_message(
+    tmp_path: Path,
+) -> None:
+    operations = _operations(tmp_path)
+    vm = {**_VM_CONTEXT, "status": "retiring_process_zero"}
+
+    result = await operations.get_vm_status(
+        JOB_ID, {"id": JOB_ID, "context": {"vm": vm}}, live=False
+    )
+
+    assert result["vm"]["status"] == "retiring_process_zero"
+    assert result["vm"]["message"].startswith("VM cleanup is waiting")
+    assert "live" not in result
+
+
 def test_extracted_router_openapi_matches_original_surface() -> None:
     extracted = FastAPI()
     extracted.include_router(routes.router)

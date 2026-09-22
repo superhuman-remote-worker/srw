@@ -26,6 +26,10 @@ from orchestrator.schemas.job_controls import (
 )
 from orchestrator.schemas.workspaces import VMCreateRequest
 from orchestrator.services.grant_enforcement import GrantDenied
+from orchestrator.services.job_projection import (
+    public_live_vm_status,
+    public_vm_status,
+)
 from orchestrator.services.manifest_runtime_ownership import (
     require_srw_runtime,
     uses_srw_runtime,
@@ -163,7 +167,12 @@ class JobControlOperations:
         *,
         live: bool,
     ) -> dict[str, Any]:
-        """Read one authorized job's captured and optional live VM status."""
+        """Read one authorized job's captured and optional live VM status.
+
+        Coordinate-free, like the job API: the router's gate is job access (any
+        project member), and the job API keeps ``context.vm`` — SSH host/port,
+        host-key pin, pod and VM identities — from exactly that audience.
+        """
 
         context = job.get("context") or {}
         vm_context = context.get("vm") if isinstance(context, dict) else None
@@ -172,7 +181,10 @@ class JobControlOperations:
                 status_code=404,
                 detail=f"No VM context for job '{job_id}'",
             )
-        result: dict[str, Any] = {"job_id": job_id, "vm": vm_context}
+        result: dict[str, Any] = {
+            "job_id": job_id,
+            "vm": public_vm_status(vm_context),
+        }
         if live:
             if not self.dependencies.vm_provisioner.lifecycle_available:
                 result["live_error"] = "VM provisioning not available"
@@ -181,7 +193,7 @@ class JobControlOperations:
                     job_id
                 )
                 if live_status:
-                    result["live"] = live_status
+                    result["live"] = public_live_vm_status(live_status)
                 else:
                     result["live_error"] = "No response from VM controller"
         return result

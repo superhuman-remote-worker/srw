@@ -126,6 +126,31 @@ def vm_provisioning_message(vm: Any) -> str | None:
     return _vm_phase_attention_message(vm)
 
 
+# The coordinate-free slice of a controller's live VM status reply. The rest of
+# it — pod IP, VM name and namespace, VM/pod UIDs, provision generation — is
+# the transport and generation authority redact_job_config_override keeps off
+# the job API; the controller's raw error text is dropped with it.
+_PUBLIC_LIVE_VM_KEYS = ("status", "ready", "phase", "vmi_phase", "created")
+
+
+def public_vm_status(vm: Any) -> dict[str, Any]:
+    """What the job API shows of a job's ``context.vm`` branch: its lifecycle
+    status and the same safe diagnostic ``redact_job_config_override`` turns
+    into ``error_message``. SSH host/port, host-key pin and identities stay
+    server-side."""
+    vm = vm if isinstance(vm, Mapping) else {}
+    public: dict[str, Any] = {"status": vm.get("status")}
+    message = vm_provisioning_message(dict(vm))
+    if message:
+        public["message"] = message
+    return public
+
+
+def public_live_vm_status(live: Mapping[str, Any]) -> dict[str, Any]:
+    """The coordinate-free fields of a live VM controller status reply."""
+    return {key: live.get(key) for key in _PUBLIC_LIVE_VM_KEYS}
+
+
 def workspace_recovery_projection(job: Mapping[str, Any]) -> dict[str, Any] | None:
     """Return the coordinate-free public view of one unresolved recovery."""
 
