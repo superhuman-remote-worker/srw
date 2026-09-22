@@ -358,6 +358,7 @@ describe('JobCreateComponent project picker', () => {
     component.selectedPriority.set(7);
     component.kickoffMessage = '  Start here  ';
     component.agentSettings = {
+      vmSizingValid: () => true,
       getOverrides: () => ({llm: {model: 'selected-model'}}),
       getInstructions: () => 'Instructions',
       getSelectedDatasourceIds: () => ['connector-1'],
@@ -371,6 +372,17 @@ describe('JobCreateComponent project picker', () => {
       instructions: 'Instructions', kickoff_message: 'Start here', datasource_ids: ['connector-1'],
       priority: 7, project_id: 'proj-1', user_id: 'user-1',
     });
+  });
+
+  it('does not create a job while VM sizing is invalid', async () => {
+    const {component, api} = setup(null);
+    component.formData.description = 'Run on a VM';
+    component.agentSettings = {vmSizingValid: () => false} as JobCreateComponent['agentSettings'];
+
+    await component.onSubmit();
+
+    expect(api.createJob).not.toHaveBeenCalled();
+    expect(component.formData.description).toBe('Run on a VM');
   });
 
   it('real onSubmit preserves selections and forwards the server error to translation', async () => {

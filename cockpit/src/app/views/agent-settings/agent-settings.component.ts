@@ -389,6 +389,10 @@ export class AgentSettingsComponent {
     return Object.keys(result).length > 0 ? result : {};
   }
 
+  vmSizingValid(): boolean {
+    return this.advancedAccordion?.vmSizingValid() ?? true;
+  }
+
   /** Return selected datasource IDs (not part of config_override). */
   getSelectedDatasourceIds(): string[] {
     return this.datasourcesGroup?.getSelectedIds() ?? [];

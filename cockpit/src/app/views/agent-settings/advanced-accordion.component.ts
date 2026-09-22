@@ -9,6 +9,24 @@ import {reasoningOptionsForModel} from './reasoning-options';
 import {ModelService} from '../../core/services/model.service';
 import {liftLegacyTiers} from '../experts/expert-config';
 
+const GIB_BYTES = 1024 ** 3;
+const VM_SIZE_UNITS: Record<string, number> = {
+  Ki: 1024, Mi: 1024 ** 2, Gi: GIB_BYTES, Ti: 1024 ** 4,
+  K: 1000, M: 1000 ** 2, G: 1000 ** 3, T: 1000 ** 4,
+};
+
+function vmQuantityInGiB(value: unknown): number | null {
+  if (typeof value !== 'string') return null;
+  const match = /^(\d+)(Ki|Mi|Gi|Ti|K|M|G|T)$/.exec(value.trim());
+  if (!match) return null;
+  const gib = Number(match[1]) * VM_SIZE_UNITS[match[2]] / GIB_BYTES;
+  return Number.isFinite(gib) && gib > 0 ? gib : null;
+}
+
+function validVmSizeGiB(value: number | null): value is number {
+  return value !== null && Number.isSafeInteger(value) && value > 0;
+}
+
 /**
  * Advanced settings tab: collapsible accordion sections for power-user settings.
  * One level of accordion only (no nesting).
@@ -323,26 +341,34 @@ import {liftLegacyTiers} from '../experts/expert-config';
               <div class="field-row" [class.modified]="vmMemory() !== null">
                 <label class="field-label">{{ 'advanced.labels.vmMemory' | transloco }}</label>
                 <div class="field-control">
-                  <input type="text" class="form-input compact-input" placeholder="16Gi"
+                  <input type="number" class="form-input compact-input" step="any" placeholder="16"
                     [ngModel]="vmMemory() ?? resolvedVmMemory()"
                     (ngModelChange)="vmMemory.set($event); emitChange()"
+                    [attr.aria-invalid]="vmMemoryInvalid()"
                     [disabled]="disabled()">
                   @if (vmMemory() !== null) {
                     <button type="button" class="reset-btn" (click)="vmMemory.set(null); emitChange()"><app-icon size="xs">close</app-icon></button>
                   }
                 </div>
+                @if (vmMemoryInvalid()) {
+                  <span class="field-hint size-error" role="alert">{{ 'advanced.hints.vmSizeWholeGiB' | transloco }}</span>
+                }
               </div>
               <div class="field-row" [class.modified]="vmDiskSize() !== null">
                 <label class="field-label">{{ 'advanced.labels.vmDiskSize' | transloco }}</label>
                 <div class="field-control">
-                  <input type="text" class="form-input compact-input" placeholder="20Gi"
+                  <input type="number" class="form-input compact-input" step="any" placeholder="20"
                     [ngModel]="vmDiskSize() ?? resolvedVmDiskSize()"
                     (ngModelChange)="vmDiskSize.set($event); emitChange()"
+                    [attr.aria-invalid]="vmDiskSizeInvalid()"
                     [disabled]="disabled()">
                   @if (vmDiskSize() !== null) {
                     <button type="button" class="reset-btn" (click)="vmDiskSize.set(null); emitChange()"><app-icon size="xs">close</app-icon></button>
                   }
                 </div>
+                @if (vmDiskSizeInvalid()) {
+                  <span class="field-hint size-error" role="alert">{{ 'advanced.hints.vmSizeWholeGiB' | transloco }}</span>
+                }
               </div>
             }
             <div class="field-row" [class.modified]="maxReadWords() !== null">
@@ -641,6 +667,7 @@ import {liftLegacyTiers} from '../experts/expert-config';
       color: var(--text-muted);
       margin-top: 2px;
     }
+    .size-error { color: var(--danger); }
     .info-icon {
       color: var(--text-muted);
       cursor: help;
@@ -777,8 +804,8 @@ export class AdvancedAccordionComponent {
   // --- Workspace ---
   private readonly modelService = inject(ModelService);
   readonly vmCpuCores = signal<number | null>(null);
-  readonly vmMemory = signal<string | null>(null);
-  readonly vmDiskSize = signal<string | null>(null);
+  readonly vmMemory = signal<number | null>(null);
+  readonly vmDiskSize = signal<number | null>(null);
   readonly maxReadWords = signal<number | null>(null);
   readonly maxWriteWords = signal<number | null>(null);
   readonly gitVersioning = signal<boolean | null>(null);
@@ -849,10 +876,17 @@ export class AdvancedAccordionComponent {
 
   readonly resolvedWorkspaceBackend = computed(() => (this.r('workspace.backend') ?? 'sandbox') as string);
   readonly resolvedVmCpuCores = computed(() => (this.r('workspace.vm.cpu_cores') ?? 8) as number);
-  readonly resolvedVmMemory = computed(() => (this.r('workspace.vm.memory') ?? '16Gi') as string);
+  readonly resolvedVmMemory = computed(() => vmQuantityInGiB(this.r('workspace.vm.memory') ?? '16Gi'));
   // Empty means "the deployment's controller default" — the orchestrator omits
   // disk_size from the VM create payload unless a job sets it.
-  readonly resolvedVmDiskSize = computed(() => (this.r('workspace.vm.disk_size') ?? '') as string);
+  readonly resolvedVmDiskSize = computed(() => vmQuantityInGiB(this.r('workspace.vm.disk_size')));
+  readonly vmMemoryInvalid = computed(() => this.vmMemory() === null
+    ? this.resolvedVmMemory() === null : !validVmSizeGiB(this.vmMemory()));
+  readonly vmDiskSizeInvalid = computed(() => this.vmDiskSize() === null
+    ? this.r('workspace.vm.disk_size') != null && this.r('workspace.vm.disk_size') !== '' && this.resolvedVmDiskSize() === null
+    : !validVmSizeGiB(this.vmDiskSize()));
+  readonly vmSizingValid = computed(() => this.effectiveBackend() !== 'vm'
+    || (!this.vmMemoryInvalid() && !this.vmDiskSizeInvalid()));
   readonly resolvedMaxReadWords = computed(() => (this.r('workspace.max_read_words') ?? 25000) as number);
   readonly resolvedMaxWriteWords = computed(() => (this.r('workspace.max_write_words') ?? 10000) as number);
   readonly resolvedGitVersioning = computed(() => {
@@ -992,8 +1026,8 @@ export class AdvancedAccordionComponent {
     if (this.effectiveBackend() === 'vm') {
       const vm: Record<string, unknown> = {};
       if (this.vmCpuCores() !== null) vm['cpu_cores'] = this.vmCpuCores();
-      if (this.vmMemory() !== null) vm['memory'] = this.vmMemory();
-      if (this.vmDiskSize() !== null && this.vmDiskSize() !== '') vm['disk_size'] = this.vmDiskSize();
+      if (validVmSizeGiB(this.vmMemory())) vm['memory'] = `${this.vmMemory()}Gi`;
+      if (validVmSizeGiB(this.vmDiskSize())) vm['disk_size'] = `${this.vmDiskSize()}Gi`;
       if (Object.keys(vm).length) ws['vm'] = vm;
     }
     if (!this.isNoneBackend()) {

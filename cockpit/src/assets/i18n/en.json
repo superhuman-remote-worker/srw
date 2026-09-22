@@ -2859,8 +2859,8 @@
       "keepRecentToolResults": "Keep recent tool results",
       "keepRecentMessages": "Keep recent messages",
       "vmCpuCores": "VM CPU cores",
-      "vmMemory": "VM memory",
-      "vmDiskSize": "VM disk",
+      "vmMemory": "VM memory (GiB)",
+      "vmDiskSize": "VM disk (GiB)",
       "maxReadWords": "Max read words",
       "maxWriteWords": "Max write words",
       "gitVersioning": "Git versioning",
@@ -2887,6 +2887,7 @@
     "hints": {
       "idleDisabled": "0 = disabled",
       "autoPlaceholder": "auto",
+      "vmSizeWholeGiB": "Enter a whole number of GiB (at least 1).",
       "parallelToolCalls": "Model support varies — some models may still make parallel tool calls regardless of this setting, while others may not support them at all.",
       "virtualBackend": "Virtual workspaces run with no container — shell, browser, and git tools are disabled. File, web, database, and knowledge tools remain available.",
       "noneBackend": "None runs with no workspace at all — shell, browser, git, and file tools are disabled. Web, database, and knowledge tools remain available."

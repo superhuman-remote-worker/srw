@@ -2859,8 +2859,8 @@
       "keepRecentToolResults": "Letzte Tool-Ergebnisse behalten",
       "keepRecentMessages": "Letzte Nachrichten behalten",
       "vmCpuCores": "VM-CPU-Kerne",
-      "vmMemory": "VM-Arbeitsspeicher",
-      "vmDiskSize": "VM-Festplatte",
+      "vmMemory": "VM-Arbeitsspeicher (GiB)",
+      "vmDiskSize": "VM-Festplatte (GiB)",
       "maxReadWords": "Max. Lese-Wörter",
       "maxWriteWords": "Max. Schreib-Wörter",
       "gitVersioning": "Git-Versionierung",
@@ -2887,6 +2887,7 @@
     "hints": {
       "idleDisabled": "0 = deaktiviert",
       "autoPlaceholder": "auto",
+      "vmSizeWholeGiB": "Geben Sie eine ganze Zahl in GiB ein (mindestens 1).",
       "parallelToolCalls": "Die Modellunterstützung variiert — manche Modelle führen unabhängig von dieser Einstellung möglicherweise parallele Tool-Aufrufe aus, während andere sie gar nicht unterstützen.",
       "virtualBackend": "Virtuelle Workspaces laufen ohne Container — Shell-, Browser- und Git-Tools sind deaktiviert. Datei-, Web-, Datenbank- und Wissens-Tools bleiben verfügbar.",
       "noneBackend": "Keiner läuft komplett ohne Workspace — Shell-, Browser-, Git- und Datei-Tools sind deaktiviert. Web-, Datenbank- und Wissens-Tools bleiben verfügbar."

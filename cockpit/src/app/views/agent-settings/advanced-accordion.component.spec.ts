@@ -100,7 +100,7 @@ describe('AdvancedAccordionComponent — VM sizing', () => {
     const {component, backend} = createComponent();
     backend.set('vm');
     component.vmCpuCores.set(4);
-    component.vmMemory.set('8Gi');
+    component.vmMemory.set(8);
 
     const o = component.getOverrides() as Record<string, any>;
     expect(o['workspace'].vm).toEqual({cpu_cores: 4, memory: '8Gi'});
@@ -109,7 +109,7 @@ describe('AdvancedAccordionComponent — VM sizing', () => {
   it('emits the VM disk size next to cores and memory', () => {
     const {component, backend} = createComponent();
     backend.set('vm');
-    component.vmDiskSize.set('120Gi');
+    component.vmDiskSize.set(120);
 
     const o = component.getOverrides() as Record<string, any>;
     expect(o['workspace'].vm).toEqual({disk_size: '120Gi'});
@@ -118,11 +118,51 @@ describe('AdvancedAccordionComponent — VM sizing', () => {
   it('leaves disk_size out until the user sets it', () => {
     const {component, backend} = createComponent();
     backend.set('vm');
-    component.vmMemory.set('8Gi');
+    component.vmMemory.set(8);
 
     const o = component.getOverrides() as Record<string, any>;
     expect(o['workspace'].vm).toEqual({memory: '8Gi'});
-    expect(component.resolvedVmDiskSize()).toBe('');
+    expect(component.resolvedVmDiskSize()).toBeNull();
+  });
+
+  it('turns a numeric 100 into 100Gi for both VM fields', () => {
+    const {component, backend} = createComponent();
+    backend.set('vm');
+    component.vmMemory.set(100);
+    component.vmDiskSize.set(100);
+
+    expect(component.vmSizingValid()).toBe(true);
+    expect((component.getOverrides() as any).workspace.vm).toEqual({memory: '100Gi', disk_size: '100Gi'});
+  });
+
+  it('displays existing quantities in GiB and refuses unitless defaults', () => {
+    const {component, backend} = createComponent();
+    const config = signal<Record<string, unknown>>({workspace: {vm: {memory: '512Mi', disk_size: '2Ti'}}});
+    Object.defineProperty(component, 'config', {value: () => config()});
+    backend.set('vm');
+
+    expect(component.resolvedVmMemory()).toBe(0.5);
+    expect(component.resolvedVmDiskSize()).toBe(2048);
+    expect(component.getOverrides()).toEqual({});
+
+    config.set({workspace: {vm: {memory: '100'}}});
+    expect(component.vmSizingValid()).toBe(false);
+    component.vmMemory.set(100);
+    expect(component.vmSizingValid()).toBe(true);
+  });
+
+  it('blocks zero, fractions, and non-finite VM sizes', () => {
+    const {component, backend} = createComponent();
+    backend.set('vm');
+    for (const invalid of [0, -1, 1.5, Number.POSITIVE_INFINITY]) {
+      component.vmMemory.set(invalid);
+      expect(component.vmSizingValid()).toBe(false);
+    }
+    component.vmMemory.set(8);
+    component.vmDiskSize.set(0);
+    expect(component.vmSizingValid()).toBe(false);
+    backend.set('sandbox');
+    expect(component.vmSizingValid()).toBe(true);
   });
 
   it('drops VM sizing once the backend moves off vm', () => {

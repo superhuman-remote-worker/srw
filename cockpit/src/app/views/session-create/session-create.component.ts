@@ -270,7 +270,7 @@ interface ExpertDetail extends Expert {
           <app-button
             variant="primary"
             [loading]="creating()"
-            [disabled]="loadingDatasources() || datasourceLoadError() || loadingExpert() || loadingWorkspacePreview()"
+            [disabled]="loadingDatasources() || datasourceLoadError() || loadingExpert() || loadingWorkspacePreview() || !vmSizingValid()"
             (clicked)="createSession()"
           >
             {{ creating() ? ('sessions.create.creating' | transloco) : ('sessions.create.createSession' | transloco) }}
@@ -993,8 +993,12 @@ export class SessionCreateComponent implements OnInit {
     };
   }
 
+  vmSizingValid(): boolean {
+    return this.agentSettings?.vmSizingValid() ?? true;
+  }
+
   async createSession(): Promise<void> {
-    if (this.loadingDatasources() || this.datasourceLoadError() || this.loadingExpert() || this.loadingWorkspacePreview()) return;
+    if (this.loadingDatasources() || this.datasourceLoadError() || this.loadingExpert() || this.loadingWorkspacePreview() || !this.vmSizingValid()) return;
     this.creating.set(true);
 
     const expert = this.selectedExpert();

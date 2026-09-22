@@ -261,6 +261,18 @@ describe('SessionCreateComponent submit flow', () => {
     expect(component.createError()).toBeNull();
   });
 
+  it('does not create a session while VM sizing is invalid', async () => {
+    const {fixture, http, navigate} = setup();
+    const component = fixture.componentInstance;
+    component.agentSettings = {vmSizingValid: () => false} as SessionCreateComponent['agentSettings'];
+
+    await component.createSession();
+
+    http.expectNone((request) => request.url.endsWith('/persistent/threads'));
+    expect(navigate).not.toHaveBeenCalled();
+    expect(component.creating()).toBe(false);
+  });
+
   it('stays on the form with the error when the server rejects the config', async () => {
     const {fixture, http, navigate} = setup();
     const component = fixture.componentInstance;

@@ -330,7 +330,7 @@ import {AppTooltipDirective} from '../../ui/tooltip';
               type="submit"
               variant="primary"
               [loading]="isSubmitting() || isUploading()"
-              [disabled]="!formData.description || isLoadingDatasources() || datasourceLoadError() || isLoadingExpertDetail() || loadingWorkspacePreview()"
+              [disabled]="!formData.description || isLoadingDatasources() || datasourceLoadError() || isLoadingExpertDetail() || loadingWorkspacePreview() || !vmSizingValid()"
             >
               @if (isSubmitting()) {
                 {{ 'jobs.create.creating' | transloco }}
@@ -1629,10 +1629,14 @@ export class JobCreateComponent implements OnInit {
 
   // ===== Form Submission =====
 
+  vmSizingValid(): boolean {
+    return this.agentSettings?.vmSizingValid() ?? true;
+  }
+
   async onSubmit(): Promise<void> {
     if (
       !this.formData.description || this.isSubmitting() || this.isUploading() ||
-      this.isLoadingDatasources() || this.datasourceLoadError() || this.isLoadingExpertDetail() || this.loadingWorkspacePreview()
+      this.isLoadingDatasources() || this.datasourceLoadError() || this.isLoadingExpertDetail() || this.loadingWorkspacePreview() || !this.vmSizingValid()
     ) return;
     this.clearMessages();
 
