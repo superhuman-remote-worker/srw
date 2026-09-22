@@ -67,7 +67,16 @@ import socket
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
+from typing import (
+    Any,
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Dict,
+    List,
+    Optional,
+    Tuple,
+)
 from uuid import UUID, uuid4
 
 import httpx
@@ -78,17 +87,21 @@ from agent.api.orchestrator_client import (
     ClaimBundleError,
     CompletionNonTerminalReportError,
 )
-from shared.event_journal import append_system_frame
+from shared.event_journal import append_system_frame, bump_epoch
 from shared.job_freeze_types import (
     AUTO_CONTINUE_FREEZE_TYPES,
     FREEZE_TYPE_BATCH_BOUNDARY,
 )
 from shared.run_queue import (
     HEARTBEAT_INTERVAL_SECONDS,
+    LANE_STATELESS,
     PARK_REASON_ATTACH_FAILED,
     PARK_REASON_COMPLETION_CAS_FAILED,
+    PARK_REASON_RETRY_EXHAUSTED,
     PARK_REASON_SHUTDOWN_CANCELLED,
     RETRYABLE_PARK_REASONS,
+    STATE_PARKED,
+    STATE_QUEUED,
     UNIT_KIND_SESSION_TURN,
     ClaimedUnit,
     attach_failure_backoff_seconds,
@@ -101,7 +114,11 @@ from shared.run_queue import (
     record_attach_failure,
     release_unit,
 )
-from shared.session_retirement import acknowledge_session_claim_quiesced
+from shared.session_permission_retirement import retire_stale_stateless_permissions
+from shared.session_retirement import (
+    acknowledge_session_claim_quiesced,
+    active_claim_authority,
+)
 from shared.cloud_push_tasks import (
     PushAdoptionDeferred,
     claim_bg_task,
@@ -572,6 +589,226 @@ _PARK_REASON_MAP = {
 
 def _park_reason_for(executor_reason: str) -> str:
     return _PARK_REASON_MAP.get(executor_reason, executor_reason)
+
+
+# --- Exhausted error release -------------------------------------------------
+# knowledge-base/knowledge/issues/voluntary_session_release_bypasses_retry_budget.md.
+# A voluntarily released row is never an expired lease, so the reaper's
+# max_attempts check cannot bound a release loop; the release itself must. When
+# it parks, the park is only half of the disposition: Cockpit derives the
+# visible lifecycle from the journal, so the epoch edge, the settled claimant
+# authority and ``turn.parked`` commit with the queue CAS or not at all.
+# Global per-thread lock order is threads -> run_queue (REST admission, End and
+# the reaper take the same order); the CAS takes the second lock.
+
+_LOCK_RELEASE_THREAD_SQL = """
+SELECT execution_lane, agent_id, metadata
+  FROM threads
+ WHERE id = $1::uuid
+   FOR UPDATE
+"""
+
+_RELEASED_QUEUE_ROW_SQL = """
+SELECT state, lease_token, leased_by, park_reason,
+       attempts_since_completion, max_attempts
+  FROM run_queue
+ WHERE unit_id = $1::uuid
+"""
+
+_CLEAR_ACTIVE_CLAIM_SQL = """
+UPDATE threads
+   SET metadata = metadata - '_stateless_active_claim'
+ WHERE id = $1::uuid
+RETURNING id
+"""
+
+
+@dataclass(frozen=True)
+class _ReleaseDisposition:
+    """The committed queue outcome of one exact error release."""
+
+    state: str
+    attempts: int
+    journaled: bool = False
+    # A retry found this claim's own earlier commit (its response was lost).
+    replayed: bool = False
+
+
+@contextlib.asynccontextmanager
+async def _db_transaction(db: Any) -> AsyncIterator[Any]:
+    """One explicit transaction on a pool wrapper or a bare connection."""
+
+    acquire = getattr(db, "acquire", None)
+    if acquire is None:
+        async with db.transaction():
+            yield db
+        return
+    async with acquire() as conn:
+        async with conn.transaction():
+            yield conn
+
+
+async def _retire_parked_claim_authority(
+    conn: Any,
+    *,
+    unit_id: str,
+    metadata: Any,
+    lease_token: int,
+    pod_name: str,
+    pod_uid: str,
+) -> None:
+    """Clear the credential-bound claimant record a quiesced park retires.
+
+    The caller has drained every local writer, so the claimant's own
+    quiescence is the proof; nothing about the workspace is asserted. A record
+    for this exact token must name this pod (and UID, when known). An older
+    token is a leftover of an earlier voluntary disposition — a steal or End
+    would already have removed it. Anything else is not this claimant's to
+    clear and is left, logged, for the operator.
+    """
+
+    if metadata is None:
+        return
+    try:
+        active = active_claim_authority(metadata)
+    except RuntimeError:
+        logger.warning(
+            "parked release left a malformed active-claim record: unit=%s", unit_id
+        )
+        return
+    if active is None:
+        return
+    active_token, authority = active
+    if active_token > lease_token or (
+        active_token == lease_token
+        and (
+            authority.pod != pod_name
+            or (bool(pod_uid) and authority.pod_uid != pod_uid)
+        )
+    ):
+        logger.warning(
+            "parked release left a foreign active claim: unit=%s token=%d "
+            "active_token=%d active_pod=%s",
+            unit_id,
+            lease_token,
+            active_token,
+            authority.pod,
+        )
+        return
+    if await conn.fetchval(_CLEAR_ACTIVE_CLAIM_SQL, unit_id) is None:
+        raise RuntimeError("parked release lost its locked thread row")
+
+
+async def _settle_session_release(
+    db: Any,
+    claim: ClaimedUnit,
+    *,
+    cas: Callable[[Any], Awaitable[Optional[str]]],
+    pod_name: str,
+    pod_uid: str,
+    park_reason: str,
+    release_reason: str,
+    error: Optional[str] = None,
+) -> Optional[_ReleaseDisposition]:
+    """Run one exact error-release CAS and, when it parks, journal it atomically.
+
+    ``cas(conn)`` is the fenced queue statement (a bounded release or the
+    attach-failure record) and returns the resulting state, ``None`` when
+    fenced out. The caller must have quiesced the claim. Returns ``None`` when
+    the lease belongs to someone else.
+    """
+
+    unit_id = str(claim.unit_id)
+    token = int(claim.lease_token)
+    session_unit = str(claim.unit_kind) == UNIT_KIND_SESSION_TURN
+    async with _db_transaction(db) as conn:
+        thread = (
+            await conn.fetchrow(_LOCK_RELEASE_THREAD_SQL, unit_id)
+            if session_unit
+            else None
+        )
+        state = await cas(conn)
+        queue = await conn.fetchrow(_RELEASED_QUEUE_ROW_SQL, unit_id)
+        attempts = (
+            int(queue["attempts_since_completion"])
+            if queue is not None
+            else int(claim.attempts_since_completion)
+        )
+        if state is None:
+            # Claims, steals and End all advance the token; only this claimant
+            # takes token N off 'leased' without doing so. A writer-free row
+            # still at N is therefore its own earlier commit whose response
+            # was lost: report it again, journal nothing twice.
+            if (
+                queue is not None
+                and int(queue["lease_token"] or 0) == token
+                and str(queue["state"] or "") in {STATE_QUEUED, STATE_PARKED}
+                and queue["leased_by"] is None
+            ):
+                return _ReleaseDisposition(
+                    state=str(queue["state"]), attempts=attempts, replayed=True
+                )
+            return None
+        if (
+            str(state) != STATE_PARKED
+            or thread is None
+            or str(thread["execution_lane"] or "") != LANE_STATELESS
+            or thread["agent_id"] is not None
+        ):
+            return _ReleaseDisposition(state=str(state), attempts=attempts)
+
+        reason = str(
+            (queue["park_reason"] if queue is not None else None) or park_reason
+        )
+        await _retire_parked_claim_authority(
+            conn,
+            unit_id=unit_id,
+            metadata=thread["metadata"],
+            lease_token=token,
+            pod_name=pod_name,
+            pod_uid=pod_uid,
+        )
+        # Fences any warm allocator still holding this epoch, exactly like a
+        # reaper park; the frames below are the new epoch's first facts.
+        await bump_epoch(conn, thread_id=unit_id)
+        # A loop that died while a tool awaited approval leaves that prompt
+        # pending under this token, and nothing retires it while parked (the
+        # reaper's parked-row sweep only reaches older tokens). The quiesced
+        # claimant cannot answer it, and N + 1 is the generation the next
+        # claim mints — the same boundary its attach-time recovery retires.
+        # Interrupts need no such step: pre-injection releases never opened
+        # admission, and loop death closes it with a final owner drain.
+        await retire_stale_stateless_permissions(
+            conn,
+            thread_id=unit_id,
+            retired_lease_token=token,
+            successor_lease_token=token + 1,
+            reason="lease_expired",
+            epoch_already_bumped=True,
+        )
+        # A pre-effect failure never reached turn.started, so there is no turn
+        # to correlate; the client clears generating state from the queue
+        # block its re-anchor fetches, and this frame names why.
+        payload: dict[str, Any] = {
+            "reason": reason,
+            "release_reason": release_reason,
+            "attempts": attempts,
+            "retryable": reason in RETRYABLE_PARK_REASONS,
+            "parked_by": pod_name,
+            "lease_token": token,
+        }
+        if queue is not None:
+            payload["max_attempts"] = int(queue["max_attempts"])
+        if error:
+            payload["error"] = error[: _ERROR_SIGNATURE_MESSAGE_CHARS * 4]
+        frame = await append_system_frame(
+            conn, thread_id=unit_id, kind="turn.parked", payload=payload
+        )
+        if frame is None:
+            raise RuntimeError("thread disappeared while journaling a parked release")
+        return _ReleaseDisposition(
+            state=STATE_PARKED, attempts=attempts, journaled=True
+        )
 
 
 class StatelessTurnExecutor:
@@ -4711,9 +4948,55 @@ class StatelessTurnExecutor:
         )
         return "error"
 
+    async def _settle_release(
+        self,
+        claim: ClaimedUnit,
+        *,
+        cas: Callable[[Any], Awaitable[Optional[str]]],
+        park_reason: str,
+        release_reason: str,
+        error: Optional[str] = None,
+    ) -> Optional[_ReleaseDisposition]:
+        """:func:`_settle_session_release` with bounded retries.
+
+        A lost commit response replays as this claim's own disposition, so a
+        retry can neither journal twice nor abandon an already-settled lease
+        to the reaper (whose claimant-loss hold would then need Pod proof).
+        Raises the last error once every attempt failed; the lease is then
+        still exactly this claim's and expires instead.
+        """
+
+        last_error: Optional[Exception] = None
+        for attempt in range(1, COMPLETE_RETRY_ATTEMPTS + 1):
+            try:
+                return await _settle_session_release(
+                    self._db,
+                    claim,
+                    cas=cas,
+                    pod_name=self._pod_name,
+                    pod_uid=self._pod_uid,
+                    park_reason=park_reason,
+                    release_reason=release_reason,
+                    error=error,
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                last_error = exc
+                if attempt < COMPLETE_RETRY_ATTEMPTS:
+                    await asyncio.sleep(0.5 * attempt)
+        assert last_error is not None
+        raise last_error
+
     async def _release(self, claim: ClaimedUnit, *, reason: str) -> None:
         """Voluntary error release (§5.1): default linear backoff, token-
-        guarded (a genuinely lost lease makes this a recorded no-op)."""
+        guarded (a genuinely lost lease makes this a recorded no-op).
+
+        Every caller is pre-effect (post-effect failures park fail-closed), so
+        the release honours the row's retry budget: the claim that reaches
+        ``max_attempts`` parks as ``retry_exhausted`` — owner-retryable — and
+        journals ``turn.parked`` in the same commit, instead of re-queueing a
+        deterministic failure forever."""
         pa = _pa()
         # Warm affinity is valid only after successful completion. Every
         # leased->queued error transition retires the cached loop/session so a
@@ -4734,12 +5017,23 @@ class StatelessTurnExecutor:
             if self._exact_claim_handle_lost(claim):
                 await self._ack_terminal_claim_loss(claim)
             return
-        try:
-            state = await release_unit(
-                self._db,
+
+        async def bounded_release(conn: Any) -> Optional[str]:
+            return await release_unit(
+                conn,
                 unit_id=claim.unit_id,
                 lease_token=claim.lease_token,
                 error=True,
+                park_reason=PARK_REASON_RETRY_EXHAUSTED,
+                last_error=reason,
+            )
+
+        try:
+            outcome = await self._settle_release(
+                claim,
+                cas=bounded_release,
+                park_reason=PARK_REASON_RETRY_EXHAUSTED,
+                release_reason=reason,
             )
         except Exception:
             logger.warning(
@@ -4750,7 +5044,7 @@ class StatelessTurnExecutor:
                 exc_info=True,
             )
             return
-        if state is None:
+        if outcome is None:
             logger.info(
                 "run_queue release: unit=%s token=%d reason=%s "
                 "(already fenced out — nothing to release)",
@@ -4761,12 +5055,15 @@ class StatelessTurnExecutor:
             await self._ack_terminal_claim_loss(claim)
             self._clear_claim_tool_effect(pa, claim)
         else:
-            logger.info(
-                "run_queue release: unit=%s token=%d reason=%s state=%s",
+            log = logger.warning if outcome.state == STATE_PARKED else logger.info
+            log(
+                "run_queue release: unit=%s token=%d reason=%s state=%s attempts=%d%s",
                 claim.unit_id,
                 claim.lease_token,
                 reason,
-                state,
+                outcome.state,
+                outcome.attempts,
+                " (retry budget exhausted)" if outcome.state == STATE_PARKED else "",
             )
             self._clear_claim_tool_effect(pa, claim)
 
@@ -4779,7 +5076,7 @@ class StatelessTurnExecutor:
         (stateless_turn_resilience.md step 2). The claim already counted this
         attempt; ``record_attach_failure`` records the failure signature and
         either re-queues with a growing backoff or parks with
-        ``park_reason='attach_failed'`` — and a park is journaled as a
+        ``park_reason='attach_failed'`` — and a park commits with its
         ``turn.parked`` frame so a queued message never turns into silence.
         """
         pa = _pa()
@@ -4801,14 +5098,30 @@ class StatelessTurnExecutor:
         signature = _error_signature(exc)
         error_text = str(exc)[:_LAST_ERROR_CHARS]
         backoff = attach_failure_backoff_seconds(claim.attempts_since_completion)
-        try:
+        recorded: dict[str, Any] = {}
+
+        async def attach_failure_release(conn: Any) -> Optional[str]:
             row = await record_attach_failure(
-                self._db,
+                conn,
                 unit_id=claim.unit_id,
                 lease_token=claim.lease_token,
                 error=error_text,
                 signature=signature,
                 backoff_seconds=backoff,
+            )
+            recorded.clear()
+            if row is None:
+                return None
+            recorded.update(row)
+            return str(row.get("state") or "")
+
+        try:
+            outcome = await self._settle_release(
+                claim,
+                cas=attach_failure_release,
+                park_reason=PARK_REASON_ATTACH_FAILED,
+                release_reason="attach_failed",
+                error=error_text,
             )
         except Exception:
             logger.warning(
@@ -4818,7 +5131,7 @@ class StatelessTurnExecutor:
                 exc_info=True,
             )
             return
-        if row is None:
+        if outcome is None:
             logger.info(
                 "run_queue release: unit=%s token=%d reason=attach_failed "
                 "(already fenced out — nothing to release)",
@@ -4829,26 +5142,17 @@ class StatelessTurnExecutor:
             self._clear_claim_tool_effect(pa, claim)
             return
         self._clear_claim_tool_effect(pa, claim)
-        state = str(row.get("state") or "")
-        attempts = int(row.get("attempts_since_completion") or 0)
         logger.warning(
             "run_queue release: unit=%s token=%d reason=attach_failed state=%s "
-            "attempts=%d attach_failures=%d backoff=%.0fs signature=%s",
+            "attempts=%d attach_failures=%s backoff=%.0fs signature=%s",
             claim.unit_id,
             claim.lease_token,
-            state,
-            attempts,
-            int(row.get("attach_failures") or 0),
+            outcome.state,
+            outcome.attempts,
+            recorded.get("attach_failures", "?"),
             backoff,
             signature,
         )
-        if state == "parked":
-            await self._journal_parked(
-                claim,
-                reason=PARK_REASON_ATTACH_FAILED,
-                error=error_text,
-                attempts=attempts,
-            )
 
     async def _journal_parked(
         self,

@@ -32,6 +32,9 @@ from agent.api.lease_context import (
 )
 from agent.api.orchestrator_client import ClaimBundleError
 from shared.run_queue import ClaimedUnit
+from shared.session_permission_retirement import (
+    _LOCK_STALE_PENDING_SQL as _LOCK_STALE_PERMISSIONS_SQL,
+)
 
 
 @pytest.mark.asyncio
@@ -221,9 +224,34 @@ class FakeDB:
         # Step 4a shutdown classification: do all persisted tool calls of the
         # pending turn have their ToolMessage? (None = query fails → park)
         self.tool_effects_durable: Optional[bool] = None
+        # Error releases lock the stateless thread before their queue CAS.
+        self.thread_row: Optional[Dict[str, Any]] = {
+            "execution_lane": "stateless",
+            "agent_id": None,
+            "metadata": {},
+        }
+        self.transactions = 0
+
+    @contextlib.asynccontextmanager
+    async def _transaction(self):
+        self.transactions += 1
+        yield
+
+    def transaction(self):
+        return self._transaction()
+
+    async def fetchrow(self, sql: str, *args):
+        self.fetch_calls.append((sql, args))
+        if sql == te._LOCK_RELEASE_THREAD_SQL:
+            return self.thread_row
+        if "SET events_epoch = events_epoch + 1" in sql:
+            return {"events_epoch": 2}
+        return None
 
     async def fetch(self, sql: str, *args):
         self.fetch_calls.append((sql, args))
+        if sql == _LOCK_STALE_PERMISSIONS_SQL:
+            return []  # no prompt pending under a parked release
         next_turn = int(getattr(pa._session, "turn_count", 0) or 0) + 1
         return [
             {**row, "turn_number": row.get("turn_number", next_turn)}
@@ -311,6 +339,7 @@ class Harness:
         self._fake_loop_tasks: List[asyncio.Task] = []
         self.disposition_order: List[str] = []
         self.park_reasons: List[Any] = []
+        self.release_budget: List[Dict[str, Any]] = []
         self.attach_failure_state = "queued"
 
         pa._agent = SimpleNamespace(postgres_conn=self.db)
@@ -350,9 +379,10 @@ class Harness:
             return "done"
 
         async def fake_release(
-            db, *, unit_id, lease_token, backoff_seconds=0.0, error=False
+            db, *, unit_id, lease_token, backoff_seconds=0.0, error=False, **bounded
         ):
             harness.disposition_order.append("release")
+            harness.release_budget.append(bounded)
             harness.calls["release"].append(
                 {
                     "unit_id": unit_id,
@@ -2230,14 +2260,42 @@ class TestShutdownCancellation:
                 "kind": "turn.parked",
                 "payload": {
                     "reason": "attach_failed",
+                    "release_reason": "attach_failed",
                     "attempts": 1,
                     "retryable": True,
                     "parked_by": "test-pod",
+                    "lease_token": 3,
                     "error": "subagent session-terminalize failed (HTTP 400)",
                 },
             }
         ]
+        # The park and its frame share the thread-locked release transaction.
+        assert harness.db.transactions == 1
         assert pa._thread_id is None
+
+    @pytest.mark.asyncio
+    async def test_bundle_refusal_release_carries_the_retry_budget(self, harness):
+        # The 2026-08-30 / 09-02 incidents: bundle_409 re-queued forever. The
+        # generic pre-effect release now asks the CAS to park at the budget.
+        harness.bundle_error = ClaimBundleError(409, "Attach assembly refused")
+        claim = make_claim(token=4)
+
+        await harness.executor._serve_claim(claim)
+        await _finish(harness)
+
+        assert harness.calls["release"] == [
+            {
+                "unit_id": claim.unit_id,
+                "lease_token": 4,
+                "backoff_seconds": 0.0,
+                "error": True,
+            }
+        ]
+        assert harness.release_budget == [
+            {"park_reason": "retry_exhausted", "last_error": "bundle_409"}
+        ]
+        assert harness.db.transactions == 1
+        assert not harness.calls["journal"]  # re-queued: nothing to tell yet
 
 
 # ---------------------------------------------------------------------------

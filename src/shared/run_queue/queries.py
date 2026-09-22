@@ -131,6 +131,10 @@ PARK_REASON_ATTACH_FAILED = "attach_failed"
 PARK_REASON_SHUTDOWN_CANCELLED = "shutdown_cancelled"
 PARK_REASON_COMPLETION_CAS_FAILED = "completion_cas_failed"
 PARK_REASON_REAPER_MAX_ATTEMPTS = "reaper_max_attempts"
+# A pre-effect error release that reached the row's own max_attempts. The
+# release paths that use it never crossed a tool boundary (post-effect
+# failures park fail-closed instead), so an owner retry replays nothing.
+PARK_REASON_RETRY_EXHAUSTED = "retry_exhausted"
 PARK_REASON_CLAIM_LOSS_HOLD = "claim_loss_hold"
 RETRYABLE_PARK_REASONS = frozenset(
     {
@@ -138,6 +142,7 @@ RETRYABLE_PARK_REASONS = frozenset(
         PARK_REASON_SHUTDOWN_CANCELLED,
         PARK_REASON_COMPLETION_CAS_FAILED,
         PARK_REASON_REAPER_MAX_ATTEMPTS,
+        PARK_REASON_RETRY_EXHAUSTED,
     }
 )
 # Attach-failure backoff: indexed by the claim's own attempt count (the claim
@@ -503,6 +508,36 @@ UPDATE run_queue SET
     -- attach failed, loop died, shutting down). Keeping it as the affinity
     -- holder would make every other pod wait out the grace before failing
     -- over to a pod that can. Same reasoning as the reaper steal.
+    last_leased_by = NULL,
+    leased_until = NULL,
+    interrupt_admission_lease_token = NULL,
+    interrupt_admission_turn_id = NULL,
+    queued_at = now(),
+    run_after = now() + make_interval(secs =>
+        CASE WHEN $4::boolean AND $3::float8 <= 0
+             THEN $5::float8 * attempts_since_completion
+             ELSE $3::float8 END)
+WHERE unit_id = $1::uuid AND lease_token = $2::bigint AND state = 'leased'
+RETURNING state
+"""
+
+# Bounded error release (voluntary_session_release_bypasses_retry_budget).
+# Same transition as _RELEASE_SQL, except that a claim whose count already
+# reached the row's OWN max_attempts parks with reason $6 instead of
+# re-queueing. The reaper cannot bound a release loop — a voluntarily released
+# row is never an expired lease — so this CASE is the only budget check such a
+# loop meets. The claim already counted this attempt: nothing is incremented.
+# $7 records the release reason for operators (NULL keeps the previous one).
+_RELEASE_BOUNDED_SQL = """
+UPDATE run_queue SET
+    state = CASE WHEN attempts_since_completion >= max_attempts
+                 THEN 'parked' ELSE 'queued' END,
+    park_reason = CASE WHEN attempts_since_completion >= max_attempts
+                       THEN $6::text ELSE park_reason END,
+    parked_at = CASE WHEN attempts_since_completion >= max_attempts
+                     THEN now() ELSE parked_at END,
+    last_error = COALESCE($7::text, last_error),
+    leased_by = NULL,
     last_leased_by = NULL,
     leased_until = NULL,
     interrupt_admission_lease_token = NULL,
@@ -1178,13 +1213,23 @@ async def release_unit(
     lease_token: int,
     backoff_seconds: float = 0.0,
     error: bool = False,
+    park_reason: str | None = None,
+    last_error: str | None = None,
 ) -> str | None:
     """Voluntarily release a lease back to ``'queued'`` (§5.1 error release).
 
     Distinct from :func:`complete_unit`: ``consumed_seq`` is untouched (the
     turn did NOT answer its input) and ``attempts_since_completion`` is NOT
-    reset — the claim already counted this attempt, which is what lets the
-    reaper park a unit that release-loops without ever completing.
+    reset — the claim already counted this attempt.
+
+    The reaper never sees a voluntarily released row (it is no longer an
+    expired lease), so a plain release cannot bound a unit that fails the
+    same way on every claim. A caller that owes the retry budget passes
+    ``park_reason``: once the claim count reached the row's own
+    ``max_attempts`` the release parks with that reason instead of
+    re-queueing (and records ``last_error``). Parking is only the queue half
+    of that disposition; a session caller journals the visible outcome in
+    the same transaction.
 
     ``run_after`` moves to ``now() + backoff_seconds``. With ``error=True``
     and no explicit backoff, a linear default backoff is applied instead
@@ -1195,13 +1240,24 @@ async def release_unit(
     Returns the resulting state, or ``None`` if fenced out (the lease was
     already stolen — nothing was changed).
     """
+    if park_reason is None:
+        return await conn.fetchval(
+            _RELEASE_SQL,
+            _uuid(unit_id),
+            lease_token,
+            float(backoff_seconds),
+            bool(error),
+            _RELEASE_BACKOFF_BASE_SECONDS,
+        )
     return await conn.fetchval(
-        _RELEASE_SQL,
+        _RELEASE_BOUNDED_SQL,
         _uuid(unit_id),
         lease_token,
         float(backoff_seconds),
         bool(error),
         _RELEASE_BACKOFF_BASE_SECONDS,
+        str(park_reason),
+        last_error,
     )
 
 
