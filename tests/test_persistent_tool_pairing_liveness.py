@@ -189,10 +189,12 @@ async def test_non_pairing_provider_400_keeps_normal_error_behavior(monkeypatch)
     async def _astream(_messages, **_kwargs):
         nonlocal provider_calls
         provider_calls += 1
-        # Two complete ordinary turns exhaust the existing three-attempt
-        # generic retry budget. Unlike pairing errors they are surfaced
-        # normally and never enter the LF-5 circuit.
-        if provider_calls <= 6:
+        # Two complete ordinary turns, each rejected deterministically: an
+        # invalid_request_error 400 is sent once per turn, not replayed through
+        # the generic retry budget (deterministic_provider_rejection_retried_
+        # unchanged.md). Unlike pairing errors they are surfaced normally and
+        # never enter the LF-5 circuit.
+        if provider_calls <= 2:
             raise _bad_request("Invalid schema for response_format")
         yield AIMessage(content="third turn still ran")
 
@@ -212,7 +214,7 @@ async def test_non_pairing_provider_400_keeps_normal_error_behavior(monkeypatch)
         messages=messages,
     )
 
-    assert provider_calls == 7
+    assert provider_calls == 3
     assert all(
         "Session halted after two consecutive" not in str(call.args[0])
         for call in on_error.await_args_list

@@ -106,6 +106,7 @@ from shared.runtime.core.llm_retry import (  # noqa: F401
     _has_api_error_body,
     _infra_edge_status,
     _summarize_llm_error,
+    _describe_llm_rejection,
     _TEXT_INPUT_REJECTION_STATUS,
     _classify_llm_error,
     initial_error_freeze_fields,
@@ -2544,7 +2545,9 @@ def create_execute_node(
                         )
                     return {
                         "error": {
-                            "message": _summarize_llm_error(e, phase_model),
+                            # Names the model and the provider's rejected
+                            # field so the failed job says what to fix.
+                            "message": _describe_llm_rejection(e, phase_model),
                             "type": "llm_error",
                             "recoverable": False,
                         },

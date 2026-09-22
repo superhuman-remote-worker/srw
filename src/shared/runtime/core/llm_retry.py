@@ -100,6 +100,46 @@ def _extract_rate_limit_delay(error: Exception) -> Optional[float]:
     return 90.0
 
 
+def _api_error_object(exc: BaseException) -> Optional[Dict[str, Any]]:
+    """The provider's error object carried on an SDK exception, for either SDK shape.
+
+    The anthropic and groq SDKs keep the whole response envelope on
+    ``exc.body`` (``{"type": "error", "error": {"type": ..., "message": ...}}``).
+    The openai SDK — the transport of every OpenAI-compatible route: OpenAI,
+    OpenRouter, Mistral, the subscription proxy, self-hosted endpoints — stores
+    the envelope's ``error`` member ALREADY UNWRAPPED
+    (``_make_status_error``: ``body.get("error", body)``), and a provider that
+    sends no envelope at all (Mistral's top-level ``{"object": "error", ...}``)
+    arrives the same way. Reading only ``body["error"]`` saw nothing on any
+    OpenAI-compatible rejection, so every one of them fell through to the
+    "400 without a parseable body" retry: pilot 9792db96 replayed an
+    unsupported ``reasoning_effort`` in two pause cycles of six identical
+    attempts (knowledge-base/knowledge/issues/deterministic_provider_rejection_retried_unchanged.md).
+
+    Returns ``None`` when the body is not a dict — an edge page, a bare text
+    response, a stream closed before it was read.
+    """
+    body = getattr(exc, "body", None)
+    if not isinstance(body, dict):
+        return None
+    inner = body.get("error")
+    return inner if isinstance(inner, dict) else body
+
+
+def _error_field(err_obj: Dict[str, Any], name: str) -> str:
+    """``err_obj[name]`` as text, or ``""`` when absent or structured.
+
+    Providers disagree on field types — OpenRouter sends ``code`` as the
+    integer ``400`` — so never call ``.lower()`` on a raw field: a classifier
+    that raises inside the caller's ``except`` handler takes the whole node
+    down with it.
+    """
+    value = err_obj.get(name)
+    if value is None or isinstance(value, (dict, list)):
+        return ""
+    return str(value)
+
+
 def _is_codex_auth_unavailable(exc: BaseException) -> bool:
     """True if a 401 is a Codex/OAuth-proxy *token-unavailable* error rather
     than a genuinely-bad API key.
@@ -111,14 +151,12 @@ def _is_codex_auth_unavailable(exc: BaseException) -> bool:
     instead of failing the job permanently. Inspects a single exception; the
     caller walks the ``__cause__`` chain.
     """
-    body = getattr(exc, "body", None)
-    if isinstance(body, dict):
-        err_obj = body.get("error") or {}
-        if isinstance(err_obj, dict):
-            code = (err_obj.get("code") or "").lower()
-            msg = (err_obj.get("message") or "").lower()
-            if code == "auth_unavailable" or "invalidated oauth token" in msg:
-                return True
+    err_obj = _api_error_object(exc)
+    if err_obj is not None:
+        code = _error_field(err_obj, "code").lower()
+        msg = _error_field(err_obj, "message").lower()
+        if code == "auth_unavailable" or "invalidated oauth token" in msg:
+            return True
     text = str(exc).lower()
     return "auth_unavailable" in text or "invalidated oauth token" in text
 
@@ -244,14 +282,12 @@ def _cooldown_reset_seconds(exc: BaseException) -> Optional[float]:
     """
     code = ""
     reset: Optional[float] = None
-    body = getattr(exc, "body", None)
-    if isinstance(body, dict):
-        err = body.get("error") or {}
-        if isinstance(err, dict):
-            code = (err.get("code") or "").lower()
-            rs = err.get("reset_seconds")
-            if isinstance(rs, (int, float)):
-                reset = float(rs)
+    err = _api_error_object(exc)
+    if err is not None:
+        code = _error_field(err, "code").lower()
+        rs = err.get("reset_seconds")
+        if isinstance(rs, (int, float)):
+            reset = float(rs)
     text = str(exc).lower()
     if reset is None:
         m = re.search(r"reset_seconds['\"]?\s*[:=]\s*([0-9.]+)", text)
@@ -273,13 +309,8 @@ def _cooldown_detail(error: Exception) -> tuple[Optional[float], Optional[str]]:
         seen.add(id(current))
         reset = _cooldown_reset_seconds(current)
         if reset is not None:
-            model = None
-            body = getattr(current, "body", None)
-            if isinstance(body, dict):
-                err = body.get("error") or {}
-                if isinstance(err, dict):
-                    model = err.get("model")
-            return reset, model
+            err = _api_error_object(current)
+            return reset, (err.get("model") if err is not None else None)
         nxt = getattr(current, "__cause__", None)
         current = nxt if nxt is not current else None
     return None, None
@@ -323,14 +354,12 @@ def _is_insufficient_quota(exc: BaseException) -> bool:
     as an ordinary per-minute quota/rate-limit signal, so treating it as a
     billing wall would wrongly fail-fast a recoverable rate limit.
     """
-    body = getattr(exc, "body", None)
-    if isinstance(body, dict):
-        err = body.get("error") or {}
-        if isinstance(err, dict):
-            code = (err.get("code") or "").lower()
-            etype = (err.get("type") or "").lower()
-            if code == "insufficient_quota" or etype == "insufficient_quota":
-                return True
+    err = _api_error_object(exc)
+    if err is not None:
+        code = _error_field(err, "code").lower()
+        etype = _error_field(err, "type").lower()
+        if code == "insufficient_quota" or etype == "insufficient_quota":
+            return True
     return "insufficient_quota" in str(exc).lower()
 
 
@@ -364,7 +393,8 @@ def _has_api_error_body(exc: BaseException) -> bool:
     """True if ``exc`` carries a parseable API error body (a dict).
 
     The openai SDK parses the error response body as JSON when it can and
-    stores the result on ``exc.body``; a non-JSON body (an nginx/LB default
+    stores the result — unwrapped to its ``error`` member, see
+    :func:`_api_error_object` — on ``exc.body``; a non-JSON body (an nginx/LB default
     error page, a bare text response) is left as the raw string, and a
     closed-before-read stream leaves it ``None``. A dict body therefore means
     the response came from the provider's API application; anything else means
@@ -419,12 +449,118 @@ def _summarize_llm_error(error: Exception, model: Optional[str] = None) -> str:
     )
 
 
+def _api_rejection(error: Exception) -> Optional[Tuple[int, Dict[str, Any]]]:
+    """``(status, error object)`` of the first API-answered status error in the
+    ``__cause__`` chain, or ``None``."""
+    current: Optional[BaseException] = error
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        status = getattr(current, "status_code", None)
+        err_obj = _api_error_object(current)
+        if isinstance(status, int) and err_obj is not None:
+            return status, err_obj
+        nxt = getattr(current, "__cause__", None)
+        current = nxt if nxt is not current else None
+    return None
+
+
+def _describe_llm_rejection(error: Exception, model: Optional[str] = None) -> str:
+    """Actionable one-liner for a request the provider rejected (``permanent``).
+
+    ``str(e)`` of an SDK rejection is ``Error code: 400 - {<repr of the body>}``:
+    accurate, but it omits the model and buries the one useful field in a dict
+    repr. Compose the rejection from the provider's error object instead —
+    model, HTTP status, ``type``, ``param``, ``code`` and ``message`` — so the
+    failed job names what to fix. Only the provider's own error fields are
+    used, never request headers or URLs, so no credential rides along. Falls
+    back to :func:`_summarize_llm_error` when no status error in the chain
+    carries an API error object (an edge page, a stringified error).
+    """
+    rejection = _api_rejection(error)
+    if rejection is None:
+        return _summarize_llm_error(error, model)
+    status, err_obj = rejection
+    etype = _error_field(err_obj, "type")
+    param = _error_field(err_obj, "param")
+    code = _error_field(err_obj, "code")
+    detail = re.sub(r"\s+", " ", _error_field(err_obj, "message")).strip()
+    detail = detail[:300].rstrip(".")
+    facts = [f"HTTP {status}"]
+    if etype:
+        facts.append(etype)
+    if param:
+        facts.append(f"param '{param}'")
+    if code and code != str(status):
+        facts.append(f"code '{code}'")
+    who = f"Model '{model}'" if model else "The provider"
+    return (
+        f"{who} rejected the request ({', '.join(facts)})"
+        + (f": {detail}" if detail else "")
+        + ". Not retried: the identical request fails identically. Fix the "
+        "model configuration (Admin → Models) or the job's model/reasoning "
+        "override, then re-run."
+    )
+
+
 # Statuses whose bodies are genuinely deterministic input rejections, i.e. the
 # only ones the stringified ``invalid_request_error`` rule below is allowed to
 # claim. 401/403/404 are handled by their own text rules above it; every other
 # status (408, 409, 425, 499, 5xx, …) is transport and must stay retryable even
 # when the provider stamps an input-rejection *label* on it.
 _TEXT_INPUT_REJECTION_STATUS = frozenset({"400", "422"})
+
+# "No such model here" in the words of providers whose 400 carries no
+# machine-readable ``type``: OpenRouter ("<id> is not a valid model ID", with
+# an integer ``code``) and Mistral ("Invalid model: <id>"). An id that does not
+# resolve fails every attempt identically. Deliberately narrow: OpenRouter also
+# forwards upstream rejections untyped ("Provider returned error"), and those
+# stay retryable — its router may pick a different upstream next time.
+_INVALID_MODEL_MARKERS = (
+    "not a valid model",
+    "invalid model",
+    "unknown model",
+    "model not found",
+    "model_not_found",
+    "no such model",
+)
+
+
+def _bad_request_verdict(exc: BaseException) -> Optional[str]:
+    """The verdict a 400's provider error object carries, or ``None``.
+
+    A 400 is an input rejection by definition, but providers overload it, so
+    it is only ``permanent`` when the error object says so: the
+    ``invalid_request_error`` / ``bad_request_error`` label (as ``type``, or as
+    ``code`` where a provider files it there) or an untyped "no such model"
+    message. The overloads keep retrying: rate limits and Groq's
+    ``tool_use_failed`` disguised as 400s, and a dropped stream mislabeled as
+    one. ``None`` — no parseable body, or one naming nothing we recognise — is
+    left to the caller's conservative default.
+    """
+    err_obj = _api_error_object(exc)
+    if err_obj is None:
+        return None
+    code = _error_field(err_obj, "code").lower()
+    etype = _error_field(err_obj, "type").lower()
+    message = _error_field(err_obj, "message").lower()
+    if "rate" in code or "rate" in etype:
+        return "rate_limit"
+    if code == "tool_use_failed":
+        return "transient"
+    if _is_stream_disconnect(message):
+        # A dropped stream mislabeled as a 400 invalid_request_error —
+        # transient transport, not a deterministic input rejection.
+        return "transient"
+    # 'invalid_request_error' is the OpenAI/Anthropic vocabulary; MiniMax says
+    # 'bad_request_error' (e.g. "invalid function arguments json string" — the
+    # 2026-07-11 wedge). Both are deterministic input rejections: no retry can
+    # fix them.
+    if {etype, code} & {"invalid_request_error", "bad_request_error"}:
+        return "permanent"
+    if any(marker in message for marker in _INVALID_MODEL_MARKERS):
+        return "permanent"
+    return None
 
 
 def _classify_llm_error(error: Exception) -> str:
@@ -483,32 +619,9 @@ def _classify_llm_error(error: Exception) -> str:
                 # 400 needs to be disambiguated — Groq's tool_use_failed and
                 # some rate-limit-disguised-as-400 errors are NOT permanent.
                 if status_code == 400:
-                    body = getattr(current, "body", None)
-                    if isinstance(body, dict):
-                        err_obj = body.get("error") or {}
-                        if isinstance(err_obj, dict):
-                            code = (err_obj.get("code") or "").lower()
-                            etype = (err_obj.get("type") or "").lower()
-                            if "rate" in code or "rate" in etype:
-                                return "rate_limit"
-                            if code == "tool_use_failed":
-                                return "transient"
-                            if _is_stream_disconnect(
-                                (err_obj.get("message") or "").lower()
-                            ):
-                                # A dropped stream mislabeled as a 400
-                                # invalid_request_error — transient transport,
-                                # not a deterministic input rejection.
-                                return "transient"
-                            # 'invalid_request_error' is the OpenAI/Anthropic
-                            # vocabulary; MiniMax says 'bad_request_error'
-                            # (e.g. "invalid function arguments json string" —
-                            # the 2026-07-11 wedge). Both are deterministic
-                            # input rejections: no retry can fix them.
-                            if etype in ("invalid_request_error", "bad_request_error"):
-                                return "permanent"
-                    # 400 without a parseable body — be conservative, retry.
-                    return "transient"
+                    # A 400 whose body names nothing we recognise (or has no
+                    # parseable body at all) — be conservative, retry.
+                    return _bad_request_verdict(current) or "transient"
                 if status_code == 401 and (
                     _is_codex_auth_unavailable(current)
                     or _is_codex_proxy_error(current)
@@ -560,21 +673,11 @@ def _classify_llm_error(error: Exception) -> str:
                 return "cooldown"
             return "rate_limit"
         if cls_name == "BadRequestError":
-            # Same disambiguation as the 400 status branch above.
-            body = getattr(current, "body", None)
-            if isinstance(body, dict):
-                err_obj = body.get("error") or {}
-                if isinstance(err_obj, dict):
-                    code = (err_obj.get("code") or "").lower()
-                    etype = (err_obj.get("type") or "").lower()
-                    if "rate" in code or "rate" in etype:
-                        return "rate_limit"
-                    if code == "tool_use_failed":
-                        return "transient"
-                    if _is_stream_disconnect((err_obj.get("message") or "").lower()):
-                        return "transient"
-                    if etype in ("invalid_request_error", "bad_request_error"):
-                        return "permanent"
+            # Same disambiguation as the 400 status branch above; an
+            # unrecognised body keeps walking to the text fallback.
+            verdict = _bad_request_verdict(current)
+            if verdict is not None:
+                return verdict
 
         nxt = getattr(current, "__cause__", None)
         current = nxt if nxt is not current else None
