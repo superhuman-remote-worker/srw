@@ -501,8 +501,9 @@ async def index_single_note(
             # Count before embedding, so an oversized note costs one cheap
             # structural pass and no embedding round-trip. Under the cap the
             # chunker runs twice; that is regex + token counting on a small
-            # note, which is far cheaper than the API call it protects.
-            planned = chunk_note(body)
+            # note, which is far cheaper than the API call it protects. Off the
+            # loop for the same reason as embed_note_chunks' own chunking.
+            planned = await asyncio.to_thread(chunk_note, body)
             if len(planned) > max_chunks:
                 return NoteIndexOutcome(
                     status="oversized", note_id=note_id, chunks=len(planned)
