@@ -9734,6 +9734,10 @@ def _job_admission_config_dependencies() -> JobAdmissionConfigDependencies:
     """Bind current collaborators; gates and the catalogue remain deferred."""
     from functools import partial
 
+    from orchestrator.services.job_admission_work_expert import (
+        preview_expert_refusals,
+    )
+
     return JobAdmissionConfigDependencies(
         store=postgres_db,
         require_project_access=_require_job_project_access,
@@ -9743,6 +9747,7 @@ def _job_admission_config_dependencies() -> JobAdmissionConfigDependencies:
         resolve_worker_expert=partial(
             resolve_root_expert, postgres_db, expert_type="worker"
         ),
+        preview_expert_refusals=partial(preview_expert_refusals, postgres_db),
     )
 
 

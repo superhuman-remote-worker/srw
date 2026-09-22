@@ -7,10 +7,10 @@ owns the lazy catalogue cache, current feature gates and collaborator lifecycles
 HTTP exceptions remain the compatibility contract for this extraction.
 """
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 import json
 import logging
-from typing import Any, Awaitable, Callable, Protocol
+from typing import Any, Awaitable, Callable, Literal, Protocol
 
 from fastapi import HTTPException
 
@@ -33,7 +33,6 @@ from orchestrator.services.project_status import (
     PROJECT_ARCHIVED_DETAIL,
     project_is_archived,
 )
-from orchestrator.services.work_categories import default_expert, normalize_category
 from shared.expert_reference import ExpertReferenceConflict, resolve_expert_selection
 from shared.runtime.core.loader import canonical_config_name
 from shared.workspace_contract import (
@@ -71,6 +70,19 @@ class ResolveWorkerExpert(Protocol):
     ) -> ExpertSelection: ...
 
 
+class PreviewExpertRefusals(Protocol):
+    """Why creation would refuse this bundled expert for this owner ([] = none)."""
+
+    async def __call__(
+        self,
+        *,
+        config_name: str,
+        owner_id: str | None,
+        project_id: str | None,
+        config_override: dict[str, Any] | None,
+    ) -> list[str]: ...
+
+
 @dataclass(frozen=True)
 class JobAdmissionConfigDependencies:
     store: JobConfigStore
@@ -79,6 +91,7 @@ class JobAdmissionConfigDependencies:
     experts_db_enabled: Callable[[], bool]
     user_experts_enabled: Callable[[], Awaitable[bool]]
     resolve_worker_expert: ResolveWorkerExpert
+    preview_expert_refusals: PreviewExpertRefusals
 
 
 @dataclass(frozen=True)
@@ -94,11 +107,15 @@ class JobAdmissionConfig:
     requested_workspace_backend: str | None
     root_creation: bool
     workspace_selection: dict[str, Any] | None = None
-    # Nobody chose this worker: no expert was named and no project/personal
-    # default applied, leaving the deployment-wide fallback (the application
-    # default, or the bare worker base). Only such a root job takes its work
-    # category's default expert — see apply_work_expert_default.
-    expert_is_fallback: bool = False
+    # Who chose this worker, read by the work-default stage that runs after
+    # the Officer stage (job_admission_work_expert): "caller" — named, or a
+    # child's inherited selector — is never displaced; "scope" is a project or
+    # personal default; "fallback" is the application default or bare base.
+    expert_source: Literal["caller", "scope", "fallback"] = "caller"
+    # config_override as it would be without the pre-selected default's
+    # project_experts overlay. Set only when that overlay was merged, so a
+    # work default that displaces the expert does not inherit its tuning.
+    unselected_config_override: dict[str, Any] | None = None
 
 
 async def prepare_job_admission_config(
@@ -246,6 +263,7 @@ async def prepare_job_admission_config(
         and dependencies.experts_db_enabled()
     )
     selection = None
+    unselected_config_override: dict[str, Any] | None = None
     try:
         if should_resolve_default or should_validate_explicit:
             principal = scope.principal
@@ -265,6 +283,7 @@ async def prepare_job_admission_config(
             if selection.project_override and not (project or {}).get(
                 "manifest_composed"
             ):
+                unselected_config_override = dict(config_override or {})
                 config_override = deep_merge_dicts(
                     config_override or {}, selection.project_override
                 )
@@ -296,23 +315,22 @@ async def prepare_job_admission_config(
             "source": "bundled",
             "expert": expert_choice.reference,
         }
-    # The application default never carries a project overlay today; the
-    # guard keeps it that way for this flag, because a later category swap
-    # cannot un-merge one from config_override.
-    expert_is_fallback = (
-        root_creation
-        and expert_choice.kind == "default"
-        and config_name == "worker_base"
-        and (
-            selection is None
-            or (selection.source == "application" and not selection.project_override)
-        )
-    )
+    expert_source: Literal["caller", "scope", "fallback"] = "caller"
+    if root_creation and expert_choice.kind == "default":
+        if selection is not None:
+            expert_source = "fallback" if selection.source == "application" else "scope"
+        else:
+            # Only the legacy project slug above can have moved config_name.
+            expert_source = "fallback" if config_name == "worker_base" else "scope"
 
     if request_config_override:
         config_override = deep_merge_dicts(
             config_override or {}, request_config_override
         )
+        if unselected_config_override is not None:
+            unselected_config_override = deep_merge_dicts(
+                unselected_config_override, request_config_override
+            )
 
     workspace_selection = None
     workspace_supplied = "workspace" in job.model_fields_set
@@ -347,6 +365,10 @@ async def prepare_job_admission_config(
         config_override = bind_execution_workspace(
             config_override or {}, workspace_config
         )
+        if unselected_config_override is not None:
+            unselected_config_override = bind_execution_workspace(
+                unselected_config_override, workspace_config
+            )
         if workspace_supplied:
             requested_workspace_backend = workspace_config["backend"]
 
@@ -360,64 +382,6 @@ async def prepare_job_admission_config(
         requested_workspace_backend=requested_workspace_backend,
         root_creation=root_creation,
         workspace_selection=workspace_selection,
-        expert_is_fallback=expert_is_fallback,
+        expert_source=expert_source,
+        unselected_config_override=unselected_config_override,
     )
-
-
-def apply_work_expert_default(
-    config: JobAdmissionConfig,
-    *,
-    context: dict[str, Any],
-    ticket_expert: str | None,
-    requested_category: str | None,
-    slot_category: str | None,
-    bundled_expert_exists: Callable[[str], bool],
-) -> JobAdmissionConfig:
-    """Staff an unchosen worker from what the work asks for, ahead of the fallback.
-
-    A category is a property of the WORK, and ``default_expert`` maps it onto
-    a worker that can produce that work — an executor gets a shell. The
-    backlog tick always applied it; a job created directly (Officer
-    hand-dispatch, the only mode in use while auto-pull is off) never did and
-    fell through to the application default, a worker with ``shell: []``.
-    See knowledge-base/knowledge/issues/category_expert_default_skipped_on_direct_dispatch.md.
-
-    Precedence: a named expert, then a project or personal default (both are
-    someone's deliberate choice), then the claimed ticket's ``expert:`` pin,
-    then the category default, then the deployment-wide application default.
-    The pin-over-category pair is ``work_categories.resolve_expert``'s. The
-    slot's category is the contract the worker is held to (§6), so it decides
-    over an explicit ``work_category`` that contradicts it.
-    ``CATEGORY_EXPERTS`` membership is not consulted: it is warn-not-forbid,
-    and nothing here refuses. Runs after the Officer stage because only that
-    stage knows the slot and the ticket; ``context`` is the dict the later
-    stages carry.
-    """
-    if not config.expert_is_fallback:
-        return config
-    category = normalize_category(slot_category) or normalize_category(
-        requested_category
-    )
-    if ticket_expert:
-        expert, source = ticket_expert, "ticket"
-    elif category is not None:
-        expert, source = default_expert(category), "category"
-    else:
-        return config
-    if not bundled_expert_exists(expert):
-        # Same reasoning as the explicit-slug check: a job whose config the
-        # agent cannot load fails only after provisioning. The fallback is
-        # the job this caller would have got before this default existed.
-        logger.warning(
-            "%s default expert %r for %s work is not installed; "
-            "keeping the fallback expert",
-            source,
-            expert,
-            category or "uncategorized",
-        )
-        return config
-    selection: dict[str, Any] = {"source": source, "expert": expert}
-    if category is not None:
-        selection["category"] = category
-    context["expert_selection"] = selection
-    return replace(config, config_name=expert, expert_id=None, expert_is_fallback=False)

@@ -25,6 +25,21 @@ SRW_ADAPTER = "srw/v1"
 SNAPSHOT_FORMAT = "srw/resolved-config-v1"
 
 
+class ExecutionGrantDenied(HTTPException):
+    """The rendered policy exceeds the runner's grants.
+
+    Wire-identical to the plain 422 every caller already handles; the
+    violations stay structured for callers that must name the missing grants
+    (job admission's default-expert preview).
+    """
+
+    def __init__(self, violations: list[str]):
+        from orchestrator.services.grant_enforcement import grant_violations_detail
+
+        super().__init__(422, grant_violations_detail(violations))
+        self.violations = list(violations)
+
+
 def object_value(value: Any) -> dict[str, Any]:
     if isinstance(value, str):
         value = json.loads(value)
@@ -208,7 +223,6 @@ async def prepare_srw_snapshot(
         seed_registry_model_overrides,
     )
     from orchestrator.services.grant_enforcement import (
-        grant_violations_detail,
         resolve_runner_grants,
         user_experts_enabled,
     )
@@ -365,7 +379,7 @@ async def prepare_srw_snapshot(
         if grants is not None:
             violations = evaluate(policy, grants)
             if violations:
-                raise HTTPException(422, grant_violations_detail(violations))
+                raise ExecutionGrantDenied(violations)
     dependencies = []
     if (expert or {}).get("project_dependency"):
         dependencies.append(deepcopy(expert["project_dependency"]))

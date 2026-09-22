@@ -54,6 +54,7 @@ def deps():
         resolve_worker_expert=AsyncMock(
             return_value=ExpertSelection({"id": EXPERT}, "application")
         ),
+        preview_expert_refusals=AsyncMock(return_value=[]),
     )
 
 

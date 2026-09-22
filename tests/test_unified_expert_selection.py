@@ -323,11 +323,18 @@ def _application_default():
     )
 
 
-async def _rest_create(db, fake_request, body, resolver):
+async def _rest_create(db, fake_request, body, resolver, preview=None):
     from tests._b09_control_seams import create_job
 
+    # The work-default preview dry-runs the snapshot renderer, which lives
+    # inside the (mocked) postgres create_job; stand in for its verdict.
+    preview = preview or AsyncMock(return_value=[])
     patches = [
         patch("orchestrator.main.postgres_db", db),
+        patch(
+            "orchestrator.services.job_admission_work_expert.preview_expert_refusals",
+            preview,
+        ),
         patch(
             "orchestrator.main.require_approved_user",
             AsyncMock(return_value={"id": USER_ID, "is_admin": False}),
@@ -534,6 +541,7 @@ class TestWorkCategoryStaffsAnUnnamedWorker:
         from orchestrator.services.work_categories import default_expert
 
         resolver = AsyncMock(return_value=_application_default())
+        preview = AsyncMock(return_value=[])
         kwargs = await _rest_create(
             db,
             fake_request,
@@ -541,8 +549,14 @@ class TestWorkCategoryStaffsAnUnnamedWorker:
                 description="build it", project_id=PROJECT_ID, work_category="executor"
             ),
             resolver,
+            preview,
         )
 
+        # Bound to the application store and asked about the exact
+        # override creation will persist.
+        assert preview.await_args.args == (db,)
+        assert preview.await_args.kwargs["config_name"] == default_expert("executor")
+        assert preview.await_args.kwargs["owner_id"] == USER_ID
         assert kwargs["config_name"] == default_expert("executor")
         assert kwargs["expert_id"] is None
         assert kwargs["context"]["expert_selection"] == {
@@ -571,3 +585,28 @@ class TestWorkCategoryStaffsAnUnnamedWorker:
         resolver.assert_not_awaited()
         assert (kwargs["config_name"], kwargs["expert_id"]) == ("scholar", None)
         assert kwargs["context"]["expert_selection"]["source"] == "bundled"
+
+    @pytest.mark.asyncio
+    async def test_a_refused_category_default_keeps_the_application_default(
+        self, db, fake_request
+    ):
+        from orchestrator.main import JobCreate
+
+        resolver = AsyncMock(return_value=_application_default())
+        kwargs = await _rest_create(
+            db,
+            fake_request,
+            JobCreate(
+                description="build it", project_id=PROJECT_ID, work_category="executor"
+            ),
+            resolver,
+            AsyncMock(return_value=["shell_tools: tools.shell requires it"]),
+        )
+
+        assert (kwargs["config_name"], kwargs["expert_id"]) == (
+            BASE_WORKER_CONFIG,
+            DB_EXPERT,
+        )
+        selection = kwargs["context"]["expert_selection"]
+        assert selection["source"] == "application"
+        assert selection["denied_defaults"][0]["expert"] == "engineer"
