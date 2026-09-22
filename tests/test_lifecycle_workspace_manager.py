@@ -2304,6 +2304,53 @@ class TestReapOrphans:
         container._delete_service.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_failed_identity_probe_releases_the_orphan_pvc_claim(self):
+        """lifecycle_reap_failure_parks_running_stateless_job: the incident's
+        failure was a read-only identity capture (a ws_client handshake error)
+        under a lifecycle claim. No teardown I/O happened, so the claim must be
+        released rather than fencing the job's controls for the whole 2 h
+        lifecycle lease — and one failing PVC must not abort the sweep."""
+        from orchestrator.services.container_provisioner import (
+            WorkspaceRuntimeAuthorityError,
+        )
+
+        mgr, container, _, _, db = _make_manager(
+            pods=[],
+            job_rows={
+                "jdone": _terminal_job_row(),
+                "jnext": _terminal_job_row("failed"),
+            },
+            completion_commands_enabled=True,
+        )
+        self._wire_pvcs(
+            container,
+            [
+                _make_pvc("pvc-workspace-jdone", "jdone"),
+                _make_pvc("pvc-workspace-jnext", "jnext"),
+            ],
+        )
+        container.capture_workspace_teardown_identity.side_effect = (
+            WorkspaceRuntimeAuthorityError("workspace Pod identity capture failed")
+        )
+
+        with patch(
+            "orchestrator.services.lifecycle.workspace_manager.asyncio.to_thread",
+            side_effect=_fake_to_thread,
+        ):
+            assert await mgr.reap_orphans() == 0
+
+        assert container.capture_workspace_teardown_identity.await_count == 2
+        container.prepare_workspace_cleanup_intent.assert_not_awaited()
+        container.reconcile_workspace_cleanup_intent.assert_not_awaited()
+        conn = db.acquire.return_value.__aenter__.return_value
+        released = [
+            call.args[1]  # (sql, job_id, claim_id)
+            for call in conn.fetchrow.await_args_list
+            if "- '_completion_control_claim'" in str(call.args[0])
+        ]
+        assert released == ["jdone", "jnext"]
+
+    @pytest.mark.asyncio
     async def test_control_marker_blocks_orphan_pvc_destructive_recheck(self):
         mgr, container, _, _, db = _make_manager(
             pods=[],
