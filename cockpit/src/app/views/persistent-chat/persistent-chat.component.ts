@@ -3341,7 +3341,12 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         // /rewind is pure UI — open the target picker instead of handing the
         // text to the service, which would send it to the agent as chat.
         if (isRewindCommand(text)) {
-            if (!this.chat.rewindModeAvailable('conversation')) return;
+            // Not offered in the slash menu either, but a typed-out /rewind
+            // must be refused out loud rather than vanish without a word.
+            if (!this.chat.rewindModeAvailable('conversation')) {
+                this.chat.error.set(this.transloco.translate('chat.rewind.unavailable'));
+                return;
+            }
             this.inputText = '';
             clearDraft(threadId);
             this.openRewindPicker();

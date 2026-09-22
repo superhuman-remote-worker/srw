@@ -97,6 +97,14 @@ function createMockWs() {
     } as any;
 }
 
+/** A pinned session whose `/connection` resolved to a control socket, with
+ *  `ws` as that socket (open, connecting, or null for a dropped one). */
+function pinned(service: PersistentChatService, ws: any): void {
+    service.threadId.set('thread-rw');
+    (service as any).controlSocket = 'websocket';
+    (service as any).controlWs = ws;
+}
+
 function framesOn(ws: any): Record<string, unknown>[] {
     return ws.send.mock.calls.map((c: any) => JSON.parse(c[0]));
 }
@@ -105,8 +113,7 @@ describe('PersistentChatService rewind', () => {
     it('sends a flat rewind frame with a request_id and flags in-flight', () => {
         const {service} = createService();
         const live = createMockWs();
-        service.threadId.set('thread-rw');
-        (service as any).controlWs = live;
+        pinned(service, live);
 
         const requestId = service.rewind('row-1', 'conversation');
 
@@ -122,8 +129,7 @@ describe('PersistentChatService rewind', () => {
     it('summarizeUpTo rides the compact verb with a boundary', () => {
         const {service} = createService();
         const live = createMockWs();
-        service.threadId.set('thread-rw');
-        (service as any).controlWs = live;
+        pinned(service, live);
 
         service.summarizeUpTo('row-2');
 
@@ -292,8 +298,7 @@ describe('PersistentChatService rewind', () => {
 describe('PersistentChatService — rewind refuses to queue when the control WS is down', () => {
     it('controlWs = null: no frame queued on controlOutbox, flag stays false, error is set', () => {
         const {service} = createService();
-        service.threadId.set('thread-rw');
-        (service as any).controlWs = null;
+        pinned(service, null);
 
         const requestId = service.rewind('row-1', 'conversation');
 
@@ -305,10 +310,9 @@ describe('PersistentChatService — rewind refuses to queue when the control WS 
 
     it('controlWs present but not OPEN (e.g. CONNECTING): same refusal, no queueing', () => {
         const {service} = createService();
-        service.threadId.set('thread-rw');
         const connecting = createMockWs();
         connecting.readyState = WebSocket.CONNECTING;
-        (service as any).controlWs = connecting;
+        pinned(service, connecting);
 
         service.rewind('row-1', 'both');
 
@@ -322,8 +326,7 @@ describe('PersistentChatService — rewind refuses to queue when the control WS 
         vi.useFakeTimers();
         try {
             const {service} = createService();
-            service.threadId.set('thread-rw');
-            (service as any).controlWs = null;
+            pinned(service, null);
 
             service.rewind('row-1', 'conversation');
 
@@ -339,8 +342,7 @@ describe('PersistentChatService — rewind refuses to queue when the control WS 
     it('a normal open-socket rewind is unaffected: still sends and flags in-flight', () => {
         const {service} = createService();
         const live = createMockWs();
-        service.threadId.set('thread-rw');
-        (service as any).controlWs = live;
+        pinned(service, live);
 
         service.rewind('row-1', 'conversation');
 
@@ -353,8 +355,7 @@ describe('PersistentChatService — rewind refuses to queue when the control WS 
         const {service} = createService();
         const live = createMockWs();
         live.send.mockImplementation(() => { throw new Error('closed'); });
-        service.threadId.set('thread-rw');
-        (service as any).controlWs = live;
+        pinned(service, live);
 
         service.rewind('row-1', 'conversation');
 
@@ -387,8 +388,7 @@ describe('PersistentChatService — rewind self-healing', () => {
     it('force-clears rewindInFlight if rewind.ack never arrives (lost/dropped frame)', async () => {
         const {service} = createService();
         const live = createMockWs();
-        service.threadId.set('thread-rw');
-        (service as any).controlWs = live;
+        pinned(service, live);
 
         service.rewind('row-1', 'conversation');
         expect(service.rewindInFlight()).toBe(true);
@@ -404,8 +404,7 @@ describe('PersistentChatService — rewind self-healing', () => {
     it('does not fire the fallback once rewind.ack has already cleared it', async () => {
         const {service} = createService();
         const live = createMockWs();
-        service.threadId.set('thread-rw');
-        (service as any).controlWs = live;
+        pinned(service, live);
 
         const requestId = service.rewind('row-1', 'conversation');
         (service as any)._handleEvent({
@@ -423,8 +422,7 @@ describe('PersistentChatService — rewind self-healing', () => {
     it('error only clears rewindInFlight for the matching request_id', () => {
         const {service} = createService();
         const live = createMockWs();
-        service.threadId.set('thread-rw');
-        (service as any).controlWs = live;
+        pinned(service, live);
 
         const requestId = service.rewind('row-1', 'conversation');
         expect(service.rewindInFlight()).toBe(true);
@@ -447,8 +445,7 @@ describe('PersistentChatService — rewind self-healing', () => {
     it('an error with no request_id at all leaves rewindInFlight untouched', () => {
         const {service} = createService();
         const live = createMockWs();
-        service.threadId.set('thread-rw');
-        (service as any).controlWs = live;
+        pinned(service, live);
 
         service.rewind('row-1', 'conversation');
         (service as any)._handleEvent({method: 'error', params: {message: 'boom'}});
@@ -461,8 +458,7 @@ describe('PersistentChatService — rewind self-healing', () => {
         // between send and ack. disconnect() must not leave the flag wedged.
         const {service} = createService();
         const live = createMockWs();
-        service.threadId.set('thread-rw');
-        (service as any).controlWs = live;
+        pinned(service, live);
 
         service.rewind('row-1', 'conversation');
         expect(service.rewindInFlight()).toBe(true);
@@ -478,5 +474,83 @@ describe('PersistentChatService — rewind self-healing', () => {
         await vi.advanceTimersByTimeAsync(90_001);
         expect(warnSpy).not.toHaveBeenCalled();
         warnSpy.mockRestore();
+    });
+});
+
+/**
+ * `rewind` rides the declared-controls choke point
+ * (knowledge-base/knowledge/issues/live_settings_silently_dropped_on_stateless_sessions.md
+ * §"rewind escapes the choke point"). The verb is offered only where a live
+ * control plane has DECLARED a transport for it, and a dispatch the session
+ * cannot carry is refused out loud — never "connection is down" for a verb the
+ * lane does not have, and never a silent drop.
+ */
+describe('PersistentChatService — rewind follows the declared controls', () => {
+    const STATELESS_WITHOUT_REWIND = {
+        'config.update': 'rest',
+        'workspace.undo': 'rest',
+        'mode.set': 'rest',
+        'narration.set': 'rest',
+    };
+
+    it('a stateless declaration without rewind offers no mode and refuses loudly', () => {
+        const {service, mockHttp} = createService();
+        // An earlier REST rewind in this file leaves its receipt marker behind.
+        sessionStorage.removeItem('srw.rewind.operation.thread-rw');
+        service.threadId.set('thread-rw');
+        (service as any).controlSocket = 'none';
+        (service as any).controlCapabilities.set({
+            threadId: 'thread-rw',
+            controls: STATELESS_WITHOUT_REWIND,
+            options: {},
+        });
+
+        expect(service.controlTransport('rewind')).toBe('unavailable');
+        for (const mode of ['both', 'conversation', 'code'] as const) {
+            expect(service.rewindModeAvailable(mode)).toBe(false);
+        }
+        service.rewind('row-1', 'conversation');
+
+        expect(service.error()).toBe('chat.rewind.unavailable');
+        expect(service.rewindInFlight()).toBe(false);
+        expect(mockHttp.post).not.toHaveBeenCalled();
+        expect((service as any).controlOutbox).toEqual([]);
+        expect(sessionStorage.getItem('srw.rewind.operation.thread-rw')).toBeNull();
+    });
+
+    it('is not offered before /connection has declared a transport', () => {
+        // Until the declaration lands, controlTransport assumes a socket — so a
+        // stateless session showed the rewind button and answered a click
+        // with "connection is down" for a verb it never had.
+        const {service} = createService();
+        service.threadId.set('thread-rw');
+
+        expect(service.rewindModeAvailable('conversation')).toBe(false);
+        service.rewind('row-1', 'conversation');
+        expect(service.error()).toBe('chat.rewind.unavailable');
+
+        // Once a pinned session resolves with a socket, it is offered again.
+        (service as any).controlSocket = 'websocket';
+        expect(service.rewindModeAvailable('conversation')).toBe(true);
+    });
+
+    it('is not offered on a retired (ended) session, whose dispatch would drop silently', () => {
+        const {service} = createService();
+        pinned(service, createMockWs());
+        (service as any).controlCapabilities.set({
+            threadId: 'thread-rw',
+            controls: {rewind: 'websocket'},
+            options: {},
+        });
+        expect(service.rewindModeAvailable('conversation')).toBe(true);
+
+        (service as any)._retireTerminalControl('thread-rw');
+
+        // The declaration outlives the retirement, but the control plane does
+        // not: _sendImmediateControl's guard would return without a word.
+        expect(service.rewindModeAvailable('conversation')).toBe(false);
+        service.rewind('row-1', 'conversation');
+        expect(service.error()).toBe('chat.rewind.unavailable');
+        expect(service.rewindInFlight()).toBe(false);
     });
 });

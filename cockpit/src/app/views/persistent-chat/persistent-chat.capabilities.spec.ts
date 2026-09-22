@@ -240,3 +240,68 @@ describe('parked unit composer', () => {
     }
   });
 });
+
+describe('rewind affordances follow the declared controls', () => {
+  beforeAll(async () => {
+    HTMLElement.prototype.scrollTo = vi.fn();
+    await ɵresolveComponentResources(() => Promise.resolve(''));
+  });
+
+  const api = {
+    getThreadIdeStatus: () => of(null),
+    getMyCapabilities: () => of(null),
+    getSshHostKeys: () => of({hostname: 'ssh.example.test', host_keys: []}),
+  };
+
+  it('neither offers /rewind nor opens the picker where the session has no rewind', async () => {
+    const chat = sessionState() as any;
+    chat.sendMessage = vi.fn(async () => true);
+    const fixture = await mountChat(chat, api, false);
+    try {
+      const view = fixture.componentInstance;
+      view.onInputChange('/re');
+      expect(view.filteredCommands().map((c) => c.command)).not.toContain('/rewind');
+
+      view.openRewindPicker();
+      expect(view.rewindPickerOpen()).toBe(false);
+
+      // Typed out in full it is refused out loud — it used to vanish without a
+      // word, and is never handed to the agent as chat.
+      view.inputText = '/rewind';
+      view.send();
+      expect(view.rewindPickerOpen()).toBe(false);
+      expect(chat.error()).toBe('chat.rewind.unavailable');
+      expect(chat.sendMessage).not.toHaveBeenCalled();
+      expect(view.inputText).toBe('/rewind');
+    } finally {
+      fixture.destroy();
+      TestBed.resetTestingModule();
+    }
+  });
+
+  it('offers /rewind and opens the picker once the session declares it', async () => {
+    const chat = sessionState() as any;
+    chat.rewindModeAvailable.set(true);
+    chat.sendMessage = vi.fn(async () => true);
+    const fixture = await mountChat(chat, api, false);
+    try {
+      const view = fixture.componentInstance;
+      view.onInputChange('/re');
+      expect(view.filteredCommands().map((c) => c.command)).toContain('/rewind');
+
+      // The picker defers its initial focus; run that timer here rather than
+      // let it fire after this file's DOM is gone.
+      vi.useFakeTimers();
+      view.inputText = '/rewind';
+      view.send();
+      vi.runOnlyPendingTimers();
+      expect(view.rewindPickerOpen()).toBe(true);
+      expect(chat.error()).toBeNull();
+      expect(chat.sendMessage).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+      fixture.destroy();
+      TestBed.resetTestingModule();
+    }
+  });
+});

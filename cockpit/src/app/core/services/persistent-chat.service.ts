@@ -3692,12 +3692,22 @@ export class PersistentChatService {
     return 'websocket';
   }
 
-  /** Whether the currently declared session supports this rewind mode. */
+  /** Whether the currently declared session supports this rewind mode.
+   *
+   *  Only a live control plane whose transport is KNOWN can carry a rewind.
+   *  Before `/connection` answers, `controlTransport` assumes a socket (so a
+   *  stateless session offered the verb and answered "connection is down"),
+   *  and on a retired session (ended, ending, binding refused) the dispatch
+   *  guard drops the frame without a word. Rewind is destructive and never
+   *  queued, so it is not offered until a resolved transport can carry it. */
   rewindModeAvailable(mode: 'both' | 'conversation' | 'code'): boolean {
+    const threadId = this.threadId();
+    if (!threadId || !this._controlPlaneAllowed(threadId)) return false;
+    const declared = this.controlCapabilities();
+    if (declared?.threadId !== threadId && this.controlSocket === 'unknown') return false;
     const transport = this.controlTransport('rewind');
     if (transport === 'unavailable') return false;
     if (transport === 'websocket') return true;
-    const declared = this.controlCapabilities();
     const modes = declared?.options['rewind']?.modes;
     return mode === 'conversation' && (!modes || modes.includes(mode));
   }
