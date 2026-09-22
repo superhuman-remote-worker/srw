@@ -63,6 +63,15 @@ INSTRUCTION_PATH_KEY = "srw_instruction_path"
 # ``additional_kwargs``, and the stamp is never sent to a provider.
 TURN_MEMBERSHIP_KEY = "_srw_turn_id"
 
+# Compaction-view mark (sessions). A compaction rewrite that leaves a lossy
+# resident copy of a row (keep-window cap, elision, image shedding) keeps the
+# row's id and turn stamp — the reconcile still owes the row when its
+# incremental write was lost, and a tool call without its result wedges the
+# session — and carries this mark, so the reconcile writes it
+# insert-if-absent: it fills a missing row, and never overwrites the durable
+# full row with the view. Same in-memory-only rule as the stamp.
+COMPACTION_VIEW_KEY = "_srw_compaction_view"
+
 # ``PROTECTED_KEY`` value the persistent loop pins the active turn's input
 # with: the user's live request survives a mid-turn summary verbatim (generic
 # pin, re-seated right after the summary) and is unpinned when the turn ends.
@@ -144,6 +153,19 @@ def turn_membership(message: Any) -> Optional[int]:
         return None
 
 
+def mark_compaction_view(message: Any) -> Any:
+    """Mark ``message`` as a lossy compaction view of its row; returns it."""
+    kwargs = getattr(message, "additional_kwargs", None)
+    if isinstance(kwargs, dict):
+        kwargs[COMPACTION_VIEW_KEY] = True
+    return message
+
+
+def is_compaction_view(message: Any) -> bool:
+    """True when ``message`` is a lossy compaction view of its durable row."""
+    return _kwargs(message).get(COMPACTION_VIEW_KEY) is True
+
+
 def pin_turn_input(message: Any) -> Any:
     """Pin the active turn's input so a mid-turn summary re-seats it verbatim.
 
@@ -165,6 +187,7 @@ def unpin_turn_input(message: Any) -> Any:
 
 
 __all__ = [
+    "COMPACTION_VIEW_KEY",
     "INSTRUCTION_PATH_KEY",
     "PERSIST_ROLE_EVENT",
     "PERSIST_ROLE_KEY",
@@ -172,8 +195,10 @@ __all__ = [
     "PROTECTED_KEY",
     "PROTECTED_TURN_INPUT",
     "TURN_MEMBERSHIP_KEY",
+    "is_compaction_view",
     "is_pinned_for_phase",
     "is_protected_message",
+    "mark_compaction_view",
     "phase_key_for",
     "pin_turn_input",
     "protected_identity",

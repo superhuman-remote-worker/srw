@@ -1920,3 +1920,82 @@ class TestPreserveMessageIdentity:
         )
         unpin_turn_input(other)
         assert other.additional_kwargs[PROTECTED_KEY] is True
+
+    @staticmethod
+    def _tool_turn(result: str):
+        from shared.runtime.core.message_markers import stamp_turn_membership
+
+        messages = [HumanMessage(content="read the rows", id="msg-in")]
+        for i in range(3):
+            messages.append(
+                AIMessage(
+                    content="",
+                    id=f"msg-call-{i}",
+                    tool_calls=[{"name": "read", "args": {}, "id": f"tc{i}"}],
+                )
+            )
+            messages.append(
+                ToolMessage(content=result, tool_call_id=f"tc{i}", id=f"msg-res-{i}")
+            )
+        return [stamp_turn_membership(m, 4) for m in messages]
+
+    @pytest.mark.asyncio
+    async def test_capped_keep_window_result_is_a_stamped_compaction_view(
+        self, mock_llm
+    ):
+        """A capped copy is lossy: it keeps its id AND its turn stamp (the
+        reconcile still owes the row if its incremental write was lost) and is
+        marked a compaction view (so the reconcile writes it insert-if-absent,
+        never over the durable full result)."""
+        from shared.runtime.core.message_markers import (
+            is_compaction_view,
+            turn_membership,
+        )
+
+        config = ContextConfig(
+            keep_recent_messages=2, keep_window_max_tool_result_chars=200
+        )
+        big = "row-data " * 80
+        for preserve in (True, False):
+            manager = self._manager(config, preserve=preserve)
+            result = await manager.summarize_and_compact(self._tool_turn(big), mock_llm)
+            tools = [m for m in result if isinstance(m, ToolMessage)]
+            assert tools and all(m.content != big for m in tools)
+            if preserve:
+                assert all(m.id and turn_membership(m) == 4 for m in tools)
+                assert all(is_compaction_view(m) for m in tools)
+            else:
+                # The worker graph's id-less fresh copies carry no marks.
+                assert not any(is_compaction_view(m) for m in tools)
+
+    def test_elided_and_shed_copies_are_stamped_compaction_views(self):
+        from shared.runtime.core.message_markers import (
+            is_compaction_view,
+            stamp_turn_membership,
+            turn_membership,
+        )
+
+        image = stamp_turn_membership(
+            HumanMessage(
+                content=[
+                    {"type": "text", "text": "Image content from tool call tc0:"},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": "data:image/png;base64," + "Z" * 400},
+                    },
+                ],
+                id="msg-image",
+            ),
+            4,
+        )
+        for preserve in (True, False):
+            manager = self._manager(ContextConfig(), preserve=preserve)
+            messages = self._tool_turn("row-data " * 4_000) + [image]
+            result = manager._elide_largest_tool_results(messages, target_tokens=500)
+            rewritten = [m for m in result if not any(m is o for o in messages)]
+            assert {m.id for m in rewritten} >= {"msg-image", "msg-res-0"}
+            if preserve:
+                assert all(turn_membership(m) == 4 for m in rewritten)
+                assert all(is_compaction_view(m) for m in rewritten)
+            else:
+                assert not any(is_compaction_view(m) for m in rewritten)

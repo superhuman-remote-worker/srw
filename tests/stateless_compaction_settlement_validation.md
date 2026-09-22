@@ -21,6 +21,7 @@ change can be called done in production. Tick items off in place.
 | settlement retry: transient → retried, contract error / lost lease → not retried, exhausted → propagates, pinned → best effort | `tests/test_persistent_app.py::TestReconcileTurnWithRetry` | green |
 | loop crash emits `turn.error` before terminate, not on `LeaseLostError` | `tests/test_persistent_app.py::TestLoopCrashTerminalEdge` | green |
 | every message a turn appends carries its stamp and survives eviction of the input | `tests/test_persistent_graph.py::…stamped_and_survive_input_eviction`, `tests/test_persistent_turn_membership.py` | green |
+| composed (real loop + real identity-preserving `ContextManager` summarising mid-turn + incremental persist + authoritative reconcile, in-memory transcript): settles, effect `end_seq` = final answer, no fresh-id rows, and no reconciled row rewrites a durable row's content — a keep-window-capped / elided / shed copy is a marked compaction view the reconcile writes `ON CONFLICT (id) DO NOTHING`: it never overwrites the full durable row, and still fills a row whose incremental write was lost (no tool call left unpaired) (2026-09-22) | `tests/test_stateless_midturn_compaction_settlement.py`, `tests/test_batch_thread_messages.py::test_compaction_view_fills_a_lost_row_but_never_rewrites_a_landed_one` (real Postgres), `tests/test_postgres_db_save_message.py::test_batch_insert_if_absent_rows_never_update_and_keep_row_order`, `tests/test_context_safety.py::TestPreserveMessageIdentity` | green |
 | executor: transcript leg completes an answered-but-unsettled input without attach; unanswered / pending-event keep the ordinary path | `tests/test_turn_executor.py::TestSkipIfAnswered::test_transcript_*` | green |
 | cockpit: durable snapshot with `turn_in_flight=false` closes a retained turn; silence clock ignores `session.state` and stream reopens; replayed `turn_started` rebuilds the live turn | `cockpit/src/app/core/services/{turn-reducer,persistent-chat.service}.spec.ts` | 384 green, `tsc -p tsconfig.app.json` clean |
 | no regression across the wider tree | `./scripts/pytest-fast.sh` 2026-09-05 | 22 743 passed, 125 skipped, **1 failed: `test_mcp_manager::test_connect_discover_call_close`** — its stdio echo server never starts on this host (fails standalone, unrelated) |
@@ -62,7 +63,10 @@ Expected signals (all must hold):
 - `run_queue`: `state='done'`, `consumed_seq = input_seq`.
 - `thread_messages`: exactly one `role='summary'` row for the turn; no duplicate
   `tool_call_id` rows; no duplicate `ai` rows (content+tool_calls); the final
-  `ai` row is the answer.
+  `ai` row is the answer; no `role='tool'` row of the turn contains
+  `[tool result truncated by compaction` (make at least one tool result
+  exceed `keep_window_max_tool_result_chars`, 16 000, so the cap fires — the
+  capped copy is written only to fill a row whose incremental write was lost).
 - `llm_requests` (audit store) for a post-compaction call: the message list is
   `[system, "[Summary of prior work]…", <the user's request verbatim>, …kept window]`
   — the pin re-seated the request right after the recap.

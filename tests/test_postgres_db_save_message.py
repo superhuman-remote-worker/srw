@@ -200,3 +200,32 @@ async def test_batch_empty_is_noop():
     await db.save_thread_messages("t1", [])
     conn.executemany.assert_not_called()
     conn.execute.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_batch_insert_if_absent_rows_never_update_and_keep_row_order():
+    """A compaction view (``insert_if_absent``) fills a missing row but never
+    rewrites a landed one; runs execute in row order so a row either kind has
+    to mint keeps its place in seq."""
+    db, conn = _fake_db_batch()
+    rows = [
+        {"id": f"m{i}", "role": role, "content": role, "turn_number": 3}
+        for i, role in enumerate(("ai", "tool", "tool", "ai"))
+    ]
+    rows[1]["insert_if_absent"] = True
+    rows[2]["insert_if_absent"] = True
+    await db.save_thread_messages("t1", rows)
+
+    calls = conn.executemany.call_args_list
+    sqls = [" ".join(call.args[0].split()) for call in calls]
+    assert [len(call.args[1]) for call in calls] == [1, 2, 1]
+    assert "ON CONFLICT (id) DO UPDATE" in sqls[0]
+    assert sqls[1].endswith("ON CONFLICT (id) DO NOTHING")
+    assert "DO UPDATE" not in sqls[1]
+    assert "ON CONFLICT (id) DO UPDATE" in sqls[2]
+    ids = [args[0] for call in calls for args in call.args[1]]
+    assert ids == [_coerce_row_id(f"m{i}") for i in range(4)]
+    # The flag selects the statement; it is not a column.
+    assert all(
+        len(args) == len(calls[0].args[1][0]) for c in calls for args in c.args[1]
+    )

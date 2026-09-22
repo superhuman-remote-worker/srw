@@ -59,7 +59,7 @@ from agent.api.persistent_session import (
 from agent.tools.registry import TOOL_REGISTRY
 from agent.core.archiver import inflight_tool_call
 from agent.core.context import extract_summary_text, repair_tool_pairing
-from shared.runtime.core.message_markers import turn_membership
+from shared.runtime.core.message_markers import is_compaction_view, turn_membership
 from shared.runtime.core.skill_resolution import (
     APP_GUIDE_LOADER_TOOL,
     app_guide_health_snapshot,
@@ -14797,13 +14797,18 @@ async def _save_turn_ai_messages(
         # mid-turn, this updates the same rows (stable id, ON CONFLICT). Saving
         # every row (not just AI) keeps the reconcile the durability backstop for
         # any incremental write that was dropped mid-turn (_loop_persist_message
-        # is best-effort).
-        rows = [
-            _serialize_message_row(
+        # is best-effort). A compaction view (a capped/elided/shed copy of a
+        # row) is written insert-if-absent: it backstops a lost write — a tool
+        # call must never be left without its result — but never overwrites
+        # the durable full row with the lossy copy.
+        rows = []
+        for msg in to_save:
+            row = _serialize_message_row(
                 msg, turn_number, metrics=metrics, tool_decisions=tool_decisions
             )
-            for msg in to_save
-        ]
+            if is_compaction_view(msg):
+                row["insert_if_absent"] = True
+            rows.append(row)
         if authoritative_turn_boundary:
             producer_id = await client.save_thread_messages(
                 thread_id,

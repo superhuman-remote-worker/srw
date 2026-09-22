@@ -329,6 +329,75 @@ async def test_reconcile_is_idempotent(db):
 
 
 @pytest.mark.asyncio
+async def test_compaction_view_fills_a_lost_row_but_never_rewrites_a_landed_one(db):
+    """``insert_if_absent`` rows (lossy compaction views): the landed full
+    result keeps its content and seq, a result whose incremental write was
+    lost is filled with the view (no tool call left without its result), rows
+    the batch mints keep their order, and the effect range still ends at the
+    final answer."""
+    await _seed_turn_boundary(db, "view-boundary", 9)
+    landed = await db.save_thread_message(
+        thread_id=_TID,
+        role="tool",
+        content="full result",
+        turn_number=9,
+        tool_call_id="tc-landed",
+        id="view-landed",
+    )
+    rows = [
+        _row(
+            "view-landed",
+            "tool",
+            "capped view",
+            9,
+            tool_call_id="tc-landed",
+            insert_if_absent=True,
+        ),
+        _row(
+            "view-lost",
+            "tool",
+            "capped view",
+            9,
+            tool_call_id="tc-lost",
+            insert_if_absent=True,
+        ),
+        _row("view-final", "ai", "answer", 9),
+    ]
+    lease = LeaseHandle()
+    lease.update(_TID, 17)
+    context_token = current_lease.set(lease)
+    try:
+        for _attempt in range(2):  # the reconcile is retryable: idempotent
+            await db.save_thread_messages(
+                _TID,
+                rows,
+                turn_input_message_id="view-boundary",
+                turn_number=9,
+                memory_scope_kind="thread",
+                memory_scope_id=_TID,
+            )
+    finally:
+        current_lease.reset(context_token)
+
+    after = await _seqs_by_id(db)
+    landed_row = after[_coerce_row_id("view-landed")]
+    lost_row = after[_coerce_row_id("view-lost")]
+    final_row = after[_coerce_row_id("view-final")]
+    assert landed_row["content"] == "full result"
+    assert landed_row["seq"] == landed["seq"]
+    assert lost_row["content"] == "capped view"
+    assert lost_row["seq"] < final_row["seq"]
+    assert len(after) == 4  # boundary + three rows, nothing duplicated
+    async with db.acquire() as conn:
+        detail = await conn.fetchval(
+            "SELECT detail FROM completion_effects WHERE producer_kind = 'session_turn'"
+        )
+    if isinstance(detail, str):
+        detail = json.loads(detail)
+    assert detail["end_seq"] == final_row["seq"]
+
+
+@pytest.mark.asyncio
 async def test_reconcile_bumps_thread_turn_count(db):
     await db.save_thread_messages(
         _TID,

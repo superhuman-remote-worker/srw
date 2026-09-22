@@ -47,6 +47,7 @@ from shared.runtime.core.image_tokens import (
 from shared.runtime.core.message_markers import (
     is_pinned_for_phase,
     is_protected_message,
+    mark_compaction_view,
     protected_identity,
 )
 
@@ -1085,6 +1086,27 @@ class ContextManager:
         self.compaction_runs += 1
         self._state.last_provider_input_tokens = None
 
+    def _as_compaction_view(
+        self, original: BaseMessage, view: BaseMessage
+    ) -> BaseMessage:
+        """Tag a lossy rewrite of ``original`` for the session's reconcile.
+
+        Identity-preserving callers (the persistent session) keep the
+        original's markers — its turn stamp included — on the rewrite and
+        mark it a compaction view (``message_markers.COMPACTION_VIEW_KEY``).
+        The turn-end reconcile still owes the row when its incremental write
+        was lost, and writes a view insert-if-absent: it fills a missing row
+        (a tool call without its result wedges the session) and never
+        overwrites the durable full row. Every caller keeps the id itself.
+        The worker graph's rewrites are left exactly as they were.
+        """
+        if self.preserve_message_identity:
+            view.additional_kwargs = dict(
+                getattr(original, "additional_kwargs", None) or {}
+            )
+            mark_compaction_view(view)
+        return view
+
     def update_limits(self, config: ContextConfig, model: str) -> None:
         """Rebind thresholds + token counter to a new model's window, in place.
 
@@ -1651,7 +1673,7 @@ class ContextManager:
                 )
                 if getattr(msg, "id", None):
                     replacement.id = msg.id
-                result[i] = replacement
+                result[i] = self._as_compaction_view(msg, replacement)
                 shed += 1
         return result, shed
 
@@ -1718,7 +1740,7 @@ class ContextManager:
                 replacement.name = msg.name
             if getattr(msg, "id", None):
                 replacement.id = msg.id
-            result[idx] = replacement
+            result[idx] = self._as_compaction_view(msg, replacement)
             elided += 1
 
         if images_shed or elided:
@@ -2253,6 +2275,9 @@ class ContextManager:
                         ),
                     )
                 )
+                # ...as a compaction view: the reconcile must never write the
+                # truncation over the durable full result.
+                self._as_compaction_view(msg, capped_messages[-1])
 
             after_tokens = self.get_token_count(
                 [m for m in capped_messages if not isinstance(m, RemoveMessage)]

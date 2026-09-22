@@ -15,6 +15,7 @@ import os
 import re
 import uuid
 from contextlib import asynccontextmanager
+from itertools import groupby
 from pathlib import Path
 from typing import Optional, Any, List, Dict, Tuple
 
@@ -2008,6 +2009,13 @@ class PostgresDB:
     _THREAD_MESSAGE_UPSERT_BATCH_SQL = _THREAD_MESSAGE_UPSERT_SQL.replace(
         "RETURNING id, seq", ""
     )
+    # Same columns, insert-if-absent: a batch row flagged ``insert_if_absent``
+    # (a lossy compaction view the reconcile still owes when the incremental
+    # write was lost) fills a missing row but never rewrites an existing one.
+    _THREAD_MESSAGE_INSERT_IF_ABSENT_BATCH_SQL = (
+        _THREAD_MESSAGE_UPSERT_SQL.partition("ON CONFLICT (id)")[0]
+        + "ON CONFLICT (id) DO NOTHING"
+    )
     _THREAD_ACTIVITY_BUMP_SQL = """
         UPDATE threads
         SET last_activity = CURRENT_TIMESTAMP,
@@ -2472,7 +2480,10 @@ class PostgresDB:
         a stable ``id`` makes the upsert land on the incremental row via
         ``ON CONFLICT (id)``, and ``seq`` is preserved (assigned once on first
         insert). No ``RETURNING`` — the reconcile never reads ``seq`` back, and
-        ``executemany`` discards results anyway.
+        ``executemany`` discards results anyway. A dict flagged
+        ``insert_if_absent`` (a lossy compaction view of its row) is written
+        ``ON CONFLICT (id) DO NOTHING`` instead: it fills a row whose
+        incremental write was lost and never rewrites one that landed.
 
         The upsert runs inside a transaction so the whole turn reconciles
         atomically. This batches ONLY the reconcile; the incremental mid-turn
@@ -2529,10 +2540,12 @@ class PostgresDB:
             return json.dumps(value) if value is not None else None
 
         args: List[Tuple] = []
+        insert_if_absent: List[bool] = []
         max_turn = 0
         for m in messages:
             row_turn_number = m.get("turn_number")
             max_turn = max(max_turn, row_turn_number or 0)
+            insert_if_absent.append(m.get("insert_if_absent") is True)
             args.append(
                 (
                     _coerce_row_id(m.get("id")),
@@ -2608,10 +2621,17 @@ class PostgresDB:
                 # Same upsert as save_thread_message, minus RETURNING. Each
                 # execution's ON CONFLICT is independent (executemany runs N
                 # separate commands), so distinct-id rows never collide.
-                if args:
+                # Insert-if-absent rows run as their own statement per
+                # consecutive run, in row order, so a row either kind has to
+                # mint still lands at its position in seq.
+                for only_if_absent, run in groupby(
+                    zip(insert_if_absent, args), key=lambda pair: pair[0]
+                ):
                     await conn.executemany(
-                        self._THREAD_MESSAGE_UPSERT_BATCH_SQL,
-                        args,
+                        self._THREAD_MESSAGE_INSERT_IF_ABSENT_BATCH_SQL
+                        if only_if_absent
+                        else self._THREAD_MESSAGE_UPSERT_BATCH_SQL,
+                        [row for _, row in run],
                     )
                 # One activity/turn bump for the whole batch (was per-message).
                 # The stateless producer path also bumps an output-less turn.
