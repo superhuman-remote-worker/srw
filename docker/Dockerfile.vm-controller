@@ -37,6 +37,15 @@ RUN --network=none --mount=type=bind,source=scripts/check_kubernetes_sdk_auth.py
 RUN --network=none --mount=type=bind,source=scripts/check_vm_controller_imports.py,target=/tmp/check_vm_controller_imports.py \
     python -I /tmp/check_vm_controller_imports.py
 
+# Belt-and-braces alongside the AST probe above (which is bind-mounted from
+# the build context): assert the deferred shared module the controller
+# imports at startup also resolves in this exact image. Offline, no
+# credentials or network, so this is safe wherever this Dockerfile builds,
+# including production CI. Limit: guards live in the watched tree, so a
+# wholesale tree swap can replace them too; branch-changing work belongs in
+# a separate worktree (see Tiltfile operational rule).
+RUN --network=none python -I -c "import shared.vm_resource_inventory_settings"
+
 # Non-root user — K8s RBAC handles authorization
 RUN useradd --create-home --no-log-init controller
 USER controller

@@ -19,7 +19,9 @@ def test_discovery_preserves_explicit_namespaces_and_original_config(
     binaries = tmp_path / "bin"
     binaries.mkdir()
     original = tmp_path / "original.json"
-    original.write_text('{"current-context":"local","private":"unchanged"}')
+    # Ambient current-context is deliberately NOT k3d-srw: the script must
+    # operate on the explicitly selected entry regardless of ambient state.
+    original.write_text('{"current-context":"ambient-other","private":"unchanged"}')
     before = original.read_bytes()
     observation = tmp_path / "observation.json"
     fake = (
@@ -27,9 +29,18 @@ def test_discovery_preserves_explicit_namespaces_and_original_config(
         + """
 import json, os, sys
 from pathlib import Path
+CTX = os.environ.get('SRW_HELM_EXPECT_CONTEXT', 'k3d-srw')
 name = Path(sys.argv[0]).name
 args = sys.argv[1:]
+def strip_target(args, flag):
+    # The apply script must target every cluster operation explicitly: assert
+    # the expected flag/value instead of merely discarding unknown prefixes.
+    assert args[0] == flag and args[1] == CTX, args
+    rest = args[2:]
+    assert '--kube-context' not in rest and '--context' not in rest, rest
+    return rest
 if name == 'helm':
+    args = strip_target(args, '--kube-context')
     if args[0] == 'status':
         print(json.dumps({'info': {'status': 'deployed'}}))
     elif args[:2] == ['get', 'manifest']:
@@ -39,23 +50,29 @@ if name == 'helm':
         ]}))
     elif args[:2] != ['upgrade', '--install']:
         raise AssertionError(args)
-elif args[:2] == ['config', 'view']:
-    print(json.dumps({'current-context': 'local', 'contexts': [
-        {'name': 'local', 'context': {'cluster': 'cluster', 'user': 'user', 'namespace': 'old'}}
-    ], 'users': [{'name': 'user', 'user': {'token': 'test-only-no-copy'}}]}))
-else:
-    assert args == ['get', '-oyaml', '-f', '-'], args
-    paths = os.environ['KUBECONFIG'].split(os.pathsep)
-    overlay = json.loads(Path(paths[0]).read_text())
-    docs = json.load(sys.stdin)
-    json.dump({'overlay': overlay, 'paths': paths, 'docs': docs},
-              open(os.environ['OBSERVATION'], 'w'))
-    if os.environ['GET_FAILS'] == 'true':
-        sys.exit(9)
-    namespace = overlay['contexts'][0]['context']['namespace']
-    for item in docs['items']:
-        item['metadata'].setdefault('namespace', namespace)
-    print(json.dumps(docs))
+elif name == 'kubectl':
+    args = strip_target(args, '--context')
+    if args[:2] == ['config', 'view']:
+        # Emulate real kubectl: `config view --minify` honors --context, so
+        # the round-tripped name proves the explicitly selected entry
+        # resolves. Ambient current-context is never consulted here.
+        selected = CTX
+        print(json.dumps({'current-context': selected, 'contexts': [
+            {'name': selected, 'context': {'cluster': 'cluster', 'user': 'user', 'namespace': 'old'}}
+        ], 'users': [{'name': 'user', 'user': {'token': 'test-only-no-copy'}}]}))
+    else:
+        assert args == ['get', '-oyaml', '-f', '-'], args
+        paths = os.environ['KUBECONFIG'].split(os.pathsep)
+        overlay = json.loads(Path(paths[0]).read_text())
+        docs = json.load(sys.stdin)
+        json.dump({'overlay': overlay, 'paths': paths, 'docs': docs},
+                  open(os.environ['OBSERVATION'], 'w'))
+        if os.environ['GET_FAILS'] == 'true':
+            sys.exit(9)
+        namespace = overlay['contexts'][0]['context']['namespace']
+        for item in docs['items']:
+            item['metadata'].setdefault('namespace', namespace)
+        print(json.dumps(docs))
 """
     )
     for name in ("helm", "kubectl"):
@@ -86,10 +103,10 @@ else:
     assert observed["overlay"] == {
         "apiVersion": "v1",
         "kind": "Config",
-        "current-context": "local",
+        "current-context": "k3d-srw",
         "contexts": [
             {
-                "name": "local",
+                "name": "k3d-srw",
                 "context": {"cluster": "cluster", "user": "user", "namespace": "srw"},
             }
         ],

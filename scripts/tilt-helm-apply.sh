@@ -37,21 +37,61 @@ RELEASE="${RELEASE_NAME:?RELEASE_NAME not set (Tilt supplies this)}"
 CHART="${CHART:?CHART not set (Tilt supplies this)}"
 NS="${NAMESPACE:-}"
 STALE_AFTER="${SRW_HELM_STALE_AFTER:-60}"
-# helm/kubectl here use the ambient kubeconfig context, same as the extension's
-# helper did. That is fine for `helm upgrade` (Tilt refuses non-local contexts
-# unless allow_k8s_contexts is set), but the preflight *deletes* a Secret, so
-# gate that one step on the context actually being the local dev cluster.
+# helm/kubectl below must each name the target cluster explicitly via
+# EXPECT_CONTEXT. Ambient kubeconfig is not sufficient: a --context/
+# --kube-context flag on a parent command does not propagate to these child
+# invocations, and the preflight *deletes* a Secret, so every operation
+# carries its own context flag. Never point these at `main`.
 EXPECT_CONTEXT="${SRW_HELM_EXPECT_CONTEXT:-k3d-srw}"
+
+# --- cluster-target guard: fail before any Helm/kubectl invocation ---------
+# EXPECT_CONTEXT used to gate only the preflight delete; it now selects every
+# operation, so a disallowed value (e.g. SRW_HELM_EXPECT_CONTEXT=main) would
+# redirect upgrades at another cluster. Reject anything outside the allowlist
+# here, before the first cluster command runs.
+case "$EXPECT_CONTEXT" in
+k3d-srw) ;;
+*)
+    echo "srw-preflight: refusing disallowed target '$EXPECT_CONTEXT' (SRW_HELM_EXPECT_CONTEXT)." >&2
+    echo "srw-preflight: only 'k3d-srw' is permitted for this inner-loop apply." >&2
+    exit 1
+    ;;
+esac
+
+# Forwarded Tilt/CLI arguments (Tilt passes --take-ownership, --wait,
+# --timeout, --values, --set/--set-string) must not smuggle cluster
+# selectors: pflag lets a later duplicate flag win, so an inherited
+# --kube-context/--context/--namespace would silently override the explicit
+# targeting below. Cluster selectors travel via SRW_HELM_EXPECT_CONTEXT and
+# NAMESPACE env, never argv; reject them outright (even redundant ones, since
+# this script appends its own).
+for _srw_forwarded_arg in "$@"; do
+    case "$_srw_forwarded_arg" in
+    --kube-context* | --context | --context=* | --cluster* | --server | -s | \
+    --kubeconfig* | --namespace | --namespace=* | -n | --as* | --token* | \
+    --username* | --password* | --client-certificate* | --client-key* | \
+    --certificate-authority* | --insecure-skip-tls-verify* | --tls-server-name*)
+        echo "srw-preflight: refusing cluster-selecting argument '$_srw_forwarded_arg'." >&2
+        echo "srw-preflight: cluster targeting is fixed to '$EXPECT_CONTEXT' via env, not argv." >&2
+        exit 1
+        ;;
+    esac
+done
+unset _srw_forwarded_arg
 
 ns_args=()
 if [[ -n "$NS" ]]; then
     ns_args=(--namespace "$NS")
 fi
+# Per-operation cluster targeting (see above): helm takes --kube-context,
+# kubectl takes --context.
+helm_ctx_args=(--kube-context "$EXPECT_CONTEXT")
+kctx_args=(--context "$EXPECT_CONTEXT")
 
 # --- preflight: clear a stale pending-* revision -----------------------------
 unstick_pending_release() {
     local status age pending_revs
-    status="$(helm status "$RELEASE" "${ns_args[@]}" -o json 2>/dev/null |
+    status="$(helm "${helm_ctx_args[@]}" status "$RELEASE" "${ns_args[@]}" -o json 2>/dev/null |
         python3 -c 'import json,sys; print(json.load(sys.stdin)["info"]["status"])' 2>/dev/null || true)"
 
     case "$status" in
@@ -60,7 +100,7 @@ unstick_pending_release() {
     esac
 
     # How long has it sat there? A live helm run is not ours to interrupt.
-    age="$(helm status "$RELEASE" "${ns_args[@]}" -o json 2>/dev/null | python3 -c '
+    age="$(helm "${helm_ctx_args[@]}" status "$RELEASE" "${ns_args[@]}" -o json 2>/dev/null | python3 -c '
 import datetime, json, sys
 ts = json.load(sys.stdin)["info"]["last_deployed"]
 # Helm emits RFC3339 with nanosecond precision; trim to microseconds for fromisoformat.
@@ -75,7 +115,7 @@ print(int(delta.total_seconds()))
         return 0
     fi
 
-    pending_revs="$(helm history "$RELEASE" "${ns_args[@]}" -o json 2>/dev/null | python3 -c '
+    pending_revs="$(helm "${helm_ctx_args[@]}" history "$RELEASE" "${ns_args[@]}" -o json 2>/dev/null | python3 -c '
 import json, sys
 hist = json.load(sys.stdin)
 print(" ".join(str(h["revision"]) for h in hist if h["status"].startswith("pending")))
@@ -85,11 +125,18 @@ print(" ".join(str(h["revision"]) for h in hist if h["status"].startswith("pendi
         return 0
     fi
 
-    local ctx
-    ctx="$(kubectl config current-context 2>/dev/null || true)"
-    if [[ "$ctx" != "$EXPECT_CONTEXT" ]]; then
-        echo "srw-preflight: refusing to clear the lock — kube context is '$ctx', expected '$EXPECT_CONTEXT'." >&2
-        echo "srw-preflight: set SRW_HELM_EXPECT_CONTEXT if that is wrong. Letting helm fail loudly instead." >&2
+    # Validate the EXPLICITLY selected context, not the ambient one:
+    # `kubectl config current-context` reports ambient current-context even
+    # when --context names another entry, so consulting it here can refuse
+    # recovery of the intended local release (or approve the wrong one).
+    # `config view --minify` honors --context, so the round-tripped name
+    # proves the selected entry resolves. This reads local kubeconfig files
+    # only: no cluster contact, no change to the user's global kubeconfig.
+    local selected
+    selected="$(kubectl "${kctx_args[@]}" config view --minify -o json 2>/dev/null | python3 -c 'import json,sys; print(json.load(sys.stdin).get("current-context", ""))' 2>/dev/null || true)"
+    if [[ "$selected" != "$EXPECT_CONTEXT" ]]; then
+        echo "srw-preflight: refusing to clear the lock — explicitly selected context resolves to '$selected', expected '$EXPECT_CONTEXT'." >&2
+        echo "srw-preflight: ambient current-context is not consulted. Letting helm fail loudly instead." >&2
         return 0
     fi
 
@@ -97,11 +144,11 @@ print(" ".join(str(h["revision"]) for h in hist if h["status"].startswith("pendi
     echo "srw-preflight: dropping the pending revision secret(s); --take-ownership re-adopts any applied object." >&2
 
     for rev in $pending_revs; do
-        kubectl delete secret "sh.helm.release.v1.${RELEASE}.v${rev}" \
+        kubectl "${kctx_args[@]}" delete secret "sh.helm.release.v1.${RELEASE}.v${rev}" \
             "${ns_args[@]}" --ignore-not-found >&2
     done
 
-    echo "srw-preflight: cleared. Head is now $(helm list "${ns_args[@]}" --all -o json 2>/dev/null | python3 -c '
+    echo "srw-preflight: cleared. Head is now $(helm "${helm_ctx_args[@]}" list "${ns_args[@]}" --all -o json 2>/dev/null | python3 -c '
 import json, sys
 rels = json.load(sys.stdin)
 print(next((f'"'"'rev {r["revision"]} ({r["status"]})'"'"' for r in rels), "none"))
@@ -148,7 +195,7 @@ for ((i = 0; i < image_count; i++)); do
 done
 
 # --- apply -------------------------------------------------------------------
-install_cmd=(helm upgrade --install "${flags[@]}" "${ns_args[@]}" "$RELEASE" "$CHART")
+install_cmd=(helm "${helm_ctx_args[@]}" upgrade --install "${flags[@]}" "${ns_args[@]}" "$RELEASE" "$CHART")
 echo "Running cmd: ${install_cmd[*]}" >&2
 "${install_cmd[@]}" >&2
 
@@ -160,12 +207,14 @@ echo "Running cmd: ${install_cmd[*]}" >&2
 # kubeconfig files, which are never changed.
 read_release_resources() (
     if [[ -z "$NS" ]]; then
-        helm get manifest "$RELEASE" | kubectl get -oyaml -f -
+        helm "${helm_ctx_args[@]}" get manifest "$RELEASE" | kubectl "${kctx_args[@]}" get -oyaml -f -
         exit
     fi
     srw_read_context_file="$(mktemp "${TMPDIR:-/tmp}/srw-tilt-context.XXXXXX")"
     trap 'rm -f -- "$srw_read_context_file"' EXIT
-    kubectl config view --minify -o json | python3 -c '
+    # Select EXPECT_CONTEXT explicitly: ambient current-context is not proof
+    # of the right cluster (verified: config view --minify honors --context).
+    kubectl --context "$EXPECT_CONTEXT" config view --minify -o json | python3 -c '
 import json, sys
 config = json.load(sys.stdin)
 name = config["current-context"]
@@ -174,10 +223,10 @@ context = {key: current[key] for key in ("cluster", "user") if key in current}
 context["namespace"] = sys.argv[1]
 json.dump({"apiVersion": "v1", "kind": "Config", "current-context": name,
            "contexts": [{"name": name, "context": context}]}, sys.stdout)
-' "$NS" > "$srw_read_context_file"
-    helm get manifest "$RELEASE" "${ns_args[@]}" |
+    ' "$NS" > "$srw_read_context_file"
+    helm "${helm_ctx_args[@]}" get manifest "$RELEASE" "${ns_args[@]}" |
         KUBECONFIG="$srw_read_context_file:${KUBECONFIG:-$HOME/.kube/config}" \
-        kubectl get -oyaml -f -
+        kubectl --context "$EXPECT_CONTEXT" get -oyaml -f -
 )
 echo "Running cmd: helm get manifest $RELEASE | kubectl get -f - -oyaml" >&2
 read_release_resources

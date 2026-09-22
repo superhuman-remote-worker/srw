@@ -34,6 +34,22 @@
 # Tilt gives up.
 update_settings(k8s_upsert_timeout_secs=900)
 
+# Context guard — the inner loop must never touch the shared `main` cluster.
+# allow_k8s_contexts() is ADDITIVE to Tilt's built-in local-context allowance,
+# so it alone cannot exclude other local clusters. Fail fast unless the active
+# context is exactly the local k3d dev cluster, before any side-effecting work
+# below. Do NOT add `main` (or any other context) here.
+allow_k8s_contexts('k3d-srw')
+
+if k8s_context() != 'k3d-srw':
+    fail("Refusing to run: Kubernetes context is '%s', expected 'k3d-srw'. " % k8s_context() +
+         "Switch with 'kubectl config use-context k3d-srw' or export a k3d-only KUBECONFIG.")
+
+# Operational rule: keep Tilt's watched checkout stable. Branch-changing work
+# (checkout/pull/rebase) belongs in a separate worktree, never in this tree
+# while Tilt watches it — a mid-build tree swap can ship mixed image content
+# that no in-tree guard can catch (2026-09-22 incident).
+
 # -----------------------------------------------------------------------------
 # Global watch exclusions — paths Tilt must never treat as a code change.
 #
@@ -417,7 +433,7 @@ k8s_custom_deploy(
         '--timeout=14m',
     ] + _srw_values_args,
     apply_env=_srw_helm_env,
-    delete_cmd=['helm', 'uninstall', '--namespace', 'srw', 'srw'],
+    delete_cmd=['helm', 'uninstall', '--kube-context', 'k3d-srw', '--namespace', 'srw', 'srw'],
     # Values edits DO trigger a redeploy (changed 2026-08-30). This was `deps=[]`,
     # inherited from the `helm_resource` default this replaced, which meant an
     # edit to either values file was silently a no-op: Tilt reported the resource
