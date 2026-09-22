@@ -18,6 +18,7 @@ import binascii
 import hashlib
 import logging
 import posixpath
+import re
 import shlex
 import shutil
 import subprocess
@@ -50,6 +51,12 @@ _UNDO_PREPARE_TRAILER = "SRW-Undo-Prepare"
 _UNDO_SOURCE_TRAILER = "SRW-Undo-Source"
 _UNDO_TARGET_TRAILER = "SRW-Undo-Target"
 _GIT_NUL_INTEGRITY_FRAME = "SRW-Git-NUL-Integrity"
+
+# One `git status --porcelain` (v1) entry: one or two status columns, a space,
+# the path. One column when the backend shell stripped the first line's leading
+# space. Anything else (a merged-in "warning: could not open directory ...")
+# is kept whole: it still means git cannot account for part of the tree.
+_PORCELAIN_ENTRY = re.compile(r"^[ MADRCUT?!]{1,2} (.+)$")
 
 
 @dataclass(frozen=True, slots=True)
@@ -950,6 +957,40 @@ class GitManager:
             return bool(result.stdout.strip())
         except Exception:
             return False
+
+    def uncommitted_paths(self) -> Optional[list[str]]:
+        """Paths whose state is not in HEAD — staged, unstaged or untracked.
+
+        ``has_uncommitted_changes`` answers False when git cannot run, the
+        right default for a progress probe and the wrong one for a seal: a
+        status that cannot be read must not read as clean. This returns None
+        for "unknown" (inactive repo, failed command) so the caller decides.
+
+        Paths are best-effort labels for a message (porcelain v1, one per
+        line); the emptiness of the list is the exact answer.
+
+        ``--ignore-submodules=dirty``: an embedded repository (an agent's own
+        ``git clone`` into a non-ignored directory) with edits inside it reads
+        `` M <dir>`` forever — ``add -A`` can only stage its HEAD, never its
+        working tree. A moved nested HEAD is still reported until committed.
+        """
+        if not self.is_active:
+            return None
+        try:
+            result = self._run_git(
+                ["status", "--porcelain", "--ignore-submodules=dirty"]
+            )
+        except Exception:
+            return None
+        if result.returncode != 0:
+            return None
+        paths = []
+        for line in result.stdout.splitlines():
+            if not line.strip():
+                continue
+            entry = _PORCELAIN_ENTRY.match(line)
+            paths.append(entry.group(1).strip() if entry else line.strip())
+        return paths
 
     def tag(self, tag_name: str, message: Optional[str] = None) -> bool:
         """Create a git tag at current HEAD (create-once, never moved).

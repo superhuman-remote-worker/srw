@@ -1695,6 +1695,45 @@ class TestGitManagerBackendLogStatusDiff:
 
         assert "Add research notes" in result
 
+    def test_uncommitted_paths_reads_backend_porcelain(self):
+        """The backend strips the first line's leading space; a merged-in
+        stderr warning stays visible rather than reading as clean."""
+        gm, backend = self._make_active_gm()
+        backend.shell_run.return_value = (
+            "Exit code: 0\nCWD: /home/agent-host/workspace\n--- stdout ---\n"
+            "M output/report.md\n"
+            "?? output/logs/\n"
+            "warning: could not open directory 'output/root-only/': "
+            "Permission denied"
+        )
+
+        paths = gm.uncommitted_paths()
+
+        assert paths == [
+            "output/report.md",
+            "output/logs/",
+            "warning: could not open directory 'output/root-only/': Permission denied",
+        ]
+        cmd = backend.shell_run.call_args[0][0]
+        assert "git status --porcelain --ignore-submodules=dirty" in cmd
+
+    def test_uncommitted_paths_clean_is_empty_not_unknown(self):
+        gm, backend = self._make_active_gm()
+        backend.shell_run.return_value = "Exit code: 0\n(no output)"
+
+        assert gm.uncommitted_paths() == []
+
+    def test_uncommitted_paths_unknown_when_status_fails(self):
+        """``has_uncommitted_changes`` reads a failure as clean; this must not."""
+        gm, backend = self._make_active_gm()
+        backend.shell_run.return_value = (
+            "Tab 'git' has a previous command still running; your new command "
+            "was NOT executed."
+        )
+
+        assert gm.uncommitted_paths() is None
+        assert gm.has_uncommitted_changes() is False  # the contrast
+
 
 class TestGitManagerBackendBranch:
     """Tests for branch operations via backend."""
