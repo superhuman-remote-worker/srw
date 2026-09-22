@@ -518,3 +518,56 @@ class TestExplicitBundledExpertVersusApplicationDefault:
             )
 
         assert excinfo.value.status_code == 400
+
+
+class TestWorkCategoryStaffsAnUnnamedWorker:
+    """The same funnel, one tier further down the precedence: a job that names
+    no expert but carries a work category is staffed by that category's
+    default rather than the application default. See
+    knowledge-base/knowledge/issues/category_expert_default_skipped_on_direct_dispatch.md."""
+
+    @pytest.mark.asyncio
+    async def test_an_executor_reaches_create_job_as_its_default_expert(
+        self, db, fake_request
+    ):
+        from orchestrator.main import JobCreate
+        from orchestrator.services.work_categories import default_expert
+
+        resolver = AsyncMock(return_value=_application_default())
+        kwargs = await _rest_create(
+            db,
+            fake_request,
+            JobCreate(
+                description="build it", project_id=PROJECT_ID, work_category="executor"
+            ),
+            resolver,
+        )
+
+        assert kwargs["config_name"] == default_expert("executor")
+        assert kwargs["expert_id"] is None
+        assert kwargs["context"]["expert_selection"] == {
+            "source": "category",
+            "category": "executor",
+            "expert": default_expert("executor"),
+        }
+
+    @pytest.mark.asyncio
+    async def test_a_named_expert_still_outranks_the_category(self, db, fake_request):
+        from orchestrator.main import JobCreate
+
+        resolver = AsyncMock(return_value=_application_default())
+        kwargs = await _rest_create(
+            db,
+            fake_request,
+            JobCreate(
+                description="look first",
+                project_id=PROJECT_ID,
+                expert="scholar",
+                work_category="executor",
+            ),
+            resolver,
+        )
+
+        resolver.assert_not_awaited()
+        assert (kwargs["config_name"], kwargs["expert_id"]) == ("scholar", None)
+        assert kwargs["context"]["expert_selection"]["source"] == "bundled"

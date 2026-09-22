@@ -26,6 +26,7 @@ from orchestrator.services.job_admission_scope import (
 )
 from orchestrator.services.job_admission_config import (
     JobAdmissionConfigDependencies,
+    apply_work_expert_default,
     prepare_job_admission_config,
 )
 from orchestrator.services.job_admission_officer import (
@@ -89,17 +90,33 @@ async def admit_job(
             origin=origin,
             dependencies=dependencies.scope(),
         )
+        config_dependencies = dependencies.config()
         config = await prepare_job_admission_config(
             command=command,
             scope=scope,
             origin=origin,
-            dependencies=dependencies.config(),
+            dependencies=config_dependencies,
         )
         officer = await prepare_job_admission_officer(
             command=command,
             config=config,
             dependencies=dependencies.officer(),
         )
+        if config.expert_is_fallback:
+            # Needs the slot's category and the ticket's pin, which only the
+            # Officer stage knows.
+            config = apply_work_expert_default(
+                config,
+                context=officer.context,
+                ticket_expert=officer.ticket_expert,
+                requested_category=command.work_category,
+                slot_category=(
+                    officer.preparation.category
+                    if officer.preparation is not None
+                    else None
+                ),
+                bundled_expert_exists=config_dependencies.bundled_expert_exists,
+            )
         workspace_selection = config.workspace_selection
         if workspace_selection and workspace_selection.get("project_revision"):
             from orchestrator.services.manifest_workspace_selection import (

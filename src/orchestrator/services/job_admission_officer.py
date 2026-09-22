@@ -68,6 +68,9 @@ class JobAdmissionOfficer:
     config_override: dict[str, Any] | None
     preparation: OfficerAdmissionPreparation | None
     ticket_ready_at: datetime | None
+    # The claimed ticket's validated ``expert:`` pin. It outranks the
+    # category default, as in ``work_categories.resolve_expert``.
+    ticket_expert: str | None = None
 
 
 async def prepare_job_admission_officer(
@@ -92,6 +95,7 @@ async def prepare_job_admission_officer(
     officer_slot_name: str | None = None
     officer_admission_preparation = None
     officer_ticket_ready_at: datetime | None = None
+    officer_ticket_expert: str | None = None
     thread_id = (
         str(command.thread_id) if (command.thread_id and root_creation) else None
     )
@@ -226,6 +230,7 @@ async def prepare_job_admission_officer(
                     if ready_value.tzinfo
                     else ready_value.replace(tzinfo=timezone.utc)
                 )
+                officer_ticket_expert = classification.expert
 
             # Precedence law (§6): the SLOT's category decides the contract
             # this worker is held to. Explicit model/backend choices must
@@ -259,6 +264,7 @@ async def prepare_job_admission_officer(
         config_override=config_override,
         preparation=officer_admission_preparation,
         ticket_ready_at=officer_ticket_ready_at,
+        ticket_expert=officer_ticket_expert,
     )
 
 
