@@ -310,6 +310,11 @@ def family_of(model_id: str, default: str = "default") -> str:
     known family names. Deliberately minimal and explicit-loss: returns
     ``default`` on any miss rather than inventing new families.
     """
+    # A non-string id is a miss, not an error: the matcher below uses
+    # ``re.match``, and restore paths that swallow exceptions as non-fatal
+    # would otherwise drop a session's messages over a family lookup.
+    if not isinstance(model_id, str):
+        return default
     name = model_id.lower()
     for prefix in ("openrouter/", "groq/", "codex/"):
         if name.startswith(prefix):

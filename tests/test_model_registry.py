@@ -311,6 +311,16 @@ class TestFamilyOf:
         # Dated Opus 5 snapshots start with a digit after the dash, not "5".
         assert family_of("claude-opus-5-20260401") == "claude-opus-5"
 
+    def test_non_string_model_id_is_a_miss_not_an_error(self):
+        # The 5.5 rule is a regex; a non-string id (None, a mock config's
+        # model) must fall back to the default rather than raise, because the
+        # session-restore path swallows the raise and drops the messages.
+        from unittest.mock import MagicMock
+
+        assert family_of(None) == "default"
+        assert family_of(MagicMock()) == "default"
+        assert family_of(MagicMock(), default="x") == "x"
+
     def test_claude_fable_is_one_family_for_5_and_5_1(self):
         assert family_of("claude-fable-5") == "claude-fable"
         assert family_of("claude-fable-5-1") == "claude-fable"
