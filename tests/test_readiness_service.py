@@ -52,12 +52,14 @@ class _FakeDb:
         pinned_capabilities: list[str] | None = None,
         fallback_setting: dict[str, Any] | None = None,
         expert_defaults: list[dict[str, Any]] | None = None,
+        endpoint_models: list[dict[str, Any]] | None = None,
     ) -> None:
         self._api_keys = api_keys or []
         self._endpoints = endpoints or []
         self._counts = capability_counts or {}
         self._pinned = pinned_capabilities or []
         self._fallback_setting = fallback_setting
+        self._endpoint_models = endpoint_models or []
         self._expert_defaults = (
             expert_defaults
             if expert_defaults is not None
@@ -69,6 +71,9 @@ class _FakeDb:
 
     async def list_system_llm_endpoints(self) -> list[dict[str, Any]]:
         return list(self._endpoints)
+
+    async def list_models(self, *, provider_kind: str) -> list[dict[str, Any]]:
+        return [m for m in self._endpoint_models if m["provider_kind"] == provider_kind]
 
     async def count_enabled_models_by_capability(self) -> dict[str, int]:
         return dict(self._counts)
@@ -304,3 +309,43 @@ def test_gate_error_detail_message_for_no_providers() -> None:
     }
     detail = readiness.gate_error_detail(payload)
     assert "Configure at least one provider" in detail["message"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("capabilities", [["search"], ["search", "fetch"], ["fetch"]])
+async def test_research_endpoint_does_not_complete_model_provider_setup(capabilities):
+    db = _FakeDb(
+        endpoints=[{"id": "research-endpoint", "label": "Renamed search service"}],
+        endpoint_models=[
+            {
+                "provider_kind": "endpoint",
+                "provider_ref": "research-endpoint",
+                "capabilities": capabilities,
+                "enabled": True,
+            }
+        ],
+    )
+    result = await readiness.compute_readiness(db)
+    assert result["missing_providers"] == ["any"]
+    assert result["ready"] is False
+
+
+@pytest.mark.asyncio
+async def test_mixed_research_and_chat_endpoint_counts_as_model_provider():
+    db = _FakeDb(
+        endpoints=[{"id": "mixed-endpoint"}],
+        endpoint_models=[
+            {
+                "provider_kind": "endpoint",
+                "provider_ref": "mixed-endpoint",
+                "capabilities": ["search"],
+            },
+            {
+                "provider_kind": "endpoint",
+                "provider_ref": "mixed-endpoint",
+                "capabilities": ["chat", "auxiliary"],
+            },
+        ],
+    )
+    result = await readiness.compute_readiness(db)
+    assert result["missing_providers"] == []

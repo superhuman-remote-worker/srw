@@ -41,11 +41,17 @@ server, etc.) — see [Production install](#production-install-bring-your-own).
 
 ## Prerequisites
 
+For a fresh K3s server, complete [host preparation](../docs/k3s-host-preparation.md)
+first, especially on shared Fedora hosts or when volumes must use a separate disk.
+
 - **Kubernetes** 1.28+ with at least 8 vCPU / 16 GiB RAM available for the namespace
 - **Ingress controller** — `nginx`, `traefik`, or another. The chart defaults to `traefik` (override via `ingress.className`). The opt-in single-origin profile supplies its own namespaced gateway instead.
 - **cert-manager** with a `ClusterIssuer` for multi-host TLS (set `ingress.tls.issuerName`). It is not required by the self-signed single-origin profile.
 - **DNS** — wildcard or per-subdomain records pointing at your ingress LB for `*.<global.domain>` (`api`, `auth`, `git`, `cloud`, `mcp`). An IP-based single-origin profile needs no DNS.
 - **Helm** 3.12+
+- **Workspace SSH Secret** `srw-vm-ssh-key` with matching `ssh-privatekey` and
+  `ssh-publickey`, including for container-only installations. The generator's
+  `install.sh` creates or validates this before Helm; manual installs must supply it.
 - **A `dockerconfigjson` pull secret** if you're pulling private GHCR images. Public images need no credentials.
 
 Optional but recommended:

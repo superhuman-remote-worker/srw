@@ -1505,3 +1505,18 @@ class TestRouteHeaderInjection:
         )
         betas = result["llm"]["summarization"]["extra_headers"]["Anthropic-Beta"]
         assert "redact-thinking" not in betas
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["local", "openrouter"])
+async def test_empty_install_quietly_skips_kb_embeddings(monkeypatch, caplog, provider):
+    for name in ("EMBEDDING_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("EMBEDDING_PROVIDER", provider)
+    monkeypatch.setattr(
+        orchestrator.main.postgres_db,
+        "resolve_default_for_capability",
+        AsyncMock(return_value=None),
+    )
+    assert await _build_kb_embedding_service() is None
+    assert not [r for r in caplog.records if r.levelno >= 30]

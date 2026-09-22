@@ -6,7 +6,7 @@ import {UserService} from '../../core/services/user.service';
 
 /**
  * Persistent top banner shown when the model catalog (`GET /api/models`) is
- * empty. Copy is role-aware: admins are pointed at Admin → Providers, regular
+ * empty. Copy is role-aware: admins are pointed at Admin → Models → Providers, regular
  * users at Settings → API Keys. Dismiss is session-local and resets on reload
  * — deliberately not stored, so the nag returns until the catalog is populated.
  */

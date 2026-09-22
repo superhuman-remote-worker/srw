@@ -1076,7 +1076,7 @@
   },
   "emptyCatalog": {
     "bannerUser": "No LLMs configured yet — add an API key in Settings → API Keys, or register a custom LLM, to use the app.",
-    "bannerAdmin": "No LLMs configured yet — configure a provider in Admin → Providers to use the app.",
+    "bannerAdmin": "No LLMs configured yet — configure a provider in Admin → Models → Providers to use the app.",
     "pickerCta": "Configure a provider to enable this picker.",
     "dismiss": "Dismiss"
   },

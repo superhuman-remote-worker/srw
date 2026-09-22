@@ -1076,7 +1076,7 @@
   },
   "emptyCatalog": {
     "bannerUser": "Noch keine LLMs konfiguriert — füge in Einstellungen → API-Keys einen Key hinzu oder registriere ein eigenes LLM.",
-    "bannerAdmin": "Noch keine LLMs konfiguriert — konfiguriere unter Admin → Anbieter einen Anbieter, um die App zu nutzen.",
+    "bannerAdmin": "Noch keine LLMs konfiguriert — konfiguriere unter Admin → Modelle → Anbieter einen Anbieter, um die App zu nutzen.",
     "pickerCta": "Konfiguriere einen Anbieter, um diese Auswahl zu aktivieren.",
     "dismiss": "Schließen"
   },

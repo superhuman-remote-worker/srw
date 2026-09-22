@@ -68,7 +68,24 @@ async def compute_readiness(db: Any) -> dict[str, Any]:
     """
     api_keys = await db.list_system_api_keys()
     endpoints = await db.list_system_llm_endpoints()
-    has_any_provider = bool(api_keys) or bool(endpoints)
+    # Search/fetch providers share the endpoint table with model transports.
+    # Use catalog capabilities rather than labels (operators can rename them).
+    # A newly added endpoint without catalog rows still completes this first
+    # setup step; model capabilities/defaults are checked separately below.
+    research_only: set[str] = set()
+    model_endpoints: set[str] = set()
+    if endpoints and not api_keys:
+        for model in await db.list_models(provider_kind="endpoint"):
+            ref = str(model["provider_ref"])
+            caps = set(model.get("capabilities") or [])
+            if caps and caps <= {"search", "fetch"}:
+                research_only.add(ref)
+            else:
+                model_endpoints.add(ref)
+    research_only -= model_endpoints
+    has_any_provider = bool(api_keys) or any(
+        str(endpoint["id"]) not in research_only for endpoint in endpoints
+    )
 
     counts = await db.count_enabled_models_by_capability()
     pinned_caps = set(await db.list_default_pin_capabilities())

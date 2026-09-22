@@ -554,6 +554,17 @@ async def inject_system_kb_embedding_profile(
         # per-user model and filtered every indexed chunk out.
         from shared.runtime.services.embedding_service import EmbeddingService
 
+        provider = os.getenv("EMBEDDING_PROVIDER", "local").lower()
+        fallback_key = (
+            os.getenv("OPENROUTER_API_KEY")
+            if provider == "openrouter"
+            else os.getenv("EMBEDDING_API_KEY") or os.getenv("OPENAI_API_KEY")
+        )
+        # The SDK rejects missing credentials during construction, before the
+        # old fallback.api_key guard could run. A fresh install has no provider
+        # yet: leave the KB sweep idle without constructing a broken client.
+        if not fallback_key:
+            return None
         fallback = EmbeddingService()
         if not fallback.api_key:
             return None

@@ -10,6 +10,7 @@ notes are intentionally not prerequisites for using the public repository.
 |---|---|
 | Understand what SRW is | [Project README](../README.md) |
 | Evaluate SRW on a Linux workstation | [Local Kubernetes with k3d](local-kubernetes.md) |
+| Prepare K3s on a shared server with separate volume storage | [K3s host preparation](k3s-host-preparation.md) |
 | Install on an existing cluster | [Helm chart guide](../helm/README.md) |
 | Understand the runtime and data flow | [Architecture](architecture.md) |
 | Evaluate the isolation boundary | [Security model](security-model.md) |
