@@ -25,6 +25,14 @@ from orchestrator.services.family_matcher import detect_family
         ("claude-opus-5", "claude-opus-5"),
         ("openrouter/anthropic/claude-opus-5", "claude-opus-5"),
         ("claude-opus-4-5", "claude-opus"),
+        # Opus 5.5 splits off Opus 5 (default effort moved to medium). Anthropic
+        # and CLIProxyAPI spell it with a hyphen, OpenRouter with a dot; a dated
+        # Opus 5 snapshot must not be mistaken for it.
+        ("claude-opus-5-5", "claude-opus-5-5"),
+        ("claude-opus-5-5-20260922", "claude-opus-5-5"),
+        ("openrouter/anthropic/claude-opus-5.5", "claude-opus-5-5"),
+        ("openrouter/anthropic/claude-opus-5.5:batch", "claude-opus-5-5"),
+        ("claude-opus-5-20260401", "claude-opus-5"),
         ("claude-sonnet-4-6", "claude-sonnet"),
         ("claude-haiku-4-5", "claude-haiku"),
         # Fable 5 and 5.1 share one family.
@@ -134,6 +142,7 @@ def test_case_insensitive_match() -> None:
     GEMINI-2.5-pro). The matcher should not care."""
     assert detect_family("CLAUDE-OPUS-4-7").family == "claude-opus"
     assert detect_family("Claude-Opus-5").family == "claude-opus-5"
+    assert detect_family("Claude-Opus-5-5").family == "claude-opus-5-5"
     assert detect_family("Gemini-2.5-pro").family == "gemini"
     assert detect_family("GPT-OSS-120B").family == "gpt-oss"
 

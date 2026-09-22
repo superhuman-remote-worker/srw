@@ -396,6 +396,34 @@ claude-opus-5:
     # 28px patches, Opus 4.7+/Fable5 high-res cap (2576px edge / 4784 tok max).
     image_tokens: { mode: anthropic_patches, patch_px: 28, max_edge: 2576, max_tokens: 4784, flat: 4784 }
 
+# Claude Opus 5.5 (released 2026-09-22). Same ladder, window, output cap and
+# vision as Opus 5, but split off because the calibrated default moved:
+# Anthropic's API default effort is `medium` on 5.5 (`high` on every other
+# effort model), and 5.5 thinks more per turn than Opus 5 at the same level —
+# carrying `high` over would silently buy a deeper, costlier default than the
+# provider tuned for. `high`/`xhigh`/`max` stay one dropdown pick away.
+#
+# 5.5 also rejects two things Opus 5 accepted, both upstream 400s — which on
+# the subscription proxy bench the whole Claude credential for ~60s:
+#   - thinking cannot be disabled (`thinking.type` disabled/enabled+budget).
+#     SRW never sends either; effort is the only reasoning control it drives.
+#   - forced tool use (`tool_choice` any/tool). Structured output here goes
+#     through `json_schema` (default block), never a forced tool; keep it that
+#     way — `function_calling` on this family would 400 every aux call.
+# OpenRouter lists it as `anthropic/claude-opus-5.5` (dot), Anthropic and
+# CLIProxyAPI as `claude-opus-5-5` (hyphen); all three resolvers take both.
+claude-opus-5-5:
+  reasoning: { method: effort_enum, delivery: native, default: medium, options: [low, medium, high, xhigh, max] }
+  settings:
+    shell_mode: persistent  # capable family -> stateful multi-tab shell (shell_execute); human/session override wins
+    temperature: 1.0  # Anthropic: just use temperature, leave top_p/top_k at defaults
+    multimodal: true
+    parallel_tool_calls: true
+    model_max_context_tokens: 1000000  # Opus 5.5: 1M context, 128K max output
+    max_output_tokens: 65536  # reasoning headroom (resolver clamps to ctx backstop)
+    # 28px patches, Opus 4.7+/Fable5 high-res cap (2576px edge / 4784 tok max).
+    image_tokens: { mode: anthropic_patches, patch_px: 28, max_edge: 2576, max_tokens: 4784, flat: 4784 }
+
 # Claude Sonnet / Haiku — NEW rows. Without them family_of('claude-sonnet')
 # falls through to `default` (multimodal:false!), so the homelab interactive
 # main model never counted images and compacted at the 128k default window.

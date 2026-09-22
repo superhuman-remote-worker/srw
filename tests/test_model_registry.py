@@ -302,6 +302,15 @@ class TestFamilyOf:
         assert family_of("claude-opus-5-20260401") == "claude-opus-5"
         assert family_of("openrouter/anthropic/claude-opus-5") == "claude-opus-5"
 
+    def test_claude_opus_5_5_splits_off_opus_5(self):
+        # Opus 5.5 moved the default effort, so it has its own family; the rule
+        # must beat the Opus 5 prefix and take OpenRouter's dotted spelling.
+        assert family_of("claude-opus-5-5") == "claude-opus-5-5"
+        assert family_of("claude-opus-5-5-20260922") == "claude-opus-5-5"
+        assert family_of("openrouter/anthropic/claude-opus-5.5") == "claude-opus-5-5"
+        # Dated Opus 5 snapshots start with a digit after the dash, not "5".
+        assert family_of("claude-opus-5-20260401") == "claude-opus-5"
+
     def test_claude_fable_is_one_family_for_5_and_5_1(self):
         assert family_of("claude-fable-5") == "claude-fable"
         assert family_of("claude-fable-5-1") == "claude-fable"

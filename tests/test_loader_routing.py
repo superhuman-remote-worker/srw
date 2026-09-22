@@ -583,6 +583,52 @@ class TestClaudeOpus5Reasoning:
         assert call_kwargs["model_kwargs"]["reasoning_effort"] == "high"
 
 
+class TestClaudeOpus55Reasoning:
+    """claude-opus-5-5 splits off claude-opus-5 for its default: Anthropic
+    calibrated 5.5 to `medium` (every other effort model defaults to `high`),
+    and it thinks more per turn at a given level. Ladder and settings are
+    otherwise Opus 5's."""
+
+    def test_capability_defaults_to_medium_on_the_full_ladder(self):
+        cap = reasoning_capability("claude-opus-5-5")
+        assert cap["method"] == "effort_enum"
+        assert cap["default"] == "medium"
+        assert cap["options"] == ["low", "medium", "high", "xhigh", "max"]
+
+    def test_openrouter_dotted_id_resolves_the_same_capability(self):
+        assert reasoning_capability("openrouter/anthropic/claude-opus-5.5") == (
+            reasoning_capability("claude-opus-5-5")
+        )
+
+    def test_opus_5_keeps_its_high_default(self):
+        # Regression guard: the split must not leak medium back onto Opus 5.
+        assert reasoning_capability("claude-opus-5")["default"] == "high"
+
+    def test_settings_match_opus_5(self):
+        # A family block falls through to `default`, never to a sibling — if the
+        # settings were dropped here Opus 5.5 would silently become
+        # non-multimodal with a 128k window.
+        from shared.runtime.core.loader import _apply_settings_matrix
+
+        five_five = {"llm": {"model": "claude-opus-5-5"}}
+        five = {"llm": {"model": "claude-opus-5"}}
+        _apply_settings_matrix(five_five, expert_llm_keys=set())
+        _apply_settings_matrix(five, expert_llm_keys=set())
+        five_five["llm"].pop("model")
+        five["llm"].pop("model")
+        assert five_five == five
+
+    @patch("shared.runtime.core.loader.ReasoningChatOpenAI")
+    def test_max_survives_the_chat_completions_factory(self, mock_chat):
+        mock_chat.return_value = MagicMock()
+        config = _make_config(model="claude-opus-5-5", reasoning_level="max")
+
+        _create_openai_llm(config, limits=None)
+
+        call_kwargs = mock_chat.call_args[1]
+        assert call_kwargs["model_kwargs"]["reasoning_effort"] == "max"
+
+
 class TestClaudeFableReasoning:
     """claude-fable covers Fable 5 and 5.1 in one family: identical matrix
     knobs, and the full effort ladder on both."""

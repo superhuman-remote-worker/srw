@@ -40,11 +40,14 @@ _FAMILY_RULES: list[tuple[re.Pattern, str | Callable[[re.Match], FamilyDetection
         re.compile(r"^openrouter/(.+)$"),
         lambda m: detect_family(m.group(1)),
     ),
-    # Anthropic. claude-opus-5 must beat the generic claude-opus rule: only
-    # Opus 5 accepts the full effort ladder, so it has its own matrix family
+    # Anthropic. claude-opus-5-5 must beat claude-opus-5, which must beat the
+    # generic claude-opus rule: only Opus 5.x accepts the full effort ladder,
+    # and 5.5 moved the default effort, so each has its own matrix family
     # (family_of() in shared/runtime/core/model_registry.py encodes the same
-    # precedence). Older ids stay on `claude-opus` — "claude-opus-4-5" does not
-    # contain "claude-opus-5".
+    # precedence). 5.5 matches the hyphen and OpenRouter's dotted form; the
+    # digit guard keeps a dated Opus 5 snapshot on claude-opus-5. Older ids
+    # stay on `claude-opus` — "claude-opus-4-5" does not contain "claude-opus-5".
+    (re.compile(r"claude-opus-5[.-]5(?!\d)", re.IGNORECASE), "claude-opus-5-5"),
     (re.compile(r"claude-opus-5", re.IGNORECASE), "claude-opus-5"),
     (re.compile(r"claude-opus", re.IGNORECASE), "claude-opus"),
     (re.compile(r"claude-sonnet", re.IGNORECASE), "claude-sonnet"),

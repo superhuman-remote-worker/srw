@@ -53,6 +53,20 @@ describe('detectModelFamily — Claude Opus 5', () => {
   });
 });
 
+describe('detectModelFamily — Claude Opus 5.5', () => {
+  it('maps Opus 5.5 IDs to their own family in both spellings', () => {
+    expect(detectModelFamily('claude-opus-5-5')).toBe('claude-opus-5-5');
+    expect(detectModelFamily('claude-opus-5-5-20260922')).toBe('claude-opus-5-5');
+    expect(detectModelFamily('openrouter/anthropic/claude-opus-5.5')).toBe(
+      'claude-opus-5-5',
+    );
+  });
+
+  it('keeps dated Opus 5 snapshots on claude-opus-5', () => {
+    expect(detectModelFamily('claude-opus-5-20260401')).toBe('claude-opus-5');
+  });
+});
+
 describe('detectModelFamily — Claude Fable', () => {
   it('maps Fable 5 and 5.1 to one family', () => {
     expect(detectModelFamily('claude-fable-5')).toBe('claude-fable');

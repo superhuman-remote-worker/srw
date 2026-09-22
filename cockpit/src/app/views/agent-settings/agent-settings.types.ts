@@ -183,9 +183,12 @@ export function detectModelFamily(model: string): string {
   }
   if (name.startsWith('openai/')) name = name.slice('openai/'.length);
 
-  // Opus 5 before the generic Opus rule — mirrors family_of() in
-  // src/shared/runtime/core/model_registry.py (Opus 5 is the only Opus with
-  // the full xhigh/max effort ladder, so it has its own matrix family).
+  // Opus 5.5 before Opus 5, Opus 5 before the generic Opus rule — mirrors
+  // family_of() in src/shared/runtime/core/model_registry.py (Opus 5.x is the
+  // only Opus with the full xhigh/max effort ladder, and 5.5 moved the default
+  // effort, so each has its own matrix family). 5.5 matches the hyphen and
+  // OpenRouter's dotted form; the digit guard keeps dated Opus 5 ids on 5.
+  if (/^claude-opus-5[.-]5(?!\d)/.test(name)) return 'claude-opus-5-5';
   if (name.startsWith('claude-opus-5')) return 'claude-opus-5';
   if (name.startsWith('claude-opus')) return 'claude-opus';
   if (name.startsWith('claude-sonnet')) return 'claude-sonnet';

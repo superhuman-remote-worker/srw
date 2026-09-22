@@ -320,9 +320,14 @@ def family_of(model_id: str, default: str = "default") -> str:
     if name.startswith("openai/"):
         name = name[len("openai/") :]
 
-    # Opus 5 before the generic Opus rule: it is the only Opus that takes the
-    # full effort ladder (xhigh/max), so it carries its own matrix family.
+    # Opus 5.5 before Opus 5, Opus 5 before the generic Opus rule: 5.x is the
+    # only Opus that takes the full effort ladder (xhigh/max), and 5.5 moved
+    # the default effort, so each carries its own matrix family. 5.5 takes the
+    # hyphen form (Anthropic, CLIProxyAPI) and OpenRouter's dotted form; the
+    # digit guard keeps a dated Opus 5 snapshot (claude-opus-5-2026...) on 5.
     # family_matcher.detect_family orders its rules the same way.
+    if re.match(r"claude-opus-5[.-]5(?!\d)", name):
+        return "claude-opus-5-5"
     if name.startswith("claude-opus-5"):
         return "claude-opus-5"
     if name.startswith("claude-opus"):
