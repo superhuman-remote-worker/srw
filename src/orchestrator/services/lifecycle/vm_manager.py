@@ -1217,7 +1217,8 @@ class VMInstanceManager:
             )
 
             if await retained_terminal_rootdisk(
-                self._db, job_id=owner_id,
+                self._db,
+                job_id=owner_id,
                 generation=identity.provision_generation,
                 pvc_uid=identity.rootdisk_pvc_uid,
             ):
@@ -1287,7 +1288,8 @@ class VMInstanceManager:
                 )
 
                 await prepare_vm_cleanup_resource(
-                    self._workspace_recovery_store, bound,
+                    self._workspace_recovery_store,
+                    bound,
                 )
             return bound
         logger.info(
@@ -1312,20 +1314,19 @@ class VMInstanceManager:
             )
 
             await complete_vm_cleanup_permit(
-                self._workspace_recovery_store, cleanup, outcome=outcome,
+                self._workspace_recovery_store,
+                cleanup,
+                outcome=outcome,
                 provisioner=self._provisioner,
             )
-        except Exception as exc:
-            # The controller result is already conclusive. Leaving the durable
-            # admission open is the safe failure mode and keeps later recovery
-            # or pruning from racing an unrecorded cleanup result.
+        except Exception:
+            # Physical deletion does not settle the durable permit or charge.
+            # Preserve the owner's context and incomplete lifecycle action on
+            # native guard/connection failures as well as domain refusals.
             logger.exception(
                 "VM cleanup admission %s could not be completed", admission_id
             )
-            from shared.vm_resource_admission import ResourceAdmissionError
-
-            if isinstance(exc, ResourceAdmissionError):
-                raise
+            raise
 
     # -------------------------------------------------------------------------
     # Internals
