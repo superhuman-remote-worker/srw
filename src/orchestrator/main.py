@@ -9664,15 +9664,6 @@ def _redact_job_config_override(job: dict[str, Any]) -> dict[str, Any]:
     )
 
 
-def _redact_nested_workspace_state(
-    record: dict[str, Any], *, field: str
-) -> dict[str, Any]:
-    """Shared thread/job redaction; policy lives in job_projection."""
-    return job_projection.redact_nested_workspace_state(
-        record, field=field, runtime_incarnation_key=WORKSPACE_RUNTIME_INCARNATION_KEY
-    )
-
-
 def _resolve_exported_folder_url(handle_str: str | None) -> Optional[str]:
     """Resolve export URLs through the application-owned cloud router."""
     return job_projection.resolve_exported_folder_url(
