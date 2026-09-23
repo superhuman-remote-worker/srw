@@ -363,6 +363,8 @@ async def joined_call(function, *args, **kwargs):
 class KubernetesStopObjects:
     """Explicit merge PATCH replaces just our freshly read finalizer array."""
 
+    _response_types = {200: "object", 201: "object", 202: "object", 204: None}
+
     def __init__(self, core):
         self.api = core.api_client
 
@@ -381,7 +383,7 @@ class KubernetesStopObjects:
                 path,
                 method,
                 body=body,
-                response_type="object",
+                response_types_map=self._response_types,
                 auth_settings=["BearerToken"],
                 header_params={
                     "Accept": "application/json",
@@ -413,7 +415,7 @@ class KubernetesStopObjects:
                     self.api.call_api,
                     f"{prefix}/namespaces/{namespace}/{plural}/{name}",
                     "GET",
-                    response_type="object",
+                    response_types_map=self._response_types,
                     auth_settings=["BearerToken"],
                     header_params={"Accept": "application/json"},
                     _return_http_data_only=True,
@@ -441,7 +443,7 @@ class KubernetesStopObjects:
                     f"{prefix}/namespaces/{doc['namespace']}/{plural}",
                     "GET",
                     query_params=query,
-                    response_type="object",
+                    response_types_map=self._response_types,
                     auth_settings=["BearerToken"],
                     header_params={"Accept": "application/json"},
                     _return_http_data_only=True,

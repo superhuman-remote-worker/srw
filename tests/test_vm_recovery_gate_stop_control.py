@@ -365,6 +365,57 @@ async def test_patch_transport_uses_merge_patch_uid_rv_and_timeout():
 
 
 @pytest.mark.asyncio
+async def test_kube_port_uses_installed_api_client_response_contract():
+    """Exercise the generated client's call_api, not a permissive fake signature."""
+    import inspect
+    import json
+    from types import SimpleNamespace
+
+    from kubernetes.client import ApiClient
+    from orchestrator.operator_cli.vm_recovery_gate_stop_control import KubernetesStopObjects
+
+    assert "response_types_map" in inspect.signature(ApiClient.call_api).parameters
+    doc, state = objects()
+    responses = []
+
+    class Response:
+        def __init__(self, status, value):
+            self.status = status
+            self.data = json.dumps(value).encode() if value is not None else b""
+
+        def getheader(self, _name):
+            return "application/json"
+
+        def getheaders(self):
+            return {}
+
+    def request(method, url, **_kwargs):
+        responses.append((method, url))
+        if method == "DELETE":
+            return Response(delete_status, None if delete_status == 204 else {"kind": "Status"})
+        if url.endswith("/pods"):
+            return Response(200, {"metadata": {}, "items": [state["pod"]]})
+        if url.endswith("/virtualmachineinstancemigrations"):
+            return Response(200, {"metadata": {}, "items": []})
+        if method == "PATCH":
+            return Response(200, state["pod"])
+        return Response(200, state["vm"])
+
+    client = ApiClient()
+    client.request = request
+    port = KubernetesStopObjects(SimpleNamespace(api_client=client))
+    assert (await port.read(doc, "vm"))["metadata"]["uid"] == doc["vm_uid"]
+    await port.assert_quiet(doc)
+    assert (await port.fixture_objects(doc["namespace"], doc["job_id"]))["vm"]
+    assert (await port.patch(doc, "pod", {"metadata": {"finalizers": []}}))["metadata"]["uid"] == doc["pod_uid"]
+    for delete_status in (200, 202, 204):
+        reply = await port._call(doc, "pod", "DELETE")
+        assert reply == (None if delete_status == 204 else {"kind": "Status"})
+    assert any(method == "GET" and url.endswith("/pods") for method, url in responses)
+    assert sum(method == "DELETE" for method, _ in responses) == 3
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("lost_process", [False, True])
 async def test_cli_scope_failure_and_cleanup_only_reconstruct_abort(
     monkeypatch, lost_process
