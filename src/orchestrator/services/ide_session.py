@@ -28,7 +28,6 @@ from orchestrator.services.managed_repository_authority import (
 )
 
 from orchestrator.services import resolve_ssh_key_path
-from orchestrator.services.blocking_effect import joined_async_call
 from orchestrator.services.container_provisioner import (
     WORKSPACE_CREATION_CLAIM_TOKEN_CONTEXT_KEY,
     WORKSPACE_CREATION_RESERVATION_CONTEXT_KEY,
@@ -1424,7 +1423,10 @@ class IdeSessionService:
                     await process.wait()
                     return process.returncode == 0
 
-            return bool(await joined_async_call(_complete()))
+            # The owned subprocess is cancellable: let lease loss interrupt
+            # drain/wait, then terminate and reap below before releasing it.
+            # Shielding the whole command would defer revocation until timeout.
+            return await _complete()
         except asyncio.CancelledError:
             # Durable restore-work lease loss cancels the owner task. Reap the
             # SSH transport before returning the token so no old replica keeps
