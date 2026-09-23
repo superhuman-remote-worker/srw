@@ -52,11 +52,14 @@ _UNDO_SOURCE_TRAILER = "SRW-Undo-Source"
 _UNDO_TARGET_TRAILER = "SRW-Undo-Target"
 _GIT_NUL_INTEGRITY_FRAME = "SRW-Git-NUL-Integrity"
 
-# One `git status --porcelain` (v1) entry: one or two status columns, a space,
-# the path. One column when the backend shell stripped the first line's leading
-# space. Anything else (a merged-in "warning: could not open directory ...")
-# is kept whole: it still means git cannot account for part of the tree.
-_PORCELAIN_ENTRY = re.compile(r"^[ MADRCUT?!]{1,2} (.+)$")
+# One `git status --porcelain` (v1) entry: two status columns, a space, the
+# path. The backend shell strips the whole output's leading whitespace, so the
+# FIRST line alone may have lost a blank index column (` M x` -> `M x`).
+# Nothing else is an entry: the remote backend merges stderr into stdout, and
+# `warning: could not open directory 'pgdata/'` (a docker volume owned by
+# another uid) is git saying what it skipped, not a change it left behind.
+_PORCELAIN_ENTRY = re.compile(r"^[ MTADRCU?!]{2} (.+)$")
+_PORCELAIN_STRIPPED_FIRST_ENTRY = re.compile(r"^[MTADRCU?!] (.+)$")
 
 
 @dataclass(frozen=True, slots=True)
@@ -144,6 +147,9 @@ class GitManager:
         self._workspace_path = Path(workspace_path)
         self._backend = backend
         self._remote_cwd = remote_cwd
+        # Why the most recent push() returned False (None after a success), so
+        # a caller can tell a refusal that will repeat from a blip.
+        self.last_push_error: Optional[str] = None
         self._use_backend = backend is not None and getattr(
             backend, "supports_shell", False
         )
@@ -966,8 +972,9 @@ class GitManager:
         status that cannot be read must not read as clean. This returns None
         for "unknown" (inactive repo, failed command) so the caller decides.
 
-        Paths are best-effort labels for a message (porcelain v1, one per
-        line); the emptiness of the list is the exact answer.
+        Only porcelain v1 entries count (``XY path``, both sides of a rename);
+        any other line (a merged-in stderr warning) is logged and ignored. A
+        status that ran is an answer — only a failed command is None.
 
         ``--ignore-submodules=dirty``: an embedded repository (an agent's own
         ``git clone`` into a non-ignored directory) with edits inside it reads
@@ -984,13 +991,52 @@ class GitManager:
             return None
         if result.returncode != 0:
             return None
-        paths = []
-        for line in result.stdout.splitlines():
+        paths: list[str] = []
+        ignored: list[str] = []
+        for index, line in enumerate(result.stdout.splitlines()):
             if not line.strip():
                 continue
-            entry = _PORCELAIN_ENTRY.match(line)
-            paths.append(entry.group(1).strip() if entry else line.strip())
+            entry = _PORCELAIN_ENTRY.match(line) or (
+                _PORCELAIN_STRIPPED_FIRST_ENTRY.match(line) if index == 0 else None
+            )
+            if entry is None:
+                ignored.append(line.strip())
+                continue
+            # A rename/copy names both sides; either may be a deliverable.
+            for side in entry.group(1).split(" -> "):
+                side = side.strip()
+                if len(side) >= 2 and side[0] == side[-1] == '"':
+                    side = side[1:-1]  # core.quotePath quoting, label only
+                if side:
+                    paths.append(side)
+        if ignored:
+            logger.warning(
+                "git status printed %d non-entry line(s), ignored: %s",
+                len(ignored),
+                "; ".join(ignored[:3]),
+            )
         return paths
+
+    def tracked_tree_matches_head(self) -> Optional[bool]:
+        """Whether tracked files match HEAD, decided by exit code alone.
+
+        ``git diff --quiet`` answers through its exit status (0 same, 1
+        different), which survives a transport that loses stdout. Untracked
+        files are not considered. None when git could not answer.
+        """
+        if not self.is_active:
+            return None
+        try:
+            result = self._run_git(
+                ["diff", "--quiet", "--ignore-submodules=dirty", "HEAD", "--"]
+            )
+        except Exception:
+            return None
+        if result.returncode == 0:
+            return True
+        if result.returncode == 1:
+            return False
+        return None
 
     def tag(self, tag_name: str, message: Optional[str] = None) -> bool:
         """Create a git tag at current HEAD (create-once, never moved).
@@ -1399,10 +1445,13 @@ class GitManager:
         Returns:
             True if push succeeded, False otherwise
         """
+        self.last_push_error = None
         if not self.is_active:
-            logger.warning(f"push skipped — git not active: {self._inactive_reason()}")
+            self.last_push_error = f"git not active: {self._inactive_reason()}"
+            logger.warning(f"push skipped — {self.last_push_error}")
             return False
         if not self.has_remote(remote):
+            self.last_push_error = f"no '{remote}' remote configured"
             logger.warning(
                 f"push skipped — no '{remote}' remote configured "
                 f"(at {self._remote_cwd or self._workspace_path})"
@@ -1421,6 +1470,9 @@ class GitManager:
                 result = self._run_git(["branch", "--show-current"])
                 detected = result.stdout.strip() if result.returncode == 0 else ""
                 if not detected:
+                    self.last_push_error = (
+                        "HEAD is detached, or the current branch could not be read"
+                    )
                     logger.warning(
                         "push refused — HEAD is detached (or the current "
                         "branch could not be read) at "
@@ -1436,6 +1488,7 @@ class GitManager:
                 timeout=120,
             )
             if result.returncode != 0:
+                self.last_push_error = result.stderr or "git push failed"
                 logger.warning(f"git push failed: {result.stderr}")
                 return False
 
@@ -1453,6 +1506,7 @@ class GitManager:
             return True
 
         except Exception as e:
+            self.last_push_error = str(e) or type(e).__name__
             logger.warning(f"Push failed: {e}")
             return False
 

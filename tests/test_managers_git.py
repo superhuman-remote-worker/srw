@@ -1590,6 +1590,26 @@ class TestGitManagerBackendPush:
         push_call = backend.shell_run.call_args_list[2][0][0]
         assert "git push -u origin main" in push_call
 
+    def test_push_records_why_it_failed(self):
+        """A caller deciding whether a retry can help needs the reason, not
+        only False."""
+        backend = _make_mock_backend()
+        backend.exists.return_value = True
+        backend.shell_run.side_effect = [
+            "Exit code: 0\n--- stdout ---\nhttps://git.example.com/repo.git",
+            "Exit code: 0\n--- stdout ---\nmain",
+            "Exit code: 128\n--- stdout ---\nfatal: Authentication failed",
+            "Exit code: 0\n--- stdout ---\nhttps://git.example.com/repo.git",
+            "Exit code: 0\n--- stdout ---\nmain",
+            "Exit code: 0\n(no output)",
+        ]
+        gm = GitManager(Path("/tmp/ws"), backend=backend)
+
+        assert gm.push() is False
+        assert "Authentication failed" in gm.last_push_error
+        assert gm.push() is True
+        assert gm.last_push_error is None
+
     def test_push_with_120s_timeout(self):
         """push() uses 120s timeout for the push command."""
         backend = _make_mock_backend()
@@ -1696,15 +1716,18 @@ class TestGitManagerBackendLogStatusDiff:
         assert "Add research notes" in result
 
     def test_uncommitted_paths_reads_backend_porcelain(self):
-        """The backend strips the first line's leading space; a merged-in
-        stderr warning stays visible rather than reading as clean."""
+        """The backend strips the first line's leading space and merges
+        stderr into stdout. Only porcelain entries count: a docker volume
+        owned by another uid makes git warn that it skipped a directory,
+        which is not a change left behind (the commit that follows lands)."""
         gm, backend = self._make_active_gm()
         backend.shell_run.return_value = (
             "Exit code: 0\nCWD: /home/agent-host/workspace\n--- stdout ---\n"
-            "M output/report.md\n"
+            "warning: could not open directory 'pgdata/': Permission denied\n"
+            " M output/report.md\n"
             "?? output/logs/\n"
-            "warning: could not open directory 'output/root-only/': "
-            "Permission denied"
+            "R  old.md -> output/new.md\n"
+            '?? "output/odd\\tname.md"'
         )
 
         paths = gm.uncommitted_paths()
@@ -1712,8 +1735,27 @@ class TestGitManagerBackendLogStatusDiff:
         assert paths == [
             "output/report.md",
             "output/logs/",
-            "warning: could not open directory 'output/root-only/': Permission denied",
+            "old.md",
+            "output/new.md",
+            "output/odd\\tname.md",
         ]
+
+    def test_uncommitted_paths_accepts_a_stripped_first_entry(self):
+        gm, backend = self._make_active_gm()
+        backend.shell_run.return_value = (
+            "Exit code: 0\n--- stdout ---\nM output/report.md\n?? notes.md"
+        )
+
+        assert gm.uncommitted_paths() == ["output/report.md", "notes.md"]
+
+    def test_uncommitted_paths_only_warnings_is_clean(self):
+        gm, backend = self._make_active_gm()
+        backend.shell_run.return_value = (
+            "Exit code: 0\n--- stdout ---\n"
+            "warning: could not open directory 'pgdata/': Permission denied"
+        )
+
+        assert gm.uncommitted_paths() == []
         cmd = backend.shell_run.call_args[0][0]
         assert "git status --porcelain --ignore-submodules=dirty" in cmd
 
