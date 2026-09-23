@@ -38,6 +38,7 @@ from orchestrator.services.vm_workspace_recovery_store import (
     vm_cleanup_kwargs,
 )
 from shared.workspace_idle_policy import IdlePolicyError, RuntimeIdentity, evaluate_idle, read_episode
+from shared.vm_resource_admission import ResourceAdmissionError
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +65,52 @@ def _release_kind(operation: Mapping[str, Any]) -> str:
     # During the 0275 rollout an older 0270-0273 schema has only stateless
     # operations. Never index the new field before the migration is present.
     return operation["release_kind"] if "release_kind" in operation else "stateless"
+
+
+async def _idle_resource_binding_on_conn(conn, db, *, retry, operation,
+                                         released_replay: bool = False):
+    """Resolve an owed v3 charge from its frozen retry, never from VM context."""
+    from orchestrator.services.vm_resource_job_runtime import (
+        installed_job_resource_store,
+    )
+    configuration = _object(retry["controller_configuration"])
+    charge = await conn.fetchrow(
+        "SELECT state,release_evidence FROM vm_resource_reservations "
+        "WHERE request_id=$1", retry["request_id"],
+    )
+    if charge is None:
+        if configuration.get("version") == 3:
+            raise ResourceAdmissionError("resource_idle_charge_unproven")
+        return None
+    if configuration.get("version") != 3:
+        raise ResourceAdmissionError("resource_idle_policy_unproven")
+    if charge["state"] == "released":
+        proof = _object(charge["release_evidence"])
+        stop_digest = await conn.fetchval(
+            "SELECT 'sha256:'||encode(sha256(convert_to(stop_evidence::text,'UTF8')),'hex') "
+            "FROM vm_idle_operations WHERE id=$1", operation["id"],
+        )
+        if (
+            not released_replay
+            or proof.get("kind") != "exact_compute_absent"
+            or proof.get("operation_id") != str(operation["id"])
+            or proof.get("job_id") != str(operation["owner_id"])
+            or proof.get("provision_generation")
+                != str(operation["provision_generation"])
+            or proof.get("vm_uid") != str(operation["vm_uid"])
+            or proof.get("vmi_uid") != str(operation["vmi_uid"])
+            or proof.get("launcher_uid") != str(operation["launcher_uid"])
+            or proof.get("pvc_uid") != str(operation["pvc_uid"])
+            or proof.get("stop_evidence_digest") != stop_digest
+        ):
+            raise ResourceAdmissionError("resource_idle_charge_changed")
+        return None
+    resource = await installed_job_resource_store(
+        conn, db, retry["controller_configuration"], fresh=False,
+    )
+    if resource is None:
+        raise ResourceAdmissionError("resource_idle_policy_unproven")
+    return resource
 
 
 async def _pinned_stop_valid_on_conn(conn: Any, operation: Mapping[str, Any]) -> bool:
@@ -197,10 +244,17 @@ class VMIdleLifecycleStore:
         )
         if episode is None or review_source_snapshot(dict(job)) != expected_source:
             return None
+        current_generation = _uuid(_object(context.get("vm")).get("provision_generation"))
+        retry = await conn.fetchrow(
+            "SELECT * FROM vm_creation_retries WHERE job_id=$1 "
+            "AND provision_generation=$2 FOR UPDATE",
+            owner_id, current_generation,
+        ) if current_generation is not None else None
         operation = await conn.fetchrow(
             "SELECT * FROM vm_idle_operations WHERE owner_kind='job' AND owner_id=$1 "
             "AND closed_at IS NULL FOR UPDATE", owner_id,
         )
+        new_operation = operation is None
         if operation is not None and _release_kind(operation) != (
             "pinned_job" if job["execution_lane"] == "pinned" else "stateless"
         ):
@@ -439,6 +493,16 @@ class VMIdleLifecycleStore:
             operation["id"], UUID(source["command_id"]),
             json.dumps(dict(publication)),
         )
+        if retry is not None:
+            resource = await _idle_resource_binding_on_conn(
+                conn, self.db, retry=retry, operation=operation,
+            )
+            if resource is not None:
+                changed = await resource.mark_idle_teardown_on_conn(
+                    conn, retry=retry, operation=operation,
+                )
+                if new_operation and not changed:
+                    raise ResourceAdmissionError("resource_idle_charge_changed")
         return dict(operation)
 
     async def admit_release(
@@ -678,8 +742,8 @@ class VMIdleLifecycleStore:
                     from shared.vm_creation_retry import canonical_request_digest
 
                     ledger = await conn.fetchrow(
-                        "SELECT canonical_request,request_digest,state,provision_generation,observed_pvc_uid,observed_vm_uid "
-                        "FROM vm_creation_retries WHERE job_id=$1 AND provision_generation=$2 FOR SHARE",
+                        "SELECT * FROM vm_creation_retries "
+                        "WHERE job_id=$1 AND provision_generation=$2 FOR SHARE",
                         owner_id, expected["generation"],
                     )
                     if (
@@ -984,6 +1048,14 @@ class VMIdleLifecycleStore:
                 owner_id,
                 json.dumps(context),
             )
+            resource = await _idle_resource_binding_on_conn(
+                conn, self.db, retry=ledger, operation=operation,
+            )
+            if resource is not None:
+                if not await resource.mark_idle_teardown_on_conn(
+                    conn, retry=ledger, operation=operation,
+                ):
+                    raise ResourceAdmissionError("resource_idle_charge_changed")
             return dict(operation)
 
     async def record_pinned_terminal(
@@ -1072,7 +1144,8 @@ class VMIdleLifecycleStore:
             return False
         async with self.db.acquire() as conn, conn.transaction():
             located = await conn.fetchrow(
-                "SELECT owner_kind,owner_id FROM vm_idle_operations WHERE id=$1",
+                "SELECT owner_kind,owner_id,provision_generation "
+                "FROM vm_idle_operations WHERE id=$1",
                 UUID(operation_id),
             )
             if located is None or located["owner_kind"] != "job":
@@ -1086,6 +1159,11 @@ class VMIdleLifecycleStore:
                 "FROM jobs WHERE id=$1 FOR UPDATE",
                 owner_id,
             )
+            retry = await conn.fetchrow(
+                "SELECT * FROM vm_creation_retries WHERE job_id=$1 "
+                "AND provision_generation=$2 FOR UPDATE",
+                owner_id, located["provision_generation"],
+            )
             operation = await conn.fetchrow(
                 "SELECT * FROM vm_idle_operations WHERE id=$1 FOR UPDATE",
                 UUID(operation_id),
@@ -1093,6 +1171,15 @@ class VMIdleLifecycleStore:
             if job is None or operation is None:
                 return False
             if operation["phase"] == "suspended":
+                if retry is not None:
+                    resource = await _idle_resource_binding_on_conn(
+                        conn, self.db, retry=retry, operation=operation,
+                        released_replay=True,
+                    )
+                    if resource is not None:
+                        await resource.release_idle_compute_on_conn(
+                            conn, retry=retry, operation=operation,
+                        )
                 return True
             if operation["phase"] not in {"releasing", "release_held"}:
                 return False
@@ -1160,17 +1247,25 @@ class VMIdleLifecycleStore:
                     or current_episode.revision != operation["episode_revision"]
                 )
             )
-            await conn.execute(
+            suspended = await conn.fetchrow(
                 "UPDATE vm_idle_operations SET phase='suspended',"
                 "stop_evidence=$2::jsonb,stop_verified_at=clock_timestamp(),"
                 "wake_requested=wake_requested OR $3,"
                 "wake_execution_requested=wake_execution_requested OR $3,"
                 "last_progress_at=clock_timestamp() "
-                "WHERE id=$1",
+                "WHERE id=$1 RETURNING *",
                 operation["id"],
                 json.dumps(dict(evidence)),
                 wake_requested,
             )
+            if retry is not None:
+                resource = await _idle_resource_binding_on_conn(
+                    conn, self.db, retry=retry, operation=suspended,
+                )
+                if resource is not None:
+                    await resource.release_idle_compute_on_conn(
+                        conn, retry=retry, operation=suspended,
+                    )
             return True
 
     @staticmethod

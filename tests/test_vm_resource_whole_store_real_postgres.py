@@ -111,7 +111,8 @@ async def environment(
     ), inventory, value, demand
 
 
-async def waiter(db, store, inventory, *, user_id=None, lane="pinned"):
+async def waiter(db, store, inventory, *, user_id=None, lane="pinned",
+                 request_options=None):
     config = whole_launcher_configuration()
     config.update(namespace="workers", storage_class="local")
     resource = config["resource_admission"]
@@ -125,6 +126,7 @@ async def waiter(db, store, inventory, *, user_id=None, lane="pinned"):
     resource["host_mapping"]["vector"] = store.cost.cost(8, "16Gi").to_six_dict()
     job, generation, proposal = await admitted_job(
         db, lane=lane, controller_configuration=config,
+        request_options=request_options,
     )
     if user_id is not None:
         await db.execute("INSERT INTO users(id,display_name) VALUES($1,'whole-owner') ON CONFLICT DO NOTHING", user_id)

@@ -1,7 +1,7 @@
 """Job resource reservation before the actual creation-retry transport."""
 
 from copy import deepcopy
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -49,8 +49,578 @@ from tests.test_vm_workspace_recovery_real_postgres import (
 from vm_controller import controller as controller_settings
 from vm_controller.creation_disposition import CreationDisposer
 from shared.vm_creation_disposition import disposition_identity
+from shared.vm_network_profile import NETWORK_PROFILE
+from shared.workspace_idle_policy import IdleEpisode, RuntimeIdentity, episode_document
+from orchestrator.services.vm_idle_lifecycle import VMIdleLifecycleStore
+from shared.pinned_session_identity import PinnedJobRecipient
 
 controller_setup = _controller_setup
+
+PROFILED_IMAGE = "registry.example/charged-idle@sha256:" + "a" * 64
+
+
+async def charged_idle_wait(db, monkeypatch, *, lane="stateless"):
+    for key, value in {
+        "WORKSPACE_IDLE_RELEASE_ENABLED": "true",
+        "VM_CREATION_RETRY_ENABLED": "true",
+        "VM_REMOTE_OPERATION_PROTOCOL_ENABLED": "true",
+        "VM_MODE": "same-cluster",
+        "VM_PERSISTENT_ROOTDISK": "true",
+        "VM_NETWORK_PROFILE_IMAGE_ALLOWLIST": PROFILED_IMAGE,
+    }.items():
+        monkeypatch.setenv(key, value)
+    policy, inventory, _, _ = await environment(db)
+    retry = await waiter(
+        db, policy, inventory, lane=lane,
+        request_options={
+            "vm_image": PROFILED_IMAGE,
+            "network_profile": dict(NETWORK_PROFILE),
+        },
+    )
+    admitted = await policy.admit(request_id=str(retry["request_id"]))
+    assert admitted["action"] == "admitted"
+    vm_uid, vmi_uid, launcher_uid, pvc_uid = (uuid4() for _ in range(4))
+    claim = (await VMCreationRetryStore(db).claim_due(limit=1))[0]
+    authorized = await VMCreationRetryStore(db).authorize_controller(
+        request_id=str(retry["request_id"]),
+        claim_token=str(claim["claim_token"]),
+        observed={
+            "job_id": str(claim["job_id"]),
+            "provision_generation": str(claim["provision_generation"]),
+            "request_digest": claim["request_digest"],
+            "controller_configuration_digest": claim["controller_configuration_digest"],
+            "expected_pvc_uid": None,
+        },
+    )
+    assert authorized["allowed"]
+    await db.execute(
+        "UPDATE vm_creation_retries SET state='succeeded',revision=revision+1,"
+        "observed_vm_uid=$2,observed_pvc_uid=$3,resolved_at=clock_timestamp(),"
+        "claim_token=NULL,claim_expires_at=NULL WHERE request_id=$1",
+        retry["request_id"], vm_uid, pvc_uid,
+    )
+    await db.execute(
+        "UPDATE vm_workspace_cleanup_admissions SET completed_at=clock_timestamp(),"
+        "outcome='completed' WHERE id=(SELECT creation_admission_id "
+        "FROM vm_creation_retries WHERE request_id=$1)",
+        retry["request_id"],
+    )
+    await db.execute(
+        "UPDATE vm_resource_reservations SET state='active',vm_uid=$2,"
+        "vmi_uid=$3,launcher_uid=$4 WHERE id=$1",
+        UUID(admitted["reservation_id"]), vm_uid, vmi_uid, launcher_uid,
+    )
+    execution = await db.fetchrow(
+        "SELECT id,revision,generation,created_at+interval '1 hour' AS deadline "
+        "FROM srw_execution_specs WHERE work_kind='Job' AND work_id=$1",
+        retry["job_id"],
+    )
+    route_id = uuid4()
+    identity = {
+        "generation": str(retry["provision_generation"]),
+        "vm_uid": str(vm_uid), "vmi_uid": str(vmi_uid),
+        "launcher_uid": str(launcher_uid), "pvc_uid": str(pvc_uid),
+    }
+    episode = IdleEpisode(
+        str(uuid4()), 1, "human_message", str(route_id),
+        datetime.now(timezone.utc) - timedelta(minutes=16),
+        None, 0, RuntimeIdentity(
+            "job", str(retry["job_id"]), "vm",
+            identity["generation"], identity["vm_uid"],
+        ),
+    )
+    context = json.loads(await db.fetchval(
+        "SELECT context FROM jobs WHERE id=$1", retry["job_id"],
+    ))
+    vm = context["vm"]
+    vm.update({
+        "status": "ready", "provision_generation": identity["generation"],
+        "identity_authenticated": True,
+        "identity_provision_generation": identity["generation"],
+        "vm_uid": identity["vm_uid"], "vmi_uid": identity["vmi_uid"],
+        "active_pod_uid": identity["launcher_uid"],
+        "rootdisk_pvc_uid": identity["pvc_uid"],
+        "ssh_host": "10.42.0.91", "ssh_port": 22,
+        "ssh_ready_source": "provisioner_probe",
+        "ssh_host_key_fingerprint": "SHA256:" + "A" * 43,
+        "creation_preflight": {
+            "version": 1, "request_id": str(retry["request_id"]),
+            "job_id": str(retry["job_id"]),
+            "request": retry["canonical_request"],
+            "request_digest": retry["request_digest"],
+            "revision": 1, "attempt": 0, "state": "admitted",
+            "execution_id": str(execution["id"]),
+            "execution_revision": execution["revision"],
+            "execution_generation": execution["generation"],
+            "admission_deadline": execution["deadline"].isoformat(),
+            "expected_pvc_uid": None,
+        },
+        "creation_request_id": str(retry["request_id"]),
+        "provision_attempts": 0,
+        "network_profile_evidence": {
+            "profile": NETWORK_PROFILE,
+            "provision_generation": identity["generation"],
+            "vm_uid": identity["vm_uid"], "pvc_uid": identity["pvc_uid"],
+            "vmi_uid": identity["vmi_uid"],
+            "launcher_uid": identity["launcher_uid"],
+            "guest_boot_id": str(uuid4()),
+            "cloud_init_instance_id": "i-charged-idle",
+            "cloud_init_cached_instance_id": "i-charged-idle",
+            "network_file_sha256": "a" * 64,
+            "name_only_dhcp": True,
+        },
+    })
+    context["vm"] = vm
+    context.pop("_vm_creation_pending", None)
+    await db.execute(
+        "UPDATE jobs SET status='waiting_for_reply',execution_lane=$2,"
+        "context=$3::jsonb,config_override=$6::jsonb,freeze_data=$4::jsonb,"
+        "workspace_idle_revision=1,workspace_idle_episode=$5::jsonb "
+        "WHERE id=$1", retry["job_id"], lane, json.dumps(context),
+        json.dumps({"route_id": str(route_id)}),
+        json.dumps(episode_document(episode)),
+        json.dumps({"workspace": {"backend": "vm"}}),
+    )
+    if lane == "stateless":
+        await db.execute(
+            "INSERT INTO run_queue(unit_id,unit_kind,state) "
+            "VALUES($1,'worker_batch','done') "
+            "ON CONFLICT (unit_id) DO UPDATE "
+            "SET state='done',leased_by=NULL,leased_until=NULL",
+            retry["job_id"],
+        )
+    return policy, retry, admitted, episode, identity
+
+
+async def charged_pinned_idle_wait(db, monkeypatch):
+    from orchestrator.services.pinned_job_delivery import (
+        accept_pinned_report_on_conn, record_pinned_wait_receipt_on_conn,
+    )
+    from shared.pinned_job_delivery import pinned_job_delivery_proof
+
+    policy, retry, admitted, episode, identity = await charged_idle_wait(
+        db, monkeypatch, lane="pinned",
+    )
+    monkeypatch.setenv("VM_LIFECYCLE_HMAC_SECRET", "x" * 64)
+    owner = retry["job_id"]
+    agent_id, process_generation, pod_uid = uuid4(), uuid4(), uuid4()
+    await db.execute("DELETE FROM run_queue WHERE unit_id=$1", owner)
+    await db.execute(
+        "INSERT INTO agents(id,config_name,hostname,status,pod_uid,metadata) "
+        "VALUES($1,'worker_base','charged-pinned-agent','ready',$2,$3::jsonb)",
+        agent_id, str(pod_uid),
+        json.dumps({"dispatch_process_generation": str(process_generation)}),
+    )
+    await db.execute(
+        "UPDATE jobs SET status='created',freeze_data=NULL WHERE id=$1", owner,
+    )
+    assert await db.claim_job_for_agent(str(owner), str(agent_id))
+    recipient = PinnedJobRecipient(
+        expected_agent_id=str(agent_id), expected_pod_uid=str(pod_uid),
+        expected_process_generation=str(process_generation),
+        expected_job_id=str(owner),
+    )
+    digest = "sha256:" + "a" * 64
+    intent = await db.prepare_pinned_job_delivery(
+        str(owner), str(agent_id), recipient=recipient,
+        projection_digest=digest,
+    )
+    assert intent is not None
+    proof = pinned_job_delivery_proof(
+        b"x" * 64, delivery_id=str(intent["id"]), agent_id=str(agent_id),
+        process_generation=str(process_generation), pod_uid=str(pod_uid),
+        projection_digest=digest,
+    )
+    route_id = UUID(episode.wait_key)
+    async with db.acquire() as conn, conn.transaction():
+        accepted = await accept_pinned_report_on_conn(
+            conn, job_id=owner, agent_id=agent_id, delivery_id=intent["id"],
+            projection_digest=digest, process_generation=str(process_generation),
+            pod_uid=str(pod_uid), delivery_proof=proof, source_kind="route",
+        )
+        assert accepted is not None
+        await conn.execute(
+            "INSERT INTO job_message_routes(route_id,job_id,thread_id,state,blocking) "
+            "VALUES($1,$2,'charged-pinned-route','user_direct',true)",
+            route_id, owner,
+        )
+        await conn.execute(
+            "UPDATE jobs SET status='waiting_for_reply',"
+            "freeze_data=jsonb_build_object('route_id',$2::text) WHERE id=$1",
+            owner, str(route_id),
+        )
+        assert await record_pinned_wait_receipt_on_conn(
+            conn, delivery=accepted, source_kind="route", source_id=route_id,
+        ) is not None
+    await db.execute(
+        "UPDATE jobs SET lease_expires_at=clock_timestamp()-interval '1 hour' "
+        "WHERE id=$1", owner,
+    )
+    return policy, retry, admitted, episode, identity
+
+
+async def charged_final_review(db, monkeypatch):
+    from orchestrator.services.workspace_idle_completion_events import (
+        ACCEPTED_IDLE_WAIT_SOURCE_KEY, completion_runtime_evidence,
+    )
+    from shared.workspace_idle_completion import classify_completion_wait
+
+    policy, retry, admitted, previous, identity = await charged_idle_wait(
+        db, monkeypatch,
+    )
+    command_id, decision_id = uuid4(), "charged-final-review"
+    freeze = {
+        "job_id": str(retry["job_id"]), "status": "pending_review",
+        "freeze_type": "job_complete", "summary": "reviewed",
+    }
+    context = json.loads(await db.fetchval(
+        "SELECT context FROM jobs WHERE id=$1", retry["job_id"],
+    ))
+    context["completion_decision"] = {"tool_call_id": decision_id}
+    await db.execute(
+        "UPDATE jobs SET status='pending_review',context=$2::jsonb,"
+        "freeze_data=$3::jsonb,resolved_config=$4::jsonb,completion_seq_hwm=1 "
+        "WHERE id=$1",
+        retry["job_id"], json.dumps(context), json.dumps(freeze),
+        json.dumps({"agent": {"autonomy": "review", "verification": {"enabled": False}}}),
+    )
+    job = dict(await db.fetchrow("SELECT * FROM jobs WHERE id=$1", retry["job_id"]))
+    report = {
+        "should_stop": True, "goal_achieved": False,
+        "error": None, "freeze_data": freeze,
+    }
+    semantics = classify_completion_wait(
+        job=job, report=report, decision_tool_call_id=decision_id,
+    )
+    runtime = completion_runtime_evidence(job)
+    assert semantics and runtime
+    await db.execute(
+        "INSERT INTO job_completion_commands "
+        "(id,job_id,report_seq,client_report_id,payload,payload_digest,"
+        "accepted_lease_token,requested_by,state,outcome,finalized_at,deadline_at,"
+        "code_version) VALUES($1,$2,1,$3,$4::jsonb,$5,71,'charged-terminal',"
+        "'done','{}'::jsonb,clock_timestamp(),"
+        "clock_timestamp()+interval '1 hour','charged-terminal')",
+        command_id, retry["job_id"], uuid4(),
+        json.dumps({**report, ACCEPTED_IDLE_WAIT_SOURCE_KEY: {
+            "version": 1, "semantics": semantics, **runtime,
+        }}),
+        "sha256:" + "a" * 64,
+    )
+    await db.execute(
+        "INSERT INTO completion_effects "
+        "(producer_kind,producer_id,scope_id,effect_name,effect_group,state,completed_at) "
+        "VALUES('job_completion',$1,$2,'main_status_write','status','done',clock_timestamp())",
+        command_id, retry["job_id"],
+    )
+    episode = IdleEpisode(
+        str(uuid4()), previous.revision + 1, "human_review", str(command_id),
+        previous.entered_at, None, 0, previous.runtime_identity,
+    )
+    await db.execute(
+        "UPDATE jobs SET workspace_idle_revision=$2,"
+        "workspace_idle_episode=$3::jsonb WHERE id=$1",
+        retry["job_id"], episode.revision,
+        json.dumps(episode_document(episode)),
+    )
+    return policy, retry, admitted, episode, identity
+
+
+@pytest.mark.asyncio
+async def test_charged_final_approval_marks_teardown_before_terminal_release(
+    db, monkeypatch, tmp_path,
+):
+    from tests.test_vm_idle_terminal_review_real_postgres import controls_for
+
+    _, retry, admitted, _, identity = await charged_final_review(db, monkeypatch)
+    controls = await controls_for(db, monkeypatch, tmp_path)
+    controls.dependencies.forge.is_initialized = False
+    (tmp_path / "output").mkdir()
+    result = await controls.approve_job(
+        str(retry["job_id"]), user={"id": "reviewer"},
+        job=await db.get_job(str(retry["job_id"])), request=None,
+    )
+    assert result["status"] == "approved"
+    operation = await VMIdleLifecycleStore(db).get_open_for_owner(str(retry["job_id"]))
+    assert operation is not None and operation["terminal_source_command_id"] is not None
+    assert await db.fetchval(
+        "SELECT state FROM vm_resource_reservations WHERE id=$1",
+        UUID(admitted["reservation_id"]),
+    ) == "teardown"
+    await db.execute(
+        "INSERT INTO managed_repository_process_zero_receipts "
+        "(owner_kind,owner_id,scope,provisioner,runtime_incarnation) "
+        "VALUES('job',$1,'vm','vm',$2)",
+        retry["job_id"], identity["generation"],
+    )
+    physical = {
+        "version": 1, "kind": "vm_idle_physical_stop",
+        "operation_id": str(operation["id"]), **identity,
+        "vm_absent": True, "vmi_absent": True,
+        "launcher_absent": True, "retained_pvc": True,
+        "controller_authenticated": True,
+        "same_generation_replacement": False,
+    }
+    assert await VMIdleLifecycleStore(db).complete_release(
+        str(operation["id"]), evidence=physical,
+    )
+    assert await db.fetchval(
+        "SELECT state FROM vm_resource_reservations WHERE id=$1",
+        UUID(admitted["reservation_id"]),
+    ) == "released"
+
+
+@pytest.mark.asyncio
+async def test_charged_idle_admission_marks_current_compute_teardown(db, monkeypatch):
+    _, retry, admitted, episode, identity = await charged_idle_wait(db, monkeypatch)
+    operation = await VMIdleLifecycleStore(db).admit_release(
+        str(retry["job_id"]), episode_id=episode.episode_id,
+        revision=episode.revision, identity=identity,
+    )
+    assert operation is not None
+    assert await db.fetchval(
+        "SELECT state FROM vm_resource_reservations WHERE id=$1",
+        UUID(admitted["reservation_id"]),
+    ) == "teardown"
+
+
+@pytest.mark.asyncio
+async def test_charged_idle_admission_rolls_back_if_charge_cannot_enter_teardown(
+    db, monkeypatch,
+):
+    from orchestrator.services.vm_resource_reservation_store import (
+        VMResourceReservationStore,
+    )
+
+    _, retry, admitted, episode, identity = await charged_idle_wait(db, monkeypatch)
+
+    async def fail_teardown(self, conn, *, retry, operation):
+        raise ResourceAdmissionError("test_teardown_unavailable")
+
+    monkeypatch.setattr(
+        VMResourceReservationStore, "mark_idle_teardown_on_conn", fail_teardown,
+    )
+    with pytest.raises(ResourceAdmissionError, match="test_teardown_unavailable"):
+        await VMIdleLifecycleStore(db).admit_release(
+            str(retry["job_id"]), episode_id=episode.episode_id,
+            revision=episode.revision, identity=identity,
+        )
+    assert await db.fetchval(
+        "SELECT count(*) FROM vm_idle_operations WHERE owner_id=$1",
+        retry["job_id"],
+    ) == 0
+    assert await db.fetchval(
+        "SELECT context->'vm'->>'status' FROM jobs WHERE id=$1",
+        retry["job_id"],
+    ) == "ready"
+    assert await db.fetchval(
+        "SELECT state FROM vm_resource_reservations WHERE id=$1",
+        UUID(admitted["reservation_id"]),
+    ) == "active"
+
+
+@pytest.mark.asyncio
+async def test_charged_idle_new_operation_refuses_preexisting_teardown_charge(
+    db, monkeypatch,
+):
+    _, retry, admitted, episode, identity = await charged_idle_wait(db, monkeypatch)
+    await db.execute(
+        "UPDATE vm_resource_reservations SET state='teardown' WHERE id=$1",
+        UUID(admitted["reservation_id"]),
+    )
+    with pytest.raises(ResourceAdmissionError, match="resource_idle_charge_changed"):
+        await VMIdleLifecycleStore(db).admit_release(
+            str(retry["job_id"]), episode_id=episode.episode_id,
+            revision=episode.revision, identity=identity,
+        )
+    assert await db.fetchval(
+        "SELECT count(*) FROM vm_idle_operations WHERE owner_id=$1",
+        retry["job_id"],
+    ) == 0
+    assert await db.fetchval(
+        "SELECT context->'vm'->>'status' FROM jobs WHERE id=$1",
+        retry["job_id"],
+    ) == "ready"
+
+
+@pytest.mark.asyncio
+async def test_charged_idle_replays_persisted_suspension_with_owed_debit(
+    db, monkeypatch,
+):
+    _, retry, admitted, episode, identity = await charged_idle_wait(db, monkeypatch)
+    store = VMIdleLifecycleStore(db)
+    operation = await store.admit_release(
+        str(retry["job_id"]), episode_id=episode.episode_id,
+        revision=episode.revision, identity=identity,
+    )
+    assert operation is not None
+    await db.execute(
+        "INSERT INTO managed_repository_process_zero_receipts "
+        "(owner_kind,owner_id,scope,provisioner,runtime_incarnation) "
+        "VALUES('job',$1,'vm','vm',$2)",
+        retry["job_id"], identity["generation"],
+    )
+    physical = {
+        "version": 1, "kind": "vm_idle_physical_stop",
+        "operation_id": str(operation["id"]), **identity,
+        "vm_absent": True, "vmi_absent": True,
+        "launcher_absent": True, "retained_pvc": True,
+        "controller_authenticated": True,
+        "same_generation_replacement": False,
+    }
+    await db.execute(
+        "UPDATE jobs SET context=jsonb_set(context,'{vm,status}',"
+        "'\"suspended\"'::jsonb) WHERE id=$1",
+        retry["job_id"],
+    )
+    await db.execute(
+        "UPDATE vm_idle_operations SET phase='suspended',"
+        "stop_evidence=$2::jsonb,stop_verified_at=clock_timestamp() WHERE id=$1",
+        operation["id"], json.dumps(physical),
+    )
+    assert await store.complete_release(str(operation["id"]), evidence=physical)
+    assert await db.fetchval(
+        "SELECT state FROM vm_resource_reservations WHERE id=$1",
+        UUID(admitted["reservation_id"]),
+    ) == "released"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("case", [
+    "exact", "flag_off", "missing_process_zero", "wrong_successor",
+    "settlement_rollback",
+])
+async def test_charged_idle_actual_release_debits_only_after_c_stop(
+    db, monkeypatch, case,
+):
+    _, retry, admitted, episode, identity = await charged_idle_wait(db, monkeypatch)
+    store = VMIdleLifecycleStore(db)
+    operation = await store.admit_release(
+        str(retry["job_id"]), episode_id=episode.episode_id,
+        revision=episode.revision, identity=identity,
+    )
+    assert operation is not None
+    if case == "flag_off":
+        monkeypatch.setenv("WORKSPACE_IDLE_RELEASE_ENABLED", "false")
+        await db.execute(
+            "UPDATE vm_resource_admission_policy SET mode='off',revision=revision+1 "
+            "WHERE cluster_id=(SELECT cluster_id FROM vm_resource_reservations "
+            "WHERE id=$1)", UUID(admitted["reservation_id"]),
+        )
+    if case != "missing_process_zero":
+        await db.execute(
+            "INSERT INTO managed_repository_process_zero_receipts "
+            "(owner_kind,owner_id,scope,provisioner,runtime_incarnation) "
+            "VALUES('job',$1,'vm','vm',$2)",
+            retry["job_id"], identity["generation"],
+        )
+    evidence = {
+        "version": 1, "kind": "vm_idle_physical_stop",
+        "operation_id": str(operation["id"]), **identity,
+        "vm_absent": True, "vmi_absent": True,
+        "launcher_absent": True, "retained_pvc": True,
+        "controller_authenticated": True,
+        "same_generation_replacement": False,
+    }
+    if case == "wrong_successor":
+        evidence["launcher_uid"] = str(uuid4())
+    if case == "settlement_rollback":
+        from orchestrator.services.vm_resource_reservation_store import (
+            VMResourceReservationStore,
+        )
+
+        async def fail_settlement(self, conn, *, retry, operation):
+            raise ResourceAdmissionError("test_resource_settlement_unavailable")
+
+        monkeypatch.setattr(
+            VMResourceReservationStore, "release_idle_compute_on_conn",
+            fail_settlement,
+        )
+        with pytest.raises(
+            ResourceAdmissionError, match="test_resource_settlement_unavailable"
+        ):
+            await store.complete_release(str(operation["id"]), evidence=evidence)
+    elif case in {"missing_process_zero", "wrong_successor"}:
+        assert not await store.complete_release(
+            str(operation["id"]), evidence=evidence,
+        )
+    else:
+        assert await store.complete_release(str(operation["id"]), evidence=evidence)
+        assert await store.complete_release(str(operation["id"]), evidence=evidence)
+    charge = await db.fetchrow(
+        "SELECT state,release_evidence FROM vm_resource_reservations WHERE id=$1",
+        UUID(admitted["reservation_id"]),
+    )
+    projected = await db.fetchval(
+        "SELECT context->'vm'->>'status' FROM jobs WHERE id=$1",
+        retry["job_id"],
+    )
+    phase = await db.fetchval(
+        "SELECT phase FROM vm_idle_operations WHERE id=$1", operation["id"],
+    )
+    if case in {"exact", "flag_off"}:
+        assert (charge["state"], projected, phase) == (
+            "released", "suspended", "suspended",
+        )
+        assert json.loads(charge["release_evidence"])["operation_id"] == str(
+            operation["id"]
+        )
+    else:
+        assert (charge["state"], projected, phase) == (
+            "teardown", "suspending", "releasing",
+        )
+
+
+@pytest.mark.asyncio
+async def test_charged_pinned_idle_requires_agent_stop_before_compute_debit(
+    db, monkeypatch,
+):
+    _, retry, admitted, episode, identity = await charged_pinned_idle_wait(
+        db, monkeypatch,
+    )
+    store = VMIdleLifecycleStore(db)
+    operation = await store.admit_release(
+        str(retry["job_id"]), episode_id=episode.episode_id,
+        revision=episode.revision, identity=identity,
+    )
+    assert operation is not None and operation["release_kind"] == "pinned_job"
+    assert await db.fetchval(
+        "SELECT state FROM vm_resource_reservations WHERE id=$1",
+        UUID(admitted["reservation_id"]),
+    ) == "teardown"
+    await db.execute(
+        "INSERT INTO managed_repository_process_zero_receipts "
+        "(owner_kind,owner_id,scope,provisioner,runtime_incarnation) "
+        "VALUES('job',$1,'vm','vm',$2)",
+        retry["job_id"], identity["generation"],
+    )
+    physical = {
+        "version": 1, "kind": "vm_idle_physical_stop",
+        "operation_id": str(operation["id"]), **identity,
+        "vm_absent": True, "vmi_absent": True,
+        "launcher_absent": True, "retained_pvc": True,
+        "controller_authenticated": True,
+        "same_generation_replacement": False,
+    }
+    assert not await store.complete_release(str(operation["id"]), evidence=physical)
+    assert await db.fetchval(
+        "SELECT state FROM vm_resource_reservations WHERE id=$1",
+        UUID(admitted["reservation_id"]),
+    ) == "teardown"
+    claimed = await store.claim(str(operation["id"]), claimant="charged-pinned-stop")
+    assert await store.record_pinned_terminal(claimed, claimant="charged-pinned-stop")
+    assert await store.record_pinned_stop(
+        claimed, claimant="charged-pinned-stop", absence="exact_absent",
+    )
+    await store.release_claim(
+        str(operation["id"]), token=claimed["claim_token"],
+        claimant="charged-pinned-stop",
+    )
+    assert await store.complete_release(str(operation["id"]), evidence=physical)
+    assert await db.fetchval(
+        "SELECT state FROM vm_resource_reservations WHERE id=$1",
+        UUID(admitted["reservation_id"]),
+    ) == "released"
 
 @pytest_asyncio.fixture(scope="module")
 async def runtime_schema(whole_schema, pg_dsn):  # noqa: F811
