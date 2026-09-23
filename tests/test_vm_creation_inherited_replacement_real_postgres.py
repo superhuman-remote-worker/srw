@@ -1,9 +1,18 @@
 """Replacing an inherited VM requires this Job's own exact retirement authority."""
 
 import json
+import asyncio
+import hashlib
+import secrets
+import time
 from uuid import UUID, uuid4
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
+import httpx
 import pytest
+from fastapi import FastAPI
+from kubernetes.client.exceptions import ApiException
 
 from tests.test_vm_creation_inherited_attachment_real_postgres import (
     db as _db_fixture,
@@ -20,6 +29,351 @@ from orchestrator.services.vm_workspace_recovery_store import cleanup_intent_dig
 from orchestrator.services.vm_provisioner import VMProvisioner
 from vm_controller.creation_configuration import resolve_creation_configuration
 from shared.vm_workspace_storage import storage_name
+
+
+async def ordinary_lineage_owner(db, monkeypatch):
+    """Use the same snapshot builder as ordinary Job creation."""
+    from tests import test_vm_creation_inherited_attachment_real_postgres as lineage_fixture
+
+    owner = uuid4()
+    async with db.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO users(id,display_name,is_approved,is_admin) "
+            "VALUES($1,'A1 ordinary fixture',true,false)", owner,
+        )
+        await conn.execute(
+            "INSERT INTO capability_grants(scope_kind,scope_id,key,value_json) "
+            "VALUES('user',$1,'vm_workspace','true'::jsonb)", owner,
+        )
+
+    async def ordinary_job(store, *, timeout=3600, lane="stateless", context=None):
+        created = await store.create_job(
+            description="A1 ordinary retained fixture", origin="lifecycle",
+            status="created", execution_lane=lane, user_id=str(owner),
+            context=context or {},
+            config_override={"workspace": {"backend": "vm", "vm": {
+                "image": "image-original", "cpu_cores": 2,
+                "memory": "2Gi", "disk_size": "12Gi",
+            }}},
+            requested_workspace_backend="vm",
+        )
+        return UUID(str(created["id"]))
+
+    monkeypatch.setattr(lineage_fixture, "initial_job", ordinary_job)
+    return owner
+
+
+def resume_route_app(db, operations):
+    from orchestrator.routers.job_controls import JobControlRouteDependencies, router
+    from orchestrator.security.access import require_internal_or_job_access
+
+    app = FastAPI()
+    app.include_router(router)
+    app.state.job_control_dependencies_factory = lambda: JobControlRouteDependencies(
+        operations=operations, store=db,
+        require_internal_or_job_access=require_internal_or_job_access,
+        require_job_access=AsyncMock(), require_admin=AsyncMock(),
+        require_approved_user=AsyncMock(), require_sudo_request_authority=AsyncMock(),
+        user_can_access_job_or_thread=AsyncMock(), mcp_scope_project_id=lambda _: None,
+    )
+    return app
+
+
+async def owner_token(db, owner):
+    token = "srw_" + secrets.token_urlsafe(32)
+    await db.create_mcp_token(
+        user_id=str(owner), name="a1-route-test",
+        token_hash=hashlib.sha256(token.encode()).hexdigest(),
+        token_prefix=token[:12], scope="user",
+    )
+    return token
+
+
+@pytest.mark.asyncio
+async def test_quota_rejected_retained_vm_effect_survives_ordinary_resume(
+    db, attached, monkeypatch, tmp_path,
+):
+    """The public Resume preserves one rejected replacement, disk and deadline."""
+    from tests.test_job_control_operations import _operations
+
+    owner = await ordinary_lineage_owner(db, monkeypatch)
+
+    ctrl, api, _, _ = attached
+    store, first, (request, fresh, old, _, _) = await replacing(db, attached)
+    _, row, payload = await admit_replacement(db, ctrl, store, request, fresh)
+    assert str(row["expected_pvc_uid"]) == old["rootdisk_pvc_uid"]
+    quota_active = True
+    create = api.create
+
+    def quota_create(body):
+        if quota_active and body["kind"] == "VirtualMachine":
+            denied = ApiException(status=403)
+            denied.body = json.dumps({
+                "apiVersion": "v1", "kind": "Status", "status": "Failure",
+                "code": 403, "reason": "Forbidden",
+            })
+            raise denied
+        return create(body)
+
+    api.create = quota_create
+    result = await ctrl._do_create_serialized(payload)
+    assert result["status"] == "creation_pending"
+    observed = await store.inspect(request_id=str(row["request_id"]))
+    assert observed["effects"][-1]["carrier_intent"]["effect_kind"] == "vm"
+    assert observed["effects"][-1]["state"] == "rejected"
+    assert observed["expected_pvc_uid"] == old["rootdisk_pvc_uid"]
+    immutable = (
+        "request_id", "canonical_request", "request_digest",
+        "controller_configuration", "controller_configuration_digest",
+        "expected_pvc_uid", "provision_generation", "admission_deadline",
+    )
+    async with db.acquire() as conn:
+        before = dict(await conn.fetchrow(
+            "SELECT " + ",".join(immutable) + " FROM vm_creation_retries "
+            "WHERE request_id=$1", row["request_id"],
+        ))
+
+    monkeypatch.setenv("VM_CREATION_RETRY_ENABLED", "true")
+    operations = _operations(tmp_path, store=db)
+    app = resume_route_app(db, operations)
+    token = await owner_token(db, owner)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://a1.test") as client:
+        resumed_response = await client.post(
+            f"/api/jobs/{request['job_id']}/resume",
+            headers={"Authorization": f"Bearer {token}"}, json={},
+        )
+    assert resumed_response.status_code == 200, resumed_response.text
+    resumed = resumed_response.json()
+    assert resumed["vm_creation_retry_request_id"] == str(row["request_id"])
+    while_held = await store.inspect(request_id=str(row["request_id"]))
+    async with db.acquire() as conn:
+        frozen = dict(await conn.fetchrow(
+            "SELECT " + ",".join(immutable) + " FROM vm_creation_retries "
+            "WHERE request_id=$1", row["request_id"],
+        ))
+    assert frozen == before
+    assert while_held["effects"] == observed["effects"]
+    assert quota_active
+
+    quota_active = False
+    created = await ctrl._do_create_serialized(payload)
+    assert created["status"] == "created"
+    after = await store.inspect(request_id=str(row["request_id"]))
+    assert [
+        e["state"] for e in after["effects"]
+        if e["carrier_intent"]["effect_kind"] == "vm"
+    ] == [
+        "rejected", "observed",
+    ]
+    assert created["rootdisk_pvc_uid"] == old["rootdisk_pvc_uid"]
+
+
+@pytest.mark.asyncio
+async def test_a1_resume_http_route_requires_actual_bearer_owner(db):
+    """A gate token must enter the public Resume route as its non-admin owner."""
+    from orchestrator.routers.job_controls import JobControlRouteDependencies, router
+    from orchestrator.security.access import require_internal_or_job_access
+    from tests.test_vm_creation_preflight_real_postgres import initial_job
+
+    job_id, owner, outsider = await initial_job(db), uuid4(), uuid4()
+    async with db.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO users(id,display_name,is_approved,is_admin) "
+            "VALUES($1,'A1 owner',true,false),($2,'A1 outsider',true,false)",
+            owner, outsider,
+        )
+        await conn.execute("UPDATE jobs SET user_id=$2 WHERE id=$1", job_id, owner)
+
+    async def token_for(user_id):
+        token = "srw_" + secrets.token_urlsafe(32)
+        await db.create_mcp_token(
+            user_id=str(user_id), name="a1-route-test",
+            token_hash=hashlib.sha256(token.encode()).hexdigest(),
+            token_prefix=token[:12], scope="user",
+        )
+        return token
+
+    resume = AsyncMock(return_value={"status": "creation_pending", "vm_creation_retry_request_id": str(uuid4())})
+    app = FastAPI()
+    app.include_router(router)
+    app.state.job_control_dependencies_factory = lambda: JobControlRouteDependencies(
+        operations=SimpleNamespace(resume_job=resume), store=db,
+        require_internal_or_job_access=require_internal_or_job_access,
+        require_job_access=AsyncMock(), require_admin=AsyncMock(),
+        require_approved_user=AsyncMock(), require_sudo_request_authority=AsyncMock(),
+        user_can_access_job_or_thread=AsyncMock(), mcp_scope_project_id=lambda _: None,
+    )
+    owner_token, outsider_token = await token_for(owner), await token_for(outsider)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://a1.test") as client:
+        denied = await client.post(
+            f"/api/jobs/{job_id}/resume", headers={"Authorization": f"Bearer {outsider_token}"}, json={},
+        )
+        assert denied.status_code == 403
+        resume.assert_not_awaited()
+        accepted = await client.post(
+            f"/api/jobs/{job_id}/resume", headers={"Authorization": f"Bearer {owner_token}"}, json={},
+        )
+    assert accepted.status_code == 200
+    assert accepted.json()["status"] == "creation_pending"
+    assert str(resume.await_args.kwargs["user"]["id"]) == str(owner)
+    assert resume.await_args.kwargs["req"].headers.get("x-internal-key") is None
+
+
+@pytest.mark.asyncio
+async def test_a1_open_cleanup_refuses_actual_owner_resume(
+    db, attached, monkeypatch, tmp_path,
+):
+    """The predecessor cleanup hold survives the public Resume entrypoint."""
+    from tests.test_job_control_operations import _operations
+
+    owner = await ordinary_lineage_owner(db, monkeypatch)
+    ctrl, _, _, _ = attached
+    jobs, _, _, _, payload = await controller_bridge(db, attached)
+    job_id = jobs[-1]
+    assert (await ctrl._do_create_serialized(payload))["status"] == "created"
+    async with db.acquire() as conn:
+        context = json.loads(await conn.fetchval("SELECT context FROM jobs WHERE id=$1", job_id))
+        context["vm"]["retirement_cleanup_pending"] = True
+        context["vm"]["status"] = "deleting"
+        await conn.execute(
+            "UPDATE jobs SET status='paused',context=$2::jsonb WHERE id=$1",
+            job_id, json.dumps(context),
+        )
+    monkeypatch.setenv("VM_CREATION_RETRY_ENABLED", "true")
+    app = resume_route_app(db, _operations(tmp_path, store=db))
+    token = await owner_token(db, owner)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://a1.test") as client:
+        response = await client.post(
+            f"/api/jobs/{job_id}/resume",
+            headers={"Authorization": f"Bearer {token}"}, json={},
+        )
+    assert response.status_code == 409
+    async with db.acquire() as conn:
+        assert await conn.fetchval("SELECT status FROM jobs WHERE id=$1", job_id) == "paused"
+
+
+@pytest.mark.asyncio
+async def test_a1_admitted_cleanup_blocks_http_resume_then_settles(
+    db, attached, monkeypatch, tmp_path,
+):
+    from tests.test_job_control_operations import _operations
+    from orchestrator.services.vm_provisioning_cleanup import recycle_provisioning_vm
+    from orchestrator.services.vm_workspace_recovery_store import VMWorkspaceRecoveryStore
+    from orchestrator.services.vm_provisioner import VMTeardownIdentity, VMTeardownResult
+
+    owner = await ordinary_lineage_owner(db, monkeypatch)
+    ctrl, _, _, _ = attached
+    jobs, _, _, _, payload = await controller_bridge(db, attached)
+    job_id = jobs[-1]
+    assert (await ctrl._do_create_serialized(payload))["status"] == "created"
+    async with db.acquire() as conn:
+        context = json.loads(await conn.fetchval("SELECT context FROM jobs WHERE id=$1", job_id))
+        context["vm"]["status"] = "ready"
+        context.pop("_vm_creation_pending", None)
+        await conn.execute("UPDATE jobs SET status='paused',context=$2::jsonb WHERE id=$1", job_id, json.dumps(context))
+    vm = context["vm"]
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    class PausedPhysicalStop:
+        async def capture_vm_teardown_identity(self, owner_id, *, entity_type):
+            assert owner_id == str(job_id) and entity_type == "job"
+            return VMTeardownIdentity(
+                provision_generation=vm["provision_generation"],
+                vm_uid=vm["vm_uid"], rootdisk_pvc_uid=vm["rootdisk_pvc_uid"],
+            )
+
+        async def release_vm_captured(self, owner_id, identity, **kwargs):
+            assert owner_id == str(job_id)
+            assert identity.vm_uid == vm["vm_uid"]
+            assert kwargs["purge_disk"] is False
+            entered.set()
+            await release.wait()
+            assert await db.record_managed_repository_workspace_process_zero(
+                owner_id, owner_kind="job", scope="vm", provisioner="vm",
+                runtime_incarnation=identity.provision_generation,
+            )
+            return VMTeardownResult("completed", True)
+
+    task = asyncio.create_task(recycle_provisioning_vm(
+        str(job_id), vm, db=db, provisioner=PausedPhysicalStop(),
+        recovery_store=VMWorkspaceRecoveryStore(db), now=time.time(), phase_timeout=False,
+    ))
+    await asyncio.wait_for(entered.wait(), timeout=10)
+    async with db.acquire() as conn:
+        assert await conn.fetchval(
+            "SELECT count(*) FROM vm_workspace_cleanup_admissions "
+            "WHERE owner_id=$1 AND source='dispatcher_vm_recycle' AND completed_at IS NULL",
+            job_id,
+        ) == 1
+    monkeypatch.setenv("VM_CREATION_RETRY_ENABLED", "true")
+    token = await owner_token(db, owner)
+    app = resume_route_app(db, _operations(tmp_path, store=db))
+    async with db.acquire() as conn:
+        before_queue = dict(await conn.fetchrow(
+            "SELECT state,lease_token,leased_by FROM run_queue WHERE unit_id=$1", job_id,
+        ))
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://a1.test") as client:
+        blocked = await client.post(f"/api/jobs/{job_id}/resume", headers={"Authorization": f"Bearer {token}"}, json={})
+        assert blocked.status_code == 409
+        async with db.acquire() as conn:
+            after_queue = dict(await conn.fetchrow(
+                "SELECT state,lease_token,leased_by FROM run_queue WHERE unit_id=$1", job_id,
+            ))
+        assert after_queue == before_queue
+        release.set()
+        assert await asyncio.wait_for(task, timeout=10) == "completed"
+        allowed = await client.post(f"/api/jobs/{job_id}/resume", headers={"Authorization": f"Bearer {token}"}, json={})
+    assert allowed.status_code == 200, allowed.text
+
+
+@pytest.mark.asyncio
+async def test_a1_ready_recycler_loses_to_prior_queued_resume(
+    db, attached, monkeypatch, tmp_path,
+):
+    from tests.test_job_control_operations import _operations
+    from orchestrator.services.vm_provisioning_cleanup import recycle_provisioning_vm
+    from orchestrator.services.vm_workspace_recovery_store import VMWorkspaceRecoveryStore
+    from orchestrator.services.vm_provisioner import VMTeardownIdentity
+
+    owner = await ordinary_lineage_owner(db, monkeypatch)
+    ctrl, _, _, _ = attached
+    jobs, _, _, _, payload = await controller_bridge(db, attached)
+    job_id = jobs[-1]
+    assert (await ctrl._do_create_serialized(payload))["status"] == "created"
+    async with db.acquire() as conn:
+        context = json.loads(await conn.fetchval("SELECT context FROM jobs WHERE id=$1", job_id))
+        context["vm"]["status"] = "ready"
+        context.pop("_vm_creation_pending", None)
+        await conn.execute("UPDATE jobs SET status='paused',context=$2::jsonb WHERE id=$1", job_id, json.dumps(context))
+    vm = context["vm"]
+    monkeypatch.setenv("VM_CREATION_RETRY_ENABLED", "true")
+    token = await owner_token(db, owner)
+    app = resume_route_app(db, _operations(tmp_path, store=db))
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://a1.test") as client:
+        accepted = await client.post(f"/api/jobs/{job_id}/resume", headers={"Authorization": f"Bearer {token}"}, json={})
+    assert accepted.status_code == 200
+    async with db.acquire() as conn:
+        assert await conn.fetchval("SELECT state FROM run_queue WHERE unit_id=$1", job_id) == "queued"
+
+    class NoPhysicalStop:
+        async def capture_vm_teardown_identity(self, owner_id, *, entity_type):
+            return VMTeardownIdentity(vm["provision_generation"], vm["vm_uid"], vm["rootdisk_pvc_uid"])
+
+        async def release_vm_captured(self, *_args, **_kwargs):
+            raise AssertionError("queued worker must fence predecessor retirement")
+
+    outcome = await recycle_provisioning_vm(
+        str(job_id), vm, db=db, provisioner=NoPhysicalStop(),
+        recovery_store=VMWorkspaceRecoveryStore(db), now=time.time(), phase_timeout=False,
+    )
+    assert outcome == "authority_changed"
+    async with db.acquire() as conn:
+        context = json.loads(await conn.fetchval("SELECT context FROM jobs WHERE id=$1", job_id))
+        assert context["vm"].get("retirement_cleanup_pending") is not True
+        assert not await conn.fetchval(
+            "SELECT EXISTS(SELECT 1 FROM vm_workspace_cleanup_admissions "
+            "WHERE owner_id=$1 AND source='dispatcher_vm_recycle')", job_id,
+        )
 
 setup, attached, db = _setup_fixture, _attached_fixture, _db_fixture
 
@@ -421,3 +775,105 @@ async def test_replacement_uses_unchanged_ledger_without_context_copy(db, attach
     _, row, payload = await admit_replacement(db, ctrl, store, request, fresh)
     assert row["admission_deadline"] == first["admission_deadline"]
     assert (await ctrl._do_create_serialized(payload))["status"] == "created"
+
+
+@pytest.mark.asyncio
+async def test_a1_stale_workspace_resume_cannot_shed_new_ready_retirement(
+    db, attached, monkeypatch, tmp_path,
+):
+    """Old route classification must not erase a later admitted cleanup marker."""
+    from tests.test_job_control_operations import _operations
+    from orchestrator.services.vm_provisioning_cleanup import recycle_provisioning_vm
+    from orchestrator.services.vm_workspace_recovery_store import VMWorkspaceRecoveryStore
+    from orchestrator.services.vm_provisioner import VMTeardownIdentity, VMTeardownResult
+
+    owner = await ordinary_lineage_owner(db, monkeypatch)
+    ctrl, _, _, _ = attached
+    jobs, _, _, _, payload = await controller_bridge(db, attached)
+    job_id = jobs[-1]
+    assert (await ctrl._do_create_serialized(payload))["status"] == "created"
+    async with db.acquire() as conn:
+        context = json.loads(await conn.fetchval("SELECT context FROM jobs WHERE id=$1", job_id))
+        context["vm"]["status"] = "provisioning"
+        context.pop("_vm_creation_pending", None)
+        await conn.execute(
+            "UPDATE jobs SET status='paused',context=$2::jsonb WHERE id=$1",
+            job_id, json.dumps(context),
+        )
+        before_queue = dict(await conn.fetchrow(
+            "SELECT state,lease_token,leased_by FROM run_queue WHERE unit_id=$1", job_id,
+        ))
+    old_vm = context["vm"]
+    classification_reached, allow_old_classification = asyncio.Event(), asyncio.Event()
+    physical_stop_reached, allow_physical_stop = asyncio.Event(), asyncio.Event()
+    operations = _operations(tmp_path, store=db)
+
+    async def pause_before_old_classification(job):
+        classification_reached.set()
+        await allow_old_classification.wait()
+        return "ready", job, None
+
+    operations.dependencies.prepare_job_workspace_runtime.side_effect = pause_before_old_classification
+    operations.dependencies.resume_missing_workspace.side_effect = lambda job: (
+        "vm" if (json.loads(job["context"]) if isinstance(job["context"], str)
+                 else job["context"])["vm"]["status"] == "provisioning" else None
+    )
+
+    class PausedPhysicalStop:
+        async def capture_vm_teardown_identity(self, owner_id, *, entity_type):
+            assert owner_id == str(job_id) and entity_type == "job"
+            return VMTeardownIdentity(
+                old_vm["provision_generation"], old_vm["vm_uid"],
+                old_vm["rootdisk_pvc_uid"],
+            )
+
+        async def release_vm_captured(self, owner_id, identity, **kwargs):
+            assert owner_id == str(job_id)
+            assert identity.vm_uid == old_vm["vm_uid"]
+            assert kwargs["purge_disk"] is False
+            physical_stop_reached.set()
+            await allow_physical_stop.wait()
+            assert await db.record_managed_repository_workspace_process_zero(
+                owner_id, owner_kind="job", scope="vm", provisioner="vm",
+                runtime_incarnation=identity.provision_generation,
+            )
+            return VMTeardownResult("completed", True)
+
+    monkeypatch.setenv("VM_CREATION_RETRY_ENABLED", "true")
+    token = await owner_token(db, owner)
+    app = resume_route_app(db, operations)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://a1.test") as client:
+        resume_task = asyncio.create_task(client.post(
+            f"/api/jobs/{job_id}/resume",
+            headers={"Authorization": f"Bearer {token}"}, json={},
+        ))
+        await asyncio.wait_for(classification_reached.wait(), timeout=10)
+        async with db.acquire() as conn:
+            current = json.loads(await conn.fetchval("SELECT context FROM jobs WHERE id=$1", job_id))
+            current["vm"]["status"] = "ready"
+            await conn.execute("UPDATE jobs SET context=$2::jsonb WHERE id=$1", job_id, json.dumps(current))
+        cleanup_task = asyncio.create_task(recycle_provisioning_vm(
+            str(job_id), current["vm"], db=db, provisioner=PausedPhysicalStop(),
+            recovery_store=VMWorkspaceRecoveryStore(db), now=time.time(),
+            phase_timeout=False,
+        ))
+        await asyncio.wait_for(physical_stop_reached.wait(), timeout=10)
+        async with db.acquire() as conn:
+            assert await conn.fetchval(
+                "SELECT count(*) FROM vm_workspace_cleanup_admissions "
+                "WHERE owner_id=$1 AND source='dispatcher_vm_recycle' AND completed_at IS NULL",
+                job_id,
+            ) == 1
+        allow_old_classification.set()
+        refused = await asyncio.wait_for(resume_task, timeout=10)
+        assert refused.status_code == 409
+        async with db.acquire() as conn:
+            after = json.loads(await conn.fetchval("SELECT context FROM jobs WHERE id=$1", job_id))
+            after_queue = dict(await conn.fetchrow(
+                "SELECT state,lease_token,leased_by FROM run_queue WHERE unit_id=$1", job_id,
+            ))
+        assert after["vm"]["retirement_cleanup_pending"] is True
+        assert "last_vm" not in after
+        assert after_queue == before_queue
+        allow_physical_stop.set()
+        assert await asyncio.wait_for(cleanup_task, timeout=10) == "completed"
