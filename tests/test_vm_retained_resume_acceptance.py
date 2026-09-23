@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -222,14 +223,41 @@ async def test_execute_proves_worker_sentinel_before_terminal_vm_teardown(
                 state["vm_deleted"] = True
                 return VMTeardownResult("completed", True)
 
+            async def uncharged_source(query, *args):
+                assert "FROM vm_creation_retries" in query
+                assert tuple(map(str, args)) == (job_id, new_gen)
+                return {"controller_configuration": {"version": 1}}
+
+            async def no_retained_disk_hold(query, *args):
+                if query == "SELECT to_regclass('public.vm_idle_operations') IS NOT NULL":
+                    return True
+                assert "storage_disposition='retention_unknown'" in query
+                assert tuple(map(str, args)) == (job_id, new_gen, pvc_uid)
+                return None
+
+            @asynccontextmanager
+            async def transaction():
+                yield
+
+            connection = SimpleNamespace(
+                fetchrow=AsyncMock(side_effect=uncharged_source),
+                fetchval=AsyncMock(side_effect=no_retained_disk_hold),
+                transaction=transaction,
+            )
+
+            @asynccontextmanager
+            async def acquire():
+                yield connection
+
             cleanup = SimpleNamespace(
+                db=SimpleNamespace(acquire=acquire),
                 acquire_cleanup_permit=AsyncMock(return_value=CleanupPermit(
                     allowed=True, admission_id=uuid4(),
                 )),
                 complete_cleanup_permit=AsyncMock(),
             )
             dependencies = CompletionEffectDependencies(
-                store=SimpleNamespace(get_job=AsyncMock(return_value={})),
+                store=SimpleNamespace(get_job=AsyncMock(return_value={}), acquire=acquire),
                 container_provisioner=SimpleNamespace(),
                 vm_provisioner=SimpleNamespace(release_vm_captured=release_vm),
                 get_container_context=lambda _: {}, get_vm_context=lambda _: {},
@@ -242,6 +270,8 @@ async def test_execute_proves_worker_sentinel_before_terminal_vm_teardown(
             )
             assert teardown["teardown_disposition"] == "completed"
             cleanup.complete_cleanup_permit.assert_awaited_once()
+            assert connection.fetchrow.await_count == 2
+            assert connection.fetchval.await_count == 2
             state["terminal"] = True
             return {"id": str(uuid4()), "state": "done", "outcome": {},
                     "finalized_at": authorized_at, "accepted_lease_token": 1}
