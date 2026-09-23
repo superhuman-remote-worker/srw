@@ -11,7 +11,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from typing import Optional
+from collections.abc import Callable
+from typing import Any, Optional
 from uuid import uuid4
 
 from orchestrator.services.container_provisioner import (
@@ -397,41 +398,97 @@ async def reconcile_session_workspaces(*, db, provisioner, suspension) -> int:
 
 
 async def workspace_idle_sweeper(
-    shutdown_event: asyncio.Event, *, store, provisioner, suspension
+    shutdown_event: asyncio.Event,
+    *,
+    store,
+    provisioner,
+    suspension,
+    vm_idle_service_factory: Callable[[], Any] | None = None,
+    terminal_vm_controls_factory: Callable[[], Any] | None = None,
 ) -> None:
-    """Background loop: reconciles failed/missing session workspaces.
+    """Reconcile session recovery and durable stateless VM idle operations.
 
     Idle suspension and teardown now live in the lifecycle reconciler's reap
     path (``services/lifecycle/reconciler.py`` → ``WorkspaceInstanceManager``),
     which snapshots-then-deletes reapable workspaces and force-deletes ones it
     can never reach (bounded retry) instead of keeping them alive forever.
 
-    This loop retains only the session-workspace recovery reconcile —
-    recreating failed/missing workspaces for active sessions — which is
-    independent of idle policy. Runs every 60 seconds.
+    Session recovery remains independent of idle policy. When migration 0270
+    exists, the bounded VM Job release/wake adapter built by
+    ``vm_idle_service_factory`` also runs here every 60 seconds, including
+    operations admitted before the new-release flag was disabled. The Job
+    controls built by ``terminal_vm_controls_factory`` replay terminal Job VM
+    cleanup in a background task the sweep never waits on.
     """
-    logger.info("Workspace idle sweeper started (reconcile-only)")
-    while not shutdown_event.is_set():
-        # Session workspace reconcile (safety-net): recreate failed/missing
-        # workspaces for active sessions. Runs regardless of whether idle
-        # suspension is enabled — recovering a wedged workspace is independent
-        # of idle policy. This is the session-side equivalent of the job
-        # dispatcher's per-cycle workspace reconcile.
-        # (reconcile_session_workspaces never raises; the try/except is a
-        # belt-and-suspenders guard so a future change can't kill this loop.)
-        try:
-            await reconcile_session_workspaces(
-                db=store,
-                provisioner=provisioner,
-                suspension=suspension,
+    logger.info("Workspace idle sweeper started")
+    vm_idle_service = None
+    if vm_idle_service_factory is not None:
+        async with store.acquire() as idle_conn:
+            idle_schema = await idle_conn.fetchval(
+                "SELECT to_regclass('public.vm_idle_operations') IS NOT NULL"
             )
-        except Exception as e:
-            logger.error("Error in session workspace reconcile: %s", e)
+        if idle_schema:
+            vm_idle_service = vm_idle_service_factory()
+    terminal_vm_controls = (
+        terminal_vm_controls_factory()
+        if terminal_vm_controls_factory is not None
+        else None
+    )
+    terminal_vm_task: asyncio.Task[int] | None = None
+    try:
+        while not shutdown_event.is_set():
+            # Session workspace reconcile (safety-net): recreate failed/missing
+            # workspaces for active sessions. Runs regardless of whether idle
+            # suspension is enabled — recovering a wedged workspace is independent
+            # of idle policy. This is the session-side equivalent of the job
+            # dispatcher's per-cycle workspace reconcile.
+            # (reconcile_session_workspaces never raises; the try/except is a
+            # belt-and-suspenders guard so a future change can't kill this loop.)
+            try:
+                await reconcile_session_workspaces(
+                    db=store,
+                    provisioner=provisioner,
+                    suspension=suspension,
+                )
+            except Exception as e:
+                logger.error("Error in session workspace reconcile: %s", e)
 
-        try:
-            await asyncio.wait_for(shutdown_event.wait(), timeout=60.0)
-            break
-        except asyncio.TimeoutError:
-            pass
+            if vm_idle_service is not None:
+                try:
+                    await vm_idle_service.reconcile_once(limit=16)
+                except Exception:
+                    logger.exception("VM idle reconcile held")
 
+            # Terminal Job rows outlive HTTP callers. Replay their ordinary exact
+            # VM cleanup through the same admission after a timeout or restart;
+            # retained terminal reviews remain owned by vm_idle_service above.
+            if terminal_vm_controls is not None and (
+                terminal_vm_task is None or terminal_vm_task.done()
+            ):
+                if terminal_vm_task is not None:
+                    try:
+                        terminal_vm_task.result()
+                    except asyncio.CancelledError:
+                        pass
+                    except Exception:
+                        logger.exception("Terminal Job VM cleanup reconcile held")
+                terminal_vm_task = asyncio.create_task(
+                    terminal_vm_controls.reconcile_terminal_vm_cleanups(limit=4)
+                )
+
+            try:
+                await asyncio.wait_for(shutdown_event.wait(), timeout=60.0)
+                break
+            except asyncio.TimeoutError:
+                pass
+
+    finally:
+        if terminal_vm_task is not None:
+            terminal_vm_task.cancel()
+            try:
+                await terminal_vm_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.exception("Terminal Job VM cleanup reconcile held on shutdown")
     logger.info("Workspace idle sweeper stopped")

@@ -708,6 +708,16 @@ from orchestrator.services.infrastructure_metering import (  # noqa: E402
 )
 from orchestrator.services.startup_backfills import run_startup_backfills  # noqa: E402
 from orchestrator.services import job_dispatcher  # noqa: E402
+from orchestrator.services import retention_sweepers  # noqa: E402
+from orchestrator.services.agent_provisioner import agent_pool_reconciler  # noqa: E402
+from orchestrator.services.ide_session import ide_session_ttl_sweeper  # noqa: E402
+from orchestrator.services.ide_settings import code_server_settings_sweeper  # noqa: E402
+from orchestrator.services.imap_poller import imap_poll_loop  # noqa: E402
+from orchestrator.services.lifecycle.reconciler import lifecycle_reconciler_loop  # noqa: E402
+from orchestrator.services.ro_reader_reconciler import ro_reader_reconciler_loop  # noqa: E402
+from orchestrator.services.session_provisioner import workspace_idle_sweeper  # noqa: E402
+from orchestrator.services.snapshot_service import snapshot_gc_sweeper  # noqa: E402
+from orchestrator.services.sudo_gate import sudo_expiration_sweeper  # noqa: E402
 from orchestrator.services import (  # noqa: E402
     pinned_k8s_reconciliation as pinned_k8s_reconciliation_service,
 )
@@ -821,7 +831,6 @@ from orchestrator.services.workspace_lifecycle import (  # noqa: E402
 )
 from orchestrator.services.session_provisioner import (  # noqa: E402
     ensure_session_workspace,
-    reconcile_session_workspaces,
 )
 from orchestrator.services.docker_provisioner import docker_provisioner  # noqa: E402
 from orchestrator.services.persistent_provisioner import persistent_provisioner  # noqa: E402
@@ -1198,146 +1207,6 @@ def _stale_agent_detector_dependencies() -> (
     )
 
 
-async def agent_pool_reconciler(shutdown_event: asyncio.Event) -> None:
-    """Background task that maintains the dynamic agent pool.
-
-    Runs every 60 seconds:
-    - Ensures MIN_AGENTS warm pods exist (instant dispatch)
-    - Reaps completed / stale / unstartable agent pods (single dispatcher)
-
-    Drift-based draining lives in ``lifecycle_reconciler_loop`` now —
-    this loop only owns capacity (warm pool + scale-down) and crash GC.
-    """
-    logger.info("Agent pool reconciler started")
-    while not shutdown_event.is_set():
-        try:
-            if agent_provisioner.is_available:
-                await agent_provisioner.ensure_warm_pool()
-                await agent_provisioner.reap_pods()
-                await agent_provisioner.scale_down_idle()
-        except Exception as e:
-            logger.error("Error in agent pool reconciler: %s", e)
-
-        try:
-            await asyncio.wait_for(shutdown_event.wait(), timeout=60.0)
-            break
-        except asyncio.TimeoutError:
-            pass
-
-    logger.info("Agent pool reconciler stopped")
-
-
-async def lifecycle_reconciler_loop(
-    shutdown_event: asyncio.Event,
-    reconciler: InstanceLifecycleReconciler,
-) -> None:
-    """Background task driving the unified instance lifecycle reconciler.
-
-    Runs every 60 seconds. The reconciler delegates to per-kind
-    managers (``AgentInstanceManager`` etc.) for drift detection and
-    drain. Crash detection still flows through ``reap_pods`` in the
-    sibling ``agent_pool_reconciler`` for now; consolidation is a
-    follow-up.
-    """
-    logger.info("Lifecycle reconciler loop started")
-    while not shutdown_event.is_set():
-        try:
-            await reconciler.tick()
-        except Exception:
-            logger.exception("Lifecycle reconciler tick failed")
-
-        try:
-            await asyncio.wait_for(shutdown_event.wait(), timeout=60.0)
-            break
-        except asyncio.TimeoutError:
-            pass
-
-    logger.info("Lifecycle reconciler loop stopped")
-
-
-async def sudo_expiration_sweeper(shutdown_event: asyncio.Event) -> None:
-    """Background task that denies expired sudo approval requests.
-
-    Runs every 15 seconds. For each expired request, publishes a denial
-    to the stored NATS reply subject so the daemon unblocks. Expired
-    vm_upgrade requests additionally fail their frozen job loudly
-    (``vm_upgrade_expired``) instead of leaving it invisibly wedged.
-    """
-    from orchestrator.services.sudo_gate import sudo_gate  # noqa: E402
-
-    logger.info("Sudo expiration sweeper started")
-    while not shutdown_event.is_set():
-        try:
-            await sudo_gate.sweep_expired()
-        except Exception as e:
-            logger.error("Error in sudo expiration sweeper: %s", e)
-
-        try:
-            await _job_control_operations().fail_expired_vm_upgrade_jobs()
-        except Exception as e:
-            logger.error("Error failing expired vm_upgrade jobs: %s", e)
-
-        try:
-            await asyncio.wait_for(shutdown_event.wait(), timeout=15.0)
-            break
-        except asyncio.TimeoutError:
-            pass
-
-    logger.info("Sudo expiration sweeper stopped")
-
-
-async def ide_session_ttl_sweeper(shutdown_event: asyncio.Event) -> None:
-    """Background task that expires IDE sessions past their TTL.
-
-    Runs every 60 seconds. Checks active/idle sessions for:
-    - Max lifetime exceeded (default: 4 hours)
-    - Idle timeout exceeded (default: 30 minutes, only for 'idle' status)
-    """
-    logger.info("IDE session TTL sweeper started")
-    while not shutdown_event.is_set():
-        try:
-            expired = await ide_session_service.check_ttl_all()
-            if expired:
-                logger.info("IDE session sweeper: expired %d sessions", expired)
-        except Exception as e:
-            logger.error("Error in IDE session TTL sweeper: %s", e)
-
-        try:
-            await asyncio.wait_for(shutdown_event.wait(), timeout=60.0)
-            break
-        except asyncio.TimeoutError:
-            pass
-
-    logger.info("IDE session TTL sweeper stopped")
-
-
-async def ro_reader_reconciler_loop(shutdown_event: asyncio.Event) -> None:
-    """Leader-gated periodic sweep of orphaned protected-mode RO grants.
-
-    Revoke-on-teardown alone is not enough (a crash/killed pod can skip it), so
-    this independently revokes any active ``cloud_ro_mounts`` grant whose thread
-    is gone/ended (design §8.1.4). Runs every 15 minutes.
-    """
-    from orchestrator.services.ro_reader_reconciler import reconcile_orphaned_ro_mounts
-
-    logger.info("RO reader reconciler started")
-    while not shutdown_event.is_set():
-        try:
-            await reconcile_orphaned_ro_mounts(
-                postgres_db=postgres_db, router=main_cloud_router
-            )
-        except Exception as e:
-            logger.error("Error in RO reader reconciler: %s", e)
-
-        try:
-            await asyncio.wait_for(shutdown_event.wait(), timeout=900.0)
-            break
-        except asyncio.TimeoutError:
-            pass
-
-    logger.info("RO reader reconciler stopped")
-
-
 _stateless_workspace_ensure_registry = (
     stateless_workspace_scheduler.StatelessWorkspaceEnsureRegistry()
 )
@@ -1365,279 +1234,29 @@ def _schedule_stateless_workspace_ensure(thread_id: str) -> asyncio.Task[None]:
     )
 
 
-async def workspace_idle_sweeper(shutdown_event: asyncio.Event) -> None:
-    """Reconcile session recovery and durable stateless VM idle operations.
+def _build_vm_idle_service() -> Any:
+    """The VM idle release/wake adapter the workspace idle sweeper drives."""
+    from orchestrator.services.vm_idle_lifecycle import VMIdleLifecycleService
 
-    Idle suspension and teardown now live in the lifecycle reconciler's reap
-    path (``services/lifecycle/reconciler.py`` → ``WorkspaceInstanceManager``),
-    which snapshots-then-deletes reapable workspaces and force-deletes ones it
-    can never reach (bounded retry) instead of keeping them alive forever.
-
-    Session recovery remains independent of idle policy. When migration 0270
-    exists, the bounded VM Job release/wake adapter also runs here every
-    60 seconds, including operations admitted before the new-release flag
-    was disabled.
-    """
-    logger.info("Workspace idle sweeper started")
-    vm_idle_service = None
-    async with postgres_db.acquire() as idle_conn:
-        idle_schema = await idle_conn.fetchval(
-            "SELECT to_regclass('public.vm_idle_operations') IS NOT NULL"
-        )
-    if idle_schema:
-        from orchestrator.services.vm_idle_lifecycle import VMIdleLifecycleService
-
-        vm_idle_service = VMIdleLifecycleService(
-            postgres_db, vm_provisioner, VMWorkspaceRecoveryStore(postgres_db),
-            claimant=f"{os.getenv('HOSTNAME', 'orchestrator')}:vm-idle",
-            agent_provisioner=agent_provisioner,
-            thread_retirement=_thread_retirement_operations(),
-            thread_workspace_suspension=workspace_suspension_service,
-            thread_prepare=lambda thread_id, operation_id: (
-                sessions_routes.prepare_woken_pinned_session(
-                    thread_id, operation_id,
-                    dependencies=_sessions_dependencies(),
-                )
-            ),
-            terminal_publication_handler=lambda operation: (
-                _job_control_operations().publish_terminal_review(operation)
-            ),
-        )
-    terminal_vm_controls = _job_mutation_operations()
-    terminal_vm_task: asyncio.Task[int] | None = None
-    try:
-        while not shutdown_event.is_set():
-            # Session workspace reconcile (safety-net): recreate failed/missing
-            # workspaces for active sessions. Runs regardless of whether idle
-            # suspension is enabled — recovering a wedged workspace is independent
-            # of idle policy. This is the session-side equivalent of the job
-            # dispatcher's per-cycle workspace reconcile.
-            # (reconcile_session_workspaces never raises; the try/except is a
-            # belt-and-suspenders guard so a future change can't kill this loop.)
-            try:
-                await reconcile_session_workspaces(
-                    db=postgres_db,
-                    provisioner=container_provisioner,
-                    suspension=workspace_suspension_service,
-                )
-            except Exception as e:
-                logger.error("Error in session workspace reconcile: %s", e)
-
-            if vm_idle_service is not None:
-                try:
-                    await vm_idle_service.reconcile_once(limit=16)
-                except Exception:
-                    logger.exception("VM idle reconcile held")
-
-            # Terminal Job rows outlive HTTP callers. Replay their ordinary exact
-            # VM cleanup through the same admission after a timeout or restart;
-            # retained terminal reviews remain owned by vm_idle_service above.
-            if terminal_vm_task is None or terminal_vm_task.done():
-                if terminal_vm_task is not None:
-                    try:
-                        terminal_vm_task.result()
-                    except asyncio.CancelledError:
-                        pass
-                    except Exception:
-                        logger.exception("Terminal Job VM cleanup reconcile held")
-                terminal_vm_task = asyncio.create_task(
-                    terminal_vm_controls.reconcile_terminal_vm_cleanups(limit=4)
-                )
-
-            try:
-                await asyncio.wait_for(shutdown_event.wait(), timeout=60.0)
-                break
-            except asyncio.TimeoutError:
-                pass
-
-    finally:
-        if terminal_vm_task is not None:
-            terminal_vm_task.cancel()
-            try:
-                await terminal_vm_task
-            except asyncio.CancelledError:
-                pass
-            except Exception:
-                logger.exception("Terminal Job VM cleanup reconcile held on shutdown")
-    logger.info("Workspace idle sweeper stopped")
-
-
-async def code_server_settings_sweeper(shutdown_event: asyncio.Event) -> None:
-    """Background loop: reconcile per-user code-server IDE settings.
-
-    Workspaces are network-isolated from the orchestrator (egress is denied), so
-    instead of the workspace pushing changes, the orchestrator pulls inward on a
-    ~10-minute cycle: it reads each active workspace's code-server config files
-    (settings.json, keybindings.json, snippets) over SSH and merges any newer
-    edits into the owning user's stored settings (``users.settings['ide']``).
-    Conflict resolution is by filesystem mtime — newest wins, per file — so the
-    cycle order across a user's workspaces doesn't matter. See
-    orchestrator/services/ide_settings.py.
-    """
-    if os.environ.get("IDE_SETTINGS_SYNC_ENABLED", "true").lower() not in (
-        "1",
-        "true",
-        "yes",
-    ):
-        # Park instead of returning: run_when_leader re-creates a loop that
-        # exits on its next poll (~1s), which would respawn+log this every
-        # second for the whole leadership tenure.
-        logger.info("Code-server settings sweeper disabled (IDE_SETTINGS_SYNC_ENABLED)")
-        await shutdown_event.wait()
-        return
-
-    from orchestrator.services.ide_settings import (
-        IdeSettingsStore,
-        OpenVsxClassifier,
-        _coerce_context,
-        capture_ide_profile,
-        evict_dead_workspaces,
-        list_ide_extensions,
-        pull_ide_config,
-        reconcile_extensions,
-        reconcile_ide_settings,
-        reconcile_vm_ide_workspace,
-        resolve_ssh_target,
-        is_vm_capture_context,
-    )
-
-    interval = float(os.environ.get("IDE_SETTINGS_SYNC_INTERVAL_S", "600"))
-    store = IdeSettingsStore(postgres_db)
-    classifier = OpenVsxClassifier()  # cache persists across cycles for this process
-    logger.info("Code-server settings sweeper started (interval=%.0fs)", interval)
-    while not shutdown_event.is_set():
-        try:
-            workspaces = await postgres_db.list_active_ide_workspaces()
-            vm_workspaces = [
-                workspace
-                for workspace in workspaces
-                if is_vm_capture_context(workspace.get("context"))
-            ]
-            workspaces = [
-                workspace
-                for workspace in workspaces
-                if not is_vm_capture_context(workspace.get("context"))
-            ]
-            workspaces = await evict_dead_workspaces(
-                workspaces, container_provisioner, postgres_db
+    return VMIdleLifecycleService(
+        postgres_db,
+        vm_provisioner,
+        VMWorkspaceRecoveryStore(postgres_db),
+        claimant=f"{os.getenv('HOSTNAME', 'orchestrator')}:vm-idle",
+        agent_provisioner=agent_provisioner,
+        thread_retirement=_thread_retirement_operations(),
+        thread_workspace_suspension=workspace_suspension_service,
+        thread_prepare=lambda thread_id, operation_id: (
+            sessions_routes.prepare_woken_pinned_session(
+                thread_id,
+                operation_id,
+                dependencies=_sessions_dependencies(),
             )
-            if workspaces or vm_workspaces:
-                # Dial-target visibility: stable Service DNS survives pod
-                # restarts; raw IPs are legacy rows predating the headless
-                # Service and go stale with the pod.
-                _dns_dials = sum(
-                    1
-                    for w in workspaces
-                    if str(
-                        (
-                            (_coerce_context(w.get("context")) or {}).get(
-                                "workspace_container"
-                            )
-                            or {}
-                        ).get("host")
-                        or ""
-                    ).endswith(".svc.cluster.local")
-                )
-                logger.info(
-                    "IDE settings sweeper: %d workspace(s), %d dialed via "
-                    "stable service DNS",
-                    len(workspaces),
-                    _dns_dials,
-                )
-                count = await reconcile_ide_settings(store, workspaces, pull_ide_config)
-                if count:
-                    logger.info("IDE settings sweeper: synced %d file(s)", count)
-                try:
-                    ext_changed = await reconcile_extensions(
-                        store, workspaces, list_ide_extensions, classifier
-                    )
-                    if ext_changed:
-                        logger.info(
-                            "IDE settings sweeper: synced %d extension(s)", ext_changed
-                        )
-                except Exception as e:  # noqa: BLE001
-                    logger.error("Error reconciling extensions: %s", e)
-
-                # Capture license/globalStorage + non-Open-VSX bytes to S3 when a
-                # workspace's content signature changed (Phase B). Signature-gated
-                # inside capture_ide_profile so most cycles are a cheap no-op.
-                if snapshot_service.is_available:
-                    from orchestrator.services.ide_profile_store import IdeProfileStore
-
-                    profile = IdeProfileStore(
-                        snapshot_service._s3, snapshot_service._bucket
-                    )
-                    for ws in workspaces:
-                        uid = ws.get("user_id")
-                        if not uid:
-                            continue
-                        tgt = resolve_ssh_target(_coerce_context(ws.get("context")))
-                        if not tgt:
-                            continue
-                        try:
-                            await capture_ide_profile(
-                                store, str(uid), tgt[0], tgt[1], profile
-                            )
-                        except Exception as e:  # noqa: BLE001
-                            logger.warning("ide profile capture failed: %s", e)
-                    for ws in vm_workspaces:
-                        try:
-                            await reconcile_vm_ide_workspace(
-                                store=store,
-                                workspace=ws,
-                                db=postgres_db,
-                                vm_provisioner=vm_provisioner,
-                                classifier=classifier,
-                                profile_store=profile,
-                            )
-                        except Exception as e:  # noqa: BLE001
-                            logger.warning("VM IDE capture failed: %s", e)
-                else:
-                    for ws in vm_workspaces:
-                        await reconcile_vm_ide_workspace(
-                            store=store,
-                            workspace=ws,
-                            db=postgres_db,
-                            vm_provisioner=vm_provisioner,
-                            classifier=classifier,
-                        )
-        except Exception as e:
-            logger.error("Error in code-server settings sweeper: %s", e)
-
-        try:
-            await asyncio.wait_for(shutdown_event.wait(), timeout=interval)
-            break
-        except asyncio.TimeoutError:
-            pass
-
-    logger.info("Code-server settings sweeper stopped")
-
-
-async def snapshot_gc_sweeper(shutdown_event: asyncio.Event) -> None:
-    """Background task that runs snapshot garbage collection daily.
-
-    Applies retention policies, soft-deletes expired snapshots, and
-    purges items past the 7-day grace period.
-    """
-    logger.info("Snapshot GC sweeper started")
-    gc_interval = 24 * 3600  # 24 hours
-
-    while not shutdown_event.is_set():
-        try:
-            if snapshot_service.is_available:
-                stats = await snapshot_service.run_gc()
-                if stats.get("soft_deleted") or stats.get("purged"):
-                    logger.info("Snapshot GC: %s", stats)
-        except Exception as e:
-            logger.error("Error in snapshot GC sweeper: %s", e)
-
-        try:
-            await asyncio.wait_for(shutdown_event.wait(), timeout=gc_interval)
-            break
-        except asyncio.TimeoutError:
-            pass
-
-    logger.info("Snapshot GC sweeper stopped")
+        ),
+        terminal_publication_handler=lambda operation: (
+            _job_control_operations().publish_terminal_review(operation)
+        ),
+    )
 
 
 def _pinned_k8s_reconciliation_dependencies() -> (
@@ -1657,41 +1276,6 @@ async def _begin_pinned_thread_retirement(
     return await _pinned_retirement_operations().begin_pinned_thread_retirement(
         thread_id, **kwargs
     )
-
-
-async def imap_poll_loop(shutdown_event: asyncio.Event) -> None:
-    """Background task that polls IMAP for inbound email replies.
-
-    Runs every IMAP_POLL_INTERVAL seconds (default: 30).
-    Gracefully disabled when IMAP is not configured.
-    """
-    if not imap_poller.is_available:
-        logger.info("IMAP poller not started (not configured)")
-        # Park until shutdown instead of returning: run_when_leader re-invokes a
-        # loop coroutine that returns (recreating the task every poll_seconds),
-        # so a bare return here re-logs this line ~once per second on the leader.
-        await shutdown_event.wait()
-        return
-
-    logger.info("IMAP poller started (interval=%ds)", imap_poller.poll_interval)
-    while not shutdown_event.is_set():
-        try:
-            count = await imap_poller.poll_once()
-            if count > 0:
-                logger.info("IMAP poller: processed %d email reply(ies)", count)
-        except Exception as e:
-            logger.error("IMAP poller error: %s", e)
-
-        try:
-            await asyncio.wait_for(
-                shutdown_event.wait(),
-                timeout=imap_poller.poll_interval,
-            )
-            break
-        except asyncio.TimeoutError:
-            pass
-
-    logger.info("IMAP poller stopped")
 
 
 # =============================================================================
@@ -3271,9 +2855,20 @@ async def lifespan(app: FastAPI):
         if automatic_reconciler_enabled()
         else None
     )
-    sudo_sweeper_task = asyncio.create_task(sudo_expiration_sweeper(_shutdown_event))
+    sudo_sweeper_task = asyncio.create_task(
+        sudo_expiration_sweeper(
+            _shutdown_event,
+            gate=sudo_gate,
+            # Built per tick inside the sweeper's own isolated try.
+            fail_expired_vm_upgrade_jobs=lambda: (
+                _job_control_operations().fail_expired_vm_upgrade_jobs()
+            ),
+        )
+    )
     thread_events_prune_task = asyncio.create_task(
-        thread_events_prune_sweeper(_shutdown_event)
+        retention_sweepers.thread_events_prune_sweeper(
+            _shutdown_event, store=postgres_db
+        )
     )
     # Stateless-lane lease reaper (stateless_agents.md §5.2): leader-gated on
     # its OWN advisory lock (RUN_QUEUE_REAPER_ID — not run_when_leader, so the
@@ -3348,13 +2943,17 @@ async def lifespan(app: FastAPI):
             name="completion-sweep-router",
         )
     security_events_prune_task = asyncio.create_task(
-        security_events_prune_sweeper(_shutdown_event)
+        retention_sweepers.security_events_prune_sweeper(
+            _shutdown_event, store=postgres_db
+        )
     )
     # Not leader-gated, matching security_events_prune_task above: a
     # delete-by-age is idempotent, so two replicas racing it is harmless —
     # the second finds nothing.
     ssh_attachments_prune_task = asyncio.create_task(
-        ssh_attachments_prune_sweeper(_shutdown_event)
+        retention_sweepers.ssh_attachments_prune_sweeper(
+            _shutdown_event, store=postgres_db
+        )
     )
     # In-flight checkpoint retention: bound every live thread's LangGraph
     # checkpoints to the newest N while it runs (leader-gated), so a long job
@@ -3449,16 +3048,41 @@ async def lifespan(app: FastAPI):
         )
     )
     ide_sweeper_task = asyncio.create_task(
-        run_when_leader(ide_session_ttl_sweeper, _shutdown_event)
+        run_when_leader(
+            functools.partial(
+                ide_session_ttl_sweeper, ide_sessions=ide_session_service
+            ),
+            _shutdown_event,
+        )
     )
-    ws_sweeper_task = asyncio.create_task(workspace_idle_sweeper(_shutdown_event))
+    ws_sweeper_task = asyncio.create_task(
+        workspace_idle_sweeper(
+            _shutdown_event,
+            store=postgres_db,
+            provisioner=container_provisioner,
+            suspension=workspace_suspension_service,
+            vm_idle_service_factory=_build_vm_idle_service,
+            terminal_vm_controls_factory=_job_mutation_operations,
+        )
+    )
     # Leader-gated: serially SSH-dials every active workspace and captures IDE
     # profiles to per-user S3 keys — two replicas would double-dial each
     # workspace and race the signature-gated capture.
     ide_settings_sweeper_task = asyncio.create_task(
-        run_when_leader(code_server_settings_sweeper, _shutdown_event)
+        run_when_leader(
+            functools.partial(
+                code_server_settings_sweeper,
+                db=postgres_db,
+                container_provisioner=container_provisioner,
+                snapshot_service=snapshot_service,
+                vm_provisioner=vm_provisioner,
+            ),
+            _shutdown_event,
+        )
     )
-    gc_sweeper_task = asyncio.create_task(snapshot_gc_sweeper(_shutdown_event))
+    gc_sweeper_task = asyncio.create_task(
+        snapshot_gc_sweeper(_shutdown_event, snapshots=snapshot_service)
+    )
     pinned_create_intent_reconciler_task = asyncio.create_task(
         run_when_leader(
             functools.partial(
@@ -3477,7 +3101,11 @@ async def lifespan(app: FastAPI):
             _shutdown_event,
         )
     )
-    imap_task = asyncio.create_task(run_when_leader(imap_poll_loop, _shutdown_event))
+    imap_task = asyncio.create_task(
+        run_when_leader(
+            functools.partial(imap_poll_loop, poller=imap_poller), _shutdown_event
+        )
+    )
     # Unified feed: run the deferred channel steps ("mail after the officer's
     # window unless seen/resolved", quiet-hours deferrals, batched digests).
     notification_steps_task = asyncio.create_task(
@@ -3527,13 +3155,24 @@ async def lifespan(app: FastAPI):
         )
     )
     pool_reconciler_task = asyncio.create_task(
-        run_when_leader(agent_pool_reconciler, _shutdown_event)
+        run_when_leader(
+            functools.partial(agent_pool_reconciler, provisioner=agent_provisioner),
+            _shutdown_event,
+        )
     )
     # Cleanup authority is independent of fresh protected-mode admission. A
     # feature/config disable must never strand an already durable reader or
     # pre-dispatch effect intent.
     ro_reader_reconciler_task = asyncio.create_task(
-        run_when_leader(ro_reader_reconciler_loop, _shutdown_event)
+        run_when_leader(
+            functools.partial(
+                ro_reader_reconciler_loop,
+                store=postgres_db,
+                # Read per tick, as the module global always was.
+                router=lambda: main_cloud_router,
+            ),
+            _shutdown_event,
+        )
     )
     automation_cron_task = asyncio.create_task(
         cron_dispatcher_loop(
@@ -8380,154 +8019,6 @@ app.state.thread_permission_dependencies_factory = (
     lambda: _thread_permission_dependencies()
 )
 app.include_router(thread_permission_routes.router)
-
-
-async def thread_events_prune_sweeper(
-    shutdown_event: asyncio.Event,
-) -> None:
-    """Background task that prunes the thread_events log on retention.
-
-    Runs every THREAD_EVENTS_PRUNE_INTERVAL_S (default 300s). Two queries:
-      - DELETE rows for threads in 'ended' status older than 24h.
-      - DELETE rows for threads NOT in 'ended' older than 7 days.
-      - Preserve any event that is still the only durable receipt for a
-        pending session-control or exact-turn interrupt request; crash
-        recovery terminalizes it first.
-
-    Best-effort. Survives transient DB errors by logging and continuing.
-    """
-    interval_s = int(os.environ.get("THREAD_EVENTS_PRUNE_INTERVAL_S", "300"))
-    logger.info("Thread-events prune sweeper started (interval=%ds)", interval_s)
-    while not shutdown_event.is_set():
-        try:
-            async with postgres_db.acquire() as conn:
-                ended_deleted = await conn.fetchval(
-                    "WITH deleted AS ("
-                    "  DELETE FROM thread_events "
-                    "  WHERE thread_id IN ("
-                    "    SELECT id FROM threads WHERE status = 'ended'"
-                    "  ) "
-                    "  AND created_at < now() - interval '24 hours' "
-                    "  AND NOT EXISTS ("
-                    "    SELECT 1 FROM thread_control_requests request "
-                    "    WHERE request.id = thread_events.control_request_id "
-                    "      AND request.outcome IS NULL"
-                    "  ) "
-                    "  AND NOT EXISTS ("
-                    "    SELECT 1 FROM thread_interrupt_requests request "
-                    "    WHERE request.id = thread_events.interrupt_request_id "
-                    "      AND (request.outcome IS NULL "
-                    "           OR (request.outcome = 'applied' "
-                    "               AND NOT (COALESCE(request.result, '{}'::jsonb) "
-                    "                        ? 'consumed_input_seq')))"
-                    "  ) "
-                    "  RETURNING 1"
-                    ") SELECT COUNT(*) FROM deleted"
-                )
-                active_deleted = await conn.fetchval(
-                    "WITH deleted AS ("
-                    "  DELETE FROM thread_events "
-                    "  WHERE thread_id IN ("
-                    "    SELECT id FROM threads WHERE status <> 'ended'"
-                    "  ) "
-                    "  AND created_at < now() - interval '7 days' "
-                    "  AND NOT EXISTS ("
-                    "    SELECT 1 FROM thread_control_requests request "
-                    "    WHERE request.id = thread_events.control_request_id "
-                    "      AND request.outcome IS NULL"
-                    "  ) "
-                    "  AND NOT EXISTS ("
-                    "    SELECT 1 FROM thread_interrupt_requests request "
-                    "    WHERE request.id = thread_events.interrupt_request_id "
-                    "      AND (request.outcome IS NULL "
-                    "           OR (request.outcome = 'applied' "
-                    "               AND NOT (COALESCE(request.result, '{}'::jsonb) "
-                    "                        ? 'consumed_input_seq')))"
-                    "  ) "
-                    "  RETURNING 1"
-                    ") SELECT COUNT(*) FROM deleted"
-                )
-            if (ended_deleted or 0) + (active_deleted or 0) > 0:
-                logger.info(
-                    "thread_events prune: ended=%d active=%d",
-                    int(ended_deleted or 0),
-                    int(active_deleted or 0),
-                )
-        except Exception as e:
-            logger.warning("thread_events prune error (non-fatal): %s", e)
-        try:
-            await asyncio.wait_for(shutdown_event.wait(), timeout=float(interval_s))
-            break
-        except asyncio.TimeoutError:
-            pass
-    logger.info("Thread-events prune sweeper stopped")
-
-
-async def security_events_prune_sweeper(shutdown_event: asyncio.Event) -> None:
-    """Background task that prunes the security_events audit log on retention.
-
-    Runs hourly (SECURITY_EVENTS_PRUNE_INTERVAL_S, default 3600). Deletes
-    rows older than SECURITY_EVENTS_RETENTION_DAYS (default 90). Bounds
-    table growth — writes happen on the post-auth 403 path, so any flood
-    is tied to a real account, but retention still caps the worst case.
-    Best-effort: survives transient DB errors by logging and continuing.
-    """
-    interval_s = int(os.environ.get("SECURITY_EVENTS_PRUNE_INTERVAL_S", "3600"))
-    retention_days = int(os.environ.get("SECURITY_EVENTS_RETENTION_DAYS", "90"))
-    logger.info(
-        "Security-events prune sweeper started (interval=%ds, retention=%dd)",
-        interval_s,
-        retention_days,
-    )
-    while not shutdown_event.is_set():
-        try:
-            deleted = await postgres_db.prune_security_events(retention_days)
-            if deleted:
-                logger.info("security_events prune: deleted=%d", deleted)
-        except Exception as e:
-            logger.warning("security_events prune error (non-fatal): %s", e)
-        try:
-            await asyncio.wait_for(shutdown_event.wait(), timeout=float(interval_s))
-            break
-        except asyncio.TimeoutError:
-            pass
-    logger.info("Security-events prune sweeper stopped")
-
-
-async def ssh_attachments_prune_sweeper(shutdown_event: asyncio.Event) -> None:
-    """Background task that prunes the ssh_attachments audit log on retention.
-
-    Runs hourly (SSH_ATTACHMENTS_PRUNE_INTERVAL_S, default 3600). Deletes
-    rows older than SSH_ATTACHMENTS_RETENTION_DAYS (default 90). thread_id
-    on this table is ON DELETE SET NULL rather than CASCADE (see 0204's
-    header), so ending a session no longer prunes its attach history —
-    this sweeper is what bounds the table's growth instead.
-
-    Not leader-gated, matching security_events_prune_task: a delete-by-age
-    is idempotent, so two replicas racing it is harmless — the second finds
-    nothing. Best-effort: survives transient DB errors by logging and
-    continuing.
-    """
-    interval_s = int(os.environ.get("SSH_ATTACHMENTS_PRUNE_INTERVAL_S", "3600"))
-    retention_days = int(os.environ.get("SSH_ATTACHMENTS_RETENTION_DAYS", "90"))
-    logger.info(
-        "SSH-attachments prune sweeper started (interval=%ds, retention=%dd)",
-        interval_s,
-        retention_days,
-    )
-    while not shutdown_event.is_set():
-        try:
-            deleted = await postgres_db.prune_ssh_attachments(retention_days)
-            if deleted:
-                logger.info("ssh_attachments prune: deleted=%d", deleted)
-        except Exception as e:
-            logger.warning("ssh_attachments prune error (non-fatal): %s", e)
-        try:
-            await asyncio.wait_for(shutdown_event.wait(), timeout=float(interval_s))
-            break
-        except asyncio.TimeoutError:
-            pass
-    logger.info("SSH-attachments prune sweeper stopped")
 
 
 # =============================================================================

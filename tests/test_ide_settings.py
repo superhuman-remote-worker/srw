@@ -1561,14 +1561,34 @@ class TestEvictDeadWorkspaces:
 
 class TestSweeperRegistrationShape:
     def test_settings_sweeper_is_leader_gated(self):
+        """The sweeper is only ever started through ``run_when_leader``.
+
+        (The lifespan characterization also pins this behaviourally.)
+        """
+        import ast
         import inspect
 
         import orchestrator.main as orchestrator_main
 
-        source = inspect.getsource(orchestrator_main.lifespan)
-        assert (
-            "run_when_leader(code_server_settings_sweeper, _shutdown_event)" in source
+        tree = ast.parse(inspect.getsource(orchestrator_main.lifespan))
+        gated = []
+        for node in ast.walk(tree):
+            if not (
+                isinstance(node, ast.Call)
+                and ast.unparse(node.func) == "run_when_leader"
+            ):
+                continue
+            target = node.args[0]
+            if isinstance(target, ast.Call) and ast.unparse(target.func).endswith(
+                "partial"
+            ):
+                target = target.args[0]
+            gated.append(ast.unparse(target))
+        assert "code_server_settings_sweeper" in gated
+        mentions = inspect.getsource(orchestrator_main.lifespan).count(
+            "code_server_settings_sweeper"
         )
+        assert mentions == 1
 
     @pytest.mark.asyncio
     async def test_disabled_sweeper_parks_instead_of_returning(self, monkeypatch):

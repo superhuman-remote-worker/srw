@@ -413,10 +413,75 @@ class TestWorkspaceIdleSweeper:
             == [call(db=store, provisioner=provisioner, suspension=suspension)] * 2
         )
         assert _records(caplog, session_provisioner_module) == [
-            ("INFO", "Workspace idle sweeper started (reconcile-only)"),
+            ("INFO", "Workspace idle sweeper started"),
             ("ERROR", "Error in session workspace reconcile: k8s down"),
             ("INFO", "Workspace idle sweeper stopped"),
         ]
+        store.acquire.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_drives_the_vm_idle_service_once_migration_0270_exists(
+        self, monkeypatch, caplog
+    ):
+        caplog.set_level(logging.INFO)
+        conn = _FakeConn([True])
+        store = _store_with_conn(conn)
+        reconcile = AsyncMock(return_value=0)
+        monkeypatch.setattr(
+            session_provisioner_module, "reconcile_session_workspaces", reconcile
+        )
+        vm_idle = MagicMock()
+        vm_idle.reconcile_once = AsyncMock(side_effect=[RuntimeError("held"), 0])
+        factory = MagicMock(return_value=vm_idle)
+
+        cadence = await _drive(
+            monkeypatch,
+            session_provisioner_module,
+            session_provisioner_module.workspace_idle_sweeper,
+            ticks=2,
+            store=store,
+            provisioner=MagicMock(),
+            suspension=MagicMock(),
+            vm_idle_service_factory=factory,
+        )
+
+        assert cadence.timeouts == [60.0, 60.0]
+        conn.fetchval.assert_awaited_once_with(
+            "SELECT to_regclass('public.vm_idle_operations') IS NOT NULL"
+        )
+        # Built once at loop start, driven every tick; a failed pass is held,
+        # not fatal, and the session reconcile still runs each tick.
+        factory.assert_called_once_with()
+        assert vm_idle.reconcile_once.await_args_list == [call(limit=16)] * 2
+        assert reconcile.await_count == 2
+        assert [
+            level
+            for level, message in _records(caplog, session_provisioner_module)
+            if message == "VM idle reconcile held"
+        ] == ["ERROR"]
+
+    @pytest.mark.asyncio
+    async def test_skips_the_vm_idle_service_before_migration_0270(self, monkeypatch):
+        store = _store_with_conn(_FakeConn([False]))
+        monkeypatch.setattr(
+            session_provisioner_module,
+            "reconcile_session_workspaces",
+            AsyncMock(return_value=0),
+        )
+        factory = MagicMock()
+
+        await _drive(
+            monkeypatch,
+            session_provisioner_module,
+            session_provisioner_module.workspace_idle_sweeper,
+            ticks=1,
+            store=store,
+            provisioner=MagicMock(),
+            suspension=MagicMock(),
+            vm_idle_service_factory=factory,
+        )
+
+        factory.assert_not_called()
 
 
 # =============================================================================
