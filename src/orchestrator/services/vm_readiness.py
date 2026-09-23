@@ -6,6 +6,7 @@ import asyncio
 from collections.abc import Callable, Mapping
 from datetime import datetime, timezone
 import json
+import ipaddress
 import logging
 import os
 import secrets
@@ -115,12 +116,25 @@ def _complete_recovery_network(
         rule = value.get("network_profile_rule")
         if (
             not isinstance(rule, Mapping)
-            or set(rule) != {"kind", "interface", "name_only_dhcp", "network_file_sha256"}
+            or set(rule) != {
+                "kind", "interface", "name_only_dhcp", "network_file_sha256",
+                "dhcp4_address", "dhcp4_gateway", "dhcp4_lease_sha256", "dhcp4_ifindex",
+            }
             or rule["kind"] != "networkd-name-dhcp-v1"
             or rule["interface"] != "enp1s0"
             or rule["name_only_dhcp"] is not True
             or not isinstance(rule["network_file_sha256"], str)
             or rule["network_file_sha256"] not in networkd.values()
+            or not isinstance(rule["dhcp4_lease_sha256"], str)
+            or len(rule["dhcp4_lease_sha256"]) != 64
+            or any(char not in "0123456789abcdef" for char in rule["dhcp4_lease_sha256"])
+            or type(rule["dhcp4_ifindex"]) is not int
+            or rule["dhcp4_ifindex"] <= 0
+            or rule["dhcp4_address"] != value.get("address")
+            or rule["dhcp4_gateway"] != default_route.get("gateway")
+            or default_route.get("dev") != "enp1s0"
+            or default_route.get("protocol") != "dhcp"
+            or default_route not in routes
             or value.get("cloud_init_cached_instance_id") != value.get("cloud_init_instance_id")
             or sum(
                 1 for item in interfaces
@@ -130,6 +144,11 @@ def _complete_recovery_network(
                 and item.get("address") == value.get("address")
             ) != 1
         ):
+            return False
+        try:
+            ipaddress.IPv4Address(rule["dhcp4_address"])
+            ipaddress.IPv4Address(rule["dhcp4_gateway"])
+        except (ipaddress.AddressValueError, TypeError):
             return False
     return all(
         isinstance(path, str)
@@ -544,7 +563,25 @@ class VMReadinessService:
                 reprobe=reprobe,
             )
             return
-        if unchanged_ready_identity and network_profile is None:
+        exact_profile_receipt = False
+        if unchanged_ready_identity and network_profile is not None:
+            from shared.vm_network_profile import reusable_profile_evidence
+
+            exact_profile_receipt = (
+                all(
+                    vm.get(identity) in (None, status.get(identity))
+                    for identity in ("vm_uid", "rootdisk_pvc_uid", "vmi_uid")
+                )
+                and reusable_profile_evidence(
+                    vm.get("network_profile_evidence"), network_profile,
+                    provision_generation=generation,
+                    vm_uid=status.get("vm_uid"),
+                    pvc_uid=status.get("rootdisk_pvc_uid"),
+                    vmi_uid=status.get("vmi_uid"),
+                    launcher_uid=status.get("active_pod_uid"),
+                )
+            )
+        if unchanged_ready_identity and (network_profile is None or exact_profile_receipt):
             if vm.get("initialization") is None:
                 return
             from shared.workspace_initialization import (
