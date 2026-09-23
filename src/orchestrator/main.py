@@ -219,8 +219,6 @@ from orchestrator.services.vm_workspace_recovery_store import (  # noqa: E402
 )
 from orchestrator.services.vm_creation_retry_store import VMCreationRetryStore  # noqa: E402
 from orchestrator.services.vm_creation_retry import VMCreationRetryService  # noqa: E402
-from orchestrator.services.vm_creation_dispatch import handle_creation_pending  # noqa: E402
-from orchestrator.services.vm_provisioning_cleanup import handle_provisioning_wait  # noqa: E402
 from orchestrator.services.vm_workspace_recovery import (  # noqa: E402
     VMWorkspaceRecoveryService,
 )
@@ -248,7 +246,6 @@ from orchestrator.services.session_attach_recovery import (  # noqa: E402
     current_attach_abort_successor as _current_attach_abort_successor,  # noqa: F401
 )
 from orchestrator.services.session_runtime_identity import (  # noqa: E402
-    agent_sha_is_current as _agent_sha_is_current,
     expected_agent_shas as _expected_agent_shas,  # noqa: F401
     thread_accepts_runtime as _thread_accepts_runtime,
     thread_uses_pinned_execution as _thread_uses_pinned_execution,
@@ -694,23 +691,6 @@ from orchestrator.services.stateless_workspace_gate import (  # noqa: E402
 from orchestrator.services.stale_verification_sweeper import (  # noqa: E402
     stale_verification_sweeper_loop,
 )
-from orchestrator.services.dispatch_guards import (  # noqa: E402
-    VM_CAPACITY_POLL,
-    VM_GOLDEN_POLL,
-    VM_PREPARATION_POLL,
-    VM_PARK_PREPARATION,
-    VM_HEADSCALE_POLL,
-    VM_PARK_EXHAUSTED,
-    VM_PARK_GOLDEN,
-    VM_PARK_INITIALIZATION,
-    VM_PARK_HEADSCALE,
-    VM_PARKED,
-    VM_PROVISION,
-    VM_READY,
-    preemption_blocked_reason,
-    resume_lane_applies,
-    vm_provisioning_decision,
-)
 from orchestrator.services.cloud_pricing import (  # noqa: E402
     CloudCostEstimator,
     cloud_pricing_sync_loop,
@@ -728,6 +708,7 @@ from orchestrator.services.infrastructure_metering import (  # noqa: E402
     typed_usage_rollup_loop,
 )
 from orchestrator.services.startup_backfills import run_startup_backfills  # noqa: E402
+from orchestrator.services import job_dispatcher  # noqa: E402
 from orchestrator.services.infrastructure_metering.bootstrap import (  # noqa: E402
     bootstrap_infrastructure_metering,
 )
@@ -816,7 +797,6 @@ from shared.workspace_contract import (  # noqa: E402
     WORKSPACE_CONTRACT_CONTEXT_KEY as WORKSPACE_CONTRACT_CONTEXT_KEY,
     WORKSPACE_DISPATCH_AUTHORITY_CONTEXT_KEY as WORKSPACE_DISPATCH_AUTHORITY_CONTEXT_KEY,
     resolve_workspace_contract,
-    resolve_workspace_runtime,
 )
 
 # Datasource type → tool-category map, shared with the agent's session attach
@@ -826,7 +806,6 @@ from shared.workspace_contract import (  # noqa: E402
 # Same registry the agent's live SSE frames read, so the two can't disagree.
 from orchestrator.services.nats_bridge import nats_bridge  # noqa: E402
 from orchestrator.services.vm_provisioner import vm_provisioner  # noqa: E402
-from orchestrator.services.vm_workspace_config import vm_provisioning_options  # noqa: E402
 from orchestrator.services.vm_readiness import vm_readiness_prober  # noqa: E402
 from orchestrator.services.container_provisioner import (  # noqa: E402
     WORKSPACE_RUNTIME_INCARNATION_KEY,
@@ -835,8 +814,6 @@ from orchestrator.services.container_provisioner import (  # noqa: E402
     container_provisioner,
 )
 from orchestrator.services.workspace_lifecycle import (  # noqa: E402
-    EnsureOutcome,
-    WorkspaceOwner,
     ensure_workspace,
 )
 from orchestrator.services.session_provisioner import (  # noqa: E402
@@ -1191,11 +1168,10 @@ _PINNED_RETIREMENT_PROVEN_RETRY_GRACE_SECONDS = max(
 # pinned agent's 60-second report timeout while leaving room for API latency.
 _COMPLETION_S36_EXACT_ABSENCE_TIMEOUT_SECONDS = 45.0
 
-# Dispatcher lock prevents concurrent dispatch (double-assignment)
-_dispatch_lock = asyncio.Lock()
-
-# Track jobs with pending pause requests (prevent re-preemption)
-_pause_pending_job_ids: set[str] = set()
+# One application-owned dispatch state (R1.B11): the lock that prevents a
+# double-assignment, and the pause-pending set preemption shares with
+# job-control delivery (which discards a job once its pause lands).
+_job_dispatch_state = job_dispatcher.JobDispatchState()
 
 # One app-owned registry for the request-spawned KB datasource reindexes
 # (R1.B03). It holds both views the two former globals held — the shutdown
@@ -3243,11 +3219,6 @@ from orchestrator.services.job_workspace_runtime import (  # noqa: E402
 )
 
 
-from orchestrator.services.job_workspace_runtime import (  # noqa: E402
-    scholar_provision_parent_id as _scholar_provision_parent_id,
-)
-
-
 def _scholar_should_provision_parent_container(*args: Any, **kwargs: Any) -> Any:
     return job_workspace_runtime.scholar_should_provision_parent_container(
         *args, **kwargs, dependencies=_job_workspace_runtime_dependencies()
@@ -3511,943 +3482,44 @@ from orchestrator.services.dispatch_credentials import (  # noqa: E402
 )
 
 
-async def _try_dispatch_pending_jobs() -> None:
-    """Core dispatcher: match pending jobs to available agents.
+def _job_dispatch_dependencies() -> job_dispatcher.JobDispatchDependencies:
+    """Bind dispatch scheduling to this application's collaborators.
 
-    Phase 1: Direct assignment (free agents → highest priority pending jobs)
-    Phase 2: Preemption (remaining high-priority jobs → lowest-priority running jobs)
-
-    VM-aware: jobs needing a VM are auto-provisioned and held until the VM
-    registers as ready. Jobs with a ready VM get workspace config injected
-    into config_override before dispatch.
+    Rebuilt per trigger (and once per lifespan for the periodic loop), so the
+    deployment flags and collaborators are the ones current at that moment;
+    the dispatch state is the one application-owned object.
     """
-    if (
-        getattr(postgres_db, "manifests_ready", False) is True
-        and agent_provisioner._k8s_available
-    ):
-        await _manifest_execution_service().reconcile()
-    if not AUTO_ASSIGN_ENABLED and not STATELESS_WORKER_ENABLED:
-        return
 
-    async with _dispatch_lock:
-        try:
-            # Both lanes retain the same leader-owned workspace preflight. The
-            # pinned set proceeds to registered-agent matching; a ready
-            # stateless set is admitted to run_queue and never reaches that
-            # half of this function.
-            pending_jobs = (
-                await postgres_db.get_dispatchable_jobs(
-                    limit=50,
-                    **_completion_control_boundary.dispatch_guard_kwargs(),
-                )
-                if AUTO_ASSIGN_ENABLED
-                else []
-            )
-            if STATELESS_WORKER_ENABLED:
-                pending_jobs.extend(
-                    await postgres_db.get_admittable_stateless_jobs(
-                        limit=50,
-                        **_completion_control_boundary.dispatch_guard_kwargs(),
-                    )
-                )
-            if not pending_jobs:
-                return
-
-            # Pre-filter: auto-provision VMs/containers for jobs that need one
-            dispatchable_jobs = []
-            for job in pending_jobs:
-                job_id = str(job["id"])
-                stateless_worker = job.get("execution_lane") == "stateless"
-                if await handle_creation_pending(job, db=postgres_db):
-                    continue
-                (
-                    workspace_action,
-                    job,
-                    workspace_recovery_reason,
-                ) = await _prepare_job_workspace_runtime(job)
-                if workspace_action == "wait":
-                    logger.warning(
-                        "Dispatcher: job %s waiting for live workspace authority "
-                        "recovery (%s)",
-                        job_id,
-                        workspace_recovery_reason or "retryable",
-                    )
-                    continue
-                if workspace_action == "fail":
-                    await _fail_subjob_and_unblock_parent(
-                        job,
-                        workspace_recovery_reason
-                        or "Inherited workspace authority is unavailable.",
-                    )
-                    continue
-                workspace_decision = resolve_workspace_runtime(
-                    job, vm_mode=vm_provisioner.mode
-                )
-                if (
-                    workspace_decision.contract is None
-                    or workspace_decision.state == "invalid"
-                ):
-                    logger.error(
-                        "Dispatcher: refusing job %s with invalid workspace "
-                        "authority (%s)",
-                        job_id,
-                        workspace_decision.reason or workspace_decision.state,
-                    )
-                    await postgres_db.update_job_status(
-                        job_id,
-                        status="failed",
-                        error_message=(
-                            "Workspace contract is ambiguous or invalid; "
-                            "refusing dispatch"
-                        ),
-                        expected_status=str(job.get("status")),
-                    )
-                    continue
-
-                job_needs_vm = _job_needs_vm(job)
-                stateless_same_cluster_vm = bool(
-                    stateless_worker and job_needs_vm and vm_workspaces_on_pod_network()
-                )
-
-                # Defense for inherited/operator-created rows. External VMs
-                # still belong to the mesh-enabled registered-agent plane; a
-                # same-cluster VM remains on the pool lane below.
-                if (
-                    stateless_worker
-                    and job_needs_vm
-                    and not vm_workspaces_on_pod_network()
-                ):
-                    moved_to_pinned = False
-                    async with postgres_db.acquire() as conn:
-                        async with conn.transaction():
-                            await conn.fetchrow(
-                                "SELECT state FROM run_queue "
-                                "WHERE unit_id = $1::uuid "
-                                "AND unit_kind = 'worker_batch' FOR UPDATE",
-                                job_id,
-                            )
-                            moved = await conn.fetchrow(
-                                "UPDATE jobs SET execution_lane = 'pinned', "
-                                "updated_at = CURRENT_TIMESTAMP "
-                                "WHERE id = $1::uuid "
-                                "AND execution_lane = 'stateless' "
-                                "AND status::text = $2::text "
-                                "RETURNING id",
-                                job_id,
-                                str(job.get("status") or ""),
-                            )
-                            if moved is not None:
-                                moved_to_pinned = True
-                                await conn.execute(
-                                    "UPDATE run_queue SET state = 'done', "
-                                    "lease_token = lease_token + 1, "
-                                    "leased_by = NULL, last_leased_by = NULL, "
-                                    "leased_until = NULL, run_after = now(), "
-                                    "queued_at = now() "
-                                    "WHERE unit_id = $1::uuid "
-                                    "AND unit_kind = 'worker_batch'",
-                                    job_id,
-                                )
-                    if moved_to_pinned:
-                        logger.info(
-                            "Dispatcher: moved VM job %s from stateless to pinned lane",
-                            job_id,
-                        )
-                    else:
-                        logger.debug(
-                            "Dispatcher: VM lane repair lost the status CAS for job %s",
-                            job_id,
-                        )
-                    continue
-                _stateless_container = _get_container_context(job)
-                _stateless_has_k8s_workspace = (
-                    _stateless_container.get("status") == "ready"
-                    and _stateless_container.get("provisioner") == "k8s"
-                    and bool(
-                        _stateless_container.get("host")
-                        or _stateless_container.get("pod_ip")
-                    )
-                )
-                if stateless_worker and not (
-                    stateless_same_cluster_vm
-                    or _job_needs_sandbox(job)
-                    or _stateless_has_k8s_workspace
-                ):
-                    logger.error(
-                        "Dispatcher: refusing stateless job %s without a compatible "
-                        "workspace",
-                        job_id,
-                    )
-                    await postgres_db.update_job_status(
-                        job_id,
-                        status="failed",
-                        error_message=(
-                            "Stateless workers currently require a Kubernetes "
-                            "sandbox or same-cluster VM workspace"
-                        ),
-                        expected_status=str(job.get("status")),
-                    )
-                    continue
-                if (
-                    stateless_worker
-                    and not stateless_same_cluster_vm
-                    and not (
-                        container_provisioner.is_available
-                        and container_provisioner.in_cluster
-                    )
-                ):
-                    logger.warning(
-                        "Dispatcher: stateless job %s waiting for the in-cluster "
-                        "Kubernetes workspace provisioner",
-                        job_id,
-                    )
-                    continue
-
-                if job_needs_vm:
-                    # Admin-gated permission check (kill-switch + per-user grant).
-                    # Re-verified here in case a grant was revoked or the
-                    # kill-switch flipped after the job was submitted. Already
-                    # running VMs aren't torn down by this check — the gate
-                    # only blocks jobs that haven't been dispatched yet.
-                    creator = None
-                    creator_id = job.get("user_id")
-                    if creator_id:
-                        try:
-                            creator = await postgres_db.get_user(str(creator_id))
-                        except Exception:
-                            creator = None
-                    try:
-                        await _check_vm_permission(creator, job_needs_vm=True)
-                    except HTTPException as permission_error:
-                        logger.error(
-                            "Dispatcher: job %s denied VM workspace: %s",
-                            job_id,
-                            permission_error.detail,
-                        )
-                        await postgres_db.update_job_status(
-                            job_id,
-                            status="failed",
-                            error_message=str(permission_error.detail),
-                        )
-                        continue
-                    vm_ctx = _get_vm_context(job)
-                    # Bounded provisioning retries. A VM that never reaches 'ready'
-                    # (real infra failure) must park after N attempts instead of
-                    # re-provisioning forever against the shared VM cluster. The
-                    # counter records one exact admitted VM per generation and
-                    # resets atomically with verified Ready, so it survives async
-                    # status callbacks that a status-based park cannot. Decision
-                    # logic is extracted + unit-tested in dispatch_guards.
-                    provision_attempts = int(vm_ctx.get("provision_attempts") or 0)
-                    max_provision_attempts = int(
-                        os.environ.get("VM_PROVISION_MAX_ATTEMPTS", "3")
-                    )
-                    timeout_s = int(os.environ.get("VM_PROVISION_TIMEOUT_S", "600"))
-                    rootdisk_stall_timeout_s = int(
-                        os.environ.get("VM_ROOTDISK_STALL_TIMEOUT_S", "2700")
-                    )
-                    golden_timeout_s = int(
-                        os.environ.get("VM_GOLDEN_WAIT_TIMEOUT_S", "2700")
-                    )
-                    headscale_timeout_s = int(
-                        os.environ.get("VM_HEADSCALE_WAIT_TIMEOUT_S", "900")
-                    )
-                    vm_decision = vm_provisioning_decision(
-                        vm_ctx,
-                        provision_attempts=provision_attempts,
-                        max_provision_attempts=max_provision_attempts,
-                        now=time.time(),
-                        timeout_s=timeout_s,
-                        rootdisk_stall_timeout_s=rootdisk_stall_timeout_s,
-                        golden_timeout_s=golden_timeout_s,
-                        headscale_timeout_s=headscale_timeout_s,
-                    )
-                    if vm_decision == VM_PARK_EXHAUSTED:
-                        # Retries used up — park the VM context AND fail the job.
-                        # 'failed' is terminal for the dispatcher (VM_PARKED) and
-                        # skipped by the reconciler (_PARKED_VM_STATUSES), so the
-                        # park holds. The job itself must go terminal too: leaving
-                        # it 'created' with nothing scheduled to change its state
-                        # is an invisible wedge (a loop's current_job never turns
-                        # terminal → the loop stalls forever). See knowledge-base/knowledge/issues/
-                        # vm_ssh_readiness_probe_unroutable_from_orchestrator.md.
-                        park_error = (
-                            f"provisioning exhausted after "
-                            f"{provision_attempts} attempts "
-                            f"(never reached 'ready')"
-                        )
-                        logger.warning(
-                            "Dispatcher: job %s VM provisioning exhausted "
-                            "(%d/%d attempts) — failing job",
-                            job_id,
-                            provision_attempts,
-                            max_provision_attempts,
-                        )
-                        await postgres_db.merge_vm_context(
-                            job_id,
-                            {"status": "failed", "error": park_error},
-                        )
-                        await _fail_vm_parked_job(job_id, park_error)
-                        continue
-                    if vm_decision == VM_PROVISION:
-                        # VM needed but absent — never provisioned, torn down while
-                        # parked ('deleted': deploy-drain / crash recovery release
-                        # it; work survives in the pushed branch + checkpoint), or
-                        # recycled by the timeout. Without re-provisioning here a
-                        # paused VM job waits forever on a VM nothing will create.
-                        if not vm_provisioner.is_available:
-                            # VM explicitly requested but no provisioner — fail
-                            logger.error(
-                                "Dispatcher: job %s requires VM workspace but VM "
-                                "provisioner is unavailable for VM_MODE=%s. "
-                                "Failing job.",
-                                job_id,
-                                vm_provisioner.mode,
-                            )
-                            await postgres_db.update_job_status(
-                                job_id,
-                                status="failed",
-                                error_message=(
-                                    "VM workspace requested but VM provisioner is not "
-                                    f"available for VM_MODE={vm_provisioner.mode!r}. "
-                                    "Configure VM_MODE and its required controller, use "
-                                    "workspace.backend='container', or "
-                                    "remove the explicit backend override."
-                                ),
-                            )
-                            continue
-                        config_override = job.get("config_override") or {}
-                        if isinstance(config_override, str):
-                            config_override = json.loads(config_override)
-                        vm_options = await vm_provisioning_options(
-                            postgres_db, "Job", job, fallback=config_override
-                        )
-                        ok = await vm_provisioner.create_vm(
-                            job_id=job_id,
-                            agent_config=canonical_config_name(
-                                job.get("config_name", "worker_base")
-                            ),
-                            **vm_options,
-                            description=job.get("description", ""),
-                        )
-                        protocol_pending = (
-                            isinstance(ok, dict)
-                            and type(ok.get("creation_retry_protocol")) is int
-                            and ok["creation_retry_protocol"] == 1
-                        )
-                        if protocol_pending:
-                            # Exact VM adoption counts a boot in the ledger;
-                            # scheduling and dependency waits count no attempt.
-                            continue
-                        if not ok:
-                            logger.warning(
-                                "Dispatcher: VM provisioning failed for job %s", job_id
-                            )
-                        # Authenticated phase observation accounts admission;
-                        # a create acknowledgement or dependency wait does not.
-                        continue  # Skip this job — wait for VM to register
-                    if vm_decision == VM_PARKED:
-                        # Provisioning failed terminally — do NOT hot-retry every
-                        # tick (shared VM cluster). The job is still non-terminal
-                        # (it's in the dispatchable list), which means something
-                        # left it parked-but-alive: an older build's park, or a
-                        # controller-callback race with PARK_EXHAUSTED. Heal it
-                        # to 'failed' so it stops wedging its loop.
-                        vm_error = vm_ctx.get("error") or "VM provisioning failed"
-                        logger.warning(
-                            "Dispatcher: job %s VM parked (%s) — failing job",
-                            job_id,
-                            vm_error,
-                        )
-                        await _fail_vm_parked_job(job_id, vm_error)
-                        continue
-                    if vm_decision == VM_PARK_PREPARATION:
-                        park_error = (
-                            "Workspace preparation did not complete within its deadline"
-                        )
-                        await postgres_db.merge_vm_context(
-                            job_id, {"status": "failed", "error": park_error}
-                        )
-                        await _fail_vm_parked_job(job_id, park_error)
-                        continue
-                    if vm_decision in (
-                        VM_GOLDEN_POLL,
-                        VM_CAPACITY_POLL,
-                        VM_PREPARATION_POLL,
-                    ):
-                        # No VM exists yet — the controller is waiting on a
-                        # shared golden-image import (cold import after an
-                        # agent-vm-base bump: ~30 min, longer than timeout_s).
-                        # Re-issue create as the poll: the controller answers
-                        # waiting_golden (cheap DV GET) until the golden is
-                        # Succeeded, then actually builds the VM. fresh=False
-                        # keeps the golden budget anchor + counters and does
-                        # NOT consume a provision attempt — the attempt budget
-                        # bounds VM boots, and no boot is happening. See
-                        # knowledge-history/done/
-                        # golden_image_cold_import_fails_inflight_vm_jobs.md.
-                        wait_anchor = (
-                            "preparation_wait_started_at"
-                            if vm_decision == VM_PREPARATION_POLL
-                            else "capacity_wait_started_at"
-                            if vm_decision == VM_CAPACITY_POLL
-                            else "golden_wait_started_at"
-                        )
-                        if not vm_ctx.get(wait_anchor):
-                            await postgres_db.merge_vm_context(
-                                job_id,
-                                {wait_anchor: time.time()},
-                            )
-                        config_override = job.get("config_override") or {}
-                        if isinstance(config_override, str):
-                            config_override = json.loads(config_override)
-                        vm_options = await vm_provisioning_options(
-                            postgres_db, "Job", job, fallback=config_override
-                        )
-                        await vm_provisioner.create_vm(
-                            job_id=job_id,
-                            agent_config=canonical_config_name(
-                                job.get("config_name", "worker_base")
-                            ),
-                            **vm_options,
-                            description=job.get("description", ""),
-                            fresh=False,
-                        )
-                        if vm_decision == VM_PREPARATION_POLL:
-                            logger.info(
-                                "Dispatcher: job %s waiting on workspace preparation",
-                                job_id,
-                            )
-                        elif vm_decision == VM_CAPACITY_POLL:
-                            logger.info(
-                                "Dispatcher: job %s waiting on VM capacity (%s/%s) "
-                                "— polling",
-                                job_id,
-                                vm_ctx.get("running_vms") or "?",
-                                vm_ctx.get("max_concurrent_vms") or "?",
-                            )
-                        else:
-                            logger.info(
-                                "Dispatcher: job %s waiting on golden image %s "
-                                "(%s) — polling",
-                                job_id,
-                                vm_ctx.get("golden") or "?",
-                                vm_ctx.get("golden_progress")
-                                or vm_ctx.get("golden_phase")
-                                or "importing",
-                            )
-                        continue
-                    if vm_decision == VM_PARK_GOLDEN:
-                        # The golden import outlived even the golden budget —
-                        # CDI is wedged or the registry is unreachable. No VM
-                        # was ever created, so there is nothing to recycle;
-                        # fail the job with the truth (not the misleading
-                        # "provisioning exhausted after N attempts").
-                        elapsed = int(
-                            time.time()
-                            - float(vm_ctx.get("golden_wait_started_at") or 0)
-                        )
-                        park_error = (
-                            f"golden image import did not complete within "
-                            f"{golden_timeout_s}s (golden "
-                            f"{vm_ctx.get('golden') or 'unknown'}, last progress "
-                            f"{vm_ctx.get('golden_progress') or 'unknown'}, "
-                            f"waited {elapsed}s) — VM never created"
-                        )
-                        logger.warning(
-                            "Dispatcher: job %s golden wait exhausted — "
-                            "failing job (%s)",
-                            job_id,
-                            park_error,
-                        )
-                        await postgres_db.merge_vm_context(
-                            job_id,
-                            {"status": "failed", "error": park_error},
-                        )
-                        await _fail_vm_parked_job(job_id, park_error)
-                        continue
-                    if vm_decision == VM_HEADSCALE_POLL:
-                        # No VM exists yet — the controller refused to build one
-                        # while Headscale is unreachable, because a VM with no
-                        # tailnet pre-auth key boots and heartbeats but is never
-                        # reachable over SSH. Poll create (fresh=False, no
-                        # attempt consumed) until the mesh recovers; the
-                        # controller then builds the VM on the very next poll.
-                        if not vm_ctx.get("headscale_wait_started_at"):
-                            await postgres_db.merge_vm_context(
-                                job_id,
-                                {"headscale_wait_started_at": time.time()},
-                            )
-                        config_override = job.get("config_override") or {}
-                        if isinstance(config_override, str):
-                            config_override = json.loads(config_override)
-                        vm_options = await vm_provisioning_options(
-                            postgres_db, "Job", job, fallback=config_override
-                        )
-                        await vm_provisioner.create_vm(
-                            job_id=job_id,
-                            agent_config=canonical_config_name(
-                                job.get("config_name", "worker_base")
-                            ),
-                            **vm_options,
-                            description=job.get("description", ""),
-                            fresh=False,
-                        )
-                        logger.info(
-                            "Dispatcher: job %s waiting on Headscale (%s) — polling",
-                            job_id,
-                            vm_ctx.get("headscale_error") or "mesh VPN unavailable",
-                        )
-                        continue
-                    if vm_decision == VM_PARK_HEADSCALE:
-                        # Headscale never came back inside its budget. No VM was
-                        # ever created, so there is nothing to recycle — fail
-                        # with the real cause rather than the misleading
-                        # "provisioning exhausted after N attempts".
-                        elapsed = int(
-                            time.time()
-                            - float(vm_ctx.get("headscale_wait_started_at") or 0)
-                        )
-                        park_error = (
-                            f"Headscale (mesh VPN) unavailable for {elapsed}s "
-                            f"(budget {headscale_timeout_s}s, last error: "
-                            f"{vm_ctx.get('headscale_error') or 'unknown'}) — "
-                            f"VM never created"
-                        )
-                        logger.warning(
-                            "Dispatcher: job %s Headscale wait exhausted — "
-                            "failing job (%s)",
-                            job_id,
-                            park_error,
-                        )
-                        await postgres_db.merge_vm_context(
-                            job_id,
-                            {"status": "failed", "error": park_error},
-                        )
-                        await _fail_vm_parked_job(job_id, park_error)
-                        continue
-                    if vm_decision == VM_PARK_INITIALIZATION:
-                        park_error = "Workspace initialization did not complete within its deadline"
-                        await postgres_db.merge_vm_context(
-                            job_id, {"status": "failed", "error": park_error}
-                        )
-                        await _fail_vm_parked_job(job_id, park_error)
-                        continue
-                    if await handle_provisioning_wait(
-                        vm_decision,
-                        job_id,
-                        vm_ctx,
-                        db=postgres_db,
-                        provisioner=vm_provisioner,
-                        recovery_store=VMWorkspaceRecoveryStore(postgres_db),
-                        now=time.time(),
-                        boot_timeout_s=timeout_s,
-                        rootdisk_stall_timeout_s=rootdisk_stall_timeout_s,
-                    ):
-                        continue
-                    if vm_decision != VM_READY:
-                        logger.warning(
-                            "Dispatcher: job %s has an unhandled VM decision", job_id
-                        )
-                        continue
-                    # VM_READY: proceed with dispatch.
-                    logger.info("Dispatcher: job %s using VM workspace", job_id)
-                elif _job_needs_sandbox(job):
-                    # Phase 1: a pre-agent scholar spawned before its parent had a
-                    # workspace provisions the parent's ONE shared pod under the
-                    # parent's identity and rides it, instead of self-provisioning
-                    # a throwaway pod. k8s only — VM/docker parents fall through to
-                    # the normal self-provision path below.
-                    provision_parent_id = _scholar_provision_parent_id(job)
-                    if (
-                        provision_parent_id
-                        and container_provisioner.is_available
-                        and container_provisioner.in_cluster
-                    ):
-                        await _provision_parent_workspace_for_scholar(
-                            job, provision_parent_id
-                        )
-                        # wait → retry next tick; promoted → dispatches next tick
-                        # via the inherit path; fail → already failed + unblocked.
-                        continue
-                    container_ctx = _get_container_context(job)
-                    container_status = container_ctx.get("status")
-                    # K8s in-cluster takes priority; a local kubeconfig must not
-                    # shadow Docker Compose when running outside the cluster.
-                    use_k8s = container_provisioner.is_available and (
-                        container_provisioner.in_cluster
-                        or not docker_provisioner.is_available
-                    )
-                    # States that mean "no live workspace yet" → (re)create.
-                    needs_create = container_status in (None, "", "deleted", "none")
-                    if needs_create and not use_k8s:
-                        # Docker Compose pool / no-provisioner CREATE path (unchanged).
-                        if docker_provisioner.is_available:
-                            logger.info(
-                                "Dispatcher: job %s assigning workspace from "
-                                "Docker Compose pool",
-                                job_id,
-                            )
-                            result = await docker_provisioner.assign_workspace(job_id)
-                            if not result:
-                                logger.warning(
-                                    "Dispatcher: no free workspace for job %s "
-                                    "— all containers occupied, will retry",
-                                    job_id,
-                                )
-                        else:
-                            logger.error(
-                                "Dispatcher: job %s needs workspace but no "
-                                "provisioner available. Failing job.",
-                                job_id,
-                            )
-                            await postgres_db.update_job_status(
-                                job_id,
-                                status="failed",
-                                error_message=(
-                                    "No workspace provisioner available. "
-                                    "Neither Kubernetes API nor WORKSPACE_HOSTS "
-                                    "configured."
-                                ),
-                            )
-                        continue  # Skip — wait for container to become ready
-                    # K8s create (when status absent) + all lifecycle states route
-                    # through the shared, owner-agnostic state machine.
-                    config_override = job.get("config_override") or {}
-                    if isinstance(config_override, str):
-                        config_override = json.loads(config_override)
-                    ws_cfg = config_override.get("workspace", {}).get("container", {})
-                    res = await ensure_workspace(
-                        WorkspaceOwner.job(job_id),
-                        provisioner=container_provisioner,
-                        suspension=workspace_suspension_service,
-                        current_status=container_status,
-                        ws_config={
-                            k: ws_cfg[k]
-                            for k in (
-                                "cpu",
-                                "memory",
-                                "cpu_limit",
-                                "memory_limit",
-                                "image",
-                            )
-                            if k in ws_cfg
-                        },
-                    )
-                    if res.outcome is EnsureOutcome.FAILED:
-                        failed_ctx = container_ctx
-                        if container_status != "failed":
-                            # create_workspace records the concrete failure in
-                            # context before returning False. Refresh once so a
-                            # first-attempt auth/RBAC/image failure reaches the
-                            # job error instead of being replaced by the generic
-                            # "could not be created" wrapper.
-                            try:
-                                refreshed_job = await postgres_db.get_job(job_id)
-                                if refreshed_job:
-                                    failed_ctx = _get_container_context(refreshed_job)
-                            except Exception:
-                                logger.warning(
-                                    "Dispatcher: could not refresh failed workspace "
-                                    "context for job %s",
-                                    job_id,
-                                    exc_info=True,
-                                )
-                        error = failed_ctx.get("error")
-                        if error:
-                            msg = f"Workspace container failed: {error}"
-                        else:
-                            msg = (
-                                "Workspace container could not be created. Check "
-                                "orchestrator logs for details (image pull failures, "
-                                "insufficient resources, RBAC issues)."
-                            )
-                        logger.error(
-                            "Dispatcher: workspace ensure failed for job %s: %s. "
-                            "Failing job.",
-                            job_id,
-                            msg,
-                        )
-                        await postgres_db.update_job_status(
-                            job_id,
-                            status="failed",
-                            error_message=msg,
-                            expected_status=(
-                                str(job.get("status")) if stateless_worker else None
-                            ),
-                        )
-                        continue
-                    if res.outcome is EnsureOutcome.PENDING:
-                        if container_status not in (
-                            None,
-                            "",
-                            "deleted",
-                            "none",
-                            "created",
-                            "creating",
-                            "restoring",
-                            "suspending",
-                            "pending",
-                        ):
-                            logger.warning(
-                                "Dispatcher: job %s has unexpected workspace "
-                                "container status %r — waiting",
-                                job_id,
-                                container_status,
-                            )
-                        continue  # in progress — wait for next cycle
-                    # READY → proceed with dispatch
-                    logger.info("Dispatcher: job %s using workspace container", job_id)
-                else:
-                    # No VM or container provisioning needed — check if a workspace
-                    # was already assigned (e.g. Docker provisioner assigned it on a
-                    # previous cycle and the job is now ready for dispatch).
-                    existing_ctx = _get_container_context(job)
-                    if existing_ctx.get("status") == "ready":
-                        logger.info(
-                            "Dispatcher: job %s using pre-assigned workspace",
-                            job_id,
-                        )
-                    else:
-                        logger.debug(
-                            "Dispatcher: job %s — no workspace provisioner needed",
-                            job_id,
-                        )
-                if not await _prepare_job_repository_before_claim(job):
-                    # Retry on the next dispatcher tick. A Gitea/SSH outage is
-                    # not a worker failure and must not make the job cross the
-                    # processing boundary with unproven repository authority.
-                    continue
-                if stateless_worker:
-                    (
-                        admitted,
-                        queue_result,
-                    ) = await postgres_db.admit_stateless_worker_job(
-                        job_id,
-                        fair_key=(str(job["user_id"]) if job.get("user_id") else None),
-                        priority=int(job.get("priority") or 0),
-                        allow_vm_workspace=vm_workspaces_on_pod_network(),
-                        **_completion_control_boundary.dispatch_guard_kwargs(),
-                    )
-                    if not admitted:
-                        logger.warning(
-                            "Dispatcher: stateless admission CAS lost for job %s; "
-                            "workspace/lane/status changed after preflight",
-                            job_id,
-                        )
-                        continue
-                    logger.info(
-                        "Dispatcher: admitted stateless worker job %s "
-                        "(queue=%s, workspace=k8s-ready)",
-                        job_id,
-                        queue_result,
-                    )
-                    continue
-                dispatchable_jobs.append(job)
-
-            if not dispatchable_jobs:
-                return
-
-            # Get available agents (ready, cooldown passed), skip stale images
-            all_agents = await postgres_db.get_available_agents(limit=50)
-            available_agents = []
-            for ag in all_agents:
-                meta = ag.get("metadata") or {}
-                if isinstance(meta, str):
-                    try:
-                        meta = json.loads(meta)
-                    except (json.JSONDecodeError, ValueError):
-                        meta = {}
-                if _agent_sha_is_current(meta):
-                    available_agents.append(ag)
-                else:
-                    # Stale-SHA agents are skipped here; the lifecycle
-                    # reconciler is responsible for draining them.
-                    logger.debug(
-                        "Skipping stale worker agent %s (build_sha=%s)",
-                        ag["id"],
-                        meta.get("build_sha", ""),
-                    )
-
-            # Phase 1: Direct assignment
-            matched_job_ids = set()
-            matched_agent_ids = set()
-
-            agents_iter = iter(available_agents)
-            for job in dispatchable_jobs:
-                agent = next(agents_iter, None)
-                if agent is None:
-                    break  # No more free agents
-
-                job_id = str(job["id"])
-                # Atomically claim the job for this agent BEFORE notifying the
-                # pod. Closes the dual-leader double-assign that leader election
-                # cannot fence (M1): two transient leaders may both scan the same
-                # candidate, but only one CAS wins — the loser skips. The claim
-                # sets status='processing'+assigned_agent_id; a failed
-                # dispatch/resume below self-heals via recover_orphaned_jobs.
-                if not await postgres_db.claim_job_for_agent(
-                    job_id,
-                    str(agent["id"]),
-                    **_completion_control_boundary.dispatch_guard_kwargs(),
-                ):
-                    logger.debug(
-                        "Dispatcher: job %s already claimed by another replica; skipping",
-                        job_id,
-                    )
-                    continue
-                if resume_lane_applies(
-                    job,
-                    has_checkpoint=await postgres_db.job_has_checkpoint(job_id),
-                ):
-                    success = await _job_delivery_operations().resume(job, agent)
-                else:
-                    if job["status"] == "paused":
-                        logger.info(
-                            "Dispatcher: job %s is paused with no checkpoint "
-                            "to resume from (never started, or pruned at a "
-                            "terminal state) — dispatching via the fresh "
-                            "/job/start lane",
-                            job_id,
-                        )
-                    success = await _job_delivery_operations().dispatch(job, agent)
-
-                if success:
-                    matched_job_ids.add(job_id)
-                    matched_agent_ids.add(str(agent["id"]))
-
-            # Phase 1.5: Provision agent pods for unmatched jobs (K8s only)
-            remaining = [
-                j for j in dispatchable_jobs if str(j["id"]) not in matched_job_ids
-            ]
-            if remaining and agent_provisioner.is_available:
-                for job in remaining:
-                    if (
-                        await agent_provisioner.active_count()
-                        >= agent_provisioner.max_agents
-                    ):
-                        break
-                    pod_name = await agent_provisioner.provision_agent(purpose="job")
-                    if pod_name:
-                        logger.info(
-                            "Provisioned agent %s for pending job %s",
-                            pod_name,
-                            str(job["id"]),
-                        )
-                    else:
-                        break  # At capacity or error
-                    # Don't assign yet — pod needs to register first.
-                    # Agent heartbeats "ready" → _trigger_dispatch() → next
-                    # cycle matches it.
-
-            # Phase 2: Preemption (non-blocking). D1 placeability guard: only
-            # workspace-ready jobs (dispatchable_jobs, not the full pending set)
-            # may drive preemption — pausing a running job to free an agent is
-            # pointless for a job that has no workspace to run in.
-            remaining = [
-                j for j in dispatchable_jobs if str(j["id"]) not in matched_job_ids
-            ]
-            if not remaining:
-                return
-
-            candidates = await postgres_db.get_preemption_candidates()
-            if not candidates:
-                return
-
-            for pending_job in remaining:
-                pending_priority = pending_job.get("priority", 5)
-                pending_job_id = str(pending_job["id"])
-
-                # D1 Guard 2: a verification/critic subjob whose parent is
-                # already terminal can never run, so it must not preempt — even
-                # if it slipped past Guard 1 by inheriting a (now-dead) parent
-                # workspace. Costs one lookup, only for sub-jobs reaching Phase 2.
-                parent_status = None
-                parent_id = pending_job.get("parent_job_id")
-                if parent_id:
-                    parent = await postgres_db.get_job(str(parent_id))
-                    parent_status = parent.get("status") if parent else None
-                block_reason = preemption_blocked_reason(pending_job, parent_status)
-                if block_reason:
-                    logger.warning(
-                        "Preempt: skipping pending job %s — %s",
-                        pending_job_id,
-                        block_reason,
-                    )
-                    continue
-
-                # Find lowest-priority running job that can be preempted
-                for candidate in candidates:
-                    candidate_id = str(candidate["id"])
-                    candidate_priority = candidate.get("priority", 5)
-
-                    # Only preempt if strictly higher priority
-                    if pending_priority <= candidate_priority:
-                        continue
-
-                    # Skip if already being paused
-                    if candidate_id in _pause_pending_job_ids:
-                        continue
-
-                    # Skip if already matched (agent taken)
-                    if str(candidate.get("assigned_agent_id", "")) in matched_agent_ids:
-                        continue
-
-                    # Initiate preemption (fire-and-forget)
-                    _pause_pending_job_ids.add(candidate_id)
-                    asyncio.create_task(
-                        _job_delivery_operations().initiate_pause(candidate)
-                    )
-                    logger.info(
-                        f"Preempt: pausing job {candidate_id} (priority={candidate_priority}) "
-                        f"for pending job {pending_job_id} (priority={pending_priority})"
-                    )
-                    # Remove this candidate so it's not preempted again in this cycle
-                    candidates.remove(candidate)
-                    break  # One preemption per pending job per cycle
-
-        except Exception as e:
-            logger.error(f"Dispatcher error: {e}", exc_info=True)
-
-
-async def auto_assign_dispatcher(shutdown_event: asyncio.Event) -> None:
-    """Background task that periodically dispatches pending jobs to available agents.
-
-    Runs every 30 seconds as a catch-all. Event-driven triggers (job creation,
-    agent heartbeat) also call _try_dispatch_pending_jobs() for faster response.
-    """
-    logger.info(
-        "Auto-assign dispatcher started (pinned=%s, stateless_workers=%s)",
-        AUTO_ASSIGN_ENABLED,
-        STATELESS_WORKER_ENABLED,
+    return job_dispatcher.JobDispatchDependencies(
+        state=_job_dispatch_state,
+        store=postgres_db,
+        completion_control_boundary=_completion_control_boundary,
+        agent_provisioner=agent_provisioner,
+        vm_provisioner=vm_provisioner,
+        container_provisioner=container_provisioner,
+        docker_provisioner=docker_provisioner,
+        workspace_suspension=workspace_suspension_service,
+        auto_assign_enabled=AUTO_ASSIGN_ENABLED,
+        stateless_worker_enabled=STATELESS_WORKER_ENABLED,
+        manifest_execution_service=_manifest_execution_service,
+        prepare_job_workspace_runtime=_prepare_job_workspace_runtime,
+        fail_subjob_and_unblock_parent=_fail_subjob_and_unblock_parent,
+        check_vm_permission=_check_vm_permission,
+        fail_vm_parked_job=_fail_vm_parked_job,
+        job_needs_sandbox=_job_needs_sandbox,
+        provision_parent_workspace_for_scholar=_provision_parent_workspace_for_scholar,
+        prepare_job_repository_before_claim=_prepare_job_repository_before_claim,
+        job_delivery_operations=_job_delivery_operations,
     )
-    while not shutdown_event.is_set():
-        try:
-            await _try_dispatch_pending_jobs()
-        except Exception as e:
-            logger.error(f"Error in auto-assign dispatcher: {e}")
-
-        # Wait 30 seconds or until shutdown
-        try:
-            await asyncio.wait_for(shutdown_event.wait(), timeout=30.0)
-            break
-        except asyncio.TimeoutError:
-            pass
-
-    logger.info("Auto-assign dispatcher stopped")
 
 
 def _trigger_dispatch() -> None:
-    """Fire-and-forget trigger for the dispatcher. Safe to call from any endpoint.
+    """The application's dispatch trigger. Safe to call from any endpoint.
 
-    Gated on leadership (M1): only the elected leader dispatches, so a job
-    created via a REST handler on a non-leader replica is picked up by the
-    leader's periodic dispatcher loop rather than dispatched here.
+    Fire-and-forget and leader-gated (M1): see
+    ``services/job_dispatcher.trigger_dispatch`` (R1.B11).
     """
-    from orchestrator.services.leader_election import is_leader
-
-    if (AUTO_ASSIGN_ENABLED or STATELESS_WORKER_ENABLED) and is_leader.is_set():
-        asyncio.create_task(_try_dispatch_pending_jobs())
+    job_dispatcher.trigger_dispatch(dependencies=_job_dispatch_dependencies())
 
 
 # =============================================================================
@@ -5123,7 +4195,13 @@ async def lifespan(app: FastAPI):
         cleanup_expired_sessions(postgres_db, _shutdown_event)
     )
     dispatcher_task = asyncio.create_task(
-        run_when_leader(auto_assign_dispatcher, _shutdown_event)
+        run_when_leader(
+            functools.partial(
+                job_dispatcher.auto_assign_dispatcher,
+                dependencies=_job_dispatch_dependencies(),
+            ),
+            _shutdown_event,
+        )
     )
     vm_readiness_task = (
         asyncio.create_task(
@@ -7390,7 +6468,7 @@ def _job_delivery_operations() -> job_delivery_operations.JobDeliveryOperations:
             completion_commands_enabled=lambda: COMPLETION_COMMANDS_ENABLED,
             http_client_factory=httpx.AsyncClient,
             completion_control=_completion_control_boundary,
-            pause_pending_job_ids=_pause_pending_job_ids,
+            pause_pending_job_ids=_job_dispatch_state.pause_pending_job_ids,
             gitea_client=gitea_client,
             workspace_context_keys=_WORKSPACE_CONTEXT_KEYS,
             prepare_job_workspace_runtime=_prepare_job_workspace_runtime,

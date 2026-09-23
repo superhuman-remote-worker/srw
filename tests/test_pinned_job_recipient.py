@@ -1,5 +1,6 @@
 """Pinned job mutations are bound to one registered runtime process."""
 
+from orchestrator.services.workspace_lifecycle import WorkspaceOwner
 from tests import _b09_control_seams as control_seams
 
 from unittest.mock import AsyncMock, patch
@@ -419,7 +420,7 @@ async def test_fresh_start_delivers_exact_k8s_authority_and_refuses_final_drift(
         port=30022,
     )
     authority = main._PinnedK8sJobWorkspaceAuthority(
-        main.WorkspaceOwner.job(JOB_ID),
+        WorkspaceOwner.job(JOB_ID),
         attestation,
     )
     start_request = main.JobStartRequest(
@@ -488,7 +489,7 @@ async def test_final_recheck_attests_inherited_parent_without_child_runtime_snap
         port=30022,
     )
     authority = main._PinnedK8sJobWorkspaceAuthority(
-        main.WorkspaceOwner.job(parent_id),
+        WorkspaceOwner.job(parent_id),
         attestation,
     )
 
@@ -509,4 +510,4 @@ async def test_final_recheck_attests_inherited_parent_without_child_runtime_snap
             child, authority
         )
 
-    attest.assert_awaited_once_with(main.WorkspaceOwner.job(parent_id))
+    attest.assert_awaited_once_with(WorkspaceOwner.job(parent_id))

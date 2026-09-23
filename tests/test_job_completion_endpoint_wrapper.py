@@ -7,6 +7,7 @@ gate, admission ordering, durable outcome handoff, and replay response matrix.
 
 from __future__ import annotations
 
+from orchestrator.services.workspace_lifecycle import WorkspaceOwner
 from tests import b08_completion_helpers as b08_helpers
 
 import builtins
@@ -1854,13 +1855,13 @@ async def test_durable_recovery_delete_uses_exact_cleanup_intent(
 
     assert result["actions"] == ["workspace recovery tested"]
     prepare_cleanup.assert_awaited_once_with(
-        orchestrator.main.WorkspaceOwner.job(JOB_ID),
+        WorkspaceOwner.job(JOB_ID),
         expected_runtime_incarnation=runtime_uid,
         target_disposition="deleted",
         reclaim_shared_resources=False,
     )
     reconcile_cleanup.assert_awaited_once_with(
-        orchestrator.main.WorkspaceOwner.job(JOB_ID),
+        WorkspaceOwner.job(JOB_ID),
         expected_runtime_incarnation=runtime_uid,
         intent_generation=7,
     )
@@ -2778,7 +2779,7 @@ async def test_hybrid_s36_replacement_supersedes_and_preserves_other_names(
         assert output["actions"] == ["k8s workspace released"]
     else:
         classify_kubernetes.assert_awaited_once_with(
-            orchestrator.main.WorkspaceOwner.job(JOB_ID), workspace_identity
+            WorkspaceOwner.job(JOB_ID), workspace_identity
         )
         assert output["actions"] == ["vm released"]
 
@@ -2865,12 +2866,12 @@ async def test_flagged_kubernetes_teardown_captures_and_uses_exact_uids(
     )
 
     async def capture(owner):
-        assert owner == orchestrator.main.WorkspaceOwner.job(JOB_ID)
+        assert owner == WorkspaceOwner.job(JOB_ID)
         runner.probe_order.append("capture_resource")
         return identity
 
     async def release(owner, **kwargs):
-        assert owner == orchestrator.main.WorkspaceOwner.job(JOB_ID)
+        assert owner == WorkspaceOwner.job(JOB_ID)
         assert kwargs == {
             "teardown_identity": identity,
             "require_snapshot": True,

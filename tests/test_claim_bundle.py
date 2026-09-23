@@ -9,6 +9,7 @@ mismatch (no enumeration oracle); 404 absent unit row; 409 non-session unit /
 wrong lane / assembly refused.
 """
 
+from orchestrator.services.workspace_lifecycle import WorkspaceOwner
 import asyncio
 from copy import deepcopy
 from unittest.mock import ANY, AsyncMock, MagicMock
@@ -834,7 +835,7 @@ async def test_worker_bundle_reuses_job_start_builder_and_rechecks_lease(monkeyp
     # is the flag.
     assert builder.await_args.kwargs["persist_dispatch_state"] is False
     assert attest.await_count == 2
-    assert attest.await_args_list[0].args[0] == orch_main.WorkspaceOwner.job(UNIT_ID)
+    assert attest.await_args_list[0].args[0] == WorkspaceOwner.job(UNIT_ID)
     lease_reads = [
         call
         for call in db.conn.fetchval.await_args_list
@@ -1232,8 +1233,7 @@ async def test_inherited_worker_attests_parent_but_keeps_child_tmux_owner(monkey
 
     assert attest.await_count == 2
     assert all(
-        call.args[0] == orch_main.WorkspaceOwner.job(parent_id)
-        for call in attest.await_args_list
+        call.args[0] == WorkspaceOwner.job(parent_id) for call in attest.await_args_list
     )
     assert builder.await_args.args[0]["context"]["workspace_container"]["host"] == (
         "10.0.0.9"
@@ -1312,8 +1312,7 @@ async def test_pre_0175_inherited_worker_final_reread_converges_parent(monkeypat
     assert out["job"]["workspace_runtime_incarnation"] == WORKSPACE_RUNTIME
     assert attest.await_count == 7
     assert all(
-        call.args[0] == orch_main.WorkspaceOwner.job(parent_id)
-        for call in attest.await_args_list
+        call.args[0] == WorkspaceOwner.job(parent_id) for call in attest.await_args_list
     )
     # The historical child row remains a snapshot; both the initial and final
     # contract checks obtained current authority from the parent overlay.
@@ -1378,7 +1377,7 @@ async def test_inherited_worker_rejects_parent_change_after_assembly(
 
     async def attest(owner):
         nonlocal calls
-        assert owner == orch_main.WorkspaceOwner.job(parent_id)
+        assert owner == WorkspaceOwner.job(parent_id)
         calls += 1
         if calls == 4:
             if change == "replacement":

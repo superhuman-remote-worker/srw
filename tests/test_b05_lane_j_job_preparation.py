@@ -36,6 +36,7 @@ file.
 from __future__ import annotations
 
 
+from orchestrator.services.workspace_lifecycle import EnsureOutcome
 from tests import b08_completion_helpers as b08_helpers
 
 import json
@@ -1656,7 +1657,7 @@ class TestScholarParentProvisioning:
         store.merge_job_context = AsyncMock()
         ensure = AsyncMock(
             return_value=SimpleNamespace(
-                outcome=main.EnsureOutcome.PENDING, status="provisioning"
+                outcome=EnsureOutcome.PENDING, status="provisioning"
             )
         )
         outcome = await job_workspace_authority.provision_parent_workspace_for_scholar(
@@ -1677,9 +1678,7 @@ class TestScholarParentProvisioning:
             }
         )
         ensure = AsyncMock(
-            return_value=SimpleNamespace(
-                outcome=main.EnsureOutcome.FAILED, status="failed"
-            )
+            return_value=SimpleNamespace(outcome=EnsureOutcome.FAILED, status="failed")
         )
         fail = AsyncMock()
         outcome = await job_workspace_authority.provision_parent_workspace_for_scholar(
@@ -1717,9 +1716,7 @@ class TestScholarParentProvisioning:
 
         store.acquire = MagicMock(return_value=_Acquire())
         ensure = AsyncMock(
-            return_value=SimpleNamespace(
-                outcome=main.EnsureOutcome.READY, status="ready"
-            )
+            return_value=SimpleNamespace(outcome=EnsureOutcome.READY, status="ready")
         )
         outcome = await job_workspace_authority.provision_parent_workspace_for_scholar(
             {"id": "scholar-1", "config_name": "scholar"},

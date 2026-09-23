@@ -1,5 +1,7 @@
 """Focused control-plane regressions for stateless worker admission/verbs."""
 
+from orchestrator.services import job_dispatcher
+from orchestrator.services.workspace_lifecycle import EnsureOutcome
 from tests import _b09_control_seams as control_seams
 
 import asyncio
@@ -1024,7 +1026,9 @@ async def test_stateless_dispatch_refusal_cannot_overwrite_winning_control(
     update = AsyncMock(return_value=False)
     monkeypatch.setattr(main.postgres_db, "update_job_status", update)
 
-    await main._try_dispatch_pending_jobs()
+    await job_dispatcher.dispatch_pending_jobs(
+        dependencies=main._job_dispatch_dependencies()
+    )
 
     update.assert_awaited_once_with(
         JOB_ID,
@@ -1068,11 +1072,11 @@ async def test_stateless_workspace_failure_uses_scanned_status_cas(monkeypatch):
         AsyncMock(return_value=[job]),
     )
     monkeypatch.setattr(
-        main,
+        job_dispatcher,
         "ensure_workspace",
         AsyncMock(
             return_value=SimpleNamespace(
-                outcome=main.EnsureOutcome.FAILED,
+                outcome=EnsureOutcome.FAILED,
                 status="failed",
             )
         ),
@@ -1080,7 +1084,9 @@ async def test_stateless_workspace_failure_uses_scanned_status_cas(monkeypatch):
     update = AsyncMock(return_value=False)
     monkeypatch.setattr(main.postgres_db, "update_job_status", update)
 
-    await main._try_dispatch_pending_jobs()
+    await job_dispatcher.dispatch_pending_jobs(
+        dependencies=main._job_dispatch_dependencies()
+    )
 
     update.assert_awaited_once_with(
         JOB_ID,
@@ -1126,9 +1132,11 @@ async def test_dispatcher_waits_instead_of_failing_uidless_k8s_runtime(monkeypat
     update = AsyncMock()
     monkeypatch.setattr(main.postgres_db, "update_job_status", update)
     provision = AsyncMock(side_effect=AssertionError("provisioning attempted"))
-    monkeypatch.setattr(main, "ensure_workspace", provision)
+    monkeypatch.setattr(job_dispatcher, "ensure_workspace", provision)
 
-    await main._try_dispatch_pending_jobs()
+    await job_dispatcher.dispatch_pending_jobs(
+        dependencies=main._job_dispatch_dependencies()
+    )
 
     prepare.assert_awaited_once_with(job)
     update.assert_not_awaited()
@@ -1174,7 +1182,9 @@ async def test_vm_lane_repair_losing_status_cas_does_not_close_queue(monkeypatch
     )
     monkeypatch.setattr(main.postgres_db, "acquire", acquire)
 
-    await main._try_dispatch_pending_jobs()
+    await job_dispatcher.dispatch_pending_jobs(
+        dependencies=main._job_dispatch_dependencies()
+    )
 
     conn.execute.assert_not_called()
 
@@ -1231,7 +1241,7 @@ async def test_same_cluster_vm_dispatch_stays_stateless_and_reaches_admission(
     )
     monkeypatch.setattr(main, "_check_vm_permission", AsyncMock())
     monkeypatch.setattr(
-        main, "vm_provisioning_decision", MagicMock(return_value="ready")
+        job_dispatcher, "vm_provisioning_decision", MagicMock(return_value="ready")
     )
     monkeypatch.setattr(
         main,
@@ -1241,7 +1251,9 @@ async def test_same_cluster_vm_dispatch_stays_stateless_and_reaches_admission(
     admitted = AsyncMock(return_value=(True, "inserted"))
     monkeypatch.setattr(main.postgres_db, "admit_stateless_worker_job", admitted)
 
-    await main._try_dispatch_pending_jobs()
+    await job_dispatcher.dispatch_pending_jobs(
+        dependencies=main._job_dispatch_dependencies()
+    )
 
     admitted.assert_awaited_once_with(
         JOB_ID,

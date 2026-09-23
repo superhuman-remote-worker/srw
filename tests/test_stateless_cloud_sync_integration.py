@@ -8,6 +8,7 @@ push.
 
 from __future__ import annotations
 
+from orchestrator.services.workspace_lifecycle import WorkspaceOwner
 import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -1021,7 +1022,7 @@ async def test_internal_workspace_pinned_sandbox_requires_exact_live_authority()
     probe.assert_not_awaited()
     assert attest.await_count == 2
     assert all(
-        call.args == (orch_main.WorkspaceOwner.session(THREAD_ID),)
+        call.args == (WorkspaceOwner.session(THREAD_ID),)
         for call in attest.await_args_list
     )
     schedule.assert_not_called()

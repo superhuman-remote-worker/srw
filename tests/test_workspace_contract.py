@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from orchestrator.services import job_dispatcher
+from orchestrator.services.workspace_lifecycle import EnsureOutcome, WorkspaceOwner
 from copy import deepcopy
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -795,7 +797,7 @@ async def test_completion_recovery_reprovisions_and_retires_the_stale_marker(
     )
 
     async def provision_replacement(owner, **kwargs):
-        assert owner == orch_main.WorkspaceOwner.job(job["id"])
+        assert owner == WorkspaceOwner.job(job["id"])
         assert kwargs["current_status"] == "deleted"
         db.jobs[job["id"]]["context"]["workspace_container"].update(
             {
@@ -808,7 +810,7 @@ async def test_completion_recovery_reprovisions_and_retires_the_stale_marker(
             }
         )
         return SimpleNamespace(
-            outcome=orch_main.EnsureOutcome.PENDING,
+            outcome=EnsureOutcome.PENDING,
             status="creating",
         )
 
@@ -829,11 +831,13 @@ async def test_completion_recovery_reprovisions_and_retires_the_stale_marker(
         live_attestation,
     )
     ensure_workspace = AsyncMock(side_effect=provision_replacement)
-    monkeypatch.setattr(orch_main, "ensure_workspace", ensure_workspace)
+    monkeypatch.setattr(job_dispatcher, "ensure_workspace", ensure_workspace)
 
     # First real dispatcher pass sees the deleted lifecycle state and starts
     # ordinary provisioning without trying to attest the vanished predecessor.
-    await orch_main._try_dispatch_pending_jobs()
+    await job_dispatcher.dispatch_pending_jobs(
+        dependencies=orch_main._job_dispatch_dependencies()
+    )
     ensure_workspace.assert_awaited_once()
     live_attestation.assert_not_awaited()
     db.admit_stateless_worker_job.assert_not_awaited()
@@ -845,7 +849,9 @@ async def test_completion_recovery_reprovisions_and_retires_the_stale_marker(
     # Refreshing the marker instead would be a second adoption of a Pod nobody
     # adopted, and leaving it would make every later pre-network check
     # re-attest the vanished predecessor and refuse delivery for good.
-    await orch_main._try_dispatch_pending_jobs()
+    await job_dispatcher.dispatch_pending_jobs(
+        dependencies=orch_main._job_dispatch_dependencies()
+    )
 
     resumed = await db.get_job(job["id"])
     runtime = resumed["context"]["workspace_container"]

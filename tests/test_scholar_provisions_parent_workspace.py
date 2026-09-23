@@ -16,6 +16,8 @@ These tests exercise the three new helpers directly with mocked collaborators.
 
 from __future__ import annotations
 
+from orchestrator.services.job_workspace_runtime import scholar_provision_parent_id
+from orchestrator.services.workspace_lifecycle import EnsureOutcome
 import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -27,7 +29,7 @@ import orchestrator.main as main
 
 
 def _ensure(outcome, status):
-    """An ensure_workspace result. Use main.EnsureOutcome so the `is` identity
+    """An ensure_workspace result. Use EnsureOutcome so the `is` identity
     checks inside the helper match (the enum is import-path sensitive under the
     conftest sys.path shims)."""
     return SimpleNamespace(outcome=outcome, status=status)
@@ -42,14 +44,14 @@ class TestScholarProvisionMarker:
             "id": "scholar",
             "context": {"provisions_parent_workspace": "parent-uuid"},
         }
-        assert main._scholar_provision_parent_id(job) == "parent-uuid"
+        assert scholar_provision_parent_id(job) == "parent-uuid"
 
     def test_marker_present_in_json_string_context(self):
         job = {"id": "s", "context": json.dumps({"provisions_parent_workspace": "p2"})}
-        assert main._scholar_provision_parent_id(job) == "p2"
+        assert scholar_provision_parent_id(job) == "p2"
 
     def test_no_marker_returns_none(self):
-        assert main._scholar_provision_parent_id({"id": "s", "context": {}}) is None
+        assert scholar_provision_parent_id({"id": "s", "context": {}}) is None
 
     def test_inheriting_scholar_is_not_a_provisioner(self):
         # An inheriting subjob (flag + copied container) must NOT be treated as a
@@ -61,7 +63,7 @@ class TestScholarProvisionMarker:
                 "workspace_container": {"status": "ready"},
             },
         }
-        assert main._scholar_provision_parent_id(job) is None
+        assert scholar_provision_parent_id(job) is None
 
 
 # --------------------------------------------------------------------------- #
@@ -177,7 +179,7 @@ class TestProvisionParentWorkspaceForScholar:
         monkeypatch.setattr(
             main,
             "ensure_workspace",
-            AsyncMock(return_value=_ensure(main.EnsureOutcome.PENDING, "creating")),
+            AsyncMock(return_value=_ensure(EnsureOutcome.PENDING, "creating")),
         )
 
         result = await main._provision_parent_workspace_for_scholar(
@@ -196,7 +198,7 @@ class TestProvisionParentWorkspaceForScholar:
         monkeypatch.setattr(
             main,
             "ensure_workspace",
-            AsyncMock(return_value=_ensure(main.EnsureOutcome.FAILED, "failed")),
+            AsyncMock(return_value=_ensure(EnsureOutcome.FAILED, "failed")),
         )
 
         result = await main._provision_parent_workspace_for_scholar(
@@ -247,7 +249,7 @@ class TestProvisionParentWorkspaceForScholar:
         monkeypatch.setattr(
             main,
             "ensure_workspace",
-            AsyncMock(return_value=_ensure(main.EnsureOutcome.READY, "ready")),
+            AsyncMock(return_value=_ensure(EnsureOutcome.READY, "ready")),
         )
 
         result = await main._provision_parent_workspace_for_scholar(

@@ -1,5 +1,6 @@
 """Exact failed-attach abort rotation and readback contract."""
 
+from orchestrator.services.workspace_lifecycle import WorkspaceOwner
 from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -654,12 +655,12 @@ async def test_workspace_zero_abort_recreates_exact_pod_and_health_checks_ide(
         )
 
     pod_authority.assert_awaited_once_with(
-        main.WorkspaceOwner.session(THREAD_ID),
+        WorkspaceOwner.session(THREAD_ID),
         expected_runtime_incarnation=WORKSPACE_RUNTIME,
     )
     if old_pod_authority == "exact_live":
         delete_workspace.assert_awaited_once_with(
-            main.WorkspaceOwner.session(THREAD_ID),
+            WorkspaceOwner.session(THREAD_ID),
             expected_runtime_incarnation=WORKSPACE_RUNTIME,
             captured_teardown_uid=WORKSPACE_RUNTIME,
             wait_for_exact_absence=True,
@@ -685,7 +686,7 @@ async def test_workspace_zero_abort_recreates_exact_pod_and_health_checks_ide(
         _pinned_runtime_lock_held=True,
     )
     code_server.assert_awaited_once_with(
-        main.WorkspaceOwner.session(THREAD_ID),
+        WorkspaceOwner.session(THREAD_ID),
         expected_runtime_incarnation=SUCCESSOR_WORKSPACE_RUNTIME,
     )
     provision.assert_awaited_once()

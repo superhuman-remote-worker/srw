@@ -1,8 +1,8 @@
 """Unit tests for the dispatcher preemption placeability guard (D1).
 
 Covers the pure predicate ``preemption_blocked_reason``. The dispatcher itself
-(``_try_dispatch_pending_jobs`` in orchestrator/main.py) is untested, so the
-decision logic is extracted here to be verified in isolation. See
+(``dispatch_pending_jobs`` in orchestrator/services/job_dispatcher.py) reads
+its decisions from here, so they can be verified in isolation. See
 knowledge-history/done/preemption_before_first_checkpoint_replays_job_opening.md.
 """
 
