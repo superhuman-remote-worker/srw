@@ -1707,7 +1707,11 @@ class JobControlOperations:
                     ),
                 )
             control_claim = await self.dependencies.completion_control.claim(
-                {**job, "id": job_id}, source="public_approve"
+                {**job, "id": job_id}, source="public_approve",
+                **(
+                    {"terminal_review_source": review_snapshot}
+                    if review_snapshot is not None else {}
+                ),
             )
 
             # 2. Read freeze data — DB first, Gitea fallback, local fallback

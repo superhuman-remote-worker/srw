@@ -339,21 +339,64 @@ async def test_immediate_terminal_approval_preserves_live_access_and_worker_hold
     else:
         await db.execute(
             "UPDATE run_queue SET state=$2,leased_by=$3,"
-            "leased_until=clock_timestamp()+interval '5 minutes' WHERE unit_id=$1",
+            "leased_until=CASE WHEN $2='leased' THEN "
+            "clock_timestamp()+interval '5 minutes' ELSE NULL END WHERE unit_id=$1",
             owner, "leased" if hold == "queue_leased" else "queued",
             "busy-worker" if hold == "queue_leased" else None,
         )
     controls = await controls_for(db, monkeypatch, tmp_path)
-    with pytest.raises(HTTPException) as raised:
-        await controls.approve_job(
+    (tmp_path / "output").mkdir()
+    original_queue = await db.fetchrow(
+        "SELECT state,lease_token,leased_by,leased_until FROM run_queue WHERE unit_id=$1",
+        owner,
+    )
+    for _ in range(2 if hold.startswith("queue_") else 1):
+        with pytest.raises(HTTPException) as raised:
+            await controls.approve_job(
+                str(owner), user={"id": "reviewer"},
+                job=await db.get_job(str(owner)), request=None,
+            )
+        assert raised.value.status_code == 409
+        if hold.startswith("queue_"):
+            assert await db.fetchrow(
+                "SELECT state,lease_token,leased_by,leased_until FROM run_queue "
+                "WHERE unit_id=$1", owner,
+            ) == original_queue
+        assert await db.fetchval(
+            "SELECT context ? '_completion_control_claim' FROM jobs WHERE id=$1",
+            owner,
+        ) is False
+        assert await db.fetchval("SELECT status FROM jobs WHERE id=$1", owner) == "pending_review"
+        assert await db.fetchval(
+            "SELECT count(*) FROM vm_idle_operations WHERE owner_id=$1", owner,
+        ) == 0
+        assert not (tmp_path / "output" / "job_completion.json").exists()
+        controls.dependencies.forge.create_or_update_file.assert_not_called()
+        controls.dependencies.forge.delete_file.assert_not_called()
+    if hold.startswith("queue_"):
+        from shared.worker_queue import (
+            cancel_queued_worker_batch, complete_worker_batch,
+        )
+
+        # Settle through the actual queue APIs, separately from approval.
+        async with db.acquire() as conn, conn.transaction():
+            if hold == "queue_queued":
+                assert await cancel_queued_worker_batch(conn, job_id=owner)
+            else:
+                assert await complete_worker_batch(
+                    conn, unit_id=owner,
+                    lease_token=original_queue["lease_token"], consumed_seq=None,
+                ) == "done"
+        monkeypatch.setattr(type(controls), "publish_terminal_review", AsyncMock())
+        result = await controls.approve_job(
             str(owner), user={"id": "reviewer"},
             job=await db.get_job(str(owner)), request=None,
         )
-    assert raised.value.status_code == 409
-    assert await db.fetchval("SELECT status FROM jobs WHERE id=$1", owner) == "pending_review"
-    assert await db.fetchval(
-        "SELECT count(*) FROM vm_idle_operations WHERE owner_id=$1", owner,
-    ) == 0
+        assert result["status"] == "approved"
+        assert await db.fetchval(
+            "SELECT count(*) FROM vm_idle_operations WHERE owner_id=$1 "
+            "AND terminal_source_command_id IS NOT NULL", owner,
+        ) == 1
 
 
 @pytest.mark.asyncio

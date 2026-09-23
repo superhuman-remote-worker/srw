@@ -13,7 +13,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
 import math
-from typing import Any
+from typing import Any, Mapping
 from uuid import UUID, uuid4
 
 from shared.operator_pause_hold import (
@@ -237,6 +237,7 @@ class CompletionControl:
         source: str,
         expected_status: str,
         expected_lane: str,
+        terminal_review_source: Mapping[str, Any] | None = None,
     ) -> CompletionControlClaim:
         """Fence the current executor and durably claim one human mutation.
 
@@ -254,6 +255,12 @@ class CompletionControl:
             raise ValueError("completion control lane must be pinned or stateless")
         if not expected_status or len(expected_status) > 64:
             raise ValueError("completion control expected status is invalid")
+        if terminal_review_source is not None and (
+            source != "public_approve"
+            or expected_status != "pending_review"
+            or expected_lane != "stateless"
+        ):
+            raise ValueError("terminal review claim requires final stateless approval")
 
         blocked: CompletionControlDecision | None = None
         claim: CompletionControlClaim | None = None
@@ -263,7 +270,7 @@ class CompletionControl:
                 # have no row; the lookup still precedes the jobs lock.
                 queue = await conn.fetchrow(
                     """
-                    SELECT unit_kind, state, lease_token
+                    SELECT unit_kind, state, lease_token, leased_by
                     FROM run_queue
                     WHERE unit_id=$1::uuid
                     FOR UPDATE
@@ -273,7 +280,8 @@ class CompletionControl:
                 job = await conn.fetchrow(
                     """
                     SELECT status::text AS status, execution_lane,
-                           assigned_agent_id, context,
+                           assigned_agent_id, context, freeze_data,
+                           workspace_idle_episode, workspace_idle_revision,
                            extract(epoch FROM clock_timestamp())::float8
                                AS db_now_epoch
                     FROM jobs
@@ -320,6 +328,22 @@ class CompletionControl:
                             raise CompletionControlClaimConflict(
                                 "stateless worker queue is missing"
                             )
+                        if terminal_review_source is not None:
+                            from orchestrator.services.vm_idle_phase_approval import (
+                                review_source_snapshot,
+                            )
+
+                            if (
+                                bounded_source != "public_approve"
+                                or review_source_snapshot(dict(job))
+                                != dict(terminal_review_source)
+                                or queue["state"] not in {"done", "parked"}
+                                or queue["leased_by"] is not None
+                                or job["assigned_agent_id"] is not None
+                            ):
+                                raise CompletionControlClaimConflict(
+                                    "terminal review worker or source changed"
+                                )
                         fence_kind = "worker_lease"
                         fence_value = str(int(queue["lease_token"]))
                         closed = await conn.fetchrow(
