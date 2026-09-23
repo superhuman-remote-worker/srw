@@ -429,8 +429,9 @@ async def test_purge_requires_every_child_absent_and_resumes_from_snapshot(
     "receipt",
     ["missing", "pending", "wrong_pvc", "wrong_source", "stale_digest", "completed"],
 )
+@pytest.mark.parametrize("capture_available", [False, True])
 async def test_absent_purged_rootdisk_requires_matching_completed_admission(
-    app_pg, receipt
+    app_pg, receipt, capture_available
 ):
     from orchestrator.operator_cli.vm_recovery_gate_stop_control import (
         GateFixturePurge,
@@ -497,7 +498,9 @@ async def test_absent_purged_rootdisk_requires_matching_completed_admission(
             "generation": doc["generation"],
             "vm": doc["vm_uid"],
             "pvc": doc["pvc_uid"],
-        },
+        }
+        if capture_available
+        else None,
         timeout=0.01,
         interval=0,
     )
@@ -509,9 +512,39 @@ async def test_absent_purged_rootdisk_requires_matching_completed_admission(
 
 
 @pytest.mark.asyncio
+async def test_absent_objects_without_capture_or_prior_snapshot_do_not_prove_purge(
+    app_pg,
+):
+    from orchestrator.operator_cli.vm_recovery_gate_stop_control import (
+        GateFixturePurge,
+        GateStopError,
+    )
+
+    doc = await seeded(app_pg)
+
+    class Kube:
+        async def fixture_objects(self, namespace, job):
+            return dict(vm=None, vmi=None, dv=None, pvc=None)
+
+    async def unexpected_delete(job, *, purge_disk):
+        raise AssertionError("no new delete without a capture")
+
+    with pytest.raises(GateStopError, match="purge_identity_unproven"):
+        await GateFixturePurge(
+            app_pg,
+            Kube(),
+            unexpected_delete,
+            doc["run_id"],
+            doc["namespace"],
+            anchor=None,
+        ).run(UUID(doc["job_id"]))
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("completed", [False, True])
+@pytest.mark.parametrize("capture_available", [False, True])
 async def test_cli_purge_reports_success_only_after_exact_cleanup_receipt(
-    app_pg, monkeypatch, completed
+    app_pg, monkeypatch, completed, capture_available
 ):
     from types import SimpleNamespace
     from unittest.mock import AsyncMock
@@ -570,6 +603,11 @@ async def test_cli_purge_reports_success_only_after_exact_cleanup_receipt(
             return_value=VMTeardownIdentity(
                 doc["generation"], doc["vm_uid"], doc["pvc_uid"]
             )
+            if capture_available
+            else None,
+            side_effect=None
+            if capture_available
+            else RuntimeError("capture unavailable"),
         ),
         release_vm_captured=release,
     )

@@ -75,10 +75,102 @@ def _list_shape(lease):
     return _typed(listed)
 
 
+def _rootdisk_carrier():
+    owner = str(uuid4())
+    admission = str(uuid4())
+    name = f"srw-cleanup-{admission.replace('-', '')}"
+    values = {
+        "admission_id": admission,
+        "request_id": str(uuid4()),
+        "intent_digest": "sha256:" + "d" * 64,
+        "owner_kind": "job",
+        "owner_id": owner,
+        "source": "controller_rootdisk_delete",
+        "outcome": "deleted",
+        "name": f"agent-vm-{owner}-rootdisk",
+        "old_dv_uid": str(uuid4()),
+        "old_pvc_uid": str(uuid4()),
+        "provision_generation": str(uuid4()),
+        "nonce": str(uuid4()),
+        "successor_dv_uid": "",
+        "successor_pvc_uid": "",
+    }
+    uid = str(uuid4())
+    signature = VMController._workspace_cleanup_carrier_signature(
+        name=name,
+        uid=uid,
+        values=values,
+    )
+    return {
+        "apiVersion": "coordination.k8s.io/v1",
+        "kind": "Lease",
+        "metadata": {
+            "name": name,
+            "namespace": controller_module.VM_NAMESPACE,
+            "uid": uid,
+            "resourceVersion": "9",
+            "labels": {controller_module.WORKSPACE_CLEANUP_CARRIER_LABEL: "true"},
+            "annotations": {
+                **{
+                    controller_module._CLEANUP_ANNOTATIONS[k]: v
+                    for k, v in values.items()
+                },
+                "srw.io/cleanup-carrier-signature": signature,
+            },
+        },
+    }
+
+
 def _no_writes(api):
     api.create_namespaced_lease.assert_not_called()
     api.replace_namespaced_lease.assert_not_called()
     api.delete_namespaced_lease.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_gc_off_continuation_uses_authenticated_source_not_unsigned_annotation(
+    monkeypatch,
+):
+    monkeypatch.setattr(controller_module, "LIFECYCLE_HMAC_SECRET", SECRET)
+    creation = _carrier()
+    # This annotation is outside the signed creation intent. It must not
+    # select the creation carrier for rootdisk-only continuation.
+    creation["metadata"]["annotations"]["srw.io/cleanup-source"] = (
+        "controller_rootdisk_delete"
+    )
+    rootdisk = _rootdisk_carrier()
+    api = SimpleNamespace(
+        list_namespaced_lease=MagicMock(
+            return_value=V1LeaseList(
+                items=[
+                    _list_shape(creation),
+                    _list_shape(rootdisk),
+                ]
+            )
+        ),
+        read_namespaced_lease=MagicMock(return_value=_typed(creation)),
+        create_namespaced_lease=MagicMock(),
+        replace_namespaced_lease=MagicMock(),
+        delete_namespaced_lease=MagicMock(),
+    )
+    controller = VMController.__new__(VMController)
+    controller.coordination_api = api
+    controller._reconcile_workspace_cleanup_carrier = AsyncMock(return_value=True)
+
+    await controller._reconcile_workspace_cleanup_carriers(
+        sources=frozenset({"controller_rootdisk_delete"})
+    )
+    assert [
+        call.args[0]["source"]
+        for call in controller._reconcile_workspace_cleanup_carrier.await_args_list
+    ] == ["controller_rootdisk_delete"]
+    controller._reconcile_workspace_cleanup_carrier.reset_mock()
+    await controller._reconcile_workspace_cleanup_carriers()
+    assert [
+        call.args[0]["source"]
+        for call in controller._reconcile_workspace_cleanup_carrier.await_args_list
+    ] == ["controller_vm_create", "controller_rootdisk_delete"]
+    _no_writes(api)
 
 
 @pytest.mark.asyncio

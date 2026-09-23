@@ -1173,8 +1173,11 @@ class VMController:
             if (
                 sources is not None
                 and isinstance(annotations, Mapping)
-                and annotations.get(_CLEANUP_ANNOTATIONS["source"]) not in sources
+                and CREATION_INTENT_ANNOTATION in annotations
+                and "controller_vm_create" not in sources
             ):
+                # A creation carrier may carry an unrelated unsigned cleanup
+                # source annotation. It cannot join a rootdisk-only pass.
                 continue
             if CREATION_INTENT_ANNOTATION in annotations and not annotations.get(
                 CREATION_SIGNATURE_ANNOTATION
@@ -1210,6 +1213,8 @@ class VMController:
                     raise RuntimeError("creation carrier exact identity changed")
                 item = current
             carrier = self._parse_workspace_cleanup_carrier(item)
+            if sources is not None and carrier["source"] not in sources:
+                continue
             if not carrier["carrier_sealed"]:
                 carrier = await self._refresh_workspace_cleanup_carrier(carrier)
             carriers.append(carrier)

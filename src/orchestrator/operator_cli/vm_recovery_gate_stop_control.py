@@ -857,32 +857,51 @@ class GateFixturePurge:
             raise GateStopError("purge_identity_unproven")
         async with self.db.acquire() as conn, conn.transaction():
             row, context = await self._scope(conn, job_id)
-            if anchor is None:
-                # No identity is needed to verify all four resources absent;
-                # this branch never sends a delete or creates purge authority.
-                return
-            snapshot = {
-                "version": 1,
-                "generation": anchor["generation"],
-                "run_id": self.run_id,
-                "job_id": str(job_id),
-                "user_id": str(row["user_id"]),
-                "namespace": self.namespace,
-                "uids": {**identities, "vm": anchor["vm"], "pvc": anchor["pvc"]},
-            }
             previous = context.get(self.KEY)
+            if anchor is None:
+                # A failed current capture cannot erase a prior purge's
+                # durable identity or its still-open cleanup admission.
+                if previous is None:
+                    raise GateStopError("purge_identity_unproven")
+                snapshot = previous
+            else:
+                snapshot = {
+                    "version": 1,
+                    "generation": anchor["generation"],
+                    "run_id": self.run_id,
+                    "job_id": str(job_id),
+                    "user_id": str(row["user_id"]),
+                    "namespace": self.namespace,
+                    "uids": {**identities, "vm": anchor["vm"], "pvc": anchor["pvc"]},
+                }
             if previous is not None:
                 if (
                     not isinstance(previous, dict)
-                    or set(previous) != set(snapshot)
-                    or any(
-                        previous.get(k) != v for k, v in snapshot.items() if k != "uids"
+                    or set(previous)
+                    != {
+                        "version",
+                        "generation",
+                        "run_id",
+                        "job_id",
+                        "user_id",
+                        "namespace",
+                        "uids",
+                    }
+                    or previous.get("version") != 1
+                    or not isinstance(previous.get("generation"), str)
+                    or previous.get("run_id") != self.run_id
+                    or previous.get("job_id") != str(job_id)
+                    or previous.get("user_id") != str(row["user_id"])
+                    or previous.get("namespace") != self.namespace
+                    or (
+                        anchor is not None
+                        and previous.get("generation") != anchor["generation"]
                     )
                     or not isinstance(previous.get("uids"), dict)
                     or set(previous["uids"]) != set(self.KINDS)
                 ):
                     raise GateStopError("purge_snapshot_changed")
-                for value in previous["uids"].values():
+                for value in (previous["generation"], *previous["uids"].values()):
                     if value is not None:
                         try:
                             if str(UUID(value)) != value:
@@ -891,9 +910,10 @@ class GateFixturePurge:
                             raise GateStopError("purge_snapshot_changed") from None
                 snapshot = previous
                 self._matches(identities, snapshot["uids"])
-                self._matches(
-                    {"vm": anchor["vm"], "pvc": anchor["pvc"]}, snapshot["uids"]
-                )
+                if anchor is not None:
+                    self._matches(
+                        {"vm": anchor["vm"], "pvc": anchor["pvc"]}, snapshot["uids"]
+                    )
             else:
                 # Bind VM/PVC to the persisted fixture identity when one exists.
                 stop = context.get(CONTEXT_KEY)
