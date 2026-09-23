@@ -1,4 +1,6 @@
 {{- if and .Values.keycloak.enabled .Values.keycloak.internal }}
+{{- $existingRealm := lookup "v1" "ConfigMap" .Release.Namespace (printf "%s-keycloak-realm" (include "srw.fullname" .)) -}}
+{{- $bootstrapUsername := include "srw.keycloakBootstrapAdminUsername" (dict "context" . "existingRealmConfigMap" $existingRealm) -}}
 {{- $bootstrapEmailDomain := .Values.global.domain | default "srw.invalid" -}}
 {{- $cockpitRedirects := list "http://localhost:4200/*" "http://localhost:4000/*" (printf "%s/*" (include "srw.cockpitUrl" .)) -}}
 {{- $cockpitOrigins := list "http://localhost:4200" "http://localhost:4000" (include "srw.cockpitUrl" .) -}}
@@ -331,7 +333,7 @@ data:
       ],
       "users": [
         {
-          "username": "test",
+          "username": {{ $bootstrapUsername | toJson }},
           "email": {{ printf "admin@%s" $bootstrapEmailDomain | quote }},
           "emailVerified": true,
           "enabled": true,
@@ -735,6 +737,8 @@ spec:
                   key: KEYCLOAK_ADMIN_PASSWORD
             # Realm import secrets — referenced as ${VAR} in realm JSON and
             # resolved by Keycloak at import time from these env vars.
+            - name: KC_REALM_ADMIN_USERNAME
+              value: {{ $bootstrapUsername | quote }}
             - name: KC_REALM_ADMIN_PASSWORD
               valueFrom:
                 secretKeyRef:
@@ -845,7 +849,7 @@ spec:
                     # first boot (verified on Keycloak 26.2), but we still
                     # force-set on every start so Vault-rotated admin
                     # passwords propagate without requiring a DB wipe.
-                    $KC set-password -r {{ .Values.keycloak.realm }} --username test --new-password "$KC_REALM_ADMIN_PASSWORD" 2>/dev/null
+                    $KC set-password -r {{ .Values.keycloak.realm }} --username "$KC_REALM_ADMIN_USERNAME" --new-password "$KC_REALM_ADMIN_PASSWORD" 2>/dev/null
                     # --- Sync client secrets ---
                     # cockpit-bff is included so secret rotations in Vault
                     # propagate to KC on the next pod restart. The other
@@ -1027,7 +1031,7 @@ spec:
                           -s realm={{ .Values.keycloak.realm }} -s userId="$OCUID" -s groupId="$OCUGRP" -n 2>/dev/null || true
                       done
                       # Add realm admin to opencloudAdmin
-                      ADMIN_UID=$($KC get users -r {{ .Values.keycloak.realm }} -q username=test --fields id --format csv --noquotes 2>/dev/null | tail -1)
+                      ADMIN_UID=$($KC get users -r {{ .Values.keycloak.realm }} -q "username=$KC_REALM_ADMIN_USERNAME" -q exact=true --fields id --format csv --noquotes 2>/dev/null | tail -1)
                       [ -n "$ADMIN_UID" ] && [ -n "$OCGRP" ] && \
                         $KC update "users/$ADMIN_UID/groups/$OCGRP" -r {{ .Values.keycloak.realm }} \
                           -s realm={{ .Values.keycloak.realm }} -s userId="$ADMIN_UID" -s groupId="$OCGRP" -n 2>/dev/null

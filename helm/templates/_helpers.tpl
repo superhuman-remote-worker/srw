@@ -565,6 +565,53 @@ true
 {{- end }}
 
 {{/*
+Initial SRW realm administrator for the bundled Keycloak. The realm ConfigMap
+has always put this user first. Keep its identity when the value is omitted on
+an upgrade, and reject explicit changes: realm import skips an existing realm.
+The caller supplies lookup's result so selection/validation also works offline.
+*/}}
+{{- define "srw.keycloakBootstrapAdminUsername" -}}
+{{- $ctx := .context -}}
+{{- $settings := $ctx.Values.keycloak.bootstrapAdmin | default dict -}}
+{{- $requested := get $settings "username" -}}
+{{- if not (kindIs "string" $requested) -}}
+{{- fail "keycloak.bootstrapAdmin.username must be a string" -}}
+{{- end -}}
+{{- $username := default "test" $requested -}}
+{{- if .existingRealmConfigMap -}}
+  {{- $data := .existingRealmConfigMap.data | default dict -}}
+  {{- $realm := get $data "srw-realm.json" | default "{}" | fromJson -}}
+  {{- $users := get $realm "users" | default list -}}
+  {{- if or (hasKey $realm "Error") (not (kindIs "slice" $users)) (empty $users) -}}
+    {{- fail "keycloak.bootstrapAdmin.username: cannot read existing bootstrap username from the Keycloak realm ConfigMap; restore its original srw-realm.json before upgrading" -}}
+  {{- end -}}
+  {{- $firstUser := first $users -}}
+  {{- if not (kindIs "map" $firstUser) -}}
+    {{- fail "keycloak.bootstrapAdmin.username: cannot read existing bootstrap username from the Keycloak realm ConfigMap" -}}
+  {{- end -}}
+  {{- $existing := get $firstUser "username" -}}
+  {{- if or (not (kindIs "string" $existing)) (empty $existing) -}}
+    {{- fail "keycloak.bootstrapAdmin.username: cannot read existing bootstrap username from the Keycloak realm ConfigMap" -}}
+  {{- end -}}
+  {{- if and (ne $requested "") (ne $requested $existing) -}}
+    {{- fail (printf "keycloak.bootstrapAdmin.username is for the initial install only; the existing bootstrap username is %q. Keep that value or leave it empty; manage additional administrators through SRW." $existing) -}}
+  {{- end -}}
+  {{- $username = $existing -}}
+{{- end -}}
+{{- if not (regexMatch "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$" $username) -}}
+  {{- fail "keycloak.bootstrapAdmin.username must be 1-64 ASCII letters, digits, dots, underscores or hyphens, starting with a letter or digit" -}}
+{{- end -}}
+{{- if $ctx.Values.keycloak.devUsers.enabled -}}
+  {{- range $ctx.Values.keycloak.devUsers.users -}}
+    {{- if eq (lower .username) (lower $username) -}}
+      {{- fail "keycloak.bootstrapAdmin.username must not duplicate a username in keycloak.devUsers.users (case-insensitive)" -}}
+    {{- end -}}
+  {{- end -}}
+{{- end -}}
+{{- $username -}}
+{{- end -}}
+
+{{/*
 Resources for the Keycloak bootstrap Job.
 
   - srw.keycloakBootstrapServer  — URL kcadm authenticates against.

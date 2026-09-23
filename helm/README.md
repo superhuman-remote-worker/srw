@@ -580,9 +580,39 @@ the operator that owns the external database.
 **OIDC / SSO** (when Keycloak or external IdP enabled):
 - `KEYCLOAK_ADMIN_USER`, `KEYCLOAK_ADMIN_PASSWORD` (internal Keycloak only)
 - `KC_DB_PASSWORD` (internal Keycloak only) — used as the Postgres superuser password on the dedicated `srw-keycloakdb` StatefulSet *and* as the connection password the Keycloak pod presents. When pointing the bundled Keycloak at an external Postgres (`databases.keycloak.internal: false`), the same value is sent over the wire — pre-provision a `keycloak` role with this password on your managed instance.
-- `KC_REALM_ADMIN_PASSWORD`
+- `KC_REALM_ADMIN_PASSWORD` — password for the initial SRW administrator
+  selected by `keycloak.bootstrapAdmin.username` (bundled Keycloak).
 - `MCP_OIDC_CLIENT_SECRET` (if `mcp.enabled`)
 - `GITEA_OIDC_CLIENT_SECRET`, `NEXTCLOUD_OIDC_CLIENT_SECRET`, `OPENCLOUD_KEYCLOAK_CLIENT_SECRET`, `PGADMIN_OIDC_CLIENT_SECRET` (per enabled component)
+
+For a new installation with bundled Keycloak, choose the initial SRW login in
+your values file:
+
+```yaml
+keycloak:
+  bootstrapAdmin:
+    username: admin
+```
+
+Use 1–64 ASCII letters, digits, dots, underscores, or hyphens, starting with a
+letter or digit. The name must differ from enabled `keycloak.devUsers` accounts,
+including case variants. Supply its password through `KC_REALM_ADMIN_PASSWORD`
+in your chosen Secret source. Keycloak requires at least 16 characters and a
+password different from the username. For bundled Keycloak 26.2 realm import,
+exclude double quotes, backslashes, control characters, and `${` sequences from
+this password: import substitutes environment variables before parsing JSON.
+Other punctuation and Unicode are supported. This user receives the SRW `admin` role;
+Keycloak's master administrator (`KEYCLOAK_ADMIN_USER`) and the Gitea service
+administrator (`GITEA_ADMIN_USER`) keep their separate credentials.
+
+An empty or omitted username retains the historical `test` login on fresh
+installs. On connected Helm upgrades, the chart reads the existing realm
+ConfigMap, preserves its initial username when the value is empty, and rejects
+an explicit change. This setting seeds a new realm; it does not rename a user
+in an existing Keycloak database. Keep the same explicit value in offline or
+GitOps rendering, where Helm cannot read the existing ConfigMap. Create further
+administrators through SRW user management. Password reconciliation on pod
+restart continues to target the selected initial user.
 
 **Git, cloud, admin credentials:**
 - `GITEA_ADMIN_USER`, `GITEA_ADMIN_PASSWORD` (internal Gitea only)
@@ -1227,8 +1257,9 @@ kubectl -n srw get secret srw-secrets \
 Then visit `https://<global.domain>` for a multi-host deployment, or the exact
 `https://<exposure.singleOrigin.address>:<publicPort>` origin for single-origin
 mode; omit `:443` when using the default HTTPS port. The seeded realm administrator
-credentials (when using internal Keycloak) are
-`test` / value of `KC_REALM_ADMIN_PASSWORD`. The separate Keycloak server
+credentials (when using internal Keycloak) are the chosen
+`keycloak.bootstrapAdmin.username` (historical default `test`) / value of
+`KC_REALM_ADMIN_PASSWORD`. The separate Keycloak server
 administrator uses `KEYCLOAK_ADMIN_USER` and `KEYCLOAK_ADMIN_PASSWORD`.
 
 ---
