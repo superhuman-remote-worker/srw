@@ -20,11 +20,11 @@ NAMESPACE = RUN
 MODEL = "e2e-vm-a1-20260923a"
 
 
-async def _model(db, run, model):  # noqa: F811
+async def _model(db, run, model, *, api_key="a1-fixture-test-key-20260923a"):  # noqa: F811
     endpoint = await db.create_system_llm_endpoint(
         label=f"srw-a1-provider-{run}",
         base_url=f"http://srw-a1-provider.{run}.svc.cluster.local:8000/v1",
-        api_key=None,
+        api_key=api_key,
         key_prefix=None,
     )
     await db.create_model(
@@ -166,6 +166,36 @@ async def test_a1_fixture_default_off_refuses_before_writing_owner_or_job(db, mo
         await prepare_fixture(
             db, provisioner, run_id=run, namespace=run,
             vm_image=IMAGE, model_id="e2e-vm-disabled-20260923a",
+        )
+    assert await db.fetchval(
+        "SELECT count(*) FROM jobs WHERE context->>'vm_retained_resume_acceptance_gate'=$1",
+        run,
+    ) == 0
+
+
+@pytest.mark.asyncio
+async def test_a1_fixture_refuses_provider_without_worker_auth_key(db, monkeypatch):  # noqa: F811
+    from orchestrator.operator_cli.vm_retained_resume_fixture import (
+        FixtureRefusal, prepare_fixture,
+    )
+    from orchestrator.services.vm_provisioner import VMProvisioner
+
+    run = f"srw-a1-no-key-{uuid4().hex[:8]}"
+    model = f"e2e-vm-no-key-{uuid4().hex[:8]}"
+    for key, value in {
+        "VM_MODE": "same-cluster", "VM_CREATION_RETRY_ENABLED": "true",
+        "VM_NETWORK_PROFILE_ENABLED": "true",
+        "VM_NETWORK_PROFILE_IMAGE_ALLOWLIST": IMAGE,
+        "VM_RETAINED_RESUME_ACCEPTANCE_GATE_ENABLED": "true",
+    }.items():
+        monkeypatch.setenv(key, value)
+    await _model(db, run, model, api_key=None)
+    provisioner = VMProvisioner()
+    provisioner._db = db
+    with pytest.raises(FixtureRefusal, match="endpoint"):
+        await prepare_fixture(
+            db, provisioner, run_id=run, namespace=run,
+            vm_image=IMAGE, model_id=model,
         )
     assert await db.fetchval(
         "SELECT count(*) FROM jobs WHERE context->>'vm_retained_resume_acceptance_gate'=$1",

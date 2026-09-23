@@ -96,6 +96,8 @@ async def prepare_fixture(
         or model.get("endpoint_label") != f"srw-a1-provider-{run_id}"
         or model.get("endpoint_base_url")
         != f"http://srw-a1-provider.{namespace}.svc.cluster.local:8000/v1"
+        or not isinstance(model.get("api_key"), str)
+        or len(model["api_key"]) < 16
     ):
         raise FixtureRefusal("A1 deterministic model endpoint is unavailable")
     owner_id = uuid5(NAMESPACE_URL, f"srw-a1-owner:{run_id}")
