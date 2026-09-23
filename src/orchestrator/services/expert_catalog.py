@@ -14,7 +14,7 @@ from typing import Any, Literal
 from fastapi import HTTPException
 import yaml
 
-from orchestrator.security.access import redact_public_config_override
+from orchestrator.security.config_redaction import redact_public_config_override
 from orchestrator.schemas.expert_catalog import (
     ExpertInfo,
     SkillInfo,

@@ -194,14 +194,30 @@ def _openai_stream_error_event(error: dict):
     )
 
 
+def _anthropic_http():
+    """The HTTP package this anthropic SDK is built on.
+
+    anthropic 1.x runs on ``httpx2`` and rejects an ``httpx.Client``
+    ("Invalid `http_client` argument"); 0.x runs on ``httpx``. The lock pins
+    1.x while an older local venv may still carry 0.x, so the fixture follows
+    the installed SDK instead of assuming one.
+    """
+    if int(anthropic.__version__.split(".", 1)[0]) >= 1:
+        import httpx2
+
+        return httpx2
+    return httpx
+
+
 def _anthropic_status(status: int, payload: Any):
+    http = _anthropic_http()
     client = anthropic.Anthropic(
         api_key=FIXTURE_KEY,
         base_url="https://provider.invalid",
         max_retries=0,
-        http_client=httpx.Client(
-            transport=httpx.MockTransport(
-                lambda request: httpx.Response(status, json=payload)
+        http_client=http.Client(
+            transport=http.MockTransport(
+                lambda request: http.Response(status, json=payload)
             )
         ),
     )

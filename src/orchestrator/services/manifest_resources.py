@@ -6,7 +6,7 @@ from uuid import UUID, uuid4
 
 from fastapi import HTTPException
 
-from orchestrator.security.access import redact_public_config_override
+from orchestrator.security.config_redaction import redact_public_config_override
 from orchestrator.security.crypto import encrypt
 from orchestrator.services.datasource_policy_errors import (
     DatasourceMaterializationAuthorizationError,

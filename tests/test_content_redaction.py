@@ -523,11 +523,16 @@ def _best_of_three(fn, *args) -> float:
     return best
 
 
+_BOUND_S = 0.5  # linear on a slow runner; the quadratic shapes took 2.4-64 s
+
+
 class TestPlaceholderLookaheadsAreBounded:
     """The review's hostile inputs. An unbounded scan inside a lookahead that
     runs at every candidate position made each candidate cost the rest of the
     text: 4.9 s for 100 KB of `x://u:${`, 64 s for `_truncate_output` over a
-    420 KB line of `a:<`. Each must now finish in under 100 ms."""
+    420 KB line of `a:<`. Each must now finish in well under a second. The
+    bound is 0.5 s, not 0.1 s: linear inputs run ~0.1 s on a loaded CI
+    runner, and 0.5 s still leaves a 10x margin against the quadratic case."""
 
     @pytest.mark.parametrize(
         "unit", ["x://u:${", "x://u:<", "a:${", "a:<", "a:{{", "token=${", "?token=${"]
@@ -535,7 +540,7 @@ class TestPlaceholderLookaheadsAreBounded:
     @BOTH_PROFILES
     def test_100kb_of_open_placeholders(self, redact, unit):
         payload = (unit * (100_000 // len(unit) + 1))[:100_000]
-        assert _best_of_three(redact, payload) < 0.1
+        assert _best_of_three(redact, payload) < _BOUND_S
 
     @pytest.mark.parametrize(
         "payload",
@@ -553,9 +558,9 @@ class TestPlaceholderLookaheadsAreBounded:
     )
     @BOTH_PROFILES
     def test_optional_separator_shapes(self, redact, payload):
-        assert _best_of_three(redact, payload) < 0.1
+        assert _best_of_three(redact, payload) < _BOUND_S
 
     def test_truncating_a_huge_single_line(self):
         from agent.tools.shell.coding_tools import _truncate_output
 
-        assert _best_of_three(_truncate_output, "a:<" * 140_000, 50_000) < 0.1
+        assert _best_of_three(_truncate_output, "a:<" * 140_000, 50_000) < _BOUND_S
