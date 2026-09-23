@@ -88,6 +88,8 @@ class VMIdleLifecycleStore:
         self, conn, *, job_id: str, claim_id: str,
         expected_source: Mapping[str, Any] | None,
         publication: Mapping[str, Any],
+        queue_state_before_claim: str | None = None,
+        queue_token_before_claim: str | None = None,
     ) -> dict[str, Any] | None:
         """Bind final approval, no-wake and retained storage before Job terminal exit.
 
@@ -137,8 +139,15 @@ class VMIdleLifecycleStore:
                 or operation["terminal_source_command_id"] is not None
                 or _uuid(vm.get("provision_generation")) != operation["provision_generation"]
                 or _uuid(vm.get("vm_uid")) != operation["vm_uid"]
+                or _uuid(vm.get("vmi_uid")) != operation["vmi_uid"]
+                or _uuid(vm.get("active_pod_uid")) != operation["launcher_uid"]
                 or _uuid(vm.get("rootdisk_pvc_uid")) != operation["pvc_uid"]
                 or vm.get("status") not in {"suspending", "suspended"}
+                or operation["wake_requested"]
+                or operation["wake_execution_requested"]
+                or any(operation[key] is not None for key in (
+                    "wake_id", "wake_generation", "wake_request_id", "wake_ready_at",
+                ))
             ):
                 return None
             generation, vm_uid, launcher_uid = (
@@ -197,6 +206,26 @@ class VMIdleLifecycleStore:
             # keeps those stricter prerequisites in admit_release.
             if not vm_remote_operation_protocol_enabled() or not vm_persistent_rootdisk_enabled():
                 return None
+            try:
+                previous_token = int(queue_token_before_claim)
+            except (TypeError, ValueError):
+                return None
+            queue = await conn.fetchrow(
+                "SELECT state,lease_token,leased_by FROM run_queue "
+                "WHERE unit_id=$1 AND unit_kind='worker_batch' FOR UPDATE",
+                owner_id,
+            )
+            ide = _object(context.get("ide_session"))
+            if (
+                queue_state_before_claim not in {"done", "parked"}
+                or queue is None
+                or queue["state"] != "done"
+                or queue["lease_token"] != previous_token + 1
+                or queue["leased_by"] is not None
+                or job["assigned_agent_id"] is not None
+                or ide.get("status") in {"active", "idle", "restoring"}
+            ):
+                return None
             if await conn.fetchval(
                 "SELECT EXISTS(SELECT 1 FROM vm_idle_access_leases WHERE owner_kind='job' "
                 "AND owner_id=$1 AND closed_at IS NULL AND expires_at>clock_timestamp()) "
@@ -210,7 +239,11 @@ class VMIdleLifecycleStore:
                 "AND owner_id=$1 AND completed_at IS NULL) "
                 "OR EXISTS(SELECT 1 FROM jobs WHERE parent_job_id=$1 "
                 "AND status NOT IN ('completed','failed','cancelled') "
-                "AND context->>'inherits_parent_workspace'='true')", owner_id,
+                "AND context->>'inherits_parent_workspace'='true') "
+                "OR EXISTS(SELECT 1 FROM job_completion_commands WHERE job_id=$1 "
+                "AND state IN ('pending','finalizing','parked')) "
+                "OR EXISTS(SELECT 1 FROM job_completion_sweep_exclusions WHERE job_id=$1)",
+                owner_id,
             ):
                 return None
             operation = await conn.fetchrow(

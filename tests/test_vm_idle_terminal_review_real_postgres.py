@@ -230,6 +230,58 @@ async def test_approval_before_release_commits_no_wake_and_replays_publication(
 
 
 @pytest.mark.asyncio
+async def test_failed_frozen_delete_replays_without_repeating_legacy_merge(
+    db, monkeypatch, tmp_path,
+):
+    from orchestrator.services.vm_idle_lifecycle import (
+        VMIdleLifecycleService, VMIdleLifecycleStore,
+    )
+
+    await _schema(db)
+    owner, _, _, _ = await seed_final_review(db)
+    controls = await controls_for(db, monkeypatch, tmp_path)
+    controls.dependencies.forge.is_initialized = True
+    controls.dependencies.forge.create_or_update_file = AsyncMock(return_value=True)
+    controls.dependencies.forge.delete_file = AsyncMock(side_effect=[False, True])
+    merge_and_record = AsyncMock(return_value={})
+    monkeypatch.setattr(
+        "orchestrator.services.completion.apply_terminal_job_side_effects",
+        merge_and_record,
+    )
+    (tmp_path / "output").mkdir()
+    (tmp_path / "output" / "job_frozen.json").write_text("{}")
+    result = await controls.approve_job(
+        str(owner), user={"id": "reviewer"},
+        job=await db.get_job(str(owner)), request=None,
+    )
+    assert result["status"] == "approved" and result["publication_pending"]
+    operation = await VMIdleLifecycleStore(db).get_open_for_owner(str(owner))
+    assert operation["terminal_published_at"] is None
+    assert controls.dependencies.forge.delete_file.await_count == 1
+    assert merge_and_record.await_count == 1
+    assert (tmp_path / "output" / "job_frozen.json").exists()
+    assert await db.get_job_change_record(str(owner)) is None
+    await db.execute(
+        "UPDATE vm_idle_operations SET terminal_publication_retry_after="
+        "clock_timestamp()-interval '1 second' WHERE id=$1", operation["id"],
+    )
+    monkeypatch.setenv("WORKSPACE_IDLE_RELEASE_ENABLED", "false")
+    service = VMIdleLifecycleService(
+        db, SimpleNamespace(), None, claimant="terminal-delete-replay",
+        terminal_publication_handler=controls.publish_terminal_review,
+    )
+    assert await service.reconcile_once(limit=4) == 1
+    assert controls.dependencies.forge.delete_file.await_count == 2
+    assert merge_and_record.await_count == 1
+    assert not (tmp_path / "output" / "job_frozen.json").exists()
+    assert await db.get_job_change_record(str(owner)) is not None
+    assert await db.fetchval(
+        "SELECT terminal_published_at IS NOT NULL FROM vm_idle_operations WHERE id=$1",
+        operation["id"],
+    )
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("state", ["releasing", "suspended"])
 async def test_approval_joins_existing_release_without_wake(db, monkeypatch, tmp_path, state):
     from orchestrator.services.vm_idle_lifecycle import VMIdleLifecycleStore
@@ -268,6 +320,76 @@ async def test_approval_joins_existing_release_without_wake(db, monkeypatch, tmp
     assert operation["terminal_source_command_id"] == command_id
     assert operation["phase"] == state
     assert not operation["wake_requested"] and not operation["wake_execution_requested"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("hold", ["ide_active", "queue_queued", "queue_leased"])
+async def test_immediate_terminal_approval_preserves_live_access_and_worker_holds(
+    db, monkeypatch, tmp_path, hold,
+):
+    from fastapi import HTTPException
+
+    await _schema(db)
+    owner, _, _, _ = await seed_final_review(db)
+    if hold == "ide_active":
+        await db.execute(
+            "UPDATE jobs SET context=jsonb_set(context,'{ide_session}',"
+            "'{\"status\":\"active\"}'::jsonb) WHERE id=$1", owner,
+        )
+    else:
+        await db.execute(
+            "UPDATE run_queue SET state=$2,leased_by=$3,"
+            "leased_until=clock_timestamp()+interval '5 minutes' WHERE unit_id=$1",
+            owner, "leased" if hold == "queue_leased" else "queued",
+            "busy-worker" if hold == "queue_leased" else None,
+        )
+    controls = await controls_for(db, monkeypatch, tmp_path)
+    with pytest.raises(HTTPException) as raised:
+        await controls.approve_job(
+            str(owner), user={"id": "reviewer"},
+            job=await db.get_job(str(owner)), request=None,
+        )
+    assert raised.value.status_code == 409
+    assert await db.fetchval("SELECT status FROM jobs WHERE id=$1", owner) == "pending_review"
+    assert await db.fetchval(
+        "SELECT count(*) FROM vm_idle_operations WHERE owner_id=$1", owner,
+    ) == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("drift", ["vmi_uid", "active_pod_uid", "access_wake"])
+async def test_joined_terminal_approval_rejects_current_pod_drift_or_access_winner(
+    db, monkeypatch, tmp_path, drift,
+):
+    from fastapi import HTTPException
+    from orchestrator.services.vm_idle_lifecycle import VMIdleLifecycleStore
+
+    await _schema(db)
+    owner, episode, identity, _ = await seed_final_review(db)
+    store = VMIdleLifecycleStore(db)
+    operation = await store.admit_release(
+        str(owner), episode_id=episode.episode_id,
+        revision=episode.revision, identity=identity,
+    )
+    assert operation is not None
+    if drift == "access_wake":
+        wake = await store.request_wake(str(owner), execution_requested=False)
+        assert wake is not None and wake["wake_requested"]
+    else:
+        await db.execute(
+            "UPDATE jobs SET context=jsonb_set(context,$2::text[],to_jsonb($3::text)) "
+            "WHERE id=$1", owner, ["vm", drift], str(uuid4()),
+        )
+    controls = await controls_for(db, monkeypatch, tmp_path)
+    with pytest.raises(HTTPException) as raised:
+        await controls.approve_job(
+            str(owner), user={"id": "reviewer"},
+            job=await db.get_job(str(owner)), request=None,
+        )
+    assert raised.value.status_code == 409
+    after = await db.fetchrow("SELECT * FROM vm_idle_operations WHERE id=$1", operation["id"])
+    assert after["terminal_source_command_id"] is None
+    assert await db.fetchval("SELECT status FROM jobs WHERE id=$1", owner) == "pending_review"
 
 
 @pytest.mark.asyncio

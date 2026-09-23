@@ -350,22 +350,34 @@ class JobControlOperations:
         )
         if not wrote:
             raise RuntimeError("terminal completion artifact publication deferred")
-        await self.dependencies.forge.delete_file(
+        removed = await self.dependencies.forge.delete_file(
             repo_name, "output/job_frozen.json",
             "Approve job: remove job_frozen.json",
         )
+        if not removed:
+            raise RuntimeError("terminal frozen artifact removal deferred")
         local_output = self.dependencies.workspace.base_path / "output"
         if local_output.exists():
             (local_output / "job_completion.json").write_text(completion_json)
             frozen_path = local_output / "job_frozen.json"
             if frozen_path.exists():
                 frozen_path.unlink()
-        from orchestrator.services.completion import apply_terminal_job_side_effects
+        from orchestrator.services.completion import write_job_change_record
+        from orchestrator.services.project_loops import job_loop_id
 
-        await apply_terminal_job_side_effects(
-            job, "completed", gitea=self.dependencies.forge,
-            db=self.dependencies.store, vector_db=self.dependencies.vector_store,
-        )
+        # The legacy merge runs only on the winning approval transition. The
+        # replayable publication owns only idempotent history and notifications.
+        if (
+            not job_loop_id(job)
+            and await self.dependencies.store.get_job_change_record(job_id) is None
+        ):
+            record_job = {**job, "freeze_data": completion_data}
+            await write_job_change_record(
+                record_job, "completed", db=self.dependencies.store,
+                vector_db=self.dependencies.vector_store,
+            )
+            if await self.dependencies.store.get_job_change_record(job_id) is None:
+                raise RuntimeError("terminal change record publication deferred")
         await self.dependencies.maybe_wake_session(
             self.dependencies.store, job_id, "completed",
         )
@@ -1899,6 +1911,8 @@ class JobControlOperations:
                             claim_id=str(control_claim.claim_id),
                             expected_source=review_snapshot,
                             publication=publication,
+                            queue_state_before_claim=control_claim.queue_state_before_claim,
+                            queue_token_before_claim=control_claim.fence_value,
                         )
                         if operation is None:
                             raise CompletionControlClaimConflict(
@@ -1918,6 +1932,23 @@ class JobControlOperations:
                 except CompletionControlClaimConflict as exc:
                     raise HTTPException(status_code=409, detail=str(exc)) from exc
                 control_claim_finished = True
+                # Preserve the pre-existing best-effort merge on this one
+                # transition. Publication replay must never repeat it.
+                try:
+                    from orchestrator.services.completion import (
+                        apply_terminal_job_side_effects,
+                    )
+
+                    await apply_terminal_job_side_effects(
+                        job, "completed", gitea=self.dependencies.forge,
+                        db=self.dependencies.store,
+                        vector_db=self.dependencies.vector_store,
+                    )
+                except Exception:
+                    self.dependencies.logger.warning(
+                        "Job %s: terminal side effects failed (non-fatal)",
+                        job_id, exc_info=True,
+                    )
                 claimant = f"approve-route:{uuid4()}"
                 claimed = await idle_store.claim_terminal_publication(
                     str(operation["id"]), claimant=claimant,

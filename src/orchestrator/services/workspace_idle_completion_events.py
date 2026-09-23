@@ -46,6 +46,12 @@ def completion_runtime_evidence(job):
     if not isinstance(vm, dict) or vm.get("status") != "ready":
         return None
     try:
+        pvc_uid = UUID(str(vm.get("rootdisk_pvc_uid")))
+        if str(pvc_uid) != vm.get("rootdisk_pvc_uid"):
+            return None
+    except (TypeError, ValueError):
+        return None
+    try:
         identity = _identity_from_row(
             job, owner_kind="job", owner_id=str(job_id), operation_kind="idle_policy"
         )
@@ -73,7 +79,7 @@ def completion_runtime_evidence(job):
             "runtime_uid": identity.vm_uid,
         },
         "launcher_uid": identity.launcher_pod_uid,
-        "rootdisk_pvc_uid": vm.get("rootdisk_pvc_uid"),
+        "rootdisk_pvc_uid": str(pvc_uid),
         "identity_digest": identity_digest,
         "runtime_authority_digest": delivered_digest,
     }

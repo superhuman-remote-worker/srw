@@ -45,6 +45,7 @@ class CompletionControlClaim:
     expected_lane: str
     fence_kind: str
     fence_value: str
+    queue_state_before_claim: str | None = None
 
 
 def _json_object(value: Any) -> dict[str, Any]:
@@ -413,6 +414,9 @@ class CompletionControl:
                         expected_lane=expected_lane,
                         fence_kind=fence_kind,
                         fence_value=fence_value,
+                        queue_state_before_claim=(
+                            str(queue["state"]) if expected_lane == "stateless" else None
+                        ),
                     )
 
         if blocked is not None:

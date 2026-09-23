@@ -34,6 +34,7 @@ def tracking(monkeypatch):
 async def seed(pg, *, proof=True, lane="stateless", manifest=None, repository=None):
     vm, _ = _vm_identity()
     vm["ssh_ready_source"] = "provisioner_probe"
+    vm["rootdisk_pvc_uid"] = str(uuid4())
     admitted_context = (
         {"required_deliverables": manifest} if manifest is not None else {}
     )
