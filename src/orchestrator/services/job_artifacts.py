@@ -17,6 +17,7 @@ from orchestrator.services.job_todos import (
     parse_archived_todos,
     parse_current_todos,
 )
+from shared.content_redaction import sanitize_data
 
 logger = logging.getLogger(__name__)
 
@@ -113,12 +114,20 @@ async def get_job_completion_report_route(
         report = json.loads(entry.get("inline_content") or "{}")
     except (json.JSONDecodeError, TypeError):
         report = {}
-    return {
+    # The report is worker text that officers and owners read (audit OC-05):
+    # the same sanitizer as the evidence page that reads this very entry, so
+    # the two views of one report cannot disagree about what was withheld.
+    # Parsed first, then cleaned per string, so the result stays valid JSON.
+    clean = sanitize_data(report)
+    body: dict[str, Any] = {
         "job_id": job_id,
         "recorded_at": manifest.get("recorded_at"),
         "source_revision": (entry.get("source") or {}).get("revision"),
-        "report": report,
+        "report": clean.value,
     }
+    if clean.redacted:
+        body.update({"redacted": True, "redacted_count": clean.count})
+    return body
 
 
 async def read_job_evidence_route(

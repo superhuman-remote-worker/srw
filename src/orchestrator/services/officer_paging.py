@@ -36,6 +36,7 @@ from orchestrator.services.officer_metadata import (
     thread_officer_meta,
 )
 from orchestrator.services.session_wake import file_officer_timer
+from shared.content_redaction import sanitize_text
 
 logger = logging.getLogger(__name__)
 
@@ -132,6 +133,12 @@ async def dispatch_officer_page(
         return None
     subject = subject or "Your centurion needs you"
     session_link = officer_session_link(thread_id)
+    # The officer writes this from what it read, worker text included (audit
+    # OC-05). Redacted here, before the server's own session link is added;
+    # the dedup digest below keeps hashing the text as written.
+    raw_subject, raw_message = subject, message_md
+    subject = sanitize_text(subject)
+    message_md = sanitize_text(message_md)
     page_body = message_md
     if session_link:
         page_body = f"{message_md}\n\nOpen his log to reply: {session_link}"
@@ -139,7 +146,7 @@ async def dispatch_officer_page(
         # Identical text on one day collapses onto one row — the anti-spam
         # role the per-day page budget used to play.
         text_digest = hashlib.sha1(
-            f"{subject}\n{message_md}".encode("utf-8")
+            f"{raw_subject}\n{raw_message}".encode("utf-8")
         ).hexdigest()[:16]
         today = datetime.now(timezone.utc).date().isoformat()
         dedup_key = f"officer_notify:{thread_id}:{text_digest}:{today}"
@@ -162,7 +169,7 @@ async def dispatch_officer_page(
                 "thread_id": str(thread_id),
                 "project_id": str(project_id) if project_id else None,
                 "config_name": str(thread.get("config_name") or "session_base"),
-                "title": thread.get("title"),
+                "title": sanitize_text(thread.get("title")) or None,
             },
         )
     except Exception:

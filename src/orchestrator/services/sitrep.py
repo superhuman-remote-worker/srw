@@ -39,6 +39,8 @@ from datetime import datetime, timezone
 from typing import Any, Optional
 from uuid import UUID
 
+from shared.content_redaction import sanitize_text
+
 logger = logging.getLogger(__name__)
 
 # Line caps per section. The sitrep is a briefing, not a dump: full detail
@@ -75,6 +77,19 @@ def _as_dict(value: Any) -> dict[str, Any]:
 def _truncate(text: str, limit: int) -> str:
     text = " ".join(str(text).split())
     return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def _excerpt(text: Any, limit: int) -> str:
+    """A bounded excerpt of worker-reachable text, redacted (audit OC-05).
+
+    Job errors, worker message subjects, event summaries and sudo commands
+    are written — or echoed — by a worker, and a failed push echoes its
+    credential-bearing remote. Redacted BEFORE the cut: a truncation inside a
+    credential leaves a fragment no pattern recognizes. The ``[REDACTED]``
+    marker stays visible in the line, so a withheld value never reads as one
+    the worker left out.
+    """
+    return _truncate(sanitize_text(str(text)), limit)
 
 
 def _ago(ts: Optional[datetime], now: datetime) -> str:
@@ -292,12 +307,12 @@ def _reason_lines(rows: list[dict[str, Any]]) -> list[str]:
         if source == "timer":
             desc = f"timer: slept ~{payload.get('minutes')} min"
             if payload.get("reason"):
-                desc += f" ({_truncate(payload['reason'], 160)})"
+                desc += f" ({_excerpt(payload['reason'], 160)})"
         else:
             desc = f"{source}: {row.get('dedup_key')}"
             detail = payload.get("summary") or payload.get("description") or ""
             if detail:
-                desc += f" — {_truncate(detail, 160)}"
+                desc += f" — {_excerpt(detail, 160)}"
         lines.append(f"- {desc}")
     return lines
 
@@ -369,7 +384,7 @@ async def _jobs_section(
 
         for jid, job in by_id.items():
             status = effective_job_status(job)
-            desc = _truncate(job.get("description") or "", _DESC_CHARS)
+            desc = _excerpt(job.get("description") or "", _DESC_CHARS)
             prev_entry = _as_dict(prev_prints.get(jid))
             if jid not in prev_prints:
                 new.append(f"- NEW {jid[:8]} {status}{_workspace_line(job)} — {desc}")
@@ -381,14 +396,14 @@ async def _jobs_section(
                     "cancelled",
                     "blocked_undelivered",
                 ):
-                    line += f" | error: {_truncate(error, 160)}"
+                    line += f" | error: {_excerpt(error, 160)}"
                 elif error and status == "pending_review":
                     # Why it is waiting on review instead of sealed — e.g. a
                     # seal held as delivery-unproven. Officer backlog jobs run
                     # at full autonomy, so without this the officer would see
                     # a bare transition and the claim would sit until the
                     # stale page.
-                    line += f" | held: {_truncate(error, 200)}"
+                    line += f" | held: {_excerpt(error, 200)}"
                 changed.append(line)
 
         # E3: the one shared liveness computation — the sitrep can never call
@@ -435,7 +450,7 @@ async def _jobs_section(
                 reasons = liveness.get("reasons") or []
                 if reasons:
                     detail += f" ({_truncate('; '.join(reasons), 160)})"
-            detail += f" — {_truncate(job.get('description') or '', _DESC_CHARS)}"
+            detail += f" — {_excerpt(job.get('description') or '', _DESC_CHARS)}"
             active_lines.append(detail)
 
         steady: dict[str, int] = {}
@@ -517,7 +532,7 @@ async def _pending_section(
                 remaining = int((row["expires_at"] - now).total_seconds())
                 lines.append(
                     f"- sudo ({row['request_type']}) job {str(row['job_id'])[:8]}: "
-                    f"{_truncate(row['command'], 100)} — expires in {remaining}s"
+                    f"{_excerpt(row['command'], 100)} — expires in {remaining}s"
                 )
     except Exception:
         logger.warning("sitrep: sudo pending query failed", exc_info=True)
@@ -580,7 +595,7 @@ async def _worker_messages_section(
         created = route.get("created_at")
         age = _ago(created, now) if created is not None else "unknown"
         marker = "BLOCKING " if route.get("blocking") else ""
-        subject = _truncate(route.get("subject") or "(no subject)", 80)
+        subject = _excerpt(route.get("subject") or "(no subject)", 80)
         purpose = _as_dict(route.get("policy_snapshot")).get("purpose")
         label = f" [{purpose}]" if purpose else ""
         lines.append(

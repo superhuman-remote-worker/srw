@@ -57,7 +57,7 @@ from __future__ import annotations
 import base64
 import re
 from dataclasses import dataclass
-from typing import Callable, Iterable, Sequence
+from typing import Any, Callable, Iterable, Sequence
 from urllib.parse import quote, quote_plus
 
 REDACTED = "[REDACTED]"
@@ -420,10 +420,71 @@ def sanitize_text(text: str | None, *, secrets: Sequence[str] = ()) -> str:
     return sanitize(text, secrets=secrets).text
 
 
+@dataclass(frozen=True, slots=True)
+class DataRedaction:
+    """:class:`Redaction` for a JSON-shaped value rather than one string."""
+
+    value: Any
+    count: int
+
+    @property
+    def redacted(self) -> bool:
+        return self.count > 0
+
+
+# A JSON key the key-value pattern would have matched in serialized form
+# (`"token": "…"`, `"github.token": "…"`): the name ends the key and starts at
+# a word boundary. Parsed apart, the value alone no longer says it is secret.
+_SECRET_KEY = re.compile(r"(?:^|[^A-Za-z0-9_])(?i:" + _SECRET_NAMES + r")$")
+
+
+def sanitize_data(value: Any, *, secrets: Sequence[str] = ()) -> DataRedaction:
+    """:func:`sanitize` every string inside a parsed JSON value.
+
+    Keys are schema, not worker text, and are kept. Sanitizing the parsed value
+    rather than its serialized form keeps the result valid JSON: a redaction
+    that swallowed the backslash of an escaped quote would end the string early
+    and turn the whole document into a parse error. What the serialized form's
+    key-value pattern caught — a string under a secret-named key — is withheld
+    whole, so the two views of one document agree.
+    """
+    if isinstance(value, str):
+        clean = sanitize(value, secrets=secrets)
+        return DataRedaction(clean.text, clean.count)
+    if isinstance(value, dict):
+        out: dict[Any, Any] = {}
+        count = 0
+        for key, item in value.items():
+            if (
+                isinstance(key, str)
+                and isinstance(item, str)
+                and item
+                and item != REDACTED
+                and len(key) <= 256
+                and _SECRET_KEY.search(key)
+                and not re.fullmatch(_PLACEHOLDER, item)
+            ):
+                out[key] = REDACTED
+                count += 1
+                continue
+            clean_item = sanitize_data(item, secrets=secrets)
+            out[key] = clean_item.value
+            count += clean_item.count
+        return DataRedaction(out, count)
+    if isinstance(value, (list, tuple)):
+        items = [sanitize_data(item, secrets=secrets) for item in value]
+        return DataRedaction(
+            [item.value for item in items], sum(item.count for item in items)
+        )
+    return DataRedaction(value, 0)
+
+
 __all__ = [
     "REDACTED",
+    "DataRedaction",
     "Redaction",
     "sanitize",
+    "sanitize_data",
     "sanitize_text",
     "sanitize_tool_output",
 ]

@@ -69,6 +69,7 @@ from orchestrator.services.session_runtime_admission import (
     thread_requests_protected_cloud,
     thread_runtime_authority,
 )
+from shared.content_redaction import sanitize_text
 from shared.job_outcome import effective_job_status
 from shared.pinned_session_identity import PinnedSessionBinding
 from orchestrator.services.usage_ledger import llm_tokens_from_rows
@@ -603,8 +604,11 @@ async def _notify_owner(
 
     job_id = str(row["id"])
     short = job_id[:8]
-    description = (row.get("description") or "")[:100]
+    # A delegated job's description is written by the session's agent (OC-05);
+    # redacted before the cut, for the body and the payload alike.
+    description = sanitize_text(row.get("description") or "")[:100]
     status = effective_job_status(row, fallback="finished")
+    title = sanitize_text(thread.get("title")) or None  # LLM-generated
     await notification_service.record(
         recipient_id=str(user_id),
         category="session_wake",
@@ -612,7 +616,7 @@ async def _notify_owner(
         subject=f"Job {short} {status} — your session is waiting",
         body=(
             f"**Job `{short}`** launched from your session "
-            f"**{thread.get('title') or 'Untitled'}** is now `{status}`.\n\n"
+            f"**{title or 'Untitled'}** is now `{status}`.\n\n"
             f"**Task:** {description}\n\n"
             "Reopen the session to pick the result up."
         ),
@@ -625,7 +629,7 @@ async def _notify_owner(
             "job_description": description,
             "config_name": str(row.get("config_name") or "worker_base"),
             "status": status,
-            "title": thread.get("title"),
+            "title": title,
         },
     )
 
@@ -660,12 +664,12 @@ async def _format_wake_message(db: Any, row: dict[str, Any], thread_id: str) -> 
         f"- Status: {status}",
     ]
     if description:
-        lines.append(f"- Task: {_truncate(description, 300)}")
+        lines.append(f"- Task: {_excerpt(description, 300)}")
 
     freeze = _as_dict(row.get("freeze_data"))
     summary = str(freeze.get("summary") or "").strip()
     if summary:
-        lines.append(f"- Summary: {_truncate(summary, _SUMMARY_CHARS)}")
+        lines.append(f"- Summary: {_excerpt(summary, _SUMMARY_CHARS)}")
     confidence = freeze.get("confidence")
     if confidence is not None:
         lines.append(f"- Confidence: {confidence}")
@@ -683,7 +687,7 @@ async def _format_wake_message(db: Any, row: dict[str, Any], thread_id: str) -> 
 
     error = (row.get("error_message") or "").strip()
     if error and status in ("failed", "cancelled"):
-        lines.append(f"- Error: {_truncate(error, 300)}")
+        lines.append(f"- Error: {_excerpt(error, 300)}")
 
     siblings = await _sibling_line(db, thread_id)
     if siblings:
@@ -751,6 +755,16 @@ def _as_dict(value: Any) -> dict[str, Any]:
 def _truncate(text: str, limit: int) -> str:
     text = " ".join(text.split())
     return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def _excerpt(text: str, limit: int) -> str:
+    """:func:`_truncate` for worker-reachable text, redacted first (OC-05).
+
+    Mirrors ``sitrep._excerpt``: a worker summary or a failed push's error can
+    carry a credential into a model's wake, and redacting after the cut would
+    leave a fragment no pattern recognizes.
+    """
+    return _truncate(sanitize_text(text), limit)
 
 
 # --------------------------------------------------------------------------
@@ -1235,7 +1249,7 @@ def _format_officer_wake(rows: list[dict[str, Any]]) -> str:
             reason = payload.get("reason") or ""
             desc = f"timer: slept ~{minutes} min"
             if reason:
-                desc += f" (reason: {_truncate(str(reason), 160)})"
+                desc += f" (reason: {_excerpt(str(reason), 160)})"
         elif source == LEGATE_NOTE_SOURCE:
             # The Legate's own words, verbatim — this renderer runs when the
             # sitrep build failed, and a truncated directive is a lost one.
@@ -1245,7 +1259,7 @@ def _format_officer_wake(rows: list[dict[str, Any]]) -> str:
             detail = payload.get("summary") or payload.get("status") or ""
             desc = f"{source}: {row.get('dedup_key')}"
             if detail:
-                desc += f" — {_truncate(str(detail), 200)}"
+                desc += f" — {_excerpt(str(detail), 200)}"
         lines.append(f"- {desc}")
     lines.append(
         "Assess with your tools, act within your authority, then file a sleep."

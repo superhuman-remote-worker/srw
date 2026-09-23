@@ -23,6 +23,7 @@ from fnmatch import fnmatch
 from typing import Any, Optional
 from uuid import UUID
 
+from shared.content_redaction import sanitize_data, sanitize_text
 from shared.sudo_command_line import render_sudo_command_line
 
 logger = logging.getLogger(__name__)
@@ -1078,9 +1079,14 @@ class SudoGateService:
                 owner = (thread or {}).get("user_id")
             if not owner:
                 return
-            full = render_sudo_command_line(
-                event.get("command"), event.get("arguments")
+            # The command line is the agent's (audit OC-05) and can carry a
+            # token it read: redacted for the body AND the payload the feed
+            # row and SSE frame ship. Approval acts on the request row, whose
+            # command stays exact — only this notice is a view.
+            full = sanitize_text(
+                render_sudo_command_line(event.get("command"), event.get("arguments"))
             )
+            event = sanitize_data(dict(event)).value
             expires_at = event.get("expires_at")
             await notification_service.record(
                 recipient_id=str(owner),

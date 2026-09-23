@@ -1557,6 +1557,13 @@ def format_evidence_read(job_id: str, evidence_id: str, data: dict[str, Any]) ->
         note = data.get("note")
         if note:
             window.append(f"[{note}]")
+        if data.get("redacted"):
+            # The API has always said so; the officer's text view did not, so
+            # a withheld value read exactly like one the worker never wrote.
+            window.append(
+                f"[{data.get('redacted_count')} secret-shaped value(s) redacted "
+                "from this page]"
+            )
         return "\n".join(header + window)
     # Binary / screenshot: bytes are a typed attachment and are deliberately
     # never interpolated into ordinary formatter text.
@@ -1595,6 +1602,11 @@ def format_completion_report(job_id: str, data: dict[str, Any]) -> str:
         lines.append(f"Notes:\n{report['notes']}")
     if not (report.get("summary") or deliverables):
         lines.append("(report carries no summary or deliverables)")
+    if data.get("redacted"):
+        lines.append(
+            f"[{data.get('redacted_count')} secret-shaped value(s) redacted from "
+            "this report]"
+        )
     return "\n".join(lines)
 
 

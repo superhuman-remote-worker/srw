@@ -53,6 +53,8 @@ import urllib.parse
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
+from shared.content_redaction import sanitize_data, sanitize_text
+
 
 logger = logging.getLogger(__name__)
 
@@ -179,7 +181,14 @@ def _build_magic_link_url(cockpit_url: str, raw_token: str) -> str:
 
 
 def _truncate_args_for_email(tool_args: dict[str, Any], max_chars: int = 600) -> str:
-    """Build a human-readable args preview, bounded for email body."""
+    """Build a human-readable args preview, bounded for email body.
+
+    The arguments are the agent's (audit OC-05): a command can carry a token
+    it read. Redacted per value, before the cut, so a truncation cannot strand
+    a fragment and the rendering stays valid JSON. The approve/deny links are
+    the server's and are never passed through here.
+    """
+    tool_args = sanitize_data(tool_args).value
     try:
         rendered = json.dumps(tool_args, indent=2, default=str)
     except Exception:
@@ -253,7 +262,8 @@ async def record_permission_pending(
         tool_args = {}
     preview = _truncate_args_for_email(tool_args)
     tool_name = str(row.get("tool_name") or "a tool")
-    title = str(row.get("title") or thread_id[:8])
+    # LLM-generated (auto-titled sessions); shown and stored in the payload.
+    title = sanitize_text(str(row.get("title") or thread_id[:8]))
     approve_url = _build_magic_link_url(cockpit_external_url, approve_token)
     deny_url = _build_magic_link_url(cockpit_external_url, deny_token)
     session_link = f"{cockpit_external_url.rstrip('/')}/sessions/{thread_id}"

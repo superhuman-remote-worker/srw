@@ -496,9 +496,18 @@ def _delimited_user_body(
     """
     parts = [reason_line]
     if officer_context and officer_context.strip():
+        # The officer writes this from what he read — worker text included —
+        # and it rides the same email as the worker's body, so it gets the
+        # same sanitizer and the same visible count.
+        context = sanitize(officer_context.strip())
+        context_block = "\n".join(f"> {line}" for line in context.text.splitlines())
+        if context.redacted:
+            context_block += (
+                f"\n\n_({context.count} secret-shaped value(s) redacted "
+                "from the officer's context.)_"
+            )
         parts.append(
-            "**Officer context** (as written by the officer):\n\n"
-            + "\n".join(f"> {line}" for line in officer_context.strip().splitlines())
+            "**Officer context** (as written by the officer):\n\n" + context_block
         )
     # "verbatim" means unedited by us, not unsanitized: a worker (or a page it
     # summarized) can put a credential in here, and this body goes to email

@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from orchestrator.services.notification_service import RecordResult
+from shared.content_redaction import sanitize_data, sanitize_text
 from shared.runtime.core.loader import canonical_config_name
 
 logger = logging.getLogger(__name__)
@@ -53,7 +54,10 @@ def delivery_hold_reason(freeze_data: dict[str, Any] | None) -> str | None:
         reason = fd.get("delivery_error") or "the job-ending push failed"
     if not isinstance(reason, str) or not reason.strip():
         return None
-    reason = " ".join(reason.split())
+    # A failed push's error echoes its credential-bearing remote (OC-05), and
+    # this string is shown AND stored in the feed payload. Redacted before
+    # the cut, so a truncation cannot strand a fragment.
+    reason = " ".join(sanitize_text(reason).split())
     if len(reason) > _DELIVERY_HOLD_CHARS:
         reason = reason[: _DELIVERY_HOLD_CHARS - 1] + "…"
     return reason
@@ -66,8 +70,16 @@ def format_freeze_notification(
     config_name: str,
     description: str,
 ) -> tuple[str, str]:
-    """Format notification subject and body for a freeze event."""
+    """Format notification subject and body for a freeze event.
+
+    Every field of ``freeze_data`` and the description is agent- or
+    user-written (audit OC-05): a summary, a sudo command, a reason or an LLM
+    error can carry a credential. Each is redacted where it is interpolated;
+    the template around it is the server's and is left alone.
+    """
     short_id = job_id[:8]
+    freeze_data = sanitize_data(dict(freeze_data or {})).value
+    description = sanitize_text(description)
 
     if freeze_type == "vm_upgrade_required":
         command = freeze_data.get("command", "unknown")
@@ -209,7 +221,11 @@ async def notify_operator_freeze(
         return None
 
     config_name = canonical_config_name(job.get("config_name") or "worker_base")
-    description = (job.get("description") or "")[:100]
+    description = sanitize_text(job.get("description") or "")[:100]
+    # One sanitized copy feeds the body AND the payload: the payload is stored
+    # in the feed row and shipped in the SSE frame, so a raw read of the
+    # worker's fields there undoes the body's redaction.
+    freeze_data = sanitize_data(dict(freeze_data or {})).value
     subject, message_md = format_freeze_notification(
         freeze_type=freeze_type,
         freeze_data=freeze_data,
