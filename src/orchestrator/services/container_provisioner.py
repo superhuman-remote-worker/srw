@@ -330,23 +330,24 @@ def _all_pod_container_statuses_terminated(pod: Any) -> bool:
 
 
 def _deleting_pod_was_never_scheduled(pod: Any) -> bool:
-    """Prove an exact deleting Pending Pod never gained process authority.
+    """Prove an exact deleting unscheduled Pod never gained process authority.
 
     A finalizer is installed before scheduling, so a Pod deleted while the
     scheduler has not assigned ``spec.nodeName`` can never acquire a kubelet
-    sandbox or container process.  Keep the exception deliberately narrow:
-    the object must still be Pending and deleting, and any contradictory
-    observed running state makes the result ambiguous.
+    sandbox or container process: the binding subresource refuses a Pod that
+    is being deleted. Keep the exception deliberately narrow — deleting, no
+    node, and any contradictory observed running state makes the result
+    ambiguous — but do not require phase ``Pending``: PodGC's
+    unscheduled-terminating sweep flips exactly these Pods to ``Failed``
+    before its force delete, and a phase gate would then retain them forever.
     """
 
     metadata = getattr(pod, "metadata", None)
     spec = getattr(pod, "spec", None)
     status = getattr(pod, "status", None)
-    if (
-        getattr(metadata, "deletion_timestamp", None) is None
-        or getattr(status, "phase", None) != "Pending"
-        or _resource_field(spec, "node_name", "nodeName") not in (None, "")
-    ):
+    if getattr(metadata, "deletion_timestamp", None) is None:
+        return False
+    if _resource_field(spec, "node_name", "nodeName") not in (None, ""):
         return False
     for status_field in (
         "container_statuses",

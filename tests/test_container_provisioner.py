@@ -1261,6 +1261,26 @@ class TestWorkspacePodAuthority:
         )
 
     @pytest.mark.asyncio
+    async def test_podgc_failed_unscheduled_pod_is_still_process_zero(self):
+        # PodGC's unscheduled-terminating sweep flips a deleting Pod that never
+        # got a node to Failed before force-deleting it; the finalizer keeps
+        # the object, and a Pending-only rule would then retain it forever.
+        provisioner = self._provisioner()
+        pod = self._pod(regular_terminated=False, deleting=True)
+        pod.status.phase = "Failed"
+        pod.status.container_statuses = []
+        pod.spec.node_name = None
+        provisioner._core_api.read_namespaced_pod.return_value = pod
+
+        assert (
+            await provisioner.workspace_pod_authority(
+                WorkspaceOwner.session("t1"),
+                expected_runtime_incarnation=self.RUNTIME,
+            )
+            == "exact_terminal"
+        )
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize(
         "ambiguity",
         ["assigned", "running", "ready"],
