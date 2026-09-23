@@ -118,19 +118,38 @@ async def test_an_unnamed_started_task_is_still_awaited_after_the_named_ones():
 
 
 @pytest.mark.asyncio
-async def test_a_failed_task_reraises_from_stop():
+async def test_a_failed_task_is_returned_after_every_task_was_awaited(caplog):
     event = asyncio.Event()
     tasks = application_tasks.ApplicationTaskSet(event)
+    finished: list[str] = []
 
-    async def broken() -> None:
-        raise ValueError("bad interval")
+    async def broken(label: str) -> None:
+        raise ValueError(f"bad interval {label}")
 
     async def fine() -> None:
         await event.wait()
+        await asyncio.sleep(0.01)
+        finished.append("fine")
 
-    tasks.start("broken", broken())
+    tasks.start("broken", broken("one"))
+    tasks.start("also_broken", broken("two"))
     tasks.start("fine", fine())
     await asyncio.sleep(0)
-    with pytest.raises(ValueError, match="bad interval"):
-        await tasks.stop(["broken", "fine"])
-    await asyncio.wait_for(tasks._tasks["fine"], timeout=1)
+    caplog.set_level("ERROR")
+    failure = await tasks.stop(["broken", "also_broken", "fine"])
+    assert isinstance(failure, ValueError) and str(failure) == "bad interval one"
+    assert finished == ["fine"]
+    assert caplog.text.count("ended with an error; shutdown continues") == 2
+
+
+@pytest.mark.asyncio
+async def test_stop_never_absorbs_cancellation():
+    event = asyncio.Event()
+    tasks = application_tasks.ApplicationTaskSet(event)
+    tasks.start("forever", asyncio.Event().wait())
+    stopper = asyncio.create_task(tasks.stop(["forever"]))
+    await asyncio.sleep(0.01)
+    stopper.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await stopper
+    tasks._tasks["forever"].cancel()

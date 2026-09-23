@@ -612,20 +612,13 @@ async def test_leader_task_uses_the_application_store(monkeypatch):
 
 
 @pytest.mark.asyncio
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason=(
-        "R1.B11 characterization: one task that ended with an error aborts the "
-        "rest of shutdown, so later tasks are never awaited and no pool closes"
-    ),
-)
 async def test_shutdown_still_stops_every_task_and_closes_pools_after_a_failure(
     monkeypatch,
 ):
     recorder = _Recorder()
     recorder.fail_labels = {"stale_agent_detector"}
-    with contextlib.suppress(RuntimeError):
+    # The failure still surfaces from shutdown, after everything else closed.
+    with pytest.raises(RuntimeError, match="stale_agent_detector ended with an error"):
         await _run_lifespan(monkeypatch, recorder)
     assert recorder.awaited == DEFAULT_SHUTDOWN
     assert _closure(recorder) == SHUTDOWN_CLOSURE

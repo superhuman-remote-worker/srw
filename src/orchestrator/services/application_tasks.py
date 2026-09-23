@@ -15,10 +15,13 @@ own advisory lock, row lease or claim are started plainly.
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Awaitable, Callable, Coroutine, Sequence
 from typing import Any
 
 from orchestrator.services import leader_election
+
+logger = logging.getLogger(__name__)
 
 
 class ApplicationTaskSet:
@@ -69,22 +72,36 @@ class ApplicationTaskSet:
             name=name,
         )
 
-    async def stop(self, order: Sequence[str]) -> None:
+    async def stop(self, order: Sequence[str]) -> Exception | None:
         """Signal shutdown, then await every started task.
 
         Tasks are awaited in ``order`` (keys that were never started, such as
         feature-gated ones, are skipped), then any started task ``order`` did
-        not name, in start order. An awaited task that ended with an exception
-        re-raises it here.
+        not name, in start order. A task that ended with an error is logged
+        and the remaining tasks are still awaited; the first such error is
+        returned so the caller can finish its own shutdown before surfacing
+        it. Cancellation is never absorbed: it propagates at once.
         """
 
         self._shutdown_event.set()
         named = list(order)
         remaining = [key for key in self._tasks if key not in set(named)]
+        first_failure: Exception | None = None
         for key in (*named, *remaining):
             task = self._tasks.get(key)
-            if task is not None:
+            if task is None:
+                continue
+            try:
                 await task
+            except Exception as exc:
+                logger.error(
+                    "Background task %r ended with an error; shutdown continues",
+                    key,
+                    exc_info=exc,
+                )
+                if first_failure is None:
+                    first_failure = exc
+        return first_failure
 
 
 __all__ = ["ApplicationTaskSet"]

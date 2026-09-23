@@ -3384,8 +3384,10 @@ async def _stop_application(tasks: ApplicationTaskSet) -> None:
     """Stop the lifecycle's tasks, drain the registries, then close clients and
     stores in order (R1.B11 split of ``lifespan``)."""
 
-    # Signal shutdown to background tasks and wait for each of them.
-    await tasks.stop(_BACKGROUND_TASK_SHUTDOWN_ORDER)
+    # Signal shutdown to background tasks and wait for each of them. A task
+    # that ended with an error does not stop the rest of shutdown; it is
+    # re-raised once every store is closed.
+    task_failure = await tasks.stop(_BACKGROUND_TASK_SHUTDOWN_ORDER)
 
     # Dispatch passes and preemptions started by triggers belong to the
     # application too: stop them before any store closes. The leader loop has
@@ -3417,6 +3419,8 @@ async def _stop_application(tasks: ApplicationTaskSet) -> None:
     await postgres_db.disconnect()
     _completion_runtime.reset()
     _session_memory_runtime.reset()
+    if task_failure is not None:
+        raise task_failure
 
 
 @asynccontextmanager
