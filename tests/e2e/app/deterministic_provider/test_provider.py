@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import subprocess
@@ -641,6 +642,91 @@ async def test_worker_job_scenario_fails_closed_without_a_required_tool(
     )
     assert response.status_code == 422
     assert response.json()["error"]["type"] == "required_tool_missing"
+
+
+@pytest.mark.parametrize("proof", ["valid", "reset", "wrong-run", "failed-command", "absent"])
+async def test_retained_sentinel_worker_requires_real_tool_result(
+    control: httpx.AsyncClient,
+    inference: httpx.AsyncClient,
+    tmp_path,
+    proof: str,
+) -> None:
+    run_id = "retained-sentinel-001"
+    sentinel = tmp_path / ".srw-a1-gate" / run_id / "sentinel"
+    sentinel.parent.mkdir(parents=True)
+    sentinel.write_bytes(b"distinct uncommitted gate data\n")
+    digest = hashlib.sha256(sentinel.read_bytes()).hexdigest()
+    armed = await control.post(
+        f"/control/scenarios/{run_id}/arm",
+        json={"scenario": "retained-sentinel-worker", "sentinel_sha256": digest},
+    )
+    assert armed.status_code == 201
+    assert (await control.post(
+        f"/control/scenarios/{run_id}/release-completion"
+    )).status_code == 409
+    tools = [
+        {"type": "function", "function": {"name": name, "parameters": {"type": "object"}}}
+        for name in ("read_file", "todo_complete", "next_phase_todos", "job_complete", "run_command")
+    ]
+    for _ in range(7):
+        response = await inference.post(
+            "/v1/chat/completions", json=chat_request(run_id, extra={"tools": tools})
+        )
+        assert response.status_code == 200
+    call = response.json()["choices"][0]["message"]["tool_calls"][0]["function"]
+    assert call["name"] == "run_command"
+    command = json.loads(call["arguments"])["command"]
+    result = subprocess.run(["sh", "-c", command], cwd=tmp_path, capture_output=True, text=True)
+    assert result.returncode == 0
+    output = "Exit code: 0\n--- stdout ---\n" + result.stdout
+    if proof == "wrong-run":
+        output = output.replace(run_id, run_id + "-other")
+    elif proof == "failed-command":
+        output = output.replace("Exit code: 0", "Exit code: 1")
+    elif proof == "absent":
+        output = "Exit code: 0\n--- stdout ---\n"
+    payload = chat_request(run_id, extra={"tools": tools})
+    payload["messages"].append({"role": "tool", "tool_call_id": "sentinel", "content": output})
+    response = await inference.post("/v1/chat/completions", json=payload)
+    if proof in {"valid", "reset"}:
+        assert response.status_code == 200
+        assert response.json()["choices"][0]["message"]["tool_calls"][0]["function"]["name"] == "todo_complete"
+        remaining = [
+            await inference.post("/v1/chat/completions", json=payload)
+            for _ in range(2)
+        ]
+        waiting_completion = asyncio.create_task(
+            inference.post("/v1/chat/completions", json=payload)
+        )
+        await asyncio.sleep(0.05)
+        assert not waiting_completion.done()
+        held = (await control.get(f"/control/scenarios/{run_id}")).json()
+        assert held["worker_job_tool_steps"] == 10
+        assert held["completion_released"] is False
+        if proof == "reset":
+            assert (await control.delete(f"/control/scenarios/{run_id}")).status_code == 200
+            refused = await asyncio.wait_for(waiting_completion, timeout=5)
+            assert refused.status_code == 409
+            assert refused.json()["error"]["type"] == "scenario_changed"
+            return
+        released = await control.post(f"/control/scenarios/{run_id}/release-completion")
+        assert released.status_code == 200
+        assert released.json()["completion_released"] is True
+        remaining.append(await asyncio.wait_for(waiting_completion, timeout=5))
+        assert [
+            item.json()["choices"][0]["message"]["tool_calls"][0]["function"]["name"]
+            for item in remaining
+        ] == ["todo_complete", "read_file", "job_complete"]
+        state = await control.get(f"/control/scenarios/{run_id}")
+        assert state.json()["worker_job_tool_steps"] == 11
+        assert state.json()["sentinel_sha256"] == digest
+        assert state.json()["completion_released"] is True
+    else:
+        assert response.status_code == 422
+        assert response.json()["error"]["type"] == "workspace_proof_missing"
+        assert (await control.post(
+            f"/control/scenarios/{run_id}/release-completion"
+        )).status_code == 409
 
 
 async def test_search_job_scenario_drives_search_completion_and_todos(

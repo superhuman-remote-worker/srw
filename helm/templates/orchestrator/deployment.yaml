@@ -1,5 +1,6 @@
 {{- $runtimeAuthorityCutover := .Values.orchestrator.runtimeAuthorityMigrationMaintenanceAck | default false -}}
 {{- $vmRemoteProtocol := .Values.orchestrator.vmRemoteOperationProtocol.enabled | default false -}}
+{{- $vmRetainedResumeGate := .Values.orchestrator.vmRetainedResumeAcceptanceGate | default dict -}}
 {{- $workspaceCleanupProtocol := .Values.orchestrator.workspaceCleanupReconciliationEnabled | default false -}}
 {{- $workspaceLifecycleCutover := .Values.orchestrator.workspaceLifecycleProtocolCutoverEnabled | default false -}}
 {{- $manifestCutover := .Values.orchestrator.manifestContractCutoverEnabled | default false -}}
@@ -60,6 +61,7 @@ spec:
         checksum/vm-remote-operation-protocol: {{ dict "enabled" $vmRemoteProtocol | toJson | sha256sum | quote }}
         checksum/vm-workspace-recovery: {{ toJson .Values.orchestrator.vmWorkspaceRecovery | sha256sum | quote }}
         checksum/vm-workspace-recovery-acceptance-gate: {{ toJson .Values.orchestrator.vmWorkspaceRecoveryAcceptanceGate | sha256sum | quote }}
+        checksum/vm-retained-resume-acceptance-gate: {{ toJson $vmRetainedResumeGate | sha256sum | quote }}
     spec:
       serviceAccountName: {{ include "srw.orchestratorServiceAccountName" . }}
       terminationGracePeriodSeconds: {{ .Values.orchestrator.terminationGracePeriodSeconds }}
@@ -1469,6 +1471,8 @@ spec:
               value: {{ (.Values.orchestrator.vmIdleRelease | default dict).enabled | default false | quote }}
             - name: VM_WORKSPACE_RECOVERY_ACCEPTANCE_GATE_ENABLED
               value: {{ .Values.orchestrator.vmWorkspaceRecoveryAcceptanceGate.enabled | quote }}
+            - name: VM_RETAINED_RESUME_ACCEPTANCE_GATE_ENABLED
+              value: {{ get $vmRetainedResumeGate "enabled" | default false | quote }}
             {{- if .Values.orchestrator.vmWorkspaceRecoveryAcceptanceGate.enabled }}
             - name: VM_WORKSPACE_RECOVERY_GATE_SLOW_BOOT_SECONDS
               value: "15"

@@ -47,6 +47,7 @@ SUPPORTED_SCENARIOS = frozenset(
         "search-job",
         "fetch-job",
         "worker-job",
+        "retained-sentinel-worker",
         "prepared-workspace-job",
     }
 )
@@ -72,10 +73,12 @@ class ArmScenarioRequest(BaseModel):
         "search-job",
         "fetch-job",
         "worker-job",
+        "retained-sentinel-worker",
         "prepared-workspace-job",
     ] = "reply"
     required_responses: int = Field(default=1, ge=1, le=100)
     chunk_delay_ms: int = Field(default=100, ge=0, le=2_000)
+    sentinel_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
 
 
 @dataclass(frozen=True)
@@ -117,6 +120,8 @@ class RunState:
     search_job_tool_steps: int = 0
     fetch_job_tool_steps: int = 0
     worker_job_tool_steps: int = 0
+    sentinel_sha256: str | None = None
+    completion_release: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
     next_sequence: int = 1
     counters: Counter[tuple[str, str, bool, str]] = field(default_factory=Counter)
     calls: list[dict[str, Any]] = field(default_factory=list)
@@ -161,6 +166,12 @@ class ScenarioStore:
 
     async def arm(self, run_id: str, request: ArmScenarioRequest) -> dict[str, Any]:
         _validate_run_id(run_id)
+        if (request.scenario == "retained-sentinel-worker") != (
+            request.sentinel_sha256 is not None
+        ):
+            raise ScenarioError(
+                422, "sentinel_contract_invalid", "Sentinel hash is required only for retained worker scenario."
+            )
         async with self._lock:
             if run_id in self._runs:
                 raise ScenarioError(
@@ -173,13 +184,17 @@ class ScenarioStore:
                 scenario=request.scenario,
                 required_responses=request.required_responses,
                 chunk_delay_ms=request.chunk_delay_ms,
+                sentinel_sha256=request.sentinel_sha256,
             )
             return self._serialize(self._runs[run_id])
 
     async def reset(self, run_id: str) -> bool:
         _validate_run_id(run_id)
         async with self._lock:
-            return self._runs.pop(run_id, None) is not None
+            state = self._runs.pop(run_id, None)
+            if state is not None:
+                state.completion_release.set()
+            return state is not None
 
     async def state(self, run_id: str) -> dict[str, Any]:
         _validate_run_id(run_id)
@@ -188,6 +203,38 @@ class ScenarioStore:
             if state is None:
                 raise ScenarioError(404, "scenario_not_found", "No scenario is armed.")
             return self._serialize(state)
+
+    async def release_retained_completion(self, run_id: str) -> dict[str, Any]:
+        """Release only a validated sentinel run before its terminal tool."""
+        _validate_run_id(run_id)
+        async with self._lock:
+            state = self._runs.get(run_id)
+            if state is None:
+                raise ScenarioError(404, "scenario_not_found", "No scenario is armed.")
+            if (
+                state.scenario != "retained-sentinel-worker"
+                or not 8 <= state.worker_job_tool_steps <= 10
+                or state.unexpected_calls != 0
+                or state.completion_release.is_set()
+            ):
+                raise ScenarioError(409, "completion_proof_missing", "Retained completion is not releasable.")
+            state.completion_release.set()
+            return self._serialize(state)
+
+    async def wait_retained_completion_release(self, run_id: str) -> None:
+        _validate_run_id(run_id)
+        async with self._lock:
+            state = self._runs.get(run_id)
+            if state is None or state.scenario != "retained-sentinel-worker":
+                raise ScenarioError(409, "scenario_changed", "Retained run changed.")
+            event = state.completion_release
+        try:
+            await asyncio.wait_for(event.wait(), timeout=90)
+        except asyncio.TimeoutError:
+            raise ScenarioError(409, "completion_barrier_timeout", "Retained completion was not released.") from None
+        async with self._lock:
+            if self._runs.get(run_id) is not state:
+                raise ScenarioError(409, "scenario_changed", "Retained run changed.")
 
     async def overview(self) -> dict[str, Any]:
         async with self._lock:
@@ -510,7 +557,7 @@ class ScenarioStore:
                 state.fetch_job_tool_steps += 1
             if (
                 outcome == "success"
-                and decision.scenario in {"worker-job", "prepared-workspace-job"}
+                and decision.scenario in {"worker-job", "prepared-workspace-job", "retained-sentinel-worker"}
                 and decision.tool_phase
             ):
                 state.worker_job_tool_steps += 1
@@ -586,6 +633,8 @@ class ScenarioStore:
             "search_job_tool_steps": state.search_job_tool_steps,
             "fetch_job_tool_steps": state.fetch_job_tool_steps,
             "worker_job_tool_steps": state.worker_job_tool_steps,
+            "sentinel_sha256": state.sentinel_sha256,
+            "completion_released": state.completion_release.is_set(),
             "unexpected_count": state.unexpected_calls,
             "pending_calls": len(state.pending),
             "counters": counters,
@@ -706,6 +755,14 @@ def create_inference_app(
                 )
 
             state = await store.state(run_id)
+            if (
+                state["scenario"] == "retained-sentinel-worker"
+                and state["worker_job_tool_steps"] >= 10
+            ):
+                # The worker's next reply would be job_complete. Hold it
+                # until the host proves the real claimant and pinned file.
+                await store.wait_retained_completion_release(run_id)
+                state = await store.state(run_id)
             tool_call: ToolCallSpec | None = None
             if structured_name is None and state["scenario"] == "tool-call":
                 has_tool_result = any(
@@ -745,6 +802,7 @@ def create_inference_app(
                     )
             elif structured_name is None and state["scenario"] in {
                 "worker-job",
+                "retained-sentinel-worker",
                 "prepared-workspace-job",
             }:
                 tool_names = _tool_names(payload)
@@ -753,10 +811,16 @@ def create_inference_app(
                     "todo_complete",
                     "next_phase_todos",
                     "job_complete",
+                    "run_command",
                 }:
                     if state["scenario"] == "prepared-workspace-job":
                         tool_call = _prepared_workspace_tool_call(
                             state["worker_job_tool_steps"], run_id, messages
+                        )
+                    elif state["scenario"] == "retained-sentinel-worker":
+                        tool_call = _retained_sentinel_tool_call(
+                            state["worker_job_tool_steps"], run_id,
+                            state["sentinel_sha256"], messages,
                         )
                     else:
                         tool_call = _worker_job_tool_call(
@@ -984,6 +1048,13 @@ def create_control_app(store: ScenarioStore, *, control_token: str) -> FastAPI:
     async def run_state(run_id: str):
         try:
             return await store.state(run_id)
+        except ScenarioError as exc:
+            return _scenario_error_response(exc)
+
+    @app.post("/control/scenarios/{run_id}/release-completion")
+    async def release_completion(run_id: str):
+        try:
+            return await store.release_retained_completion(run_id)
         except ScenarioError as exc:
             return _scenario_error_response(exc)
 
@@ -1582,6 +1653,51 @@ def _prepared_workspace_tool_call(
                 422,
                 "workspace_proof_missing",
                 "Prepared workspace execution did not return the required proof.",
+            )
+    return _worker_job_tool_call(step if step < 6 else step - 1, run_id)
+
+
+def _retained_sentinel_tool_call(
+    step: int, run_id: str, digest: str, messages: list[dict[str, Any]]
+) -> ToolCallSpec:
+    """Read the exact run-owned file in the real worker before completion."""
+    if step == 6:
+        path = f".srw-a1-gate/{run_id}/sentinel"
+        command = "\n".join(
+            (
+                "set -eu",
+                f"test -f {shlex.quote(path)}",
+                f"actual=$(sha256sum {shlex.quote(path)})",
+                f"test \"${{actual%% *}}\" = {shlex.quote(digest)}",
+                f"printf '%s\\n' {shlex.quote('SRW_A1_SENTINEL_PASS:' + run_id)}",
+            )
+        )
+        return ToolCallSpec(
+            name="run_command",
+            arguments=json.dumps(
+                {"command": command, "working_dir": ".", "timeout": 30},
+                separators=(",", ":"),
+            ),
+        )
+    if step == 7:
+        previous = next(
+            (
+                message
+                for message in reversed(messages)
+                if isinstance(message, dict) and message.get("role") == "tool"
+            ),
+            {},
+        )
+        output = previous.get("content")
+        if (
+            not isinstance(output, str)
+            or "Exit code: 0" not in output.splitlines()
+            or f"SRW_A1_SENTINEL_PASS:{run_id}" not in output.splitlines()
+        ):
+            raise ScenarioError(
+                422,
+                "workspace_proof_missing",
+                "Retained sentinel command did not return the required proof.",
             )
     return _worker_job_tool_call(step if step < 6 else step - 1, run_id)
 

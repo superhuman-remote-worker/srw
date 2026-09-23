@@ -1625,6 +1625,14 @@
             "enabled": {"type": "boolean"}
           },
           "additionalProperties": false
+        },
+        "vmRetainedResumeAcceptanceGate": {
+          "type": "object",
+          "required": ["enabled"],
+          "properties": {
+            "enabled": {"type": "boolean"}
+          },
+          "additionalProperties": false
         }
       },
       "additionalProperties": true
