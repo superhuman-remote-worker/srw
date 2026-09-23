@@ -194,15 +194,6 @@ async def _durable_candidate(db, ids: dict[str, str]) -> dict:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("backend", ["none", "virtual"])
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason=(
-        "R1.B11 characterization: the durable retry demands a fresh process-zero "
-        "proof before it reaches the End funnel, so it never uses the "
-        "same-generation soft settlement the owner's retry accepts"
-    ),
-)
 async def test_durable_retry_settles_a_soft_ended_permanent_delete(
     db, monkeypatch, backend
 ):

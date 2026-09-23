@@ -1329,14 +1329,31 @@ async def _retry_pending_pinned_retirement(candidate: Mapping[str, Any]) -> bool
             "context": context,
         }
     )
-    if runtime_exposed and not _retirement_has_exact_local_quiescence(
-        {
-            "generation": generation,
-            "token": token,
-            "permanent": permanent,
-            "context": context,
-        },
-        thread,
+    if (
+        runtime_exposed
+        and not _retirement_has_exact_local_quiescence(
+            {
+                "generation": generation,
+                "token": token,
+                "permanent": permanent,
+                "context": context,
+            },
+            thread,
+        )
+        # A same-generation soft settlement already proved this life reached
+        # process zero, and admission has stayed closed since. The End funnel
+        # accepts that proof for a permanent delete (it rechecks it under the
+        # lifecycle lock), so the retry must not demand a second, fresh one:
+        # a soft-Ended session has no captured actor left to stop and would
+        # otherwise stay pending until an owner retried by hand.
+        and not (
+            permanent
+            and await postgres_db.pinned_thread_has_prior_soft_settlement(
+                thread_id,
+                runtime_generation=generation,
+                retirement_token=token,
+            )
+        )
     ):
         recovered = await _recover_captured_sandbox_process_zero(
             {
