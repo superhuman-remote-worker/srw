@@ -16,6 +16,7 @@ from fastapi import APIRouter, Request
 from orchestrator.schemas.run_queue_admin import (
     ClaimantGoneAttestationRequest,
     CompletionCommandForceResolveRequest,
+    ExecutorPodGoneAttestationRequest,
 )
 from orchestrator.services import run_queue_admin
 
@@ -75,6 +76,28 @@ async def admin_run_queue_attest_claimant_gone(
     return await run_queue_admin.attest_claimant_gone(
         unit_id,
         pod=body.pod,
+        pod_uid=body.pod_uid,
+        reason=body.reason,
+        admin=admin,
+        dependencies=dependencies,
+    )
+
+
+@router.post("/api/admin/run-queue/executor-pods/{pod_name}/attest-gone")
+async def admin_run_queue_attest_executor_pod_gone(
+    pod_name: str,
+    body: ExecutorPodGoneAttestationRequest,
+    request: Request,
+) -> dict[str, Any]:
+    """Operator verb: release a retained stateless executor Pod that no claim
+    owes, on the administrator's audited assertion that its process is gone
+    (admin only). 404 unless that exact UID is retained by the executor
+    finalizer; 409 while it runs, is inside its grace, or a claim names it.
+    """
+    dependencies = get_run_queue_admin_dependencies(request)
+    admin = await dependencies.require_admin(request)
+    return await run_queue_admin.attest_executor_pod_gone(
+        pod_name,
         pod_uid=body.pod_uid,
         reason=body.reason,
         admin=admin,

@@ -38,7 +38,7 @@ import asyncio
 import json
 import logging
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any
 
@@ -82,6 +82,8 @@ RETAINED_EXECUTOR_RELEASE_MAX_PODS = 50
 # wedged hold is loud once per orchestrator process rather than every tick.
 _ABSENT_CLAIMANT_ANOMALIES: set[tuple[str, int, str]] = set()
 _ABSENT_CLAIMANT_ANOMALY_LIMIT = 4096
+# Last thread id reconciled when a page filled up; see _next_claim_loss_hold_page.
+_CLAIM_LOSS_RECONCILE_CURSOR: str | None = None
 
 
 class JournalStealResult(str, Enum):
@@ -327,13 +329,17 @@ FOR UPDATE OF request
 """
 
 
+# Keyset page after ``$2`` (NULL = from the start). The reconciler rotates a
+# cursor through every held thread, so a batch of permanently unsettleable
+# holds (404 Pods from before the executor finalizer) cannot starve newer ones.
 _CLAIM_LOSS_HOLD_CANDIDATES_SQL = """
 SELECT id, metadata
 FROM threads
 WHERE execution_lane = 'stateless'
   AND agent_id IS NULL
   AND COALESCE(metadata, '{}'::jsonb) ? '_stateless_claim_losses'
-ORDER BY last_activity, id
+  AND ($2::uuid IS NULL OR id > $2::uuid)
+ORDER BY id
 LIMIT $1::integer
 """
 
@@ -1338,6 +1344,26 @@ async def retry_stale_interrupt_requests(
     return reconciled
 
 
+async def _next_claim_loss_hold_page(conn: Any, limit: int) -> list[Any]:
+    """Return the next ``limit`` held threads, wrapping around the id space.
+
+    The cursor is leader-process memory only: losing it on restart merely
+    restarts the rotation, and every held thread is still visited within
+    ``ceil(held / limit)`` reaper ticks.
+    """
+
+    global _CLAIM_LOSS_RECONCILE_CURSOR
+    cursor = _CLAIM_LOSS_RECONCILE_CURSOR
+    rows = list(await conn.fetch(_CLAIM_LOSS_HOLD_CANDIDATES_SQL, limit, cursor))
+    if cursor is not None and len(rows) < limit:
+        seen = {str(row["id"]) for row in rows}
+        wrapped = await conn.fetch(_CLAIM_LOSS_HOLD_CANDIDATES_SQL, limit, None)
+        rows.extend(row for row in wrapped if str(row["id"]) not in seen)
+        rows = rows[:limit]
+    _CLAIM_LOSS_RECONCILE_CURSOR = str(rows[-1]["id"]) if len(rows) >= limit else None
+    return rows
+
+
 async def reconcile_claim_loss_holds(
     conn: Any,
     *,
@@ -1359,7 +1385,7 @@ async def reconcile_claim_loss_holds(
         mark_session_claim_eviction_requested,
     )
 
-    candidates = await conn.fetch(_CLAIM_LOSS_HOLD_CANDIDATES_SQL, int(max_threads))
+    candidates = await _next_claim_loss_hold_page(conn, int(max_threads))
     settled = 0
     for candidate in candidates:
         thread_id = str(candidate["id"])
@@ -1475,13 +1501,20 @@ async def release_retained_executor_pods(
 
     Every pool executor is born with the chart's retention finalizer so the
     claimant-loss reconciler can observe its exact terminal UID. Release
-    requires, in order: one Kubernetes LIST (process-zero evaluated on that
-    snapshot), one database snapshot proving no session lease is held by the
-    Pod's name and no claim-loss ledger names its UID, then a
-    UID/resourceVersion-tested patch. Rollouts, scale-downs, crash
-    replacements and never-claimed Pods therefore leave nothing behind, while
-    a Pod whose debt is unsettled stays readable. Stateless by design: an
-    orchestrator restart or a missed tick defers release to the next pass.
+    requires, in order: one Kubernetes LIST, per-Pod evidence evaluated on
+    that snapshot, one database snapshot proving no session lease is held by
+    the Pod's name and no claim-loss ledger names its UID, then a
+    UID/resourceVersion-tested patch. Evidence is either process-zero
+    (containers terminated, or the executor never started) or, once the
+    termination grace has passed, a lost node: Node 404 or the
+    ``out-of-service`` taint, where no kubelet will ever report terminal
+    statuses. A released object can never weaken settlement (a 404 still
+    settles nothing); the database check is what keeps an unsettled UID
+    readable. ``max_pods`` bounds patches, never candidates, so referenced
+    Pods cannot starve releasable ones. Rollouts, scale-downs, crash
+    replacements and never-claimed Pods therefore leave nothing behind.
+    Stateless by design: an orchestrator restart or a missed tick defers
+    release to the next pass.
     """
 
     from orchestrator.services.agent_provisioner import (
@@ -1493,20 +1526,47 @@ async def release_retained_executor_pods(
         retained = await agent_provisioner.list_retained_stateless_executor_pods()
         if not retained:
             return 0
-        candidates: dict[str, Any] = {}
+        now = datetime.now(timezone.utc)
+        node_lost: dict[str, bool] = {}
+        candidates: dict[str, tuple[Any, bool]] = {}
         names: dict[str, str] = {}
         for pod in retained:
-            if len(candidates) >= max_pods:
-                break
-            if not stateless_executor_process_zero(pod):
-                continue
+            process_zero = stateless_executor_process_zero(pod)
+            if not process_zero:
+                node_name = str(getattr(pod.spec, "node_name", None) or "")
+                deadline = pod.metadata.deletion_timestamp
+                if isinstance(deadline, datetime) and deadline.tzinfo is None:
+                    deadline = deadline.replace(tzinfo=timezone.utc)
+                if (
+                    not node_name
+                    or not isinstance(deadline, datetime)
+                    or deadline > now
+                ):
+                    continue
+                if node_name not in node_lost:
+                    node_lost[
+                        node_name
+                    ] = await agent_provisioner.stateless_executor_node_lost(node_name)
+                if not node_lost[node_name]:
+                    continue
             uid = str(pod.metadata.uid)
-            candidates[uid] = pod
+            candidates[uid] = (pod, process_zero)
             names[uid] = str(pod.metadata.name)
         released = 0
         for uid in sorted(await unreferenced_executor_uids(conn, names)):
+            if released >= max_pods:
+                break
+            pod, process_zero = candidates[uid]
+            if not process_zero:
+                logger.warning(
+                    "run_queue reaper: releasing executor %s uid=%s on lost-node "
+                    "evidence (node %s absent or out-of-service); no claim names it",
+                    pod.metadata.name,
+                    uid,
+                    pod.spec.node_name,
+                )
             if await agent_provisioner.release_stateless_executor_finalizer_exact(
-                candidates[uid]
+                pod, require_process_zero=process_zero
             ):
                 released += 1
         return released

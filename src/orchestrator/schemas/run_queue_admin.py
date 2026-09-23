@@ -19,6 +19,13 @@ class ClaimantGoneAttestationRequest(BaseModel):
     reason: str = Field(min_length=1, max_length=2048)
 
 
+class ExecutorPodGoneAttestationRequest(BaseModel):
+    """An administrator's assertion that one retained executor Pod is gone."""
+
+    pod_uid: str = Field(min_length=1, max_length=64)
+    reason: str = Field(min_length=1, max_length=2048)
+
+
 class CompletionCommandForceResolveRequest(BaseModel):
     """Explicit incident disposition for an unfinished completion command."""
 

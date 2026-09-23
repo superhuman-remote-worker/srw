@@ -11,11 +11,12 @@ deadlock (stateless_claim_loss_hold_never_settles_without_pod_finalizer).
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
 from orchestrator.routers import run_queue_admin as run_queue_admin_router
@@ -132,6 +133,32 @@ def test_deleting_unscheduled_executor_never_ran_a_process():
     assert not stateless_executor_process_zero(pod)
 
 
+def test_unscheduled_executor_stays_releasable_after_podgc_flips_its_phase():
+    # KEDA scale-down / a rollout deletes an Unschedulable surge Pod; PodGC's
+    # unscheduled-terminating sweep sets phase Failed before its force delete.
+    pod = executor_pod(
+        finalizers=[FINALIZER], deleting=True, phase="Failed", node_name=None
+    )
+    pod.status.init_container_statuses = None
+    pod.status.container_statuses = None
+    pod.status.conditions = [
+        SimpleNamespace(type="PodScheduled", reason="Unschedulable")
+    ]
+    assert stateless_executor_process_zero(pod)
+
+
+def test_debug_container_that_never_started_does_not_retain_the_pod():
+    # kubelet's terminal rewrite never touches ephemeral statuses.
+    pod = _terminated(executor_pod(finalizers=[FINALIZER]))
+    pod.spec.ephemeral_containers = [SimpleNamespace(name="debugger")]
+    pod.status.ephemeral_container_statuses = [
+        container_status("debugger", "waiting", reason="ImagePullBackOff")
+    ]
+    assert stateless_executor_process_zero(pod)
+    pod.status.ephemeral_container_statuses[0].restart_count = 1
+    assert not stateless_executor_process_zero(pod)
+
+
 def _killed_during_init() -> SimpleNamespace:
     """The kubelet's view of a Pod deleted inside wait-for-orchestrator."""
 
@@ -192,18 +219,66 @@ async def test_retained_list_is_pool_scoped_and_fails_closed(
         finalizers=[FINALIZER],
         labels={"app.kubernetes.io/instance": "other"},
     )
-    api = FakeExecutorCoreApi(retained, unprotected, live, other_release)
-    for name in ("a", "b", "d"):
+    # Created by this release before a chart rename changed its name label.
+    renamed_chart = executor_pod(
+        name="e",
+        uid="uid-e",
+        finalizers=[FINALIZER],
+        labels={"app.kubernetes.io/name": "superhuman-remote-worker-old"},
+    )
+    api = FakeExecutorCoreApi(retained, unprotected, live, other_release, renamed_chart)
+    for name in ("a", "b", "d", "e"):
         api.delete_namespaced_pod(name, EXECUTOR_NAMESPACE)
     provisioner = _provisioner(api)
 
     pods = await provisioner.list_retained_stateless_executor_pods()
-    assert [pod.metadata.name for pod in pods] == ["a"]
+    assert [pod.metadata.name for pod in pods] == ["a", "e"]
 
     monkeypatch.delenv("AGENT_LABEL_INSTANCE")
     assert await provisioner.list_retained_stateless_executor_pods() is None
     provisioner._k8s_available = False
     assert await provisioner.list_retained_stateless_executor_pods() is None
+
+
+@pytest.mark.asyncio
+async def test_retention_blindness_is_warned_once_per_reason(
+    pool_identity, monkeypatch, caplog
+):
+    provisioner = _provisioner(FakeExecutorCoreApi())
+    provisioner._k8s_available = False
+    with caplog.at_level(logging.WARNING, logger=provisioner_module.logger.name):
+        await provisioner.list_retained_stateless_executor_pods()
+        await provisioner.list_retained_stateless_executor_pods()
+        provisioner._k8s_available = True
+        monkeypatch.delenv("AGENT_LABEL_INSTANCE")
+        await provisioner.list_retained_stateless_executor_pods()
+        await provisioner.list_retained_stateless_executor_pods()
+    messages = [record.getMessage() for record in caplog.records]
+    assert len(messages) == 2
+    assert "no Kubernetes client" in messages[0]
+    assert "AGENT_LABEL_INSTANCE" in messages[1]
+
+
+@pytest.mark.asyncio
+async def test_claimant_reads_are_bounded(pool_identity):
+    api = FakeExecutorCoreApi(executor_pod(finalizers=[FINALIZER]))
+    seen: list[dict] = []
+    original = api.read_namespaced_pod
+
+    def read(name, namespace, **kwargs):
+        seen.append(kwargs)
+        return original(name, namespace, **kwargs)
+
+    api.read_namespaced_pod = read
+    provisioner = _provisioner(api)
+    await provisioner.agent_pod_authority(
+        "srw-agent-stateless-68d8c97ff6-w97cz",
+        expected_pod_uid="072ccef4-0000-4000-8000-000000000001",
+    )
+    assert (
+        seen[0]["_request_timeout"]
+        == provisioner_module.STATELESS_EXECUTOR_READ_TIMEOUT
+    )
 
 
 @pytest.mark.asyncio
@@ -339,6 +414,178 @@ async def test_reaper_release_failure_is_contained(pool_identity, monkeypatch):
     assert api.removed == []
 
 
+def _unreferenced_except(referenced: set[str]):
+    async def fake(_conn, candidates):
+        return {uid for uid in candidates if uid not in referenced}
+
+    return fake
+
+
+@pytest.mark.asyncio
+async def test_referenced_pods_cannot_starve_the_release_cap(
+    pool_identity, monkeypatch
+):
+    pods = [
+        _terminated(
+            executor_pod(
+                name=f"srw-agent-stateless-aaaa-{i:05d}",
+                uid=f"00000000-0000-4000-8000-{i:012d}",
+                finalizers=[FINALIZER],
+            )
+        )
+        for i in range(reaper.RETAINED_EXECUTOR_RELEASE_MAX_PODS + 3)
+    ]
+    api = FakeExecutorCoreApi(*pods)
+    monkeypatch.setattr(provisioner_module, "agent_provisioner", _provisioner(api))
+    # Everything LISTed first is still owed; only the tail is releasable.
+    owed = {pod.metadata.uid for pod in pods[:-3]}
+    monkeypatch.setattr(
+        reaper, "unreferenced_executor_uids", _unreferenced_except(owed)
+    )
+
+    assert await reaper.release_retained_executor_pods(object()) == 3
+    assert sorted(api.removed) == sorted(pod.metadata.name for pod in pods[-3:])
+
+    # The cap bounds patches per pass, not candidates.
+    more = [
+        _terminated(
+            executor_pod(name=f"x-{i}", uid=f"uid-x-{i}", finalizers=[FINALIZER])
+        )
+        for i in range(3)
+    ]
+    api = FakeExecutorCoreApi(*more)
+    monkeypatch.setattr(provisioner_module, "agent_provisioner", _provisioner(api))
+    monkeypatch.setattr(
+        reaper, "unreferenced_executor_uids", _unreferenced_except(set())
+    )
+    assert await reaper.release_retained_executor_pods(object(), max_pods=2) == 2
+    assert len(api.pods) == 1
+
+
+def _lost_node_executor(**kwargs) -> SimpleNamespace:
+    """Force-deleted by PodGC long ago; its kubelet never reported again."""
+
+    pod = executor_pod(finalizers=[FINALIZER], deleting=True, phase="Failed", **kwargs)
+    pod.metadata.deletion_timestamp = datetime.now(timezone.utc) - timedelta(hours=1)
+    return pod
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("loss", ["node_deleted", "out_of_service"])
+async def test_unowed_executor_on_a_lost_node_is_released(
+    pool_identity, monkeypatch, caplog, loss
+):
+    pod = _lost_node_executor()
+    api = FakeExecutorCoreApi(pod)
+    if loss == "node_deleted":
+        api.missing_nodes.add("node-a")
+    else:
+        api.out_of_service_nodes.add("node-a")
+    monkeypatch.setattr(provisioner_module, "agent_provisioner", _provisioner(api))
+    monkeypatch.setattr(
+        reaper, "unreferenced_executor_uids", _unreferenced_except(set())
+    )
+
+    with caplog.at_level(logging.WARNING, logger=reaper.logger.name):
+        assert await reaper.release_retained_executor_pods(object()) == 1
+    assert api.removed == [pod.metadata.name]
+    assert "lost-node evidence" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_lost_node_evidence_never_overrides_an_owed_claim(
+    pool_identity, monkeypatch
+):
+    pod = _lost_node_executor()
+    api = FakeExecutorCoreApi(pod)
+    api.missing_nodes.add("node-a")
+    monkeypatch.setattr(provisioner_module, "agent_provisioner", _provisioner(api))
+    monkeypatch.setattr(
+        reaper,
+        "unreferenced_executor_uids",
+        _unreferenced_except({pod.metadata.uid}),
+    )
+
+    assert await reaper.release_retained_executor_pods(object()) == 0
+    assert pod.metadata.name in api.pods
+
+
+@pytest.mark.asyncio
+async def test_healthy_or_unreadable_node_keeps_a_frozen_executor(
+    pool_identity, monkeypatch, caplog
+):
+    pod = _lost_node_executor()
+    api = FakeExecutorCoreApi(pod)
+    monkeypatch.setattr(provisioner_module, "agent_provisioner", _provisioner(api))
+    monkeypatch.setattr(
+        reaper, "unreferenced_executor_uids", _unreferenced_except(set())
+    )
+
+    assert await reaper.release_retained_executor_pods(object()) == 0  # healthy node
+    api.node_read_error = 403
+    with caplog.at_level(logging.WARNING, logger=provisioner_module.logger.name):
+        assert await reaper.release_retained_executor_pods(object()) == 0
+        assert await reaper.release_retained_executor_pods(object()) == 0
+    assert caplog.text.count("Node reads are forbidden") == 1
+    api.node_read_error = 500
+    assert await reaper.release_retained_executor_pods(object()) == 0
+    assert pod.metadata.name in api.pods
+
+
+@pytest.mark.asyncio
+async def test_node_is_not_consulted_inside_the_termination_grace(
+    pool_identity, monkeypatch
+):
+    pod = executor_pod(finalizers=[FINALIZER], deleting=True)
+    pod.metadata.deletion_timestamp = datetime.now(timezone.utc) + timedelta(minutes=3)
+    api = FakeExecutorCoreApi(pod)
+    api.missing_nodes.add("node-a")
+    monkeypatch.setattr(provisioner_module, "agent_provisioner", _provisioner(api))
+    monkeypatch.setattr(
+        reaper, "unreferenced_executor_uids", _unreferenced_except(set())
+    )
+
+    assert await reaper.release_retained_executor_pods(object()) == 0
+    assert api.node_reads == []
+
+
+@pytest.mark.asyncio
+async def test_reconciler_rotates_so_wedged_holds_cannot_starve_new_ones(monkeypatch):
+    held = [f"{i:08d}-0000-4000-8000-000000000000" for i in range(5)]
+
+    async def fetch(sql, limit, cursor):
+        assert sql == reaper._CLAIM_LOSS_HOLD_CANDIDATES_SQL
+        ids = [tid for tid in held if cursor is None or tid > cursor][:limit]
+        return [
+            {
+                "id": tid,
+                "metadata": {
+                    "_stateless_claim_losses": {
+                        "1": {"pod": f"pod-{tid}", "pod_uid": tid, "quiesced": False}
+                    }
+                },
+            }
+            for tid in ids
+        ]
+
+    conn = MagicMock()
+    conn.fetch = AsyncMock(side_effect=fetch)
+    # Every hold is a pre-finalizer 404: nothing ever settles.
+    authority = AsyncMock(return_value="exact_absent")
+    monkeypatch.setattr(
+        provisioner_module.agent_provisioner, "agent_pod_authority", authority
+    )
+    monkeypatch.setattr(reaper, "_CLAIM_LOSS_RECONCILE_CURSOR", None)
+    monkeypatch.setattr(reaper, "_ABSENT_CLAIMANT_ANOMALIES", set())
+
+    for _ in range(3):
+        await reaper.reconcile_claim_loss_holds(conn, max_threads=2)
+
+    visited = [call.kwargs["expected_pod_uid"] for call in authority.await_args_list]
+    assert set(visited) == set(held)
+    assert visited[:2] == held[:2] and visited[2:4] == held[2:4]
+
+
 @pytest.mark.asyncio
 async def test_reap_cycle_releases_only_after_settlement(monkeypatch):
     order: list[str] = []
@@ -444,3 +691,126 @@ def test_attest_route_is_admin_gated_and_forwards_the_exact_identity(monkeypatch
         json={"pod": "p", "pod_uid": "u", "reason": ""},
     )
     assert missing_reason.status_code == 422
+
+
+def test_release_only_route_is_admin_gated(monkeypatch):
+    admin = {"id": "admin-7"}
+    require_admin = AsyncMock(return_value=admin)
+    dependencies = run_queue_admin.RunQueueAdminDependencies(
+        db=MagicMock(),
+        require_admin=require_admin,
+        completion_commands_enabled=lambda: False,
+        get_completion_command_resolution=lambda: None,
+    )
+    attest = AsyncMock(return_value={"finalizer_released": True})
+    monkeypatch.setattr(run_queue_admin, "attest_executor_pod_gone", attest)
+    app = FastAPI()
+    app.include_router(run_queue_admin_router.router)
+    app.state.run_queue_admin_dependencies_factory = lambda: dependencies
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/admin/run-queue/executor-pods/srw-agent-stateless-x/attest-gone",
+        json={"pod_uid": "uid-1", "reason": "node-3 scrapped"},
+    )
+
+    assert response.status_code == 200
+    require_admin.assert_awaited_once()
+    assert attest.await_args.args == ("srw-agent-stateless-x",)
+    assert attest.await_args.kwargs["pod_uid"] == "uid-1"
+    assert attest.await_args.kwargs["admin"] == admin
+
+
+# --------------------------------------------------------------------------- #
+# Attestation fails closed on an unanswered Kubernetes read
+# --------------------------------------------------------------------------- #
+
+_UNIT = "11111111-1111-4111-8111-111111111111"
+
+
+def _ledger_db(pod: SimpleNamespace) -> SimpleNamespace:
+    metadata = {
+        "_stateless_claim_losses": {
+            "3": {
+                "pod": pod.metadata.name,
+                "pod_uid": pod.metadata.uid,
+                "quiesced": False,
+            }
+        }
+    }
+
+    class _Conn:
+        async def fetchrow(self, *_args):
+            return {"execution_lane": "stateless", "metadata": metadata}
+
+        async def fetchval(self, *_args):
+            return {}
+
+    class _Acquire:
+        async def __aenter__(self):
+            return _Conn()
+
+        async def __aexit__(self, *_exc):
+            return False
+
+    return SimpleNamespace(acquire=lambda: _Acquire())
+
+
+async def _refused_attestation(pod, provisioner, monkeypatch) -> HTTPException:
+    monkeypatch.setattr(provisioner_module, "agent_provisioner", provisioner)
+    ack = AsyncMock(return_value=True)
+    monkeypatch.setattr(
+        "shared.session_retirement.acknowledge_session_claim_quiesced", ack
+    )
+    with pytest.raises(HTTPException) as refused:
+        await run_queue_admin.attest_claimant_gone(
+            _UNIT,
+            pod=pod.metadata.name,
+            pod_uid=pod.metadata.uid,
+            reason="probe",
+            admin={"id": "admin-1"},
+            dependencies=SimpleNamespace(db=_ledger_db(pod)),
+        )
+    ack.assert_not_awaited()
+    return refused.value
+
+
+def _in_grace() -> SimpleNamespace:
+    pod = executor_pod(finalizers=[FINALIZER], deleting=True)
+    pod.metadata.deletion_timestamp = datetime.now(timezone.utc) + timedelta(
+        seconds=170
+    )
+    return pod
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [500, 403, 504])
+async def test_attest_refuses_when_kubernetes_does_not_answer(
+    pool_identity, monkeypatch, status
+):
+    pod = _in_grace()
+    api = FakeExecutorCoreApi(pod)
+    api.pod_read_error = status
+    refused = await _refused_attestation(pod, _provisioner(api), monkeypatch)
+    assert refused.status_code == 503
+
+
+@pytest.mark.asyncio
+async def test_attest_refuses_without_a_kubernetes_client(pool_identity, monkeypatch):
+    pod = _in_grace()
+    provisioner = _provisioner(FakeExecutorCoreApi(pod))
+    provisioner._k8s_available = False
+    refused = await _refused_attestation(pod, provisioner, monkeypatch)
+    assert refused.status_code == 503
+
+
+@pytest.mark.asyncio
+async def test_attest_grace_check_ignores_pool_label_drift(pool_identity, monkeypatch):
+    pod = _in_grace()
+    pod.metadata.labels["app.kubernetes.io/name"] = "old-chart-name"
+    pod.metadata.labels["app.kubernetes.io/instance"] = "old-release"
+    refused = await _refused_attestation(
+        pod, _provisioner(FakeExecutorCoreApi(pod)), monkeypatch
+    )
+    assert refused.status_code == 409
+    assert "termination grace" in refused.detail

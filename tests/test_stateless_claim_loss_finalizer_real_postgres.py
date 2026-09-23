@@ -111,7 +111,9 @@ async def _schema_applied(pg_dsn):
 async def pool(pg_dsn, _schema_applied):
     pool = await asyncpg.create_pool(pg_dsn, min_size=1, max_size=4)
     async with pool.acquire() as conn:
-        await conn.execute("TRUNCATE run_queue, thread_events, threads CASCADE")
+        await conn.execute(
+            "TRUNCATE run_queue, thread_events, threads, security_events CASCADE"
+        )
     try:
         yield pool
     finally:
@@ -129,6 +131,7 @@ def fake_k8s(monkeypatch):
     monkeypatch.setenv("AGENT_LABEL_NAME", POOL_NAME)
     monkeypatch.setenv("AGENT_LABEL_INSTANCE", POOL_INSTANCE)
     monkeypatch.setattr(reaper, "_ABSENT_CLAIMANT_ANOMALIES", set(), raising=False)
+    monkeypatch.setattr(reaper, "_CLAIM_LOSS_RECONCILE_CURSOR", None, raising=False)
     return api
 
 
@@ -545,3 +548,121 @@ async def test_attest_releases_a_lost_node_claimant_the_kubelet_never_finished(
     assert fake_k8s.removed == [POD]
     async with pool.acquire() as conn:
         assert (await _queue(conn, thread_id))["state"] == "queued"
+
+
+def _admin_dependencies(pool, admin_id):
+    return run_queue_admin.RunQueueAdminDependencies(
+        db=pool,
+        require_admin=AsyncMock(return_value={"id": admin_id}),
+        completion_commands_enabled=lambda: False,
+        get_completion_command_resolution=lambda: None,
+    )
+
+
+def _frozen_on_a_live_node() -> object:
+    """Statuses frozen at running on a node nobody tainted or deleted."""
+
+    pod = executor_pod(
+        name=POD, uid=POD_UID, finalizers=_rendered_executor_finalizers(), deleting=True
+    )
+    pod.metadata.deletion_timestamp = datetime.now(timezone.utc) - timedelta(hours=2)
+    return pod
+
+
+@pytest.mark.asyncio
+async def test_release_only_attestation_frees_an_unowed_frozen_executor(pool, fake_k8s):
+    fake_k8s.pods[POD] = _frozen_on_a_live_node()
+    admin_id = str(uuid4())
+    async with pool.acquire() as conn:
+        await reaper.reap_cycle(conn, grace_seconds=30)
+    assert POD in fake_k8s.pods, "no evidence the reaper trusts ever arrives"
+
+    result = await run_queue_admin.attest_executor_pod_gone(
+        POD,
+        pod_uid=POD_UID,
+        reason="node-3 hardware replaced; kubelet never came back",
+        admin={"id": admin_id},
+        dependencies=_admin_dependencies(pool, admin_id),
+    )
+
+    assert result == {
+        "pod": POD,
+        "pod_uid": POD_UID,
+        "kubernetes_authority": "unknown",
+        "finalizer_released": True,
+    }
+    assert fake_k8s.removed == [POD]
+    async with pool.acquire() as conn:
+        receipt = await conn.fetchrow(
+            "SELECT event_type, user_id, resource_type, resource_id, path, detail "
+            "FROM security_events"
+        )
+    assert receipt["event_type"] == "operator_attestation"
+    assert str(receipt["user_id"]) == admin_id
+    assert (receipt["resource_type"], receipt["resource_id"]) == (
+        "stateless_executor_pod",
+        POD_UID,
+    )
+    assert json.loads(receipt["detail"])["reason"] == (
+        "node-3 hardware replaced; kubelet never came back"
+    )
+
+
+@pytest.mark.asyncio
+async def test_release_only_attestation_refuses_owed_live_or_unretained_pods(
+    pool, fake_k8s
+):
+    admin_id = str(uuid4())
+    dependencies = _admin_dependencies(pool, admin_id)
+
+    async def attest():
+        with pytest.raises(HTTPException) as refused:
+            await run_queue_admin.attest_executor_pod_gone(
+                POD,
+                pod_uid=POD_UID,
+                reason="probe",
+                admin={"id": admin_id},
+                dependencies=dependencies,
+            )
+        return refused.value.status_code
+
+    assert await attest() == 404  # nothing retained under that name
+    fake_k8s.pods[POD] = executor_pod(
+        name=POD, uid=POD_UID, finalizers=_rendered_executor_finalizers()
+    )
+    assert await attest() == 409  # live and serving
+    fake_k8s.delete_namespaced_pod(POD, EXECUTOR_NAMESPACE, grace_period_seconds=180)
+    assert await attest() == 409  # inside its termination grace
+    fake_k8s.pods[POD] = _frozen_on_a_live_node()
+    async with pool.acquire() as conn:
+        await _insert_held_unit(conn, uuid4())
+    assert await attest() == 409  # a claim still owes it: attest-claimant-gone
+    fake_k8s.pod_read_error = 500
+    assert await attest() == 503
+    async with pool.acquire() as conn:
+        assert await conn.fetchval("SELECT count(*) FROM security_events") == 0
+    assert POD in fake_k8s.pods
+
+
+@pytest.mark.asyncio
+async def test_reconciler_page_rotates_through_every_held_thread(pool, fake_k8s):
+    """25+ unsettleable 404 holds must not starve a newer hold forever."""
+
+    held = [uuid4() for _ in range(5)]
+    async with pool.acquire() as conn:
+        for index, thread_id in enumerate(held):
+            await _insert_held_unit(
+                conn, thread_id, pod=f"gone-{index}", pod_uid=str(uuid4())
+            )
+    seen: set[str] = set()
+    original = fake_k8s.read_namespaced_pod
+
+    def read(name, namespace, **kwargs):
+        seen.add(name)
+        return original(name, namespace, **kwargs)
+
+    fake_k8s.read_namespaced_pod = read
+    async with pool.acquire() as conn:
+        for _ in range(3):
+            await reaper.reconcile_claim_loss_holds(conn, max_threads=2)
+    assert seen == {f"gone-{index}" for index in range(5)}

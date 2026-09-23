@@ -120,6 +120,12 @@ class FakeExecutorCoreApi:
         self.patches: list[tuple[str, list[dict[str, Any]]]] = []
         self.deletes: list[tuple[str, dict[str, Any] | None, int | None]] = []
         self.removed: list[str] = []
+        # Every Node is healthy unless listed here.
+        self.missing_nodes: set[str] = set()
+        self.out_of_service_nodes: set[str] = set()
+        self.node_read_error: int | None = None
+        self.pod_read_error: int | None = None
+        self.node_reads: list[str] = []
 
     # -- apiserver -------------------------------------------------------
     def _get(self, name: str) -> SimpleNamespace:
@@ -139,7 +145,28 @@ class FakeExecutorCoreApi:
 
     def read_namespaced_pod(self, name: str, namespace: str, **_: Any):
         assert namespace == EXECUTOR_NAMESPACE
+        if self.pod_read_error is not None:
+            raise ApiError(self.pod_read_error)
         return copy.deepcopy(self._get(name))
+
+    def read_node(self, name: str, **_: Any):
+        self.node_reads.append(name)
+        if self.node_read_error is not None:
+            raise ApiError(self.node_read_error)
+        if name in self.missing_nodes:
+            raise ApiError(404)
+        taints = []
+        if name in self.out_of_service_nodes:
+            taints.append(
+                SimpleNamespace(
+                    key="node.kubernetes.io/out-of-service",
+                    value="nodeshutdown",
+                    effect="NoExecute",
+                )
+            )
+        return SimpleNamespace(
+            metadata=SimpleNamespace(name=name), spec=SimpleNamespace(taints=taints)
+        )
 
     def list_namespaced_pod(self, namespace: str, label_selector: str = "", **_: Any):
         assert namespace == EXECUTOR_NAMESPACE

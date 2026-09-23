@@ -331,6 +331,37 @@ def test_stateless_executor_pods_are_born_with_the_process_zero_finalizer() -> N
 
 
 @pytest.mark.skipif(shutil.which("helm") is None, reason="Helm is not installed")
+def test_executor_retention_may_read_nodes_and_nothing_else_cluster_wide() -> None:
+    """Lost-node executors are released on Node 404 / out-of-service taint."""
+
+    def node_observer(*settings: str) -> list[dict]:
+        return [
+            document
+            for document in _render(
+                *settings, show_only="templates/orchestrator/rbac.yaml"
+            )
+            if document.get("kind") in {"ClusterRole", "ClusterRoleBinding"}
+        ]
+
+    role, binding = sorted(
+        node_observer("agent.stateless.enabled=true"), key=lambda d: d["kind"]
+    )
+    assert role["rules"] == [
+        {"apiGroups": [""], "resources": ["nodes"], "verbs": ["get"]}
+    ]
+    assert binding["roleRef"]["name"] == role["metadata"]["name"]
+    assert binding["subjects"][0]["kind"] == "ServiceAccount"
+    assert node_observer("agent.stateless.enabled=false") == []
+    assert (
+        node_observer(
+            "agent.stateless.enabled=true",
+            "agent.stateless.processZeroFinalizer=false",
+        )
+        == []
+    )
+
+
+@pytest.mark.skipif(shutil.which("helm") is None, reason="Helm is not installed")
 def test_stateless_executor_execs_python_as_pid1() -> None:
     deployment = _only_kind(
         _render(

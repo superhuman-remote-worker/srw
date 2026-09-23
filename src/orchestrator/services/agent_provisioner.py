@@ -77,6 +77,13 @@ STATELESS_EXECUTOR_LABEL_SELECTOR = (
     "srw/class=agent-stateless,app.kubernetes.io/component=agent-stateless"
 )
 STATELESS_EXECUTOR_READ_TIMEOUT = (5.0, 15.0)
+# The sanctioned human assertion that a node is powered off (non-graceful
+# node shutdown). PodGC force-deletes its Pods without any kubelet report.
+NODE_OUT_OF_SERVICE_TAINT = "node.kubernetes.io/out-of-service"
+
+
+class AgentPodObservationError(RuntimeError):
+    """The Kubernetes API could not answer (anything but an exact 404)."""
 
 
 def _executor_statuses(status: Any, field: str) -> list[Any] | None:
@@ -101,19 +108,57 @@ def _executor_status_started(container: Any) -> bool:
     )
 
 
+def _executor_containers_quiescent(pod: Any) -> bool:
+    """Every regular and init container terminated; no ephemeral one running.
+
+    ``pinned_k8s_effect.pod_containers_are_terminal`` also demands terminated
+    ephemeral statuses, but the kubelet's terminal rewrite never touches them:
+    a ``kubectl debug`` container whose image never pulled stays ``waiting``
+    forever and would retain the Pod indefinitely. An ephemeral container with
+    no start evidence has no process, so it is accepted; declared regular and
+    init containers must all report terminated.
+    """
+
+    spec = getattr(pod, "spec", None)
+    status = getattr(pod, "status", None)
+    for spec_field, status_field, unstarted_ok in (
+        ("containers", "container_statuses", False),
+        ("init_containers", "init_container_statuses", False),
+        ("ephemeral_containers", "ephemeral_container_statuses", True),
+    ):
+        statuses = _executor_statuses(status, status_field)
+        if statuses is None or (spec_field == "containers" and not statuses):
+            return False
+        declared = {str(c.name) for c in getattr(spec, spec_field, None) or []}
+        observed = {str(getattr(s, "name", "")) for s in statuses}
+        if not unstarted_ok and not declared.issubset(observed):
+            return False
+        for container in statuses:
+            state = getattr(container, "state", None)
+            if getattr(state, "terminated", None) is not None:
+                continue
+            if unstarted_ok and not _executor_status_started(container):
+                continue
+            return False
+    return True
+
+
 def _deleting_executor_never_scheduled(pod: Any) -> bool:
-    """A deleting Pending Pod without ``nodeName`` never ran any process.
+    """A deleting Pod without ``nodeName`` never ran any process.
 
     Mirrors the workspace rule (container_provisioner.
     ``_deleting_pod_was_never_scheduled``; duplicated rather than imported to
     keep this module free of a provisioner-to-provisioner import): the binding
     subresource refuses a Pod that is being deleted, so no kubelet can ever
-    start its containers. Any contradictory status is ambiguous.
+    start its containers. The phase is deliberately not consulted: PodGC's
+    unscheduled-terminating sweep flips such a Pod to ``Failed`` before its
+    force delete, and a phase gate would then retain it forever. Any
+    contradictory container status is ambiguous.
     """
 
     spec = getattr(pod, "spec", None)
     status = getattr(pod, "status", None)
-    if getattr(status, "phase", None) != "Pending" or getattr(spec, "node_name", None):
+    if getattr(spec, "node_name", None):
         return False
     for field in (
         "container_statuses",
@@ -190,16 +235,53 @@ def stateless_executor_process_zero(pod: Any) -> bool:
     The finalizer-release predicate: every declared container observed
     terminated (the exact-terminal proof the claimant-loss reconciler settles
     on), or the Pod provably never started its executor. Running or frozen
-    statuses on a lost node are never evidence; an operator attestation is.
+    statuses on a lost node are never container evidence; the reaper's
+    separate node-lost rule (Node absent or out-of-service) and an operator
+    attestation cover that case.
     """
 
     if getattr(getattr(pod, "metadata", None), "deletion_timestamp", None) is None:
         return False
     return (
-        pod_containers_are_terminal(pod)
+        _executor_containers_quiescent(pod)
         or _deleting_executor_never_scheduled(pod)
         or _deleting_executor_never_initialized(pod)
     )
+
+
+def classify_agent_pod_authority(pod: Any, expected_pod_uid: str) -> str:
+    """Classify one read of a claimant Pod name against the expected UID.
+
+    ``exact_terminal`` requires the exact UID with every container observed
+    terminated; ``replacement`` is a same-name successor; deletion grace and
+    phase Unknown remain ``unknown`` because the old process may still run.
+    """
+
+    actual_uid = str(getattr(getattr(pod, "metadata", None), "uid", "") or "")
+    if not actual_uid:
+        return "unknown"
+    if actual_uid != str(expected_pod_uid):
+        return "replacement"
+    phase = str(getattr(getattr(pod, "status", None), "phase", "") or "")
+    statuses = getattr(pod.status, "container_statuses", None) or []
+    all_containers_terminated = bool(statuses) and all(
+        getattr(getattr(status, "state", None), "terminated", None) is not None
+        for status in statuses
+    )
+    # A graceful deletion may stamp deletionTimestamp before the final
+    # terminal phase update.  Exact UID plus every container's terminated
+    # state is the process-level proof we need; deletionTimestamp alone is
+    # deliberately not proof.
+    if all_containers_terminated:
+        return "exact_terminal"
+    if getattr(getattr(pod, "metadata", None), "deletion_timestamp", None):
+        return "unknown"
+    if phase in {"Running", "Pending"}:
+        return "exact_live"
+    # A terminal phase with missing/partial container status is still
+    # ambiguous: the API object is authoritative only when every claimant
+    # container has an observed terminal state.
+    return "unknown"
 
 
 def _env_flag(name: str, default: bool) -> bool:
@@ -965,44 +1047,46 @@ class AgentProvisioner:
         if not self._k8s_available or not name or not expected_uid:
             return "unknown"
         try:
-            pod = await asyncio.to_thread(
+            state, _ = await self.observe_agent_pod_exact(
+                name, expected_pod_uid=expected_uid, namespace=namespace
+            )
+        except AgentPodObservationError as exc:
+            logger.debug("Agent pod authority probe failed for %s: %s", name, exc)
+            return "unknown"
+        return state
+
+    async def observe_agent_pod_exact(
+        self,
+        pod_name: str,
+        *,
+        expected_pod_uid: str,
+        namespace: str | None = None,
+    ) -> tuple[str, Any | None]:
+        """One bounded raw read: ``(classification, pod object or None)``.
+
+        Only an exact 404 is answered (``exact_absent``); a timeout, 403 or
+        any other failure raises ``AgentPodObservationError`` so a caller
+        that must fail closed (the operator attestation) can tell "the API
+        says gone" from "the API did not answer". No label filtering: the
+        classification binds the UID alone.
+        """
+
+        name = str(pod_name or "").strip()
+        expected_uid = str(expected_pod_uid or "").strip()
+        if not self._k8s_available or not name or not expected_uid:
+            raise AgentPodObservationError("Kubernetes client unavailable")
+        try:
+            pod = await run_bounded_k8s_call(
                 self._core_api.read_namespaced_pod,
                 name=name,
                 namespace=namespace or self._namespace,
+                request_timeout=STATELESS_EXECUTOR_READ_TIMEOUT,
             )
         except Exception as exc:
             if getattr(exc, "status", None) == 404:
-                return "exact_absent"
-            logger.debug("Agent pod authority probe failed for %s: %s", name, exc)
-            return "unknown"
-
-        actual_uid = str(getattr(getattr(pod, "metadata", None), "uid", "") or "")
-        if not actual_uid:
-            return "unknown"
-        if actual_uid != expected_uid:
-            return "replacement"
-        phase = str(getattr(getattr(pod, "status", None), "phase", "") or "")
-        statuses = getattr(pod.status, "container_statuses", None) or []
-        all_containers_terminated = bool(statuses) and all(
-            getattr(getattr(status, "state", None), "terminated", None) is not None
-            for status in statuses
-        )
-        # A graceful deletion may stamp deletionTimestamp before the final
-        # terminal phase update.  Exact UID plus every container's terminated
-        # state is the process-level proof we need; deletionTimestamp alone is
-        # deliberately not proof.
-        if all_containers_terminated:
-            return "exact_terminal"
-        if getattr(getattr(pod, "metadata", None), "deletion_timestamp", None):
-            return "unknown"
-        if phase in {"Running", "Pending"}:
-            return "exact_live"
-        if phase in {"Failed", "Succeeded"}:
-            # A terminal phase with missing/partial container status is still
-            # ambiguous: the API object is authoritative only when every
-            # claimant container has an observed terminal state.
-            return "unknown"
-        return "unknown"
+                return "exact_absent", None
+            raise AgentPodObservationError(str(exc)) from exc
+        return classify_agent_pod_authority(pod, expected_uid), pod
 
     async def attest_pinned_job_recipient(
         self,
@@ -1771,34 +1855,59 @@ class AgentProvisioner:
             return getattr(exc, "status", None) == 404
 
     @staticmethod
-    def _stateless_executor_identity(pod: Any) -> tuple[str, str, str] | None:
-        """``(name, uid, resourceVersion)`` of a pool-member executor Pod.
+    def _stateless_executor_release() -> str:
+        """The Helm release whose executors this orchestrator may release.
 
-        The pool identity comes from the server-owned chart env (the same
-        source as claim-bundle attestation), never from the Pod: a second
-        release sharing the namespace must never have its retained executors
-        released against this orchestrator's database.
+        Server-owned chart env (``AGENT_LABEL_INSTANCE`` = ``.Release.Name``),
+        never the Pod. Release names are unique per namespace, so a second
+        release sharing it can never have its executors released against this
+        orchestrator's database. The chart *name* is deliberately not part of
+        the scope: a chart rename would otherwise strand every executor the
+        previous chart created behind a selector nobody matches.
         """
 
         from orchestrator.services.stateless_claimant_attestation import (
-            claimant_pool_mismatch_reason,
             pool_identity,
         )
 
-        expected_name, expected_instance = pool_identity()
+        return pool_identity()[1]
+
+    @classmethod
+    def _stateless_executor_identity(cls, pod: Any) -> tuple[str, str, str] | None:
+        """``(name, uid, resourceVersion)`` of this release's executor Pod."""
+
+        from orchestrator.services.stateless_claimant_attestation import (
+            STATELESS_CLASS_VALUE,
+            STATELESS_COMPONENT_VALUE,
+        )
+
+        release = cls._stateless_executor_release()
         metadata = getattr(pod, "metadata", None)
+        labels = dict(getattr(metadata, "labels", None) or {})
         name = str(getattr(metadata, "name", "") or "")
         uid = str(getattr(metadata, "uid", "") or "")
         resource_version = str(getattr(metadata, "resource_version", "") or "")
-        if not (expected_name and expected_instance and name and uid):
+        if not (release and name and uid and resource_version):
             return None
-        if not resource_version:
-            return None
-        if claimant_pool_mismatch_reason(
-            pod, expected_name=expected_name, expected_instance=expected_instance
+        if (
+            labels.get("srw/class") != STATELESS_CLASS_VALUE
+            or labels.get("app.kubernetes.io/component") != STATELESS_COMPONENT_VALUE
+            or labels.get("app.kubernetes.io/instance") != release
         ):
             return None
         return name, uid, resource_version
+
+    def _warn_retention_blind_once(self, reason: str) -> None:
+        warned = self.__dict__.setdefault("_retention_blind_warned", set())
+        if reason in warned:
+            return
+        warned.add(reason)
+        logger.warning(
+            "Stateless executor retention degraded (%s): Pods retained by %s "
+            "may need a manual release",
+            reason,
+            STATELESS_EXECUTOR_PROCESS_ZERO_FINALIZER,
+        )
 
     async def list_retained_stateless_executor_pods(self) -> list[Any] | None:
         """Deleting pool executor Pods still held by the process-zero finalizer.
@@ -1807,18 +1916,17 @@ class AgentProvisioner:
         callers release nothing; an empty list means nothing is retained.
         """
 
-        from orchestrator.services.stateless_claimant_attestation import (
-            pool_identity,
-        )
-
-        expected_name, expected_instance = pool_identity()
-        if not self._k8s_available or not expected_name or not expected_instance:
+        release = self._stateless_executor_release()
+        if not self._k8s_available:
+            self._warn_retention_blind_once("no Kubernetes client")
+            return None
+        if not release:
+            self._warn_retention_blind_once("AGENT_LABEL_INSTANCE is unset")
             return None
         selector = ",".join(
             (
                 STATELESS_EXECUTOR_LABEL_SELECTOR,
-                f"app.kubernetes.io/name={expected_name}",
-                f"app.kubernetes.io/instance={expected_instance}",
+                f"app.kubernetes.io/instance={release}",
             )
         )
         try:
@@ -1866,6 +1974,42 @@ class AgentProvisioner:
         if identity is None or identity[1] != uid:
             return None
         return pod
+
+    async def stateless_executor_node_lost(self, node_name: str) -> bool:
+        """Whether a human or the cloud has declared a Pod's node gone.
+
+        ``True`` only for an exact Node 404 (PodGC's orphan sweep acts on
+        the same fact) or the ``node.kubernetes.io/out-of-service`` taint (the
+        sanctioned non-graceful-shutdown assertion). A kubelet on such a node
+        will never report terminal container statuses, so without this the
+        executor would stay Terminating forever. Any read failure is
+        ``False``: an unanswered question is never evidence.
+        """
+
+        name = str(node_name or "").strip()
+        if not self._k8s_available or not name:
+            return False
+        try:
+            node = await run_bounded_k8s_call(
+                self._core_api.read_node,
+                name=name,
+                request_timeout=STATELESS_EXECUTOR_READ_TIMEOUT,
+            )
+        except Exception as exc:
+            status = getattr(exc, "status", None)
+            if status == 404:
+                return True
+            if status == 403:
+                self._warn_retention_blind_once(
+                    "Node reads are forbidden, so executors on lost nodes are "
+                    "never released; grant the chart's orchestrator "
+                    "node-observer ClusterRole"
+                )
+            return False
+        taints = getattr(getattr(node, "spec", None), "taints", None) or []
+        return any(
+            getattr(taint, "key", None) == NODE_OUT_OF_SERVICE_TAINT for taint in taints
+        )
 
     async def release_stateless_executor_finalizer_exact(
         self, pod: Any, *, require_process_zero: bool = True
