@@ -49,6 +49,10 @@ spec:
               value: {{ include "srw.vmControllerNamespace" . | quote }}
             - name: DEFAULT_VM_IMAGE
               value: {{ .Values.vmController.defaultVmImage | default (printf "ghcr.io/superhuman-remote-worker/srw-agent-vm-base:v%s" .Chart.AppVersion) | quote }}
+            - name: VM_NETWORK_PROFILE_ENABLED
+              value: {{ .Values.vmController.networkProfile.enabled | default false | quote }}
+            - name: VM_NETWORK_PROFILE_IMAGE_ALLOWLIST
+              value: {{ join "," (.Values.vmController.networkProfile.imageAllowlist | default list) | quote }}
             - name: DEFAULT_CPU
               value: {{ .Values.vmController.defaultCpu | quote }}
             - name: DEFAULT_MEMORY

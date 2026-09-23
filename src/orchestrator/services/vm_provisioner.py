@@ -934,6 +934,7 @@ class VMProvisioner:
         initialization: dict | None = None,
         workspace_storage: dict | None = None,
         preparation: dict | None = None,
+        network_profile: dict | None = None,
         idle_wake_id: str | None = None,
     ) -> bool | dict[str, Any]:
         """Create a VM for a job.
@@ -1069,7 +1070,7 @@ class VMProvisioner:
         if preparation is not None:
             preparation = await self._validate_preparation(job_id, "job", preparation)
         if workspace_storage is not None:
-            from orchestrator.services.retained_vm_workspaces import provision_binding
+            from orchestrator.services.retained_vm_workspaces import provision_authority
             from shared.vm_workspace_storage import storage_binding
 
             workspace_storage = storage_binding(workspace_storage)
@@ -1077,7 +1078,12 @@ class VMProvisioner:
                 raise ValueError(
                     "Retained workspaces require authenticated same-cluster VM hosting."
                 )
-            if await provision_binding(self._db, job_id) != workspace_storage:
+            authority = await provision_authority(self._db, job_id)
+            if (
+                authority is None
+                or authority["storage"] != workspace_storage
+                or authority.get("network_profile") != network_profile
+            ):
                 raise ValueError("Retained workspace attachment authority changed.")
         if initialization is not None:
             from shared.workspace_initialization import validate_initialization_request
@@ -1113,6 +1119,7 @@ class VMProvisioner:
                 initialization=initialization,
                 workspace_storage=workspace_storage,
                 preparation=preparation,
+                network_profile=network_profile,
             )
             preflight = await VMCreationPreflightStore(self._db).begin(
                 job_id=job_id,
@@ -2395,9 +2402,26 @@ class VMProvisioner:
             return observation
         from orchestrator.services.vm_readiness import qualify_recovery_successor
 
+        frozen = context.get("creation_preflight") or {}
+        frozen = json.loads(frozen) if isinstance(frozen, str) else frozen
+        frozen_request = frozen.get("request") if isinstance(frozen, Mapping) else None
+        network_profile = (
+            frozen_request.get("network_profile")
+            if isinstance(frozen_request, Mapping) else None
+        )
+        if (
+            owner_kind == "job"
+            and network_profile is None
+            and context.get("rootdisk_pvc_uid")
+        ):
+            observation["network_qualification"] = {
+                "qualified": False, "reason": "retained_network_profile_unproven"
+            }
+            return observation
         qualified = await qualify_recovery_successor(
             successor,
             host_key_fingerprint=fingerprint,
+            network_profile=network_profile,
         )
         if qualified is None:
             return observation

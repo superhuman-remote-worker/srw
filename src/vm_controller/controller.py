@@ -1910,6 +1910,18 @@ class VMController:
 
         manifest = yaml.safe_load(rendered)
         vmi_spec = manifest["spec"]["template"]["spec"]
+        if "network_profile" in job_config:
+            from shared.vm_network_profile import NETWORK_DATA, validate_network_profile
+
+            validate_network_profile(job_config["network_profile"])
+            cloud_volumes = [
+                item["cloudInitNoCloud"]
+                for item in vmi_spec["volumes"]
+                if "cloudInitNoCloud" in item
+            ]
+            if len(cloud_volumes) != 1 or set(cloud_volumes[0]) != {"secretRef"}:
+                raise ValueError("Unsupported VM NoCloud volume")
+            cloud_volumes[0]["networkData"] = NETWORK_DATA
         if VM_NODE_SELECTOR:
             vmi_spec["nodeSelector"] = dict(VM_NODE_SELECTOR)
         if VM_TOLERATIONS:
@@ -1936,6 +1948,29 @@ class VMController:
             rendered_cloud_init, host_key_fingerprint = _inject_ssh_host_key(
                 rendered_cloud_init
             )
+            if "network_profile" in job_config:
+                from pathlib import Path
+                from shared import vm_network_probe_guest
+
+                cloud_document = yaml.safe_load(rendered_cloud_init) or {}
+                if not isinstance(cloud_document, dict):
+                    raise ValueError("Unsupported profile cloud-init document")
+                files = cloud_document.setdefault("write_files", [])
+                if not isinstance(files, list) or any(
+                    not isinstance(item, dict)
+                    or item.get("path") == "/usr/local/bin/srw-network-profile-qualification"
+                    for item in files
+                ):
+                    raise ValueError("Unsupported profile cloud-init write_files")
+                files.append({
+                    "path": "/usr/local/bin/srw-network-profile-qualification",
+                    "permissions": "0755",
+                    "owner": "root:root",
+                    "content": Path(vm_network_probe_guest.__file__).read_text(),
+                })
+                rendered_cloud_init = "#cloud-config\n" + yaml.safe_dump(
+                    cloud_document, sort_keys=False
+                )
             # Internal hand-off only; both fields are removed before the VM is
             # sent to KubeVirt. The private key persists only in the Secret.
             manifest["_srwCloudInitUserData"] = rendered_cloud_init
@@ -2198,6 +2233,8 @@ class VMController:
             from vm_controller.creation_actuation import CreationActuator
 
             return await CreationActuator(self).run(job_config)
+        if "network_profile" in job_config:
+            raise ValueError("VM network profile requires durable creation authority")
         from kubernetes.client.exceptions import ApiException
 
         job_id = job_config.get("job_id", "unknown")
@@ -3107,6 +3144,8 @@ class VMController:
             result["vmi_phase"] = vmi_status.get("phase")
             interfaces = vmi_status.get("interfaces") or []
             pod_ip = interfaces[0].get("ipAddress") if interfaces else None
+            if interfaces and isinstance(interfaces[0].get("mac"), str):
+                result["interface_mac"] = interfaces[0]["mac"]
             active_pods = vmi_status.get("activePods") or {}
             active_pod_uid = next(iter(active_pods), None)
             if active_pod_uid is None and self.core_api is not None:

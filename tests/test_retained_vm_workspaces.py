@@ -23,6 +23,7 @@ from orchestrator.services.retained_vm_workspaces import (
 from orchestrator.services.vm_workspace_config import vm_provisioning_options
 from tests import test_manifest_native_full_schema as full_schema
 from tests.test_manifest_vm_workspaces import template, OPTIONS
+from tests.test_manifest_vm_workspaces import IMAGE
 
 actor = full_schema.actor
 database = full_schema.database
@@ -105,6 +106,69 @@ async def first(database, actor):
     *_, job_id, snapshot = await full_schema.admit(database, actor, assignment())
     binding = await provision_binding(database, job_id)
     return job_id, snapshot, binding
+
+
+@pytest.mark.asyncio
+async def test_reservation_selects_immutable_network_profile_and_handoff_keeps_it(
+    database, actor, monkeypatch,
+):
+    from orchestrator.services.retained_vm_workspaces import provision_authority
+    from shared.vm_network_profile import NETWORK_PROFILE
+
+    monkeypatch.setenv("VM_NETWORK_PROFILE_ENABLED", "true")
+    monkeypatch.setenv("VM_NETWORK_PROFILE_IMAGE_ALLOWLIST", IMAGE)
+    first_job, _, binding = await first(database, actor)
+    authority = await provision_authority(database, first_job)
+    assert authority == {"storage": binding, "network_profile": NETWORK_PROFILE}
+    assert await vm_provisioning_options(
+        database, "Job", await database.get_job(first_job)
+    ) == {**OPTIONS, "workspace_storage": binding, "network_profile": NETWORK_PROFILE}
+    monkeypatch.setenv("VM_NETWORK_PROFILE_ENABLED", "false")
+    pvc_uid = await finished(database, first_job, binding)
+    ref = {"instanceRef": {"uid": binding["uid"]}}
+    *_, next_job, _ = await full_schema.admit(database, actor, assignment(ref))
+    successor = await provision_authority(database, next_job)
+    assert successor == {
+        "storage": {**binding, "generation": 2, "pvc_uid": pvc_uid},
+        "network_profile": NETWORK_PROFILE,
+    }
+    assert await vm_provisioning_options(
+        database, "Job", await database.get_job(next_job)
+    ) == {**OPTIONS, "workspace_storage": successor["storage"],
+          "network_profile": NETWORK_PROFILE}
+
+
+@pytest.mark.asyncio
+async def test_profiled_retained_first_preflight_requires_selected_source(
+    database, actor, monkeypatch,
+):
+    from orchestrator.services.vm_creation_preflight import VMCreationPreflightStore
+    from orchestrator.services.vm_creation_retry_store import VMCreationRetryConflict
+    from orchestrator.services.vm_creation_request import build_vm_creation_request
+    from orchestrator.services.vm_provisioner import VMProvisioner
+
+    monkeypatch.setenv("VM_NETWORK_PROFILE_ENABLED", "true")
+    monkeypatch.setenv("VM_NETWORK_PROFILE_IMAGE_ALLOWLIST", IMAGE)
+    job_id, _, _ = await first(database, actor)
+    options = await vm_provisioning_options(
+        database, "Job", await database.get_job(job_id)
+    )
+    fresh = VMProvisioner._fresh_provision_ctx()
+    request = build_vm_creation_request(
+        job_id=str(job_id), provision_generation=fresh["provision_generation"],
+        agent_config="worker_base", description="", network_tier="restricted",
+        **options,
+    )
+    with pytest.raises(VMCreationRetryConflict, match="source_changed"):
+        await VMCreationPreflightStore(database).begin(
+            job_id=str(job_id),
+            request={**request, "vm_image": "registry.example/other@sha256:" + "b" * 64},
+            fresh_context=fresh,
+        )
+    frozen = await VMCreationPreflightStore(database).begin(
+        job_id=str(job_id), request=request, fresh_context=fresh,
+    )
+    assert frozen["request"]["network_profile"] == options["network_profile"]
 
 
 async def finished(database, job_id, binding):

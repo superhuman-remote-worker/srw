@@ -15,6 +15,7 @@ import pytest
 from shared.workspace_idle_policy import (
     IdleEpisode, RuntimeIdentity, episode_document, read_episode,
 )
+from shared.vm_network_profile import NETWORK_PROFILE
 from tests.test_workspace_idle_store_real_postgres import (
     db as _db_fixture,
     postgres_db_fixture,  # noqa: F401
@@ -24,6 +25,16 @@ from tests.test_workspace_idle_store_real_postgres import (
 
 
 db = _db_fixture
+PROFILE_IMAGE = "registry.example/srw-vm@sha256:" + "a" * 64
+
+
+@pytest.fixture(autouse=True)
+def profiled_idle_image_policy(monkeypatch):
+    monkeypatch.setenv(
+        "VM_NETWORK_PROFILE_IMAGE_ALLOWLIST",
+        PROFILE_IMAGE + ",registry.example/vm@sha256:" + "a" * 64,
+    )
+
 MIGRATION = (
     Path(__file__).resolve().parents[1]
     / "src/orchestrator/database/migrations/app/0270_vm_idle_lifecycle.sql"
@@ -31,9 +42,10 @@ MIGRATION = (
 
 
 async def seed_wait(db, *, original_options=None, attempts=0, job_id=None,
-                    retained_storage=False):
+                    retained_storage=False, proven_profile=True):
     from orchestrator.services.vm_creation_request import build_vm_creation_request
     from shared.vm_creation_retry import canonical_request_digest
+    from shared.vm_network_profile import NETWORK_PROFILE
 
     owner, generation, vm_uid, vmi_uid, launcher_uid, pvc_uid = (
         job_id or uuid4(), *(uuid4() for _ in range(5))
@@ -91,10 +103,12 @@ async def seed_wait(db, *, original_options=None, attempts=0, job_id=None,
         "FROM srw_execution_specs WHERE work_kind='Job' AND work_id=$1", owner,
     )
     options = {
-        "agent_config": "worker_base", "vm_image": None, "cpu_cores": 8,
+        "agent_config": "worker_base", "vm_image": PROFILE_IMAGE if proven_profile else None, "cpu_cores": 8,
         "memory": "16Gi", "description": "", "network_tier": "restricted",
         **(original_options or {}),
     }
+    if proven_profile:
+        options["network_profile"] = dict(NETWORK_PROFILE)
     if retained_storage:
         binding = {
             "uid": str(uuid4()), "generation": 1, "pvc_uid": None,
@@ -112,7 +126,10 @@ async def seed_wait(db, *, original_options=None, attempts=0, job_id=None,
             UUID(binding["uid"]), user,
             json.dumps({"backend": "vm", "retention": "Retain"}),
             "srw-ws-" + UUID(binding["uid"]).hex,
-            str(pvc_uid), execution["id"], json.dumps({"storage": binding}),
+            str(pvc_uid), execution["id"], json.dumps({
+                "storage": binding,
+                **({"network_profile": NETWORK_PROFILE} if proven_profile else {}),
+            }),
         )
         await db.execute(
             "INSERT INTO srw_execution_workspace_bindings(execution_id,instance_id) "
@@ -136,6 +153,38 @@ async def seed_wait(db, *, original_options=None, attempts=0, job_id=None,
         creation_request_id=preflight["request_id"],
         provision_attempts=attempts,
     )
+    if proven_profile:
+        vm["network_profile_evidence"] = {
+            "profile": NETWORK_PROFILE,
+            "provision_generation": str(generation),
+            "vm_uid": str(vm_uid),
+            "pvc_uid": str(pvc_uid),
+            "vmi_uid": str(vmi_uid),
+            "launcher_uid": str(launcher_uid),
+            "guest_boot_id": str(uuid4()),
+            "cloud_init_instance_id": "i-profiled-idle",
+            "cloud_init_cached_instance_id": "i-profiled-idle",
+            "network_file_sha256": "a" * 64,
+            "name_only_dhcp": True,
+        }
+        admission = uuid4()
+        await db.execute(
+            "INSERT INTO vm_workspace_cleanup_admissions "
+            "(id,owner_kind,owner_id,pvc_uid,source,request_id,intent_digest,completed_at,outcome) "
+            "VALUES($1,'job',$2,$3,'profiled-idle-fixture',$4,'test',clock_timestamp(),'completed')",
+            admission, owner, pvc_uid, uuid4(),
+        )
+        await db.execute(
+            "INSERT INTO vm_creation_retries "
+            "(request_id,job_id,provision_generation,origin,request_digest,canonical_request,"
+            "controller_configuration_digest,execution_id,execution_revision,execution_generation,"
+            "admission_deadline,creation_admission_id,state,observed_vm_uid,observed_pvc_uid,resolved_at) "
+            "VALUES($1,$2,$3,'initial',$4,$5::jsonb,$6,$7,$8,$9,$10,$11,'succeeded',$12,$13,clock_timestamp())",
+            UUID(preflight["request_id"]), owner, generation, preflight["request_digest"],
+            json.dumps(request), "sha256:" + "a" * 64,
+            execution["id"], execution["revision"], execution["generation"],
+            execution["deadline"], admission, vm_uid, pvc_uid,
+        )
     await db.execute(
         "UPDATE jobs SET context=$2::jsonb WHERE id=$1",
         owner, json.dumps({"vm": vm}),
@@ -726,9 +775,9 @@ async def test_native_creation_requires_exact_idle_wake_operation(db, monkeypatc
     fresh = VMProvisioner._fresh_provision_ctx()
     fresh["provision_generation"] = str(wake["wake_generation"])
     request = build_vm_creation_request(
-        job_id=str(owner), agent_config="worker_base", vm_image=None,
+        job_id=str(owner), agent_config="worker_base", vm_image=PROFILE_IMAGE,
         cpu_cores=8, memory="16Gi", description="", network_tier="restricted",
-        provision_generation=fresh["provision_generation"],
+        provision_generation=fresh["provision_generation"], network_profile=NETWORK_PROFILE,
     )
     preflight = VMCreationPreflightStore(db)
     with pytest.raises(VMCreationRetryConflict):
@@ -890,9 +939,37 @@ async def test_real_provisioner_wake_preserves_predecessor_and_effective_options
             ssh_host_key_fingerprint="SHA256:" + "B" * 43,
         )
         context["vm"]["creation_preflight"]["state"] = "admitted"
+        context["vm"]["network_profile_evidence"] = {
+            **context["last_vm"]["network_profile_evidence"],
+            "provision_generation": successor_identity["generation"],
+            "vm_uid": successor_identity["vm_uid"],
+            "vmi_uid": successor_identity["vmi_uid"],
+            "launcher_uid": successor_identity["launcher_uid"],
+        }
         context.pop("_vm_creation_pending", None)
         await db.execute(
             "UPDATE jobs SET context=$2::jsonb WHERE id=$1", owner, json.dumps(context),
+        )
+        successor_admission = uuid4()
+        await db.execute(
+            "INSERT INTO vm_workspace_cleanup_admissions "
+            "(id,owner_kind,owner_id,pvc_uid,source,request_id,intent_digest,completed_at,outcome) "
+            "VALUES($1,'job',$2,$3,'profiled-idle-fixture',$4,'test',clock_timestamp(),'completed')",
+            successor_admission, owner, UUID(successor_identity["pvc_uid"]), uuid4(),
+        )
+        await db.execute(
+            "INSERT INTO vm_creation_retries "
+            "(request_id,job_id,provision_generation,origin,request_digest,canonical_request,"
+            "controller_configuration_digest,execution_id,execution_revision,execution_generation,"
+            "admission_deadline,expected_pvc_uid,creation_admission_id,state,observed_vm_uid,observed_pvc_uid,resolved_at) "
+            "VALUES($1,$2,$3,'initial',$4,$5::jsonb,$6,$7,$8,$9,$10,$11,$12,'succeeded',$13,$14,clock_timestamp())",
+            UUID(successor["request_id"]), owner, UUID(successor_identity["generation"]),
+            successor["request_digest"], json.dumps(successor["request"]),
+            "sha256:" + "a" * 64, UUID(successor["execution_id"]),
+            successor["execution_revision"], successor["execution_generation"],
+            datetime.fromisoformat(successor["admission_deadline"]),
+            UUID(successor_identity["pvc_uid"]), successor_admission,
+            UUID(successor_identity["vm_uid"]), UUID(successor_identity["pvc_uid"]),
         )
         assert await store.mark_wake_ready(str(op["id"]), **successor_identity)
         assert await store.finish_wake(str(op["id"]))
@@ -1011,9 +1088,9 @@ async def test_access_only_wake_waits_for_exact_ready_and_never_resumes_job(db, 
             fresh = VMProvisioner._fresh_provision_ctx()
             fresh["provision_generation"] = str(wake["wake_generation"])
             request = build_vm_creation_request(
-                job_id=job_id, agent_config="worker_base", vm_image=None,
+                job_id=job_id, agent_config="worker_base", vm_image=PROFILE_IMAGE,
                 cpu_cores=8, memory="16Gi", description="", network_tier="restricted",
-                provision_generation=fresh["provision_generation"],
+                provision_generation=fresh["provision_generation"], network_profile=NETWORK_PROFILE,
             )
             return await VMCreationPreflightStore(db).begin(
                 job_id=job_id, request=request, fresh_context=fresh,

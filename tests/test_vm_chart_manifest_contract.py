@@ -736,3 +736,28 @@ def test_cloud_init_sanity_budget(chart: Chart, limit: int) -> None:
         text = text.replace(f"${{{name}}}", "x" * width)
     assert not placeholders(text)
     assert len(text.encode()) <= limit
+
+
+def test_network_profile_is_default_off_and_same_policy_reaches_both_components() -> None:
+    def environments(rendered: str) -> list[dict[str, str]]:
+        return [
+            {entry["name"]: entry.get("value") for entry in container.get("env", [])}
+            for doc in documents(rendered)
+            if doc.get("kind") == "Deployment"
+            for container in doc["spec"]["template"]["spec"]["containers"]
+            if any(item["name"] == "VM_NETWORK_PROFILE_ENABLED" for item in container.get("env", []))
+        ]
+
+    default = environments(render_chart(MAIN))
+    assert len(default) == 2
+    assert all(env["VM_NETWORK_PROFILE_ENABLED"] == "false" and
+               env["VM_NETWORK_PROFILE_IMAGE_ALLOWLIST"] == "" for env in default)
+    image = "registry.example/srw-vm@sha256:" + "a" * 64
+    selected = environments(render_chart(
+        MAIN,
+        "vmController.networkProfile.enabled=true",
+        f"vmController.networkProfile.imageAllowlist[0]={image}",
+    ))
+    assert len(selected) == 2
+    assert all(env["VM_NETWORK_PROFILE_ENABLED"] == "true" and
+               env["VM_NETWORK_PROFILE_IMAGE_ALLOWLIST"] == image for env in selected)

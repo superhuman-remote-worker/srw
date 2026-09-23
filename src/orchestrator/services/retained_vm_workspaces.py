@@ -140,6 +140,15 @@ async def reserve(db, snapshot):
                 "owner_kind": "job",
             }
         )
+        from shared.vm_network_profile import selected_profile
+
+        from orchestrator.services.manifest_execution_snapshot import srw_snapshot_config
+
+        _, policy = srw_snapshot_config(snapshot)
+        vm_options = (policy.get("workspace") or {}).get("vm") or {}
+        network_profile = selected_profile(
+            vm_options.get("image"), prepared=vm_options.get("preparation") is not None
+        )
         await db.execute(
             """INSERT INTO srw_workspace_instances
             (id, owner_id, project_id, recipe, revision, pvc_name, execution_id, generation, backend_state)
@@ -151,7 +160,7 @@ async def reserve(db, snapshot):
             content_revision(recipe),
             storage_name(binding),
             snapshot["id"],
-            json.dumps({"storage": binding}),
+            json.dumps({"storage": binding, **({"network_profile": network_profile} if network_profile else {})}),
         )
     await db.execute(
         "INSERT INTO srw_execution_workspace_bindings(execution_id,instance_id) VALUES($1,$2)",
@@ -161,6 +170,12 @@ async def reserve(db, snapshot):
 
 
 async def provision_binding(db, job_id):
+    authority = await provision_authority(db, job_id)
+    return authority["storage"] if authority else None
+
+
+async def provision_authority(db, job_id):
+    """Return storage and immutable network intent from one instance read."""
     row = await db.fetchrow(
         """SELECT i.*,s.id AS requested_execution FROM srw_execution_specs s
         JOIN srw_execution_workspace_bindings b ON b.execution_id=s.id
@@ -177,7 +192,14 @@ async def provision_binding(db, job_id):
         raise HTTPException(409, "This Job no longer owns its retained workspace.")
     binding = deepcopy(object_value(row["backend_state"])["storage"])
     binding["pvc_uid"] = row["pvc_uid"]
-    return storage_binding(binding)
+    result = {"storage": storage_binding(binding)}
+    state = object_value(row["backend_state"])
+    if "network_profile" in state:
+        from shared.vm_network_profile import validate_network_profile
+
+        validate_network_profile(state["network_profile"])
+        result["network_profile"] = deepcopy(state["network_profile"])
+    return result
 
 
 async def record_created(db, job_id, binding, pvc_uid, *, namespace=None):

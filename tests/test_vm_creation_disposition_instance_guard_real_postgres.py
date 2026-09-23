@@ -1,6 +1,7 @@
 """A frozen no-VM disposition keeps exact instance authority until full settlement."""
 
 from uuid import UUID
+import json
 
 import asyncpg
 import pytest
@@ -19,6 +20,7 @@ from orchestrator.services.vm_creation_disposition_store import (
 )
 from shared.vm_creation_issuance import verify_creation_carrier
 from vm_controller.creation_actuation import CreationActuator
+from shared.vm_network_profile import NETWORK_PROFILE
 
 db, setup, attached = _db_fixture, _setup_fixture, _attached_fixture
 
@@ -85,3 +87,28 @@ async def test_native_instance_release_cannot_bypass_frozen_disposition(
             )
             == before
         )
+
+
+@pytest.mark.asyncio
+async def test_cancelled_disposition_guard_protects_network_profile_even_without_immediate_trigger(
+    db, attached
+):
+    _, _, _, disposition = await frozen_attachment(db, attached)
+    uid = UUID(disposition["workspace_instance_id"])
+    async with db.acquire() as conn:
+        with pytest.raises(asyncpg.CheckViolationError, match="Creation disposition instance remains held"):
+            async with conn.transaction():
+                # Isolate the deferred disposition guard: the ordinary BEFORE
+                # trigger independently rejects this legacy upgrade.
+                await conn.execute(
+                    "ALTER TABLE srw_workspace_instances DISABLE TRIGGER retained_vm_network_profile"
+                )
+                await conn.execute(
+                    "UPDATE srw_workspace_instances SET backend_state=backend_state || $2::jsonb WHERE id=$1",
+                    uid, json.dumps({"network_profile": NETWORK_PROFILE}),
+                )
+                await conn.execute("SET CONSTRAINTS ALL IMMEDIATE")
+    assert await db.fetchval(
+        "SELECT backend_state->'network_profile' FROM srw_workspace_instances WHERE id=$1",
+        uid,
+    ) is None

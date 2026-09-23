@@ -36,7 +36,13 @@ async def discover(conn, job_id):
     if not current:
         return None
     try:
-        binding = storage_binding(_object(current["backend_state"])["storage"])
+        backend_state = _object(current["backend_state"])
+        binding = storage_binding(backend_state["storage"])
+        network_profile = backend_state.get("network_profile")
+        if network_profile is not None:
+            from shared.vm_network_profile import validate_network_profile
+
+            validate_network_profile(network_profile)
     except (ValueError, KeyError, TypeError):
         _refuse()
     if binding["owner_id"] == str(job_id):
@@ -86,11 +92,14 @@ async def discover(conn, job_id):
                         "identity_provision_generation",
                         "identity_authenticated",
                         "vm_uid",
+                        "vmi_uid",
+                        "active_pod_uid",
                         "rootdisk_pvc_uid",
                         "workspace_storage",
                         "retirement_cleanup_pending",
                         "preparation",
                         "preparation_request",
+                        "network_profile_evidence",
                     )
                 }
                 matches.append((item, facts, old["generation"]))
@@ -117,6 +126,7 @@ async def discover(conn, job_id):
     owners = members | {r["parent_job_id"] for r in parents if r["parent_job_id"]}
     return {
         "binding": binding,
+        "network_profile": network_profile,
         "execution_id": str(current["execution_id"]),
         "previous_execution_id": str(prev["execution_id"]),
         "previous_execution_revision": prev["revision"],
@@ -179,6 +189,37 @@ async def prove(conn, *, job_id, binding, scope=None, expected=None, adoption=Fa
         or _object(instance["recipe"]).get("retention") != "Retain"
     ):
         _refuse()
+    profile = discovered["network_profile"]
+    if profile is not None:
+        from shared.vm_creation_retry import canonical_request_digest
+        from shared.vm_network_profile import reusable_profile_evidence
+
+        for identity, vm, original in (
+            (binding["owner_id"], discovered["original_vm"], True),
+            (discovered["previous_job_id"], discovered["previous_vm"], False),
+        ):
+            ledger = await conn.fetchrow(
+                "SELECT canonical_request,request_digest,state,expected_pvc_uid,observed_pvc_uid,observed_vm_uid "
+                "FROM vm_creation_retries WHERE job_id=$1 AND provision_generation=$2 FOR SHARE",
+                UUID(identity), UUID(vm["provision_generation"]),
+            )
+            request = _object(ledger["canonical_request"]) if ledger else {}
+            if (
+                not ledger
+                or ledger["state"] != "succeeded"
+                or str(ledger["observed_pvc_uid"]) != binding["pvc_uid"]
+                or str(ledger["observed_vm_uid"]) != vm["vm_uid"]
+                or (original and ledger["expected_pvc_uid"] is not None)
+                or request.get("network_profile") != profile
+                or canonical_request_digest(request) != ledger["request_digest"]
+                or not reusable_profile_evidence(
+                    vm.get("network_profile_evidence"), profile,
+                    provision_generation=vm["provision_generation"],
+                    vm_uid=vm["vm_uid"], pvc_uid=binding["pvc_uid"],
+                    vmi_uid=vm.get("vmi_uid"), launcher_uid=vm.get("active_pod_uid"),
+                )
+            ):
+                _refuse()
     for identity, vm in (
         (binding["owner_id"], discovered["original_vm"]),
         (discovered["previous_job_id"], discovered["previous_vm"]),

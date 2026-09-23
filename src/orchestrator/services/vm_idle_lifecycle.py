@@ -209,6 +209,98 @@ class VMIdleLifecycleStore:
             try:
                 max_attempts = int(os.getenv("VM_PROVISION_MAX_ATTEMPTS", "3"))
                 raw_request = _object(_object(vm.get("creation_preflight")).get("request"))
+                if raw_request.get("network_profile") is None:
+                    raise VMCreationRetryConflict("retained_network_profile_unproven")
+                if raw_request.get("network_profile") is not None:
+                    from shared.vm_creation_retry import canonical_request_digest
+
+                    ledger = await conn.fetchrow(
+                        "SELECT canonical_request,request_digest,state,provision_generation,observed_pvc_uid,observed_vm_uid "
+                        "FROM vm_creation_retries WHERE job_id=$1 AND provision_generation=$2 FOR SHARE",
+                        owner_id, expected["generation"],
+                    )
+                    if (
+                        not ledger
+                        or ledger["state"] != "succeeded"
+                        or _object(ledger["canonical_request"]) != raw_request
+                        or canonical_request_digest(raw_request) != ledger["request_digest"]
+                        or ledger["observed_pvc_uid"] != expected["pvc_uid"]
+                        or ledger["observed_vm_uid"] != expected["vm_uid"]
+                    ):
+                        raise VMCreationRetryConflict("retained_network_profile_unproven")
+                    chain = await conn.fetch(
+                        "SELECT canonical_request,request_digest,expected_pvc_uid,observed_pvc_uid,state "
+                        "FROM vm_creation_retries WHERE job_id=$1 AND "
+                        "(observed_pvc_uid=$2 OR expected_pvc_uid=$2) "
+                        "ORDER BY created_at,request_id FOR SHARE",
+                        owner_id, expected["pvc_uid"],
+                    )
+                    if (
+                        not chain
+                        or any(
+                            _object(item["canonical_request"]).get("network_profile")
+                            != raw_request["network_profile"]
+                            or canonical_request_digest(_object(item["canonical_request"]))
+                            != item["request_digest"]
+                            for item in chain
+                        )
+                    ):
+                        raise VMCreationRetryConflict("retained_network_profile_unproven")
+                    storage = raw_request.get("workspace_storage")
+                    original_owner = (
+                        UUID(storage["owner_id"]) if storage is not None else owner_id
+                    )
+                    originals = await conn.fetch(
+                        "SELECT canonical_request,request_digest,state,provision_generation,observed_pvc_uid,observed_vm_uid "
+                        "FROM vm_creation_retries WHERE job_id=$1 AND expected_pvc_uid IS NULL "
+                        "AND observed_pvc_uid=$2 ORDER BY created_at,request_id FOR SHARE",
+                        original_owner, expected["pvc_uid"],
+                    )
+                    if (
+                        len(originals) != 1
+                        or originals[0]["state"] != "succeeded"
+                        or _object(originals[0]["canonical_request"]).get("network_profile")
+                        != raw_request["network_profile"]
+                        or canonical_request_digest(_object(originals[0]["canonical_request"]))
+                        != originals[0]["request_digest"]
+                    ):
+                        raise VMCreationRetryConflict("retained_network_profile_unproven")
+                    if storage is not None:
+                        from orchestrator.services.retained_vm_workspaces import provision_authority
+
+                        authority = await provision_authority(conn, job_id)
+                        if (
+                            not authority
+                            or any(
+                                authority["storage"].get(key) != storage.get(key)
+                                for key in ("uid", "generation", "owner_id", "owner_kind")
+                            )
+                            or storage.get("pvc_uid") not in (
+                                None, authority["storage"].get("pvc_uid")
+                            )
+                            or authority["storage"].get("pvc_uid") != str(expected["pvc_uid"])
+                            or authority.get("network_profile") != raw_request["network_profile"]
+                        ):
+                            raise VMCreationRetryConflict("retained_network_profile_unproven")
+                        original_job = await conn.fetchrow(
+                            "SELECT context FROM jobs WHERE id=$1", original_owner
+                        )
+                        original_context = _object(original_job["context"]) if original_job else {}
+                        original_evidence = [
+                            _object(_object(original_context.get(name)).get("network_profile_evidence"))
+                            for name in ("vm", "last_vm")
+                        ]
+                        from shared.vm_network_profile import reusable_profile_evidence
+
+                        if not any(
+                            reusable_profile_evidence(
+                                proof, raw_request["network_profile"],
+                                provision_generation=str(originals[0]["provision_generation"]),
+                                vm_uid=str(originals[0]["observed_vm_uid"]),
+                                pvc_uid=str(expected["pvc_uid"]),
+                            ) for proof in original_evidence
+                        ):
+                            raise VMCreationRetryConflict("retained_network_profile_unproven")
                 current_storage = None
                 if raw_request.get("workspace_storage") is not None:
                     from orchestrator.services.retained_vm_workspaces import provision_binding

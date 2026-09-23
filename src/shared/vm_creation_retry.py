@@ -45,6 +45,7 @@ _CREATE_OPTION_FIELDS = frozenset(
         "workspace_storage",
         "preparation",
         "initialization",
+        "network_profile",
     }
 )
 _SENSITIVE_KEY_SUFFIXES = (
@@ -204,6 +205,10 @@ def canonical_request_digest(options: Mapping[str, object]) -> str:
     if not isinstance(options, Mapping) or set(options) - _CREATE_OPTION_FIELDS:
         raise ValueError("Unsupported unsigned create options.")
     snapshot = dict(options)
+    if "network_profile" in snapshot:
+        from shared.vm_network_profile import validate_network_profile
+
+        validate_network_profile(snapshot["network_profile"])
     _validate_json(snapshot)
     try:
         encoded = json.dumps(

@@ -33,7 +33,7 @@ attached = _attached_fixture
 db = _db_fixture
 
 
-async def inherited(db, *, length=2):
+async def inherited(db, *, length=2, network_profile=False, original_profile=True):
     jobs = [await initial_job(db) for _ in range(length)]
     binding = {
         "uid": str(uuid4()),
@@ -43,11 +43,18 @@ async def inherited(db, *, length=2):
         "owner_id": str(jobs[0]),
     }
     request, fresh = candidate(jobs[-1], workspace_storage=binding)
+    if network_profile:
+        from shared.vm_network_profile import NETWORK_PROFILE
+
+        request["network_profile"] = dict(NETWORK_PROFILE)
+        request["vm_image"] = "registry.example/srw-vm@sha256:" + "a" * 64
     async with db.acquire() as conn:
         execution = await conn.fetchval(
             "SELECT id FROM srw_execution_specs WHERE work_id=$1", jobs[-1]
         )
     await seed_instance(db, {"execution_id": execution}, request)
+    if network_profile:
+        request.pop("network_profile")  # preflight must inherit the instance's intent
     history = []
     async with db.acquire() as conn:
         for number, job in enumerate(jobs[:-1], 1):
@@ -61,6 +68,20 @@ async def inherited(db, *, length=2):
                 "rootdisk_pvc_uid": binding["pvc_uid"],
                 "workspace_storage": {**binding, "generation": number},
             }
+            if network_profile:
+                vm["network_profile_evidence"] = {
+                    "profile": NETWORK_PROFILE,
+                    "provision_generation": generation,
+                    "vm_uid": vm_uid,
+                    "pvc_uid": binding["pvc_uid"],
+                    "vmi_uid": str(uuid4()),
+                    "launcher_uid": str(uuid4()),
+                    "guest_boot_id": str(uuid4()),
+                    "cloud_init_instance_id": "i-profiled-retained",
+                    "cloud_init_cached_instance_id": "i-profiled-retained",
+                    "network_file_sha256": "b" * 64,
+                    "name_only_dhcp": True,
+                }
             await conn.execute(
                 "UPDATE jobs SET status='completed',context=$2::jsonb WHERE id=$1",
                 job,
@@ -124,7 +145,68 @@ async def inherited(db, *, length=2):
                     "detach": ids[1],
                 }
             )
+            if network_profile:
+                from orchestrator.services.vm_creation_request import build_vm_creation_request
+                from shared.vm_creation_retry import canonical_request_digest
+
+                prior_storage = {
+                    **binding,
+                    "generation": number,
+                    "pvc_uid": None if number == 1 else binding["pvc_uid"],
+                }
+                prior_request = build_vm_creation_request(
+                    job_id=str(job), provision_generation=generation,
+                    agent_config="worker_base", vm_image="registry.example/srw-vm@sha256:" + "a" * 64,
+                    cpu_cores=2, memory="2Gi", description="initial",
+                    network_tier="restricted", workspace_storage=prior_storage,
+                    **({"network_profile": NETWORK_PROFILE}
+                       if number != 1 or original_profile else {}),
+                )
+                await conn.execute(
+                    "INSERT INTO vm_creation_retries "
+                    "(request_id,job_id,provision_generation,origin,request_digest,canonical_request,"
+                    "controller_configuration_digest,execution_id,execution_revision,execution_generation,"
+                    "admission_deadline,expected_pvc_uid,creation_admission_id,state,observed_vm_uid,observed_pvc_uid,resolved_at) "
+                    "VALUES($1,$2,$3,'initial',$4,$5::jsonb,$6,$7,'revision-1',1,"
+                    "clock_timestamp()+interval '1 hour',$8,$9,'succeeded',$10,$11,clock_timestamp())",
+                    uuid4(), job, UUID(generation), canonical_request_digest(prior_request),
+                    json.dumps(prior_request), "sha256:" + "a" * 64,
+                    previous_execution,
+                    None if number == 1 else UUID(binding["pvc_uid"]),
+                    ids[0], UUID(vm_uid), UUID(binding["pvc_uid"]),
+                )
     return jobs, request, fresh, history
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("original_profile", [True, False])
+async def test_profiled_retained_handoff_uses_original_immutable_lineage(
+    db, original_profile,
+):
+    from shared.vm_network_profile import NETWORK_PROFILE
+
+    jobs, request, fresh, _ = await inherited(
+        db, network_profile=True, original_profile=original_profile,
+    )
+    store = VMCreationPreflightStore(db)
+    if not original_profile:
+        with pytest.raises(VMCreationRetryConflict, match="lineage_unproven"):
+            await store.begin(job_id=str(jobs[-1]), request=request, fresh_context=fresh)
+        return
+    frozen = await store.begin(job_id=str(jobs[-1]), request=request, fresh_context=fresh)
+    assert frozen["request"]["network_profile"] == NETWORK_PROFILE
+    assert frozen["request"]["workspace_storage"] == request["workspace_storage"]
+    assert "network_profile" not in request
+
+
+@pytest.mark.asyncio
+async def test_profiled_retained_handoff_refuses_changed_original_image(db):
+    jobs, request, fresh, _ = await inherited(db, network_profile=True)
+    request["vm_image"] = "registry.example/other@sha256:" + "b" * 64
+    with pytest.raises(VMCreationRetryConflict, match="source_changed"):
+        await VMCreationPreflightStore(db).begin(
+            job_id=str(jobs[-1]), request=request, fresh_context=fresh,
+        )
 
 
 @pytest.mark.asyncio

@@ -34,7 +34,11 @@ async def seed_instance(db, row, request):
             binding["pvc_uid"],
             binding["generation"],
             row["execution_id"],
-            json.dumps({"storage": binding}),
+            json.dumps({
+                "storage": binding,
+                **({"network_profile": request["network_profile"]}
+                   if "network_profile" in request else {}),
+            }),
         )
         await conn.execute(
             "INSERT INTO srw_execution_workspace_bindings(execution_id,instance_id) VALUES($1,$2)",

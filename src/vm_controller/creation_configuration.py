@@ -75,6 +75,19 @@ def resolve_creation_configuration(
         or payload["cpu_cores"] < 1
     ):
         raise ValueError("Invalid resolved create options")
+    if "network_profile" in payload:
+        from shared.vm_network_profile import (
+            NETWORK_PROFILE,
+            compatible_image,
+            validate_network_profile,
+        )
+
+        validate_network_profile(payload["network_profile"])
+        if (
+            not compatible_image(payload["vm_image"])
+            or payload.get("preparation") is not None
+        ):
+            raise ValueError("VM network profile source is not admitted")
     if payload.get("workspace_storage") is not None:
         from shared.vm_creation_lineage import disk_owner
 
@@ -151,6 +164,12 @@ def resolve_creation_configuration(
         "golden_disk_size": settings.VM_GOLDEN_DISK_SIZE,
         "preparation": asdict(preparation_settings),
     }
+    if "network_profile" in payload:
+        configuration["network_profile_policy"] = {
+            "version": 1,
+            "image": payload["vm_image"],
+            "profile": dict(NETWORK_PROFILE),
+        }
     # JSON-normalize tuple settings before credential validation. No credential
     # values, generated guest tokens or rendered cloud-init enter this document.
     configuration = json.loads(json.dumps(configuration))

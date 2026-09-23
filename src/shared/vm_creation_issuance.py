@@ -53,6 +53,21 @@ def validate_rootdisk_source(source, *, request, configuration, expected_pvc_uid
     """Validate complete typed clone input against immutable admitted semantics."""
     if not isinstance(source, Mapping):
         raise ValueError("Rootdisk source is unproven")
+    if "network_profile" in request:
+        from shared.vm_network_profile import NETWORK_PROFILE, compatible_image
+
+        if (
+            request["network_profile"] != NETWORK_PROFILE
+            or configuration.get("network_profile_policy") != {
+                "version": 1,
+                "image": request["vm_image"],
+                "profile": NETWORK_PROFILE,
+            }
+            or not compatible_image(request["vm_image"], allowlist=request["vm_image"])
+            or source.get("kind") not in {"registry", "golden", "retained"}
+            or request.get("preparation") is not None
+        ):
+            raise ValueError("Rootdisk network profile source is unproven")
     if request.get("preparation") is not None:
         if "inherited_origin" in source:
             from shared.vm_inherited_preparation import validate_inherited_source
@@ -470,7 +485,8 @@ def validate_prepared_vm_metadata(source, obj):
 
 
 def public_effect_observation(
-    values, carrier, observation, *, rootdisk=None, cloud_init=None
+    values, carrier, observation, *, rootdisk=None, cloud_init=None,
+    network_profile=None,
 ):
     """Extract exact public identities; never persist Secret data or API errors.
 
@@ -662,6 +678,15 @@ def public_effect_observation(
                 != cloud_init["name"]
             ):
                 raise ValueError("VM does not reference the admitted cloud-init Secret")
+            if network_profile is not None:
+                from shared.vm_network_profile import NETWORK_DATA, validate_network_profile
+
+                validate_network_profile(network_profile)
+                if cloud_volumes[0] != {
+                    "secretRef": {"name": cloud_init["name"]},
+                    "networkData": NETWORK_DATA,
+                }:
+                    raise ValueError("Observed VM network profile changed")
             result["cloud_init_uid"] = cloud_init["uid"]
             result["ssh_host_key_fingerprint"] = cloud_init["ssh_host_key_fingerprint"]
             result["pvc_uid"] = rootdisk["pvc_uid"]
@@ -709,6 +734,7 @@ def canonical_configuration_digest(configuration):
         != (
             _CONFIGURATION_FIELDS
             | ({"resource_admission"} if configuration["version"] == 2 else set())
+            | ({"network_profile_policy"} if "network_profile_policy" in configuration else set())
         )
     ):
         raise ValueError("Effective controller configuration is incomplete")
@@ -723,6 +749,18 @@ def canonical_configuration_digest(configuration):
         ):
             raise ValueError("Controller configuration identity is invalid")
     _validate_json(configuration)
+    if "network_profile_policy" in configuration:
+        from shared.vm_network_profile import NETWORK_PROFILE, compatible_image
+
+        policy = configuration["network_profile_policy"]
+        if (
+            not isinstance(policy, dict)
+            or set(policy) != {"version", "image", "profile"}
+            or policy["version"] != 1
+            or policy["profile"] != NETWORK_PROFILE
+            or not compatible_image(policy["image"], allowlist=policy["image"])
+        ):
+            raise ValueError("Unsupported VM network profile policy")
     if configuration["version"] == 2:
         from shared.vm_resource_configuration import validate_resource_configuration
 

@@ -126,6 +126,20 @@ def _contract(template_text, request, configuration, effect_intent, kind):
         configuration=configuration,
         expected_pvc_uid=values["expected_pvc_uid"],
     )
+    from shared.vm_network_profile import NETWORK_PROFILE
+
+    if "network_profile" in request:
+        if (
+            request["network_profile"] != NETWORK_PROFILE
+            or configuration.get("network_profile_policy") != {
+                "version": 1,
+                "image": request["vm_image"],
+                "profile": NETWORK_PROFILE,
+            }
+        ):
+            raise ValueError
+    elif "network_profile_policy" in configuration:
+        raise ValueError
     binding = request.get("workspace_storage")
     if binding is not None:
         binding = storage_binding(binding)
@@ -235,6 +249,10 @@ def validate_final_vm_manifest(
                 },
             },
         ]
+        if "network_profile" in request:
+            from shared.vm_network_profile import NETWORK_DATA
+
+            vmi["volumes"][1]["cloudInitNoCloud"]["networkData"] = NETWORK_DATA
         expected = {
             "apiVersion": "kubevirt.io/v1",
             "kind": "VirtualMachine",

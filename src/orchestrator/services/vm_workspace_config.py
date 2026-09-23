@@ -60,13 +60,16 @@ async def vm_provisioning_options(store, work_kind: str, work: dict, *, fallback
             or selection.get("template", {}).get("inline", {}).get("retention")
             == "Retain"
         ):
-            from orchestrator.services.retained_vm_workspaces import provision_binding
+            from orchestrator.services.retained_vm_workspaces import provision_authority
 
-            options["workspace_storage"] = await provision_binding(
+            authority = await provision_authority(
                 store, str(work["id"])
             )
-            if options["workspace_storage"] is None:
+            if authority is None:
                 raise HTTPException(
                     409, "Retained workspace reservation is unavailable."
                 )
+            options["workspace_storage"] = authority["storage"]
+            if "network_profile" in authority:
+                options["network_profile"] = authority["network_profile"]
     return options

@@ -1377,6 +1377,10 @@ spec:
                   name: {{ include "srw.configMapName" . }}
                   key: VM_PERSISTENT_ROOTDISK
                   optional: true
+            - name: VM_NETWORK_PROFILE_ENABLED
+              value: {{ .Values.vmController.networkProfile.enabled | default false | quote }}
+            - name: VM_NETWORK_PROFILE_IMAGE_ALLOWLIST
+              value: {{ join "," (.Values.vmController.networkProfile.imageAllowlist | default list) | quote }}
             # Admission must see the same capabilities as the VM controller.
             {{- range $key, $_ := (include "srw.vmPreparationEnvironment" . | fromYaml) }}
             - name: {{ $key }}

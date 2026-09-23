@@ -302,6 +302,7 @@ class CreationActuator:
             result,
             rootdisk=disk_evidence,
             cloud_init=secret_evidence,
+            network_profile=row["request"].get("network_profile"),
         )
         return result
 
@@ -324,6 +325,7 @@ class CreationActuator:
                 observation,
                 rootdisk=prior.get("rootdisk"),
                 cloud_init=prior.get("cloud_init"),
+                network_profile=row["request"].get("network_profile"),
             )
             if actual != effect["evidence"]:
                 raise CreationUnproven("creation_observed_object_changed")
@@ -757,6 +759,18 @@ class CreationActuator:
                 kind != "workspace_attach" and row.get("prepared_origin") is not None
             ):
                 await sources.validate(row, rootdisk_source)
+            if kind == "vm" and row["request"].get("network_profile") is not None:
+                if row["controller_configuration"]["version"] != 2:
+                    raise CreationUnproven("creation_network_profile_unproven")
+                from shared.vm_resource_manifest import validate_final_vm_manifest
+
+                validate_final_vm_manifest(
+                    body,
+                    template_text=self.controller.template_text,
+                    request=row["request"],
+                    configuration=row["controller_configuration"],
+                    effect_intent=values,
+                )
             grant = await self.authority(
                 "begin-effect",
                 request_id=row["request_id"],

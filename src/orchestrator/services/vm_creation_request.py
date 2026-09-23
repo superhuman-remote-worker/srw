@@ -25,6 +25,7 @@ def build_vm_creation_request(
     initialization: dict | None = None,
     workspace_storage: dict | None = None,
     preparation: dict | None = None,
+    network_profile: dict | None = None,
 ) -> dict:
     """Build the existing unsigned HTTP shape without resolving controller defaults."""
     payload = {
@@ -55,6 +56,11 @@ def build_vm_creation_request(
         from shared.workspace_initialization import validate_initialization_request
 
         payload["initialization"] = validate_initialization_request(initialization)
+    if network_profile is not None:
+        from shared.vm_network_profile import validate_network_profile
+
+        validate_network_profile(network_profile)
+        payload["network_profile"] = deepcopy(network_profile)
     return deepcopy(payload)
 
 

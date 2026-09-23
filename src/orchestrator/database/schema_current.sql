@@ -7434,6 +7434,32 @@ $$;
 
 
 --
+-- Name: guard_retained_vm_network_profile(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.guard_retained_vm_network_profile() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+DECLARE profile jsonb;
+BEGIN
+    profile := NEW.backend_state->'network_profile';
+    IF profile IS NOT NULL AND profile IS DISTINCT FROM jsonb_build_object(
+        'version', 1,
+        'kind', 'nocloud-dhcp-by-interface-name',
+        'interface', 'enp1s0',
+        'network_data_sha256', 'sha256:dcad9787224fe834481f60286fbca4dd66eecc9fe05ec6db2acae0bbf22b2e6a'
+    ) THEN
+        RAISE EXCEPTION 'Unsupported retained VM network profile' USING ERRCODE='23514';
+    END IF;
+    IF TG_OP='UPDATE' AND profile IS DISTINCT FROM OLD.backend_state->'network_profile' THEN
+        RAISE EXCEPTION 'Retained VM network profile is immutable' USING ERRCODE='23514';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
 -- Name: guard_vm_creation_carrier_identity(); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -7554,8 +7580,10 @@ BEGIN
     SELECT * INTO retry FROM public.vm_creation_retries r
         WHERE r.cancellation_disposition->>'workspace_instance_id'=NEW.id::text;
     IF ROW(current_instance.status,current_instance.execution_id,current_instance.generation,
-           current_instance.pvc_name,current_instance.pvc_uid,current_instance.backend_state->'storage')
-       IS DISTINCT FROM ROW(OLD.status,OLD.execution_id,OLD.generation,OLD.pvc_name,OLD.pvc_uid,OLD.backend_state->'storage')
+           current_instance.pvc_name,current_instance.pvc_uid,current_instance.backend_state->'storage',
+           current_instance.backend_state->'network_profile')
+       IS DISTINCT FROM ROW(OLD.status,OLD.execution_id,OLD.generation,OLD.pvc_name,OLD.pvc_uid,
+                            OLD.backend_state->'storage',OLD.backend_state->'network_profile')
        AND FOUND AND retry.state='cancel_requested' THEN
         RAISE EXCEPTION 'Creation disposition instance remains held' USING ERRCODE='23514';
     END IF;
@@ -27577,6 +27605,13 @@ CREATE TRIGGER resource_publication_plans_frozen_intent BEFORE DELETE OR UPDATE 
 --
 
 CREATE CONSTRAINT TRIGGER resource_publication_plans_manifest_complete AFTER INSERT ON public.resource_publication_plans DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION public.validate_resource_publication_plan_manifest();
+
+
+--
+-- Name: srw_workspace_instances retained_vm_network_profile; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER retained_vm_network_profile BEFORE INSERT OR UPDATE OF backend_state ON public.srw_workspace_instances FOR EACH ROW EXECUTE FUNCTION public.guard_retained_vm_network_profile();
 
 
 --

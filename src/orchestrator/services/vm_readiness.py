@@ -63,7 +63,8 @@ def _machine_identity(value: object) -> str | None:
 
 
 def _complete_recovery_network(
-    value: object, *, challenge: str, expected_mac: str
+    value: object, *, challenge: str, expected_mac: str,
+    network_profile: object = None,
 ) -> bool:
     if not isinstance(value, Mapping):
         return False
@@ -104,6 +105,32 @@ def _complete_recovery_network(
         or value.get("cloud_init_cache_cleaned") is not False
     ):
         return False
+    if network_profile is not None:
+        from shared.vm_network_profile import validate_network_profile
+
+        try:
+            validate_network_profile(network_profile)
+        except ValueError:
+            return False
+        rule = value.get("network_profile_rule")
+        if (
+            not isinstance(rule, Mapping)
+            or set(rule) != {"kind", "interface", "name_only_dhcp", "network_file_sha256"}
+            or rule["kind"] != "networkd-name-dhcp-v1"
+            or rule["interface"] != "enp1s0"
+            or rule["name_only_dhcp"] is not True
+            or not isinstance(rule["network_file_sha256"], str)
+            or rule["network_file_sha256"] not in networkd.values()
+            or value.get("cloud_init_cached_instance_id") != value.get("cloud_init_instance_id")
+            or sum(
+                1 for item in interfaces
+                if isinstance(item, Mapping)
+                and item.get("ifname") == "enp1s0"
+                and item.get("mac") == expected_mac
+                and item.get("address") == value.get("address")
+            ) != 1
+        ):
+            return False
     return all(
         isinstance(path, str)
         and bool(path)
@@ -115,7 +142,8 @@ def _complete_recovery_network(
 
 
 async def qualify_recovery_successor(
-    successor: Mapping[str, Any], *, host_key_fingerprint: str
+    successor: Mapping[str, Any], *, host_key_fingerprint: str,
+    network_profile: object = None,
 ) -> dict[str, Any] | None:
     """Read-only pinned-SSH qualification for a controller-observed successor."""
 
@@ -146,7 +174,11 @@ async def qualify_recovery_successor(
         async with pinned_agent_ssh_command(
             pod_ip,
             22,
-            "/usr/local/bin/srw-network-qualification " + shlex.quote(challenge),
+            (
+                "/usr/local/bin/srw-network-profile-qualification "
+                if network_profile is not None
+                else "/usr/local/bin/srw-network-qualification "
+            ) + shlex.quote(challenge),
             expected_host_key_fingerprint=host_key_fingerprint,
             key_path=resolve_ssh_key_path(),
             connect_timeout_s=10,
@@ -167,7 +199,8 @@ async def qualify_recovery_successor(
     except Exception:
         return None
     if not _complete_recovery_network(
-        network, challenge=challenge, expected_mac=interface_mac
+        network, challenge=challenge, expected_mac=interface_mac,
+        network_profile=network_profile,
     ):
         return None
     return {
@@ -452,6 +485,10 @@ class VMReadinessService:
             return
 
         host_key_fingerprint = vm.get("ssh_host_key_fingerprint")
+        frozen_request = _vm_object(_vm_object(vm.get("creation_preflight")).get("request"))
+        network_profile = (
+            frozen_request.get("network_profile") if entity_type == "job" else None
+        )
         if not isinstance(host_key_fingerprint, str) or not host_key_fingerprint:
             await self._transient_failure(
                 key,
@@ -507,7 +544,7 @@ class VMReadinessService:
                 reprobe=reprobe,
             )
             return
-        if unchanged_ready_identity:
+        if unchanged_ready_identity and network_profile is None:
             if vm.get("initialization") is None:
                 return
             from shared.workspace_initialization import (
@@ -572,6 +609,59 @@ class VMReadinessService:
                 reprobe=False,
             )
             return
+
+        network_profile_evidence = None
+        if network_profile is not None:
+            from shared.vm_network_profile import validate_network_profile
+
+            try:
+                validate_network_profile(network_profile)
+            except ValueError:
+                return
+            if (
+                status.get("vm_uid") != initial_attestation.vm_uid
+                or status.get("rootdisk_pvc_uid") != initial_attestation.rootdisk_pvc_uid
+                or status.get("vmi_uid") != initial_attestation.vmi_uid
+                or status.get("active_pod_uid") != initial_attestation.runtime_incarnation
+                or initial_attestation.workspace_generation != generation
+                or initial_attestation.rootdisk_pvc_uid is None
+            ):
+                await self._transient_failure(
+                    key, entity_type, entity_id, generation, vm,
+                    "VM network profile runtime identity changed", reprobe=False,
+                )
+                return
+            qualified = await qualify_recovery_successor(
+                {
+                    "pod_ip": pod_ip,
+                    "vmi_uid": status["vmi_uid"],
+                    "launcher_uid": active_pod_uid,
+                    "interface_mac": status.get("interface_mac"),
+                },
+                host_key_fingerprint=host_key_fingerprint,
+                network_profile=network_profile,
+            )
+            if qualified is None:
+                await self._transient_failure(
+                    key, entity_type, entity_id, generation, vm,
+                    "VM network profile rule or guest network is unproven",
+                    reprobe=False,
+                )
+                return
+            guest_network = qualified["guest_network"]
+            network_profile_evidence = {
+                "profile": network_profile,
+                "provision_generation": generation,
+                "vm_uid": initial_attestation.vm_uid,
+                "pvc_uid": initial_attestation.rootdisk_pvc_uid,
+                "vmi_uid": initial_attestation.vmi_uid,
+                "launcher_uid": initial_attestation.runtime_incarnation,
+                "guest_boot_id": qualified["guest_boot_id"],
+                "cloud_init_instance_id": guest_network["cloud_init_instance_id"],
+                "cloud_init_cached_instance_id": guest_network["cloud_init_cached_instance_id"],
+                "network_file_sha256": guest_network["network_profile_rule"]["network_file_sha256"],
+                "name_only_dhcp": True,
+            }
 
         async def mutation_authority() -> tuple[str, int, str] | None:
             """Re-prove the exact launcher immediately before each SSH write."""
@@ -726,6 +816,8 @@ class VMReadinessService:
             "ssh_probe_error": None,
             "recovering": False,
         }
+        if network_profile_evidence is not None:
+            ready_updates["network_profile_evidence"] = network_profile_evidence
         if (
             entity_type == "job"
             and getattr(self._db, "supports_vm_phase_observations", False) is True

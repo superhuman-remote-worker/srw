@@ -3587,6 +3587,11 @@ vm:
 #   - Nodes with hardware virtualization (vmx/svm) and KubeVirt feature gates
 #
 vmController:
+  # -- Opt in only for immutable clean single-NIC VM images whose network
+  # behavior has been verified by the operator. Existing disks are not upgraded.
+  networkProfile:
+    enabled: false
+    imageAllowlist: []
   # -- DEPRECATED one-release alias. true resolves vm.mode=off to same-cluster.
   enabled: false
   # -- DEPRECATED one-release alias. Same-cluster transport is always HTTP.

@@ -1285,6 +1285,7 @@ class VMCreationRetryStore:
                     observation,
                     rootdisk=_json(rootdisk),
                     cloud_init=_json(cloud_init),
+                    network_profile=row["canonical_request"].get("network_profile"),
                 )
                 state = "rejected" if evidence["outcome"] == "rejected" else "observed"
                 if effect["state"] != "issued":
@@ -1441,6 +1442,7 @@ class VMCreationRetryStore:
                         observations[kind],
                         rootdisk=proven.get("rootdisk"),
                         cloud_init=proven.get("cloud_init"),
+                        network_profile=row["canonical_request"].get("network_profile"),
                     )
                     if actual != _json(effect["evidence"]):
                         raise VMCreationRetryConflict(
