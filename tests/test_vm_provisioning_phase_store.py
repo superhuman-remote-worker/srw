@@ -474,6 +474,204 @@ async def test_authenticated_transport_persists_phase_and_identity_in_one_guard(
 
 
 @pytest.mark.asyncio
+async def test_authenticated_first_vmi_binding_reaches_exact_runtime_attestation(
+    db, monkeypatch
+):
+    """Catch a signed VMI that reaches phase history but not runtime authority."""
+    job, generation = await seed(db)
+    vmi_uid, launcher_uid, registration = (str(uuid4()) for _ in range(3))
+    fingerprint = "SHA256:" + "A" * 43
+    observed = status(job, generation, boot=True, vmi_uid=vmi_uid)
+    observed.update(
+        vmi_uid=vmi_uid,
+        ready=True,
+        active_pod_uid=launcher_uid,
+        pod_ip="10.42.0.90",
+        ssh_host_key_fingerprint=fingerprint,
+        credential_runtime_started=True,
+    )
+
+    async def reply(_request):
+        return observed
+
+    provisioner = await provisioner_with_response(db, monkeypatch, reply)
+    try:
+        assert await provisioner.query_status(job) is not None
+        stored = await vm_context(db, job)
+        assert stored["provisioning"]["identity"]["vmi_uid"] == vmi_uid
+        assert stored["vmi_uid"] == vmi_uid
+        assert await db.merge_vm_context_if_provision_generation(
+            job,
+            generation,
+            {
+                "active_pod_uid": launcher_uid,
+                "ssh_registration_id": registration,
+                "ssh_host": "10.42.0.90",
+                "pod_ip": "10.42.0.90",
+                "ssh_port": 22,
+            },
+        )
+        attested = await provisioner.attest_workspace_runtime(job)
+        assert attested.vmi_uid == vmi_uid
+        assert attested.launcher_pod_uid == launcher_uid
+    finally:
+        await provisioner._http_client.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "case", ["outer_nested", "previous_bound", "identity_updates", "malformed"]
+)
+async def test_phase_store_refuses_unmatched_vmi_identity_without_rebinding(db, case):
+    """A phase reply cannot bind a VMI distinct from its phase/old identity."""
+    previous = str(uuid4()) if case == "previous_bound" else None
+    job, generation = await seed(
+        db, vm_fields={"vmi_uid": previous} if previous else None
+    )
+    reply = status(job, generation, boot=True, vmi_uid=str(uuid4()))
+    reply["vmi_uid"] = reply["provisioning"]["vmi_uid"]
+    updates = {"vmi_uid": reply["vmi_uid"]}
+    if case == "outer_nested":
+        reply["vmi_uid"] = str(uuid4())
+        updates["vmi_uid"] = reply["vmi_uid"]
+    elif case == "identity_updates":
+        updates["vmi_uid"] = str(uuid4())
+    elif case == "malformed":
+        reply["vmi_uid"] = "malformed-vmi"
+        updates = {}
+    result = await VMProvisioningPhaseStore(db).apply_status(
+        await VMProvisioningPhaseStore(db).capture(job, generation),
+        reply,
+        identity_updates=updates,
+    )
+    assert result in {"conflict", "held"}
+    stored = await vm_context(db, job)
+    assert stored.get("vmi_uid") == previous
+
+
+@pytest.mark.asyncio
+async def test_phase_store_pending_or_missing_vmi_never_clears_known_binding(db):
+    job, generation = await seed(db)
+    store = VMProvisioningPhaseStore(db)
+    pending = status(job, generation)
+    pending["vmi_uid"] = None
+    assert (
+        await store.apply_status(await store.capture(job, generation), pending)
+        == "observed"
+    )
+    assert (await vm_context(db, job)).get("vmi_uid") is None
+    bound = status(job, generation, boot=True, vmi_uid=str(uuid4()))
+    bound["vmi_uid"] = bound["provisioning"]["vmi_uid"]
+    assert (
+        await store.apply_status(await store.capture(job, generation), bound)
+        == "observed"
+    )
+    identity = (await vm_context(db, job))["vmi_uid"]
+    assert (
+        await store.apply_status(await store.capture(job, generation), bound)
+        == "observed"
+    )
+    missing = dict(bound)
+    missing.pop("vmi_uid")
+    assert (
+        await store.apply_status(await store.capture(job, generation), missing)
+        == "observed"
+    )
+    assert (await vm_context(db, job))["vmi_uid"] == identity
+
+
+@pytest.mark.asyncio
+async def test_unproven_legacy_phase_reply_keeps_matching_bound_vmi(db):
+    """Missing phase evidence remains unproven without rewriting old identity."""
+    vmi_uid = str(uuid4())
+    job, generation = await seed(db, vm_fields={"vmi_uid": vmi_uid})
+    reply = status(job, generation, boot=True, vmi_uid=vmi_uid)
+    reply["vmi_uid"] = vmi_uid
+    reply.pop("provisioning")
+    store = VMProvisioningPhaseStore(db)
+    assert (
+        await store.apply_status(await store.capture(job, generation), reply)
+        == "unproven"
+    )
+    stored = await vm_context(db, job)
+    assert stored["vmi_uid"] == vmi_uid
+    assert stored["provisioning_attention_reason"] == "vm_phase_unproven"
+
+
+@pytest.mark.asyncio
+async def test_authenticated_vmi_binding_allows_real_profile_ready_promotion(
+    db, monkeypatch
+):
+    """Use the real signed status, PG phase store and attestation before Ready."""
+    from unittest.mock import AsyncMock
+
+    from orchestrator.services.vm_readiness import VMReadinessService
+    from shared.vm_network_profile import NETWORK_PROFILE
+
+    job, generation = await seed(
+        db,
+        vm_fields={
+            "creation_preflight": {"request": {"network_profile": NETWORK_PROFILE}}
+        },
+    )
+    vmi_uid, launcher_uid = str(uuid4()), str(uuid4())
+    fingerprint = "SHA256:" + "A" * 43
+    observed = status(job, generation, boot=True, vmi_uid=vmi_uid)
+    observed.update(
+        vmi_uid=vmi_uid,
+        ready=True,
+        phase="Running",
+        active_pod_uid=launcher_uid,
+        pod_ip="10.42.0.90",
+        interface_mac="02:00:00:00:00:41",
+        ssh_host_key_fingerprint=fingerprint,
+        credential_runtime_started=True,
+    )
+
+    async def reply(_request):
+        return observed
+
+    provisioner = await provisioner_with_response(db, monkeypatch, reply)
+    monkeypatch.setattr(
+        "orchestrator.services.vm_readiness.wait_for_agent_ssh",
+        AsyncMock(return_value=(True, 1, None)),
+    )
+    qualifier = AsyncMock(
+        return_value={
+            "guest_boot_id": str(uuid4()),
+            "guest_network": {
+                "cloud_init_instance_id": "instance-one",
+                "cloud_init_cached_instance_id": "instance-one",
+                "network_profile_rule": {"network_file_sha256": "a" * 64},
+            },
+        }
+    )
+    monkeypatch.setattr(
+        "orchestrator.services.vm_readiness.qualify_recovery_successor", qualifier
+    )
+    try:
+        # The first signed status poll persists the admitted SSH pin. The next
+        # readiness scan consumes that stored pin, as in the live boot loop.
+        assert await provisioner.query_status(job) is not None
+        await VMReadinessService(db, provisioner, trigger_dispatch=lambda: None)._probe(
+            "job",
+            job,
+            generation,
+            await vm_context(db, job),
+            {"user_id": None},
+            False,
+        )
+        stored = await vm_context(db, job)
+        assert stored["status"] == "ready", stored.get("ssh_probe_error")
+        assert stored["vmi_uid"] == vmi_uid
+        assert stored["network_profile_evidence"]["vmi_uid"] == vmi_uid
+        assert stored["network_profile_evidence"]["launcher_uid"] == launcher_uid
+        assert qualifier.await_args.kwargs["network_profile"] == NETWORK_PROFILE
+    finally:
+        await provisioner._http_client.aclose()
+
+
+@pytest.mark.asyncio
 async def test_query_captures_revision_before_io_and_withholds_stale_reply(
     db, monkeypatch
 ):
