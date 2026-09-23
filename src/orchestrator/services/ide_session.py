@@ -2815,3 +2815,30 @@ class IdeSessionService:
 
 # Module-level singleton
 ide_session_service = IdeSessionService()
+
+
+async def ide_session_ttl_sweeper(
+    shutdown_event: asyncio.Event, *, ide_sessions: IdeSessionService
+) -> None:
+    """Background task that expires IDE sessions past their TTL.
+
+    Runs every 60 seconds. Checks active/idle sessions for:
+    - Max lifetime exceeded (default: 4 hours)
+    - Idle timeout exceeded (default: 30 minutes, only for 'idle' status)
+    """
+    logger.info("IDE session TTL sweeper started")
+    while not shutdown_event.is_set():
+        try:
+            expired = await ide_sessions.check_ttl_all()
+            if expired:
+                logger.info("IDE session sweeper: expired %d sessions", expired)
+        except Exception as e:
+            logger.error("Error in IDE session TTL sweeper: %s", e)
+
+        try:
+            await asyncio.wait_for(shutdown_event.wait(), timeout=60.0)
+            break
+        except asyncio.TimeoutError:
+            pass
+
+    logger.info("IDE session TTL sweeper stopped")

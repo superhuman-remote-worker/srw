@@ -3,6 +3,7 @@ import asyncio
 import logging
 import pathlib
 import re
+from unittest.mock import MagicMock
 from uuid import UUID
 
 import pytest
@@ -375,25 +376,30 @@ async def test_prune_returns_zero_when_fetchval_is_none():
 # =============================================================================
 #
 # The loop body (the actual prune call) is exercised above through
-# PostgresDB.prune_ssh_attachments directly; running the sweeper's own loop
-# would mean standing up postgres_db for real. What's cheap to prove without
-# that is the sweeper's env-var default resolution: pre-setting shutdown_event
-# before the call makes ``while not shutdown_event.is_set()`` false on its
-# first check, so the loop body -- and the only DB access in this function --
-# never executes. Only the two log lines bracketing it fire, and the first one
-# names the defaults it resolved.
+# PostgresDB.prune_ssh_attachments directly, and end to end against real
+# PostgreSQL in test_b11_periodic_loops.py. What's cheap to prove here is the
+# sweeper's env-var default resolution: pre-setting shutdown_event before the
+# call makes ``while not shutdown_event.is_set()`` false on its first check, so
+# the loop body -- and the only access to the injected store -- never
+# executes. Only the two log lines bracketing it fire, and the first one names
+# the defaults it resolved. (R1.B11 moved the sweeper out of main into
+# services/retention_sweepers.py; it takes the store as a keyword parameter.)
 
 
 @pytest.mark.asyncio
 async def test_sweeper_logs_default_interval_and_retention(caplog, monkeypatch):
     monkeypatch.delenv("SSH_ATTACHMENTS_PRUNE_INTERVAL_S", raising=False)
     monkeypatch.delenv("SSH_ATTACHMENTS_RETENTION_DAYS", raising=False)
-    from orchestrator.main import ssh_attachments_prune_sweeper
+    from orchestrator.services.retention_sweepers import (
+        ssh_attachments_prune_sweeper,
+    )
 
+    store = MagicMock()
     shutdown_event = asyncio.Event()
     shutdown_event.set()
     with caplog.at_level(logging.INFO):
-        await ssh_attachments_prune_sweeper(shutdown_event)
+        await ssh_attachments_prune_sweeper(shutdown_event, store=store)
+    assert store.mock_calls == []
     assert "interval=3600" in caplog.text
     assert "retention=90" in caplog.text
 
@@ -402,11 +408,15 @@ async def test_sweeper_logs_default_interval_and_retention(caplog, monkeypatch):
 async def test_sweeper_honors_env_var_overrides(caplog, monkeypatch):
     monkeypatch.setenv("SSH_ATTACHMENTS_PRUNE_INTERVAL_S", "120")
     monkeypatch.setenv("SSH_ATTACHMENTS_RETENTION_DAYS", "14")
-    from orchestrator.main import ssh_attachments_prune_sweeper
+    from orchestrator.services.retention_sweepers import (
+        ssh_attachments_prune_sweeper,
+    )
 
+    store = MagicMock()
     shutdown_event = asyncio.Event()
     shutdown_event.set()
     with caplog.at_level(logging.INFO):
-        await ssh_attachments_prune_sweeper(shutdown_event)
+        await ssh_attachments_prune_sweeper(shutdown_event, store=store)
+    assert store.mock_calls == []
     assert "interval=120" in caplog.text
     assert "retention=14" in caplog.text

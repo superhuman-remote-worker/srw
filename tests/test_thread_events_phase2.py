@@ -27,9 +27,9 @@ import pytest
 
 
 def test_pruner_preserves_receipts_until_owner_request_is_terminal():
-    import orchestrator.main as om
+    from orchestrator.services import retention_sweepers
 
-    source = inspect.getsource(om.thread_events_prune_sweeper)
+    source = inspect.getsource(retention_sweepers.thread_events_prune_sweeper)
     assert source.count("request.id = thread_events.control_request_id") == 2
     assert source.count("request.id = thread_events.interrupt_request_id") == 2
     assert source.count("request.outcome IS NULL") == 4

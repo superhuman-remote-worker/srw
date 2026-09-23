@@ -3433,3 +3433,34 @@ class AgentProvisioner:
 
 # Module-level singleton
 agent_provisioner = AgentProvisioner()
+
+
+async def agent_pool_reconciler(
+    shutdown_event: asyncio.Event, *, provisioner: AgentProvisioner
+) -> None:
+    """Background task that maintains the dynamic agent pool.
+
+    Runs every 60 seconds:
+    - Ensures MIN_AGENTS warm pods exist (instant dispatch)
+    - Reaps completed / stale / unstartable agent pods (single dispatcher)
+
+    Drift-based draining lives in ``lifecycle_reconciler_loop`` now —
+    this loop only owns capacity (warm pool + scale-down) and crash GC.
+    """
+    logger.info("Agent pool reconciler started")
+    while not shutdown_event.is_set():
+        try:
+            if provisioner.is_available:
+                await provisioner.ensure_warm_pool()
+                await provisioner.reap_pods()
+                await provisioner.scale_down_idle()
+        except Exception as e:
+            logger.error("Error in agent pool reconciler: %s", e)
+
+        try:
+            await asyncio.wait_for(shutdown_event.wait(), timeout=60.0)
+            break
+        except asyncio.TimeoutError:
+            pass
+
+    logger.info("Agent pool reconciler stopped")

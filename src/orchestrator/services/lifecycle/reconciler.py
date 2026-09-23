@@ -15,6 +15,7 @@ drift-detection fires N concurrent drains the moment a new image lands.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -372,3 +373,31 @@ class InstanceLifecycleReconciler:
         if not expected or inst.version is None:
             return False
         return inst.version not in expected
+
+
+async def lifecycle_reconciler_loop(
+    shutdown_event: asyncio.Event,
+    reconciler: InstanceLifecycleReconciler,
+) -> None:
+    """Background task driving the unified instance lifecycle reconciler.
+
+    Runs every 60 seconds. The reconciler delegates to per-kind
+    managers (``AgentInstanceManager`` etc.) for drift detection and
+    drain. Crash detection still flows through ``reap_pods`` in the
+    sibling ``agent_pool_reconciler`` for now; consolidation is a
+    follow-up.
+    """
+    logger.info("Lifecycle reconciler loop started")
+    while not shutdown_event.is_set():
+        try:
+            await reconciler.tick()
+        except Exception:
+            logger.exception("Lifecycle reconciler tick failed")
+
+        try:
+            await asyncio.wait_for(shutdown_event.wait(), timeout=60.0)
+            break
+        except asyncio.TimeoutError:
+            pass
+
+    logger.info("Lifecycle reconciler loop stopped")

@@ -9,9 +9,11 @@ the full attempt UUID's reader and group on the immutable backend instance.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
+from typing import Any
 
 from orchestrator.services.cloud.protected_effect_contract import (
     NextcloudEffectFenceIntent,
@@ -212,4 +214,29 @@ async def reconcile_orphaned_ro_mounts(*, postgres_db, router) -> int:
     return revoked
 
 
-__all__ = ["reconcile_orphaned_ro_mounts"]
+async def ro_reader_reconciler_loop(
+    shutdown_event: asyncio.Event, *, store, router: Callable[[], Any]
+) -> None:
+    """Leader-gated periodic sweep of orphaned protected-mode RO grants.
+
+    Revoke-on-teardown alone is not enough (a crash/killed pod can skip it), so
+    this independently revokes any active ``cloud_ro_mounts`` grant whose thread
+    is gone/ended (design §8.1.4). Runs every 15 minutes.
+    """
+    logger.info("RO reader reconciler started")
+    while not shutdown_event.is_set():
+        try:
+            await reconcile_orphaned_ro_mounts(postgres_db=store, router=router())
+        except Exception as e:
+            logger.error("Error in RO reader reconciler: %s", e)
+
+        try:
+            await asyncio.wait_for(shutdown_event.wait(), timeout=900.0)
+            break
+        except asyncio.TimeoutError:
+            pass
+
+    logger.info("RO reader reconciler stopped")
+
+
+__all__ = ["reconcile_orphaned_ro_mounts", "ro_reader_reconciler_loop"]

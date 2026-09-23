@@ -1574,17 +1574,18 @@ class TestSweeperRegistrationShape:
     async def test_disabled_sweeper_parks_instead_of_returning(self, monkeypatch):
         # A bare return would make run_when_leader respawn (and log) the
         # disabled sweeper every poll second for the whole leadership tenure.
-        import orchestrator.main as orchestrator_main
+        # R1.B11: the loop lives in its domain owner and takes its
+        # collaborators as keyword parameters instead of main's globals.
         from orchestrator.services import ide_settings
 
         monkeypatch.setenv("IDE_SETTINGS_SYNC_ENABLED", "false")
         db = MagicMock()
         db.list_active_ide_workspaces = AsyncMock(return_value=[])
         provisioner = MagicMock()
+        snapshots = MagicMock()
+        vms = MagicMock()
         store_factory = MagicMock()
         classifier_factory = MagicMock()
-        monkeypatch.setattr(orchestrator_main, "postgres_db", db)
-        monkeypatch.setattr(orchestrator_main, "container_provisioner", provisioner)
         monkeypatch.setattr(ide_settings, "IdeSettingsStore", store_factory)
         monkeypatch.setattr(ide_settings, "OpenVsxClassifier", classifier_factory)
 
@@ -1599,7 +1600,13 @@ class TestSweeperRegistrationShape:
         wait = AsyncMock(side_effect=observed_wait)
         monkeypatch.setattr(shutdown, "wait", wait)
         task = asyncio.create_task(
-            orchestrator_main.code_server_settings_sweeper(shutdown)
+            ide_settings.code_server_settings_sweeper(
+                shutdown,
+                db=db,
+                container_provisioner=provisioner,
+                snapshot_service=snapshots,
+                vm_provisioner=vms,
+            )
         )
         try:
             await asyncio.wait_for(waiting.wait(), timeout=1)
@@ -1609,6 +1616,8 @@ class TestSweeperRegistrationShape:
             classifier_factory.assert_not_called()
             assert db.mock_calls == []
             assert provisioner.mock_calls == []
+            assert snapshots.mock_calls == []
+            assert vms.mock_calls == []
 
             shutdown.set()
             await asyncio.wait_for(task, timeout=1)
@@ -1617,6 +1626,8 @@ class TestSweeperRegistrationShape:
             classifier_factory.assert_not_called()
             assert db.mock_calls == []
             assert provisioner.mock_calls == []
+            assert snapshots.mock_calls == []
+            assert vms.mock_calls == []
         finally:
             if not task.done():
                 task.cancel()

@@ -12,7 +12,7 @@ and agents operate with unrestricted sudo (the pre-gate default).
 """
 
 import asyncio
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 import json
 import logging
@@ -1245,3 +1245,37 @@ class SudoGateService:
 
 # Singleton instance
 sudo_gate = SudoGateService()
+
+
+async def sudo_expiration_sweeper(
+    shutdown_event: asyncio.Event,
+    *,
+    gate: SudoGateService,
+    fail_expired_vm_upgrade_jobs: Callable[[], Awaitable[Any]],
+) -> None:
+    """Background task that denies expired sudo approval requests.
+
+    Runs every 15 seconds. For each expired request, publishes a denial
+    to the stored NATS reply subject so the daemon unblocks. Expired
+    vm_upgrade requests additionally fail their frozen job loudly
+    (``vm_upgrade_expired``) instead of leaving it invisibly wedged.
+    """
+    logger.info("Sudo expiration sweeper started")
+    while not shutdown_event.is_set():
+        try:
+            await gate.sweep_expired()
+        except Exception as e:
+            logger.error("Error in sudo expiration sweeper: %s", e)
+
+        try:
+            await fail_expired_vm_upgrade_jobs()
+        except Exception as e:
+            logger.error("Error failing expired vm_upgrade jobs: %s", e)
+
+        try:
+            await asyncio.wait_for(shutdown_event.wait(), timeout=15.0)
+            break
+        except asyncio.TimeoutError:
+            pass
+
+    logger.info("Sudo expiration sweeper stopped")

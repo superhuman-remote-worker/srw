@@ -8,6 +8,7 @@ This module closes that gap with an idempotent ensure + a periodic safety-net.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from typing import Optional
@@ -393,3 +394,44 @@ async def reconcile_session_workspaces(*, db, provisioner, suspension) -> int:
     if ensured:
         logger.info("session reconcile: re-ensured %d thread workspace(s)", ensured)
     return ensured
+
+
+async def workspace_idle_sweeper(
+    shutdown_event: asyncio.Event, *, store, provisioner, suspension
+) -> None:
+    """Background loop: reconciles failed/missing session workspaces.
+
+    Idle suspension and teardown now live in the lifecycle reconciler's reap
+    path (``services/lifecycle/reconciler.py`` → ``WorkspaceInstanceManager``),
+    which snapshots-then-deletes reapable workspaces and force-deletes ones it
+    can never reach (bounded retry) instead of keeping them alive forever.
+
+    This loop retains only the session-workspace recovery reconcile —
+    recreating failed/missing workspaces for active sessions — which is
+    independent of idle policy. Runs every 60 seconds.
+    """
+    logger.info("Workspace idle sweeper started (reconcile-only)")
+    while not shutdown_event.is_set():
+        # Session workspace reconcile (safety-net): recreate failed/missing
+        # workspaces for active sessions. Runs regardless of whether idle
+        # suspension is enabled — recovering a wedged workspace is independent
+        # of idle policy. This is the session-side equivalent of the job
+        # dispatcher's per-cycle workspace reconcile.
+        # (reconcile_session_workspaces never raises; the try/except is a
+        # belt-and-suspenders guard so a future change can't kill this loop.)
+        try:
+            await reconcile_session_workspaces(
+                db=store,
+                provisioner=provisioner,
+                suspension=suspension,
+            )
+        except Exception as e:
+            logger.error("Error in session workspace reconcile: %s", e)
+
+        try:
+            await asyncio.wait_for(shutdown_event.wait(), timeout=60.0)
+            break
+        except asyncio.TimeoutError:
+            pass
+
+    logger.info("Workspace idle sweeper stopped")
