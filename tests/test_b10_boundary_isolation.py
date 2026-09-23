@@ -3,12 +3,14 @@
 R1.B10 moved the session surface (detail, state, controls, tool groups),
 history and citations, the SSE/input/queue/interrupt transport, permission
 decisions and magic links, and the attention/permission-reminder/decision-wake
-bodies out of ``orchestrator.main``.
+bodies out of ``orchestrator.main``. It also closed the one production caller
+the ledger assigned it: ``services/session_wake.py``'s lazy application lookup
+of the usage ledger for the Officer daily-ceiling brake.
 
-These cases hold that boundary. A regression to a process-wide lookup — a
-router reading module state instead of its own application's, or a second
-application's store answering for the first — fails here rather than in
-production.
+These cases hold that closure. A regression to a process-wide lookup — a router
+reading module state instead of its own application's, a second application's
+store or ledger answering for the first, or the drain falling back to the
+application module — fails here rather than in production.
 """
 
 from __future__ import annotations
@@ -38,6 +40,7 @@ from orchestrator.services import (
     pinned_forwarding,
     session_attention,
     session_tool_view,
+    session_wake,
     stateless_input_admission,
     thread_event_stream,
     thread_permissions as thread_permission_operations,
@@ -62,6 +65,7 @@ B10_MODULES = [
     pinned_forwarding,
     session_attention,
     session_tool_view,
+    session_wake,
     stateless_input_admission,
     thread_event_stream,
     thread_permission_operations,
@@ -267,8 +271,103 @@ def test_the_application_owns_one_turn_lock_registry() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Attention bodies are composed by the application; B11 keeps the tasks
+# The Officer daily-ceiling metering is bound per store by composition
 # --------------------------------------------------------------------------- #
+
+
+@pytest.fixture
+def _clean_metering():
+    before = dict(session_wake._METERING_BY_STORE)
+    yield
+    session_wake._METERING_BY_STORE.clear()
+    session_wake._METERING_BY_STORE.update(before)
+
+
+def _ceilinged_thread() -> dict:
+    return {
+        "id": THREAD_ID,
+        "metadata": {
+            "config_override": {"officer": {"enabled": True, "daily_token_ceiling": 10}}
+        },
+    }
+
+
+def _ledger(tokens: int):
+    return SimpleNamespace(
+        is_available=True,
+        query_usage=AsyncMock(
+            return_value={"by_category": [{"unit": "prompt-token", "quantity": tokens}]}
+        ),
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_clean_metering")
+async def test_two_stores_reach_two_ledgers() -> None:
+    store_a, store_b = SimpleNamespace(name="a"), SimpleNamespace(name="b")
+    over, under = _ledger(10), _ledger(9)
+    session_wake.bind_officer_wake_metering(store_a, lambda: over)
+    session_wake.bind_officer_wake_metering(store_b, lambda: under)
+
+    deferred_a = await session_wake._officer_ceiling_deferral(
+        store_a, _ceilinged_thread()
+    )
+    deferred_b = await session_wake._officer_ceiling_deferral(
+        store_b, _ceilinged_thread()
+    )
+
+    assert deferred_a is not None
+    assert deferred_b is None
+    over.query_usage.assert_awaited_once()
+    under.query_usage.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_clean_metering")
+async def test_an_unbound_store_fails_open_and_reaches_no_other_ledger() -> None:
+    bound = _ledger(10)
+    session_wake.bind_officer_wake_metering(SimpleNamespace(), lambda: bound)
+
+    assert (
+        await session_wake._officer_ceiling_deferral(
+            SimpleNamespace(), _ceilinged_thread()
+        )
+        is None
+    )
+    bound.query_usage.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_clean_metering")
+async def test_the_provider_is_read_per_check_so_a_later_ledger_is_seen() -> None:
+    store = SimpleNamespace()
+    current: dict = {"ledger": None}
+    session_wake.bind_officer_wake_metering(store, lambda: current["ledger"])
+
+    assert (
+        await session_wake._officer_ceiling_deferral(store, _ceilinged_thread()) is None
+    )
+    current["ledger"] = _ledger(10)
+    assert (
+        await session_wake._officer_ceiling_deferral(store, _ceilinged_thread())
+        is not None
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("_clean_metering")
+async def test_unbinding_forgets_only_that_store() -> None:
+    kept, dropped = SimpleNamespace(), SimpleNamespace()
+    session_wake.bind_officer_wake_metering(kept, lambda: _ledger(10))
+    session_wake.bind_officer_wake_metering(dropped, lambda: _ledger(10))
+
+    session_wake.unbind_officer_wake_metering(dropped)
+
+    assert await session_wake._officer_ceiling_deferral(kept, _ceilinged_thread())
+    assert (
+        await session_wake._officer_ceiling_deferral(dropped, _ceilinged_thread())
+        is None
+    )
 
 
 def _lifespan() -> ast.AsyncFunctionDef:
@@ -278,6 +377,63 @@ def _lifespan() -> ast.AsyncFunctionDef:
         for node in tree.body
         if isinstance(node, ast.AsyncFunctionDef) and node.name == "lifespan"
     )
+
+
+def test_the_composition_step_is_a_plain_call_and_lifespan_stays_a_context_manager() -> (
+    None
+):
+    """Adding the bind before ``lifespan`` must not steal its decorator.
+
+    The first frozen candidate did exactly that: ``@asynccontextmanager`` ended
+    up on ``_bind_officer_wake_metering``, leaving ``lifespan`` a bare async
+    generator (the boot tests caught it). Pin both halves structurally.
+    """
+    tree = ast.parse(MAIN.read_text())
+    nodes = {
+        node.name: node
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    bind = nodes["_bind_officer_wake_metering"]
+    assert isinstance(bind, ast.FunctionDef) and bind.decorator_list == []
+    lifespan = nodes["lifespan"]
+    assert [ast.unparse(d) for d in lifespan.decorator_list] == ["asynccontextmanager"]
+
+    import contextlib
+
+    import orchestrator.main as main
+
+    assert isinstance(main.lifespan(object()), contextlib.AbstractAsyncContextManager)
+
+
+def test_lifespan_binds_the_ledger_after_building_it_and_before_the_sweeper() -> None:
+    body = ast.unparse(_lifespan())
+    built = body.index("usage_ledger = UsageLedger(")
+    bound = body.index("_bind_officer_wake_metering()")
+    sweeper = body.index("session_wake_sweeper_loop(postgres_db, _shutdown_event)")
+    assert built < bound < sweeper
+    assert body.count("_bind_officer_wake_metering()") == 1
+
+
+def test_the_composition_step_binds_the_application_store_to_its_ledger(
+    monkeypatch, _clean_metering
+) -> None:
+    import orchestrator.main as main
+
+    store = SimpleNamespace()
+    ledger = SimpleNamespace(is_available=True)
+    monkeypatch.setattr(main, "postgres_db", store)
+    monkeypatch.setattr(main, "usage_ledger", None)
+    main._bind_officer_wake_metering()
+
+    assert session_wake._bound_usage_ledger(store) is None
+    monkeypatch.setattr(main, "usage_ledger", ledger)
+    assert session_wake._bound_usage_ledger(store) is ledger
+
+
+# --------------------------------------------------------------------------- #
+# Attention bodies are composed by the application; B11 keeps the tasks
+# --------------------------------------------------------------------------- #
 
 
 def test_attention_dependencies_read_the_late_recycler_through_a_provider() -> None:

@@ -8,10 +8,10 @@ refusals and decision labels, and the Officer daily-ceiling brake reached
 through the application's own usage ledger rather than an explicit test ledger.
 
 After the extraction only the surfaces changed: the routes are mounted from
-their new routers with explicit per-application factories. Every assertion is
-unchanged. The ceiling brake still reaches the ledger through
-``session_wake``'s own application lookup here; closing that caller is the
-next, separate step.
+their new routers with explicit per-application factories, and the ceiling
+brake is reached through the application's real composition step
+(``main._bind_officer_wake_metering``) instead of a module lookup. Every
+assertion is unchanged.
 """
 
 from __future__ import annotations
@@ -571,6 +571,22 @@ def _drain_store():
     )
 
 
+@pytest.fixture(autouse=True)
+def _forget_metering_bindings():
+    before = dict(session_wake._METERING_BY_STORE)
+    yield
+    session_wake._METERING_BY_STORE.clear()
+    session_wake._METERING_BY_STORE.update(before)
+
+
+def _composed_store(monkeypatch):
+    """A drain store bound to its ledger by the application's own composition."""
+    store = _drain_store()
+    monkeypatch.setattr(main, "postgres_db", store)
+    main._bind_officer_wake_metering()
+    return store
+
+
 def _stub_sitrep(monkeypatch):
     from orchestrator.services import notification_service as ns
     from orchestrator.services import sitrep
@@ -588,7 +604,7 @@ async def test_over_budget_officer_wake_defers_to_utc_midnight_through_app_ledge
     _stub_sitrep(monkeypatch)
     ledger = _ledger(1_000)
     monkeypatch.setattr(main, "usage_ledger", ledger)
-    store = _drain_store()
+    store = _composed_store(monkeypatch)
 
     delivered = await session_wake.drain_pending_event_wakes(store)
 
@@ -619,7 +635,7 @@ async def test_over_budget_officer_wake_defers_to_utc_midnight_through_app_ledge
 async def test_officer_wake_fails_open_or_delivers_under_budget(monkeypatch, ledger):
     _stub_sitrep(monkeypatch)
     monkeypatch.setattr(main, "usage_ledger", ledger)
-    store = _drain_store()
+    store = _composed_store(monkeypatch)
 
     delivered = await session_wake.drain_pending_event_wakes(store)
 

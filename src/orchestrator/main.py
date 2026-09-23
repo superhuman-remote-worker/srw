@@ -687,6 +687,7 @@ from orchestrator.routers.contacts import router as contacts_router  # noqa: E40
 from orchestrator.services.cron_dispatcher import cron_dispatcher_loop  # noqa: E402
 from orchestrator.services.project_loop_sweeper import project_loop_sweeper_loop  # noqa: E402
 from orchestrator.services.session_wake import (  # noqa: E402
+    bind_officer_wake_metering,
     deliver_officer_note as _deliver_officer_note,
     kick_drain as _kick_session_wake_drain,
     kick_event_drain as _kick_officer_event_drain,
@@ -4426,6 +4427,18 @@ class CustomJSONResponse(JSONResponse):
         ).encode("utf-8")
 
 
+def _bind_officer_wake_metering() -> None:
+    """Bind this application's store to its usage ledger for Officer wakes.
+
+    The daily-ceiling brake runs inside the session-wake drain, which every
+    caller reaches with only the store. The provider reads this module's
+    ``usage_ledger`` per check, so a ledger built later in startup (or never,
+    without the audit tier) is seen exactly as the former application lookup
+    saw it (R1.B10 caller closure: ``session_wake`` no longer imports ``main``).
+    """
+    bind_officer_wake_metering(postgres_db, lambda: usage_ledger)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan handler."""
@@ -4587,6 +4600,7 @@ async def lifespan(app: FastAPI):
         audit_usage_pool,
         canonical_usage_rates,
     )
+    _bind_officer_wake_metering()
     # Rollup over the ledger (Phase 6 / D-1): aggregates the auditdb usage_events
     # firehose into the app-DB usage_daily mirror (+ rollup_state watermark) and
     # serves /api/usage from it for closed days, raw for the open tail. Same
