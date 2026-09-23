@@ -1,9 +1,4 @@
-"""Unconnected installation and drain state for one exact resource policy.
-
-Drain makes the resource waiter writer and reservation admission fail their
-existing policy-mode checks. It does not yet fence every VM creation effect;
-runtime wiring and final-off transitions remain deliberately absent.
-"""
+"""Explicit installed-policy transitions for the Job resource runtime."""
 
 from dataclasses import dataclass
 import json
@@ -133,3 +128,120 @@ class VMResourcePolicyLifecycleStore:
             if row is None:
                 raise ResourceAdmissionError("resource_policy_changed")
             return self._receipt(row)
+
+    async def _unclassified_occupancy_absent(self, conn):
+        """Use one fresh signed whole-cluster sample; unknown is never empty."""
+        from orchestrator.services.vm_resource_inventory_store import (
+            VMResourceInventoryStore,
+        )
+        from shared.vm_resource_accounting import account_inventory
+        from shared.vm_resource_inventory import snapshot_is_fresh
+
+        settings = self.snapshot.inventory
+        inventory = VMResourceInventoryStore(
+            self.db,
+            cluster_id=settings.cluster_id,
+            namespace=settings.namespace,
+            policy_digest=settings.policy_digest,
+            label_keys=settings.label_keys,
+            max_items=settings.max_items,
+            max_bytes=settings.max_bytes,
+            stale_after_seconds=settings.stale_after_seconds,
+            history_limit=settings.history_limit,
+            protocol=settings.protocol,
+            kubevirt_namespace=settings.kubevirt_namespace,
+            kubevirt_name=settings.kubevirt_name,
+        )
+        head = await conn.fetchrow(
+            "SELECT * FROM vm_resource_inventory_heads WHERE cluster_id=$1 "
+            "AND policy_digest=$2 FOR UPDATE",
+            settings.cluster_id, settings.policy_digest,
+        )
+        if head is None or head["current_snapshot_id"] is None or head["observation_conflict"]:
+            raise ResourceAdmissionError("inventory_unavailable")
+        observed = await conn.fetchrow(
+            "SELECT * FROM vm_resource_inventory_snapshots WHERE snapshot_id=$1",
+            head["current_snapshot_id"],
+        )
+        if observed is None:
+            raise ResourceAdmissionError("inventory_unavailable")
+        document = observed["document"]
+        if isinstance(document, str):
+            document = json.loads(document)
+        snapshot = inventory._snapshot(document, observed["digest"])
+        now = await conn.fetchval("SELECT clock_timestamp()")
+        if not snapshot["complete"] or not snapshot_is_fresh(
+            snapshot, received_at=observed["received_at"], now=now,
+            stale_after_seconds=settings.stale_after_seconds,
+        ):
+            raise ResourceAdmissionError("inventory_unavailable")
+        installed = snapshot["installed_profile"]
+        if (
+            installed["namespace"] != settings.kubevirt_namespace
+            or installed["name"] != settings.kubevirt_name
+            or _canonical(installed["profile"])
+            != _canonical(self.snapshot.launcher_profile)
+        ):
+            raise ResourceAdmissionError("installed_launcher_profile_changed")
+        # With no held rows, every SRW-attributable VM/VMI/Pod must make the
+        # accounting function refuse; unrelated external Pods remain charged
+        # only against their Node.
+        account_inventory(snapshot, [], headroom=self.snapshot.headroom)
+
+    async def activate_enforce(self, *, expected) -> ResourcePolicyReceipt:
+        """Activate an exact shadow policy only after a fresh empty-owner audit."""
+        if not _valid_receipt(expected):
+            raise ResourceAdmissionError("resource_policy_changed")
+        async with self.db.acquire() as conn, conn.transaction():
+            row = await conn.fetchrow(
+                "SELECT * FROM vm_resource_admission_policy WHERE cluster_id=$1 FOR UPDATE",
+                self.snapshot.inventory.cluster_id,
+            )
+            current = self._receipt(row)
+            if current != expected or current.mode != "shadow":
+                raise ResourceAdmissionError("resource_policy_changed")
+            if await conn.fetchval(
+                "SELECT EXISTS(SELECT 1 FROM vm_resource_reservations "
+                "WHERE cluster_id=$1 AND state<>'released')",
+                current.cluster_id,
+            ):
+                raise ResourceAdmissionError("resource_charge_unresolved")
+            await self._unclassified_occupancy_absent(conn)
+            updated = await conn.fetchrow(
+                "UPDATE vm_resource_admission_policy SET mode='enforce',"
+                "revision=revision+1 WHERE cluster_id=$1 AND revision=$2 RETURNING *",
+                current.cluster_id, current.revision,
+            )
+            if updated is None:
+                raise ResourceAdmissionError("resource_policy_changed")
+            return self._receipt(updated)
+
+    async def finalize_off(self, *, expected) -> ResourcePolicyReceipt:
+        """Retire drain only after no reservation, waiter or SRW VM remains."""
+        if not _valid_receipt(expected):
+            raise ResourceAdmissionError("resource_policy_changed")
+        async with self.db.acquire() as conn, conn.transaction():
+            row = await conn.fetchrow(
+                "SELECT * FROM vm_resource_admission_policy WHERE cluster_id=$1 FOR UPDATE",
+                self.snapshot.inventory.cluster_id,
+            )
+            current = self._receipt(row)
+            if current != expected or current.mode != "drain":
+                raise ResourceAdmissionError("resource_policy_changed")
+            if await conn.fetchval(
+                "SELECT EXISTS(SELECT 1 FROM vm_resource_reservations "
+                "WHERE cluster_id=$1 AND state<>'released') OR "
+                "EXISTS(SELECT 1 FROM vm_resource_waiters WHERE cluster_id=$1 "
+                "AND state NOT IN ('cancelled','released'))",
+                current.cluster_id,
+            ):
+                raise ResourceAdmissionError("resource_charge_unresolved")
+            await self._unclassified_occupancy_absent(conn)
+            updated = await conn.fetchrow(
+                "UPDATE vm_resource_admission_policy SET mode='off',"
+                "revision=revision+1 WHERE cluster_id=$1 AND revision=$2 RETURNING *",
+                current.cluster_id, current.revision,
+            )
+            if updated is None:
+                raise ResourceAdmissionError("resource_policy_changed")
+            return self._receipt(updated)

@@ -16,6 +16,7 @@ from orchestrator.services.vm_workspace_recovery_telemetry import (
     VMWorkspaceRecoveryTelemetry,
     workspace_recovery_telemetry,
 )
+from shared.vm_resource_admission import ResourceAdmissionError
 from shared.vm_provisioning_phases import rebind_recovered_provisioning
 from shared.worker_queue import (
     get_worker_attempt_disposition,
@@ -3532,6 +3533,27 @@ class VMWorkspaceRecoveryStore:
                 )
                 if recovered is None:
                     raise _RecoveryClaimLost
+                if operation["owner_kind"] == "job":
+                    from orchestrator.services.vm_resource_job_runtime import (
+                        installed_job_resource_store,
+                    )
+
+                    resource_retry = await conn.fetchrow(
+                        "SELECT * FROM vm_creation_retries WHERE job_id=$1 "
+                        "AND provision_generation=$2 FOR UPDATE",
+                        operation["owner_id"], operation["provision_generation"],
+                    )
+                    resource = await installed_job_resource_store(
+                        conn, self.db,
+                        resource_retry["controller_configuration"]
+                        if resource_retry is not None else None,
+                        fresh=False,
+                    )
+                    if resource is not None:
+                        await resource.append_recovery_successor_on_conn(
+                            conn, retry=resource_retry, operation=operation,
+                            final_observation=final,
+                        )
                 slot_released = await conn.fetchval(
                     "DELETE FROM vm_workspace_recovery_probe_slots "
                     "WHERE recovery_id=$1 AND claim_token=$2 RETURNING 1",
@@ -3540,7 +3562,7 @@ class VMWorkspaceRecoveryStore:
                 )
                 if slot_released is None:
                     raise _RecoveryClaimLost
-        except _RecoveryClaimLost:
+        except (_RecoveryClaimLost, ResourceAdmissionError):
             return False
         return True
 

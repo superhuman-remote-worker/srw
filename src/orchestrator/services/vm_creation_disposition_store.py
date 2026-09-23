@@ -690,6 +690,17 @@ class VMCreationDispositionStore:
                     "UPDATE vm_workspace_cleanup_admissions SET completed_at=clock_timestamp(),outcome='creation_disposed' WHERE id=$1",
                     row["creation_admission_id"],
                 )
+                from orchestrator.services.vm_resource_job_runtime import (
+                    installed_job_resource_store,
+                )
+
+                resource = await installed_job_resource_store(
+                    conn, self.db, row["controller_configuration"], fresh=False,
+                )
+                if resource is not None:
+                    await resource.release_never_issued_on_conn(
+                        conn, retry=row, disposition_complete=True,
+                    )
                 await conn.execute(
                     "UPDATE vm_creation_retries SET state='settled',reason='creation_disposed',revision=revision+1,claim_token=NULL,claim_expires_at=NULL,resolved_at=clock_timestamp(),updated_at=clock_timestamp() WHERE request_id=$1",
                     row["request_id"],

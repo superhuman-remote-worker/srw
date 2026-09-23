@@ -142,10 +142,47 @@ class VMCreationRetryService:
                     "VM creation reconciliation deferred (%s)", type(result).__name__
                 )
 
+    async def _maintain_resource_waiters(self):
+        """Nominate a bounded page, then reacquire each genuine source scope."""
+        from orchestrator.services.vm_resource_job_runtime import (
+            configured_enforcement_policy,
+            installed_job_resource_store,
+        )
+        from orchestrator.services.vm_resource_waiter_maintenance import (
+            VMResourceWaiterMaintenance,
+        )
+
+        selected = configured_enforcement_policy()
+        if selected is None:
+            return
+        async with self.db.acquire() as conn:
+            mode = await conn.fetchval(
+                "SELECT mode FROM vm_resource_admission_policy WHERE cluster_id=$1",
+                selected.inventory.cluster_id,
+            )
+            if mode == "off":
+                return
+            resource = await installed_job_resource_store(
+                conn, self.db, {
+                    "version": 3,
+                    "resource_admission": {
+                        "cluster_id": selected.inventory.cluster_id,
+                        "policy_digest": selected.policy_digest,
+                    },
+                }, fresh=False,
+            )
+        maintenance = VMResourceWaiterMaintenance(resource)
+        candidates = await maintenance.candidates(limit=8)
+        await self._bounded([
+            maintenance.maintain(request_id=request_id)
+            for request_id in candidates
+        ])
+
     async def reconcile_once(self):
         # Feature-off blocks new admission in the caller. Existing intent must
         # continue to reconcile so cancellation and uncertain effects settle.
         await self.preflight.settle_cancelled(limit=20)
+        await self._maintain_resource_waiters()
         preflights = await self.preflight.claim_due(limit=4)
         await self._bounded([self._resolve(claim) for claim in preflights])
         claims = await self.store.claim_due(limit=4)
