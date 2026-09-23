@@ -199,6 +199,26 @@ class TestJobErrorFormatters:
             assert "blocked_undelivered" in rendered
             assert "Status: cancelled" not in rendered
 
+    def test_operator_pause_hold_is_visible_in_job_detail(self):
+        held = {
+            "id": "job1",
+            "status": "paused",
+            "context": {
+                "_operator_pause_hold": {
+                    "version": 1,
+                    "hold_id": "h1",
+                    "paused_by": "user-a",
+                    "paused_at": "2026-09-23T10:00:00+00:00",
+                }
+            },
+        }
+        detail = format_job_detail(held)
+        assert "Operator pause hold" in detail
+        assert "paused_by=user-a" in detail
+        assert "Operator pause hold" not in format_job_detail(
+            {"id": "job1", "status": "paused", "context": {}}
+        )
+
     def test_workspace_contract_is_prominent_without_transport_details(self):
         job = {
             "id": "job1",

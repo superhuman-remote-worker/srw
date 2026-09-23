@@ -281,10 +281,30 @@ def format_job_detail(job: dict[str, Any]) -> str:
     if job.get("audit_count") is not None:
         lines.append(f"Audit entries: {job['audit_count']}")
     lines.extend(_freeze_lines(job))
+    lines.extend(_operator_pause_hold_lines(job))
     error_message = job.get("error_message") or job.get("error")
     if error_message:
         lines.append(f"Error: {truncate_text(error_message, limit=300)}")
     return "\n".join(lines)
+
+
+def _operator_pause_hold_lines(job: dict[str, Any]) -> list[str]:
+    """Say so when an operator pause holds the job until an explicit resume."""
+    context = job.get("context")
+    if isinstance(context, str):
+        try:
+            context = json.loads(context)
+        except (json.JSONDecodeError, ValueError):
+            return []
+    hold = context.get("_operator_pause_hold") if isinstance(context, dict) else None
+    if hold is None:
+        return []
+    detail = hold if isinstance(hold, dict) else {}
+    return [
+        "Operator pause hold: held until an explicit resume "
+        f"(paused_by={detail.get('paused_by') or 'internal'}, "
+        f"since {detail.get('paused_at') or 'unknown'})"
+    ]
 
 
 def _format_audit_entry(entry: dict[str, Any]) -> str:
