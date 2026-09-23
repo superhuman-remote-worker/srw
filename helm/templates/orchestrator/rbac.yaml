@@ -78,6 +78,9 @@ subjects:
     name: {{ include "srw.orchestratorServiceAccountName" . }}
     namespace: {{ .Release.Namespace }}
 {{- if and .Values.agent.stateless.enabled .Values.agent.stateless.processZeroFinalizer }}
+{{- /* Cluster-scoped: carry the namespace so two same-named releases in
+     different namespaces do not collide (vm-preflight does the same). */ -}}
+{{- $nodeObserver := printf "%s-%s-orchestrator-node-observer" (include "srw.fullname" .) .Release.Namespace | trunc 63 | trimSuffix "-" }}
 ---
 # Read-only Node access for the stateless executor retention sweep: an
 # executor retained by its process-zero finalizer on a Node that is gone (404)
@@ -87,7 +90,7 @@ subjects:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: {{ include "srw.fullname" . }}-orchestrator-node-observer
+  name: {{ $nodeObserver }}
   labels:
     {{- include "srw.componentLabels" (dict "context" . "component" "orchestrator") | nindent 4 }}
 rules:
@@ -98,13 +101,13 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
 metadata:
-  name: {{ include "srw.fullname" . }}-orchestrator-node-observer
+  name: {{ $nodeObserver }}
   labels:
     {{- include "srw.componentLabels" (dict "context" . "component" "orchestrator") | nindent 4 }}
 roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: ClusterRole
-  name: {{ include "srw.fullname" . }}-orchestrator-node-observer
+  name: {{ $nodeObserver }}
 subjects:
   - kind: ServiceAccount
     name: {{ include "srw.orchestratorServiceAccountName" . }}

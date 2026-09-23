@@ -15,7 +15,9 @@ ROOT = Path(__file__).resolve().parents[1]
 CHART = ROOT / "helm"
 
 
-def _render(*settings: str, show_only: str | None = None) -> list[dict]:
+def _render(
+    *settings: str, show_only: str | None = None, namespace: str | None = None
+) -> list[dict]:
     command = [
         "helm",
         "template",
@@ -32,6 +34,8 @@ def _render(*settings: str, show_only: str | None = None) -> list[dict]:
     ]
     if show_only:
         command.extend(["--show-only", show_only])
+    if namespace:
+        command.extend(["--namespace", namespace])
     for setting in settings:
         command.extend(["--set", setting])
     rendered = subprocess.run(
@@ -359,6 +363,28 @@ def test_executor_retention_may_read_nodes_and_nothing_else_cluster_wide() -> No
         )
         == []
     )
+
+
+@pytest.mark.skipif(shutil.which("helm") is None, reason="Helm is not installed")
+def test_node_observer_cluster_role_is_unique_per_release_namespace() -> None:
+    """Cluster-scoped names must not collide between two same-named releases
+    in different namespaces — the second install would fail on ownership."""
+
+    def names(namespace: str) -> set[str]:
+        return {
+            document["metadata"]["name"]
+            for document in _render(
+                "agent.stateless.enabled=true",
+                show_only="templates/orchestrator/rbac.yaml",
+                namespace=namespace,
+            )
+            if document.get("kind") in {"ClusterRole", "ClusterRoleBinding"}
+        }
+
+    first, second = names("srw-a"), names("srw-b")
+    assert first and second
+    assert first.isdisjoint(second)
+    assert all(len(name) <= 63 for name in first | second)
 
 
 @pytest.mark.skipif(shutil.which("helm") is None, reason="Helm is not installed")
