@@ -46,6 +46,7 @@ from shared.runtime.core.message_markers import (
     unpin_turn_input,
 )
 from agent.core.summarizer import count_text_tokens
+from agent.core.tool_output_redaction import redact_tool_result
 from shared.runtime.core.workspace_backend import WorkspaceUnavailableError
 from shared.tool_arg_coercion import coerce_tool_args
 from shared.runtime.core.workspace_injection import find_tail_injection_anchor
@@ -3567,6 +3568,7 @@ async def _execute_turn(
 
                 result_str, is_error = next(_approved_results)
                 cleaned_str, extracted_images = extract_image_tags(result_str)
+                cleaned_str = redact_tool_result(cleaned_str, tool_context)
                 tool_message = _ensure_msg_id(
                     ToolMessage(
                         content=cleaned_str,
@@ -3763,6 +3765,11 @@ async def _execute_turn(
             # image as a real provider content block on a follow-up
             # HumanMessage so multimodal primary models actually see it.
             cleaned_str, extracted_images = extract_image_tags(result_str)
+            # One string feeds the transcript, the persisted row and the
+            # on_tool_result frame/audit below: redact it once, here
+            # (tool_output_redaction.py). Error text included — a failed
+            # fetch or push echoes the credential-bearing remote.
+            cleaned_str = redact_tool_result(cleaned_str, tool_context)
 
             messages.append(
                 _adopt(

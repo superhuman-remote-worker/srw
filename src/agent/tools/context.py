@@ -223,6 +223,9 @@ class ToolContext:
     )
     datasources: Dict[str, Any] = field(default_factory=dict)
     config: Dict[str, Any] = field(default_factory=dict)
+    redaction_secrets: tuple = ()  # Credential values to withhold from this context's tool output that its
+    # own workspace does not reveal — a worktree child's fresh WorkspaceManager
+    # knows none of the parent's repository tokens (tool_output_redaction.py).
     _job_id: Optional[str] = None  # Direct job_id override
     citation_engine: Optional[Any] = None  # CitationEngine, imported lazily
     _source_registry: Dict[str, int] = field(

@@ -133,6 +133,7 @@ from agent.core.phase import (
 from agent.core.phase_snapshot import PhaseSnapshotManager
 from agent.core.response_validator import validate_response
 from agent.core.state import CompletionReportPayload, UniversalAgentState
+from agent.core.tool_output_redaction import redact_tool_result
 from agent.core.toolcall_recovery import (
     has_leaked_tool_call_markup,
     parse_leaked_tool_calls,
@@ -5476,6 +5477,15 @@ def create_audited_tool_node(
                 )
             if image_followups:
                 result["messages"].extend(image_followups)
+
+        # Credential redaction, once, before this content fans out to the
+        # transcript, the audit row below and the archives built from state
+        # (tool_output_redaction.py). After image extraction, so base64 is
+        # never scanned; results only, never the call's arguments.
+        if "messages" in result:
+            for msg in result["messages"]:
+                if isinstance(msg, ToolMessage) and msg.content:
+                    msg.content = redact_tool_result(msg.content, tool_context)
 
         # Enrich tool-not-found errors with actionable guidance
         if "messages" in result:

@@ -28,6 +28,8 @@ import httpx
 from fastapi import HTTPException
 from fastapi.responses import PlainTextResponse
 
+from shared.content_redaction import sanitize, sanitize_text
+
 #: Levels the log filter understands.
 LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR")
 
@@ -288,6 +290,29 @@ async def get_job_llm_requests(
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
+def _sanitized_shell_state(data: Any) -> Any:
+    """Redact credentials from the panes before anyone reads them.
+
+    A raw pane is exactly where ``git remote -v`` against a token-authenticated
+    clone printed both remote URLs to a coordinator. Redacted HERE rather than
+    only on the agent, so an agent image from before the redaction cannot put
+    one back on the wire. A tab that lost values says how many, so the reader
+    knows the pane was edited rather than silent.
+    """
+    if not isinstance(data, dict) or not isinstance(data.get("tabs"), list):
+        return data
+    tabs: list[Any] = []
+    for tab in data["tabs"]:
+        if isinstance(tab, dict) and isinstance(tab.get("recent_output"), str):
+            clean = sanitize(tab["recent_output"])
+            tab = {**tab, "recent_output": clean.text}
+            if clean.redacted:
+                tab["redacted"] = True
+                tab["redacted_count"] = clean.count
+        tabs.append(tab)
+    return {**data, "tabs": tabs}
+
+
 async def get_job_shell_state(
     *,
     job_id: str,
@@ -340,10 +365,13 @@ async def get_job_shell_state(
                 )
             raise HTTPException(
                 status_code=502,
-                detail=f"Agent returned {response.status_code}: {response.text}",
+                detail=(
+                    f"Agent returned {response.status_code}: "
+                    f"{sanitize_text(response.text)}"
+                ),
             )
 
-        return response.json()
+        return _sanitized_shell_state(response.json())
 
     except HTTPException:
         raise

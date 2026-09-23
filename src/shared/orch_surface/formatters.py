@@ -860,7 +860,12 @@ def format_shell_state(job_id: str, data: dict[str, Any]) -> str:
         name = tab.get("name", "?")
         tab_type = tab.get("type", "?")
         total = tab.get("total_lines", "?")
-        lines.append(f"  [{name}] type={tab_type} lines={total}")
+        withheld = (
+            f" ({tab['redacted_count']} secret-shaped value(s) redacted)"
+            if tab.get("redacted")
+            else ""
+        )
+        lines.append(f"  [{name}] type={tab_type} lines={total}{withheld}")
         output = tab.get("recent_output", "")
         if output:
             # Show last 20 lines, indented

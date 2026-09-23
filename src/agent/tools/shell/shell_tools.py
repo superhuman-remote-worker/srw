@@ -21,6 +21,7 @@ from typing import Any, Iterable, List, Optional
 
 from langchain_core.tools import tool
 
+from agent.core.tool_output_redaction import workspace_secrets
 from agent.tools.shell.coding_tools import _truncate_output
 from agent.tools.shell.shell_manager import SUDO_FREEZE_SENTINEL
 from agent.tools.context import ToolContext
@@ -458,13 +459,23 @@ def create_shell_tools(
             # shell_read, re-run with a higher timeout, or cancel_command it.
             if "--- still running ---" in output:
                 output = _apply_tail(output, tail)
-                output = _truncate_output(output, max_output_chars, "output")
+                output = _truncate_output(
+                    output,
+                    max_output_chars,
+                    "output",
+                    secrets=workspace_secrets(context),
+                )
                 return output + _CANCEL_HINT
 
             # Colliding: the shared run_command tab is busy with a previous
             # command, so this one never ran. cancel_command is the way out.
             if "previous command still running" in output:
-                output = _truncate_output(output, max_output_chars, "output")
+                output = _truncate_output(
+                    output,
+                    max_output_chars,
+                    "output",
+                    secrets=workspace_secrets(context),
+                )
                 return output + _CANCEL_HINT
 
             # Genuine interactive prompt: stateless run_command can't answer it,
@@ -480,7 +491,9 @@ def create_shell_tools(
                 )
 
             output = _apply_tail(output, tail)
-            output = _truncate_output(output, max_output_chars, "output")
+            output = _truncate_output(
+                output, max_output_chars, "output", secrets=workspace_secrets(context)
+            )
 
             warning = _scan_for_error_patterns(output)
             if warning:
@@ -596,7 +609,12 @@ def create_shell_tools(
                     return freeze_msg
                 time.sleep(0.5)
                 text, metadata = sm.read_with_offset(name, lines=tail)
-                text = _truncate_output(text, max_output_chars, "shell output")
+                text = _truncate_output(
+                    text,
+                    max_output_chars,
+                    "shell output",
+                    secrets=workspace_secrets(context),
+                )
                 return f"{tab_header}\n{text}"
 
             elif is_async:
@@ -631,7 +649,12 @@ def create_shell_tools(
                     return freeze_msg
                 time.sleep(0.5)
                 text, metadata = sm.read(name, since_cursor=True)
-                text = _truncate_output(text, max_output_chars, "shell output")
+                text = _truncate_output(
+                    text,
+                    max_output_chars,
+                    "shell output",
+                    secrets=workspace_secrets(context),
+                )
                 if guard_msg:
                     text = f"{guard_msg}\n\n{text}"
                 if delete_msg:
@@ -672,7 +695,12 @@ def create_shell_tools(
                 if freeze_msg:
                     return freeze_msg
                 output = _apply_tail(output, tail)
-                output = _truncate_output(output, max_output_chars, "output")
+                output = _truncate_output(
+                    output,
+                    max_output_chars,
+                    "output",
+                    secrets=workspace_secrets(context),
+                )
                 # Scan for application-level errors in output
                 warning = _scan_for_error_patterns(output)
                 if warning:
@@ -716,7 +744,12 @@ def create_shell_tools(
             text, metadata = sm.read_with_offset(
                 name, lines=capped_lines, offset=offset
             )
-            text = _truncate_output(text, max_output_chars, "shell output")
+            text = _truncate_output(
+                text,
+                max_output_chars,
+                "shell output",
+                secrets=workspace_secrets(context),
+            )
             info = f"({metadata['mode']}) {metadata['lines_returned']}/{metadata['total_lines']} lines"
             return f"{tab_header}\n{info}\n{text}"
         except (KeyError, ValueError) as e:
