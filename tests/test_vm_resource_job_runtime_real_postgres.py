@@ -11,6 +11,7 @@ from uuid import UUID, uuid4
 import asyncpg
 import pytest
 import pytest_asyncio
+from fastapi import HTTPException
 
 from orchestrator.services.vm_creation_retry import VMCreationRetryService
 from orchestrator.services.vm_creation_retry_store import VMCreationRetryStore
@@ -18,6 +19,8 @@ from orchestrator.services.vm_creation_retry_store import VMCreationRetryConflic
 from orchestrator.services.vm_creation_disposition_store import VMCreationDispositionStore
 from orchestrator.services.vm_resource_job_runtime import installed_job_resource_store
 from orchestrator.services.vm_workspace_recovery_store import VMWorkspaceRecoveryStore
+from orchestrator.services.vm_provisioner import VMTeardownIdentity, VMTeardownResult
+from orchestrator.services.job_controls import JobControlOperations
 from shared.vm_creation_issuance import seal_creation_carrier
 from shared.vm_lifecycle_auth import AUTH_FIELD, sign_payload
 from shared.vm_resource_admission import ResourceAdmissionError
@@ -768,6 +771,178 @@ async def test_idle_charge_requires_persisted_exact_operation_before_teardown(db
     )
     assert final["state"] == "released"
     assert json.loads(final["release_evidence"])["operation_id"] == str(operation["id"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stop_case", [
+    "exact", "flag_off", "partial_unknown", "wrong_successor", "logical_delete",
+    "lost_response", "missing_process_zero", "native_release_without_receipt",
+])
+async def test_public_delete_settles_adopted_charge_only_with_exact_cleanup_stop(
+    db, stop_case,
+):
+    policy, inventory, _, _ = await environment(db)
+    retry = await waiter(db, policy, inventory)
+    admitted = await policy.admit(request_id=str(retry["request_id"]))
+    vm_uid, vmi_uid, launcher_uid, pvc_uid = (uuid4() for _ in range(4))
+    claim = (await VMCreationRetryStore(db).claim_due(limit=1))[0]
+    authorized = await VMCreationRetryStore(db).authorize_controller(
+        request_id=str(retry["request_id"]),
+        claim_token=str(claim["claim_token"]),
+        observed={
+            "job_id": str(claim["job_id"]),
+            "provision_generation": str(claim["provision_generation"]),
+            "request_digest": claim["request_digest"],
+            "controller_configuration_digest": claim["controller_configuration_digest"],
+            "expected_pvc_uid": None,
+        },
+    )
+    assert authorized["allowed"]
+    await db.execute(
+        "UPDATE vm_creation_retries SET state='succeeded',revision=revision+1,"
+        "observed_vm_uid=$2,observed_pvc_uid=$3,resolved_at=clock_timestamp(),"
+        "claim_token=NULL,claim_expires_at=NULL WHERE request_id=$1",
+        retry["request_id"], vm_uid, pvc_uid,
+    )
+    await db.execute(
+        "UPDATE vm_workspace_cleanup_admissions SET completed_at=clock_timestamp(),"
+        "outcome='adopted' WHERE id=$1", authorized["admission_id"],
+    )
+    await db.execute(
+        "UPDATE vm_resource_reservations SET state='active',vm_uid=$2,"
+        "vmi_uid=$3,launcher_uid=$4 WHERE id=$1",
+        UUID(admitted["reservation_id"]), vm_uid, vmi_uid, launcher_uid,
+    )
+    await db.execute(
+        "UPDATE jobs SET context=jsonb_build_object('vm',$2::jsonb) WHERE id=$1",
+        retry["job_id"], json.dumps({
+            "provision_generation": str(retry["provision_generation"]),
+            "vm_uid": str(vm_uid), "vmi_uid": str(vmi_uid),
+            "active_pod_uid": str(launcher_uid),
+            "rootdisk_pvc_uid": str(pvc_uid), "status": "ready",
+        }),
+    )
+    if stop_case != "missing_process_zero":
+        await db.execute(
+            "INSERT INTO managed_repository_process_zero_receipts "
+            "(owner_kind,owner_id,scope,provisioner,runtime_incarnation) "
+            "VALUES('job',$1,'vm','vm',$2)",
+            retry["job_id"], str(retry["provision_generation"]),
+        )
+
+    identity = VMTeardownIdentity(
+        provision_generation=str(retry["provision_generation"]),
+        vm_uid=str(vm_uid), rootdisk_pvc_uid=str(pvc_uid),
+    )
+    proof = {
+        "version": 1, "kind": "vm_cleanup_physical_stop",
+        "job_id": str(retry["job_id"]),
+        "provision_generation": str(retry["provision_generation"]),
+        "vm_uid": str(vm_uid), "vmi_uid": str(vmi_uid),
+        "launcher_uid": str(launcher_uid), "pvc_uid": str(pvc_uid),
+        "vm_absent": True, "vmi_absent": True, "launcher_absent": True,
+        "same_generation_replacement": False,
+        "pvc_disposition": "purged", "controller_authenticated": True,
+    }
+    if stop_case == "flag_off":
+        await db.execute(
+            "UPDATE vm_resource_admission_policy SET mode='off' WHERE cluster_id=$1",
+            inventory.cluster_id,
+        )
+    if stop_case == "wrong_successor":
+        proof["vmi_uid"] = str(uuid4())
+    if stop_case == "native_release_without_receipt":
+        await db.execute(
+            "UPDATE vm_resource_reservations SET state='teardown' WHERE id=$1",
+            UUID(admitted["reservation_id"]),
+        )
+        with pytest.raises(asyncpg.CheckViolationError):
+            await db.execute(
+                "UPDATE vm_resource_reservations SET state='released',"
+                "release_evidence=$2::jsonb WHERE id=$1",
+                UUID(admitted["reservation_id"]), json.dumps({
+                    "kind": "exact_cleanup_compute_absent",
+                    "cleanup_admission_id": str(uuid4()),
+                }),
+            )
+    provisioner = SimpleNamespace(
+        lifecycle_available=True,
+        capture_vm_teardown_identity=AsyncMock(return_value=identity),
+        release_vm_captured=AsyncMock(return_value=(
+            VMTeardownResult("retry_pending", False) if stop_case == "logical_delete"
+            else VMTeardownResult("completed", True)
+        )),
+        attest_vm_cleanup_stop=AsyncMock(
+            side_effect=[None, proof] if stop_case == "lost_response" else None,
+            return_value=None if stop_case == "partial_unknown" else proof,
+        ),
+    )
+    controls = JobControlOperations(SimpleNamespace(
+        vm_provisioner=provisioner,
+        recovery_store=VMWorkspaceRecoveryStore(db),
+    ))
+    if stop_case in {
+        "partial_unknown", "wrong_successor", "logical_delete",
+        "lost_response", "missing_process_zero",
+    }:
+        with pytest.raises(HTTPException) as refused:
+            await controls.delete_vm(str(retry["job_id"]))
+        assert refused.value.status_code == (
+            500 if stop_case == "logical_delete" else 409
+        )
+    else:
+        assert (await controls.delete_vm(str(retry["job_id"])))["status"] == "deleting"
+    charge = await db.fetchrow(
+        "SELECT state,release_evidence FROM vm_resource_reservations WHERE id=$1",
+        UUID(admitted["reservation_id"]),
+    )
+    if stop_case in {
+        "partial_unknown", "wrong_successor", "logical_delete",
+        "lost_response", "missing_process_zero",
+    }:
+        assert charge["state"] == "teardown"
+        assert charge["release_evidence"] is None
+        assert await db.fetchval(
+            "SELECT completed_at IS NULL FROM vm_workspace_cleanup_admissions "
+            "WHERE source='public_vm_delete' AND owner_id=$1",
+            retry["job_id"],
+        ) is True
+        assert provisioner.attest_vm_cleanup_stop.await_count == (
+            0 if stop_case == "logical_delete" else 1
+        )
+        if stop_case != "lost_response":
+            return
+        # The controller delete already completed; a second public request
+        # reuses its durable permit and settles from a fresh exact probe.
+        assert (await controls.delete_vm(str(retry["job_id"]))) == {
+            "status": "deleting", "job_id": str(retry["job_id"]),
+        }
+        assert provisioner.release_vm_captured.await_count == 2
+        assert (await controls.delete_vm(str(retry["job_id"]))) == {
+            "status": "deleting", "job_id": str(retry["job_id"]),
+        }
+        assert provisioner.attest_vm_cleanup_stop.await_count == 2
+        charge = await db.fetchrow(
+            "SELECT state,release_evidence FROM vm_resource_reservations WHERE id=$1",
+            UUID(admitted["reservation_id"]),
+        )
+    assert charge["state"] == "released"
+    assert json.loads(charge["release_evidence"])["kind"] == "exact_cleanup_compute_absent"
+    assert await db.fetchval(
+        "SELECT count(*) FROM vm_resource_cleanup_stop_receipts WHERE reservation_id=$1",
+        UUID(admitted["reservation_id"]),
+    ) == 1
+    with pytest.raises(asyncpg.CheckViolationError):
+        await db.execute(
+            "UPDATE vm_resource_cleanup_stop_receipts SET "
+            "stop_evidence='{}'::jsonb WHERE reservation_id=$1",
+            UUID(admitted["reservation_id"]),
+        )
+    with pytest.raises(asyncpg.CheckViolationError):
+        await db.execute(
+            "DELETE FROM vm_resource_cleanup_stop_receipts WHERE reservation_id=$1",
+            UUID(admitted["reservation_id"]),
+        )
 
 
 @pytest.mark.asyncio

@@ -1007,7 +1007,14 @@ class WorkspaceSuspensionService:
                             self._workspace_recovery_store,
                             cleanup,
                             outcome=outcome.disposition,
+                            provisioner=self._vm_provisioner,
                         )
+                if replayed == "completed":
+                    await complete_vm_cleanup_permit(
+                        self._workspace_recovery_store, cleanup,
+                        outcome=replayed,
+                        provisioner=self._vm_provisioner,
+                    )
                 if (
                     not isinstance(outcome, VMTeardownResult)
                     or outcome.disposition != "completed"

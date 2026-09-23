@@ -1036,7 +1036,15 @@ async def complete_job_legacy(
                                     dependencies.workspace.recovery_store,
                                     cleanup,
                                     outcome=disposition,
+                                    provisioner=vm_provisioner,
                                 )
+                        elif disposition == "completed":
+                            await complete_vm_cleanup_permit(
+                                dependencies.workspace.recovery_store,
+                                cleanup,
+                                outcome=disposition,
+                                provisioner=vm_provisioner,
+                            )
                         vm_deleted = disposition == "completed"
                     except Exception:
                         vm_deleted = False

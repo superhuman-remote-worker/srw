@@ -122,8 +122,14 @@ async def recycle_provisioning_vm(
                 disposition = outcome.disposition
                 if disposition in {"completed", "identity_superseded"}:
                     await complete_vm_cleanup_permit(
-                        recovery_store, cleanup, outcome=disposition
+                        recovery_store, cleanup, outcome=disposition,
+                        provisioner=provisioner,
                     )
+            elif disposition == "completed":
+                await complete_vm_cleanup_permit(
+                    recovery_store, cleanup, outcome=disposition,
+                    provisioner=provisioner,
+                )
             if disposition in {"completed", "identity_superseded"}:
                 await db.merge_vm_context_if_provision_generation(
                     job_id,

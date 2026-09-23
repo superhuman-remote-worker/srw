@@ -2440,7 +2440,14 @@ class IdeSessionService:
                             self._workspace_recovery_store,
                             permit,
                             outcome=disposition,
+                            provisioner=self._vm_provisioner,
                         )
+                elif disposition == "completed":
+                    await complete_vm_cleanup_permit(
+                        self._workspace_recovery_store, permit,
+                        outcome=disposition,
+                        provisioner=self._vm_provisioner,
+                    )
                 return disposition == "completed"
             except Exception:
                 logger.exception("IDE VM cleanup authority failed for job %s", job_id)

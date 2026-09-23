@@ -926,6 +926,162 @@ class VMResourceReservationStore:
         )
         return True
 
+    async def _cleanup_charge_on_conn(self, conn, *, retry, job, cleanup, intent):
+        """Recheck an ordinary cleanup against the charged current incarnation."""
+        if (
+            cleanup is None or cleanup["owner_kind"] != "job"
+            or cleanup["owner_id"] != job["id"]
+            or cleanup["id"] != UUID(str(intent["admission_id"]))
+            or cleanup["request_id"] != UUID(str(intent["request_id"]))
+            or cleanup["intent_digest"] != intent["intent_digest"]
+            or retry["job_id"] != job["id"]
+            or retry["state"] != "succeeded"
+            or str(retry["provision_generation"])
+            != intent["intent"]["provision_generation"]
+            or str(retry["observed_vm_uid"]) != intent["intent"]["vm_uid"]
+            or str(retry["observed_pvc_uid"]) != intent["intent"]["pvc_uid"]
+            or cleanup["pvc_uid"] != retry["observed_pvc_uid"]
+            or cleanup["source"] != intent["intent"]["source"]
+            or cleanup["source"] == "vm_idle_release"
+        ):
+            raise ResourceAdmissionError("resource_cleanup_identity_unproven")
+        context = _json(job["context"])
+        vm = context.get("vm") if isinstance(context, dict) else None
+        if not isinstance(vm, dict) or any(
+            vm.get(key) != value for key, value in (
+                ("provision_generation", str(retry["provision_generation"])),
+                ("vm_uid", str(retry["observed_vm_uid"])),
+                ("rootdisk_pvc_uid", str(retry["observed_pvc_uid"])),
+            )
+        ):
+            raise ResourceAdmissionError("resource_cleanup_identity_unproven")
+        await self._lock_policy(conn, allow_off=True)
+        charge = await conn.fetchrow(
+            "SELECT * FROM vm_resource_reservations WHERE request_id=$1 "
+            "AND state<>'released' FOR UPDATE", retry["request_id"],
+        )
+        if charge is None or (
+            charge["resource_version"] != 2
+            or charge["vm_uid"] != retry["observed_vm_uid"]
+            or charge["state"] not in {"active", "warm", "teardown"}
+        ):
+            raise ResourceAdmissionError("resource_cleanup_charge_unproven")
+        successor = await conn.fetchrow(
+            "SELECT successor_vmi_uid,successor_launcher_uid "
+            "FROM vm_resource_recovery_successors WHERE reservation_id=$1 "
+            "ORDER BY ordinal DESC LIMIT 1", charge["id"],
+        )
+        vmi = successor["successor_vmi_uid"] if successor else charge["vmi_uid"]
+        launcher = (
+            successor["successor_launcher_uid"] if successor else charge["launcher_uid"]
+        )
+        if (
+            vmi is None or launcher is None
+            or vm.get("vmi_uid") != str(vmi)
+            or vm.get("active_pod_uid") != str(launcher)
+        ):
+            raise ResourceAdmissionError("resource_cleanup_successor_changed")
+        return charge, vmi, launcher
+
+    async def mark_cleanup_teardown_on_conn(
+        self, conn, *, retry, job, cleanup, intent,
+    ):
+        charge, vmi, launcher = await self._cleanup_charge_on_conn(
+            conn, retry=retry, job=job, cleanup=cleanup, intent=intent,
+        )
+        if cleanup["completed_at"] is not None and cleanup["outcome"] != "completed":
+            raise ResourceAdmissionError("resource_cleanup_outcome_changed")
+        if charge["state"] in {"active", "warm"}:
+            await conn.execute(
+                "UPDATE vm_resource_reservations SET state='teardown' WHERE id=$1",
+                charge["id"],
+            )
+        return {
+            "job_id": str(job["id"]),
+            "provision_generation": str(retry["provision_generation"]),
+            "vm_uid": str(charge["vm_uid"]),
+            "vmi_uid": str(vmi),
+            "launcher_uid": str(launcher),
+            "pvc_uid": str(retry["observed_pvc_uid"]),
+            "purge_disk": intent["intent"]["purge_disk"],
+        }
+
+    async def release_cleanup_compute_on_conn(
+        self, conn, *, retry, job, cleanup, intent, proof,
+    ):
+        charge, vmi, launcher = await self._cleanup_charge_on_conn(
+            conn, retry=retry, job=job, cleanup=cleanup, intent=intent,
+        )
+        expected = {
+            "version": 1, "kind": "vm_cleanup_physical_stop",
+            "job_id": str(job["id"]),
+            "provision_generation": str(retry["provision_generation"]),
+            "vm_uid": str(charge["vm_uid"]),
+            "vmi_uid": str(vmi), "launcher_uid": str(launcher),
+            "pvc_uid": str(retry["observed_pvc_uid"]),
+            "vm_absent": True, "vmi_absent": True,
+            "launcher_absent": True,
+            "same_generation_replacement": False,
+            "pvc_disposition": (
+                "purged" if intent["intent"]["purge_disk"] else "retained"
+            ),
+            "controller_authenticated": True,
+        }
+        if (
+            charge["state"] != "teardown"
+            or proof != expected
+            or cleanup["completed_at"] is not None
+            and cleanup["outcome"] != "completed"
+            or not await conn.fetchval(
+                "SELECT EXISTS(SELECT 1 FROM managed_repository_process_zero_receipts "
+                "WHERE owner_kind='job' AND owner_id=$1 AND scope='vm' "
+                "AND provisioner='vm' AND runtime_incarnation=$2)",
+                job["id"], str(retry["provision_generation"]),
+            )
+        ):
+            raise ResourceAdmissionError("resource_cleanup_stop_unproven")
+        if cleanup["completed_at"] is None:
+            await conn.execute(
+                "UPDATE vm_workspace_cleanup_admissions SET "
+                "completed_at=clock_timestamp(),outcome='completed' WHERE id=$1",
+                cleanup["id"],
+            )
+        await conn.execute(
+            "INSERT INTO vm_resource_cleanup_stop_receipts "
+            "(cleanup_admission_id,reservation_id,request_id,job_id,"
+            "provision_generation,vm_uid,vmi_uid,launcher_uid,pvc_uid,"
+            "intent_digest,stop_evidence) "
+            "VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb)",
+            cleanup["id"], charge["id"], retry["request_id"], job["id"],
+            retry["provision_generation"], charge["vm_uid"], vmi, launcher,
+            retry["observed_pvc_uid"], cleanup["intent_digest"], json.dumps(proof),
+        )
+        digest = await conn.fetchval(
+            "SELECT 'sha256:'||encode(sha256(convert_to(stop_evidence::text,'UTF8')),'hex') "
+            "FROM vm_resource_cleanup_stop_receipts WHERE cleanup_admission_id=$1",
+            cleanup["id"],
+        )
+        evidence = {
+            "kind": "exact_cleanup_compute_absent",
+            "cleanup_admission_id": str(cleanup["id"]),
+            "job_id": str(job["id"]),
+            "provision_generation": str(retry["provision_generation"]),
+            "vm_uid": str(charge["vm_uid"]),
+            "vmi_uid": str(vmi), "launcher_uid": str(launcher),
+            "pvc_uid": str(retry["observed_pvc_uid"]),
+            "stop_evidence_digest": digest,
+        }
+        await conn.execute(
+            "UPDATE vm_resource_reservations SET state='released',"
+            "released_at=clock_timestamp(),release_evidence=$2::jsonb WHERE id=$1",
+            charge["id"], json.dumps(evidence),
+        )
+        await conn.execute(
+            "UPDATE vm_resource_waiters SET state='released',revision=revision+1 "
+            "WHERE request_id=$1 AND state='admitted'", retry["request_id"],
+        )
+        return True
+
     async def _lock_policy(self, conn, *, allow_drain=False, allow_off=False):
         policy = await conn.fetchrow(
             "SELECT * FROM vm_resource_admission_policy WHERE cluster_id=$1 FOR UPDATE",
