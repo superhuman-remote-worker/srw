@@ -30160,6 +30160,15 @@ class PostgresDB:
                          WHERE id = $1
                            AND execution_lane = 'stateless'
                            AND status = $3
+                           -- The route may have classified an older unready
+                           -- VM before an exact Ready retirement won the
+                           -- queue/Job locks. Refuse on this pre-shed row:
+                           -- moving the marker to last_vm would erase the
+                           -- ordinary Resume guard and can trip the native
+                           -- process-zero fence instead of returning 409.
+                           AND ($2::text <> 'vm' OR COALESCE(
+                               context->'vm'->>'retirement_cleanup_pending', ''
+                           ) <> 'true')
                            AND ($2::text <> 'vm' OR NOT (COALESCE(context, '{}'::jsonb) ? '_vm_creation_pending'))
                         RETURNING id
                         """,

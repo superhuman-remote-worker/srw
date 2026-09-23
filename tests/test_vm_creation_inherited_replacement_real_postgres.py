@@ -775,3 +775,105 @@ async def test_replacement_uses_unchanged_ledger_without_context_copy(db, attach
     _, row, payload = await admit_replacement(db, ctrl, store, request, fresh)
     assert row["admission_deadline"] == first["admission_deadline"]
     assert (await ctrl._do_create_serialized(payload))["status"] == "created"
+
+
+@pytest.mark.asyncio
+async def test_a1_stale_workspace_resume_cannot_shed_new_ready_retirement(
+    db, attached, monkeypatch, tmp_path,
+):
+    """Old route classification must not erase a later admitted cleanup marker."""
+    from tests.test_job_control_operations import _operations
+    from orchestrator.services.vm_provisioning_cleanup import recycle_provisioning_vm
+    from orchestrator.services.vm_workspace_recovery_store import VMWorkspaceRecoveryStore
+    from orchestrator.services.vm_provisioner import VMTeardownIdentity, VMTeardownResult
+
+    owner = await ordinary_lineage_owner(db, monkeypatch)
+    ctrl, _, _, _ = attached
+    jobs, _, _, _, payload = await controller_bridge(db, attached)
+    job_id = jobs[-1]
+    assert (await ctrl._do_create_serialized(payload))["status"] == "created"
+    async with db.acquire() as conn:
+        context = json.loads(await conn.fetchval("SELECT context FROM jobs WHERE id=$1", job_id))
+        context["vm"]["status"] = "provisioning"
+        context.pop("_vm_creation_pending", None)
+        await conn.execute(
+            "UPDATE jobs SET status='paused',context=$2::jsonb WHERE id=$1",
+            job_id, json.dumps(context),
+        )
+        before_queue = dict(await conn.fetchrow(
+            "SELECT state,lease_token,leased_by FROM run_queue WHERE unit_id=$1", job_id,
+        ))
+    old_vm = context["vm"]
+    classification_reached, allow_old_classification = asyncio.Event(), asyncio.Event()
+    physical_stop_reached, allow_physical_stop = asyncio.Event(), asyncio.Event()
+    operations = _operations(tmp_path, store=db)
+
+    async def pause_before_old_classification(job):
+        classification_reached.set()
+        await allow_old_classification.wait()
+        return "ready", job, None
+
+    operations.dependencies.prepare_job_workspace_runtime.side_effect = pause_before_old_classification
+    operations.dependencies.resume_missing_workspace.side_effect = lambda job: (
+        "vm" if (json.loads(job["context"]) if isinstance(job["context"], str)
+                 else job["context"])["vm"]["status"] == "provisioning" else None
+    )
+
+    class PausedPhysicalStop:
+        async def capture_vm_teardown_identity(self, owner_id, *, entity_type):
+            assert owner_id == str(job_id) and entity_type == "job"
+            return VMTeardownIdentity(
+                old_vm["provision_generation"], old_vm["vm_uid"],
+                old_vm["rootdisk_pvc_uid"],
+            )
+
+        async def release_vm_captured(self, owner_id, identity, **kwargs):
+            assert owner_id == str(job_id)
+            assert identity.vm_uid == old_vm["vm_uid"]
+            assert kwargs["purge_disk"] is False
+            physical_stop_reached.set()
+            await allow_physical_stop.wait()
+            assert await db.record_managed_repository_workspace_process_zero(
+                owner_id, owner_kind="job", scope="vm", provisioner="vm",
+                runtime_incarnation=identity.provision_generation,
+            )
+            return VMTeardownResult("completed", True)
+
+    monkeypatch.setenv("VM_CREATION_RETRY_ENABLED", "true")
+    token = await owner_token(db, owner)
+    app = resume_route_app(db, operations)
+    async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://a1.test") as client:
+        resume_task = asyncio.create_task(client.post(
+            f"/api/jobs/{job_id}/resume",
+            headers={"Authorization": f"Bearer {token}"}, json={},
+        ))
+        await asyncio.wait_for(classification_reached.wait(), timeout=10)
+        async with db.acquire() as conn:
+            current = json.loads(await conn.fetchval("SELECT context FROM jobs WHERE id=$1", job_id))
+            current["vm"]["status"] = "ready"
+            await conn.execute("UPDATE jobs SET context=$2::jsonb WHERE id=$1", job_id, json.dumps(current))
+        cleanup_task = asyncio.create_task(recycle_provisioning_vm(
+            str(job_id), current["vm"], db=db, provisioner=PausedPhysicalStop(),
+            recovery_store=VMWorkspaceRecoveryStore(db), now=time.time(),
+            phase_timeout=False,
+        ))
+        await asyncio.wait_for(physical_stop_reached.wait(), timeout=10)
+        async with db.acquire() as conn:
+            assert await conn.fetchval(
+                "SELECT count(*) FROM vm_workspace_cleanup_admissions "
+                "WHERE owner_id=$1 AND source='dispatcher_vm_recycle' AND completed_at IS NULL",
+                job_id,
+            ) == 1
+        allow_old_classification.set()
+        refused = await asyncio.wait_for(resume_task, timeout=10)
+        assert refused.status_code == 409
+        async with db.acquire() as conn:
+            after = json.loads(await conn.fetchval("SELECT context FROM jobs WHERE id=$1", job_id))
+            after_queue = dict(await conn.fetchrow(
+                "SELECT state,lease_token,leased_by FROM run_queue WHERE unit_id=$1", job_id,
+            ))
+        assert after["vm"]["retirement_cleanup_pending"] is True
+        assert "last_vm" not in after
+        assert after_queue == before_queue
+        allow_physical_stop.set()
+        assert await asyncio.wait_for(cleanup_task, timeout=10) == "completed"
