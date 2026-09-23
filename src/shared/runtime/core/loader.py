@@ -2059,6 +2059,16 @@ class LLMConfig:
         if override is None:
             return self
 
+        # A key follows its endpoint: when the overlay moves the call to a
+        # different base_url without bringing its own key, the parent's key
+        # must not ride along to the new host.
+        if override.api_key is not None:
+            api_key = override.api_key
+        elif override.base_url is not None and override.base_url != self.base_url:
+            api_key = None
+        else:
+            api_key = self.api_key
+
         # Create new config with overrides applied (don't copy phase fields)
         return LLMConfig(
             model=override.model if override.model is not None else self.model,
@@ -2079,7 +2089,7 @@ class LLMConfig:
             base_url=override.base_url
             if override.base_url is not None
             else self.base_url,
-            api_key=override.api_key if override.api_key is not None else self.api_key,
+            api_key=api_key,
             timeout=override.timeout if override.timeout is not None else self.timeout,
             max_retries=override.max_retries
             if override.max_retries is not None
@@ -4220,6 +4230,26 @@ def _is_output_truncated(finish_reason: Any) -> bool:
     return "length" in fr or "max_tokens" in fr or "max_output" in fr
 
 
+def _env_fallback_key(
+    config: LLMConfig,
+    env_name: str,
+    default: Optional[str] = None,
+    *,
+    canonical_base_url: Optional[str] = None,
+) -> Optional[str]:
+    """The process-env provider key, only for that provider's own endpoint.
+
+    A key follows its endpoint. The env key belongs to the provider's default
+    host; when ``config.base_url`` names a different host and the config
+    brought no key of its own, return ``default`` instead of the env key.
+    """
+    base = (config.base_url or "").rstrip("/")
+    if base and base != (canonical_base_url or "").rstrip("/"):
+        return default
+    value = os.getenv(env_name)
+    return value if value else default
+
+
 def _create_openai_llm(
     config: LLMConfig,
     limits: Optional[LimitsConfig] = None,
@@ -4240,7 +4270,9 @@ def _create_openai_llm(
     from shared.runtime.llm.key_ring import parse_key_string, get_or_create_key_ring
 
     # Parse API keys (supports comma-separated list for fallback)
-    raw_key = config.api_key or os.getenv("OPENAI_API_KEY", "not-needed")
+    raw_key = config.api_key or _env_fallback_key(
+        config, "OPENAI_API_KEY", "not-needed"
+    )
     keys = parse_key_string(raw_key) or ["not-needed"]
     cooldown = float(os.getenv("KEY_COOLDOWN_SECONDS", "1800"))
     key_ring = get_or_create_key_ring(
@@ -4560,7 +4592,7 @@ def _create_groq_llm(
     # Lazy import to avoid requiring the package when not used
     from langchain_groq import ChatGroq
 
-    api_key = config.api_key or os.getenv("GROQ_API_KEY")
+    api_key = config.api_key or _env_fallback_key(config, "GROQ_API_KEY")
     if not api_key:
         raise ValueError(
             "GROQ_API_KEY environment variable required for Groq provider. "
@@ -4635,7 +4667,11 @@ def _create_openrouter_llm(
     from shared.runtime.llm.key_ring import parse_key_string, get_or_create_key_ring
 
     # Parse API keys (supports comma-separated list for fallback)
-    raw_key = config.api_key or os.getenv("OPENROUTER_API_KEY")
+    raw_key = config.api_key or _env_fallback_key(
+        config,
+        "OPENROUTER_API_KEY",
+        canonical_base_url="https://openrouter.ai/api/v1",
+    )
     if not raw_key:
         raise ValueError(
             "OPENROUTER_API_KEY environment variable required for OpenRouter provider. "
@@ -4786,7 +4822,9 @@ def _create_mistral_llm(
     mistral-small-latest, codestral-latest, …). A defensive ``mistral/`` prefix
     is stripped if present; the API expects the bare id.
     """
-    api_key = config.api_key or os.getenv("MISTRAL_API_KEY")
+    api_key = config.api_key or _env_fallback_key(
+        config, "MISTRAL_API_KEY", canonical_base_url="https://api.mistral.ai/v1"
+    )
     if not api_key:
         raise ValueError(
             "MISTRAL_API_KEY environment variable required for Mistral provider. "
@@ -4877,7 +4915,12 @@ def _create_codex_llm(
     from shared.runtime.llm.key_ring import parse_key_string, get_or_create_key_ring
 
     # Parse API keys — CLIProxyAPI handles OAuth, so "not-needed" is the default
-    raw_key = config.api_key or os.getenv("CODEX_API_KEY", "not-needed")
+    raw_key = config.api_key or _env_fallback_key(
+        config,
+        "CODEX_API_KEY",
+        "not-needed",
+        canonical_base_url=os.getenv("CODEX_BASE_URL", "http://localhost:8317/v1"),
+    )
     keys = parse_key_string(raw_key) or ["not-needed"]
     cooldown = float(os.getenv("KEY_COOLDOWN_SECONDS", "1800"))
     key_ring = get_or_create_key_ring(keys, provider="codex", cooldown_seconds=cooldown)

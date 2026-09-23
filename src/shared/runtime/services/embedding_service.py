@@ -172,14 +172,23 @@ class EmbeddingService:
             self.model = f"qwen/{base_model}" if "/" not in base_model else base_model
         else:
             # "local" provider (default) — custom endpoint or OpenAI
-            self.api_key = (
-                api_key
-                if api_key is not None
-                else os.getenv("EMBEDDING_API_KEY") or os.getenv("OPENAI_API_KEY", "")
-            )
             self.base_url = base_url or os.getenv(
                 "EMBEDDING_BASE_URL", self.OPENAI_API_URL
             )
+            if api_key is not None:
+                self.api_key = api_key
+            else:
+                # A key follows its endpoint: OPENAI_API_KEY belongs to OpenAI
+                # itself and is never the fallback for another embedding host.
+                from shared.runtime.core.transport_resolution import (
+                    is_openai_default_endpoint,
+                )
+
+                self.api_key = os.getenv("EMBEDDING_API_KEY") or (
+                    os.getenv("OPENAI_API_KEY", "")
+                    if is_openai_default_endpoint(self.base_url)
+                    else ""
+                )
             self.model = base_model
 
         # Schema columns are vector(4096); a provider returning any other

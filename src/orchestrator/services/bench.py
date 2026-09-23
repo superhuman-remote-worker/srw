@@ -23,6 +23,7 @@ from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID
 
+from orchestrator.services.config_overrides import refuse_caller_transport_keys
 from orchestrator.services.deliverable_gate import parse_required_deliverables
 from orchestrator.services.job_todos import build_archive_listing
 from shared.runtime.core.loader import canonical_config_name, deep_merge
@@ -270,6 +271,10 @@ def freeze_spec(spec: Mapping[str, Any]) -> dict[str, Any]:
     tasks: list[dict[str, Any]] = []
     for raw in spec.get("tasks") or []:
         task = dict(raw)
+        # Bench arms/tasks reach db.create_job through admit_job (main
+        # ``_create_bench_job``), never through the POST /api/jobs adapter, so
+        # the transport fence runs here at the run-creation write boundary.
+        refuse_caller_transport_keys(task.get("config_override"))
         frozen_task: dict[str, Any] = {
             "id": str(task["id"]),
             "description": str(task["description"]),
@@ -289,6 +294,7 @@ def freeze_spec(spec: Mapping[str, Any]) -> dict[str, Any]:
     arms: list[dict[str, Any]] = []
     for raw in spec.get("arms") or []:
         arm = dict(raw)
+        refuse_caller_transport_keys(arm.get("config_override"))
         frozen_arm: dict[str, Any] = {
             "name": str(arm["name"]),
             "config_override": copy.deepcopy(arm.get("config_override") or {}),

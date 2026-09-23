@@ -271,18 +271,36 @@ class TestOpenRouterLLMCreation:
 
     @patch.dict(os.environ, {"OPENROUTER_API_KEY": "sk-or-test-key"}, clear=False)
     @patch("shared.runtime.core.loader.ReasoningChatOpenAI")
-    def test_explicit_base_url_overrides(self, mock_chat):
-        """Explicit config.base_url should override the default OpenRouter URL."""
+    def test_explicit_base_url_overrides_with_own_key(self, mock_chat):
+        """A pinned base_url is honoured when the config brings its own key
+        (BYO). The env OPENROUTER_API_KEY belongs to openrouter.ai and must not
+        be sent to the pinned host — a key follows its endpoint."""
         mock_chat.return_value = MagicMock()
         config = _make_config(
             model="openrouter/openai/gpt-4o",
             base_url="https://custom-proxy.example.com/v1",
+            api_key="sk-or-byo-key",
         )
 
         _create_openrouter_llm(config, limits=None)
 
         call_kwargs = mock_chat.call_args[1]
         assert call_kwargs["base_url"] == "https://custom-proxy.example.com/v1"
+        assert call_kwargs["api_key"] == "sk-or-byo-key"
+
+    @patch.dict(os.environ, {"OPENROUTER_API_KEY": "sk-or-test-key"}, clear=False)
+    @patch("shared.runtime.core.loader.ReasoningChatOpenAI")
+    def test_env_key_not_sent_to_pinned_foreign_host(self, mock_chat):
+        """A base_url pinned away from openrouter.ai with no config key must NOT
+        inherit the deployment's OPENROUTER_API_KEY (the exfiltration class)."""
+        mock_chat.return_value = MagicMock()
+        config = _make_config(
+            model="openrouter/openai/gpt-4o",
+            base_url="https://custom-proxy.example.com/v1",
+        )
+
+        with pytest.raises(ValueError, match="OPENROUTER_API_KEY"):
+            _create_openrouter_llm(config, limits=None)
 
     @patch.dict(
         os.environ,

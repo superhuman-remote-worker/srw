@@ -190,6 +190,49 @@ class TestEnvKeyBinding:
         )
         assert env_keys["EMBEDDING_API_KEY"] == SYSTEM_OR_KEY
 
+    @pytest.mark.asyncio
+    async def test_key_not_injected_over_citation_url_alias(self):
+        # The guard checks every endpoint name a reader consults, not just the
+        # canonical one: CITATION_LLM_URL is an alias for CITATION_LLM_BASE_URL.
+        env_keys = {"CITATION_LLM_URL": CALLER_HOST}
+        await dc.inject_env_key_credentials(
+            env_keys=env_keys,
+            prefix="CITATION_LLM",
+            model_id="router-chat",
+            user_id="u",
+            resolved_keys={"openrouter": SYSTEM_OR_KEY},
+            capability="chat",
+            dependencies=_service_deps({"router-chat": ROUTER_META}),
+        )
+        assert "CITATION_LLM_API_KEY" not in env_keys
+
+    @pytest.mark.asyncio
+    async def test_endpoint_row_overwrites_preset_alias(self):
+        # An endpoint row is authoritative: a pre-set alias cannot survive next
+        # to the row's key (setdefault would have left the stale foreign host).
+        emb_meta = ModelMeta(
+            model_id="sys-embed",
+            provider="openai",
+            family="embedding",
+            display_name="Embed",
+            origin="catalog",
+            endpoint_id=ENDPOINT_ID,
+            api_key_ref="openai",
+            capability="embedding",
+        )
+        env_keys = {"EMBEDDING_BASE_URL": CALLER_HOST}
+        await dc.inject_env_key_credentials(
+            env_keys=env_keys,
+            prefix="EMBEDDING",
+            model_id="sys-embed",
+            user_id="u",
+            resolved_keys={"openai": ENDPOINT_KEY},
+            capability="embedding",
+            dependencies=_service_deps({"sys-embed": emb_meta}),
+        )
+        assert env_keys["EMBEDDING_BASE_URL"] == ENDPOINT_BASE_URL
+        assert env_keys["EMBEDDING_API_KEY"] == ENDPOINT_KEY
+
 
 # ---------------------------------------------------------------------------
 # inject_dispatch_credentials — the top-level composition (the review's repro)
@@ -287,3 +330,122 @@ class TestCompositionBinding:
         child = out["subagents"]["roster"]["child"]["llm"]
         assert child["base_url"] == CALLER_HOST
         assert "api_key" not in child
+
+
+# ---------------------------------------------------------------------------
+# Agent-side sink: a key follows its endpoint at the point of use
+# ---------------------------------------------------------------------------
+
+
+class TestWithOverrideKeyFollowsEndpoint:
+    """``LLMConfig.with_override`` — summarization / subagents.llm overlay."""
+
+    def _base(self):
+        from shared.runtime.core.loader import LLMConfig
+
+        return LLMConfig(model="m", base_url="https://parent/v1", api_key="PARENT-KEY")
+
+    def test_new_base_url_without_key_drops_parent_key(self):
+        from shared.runtime.core.loader import PhaseLLMOverride
+
+        out = self._base().with_override(PhaseLLMOverride(base_url=CALLER_HOST))
+        assert out.base_url == CALLER_HOST
+        assert out.api_key is None
+
+    def test_new_base_url_with_own_key_keeps_it(self):
+        from shared.runtime.core.loader import PhaseLLMOverride
+
+        out = self._base().with_override(
+            PhaseLLMOverride(base_url=CALLER_HOST, api_key="BYO")
+        )
+        assert out.base_url == CALLER_HOST
+        assert out.api_key == "BYO"
+
+    def test_same_base_url_keeps_parent_key(self):
+        from shared.runtime.core.loader import PhaseLLMOverride
+
+        out = self._base().with_override(PhaseLLMOverride(temperature=0.5))
+        assert out.base_url == "https://parent/v1"
+        assert out.api_key == "PARENT-KEY"
+
+
+class TestFactoryEnvFallbackBinding:
+    """``_create_*_llm`` env fallbacks bind to the provider's own endpoint."""
+
+    def test_openrouter_env_key_not_sent_to_foreign_host(self, monkeypatch):
+        from shared.runtime.core.loader import LLMConfig, _create_openrouter_llm
+
+        monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-system")
+        cfg = LLMConfig(model="openrouter/x/y", base_url=CALLER_HOST)
+        with pytest.raises(ValueError, match="OPENROUTER_API_KEY"):
+            _create_openrouter_llm(cfg, limits=None)
+
+
+class TestRerankerTransportBinding:
+    def _cfg(self, **kw):
+        from types import SimpleNamespace
+
+        kw.setdefault("model", None)
+        kw.setdefault("base_url", None)
+        kw.setdefault("api_key", None)
+        return SimpleNamespace(**kw)
+
+    def test_explicit_base_url_no_key_gets_no_foreign_env_key(self):
+        from agent.services.memory.plugins.reranker import resolve_reranker_transport
+
+        _, base_url, api_key = resolve_reranker_transport(
+            self._cfg(base_url=CALLER_HOST),
+            env={
+                "RERANK_BASE_URL": "https://rr.internal/v1",
+                "RERANK_API_KEY": "rr-key",
+                "EMBEDDING_API_KEY": "emb-key",
+            },
+        )
+        assert base_url == CALLER_HOST
+        assert api_key is None  # neither RERANK_API_KEY nor EMBEDDING_API_KEY
+
+    def test_explicit_base_url_matching_env_host_uses_that_key(self):
+        from agent.services.memory.plugins.reranker import resolve_reranker_transport
+
+        _, base_url, api_key = resolve_reranker_transport(
+            self._cfg(base_url="https://rr.internal/v1"),
+            env={
+                "RERANK_BASE_URL": "https://rr.internal/v1",
+                "RERANK_API_KEY": "rr-key",
+            },
+        )
+        assert base_url == "https://rr.internal/v1"
+        assert api_key == "rr-key"
+
+    def test_explicit_key_wins(self):
+        from agent.services.memory.plugins.reranker import resolve_reranker_transport
+
+        _, _, api_key = resolve_reranker_transport(
+            self._cfg(base_url=CALLER_HOST, api_key="cfg-key"),
+            env={"EMBEDDING_API_KEY": "emb-key"},
+        )
+        assert api_key == "cfg-key"
+
+
+class TestExportableEnvKeys:
+    def test_only_dispatch_names_export(self):
+        from shared.runtime.core.transport_resolution import exportable_env_keys
+
+        kept, dropped = exportable_env_keys(
+            {
+                "EMBEDDING_API_KEY": "k1",
+                "VISION_BASE_URL": "https://v/v1",
+                "OPENAI_BASE_URL": "https://evil/v1",
+                "OPENAI_API_BASE": "https://evil/v1",
+                "OPENAI_API_KEY": "leak",
+                "PATH": "/usr/bin",
+            }
+        )
+        assert kept == {
+            "EMBEDDING_API_KEY": "k1",
+            "VISION_BASE_URL": "https://v/v1",
+        }
+        assert "OPENAI_BASE_URL" in dropped
+        assert "OPENAI_API_BASE" in dropped
+        assert "OPENAI_API_KEY" in dropped
+        assert "PATH" in dropped

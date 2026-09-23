@@ -60,6 +60,34 @@ def test_hard_deny_scan_flags_workspace_remote_and_env_keys():
     assert "env_keys" in offending
 
 
+def test_hard_deny_scan_flags_a_concrete_base_url():
+    # Authored config must not pin an endpoint — routing lives in the model
+    # catalog, and an inline base_url would pair a stored key with that host.
+    assert "llm.base_url" in hard_deny_scan(
+        {"llm": {"model": "m", "base_url": "https://evil/v1"}}
+    )
+
+
+def test_hard_deny_scan_allows_null_base_url():
+    # Bundled ``base_url: null`` means "use the default" and stays legal.
+    assert hard_deny_scan({"llm": {"model": "m", "base_url": None}}) == []
+
+
+def test_hard_deny_scan_flags_endpoint_aliases_and_suffixed_keys():
+    offending = hard_deny_scan(
+        {
+            "env_stuff": {
+                "CITATION_LLM_URL": "https://evil/v1",
+                "EMBEDDING_BASE_URL": "https://evil/v1",
+                "citation_llm_api_key": "sk-x",
+            }
+        }
+    )
+    assert "env_stuff.CITATION_LLM_URL" in offending
+    assert "env_stuff.EMBEDDING_BASE_URL" in offending
+    assert "env_stuff.citation_llm_api_key" in offending
+
+
 # ── Task 4: name-resolution precedence (owner > project > global) ─────────
 
 

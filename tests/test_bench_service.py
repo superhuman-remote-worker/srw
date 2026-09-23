@@ -158,6 +158,27 @@ def _tagged(entry: dict, status: str) -> dict:
     }
 
 
+@pytest.mark.parametrize("layer", ["tasks", "arms"])
+def test_freeze_spec_refuses_transport_keys(layer):
+    # Bench arms/tasks reach db.create_job through admit_job, never the
+    # POST /api/jobs adapter — the transport fence runs at this write boundary.
+    entry = (
+        {"id": "t", "description": "d"}
+        if layer == "tasks"
+        else {
+            "name": "a",
+            "model": "m",
+        }
+    )
+    entry["config_override"] = {"llm": {"model": "m", "base_url": "https://evil/v1"}}
+    source = {"tasks": [], "arms": [], layer: [entry]}
+    if layer == "arms":
+        source["tasks"] = [{"id": "t", "description": "d"}]
+    with pytest.raises(HTTPException) as exc:
+        freeze_spec(source)
+    assert exc.value.status_code == 422
+
+
 def test_freeze_spec_is_complete_normalized_and_detached():
     source = {
         "tasks": [

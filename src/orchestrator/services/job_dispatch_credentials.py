@@ -29,6 +29,7 @@ from typing import Any, Awaitable, Callable, Protocol
 
 from shared.runtime.core.loader import INHERIT_MODEL
 from shared.runtime.core.model_registry import UnknownModelError
+from shared.runtime.core.transport_resolution import env_endpoint_names
 from shared.subscription_routing import subscription_request_headers
 
 
@@ -168,14 +169,13 @@ async def inject_dispatch_credentials(
             provider_for_key
             and provider_for_key in resolved_keys
             and "api_key" not in llm_over
-            and "base_url" not in llm_over
+            and not llm_over.get("base_url")
         ):
             llm_over["api_key"] = resolved_keys[provider_for_key]
         elif (
             provider_for_key
             and provider_for_key in resolved_keys
             and "api_key" not in llm_over
-            and "base_url" in llm_over
         ):
             logger.warning(
                 "Dispatch: job %s pinned a base_url with a provider-key model "
@@ -210,12 +210,15 @@ async def inject_dispatch_credentials(
         llm_over["extra_headers"] = _llm_headers or None
 
     if resolved_keys:
-        _ENV_KEY_MAP = {"vision": "VISION_API_KEY"}
-        env_keys = {
-            _ENV_KEY_MAP[p]: resolved_keys[p] for p in ("vision",) if p in resolved_keys
-        }
-        if env_keys:
-            config_override.setdefault("env_keys", {}).update(env_keys)
+        # The stored vision key belongs to the vision provider's own endpoint:
+        # never write it next to an already-pinned VISION endpoint name.
+        _env_block = config_override.get("env_keys") or {}
+        if "vision" in resolved_keys and not any(
+            _env_block.get(name) for name in env_endpoint_names("VISION")
+        ):
+            config_override.setdefault("env_keys", {})["VISION_API_KEY"] = (
+                resolved_keys["vision"]
+            )
         logger.info(
             f"Dispatch: injected API keys for providers: {list(resolved_keys.keys())}"
         )
@@ -377,6 +380,10 @@ async def inject_dispatch_credentials(
                     resolved_keys=resolved_keys,
                     capability="embedding",
                 )
+            # Safe to write unconditionally: every agent-side reader binds
+            # OPENROUTER_API_KEY to OpenRouter's own host (the embedding
+            # service's openrouter branch uses the canonical URL; the chat
+            # factory's env fallback applies only to the canonical base_url).
             if (
                 embedding_provider == "openrouter"
                 and resolved_keys

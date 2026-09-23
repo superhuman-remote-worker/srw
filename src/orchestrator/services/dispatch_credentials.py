@@ -47,6 +47,7 @@ from typing import Any
 
 from shared.runtime.core.loader import INHERIT_MODEL, canonical_config_name
 from shared.runtime.core.model_registry import UnknownModelError
+from shared.runtime.core.transport_resolution import env_endpoint_names
 from shared.subscription_routing import subscription_request_headers
 
 
@@ -340,13 +341,18 @@ async def inject_model_credentials(
     # caller pinned in this section. Withhold the stored key when a caller
     # base_url is present so a system/project/user credential is never sent to
     # a caller-chosen host (the exfiltration in the credential-leak review).
-    if (
-        provider
-        and resolved_keys
-        and provider in resolved_keys
-        and "api_key" not in section
-        and "base_url" not in section
-    ):
+    if provider and resolved_keys and provider in resolved_keys:
+        if "api_key" in section:
+            return
+        if section.get("base_url"):
+            dependencies.logger.warning(
+                "Dispatch: %s model %r has a pinned base_url; withholding the "
+                "resolved %s key so it is not sent to that endpoint.",
+                capability,
+                model_id,
+                provider,
+            )
+            return
         section["api_key"] = resolved_keys[provider]
 
 
@@ -366,9 +372,10 @@ async def inject_env_key_credentials(
     flat env vars (vision, whisper, tts, ...) rather than structured config
     sections. Endpoint-backed models (origin in {'custom','system','catalog'}
     with an endpoint_id) contribute the inline base_url+api_key from the
-    endpoint row; built-ins and system-anchored catalog rows resolve the
-    api_key via ``resolved_keys[provider]``. All writes are setdefault so
-    caller / earlier overrides win.
+    endpoint row, which overwrites any pre-set endpoint name; built-ins and
+    system-anchored catalog rows resolve the api_key via
+    ``resolved_keys[provider]`` (setdefault), withheld when an endpoint name
+    for the prefix is already set.
     """
     env_keys.setdefault(f"{prefix}_MODEL", model_id)
 
@@ -405,26 +412,38 @@ async def inject_env_key_credentials(
                     prefix,
                 )
                 return
+            # The endpoint row is authoritative for its own transport, exactly
+            # like the model-section branch: overwrite, never setdefault, so a
+            # pre-set endpoint name (under any alias a reader consults) cannot
+            # survive next to this row's key.
             if base_url:
-                env_keys.setdefault(f"{prefix}_BASE_URL", base_url)
+                names = env_endpoint_names(prefix)
+                for alias in names[1:]:
+                    env_keys.pop(alias, None)
+                env_keys[names[0]] = base_url
             if api_key:
-                env_keys.setdefault(f"{prefix}_API_KEY", api_key)
+                env_keys[f"{prefix}_API_KEY"] = api_key
         return
 
     provider = meta.api_key_ref if meta is not None else provider_of_model(model_id)
     # Same contract as the model-section injector: a provider-key row has no
     # endpoint of its own, so the resolved key belongs to the provider's
-    # canonical endpoint. If a caller pinned ``{prefix}_BASE_URL`` (the
-    # endpoint-backed branch above already returned for real endpoint rows),
-    # withhold the key so a stored credential is not sent to a caller-chosen
-    # host.
-    if (
-        provider
-        and resolved_keys
-        and provider in resolved_keys
-        and f"{prefix}_BASE_URL" not in env_keys
-    ):
-        env_keys.setdefault(f"{prefix}_API_KEY", resolved_keys[provider])
+    # canonical endpoint. If any endpoint name for this prefix is already set
+    # (the endpoint-backed branch above returned for real endpoint rows),
+    # withhold the key so a stored credential is not sent to that host.
+    if provider and resolved_keys and provider in resolved_keys:
+        pinned = [name for name in env_endpoint_names(prefix) if env_keys.get(name)]
+        if pinned:
+            dependencies.logger.warning(
+                "Dispatch: %s model %r has a pinned endpoint (%s); withholding "
+                "the resolved %s key so it is not sent to that endpoint.",
+                prefix,
+                model_id,
+                ", ".join(pinned),
+                provider,
+            )
+        else:
+            env_keys.setdefault(f"{prefix}_API_KEY", resolved_keys[provider])
 
 
 async def inject_search_credentials(

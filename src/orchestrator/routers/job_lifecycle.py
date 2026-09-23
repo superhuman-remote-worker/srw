@@ -9,9 +9,9 @@ from typing import Any, Awaitable, Callable
 from fastapi import APIRouter, Depends, HTTPException, Request
 
 from orchestrator.schemas.job_create import PublicJobCreateBody
+from orchestrator.services.config_overrides import refuse_caller_transport_keys
 from orchestrator.services.job_admission import JobAdmissionActor
 from orchestrator.services.job_mutation_controls import JobControlOperations
-from shared.orch_surface.jobs._utils import transport_key_paths
 
 router = APIRouter()
 
@@ -108,26 +108,10 @@ async def admit_job_request(
                 str(job.project_id),
                 min_role="editor",
             )
-    # Fail closed on caller-supplied transport, exactly as the MCP create tool
-    # does (shared.orch_surface.jobs.control). ``config_override`` routing is
-    # resolved server-side from the model ID and credentials are injected only
-    # in-flight at dispatch; a caller that pins ``base_url`` / ``api_key`` /
-    # ``env_keys`` here would otherwise have the deployment's stored key
-    # injected next to its chosen endpoint at dispatch. Refuse loudly rather
-    # than silently drop, so a legitimate self-hosted model is routed through
-    # its catalog endpoint (Admin -> Models) instead. Runs after auth so an
-    # anonymous request still gets 401 first.
-    offending = transport_key_paths(job.config_override)
-    if offending:
-        raise HTTPException(
-            status_code=422,
-            detail=(
-                "config_override may not set credential or transport keys ("
-                + ", ".join(sorted(offending))
-                + "). Routing is resolved server-side from the model ID — pass "
-                '{"llm": {"model": "<id>"}} and drop these keys.'
-            ),
-        )
+    # Fail closed on caller-supplied transport, the same write-boundary
+    # vocabulary as the MCP create tool. Runs after auth so an anonymous
+    # request still gets 401 first.
+    refuse_caller_transport_keys(job.config_override)
     return await dependencies.admit_job(
         command=job,
         actor=JobAdmissionActor(

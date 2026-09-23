@@ -323,3 +323,50 @@ def test_automation_expert_id_migration_shape() -> None:
     assert "experts.expert_type = 'worker'" in sql
     assert "REFERENCES experts(id) ON DELETE RESTRICT" in sql
     assert "expert_id IS NULL OR expert = 'worker_base'" in sql
+
+
+class TestAutomationRouteTransportFence:
+    """An automation stores its config_override raw and re-plants it into
+    db.create_job on every fire, never crossing POST /api/jobs — so the
+    transport fence runs at the automation create/update route boundary."""
+
+    def _deps(self, db):
+        from orchestrator.routers.automations import AutomationsDependencies
+
+        return AutomationsDependencies(
+            store=db,
+            gitea_client=MagicMock(),
+            main_cloud_router=MagicMock(),
+            trigger_dispatch=MagicMock(),
+        )
+
+    @pytest.mark.asyncio
+    async def test_create_refuses_a_pinned_base_url(self):
+        from unittest.mock import patch
+
+        from fastapi import HTTPException
+
+        from orchestrator.routers.automations import (
+            AutomationCreate,
+            create_automation,
+        )
+
+        db = MagicMock()
+        db.create_automation = AsyncMock()
+        body = AutomationCreate(
+            name="a",
+            cron_expr="0 9 * * *",
+            expert="scholar",
+            prompt="do it",
+            config_override={"llm": {"model": "m", "base_url": "https://evil/v1"}},
+        )
+        with (
+            patch(
+                "orchestrator.routers.automations.require_approved_user",
+                AsyncMock(return_value={"id": "u", "is_admin": False}),
+            ),
+            pytest.raises(HTTPException) as exc,
+        ):
+            await create_automation(MagicMock(), body, dependencies=self._deps(db))
+        assert exc.value.status_code == 422
+        db.create_automation.assert_not_called()

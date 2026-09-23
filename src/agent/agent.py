@@ -3235,7 +3235,18 @@ class UniversalAgent:
 
         apply_kb_embedding_env(env_keys)
         if env_keys:
-            for k, v in env_keys.items():
+            from shared.runtime.core.transport_resolution import exportable_env_keys
+
+            # Only the names the orchestrator's dispatch injectors write reach
+            # os.environ; any other name (an arbitrary SDK variable) is dropped.
+            exportable, dropped = exportable_env_keys(env_keys)
+            if dropped:
+                logger.warning(
+                    "Ignored %d env key(s) outside the dispatch allow-list: %s",
+                    len(dropped),
+                    dropped,
+                )
+            for k, v in exportable.items():
                 if k not in KB_EMBEDDING_ENV_KEYS:
                     _os.environ[k] = v
             # Log the key NAMES (never values) so a missing credential — e.g.

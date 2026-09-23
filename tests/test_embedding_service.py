@@ -530,9 +530,11 @@ class TestExplicitConfigOverrides:
         assert kwargs["api_key"] == "k"
         assert kwargs["base_url"] == "https://x.example/v1"
 
-    def test_partial_kwargs_fall_back_to_env(
+    def test_openai_key_not_inherited_by_foreign_embedding_host(
         self, mock_env, monkeypatch, mock_openai_client
     ):
+        # A key follows its endpoint: OPENAI_API_KEY belongs to api.openai.com,
+        # never to a custom EMBEDDING_BASE_URL that carries no EMBEDDING_API_KEY.
         monkeypatch.setenv("EMBEDDING_BASE_URL", "https://env.example/v1")
 
         from shared.runtime.services.embedding_service import EmbeddingService
@@ -540,7 +542,20 @@ class TestExplicitConfigOverrides:
         service = EmbeddingService(model="only-model-given")
         assert service.model == "only-model-given"
         assert service.base_url == "https://env.example/v1"
-        assert service.api_key == "test-key-123"  # OPENAI_API_KEY from mock_env
+        assert service.api_key == ""
+
+    def test_embedding_key_paired_with_custom_host_is_used(
+        self, mock_env, monkeypatch, mock_openai_client
+    ):
+        # The endpoint's own EMBEDDING_API_KEY is what authenticates it.
+        monkeypatch.setenv("EMBEDDING_BASE_URL", "https://env.example/v1")
+        monkeypatch.setenv("EMBEDDING_API_KEY", "emb-key")
+
+        from shared.runtime.services.embedding_service import EmbeddingService
+
+        service = EmbeddingService(model="only-model-given")
+        assert service.base_url == "https://env.example/v1"
+        assert service.api_key == "emb-key"
 
     def test_no_kwargs_is_pure_env_backward_compat(self, mock_env, mock_openai_client):
         from shared.runtime.services.embedding_service import EmbeddingService

@@ -140,6 +140,70 @@ def rerank_role_violation(
 
 
 # ---------------------------------------------------------------------------
+# Env-key endpoint names
+# ---------------------------------------------------------------------------
+#
+# Every env name a reader consults for the endpoint of a ``{PREFIX}_*`` flat
+# capability, in reader precedence order. The dispatch injector derives its
+# "a key follows its endpoint" guard from this same table, so a reader that
+# grows a new alias cannot drift away from the guard.
+ENV_ENDPOINT_ALIASES: dict[str, tuple[str, ...]] = {
+    "CITATION_LLM": ("CITATION_LLM_BASE_URL", "CITATION_LLM_URL"),
+}
+
+
+def env_endpoint_names(prefix: str) -> tuple[str, ...]:
+    """Env names that carry the endpoint for ``prefix`` (reader order)."""
+    return ENV_ENDPOINT_ALIASES.get(prefix, (f"{prefix}_BASE_URL",))
+
+
+# The flat capabilities the orchestrator's dispatch injectors write into a
+# delivered ``env_keys`` block — the only names an agent may export from it
+# into its process environment. Anything else (an arbitrary SDK variable) is
+# dropped at the export seam.
+_DISPATCH_ENV_PREFIXES = (
+    "EMBEDDING",
+    "KB_EMBEDDING",
+    "RERANK",
+    "VISION",
+    "WHISPER",
+    "TTS",
+    "CITATION_LLM",
+)
+_DISPATCH_ENV_SUFFIXES = (
+    "MODEL",
+    "BASE_URL",
+    "API_KEY",
+    "PROVIDER",
+    "PROFILE_ID",
+    "DIMENSIONS",
+)
+DISPATCH_ENV_KEY_NAMES = frozenset(
+    {f"{p}_{s}" for p in _DISPATCH_ENV_PREFIXES for s in _DISPATCH_ENV_SUFFIXES}
+    | {name for names in ENV_ENDPOINT_ALIASES.values() for name in names}
+    | {"OPENROUTER_API_KEY"}
+)
+
+
+def exportable_env_keys(
+    env_keys: Optional[Mapping],
+) -> tuple[dict[str, str], list[str]]:
+    """Split a delivered ``env_keys`` block into (exportable, dropped names).
+
+    Only :data:`DISPATCH_ENV_KEY_NAMES` with a string value are exportable.
+    The dropped list carries names only, for a log line.
+    """
+    kept: dict[str, str] = {}
+    dropped: list[str] = []
+    for name, value in (env_keys or {}).items():
+        if name in DISPATCH_ENV_KEY_NAMES and isinstance(value, str):
+            kept[name] = value
+        else:
+            dropped.append(str(name))
+    return kept, sorted(dropped)
+
+
+# ---------------------------------------------------------------------------
 # Citation LLM credential isolation
 # ---------------------------------------------------------------------------
 #
@@ -220,18 +284,15 @@ def resolve_citation_transport(env: Optional[Mapping] = None) -> CitationTranspo
         import os
 
         env = os.environ
-    base_url = env.get("CITATION_LLM_BASE_URL") or env.get("CITATION_LLM_URL") or None
+    names = env_endpoint_names("CITATION_LLM")
+    url_var = next((name for name in names if env.get(name)), names[-1])
+    base_url = env.get(url_var) or None
     dedicated = env.get("CITATION_LLM_API_KEY") or None
     if dedicated:
         return CitationTransport(
             base_url=base_url, api_key=dedicated, key_source="CITATION_LLM_API_KEY"
         )
     if not is_openai_default_endpoint(base_url):
-        url_var = (
-            "CITATION_LLM_BASE_URL"
-            if env.get("CITATION_LLM_BASE_URL")
-            else "CITATION_LLM_URL"
-        )
         raise CitationTransportError(
             f"{url_var}={base_url!r} names a non-OpenAI endpoint but "
             "CITATION_LLM_API_KEY is unset; refusing to send OPENAI_API_KEY "
