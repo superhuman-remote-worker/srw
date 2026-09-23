@@ -8,6 +8,18 @@
     "global"
   ],
   "definitions": {
+    "vmResourceSixBudget": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "cpuMillicores": {"type": ["integer", "null"], "minimum": 0},
+        "memoryBytes": {"type": ["integer", "null"], "minimum": 0},
+        "ephemeralStorageBytes": {"type": ["integer", "null"], "minimum": 0},
+        "kvmDevices": {"type": ["integer", "null"], "minimum": 0},
+        "tunDevices": {"type": ["integer", "null"], "minimum": 0},
+        "vhostNetDevices": {"type": ["integer", "null"], "minimum": 0}
+      }
+    },
     "labelSelector": {
       "type": "object",
       "properties": {
@@ -1951,6 +1963,14 @@
                     "minLength": 1,
                     "maxLength": 253
                   }
+                },
+                "kubevirtNamespace": {
+                  "type": ["string", "null"],
+                  "maxLength": 63
+                },
+                "kubevirtName": {
+                  "type": ["string", "null"],
+                  "maxLength": 253
                 }
               }
             },
@@ -2005,7 +2025,12 @@
                   ],
                   "minimum": 0,
                   "maximum": 9007199254740991
-                }
+                },
+                "version": {"type": ["integer", "null"], "enum": [null, 2]},
+                "ephemeralStorageReserveBytes": {"type": ["integer", "null"], "minimum": 0},
+                "kvmDevices": {"type": ["integer", "null"], "minimum": 0},
+                "tunDevices": {"type": ["integer", "null"], "minimum": 0},
+                "vhostNetDevices": {"type": ["integer", "null"], "minimum": 0}
               }
             },
             "nodeHeadroom": {
@@ -2035,9 +2060,15 @@
                   ],
                   "minimum": 0,
                   "maximum": 9007199254740991
-                }
+                },
+                "ephemeralStorageBytes": {"type": ["integer", "null"], "minimum": 0},
+                "tunDevices": {"type": ["integer", "null"], "minimum": 0},
+                "vhostNetDevices": {"type": ["integer", "null"], "minimum": 0}
               }
             },
+            "launcherProfile": {"type": ["object", "null"]},
+            "installationBudget": {"$ref": "#/definitions/vmResourceSixBudget"},
+            "ownerBudget": {"$ref": "#/definitions/vmResourceSixBudget"},
             "fairness": {
               "type": "object",
               "additionalProperties": false,

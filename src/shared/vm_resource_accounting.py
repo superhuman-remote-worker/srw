@@ -38,6 +38,8 @@ class ReservationCharge:
     vm_uid: str | None = None
     vmi_uid: str | None = None
     launcher_uid: str | None = None
+    version: int = 1
+    observed_high_water: ResourceVector | None = None
 
     def __post_init__(self):
         for key in ("reservation_id", "node_uid", "owner_id", "provision_generation"):
@@ -48,6 +50,13 @@ class ReservationCharge:
             self.owner_kind not in {"job", "thread"}
             or self.state not in _HELD | {"released"}
             or not isinstance(self.vector, ResourceVector)
+            or type(self.version) is not int
+            or self.version not in (1, 2)
+            or (
+                self.observed_high_water is not None
+                and not isinstance(self.observed_high_water, ResourceVector)
+            )
+            or (self.version == 1 and self.observed_high_water is not None)
             or not isinstance(self.node_name, str)
             or not 1 <= len(self.node_name) <= 253
             or self.node_name != self.node_name.strip()
@@ -125,6 +134,12 @@ def account_inventory(snapshot, reservations, *, headroom):
             raise ResourceAdmissionError("reservation_identity")
         if reservation.state == "released":
             continue
+        if (snapshot["protocol"] == 2 and reservation.version != 2) or (
+            snapshot["protocol"] == 1 and reservation.version != 1
+        ):
+            # A historical three-field charge cannot become zero ephemeral or
+            # device demand by silently joining a six-field inventory.
+            raise ResourceAdmissionError("legacy_occupancy_unclassified")
         generation_key = (
             reservation.owner_kind,
             reservation.owner_id,
@@ -158,6 +173,8 @@ def account_inventory(snapshot, reservations, *, headroom):
             raise ResourceAdmissionError("reservation_node_identity")
         pod = pods.get(reservation.launcher_uid)
         charge = reservation.vector
+        if reservation.observed_high_water is not None:
+            charge = charge.maximum(reservation.observed_high_water)
         if _exact_launcher(reservation, pod, vmis, vms):
             charge = charge.maximum(ResourceVector(**pod["requests"]))
             excluded.add(pod["uid"])

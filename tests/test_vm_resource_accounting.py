@@ -80,6 +80,35 @@ def test_exact_bound_launcher_charged_once_at_component_max():
     assert node.available == ResourceVector(2800, 7 * 1024**3, 9)
 
 
+def test_protocol_two_retains_authenticated_high_water_across_missing_pod_and_phases():
+    from shared.vm_launcher_profile import default_launcher_profile
+
+    value, reservation = setup()
+    value["protocol"] = 2
+    value["label_keys"].append("kubernetes.io/arch")
+    value["nodes"][0]["labels"]["kubernetes.io/arch"] = "amd64"
+    value["nodes"][0]["allocatable"].update(
+        ephemeral_storage_bytes=1000000000, tun_devices=8, vhost_net_devices=8,
+    )
+    value["resource_versions"].update(kubevirt="10", limitranges="10")
+    value["installed_profile"] = {
+        "uid": str(uuid4()), "namespace": "kubevirt", "name": "kubevirt",
+        "generation": 1, "observedGeneration": 1, "version": "v1.6.6",
+        "deploymentID": "settled", "profile": default_launcher_profile(),
+    }
+    value["pods"] = []
+    reserved = ResourceVector(1000, 1024**3, 1, 50000000, 1, 1)
+    high = ResourceVector(1200, 2 * 1024**3, 1, 70000000, 2, 1)
+    for state in ("reserved", "active", "warm", "teardown"):
+        held = replace(reservation, state=state, version=2, vector=reserved,
+                       observed_high_water=high)
+        node = result(value, [held]).nodes[reservation.node_uid]
+        assert node.held == high
+        assert node.available.ephemeral_storage_bytes == 930000000
+    with pytest.raises(ResourceAdmissionError):
+        result(value, [reservation])
+
+
 @pytest.mark.parametrize(
     "field",
     [

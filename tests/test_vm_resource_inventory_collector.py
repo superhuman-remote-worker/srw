@@ -101,6 +101,47 @@ async def test_collects_complete_scope_without_serializing_private_fields():
 
 
 @pytest.mark.asyncio
+async def test_protocol_two_gets_exact_installed_cr_and_limitranges_without_raw_dump():
+    from tests.test_vm_launcher_profile import installed_cr
+
+    collector, pages, calls = fixture()
+    node = pages["nodes"][0]["items"][0]
+    node["metadata"]["labels"]["kubernetes.io/arch"] = "amd64"
+    node["status"]["allocatable"].update({
+        "ephemeral-storage": "100G",
+        "devices.kubevirt.io/tun": "8",
+        "devices.kubevirt.io/vhost-net": "8",
+    })
+    collector.protocol = 2
+    collector.kubevirt_namespace = "kubevirt"
+    collector.kubevirt_name = "kubevirt"
+    collector.label_keys.append("kubernetes.io/arch")
+    raw_cr = installed_cr()
+    raw_cr["metadata"]["resourceVersion"] = "11"
+    raw_cr["spec"]["private"] = "DO_NOT_EMIT"
+    observed = []
+
+    def get_cr(**kwargs):
+        observed.append(kwargs)
+        return deepcopy(raw_cr)
+
+    collector.custom.get_namespaced_custom_object = get_cr
+    collector.core.list_namespaced_limit_range = lambda **kwargs: page([])
+    result = await collector.collect(1)
+    assert result["complete"] is True
+    assert result["protocol"] == 2
+    assert result["installed_profile"]["profile"]["kubevirtVersion"] == "v1.6.6"
+    assert result["nodes"][0]["allocatable"]["ephemeral_storage_bytes"] == 100000000000
+    assert result["resource_versions"]["kubevirt"] == "11"
+    assert observed[0]["namespace"] == "kubevirt" and observed[0]["name"] == "kubevirt"
+    assert "DO_NOT_EMIT" not in json.dumps(result)
+    raw_cr["status"]["observedGeneration"] = 2
+    refused = await collector.collect(2)
+    assert refused["complete"] is False
+    assert refused["installed_profile"] is None
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "fault,reason",
     [

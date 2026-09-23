@@ -8,6 +8,7 @@ from uuid import uuid4
 from kubernetes.client import ApiClient
 
 from shared.vm_resource_admission import effective_pod_request, scheduled_pod_charge
+from shared.vm_launcher_profile import normalize_installed_profile
 from shared.vm_resource_inventory import (
     INVENTORY_KINDS,
     INCOMPLETE_REASONS,
@@ -119,7 +120,7 @@ def _allowed_topology(storage_class):
     return {"nodeSelectorTerms": result}
 
 
-def normalize_inventory(raw, *, namespace, label_keys):
+def normalize_inventory(raw, *, namespace, label_keys, protocol=1):
     """Build each public field explicitly. Raw object dictionaries stay local."""
     nodes, vms, vmis, pvcs, pvs, classes, dvs = (
         _index(
@@ -158,7 +159,10 @@ def normalize_inventory(raw, *, namespace, label_keys):
                     }
                     for taint in spec.get("taints", [])
                 ],
-                "allocatable": node_allocatable(value).to_dict(),
+                "allocatable": (
+                    node_allocatable(value, six=True).to_six_dict()
+                    if protocol == 2 else node_allocatable(value).to_dict()
+                ),
             }
         )
     for name, value in vms.items():
@@ -201,7 +205,11 @@ def normalize_inventory(raw, *, namespace, label_keys):
         )
         # This validates lifecycle/resize evidence, including scheduled-without-node.
         scheduled_pod_charge(value)
-        request = effective_pod_request(value)
+        vmi_uid = (
+            _owner(value, "VirtualMachineInstance", vmis, "kubevirt.io")
+            if meta.get("namespace") == namespace else None
+        )
+        request = effective_pod_request(value, managed_launcher=protocol == 2 and vmi_uid is not None)
         node_name = spec.get("nodeName") or None
         node_uid = _meta(nodes[node_name]).get("uid") if node_name in nodes else None
         annotations = _map(meta.get("annotations", {}))
@@ -212,12 +220,10 @@ def normalize_inventory(raw, *, namespace, label_keys):
                 "namespace": meta.get("namespace"),
                 "node_uid": node_uid,
                 "node_name": node_name,
-                "requests": request.to_dict(),
+                "requests": request.to_six_dict() if protocol == 2 else request.to_dict(),
                 "terminal": status.get("phase") in {"Succeeded", "Failed"},
                 "deleting": meta.get("deletionTimestamp") is not None,
-                "vmi_uid": _owner(value, "VirtualMachineInstance", vmis, "kubevirt.io")
-                if meta.get("namespace") == namespace
-                else None,
+                "vmi_uid": vmi_uid,
                 "reservation_id": annotations.get(_RESERVATION),
                 "provision_generation": annotations.get(_GENERATION),
             }
@@ -311,6 +317,9 @@ class ResourceInventoryCollector:
         max_bytes,
         request_timeout_seconds,
         collection_timeout_seconds,
+        protocol=1,
+        kubevirt_namespace=None,
+        kubevirt_name=None,
     ):
         self.core, self.custom, self.storage = core, custom, storage
         self.namespace, self.cluster_id, self.controller_id = (
@@ -332,6 +341,17 @@ class ResourceInventoryCollector:
             request_timeout_seconds,
             collection_timeout_seconds,
         )
+        if type(protocol) is not int or protocol not in (1, 2):
+            raise InventoryError("invalid_inventory_configuration")
+        if protocol == 2 and (
+            not isinstance(kubevirt_namespace, str) or not kubevirt_namespace
+            or not isinstance(kubevirt_name, str) or not kubevirt_name
+            or "kubernetes.io/arch" not in label_keys
+        ):
+            raise InventoryError("invalid_inventory_configuration")
+        self.protocol = protocol
+        self.kubevirt_namespace = kubevirt_namespace
+        self.kubevirt_name = kubevirt_name
 
     async def _call(self, method, **kwargs):
         task = asyncio.create_task(asyncio.to_thread(method, **kwargs))
@@ -391,7 +411,7 @@ class ResourceInventoryCollector:
         started = datetime.now(timezone.utc).isoformat()
         deadline = time.monotonic() + self.collection_timeout_seconds
         snapshot = {
-            "protocol": 1,
+            "protocol": self.protocol,
             "snapshot_id": str(uuid4()),
             "cluster_id": self.cluster_id,
             "controller_id": self.controller_id,
@@ -406,6 +426,8 @@ class ResourceInventoryCollector:
             "resource_versions": {},
             **{kind: [] for kind in INVENTORY_KINDS},
         }
+        if self.protocol == 2:
+            snapshot["installed_profile"] = None
         try:
             raw, versions, count = {}, {}, 0
             calls = {
@@ -444,9 +466,42 @@ class ResourceInventoryCollector:
                     **kwargs,
                 )
                 count += len(raw[kind])
+            if self.protocol == 2:
+                limits, versions["limitranges"] = await self._list(
+                    self.core.list_namespaced_limit_range,
+                    deadline=deadline,
+                    remaining=self.max_items - count,
+                    namespace=self.namespace,
+                )
+                if limits:
+                    raise InventoryError("normalization_failed")
+                budget = deadline - time.monotonic()
+                if budget <= 0:
+                    raise InventoryError("collection_stale")
+                kubevirt = await self._call(
+                    self.custom.get_namespaced_custom_object,
+                    group="kubevirt.io",
+                    version="v1",
+                    plural="kubevirts",
+                    namespace=self.kubevirt_namespace,
+                    name=self.kubevirt_name,
+                    _request_timeout=min(self.request_timeout_seconds, budget),
+                )
+                if time.monotonic() > deadline:
+                    raise InventoryError("collection_stale")
+                rv = _meta(kubevirt).get("resourceVersion")
+                if not isinstance(rv, str) or not rv:
+                    raise InventoryError("collection_incomplete")
+                versions["kubevirt"] = rv
+                snapshot["installed_profile"] = normalize_installed_profile(
+                    kubevirt,
+                    namespace=self.kubevirt_namespace,
+                    name=self.kubevirt_name,
+                )
             snapshot.update(
                 normalize_inventory(
-                    raw, namespace=self.namespace, label_keys=self.label_keys
+                    raw, namespace=self.namespace, label_keys=self.label_keys,
+                    protocol=self.protocol,
                 )
             )
             snapshot.update(
@@ -467,6 +522,8 @@ class ResourceInventoryCollector:
                 else "collection_failed"
             )
             snapshot.update({kind: [] for kind in INVENTORY_KINDS})
+            if self.protocol == 2:
+                snapshot["installed_profile"] = None
             snapshot.update(
                 complete=False,
                 reason=reason,

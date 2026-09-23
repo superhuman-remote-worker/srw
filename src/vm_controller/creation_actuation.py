@@ -795,7 +795,10 @@ class CreationActuator:
                 kind != "workspace_attach" and row.get("prepared_origin") is not None
             ):
                 await sources.validate(row, rootdisk_source)
-            if kind == "vm" and row["request"].get("network_profile") is not None:
+            if kind == "vm" and (
+                row["request"].get("network_profile") is not None
+                or row["controller_configuration"]["version"] == 3
+            ):
                 from shared.vm_resource_manifest import validate_final_vm_manifest
 
                 validate_final_vm_manifest(

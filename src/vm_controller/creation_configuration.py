@@ -175,8 +175,14 @@ def resolve_creation_configuration(
     configuration = json.loads(json.dumps(configuration))
     if _resource_policy_snapshot is not None:
         from shared.vm_resource_configuration import build_resource_configuration
+        from shared.vm_resource_policy import validate_resource_policy_snapshot
 
-        configuration["version"] = 2
+        _resource_policy_snapshot = validate_resource_policy_snapshot(
+            _resource_policy_snapshot
+        )
+        configuration["version"] = (
+            3 if _resource_policy_snapshot.inventory.protocol == 2 else 2
+        )
         configuration["resource_admission"] = build_resource_configuration(
             _resource_policy_snapshot,
             template=template,

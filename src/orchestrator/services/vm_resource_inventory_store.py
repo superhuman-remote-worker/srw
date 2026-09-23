@@ -26,6 +26,9 @@ class VMResourceInventoryStore:
         max_bytes,
         stale_after_seconds,
         history_limit,
+        protocol=1,
+        kubevirt_namespace=None,
+        kubevirt_name=None,
     ):
         self.db = db
         self.cluster_id, self.namespace, self.policy_digest = (
@@ -39,6 +42,16 @@ class VMResourceInventoryStore:
             stale_after_seconds,
             history_limit,
         )
+        if type(protocol) is not int or protocol not in (1, 2):
+            raise InventoryError("invalid_inventory_configuration")
+        self.protocol = protocol
+        self.kubevirt_namespace = kubevirt_namespace
+        self.kubevirt_name = kubevirt_name
+        if protocol == 2 and (
+            not kubevirt_namespace or not kubevirt_name
+            or type(kubevirt_namespace) is not str or type(kubevirt_name) is not str
+        ):
+            raise InventoryError("invalid_inventory_configuration")
         for limit in (max_items, max_bytes, stale_after_seconds, history_limit):
             if type(limit) is not int or not 1 <= limit < 2**63:
                 raise InventoryError("invalid_inventory_configuration")
@@ -52,6 +65,7 @@ class VMResourceInventoryStore:
             or value["namespace"] != self.namespace
             or value["policy_digest"] != self.policy_digest
             or value["label_keys"] != self.label_keys
+            or value["protocol"] != self.protocol
         ):
             raise InventoryError("inventory_scope_changed")
         if not isinstance(digest, str) or not hmac.compare_digest(

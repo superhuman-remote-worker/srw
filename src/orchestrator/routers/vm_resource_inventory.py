@@ -63,6 +63,9 @@ def configure_from_environment(db):
         max_bytes=settings.max_bytes,
         stale_after_seconds=settings.stale_after_seconds,
         history_limit=settings.history_limit,
+        protocol=settings.protocol,
+        kubevirt_namespace=settings.kubevirt_namespace,
+        kubevirt_name=settings.kubevirt_name,
     )
     configure(
         store_factory=lambda: store,

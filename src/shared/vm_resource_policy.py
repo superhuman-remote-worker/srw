@@ -11,8 +11,10 @@ from shared.vm_resource_admission import (
     HostCostPolicy,
     ResourceAdmissionError,
     ResourceVector,
+    WholeLauncherHostCostPolicy,
 )
 from shared.vm_resource_inventory_settings import InventorySettings
+from shared.vm_launcher_profile import validate_launcher_profile
 
 
 HOST_COST_FIELDS = (
@@ -22,6 +24,14 @@ HOST_COST_FIELDS = (
     "fixedMemoryOverheadBytes",
     "perVcpuMemoryOverheadBytes",
     "memoryOverheadBasisPoints",
+)
+WHOLE_HOST_COST_FIELDS = HOST_COST_FIELDS + (
+    "version", "ephemeralStorageReserveBytes", "kvmDevices", "tunDevices",
+    "vhostNetDevices",
+)
+SIX_BUDGET_FIELDS = (
+    "cpuMillicores", "memoryBytes", "ephemeralStorageBytes", "kvmDevices",
+    "tunDevices", "vhostNetDevices",
 )
 
 
@@ -35,6 +45,48 @@ def parse_host_cost_policy(value):
     """Validate the closed six-field operator estimate used by both services."""
     try:
         return HostCostPolicy(*_fields(value, HOST_COST_FIELDS))
+    except (ValueError, TypeError, KeyError):
+        raise ResourceAdmissionError("invalid_resource_policy") from None
+
+
+def parse_whole_launcher_host_cost_policy(value):
+    try:
+        _fields(value, WHOLE_HOST_COST_FIELDS)
+        if type(value["version"]) is not int or value["version"] != 2:
+            raise ValueError
+        return WholeLauncherHostCostPolicy(
+            parse_host_cost_policy({key: value[key] for key in HOST_COST_FIELDS}),
+            value["ephemeralStorageReserveBytes"],
+            value["kvmDevices"],
+            value["tunDevices"],
+            value["vhostNetDevices"],
+        )
+    except (ValueError, TypeError, KeyError):
+        raise ResourceAdmissionError("invalid_resource_policy") from None
+
+
+def parse_six_budget(value):
+    try:
+        values = _fields(value, SIX_BUDGET_FIELDS)
+        return ResourceVector(values[0], values[1], values[3], values[2], values[4], values[5])
+    except (ValueError, TypeError, KeyError):
+        raise ResourceAdmissionError("invalid_resource_policy") from None
+
+
+def parse_whole_launcher_policy_values(policy):
+    try:
+        cost = parse_whole_launcher_host_cost_policy(policy["hostCost"])
+        headroom = parse_six_budget(policy["nodeHeadroom"])
+        installation = parse_six_budget(policy["installationBudget"])
+        owner = parse_six_budget(policy["ownerBudget"])
+        profile = validate_launcher_profile(policy["launcherProfile"])
+        bypasses, aging = _fields(policy["fairness"], ("maxBypasses", "priorityAgingSeconds"))
+        if (
+            type(bypasses) is not int or not 0 <= bypasses < 2**63
+            or type(aging) is not int or not 1 <= aging < 2**63
+        ):
+            raise ValueError
+        return cost, headroom, installation, owner, bypasses, aging, profile
     except (ValueError, TypeError, KeyError):
         raise ResourceAdmissionError("invalid_resource_policy") from None
 
@@ -72,6 +124,9 @@ class CompleteResourcePolicySnapshot:
     headroom: ResourceVector
     max_bypasses: int
     priority_aging_seconds: int
+    launcher_profile: dict | None = None
+    installation_budget: ResourceVector | None = None
+    owner_budget: ResourceVector | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,6 +138,9 @@ class EnforcementResourcePolicySnapshot:
     headroom: ResourceVector
     max_bypasses: int
     priority_aging_seconds: int
+    launcher_profile: dict | None = None
+    installation_budget: ResourceVector | None = None
+    owner_budget: ResourceVector | None = None
 
 
 def _validate_resource_policy(document, *, inventory_loader, snapshot_type):
@@ -101,7 +159,13 @@ def _validate_resource_policy(document, *, inventory_loader, snapshot_type):
         inventory = inventory_loader(value)
         if inventory is None:
             raise ValueError
-        cost, headroom, bypasses, aging = parse_resource_policy_values(value["policy"])
+        if inventory.protocol == 2:
+            cost, headroom, installation, owner, bypasses, aging, profile = (
+                parse_whole_launcher_policy_values(value["policy"])
+            )
+        else:
+            cost, headroom, bypasses, aging = parse_resource_policy_values(value["policy"])
+            profile = installation = owner = None
         return snapshot_type(
             canonical,
             inventory.policy_digest,
@@ -110,6 +174,9 @@ def _validate_resource_policy(document, *, inventory_loader, snapshot_type):
             headroom,
             bypasses,
             aging,
+            profile,
+            installation,
+            owner,
         )
     except (ValueError, TypeError, KeyError, UnicodeError, RecursionError):
         raise ResourceAdmissionError("invalid_resource_policy") from None
@@ -154,6 +221,11 @@ def _same_typed_value(actual, expected):
     if isinstance(expected, tuple):
         return len(actual) == len(expected) and all(
             _same_typed_value(left, right) for left, right in zip(actual, expected)
+        )
+    if isinstance(expected, dict):
+        return actual.keys() == expected.keys() and all(
+            _same_typed_value(actual[key], value)
+            for key, value in expected.items()
         )
     return actual == expected
 

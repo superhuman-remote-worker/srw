@@ -84,6 +84,44 @@ def test_inventory_digest_is_canonical_without_changing_input():
     assert snapshot_digest(validate(raw)) != snapshot_digest(result)
 
 
+def test_protocol_two_requires_all_six_dimensions_and_installed_profile_proof():
+    from shared.vm_launcher_profile import default_launcher_profile
+
+    raw = snapshot()
+    raw["protocol"] = 2
+    raw["label_keys"].append("kubernetes.io/arch")
+    raw["nodes"][0]["labels"]["kubernetes.io/arch"] = "amd64"
+    raw["nodes"][0]["allocatable"].update(
+        ephemeral_storage_bytes=1000000000, tun_devices=8, vhost_net_devices=8,
+    )
+    raw["resource_versions"].update(kubevirt="10", limitranges="10")
+    raw["installed_profile"] = {
+        "uid": str(uuid4()),
+        "namespace": "kubevirt",
+        "name": "kubevirt",
+        "generation": 2,
+        "observedGeneration": 2,
+        "targetVersion": "v1.6.6",
+        "observedVersion": "v1.6.6",
+        "targetDeploymentID": "settled",
+        "observedDeploymentID": "settled",
+        "profile": default_launcher_profile(),
+    }
+    assert validate(raw)["protocol"] == 2
+    for key in ("ephemeral_storage_bytes", "tun_devices", "vhost_net_devices"):
+        broken = deepcopy(raw)
+        del broken["nodes"][0]["allocatable"][key]
+        with pytest.raises(InventoryError):
+            validate(broken)
+    broken = deepcopy(raw)
+    del broken["installed_profile"]
+    with pytest.raises(InventoryError):
+        validate(broken)
+    broken = deepcopy(raw)
+    broken["installed_profile"]["profile"]["cpuAllocationRatio"] += 1
+    assert snapshot_digest(validate(broken)) != snapshot_digest(validate(raw))
+
+
 @pytest.mark.parametrize(
     "mutate",
     [
