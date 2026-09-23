@@ -1,0 +1,48 @@
+# Profile overlay for R1.B10's live acceptance — session transport, permission
+# decisions, magic links and attention/wake. Layered ON TOP of values-e2e.yaml,
+# values-stateless-sandbox.yaml and values-forge-sandbox.yaml, never instead of
+# them.
+#
+# Three additions, each needed by a behaviour under test and nothing else:
+#
+# - A local mail sink. GreenMail accepts any envelope and never relays, so the
+#   permission reminder's magic-link mail is observable without any message
+#   leaving the disposable cluster. SMTP points only at it.
+# - The audit tier. The Officer daily-ceiling brake reads the usage ledger,
+#   which is unavailable (and therefore fails open) without it; with it the
+#   brake's real accounting path can be exercised.
+# - The bundled object store. Workspace suspension — and therefore pinned
+#   attention sleep and its wake — is only enabled when snapshots can be
+#   written.
+#
+# The reminder (30 s) and attention-sleep (60 s) cadences keep their defaults;
+# the per-thread attention TTL is set on the fixture thread, not here.
+test:
+  greenmail:
+    enabled: true
+
+# `email.enabled` stays false: it only adds SMTP/IMAP credential refs (and
+# Keycloak's own SMTP), which GreenMail does not need. Host, port and TLS are
+# ConfigMap keys rendered regardless, so the orchestrator sends unauthenticated
+# mail to the sink and nowhere else.
+email:
+  smtp:
+    host: srw-e2e-greenmail
+    port: "3025"
+    useTls: "false"
+    trustSelfSigned: "true"
+    from: "srw@srw-e2e-mailsink.internal"
+  domain: ""
+
+databases:
+  audit:
+    enabled: true
+    storageSize: 1Gi
+
+garage:
+  enabled: true
+  dataStorageSize: 4Gi
+  capacityBytes: 2147483648
+  resources:
+    requests: {memory: 128Mi, cpu: 50m}
+    limits: {memory: 512Mi, cpu: 500m}

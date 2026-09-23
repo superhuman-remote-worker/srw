@@ -1413,6 +1413,7 @@ def test_stateless_sandbox_profile_renders_current_executor_and_workspace_images
         "forge-sandbox",
         "cloud-sandbox",
         "officer-watchdog",
+        "session-attention",
     ],
 )
 def test_session_profiles_do_not_render_an_extra_catalog_provider(
@@ -1449,6 +1450,52 @@ def test_session_profiles_do_not_render_an_extra_catalog_provider(
     # catalogue check, even if its service were omitted from the chart.
     environment = research_seed["spec"]["template"]["spec"]["containers"][0]["env"]
     assert "SEARXNG_BASE_URL" not in {item["name"] for item in environment}
+
+
+@pytest.mark.skipif(shutil.which("helm") is None, reason="Helm is not installed")
+def test_session_attention_profile_renders_a_mail_sink_audit_tier_and_store() -> None:
+    """R1.B10's live gate composes the forge profile and adds only its needs.
+
+    SMTP must point at the in-cluster GreenMail sink and nowhere else, the audit
+    StatefulSet the harness waits on must render, and so must the object store
+    that enables workspace suspension.
+    """
+    forge = harness.resolve_profile("forge-sandbox")
+    profile = harness.resolve_profile("session-attention")
+    assert profile.values_files[: len(forge.values_files)] == forge.values_files
+    assert profile.values_files[-1] == harness.SESSION_ATTENTION_VALUES_FILE
+
+    command = [
+        "helm",
+        "template",
+        "srw-e2e",
+        str(harness.REPO_ROOT / "helm"),
+        "-n",
+        harness.NAMESPACE,
+    ]
+    for values_file in profile.values_files:
+        command.extend(("-f", str(values_file)))
+    rendered = subprocess.run(
+        command, check=True, capture_output=True, text=True, timeout=120
+    ).stdout
+    documents = [document for document in yaml.safe_load_all(rendered) if document]
+    names = {
+        (document.get("kind"), document.get("metadata", {}).get("name"))
+        for document in documents
+    }
+    for deployment in profile.additional_deployments:
+        assert ("Deployment", deployment) in names
+    for statefulset in profile.additional_statefulsets:
+        assert ("StatefulSet", statefulset) in names
+    config = next(
+        document
+        for document in documents
+        if document.get("kind") == "ConfigMap"
+        and document.get("metadata", {}).get("name") == "srw-e2e-config"
+    )
+    assert config["data"]["SMTP_HOST"] == "srw-e2e-greenmail"
+    assert config["data"]["SMTP_PORT"] == "3025"
+    assert config["data"]["SMTP_USE_TLS"] == "false"
 
 
 def test_forge_sandbox_profile_composes_the_sandbox_overlay_and_adds_the_forge() -> (
