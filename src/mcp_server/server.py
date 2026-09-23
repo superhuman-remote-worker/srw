@@ -1596,7 +1596,17 @@ async def update_project(
         default_config_override=default_config_override,
     )
     s = result.get("status", "unknown")
-    return f"Project {project_id} updated ({s})."
+    message = f"Project {project_id} updated ({s})."
+    dropped = result.get("dropped_hidden_keys") or []
+    if dropped:
+        # get_project serves the override redacted; a write that changed an
+        # endpoint (or a section) kept none of these stored secrets.
+        message += (
+            " Stored secrets NOT kept (send them again to restore): "
+            + ", ".join(dropped)
+            + "."
+        )
+    return message
 
 
 @mcp_tool

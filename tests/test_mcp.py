@@ -708,6 +708,31 @@ async def test_reindex_summary_defaults_skipped_duplicates_for_older_payloads():
     assert "skipped_duplicates: 0" in result
 
 
+@pytest.mark.asyncio
+async def test_update_project_tool_names_the_stored_secrets_it_dropped():
+    """A read-modify-write through get_project + update_project that changes
+    an endpoint keeps none of the redacted secrets; the tool must say so."""
+    mock_client = AsyncMock()
+    mock_client.update_project.return_value = {
+        "status": "updated",
+        "dropped_hidden_keys": ["llm.api_key", "workspace.remote"],
+    }
+
+    with patch.object(_mcp_server_mod, "_get_client", return_value=mock_client):
+        result = await _mcp_server_mod.update_project(
+            "project-1", default_config_override={"llm": {"base_url": "https://x"}}
+        )
+
+    assert "llm.api_key" in result
+    assert "workspace.remote" in result
+
+    mock_client.update_project.return_value = {"status": "updated"}
+    with patch.object(_mcp_server_mod, "_get_client", return_value=mock_client):
+        result = await _mcp_server_mod.update_project("project-1", name="n")
+
+    assert result == "Project project-1 updated (updated)."
+
+
 class TestMcpPersistentThreadTools:
     """Tests for MCP server persistent thread tool functions.
 

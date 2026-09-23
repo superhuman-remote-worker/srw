@@ -573,6 +573,8 @@ class TestDefaultConfigOverrideRedaction:
             "default_config_override"
         ]
         assert written == {**SECRET_OVERRIDE, "memory": {"project_scoped": False}}
+        # Nothing was lost, so nothing is reported.
+        assert response.json() == {"status": "updated"}
 
     def test_a_redirected_endpoint_restores_nothing_anywhere(self):
         """An override has several writers (any co-owner), and one who cannot
@@ -593,6 +595,27 @@ class TestDefaultConfigOverrideRedaction:
             "default_config_override"
         ]
         assert written == override
+        # Not silent: a read-modify-write client learns which stored values
+        # the write discarded and must re-enter.
+        assert sorted(response.json()["dropped_hidden_keys"]) == [
+            "env_keys.EMBEDDING_API_KEY",
+            "llm.api_key",
+            "workspace.mounts[0].rclone_spec",
+            "workspace.remote",
+        ]
+
+    def test_an_explicitly_resent_secret_is_not_reported_dropped(self):
+        gate = _stored_project_gate(SECRET_OVERRIDE)
+        wired = _wire(project_owner=gate)
+        override = json.loads(json.dumps(PUBLIC_OVERRIDE))
+        override["llm"]["base_url"] = "https://other.example/v1"
+        override["llm"]["api_key"] = "sk-new"
+
+        response = wired.client.patch(
+            f"/api/projects/{PROJECT_ID}", json={"default_config_override": override}
+        )
+
+        assert "llm.api_key" not in response.json()["dropped_hidden_keys"]
 
     def test_editing_a_section_drops_the_hidden_values_in_it(self):
         """Without an endpoint change, only the sections the write touched lose

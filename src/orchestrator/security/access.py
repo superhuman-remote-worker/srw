@@ -1343,6 +1343,50 @@ def _restore_hidden(incoming: Any, stored: Any, path: tuple[str, ...]) -> Any:
     return incoming
 
 
+def dropped_hidden_config_values(written: Any, stored: Any) -> list[str]:
+    """Paths (``llm.api_key``, ``workspace.mounts[0].rclone_spec``) of the
+    hidden values ``stored`` holds that ``written`` neither kept nor sent a
+    value for — what a write of the redacted view discarded, so the caller can
+    be told instead of losing a key silently.
+
+    A key the write sends itself (any letter case) is not reported. A list
+    element the write kept verbatim is not reported; one it changed is
+    compared with the written element at the same index, since list elements
+    have no key to line up by. A stored ``null`` is not a secret and is never
+    reported. ``stored`` may be JSONB text.
+    """
+    if isinstance(stored, str):
+        try:
+            stored = json.loads(stored)
+        except (json.JSONDecodeError, TypeError):
+            return []
+    return _dropped_hidden(written, stored, (), "")
+
+
+def _dropped_hidden(
+    written: Any, stored: Any, path: tuple[str, ...], label: str
+) -> list[str]:
+    dropped: list[str] = []
+    if isinstance(stored, dict):
+        kept = written if isinstance(written, dict) else {}
+        sent = {k.lower() for k in kept}
+        for k, v in stored.items():
+            name = f"{label}.{k}" if label else k
+            if _hidden_config_key(path, k):
+                if v is not None and k.lower() not in sent:
+                    dropped.append(name)
+            else:
+                dropped += _dropped_hidden(kept.get(k), v, (*path, k), name)
+    elif isinstance(stored, list):
+        items = written if isinstance(written, list) else []
+        for i, v in enumerate(stored):
+            if v in items:
+                continue
+            counterpart = items[i] if i < len(items) else None
+            dropped += _dropped_hidden(counterpart, v, (*path, "[]"), f"{label}[{i}]")
+    return dropped
+
+
 async def user_can_access_datasource(
     user: dict[str, Any], db, ds: dict[str, Any]
 ) -> bool:

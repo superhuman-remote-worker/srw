@@ -47,6 +47,7 @@ from orchestrator.security.access import (
     redact_public_config_override,
     redact_repositories,
     redact_repository,
+    dropped_hidden_config_values,
     restore_hidden_config_values,
     user_can_access_datasource,
 )
@@ -585,13 +586,23 @@ async def update_project(
     # project-memory toggle re-submits the STORED override, so a project
     # already holding an invalid tools block surfaces it here instead of
     # quietly binding foreign tools on every job.
+    report: dict[str, Any] = {}
     if "default_config_override" in kwargs:
         # Reads serve the redacted view (public_project) and the cockpit writes
         # that view back whole, so without this, flipping one key would delete
         # every stored secret in the override.
+        stored_override = project.get("default_config_override")
         kwargs["default_config_override"] = restore_hidden_config_values(
-            kwargs["default_config_override"], project.get("default_config_override")
+            kwargs["default_config_override"], stored_override
         )
+        # A write that changes an endpoint (or a section) restores nothing
+        # there; say so rather than 200 with keys silently gone — an MCP
+        # read-modify-write client has no other way to find out.
+        dropped = dropped_hidden_config_values(
+            kwargs["default_config_override"], stored_override
+        )
+        if dropped:
+            report["dropped_hidden_keys"] = dropped
         kwargs["default_config_override"] = dependencies.with_validated_tool_overrides(
             kwargs["default_config_override"]
         )
@@ -638,9 +649,9 @@ async def update_project(
     archiving_now = str(kwargs.get("status") or "").lower() == "archived"
     if archiving_now and not project_is_archived(project):
         quiesced = await quiesce_archived_project(project_id, dependencies=dependencies)
-        return {"status": "updated", "archived": True, **quiesced}
+        return {"status": "updated", "archived": True, **quiesced, **report}
 
-    return {"status": "updated"}
+    return {"status": "updated", **report}
 
 
 async def delete_project(
