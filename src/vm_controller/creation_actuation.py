@@ -5,6 +5,7 @@ release database transactions before controller I/O; unknown results stay held.
 """
 
 import asyncio
+from contextvars import ContextVar
 from copy import deepcopy
 import json
 import logging
@@ -55,6 +56,161 @@ _SAFE_CREATION_REASON_CODES = frozenset(
         "creation_network_profile_unproven",
     }
 )
+
+# A ContextVar belongs to one run() invocation, including across awaited calls.
+# Only these literal labels may reach the log; request or exception data cannot
+# become a stage. In particular, concurrent retries share an actuator instance.
+_CREATION_DIAGNOSTIC_STAGE = ContextVar("creation_diagnostic_stage", default="unknown")
+_SAFE_CREATION_STAGES = frozenset(
+    {
+        "protocol",
+        "inspect",
+        "carrier_read",
+        "prior_effects",
+        "source_release",
+        "effect_observation",
+        "effect_settle",
+        "prepublish_absence",
+        "configuration",
+        "capacity",
+        "stage_plan",
+        "disk_pre_authorize",
+        "authorize",
+        "source_prepare",
+        "attachment_prepare",
+        "effect_values",
+    }
+    | {
+        f"{kind}_{stage}"
+        for kind in ("rootdisk", "cloud_init", "workspace_attach", "vm")
+        for stage in (
+            "carrier_publish",
+            "postpublish_previous",
+            "postpublish_disk",
+            "postpublish_absence",
+            "attachment_validate",
+            "render_body",
+            "source_validate",
+            "final_manifest",
+            "begin_effect",
+            "grant_carrier_read",
+            "grant_previous",
+            "grant_disk",
+            "grant_absence",
+            "grant_source_validate",
+            "api_create",
+        )
+    }
+)
+_SAFE_CREATION_LOCATIONS = {
+    "vm_controller.creation_actuation": (
+        "creation_actuation",
+        frozenset(
+            {
+                "_run",
+                "run",
+                "publish",
+                "exact_previous",
+                "disk",
+                "observation",
+                "require_vm_absent",
+                "body",
+                "values",
+                "create_object",
+                "read",
+            }
+        ),
+    ),
+    "vm_controller.creation_configuration": (
+        "creation_configuration",
+        frozenset({"resolve_creation_configuration"}),
+    ),
+    "vm_controller.creation_sources": (
+        "creation_sources",
+        frozenset({"prepare", "validate", "release_completed", "source_manager"}),
+    ),
+    "vm_controller.creation_attachment": (
+        "creation_attachment",
+        frozenset({"prepare", "validate", "create"}),
+    ),
+    "vm_controller.controller": (
+        "controller",
+        frozenset({"render_template"}),
+    ),
+    "shared.vm_creation_issuance": (
+        "vm_creation_issuance",
+        frozenset(
+            {
+                "validate_rootdisk_source",
+                "_validate_prepared_source",
+                "verify_creation_carrier",
+                "public_effect_observation",
+            }
+        ),
+    ),
+    "shared.vm_creation_lineage": (
+        "vm_creation_lineage",
+        frozenset({"disk_owner"}),
+    ),
+    "shared.vm_resource_manifest": (
+        "vm_resource_manifest",
+        frozenset(
+            {
+                "validate_final_vm_manifest",
+                "validate_final_rootdisk_manifest",
+                "_contract",
+                "_metadata",
+                "_stamp",
+            }
+        ),
+    ),
+}
+
+
+def _mark_creation_stage(stage):
+    _CREATION_DIAGNOSTIC_STAGE.set(
+        stage if stage in _SAFE_CREATION_STAGES else "unknown"
+    )
+
+
+def _effect_stage(kind, stage):
+    _mark_creation_stage(
+        f"{kind}_{stage}"
+        if kind in {"rootdisk", "cloud_init", "workspace_attach", "vm"}
+        else "unknown"
+    )
+
+
+def _creation_exception_family(exc):
+    if type(exc) is CreationUnproven:
+        return "creation_unproven"
+    if isinstance(exc, KeyError):
+        return "key_error"
+    if isinstance(exc, TypeError):
+        return "type_error"
+    if isinstance(exc, ValueError):
+        return "value_error"
+    return "unknown"
+
+
+def _creation_exception_location(exc):
+    """Use only allowlisted in-image code names and a bounded line number."""
+    location = "unknown"
+    traceback = exc.__traceback__
+    while traceback is not None:
+        code = traceback.tb_frame.f_code
+        allowed = _SAFE_CREATION_LOCATIONS.get(
+            traceback.tb_frame.f_globals.get("__name__")
+        )
+        if (
+            allowed is not None
+            and code.co_name in allowed[1]
+            and type(traceback.tb_lineno) is int
+            and 1 <= traceback.tb_lineno <= 2000
+        ):
+            location = f"{allowed[0]}.{code.co_name}:{traceback.tb_lineno}"
+        traceback = traceback.tb_next
+    return location
 
 
 def document(value):
@@ -560,6 +716,7 @@ class CreationActuator:
         from vm_controller.creation_sources import GoldenWaiting
         from vm_controller.creation_preparation import PreparedWaiting
 
+        diagnostic_token = _CREATION_DIAGNOSTIC_STAGE.set("protocol")
         try:
             return await self._run(payload)
         except PreparedWaiting:
@@ -567,15 +724,24 @@ class CreationActuator:
         except GoldenWaiting:
             return {**base, "status": "creation_pending", "reason": "golden_wait"}
         except (CreationUnproven, ValueError, KeyError, TypeError) as exc:
-            if (
-                type(exc) is CreationUnproven
-                and len(exc.args) == 1
-                and type(exc.args[0]) is str
-                and exc.args[0] in _SAFE_CREATION_REASON_CODES
-            ):
-                logging.getLogger(__name__).warning(
-                    "VM creation evidence refusal: %s", exc.args[0]
+            code = (
+                exc.args[0]
+                if (
+                    type(exc) is CreationUnproven
+                    and len(exc.args) == 1
+                    and type(exc.args[0]) is str
+                    and exc.args[0] in _SAFE_CREATION_REASON_CODES
                 )
+                else "none"
+            )
+            stage = _CREATION_DIAGNOSTIC_STAGE.get()
+            logging.getLogger(__name__).warning(
+                "VM creation evidence refusal: stage=%s family=%s code=%s location=%s",
+                stage if stage in _SAFE_CREATION_STAGES else "unknown",
+                _creation_exception_family(exc),
+                code,
+                _creation_exception_location(exc),
+            )
             return {
                 **base,
                 "status": "creation_attention",
@@ -588,6 +754,8 @@ class CreationActuator:
                 "status": "creation_pending",
                 "reason": "creation_observation_pending",
             }
+        finally:
+            _CREATION_DIAGNOSTIC_STAGE.reset(diagnostic_token)
 
     async def _run(self, payload):
         request = dict(payload)
@@ -622,6 +790,7 @@ class CreationActuator:
             "reason": "creation_observation_pending",
         }
         for _ in range(9):
+            _mark_creation_stage("inspect")
             row = await self.authority("inspect", request_id=envelope["request_id"])
             if (
                 any(
@@ -642,17 +811,21 @@ class CreationActuator:
             latest = effects[-1] if effects else None
             lease = None
             if row.get("creation_carrier_uid"):
+                _mark_creation_stage("carrier_read")
                 lease = await self.read(
                     "lease", "srw-cleanup-" + UUID(row["creation_admission_id"]).hex
                 )
                 if not lease or lease["metadata"]["uid"] != row["creation_carrier_uid"]:
                     raise CreationUnproven("creation_carrier_changed")
                 verify_creation_carrier(lease, secret=self.secret)
+                _mark_creation_stage("prior_effects")
                 observations = await self.exact_previous(row, lease)
                 from vm_controller.creation_sources import source_manager
 
+                _mark_creation_stage("source_release")
                 await source_manager(self.controller, row).release_completed(row)
                 if latest and latest["state"] == "issued":
+                    _mark_creation_stage("effect_observation")
                     observation = await self.observation(row, latest, lease)
                     if observation is None:
                         return pending
@@ -670,6 +843,7 @@ class CreationActuator:
                     and latest["state"] == "observed"
                     and latest["carrier_intent"]["effect_kind"] == "vm"
                 ):
+                    _mark_creation_stage("effect_settle")
                     result = await self.authority(
                         "settle-adopted",
                         request_id=row["request_id"],
@@ -706,7 +880,9 @@ class CreationActuator:
                 raise CreationUnproven("creation_source_not_active")
             # Already-issued VM observation/adoption returned above. All paths
             # below would grant a fresh effect and require authoritative absence.
+            _mark_creation_stage("prepublish_absence")
             await self.require_vm_absent(row)
+            _mark_creation_stage("configuration")
             resolved = resolve_creation_configuration(self.controller, request)
             if (
                 resolved["request_digest"] != row["request_digest"]
@@ -714,17 +890,20 @@ class CreationActuator:
                 != row["controller_configuration_digest"]
             ):
                 raise CreationUnproven("creation_configuration_changed")
+            _mark_creation_stage("capacity")
             if await self.controller._capacity_wait("agent-vm-" + row["job_id"]):
                 return {**pending, "reason": "capacity_wait"}
             from shared.vm_creation_attachment import attachment_effect_kinds
             from vm_controller.creation_attachment import CreationAttachment
 
+            _mark_creation_stage("stage_plan")
             stages = attachment_effect_kinds(request)
             attachment_stage = request.get("workspace_storage") is not None and not any(
                 effect["state"] == "observed"
                 and effect["carrier_intent"]["effect_kind"] == "workspace_attach"
                 for effect in effects
             )
+            _mark_creation_stage("disk_pre_authorize")
             _, dv, pvc = await self.disk(row, require_attachment=not attachment_stage)
             if (
                 not any(
@@ -745,6 +924,7 @@ class CreationActuator:
                     "expected_pvc_uid",
                 )
             }
+            _mark_creation_stage("authorize")
             reservation = await self.authority(
                 "authorize",
                 request_id=row["request_id"],
@@ -767,6 +947,7 @@ class CreationActuator:
 
             sources = source_manager(self.controller, row)
             frozen = previous.get("rootdisk_source") if previous else None
+            _mark_creation_stage("source_prepare")
             rootdisk_source = (
                 await sources.prepare(row, frozen) if kind == "rootdisk" else frozen
             )
@@ -774,18 +955,26 @@ class CreationActuator:
                 raise CreationUnproven("creation_rootdisk_source_unproven")
             attachment = previous.get("workspace_attachment") if previous else None
             if kind == "workspace_attach":
+                _mark_creation_stage("attachment_prepare")
                 attachment = await CreationAttachment(self).prepare(row, attachment)
+            _mark_creation_stage("effect_values")
             values = self.values(
                 row, reservation, kind, dv, pvc, previous, rootdisk_source, attachment
             )
+            _effect_stage(kind, "carrier_publish")
             carrier = await self.publish(values, prior=previous)
             if lease and carrier["metadata"]["uid"] != lease["metadata"]["uid"]:
                 raise CreationUnproven("creation_carrier_changed")
+            _effect_stage(kind, "postpublish_previous")
             await self.exact_previous(row, carrier)
+            _effect_stage(kind, "postpublish_disk")
             await self.disk(row, require_attachment=kind != "workspace_attach")
+            _effect_stage(kind, "postpublish_absence")
             await self.require_vm_absent(row)
             if kind == "workspace_attach":
+                _effect_stage(kind, "attachment_validate")
                 await CreationAttachment(self).validate(row, attachment)
+            _effect_stage(kind, "render_body")
             body = (
                 None
                 if kind == "rootdisk" and row["expected_pvc_uid"]
@@ -794,10 +983,12 @@ class CreationActuator:
             if kind == "rootdisk" or (
                 kind != "workspace_attach" and row.get("prepared_origin") is not None
             ):
+                _effect_stage(kind, "source_validate")
                 await sources.validate(row, rootdisk_source)
             if kind == "vm" and row["request"].get("network_profile") is not None:
                 from shared.vm_resource_manifest import validate_final_vm_manifest
 
+                _effect_stage(kind, "final_manifest")
                 validate_final_vm_manifest(
                     body,
                     template_text=self.controller.template_text,
@@ -805,6 +996,7 @@ class CreationActuator:
                     configuration=row["controller_configuration"],
                     effect_intent=values,
                 )
+            _effect_stage(kind, "begin_effect")
             grant = await self.authority(
                 "begin-effect",
                 request_id=row["request_id"],
@@ -815,6 +1007,7 @@ class CreationActuator:
                 return pending
             # The returned CAS grants only this one API call. Any subsequent
             # refusal/transport loss remains conservatively issued-unknown.
+            _effect_stage(kind, "grant_carrier_read")
             current = await self.read("lease", carrier["metadata"]["name"])
             if (
                 not current
@@ -822,17 +1015,23 @@ class CreationActuator:
                 or verify_creation_carrier(current, secret=self.secret) != values
             ):
                 raise CreationUnproven("creation_carrier_changed")
+            _effect_stage(kind, "grant_previous")
             await self.exact_previous(row, current)
+            _effect_stage(kind, "grant_disk")
             await self.disk(row, require_attachment=kind != "workspace_attach")
+            _effect_stage(kind, "grant_absence")
             await self.require_vm_absent(row)
             if kind == "workspace_attach":
+                _effect_stage(kind, "attachment_validate")
                 await CreationAttachment(self).validate(row, attachment)
             if kind == "rootdisk" or (
                 kind != "workspace_attach" and row.get("prepared_origin") is not None
             ):
+                _effect_stage(kind, "grant_source_validate")
                 await sources.validate(row, rootdisk_source)
             if body is not None:
                 try:
+                    _effect_stage(kind, "api_create")
                     if kind == "workspace_attach":
                         await CreationAttachment(self).create(body, attachment)
                     else:
