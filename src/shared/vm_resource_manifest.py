@@ -133,14 +133,13 @@ def _contract(template_text, request, configuration, effect_intent, kind):
     from shared.vm_network_profile import NETWORK_PROFILE
 
     if "network_profile" in request:
-        if (
-            request["network_profile"] != NETWORK_PROFILE
-            or configuration.get("network_profile_policy") != {
-                "version": 1,
-                "image": request["vm_image"],
-                "profile": NETWORK_PROFILE,
-            }
-        ):
+        if request["network_profile"] != NETWORK_PROFILE or configuration.get(
+            "network_profile_policy"
+        ) != {
+            "version": 1,
+            "image": request["vm_image"],
+            "profile": NETWORK_PROFILE,
+        }:
             raise ValueError
     elif "network_profile_policy" in configuration:
         raise ValueError
@@ -224,11 +223,13 @@ def validate_final_vm_manifest(
                 )
             if "resource_grant" in effect_intent:
                 grant = effect_intent["resource_grant"]
-                meta.setdefault("annotations", {}).update({
-                    "srw.io/vm-resource-reservation": grant["id"],
-                    "srw.io/vm-resource-node-uid": grant["node_uid"],
-                    "srw.io/provision-generation": request["provision_generation"],
-                })
+                meta.setdefault("annotations", {}).update(
+                    {
+                        "srw.io/vm-resource-reservation": grant["id"],
+                        "srw.io/vm-resource-node-uid": grant["node_uid"],
+                        "srw.io/provision-generation": request["provision_generation"],
+                    }
+                )
         _stamp(metadata, request, effect_intent)
         _stamp(template_metadata, request)
         if source["kind"] == "prepared":

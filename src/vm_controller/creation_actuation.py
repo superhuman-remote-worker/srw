@@ -551,9 +551,11 @@ class CreationActuator:
         if previous and previous.get("resource_grant") != resource_grant:
             raise CreationUnproven("resource_reservation_changed")
         return {
-            "version": (
-                5 if attachment is not None else 4
-            ) if resource_enabled else 3 if attachment is not None else 2,
+            "version": (5 if attachment is not None else 4)
+            if resource_enabled
+            else 3
+            if attachment is not None
+            else 2,
             **({"resource_grant": resource_grant} if resource_enabled else {}),
             **(
                 {
@@ -682,7 +684,9 @@ class CreationActuator:
             if "resource_grant" in values:
                 from shared.vm_resource_manifest import conjoin_required_hostname
 
-                required = row["controller_configuration"]["resource_admission"]["template_profile"]["required_affinity"]
+                required = row["controller_configuration"]["resource_admission"][
+                    "template_profile"
+                ]["required_affinity"]
                 result["spec"]["template"]["spec"].setdefault(
                     "affinity", {}
                 ).setdefault("nodeAffinity", {})[
@@ -691,7 +695,8 @@ class CreationActuator:
                     required, values["resource_grant"]["node_name"]
                 )
                 for meta in (
-                    result["metadata"], result["spec"]["template"].setdefault("metadata", {}),
+                    result["metadata"],
+                    result["spec"]["template"].setdefault("metadata", {}),
                 ):
                     meta.setdefault("annotations", {})[
                         "srw.io/vm-resource-reservation"
@@ -981,7 +986,9 @@ class CreationActuator:
                 try:
                     _mark_creation_stage("resource_node")
                     await fresh_resource_effect_node(
-                        self.controller, row, reservation["resource_grant"],
+                        self.controller,
+                        row,
+                        reservation["resource_grant"],
                     )
                 except ResourceAdmissionError as exc:
                     raise CreationUnproven(str(exc)) from None
@@ -1052,7 +1059,8 @@ class CreationActuator:
                     effect_intent=values,
                     reservation_hostname=(
                         values["resource_grant"]["node_name"]
-                        if "resource_grant" in values else None
+                        if "resource_grant" in values
+                        else None
                     ),
                 )
             _effect_stage(kind, "begin_effect")
@@ -1071,7 +1079,9 @@ class CreationActuator:
                 try:
                     _mark_creation_stage("resource_node")
                     await fresh_resource_effect_node(
-                        self.controller, row, values["resource_grant"],
+                        self.controller,
+                        row,
+                        values["resource_grant"],
                     )
                 except ResourceAdmissionError as exc:
                     raise CreationUnproven(str(exc)) from None

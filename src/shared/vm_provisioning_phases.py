@@ -130,6 +130,37 @@ def _stored_state(previous: Mapping, now: float) -> dict:
     return dict(previous)
 
 
+def rebind_recovered_provisioning(
+    previous: Mapping,
+    *,
+    expected_identity: Mapping,
+    successor_vmi_uid: str,
+    now: float,
+) -> dict:
+    """Carry valid clocks across an exact, separately authorized recovery release.
+
+    The recovery store must first prove the predecessor stop and authenticated
+    successor. Ordinary observations must continue to reject bound VMI changes.
+    """
+    state = _stored_state(previous, now)
+    identity = dict(state["identity"])
+    for field in (
+        "owner_kind",
+        "owner_id",
+        "namespace",
+        "provision_generation",
+        "vm_uid",
+        "vmi_uid",
+        "rootdisk_pvc_uid",
+    ):
+        if identity[field] != expected_identity.get(field):
+            raise ValueError("recovery predecessor phase identity changed")
+    identity["vmi_uid"] = successor_vmi_uid
+    _identity(identity)
+    state["identity"] = identity
+    return _stored_state(state, now)
+
+
 def observe_provisioning(
     previous: Mapping | None, observation: Mapping, *, now: float
 ) -> dict:
