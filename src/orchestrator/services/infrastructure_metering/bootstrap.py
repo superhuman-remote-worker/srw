@@ -103,6 +103,25 @@ class InfrastructureMeteringBootstrap:
     infrastructure_storage_source_activation_ready: bool
 
 
+async def allocate_metering_generation(conn: Any) -> int:
+    """Advance the metering fencing generation on the leader's own session.
+
+    Runs as ``run_as_leader``'s ``on_acquired`` callback, on the exact
+    advisory-lock connection and before ``is_leader`` becomes visible, so the
+    collector, cutover, publisher and sealer share one tenure token.
+    """
+
+    generation = await conn.fetchval(
+        "UPDATE infra_metering_control "
+        "SET leader_generation=leader_generation+1, "
+        "updated_at=statement_timestamp() "
+        "WHERE singleton=TRUE RETURNING leader_generation"
+    )
+    if generation is None:
+        raise RuntimeError("infrastructure metering control row is missing")
+    return int(generation)
+
+
 async def bootstrap_infrastructure_metering(
     *,
     app_pool: Any,

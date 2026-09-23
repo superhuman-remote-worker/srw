@@ -145,3 +145,15 @@ async def test_collector_without_inventory_schema_stays_unavailable(
     assert result.infrastructure_inventory_store is None
     assert result.infrastructure_ingestion_service is None
     assert "Slice 1 Pod inventory" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_the_fencing_generation_advances_on_the_leader_session():
+    conn = AsyncMock()
+    conn.fetchval = AsyncMock(return_value=7)
+    assert await bootstrap.allocate_metering_generation(conn) == 7
+    sql = conn.fetchval.await_args.args[0]
+    assert "leader_generation=leader_generation+1" in sql
+    conn.fetchval = AsyncMock(return_value=None)
+    with pytest.raises(RuntimeError, match="control row is missing"):
+        await bootstrap.allocate_metering_generation(conn)

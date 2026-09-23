@@ -453,8 +453,11 @@ def test_lifespan_keeps_leader_gated_tasks_over_the_moved_bodies() -> None:
     for name in ("thread_permission_notify_sweeper", "attention_sleep_sweeper"):
         call = f"session_attention_operations.{name}"
         assert call in body
-        start = body.rindex("run_when_leader(", 0, body.index(call))
-        assert "asyncio.create_task(" in body[max(0, start - 40) : start]
+        # R1.B11: lifespan starts leader-only loops through its task set.
+        at = body.index(call)
+        gated = body.rindex("tasks.start_leader_gated(", 0, at)
+        plain = body.rfind("tasks.start(", 0, at)
+        assert gated > plain
 
 
 @pytest.mark.asyncio

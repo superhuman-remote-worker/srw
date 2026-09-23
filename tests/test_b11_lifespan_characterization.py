@@ -717,3 +717,98 @@ def test_identify_names_the_gated_loop_not_the_wrapper():
         "test_identify_names_the_gated_loop_not_the_wrapper.<locals>.some_loop",
         True,
     )
+
+
+# --------------------------------------------------------------------------- #
+# Bindings: the moved bodies receive this application's own collaborators
+# --------------------------------------------------------------------------- #
+
+
+def _keywords(entry: dict[str, Any]) -> dict[str, Any]:
+    target = entry["target"]
+    if isinstance(target, functools.partial):
+        return dict(target.keywords)
+    return {
+        key: value
+        for key, value in entry["arguments"].items()
+        if key not in {"shutdown_event", "stop", "ev", "se", "shutdown"}
+    }
+
+
+@pytest.mark.asyncio
+async def test_moved_loops_receive_the_application_collaborators(monkeypatch):
+    recorder = _Recorder()
+    names = (
+        "agent_provisioner",
+        "persistent_provisioner",
+        "container_provisioner",
+        "ide_session_service",
+        "imap_poller",
+        "snapshot_service",
+        "workspace_suspension_service",
+        "main_cloud_router",
+        "sudo_gate",
+    )
+    during: dict[str, Any] = {}
+
+    async def _snapshot(_world):
+        # The environment restores the real singletons on exit; compare with
+        # the collaborators that were live while the lifespan ran.
+        during.update({name: getattr(main, name) for name in names})
+
+    world = await _run_lifespan(monkeypatch, recorder, inside=_snapshot)
+    live = SimpleNamespace(**during)
+    created = {entry["label"]: entry for entry in recorder.created}
+
+    dispatch = _keywords(created["auto_assign_dispatcher"])["dependencies"]
+    assert dispatch.store is world.store
+    assert dispatch.state is main._job_dispatch_state
+    assert dispatch.agent_provisioner is live.agent_provisioner
+    # The pause-pending set preemption fills is the one delivery discards from.
+    assert (
+        main._job_delivery_operations().dependencies.pause_pending_job_ids
+        is main._job_dispatch_state.pause_pending_job_ids
+    )
+
+    detector = _keywords(created["stale_agent_detector"])["dependencies"]
+    assert detector.store is world.store
+    assert detector.trigger_dispatch is main._trigger_dispatch
+    assert detector.pinned_retirement_operations is main._pinned_retirement_operations
+    assert detector.thread_retirement_operations is main._thread_retirement_operations
+
+    for label in (
+        "pinned_agent_create_intent_reconciler",
+        "pinned_k8s_create_fence_gc_sweeper",
+    ):
+        dependencies = _keywords(created[label])["dependencies"]
+        assert dependencies.store is world.store
+        assert dependencies.persistent_provisioner is live.persistent_provisioner
+
+    for label in (
+        "thread_events_prune_sweeper",
+        "security_events_prune_sweeper",
+        "ssh_attachments_prune_sweeper",
+    ):
+        assert _keywords(created[label])["store"] is world.store
+
+    assert _keywords(created["agent_pool_reconciler"])["provisioner"] is (
+        live.agent_provisioner
+    )
+    assert _keywords(created["ide_session_ttl_sweeper"])["ide_sessions"] is (
+        live.ide_session_service
+    )
+    assert _keywords(created["imap_poll_loop"])["poller"] is live.imap_poller
+    assert _keywords(created["snapshot_gc_sweeper"])["snapshots"] is (
+        live.snapshot_service
+    )
+    ide_settings = _keywords(created["code_server_settings_sweeper"])
+    assert ide_settings["db"] is world.store
+    assert ide_settings["container_provisioner"] is live.container_provisioner
+    workspace_idle = _keywords(created["workspace_idle_sweeper"])
+    assert workspace_idle["store"] is world.store
+    assert workspace_idle["suspension"] is live.workspace_suspension_service
+    ro_reader = _keywords(created["ro_reader_reconciler_loop"])
+    assert ro_reader["store"] is world.store
+    assert ro_reader["router"]() is live.main_cloud_router
+    sudo = _keywords(created["sudo_expiration_sweeper"])
+    assert sudo["gate"] is live.sudo_gate

@@ -708,6 +708,7 @@ from orchestrator.services.infrastructure_metering import (  # noqa: E402
 )
 from orchestrator.services.startup_backfills import run_startup_backfills  # noqa: E402
 from orchestrator.services import job_dispatcher  # noqa: E402
+from orchestrator.services.application_tasks import ApplicationTaskSet  # noqa: E402
 from orchestrator.services import retention_sweepers  # noqa: E402
 from orchestrator.services.agent_provisioner import agent_pool_reconciler  # noqa: E402
 from orchestrator.services.ide_session import ide_session_ttl_sweeper  # noqa: E402
@@ -723,6 +724,7 @@ from orchestrator.services import (  # noqa: E402
 )
 from orchestrator.services import stale_agent_detector as stale_agent_detector_service  # noqa: E402
 from orchestrator.services.infrastructure_metering.bootstrap import (  # noqa: E402
+    allocate_metering_generation,
     bootstrap_infrastructure_metering,
 )
 from orchestrator.services.infrastructure_metering.compute_activation import (  # noqa: E402
@@ -2184,6 +2186,67 @@ def _bind_officer_wake_metering() -> None:
     bind_officer_wake_metering(postgres_db, lambda: usage_ledger)
 
 
+# The order shutdown awaits the lifecycle's background tasks (every task sees
+# the shutdown event at once; the order only decides which failure surfaces
+# first). Feature-gated keys that were never started are skipped.
+_BACKGROUND_TASK_SHUTDOWN_ORDER: tuple[str, ...] = (
+    "leader",
+    "infrastructure_inventory_generation",
+    "datasource_reconciliation",
+    "stale_detector",
+    "token_cleanup",
+    "session_cleanup",
+    "dispatcher",
+    "vm_readiness",
+    "vm_creation_retry",
+    "vm_workspace_recovery",
+    "sudo_sweeper",
+    "thread_events_prune",
+    "run_queue_reaper",
+    "stateless_deletion_cost",
+    "session_memory_effect",
+    "completion_finalizer",
+    "completion_sweep_router",
+    "completion_monitor",
+    "security_events_prune",
+    "ssh_attachments_prune",
+    "checkpoint_retention",
+    "headless_notify",
+    "attention_sleep",
+    "officer_watchdog",
+    "message_route_reconciler",
+    "officer_backlog",
+    "ide_sweeper",
+    "ws_sweeper",
+    "ide_settings_sweeper",
+    "gc_sweeper",
+    "pinned_create_intent_reconciler",
+    "pinned_create_fence_gc",
+    "imap",
+    "notification_steps",
+    "delegation_timeout",
+    "llm_outage",
+    "infra_transient",
+    "pool_reconciler",
+    "ro_reader_reconciler",
+    "lifecycle_reconciler",
+    "main_cloud_listen",
+    "automation_cron",
+    "project_loop_sweeper",
+    "stale_verification_sweeper",
+    "session_wake_sweeper",
+    "kb_reindex_sweeper",
+    "pricing_sync",
+    "cloud_pricing_sync",
+    "workspace_metering",
+    "llm_usage",
+    "usage_rollup",
+    "infrastructure_usage_rollup",
+    "infrastructure_metering_runtime",
+    "audit_maintenance",
+)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan handler."""
@@ -2669,8 +2732,11 @@ async def lifespan(app: FastAPI):
 
     imap_poller.connect(db=postgres_db, reply_handler=_imap_reply_handler)
 
-    # Start background tasks
+    # Start background tasks. One task set per lifecycle owns them: leader-only
+    # loops go through run_when_leader, and shutdown awaits every started task
+    # in _BACKGROUND_TASK_SHUTDOWN_ORDER (R1.B11).
     _shutdown_event = asyncio.Event()
+    tasks = ApplicationTaskSet(_shutdown_event)
     # Leader election (M1): this replica contends for the singleton-loop
     # leadership lock; the run_when_leader-wrapped loops below run only while
     # this replica holds it. See services/leader_election.py.
@@ -2683,7 +2749,6 @@ async def lifespan(app: FastAPI):
         get_leader_generation,
         is_leader,
         run_as_leader,
-        run_when_leader,
     )
 
     async def _strict_datasource_sync(
@@ -2707,32 +2772,22 @@ async def lifespan(app: FastAPI):
             dependencies=_knowledge_projection_dependencies(),
         )
 
-    async def _allocate_metering_generation(conn: Any) -> int:
-        generation = await conn.fetchval(
-            "UPDATE infra_metering_control "
-            "SET leader_generation=leader_generation+1, "
-            "updated_at=statement_timestamp() "
-            "WHERE singleton=TRUE RETURNING leader_generation"
-        )
-        if generation is None:
-            raise RuntimeError("infrastructure metering control row is missing")
-        return int(generation)
-
     # Allocate the infrastructure fencing token on the exact advisory-lock
     # session, before is_leader becomes visible to any singleton loop. This
     # gives collector, cutover, publisher, and sealer one shared tenure token.
     metering_generation_callback = (
-        _allocate_metering_generation
+        allocate_metering_generation
         if metering_capabilities.slice1_inventory_ready
         else None
     )
-    leader_task = asyncio.create_task(
+    tasks.start(
+        "leader",
         run_as_leader(
             postgres_db,
             LEADER_ID,
             _shutdown_event,
             on_acquired=metering_generation_callback,
-        )
+        ),
     )
 
     async def _inventory_generation_coro(stop: asyncio.Event) -> None:
@@ -2754,108 +2809,83 @@ async def lifespan(app: FastAPI):
             ),
         )
 
-    infrastructure_inventory_generation_task = (
-        asyncio.create_task(
-            run_when_leader(
-                _inventory_generation_coro,
-                _shutdown_event,
-            )
+    if infrastructure_inventory_store is not None:
+        tasks.start_leader_gated(
+            "infrastructure_inventory_generation",
+            _inventory_generation_coro,
         )
-        if infrastructure_inventory_store is not None
-        else None
-    )
 
-    infrastructure_metering_runtime_task = (
-        asyncio.create_task(
-            run_when_leader(
-                lambda stop: infrastructure_metering_runtime_loop(
-                    stop,
-                    infrastructure_metering_runtime,
-                    get_leader_generation,
-                ),
-                _shutdown_event,
-            )
+    if infrastructure_metering_runtime is not None:
+        tasks.start_leader_gated(
+            "infrastructure_metering_runtime",
+            lambda stop: infrastructure_metering_runtime_loop(
+                stop,
+                infrastructure_metering_runtime,
+                get_leader_generation,
+            ),
         )
-        if infrastructure_metering_runtime is not None
-        else None
-    )
-    datasource_reconciliation_task = asyncio.create_task(
+    tasks.start(
+        "datasource_reconciliation",
         run_datasource_project_reconciler(
             postgres_db,
             _shutdown_event,
             is_leader.is_set,
             sync_fn=_strict_datasource_sync,
             delete_fn=_strict_datasource_delete,
-        )
+        ),
     )
-    stale_detector_task = asyncio.create_task(
-        run_when_leader(
-            functools.partial(
-                stale_agent_detector_service.stale_agent_detector,
-                dependencies=_stale_agent_detector_dependencies(),
+    tasks.start_leader_gated(
+        "stale_detector",
+        functools.partial(
+            stale_agent_detector_service.stale_agent_detector,
+            dependencies=_stale_agent_detector_dependencies(),
+        ),
+    )
+    tasks.start(
+        "token_cleanup",
+        cleanup_expired_tokens(postgres_db, _shutdown_event),
+    )
+    tasks.start(
+        "session_cleanup",
+        cleanup_expired_sessions(postgres_db, _shutdown_event),
+    )
+    tasks.start_leader_gated(
+        "dispatcher",
+        functools.partial(
+            job_dispatcher.auto_assign_dispatcher,
+            dependencies=_job_dispatch_dependencies(),
+        ),
+    )
+    if os.getenv("VM_MODE", "off").strip().lower() == "same-cluster":
+        tasks.start_leader_gated(
+            "vm_readiness",
+            lambda shutdown: vm_readiness_prober(
+                shutdown,
+                db=postgres_db,
+                provisioner=vm_provisioner,
+                trigger_dispatch=_trigger_dispatch,
             ),
-            _shutdown_event,
         )
-    )
-    token_cleanup_task = asyncio.create_task(
-        cleanup_expired_tokens(postgres_db, _shutdown_event)
-    )
-    session_cleanup_task = asyncio.create_task(
-        cleanup_expired_sessions(postgres_db, _shutdown_event)
-    )
-    dispatcher_task = asyncio.create_task(
-        run_when_leader(
-            functools.partial(
-                job_dispatcher.auto_assign_dispatcher,
-                dependencies=_job_dispatch_dependencies(),
-            ),
-            _shutdown_event,
-        )
-    )
-    vm_readiness_task = (
-        asyncio.create_task(
-            run_when_leader(
-                lambda shutdown: vm_readiness_prober(
-                    shutdown,
-                    db=postgres_db,
-                    provisioner=vm_provisioner,
-                    trigger_dispatch=_trigger_dispatch,
-                ),
-                _shutdown_event,
-            )
-        )
-        if os.getenv("VM_MODE", "off").strip().lower() == "same-cluster"
-        else None
-    )
     vm_workspace_recovery_settings = VMWorkspaceRecoverySettings.from_env()
-    vm_creation_retry_task = (
-        asyncio.create_task(
-            run_when_leader(
-                VMCreationRetryService(postgres_db, vm_provisioner).run,
-                _shutdown_event,
-            ),
+    if os.getenv("VM_MODE", "off").strip().lower() == "same-cluster":
+        tasks.start_leader_gated(
+            "vm_creation_retry",
+            VMCreationRetryService(postgres_db, vm_provisioner).run,
             name="vm-creation-retry",
         )
-        if os.getenv("VM_MODE", "off").strip().lower() == "same-cluster"
-        else None
-    )
     vm_workspace_recovery_store = VMWorkspaceRecoveryStore(postgres_db)
-    vm_workspace_recovery_task = (
-        asyncio.create_task(
-            run_when_leader(
-                VMWorkspaceRecoveryService.from_settings(
-                    vm_workspace_recovery_store,
-                    vm_provisioner,
-                    settings=vm_workspace_recovery_settings,
-                ).run,
-                _shutdown_event,
-            ),
+    if automatic_reconciler_enabled():
+        tasks.start_leader_gated(
+            "vm_workspace_recovery",
+            VMWorkspaceRecoveryService.from_settings(
+                vm_workspace_recovery_store,
+                vm_provisioner,
+                settings=vm_workspace_recovery_settings,
+            ).run,
             name="vm-workspace-recovery",
         )
-        if automatic_reconciler_enabled()
-        else None
-    )
-    sudo_sweeper_task = asyncio.create_task(
+    tasks.start(
+        "sudo_sweeper",
         sudo_expiration_sweeper(
             _shutdown_event,
             gate=sudo_gate,
@@ -2863,12 +2893,13 @@ async def lifespan(app: FastAPI):
             fail_expired_vm_upgrade_jobs=lambda: (
                 _job_control_operations().fail_expired_vm_upgrade_jobs()
             ),
-        )
+        ),
     )
-    thread_events_prune_task = asyncio.create_task(
+    tasks.start(
+        "thread_events_prune",
         retention_sweepers.thread_events_prune_sweeper(
             _shutdown_event, store=postgres_db
-        )
+        ),
     )
     # Stateless-lane lease reaper (stateless_agents.md §5.2): leader-gated on
     # its OWN advisory lock (RUN_QUEUE_REAPER_ID — not run_when_leader, so the
@@ -2876,8 +2907,9 @@ async def lifespan(app: FastAPI):
     # steals + turn.interrupted/turn.parked journal frames.
     from orchestrator.services.run_queue_reaper import run_queue_reaper_loop
 
-    run_queue_reaper_task = asyncio.create_task(
-        run_queue_reaper_loop(postgres_db, _shutdown_event)
+    tasks.start(
+        "run_queue_reaper",
+        run_queue_reaper_loop(postgres_db, _shutdown_event),
     )
     # Pod-deletion-cost reconciler (capacity_ux_and_queue_autoscaling.md §2):
     # leader-gated on its OWN advisory lock (STATELESS_DELETION_COST_ID), it
@@ -2888,30 +2920,28 @@ async def lifespan(app: FastAPI):
         stateless_pod_deletion_cost_loop,
     )
 
-    stateless_deletion_cost_task = (
-        asyncio.create_task(
+    if _deletion_cost_reconciler_enabled():
+        tasks.start(
+            "stateless_deletion_cost",
             stateless_pod_deletion_cost_loop(postgres_db, _shutdown_event),
             name="stateless-pod-deletion-cost",
         )
-        if _deletion_cost_reconciler_enabled()
-        else None
-    )
     # Stateless turn memory is its own transactional-outbox ownership domain.
     # It is always resident and never hidden behind completion-command flags or
     # advisory leadership: row leases serialize replicas and survive handover.
-    session_memory_effect_task = asyncio.create_task(
+    tasks.start(
+        "session_memory_effect",
         _session_memory_runtime.drain().run_drain(_shutdown_event),
         name="session-memory-effect-drain",
     )
     # Gate-3 completion drain uses its own observable River-style lease row;
     # it must never be wrapped in the orchestrator advisory-leader helper.
     # Keep the finalizer/router module imports dark while the gate is closed.
-    completion_finalizer_task = None
-    completion_sweep_router_task = None
     # Queue age is a worker-availability signal, so the monitor must remain
     # alive when fresh worker admission or Gate-3 commands are disabled.
     # Its commands-off sampler is explicitly run_queue-only.
-    completion_monitor_task = asyncio.create_task(
+    tasks.start(
+        "completion_monitor",
         _completion_runtime.monitor().run(_shutdown_event),
         name="completion-monitor",
     )
@@ -2927,7 +2957,8 @@ async def lifespan(app: FastAPI):
 
             return await sweep_stale_cloud_pushes(postgres_db)
 
-        completion_finalizer_task = asyncio.create_task(
+        tasks.start(
+            "completion_finalizer",
             completion_finalizer.run_drain(
                 _shutdown_event,
                 drain_commands=COMPLETION_COMMANDS_ENABLED,
@@ -2938,37 +2969,39 @@ async def lifespan(app: FastAPI):
             name="completion-finalizer-drain",
         )
     if COMPLETION_COMMANDS_ENABLED:
-        completion_sweep_router_task = asyncio.create_task(
+        tasks.start(
+            "completion_sweep_router",
             _completion_runtime.sweep_router().run(_shutdown_event),
             name="completion-sweep-router",
         )
-    security_events_prune_task = asyncio.create_task(
+    tasks.start(
+        "security_events_prune",
         retention_sweepers.security_events_prune_sweeper(
             _shutdown_event, store=postgres_db
-        )
+        ),
     )
     # Not leader-gated, matching security_events_prune_task above: a
     # delete-by-age is idempotent, so two replicas racing it is harmless —
     # the second finds nothing.
-    ssh_attachments_prune_task = asyncio.create_task(
+    tasks.start(
+        "ssh_attachments_prune",
         retention_sweepers.ssh_attachments_prune_sweeper(
             _shutdown_event, store=postgres_db
-        )
+        ),
     )
     # In-flight checkpoint retention: bound every live thread's LangGraph
     # checkpoints to the newest N while it runs (leader-gated), so a long job
     # can't fill the checkpointer PVC before it terminates.
-    checkpoint_retention_task = asyncio.create_task(
-        run_retention_sweeper(postgres_db, _shutdown_event, is_leader.is_set)
+    tasks.start(
+        "checkpoint_retention",
+        run_retention_sweeper(postgres_db, _shutdown_event, is_leader.is_set),
     )
-    headless_notify_task = asyncio.create_task(
-        run_when_leader(
-            functools.partial(
-                session_attention_operations.thread_permission_notify_sweeper,
-                dependencies=_session_attention_dependencies(),
-            ),
-            _shutdown_event,
-        )
+    tasks.start_leader_gated(
+        "headless_notify",
+        functools.partial(
+            session_attention_operations.thread_permission_notify_sweeper,
+            dependencies=_session_attention_dependencies(),
+        ),
     )
     # Leader-gated: both snapshot/teardown idle workspaces (attention-sleep) or
     # delete idle IDE VMs/pods (ide-sweeper) after a plain SELECT, with no
@@ -2976,25 +3009,21 @@ async def lifespan(app: FastAPI):
     # to the same S3 key and race teardown against an in-flight snapshot. Gating
     # mirrors the lifecycle reconciler, which already owns the parallel idle
     # workspace-teardown path. See knowledge-base/knowledge/tests/orchestrator_ha_background_loop_sweep.md.
-    attention_sleep_task = asyncio.create_task(
-        run_when_leader(
-            functools.partial(
-                session_attention_operations.attention_sleep_sweeper,
-                dependencies=_session_attention_dependencies(),
-            ),
-            _shutdown_event,
-        )
+    tasks.start_leader_gated(
+        "attention_sleep",
+        functools.partial(
+            session_attention_operations.attention_sleep_sweeper,
+            dependencies=_session_attention_dependencies(),
+        ),
     )
     # Officer (centurion) lifecycle: implicit-timer filing, overdue kicks,
     # rate-limited respawn. Leader-gated — respawn must be single-flight.
-    officer_watchdog_task = asyncio.create_task(
-        run_when_leader(
-            functools.partial(
-                officer_watchdog_service.officer_watchdog,
-                dependencies=_officer_watchdog_dependencies(),
-            ),
-            _shutdown_event,
-        )
+    tasks.start_leader_gated(
+        "officer_watchdog",
+        functools.partial(
+            officer_watchdog_service.officer_watchdog,
+            dependencies=_officer_watchdog_dependencies(),
+        ),
     )
     # Worker-message route reconciler (officer_message_routing.md §5.2):
     # officer-SLA escalation, the total blocking timeout, and delivery repair.
@@ -3004,17 +3033,15 @@ async def lifespan(app: FastAPI):
         message_route_reconciler_loop,
     )
 
-    message_route_reconciler_task = asyncio.create_task(
-        run_when_leader(
-            lambda ev: message_route_reconciler_loop(
-                postgres_db,
-                ev,
-                resume_job=lambda *args, **kwargs: (
-                    _job_control_operations().internal_resume_job(*args, **kwargs)
-                ),
+    tasks.start_leader_gated(
+        "message_route_reconciler",
+        lambda ev: message_route_reconciler_loop(
+            postgres_db,
+            ev,
+            resume_job=lambda *args, **kwargs: (
+                _job_control_operations().internal_resume_job(*args, **kwargs)
             ),
-            _shutdown_event,
-        )
+        ),
     )
     # Officer auto-pull tick (officer_backlog_pools.md §5): fill a pool's free
     # slot from its ready, categorized, unclaimed tickets. Leader-gated as an
@@ -3023,39 +3050,34 @@ async def lifespan(app: FastAPI):
     # are real. Dormant until a century sets officer.auto_pull (ships off).
     from orchestrator.services.officer_backlog import officer_backlog_tick_loop
 
-    officer_backlog_task = asyncio.create_task(
-        run_when_leader(
-            lambda ev: officer_backlog_tick_loop(
-                postgres_db,
-                vector_db,
-                ev,
-                release_enabled=OFFICER_AUTO_PULL_RELEASE_ENABLED,
-                provision_repo=_provision_officer_ticket_repo,
-                trigger_dispatch=_trigger_dispatch,
-                enforce_grants=(
-                    lambda *args, **kwargs: (
-                        project_loop_spawn_service.enforce_officer_ticket_grants(
-                            *args,
-                            **kwargs,
-                            dependencies=_project_loop_dependencies(),
-                        )
+    tasks.start_leader_gated(
+        "officer_backlog",
+        lambda ev: officer_backlog_tick_loop(
+            postgres_db,
+            vector_db,
+            ev,
+            release_enabled=OFFICER_AUTO_PULL_RELEASE_ENABLED,
+            provision_repo=_provision_officer_ticket_repo,
+            trigger_dispatch=_trigger_dispatch,
+            enforce_grants=(
+                lambda *args, **kwargs: (
+                    project_loop_spawn_service.enforce_officer_ticket_grants(
+                        *args,
+                        **kwargs,
+                        dependencies=_project_loop_dependencies(),
                     )
-                ),
-                usage_ledger=usage_ledger,
-                notify=notify_officer,
+                )
             ),
-            _shutdown_event,
-        )
+            usage_ledger=usage_ledger,
+            notify=notify_officer,
+        ),
     )
-    ide_sweeper_task = asyncio.create_task(
-        run_when_leader(
-            functools.partial(
-                ide_session_ttl_sweeper, ide_sessions=ide_session_service
-            ),
-            _shutdown_event,
-        )
+    tasks.start_leader_gated(
+        "ide_sweeper",
+        functools.partial(ide_session_ttl_sweeper, ide_sessions=ide_session_service),
     )
-    ws_sweeper_task = asyncio.create_task(
+    tasks.start(
+        "ws_sweeper",
         workspace_idle_sweeper(
             _shutdown_event,
             store=postgres_db,
@@ -3063,118 +3085,99 @@ async def lifespan(app: FastAPI):
             suspension=workspace_suspension_service,
             vm_idle_service_factory=_build_vm_idle_service,
             terminal_vm_controls_factory=_job_mutation_operations,
-        )
+        ),
     )
     # Leader-gated: serially SSH-dials every active workspace and captures IDE
     # profiles to per-user S3 keys — two replicas would double-dial each
     # workspace and race the signature-gated capture.
-    ide_settings_sweeper_task = asyncio.create_task(
-        run_when_leader(
-            functools.partial(
-                code_server_settings_sweeper,
-                db=postgres_db,
-                container_provisioner=container_provisioner,
-                snapshot_service=snapshot_service,
-                vm_provisioner=vm_provisioner,
-            ),
-            _shutdown_event,
-        )
+    tasks.start_leader_gated(
+        "ide_settings_sweeper",
+        functools.partial(
+            code_server_settings_sweeper,
+            db=postgres_db,
+            container_provisioner=container_provisioner,
+            snapshot_service=snapshot_service,
+            vm_provisioner=vm_provisioner,
+        ),
     )
-    gc_sweeper_task = asyncio.create_task(
-        snapshot_gc_sweeper(_shutdown_event, snapshots=snapshot_service)
+    tasks.start(
+        "gc_sweeper",
+        snapshot_gc_sweeper(_shutdown_event, snapshots=snapshot_service),
     )
-    pinned_create_intent_reconciler_task = asyncio.create_task(
-        run_when_leader(
-            functools.partial(
-                pinned_k8s_reconciliation_service.pinned_agent_create_intent_reconciler,
-                dependencies=_pinned_k8s_reconciliation_dependencies(),
-            ),
-            _shutdown_event,
-        )
+    tasks.start_leader_gated(
+        "pinned_create_intent_reconciler",
+        functools.partial(
+            pinned_k8s_reconciliation_service.pinned_agent_create_intent_reconciler,
+            dependencies=_pinned_k8s_reconciliation_dependencies(),
+        ),
     )
-    pinned_create_fence_gc_task = asyncio.create_task(
-        run_when_leader(
-            functools.partial(
-                pinned_k8s_reconciliation_service.pinned_k8s_create_fence_gc_sweeper,
-                dependencies=_pinned_k8s_reconciliation_dependencies(),
-            ),
-            _shutdown_event,
-        )
+    tasks.start_leader_gated(
+        "pinned_create_fence_gc",
+        functools.partial(
+            pinned_k8s_reconciliation_service.pinned_k8s_create_fence_gc_sweeper,
+            dependencies=_pinned_k8s_reconciliation_dependencies(),
+        ),
     )
-    imap_task = asyncio.create_task(
-        run_when_leader(
-            functools.partial(imap_poll_loop, poller=imap_poller), _shutdown_event
-        )
+    tasks.start_leader_gated(
+        "imap",
+        functools.partial(imap_poll_loop, poller=imap_poller),
     )
     # Unified feed: run the deferred channel steps ("mail after the officer's
     # window unless seen/resolved", quiet-hours deferrals, batched digests).
-    notification_steps_task = asyncio.create_task(
-        run_when_leader(
-            lambda stop: notification_steps_loop(
-                stop, postgres_db, notification_service
-            ),
-            _shutdown_event,
-        )
+    tasks.start_leader_gated(
+        "notification_steps",
+        lambda stop: notification_steps_loop(stop, postgres_db, notification_service),
     )
-    delegation_timeout_task = asyncio.create_task(
-        run_when_leader(
-            functools.partial(
-                completion_recovery_operations.delegation_timeout_sweeper,
-                dependencies=_completion_recovery_dependencies(),
-                interval_seconds=60,
-            ),
-            _shutdown_event,
-        )
+    tasks.start_leader_gated(
+        "delegation_timeout",
+        functools.partial(
+            completion_recovery_operations.delegation_timeout_sweeper,
+            dependencies=_completion_recovery_dependencies(),
+            interval_seconds=60,
+        ),
     )
     # Re-dispatch worker jobs paused for a transient LLM outage once their
     # backoff timer is due (fail-loud past the give-up ceiling). Leader-gated —
     # per-row CAS + run_when_leader keep N replicas from double-dispatching.
     # knowledge-base/knowledge/features/llm_outage_pause_and_backoff_redispatch.md
-    llm_outage_task = asyncio.create_task(
-        run_when_leader(
-            functools.partial(
-                completion_recovery_operations.llm_outage_redispatch_sweeper,
-                dependencies=_completion_recovery_dependencies(),
-                interval_seconds=float(
-                    (os.getenv("LLM_OUTAGE_SWEEP_SECONDS") or "").strip() or 30
-                ),
+    tasks.start_leader_gated(
+        "llm_outage",
+        functools.partial(
+            completion_recovery_operations.llm_outage_redispatch_sweeper,
+            dependencies=_completion_recovery_dependencies(),
+            interval_seconds=float(
+                (os.getenv("LLM_OUTAGE_SWEEP_SECONDS") or "").strip() or 30
             ),
-            _shutdown_event,
-        )
+        ),
     )
-    infra_transient_task = asyncio.create_task(
-        run_when_leader(
-            functools.partial(
-                completion_recovery_operations.infra_transient_redispatch_sweeper,
-                dependencies=_completion_recovery_dependencies(),
-                interval_seconds=float(
-                    (os.getenv("INFRA_TRANSIENT_SWEEP_SECONDS") or "").strip() or 30
-                ),
+    tasks.start_leader_gated(
+        "infra_transient",
+        functools.partial(
+            completion_recovery_operations.infra_transient_redispatch_sweeper,
+            dependencies=_completion_recovery_dependencies(),
+            interval_seconds=float(
+                (os.getenv("INFRA_TRANSIENT_SWEEP_SECONDS") or "").strip() or 30
             ),
-            _shutdown_event,
-        )
+        ),
     )
-    pool_reconciler_task = asyncio.create_task(
-        run_when_leader(
-            functools.partial(agent_pool_reconciler, provisioner=agent_provisioner),
-            _shutdown_event,
-        )
+    tasks.start_leader_gated(
+        "pool_reconciler",
+        functools.partial(agent_pool_reconciler, provisioner=agent_provisioner),
     )
     # Cleanup authority is independent of fresh protected-mode admission. A
     # feature/config disable must never strand an already durable reader or
     # pre-dispatch effect intent.
-    ro_reader_reconciler_task = asyncio.create_task(
-        run_when_leader(
-            functools.partial(
-                ro_reader_reconciler_loop,
-                store=postgres_db,
-                # Read per tick, as the module global always was.
-                router=lambda: main_cloud_router,
-            ),
-            _shutdown_event,
-        )
+    tasks.start_leader_gated(
+        "ro_reader_reconciler",
+        functools.partial(
+            ro_reader_reconciler_loop,
+            store=postgres_db,
+            # Read per tick, as the module global always was.
+            router=lambda: main_cloud_router,
+        ),
     )
-    automation_cron_task = asyncio.create_task(
+    tasks.start(
+        "automation_cron",
         cron_dispatcher_loop(
             postgres_db,
             _shutdown_event,
@@ -3182,11 +3185,12 @@ async def lifespan(app: FastAPI):
             # The loop outlives every request, so it carries the provisioning
             # adapter explicitly (R1.B07 caller closure).
             provision_repo=_provision_cron_job_repo,
-        )
+        ),
     )
     # Safety-net for project self-improvement loops: recover any loop whose
     # current job went terminal without the completion hook advancing it.
-    project_loop_sweeper_task = asyncio.create_task(
+    tasks.start(
+        "project_loop_sweeper",
         project_loop_sweeper_loop(
             postgres_db,
             _shutdown_event,
@@ -3207,12 +3211,13 @@ async def lifespan(app: FastAPI):
                 if COMPLETION_COMMANDS_ENABLED
                 else {}
             ),
-        )
+        ),
     )
     # Reap orphaned verification (critic) subjobs that would otherwise linger as
     # priority-10 dispatchable jobs and parasitically preempt real work. See
     # knowledge-history/done/preemption_before_first_checkpoint_replays_job_opening.md.
-    stale_verification_sweeper_task = asyncio.create_task(
+    tasks.start(
+        "stale_verification_sweeper",
         stale_verification_sweeper_loop(
             postgres_db,
             _shutdown_event,
@@ -3220,15 +3225,16 @@ async def lifespan(app: FastAPI):
                 postgres_db.cancel_and_settle_stale_stateless_verification_subjob
             ),
             completion_commands_enabled=COMPLETION_COMMANDS_ENABLED,
-        )
+        ),
     )
     # Backstop for session wakes: deliver any completion notice whose
     # opportunistic post-commit send was lost, or whose terminal path has no
     # hook at all. Deliberately NOT run_when_leader — single-firing comes from
     # the row claim, which works from every replica, and leader-gating would
     # make this a SPOF across a handover. See services/session_wake.py.
-    session_wake_sweeper_task = asyncio.create_task(
-        session_wake_sweeper_loop(postgres_db, _shutdown_event)
+    tasks.start(
+        "session_wake_sweeper",
+        session_wake_sweeper_loop(postgres_db, _shutdown_event),
     )
 
     # Slice-3 KB index freshness sweep: catch out-of-band vault edits (human
@@ -3253,41 +3259,42 @@ async def lifespan(app: FastAPI):
             ),
         )
 
-    kb_reindex_sweeper_task = asyncio.create_task(
-        run_when_leader(_kb_sweeper_coro, _shutdown_event)
+    tasks.start_leader_gated(
+        "kb_reindex_sweeper",
+        _kb_sweeper_coro,
     )
 
     # LLM $/token pricing sync: seed usage_rates from OpenRouter × the model
     # catalog (params_json.pricing_id) so record_events can cost the audit-
     # sourced token rows. Slow (6h) + change-only; no-op without the app pool.
-    pricing_sync_task = asyncio.create_task(
+    tasks.start(
+        "pricing_sync",
         llm_pricing_sync_loop(
             _shutdown_event, postgres_db.pool, postgres_db.list_models
-        )
+        ),
     )
 
     # Public-cloud comparison prices: AWS/Azure publish machine-readable list
     # prices. Refresh change-only once per day; STACKIT's PDF-backed reference
     # card is source-labelled and seeded by app migration 0082.
-    cloud_pricing_sync_task = asyncio.create_task(
-        cloud_pricing_sync_loop(_shutdown_event, postgres_db.pool)
+    tasks.start(
+        "cloud_pricing_sync",
+        cloud_pricing_sync_loop(_shutdown_event, postgres_db.pool),
     )
 
     # Workspace compute metering (Slice 4b): materialize CLOSED workspace
     # intervals into the usage ledger + reconcile leaked opens. Self-disables
     # when the app pool or ledger is absent (non-load-bearing tier).
-    workspace_metering_task = asyncio.create_task(
-        run_when_leader(
-            lambda stop: workspace_metering.workspace_metering_loop(
-                stop,
-                postgres_db,
-                usage_ledger,
-                lambda owner_kind, owner_id: workspace_metering_attribution(
-                    owner_kind, owner_id, store=postgres_db
-                ),
+    tasks.start_leader_gated(
+        "workspace_metering",
+        lambda stop: workspace_metering.workspace_metering_loop(
+            stop,
+            postgres_db,
+            usage_ledger,
+            lambda owner_kind, owner_id: workspace_metering_attribution(
+                owner_kind, owner_id, store=postgres_db
             ),
-            _shutdown_event,
-        )
+        ),
     )
 
     # LLM usage materialization (Slice 4c): materialize audit llm_requests into
@@ -3295,47 +3302,44 @@ async def lifespan(app: FastAPI):
     # R1.B05 lane C moved the loop body beside the work it drives
     # (`services/audit_usage.py`, like the pricing and metering loops).
     # B11 still owns the scheduling; only the call shape changed.
-    llm_usage_task = asyncio.create_task(
+    tasks.start(
+        "llm_usage",
         audit_usage.llm_usage_poll_loop(
             _shutdown_event,
             audit_db=audit_db,
             app_store=postgres_db,
             usage_ledger=usage_ledger,
             logger=logger,
-        )
+        ),
     )
 
     # Usage rollup (Phase 6 / D-1): re-aggregate closed days from the auditdb
     # usage_events firehose into the app-DB usage_daily mirror + advance the
     # rollup_state watermark. Leader-only (the upsert is idempotent, but there's
     # no value in every replica re-aggregating); self-disables without both pools.
-    usage_rollup_task = asyncio.create_task(
-        run_when_leader(lambda se: usage_rollup_loop(se, usage_rollup), _shutdown_event)
+    tasks.start_leader_gated(
+        "usage_rollup",
+        lambda se: usage_rollup_loop(se, usage_rollup),
     )
 
     # Typed v2 bootstrap/dirty-day reconciliation is also leader-owned and
     # non-load-bearing. It runs while the public read gate is off so operators
     # can enable v2 only after the durable bootstrap state reports complete.
-    infrastructure_usage_rollup_task = (
-        asyncio.create_task(
-            run_when_leader(
-                lambda se: typed_usage_rollup_loop(se, infrastructure_usage_rollup),
-                _shutdown_event,
-            )
+    if infrastructure_usage_rollup is not None:
+        tasks.start_leader_gated(
+            "infrastructure_usage_rollup",
+            lambda se: typed_usage_rollup_loop(se, infrastructure_usage_rollup),
         )
-        if infrastructure_usage_rollup is not None
-        else None
-    )
 
     # Audit-store partition maintenance (creation + ANALYZE + lookahead alarms;
     # retention deferred — see services/audit_partitions.py). Only when the
     # audit DB is configured; otherwise the store is inactive and there is
     # nothing to maintain.
-    audit_maintenance_task = (
-        asyncio.create_task(audit_maintenance_loop(audit_db.pool, _shutdown_event))
-        if (audit_db is not None and audit_ready)
-        else None
-    )
+    if audit_db is not None and audit_ready:
+        tasks.start(
+            "audit_maintenance",
+            audit_maintenance_loop(audit_db.pool, _shutdown_event),
+        )
 
     # Unified instance lifecycle reconciler (drift-based draining and,
     # in future phases, crash recovery + cross-kind primitives). Runs
@@ -3393,11 +3397,9 @@ async def lifespan(app: FastAPI):
         )
     except Exception:
         logger.exception("Lifecycle startup reconciliation failed (non-fatal)")
-    lifecycle_reconciler_task = asyncio.create_task(
-        run_when_leader(
-            lambda se: lifecycle_reconciler_loop(se, lifecycle_reconciler),
-            _shutdown_event,
-        )
+    tasks.start_leader_gated(
+        "lifecycle_reconciler",
+        lambda se: lifecycle_reconciler_loop(se, lifecycle_reconciler),
     )
 
     # Phase 4: main-cloud config LISTEN task — reacts to pg_notify when
@@ -3405,79 +3407,15 @@ async def lifespan(app: FastAPI):
     async def _main_cloud_reload_callback() -> None:
         await _reload_from_db_and_swap(postgres_db, main_cloud_router)
 
-    main_cloud_listen_task = asyncio.create_task(
-        run_listen_loop(postgres_db, _main_cloud_reload_callback, _shutdown_event)
+    tasks.start(
+        "main_cloud_listen",
+        run_listen_loop(postgres_db, _main_cloud_reload_callback, _shutdown_event),
     )
 
     yield
 
-    # Signal shutdown to background tasks
-    _shutdown_event.set()
-    await leader_task
-    if infrastructure_inventory_generation_task is not None:
-        await infrastructure_inventory_generation_task
-    await datasource_reconciliation_task
-    await stale_detector_task
-    await token_cleanup_task
-    await session_cleanup_task
-    await dispatcher_task
-    if vm_readiness_task is not None:
-        await vm_readiness_task
-    if vm_creation_retry_task is not None:
-        await vm_creation_retry_task
-    if vm_workspace_recovery_task is not None:
-        await vm_workspace_recovery_task
-    await sudo_sweeper_task
-    await thread_events_prune_task
-    await run_queue_reaper_task
-    if stateless_deletion_cost_task is not None:
-        await stateless_deletion_cost_task
-    await session_memory_effect_task
-    if completion_finalizer_task is not None:
-        await completion_finalizer_task
-    if completion_sweep_router_task is not None:
-        await completion_sweep_router_task
-    await completion_monitor_task
-    await security_events_prune_task
-    await ssh_attachments_prune_task
-    await checkpoint_retention_task
-    await headless_notify_task
-    await attention_sleep_task
-    await officer_watchdog_task
-    await message_route_reconciler_task
-    await officer_backlog_task
-    await ide_sweeper_task
-    await ws_sweeper_task
-    await ide_settings_sweeper_task
-    await gc_sweeper_task
-    await pinned_create_intent_reconciler_task
-    await pinned_create_fence_gc_task
-    await imap_task
-    await notification_steps_task
-    await delegation_timeout_task
-    await llm_outage_task
-    await infra_transient_task
-    await pool_reconciler_task
-    if ro_reader_reconciler_task is not None:
-        await ro_reader_reconciler_task
-    await lifecycle_reconciler_task
-    await main_cloud_listen_task
-    await automation_cron_task
-    await project_loop_sweeper_task
-    await stale_verification_sweeper_task
-    await session_wake_sweeper_task
-    await kb_reindex_sweeper_task
-    await pricing_sync_task
-    await cloud_pricing_sync_task
-    await workspace_metering_task
-    await llm_usage_task
-    await usage_rollup_task
-    if infrastructure_usage_rollup_task is not None:
-        await infrastructure_usage_rollup_task
-    if infrastructure_metering_runtime_task is not None:
-        await infrastructure_metering_runtime_task
-    if audit_maintenance_task is not None:
-        await audit_maintenance_task
+    # Signal shutdown to background tasks and wait for each of them.
+    await tasks.stop(_BACKGROUND_TASK_SHUTDOWN_ORDER)
 
     # Initial/manual datasource reindexes are request-spawned rather than loop
     # tasks. Cancel them before closing git/vector clients; the source context

@@ -1561,7 +1561,7 @@ class TestEvictDeadWorkspaces:
 
 class TestSweeperRegistrationShape:
     def test_settings_sweeper_is_leader_gated(self):
-        """The sweeper is only ever started through ``run_when_leader``.
+        """The sweeper is only ever started leader-gated (``run_when_leader``).
 
         (The lifespan characterization also pins this behaviourally.)
         """
@@ -1575,10 +1575,10 @@ class TestSweeperRegistrationShape:
         for node in ast.walk(tree):
             if not (
                 isinstance(node, ast.Call)
-                and ast.unparse(node.func) == "run_when_leader"
+                and ast.unparse(node.func) == "tasks.start_leader_gated"
             ):
                 continue
-            target = node.args[0]
+            target = node.args[1]
             if isinstance(target, ast.Call) and ast.unparse(target.func).endswith(
                 "partial"
             ):
