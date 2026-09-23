@@ -80,6 +80,32 @@ def test_exact_bound_launcher_charged_once_at_component_max():
     assert node.available == ResourceVector(2800, 7 * 1024**3, 9)
 
 
+def test_protocol_two_external_launcher_keeps_node_charge_without_srw_budget_identity():
+    value, reservation = setup()
+    value["protocol"] = 2
+    value["vms"][0].update(
+        owner_kind=None, owner_id=None, provision_generation=None,
+    )
+    request = ResourceVector(1200, 512 * 1024**2, 1, 50000000, 1, 1)
+    value["pods"][0]["requests"] = request.to_six_dict()
+    value["pods"][0]["reservation_id"] = None
+    value["pods"][0]["provision_generation"] = None
+    value["nodes"][0]["allocatable"].update(
+        ephemeral_storage_bytes=1000000000, tun_devices=8, vhost_net_devices=8,
+    )
+    node = result(value, []).nodes[reservation.node_uid]
+    assert node.external == request
+    assert node.held == ResourceVector(0, 0, 0)
+
+
+def test_protocol_two_rejects_extra_live_launcher_for_attributable_vm():
+    value, reservation = setup()
+    value["protocol"] = 2
+    value["pods"].append({**value["pods"][0], "uid": str(uuid4())})
+    with pytest.raises(ResourceAdmissionError, match="legacy_occupancy_unclassified"):
+        result(value, [replace(reservation, version=2)])
+
+
 def test_protocol_two_retains_authenticated_high_water_across_missing_pod_and_phases():
     from shared.vm_launcher_profile import default_launcher_profile
 

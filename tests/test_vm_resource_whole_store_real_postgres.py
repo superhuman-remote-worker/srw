@@ -360,6 +360,135 @@ async def test_legacy_three_field_held_charge_blocks_cutover(db):
     }
 
 
+async def publish_attributable_vm(inventory, value, *, with_pod):
+    observed = deepcopy(value)
+    observed["snapshot_id"] = str(uuid4())
+    observed["sequence"] += 1
+    observed["started_at"] = observed["finished_at"] = datetime.now(timezone.utc).isoformat()
+    node = observed["nodes"][0]
+    vm_uid, vmi_uid = str(uuid4()), str(uuid4())
+    observed["vms"] = [{
+        "uid": vm_uid, "name": "agent-vm-legacy", "owner_kind": "job",
+        "owner_id": str(uuid4()), "provision_generation": str(uuid4()),
+        "deleting": False,
+    }]
+    observed["vmis"] = [{
+        "uid": vmi_uid, "name": "agent-vm-legacy", "vm_uid": vm_uid,
+        "node_uid": node["uid"], "node_name": node["name"],
+        "phase": "Running", "deleting": False,
+    }]
+    if with_pod:
+        observed["pods"] = [{
+            "uid": str(uuid4()), "namespace": observed["namespace"],
+            "name": "virt-launcher-legacy", "node_uid": node["uid"],
+            "node_name": node["name"], "terminal": False, "deleting": False,
+            "requests": {
+                "cpu_millicores": 205, "memory_bytes": 861277888,
+                "ephemeral_storage_bytes": 50000000, "kvm_devices": 1,
+                "tun_devices": 1, "vhost_net_devices": 1,
+            },
+            "vmi_uid": vmi_uid, "reservation_id": None,
+            "provision_generation": observed["vms"][0]["provision_generation"],
+        }]
+    await publish(inventory, observed)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("with_pod", [True, False])
+async def test_live_attributable_vm_without_v2_charge_refuses_budget_cutover(db, with_pod):
+    store, inventory, value, _ = await environment(db, installation_count=2)
+    await publish_attributable_vm(inventory, value, with_pod=with_pod)
+    target = await waiter(db, store, inventory, user_id=uuid4())
+    assert await store.admit(request_id=str(target["request_id"])) == {
+        "action": "unavailable", "reason": "legacy_occupancy_unclassified",
+    }
+    assert await db.fetchval(
+        "SELECT count(*) FROM vm_resource_reservations WHERE cluster_id=$1",
+        inventory.cluster_id,
+    ) == 0
+
+
+@pytest.mark.asyncio
+async def test_srw_marked_launcher_without_vm_owner_link_refuses_cutover(db):
+    store, inventory, value, _ = await environment(db, installation_count=2)
+    observed = deepcopy(value)
+    observed["snapshot_id"] = str(uuid4())
+    observed["sequence"] += 1
+    observed["started_at"] = observed["finished_at"] = datetime.now(timezone.utc).isoformat()
+    node = observed["nodes"][0]
+    vmi_uid = str(uuid4())
+    observed["vmis"] = [{
+        "uid": vmi_uid, "name": "legacy-unlinked", "vm_uid": None,
+        "node_uid": node["uid"], "node_name": node["name"],
+        "phase": "Running", "deleting": False,
+    }]
+    observed["pods"] = [{
+        "uid": str(uuid4()), "namespace": observed["namespace"],
+        "name": "virt-launcher-unlinked", "node_uid": node["uid"],
+        "node_name": node["name"], "terminal": False, "deleting": False,
+        "requests": {
+            "cpu_millicores": 205, "memory_bytes": 861277888,
+            "ephemeral_storage_bytes": 50000000, "kvm_devices": 1,
+            "tun_devices": 1, "vhost_net_devices": 1,
+        },
+        "vmi_uid": vmi_uid, "reservation_id": str(uuid4()),
+        "provision_generation": str(uuid4()),
+    }]
+    await publish(inventory, observed)
+    target = await waiter(db, store, inventory, user_id=uuid4())
+    assert await store.admit(request_id=str(target["request_id"])) == {
+        "action": "unavailable", "reason": "legacy_occupancy_unclassified",
+    }
+
+
+@pytest.mark.asyncio
+async def test_exact_bound_live_launcher_uses_one_v2_charge(db):
+    store, inventory, value, demand = await environment(
+        db, installation_count=2, owner_count=2,
+    )
+    first = await waiter(db, store, inventory, user_id=uuid4())
+    admitted = await store.admit(request_id=str(first["request_id"]))
+    assert admitted["action"] == "admitted"
+    vm_uid, vmi_uid, launcher_uid = uuid4(), uuid4(), uuid4()
+    await db.execute(
+        "UPDATE vm_resource_reservations SET state='active',vm_uid=$2,"
+        "vmi_uid=$3,launcher_uid=$4 WHERE id=$1",
+        UUID(admitted["reservation_id"]), vm_uid, vmi_uid, launcher_uid,
+    )
+    observed = deepcopy(value)
+    observed["snapshot_id"] = str(uuid4())
+    observed["sequence"] += 1
+    observed["started_at"] = observed["finished_at"] = datetime.now(timezone.utc).isoformat()
+    node = observed["nodes"][0]
+    observed["vms"] = [{
+        "uid": str(vm_uid), "name": "agent-vm-bound", "owner_kind": "job",
+        "owner_id": str(first["job_id"]),
+        "provision_generation": str(first["provision_generation"]),
+        "deleting": False,
+    }]
+    observed["vmis"] = [{
+        "uid": str(vmi_uid), "name": "agent-vm-bound", "vm_uid": str(vm_uid),
+        "node_uid": node["uid"], "node_name": node["name"],
+        "phase": "Running", "deleting": False,
+    }]
+    observed["pods"] = [{
+        "uid": str(launcher_uid), "namespace": observed["namespace"],
+        "name": "virt-launcher-bound", "node_uid": node["uid"],
+        "node_name": node["name"], "terminal": False, "deleting": False,
+        "requests": demand.to_six_dict(), "vmi_uid": str(vmi_uid),
+        "reservation_id": admitted["reservation_id"],
+        "provision_generation": str(first["provision_generation"]),
+    }]
+    await publish(inventory, observed)
+    second = await waiter(db, store, inventory, user_id=uuid4())
+    second_result = await store.admit(request_id=str(second["request_id"]))
+    assert second_result["action"] == "admitted"
+    assert await db.fetchval(
+        "SELECT count(*) FROM vm_resource_reservations WHERE cluster_id=$1",
+        inventory.cluster_id,
+    ) == 2
+
+
 @pytest.mark.asyncio
 async def test_stale_installed_observation_is_not_capacity(db):
     store, inventory, _, _ = await environment(db, age_seconds=120)
