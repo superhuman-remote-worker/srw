@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
+import hashlib
+import json
 import re
 import time
 from uuid import UUID
@@ -776,9 +778,63 @@ class GateFixturePurge:
         ):
             raise GateStopError("purge_object_recreated")
 
-    async def run(self, job_id):
-        import json
+    async def _cleanup_completed(self, job_id, snapshot):
+        pvc_uid = snapshot["uids"]["pvc"]
+        if pvc_uid is None:
+            return True
+        dv_uid = snapshot["uids"]["dv"]
+        if dv_uid is None:
+            raise GateStopError("purge_cleanup_identity_unproven")
+        identity = {
+            "source": "controller_rootdisk_delete",
+            "owner_kind": "job",
+            "owner_id": str(job_id),
+            "pvc_uid": pvc_uid,
+            "dv_uid": dv_uid,
+            "provision_generation": snapshot["generation"],
+        }
+        intent_digest = (
+            "sha256:"
+            + hashlib.sha256(
+                json.dumps(
+                    identity, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+                ).encode("utf-8")
+            ).hexdigest()
+        )
+        async with self.db.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT completed_at,outcome,intent_digest "
+                "FROM vm_workspace_cleanup_admissions "
+                "WHERE owner_kind='job' AND owner_id=$1 AND pvc_uid=$2 "
+                "AND source='controller_rootdisk_delete'",
+                job_id,
+                UUID(pvc_uid),
+            )
+        if len(rows) != 1:
+            raise GateStopError("purge_cleanup_receipt_missing")
+        if rows[0]["intent_digest"] != intent_digest:
+            raise GateStopError("purge_cleanup_receipt_changed")
+        if rows[0]["completed_at"] is None:
+            return False
+        if rows[0]["outcome"] != "deleted":
+            raise GateStopError("purge_cleanup_receipt_changed")
+        return True
 
+    async def _await_cleanup_completed(self, job_id, snapshot, stop_at):
+        while True:
+            current = self._identities(
+                job_id, await self.kube.fixture_objects(self.namespace, str(job_id))
+            )
+            self._matches(current, snapshot["uids"])
+            if any(current.values()):
+                raise GateStopError("purge_resources_still_present")
+            if await self._cleanup_completed(job_id, snapshot):
+                return
+            if time.monotonic() >= stop_at:
+                raise GateStopError("purge_cleanup_unresolved")
+            await asyncio.sleep(self.interval)
+
+    async def run(self, job_id):
         job_id = UUID(str(job_id))
         objects = await self.kube.fixture_objects(self.namespace, str(job_id))
         identities = self._identities(job_id, objects)
@@ -864,6 +920,9 @@ class GateFixturePurge:
                     json.dumps(snapshot),
                 )
         if not any(identities.values()):
+            await self._await_cleanup_completed(
+                job_id, snapshot, time.monotonic() + self.timeout
+            )
             return
         # The normal provisioner retains its process-zero and cleanup-admission
         # checks. A request response is not proof of physical resource absence.
@@ -880,6 +939,7 @@ class GateFixturePurge:
             )
             self._matches(current, snapshot["uids"])
             if not any(current.values()):
+                await self._await_cleanup_completed(job_id, snapshot, stop_at)
                 return
             await asyncio.sleep(self.interval)
         raise GateStopError("purge_resources_still_present")

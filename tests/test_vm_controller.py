@@ -3941,6 +3941,31 @@ class TestWorkspaceCleanupCarriers:
         controller.coordination_api.delete_namespaced_lease.assert_called_once()
 
     @pytest.mark.asyncio
+    async def test_admitted_rootdisk_delete_settles_with_orphan_gc_disabled(
+        self, controller
+    ):
+        carrier_lease = _cleanup_carrier_lease()
+        controller.coordination_api.list_namespaced_lease.return_value = {
+            "items": [carrier_lease]
+        }
+        controller._get_dv = AsyncMock(return_value=None)
+        controller.core_api.read_namespaced_persistent_volume_claim.side_effect = (
+            _FakeApiException(status=404)
+        )
+
+        async def preparation_once():
+            controller._shutdown.set()
+
+        controller._workspace_preparation = lambda: types.SimpleNamespace(
+            reconcile=preparation_once
+        )
+        with patch("vm_controller.controller.VM_ROOTDISK_GC_ENABLED", False):
+            await controller._preparation_loop()
+
+        controller._complete_workspace_cleanup_reservation.assert_awaited_once()
+        controller.k8s_client.list_namespaced_custom_object.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_create_settles_interrupted_delete_before_replacement_with_gc_disabled(
         self, controller
     ):
@@ -4911,7 +4936,9 @@ class TestLifecycleIdentityGeneration:
     ):
         """A missing VM alone cannot return its compute budget while a VMI remains."""
         job_id = SAMPLE_JOB_CONFIG["job_id"]
-        controller.k8s_client.get_namespaced_custom_object.side_effect = _FakeApiException(404)
+        controller.k8s_client.get_namespaced_custom_object.side_effect = (
+            _FakeApiException(404)
+        )
         controller._rootdisk_pvc_probe = AsyncMock(
             return_value=(True, f"root-pvc-uid-{job_id}")
         )

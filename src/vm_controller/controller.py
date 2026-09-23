@@ -1141,7 +1141,9 @@ class VMController:
             raise RuntimeError("workspace cleanup carrier identity changed")
         return carrier
 
-    async def _list_workspace_cleanup_carriers(self) -> tuple[dict[str, object], ...]:
+    async def _list_workspace_cleanup_carriers(
+        self, *, sources: frozenset[str] | None = None
+    ) -> tuple[dict[str, object], ...]:
         from shared.vm_creation_issuance import (
             CREATION_INTENT_ANNOTATION,
             CREATION_SIGNATURE_ANNOTATION,
@@ -1168,6 +1170,12 @@ class VMController:
             ):
                 continue
             annotations = _metadata_value(item, "annotations", {}) or {}
+            if (
+                sources is not None
+                and isinstance(annotations, Mapping)
+                and annotations.get(_CLEANUP_ANNOTATIONS["source"]) not in sources
+            ):
+                continue
             if CREATION_INTENT_ANNOTATION in annotations and not annotations.get(
                 CREATION_SIGNATURE_ANNOTATION
             ):
@@ -1984,16 +1992,19 @@ class VMController:
                 files = cloud_document.setdefault("write_files", [])
                 if not isinstance(files, list) or any(
                     not isinstance(item, dict)
-                    or item.get("path") == "/usr/local/bin/srw-network-profile-qualification"
+                    or item.get("path")
+                    == "/usr/local/bin/srw-network-profile-qualification"
                     for item in files
                 ):
                     raise ValueError("Unsupported profile cloud-init write_files")
-                files.append({
-                    "path": "/usr/local/bin/srw-network-profile-qualification",
-                    "permissions": "0755",
-                    "owner": "root:root",
-                    "content": Path(vm_network_probe_guest.__file__).read_text(),
-                })
+                files.append(
+                    {
+                        "path": "/usr/local/bin/srw-network-profile-qualification",
+                        "permissions": "0755",
+                        "owner": "root:root",
+                        "content": Path(vm_network_probe_guest.__file__).read_text(),
+                    }
+                )
                 rendered_cloud_init = "#cloud-config\n" + yaml.safe_dump(
                     cloud_document, sort_keys=False
                 )
@@ -2215,6 +2226,14 @@ class VMController:
 
     async def _preparation_loop(self):
         while not self._shutdown.is_set():
+            try:
+                # Continue only admitted exact rootdisk deletes. Orphan discovery
+                # remains gated by VM_ROOTDISK_GC_ENABLED.
+                await self._reconcile_workspace_cleanup_carriers(
+                    sources=frozenset({"controller_rootdisk_delete"})
+                )
+            except Exception:
+                log.exception("Workspace cleanup permit reconciliation failed")
             try:
                 await self._workspace_preparation().reconcile()
             except Exception:
@@ -4025,8 +4044,10 @@ class VMController:
                 )
             return False
 
-    async def _reconcile_workspace_cleanup_carriers(self) -> None:
-        for carrier in await self._list_workspace_cleanup_carriers():
+    async def _reconcile_workspace_cleanup_carriers(
+        self, *, sources: frozenset[str] | None = None
+    ) -> None:
+        for carrier in await self._list_workspace_cleanup_carriers(sources=sources):
             try:
                 await self._reconcile_workspace_cleanup_carrier(carrier)
             except Exception as exc:
