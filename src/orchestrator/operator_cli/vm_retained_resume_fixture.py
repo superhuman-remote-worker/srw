@@ -398,7 +398,7 @@ async def probe_ready_fixture(
         or preflight["request"].get("network_profile") != NETWORK_PROFILE
     ):
         raise FixtureRefusal("A1 fixture immutable authority changed")
-    if context.get("_vm_creation_pending") is not None:
+    if vm.get("status") != "ready":
         return None
     status = _json(await provisioner.query_status(str(job_id), timeout=10))
     identity = {
@@ -455,7 +455,6 @@ async def probe_ready_fixture(
         != prepared["provision_generation"]
         or retry["state"] != "succeeded"
         or retry["reason"] != "creation_adopted"
-        or retry["ready_at"] is None
         or str(retry["observed_vm_uid"]) != identity["vm_uid"]
         or str(retry["observed_pvc_uid"]) != identity["pvc_uid"]
         or canonical != preflight["request"]
@@ -475,6 +474,29 @@ async def probe_ready_fixture(
         "SELECT EXISTS(SELECT 1 FROM worker_batch_attempts WHERE job_id=$1)", job_id,
     ):
         raise FixtureRefusal("A1 fixture acquired a worker before acceptance")
+    if retry["ready_at"] is None:
+        from orchestrator.operator_cli.vm_fixture_readiness import (
+            settle_owned_fixture_ready,
+        )
+
+        if context.get("_vm_creation_pending") != prepared["request_id"]:
+            return None
+        if not await settle_owned_fixture_ready(
+            db=db, job_id=str(job_id), owner_id=prepared["owner_id"],
+            run_id=run_id, marker_key="vm_retained_resume_acceptance_gate",
+            request_id=prepared["request_id"],
+            generation=prepared["provision_generation"],
+            vm_uid=identity["vm_uid"], pvc_uid=identity["pvc_uid"],
+        ):
+            return None
+        # The production writer has changed only the pending/Ready receipt.
+        # Re-read every live, source and queue predicate before returning it.
+        return await probe_ready_fixture(
+            db, provisioner, run_id=run_id, vm_image=vm_image,
+            prepared=prepared,
+        )
+    if context.get("_vm_creation_pending") is not None:
+        return None
     return {key: str(value) for key, value in identity.items()}
 
 
