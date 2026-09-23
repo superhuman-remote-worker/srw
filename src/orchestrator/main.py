@@ -3460,7 +3460,17 @@ async def lifespan(app: FastAPI):
 
     _shutdown_event = asyncio.Event()
     tasks = ApplicationTaskSet(_shutdown_event)
-    await _start_application(tasks)
+    try:
+        await _start_application(tasks)
+    except BaseException:
+        # A failed startup must not leave the tasks it already started running
+        # or its pools open: run the ordinary shutdown (every close is a no-op
+        # for something never opened), then report the original failure.
+        try:
+            await _stop_application(tasks)
+        except Exception:
+            logger.exception("Cleanup after the failed startup also failed")
+        raise
     yield
     await _stop_application(tasks)
 

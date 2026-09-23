@@ -595,6 +595,8 @@ async def test_preflight_refusal_happens_before_any_resource_is_acquired(
         await _run_lifespan(monkeypatch, recorder)
     assert recorder.created == []
     assert "postgres_db.connect" not in recorder.events
+    # Nothing was acquired, so nothing is unwound either.
+    assert "postgres_db.disconnect" not in recorder.events
 
 
 @pytest.mark.asyncio
@@ -625,14 +627,6 @@ async def test_shutdown_still_stops_every_task_and_closes_pools_after_a_failure(
 
 
 @pytest.mark.asyncio
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason=(
-        "R1.B11 characterization: a startup failure after tasks exist leaves "
-        "them running and the pools open"
-    ),
-)
 async def test_startup_failure_stops_started_tasks_and_releases_pools(monkeypatch):
     recorder = _Recorder()
 
@@ -797,3 +791,40 @@ async def test_moved_loops_receive_the_application_collaborators(monkeypatch):
     assert ro_reader["router"]() is live.main_cloud_router
     sudo = _keywords(created["sudo_expiration_sweeper"])
     assert sudo["gate"] is live.sudo_gate
+
+
+@pytest.mark.asyncio
+async def test_a_failed_first_connect_unwinds_without_masking_the_error(monkeypatch):
+    recorder = _Recorder()
+
+    async def _refused():
+        raise ConnectionRefusedError("app database unreachable")
+
+    async def _inside(_world):  # pragma: no cover - startup never completes
+        raise AssertionError("startup must not complete")
+
+    with _lifespan_environment(monkeypatch, recorder) as world:
+        world.store.connect = _refused
+        with pytest.raises(ConnectionRefusedError, match="unreachable"):
+            async with main.lifespan(main.app):
+                await _inside(world)
+    assert recorder.created == []
+    # The ordinary closure ran; each close was a no-op on an unopened client.
+    assert _closure(recorder) == SHUTDOWN_CLOSURE
+
+
+@pytest.mark.asyncio
+async def test_a_failing_cleanup_does_not_replace_the_startup_error(monkeypatch):
+    recorder = _Recorder()
+
+    class _Boom(RuntimeError):
+        pass
+
+    def _explode(*_a, **_k):
+        raise _Boom("lifecycle reconciler construction failed")
+
+    monkeypatch.setattr(main, "InstanceLifecycleReconciler", _explode)
+    recorder.fail_labels = {"stale_agent_detector"}
+    with pytest.raises(_Boom):
+        await _run_lifespan(monkeypatch, recorder)
+    assert "postgres_db.disconnect" in recorder.events
