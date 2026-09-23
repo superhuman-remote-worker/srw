@@ -2247,41 +2247,10 @@ _BACKGROUND_TASK_SHUTDOWN_ORDER: tuple[str, ...] = (
 )
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Application lifespan handler."""
-    global _shutdown_event
+async def _start_application(tasks: ApplicationTaskSet) -> None:
+    """Connect the stores, run migrations and bootstraps, bind the services and
+    start the lifecycle's background tasks (R1.B11 split of ``lifespan``)."""
     global _persistent_thread_recycler
-
-    # Reordering is an execution mode of durable completion commands, never a
-    # standalone legacy-path feature. The admission bit is persisted, so this
-    # process flag changes only fresh commands. Reject the invalid combination
-    # before opening either database so a bad rollout fails loudly and
-    # side-effect free.
-    if COMPLETION_STATUS_REORDER_ENABLED and not COMPLETION_COMMANDS_ENABLED:
-        logger.error(
-            "COMPLETION_STATUS_REORDER_ENABLED requires COMPLETION_COMMANDS_ENABLED"
-        )
-        sys.exit(1)
-
-    # Hard-fail if the legacy LLM_BASE_URL env var is set. The env-var-driven
-    # routing for self-hosted "Local" group models was removed in chunk 6 of
-    # the models_yaml_removal work. Operators currently relying on it must
-    # migrate to a helm-seeded llm_endpoints row + catalog rows referencing
-    # it. ERROR + sys.exit(1) (not WARN + ignore) because the var being set
-    # with no consumer is an active misconfiguration that won't self-heal —
-    # the legacy code path silently fell through to api.openai.com with
-    # `not-needed` (the bug captured in knowledge-base/knowledge/llm_routing_issues.md).
-    if os.getenv("LLM_BASE_URL"):
-        logger.error(
-            "LLM_BASE_URL is set but no longer honoured. Self-hosted models "
-            "must now be configured via Admin → Providers (system endpoint) "
-            "+ Admin → Models (catalog row) or via "
-            "helm.llm.seed.systemEndpoints[]. Unset LLM_BASE_URL and seed "
-            "the endpoint in helm to migrate. See "
-            "knowledge-base/knowledge/features/models_yaml_removal.md."
-        )
-        sys.exit(1)
 
     # Connect to databases
     await postgres_db.connect()
@@ -2732,11 +2701,9 @@ async def lifespan(app: FastAPI):
 
     imap_poller.connect(db=postgres_db, reply_handler=_imap_reply_handler)
 
-    # Start background tasks. One task set per lifecycle owns them: leader-only
+    # Start background tasks. The lifecycle's task set owns them: leader-only
     # loops go through run_when_leader, and shutdown awaits every started task
     # in _BACKGROUND_TASK_SHUTDOWN_ORDER (R1.B11).
-    _shutdown_event = asyncio.Event()
-    tasks = ApplicationTaskSet(_shutdown_event)
     # Leader election (M1): this replica contends for the singleton-loop
     # leadership lock; the run_when_leader-wrapped loops below run only while
     # this replica holds it. See services/leader_election.py.
@@ -3412,7 +3379,10 @@ async def lifespan(app: FastAPI):
         run_listen_loop(postgres_db, _main_cloud_reload_callback, _shutdown_event),
     )
 
-    yield
+
+async def _stop_application(tasks: ApplicationTaskSet) -> None:
+    """Stop the lifecycle's tasks, drain the registries, then close clients and
+    stores in order (R1.B11 split of ``lifespan``)."""
 
     # Signal shutdown to background tasks and wait for each of them.
     await tasks.stop(_BACKGROUND_TASK_SHUTDOWN_ORDER)
@@ -3447,6 +3417,48 @@ async def lifespan(app: FastAPI):
     await postgres_db.disconnect()
     _completion_runtime.reset()
     _session_memory_runtime.reset()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Application lifespan handler."""
+    global _shutdown_event
+
+    # Reordering is an execution mode of durable completion commands, never a
+    # standalone legacy-path feature. The admission bit is persisted, so this
+    # process flag changes only fresh commands. Reject the invalid combination
+    # before opening either database so a bad rollout fails loudly and
+    # side-effect free.
+    if COMPLETION_STATUS_REORDER_ENABLED and not COMPLETION_COMMANDS_ENABLED:
+        logger.error(
+            "COMPLETION_STATUS_REORDER_ENABLED requires COMPLETION_COMMANDS_ENABLED"
+        )
+        sys.exit(1)
+
+    # Hard-fail if the legacy LLM_BASE_URL env var is set. The env-var-driven
+    # routing for self-hosted "Local" group models was removed in chunk 6 of
+    # the models_yaml_removal work. Operators currently relying on it must
+    # migrate to a helm-seeded llm_endpoints row + catalog rows referencing
+    # it. ERROR + sys.exit(1) (not WARN + ignore) because the var being set
+    # with no consumer is an active misconfiguration that won't self-heal —
+    # the legacy code path silently fell through to api.openai.com with
+    # `not-needed` (the bug captured in knowledge-base/knowledge/llm_routing_issues.md).
+    if os.getenv("LLM_BASE_URL"):
+        logger.error(
+            "LLM_BASE_URL is set but no longer honoured. Self-hosted models "
+            "must now be configured via Admin → Providers (system endpoint) "
+            "+ Admin → Models (catalog row) or via "
+            "helm.llm.seed.systemEndpoints[]. Unset LLM_BASE_URL and seed "
+            "the endpoint in helm to migrate. See "
+            "knowledge-base/knowledge/features/models_yaml_removal.md."
+        )
+        sys.exit(1)
+
+    _shutdown_event = asyncio.Event()
+    tasks = ApplicationTaskSet(_shutdown_event)
+    await _start_application(tasks)
+    yield
+    await _stop_application(tasks)
 
 
 app = FastAPI(

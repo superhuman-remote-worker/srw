@@ -371,11 +371,13 @@ async def test_unbinding_forgets_only_that_store() -> None:
 
 
 def _lifespan() -> ast.AsyncFunctionDef:
+    """The application's startup body (R1.B11 moved it from ``lifespan``
+    into ``_start_application``; ``lifespan`` now only sequences it)."""
     tree = ast.parse(MAIN.read_text())
     return next(
         node
         for node in tree.body
-        if isinstance(node, ast.AsyncFunctionDef) and node.name == "lifespan"
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "_start_application"
     )
 
 
