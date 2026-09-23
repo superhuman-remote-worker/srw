@@ -70,6 +70,205 @@ async def snapshot(db, job):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("stage", ["preflight", "ledger"])
+async def test_public_creation_resume_lifts_exact_paused_fixture_hold(db, monkeypatch, stage):
+    from orchestrator.services.vm_creation_resume import resume_pending_creation
+
+    monkeypatch.setenv("VM_CREATION_RETRY_ENABLED", "true")
+    job, original = await pending(db, stage)
+    owner = str(uuid4())
+    await db.execute("UPDATE jobs SET status='paused' WHERE id=$1", job)
+    assert await db.hold_paused_job(str(job), paused_by=owner)
+    before = await snapshot(db, job)
+    hold = json.loads(before["job"]["context"])["_operator_pause_hold"]
+
+    result = await resume_pending_creation(
+        db, job_id=str(job), lift_operator_pause_hold=hold["hold_id"],
+    )
+
+    assert result["vm_creation_retry_request_id"] == original["request_id"]
+    after = await snapshot(db, job)
+    context = json.loads(after["job"]["context"])
+    assert "_operator_pause_hold" not in context
+    assert context["last_operator_pause_hold"]["hold_id"] == hold["hold_id"]
+    if stage == "ledger":
+        assert (after["retry"][0]["canonical_request"],
+                after["retry"][0]["request_digest"],
+                after["retry"][0]["admission_deadline"]) == (
+                    before["retry"][0]["canonical_request"],
+                    before["retry"][0]["request_digest"],
+                    before["retry"][0]["admission_deadline"],
+                )
+    else:
+        assert context["vm"]["creation_preflight"]["request"] == original["request"]
+    assert after["queue"]["state"] == "done"
+    assert after["queue"]["lease_token"] == before["queue"]["lease_token"]
+
+
+@pytest.mark.asyncio
+async def test_background_creation_resume_preserves_owner_pause(db, monkeypatch):
+    from orchestrator.services.vm_creation_resume import resume_pending_creation
+
+    monkeypatch.setenv("VM_CREATION_RETRY_ENABLED", "true")
+    job, _ = await pending(db, "ledger")
+    await db.execute("UPDATE jobs SET status='paused' WHERE id=$1", job)
+    assert await db.hold_paused_job(str(job), paused_by=str(uuid4()))
+    before = await snapshot(db, job)
+    assert (await resume_pending_creation(db, job_id=str(job)))["status"] == "queued"
+    after = await snapshot(db, job)
+    assert json.loads(after["job"]["context"])["_operator_pause_hold"] == (
+        json.loads(before["job"]["context"])["_operator_pause_hold"]
+    )
+    assert after["queue"]["state"] == "done"
+
+
+@pytest.mark.asyncio
+async def test_stale_public_creation_resume_cannot_cross_newer_pause(db, monkeypatch):
+    from orchestrator.services.vm_creation_resume import resume_pending_creation
+
+    monkeypatch.setenv("VM_CREATION_RETRY_ENABLED", "true")
+    job, _ = await pending(db, "ledger")
+    await db.execute("UPDATE jobs SET status='paused' WHERE id=$1", job)
+    assert await db.hold_paused_job(str(job), paused_by=str(uuid4()))
+    first = json.loads((await snapshot(db, job))["job"]["context"])["_operator_pause_hold"]
+    assert await db.queue_stateless_job_for_resume(
+        str(job), expected_status="paused",
+        lift_operator_pause_hold=first["hold_id"],
+    )
+    assert await db.hold_paused_job(str(job), paused_by=str(uuid4()))
+    before = await snapshot(db, job)
+    with pytest.raises(VMCreationRetryConflict, match="job_control_busy"):
+        await resume_pending_creation(
+            db, job_id=str(job), lift_operator_pause_hold=first["hold_id"],
+        )
+    assert await snapshot(db, job) == before
+
+
+@pytest.mark.asyncio
+async def test_owner_resume_route_merges_held_feedback_and_revokes_token(
+    db, monkeypatch, tmp_path,
+):
+    import hashlib
+    from datetime import datetime, timedelta, timezone
+
+    import httpx
+    from fastapi import FastAPI
+
+    from orchestrator.routers import job_controls as routes
+    from orchestrator.routers import job_lifecycle as mutation_routes
+    from orchestrator.security.access import (
+        require_internal, require_internal_or_job_access, require_job_access,
+    )
+    from orchestrator.operator_cli.vm_retained_resume_fixture import (
+        prepare_fixture, seed_model,
+    )
+    from orchestrator.services.vm_creation_preflight import VMCreationPreflightStore
+    from orchestrator.services.vm_provisioner import VMProvisioner
+    from tests.test_job_control_operations import _operations
+    from tests.test_operator_pause_hold_real_postgres import (
+        _operations as pause_operations,
+    )
+
+    image = "registry.example/a1-guest@sha256:" + "a" * 64
+    for name, value in {
+        "VM_MODE": "same-cluster", "VM_CREATION_RETRY_ENABLED": "true",
+        "VM_NETWORK_PROFILE_ENABLED": "true",
+        "VM_NETWORK_PROFILE_IMAGE_ALLOWLIST": image,
+        "VM_RETAINED_RESUME_ACCEPTANCE_GATE_ENABLED": "true",
+    }.items():
+        monkeypatch.setenv(name, value)
+    run = "srw-a1-route-" + uuid4().hex[:8]
+    model = "e2e-vm-a1-route-" + uuid4().hex[:8]
+    await seed_model(
+        db, run_id=run, namespace=run, model_id=model,
+        inference_key="a1-owner-route-test-key-20260924",
+    )
+    provisioner = VMProvisioner()
+    provisioner._db = db
+    prepared = await prepare_fixture(
+        db, provisioner, run_id=run, namespace=run,
+        vm_image=image, model_id=model,
+    )
+    job, owner = prepared["job_id"], prepared["owner_id"]
+    preflight = VMCreationPreflightStore(db)
+    claim = (await preflight.claim_due(limit=1))[0]
+    assert await preflight.record_failure(
+        claim, reason="creation_configuration_unproven",
+    )
+    original = json.loads(await db.fetchval(
+        "SELECT context->'vm'->'creation_preflight' FROM jobs WHERE id=$1",
+        job,
+    ))
+    operations = _operations(tmp_path, store=db)
+    dependencies = routes.JobControlRouteDependencies(
+        operations=operations, store=db,
+        require_internal_or_job_access=require_internal_or_job_access,
+        require_job_access=require_job_access,
+        require_admin=None, require_approved_user=None,
+        require_sudo_request_authority=None, user_can_access_job_or_thread=None,
+        mcp_scope_project_id=None,
+    )
+    app = FastAPI()
+    app.include_router(routes.router)
+    app.include_router(mutation_routes.router)
+    app.state.job_control_dependencies_factory = lambda: dependencies
+    pause_dependencies = mutation_routes.JobControlRouteDependencies(
+        operations=pause_operations(db, commands_enabled=True), store=db,
+        require_internal_or_job_access=require_internal_or_job_access,
+        require_job_access=require_job_access, require_internal=require_internal,
+    )
+    app.state.job_control_route_dependencies_factory = lambda: pause_dependencies
+    raw = "srw_" + uuid4().hex + uuid4().hex
+    token = await db.create_mcp_token(
+        user_id=str(owner), name="a1-owner-route",
+        token_hash=hashlib.sha256(raw.encode()).hexdigest(),
+        token_prefix=raw[:12], scope="user",
+        expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
+        origin="vm-retained-resume-fixture-test",
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://owner.test",
+    ) as client:
+        pause = await client.put(
+            f"/api/jobs/{job}/pause",
+            headers={"Authorization": f"Bearer {raw}"},
+        )
+        assert pause.status_code == 200
+        hold = json.loads(await db.fetchval(
+            "SELECT context->'_operator_pause_hold' FROM jobs WHERE id=$1",
+            job,
+        ))
+        assert hold["paused_by"] == owner and hold["source"] == "public_pause"
+        await db.execute(
+            "UPDATE jobs SET context=context || $2::jsonb WHERE id=$1",
+            job, json.dumps({"queued_feedback": "held earlier"}),
+        )
+        response = await client.post(
+            f"/api/jobs/{job}/resume",
+            headers={"Authorization": f"Bearer {raw}"},
+            json={"feedback": "new request"},
+        )
+        assert response.status_code == 200
+        assert response.json()["vm_creation_retry_request_id"] == original["request_id"]
+        assert await db.revoke_mcp_token(str(token["id"]), owner)
+        refused = await client.post(
+            f"/api/jobs/{job}/resume",
+            headers={"Authorization": f"Bearer {raw}"}, json={},
+        )
+        assert refused.status_code == 401
+    after = await snapshot(db, job)
+    context = json.loads(after["job"]["context"])
+    assert "_operator_pause_hold" not in context
+    assert context["last_operator_pause_hold"]["hold_id"] == hold["hold_id"]
+    assert context["queued_feedback"] == "held earlier\n\n---\n\nnew request"
+    assert after["queue"]["state"] == "done"
+    assert context["vm"]["creation_preflight"]["request"] == original["request"]
+    assert context["vm"]["creation_preflight"]["admission_deadline"] == (
+        original["admission_deadline"]
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ["preflight", "ledger"])
 async def test_duplicate_resume_retains_one_request_and_pending_worker_budget(
     db, monkeypatch, stage
 ):
