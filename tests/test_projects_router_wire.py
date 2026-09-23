@@ -755,6 +755,14 @@ class TestRestoreEndpointGuard:
             "baseUrl",
             "http_proxy",
             "api_base",
+            "REDIS_ADDR",
+            "dsn",
+            "connection_string",
+            "webhook",
+            "apiBase",
+            "gateway",
+            "allowed_domains",
+            "$ref",
         ],
     )
     def test_every_endpoint_shape_counts(self, key):

@@ -1250,6 +1250,14 @@ _ENDPOINT_KEY_TOKENS = frozenset(
         "server",
         "servers",
         "address",
+        "addr",
+        "dsn",
+        "webhook",
+        "webhooks",
+        "gateway",
+        "domain",
+        "domains",
+        "ref",
     }
 )
 
@@ -1258,7 +1266,9 @@ def _is_endpoint_key(key: str) -> bool:
     k = key.lower()
     return not _ENDPOINT_KEY_TOKENS.isdisjoint(
         re.split(r"[^a-z0-9]+", k)
-    ) or k.endswith(("url", "uri", "host", "endpoint", "api_base"))
+    ) or k.endswith(
+        ("url", "uri", "host", "endpoint", "api_base", "apibase", "connection_string")
+    )
 
 
 def _endpoint_values(value: Any, path: tuple[Any, ...] = ()) -> dict[Any, Any]:
