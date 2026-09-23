@@ -757,6 +757,7 @@ async def test_stale_authorized_approval_cannot_approve_new_phase_with_same_stat
         source["runtime_identity"]["runtime_generation"] = identity_b["generation"]
         source["runtime_identity"]["runtime_uid"] = identity_b["vm_uid"]
         source["launcher_uid"] = identity_b["launcher_uid"]
+        source["rootdisk_pvc_uid"] = identity_b["pvc_uid"]
         await db.execute(
             "INSERT INTO job_completion_commands "
             "(id,job_id,report_seq,client_report_id,payload,payload_digest,"

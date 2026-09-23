@@ -1645,12 +1645,20 @@ class JobControlOperations:
                 idle_episode = json.loads(idle_episode)
             except (TypeError, ValueError):
                 idle_episode = None
+        vm_phase_wait = bool(
+            isinstance(idle_episode, dict)
+            and idle_episode.get("wait_kind") == "human_approval"
+            and isinstance(idle_episode.get("runtime_identity"), dict)
+            and idle_episode["runtime_identity"].get("backend") == "vm"
+        )
         if (
             isinstance(idle_episode, dict)
             and idle_episode.get("wait_kind") == "human_review"
             and review_snapshot is None
         ):
             raise HTTPException(status_code=409, detail="terminal review source changed")
+        if vm_phase_wait and phase_snapshot is None:
+            raise HTTPException(status_code=409, detail="idle phase approval source changed")
         if request is None:
             request = JobApproveRequest()
         await self.dependencies.completion_control.guard(
@@ -1818,6 +1826,9 @@ class JobControlOperations:
                             expected_status=str(job["status"]),
                             **self.dependencies.completion_control.resume_guard_kwargs(
                                 control_claim=control_claim
+                            ),
+                            idle_phase_source_snapshot=(
+                                phase_snapshot if vm_phase_wait else None
                             ),
                         )
                     )
