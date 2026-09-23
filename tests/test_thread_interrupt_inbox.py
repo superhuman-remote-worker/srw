@@ -384,7 +384,7 @@ async def test_admission_fails_closed_when_exact_gate_is_not_open(queue_patch):
 
 
 def test_public_envelope_is_complete_and_js_safe():
-    from orchestrator.main import ThreadInterruptRequest
+    from orchestrator.schemas.thread_transport import ThreadInterruptRequest
 
     with pytest.raises(ValidationError):
         ThreadInterruptRequest(client_request_id=uuid4())
@@ -397,25 +397,38 @@ def test_public_envelope_is_complete_and_js_safe():
     assert ThreadInterruptRequest().client_request_id is None  # pinned legacy
 
 
-def _patch_owner(monkeypatch, orch_main, thread):
+def _owner_deps(monkeypatch, thread):
+    """One application's transport collaborators with ``thread`` owned by the
+    caller. ``find_existing_thread_interrupt`` is looked up in the router
+    module at call time, so the no-prior-request default is patched there."""
+    from types import SimpleNamespace
+
+    from orchestrator.routers import thread_transport
+    from orchestrator.services.thread_turn_locks import ThreadTurnLocks
+
     user = {"id": str(OWNER_ID), "is_admin": False}
     monkeypatch.setattr(
-        orch_main,
-        "require_thread_owner",
-        AsyncMock(return_value=(user, thread)),
-    )
-    monkeypatch.setattr(orch_main, "postgres_db", MagicMock())
-    monkeypatch.setattr(
-        orch_main,
+        thread_transport,
         "find_existing_thread_interrupt",
         AsyncMock(return_value=None),
     )
-    return user
+    deps = thread_transport.ThreadTransportDependencies(
+        store=MagicMock(),
+        require_thread_owner=AsyncMock(return_value=(user, thread)),
+        require_approved_user=AsyncMock(
+            side_effect=AssertionError("interrupt gates on the owner check")
+        ),
+        forwarding=SimpleNamespace(),
+        stateless_input=SimpleNamespace(),
+        turn_locks=ThreadTurnLocks(),
+    )
+    return user, deps
 
 
 @pytest.mark.asyncio
 async def test_pinned_legacy_empty_body_forwards_byte_identical_payload(monkeypatch):
-    from orchestrator import main as orch_main
+    from orchestrator.routers import thread_transport
+    from orchestrator.services import pinned_forwarding
 
     thread = {
         "id": str(THREAD_ID),
@@ -423,23 +436,27 @@ async def test_pinned_legacy_empty_body_forwards_byte_identical_payload(monkeypa
         "execution_lane": "pinned",
         "agent_id": str(uuid4()),
     }
-    user = _patch_owner(monkeypatch, orch_main, thread)
+    user, deps = _owner_deps(monkeypatch, thread)
     agent = {"id": "agent-a", "pod_ip": "10.0.0.2", "pod_port": 8001}
     resolve = AsyncMock(return_value=(thread, agent))
     forward = AsyncMock(return_value={"ack": True, "mode": "hard"})
-    monkeypatch.setattr(orch_main, "_resolve_thread_for_forwarding", resolve)
-    monkeypatch.setattr(orch_main, "_forward_to_agent", forward)
+    monkeypatch.setattr(pinned_forwarding, "resolve_thread_for_forwarding", resolve)
+    monkeypatch.setattr(pinned_forwarding, "forward_to_agent", forward)
 
-    result = await orch_main.thread_interrupt(str(THREAD_ID), MagicMock(), None)
+    result = await thread_transport.thread_interrupt(
+        str(THREAD_ID), MagicMock(), None, dependencies=deps
+    )
 
-    resolve.assert_awaited_once_with(str(THREAD_ID), user)
-    forward.assert_awaited_once_with(agent, "/api/interrupt", {})
+    resolve.assert_awaited_once_with(str(THREAD_ID), user, dependencies=deps.forwarding)
+    forward.assert_awaited_once_with(agent, "/api/interrupt", {}, store=deps.store)
     assert result == {"accepted": True, "agent": {"ack": True, "mode": "hard"}}
 
 
 @pytest.mark.asyncio
 async def test_pinned_correlated_envelope_forwards_target_intact(monkeypatch):
-    from orchestrator import main as orch_main
+    from orchestrator.routers import thread_transport
+    from orchestrator.schemas.thread_transport import ThreadInterruptRequest
+    from orchestrator.services import pinned_forwarding
 
     thread = {
         "id": str(THREAD_ID),
@@ -447,22 +464,24 @@ async def test_pinned_correlated_envelope_forwards_target_intact(monkeypatch):
         "execution_lane": "pinned",
         "agent_id": str(uuid4()),
     }
-    _patch_owner(monkeypatch, orch_main, thread)
+    _user, deps = _owner_deps(monkeypatch, thread)
     agent = {"id": "agent-a", "pod_ip": "10.0.0.2", "pod_port": 8001}
     monkeypatch.setattr(
-        orch_main,
-        "_resolve_thread_for_forwarding",
+        pinned_forwarding,
+        "resolve_thread_for_forwarding",
         AsyncMock(return_value=(thread, agent)),
     )
     forward = AsyncMock(return_value={"ack": True, "mode": "hard"})
-    monkeypatch.setattr(orch_main, "_forward_to_agent", forward)
+    monkeypatch.setattr(pinned_forwarding, "forward_to_agent", forward)
     client_request_id = uuid4()
-    body = orch_main.ThreadInterruptRequest(
+    body = ThreadInterruptRequest(
         client_request_id=client_request_id,
         target_turn_id=7,
     )
 
-    await orch_main.thread_interrupt(str(THREAD_ID), MagicMock(), body)
+    await thread_transport.thread_interrupt(
+        str(THREAD_ID), MagicMock(), body, dependencies=deps
+    )
 
     forward.assert_awaited_once_with(
         agent,
@@ -471,12 +490,15 @@ async def test_pinned_correlated_envelope_forwards_target_intact(monkeypatch):
             "client_request_id": str(client_request_id),
             "target_turn_id": 7,
         },
+        store=deps.store,
     )
 
 
 @pytest.mark.asyncio
 async def test_masked_stateless_retry_is_returned_before_pinned_forward(monkeypatch):
-    from orchestrator import main as orch_main
+    from orchestrator.routers import thread_transport
+    from orchestrator.schemas.thread_transport import ThreadInterruptRequest
+    from orchestrator.services import pinned_forwarding
 
     thread = {
         "id": str(THREAD_ID),
@@ -484,7 +506,7 @@ async def test_masked_stateless_retry_is_returned_before_pinned_forward(monkeypa
         "execution_lane": "pinned",
         "agent_id": str(uuid4()),
     }
-    _patch_owner(monkeypatch, orch_main, thread)
+    _user, deps = _owner_deps(monkeypatch, thread)
     client_request_id = uuid4()
     existing = AdmittedInterrupt(
         id=uuid4(),
@@ -496,20 +518,21 @@ async def test_masked_stateless_retry_is_returned_before_pinned_forward(monkeypa
         duplicate=True,
     )
     monkeypatch.setattr(
-        orch_main,
+        thread_transport,
         "find_existing_thread_interrupt",
         AsyncMock(return_value=existing),
     )
     forward = AsyncMock(side_effect=AssertionError("retry must not hit pinned agent"))
-    monkeypatch.setattr(orch_main, "_forward_to_agent", forward)
+    monkeypatch.setattr(pinned_forwarding, "forward_to_agent", forward)
 
-    response = await orch_main.thread_interrupt(
+    response = await thread_transport.thread_interrupt(
         str(THREAD_ID),
         MagicMock(),
-        orch_main.ThreadInterruptRequest(
+        ThreadInterruptRequest(
             client_request_id=client_request_id,
             target_turn_id=7,
         ),
+        dependencies=deps,
     )
 
     assert response.status_code == 202
@@ -520,7 +543,9 @@ async def test_masked_stateless_retry_is_returned_before_pinned_forward(monkeypa
 
 @pytest.mark.asyncio
 async def test_stateless_route_returns_admission_only(monkeypatch):
-    from orchestrator import main as orch_main
+    from orchestrator.routers import thread_transport
+    from orchestrator.schemas.thread_transport import ThreadInterruptRequest
+    from orchestrator.services import pinned_forwarding
 
     thread = {
         "id": str(THREAD_ID),
@@ -528,7 +553,7 @@ async def test_stateless_route_returns_admission_only(monkeypatch):
         "execution_lane": "stateless",
         "agent_id": None,
     }
-    _patch_owner(monkeypatch, orch_main, thread)
+    _user, deps = _owner_deps(monkeypatch, thread)
     client_request_id = uuid4()
     admitted = AdmittedInterrupt(
         id=uuid4(),
@@ -540,17 +565,18 @@ async def test_stateless_route_returns_admission_only(monkeypatch):
         duplicate=False,
     )
     admit = AsyncMock(return_value=admitted)
-    monkeypatch.setattr(orch_main, "admit_thread_interrupt", admit)
+    monkeypatch.setattr(thread_transport, "admit_thread_interrupt", admit)
     forward = AsyncMock(side_effect=AssertionError("stateless path must not forward"))
-    monkeypatch.setattr(orch_main, "_forward_to_agent", forward)
+    monkeypatch.setattr(pinned_forwarding, "forward_to_agent", forward)
 
-    response = await orch_main.thread_interrupt(
+    response = await thread_transport.thread_interrupt(
         str(THREAD_ID),
         MagicMock(),
-        orch_main.ThreadInterruptRequest(
+        ThreadInterruptRequest(
             client_request_id=client_request_id,
             target_turn_id=7,
         ),
+        dependencies=deps,
     )
 
     assert response.status_code == 202
@@ -564,6 +590,7 @@ async def test_stateless_route_returns_admission_only(monkeypatch):
         "duplicate": False,
     }
     forward.assert_not_awaited()
+    assert admit.await_args.args == (deps.store,)
 
 
 def test_event_pruner_preserves_pending_interrupt_receipts():

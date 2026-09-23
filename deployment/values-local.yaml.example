@@ -501,4 +501,3 @@ llm:
     #   auxiliary: "gpt-5-mini"
     #   embedding: "qwen/qwen3-embedding-8b"
     #   rerank: "qwen/qwen3-reranker-8b"
-    #   rerank: "qwen/qwen3-reranker-8b"

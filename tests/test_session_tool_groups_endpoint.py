@@ -20,7 +20,12 @@ import pytest
 from fastapi import HTTPException
 
 from shared.runtime.core.session_tool_overrides import SESSION_TOOL_OVERRIDE_NAMES
+from orchestrator.routers import thread_session
 from orchestrator.services import session_config_resolution
+
+#: The tool view's own module-level collaborators (deployment gate, policy
+#: merge) are looked up here at call time, so they are patched here.
+_TOOL_VIEW = "orchestrator.services.session_tool_view"
 
 
 def _patch_caller_and_db(user: dict, db):
@@ -52,20 +57,31 @@ def _thread(metadata=None, config_name=None, project_id=None) -> dict:
     }
 
 
-async def _call(user, db, thread_row, fake_request, *, experts=True):
-    from orchestrator.main import get_thread_tool_groups
+async def _get_tool_groups(thread_id, request):
+    """Drive the route through the application's own dependency composition.
 
+    ``main._thread_session_dependencies()`` is rebuilt per call and reads the
+    app-owned collaborators (``postgres_db``, ``_user_experts_enabled``,
+    ``_resolve_runner_grants``, ...) at call time, so patches of those still
+    steer the extracted route.
+    """
+    import orchestrator.main as orch_main
+
+    return await thread_session.get_thread_tool_groups(
+        thread_id, request, dependencies=orch_main._thread_session_dependencies()
+    )
+
+
+async def _call(user, db, thread_row, fake_request, *, experts=True):
     db.get_thread = AsyncMock(return_value=thread_row)
     with (
         _patch_caller_and_db(user, db),
-        patch(
-            "orchestrator.main._is_experts_db_enabled", MagicMock(return_value=experts)
-        ),
+        patch(f"{_TOOL_VIEW}.is_experts_db_enabled", MagicMock(return_value=experts)),
         patch(
             "orchestrator.main._user_experts_enabled", AsyncMock(return_value=experts)
         ),
     ):
-        return await get_thread_tool_groups(str(thread_row["id"]), fake_request)
+        return await _get_tool_groups(str(thread_row["id"]), fake_request)
 
 
 # =============================================================================
@@ -364,19 +380,15 @@ class TestLegacyPath:
     async def test_user_experts_kill_switch_selects_legacy(
         self, user_a, fake_db, fake_request
     ):
-        from orchestrator.main import get_thread_tool_groups
-
         fake_db.get_thread = AsyncMock(return_value=_thread())
         with (
             _patch_caller_and_db(user_a, fake_db),
-            patch(
-                "orchestrator.main._is_experts_db_enabled", MagicMock(return_value=True)
-            ),
+            patch(f"{_TOOL_VIEW}.is_experts_db_enabled", MagicMock(return_value=True)),
             patch(
                 "orchestrator.main._user_experts_enabled", AsyncMock(return_value=False)
             ),
         ):
-            result = await get_thread_tool_groups(str(_thread()["id"]), fake_request)
+            result = await _get_tool_groups(str(_thread()["id"]), fake_request)
 
         assert result["source"] == "legacy"
 
@@ -397,46 +409,38 @@ class TestFailureModes:
         the bug, so the endpoint says so and lets the client use its own
         defaults.
         """
-        from orchestrator.main import get_thread_tool_groups
-
         fake_db.get_thread = AsyncMock(return_value=_thread())
         with (
             _patch_caller_and_db(user_a, fake_db),
-            patch(
-                "orchestrator.main._is_experts_db_enabled", MagicMock(return_value=True)
-            ),
+            patch(f"{_TOOL_VIEW}.is_experts_db_enabled", MagicMock(return_value=True)),
             patch(
                 "orchestrator.main._user_experts_enabled", AsyncMock(return_value=True)
             ),
             patch(
-                "orchestrator.main._merged_session_tool_policy",
+                f"{_TOOL_VIEW}.merged_session_tool_policy",
                 MagicMock(side_effect=RuntimeError("boom")),
             ),
         ):
-            result = await get_thread_tool_groups(str(_thread()["id"]), fake_request)
+            result = await _get_tool_groups(str(_thread()["id"]), fake_request)
 
         assert result["source"] == "error"
         assert result["tool_groups"] is None
 
     @pytest.mark.asyncio
     async def test_cross_user_blocked(self, user_b, fake_db, fake_request):
-        from orchestrator.main import get_thread_tool_groups
-
         sentinel = MagicMock(side_effect=AssertionError("called past gate"))
         with (
             _patch_caller_and_db(user_b, fake_db),
-            patch("orchestrator.main._merged_session_tool_policy", sentinel),
+            patch(f"{_TOOL_VIEW}.merged_session_tool_policy", sentinel),
         ):
             with pytest.raises(HTTPException) as exc:
-                await get_thread_tool_groups(str(_thread()["id"]), fake_request)
+                await _get_tool_groups(str(_thread()["id"]), fake_request)
 
         assert exc.value.status_code == 403
         sentinel.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_orphan_thread_blocked(self, user_a, fake_db, fake_request):
-        from orchestrator.main import get_thread_tool_groups
-
         orphan_id = "ccc55555-5555-5555-5555-555555555555"
         fake_db.get_thread = AsyncMock(
             return_value={"id": orphan_id, "user_id": None, "title": "orphan"}
@@ -444,10 +448,10 @@ class TestFailureModes:
         sentinel = MagicMock(side_effect=AssertionError("called past gate"))
         with (
             _patch_caller_and_db(user_a, fake_db),
-            patch("orchestrator.main._merged_session_tool_policy", sentinel),
+            patch(f"{_TOOL_VIEW}.merged_session_tool_policy", sentinel),
         ):
             with pytest.raises(HTTPException) as exc:
-                await get_thread_tool_groups(orphan_id, fake_request)
+                await _get_tool_groups(orphan_id, fake_request)
 
         assert exc.value.status_code == 403
         sentinel.assert_not_called()
@@ -519,6 +523,31 @@ class TestAcknowledgedGrantDriftReportedNotJustEnforced:
 
         assert result["categories"]["catalog_authoring"]["state"] == "on"
         assert result["tool_groups"]["catalog_authoring"] is True
+
+
+class TestAdminViewUsesTheOwnersGrants:
+    """An admin viewing another user's session must see THAT owner's grants —
+    both for the ``unavailable`` explanation and for the acknowledged-drift
+    strip — never their own; the owner-vs-caller fix the view mirrors."""
+
+    @pytest.mark.asyncio
+    async def test_every_grant_lookup_names_the_thread_owner(
+        self, user_admin, fake_db, fake_request
+    ):
+        from tests.conftest import _UID_A
+
+        thread = _thread(
+            metadata={"config_drift_ack": {"grant:catalog_authoring": "revoked"}}
+        )
+        resolve = AsyncMock(return_value={"catalog_authoring": False})
+        with patch("orchestrator.main._resolve_runner_grants", resolve):
+            await _call(user_admin, fake_db, thread, fake_request)
+
+        # One lookup explains ``unavailable``, one builds the drift strip.
+        assert resolve.await_count == 2
+        assert {c.kwargs["runner_user_id"] for c in resolve.await_args_list} == {
+            str(_UID_A)
+        }
 
 
 # =============================================================================

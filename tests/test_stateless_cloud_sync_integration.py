@@ -564,7 +564,7 @@ async def test_internal_workspace_payload_exposes_private_binding_generation():
 
 
 def test_owner_payload_redacts_private_workspace_runtime_incarnation():
-    import orchestrator.main as orch_main
+    from orchestrator.services.thread_projection import redact_thread_metadata
 
     record = {
         "metadata": {
@@ -576,7 +576,7 @@ def test_owner_payload_redacts_private_workspace_runtime_incarnation():
         }
     }
 
-    redacted = orch_main._redact_nested_workspace_state(record, field="metadata")
+    redacted = redact_thread_metadata(record)
 
     workspace = redacted["metadata"]["workspace_container"]
     assert "_canvas_workspace_generation" not in workspace

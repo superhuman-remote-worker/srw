@@ -100,8 +100,9 @@ def test_allowed_runtime_and_lightweight_dependencies_pass(boundary_tree):
     result = lint_boundaries(boundary_tree)
     assert result.returncode == 0, result.stdout + result.stderr
     # The generic manifest path also excludes the legacy harness adapter.
-    # 24 since R1.B09 added its contract over control, delivery and retirement.
-    assert "Contracts: 24 kept, 0 broken" in result.stdout
+    # 24 since R1.B09 added its contract over control, delivery and retirement;
+    # 25 since R1.B10 added session transport, projections and permissions.
+    assert "Contracts: 25 kept, 0 broken" in result.stdout
 
 
 @pytest.mark.parametrize(
@@ -144,6 +145,22 @@ def test_allowed_runtime_and_lightweight_dependencies_pass(boundary_tree):
             "orchestrator.main",
         ),
         ("orchestrator/services/pinned_retirement.py", "orchestrator.main"),
+        ("orchestrator/routers/thread_session.py", "orchestrator.main"),
+        ("orchestrator/routers/thread_history.py", "orchestrator.main"),
+        ("orchestrator/routers/thread_transport.py", "orchestrator.main"),
+        ("orchestrator/routers/thread_permissions.py", "orchestrator.main"),
+        ("orchestrator/schemas/thread_session.py", "orchestrator.main"),
+        ("orchestrator/schemas/thread_transport.py", "orchestrator.main"),
+        ("orchestrator/services/session_wake.py", "orchestrator.main"),
+        ("orchestrator/services/session_attention.py", "orchestrator.main"),
+        ("orchestrator/services/pinned_forwarding.py", "orchestrator.main"),
+        ("orchestrator/services/thread_event_stream.py", "orchestrator.main"),
+        ("orchestrator/services/stateless_input_admission.py", "orchestrator.main"),
+        ("orchestrator/services/session_tool_view.py", "orchestrator.main"),
+        ("orchestrator/services/thread_permissions.py", "orchestrator.main"),
+        ("orchestrator/services/thread_projection.py", "orchestrator.main"),
+        ("orchestrator/services/magic_link_pages.py", "orchestrator.main"),
+        ("orchestrator/services/thread_turn_locks.py", "orchestrator.main"),
         ("orchestrator/services/preference_defaults.py", "orchestrator.main"),
         ("orchestrator/services/session_workspace_policy.py", "orchestrator.main"),
         ("orchestrator/schemas/job_create.py", "orchestrator.main"),

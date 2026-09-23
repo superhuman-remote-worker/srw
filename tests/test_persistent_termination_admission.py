@@ -2617,7 +2617,7 @@ async def test_orchestrator_surfaces_terminating_direct_input_as_retryable(
     monkeypatch,
 ):
     from fastapi import HTTPException
-    from orchestrator import main as orchestrator_main
+    from orchestrator.services import pinned_forwarding
 
     class _Response:
         status_code = 503
@@ -2641,7 +2641,7 @@ async def test_orchestrator_surfaces_terminating_direct_input_as_retryable(
         async def post(self, *args, **kwargs):
             return _Response()
 
-    monkeypatch.setattr(orchestrator_main.httpx, "AsyncClient", _Client)
+    monkeypatch.setattr(pinned_forwarding.httpx, "AsyncClient", _Client)
     binding = PinnedSessionBinding(
         thread_id="11111111-1111-4111-8111-111111111111",
         runtime_generation="22222222-2222-4222-8222-222222222222",
@@ -2655,16 +2655,17 @@ async def test_orchestrator_surfaces_terminating_direct_input_as_retryable(
         agent_status="session",
     )
     monkeypatch.setattr(
-        orchestrator_main,
-        "_revalidate_pinned_forwarding_binding",
+        pinned_forwarding,
+        "revalidate_pinned_forwarding_binding",
         AsyncMock(return_value=binding),
     )
 
     with pytest.raises(HTTPException) as caught:
-        await orchestrator_main._forward_to_agent(
+        await pinned_forwarding.forward_to_agent(
             binding,
             "/api/input",
             {"content": "retain me"},
+            store=object(),
         )
 
     assert caught.value.status_code == 503

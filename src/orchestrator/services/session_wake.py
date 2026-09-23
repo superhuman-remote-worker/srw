@@ -59,6 +59,7 @@ import hashlib
 import json
 import logging
 import os
+from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Any, Optional
@@ -916,8 +917,49 @@ def _next_utc_midnight(now: datetime) -> datetime:
     return (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
 
 
+# Officer daily-ceiling metering, bound per store by application composition.
+#
+# The ceiling brake runs inside ``drain_pending_event_wakes``, which is reached
+# from the lifespan sweeper and from ``kick_event_drain(db)`` at a dozen call
+# sites that hold nothing but the store (completion hooks, routers, the sudo
+# gate, the Officer watchdog). A defaulted parameter would silently disable the
+# ceiling on every path that forgot it, and threading the ledger through all of
+# them moves the coupling rather than removing it. The store every path already
+# carries is the application's identity here, so the application binds its store
+# to a provider of its ledger (R1.B10). The provider is read per check: startup
+# builds the ledger after the store exists, and a missing ledger fails open
+# exactly like an unavailable one. Two applications with two stores reach two
+# ledgers.
+_UNSET: Any = object()
+_METERING_BY_STORE: dict[int, tuple[Any, Callable[[], Any]]] = {}
+
+
+def bind_officer_wake_metering(store: Any, usage_ledger: Callable[[], Any]) -> None:
+    """Bind ``store``'s officer wakes to its application's usage ledger.
+
+    ``usage_ledger`` is a zero-argument provider evaluated at every ceiling
+    check. Rebinding the same store replaces its provider.
+    """
+    _METERING_BY_STORE[id(store)] = (store, usage_ledger)
+
+
+def unbind_officer_wake_metering(store: Any) -> None:
+    """Forget ``store``'s binding (tests and application teardown)."""
+    entry = _METERING_BY_STORE.get(id(store))
+    if entry is not None and entry[0] is store:
+        del _METERING_BY_STORE[id(store)]
+
+
+def _bound_usage_ledger(store: Any) -> Any:
+    """The ledger bound for exactly this store, or None when none is bound."""
+    entry = _METERING_BY_STORE.get(id(store))
+    if entry is None or entry[0] is not store:
+        return None
+    return entry[1]()
+
+
 async def _officer_ceiling_deferral(
-    db: Any, thread: dict[str, Any], *, usage_ledger: Any = None
+    db: Any, thread: dict[str, Any], *, usage_ledger: Any = _UNSET
 ) -> Optional[datetime]:
     """Daily-token-ceiling brake (centurion.md §4, the third loop-guard layer).
 
@@ -930,15 +972,16 @@ async def _officer_ceiling_deferral(
     The brake only touches the drain — direct Legate input bypasses it, so
     a ceilinged officer still answers his commander immediately. The ledger
     lags live usage by one materializer poll, which is fine for a daily cap.
+
+    The ledger is the one the application bound for ``db``
+    (:func:`bind_officer_wake_metering`); an explicit ``usage_ledger`` wins.
     """
     ceiling = _officer_daily_ceiling(thread)
     if ceiling <= 0:
         return None
     try:
-        if usage_ledger is None:
-            import orchestrator.main as orchestrator_main
-
-            usage_ledger = getattr(orchestrator_main, "usage_ledger", None)
+        if usage_ledger is _UNSET:
+            usage_ledger = _bound_usage_ledger(db)
         if usage_ledger is None or not getattr(usage_ledger, "is_available", False):
             return None
         now = datetime.now(timezone.utc)

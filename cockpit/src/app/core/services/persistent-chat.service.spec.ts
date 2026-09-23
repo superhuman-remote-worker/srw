@@ -10743,4 +10743,147 @@ describe('PersistentChatService — queue state (parked / poll / retry)', () => 
     expect(ctx.service.isParked()).toBe(true);
     expect((TestBed.inject(AppToastService) as any).danger).toHaveBeenCalled();
   });
+
+  it('retryParked on a unit with no pending input opens no awaiting stretch', async () => {
+    // A unit parked with nothing to run (e.g. a push remainder) settles to
+    // `done` on retry without ever starting a turn; counting a turn here
+    // left "Waiting for an available agent…" up forever (live k3d, 09-23).
+    const ctx = await readyOn('thread-np', { queue: { ...parkedBlock, pending_input: false } });
+    await new Promise((r) => setTimeout(r, 0));
+    expect(ctx.service.isParked()).toBe(true);
+    (ctx.mockApi as any).retryThreadQueue = vi.fn().mockReturnValue(of({ kind: 'ok', state: 'queued' }));
+    expect(await ctx.service.retryParked()).toBe('ok');
+    expect(ctx.service.isParked()).toBe(false);
+    expect(ctx.service.queueState()?.pending_input).toBe(false);
+    expect(ctx.service.pendingTurnCount()).toBe(0);
+    expect(ctx.service.isAwaitingTurn()).toBe(false);
+  });
+
+  // A reload hydrates the durable snapshot, opens SSE at the replay floor
+  // (just before the latest turn) and reads /connection. The replayed
+  // turn.started is history the snapshot already covers: it says nothing
+  // about the unit's lease, so it must not wipe the parked block /connection
+  // just delivered (live k3d, 09-23: the composer reopened on a parked unit).
+  function durableReload(threadId: string, queue: Record<string, unknown>) {
+    const ctx = createService();
+    ctx.mockHttp.get.mockImplementation((url: string) => {
+      if (url.endsWith(`/sessions/${threadId}/connection`)) {
+        return of({ state: 'ready', ws_url: null, control_socket: 'none', queue });
+      }
+      if (url.endsWith(`/threads/${threadId}/state`)) {
+        return of({
+          thread_id: threadId,
+          permission_mode: 'supervised',
+          narration_mode: 'auto',
+          turn_count: 2,
+          turn_in_flight: false,
+          message_count: 4,
+          model: null,
+          temperature: null,
+          running_tool: null,
+          pending_permissions: [],
+          event_cursor: { epoch: 0, seq: 40 },
+          replay_cursor: { epoch: 0, seq: 30 },
+          snapshot_source: 'durable_journal',
+        });
+      }
+      return of({ status: 'active', total_turns: 2, messages: [], total: 0 });
+    });
+    return ctx;
+  }
+
+  it('a replayed turn.started the snapshot covers keeps the parked block from /connection', async () => {
+    const ctx = durableReload('thread-reload', parkedBlock);
+    await ctx.service.connect('thread-reload');
+    await new Promise((r) => setTimeout(r, 0));
+    expect(ctx.service.isParked()).toBe(true);
+
+    fireSseOpen(ctx.sseInstances[0]);
+    fireSseMessage(ctx.sseInstances[0], { method: 'turn.started', params: { turn_id: 2 } }, '0:31');
+    fireSseMessage(ctx.sseInstances[0], { method: 'turn.completed', params: { turn_id: 2 } }, '0:39');
+
+    expect(ctx.service.isParked()).toBe(true);
+    expect(ctx.service.queueState()?.park_reason).toBe('attach_failed');
+  });
+
+  it('a live turn.started past the snapshot still clears the parked block', async () => {
+    const ctx = durableReload('thread-live', parkedBlock);
+    await ctx.service.connect('thread-live');
+    await new Promise((r) => setTimeout(r, 0));
+    expect(ctx.service.isParked()).toBe(true);
+
+    fireSseOpen(ctx.sseInstances[0]);
+    fireSseMessage(ctx.sseInstances[0], { method: 'turn.started', params: { turn_id: 3 } }, '0:41');
+
+    expect(ctx.service.queueState()).toBeNull();
+    expect(ctx.service.isParked()).toBe(false);
+  });
+
+  const leasedBlock = {
+    state: 'leased',
+    park_reason: null,
+    parked_at: null,
+    retryable: false,
+    attempts: 0,
+    pending_input: false,
+  };
+
+  it('a snapshot reload that skips /connection re-reads the block (unit claimed meanwhile)', async () => {
+    const ctx = durableReload('thread-h', parkedBlock);
+    await ctx.service.connect('thread-h');
+    await new Promise((r) => setTimeout(r, 0));
+    expect(ctx.service.isParked()).toBe(true);
+    // Another tab retried while this one was away; the reload's replayed
+    // turn.started is now covered, so only the re-read can clear the block.
+    (ctx.mockApi as any).getThreadQueue = vi.fn().mockReturnValue(of(leasedBlock));
+    await (ctx.service as any)._retrySnapshotAndOpenSse(
+      'thread-h',
+      (ctx.service as any).connectGeneration,
+      null,
+    );
+    await new Promise((r) => setTimeout(r, 0));
+    fireSseMessage(ctx.sseInstances.at(-1)!, { method: 'turn.started', params: { turn_id: 2 } }, '0:31');
+
+    expect((ctx.mockApi as any).getThreadQueue).toHaveBeenCalledWith('thread-h');
+    expect(ctx.service.isParked()).toBe(false);
+    expect(ctx.service.queueState()?.state).toBe('leased');
+  });
+
+  it('a queue read that straddles a live turn.started is dropped, not re-applied', async () => {
+    const ctx = durableReload('thread-s', { ...parkedBlock, state: 'queued', park_reason: null });
+    await ctx.service.connect('thread-s');
+    await new Promise((r) => setTimeout(r, 0));
+    const pending = new Subject<unknown>();
+    (ctx.mockApi as any).getThreadQueue = vi.fn().mockReturnValue(pending);
+    const poll = (ctx.service as any)._pollQueueState();
+
+    fireSseOpen(ctx.sseInstances[0]);
+    fireSseMessage(ctx.sseInstances[0], { method: 'turn.started', params: { turn_id: 3 } }, '0:41');
+    expect(ctx.service.queueState()).toBeNull();
+    // The read was served before the claim and reports the unit parked.
+    pending.next(parkedBlock);
+    pending.complete();
+    await poll;
+
+    expect(ctx.service.queueState()).toBeNull();
+    expect(ctx.service.isParked()).toBe(false);
+  });
+
+  it('a refused retry re-reads the block, so a unit settled elsewhere unparks', async () => {
+    const ctx = await readyOn('thread-rr', { queue: parkedBlock });
+    await new Promise((r) => setTimeout(r, 0));
+    expect(ctx.service.isParked()).toBe(true);
+    (ctx.mockApi as any).retryThreadQueue = vi
+      .fn()
+      .mockReturnValue(of({ kind: 'refused', status: 404, code: 'not_parked' }));
+    (ctx.mockApi as any).getThreadQueue = vi
+      .fn()
+      .mockReturnValue(of({ ...leasedBlock, state: 'done' }));
+
+    expect(await ctx.service.retryParked()).toBe('refused');
+    await new Promise((r) => setTimeout(r, 0));
+
+    expect(ctx.service.isParked()).toBe(false);
+    expect(ctx.service.queueState()?.state).toBe('done');
+  });
 });

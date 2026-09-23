@@ -9,6 +9,7 @@ lease-owner duties.
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import UUID
@@ -22,6 +23,8 @@ from orchestrator.services import agent_thread_status  # noqa: E402
 from fastapi import HTTPException
 from pydantic import ValidationError
 
+from orchestrator.routers import thread_session
+from orchestrator.schemas.thread_session import ThreadControlRequest
 from orchestrator.services.thread_control_inbox import (
     AdmittedControl,
     ControlAdmissionError,
@@ -173,6 +176,34 @@ def _calls(conn: _ControlConn, operation: str, contains: str):
     return [call for call in conn.calls if call[0] == operation and contains in call[1]]
 
 
+def _unused(name: str):
+    async def _fail(*_args: Any, **_kwargs: Any):
+        raise AssertionError(f"the control route must not reach {name}")
+
+    return _fail
+
+
+def _control_dependencies(
+    *, owner: Any, enforce: Any = None, store: Any = None
+) -> thread_session.ThreadSessionDependencies:
+    """The control route's application collaborators: the owner gate and PDP.
+
+    Admission, idempotency lookup, the workspace gate and the audit log are
+    module-level names of ``routers.thread_session`` and are patched there.
+    """
+    return thread_session.ThreadSessionDependencies(
+        store=store if store is not None else MagicMock(name="store"),
+        require_thread_owner=owner,
+        require_approved_user=_unused("require_approved_user"),
+        resolve_cloud_session_url=_unused("resolve_cloud_session_url"),
+        resolve_session_config=_unused("resolve_session_config"),
+        enforce_session_create_grants=(
+            enforce if enforce is not None else _unused("enforce_session_create_grants")
+        ),
+        tool_view=SimpleNamespace(),
+    )
+
+
 @pytest.mark.parametrize(
     "payload",
     [
@@ -194,16 +225,12 @@ def _calls(conn: _ControlConn, operation: str, contains: str):
     ],
 )
 def test_public_control_envelope_rejects_invalid_method_mode_or_request_id(payload):
-    import orchestrator.main as orchestrator_main
-
     with pytest.raises(ValidationError):
-        orchestrator_main.ThreadControlRequest.model_validate(payload)
+        ThreadControlRequest.model_validate(payload)
 
 
 def test_public_workspace_undo_envelope_has_empty_canonical_payload():
-    import orchestrator.main as orchestrator_main
-
-    body = orchestrator_main.ThreadControlRequest(
+    body = ThreadControlRequest(
         client_request_id=CLIENT_REQUEST_ID,
         method="workspace.undo",
     )
@@ -211,7 +238,7 @@ def test_public_workspace_undo_envelope_has_empty_canonical_payload():
     assert body.control_payload() == {}
 
     with pytest.raises(ValidationError, match="does not accept a mode"):
-        orchestrator_main.ThreadControlRequest(
+        ThreadControlRequest(
             client_request_id=CLIENT_REQUEST_ID,
             method="workspace.undo",
             mode="auto",
@@ -237,36 +264,33 @@ async def test_generic_orchestrator_config_update_cannot_bypass_inbox(key):
 
 @pytest.mark.asyncio
 async def test_control_endpoint_stops_at_exact_owner_gate():
-    import orchestrator.main as orchestrator_main
-
     denial = HTTPException(status_code=403, detail="Not thread owner")
     owner = AsyncMock(side_effect=denial)
     admit = AsyncMock()
     request = MagicMock()
-    body = orchestrator_main.ThreadControlRequest(
+    store = MagicMock(name="store")
+    body = ThreadControlRequest(
         client_request_id=CLIENT_REQUEST_ID,
         method="narration.set",
         mode="verbose",
     )
 
-    with (
-        patch.object(orchestrator_main, "require_thread_owner", owner),
-        patch.object(orchestrator_main, "admit_thread_control", admit),
-    ):
+    with patch.object(thread_session, "admit_thread_control", admit):
         with pytest.raises(HTTPException) as exc:
-            await orchestrator_main.submit_thread_control(str(THREAD_ID), body, request)
+            await thread_session.submit_thread_control(
+                str(THREAD_ID),
+                body,
+                request,
+                dependencies=_control_dependencies(owner=owner, store=store),
+            )
 
     assert exc.value is denial
-    owner.assert_awaited_once_with(
-        request, orchestrator_main.postgres_db, str(THREAD_ID)
-    )
+    owner.assert_awaited_once_with(request, store, str(THREAD_ID))
     admit.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 async def test_control_endpoint_admits_owner_request_without_exposing_lane():
-    import orchestrator.main as orchestrator_main
-
     user = {"id": OWNER_ID}
     thread = {
         "id": THREAD_ID,
@@ -289,25 +313,29 @@ async def test_control_endpoint_admits_owner_request_without_exposing_lane():
     admit = AsyncMock(return_value=admitted)
     audit = AsyncMock()
     request = MagicMock()
-    body = orchestrator_main.ThreadControlRequest(
+    store = MagicMock(name="store")
+    body = ThreadControlRequest(
         client_request_id=CLIENT_REQUEST_ID,
         method="mode.set",
         mode="supervised",
     )
 
     with (
-        patch.object(orchestrator_main, "require_thread_owner", owner),
         patch.object(
-            orchestrator_main,
+            thread_session,
             "find_existing_thread_control",
             new=AsyncMock(return_value=None),
         ),
-        patch.object(orchestrator_main, "_enforce_session_create_grants", enforce),
-        patch.object(orchestrator_main, "admit_thread_control", admit),
-        patch.object(orchestrator_main, "log_security_event", audit),
+        patch.object(thread_session, "admit_thread_control", admit),
+        patch.object(thread_session, "log_security_event", audit),
     ):
-        result = await orchestrator_main.submit_thread_control(
-            str(THREAD_ID), body, request
+        result = await thread_session.submit_thread_control(
+            str(THREAD_ID),
+            body,
+            request,
+            dependencies=_control_dependencies(
+                owner=owner, enforce=enforce, store=store
+            ),
         )
 
     assert result == {
@@ -321,16 +349,14 @@ async def test_control_endpoint_admits_owner_request_without_exposing_lane():
         "session_runtime_generation": None,
     }
     assert "execution_lane" not in result
-    owner.assert_awaited_once_with(
-        request, orchestrator_main.postgres_db, str(THREAD_ID)
-    )
+    owner.assert_awaited_once_with(request, store, str(THREAD_ID))
     enforce.assert_awaited_once_with(
         {"interactive": {"permission_mode": "supervised"}},
         user_id=str(OWNER_ID),
         project_ids=[str(PROJECT_ID)],
     )
     admit.assert_awaited_once_with(
-        orchestrator_main.postgres_db,
+        store,
         thread_id=str(THREAD_ID),
         owner_user_id=OWNER_ID,
         client_request_id=CLIENT_REQUEST_ID,
@@ -345,8 +371,6 @@ async def test_control_endpoint_admits_owner_request_without_exposing_lane():
 
 @pytest.mark.asyncio
 async def test_control_endpoint_refuses_unattested_stateless_sandbox_request():
-    import orchestrator.main as orchestrator_main
-
     thread = {
         "id": THREAD_ID,
         "user_id": OWNER_ID,
@@ -357,26 +381,24 @@ async def test_control_endpoint_refuses_unattested_stateless_sandbox_request():
     admit = AsyncMock()
     with (
         patch.object(
-            orchestrator_main,
-            "require_thread_owner",
-            AsyncMock(return_value=({"id": OWNER_ID}, thread)),
-        ),
-        patch.object(
-            orchestrator_main,
+            thread_session,
             "find_existing_thread_control",
             AsyncMock(return_value=None),
         ),
-        patch.object(orchestrator_main, "admit_thread_control", admit),
+        patch.object(thread_session, "admit_thread_control", admit),
     ):
         with pytest.raises(HTTPException) as exc:
-            await orchestrator_main.submit_thread_control(
+            await thread_session.submit_thread_control(
                 str(THREAD_ID),
-                orchestrator_main.ThreadControlRequest(
+                ThreadControlRequest(
                     client_request_id=CLIENT_REQUEST_ID,
                     method="narration.set",
                     mode="verbose",
                 ),
                 MagicMock(),
+                dependencies=_control_dependencies(
+                    owner=AsyncMock(return_value=({"id": OWNER_ID}, thread))
+                ),
             )
 
     assert exc.value.status_code == 409
@@ -386,8 +408,6 @@ async def test_control_endpoint_refuses_unattested_stateless_sandbox_request():
 
 @pytest.mark.asyncio
 async def test_control_endpoint_admits_lane_free_workspace_undo_payload():
-    import orchestrator.main as orchestrator_main
-
     thread = {
         "id": THREAD_ID,
         "user_id": OWNER_ID,
@@ -405,29 +425,28 @@ async def test_control_endpoint_admits_lane_free_workspace_undo_payload():
     )
     admit = AsyncMock(return_value=admitted)
     gate = MagicMock(return_value="sandbox")
+    grants = AsyncMock()
     with (
         patch.object(
-            orchestrator_main,
-            "require_thread_owner",
-            AsyncMock(return_value=({"id": OWNER_ID}, thread)),
-        ),
-        patch.object(
-            orchestrator_main,
+            thread_session,
             "find_existing_thread_control",
             AsyncMock(return_value=None),
         ) as find_existing,
-        patch.object(orchestrator_main, "_require_stateless_workspace", gate),
-        patch.object(orchestrator_main, "_enforce_session_create_grants") as grants,
-        patch.object(orchestrator_main, "admit_thread_control", admit),
-        patch.object(orchestrator_main, "log_security_event", AsyncMock()),
+        patch.object(thread_session, "require_stateless_workspace", gate),
+        patch.object(thread_session, "admit_thread_control", admit),
+        patch.object(thread_session, "log_security_event", AsyncMock()),
     ):
-        response = await orchestrator_main.submit_thread_control(
+        response = await thread_session.submit_thread_control(
             str(THREAD_ID),
-            orchestrator_main.ThreadControlRequest(
+            ThreadControlRequest(
                 client_request_id=CLIENT_REQUEST_ID,
                 method="workspace.undo",
             ),
             MagicMock(),
+            dependencies=_control_dependencies(
+                owner=AsyncMock(return_value=({"id": OWNER_ID}, thread)),
+                enforce=grants,
+            ),
         )
 
     assert response["method"] == "workspace.undo"
@@ -441,8 +460,6 @@ async def test_control_endpoint_admits_lane_free_workspace_undo_payload():
 @pytest.mark.asyncio
 async def test_admin_can_control_ownerless_legacy_thread_without_fake_uuid():
     """Admin-only ownerless threads retain their pre-REST control surface."""
-
-    import orchestrator.main as orchestrator_main
 
     admin_id = UUID("77777777-7777-4777-8777-777777777777")
     thread = {
@@ -464,27 +481,27 @@ async def test_admin_can_control_ownerless_legacy_thread_without_fake_uuid():
     enforce = AsyncMock()
     with (
         patch.object(
-            orchestrator_main,
-            "require_thread_owner",
-            AsyncMock(return_value=({"id": admin_id, "is_admin": True}, thread)),
-        ),
-        patch.object(
-            orchestrator_main,
+            thread_session,
             "find_existing_thread_control",
             AsyncMock(return_value=None),
         ),
-        patch.object(orchestrator_main, "_enforce_session_create_grants", enforce),
-        patch.object(orchestrator_main, "admit_thread_control", admit),
-        patch.object(orchestrator_main, "log_security_event", AsyncMock()),
+        patch.object(thread_session, "admit_thread_control", admit),
+        patch.object(thread_session, "log_security_event", AsyncMock()),
     ):
-        response = await orchestrator_main.submit_thread_control(
+        response = await thread_session.submit_thread_control(
             str(THREAD_ID),
-            orchestrator_main.ThreadControlRequest(
+            ThreadControlRequest(
                 client_request_id=CLIENT_REQUEST_ID,
                 method="mode.set",
                 mode="supervised",
             ),
             MagicMock(),
+            dependencies=_control_dependencies(
+                owner=AsyncMock(
+                    return_value=({"id": admin_id, "is_admin": True}, thread)
+                ),
+                enforce=enforce,
+            ),
         )
 
     assert response["accepted"] is True
@@ -499,9 +516,7 @@ async def test_admin_can_control_ownerless_legacy_thread_without_fake_uuid():
 
 @pytest.mark.asyncio
 async def test_control_endpoint_maps_admission_conflict_to_409():
-    import orchestrator.main as orchestrator_main
-
-    body = orchestrator_main.ThreadControlRequest(
+    body = ThreadControlRequest(
         client_request_id=CLIENT_REQUEST_ID,
         method="narration.set",
         mode="silent",
@@ -512,24 +527,24 @@ async def test_control_endpoint_maps_admission_conflict_to_409():
             {"id": THREAD_ID, "user_id": OWNER_ID, "project_id": None},
         )
     )
-    # ``main`` imports the service from its runtime top-level package
-    # (``services``), while unit tests also import it through ``orchestrator``;
-    # raise the exact class object the route catches.
+    # Raise the exact class object the route module catches.
     conflict = AsyncMock(
-        side_effect=orchestrator_main.ControlAdmissionError(
+        side_effect=thread_session.ControlAdmissionError(
             "client_request_id was already used for a different control"
         )
     )
     admit = AsyncMock()
 
     with (
-        patch.object(orchestrator_main, "require_thread_owner", owner),
-        patch.object(orchestrator_main, "find_existing_thread_control", conflict),
-        patch.object(orchestrator_main, "admit_thread_control", admit),
+        patch.object(thread_session, "find_existing_thread_control", conflict),
+        patch.object(thread_session, "admit_thread_control", admit),
     ):
         with pytest.raises(HTTPException) as exc:
-            await orchestrator_main.submit_thread_control(
-                str(THREAD_ID), body, MagicMock()
+            await thread_session.submit_thread_control(
+                str(THREAD_ID),
+                body,
+                MagicMock(),
+                dependencies=_control_dependencies(owner=owner),
             )
 
     assert exc.value.status_code == 409
@@ -539,9 +554,7 @@ async def test_control_endpoint_maps_admission_conflict_to_409():
 
 @pytest.mark.asyncio
 async def test_control_endpoint_maps_transient_owner_readiness_to_425():
-    import orchestrator.main as orchestrator_main
-
-    body = orchestrator_main.ThreadControlRequest(
+    body = ThreadControlRequest(
         client_request_id=CLIENT_REQUEST_ID,
         method="narration.set",
         mode="silent",
@@ -553,24 +566,26 @@ async def test_control_endpoint_maps_transient_owner_readiness_to_425():
         )
     )
     admit = AsyncMock(
-        side_effect=orchestrator_main.ControlAdmissionNotReady(
+        side_effect=thread_session.ControlAdmissionNotReady(
             "Session is not ready to accept controls"
         )
     )
 
     with (
-        patch.object(orchestrator_main, "require_thread_owner", owner),
         patch.object(
-            orchestrator_main,
+            thread_session,
             "find_existing_thread_control",
             AsyncMock(return_value=None),
         ),
-        patch.object(orchestrator_main, "admit_thread_control", admit),
-        patch.object(orchestrator_main, "log_security_event", AsyncMock()),
+        patch.object(thread_session, "admit_thread_control", admit),
+        patch.object(thread_session, "log_security_event", AsyncMock()),
     ):
         with pytest.raises(HTTPException) as exc:
-            await orchestrator_main.submit_thread_control(
-                str(THREAD_ID), body, MagicMock()
+            await thread_session.submit_thread_control(
+                str(THREAD_ID),
+                body,
+                MagicMock(),
+                dependencies=_control_dependencies(owner=owner),
             )
 
     assert exc.value.status_code == 425
@@ -761,8 +776,6 @@ async def test_strict_pinned_status_phase_rejects_missing_identity(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_committed_retry_bypasses_mutable_grant_policy():
-    import orchestrator.main as orchestrator_main
-
     thread = {"id": THREAD_ID, "user_id": OWNER_ID, "project_id": PROJECT_ID}
     duplicate = AdmittedControl(
         id=REQUEST_ID,
@@ -776,27 +789,25 @@ async def test_committed_retry_bypasses_mutable_grant_policy():
     admit = AsyncMock(return_value=duplicate)
     with (
         patch.object(
-            orchestrator_main,
-            "require_thread_owner",
-            AsyncMock(return_value=({"id": OWNER_ID}, thread)),
-        ),
-        patch.object(
-            orchestrator_main,
+            thread_session,
             "find_existing_thread_control",
             AsyncMock(return_value=duplicate),
         ),
-        patch.object(orchestrator_main, "_enforce_session_create_grants", enforce),
-        patch.object(orchestrator_main, "admit_thread_control", admit),
-        patch.object(orchestrator_main, "log_security_event", AsyncMock()),
+        patch.object(thread_session, "admit_thread_control", admit),
+        patch.object(thread_session, "log_security_event", AsyncMock()),
     ):
-        response = await orchestrator_main.submit_thread_control(
+        response = await thread_session.submit_thread_control(
             str(THREAD_ID),
-            orchestrator_main.ThreadControlRequest(
+            ThreadControlRequest(
                 client_request_id=CLIENT_REQUEST_ID,
                 method="mode.set",
                 mode="autonomous",
             ),
             MagicMock(),
+            dependencies=_control_dependencies(
+                owner=AsyncMock(return_value=({"id": OWNER_ID}, thread)),
+                enforce=enforce,
+            ),
         )
 
     assert response["state"] == "applied"

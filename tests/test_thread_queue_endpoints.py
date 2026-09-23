@@ -2,10 +2,10 @@
 (stateless_turn_resilience.md step 2 API contract).
 
 ``GET /api/persistent/threads/{id}/queue`` and ``POST …/queue/retry`` are
-main-module routes gated by ``require_thread_owner``; ``/connection`` (sessions
+owner-gated routes of ``routers/thread_transport``; ``/connection`` (sessions
 router) and ``/input`` carry the same block. The handlers are driven directly
-with fakes for the DB and the gate; the route inventory proves they are
-mounted and gated.
+with one application's transport dependencies built from fakes for the DB and
+the gate; the route inventory proves the application mounts them.
 """
 
 from __future__ import annotations
@@ -13,6 +13,7 @@ from __future__ import annotations
 import contextlib
 import uuid
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
@@ -20,7 +21,9 @@ from fastapi import HTTPException
 
 from orchestrator import main
 from orchestrator.routers import sessions as sessions_routes
+from orchestrator.routers import thread_transport
 from orchestrator.services import stateless_queue_state as sqs
+from orchestrator.services.thread_turn_locks import ThreadTurnLocks
 from shared.run_queue import PARK_REASON_ATTACH_FAILED, PARK_REASON_CLAIM_LOSS_HOLD
 from shared.session_retirement import CLAIM_LOSS_HOLD_KEY
 
@@ -70,16 +73,33 @@ def _parked(reason=PARK_REASON_ATTACH_FAILED, attempts=3):
 def owner(monkeypatch):
     thread = {"id": THREAD, "user_id": "u1", "metadata": {}}
     gate = AsyncMock(return_value=(USER, thread))
-    monkeypatch.setattr(main, "require_thread_owner", gate)
-    monkeypatch.setattr(main, "log_security_event", AsyncMock())
+    # The retry audit is looked up in the router module at call time.
+    monkeypatch.setattr(thread_transport, "log_security_event", AsyncMock())
     return gate
+
+
+def _deps(gate, conn=None):
+    """One application's transport collaborators: its store and owner gate.
+
+    The queue routes consult nothing else; the input/forwarding collaborators
+    are inert placeholders.
+    """
+    return thread_transport.ThreadTransportDependencies(
+        store=_Db(conn if conn is not None else _Conn()),
+        require_thread_owner=gate,
+        require_approved_user=AsyncMock(
+            side_effect=AssertionError("queue routes gate on the owner check")
+        ),
+        forwarding=SimpleNamespace(),
+        stateless_input=SimpleNamespace(),
+        turn_locks=ThreadTurnLocks(),
+    )
 
 
 def _wire(monkeypatch, *, state, authority, unpark=True):
     import shared.run_queue as rq
 
     conn = _Conn(authority=authority)
-    monkeypatch.setattr(main, "postgres_db", _Db(conn))
     # The retry handler imports the statement at call time (shared.run_queue);
     # the block builder bound it at import (stateless_queue_state). Patch both.
     reader = AsyncMock(return_value=state)
@@ -97,8 +117,10 @@ def _wire(monkeypatch, *, state, authority, unpark=True):
 
 @pytest.mark.asyncio
 async def test_queue_state_returns_the_block_for_the_owner(owner, monkeypatch):
-    _wire(monkeypatch, state=_parked(), authority=None)
-    body = await main.thread_queue_state(THREAD, request=object())
+    conn, _ = _wire(monkeypatch, state=_parked(), authority=None)
+    body = await thread_transport.thread_queue_state(
+        THREAD, request=object(), dependencies=_deps(owner, conn)
+    )
     assert body["thread_id"] == THREAD
     assert body["queue"] == {
         "state": "parked",
@@ -114,28 +136,30 @@ async def test_queue_state_returns_the_block_for_the_owner(owner, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_queue_state_reports_none_when_never_enqueued(owner, monkeypatch):
-    _wire(monkeypatch, state=None, authority=None)
-    body = await main.thread_queue_state(THREAD, request=object())
+    conn, _ = _wire(monkeypatch, state=None, authority=None)
+    body = await thread_transport.thread_queue_state(
+        THREAD, request=object(), dependencies=_deps(owner, conn)
+    )
     assert body["queue"]["state"] == "none" and body["queue"]["retryable"] is False
 
 
 @pytest.mark.asyncio
 async def test_queue_state_rejects_a_non_uuid_before_the_gate(owner):
     with pytest.raises(HTTPException) as err:
-        await main.thread_queue_state("ad7eb761", request=object())
+        await thread_transport.thread_queue_state(
+            "ad7eb761", request=object(), dependencies=_deps(owner)
+        )
     assert err.value.status_code == 404
     owner.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_queue_state_gate_denial_propagates(monkeypatch):
-    monkeypatch.setattr(
-        main,
-        "require_thread_owner",
-        AsyncMock(side_effect=HTTPException(status_code=403, detail="no")),
-    )
+async def test_queue_state_gate_denial_propagates():
+    gate = AsyncMock(side_effect=HTTPException(status_code=403, detail="no"))
     with pytest.raises(HTTPException) as err:
-        await main.thread_queue_state(THREAD, request=object())
+        await thread_transport.thread_queue_state(
+            THREAD, request=object(), dependencies=_deps(gate)
+        )
     assert err.value.status_code == 403
 
 
@@ -151,7 +175,9 @@ async def test_retry_unparks_a_retryable_park_and_audits(owner, monkeypatch):
         state=_parked(),
         authority={"execution_lane": "stateless", "metadata": {}},
     )
-    body = await main.thread_queue_retry(THREAD, request=object())
+    body = await thread_transport.thread_queue_retry(
+        THREAD, request=object(), dependencies=_deps(owner, conn)
+    )
     assert body == {
         "thread_id": THREAD,
         "unit_id": THREAD,
@@ -161,7 +187,7 @@ async def test_retry_unparks_a_retryable_park_and_audits(owner, monkeypatch):
     unpark.assert_awaited_once()
     assert unpark.await_args.kwargs["unit_id"] == THREAD
     assert conn.fetchrow_calls == 1  # the FOR UPDATE authority read
-    audit = main.log_security_event
+    audit = thread_transport.log_security_event
     audit.assert_awaited_once()
     assert audit.await_args.kwargs["event_type"] == "queue_retry"
     assert audit.await_args.kwargs["resource_id"] == THREAD
@@ -169,37 +195,43 @@ async def test_retry_unparks_a_retryable_park_and_audits(owner, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_retry_404_when_not_parked(owner, monkeypatch):
-    _, unpark = _wire(
+    conn, unpark = _wire(
         monkeypatch,
         state={**_parked(), "state": "queued"},
         authority={"execution_lane": "stateless", "metadata": {}},
     )
     with pytest.raises(HTTPException) as err:
-        await main.thread_queue_retry(THREAD, request=object())
+        await thread_transport.thread_queue_retry(
+            THREAD, request=object(), dependencies=_deps(owner, conn)
+        )
     assert err.value.status_code == 404
     unpark.assert_not_awaited()
 
 
 @pytest.mark.asyncio
 async def test_retry_404_when_no_queue_row_or_thread(owner, monkeypatch):
-    _wire(
+    conn, _ = _wire(
         monkeypatch,
         state=None,
         authority={"execution_lane": "stateless", "metadata": {}},
     )
     with pytest.raises(HTTPException) as err:
-        await main.thread_queue_retry(THREAD, request=object())
+        await thread_transport.thread_queue_retry(
+            THREAD, request=object(), dependencies=_deps(owner, conn)
+        )
     assert err.value.status_code == 404
-    _wire(monkeypatch, state=_parked(), authority=None)
+    conn, _ = _wire(monkeypatch, state=_parked(), authority=None)
     with pytest.raises(HTTPException) as err:
-        await main.thread_queue_retry(THREAD, request=object())
+        await thread_transport.thread_queue_retry(
+            THREAD, request=object(), dependencies=_deps(owner, conn)
+        )
     assert err.value.status_code == 404
 
 
 @pytest.mark.asyncio
 async def test_retry_409_codes(owner, monkeypatch):
     # claim-loss hold marker on the thread
-    _, unpark = _wire(
+    conn, unpark = _wire(
         monkeypatch,
         state=_parked(),
         authority={
@@ -208,27 +240,33 @@ async def test_retry_409_codes(owner, monkeypatch):
         },
     )
     with pytest.raises(HTTPException) as err:
-        await main.thread_queue_retry(THREAD, request=object())
+        await thread_transport.thread_queue_retry(
+            THREAD, request=object(), dependencies=_deps(owner, conn)
+        )
     assert err.value.status_code == 409
     assert err.value.detail["code"] == sqs.RETRY_REFUSAL_CLAIM_LOSS_HOLD
     unpark.assert_not_awaited()
     # hold by reason alone
-    _, unpark = _wire(
+    conn, unpark = _wire(
         monkeypatch,
         state=_parked(reason=PARK_REASON_CLAIM_LOSS_HOLD),
         authority={"execution_lane": "stateless", "metadata": {}},
     )
     with pytest.raises(HTTPException) as err:
-        await main.thread_queue_retry(THREAD, request=object())
+        await thread_transport.thread_queue_retry(
+            THREAD, request=object(), dependencies=_deps(owner, conn)
+        )
     assert err.value.detail["code"] == sqs.RETRY_REFUSAL_CLAIM_LOSS_HOLD
     # non-retryable free-form reason
-    _, unpark = _wire(
+    conn, unpark = _wire(
         monkeypatch,
         state=_parked(reason="loop_died_interrupt_drain_failed"),
         authority={"execution_lane": "stateless", "metadata": {}},
     )
     with pytest.raises(HTTPException) as err:
-        await main.thread_queue_retry(THREAD, request=object())
+        await thread_transport.thread_queue_retry(
+            THREAD, request=object(), dependencies=_deps(owner, conn)
+        )
     assert err.value.detail == {
         "code": sqs.RETRY_REFUSAL_NOT_RETRYABLE,
         "park_reason": "loop_died_interrupt_drain_failed",
@@ -238,15 +276,14 @@ async def test_retry_409_codes(owner, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_retry_gate_denial_never_reads_the_queue(monkeypatch):
-    monkeypatch.setattr(
-        main,
-        "require_thread_owner",
-        AsyncMock(side_effect=HTTPException(status_code=403, detail="no")),
-    )
-    _, unpark = _wire(monkeypatch, state=_parked(), authority=None)
+    gate = AsyncMock(side_effect=HTTPException(status_code=403, detail="no"))
+    conn, unpark = _wire(monkeypatch, state=_parked(), authority=None)
     with pytest.raises(HTTPException):
-        await main.thread_queue_retry(THREAD, request=object())
+        await thread_transport.thread_queue_retry(
+            THREAD, request=object(), dependencies=_deps(gate, conn)
+        )
     unpark.assert_not_awaited()
+    assert conn.fetchrow_calls == 0
 
 
 # ---------------------------------------------------------------------------
@@ -300,7 +337,9 @@ async def test_queue_block_reports_no_cloud_push_when_nothing_pending(
 ):
     conn, _ = _wire(monkeypatch, state=_parked(), authority=None)
     conn.fetch = AsyncMock(return_value=[])  # pending_push_state → no rows
-    body = await main.thread_queue_state(THREAD, request=object())
+    body = await thread_transport.thread_queue_state(
+        THREAD, request=object(), dependencies=_deps(owner, conn)
+    )
     assert body["queue"]["cloud_push"] is None
 
 
@@ -330,7 +369,9 @@ async def test_queue_block_reports_the_off_slot_push(owner, monkeypatch):
             }
         ]
     )
-    body = await main.thread_queue_state(THREAD, request=object())
+    body = await thread_transport.thread_queue_state(
+        THREAD, request=object(), dependencies=_deps(owner, conn)
+    )
     assert body["queue"]["cloud_push"] == {
         "pending": 1,
         "uploaded": 1,
@@ -344,6 +385,8 @@ async def test_queue_block_reports_the_off_slot_push(owner, monkeypatch):
 async def test_queue_block_survives_a_cloud_push_read_failure(owner, monkeypatch):
     conn, _ = _wire(monkeypatch, state=_parked(), authority=None)
     conn.fetch = AsyncMock(side_effect=RuntimeError("db down"))
-    body = await main.thread_queue_state(THREAD, request=object())
+    body = await thread_transport.thread_queue_state(
+        THREAD, request=object(), dependencies=_deps(owner, conn)
+    )
     assert body["queue"]["state"] == "parked"
     assert body["queue"]["cloud_push"] is None

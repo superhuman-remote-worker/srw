@@ -38,6 +38,7 @@ from orchestrator.services import (
     session_config_resolution as sessioncfg,
     session_create_overrides as overrides,
     session_tool_policy as toolpolicy,
+    session_tool_view,
     session_workspace_policy as wspolicy,
     virtual_workspace,
     vm_workspace_policy as vmpolicy,
@@ -698,7 +699,14 @@ class TestToolOverrideBoundary:
 
 
 class TestToolPolicyPrediction:
-    """The resolved and legacy predictions, compared against ``main``."""
+    """The resolved and legacy predictions, compared against their consumers.
+
+    The differential cases originally compared the moved functions with the
+    copies still in ``main``. Since R1.B10 their only consumer is
+    ``services.session_tool_view`` (the tool-groups read and the creation
+    preview), so the contract is now that the name *that* module looks up at
+    call time is the canonical policy.
+    """
 
     CASES = [
         None,
@@ -709,7 +717,7 @@ class TestToolPolicyPrediction:
     ]
 
     @pytest.mark.parametrize("override", CASES)
-    def test_merged_policy_matches_main(self, override):
+    def test_merged_policy_matches_its_consumer(self, override):
         kwargs = dict(
             base_config_name="session_base",
             expert_row=None,
@@ -717,13 +725,13 @@ class TestToolPolicyPrediction:
             request_override=override,
         )
         assert toolpolicy.merged_session_tool_policy(**kwargs) == (
-            main._merged_session_tool_policy(**kwargs)
+            session_tool_view.merged_session_tool_policy(**kwargs)
         )
 
     @pytest.mark.parametrize("override", CASES)
-    def test_legacy_policy_matches_main(self, override):
+    def test_legacy_policy_matches_its_consumer(self, override):
         assert toolpolicy.legacy_session_tool_policy("session_base", override) == (
-            main._legacy_session_tool_policy("session_base", override)
+            session_tool_view.legacy_session_tool_policy("session_base", override)
         )
 
     @pytest.mark.parametrize("override", CASES)
@@ -767,7 +775,7 @@ class TestToolPolicyPrediction:
         legacy_on, _ = toolpolicy.legacy_session_tool_policy("session_base", gated)
         assert legacy_on["delegation"] == ["delegate_agent"]
 
-    def test_a_malformed_stored_expert_fragment_raises_exactly_as_main_does(self):
+    def test_a_malformed_stored_expert_fragment_raises_exactly_as_its_consumer(self):
         """Pinned, not endorsed.
 
         ``resolve_config`` json-decodes the expert row BEFORE the provenance
@@ -784,7 +792,7 @@ class TestToolPolicyPrediction:
         with pytest.raises(json.JSONDecodeError):
             toolpolicy.merged_session_tool_policy(**kwargs)
         with pytest.raises(json.JSONDecodeError):
-            main._merged_session_tool_policy(**kwargs)
+            session_tool_view.merged_session_tool_policy(**kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -816,7 +824,7 @@ class TestAgentToolsetProbe:
         assert partial["degraded_reason"] == "thin"
         assert partial["prediction_reason"] is None
 
-    def test_origin_fields_match_main(self):
+    def test_origin_fields_match_the_tool_view_consumer(self):
         for m in (
             toolset.unmeasured("x"),
             toolset.Measurement({"core": []}, "t", {"a": 1}, None),
@@ -825,7 +833,7 @@ class TestAgentToolsetProbe:
             twin = main._Measurement(
                 m.categories, m.observed_at, m.backend, m.reason, m.partial
             )
-            assert toolset.origin_fields(m) == main._origin_fields(twin)
+            assert toolset.origin_fields(m) == session_tool_view.origin_fields(twin)
 
     @pytest.mark.asyncio
     async def test_no_agent_is_unmeasured_without_touching_the_store(self):

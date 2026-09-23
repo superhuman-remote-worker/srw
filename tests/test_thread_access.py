@@ -10,15 +10,19 @@ left behind by user deletion) — letting attackers enumerate them by
 UUID. It also didn't bypass for admins or enforce MCP project-scope
 refusal. G3 replaces every occurrence with a single
 ``require_thread_owner`` call (new helper in ``security/access.py``).
-A private ``_resolve_thread_for_forwarding`` helper that takes ``user``
-but not ``request`` got an inline fail-closed + admin-bypass fix.
+The forwarding resolver that takes ``user`` but not ``request`` (now
+``services/pinned_forwarding.resolve_thread_for_forwarding``) got an inline
+fail-closed + admin-bypass fix.
 
 This file covers the helper directly (the cross-cutting properties) and
-samples a few endpoints to prove the gate is wired. The previous F2-F7
-pattern of patching ``main.require_approved_user`` AND
-``security.access.require_approved_user`` is reused.
+samples a few endpoints to prove the gate is wired. The endpoints now live in
+their R1.B10 routers and receive the real ``require_thread_owner`` through
+their application's dependencies, so only the caller resolver the gate itself
+consults (``security.access.require_approved_user``) is patched.
 """
 
+import dataclasses
+import inspect
 from contextlib import ExitStack
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -26,6 +30,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from fastapi import HTTPException
 
+from orchestrator.routers import thread_history, thread_session, thread_transport
+from orchestrator.security.access import require_thread_owner
+from orchestrator.services import pinned_forwarding
+from orchestrator.services.thread_turn_locks import ThreadTurnLocks
 from shared.pinned_session_identity import PinnedSessionBinding
 
 
@@ -80,19 +88,89 @@ def _forwarding_stateless_thread(*, ready: bool) -> dict:
 # =============================================================================
 
 
-def _patch_caller_and_db(user: dict, db):
+def _patch_caller(user: dict):
+    """Resolve ``user`` as the caller of the real owner gate.
+
+    The store is handed to the gate (or the route's dependencies) explicitly
+    by each case; nothing reads an application-module store any more.
+    """
     stack = ExitStack()
-    stack.enter_context(
-        patch("orchestrator.main.require_approved_user", AsyncMock(return_value=user))
-    )
     stack.enter_context(
         patch(
             "orchestrator.security.access.require_approved_user",
             AsyncMock(return_value=user),
         )
     )
-    stack.enter_context(patch("orchestrator.main.postgres_db", db))
     return stack
+
+
+def _forwarding_deps(
+    db, suspension=None
+) -> pinned_forwarding.PinnedForwardingDependencies:
+    return pinned_forwarding.PinnedForwardingDependencies(
+        store=db,
+        workspace_suspension=(
+            suspension
+            if suspension is not None
+            else SimpleNamespace(
+                is_enabled=True,
+                restore_thread_workspace=AsyncMock(
+                    side_effect=AssertionError("unexpected workspace restore")
+                ),
+            )
+        ),
+        protected_cloud_delivery_state=AsyncMock(
+            side_effect=AssertionError("unexpected protected-cloud read")
+        ),
+    )
+
+
+def _assert_forwarding_has_no_reconciliation_path() -> None:
+    """The resolver can refuse "before reconciliation" only if it has no way to
+    reconcile: its collaborators are the store, the suspension service and
+    the protected-cloud probe, and it never names the workspace ensure."""
+    assert {
+        field.name
+        for field in dataclasses.fields(pinned_forwarding.PinnedForwardingDependencies)
+    } == {"store", "workspace_suspension", "protected_cloud_delivery_state"}
+    assert "ensure_session_workspace" not in inspect.getsource(pinned_forwarding)
+
+
+def _session_deps(db, resolve_cloud_session_url):
+    return thread_session.ThreadSessionDependencies(
+        store=db,
+        require_thread_owner=require_thread_owner,
+        require_approved_user=AsyncMock(
+            side_effect=AssertionError("thread reads gate on the owner check")
+        ),
+        resolve_cloud_session_url=resolve_cloud_session_url,
+        resolve_session_config=AsyncMock(side_effect=AssertionError("not reached")),
+        enforce_session_create_grants=AsyncMock(
+            side_effect=AssertionError("not reached")
+        ),
+        tool_view=SimpleNamespace(),
+    )
+
+
+def _history_deps(db):
+    return thread_history.ThreadHistoryDependencies(
+        store=db,
+        vector_db=SimpleNamespace(),
+        require_thread_owner=require_thread_owner,
+    )
+
+
+def _transport_deps(db):
+    return thread_transport.ThreadTransportDependencies(
+        store=db,
+        require_thread_owner=require_thread_owner,
+        require_approved_user=AsyncMock(
+            side_effect=AssertionError("the stream gates on the owner check")
+        ),
+        forwarding=_forwarding_deps(db),
+        stateless_input=SimpleNamespace(),
+        turn_locks=ThreadTurnLocks(),
+    )
 
 
 def _scoped(user: dict, scope: str) -> dict:
@@ -112,7 +190,7 @@ class TestRequireThreadOwner:
     async def test_owner_passes(self, user_a, thread_a, fake_db, fake_request):
         from orchestrator.security.access import require_thread_owner
 
-        with _patch_caller_and_db(user_a, fake_db):
+        with _patch_caller(user_a):
             user, thread = await require_thread_owner(
                 fake_request, fake_db, str(thread_a["id"])
             )
@@ -123,7 +201,7 @@ class TestRequireThreadOwner:
     async def test_cross_user_403(self, user_b, thread_a, fake_db, fake_request):
         from orchestrator.security.access import require_thread_owner
 
-        with _patch_caller_and_db(user_b, fake_db):
+        with _patch_caller(user_b):
             with pytest.raises(HTTPException) as exc:
                 await require_thread_owner(fake_request, fake_db, str(thread_a["id"]))
         assert exc.value.status_code == 403
@@ -132,8 +210,6 @@ class TestRequireThreadOwner:
 class TestForwardingWorkspaceAuthority:
     @pytest.mark.asyncio
     async def test_pinned_forwarding_uses_one_joined_binding_snapshot(self):
-        import orchestrator.main as main
-
         thread = _forwarding_stateless_thread(ready=True)
         thread["execution_lane"] = "pinned"
         binding = PinnedSessionBinding(
@@ -158,14 +234,11 @@ class TestForwardingWorkspaceAuthority:
             restore_thread_workspace=AsyncMock(),
         )
 
-        with (
-            patch.object(main, "postgres_db", db),
-            patch.object(main, "workspace_suspension_service", suspension),
-        ):
-            resolved, selected = await main._resolve_thread_for_forwarding(
-                FORWARD_THREAD_ID,
-                {"id": "user-1", "is_admin": False},
-            )
+        resolved, selected = await pinned_forwarding.resolve_thread_for_forwarding(
+            FORWARD_THREAD_ID,
+            {"id": "user-1", "is_admin": False},
+            dependencies=_forwarding_deps(db, suspension),
+        )
 
         assert resolved is thread
         assert selected is binding
@@ -177,40 +250,30 @@ class TestForwardingWorkspaceAuthority:
 
     @pytest.mark.asyncio
     async def test_direct_stateless_forwarding_is_refused_before_reconciliation(self):
-        import orchestrator.main as main
-
         in_progress = _forwarding_stateless_thread(ready=False)
         ready = _forwarding_stateless_thread(ready=True)
         db = SimpleNamespace(
             get_thread=AsyncMock(side_effect=[in_progress, ready]),
             get_agent=AsyncMock(return_value={"id": "agent-1", "pod_ip": "10.0.0.2"}),
         )
-        ensure = AsyncMock()
         suspension = SimpleNamespace(
             is_enabled=True,
             restore_thread_workspace=AsyncMock(),
         )
-        provisioner = SimpleNamespace()
 
-        with (
-            patch.object(main, "postgres_db", db),
-            patch.object(main, "ensure_session_workspace", ensure),
-            patch.object(main, "container_provisioner", provisioner),
-            patch.object(main, "workspace_suspension_service", suspension),
-        ):
-            with pytest.raises(HTTPException) as exc:
-                await main._resolve_thread_for_forwarding(
-                    FORWARD_THREAD_ID, {"id": "user-1", "is_admin": False}
-                )
+        with pytest.raises(HTTPException) as exc:
+            await pinned_forwarding.resolve_thread_for_forwarding(
+                FORWARD_THREAD_ID,
+                {"id": "user-1", "is_admin": False},
+                dependencies=_forwarding_deps(db, suspension),
+            )
 
         assert exc.value.status_code == 409
-        ensure.assert_not_awaited()
+        _assert_forwarding_has_no_reconciliation_path()
         suspension.restore_thread_workspace.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_stateless_forwarding_refuses_fresh_lane_flip(self):
-        import orchestrator.main as main
-
         initial = _forwarding_stateless_thread(ready=False)
         flipped = _forwarding_stateless_thread(ready=True)
         flipped["execution_lane"] = "pinned"
@@ -218,23 +281,17 @@ class TestForwardingWorkspaceAuthority:
             get_thread=AsyncMock(side_effect=[initial, flipped]),
             get_agent=AsyncMock(),
         )
-        ensure = AsyncMock()
         suspension = SimpleNamespace(
             is_enabled=True,
             restore_thread_workspace=AsyncMock(),
         )
 
-        with (
-            patch.object(main, "postgres_db", db),
-            patch.object(main, "ensure_session_workspace", ensure),
-            patch.object(main, "container_provisioner", SimpleNamespace()),
-            patch.object(main, "workspace_suspension_service", suspension),
-        ):
-            with pytest.raises(HTTPException) as exc:
-                await main._resolve_thread_for_forwarding(
-                    FORWARD_THREAD_ID,
-                    {"id": "user-1", "is_admin": False},
-                )
+        with pytest.raises(HTTPException) as exc:
+            await pinned_forwarding.resolve_thread_for_forwarding(
+                FORWARD_THREAD_ID,
+                {"id": "user-1", "is_admin": False},
+                dependencies=_forwarding_deps(db, suspension),
+            )
 
         assert exc.value.status_code == 409
         db.get_agent.assert_not_awaited()
@@ -242,8 +299,6 @@ class TestForwardingWorkspaceAuthority:
 
     @pytest.mark.asyncio
     async def test_stateless_suspended_forwarding_refuses_legacy_restore(self):
-        import orchestrator.main as main
-
         suspended = _forwarding_stateless_thread(ready=False)
         workspace = suspended["metadata"]["workspace_container"]
         workspace["status"] = "suspended"
@@ -259,42 +314,31 @@ class TestForwardingWorkspaceAuthority:
             restore_thread_workspace=AsyncMock(),
         )
 
-        with (
-            patch.object(main, "postgres_db", db),
-            patch.object(main, "ensure_session_workspace", AsyncMock()),
-            patch.object(main, "container_provisioner", SimpleNamespace()),
-            patch.object(main, "workspace_suspension_service", suspension),
-        ):
-            with pytest.raises(HTTPException) as exc:
-                await main._resolve_thread_for_forwarding(
-                    FORWARD_THREAD_ID,
-                    {"id": "user-1", "is_admin": False},
-                )
+        with pytest.raises(HTTPException) as exc:
+            await pinned_forwarding.resolve_thread_for_forwarding(
+                FORWARD_THREAD_ID,
+                {"id": "user-1", "is_admin": False},
+                dependencies=_forwarding_deps(db, suspension),
+            )
 
         assert exc.value.status_code == 409
         suspension.restore_thread_workspace.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_stateless_forwarding_refuses_malformed_physical_class_first(self):
-        import orchestrator.main as main
-
         thread = _forwarding_stateless_thread(ready=True)
         thread["metadata"]["vm"] = {"status": "ready"}
         db = SimpleNamespace(get_thread=AsyncMock(return_value=thread))
-        ensure = AsyncMock()
 
-        with (
-            patch.object(main, "postgres_db", db),
-            patch.object(main, "ensure_session_workspace", ensure),
-        ):
-            with pytest.raises(HTTPException) as exc:
-                await main._resolve_thread_for_forwarding(
-                    FORWARD_THREAD_ID,
-                    {"id": "user-1", "is_admin": False},
-                )
+        with pytest.raises(HTTPException) as exc:
+            await pinned_forwarding.resolve_thread_for_forwarding(
+                FORWARD_THREAD_ID,
+                {"id": "user-1", "is_admin": False},
+                dependencies=_forwarding_deps(db),
+            )
 
         assert exc.value.status_code == 409
-        ensure.assert_not_awaited()
+        _assert_forwarding_has_no_reconciliation_path()
 
     @pytest.mark.asyncio
     async def test_orphan_thread_fail_closed(self, user_a, fake_db, fake_request):
@@ -305,7 +349,7 @@ class TestForwardingWorkspaceAuthority:
         fake_db.get_thread = AsyncMock(
             return_value={"id": orphan_id, "user_id": None, "title": "ophan"}
         )
-        with _patch_caller_and_db(user_a, fake_db):
+        with _patch_caller(user_a):
             with pytest.raises(HTTPException) as exc:
                 await require_thread_owner(fake_request, fake_db, orphan_id)
         assert exc.value.status_code == 403
@@ -318,7 +362,7 @@ class TestForwardingWorkspaceAuthority:
         orphan_id = "ccc55555-5555-5555-5555-555555555555"
         orphan = {"id": orphan_id, "user_id": None, "title": "orphan"}
         fake_db.get_thread = AsyncMock(return_value=orphan)
-        with _patch_caller_and_db(user_admin, fake_db):
+        with _patch_caller(user_admin):
             user, thread = await require_thread_owner(fake_request, fake_db, orphan_id)
         assert thread is orphan
 
@@ -326,7 +370,7 @@ class TestForwardingWorkspaceAuthority:
     async def test_admin_bypass(self, user_admin, thread_a, fake_db, fake_request):
         from orchestrator.security.access import require_thread_owner
 
-        with _patch_caller_and_db(user_admin, fake_db):
+        with _patch_caller(user_admin):
             user, thread = await require_thread_owner(
                 fake_request, fake_db, str(thread_a["id"])
             )
@@ -336,7 +380,7 @@ class TestForwardingWorkspaceAuthority:
     async def test_missing_404(self, user_a, fake_db, fake_request):
         from orchestrator.security.access import require_thread_owner
 
-        with _patch_caller_and_db(user_a, fake_db):
+        with _patch_caller(user_a):
             with pytest.raises(HTTPException) as exc:
                 await require_thread_owner(
                     fake_request, fake_db, "00000000-0000-0000-0000-000000000999"
@@ -351,7 +395,7 @@ class TestForwardingWorkspaceAuthority:
         from orchestrator.security.access import require_thread_owner
 
         scoped = _scoped(user_a, f"project:{project_a['id']}")
-        with _patch_caller_and_db(scoped, fake_db):
+        with _patch_caller(scoped):
             with pytest.raises(HTTPException) as exc:
                 await require_thread_owner(fake_request, fake_db, str(thread_a["id"]))
         assert exc.value.status_code == 403
@@ -365,20 +409,19 @@ class TestForwardingWorkspaceAuthority:
 class TestThreadEndpointGates:
     @pytest.mark.asyncio
     async def test_get_thread_orphan_blocked(self, user_a, fake_db, fake_request):
-        from orchestrator.main import get_thread
-
         orphan_id = "ccc55555-5555-5555-5555-555555555555"
         fake_db.get_thread = AsyncMock(
             return_value={"id": orphan_id, "user_id": None, "title": "orphan"}
         )
-        # _resolve_cloud_session_url should NOT be reached.
+        # resolve_cloud_session_url should NOT be reached.
         sentinel = MagicMock(side_effect=AssertionError("called past gate"))
-        with (
-            _patch_caller_and_db(user_a, fake_db),
-            patch("orchestrator.main._resolve_cloud_session_url", sentinel),
-        ):
+        with _patch_caller(user_a):
             with pytest.raises(HTTPException) as exc:
-                await get_thread(orphan_id, fake_request)
+                await thread_session.get_thread(
+                    orphan_id,
+                    fake_request,
+                    dependencies=_session_deps(fake_db, sentinel),
+                )
         assert exc.value.status_code == 403
         sentinel.assert_not_called()
 
@@ -386,46 +429,44 @@ class TestThreadEndpointGates:
     async def test_get_thread_cross_user_blocked(
         self, user_b, thread_a, fake_db, fake_request
     ):
-        from orchestrator.main import get_thread
-
         sentinel = MagicMock(side_effect=AssertionError("called past gate"))
-        with (
-            _patch_caller_and_db(user_b, fake_db),
-            patch("orchestrator.main._resolve_cloud_session_url", sentinel),
-        ):
+        with _patch_caller(user_b):
             with pytest.raises(HTTPException) as exc:
-                await get_thread(str(thread_a["id"]), fake_request)
+                await thread_session.get_thread(
+                    str(thread_a["id"]),
+                    fake_request,
+                    dependencies=_session_deps(fake_db, sentinel),
+                )
         assert exc.value.status_code == 403
+        sentinel.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_get_thread_owner_passes(
         self, user_a, thread_a, fake_db, fake_request
     ):
-        from orchestrator.main import get_thread
-
-        with (
-            _patch_caller_and_db(user_a, fake_db),
-            patch(
-                "orchestrator.main._resolve_cloud_session_url",
-                MagicMock(return_value=None),
-            ),
-        ):
-            result = await get_thread(str(thread_a["id"]), fake_request)
+        with _patch_caller(user_a):
+            result = await thread_session.get_thread(
+                str(thread_a["id"]),
+                fake_request,
+                dependencies=_session_deps(fake_db, MagicMock(return_value=None)),
+            )
         assert result["id"] == thread_a["id"]
 
     @pytest.mark.asyncio
     async def test_get_thread_messages_history_cross_user_blocked(
         self, user_b, thread_a, fake_db, fake_request
     ):
-        from orchestrator.main import get_thread_messages_history
-
         fake_db.get_thread_messages_history = AsyncMock(
             side_effect=AssertionError("called past gate")
         )
-        with _patch_caller_and_db(user_b, fake_db):
+        with _patch_caller(user_b):
             with pytest.raises(HTTPException) as exc:
-                await get_thread_messages_history(
-                    str(thread_a["id"]), fake_request, limit=200, offset=0
+                await thread_history.get_thread_messages_history(
+                    str(thread_a["id"]),
+                    fake_request,
+                    limit=200,
+                    offset=0,
+                    dependencies=_history_deps(fake_db),
                 )
         assert exc.value.status_code == 403
 
@@ -433,8 +474,6 @@ class TestThreadEndpointGates:
     async def test_thread_event_stream_orphan_blocked(
         self, user_a, fake_db, fake_request
     ):
-        from orchestrator.main import thread_event_stream
-
         orphan_id = "ccc55555-5555-5555-5555-555555555555"
         fake_db.get_thread = AsyncMock(
             return_value={
@@ -444,7 +483,9 @@ class TestThreadEndpointGates:
                 "title": "x",
             }
         )
-        with _patch_caller_and_db(user_a, fake_db):
+        with _patch_caller(user_a):
             with pytest.raises(HTTPException) as exc:
-                await thread_event_stream(orphan_id, fake_request)
+                await thread_transport.thread_event_stream(
+                    orphan_id, fake_request, dependencies=_transport_deps(fake_db)
+                )
         assert exc.value.status_code == 403

@@ -1051,6 +1051,7 @@
         "unset": "— not set —",
         "none": "None",
         "sameSearchWarning": "This matches the primary search provider, so runtime failover is suppressed.",
+        "autoPinned": "Picked automatically because no default was set. Choose another model to change it.",
         "emptyCatalog": "No models in the catalog yet. Add a provider key or endpoint above, then pick a default.",
         "auxiliaryGroup": "Auxiliary (helper)",
         "kind": {

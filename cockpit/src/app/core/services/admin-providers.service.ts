@@ -42,6 +42,8 @@ export interface HelmManagedDefault {
   source: HelmProvenanceSource | null;
   managed_by_helm: boolean;
   helm_drift: boolean;
+  /** The system pinned it because a required kind had models but no pin. */
+  auto_pinned?: boolean;
 }
 
 /**

@@ -7,7 +7,12 @@ catalog row exists. This module computes the readiness signal that:
 - Powers the cockpit's onboarding checklist (provider → models → model defaults
   pinned → application expert defaults selected).
 - Gates ``POST /api/jobs`` and ``POST /api/persistent/threads`` with a
-  503 when one of the three required capabilities is missing.
+  503 when a required capability is missing.
+
+It also owns the auto-pin (:func:`auto_pin_required_defaults`): a required
+capability that has enabled catalog rows but no default pin gets one, so a
+fresh install that adds one model per capability is ready without a trip to
+Admin → Models → Defaults.
 
 Required capabilities: ``chat``, ``embedding``, ``auxiliary``, ``rerank``.
 Optional: ``vision`` (falls back to chat when
@@ -32,8 +37,13 @@ an obvious cause.
 
 from __future__ import annotations
 
+import logging
 import os
 from typing import Any
+
+from shared.helm_provenance import AUTO_PIN_BREADCRUMB, SOURCE_DEFAULT
+
+logger = logging.getLogger(__name__)
 
 # Capabilities that *must* be ready before the cockpit releases. Aligns
 # with knowledge-base/knowledge/features/models_yaml_removal.md §"Role-completeness gate".
@@ -148,6 +158,61 @@ async def compute_readiness(db: Any) -> dict[str, Any]:
         "missing_expert_defaults": missing_expert_defaults,
         "optional_capability_fallbacks": optional_fallbacks,
     }
+
+
+async def auto_pin_required_defaults(db: Any) -> list[tuple[str, str]]:
+    """Pin a default for each required capability that has rows but no pin.
+
+    The pinned row is the one dispatch already falls back to when no pin
+    exists (the first enabled row by ``display_label``, see
+    ``PostgresDB.resolve_default_for_capability``), so auto-pinning changes
+    no runtime behaviour: it only makes the choice visible in Admin → Models
+    → Defaults and satisfies the readiness gate. In the usual one-model-at-a-
+    time setup that is simply the first model added for the capability.
+
+    Never replaces a pin: a capability that already names a model is skipped,
+    and the write itself is conditional, so an admin pin racing this call
+    wins. Auto pins carry ``updated_by=AUTO_PIN_BREADCRUMB`` so a declared
+    ``llm.seed.defaults`` entry can still replace them.
+
+    Returns the ``(capability, model_id)`` pairs it pinned.
+    """
+    pinned = set(await db.list_default_pin_capabilities())
+    pinned_now: list[tuple[str, str]] = []
+    for capability in REQUIRED_CAPABILITIES:
+        if capability in pinned:
+            continue
+        candidates = await db.list_models_by_capability_alphabetical(capability)
+        if not candidates:
+            continue
+        model_id = candidates[0]["model_id"]
+        if await db.pin_default_llm_model_if_unset(
+            capability,
+            model_id,
+            updated_by=AUTO_PIN_BREADCRUMB,
+            source=SOURCE_DEFAULT,
+        ):
+            logger.info(
+                "auto-pinned default %s model to %s (no pin was set)",
+                capability,
+                model_id,
+            )
+            pinned_now.append((capability, model_id))
+    return pinned_now
+
+
+async def try_auto_pin_required_defaults(db: Any) -> list[tuple[str, str]]:
+    """:func:`auto_pin_required_defaults` for write paths that must not fail.
+
+    Called after catalog writes (admin API, seed Job, subscription import,
+    startup); a failure is logged and leaves the capability for the admin to
+    pin, which is exactly the pre-auto-pin behaviour.
+    """
+    try:
+        return await auto_pin_required_defaults(db)
+    except Exception:
+        logger.warning("auto-pinning required default models failed", exc_info=True)
+        return []
 
 
 async def _fallback_optional_capabilities_to_chat(db: Any) -> bool:

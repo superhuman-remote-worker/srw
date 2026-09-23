@@ -6,7 +6,6 @@ Run with:
 
 import asyncio
 import functools
-import html
 import json
 import logging
 import os
@@ -14,7 +13,6 @@ import sys
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
-import urllib.parse
 from urllib.parse import urlparse
 
 from dotenv import find_dotenv, load_dotenv
@@ -48,7 +46,7 @@ from datetime import date, datetime, timedelta, timezone  # noqa: E402
 from decimal import Decimal  # noqa: E402
 from collections.abc import Mapping  # noqa: E402
 from typing import Any, Literal, Optional  # noqa: E402
-from uuid import UUID, uuid4  # noqa: E402
+from uuid import UUID  # noqa: E402
 
 from fastapi import (  # noqa: E402
     FastAPI,
@@ -58,18 +56,9 @@ from fastapi import (  # noqa: E402
 )
 from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
 from fastapi.responses import (  # noqa: E402
-    HTMLResponse,
     JSONResponse,
-    Response,
-    StreamingResponse,
 )
 
-from pydantic import (  # noqa: E402
-    BaseModel,
-    ConfigDict,
-    Field,
-    model_validator,
-)
 
 from orchestrator.database import (  # noqa: E402
     PostgresDB,
@@ -117,7 +106,6 @@ from orchestrator.security.access import (  # noqa: E402
     user_visible_project_ids,
 )
 from orchestrator.security.csrf import CSRFMiddleware  # noqa: E402
-from orchestrator.security.token_scopes import tethers_session  # noqa: E402
 from shared.anti_framing import (  # noqa: E402
     TrustedParentAntiFramingMiddleware,
 )
@@ -363,6 +351,23 @@ from orchestrator.routers import job_lifecycle as job_lifecycle_routes  # noqa: 
 from orchestrator.routers import thread_lifecycle as thread_lifecycle_routes  # noqa: E402
 from orchestrator.routers import thread_rewind as thread_rewind_routes  # noqa: E402
 from orchestrator.routers import verification as verification_routes  # noqa: E402
+
+# R1.B10 — session projections, history, transport, permissions and the
+# attention/wake bodies. Main composes their dependencies and keeps route
+# positions, task creation and leader gating (B11).
+from orchestrator.routers import thread_history as thread_history_routes  # noqa: E402
+from orchestrator.routers import thread_permissions as thread_permission_routes  # noqa: E402
+from orchestrator.routers import thread_session as thread_session_routes  # noqa: E402
+from orchestrator.routers import thread_transport as thread_transport_routes  # noqa: E402
+from orchestrator.services import (  # noqa: E402
+    pinned_forwarding as pinned_forwarding_operations,
+    session_attention as session_attention_operations,
+    session_tool_view as session_tool_view_operations,
+    stateless_input_admission as stateless_input_operations,
+    thread_permissions as thread_permission_operations,
+    thread_projection as thread_projection_operations,
+)
+from orchestrator.services.thread_turn_locks import ThreadTurnLocks  # noqa: E402
 from orchestrator.services import (  # noqa: E402
     completion_effects as completion_effect_operations,
     completion_recovery as completion_recovery_operations,
@@ -682,6 +687,7 @@ from orchestrator.routers.contacts import router as contacts_router  # noqa: E40
 from orchestrator.services.cron_dispatcher import cron_dispatcher_loop  # noqa: E402
 from orchestrator.services.project_loop_sweeper import project_loop_sweeper_loop  # noqa: E402
 from orchestrator.services.session_wake import (  # noqa: E402
+    bind_officer_wake_metering,
     deliver_officer_note as _deliver_officer_note,
     kick_drain as _kick_session_wake_drain,
     kick_event_drain as _kick_officer_event_drain,
@@ -690,26 +696,6 @@ from orchestrator.services.session_wake import (  # noqa: E402
     notify_officer,
     notify_owning_officers,
     session_wake_sweeper_loop,
-)
-from orchestrator.services.session_state_snapshot import (  # noqa: E402
-    build_session_state_snapshot,
-)
-from orchestrator.services.thread_control_inbox import (  # noqa: E402
-    ControlAdmissionError,
-    ControlAdmissionNotReady,
-    admit_thread_control,
-    find_existing_thread_control,
-)
-from orchestrator.services.thread_interrupt_inbox import (  # noqa: E402
-    InterruptAdmissionError,
-    admit_thread_interrupt,
-    find_existing_thread_interrupt,
-)
-from shared.thread_presence import (  # noqa: E402
-    DEFAULT_PRESENCE_RENEW_SECONDS,
-    DEFAULT_PRESENCE_TTL_SECONDS,
-    promote_expired_stateless_pauses,
-    refresh_thread_presence,
 )
 from shared.pinned_session_identity import PinnedSessionBinding  # noqa: E402
 from shared.pinned_session_identity import PinnedJobRecipient  # noqa: E402, F401
@@ -795,14 +781,6 @@ from orchestrator.services.virtual_workspace import (  # noqa: E402
     virtual_workspace_rclone_spec as _virtual_workspace_rclone_spec,
 )
 from orchestrator.services.workspace import workspace_service  # noqa: E402
-from orchestrator.services.session_runtime_admission import (  # noqa: E402
-    ThreadRuntimeAuthority,
-    pinned_binding_invalid_detail,
-    protected_cloud_marker_state,
-    same_thread_runtime_authority,
-    thread_runtime_authority,
-    thread_runtime_refusal_detail,
-)
 from orchestrator.services.gitea import (  # noqa: E402
     GiteaClient,
     GiteaPathError,
@@ -861,17 +839,9 @@ from shared.workspace_contract import (  # noqa: E402
 
 # Datasource type → tool-category map, shared with the agent's session attach
 # path so the two boundaries can't drift (live_session_settings.md P0.2).
-from shared.runtime.core.tool_policy import (  # noqa: E402
-    enumerate_only_members,
-)
-from shared.runtime.core.tool_report import (  # noqa: E402
-    compose_tool_view,
-    tool_groups_from_view,
-)
 
 # Tool -> category, for annotating replayed history (_stamp_tool_categories).
 # Same registry the agent's live SSE frames read, so the two can't disagree.
-from shared.tool_catalog import TOOL_REGISTRY  # noqa: E402
 from orchestrator.services.nats_bridge import nats_bridge  # noqa: E402
 from orchestrator.services.vm_provisioner import vm_provisioner  # noqa: E402
 from orchestrator.services.vm_workspace_config import vm_provisioning_options  # noqa: E402
@@ -895,7 +865,6 @@ from orchestrator.services.docker_provisioner import docker_provisioner  # noqa:
 from orchestrator.services.persistent_provisioner import persistent_provisioner  # noqa: E402
 from orchestrator.services.persistent_recycler import (  # noqa: E402
     PersistentThreadRecycler,
-    read_recycle_record,
 )
 from orchestrator.services.pinned_agent_authority import (  # noqa: E402
     reconcile_legacy_pinned_agent_authority,
@@ -951,8 +920,6 @@ from orchestrator.services.ide_proxy import (  # noqa: E402
     ide_proxy_service,
 )
 from orchestrator.services.email import email_service  # noqa: E402
-from orchestrator.services import headless_notifications  # noqa: E402
-from orchestrator.services.brand import TRAVERTINE as _BRAND  # noqa: E402
 from orchestrator.services.imap_poller import imap_poller  # noqa: E402
 from orchestrator.services.notification_service import (  # noqa: E402
     notification_service,
@@ -2788,22 +2755,6 @@ async def _resolve_session_config(*args: Any, **kwargs: Any) -> Any:
 #: every session — the exact silently-wrong answer this endpoint removes.
 
 
-from orchestrator.services.session_tool_policy import (  # noqa: E402
-    merged_session_tool_policy as _merged_session_tool_policy,
-)
-
-
-from orchestrator.services.session_tool_policy import (  # noqa: E402
-    legacy_session_tool_policy as _legacy_session_tool_policy,
-)
-
-
-from orchestrator.services.agent_toolset_probe import unmeasured as _unmeasured  # noqa: E402
-
-
-from orchestrator.services.agent_toolset_probe import origin_fields as _origin_fields  # noqa: E402
-
-
 def _agent_toolset_dependencies() -> agent_toolset_probe.AgentToolsetDependencies:
     return agent_toolset_probe.AgentToolsetDependencies(store=postgres_db)
 
@@ -4499,6 +4450,18 @@ class CustomJSONResponse(JSONResponse):
         ).encode("utf-8")
 
 
+def _bind_officer_wake_metering() -> None:
+    """Bind this application's store to its usage ledger for Officer wakes.
+
+    The daily-ceiling brake runs inside the session-wake drain, which every
+    caller reaches with only the store. The provider reads this module's
+    ``usage_ledger`` per check, so a ledger built later in startup (or never,
+    without the audit tier) is seen exactly as the former application lookup
+    saw it (R1.B10 caller closure: ``session_wake`` no longer imports ``main``).
+    """
+    bind_officer_wake_metering(postgres_db, lambda: usage_ledger)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan handler."""
@@ -4643,6 +4606,11 @@ async def lifespan(app: FastAPI):
             "ensure_elevenlabs_tts_endpoint failed at startup", exc_info=True
         )
 
+    # Pin a default for each required capability that has catalog rows but no
+    # pin (bare-metal init.py rows, installs upgraded with rows never pinned).
+    # Best-effort: logs and leaves the pin to the admin on failure.
+    await readiness_service.try_auto_pin_required_defaults(postgres_db)
+
     # Usage-metering ledger (Slice 4). Writes go to the auditdb usage_events
     # table (None → no-op when the audit tier is absent); rates resolve against
     # the app-DB usage_rates table created by the migration above. Built here so
@@ -4655,6 +4623,7 @@ async def lifespan(app: FastAPI):
         audit_usage_pool,
         canonical_usage_rates,
     )
+    _bind_officer_wake_metering()
     # Rollup over the ledger (Phase 6 / D-1): aggregates the auditdb usage_events
     # firehose into the app-DB usage_daily mirror (+ rollup_state watermark) and
     # serves /api/usage from it for closed days, raw for the open tail. Same
@@ -5847,7 +5816,13 @@ async def lifespan(app: FastAPI):
         run_retention_sweeper(postgres_db, _shutdown_event, is_leader.is_set)
     )
     headless_notify_task = asyncio.create_task(
-        run_when_leader(thread_permission_notify_sweeper, _shutdown_event)
+        run_when_leader(
+            functools.partial(
+                session_attention_operations.thread_permission_notify_sweeper,
+                dependencies=_session_attention_dependencies(),
+            ),
+            _shutdown_event,
+        )
     )
     # Leader-gated: both snapshot/teardown idle workspaces (attention-sleep) or
     # delete idle IDE VMs/pods (ide-sweeper) after a plain SELECT, with no
@@ -5856,7 +5831,13 @@ async def lifespan(app: FastAPI):
     # mirrors the lifecycle reconciler, which already owns the parallel idle
     # workspace-teardown path. See knowledge-base/knowledge/tests/orchestrator_ha_background_loop_sweep.md.
     attention_sleep_task = asyncio.create_task(
-        run_when_leader(attention_sleep_sweeper, _shutdown_event)
+        run_when_leader(
+            functools.partial(
+                session_attention_operations.attention_sleep_sweeper,
+                dependencies=_session_attention_dependencies(),
+            ),
+            _shutdown_event,
+        )
     )
     # Officer (centurion) lifecycle: implicit-timer filing, overdue kicks,
     # rate-limited respawn. Leader-gated — respawn must be single-flight.
@@ -6995,7 +6976,7 @@ def _thread_admission_dependencies() -> (
         find_idle_persistent_agent=_find_idle_persistent_agent,
         send_session_attach=_send_session_attach,
         provision_or_assign=_provision_or_assign,
-        redact_thread_metadata=_redact_thread_metadata,
+        redact_thread_metadata=thread_projection_operations.redact_thread_metadata,
     )
 
 
@@ -7306,7 +7287,12 @@ def _notification_action_dependencies() -> (
         apply_vm_upgrade_decision=lambda *args, **kwargs: (
             _job_control_operations().apply_vm_upgrade_decision(*args, **kwargs)
         ),
-        decide_permission_request=_decide_permission_request,
+        decide_permission_request=(
+            lambda *args,
+            **kwargs: thread_permission_operations.decide_permission_request(
+                postgres_db, *args, **kwargs
+            )
+        ),
         job_resume_request=JobResumeRequest,
         job_approve_request=JobApproveRequest,
     )
@@ -9701,15 +9687,6 @@ def _redact_job_config_override(job: dict[str, Any]) -> dict[str, Any]:
     )
 
 
-def _redact_nested_workspace_state(
-    record: dict[str, Any], *, field: str
-) -> dict[str, Any]:
-    """Shared thread/job redaction; policy lives in job_projection."""
-    return job_projection.redact_nested_workspace_state(
-        record, field=field, runtime_incarnation_key=WORKSPACE_RUNTIME_INCARNATION_KEY
-    )
-
-
 def _resolve_exported_folder_url(handle_str: str | None) -> Optional[str]:
     """Resolve export URLs through the application-owned cloud router."""
     return job_projection.resolve_exported_folder_url(
@@ -9987,79 +9964,6 @@ async def _require_job_project_access(
     )
     if role not in {"editor", "owner"}:
         raise HTTPException(status_code=403, detail=denial_detail)
-
-
-def _redact_thread_metadata(thread: dict[str, Any]) -> dict[str, Any]:
-    """Parse and strip credential fields from a thread's ``metadata`` before
-    it leaves over REST.
-
-    ``metadata`` is a JSONB column asyncpg hands back as a JSON *string*.
-    This helper used to "re-serialize to the original representation", which
-    meant the owner-facing thread endpoints returned metadata as a string —
-    silently breaking every Cockpit consumer typed against
-    ``metadata?: Record<string, unknown>`` (settings-pane config/tools
-    prefill, the attached-datasource default, and the REST model/temperature
-    seeding — the long-standing "model shows the config name until the
-    welcome frame" oddity). The contract is now: metadata always leaves as a
-    parsed OBJECT (unparseable/absent → ``{}``).
-    """
-    raw_retirement_context = thread.get("runtime_retirement_context") or {}
-    if isinstance(raw_retirement_context, str):
-        try:
-            raw_retirement_context = json.loads(raw_retirement_context)
-        except (json.JSONDecodeError, TypeError):
-            raw_retirement_context = {}
-    # The token is installed before abortable turn/Officer preflight.  Only
-    # the append-only authorized edge is a public `ending` state; exposing the
-    # hidden preflight would make Cockpit retire control even when a non-force
-    # End is about to abort as an observational no-op.
-    retirement_pending = bool(
-        thread.get("runtime_retirement_token") is not None
-        and thread.get("runtime_retirement_authorized_at") is not None
-    )
-    retirement_disposition: str | None = None
-    if retirement_pending and isinstance(raw_retirement_context, Mapping):
-        candidate = str(raw_retirement_context.get("settle_status") or "")
-        if candidate in {"ended", "suspended"}:
-            retirement_disposition = candidate
-
-    thread = _redact_nested_workspace_state(thread, field="metadata")
-    md = thread.get("metadata")
-    if isinstance(md, str):
-        try:
-            md = json.loads(md)
-        except (json.JSONDecodeError, TypeError):
-            md = {}
-    if not isinstance(md, dict):
-        md = {}
-    thread = dict(thread)
-    md = dict(md)
-    if "config_override" in md:
-        md["config_override"] = redact_config_override(md["config_override"])
-    md.pop("_workspace_binding", None)
-    md.pop("_stateless_workspace_process_zero_observation", None)
-    thread["metadata"] = md
-    # These are internal capabilities or immutable physical cleanup evidence,
-    # not owner API fields.  Never let a broad SELECT * list/detail response
-    # leak them.  Cockpit gets only the durable, non-secret lifecycle shape.
-    for internal_key in (
-        "runtime_generation",
-        "runtime_attach_token",
-        "runtime_attach_abort_receipt",
-        "runtime_authority_exposed",
-        "runtime_retirement_token",
-        "runtime_retirement_permanent",
-        "runtime_retirement_started_at",
-        "runtime_retirement_authorized_at",
-        "runtime_retirement_context",
-        "runtime_retirement_stage_receipt",
-        "runtime_retirement_local_quiescence",
-        "runtime_retirement_external_cleanup",
-    ):
-        thread.pop(internal_key, None)
-    thread["runtime_retirement_pending"] = retirement_pending
-    thread["retirement_disposition"] = retirement_disposition
-    return thread
 
 
 async def get_job(request: Request, job_id: str) -> dict[str, Any]:
@@ -10720,736 +10624,46 @@ async def _apply_thread_config_update_locked(
 
 
 # =============================================================================
-# Persistent Agent — Thread CRUD + WebSocket Proxy
+# Persistent Agent — session surface (R1.B10)
 # =============================================================================
+#
+# Detail, state, controls, tool groups/preview and rename are served by
+# routers/thread_session.py; history and citations by routers/thread_history.py;
+# stream, input, queue and interrupt by routers/thread_transport.py; permission
+# decisions and magic links by routers/thread_permissions.py. Each router is
+# included where its routes used to be declared, so route order is unchanged.
+# The factories are rebuilt per call and read this module's collaborators at
+# call time.
 
 
-@app.get("/api/persistent/threads/{thread_id}")
-async def get_thread(thread_id: str, request: Request) -> dict[str, Any]:
-    """Get thread status and metadata (auth: owner only).
-
-    Phase 1 of cloud_collaboration_model.md §9 surfaces the thread's
-    attached mounts here so the Cockpit "Project files" panel can render
-    them without a second round-trip. ``project_ids`` is the derived
-    list-of-strings view kept stable for callers that only need scoping.
-
-    Threads created before migration 0202 have ``ssh_handle IS NULL``; mint
-    one lazily here on first view rather than showing an empty SSH panel
-    forever. Deliberately not done on the list endpoint — minting up to 50
-    handles as a side effect of rendering a list is unwanted write
-    amplification.
-
-    The mint is guarded (M-1): it's a write on an otherwise read-only view,
-    so a write failure here (a read-only replica, a full disk — this
-    deployment has actually had one) must not turn the whole thread view
-    into a 500 for the sake of one SSH-panel field. Caught broadly since
-    ``ensure_thread_ssh_handle`` can raise asyncpg errors or its own
-    exhausted-retries ``RuntimeError``; either way the response degrades to
-    a null handle (the panel already renders "unavailable" for that).
-    """
-    user, thread = await require_thread_owner(request, postgres_db, thread_id)
-    result = _redact_thread_metadata(dict(thread))
-    if not result.get("ssh_handle"):
-        try:
-            result["ssh_handle"] = await postgres_db.ensure_thread_ssh_handle(thread_id)
-        except Exception:
-            logger.warning(
-                "ensure_thread_ssh_handle failed for thread %s (non-fatal)",
-                str(thread_id)[:8],
-                exc_info=True,
-            )
-    mounts = await postgres_db.list_thread_mounts(thread_id)
-    result["cloud_session_url"] = _resolve_cloud_session_url(thread, mounts)
-    result["mounts"] = [
-        {
-            "id": str(m["id"]),
-            "mount_kind": m["mount_kind"],
-            "target_path": m["target_path"],
-            "source_kind": m["source_kind"],
-            "source_ref": str(m["source_ref"]) if m.get("source_ref") else None,
-            "backend_id": m.get("backend_id"),
-        }
-        for m in mounts
-    ]
-    result["project_ids"] = [
-        str(m["source_ref"])
-        for m in mounts
-        if m.get("mount_kind") == "project" and m.get("source_ref")
-    ]
-    return result
-
-
-@app.get("/api/persistent/threads/{thread_id}/state")
-async def get_thread_session_state(
-    thread_id: str, request: Request, response: Response
-) -> dict[str, Any]:
-    """Lane-agnostic, owner-gated current state for a session Cockpit.
-
-    This is the REST twin of the agent's direct ``session.state`` welcome
-    frame.  It intentionally reads durable state for *both* execution lanes;
-    no lane or pod identity crosses the wire.  Journal-derived fields are
-    point-in-time values at ``event_cursor``.  A client must apply the snapshot
-    before replaying the journal from ``replay_cursor`` so the latest logical
-    turn is rebuilt before any not-yet-flushed agent edge advances it.
-    """
-
-    started = time.perf_counter()
-    _user, _thread = await require_thread_owner(request, postgres_db, thread_id)
-    auth_done = time.perf_counter()
-
-    # Model/temperature/narration are not all first-class thread columns yet.
-    # Resolve from the exact thread row captured inside the snapshot's
-    # repeatable-read transaction. A later config write then lands above the
-    # returned event cursor and SSE replays it, instead of the cursor hiding a
-    # scalar resolved from a different metadata revision.
-    config_seconds = 0.0
-
-    async def _resolve_snapshot_config(
-        snapshot_thread: dict[str, Any], snapshot_metadata: dict[str, Any]
-    ) -> dict[str, Any] | None:
-        nonlocal config_seconds
-        config_started = time.perf_counter()
-        try:
-            return await _resolve_session_config(snapshot_thread, snapshot_metadata)
-        except GrantDenied:
-            logger.warning(
-                "Session-state config resolve denied for thread %s; using stored "
-                "display fields",
-                thread_id,
-            )
-            return None
-        finally:
-            config_seconds += time.perf_counter() - config_started
-
-    snapshot = await build_session_state_snapshot(
-        postgres_db,
-        thread_id,
-        config_resolver=_resolve_snapshot_config,
-    )
-    if snapshot is None:
-        raise HTTPException(status_code=404, detail="Thread not found")
-    # Pending permissions include tool arguments. Never let a browser or an
-    # intermediary retain one user's current control state for another read.
-    response.headers["Cache-Control"] = "private, no-store"
-    finished = time.perf_counter()
-    logger.info(
-        "session-state timing: thread=%s auth=%.3fs config=%.3fs "
-        "snapshot=%.3fs total=%.3fs",
-        thread_id,
-        auth_done - started,
-        config_seconds,
-        max(0.0, finished - auth_done - config_seconds),
-        finished - started,
-    )
-    return snapshot
-
-
-class ThreadControlRequest(BaseModel):
-    """Strict public envelope for the durable control-inbox subset."""
-
-    client_request_id: UUID
-    method: Literal["mode.set", "narration.set", "workspace.undo"]
-    session_runtime_generation: UUID | None = Field(
-        None,
-        description=(
-            "Runtime generation rendered with the current session. Pinned "
-            "admission compares it under the thread-row lock."
-        ),
-    )
-    mode: (
-        Literal[
-            "supervised",
-            "auto_accept",
-            "autonomous",
-            "silent",
-            "verbose",
-            "auto",
-        ]
-        | None
-    ) = None
-
-    @model_validator(mode="after")
-    def validate_method_mode_pair(self) -> "ThreadControlRequest":
-        permission_modes = {"supervised", "auto_accept", "autonomous"}
-        narration_modes = {"silent", "verbose", "auto"}
-        if self.method == "mode.set" and self.mode not in permission_modes:
-            raise ValueError("mode.set requires a permission mode")
-        if self.method == "narration.set" and self.mode not in narration_modes:
-            raise ValueError("narration.set requires a narration mode")
-        if self.method == "workspace.undo" and self.mode is not None:
-            raise ValueError("workspace.undo does not accept a mode")
-        return self
-
-    def control_payload(self) -> dict[str, Any]:
-        """Canonical payload used for idempotency and durable admission."""
-
-        return {} if self.method == "workspace.undo" else {"mode": self.mode}
-
-
-@app.post(
-    "/api/persistent/threads/{thread_id}/controls",
-    status_code=202,
-)
-async def submit_thread_control(
-    thread_id: str,
-    body: ThreadControlRequest,
-    request: Request,
-) -> dict[str, Any]:
-    """Admit an owner-authorized control for the exact serving owner.
-
-    This endpoint serves both execution lanes and deliberately exposes neither
-    one. It persists a commit-ordered request, but neither the desired scalar
-    nor a journal frame: the current lease owner (or exact reciprocal pinned
-    binding) applies the request and journals the result with its own allocator.
-    """
-    from shared.run_queue import LANE_STATELESS
-
-    started = time.perf_counter()
-    user, thread = await require_thread_owner(request, postgres_db, thread_id)
-    thread_owner_id = thread.get("user_id")
-    policy_user_id = str(thread_owner_id or user["id"])
-    control_payload = body.control_payload()
-    control_metadata = thread_metadata_object(thread)
-    require_control_generation = bool(
-        thread.get("execution_lane") == "pinned"
-        and (
-            protected_cloud_marker_state(control_metadata) != "off"
-            or _require_pinned_status_identity()
-        )
+def _session_tool_view_dependencies() -> (
+    session_tool_view_operations.SessionToolViewDependencies
+):
+    return session_tool_view_operations.SessionToolViewDependencies(
+        store=postgres_db,
+        user_experts_enabled=_user_experts_enabled,
+        resolve_runner_grants=_resolve_runner_grants,
+        acknowledged_grant_strip=_acknowledged_grant_strip,
+        prefetch_roster_refs=_prefetch_roster_refs,
+        agent_toolset_measurement=_agent_toolset_measurement,
+        session_config_dependencies=_session_config_dependencies,
     )
 
-    try:
-        existing = await find_existing_thread_control(
-            postgres_db,
-            thread_id=thread_id,
-            owner_user_id=thread_owner_id,
-            client_request_id=body.client_request_id,
-            verb=body.method,
-            payload=control_payload,
-        )
-    except ControlAdmissionError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
-    # A new stateless control can create a control-only queue claim just like
-    # human input. Refuse unsupported workspace bindings before that durable
-    # admission can wake an executor. Exact idempotent retries remain observable
-    # even if the thread's lane/tier changed after their commit.
-    if existing is None and thread.get("execution_lane") == LANE_STATELESS:
-        _require_stateless_workspace(thread)
-
-    if body.method == "mode.set" and existing is None:
-        # Same PDP as create/attach/config.update. A stale or direct client
-        # cannot persist a permission mode above the owner's current ceiling.
-        # A retry of an already committed UUID bypasses mutable policy: a lost
-        # 202 must stay observable even if grants changed afterward.
-        try:
-            await _enforce_session_create_grants(
-                {"interactive": {"permission_mode": body.mode}},
-                user_id=policy_user_id,
-                project_ids=(
-                    [str(thread["project_id"])] if thread.get("project_id") else []
-                ),
-            )
-        except HTTPException:
-            # Close the concurrent masked-commit race between the preflight
-            # and PDP without weakening authorization for a genuinely new id.
-            try:
-                existing = await find_existing_thread_control(
-                    postgres_db,
-                    thread_id=thread_id,
-                    owner_user_id=thread_owner_id,
-                    client_request_id=body.client_request_id,
-                    verb=body.method,
-                    payload=control_payload,
-                )
-            except ControlAdmissionError as exc:
-                raise HTTPException(status_code=409, detail=str(exc)) from exc
-            if existing is None:
-                raise
-
-    actor_id = str(user.get("id") or user.get("sub") or "rest_client")
-    try:
-        admitted = await admit_thread_control(
-            postgres_db,
-            thread_id=thread_id,
-            owner_user_id=thread_owner_id,
-            client_request_id=body.client_request_id,
-            verb=body.method,
-            payload=control_payload,
-            requested_by=actor_id,
-            expected_runtime_generation=body.session_runtime_generation,
-            require_pinned_runtime_generation=require_control_generation,
-        )
-    except ControlAdmissionNotReady as exc:
-        # Registration intentionally keeps the exact pinned-owner capability
-        # closed until its writer and first inbox drain are ready.  A control
-        # clicked during that window is not a semantic conflict: 425 tells the
-        # lane-free client to retry the same UUID after its bounded backoff.
-        raise HTTPException(status_code=425, detail=str(exc)) from exc
-    except ControlAdmissionError as exc:
-        raise HTTPException(status_code=409, detail=str(exc)) from exc
-
-    await log_security_event(
-        postgres_db,
-        resource_type="thread",
-        event_type="session_control_requested",
-        user=user,
-        resource_id=thread_id,
-        detail=f"verb={body.method} request_seq={admitted.request_seq}",
-        request=request,
+def _thread_session_dependencies() -> thread_session_routes.ThreadSessionDependencies:
+    return thread_session_routes.ThreadSessionDependencies(
+        store=postgres_db,
+        require_thread_owner=require_thread_owner,
+        require_approved_user=require_approved_user,
+        resolve_cloud_session_url=_resolve_cloud_session_url,
+        resolve_session_config=_resolve_session_config,
+        enforce_session_create_grants=_enforce_session_create_grants,
+        tool_view=_session_tool_view_dependencies(),
     )
-    logger.info(
-        "session-control admission: thread=%s verb=%s seq=%d duplicate=%s total=%.3fs",
-        thread_id,
-        body.method,
-        admitted.request_seq,
-        admitted.duplicate,
-        time.perf_counter() - started,
-    )
-    return {
-        "accepted": True,
-        "request_id": str(admitted.id),
-        "client_request_id": str(admitted.client_request_id),
-        "request_seq": admitted.request_seq,
-        "method": admitted.verb,
-        "state": admitted.state,
-        "duplicate": admitted.duplicate,
-        "session_runtime_generation": (
-            str(admitted.runtime_generation)
-            if admitted.runtime_generation is not None
-            else None
-        ),
-    }
 
 
-async def _session_tool_grants(thread: dict[str, Any]) -> dict[str, Any] | None:
-    """The owner's capability grants, for explaining an ``unavailable``.
-
-    ``None`` means "impose no grant-based restriction" — both for an admin
-    (``_resolve_runner_grants`` returns ``None``) and for a lookup failure. A
-    read surface must never INVENT a denial: the PDP at attach and dispatch is
-    the enforcement, this is only the explanation, and a fabricated
-    "unavailable — needs the shell_tools grant" is its own D1 violation.
-    """
-    try:
-        project_ids = [str(thread["project_id"])] if thread.get("project_id") else []
-        return await _resolve_runner_grants(
-            runner_user_id=str(thread.get("user_id"))
-            if thread.get("user_id")
-            else None,
-            project_ids=project_ids,
-        )
-    except Exception:
-        logger.warning(
-            "Tool-group grant lookup failed for thread %s; reporting no "
-            "grant-based restrictions",
-            thread.get("id"),
-        )
-        return None
-
-
-@app.get("/api/persistent/threads/{thread_id}/tool-groups")
-async def get_thread_tool_groups(thread_id: str, request: Request) -> dict[str, Any]:
-    """What toolset does this session's agent actually have? (auth: owner)
-
-    D6: **the answer comes from the agent.** The orchestrator asks the bound
-    pod what it bound and serves that; it does not recompute it. Only the agent
-    sees the runtime injection layer (``persistent_session._load_tools_for_backend``
-    appends the session-task trio, the product guide, the fleet/catalog/workflow
-    lists, ``srw_cloud_status``, the officer pair, the datasource categories),
-    ``filter_tools_by_backend``, and ``load_tools``'s per-tool fallback. A
-    config-only view over-reports by dozens of names, and the divergence
-    between two implementations of one fact is the original bug here.
-
-    ``origin`` is the field that matters, and callers MUST branch on it:
-
-    - ``agent`` — **measured, in full**. A running pod enumerated its bound
-      tools and returned the structured report. ``observed_at`` and ``backend``
-      are set.
-    - ``agent_partial`` — **measured, names only**. The pod answered but its
-      image predates ``GET /session/toolset``, so the bound names come from
-      ``/status`` with no timestamp, no workspace capabilities and no
-      agent-side categorisation. ``degraded_reason`` says so. The names are as
-      trustworthy as ``agent``; do NOT render a workspace-tier explanation from
-      this answer, and do NOT infer measured-ness from ``observed_at``, which
-      is legitimately null here.
-    - ``prediction`` — **forecast** from the merged config, because there is no
-      agent to ask (a new session, a suspended one, an unreachable pod).
-      ``prediction_reason`` says which. Structurally weaker, not merely older:
-      it cannot see the three layers listed above. Rendering it as fact is D1
-      violated at a new seam.
-
-    ``categories`` answers for ALL of them (25, ``mcp`` included), each with
-    ``state`` (``on``/``off``/``unavailable``), ``reason`` when not settable,
-    ``settable``, ``decided_by`` (the layer that produced the answer) and
-    ``tools``. Measured entries also carry ``configured``, so a caller can see
-    the merge and the measurement disagree instead of having to trust one.
-
-    ``off`` is a promise that ticking the box would work, and it is only made
-    when it can be kept: on a measurement, a category whose merged config
-    grants tools while the agent bound none is ``unavailable``. See
-    ``compose_tool_view``.
-
-    ``source`` is unchanged and still describes the PREDICTION's model —
-    ``resolved`` / ``legacy`` / ``error``. It says nothing about ``origin``:
-    a measured answer is a measured answer whichever path the config took.
-
-    ``tool_groups`` (the closed groups, booleans) is retained for the
-    cockpit and is now DERIVED from ``categories`` rather than computed beside
-    it, so the endpoint cannot disagree with itself.
-
-    ``enumerate_only`` answers the *write* half of the same question: which
-    categories refuse ``tools.<c>: true`` at the write boundary, and the
-    registry-derived enumeration a caller must send instead
-    (``{"shell": ["cancel_command", ...]}``). Without it the only way for the
-    New Session form to offer "shell on" would be a hand-maintained tool-name
-    list in the cockpit — a fifth parallel list, in the change that deletes
-    four. See :func:`src.core.tool_policy.enumerate_only_members`.
-
-    Deliberately NOT a field on ``GET /api/persistent/threads/{id}``: that
-    endpoint is hot and this answer costs a config resolve plus a pod probe.
-    """
-    user, thread = await require_thread_owner(request, postgres_db, thread_id)
-    metadata = thread.get("metadata") or {}
-    if isinstance(metadata, str):
-        try:
-            metadata = json.loads(metadata)
-        except (json.JSONDecodeError, TypeError):
-            metadata = {}
-    request_override = metadata.get("config_override") or None
-
-    base = canonical_config_name(thread.get("config_name") or "session_base")
-    if _looks_like_uuid(base):
-        # Sentinel / cockpit-conflated expert UUID → the real session base.
-        base = "session_base"
-
-    m = await _agent_toolset_measurement(thread)
-    grants = await _session_tool_grants(thread)
-
-    from shared.runtime.core.subagent_roster import roster_summary
-
-    source = "resolved"
-    configured: dict[str, Any] = {}
-    provenance: dict[str, str] = {}
-    # What a Delegation tick reaches: the expert's materialised roster, or an
-    # empty one the pane can name as such. None only when the resolve failed.
-    roster: dict[str, Any] | None = None
-
-    if not _is_experts_db_enabled() or not await _user_experts_enabled():
-        source = "legacy"
-        configured, provenance = await asyncio.to_thread(
-            _legacy_session_tool_policy, base, request_override
-        )
-        # The legacy path merges a public base only; none carries a roster.
-        roster = roster_summary(None)
-    else:
-        try:
-            expert_id = metadata.get("expert_id")
-            expert_row = (
-                await postgres_db.get_expert_by_id(str(expert_id))
-                if expert_id
-                else None
-            )
-            project_id = str(thread["project_id"]) if thread.get("project_id") else None
-            project_overrides = None
-            if project_id and expert_id:
-                link = await postgres_db.get_project_expert_link(
-                    project_id=project_id, expert_id=str(expert_id)
-                )
-                if link:
-                    project_overrides = link.get("config_override") or None
-                    if isinstance(project_overrides, str):
-                        project_overrides = json.loads(project_overrides)
-            # Owner-correct, same as _session_tool_grants below: an admin
-            # viewing another user's thread must see THAT owner's
-            # acknowledged grants, not their own (see _acknowledged_grant_strip
-            # and the resume-time owner-vs-caller fix it mirrors).
-            grant_strip = await _acknowledged_grant_strip(
-                metadata,
-                user_id=str(thread["user_id"]) if thread.get("user_id") else None,
-                project_id=project_id,
-            )
-            # The same roster rows the attach prefetches: a DB `$ref` entry
-            # the resolve cannot see is dropped, and the pane would then
-            # report a roster the agent does bind as missing.
-            db_refs = await _prefetch_roster_refs(
-                expert_row=expert_row,
-                overrides=[project_overrides, request_override],
-                user_id=str(thread["user_id"]) if thread.get("user_id") else None,
-                project_ids=[project_id] if project_id else [],
-            )
-            capture: dict[str, Any] = {}
-            configured, provenance = await asyncio.to_thread(
-                _merged_session_tool_policy,
-                base_config_name=base,
-                expert_row=expert_row,
-                project_overrides=project_overrides,
-                request_override=request_override,
-                grant_strip=grant_strip,
-                db_refs=db_refs,
-                capture=capture,
-            )
-            roster = roster_summary(
-                (capture.get("merged_fragment") or {}).get("subagents")
-            )
-        except Exception:
-            logger.exception("Tool-group resolve failed for thread %s", thread_id)
-            source = "error"
-            if m.categories is None:
-                # No measurement AND no resolve: there is nothing honest to
-                # report. A resolve error REFUSES the attach (fail closed), so
-                # there is no agent answer either.
-                return {
-                    "thread_id": thread_id,
-                    "source": "error",
-                    **_origin_fields(m),
-                    "tool_groups": None,
-                    "categories": None,
-                    "subagents": None,
-                }
-
-    # Only a MEASURED answer carries backend capabilities: they come from the
-    # agent's own report. A prediction has no provisioned workspace to inspect,
-    # which is one of the three reasons it over-reports (the live gate saw it
-    # over-report by 14 execution tools on a no-shell tier).
-    view = compose_tool_view(
-        measured=m.categories,
-        configured=configured,
-        provenance=provenance,
-        backend_caps=m.backend,
-        grants=grants,
-    )
-    return {
-        "thread_id": thread_id,
-        "source": source,
-        **_origin_fields(m),
-        "enumerate_only": enumerate_only_members(),
-        "tool_groups": tool_groups_from_view(view),
-        "categories": view,
-        "subagents": roster,
-    }
-
-
-class ToolGroupPreviewRequest(BaseModel):
-    """What would a session or job created with THIS config bind? (a prediction)"""
-
-    config_name: Optional[str] = None
-    expert_id: Optional[str] = None
-    project_id: Optional[str] = None
-    config_override: Optional[dict[str, Any]] = None
-    workspace: Optional[dict[str, Any]] = None
-    workspace_preference: Literal["none", "virtual", "sandbox", "vm"] | None = None
-    #: Which surface is asking. ``worker`` is the job-create form and defaults
-    #: the base to ``worker_base``; ``session`` is the New Session form. Default
-    #: stays ``session`` so the shipped cockpit's payloads keep their meaning.
-    expert_type: Literal["worker", "session"] = "session"
-
-
-@app.post("/api/persistent/tool-groups/preview")
-async def preview_tool_groups(
-    body: ToolGroupPreviewRequest, request: Request
-) -> dict[str, Any]:
-    """The New Session form's read. **Always a prediction, by construction.**
-
-    There is no agent yet, so this endpoint can never return ``origin:
-    "agent"`` — and that is the point of it being a separate route rather than
-    a mode of the thread endpoint. D6's consequence is that the creation form
-    forecasts while the live pane measures; making the difference structural
-    (two routes, one of which cannot ever say "measured") is cheaper to keep
-    honest than a flag someone forgets to read.
-
-    ``source`` models the same three agent paths as the thread endpoint and is
-    NOT hardcoded: with the experts feature or the per-user kill switch off, a
-    created session takes the legacy path, where the compatibility groups are
-    APPENDED unless explicitly disabled — the opposite of the resolved path for
-    an unset group. Predicting "off" and labelling it ``resolved`` on such a
-    deployment would be this series' own defect, rebuilt in the form that
-    predicts it.
-
-    Same ``categories`` shape as the thread endpoint, so one renderer serves
-    both surfaces.
-    """
-    user = await require_approved_user(request, postgres_db)
-    is_worker = body.expert_type == "worker"
-    default_base = "worker_base" if is_worker else "session_base"
-    base = canonical_config_name(body.config_name or default_base)
-    if _looks_like_uuid(base):
-        base = default_base
-
-    expert_row = None
-    project_overrides = None
-    legacy = not _is_experts_db_enabled() or not await _user_experts_enabled()
-    try:
-        if body.expert_id and not legacy:
-            expert_row = await postgres_db.get_expert_by_id(str(body.expert_id))
-            if body.project_id:
-                link = await postgres_db.get_project_expert_link(
-                    project_id=str(body.project_id), expert_id=str(body.expert_id)
-                )
-                if link:
-                    project_overrides = link.get("config_override") or None
-                    if isinstance(project_overrides, str):
-                        project_overrides = json.loads(project_overrides)
-    except Exception:
-        logger.warning("Tool-group preview could not load the expert/project layer")
-
-    from orchestrator.services.manifest_workspace_selection import (
-        select_execution_workspace,
-    )
-    from shared.runtime.core.workspace_selection import bind_execution_workspace
-
-    account = (
-        await session_config_resolution.resolve_session_account_defaults(
-            str(user["id"]), dependencies=_session_config_dependencies()
-        )
-        if not is_worker
-        else {}
-    )
-    workspace_config, workspace_selection = await select_execution_workspace(
-        postgres_db,
-        user,
-        project_id=body.project_id,
-        role=body.expert_type,
-        workspace=body.workspace,
-        supplied="workspace" in body.model_fields_set,
-        config_override=body.config_override,
-        account_defaults=account,
-        request=request,
-    )
-    workspace_source = (
-        "project"
-        if workspace_selection and workspace_selection.get("project_revision")
-        else "request"
-        if "workspace" in body.model_fields_set
-        or "backend" in ((body.config_override or {}).get("workspace") or {})
-        else "default"
-    )
-    # A creation client can ask to preview its proposed recommendation. It must
-    # materialize that choice in the submitted execution; admission never reads it.
-    if workspace_source == "default" and body.workspace_preference is not None:
-        workspace_config["backend"] = body.workspace_preference
-        workspace_source = "recommendation"
-    preview_override = bind_execution_workspace(
-        body.config_override or {}, workspace_config
-    )
-    preview_workspace = {
-        "backend": workspace_config["backend"],
-        "source": workspace_source,
-        "binding": workspace_selection["document"]
-        if workspace_selection
-        else (
-            None
-            if workspace_config["backend"] == "none"
-            else {"template": {"inline": {"backend": workspace_config["backend"]}}}
-        ),
-    }
-
-    # The legacy branch models ONE agent's behaviour: persistent_session's
-    # re-adding of the closed group lists when no disable marker is present.
-    # Worker jobs have no such step, so on the worker surface "experts off" only
-    # means there is no expert layer to merge — the resolved path already answers
-    # that correctly. Routing a worker preview through the session legacy policy
-    # would predict appended session groups for a job that cannot hold them.
-    use_legacy = legacy and not is_worker
-    from shared.runtime.core.subagent_roster import roster_summary
-
-    roster: dict[str, Any] = roster_summary(None)
-    try:
-        if use_legacy:
-            configured, provenance = await asyncio.to_thread(
-                _legacy_session_tool_policy, base, preview_override
-            )
-        else:
-            # No grant_strip here: this is a not-yet-created session, so
-            # there is no thread and no metadata.config_drift_ack to have
-            # acknowledged anything against — unlike the thread endpoint
-            # above, omitting it is not a gap to close, it is the correct
-            # answer for a config that cannot yet have drifted.
-            db_refs = await _prefetch_roster_refs(
-                expert_row=expert_row,
-                overrides=[project_overrides, body.config_override],
-                user_id=str(user["id"]),
-                project_ids=[str(body.project_id)] if body.project_id else [],
-            )
-            capture: dict[str, Any] = {}
-            configured, provenance = await asyncio.to_thread(
-                _merged_session_tool_policy,
-                base_config_name=base,
-                expert_row=expert_row,
-                project_overrides=project_overrides,
-                request_override=preview_override,
-                expert_type=body.expert_type,
-                db_refs=db_refs,
-                capture=capture,
-            )
-            roster = roster_summary(
-                (capture.get("merged_fragment") or {}).get("subagents")
-            )
-    except Exception:
-        logger.exception("Tool-group preview resolve failed")
-        raise HTTPException(
-            status_code=422,
-            detail="This configuration cannot be resolved, so its toolset "
-            "cannot be predicted.",
-        )
-
-    try:
-        grants = await _resolve_runner_grants(
-            runner_user_id=str(user["id"]),
-            project_ids=[str(body.project_id)] if body.project_id else [],
-        )
-    except Exception:
-        logger.warning("Tool-group preview grant lookup failed")
-        grants = None
-
-    view = compose_tool_view(
-        measured=None,
-        configured=configured,
-        provenance=provenance,
-        backend_caps={
-            "supports_shell": workspace_config["backend"] in ("sandbox", "vm"),
-            "supports_file_tools": workspace_config["backend"] != "none",
-            "supports_canvas_presentation": workspace_config["backend"] != "none",
-        },
-        grants=grants,
-    )
-    return {
-        "workspace": preview_workspace,
-        "source": "legacy" if use_legacy else "resolved",
-        **_origin_fields(
-            _unmeasured(
-                "no agent exists for an unsaved job"
-                if is_worker
-                else "no agent exists for an unsaved session"
-            )
-        ),
-        "enumerate_only": enumerate_only_members(),
-        "tool_groups": tool_groups_from_view(view),
-        "categories": view,
-        "subagents": roster,
-    }
-
-
-@app.patch("/api/persistent/threads/{thread_id}")
-async def update_thread(
-    thread_id: str, body: ThreadUpdateRequest, request: Request
-) -> dict[str, str]:
-    """Rename a persistent thread (auth: owner only).
-
-    The title was previously settable only at creation and auto-generated
-    once by the LLM after the first turn; this lets the user rename a session
-    inline from the Cockpit. A user-chosen title naturally blocks the
-    auto-titler, which only overwrites empty / "Untitled Session" / "Local
-    Session" titles (src/api/persistent_app.py).
-    """
-    user, thread = await require_thread_owner(request, postgres_db, thread_id)
-    title = (body.title or "").strip()
-    if not title:
-        raise HTTPException(status_code=400, detail="Title cannot be empty")
-    if len(title) > 200:
-        raise HTTPException(status_code=400, detail="Title too long (max 200)")
-    await postgres_db.update_thread_title(thread_id, title)
-    return {"status": "updated", "title": title}
+app.state.thread_session_dependencies_factory = lambda: _thread_session_dependencies()
+app.include_router(thread_session_routes.router)
 
 
 app.include_router(thread_lifecycle_routes.end_router)
@@ -11478,828 +10692,59 @@ app.include_router(thread_lifecycle_routes.resume_router)
 app.include_router(thread_lifecycle_routes.rewind_router)
 
 
-@app.get("/api/persistent/threads/{thread_id}/citations")
-async def get_thread_citations(
-    thread_id: str,
-    request: Request,
-    limit: int = Query(default=200, ge=1, le=500),
-    offset: int = Query(default=0, ge=0),
-) -> dict[str, Any]:
-    """List citations created in a persistent session, for inline ``[N]`` rendering.
-
-    The citation engine stores a session's citations with ``job_id = thread_id``
-    (it maps ``CitationContext.session_id`` → ``job_id``), so the thread UUID *is*
-    the ``job_id`` — there is no separate thread column. Owner-only (the by-job
-    endpoint 404s for a thread since no ``jobs`` row exists). The marker the agent
-    emits is the citation ``id``; the cockpit renumbers for display and resolves
-    each ``[id]`` to a row returned here.
-    """
-    await require_thread_owner(request, postgres_db, thread_id)
-    try:
-        async with vector_db.acquire() as conn:
-            count_row = await conn.fetchrow(
-                "SELECT COUNT(*) AS total FROM citations WHERE job_id = $1::uuid",
-                thread_id,
-            )
-            total = count_row["total"] if count_row else 0
-            rows = await conn.fetch(
-                """SELECT c.id, LEFT(c.claim, 300) AS claim, c.source_id,
-                       s.name AS source_name, s.type::text AS source_type,
-                       s.identifier AS source_identifier,
-                       c.verification_status::text AS verification_status,
-                       c.confidence::text AS confidence,
-                       c.created_at, s.metadata
-                FROM citations c
-                JOIN sources s ON c.source_id = s.id
-                WHERE c.job_id = $1::uuid
-                ORDER BY c.id ASC
-                LIMIT $2 OFFSET $3""",
-                thread_id,
-                limit,
-                offset,
-            )
-            citations = []
-            for r in rows:
-                d = dict(r)
-                # Cloud-document citations (cite_document with a snapshot-anchor)
-                # can offer "view original" (/snapshot) + on-view drift (/drift);
-                # web citations have neither. Surface the two flags so the cockpit
-                # only renders those controls where they apply. The raw metadata
-                # isn't returned (internal blob keys / anchor URLs).
-                cloud = citations_operations._source_cloud_meta(d.pop("metadata", None))
-                d["has_cloud_anchor"] = bool(cloud)
-                d["has_snapshot"] = bool(cloud.get("snapshot_blob_key"))
-                citations.append(d)
-            return {
-                "citations": citations,
-                "total": total,
-                "thread_id": thread_id,
-            }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e)) from e
-
-
-def _stamp_tool_categories(messages: list[dict[str, Any]]) -> None:
-    """Annotate replayed tool calls with their registry category, in place.
-
-    The live SSE ``tool.started`` frame carries ``category`` (see graph.py's
-    ``_get_tool_category``), but the stored ``thread_messages.tool_calls`` JSONB
-    never did. Without this the cockpit's folded-chip summary buckets every
-    replayed call as "other", so one turn reads
-    "19× citations · 12× searches" while streaming and "38× steps" after a
-    reload — same turn, same data, different answer.
-
-    Derived at read time rather than persisted so that re-categorising a tool
-    doesn't need a backfill of historical rows. Unknown tools (renamed, removed,
-    or from another deployment) simply get no category and fall back to the
-    cockpit's "other" bucket, which is the honest answer.
-    """
-    for m in messages:
-        for tc in m.get("tool_calls") or []:
-            category = TOOL_REGISTRY.get(tc.get("name") or "", {}).get("category")
-            if category:
-                tc["category"] = category
-
-
-@app.get("/api/persistent/threads/{thread_id}/messages")
-async def get_thread_messages_history(
-    thread_id: str,
-    request: Request,
-    response: Response = None,
-    limit: Optional[int] = None,
-    before: Optional[str] = None,
-    after: Optional[str] = None,
-    offset: int = 0,
-) -> dict[str, Any]:
-    """Load message history for a persistent thread, ascending (chronological).
-
-    Default (no params) returns the **entire** conversation — the cockpit caches
-    the full thread client-side and windows the render itself, so the display
-    must not be truncated. Cursor paging (mutually exclusive, ISO-8601):
-
-    - ``before=<ts>``: backfill — newest messages at-or-before the cursor, up to
-      ``limit``.
-    - ``after=<ts>``:  catch-up — messages at-or-after the cursor, up to ``limit``.
-
-    A bare ``limit`` with no cursor keeps the legacy oldest-first paged read
-    (``offset`` honored) used by the MCP inspection tool. Returns
-    ``{messages, total, has_more, thread_id}``.
-    """
-    user, thread = await require_thread_owner(request, postgres_db, thread_id)
-    if response is not None:
-        response.headers["Cache-Control"] = "private, no-store"
-
-    def _parse_cursor(value: Optional[str]) -> Optional[datetime]:
-        if not value:
-            return None
-        try:
-            return datetime.fromisoformat(value.replace("Z", "+00:00"))
-        except ValueError:
-            raise HTTPException(
-                status_code=400, detail=f"Invalid ISO-8601 timestamp: {value!r}"
-            )
-
-    before_dt = _parse_cursor(before)
-    after_dt = _parse_cursor(after)
-    if before_dt is not None and after_dt is not None:
-        raise HTTPException(
-            status_code=400, detail="Pass at most one of 'before' / 'after'"
-        )
-
-    capped_limit = min(limit, 500) if limit is not None else None
-
-    # Rows and their cache fence come from one repeatable-read snapshot. A
-    # rewind cannot therefore pair its newer epoch/revision with an older page
-    # that still contains tombstoned messages (or vice versa).
-    async with postgres_db.acquire() as conn:
-        async with conn.transaction(isolation="repeatable_read", readonly=True):
-            history_state = await conn.fetchrow(
-                "SELECT events_epoch, conversation_revision FROM threads WHERE id=$1",
-                thread_id,
-            )
-            if history_state is None:
-                raise HTTPException(status_code=404, detail="Thread not found")
-            if before_dt is not None or after_dt is not None:
-                messages, has_more = await postgres_db.get_thread_messages_page(
-                    thread_id=thread_id,
-                    before=before_dt,
-                    after=after_dt,
-                    limit=capped_limit,
-                    conn=conn,
-                )
-                # A cursor window carries no cheap true total; no consumer reads it here.
-                total = len(messages)
-            else:
-                messages = await postgres_db.get_thread_messages_history(
-                    thread_id=thread_id,
-                    limit=capped_limit,
-                    offset=offset,
-                    conn=conn,
-                )
-                # Legacy paged read: a full page implies there may be more.
-                has_more = capped_limit is not None and len(messages) == capped_limit
-                if capped_limit is None:
-                    total = len(messages)
-                else:
-                    total = await postgres_db.get_thread_message_count(
-                        thread_id, conn=conn
-                    )
-
-    _stamp_tool_categories(messages)
-
-    return {
-        "messages": messages,
-        "total": total,
-        "has_more": has_more,
-        "thread_id": thread_id,
-        "events_epoch": int(history_state["events_epoch"] or 0),
-        "conversation_revision": int(history_state["conversation_revision"] or 0),
-    }
-
-
-# =============================================================================
-# Headless persistent sessions — Phase 2 SSE + REST transport
-# =============================================================================
-#
-# SSE replaces the WebSocket as the primary server→client path; the existing
-# /ws/persistent/{thread_id} stays as a fallback. Per
-# knowledge-base/knowledge/features/headless_persistent_sessions.md.
-#
-# The per-turn input lock guards against duplicate POSTs from concurrent
-# cockpit tabs racing on the same turn. Single-instance orchestrator, so a
-# module-level dict is enough; entries auto-clean 5 min after release.
-
-_thread_turn_locks: dict[tuple[str, int], asyncio.Lock] = {}
-_thread_turn_inflight: dict[str, int] = {}
-
-
-def _ensure_thread_turn_lock(thread_id: str, turn_id: int) -> asyncio.Lock:
-    """Get or create the lock for (thread_id, turn_id). Concurrent callers
-    landing on the same tuple share the same Lock object."""
-    key = (thread_id, turn_id)
-    lock = _thread_turn_locks.get(key)
-    if lock is None:
-        lock = asyncio.Lock()
-        _thread_turn_locks[key] = lock
-    return lock
-
-
-def _schedule_turn_lock_cleanup(thread_id: str, turn_id: int) -> None:
-    """Remove the lock entry 5 minutes after release. Memory-leak guard
-    for long-lived sessions accumulating per-turn locks."""
-
-    async def _later() -> None:
-        await asyncio.sleep(300)
-        _thread_turn_locks.pop((thread_id, turn_id), None)
-        if _thread_turn_inflight.get(thread_id) == turn_id:
-            _thread_turn_inflight.pop(thread_id, None)
-
-    asyncio.create_task(_later(), name=f"turn-lock-cleanup-{thread_id[:8]}")
-
-
-async def _resolve_thread_for_forwarding(
-    thread_id: str, user: dict
-) -> tuple[dict, PinnedSessionBinding]:
-    """Resolve one owner-visible thread and its exact pinned runtime binding.
-
-    Stateless callers branch before this helper.  All agent/endpoint fields in
-    the result come from one reciprocal DB snapshot rather than independent
-    thread and agent reads.  A suspended pinned workspace is restored before
-    that final snapshot.
-    """
-    thread = await postgres_db.get_thread(thread_id)
-    if not thread:
-        raise HTTPException(status_code=404, detail="Thread not found")
-    # Fail-closed for orphans (user_id IS NULL); admins bypass.
-    if not user.get("is_admin") and str(thread.get("user_id") or "") != str(user["id"]):
-        raise HTTPException(status_code=403, detail="Not your thread")
-    if not _thread_accepts_runtime(thread):
-        raise HTTPException(
-            status_code=409, detail=thread_runtime_refusal_detail(thread)
-        )
-    if thread.get("execution_lane") != "pinned":
-        raise HTTPException(
-            status_code=409,
-            detail="Thread execution lane does not support direct forwarding",
-        )
-
-    async def _refresh_runtime_authority() -> dict[str, Any]:
-        current = await postgres_db.get_thread(thread_id)
-        if not _thread_accepts_runtime(current):
-            raise HTTPException(
-                status_code=409, detail=thread_runtime_refusal_detail(current)
-            )
-        if not user.get("is_admin") and str(current.get("user_id") or "") != str(
-            user["id"]
-        ):
-            raise HTTPException(status_code=403, detail="Not your thread")
-        if current.get("execution_lane") != "pinned":
-            raise HTTPException(
-                status_code=409,
-                detail="Thread execution lane does not support direct forwarding",
-            )
-        marker = protected_cloud_marker_state(thread_metadata_object(current))
-        if marker == "malformed":
-            raise HTTPException(
-                status_code=409,
-                detail={
-                    "code": "protected_cloud_malformed",
-                    "message": "Protected cloud session state is invalid.",
-                },
-            )
-        if marker == "on":
-            state, code = await _protected_cloud_delivery_state(
-                current, thread_metadata_object(current)
-            )
-            if state != "ready":
-                raise HTTPException(
-                    status_code=425,
-                    detail={
-                        "code": "protected_cloud_not_ready",
-                        "state": state,
-                        "reason": code,
-                    },
-                )
-        return current
-
-    thread = await _refresh_runtime_authority()
-
-    # Restore suspended workspace before forwarding (mirrors persistent_ws_proxy)
-    metadata = thread.get("metadata") or {}
-    if isinstance(metadata, str):
-        try:
-            metadata = json.loads(metadata)
-        except (json.JSONDecodeError, TypeError):
-            metadata = {}
-    ws_ctx = metadata.get("workspace_container") or {}
-    if ws_ctx.get("status") == "suspended" and workspace_suspension_service.is_enabled:
-        logger.info("Restoring suspended workspace for thread %s", thread_id)
-        ok = await workspace_suspension_service.restore_thread_workspace(thread_id)
-        if not ok:
-            raise HTTPException(
-                status_code=503,
-                detail="Failed to restore suspended workspace",
-            )
-        thread = await _refresh_runtime_authority()
-
-    runtime_authority = thread_runtime_authority(thread)
-    if runtime_authority is None:  # _refresh_runtime_authority proves this
-        raise HTTPException(
-            status_code=409, detail=thread_runtime_refusal_detail(thread)
-        )
-    binding = await postgres_db.get_pinned_session_binding(
-        thread_id,
-        expected_runtime_generation=runtime_authority.generation,
-    )
-    if binding is None:
-        raise HTTPException(
-            status_code=409,
-            detail=pinned_binding_invalid_detail(runtime_authority),
-        )
-    _require_forwardable_pinned_binding(binding)
-    return thread, binding
-
-
-def _require_forwardable_pinned_binding(binding: PinnedSessionBinding) -> None:
-    """Require a currently live agent status without freezing status equality."""
-
-    if binding.agent_status not in {"ready", "working", "session"}:
-        raise HTTPException(status_code=425, detail="session not ready")
-
-
-def _binding_runtime_authority(
-    binding: PinnedSessionBinding,
-) -> ThreadRuntimeAuthority:
-    return ThreadRuntimeAuthority(
-        thread_id=binding.thread_id,
-        generation=binding.runtime_generation,
+def _thread_history_dependencies() -> thread_history_routes.ThreadHistoryDependencies:
+    return thread_history_routes.ThreadHistoryDependencies(
+        store=postgres_db,
+        vector_db=vector_db,
+        require_thread_owner=require_thread_owner,
     )
 
 
-async def _revalidate_pinned_forwarding_binding(
-    binding: PinnedSessionBinding,
-) -> PinnedSessionBinding:
-    """Re-read and compare every immutable DB/routing coordinate."""
-
-    current = await postgres_db.get_pinned_session_binding(
-        binding.thread_id,
-        expected_runtime_generation=binding.runtime_generation,
-    )
-    if current is None or current.target_key != binding.target_key:
-        raise HTTPException(
-            status_code=409,
-            detail=pinned_binding_invalid_detail(_binding_runtime_authority(binding)),
-        )
-    _require_forwardable_pinned_binding(current)
-    return current
+app.state.thread_history_dependencies_factory = lambda: _thread_history_dependencies()
+app.include_router(thread_history_routes.router)
 
 
-async def _forward_to_agent(
-    binding: PinnedSessionBinding,
-    path: str,
-    payload: dict,
-    timeout: float = 30.0,
-) -> dict[str, Any]:
-    """POST to one exact pinned Pod after a client-boundary DB reread."""
+# The per-turn pinned input locks are process state; this application owns one
+# registry (R1.B10). The stateless lane never uses it.
+_thread_turn_locks = ThreadTurnLocks()
 
-    identity_fingerprint = binding.session_identity_fingerprint
-    forwarded_payload = dict(payload)
-    supplied_fingerprint = forwarded_payload.get("session_identity_fingerprint")
-    if supplied_fingerprint not in (None, identity_fingerprint):
-        raise ValueError("forwarded session identity does not match its binding")
-    forwarded_payload["session_identity_fingerprint"] = identity_fingerprint
-    agent_url = f"http://{binding.pod_ip}:{binding.pod_port}{path}"
-    try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
-            # Client/pool entry may await.  Re-read after it so no stale target
-            # receives an effect merely because it was authoritative before
-            # transport setup.  The endpoint validates the fingerprint again
-            # across the final network race.
-            await _revalidate_pinned_forwarding_binding(binding)
-            response = await client.post(agent_url, json=forwarded_payload)
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.warning(
-            "Agent forward failed: %s %s -> %s",
-            path,
-            binding.agent_id,
-            e,
-        )
-        raise HTTPException(status_code=503, detail=f"Agent unreachable: {e}") from e
-    try:
-        response_body = response.json()
-    except Exception:
-        response_body = None
-    if (
-        response.status_code == 409
-        and isinstance(response_body, dict)
-        and response_body.get("error") == "session_identity_mismatch"
-    ):
-        raise HTTPException(
-            status_code=409,
-            detail=pinned_binding_invalid_detail(_binding_runtime_authority(binding)),
-        )
-    if response.status_code == 503:
-        if (
-            isinstance(response_body, dict)
-            and response_body.get("error") == "runtime_terminating"
-        ):
-            raise HTTPException(
-                status_code=503,
-                detail={
-                    "error": "runtime_terminating",
-                    "retryable": True,
-                    "message": "The runtime is terminating; retry on its replacement.",
-                },
-                headers={"Retry-After": response.headers.get("Retry-After", "5")},
-            )
-    if response.status_code >= 500:
-        raise HTTPException(
-            status_code=502,
-            detail=f"Agent error: {response.status_code} {response.text[:200]}",
-        )
-    if response.status_code >= 400:
-        raise HTTPException(
-            status_code=response.status_code,
-            detail=response.text[:200],
-        )
-    return (
-        response_body
-        if isinstance(response_body, dict)
-        else {"raw": response.text[:500]}
+
+def _pinned_forwarding_dependencies() -> (
+    pinned_forwarding_operations.PinnedForwardingDependencies
+):
+    return pinned_forwarding_operations.PinnedForwardingDependencies(
+        store=postgres_db,
+        workspace_suspension=workspace_suspension_service,
+        protected_cloud_delivery_state=_protected_cloud_delivery_state,
     )
 
 
-async def _no_cursor_replay_start(conn, thread_id: str, epoch: int) -> int:
-    """Replay floor (exclusive) for an SSE attach that carries no cursor.
-
-    A fresh client — opening the session on a second device, or any client
-    with no cached cursor for this thread — has already painted the thread's
-    completed turns from REST history. Replaying the whole epoch from seq 0
-    would re-deliver each completed turn as a *live* copy the cockpit reducer
-    can't reconcile (history turns are keyed by message id, replayed turns by
-    turn_id), so the last assistant turn renders twice, split by a spurious
-    "SESSION RESUMED" divider — the cold-attach twin of the gone_beyond_horizon
-    duplicate render.
-
-    Anchor instead just past the last turn-terminal event (``turn.completed`` /
-    ``turn.error``, both of which persist their turn to ``thread_messages``), so
-    the replay carries only the in-flight, not-yet-persisted turn. Returns 0
-    when no turn has finished yet (first turn still streaming) so that turn —
-    absent from REST history — still replays from the start.
-    """
-    anchor = await conn.fetchval(
-        "SELECT COALESCE(MAX(seq), 0) FROM thread_events "
-        "WHERE thread_id = $1 AND epoch = $2 "
-        "AND kind IN ('turn.completed', 'turn.error')",
-        thread_id,
-        epoch,
+def _stateless_input_dependencies() -> (
+    stateless_input_operations.StatelessInputDependencies
+):
+    return stateless_input_operations.StatelessInputDependencies(
+        store=postgres_db,
+        schedule_stateless_workspace_ensure=_schedule_stateless_workspace_ensure,
     )
-    return int(anchor or 0)
 
 
-# How much *accumulated idle time* (seconds with no new rows) a live SSE stream
-# tolerates before it re-reads `events_epoch` to detect a mid-stream bump. The
-# epoch is bumped when an agent (re-)attaches; a generator opened before the
-# bump would otherwise poll the dead old epoch forever, delivering nothing but
-# keepalive pings that fool the client watchdog into thinking the stream is
-# healthy (the "stale → refresh to fix" zombie). Read as a module global so
-# tests can monkeypatch it to 0 to force a re-check on the first empty poll.
-THREAD_EVENTS_EPOCH_RECHECK_S: float = float(
-    os.environ.get("THREAD_EVENTS_EPOCH_RECHECK_S", "2.0")
+def _thread_transport_dependencies() -> (
+    thread_transport_routes.ThreadTransportDependencies
+):
+    return thread_transport_routes.ThreadTransportDependencies(
+        store=postgres_db,
+        require_thread_owner=require_thread_owner,
+        require_approved_user=require_approved_user,
+        forwarding=_pinned_forwarding_dependencies(),
+        stateless_input=_stateless_input_dependencies(),
+        turn_locks=_thread_turn_locks,
+    )
+
+
+app.state.thread_transport_dependencies_factory = (
+    lambda: _thread_transport_dependencies()
 )
-THREAD_CLIENT_PRESENCE_RENEW_S: float = max(
-    1.0,
-    float(
-        os.environ.get(
-            "THREAD_CLIENT_PRESENCE_RENEW_S",
-            str(DEFAULT_PRESENCE_RENEW_SECONDS),
-        )
-    ),
-)
-THREAD_CLIENT_PRESENCE_TTL_S: float = max(
-    THREAD_CLIENT_PRESENCE_RENEW_S * 2.0,
-    float(
-        os.environ.get(
-            "THREAD_CLIENT_PRESENCE_TTL_S",
-            str(DEFAULT_PRESENCE_TTL_SECONDS),
-        )
-    ),
-)
-
-
-@app.get("/api/persistent/threads/{thread_id}/stream")
-async def thread_event_stream(thread_id: str, request: Request) -> StreamingResponse:
-    """SSE: stream this thread's event log with replay-from-cursor.
-
-    The client sends `Last-Event-ID: <epoch>:<seq>` to resume from a known
-    point. If the cursor's epoch doesn't match the server, or its seq is
-    older than retention, the server emits a single `gone_beyond_horizon`
-    event and closes — the client must drop its cursor and re-sync.
-
-    Otherwise: replay everything since the cursor, then switch to live
-    mode (200ms poll, adaptive backoff to 1s after 5 empty polls).
-    """
-    user, thread = await require_thread_owner(request, postgres_db, thread_id)
-
-    # The existing owner-gated SSE connection is the lane-agnostic client
-    # attachment signal. No lane field crosses the wire. Pinned streams keep
-    # their exact behavior; a stateless stream must establish its durable TTL
-    # before the browser can believe it is attached. Only a caller who could
-    # answer tethers (tethers_session): a read-only token still streams and is
-    # re-authorized on the renewal cadence, but records no presence.
-    stateless_stream = thread.get("execution_lane") == "stateless"
-    track_presence = stateless_stream and tethers_session(user)
-    if track_presence:
-        try:
-            presence = await refresh_thread_presence(
-                postgres_db,
-                thread_id=thread_id,
-                ttl_seconds=THREAD_CLIENT_PRESENCE_TTL_S,
-                establish=True,
-            )
-        except Exception as exc:
-            logger.warning(
-                "thread_event_stream presence establish failed (thread=%s): %s",
-                thread_id,
-                exc,
-            )
-            raise HTTPException(
-                status_code=503,
-                detail="Session presence is temporarily unavailable",
-            ) from exc
-        if not presence.served:
-            # The row changed lane or disappeared after the owner lookup. A
-            # reconnect re-runs authorization and resolves the current lane.
-            raise HTTPException(status_code=409, detail="Session lane changed")
-
-    server_epoch = int(thread.get("events_epoch") or 0)
-
-    # Parse Last-Event-ID. Format: "<epoch>:<seq>". Missing/malformed → no
-    # cursor, so the replay floor is computed by _no_cursor_replay_start below
-    # (anchored past the last completed turn, not seq 0).
-    #
-    # EventSource doesn't let the browser set custom request headers, so the
-    # cockpit hands us the cached cursor via `?last_event_id=` for the
-    # initial connection. On automatic reconnect, the browser appends the
-    # `Last-Event-ID` header from the latest `id:` line we yielded — that
-    # path is fully native and doesn't need the query param.
-    last_event_id = (
-        request.headers.get("Last-Event-ID")
-        or request.headers.get("last-event-id")
-        or request.query_params.get("last_event_id")
-    )
-    cursor_epoch: Optional[int] = None
-    cursor_seq: Optional[int] = None
-    if last_event_id:
-        try:
-            e_str, s_str = last_event_id.split(":", 1)
-            cursor_epoch = int(e_str)
-            cursor_seq = int(s_str)
-        except (ValueError, AttributeError):
-            cursor_epoch = None
-            cursor_seq = None
-
-    async def event_stream():
-        # Kickstart: flush a comment immediately so the browser EventSource
-        # fires `onopen` at once and buffering intermediaries (Cloudflare
-        # Tunnel, Traefik) don't hold the response headers / idle-timeout the
-        # connection waiting for the first body byte. Without this, a connect
-        # whose cursor is already at the tail sends nothing until the ~20s
-        # keepalive ping below — stalling the SSE receive path ~20s. Comments
-        # (lines starting with `:`) are ignored by EventSource, so this is
-        # side-effect-free on the client.
-        yield ": open\n\n"
-
-        next_presence_renew = time.monotonic() + THREAD_CLIENT_PRESENCE_RENEW_S
-
-        # Mismatched epoch → force re-sync.
-        if cursor_epoch is not None and cursor_epoch != server_epoch:
-            async with postgres_db.acquire() as conn:
-                tail = await conn.fetchval(
-                    "SELECT COALESCE(MAX(seq), 0) FROM thread_events "
-                    "WHERE thread_id = $1 AND epoch = $2",
-                    thread_id,
-                    server_epoch,
-                )
-            payload = json.dumps(
-                {
-                    "method": "gone_beyond_horizon",
-                    "params": {
-                        "epoch": server_epoch,
-                        "server_seq": int(tail or 0),
-                        "reason": "epoch_mismatch",
-                    },
-                }
-            )
-            yield f"id: {server_epoch}:0\nevent: gone_beyond_horizon\ndata: {payload}\n\n"
-            return
-
-        # Retention floor for the current epoch.
-        async with postgres_db.acquire() as conn:
-            min_seq = await conn.fetchval(
-                "SELECT MIN(seq) FROM thread_events "
-                "WHERE thread_id = $1 AND epoch = $2",
-                thread_id,
-                server_epoch,
-            )
-        min_seq = int(min_seq) if min_seq is not None else 0
-
-        # Cursor older than retention → also force re-sync.
-        if cursor_seq is not None and min_seq > 0 and cursor_seq < min_seq - 1:
-            async with postgres_db.acquire() as conn:
-                tail = await conn.fetchval(
-                    "SELECT COALESCE(MAX(seq), 0) FROM thread_events "
-                    "WHERE thread_id = $1 AND epoch = $2",
-                    thread_id,
-                    server_epoch,
-                )
-            payload = json.dumps(
-                {
-                    "method": "gone_beyond_horizon",
-                    "params": {
-                        "epoch": server_epoch,
-                        "server_seq": int(tail or 0),
-                        "retention_min_seq": min_seq,
-                        "reason": "cursor_older_than_retention",
-                    },
-                }
-            )
-            yield f"id: {server_epoch}:0\nevent: gone_beyond_horizon\ndata: {payload}\n\n"
-            return
-
-        # Replay floor. With a cursor, resume right after it. Without one, a
-        # fresh attach has already loaded completed turns from REST history, so
-        # anchor past the last completed turn instead of replaying the whole
-        # epoch from 0 (which doubles the last assistant turn + shows a spurious
-        # "SESSION RESUMED" divider — see _no_cursor_replay_start).
-        if cursor_seq is not None:
-            last_sent_seq = cursor_seq
-        else:
-            async with postgres_db.acquire() as conn:
-                last_sent_seq = await _no_cursor_replay_start(
-                    conn, thread_id, server_epoch
-                )
-        empty_polls = 0
-        idle_keepalive_at = 0.0
-        epoch_idle = 0.0
-        cancelled = False
-        try:
-            while not cancelled:
-                if await request.is_disconnected():
-                    break
-                if stateless_stream and time.monotonic() >= next_presence_renew:
-                    # A long-lived stream does not retain authorization from
-                    # its opening handshake forever. Re-run the same BFF-cookie
-                    # owner gate before every attested renewal; expiry or an
-                    # ownership change closes the stream and writes no TTL.
-                    renew_user, renew_thread = await require_thread_owner(
-                        request, postgres_db, thread_id
-                    )
-                    if renew_thread.get("execution_lane") != "stateless":
-                        return
-                    if track_presence and tethers_session(renew_user):
-                        presence = await refresh_thread_presence(
-                            postgres_db,
-                            thread_id=thread_id,
-                            ttl_seconds=THREAD_CLIENT_PRESENCE_TTL_S,
-                            establish=False,
-                        )
-                        if not presence.served:
-                            # Lane change/deletion: close. EventSource
-                            # reconnects through require_thread_owner and
-                            # current DB truth.
-                            return
-                    next_presence_renew = (
-                        time.monotonic() + THREAD_CLIENT_PRESENCE_RENEW_S
-                    )
-                async with postgres_db.acquire() as conn:
-                    rows = await conn.fetch(
-                        "SELECT seq, kind, payload "
-                        "FROM thread_events "
-                        "WHERE thread_id = $1 AND epoch = $2 AND seq > $3 "
-                        "ORDER BY seq ASC "
-                        "LIMIT 500",
-                        thread_id,
-                        server_epoch,
-                        last_sent_seq,
-                    )
-                    # Zombie-epoch guard: after enough accumulated idle time
-                    # with no new rows, re-read events_epoch on the SAME
-                    # connection (no extra acquire). If an agent re-attached and
-                    # bumped the epoch, this generator has been polling a dead
-                    # epoch — terminate deterministically so the client
-                    # re-anchors, instead of feeding it pings forever.
-                    if not rows and epoch_idle >= THREAD_EVENTS_EPOCH_RECHECK_S:
-                        epoch_idle = 0.0
-                        current_epoch = await conn.fetchval(
-                            "SELECT events_epoch FROM threads WHERE id = $1",
-                            thread_id,
-                        )
-                        if current_epoch is None:
-                            # Thread deleted mid-stream — terminate silently;
-                            # the client's reconnect hits require_thread_owner
-                            # → 404 and it drops the thread.
-                            return
-                        if int(current_epoch) != server_epoch:
-                            new_epoch = int(current_epoch)
-                            # Anchor past the last completed turn of the NEW
-                            # epoch, not its tail: the bump lands mid-turn and
-                            # the client's history reload only carries completed
-                            # turns, so a tail anchor would drop the in-flight
-                            # turn's already-journaled frames.
-                            anchor = await _no_cursor_replay_start(
-                                conn, thread_id, new_epoch
-                            )
-                            logger.info(
-                                "thread_event_stream epoch bump %d→%d "
-                                "(thread=%s), re-anchoring client to seq %d",
-                                server_epoch,
-                                new_epoch,
-                                thread_id,
-                                anchor,
-                            )
-                            payload = json.dumps(
-                                {
-                                    "method": "gone_beyond_horizon",
-                                    "params": {
-                                        "epoch": new_epoch,
-                                        "server_seq": anchor,
-                                        "reason": "epoch_bumped_mid_stream",
-                                    },
-                                }
-                            )
-                            # The `id:` line carries the new epoch's floor so a
-                            # browser-native reconnect (bypassing the app
-                            # handler) converges to the same replay start
-                            # instead of replaying the new epoch from :0.
-                            yield (
-                                f"id: {new_epoch}:{anchor}\n"
-                                f"event: gone_beyond_horizon\n"
-                                f"data: {payload}\n\n"
-                            )
-                            return
-                if rows:
-                    empty_polls = 0
-                    epoch_idle = 0.0
-                    for row in rows:
-                        seq = int(row["seq"])
-                        # row["payload"] is a JSONB column — asyncpg may
-                        # return it as str or already-parsed dict depending
-                        # on codec registration.
-                        raw_payload = row["payload"]
-                        if isinstance(raw_payload, str):
-                            payload_obj = json.loads(raw_payload)
-                        else:
-                            payload_obj = raw_payload
-                        frame = {
-                            "method": row["kind"],
-                            "params": payload_obj,
-                        }
-                        body = json.dumps(frame)
-                        yield f"id: {server_epoch}:{seq}\ndata: {body}\n\n"
-                        last_sent_seq = seq
-                    idle_keepalive_at = 0.0
-                else:
-                    # Adaptive backoff: 200ms × 5 empty polls, then 1s.
-                    empty_polls += 1
-                    wait = 1.0 if empty_polls >= 5 else 0.2
-                    epoch_idle += wait
-                    # Typed `ping` event every ~20s of idle. A bare `:`
-                    # comment would keep the socket warm but never fire
-                    # `onmessage` in the browser, leaving silent network
-                    # drops undetectable client-side. A typed event with no
-                    # `id:` line lets the cockpit watchdog observe liveness
-                    # without advancing the replay cursor.
-                    idle_keepalive_at += wait
-                    if idle_keepalive_at >= 20.0:
-                        yield "event: ping\ndata: {}\n\n"
-                        idle_keepalive_at = 0.0
-                    try:
-                        await asyncio.sleep(wait)
-                    except asyncio.CancelledError:
-                        cancelled = True
-                        break
-        except asyncio.CancelledError:
-            return
-        except Exception as e:
-            logger.warning("thread_event_stream error (thread=%s): %s", thread_id, e)
-            return
-
-    return StreamingResponse(
-        event_stream(),
-        media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",
-            "Connection": "keep-alive",
-        },
-    )
-
-
-class ThreadInputRequest(BaseModel):
-    """Body for POST /api/persistent/threads/{thread_id}/input."""
-
-    content: str
-    turn_id: Optional[int] = None
-    expected_conversation_revision: int | None = Field(default=None, ge=0)
-
-
-async def _load_thread_for_owner(thread_id: str, user: dict) -> dict:
-    """Load a thread under the same owner gate ``_resolve_thread_for_forwarding``
-    applies (404 unknown; fail-closed 403 for orphans and non-owners; admin
-    bypass) — WITHOUT its agent-resolution / workspace-restore side effects.
-
-    Used by the stateless-lane branches: queue-lane threads have no bound
-    agent, so the forwarding resolver's 503 would mask the lane entirely.
-    """
-    thread = await postgres_db.get_thread(thread_id)
-    if not thread:
-        raise HTTPException(status_code=404, detail="Thread not found")
-    if not user.get("is_admin") and str(thread.get("user_id") or "") != str(user["id"]):
-        raise HTTPException(status_code=403, detail="Not your thread")
-    return thread
+app.include_router(thread_transport_routes.router)
 
 
 async def _thread_input_stateless(
@@ -12307,582 +10752,63 @@ async def _thread_input_stateless(
     content: str,
     expected_conversation_revision: int | None = None,
 ) -> dict[str, Any]:
-    """Admit one user turn for a stateless-lane thread (stateless_agents.md
-    §5.3.1): persist the message, advance the input watermark, and queue the
-    unit — all in ONE transaction, so "message durable ⟺ watermark advanced"
-    can never tear and a signal can never be lost.
+    """Compatibility entry for ``operator_cli/stateless_wake_acceptance.py`` (B12).
 
-    The message row is indistinguishable from the agent's accept-time persist
-    of a plain-text human message (``src/api/persistent_app._accept_user_input``
-    → ``src/database/postgres_db.save_thread_message``): same ``msg_`` id mint
-    with the agent's own uuid5 row-id coercion, ``role='human'``,
-    ``turn_number = total_turns + 1``, all other columns at their NULL
-    defaults, and the same ``threads`` last_activity/total_turns bump.
-
-    Admission is ``record_input_seq`` — the input-during-anything path: it
-    creates a fresh ``'queued'`` row, revives ``'done'``, merges the watermark
-    into ``'queued'``, bumps ONLY the watermark on ``'leased'`` (the running
-    turn's completion re-queues via ``input_seq > consumed_seq``), and records
-    input on ``'parked'`` without reviving it (explicit unpark only). No
-    separate ``enqueue_unit`` call is needed: every branch leaves the unit
-    queued, leased-with-watermark, or deliberately parked.
+    The operator harness bootstraps this module and admits fixture turns
+    through it; the operation lives in ``services/stateless_input_admission``.
     """
-    from shared.row_identity import _coerce_row_id
-    from orchestrator.services.stateless_queue_state import queue_block
-    from shared.run_queue import (
-        LANE_STATELESS,
-        UNIT_KIND_SESSION_TURN,
-        queue_depth_for,
-        queue_state_for,
-        record_input_seq,
+    return await stateless_input_operations.admit_stateless_input(
+        thread,
+        content,
+        expected_conversation_revision,
+        dependencies=_stateless_input_dependencies(),
     )
 
-    # The unlocked preflight provides a fast refusal. The locked copy below is
-    # authoritative against lane/tier/lifecycle changes before message commit.
-    _require_stateless_workspace(thread)
 
-    thread_id = str(thread["id"])
-    # Mirror the agent's accept-time mint exactly; the row id is the same
-    # deterministic uuid5 the agent-side coercion would derive from this raw
-    # id, so a later executor re-persist upserts onto this row (ON CONFLICT
-    # (id)) instead of duplicating the user bubble.
-    raw_msg_id = f"msg_{uuid4().hex[:24]}"
-    row_id = _coerce_row_id(raw_msg_id)
-
-    async with postgres_db.acquire() as conn:
-        async with conn.transaction():
-            locked_thread = await conn.fetchrow(
-                "SELECT id, user_id, execution_lane, agent_id, status, "
-                "       total_turns, metadata, conversation_revision "
-                "FROM threads WHERE id = $1 FOR UPDATE",
-                thread_id,
-            )
-            if (
-                locked_thread is None
-                or str(locked_thread["execution_lane"] or "") != LANE_STATELESS
-                or locked_thread["agent_id"] is not None
-            ):
-                raise HTTPException(
-                    status_code=409,
-                    detail="Thread is no longer eligible for stateless admission",
-                )
-            locked_thread_dict = dict(locked_thread)
-            current_revision = int(locked_thread_dict.get("conversation_revision") or 0)
-            if expected_conversation_revision is None:
-                revision_matches = current_revision == 0
-            else:
-                revision_matches = (
-                    int(expected_conversation_revision) == current_revision
-                )
-            if not revision_matches:
-                raise HTTPException(
-                    status_code=409,
-                    detail={
-                        "code": "session_view_stale",
-                        "reason": "conversation_revision_changed",
-                        "conversation_revision": current_revision,
-                    },
-                )
-            locked_backend = _require_stateless_workspace(locked_thread_dict)
-            locked_status = str(locked_thread["status"] or "")
-            if locked_status not in {
-                "created",
-                "active",
-                "awaiting_user",
-                "suspended",
-            }:
-                raise HTTPException(
-                    status_code=409,
-                    detail=(
-                        "Thread is not currently accepting stateless input "
-                        f"(status={locked_status or 'unknown'})"
-                    ),
-                )
-            needs_workspace_ensure = locked_backend == "sandbox"
-            if locked_status == "suspended":
-                # Wake and enqueue are one lifecycle transaction. Workspace
-                # restore remains a post-commit side effect, but no claimant
-                # can observe a runnable queue paired with a still-suspended
-                # thread (the claim/credential boundary correctly refuses
-                # suspended rows).
-                woke = await conn.fetchval(
-                    "UPDATE threads SET status = 'created', "
-                    "agent_id = NULL, control_admission_agent_id = NULL, "
-                    "awaiting_user_since = NULL, extend_count = 0 "
-                    "WHERE id = $1::uuid AND execution_lane = 'stateless' "
-                    "AND status = 'suspended' RETURNING id",
-                    thread_id,
-                )
-                if woke is None:
-                    raise RuntimeError(
-                        "stateless suspended-input wake lost thread authority"
-                    )
-            turn_number = int(locked_thread["total_turns"] or 0) + 1
-            fair_key = (
-                str(locked_thread["user_id"])
-                if locked_thread["user_id"] is not None
-                else None
-            )
-            seq = await conn.fetchval(
-                """
-                INSERT INTO thread_messages (id, thread_id, role, content, turn_number)
-                VALUES ($1, $2, 'human', $3, $4)
-                RETURNING seq
-                """,
-                row_id,
-                thread_id,
-                content,
-                turn_number,
-            )
-            # Same activity bump the agent's save_thread_message performs.
-            await conn.execute(
-                """
-                UPDATE threads
-                SET last_activity = CURRENT_TIMESTAMP,
-                    total_turns   = GREATEST(total_turns, COALESCE($2, 0))
-                WHERE id = $1
-                """,
-                thread_id,
-                turn_number,
-            )
-            state = await record_input_seq(
-                conn,
-                unit_id=thread_id,
-                unit_kind=UNIT_KIND_SESSION_TURN,
-                input_seq=int(seq),
-                fair_key=fair_key,
-            )
-
-        if needs_workspace_ensure:
-            # Queue admission commits before this side effect. The claimant may
-            # arrive first, but its internal workspace poll independently
-            # suppresses cached Ready credentials until the exact Pod UID is
-            # live. Always schedule sandbox reconciliation: a DB-Ready row can
-            # be stale even though its lifecycle string looks terminally good.
-            _schedule_stateless_workspace_ensure(thread_id)
-        # Post-commit watermark read (same conn): §5.3.1 response parity —
-        # queue_depth comes from unconsumed watermarks, not a process queue.
-        wm = await queue_depth_for(conn, unit_id=thread_id)
-        queue_state = await queue_state_for(conn, unit_id=thread_id)
-
-    queue_depth = 1 if (wm is not None and wm.has_pending_input) else 0
-    # Lifecycle block (stateless_turn_resilience.md step 2): the SAME shape
-    # /connection and GET …/queue return, so a parked unit is never mistaken
-    # for a busy pool by the client.
-    lifecycle = queue_block(queue_state, thread.get("metadata"))
-    logger.info(
-        "run_queue enqueue: thread=%s turn=%d input_seq=%d state=%s",
-        thread_id,
-        turn_number,
-        int(seq),
-        state,
-    )
-    return {
-        "accepted": True,
-        "turn_id": turn_number,
-        "conversation_revision": current_revision,
-        "queue": {
-            "state": state,
-            "queue_depth": queue_depth,
-            "message_id": raw_msg_id,
-            "input_seq": int(seq),
-            "park_reason": lifecycle["park_reason"],
-            "parked_at": lifecycle["parked_at"],
-            "retryable": lifecycle["retryable"],
-            "attempts": lifecycle["attempts"],
-            "pending_input": lifecycle["pending_input"],
-        },
-    }
+def _magic_link_cockpit_url() -> str:
+    return email_service.cockpit_url or "http://localhost:4200"
 
 
-@app.post("/api/persistent/threads/{thread_id}/input")
-async def thread_input(
-    thread_id: str, body: ThreadInputRequest, request: Request
-) -> dict[str, Any]:
-    """Submit user input to a thread. Per-turn lock returns 409 on dupes."""
-    from shared.run_queue import LANE_STATELESS
+def _session_attention_dependencies() -> (
+    session_attention_operations.SessionAttentionDependencies
+):
+    """Attention sleep, permission reminders and permission-decision wake.
 
-    user = await require_approved_user(request, postgres_db)
-
-    # Stateless-lane admission (stateless_agents.md §5.3.1) resolves BEFORE
-    # agent forwarding — queue-lane threads have no bound agent, so
-    # _resolve_thread_for_forwarding would 503 on them. Owner gate identical
-    # to the resolver's; the pinned path below is untouched (its resolver
-    # re-loads the thread and re-applies the same checks).
-    lane_thread = await _load_thread_for_owner(thread_id, user)
-    if lane_thread.get("execution_lane") == LANE_STATELESS:
-        if not body.content or not isinstance(body.content, str):
-            raise HTTPException(
-                status_code=400, detail="content must be a non-empty string"
-            )
-        # The per-turn in-process lock below is deliberately SKIPPED on this
-        # lane: the run_queue itself serializes turns (input during a leased
-        # turn only advances the watermark; one row per unit dedups the
-        # queue), and the lock dict is per-process state — replica-unsafe
-        # under the 2-replica topology anyway. body.turn_id is ignored: the
-        # queue lane derives the turn number from DB truth (total_turns + 1).
-        return await _thread_input_stateless(
-            lane_thread,
-            body.content,
-            body.expected_conversation_revision,
-        )
-
-    thread, binding = await _resolve_thread_for_forwarding(thread_id, user)
-
-    if not body.content or not isinstance(body.content, str):
-        raise HTTPException(
-            status_code=400, detail="content must be a non-empty string"
-        )
-
-    # Turn id defaults to the thread's current total_turns + 1. Reject
-    # arbitrarily-large values to bound the lock dict.
-    total_turns = int(thread.get("total_turns") or 0)
-    if body.turn_id is None:
-        turn_id = total_turns + 1
-    else:
-        turn_id = body.turn_id
-        if turn_id < 0 or turn_id > total_turns + 5:
-            raise HTTPException(
-                status_code=400,
-                detail=f"turn_id out of range "
-                f"(thread at turn {total_turns}, max accepted "
-                f"{total_turns + 5})",
-            )
-
-    lock = _ensure_thread_turn_lock(thread_id, turn_id)
-    if lock.locked():
-        in_flight = _thread_turn_inflight.get(thread_id, turn_id)
-        return JSONResponse(
-            status_code=409,
-            content={
-                "error": "turn_in_flight",
-                "turn_id": in_flight,
-                "thread_id": thread_id,
-            },
-        )
-    async with lock:
-        _thread_turn_inflight[thread_id] = turn_id
-        try:
-            # Waiting for another tab's turn lock is an authority boundary.
-            # Refuse a same-G Pod/attach/endpoint rotation before constructing
-            # the HTTP client; _forward_to_agent performs the final reread
-            # after client entry as well.
-            await _revalidate_pinned_forwarding_binding(binding)
-            result = await _forward_to_agent(
-                binding,
-                "/api/input",
-                {"content": body.content, "turn_id": turn_id},
-            )
-        finally:
-            _schedule_turn_lock_cleanup(thread_id, turn_id)
-    return {
-        "accepted": True,
-        "turn_id": turn_id,
-        "agent": result,
-    }
-
-
-@app.get("/api/persistent/threads/{thread_id}/queue")
-async def thread_queue_state(thread_id: str, request: Request) -> dict[str, Any]:
-    """Owner read of the unit's queue lifecycle
-    (stateless_turn_resilience.md step 2) — the same ``queue`` block that
-    ``/input`` and ``/connection`` carry, for polling while a turn is awaited.
-    A thread that never enqueued (pinned lane, or no turn yet) reports
-    ``state='none'``.
+    The recycler is read through a provider because startup assigns it after
+    the provisioners; retirement operations are recomposed per call.
     """
-    from orchestrator.services.stateless_queue_state import queue_block_for_thread
-
-    try:
-        UUID(str(thread_id))
-    except (ValueError, TypeError):
-        raise HTTPException(status_code=404, detail="Thread not found") from None
-    _user, thread = await require_thread_owner(request, postgres_db, thread_id)
-    async with postgres_db.acquire() as conn:
-        block = await queue_block_for_thread(conn, thread)
-    return {"thread_id": thread_id, "queue": block}
-
-
-@app.post("/api/persistent/threads/{thread_id}/queue/retry")
-async def thread_queue_retry(thread_id: str, request: Request) -> dict[str, Any]:
-    """Owner verb: revive a parked, retryable unit
-    (stateless_turn_resilience.md step 2). ``parked`` + retryable →
-    ``unpark_unit`` (attempts reset, park_reason cleared) → 200
-    ``{state:'queued'}``; 409 ``{code}`` under stop markers / a claim-loss
-    hold / a non-retryable reason; 404 when not parked. Audited. The admin
-    verb ``POST /api/admin/run-queue/{unit_id}/unpark`` remains the
-    operator path for the non-retryable reasons.
-    """
-    from orchestrator.services.stateless_queue_state import park_retry_refusal
-    from shared.run_queue import STATE_PARKED, queue_state_for, unpark_unit
-
-    try:
-        UUID(str(thread_id))
-    except (ValueError, TypeError):
-        raise HTTPException(status_code=404, detail="Thread not found") from None
-    user, _thread = await require_thread_owner(request, postgres_db, thread_id)
-    async with postgres_db.acquire() as conn:
-        async with conn.transaction():
-            authority = await conn.fetchrow(
-                "SELECT execution_lane, metadata FROM threads "
-                "WHERE id = $1::uuid FOR UPDATE",
-                thread_id,
-            )
-            if authority is None:
-                raise HTTPException(status_code=404, detail="Thread not found")
-            queue_state = await queue_state_for(conn, unit_id=thread_id)
-            if queue_state is None or queue_state.get("state") != STATE_PARKED:
-                raise HTTPException(status_code=404, detail="Unit is not parked")
-            park_reason = queue_state.get("park_reason")
-            refusal = park_retry_refusal(park_reason, authority["metadata"])
-            if refusal is not None:
-                raise HTTPException(
-                    status_code=409,
-                    detail={"code": refusal, "park_reason": park_reason},
-                )
-            ok = await unpark_unit(conn, unit_id=thread_id)
-    if not ok:
-        raise HTTPException(status_code=404, detail="Unit is not parked")
-    attempts = int(queue_state.get("attempts") or 0)
-    logger.info(
-        "run_queue retry (owner): unit=%s park_reason=%s attempts=%d",
-        thread_id,
-        park_reason,
-        attempts,
-    )
-    await log_security_event(
-        postgres_db,
-        resource_type="thread",
-        event_type="queue_retry",
-        user=user,
-        resource_id=thread_id,
-        detail=f"owner unpark park_reason={park_reason} attempts={attempts}",
-        request=request,
-    )
-    return {
-        "thread_id": thread_id,
-        "unit_id": thread_id,
-        "state": "queued",
-        "park_reason": park_reason,
-    }
-
-
-class ThreadInterruptRequest(BaseModel):
-    """Optional correlated envelope; an empty body is pinned back-compat."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    client_request_id: UUID | None = None
-    target_turn_id: int | None = Field(
-        default=None,
-        ge=1,
-        le=2_147_483_647,
-        strict=True,
+    return session_attention_operations.SessionAttentionDependencies(
+        store=postgres_db,
+        container_provisioner=container_provisioner,
+        workspace_suspension=workspace_suspension_service,
+        persistent_provisioner=persistent_provisioner,
+        persistent_thread_recycler=lambda: _persistent_thread_recycler,
+        emit_session_provisioning_failure=_emit_session_provisioning_failure,
+        thread_retirement_operations=_thread_retirement_operations,
+        notification_service=notification_service,
+        cockpit_url=_magic_link_cockpit_url,
     )
 
-    @model_validator(mode="after")
-    def validate_complete_envelope(self) -> "ThreadInterruptRequest":
-        if (self.client_request_id is None) != (self.target_turn_id is None):
-            raise ValueError(
-                "client_request_id and target_turn_id must be supplied together"
-            )
-        return self
+
+def _thread_permission_dependencies() -> (
+    thread_permission_routes.ThreadPermissionDependencies
+):
+    return thread_permission_routes.ThreadPermissionDependencies(
+        store=postgres_db,
+        require_thread_owner=require_thread_owner,
+        notification_service=notification_service,
+        cockpit_url=_magic_link_cockpit_url,
+        wake_after_permission_decision=functools.partial(
+            session_attention_operations.wake_after_permission_decision,
+            dependencies=_session_attention_dependencies(),
+        ),
+    )
 
 
-@app.post(
-    "/api/persistent/threads/{thread_id}/interrupt",
-    responses={202: {"description": "Stateless interrupt admitted"}},
+app.state.thread_permission_dependencies_factory = (
+    lambda: _thread_permission_dependencies()
 )
-async def thread_interrupt(
-    thread_id: str,
-    request: Request,
-    body: ThreadInterruptRequest | None = None,
-) -> Any:
-    """Interrupt one exact in-flight turn without exposing its execution lane.
-
-    Pinned sessions retain their direct agent forward. Every forwarded body is
-    bound to the exact runtime fingerprint; an otherwise-empty legacy command
-    still targets the active turn observed by that runtime. A correlated
-    client is forwarded intact so the agent can reject a retry aimed at an
-    older turn. Stateless sessions commit an exact-lease request for the
-    serving executor and return admission only — that owner applies the verb
-    and journals the authoritative ack.
-    """
-    from shared.run_queue import LANE_STATELESS
-
-    user, lane_thread = await require_thread_owner(request, postgres_db, thread_id)
-    correlated = body is not None and body.client_request_id is not None
-    if correlated and body is not None and body.target_turn_id is not None:
-        try:
-            existing = await find_existing_thread_interrupt(
-                postgres_db,
-                thread_id=thread_id,
-                owner_user_id=lane_thread.get("user_id"),
-                client_request_id=body.client_request_id,
-                target_turn_id=body.target_turn_id,
-            )
-        except InterruptAdmissionError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
-        if existing is not None:
-            return JSONResponse(
-                status_code=202,
-                content={
-                    "accepted": True,
-                    "request_id": str(existing.id),
-                    "client_request_id": str(existing.client_request_id),
-                    "target_turn_id": existing.target_turn_id,
-                    "state": existing.state,
-                    "duplicate": True,
-                },
-            )
-    if lane_thread.get("execution_lane") == LANE_STATELESS:
-        if not correlated or body is None or body.target_turn_id is None:
-            # Stateless interrupt did not exist for legacy clients. Refuse an
-            # uncorrelated command rather than letting it strike whichever
-            # lease/turn happens to be current.
-            raise HTTPException(
-                status_code=422,
-                detail=(
-                    "client_request_id and target_turn_id are required for "
-                    "stateless interrupt"
-                ),
-            )
-        try:
-            admitted = await admit_thread_interrupt(
-                postgres_db,
-                thread_id=thread_id,
-                owner_user_id=lane_thread.get("user_id"),
-                client_request_id=body.client_request_id,
-                target_turn_id=body.target_turn_id,
-                requested_by=str(user.get("id") or user.get("sub") or "rest_client"),
-            )
-        except InterruptAdmissionError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
-
-        logger.info(
-            "session-interrupt admission: thread=%s turn=%d token=%d duplicate=%s",
-            thread_id,
-            admitted.target_turn_id,
-            admitted.accepted_lease_token,
-            admitted.duplicate,
-        )
-        return JSONResponse(
-            status_code=202,
-            content={
-                "accepted": True,
-                "request_id": str(admitted.id),
-                "client_request_id": str(admitted.client_request_id),
-                "target_turn_id": admitted.target_turn_id,
-                "state": admitted.state,
-                "duplicate": admitted.duplicate,
-            },
-        )
-
-    _, binding = await _resolve_thread_for_forwarding(thread_id, user)
-    payload: dict[str, Any] = {}
-    if correlated and body is not None and body.target_turn_id is not None:
-        payload = {
-            "client_request_id": str(body.client_request_id),
-            "target_turn_id": body.target_turn_id,
-        }
-    result = await _forward_to_agent(binding, "/api/interrupt", payload)
-    return {"accepted": True, "agent": result}
-
-
-class ThreadApproveRequest(BaseModel):
-    """Body for POST /api/persistent/threads/{id}/approve/{approval_id}."""
-
-    decision: str  # "approve" or "deny"
-
-
-@app.post("/api/persistent/threads/{thread_id}/approve/{approval_id}")
-async def thread_approve(
-    thread_id: str,
-    approval_id: str,
-    body: ThreadApproveRequest,
-    request: Request,
-) -> dict[str, Any]:
-    """Resolve a pending permission gate by updating thread_permission_requests
-    directly. The DB trigger fires NOTIFY → the agent's LISTEN wakes its
-    permission_check. No agent forwarding hop — this endpoint is the
-    canonical resolution path for magic-link approvals and MCP clients
-    alike. The cockpit WS approve method does the same UPDATE inside the
-    agent for back-compat.
-
-    Returns:
-        200 — request resolved (status flipped)
-        400 — invalid decision
-        403 — not thread owner
-        404 — approval_id not found, or wrong thread, or no pending request
-        409 — request already decided (idempotent re-clicks land here)
-    """
-    user, thread = await require_thread_owner(request, postgres_db, thread_id)
-    decided_by = str(user.get("id") or user.get("sub") or "rest_client")
-    outcome = await _decide_permission_request(
-        thread_id, approval_id, body.decision, decided_by=decided_by
-    )
-    await notification_service.resolve_source(
-        "permission_request", approval_id, resolved_by=f"user:{decided_by}"
-    )
-    return outcome
-
-
-async def _decide_permission_request(
-    thread_id: str, approval_id: str, decision: str, *, decided_by: str
-) -> dict[str, Any]:
-    """The one UPDATE that decides a permission gate — shared by the REST
-    endpoint and the notification's approve/deny actions. Raises the
-    endpoint's HTTP errors: 400 bad decision, 404 unknown, 409 decided."""
-    if decision == "approve":
-        new_status = "approved"
-    elif decision == "deny":
-        new_status = "denied"
-    else:
-        raise HTTPException(
-            status_code=400,
-            detail="decision must be 'approve' or 'deny'",
-        )
-
-    async with postgres_db.acquire() as conn:
-        # Lookup-then-update so we can distinguish 404 (wrong id/thread)
-        # from 409 (already decided).
-        existing = await conn.fetchrow(
-            "SELECT id, status, tool_call_id FROM thread_permission_requests "
-            "WHERE id = $1 AND thread_id = $2",
-            approval_id,
-            thread_id,
-        )
-        if existing is None:
-            raise HTTPException(
-                status_code=404,
-                detail="Permission request not found for this thread",
-            )
-        if existing["status"] != "pending":
-            raise HTTPException(
-                status_code=409,
-                detail=f"Already {existing['status']}",
-            )
-        row = await conn.fetchrow(
-            "UPDATE thread_permission_requests "
-            "SET status = $2, decided_at = now(), decided_by = $3 "
-            "WHERE id = $1 AND status = 'pending' "
-            "RETURNING id, status, tool_call_id",
-            approval_id,
-            new_status,
-            decided_by,
-        )
-    if row is None:
-        # Lost the race — somebody else just decided this. Idempotency.
-        raise HTTPException(
-            status_code=409,
-            detail="Already decided (race lost)",
-        )
-    return {
-        "accepted": True,
-        "decision": decision,
-        "approval_id": str(row["id"]),
-        "status": row["status"],
-        "tool_call_id": row["tool_call_id"],
-    }
+app.include_router(thread_permission_routes.router)
 
 
 async def thread_events_prune_sweeper(
@@ -13031,1043 +10957,6 @@ async def ssh_attachments_prune_sweeper(shutdown_event: asyncio.Event) -> None:
         except asyncio.TimeoutError:
             pass
     logger.info("SSH-attachments prune sweeper stopped")
-
-
-# =============================================================================
-# Headless persistent sessions — Phase 4 magic-link routes + watcher
-# =============================================================================
-#
-# Email magic-links land at /magic/approve/{token}. GET renders a
-# confirmation page (read-only, prefetch-safe). POST consumes the token
-# and UPDATEs thread_permission_requests via the same trigger path as
-# the cockpit WS approve handler.
-#
-# Background watcher (thread_permission_notify_sweeper) detects pending
-# requests older than 30s with no notification on record and dispatches
-# the email via services.headless_notifications.
-
-
-# Phase 5: per-thread cap on /magic/extend clicks. 4 × 60min = 4h total
-# awaiting_user before unconditional suspension. Configurable via env for
-# ops tuning during incident response.
-_MAGIC_EXTEND_CAP: int = int(os.environ.get("HEADLESS_EXTEND_CAP", "4"))
-
-
-def _magic_link_confirmation_page(
-    *,
-    tool_name: str,
-    tool_args_preview: str,
-    intended_decision: Optional[str],
-    token: str,
-    extend_status: Optional[str] = None,
-    extends_remaining: Optional[int] = None,
-) -> str:
-    """Render the GET landing page. Single button POSTs back to the same
-    URL with the actual decision; this is what prevents email-link
-    prefetchers (Outlook Safe Links, Gmail) from auto-consuming tokens.
-
-    Phase 5: a second form lets the user POST /magic/extend/{token} to
-    bump the attention-sleep clock by 60 min without consuming the
-    approval token. extend_status (when set) drives an inline toast:
-    'extended' on success, 'cap_reached' when extend_count >= cap,
-    'not_awaiting' when the thread is no longer in awaiting_user.
-    """
-    # Both values come from the agent's pending tool call and land in element
-    # content; the token below lands in an attribute. html.escape(quote=True)
-    # covers & < > " ' in one pass — the hand-rolled chains here missed ">" on
-    # the tool name and the quotes on both, which is the reflected-XSS hole.
-    safe_args = html.escape(tool_args_preview, quote=True)
-    safe_tool = html.escape(tool_name, quote=True)
-    if intended_decision == "approved":
-        button_label = "Confirm: Approve"
-        button_color = _BRAND["success"]
-    elif intended_decision == "denied":
-        button_label = "Confirm: Deny"
-        button_color = _BRAND["danger"]
-    else:
-        button_label = "Confirm decision"
-        button_color = _BRAND["accent-color"]
-
-    # The token lands in a form ``action`` attribute. Percent-encoding already
-    # removes every character that could close the attribute; escaping the
-    # result as well is a no-op on that output but keeps the sanitizer
-    # explicit at the sink rather than inferred from the encoder.
-    quoted_token = html.escape(urllib.parse.quote(token, safe=""), quote=True)
-
-    # Extend banner copy — friendly, action-specific.
-    extend_banner_html = ""
-    if extend_status == "extended":
-        remaining_str = (
-            f" — {extends_remaining} extends remaining"
-            if extends_remaining is not None
-            else ""
-        )
-        extend_banner_html = (
-            f'<div style="background: {_BRAND["surface-0"]}; border: 1px solid {_BRAND["success"]}; '
-            "padding: 10px 12px; margin: 0 0 12px 0; "
-            f'color: {_BRAND["success"]}; font-size: 13px;">Window extended by 60 minutes'
-            f"{remaining_str}.</div>"
-        )
-    elif extend_status == "cap_reached":
-        extend_banner_html = (
-            f'<div style="background: {_BRAND["surface-0"]}; border: 1px solid {_BRAND["text-secondary"]}; '
-            "padding: 10px 12px; margin: 0 0 12px 0; "
-            f'color: {_BRAND["text-secondary"]}; font-size: 13px;">Extend limit reached — please '
-            "approve, deny, or open the cockpit.</div>"
-        )
-    elif extend_status == "not_awaiting":
-        extend_banner_html = (
-            f'<div style="background: {_BRAND["surface-0"]}; border: 1px solid {_BRAND["accent-color"]}; '
-            "padding: 10px 12px; margin: 0 0 12px 0; "
-            f'color: {_BRAND["accent-color"]}; font-size: 13px;">No extend needed — the agent '
-            "is already active.</div>"
-        )
-
-    # Disable the extend button if we already know the cap was hit.
-    #
-    # The disabled look MUST be merged into the button's own style attribute.
-    # HTML keeps the FIRST style= on an element and ignores every later one,
-    # so emitting a second one meant the cap_reached branch -- and only that
-    # branch -- rendered a button with opacity/cursor and none of the brand
-    # colours, border or type scale.
-    _extend_cap_reached = extend_status == "cap_reached"
-    extend_disabled_attr = " disabled" if _extend_cap_reached else ""
-    extend_button_style = (
-        f"background: transparent; color: {_BRAND['accent-color']}; "
-        f"padding: 10px 20px; border: 1px solid {_BRAND['accent-color']}; "
-        f"font-weight: 600; font-size: 14px; "
-        + (
-            "opacity: 0.5; cursor: not-allowed;"
-            if _extend_cap_reached
-            else "cursor: pointer;"
-        )
-    )
-
-    return f"""<!DOCTYPE html>
-<html><head><meta charset="utf-8"><title>SRW — Confirm Decision</title></head>
-<body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: {_BRAND["app-bg"]}; color: {_BRAND["text-primary"]}; padding: 40px 20px;">
-  <div style="max-width: 600px; margin: 0 auto; background: {_BRAND["panel-bg"]}; border: 1px solid {_BRAND["border-color"]}; overflow: hidden;">
-    <div style="background: {_BRAND["surface-0"]}; padding: 16px 20px; border-bottom: 1px solid {_BRAND["border-color"]};">
-      <h2 style="margin: 0; color: {_BRAND["accent-color"]}; font-size: 16px;">Confirm tool decision</h2>
-    </div>
-    <div style="padding: 20px; font-size: 14px; line-height: 1.6;">
-      {extend_banner_html}
-      <p>The agent wants to call <code style="background: {_BRAND["surface-0"]}; padding: 2px 6px;">{safe_tool}</code> with these arguments:</p>
-      <pre style="background: {_BRAND["surface-0"]}; padding: 12px; overflow-x: auto; font-size: 12px; color: {_BRAND["success"]};">{safe_args}</pre>
-    </div>
-    <div style="background: {_BRAND["surface-0"]}; padding: 16px 20px; border-top: 1px solid {_BRAND["border-color"]}; text-align: center;">
-      <form method="POST" action="/magic/approve/{quoted_token}" style="display: inline;">
-        <button type="submit" style="background: {button_color}; color: {_BRAND["on-accent"]}; padding: 10px 28px; border: 0; cursor: pointer; font-weight: 600; font-size: 14px;">{button_label}</button>
-      </form>
-      <form method="POST" action="/magic/extend/{quoted_token}" style="display: inline; margin-left: 8px;">
-        <button type="submit"{extend_disabled_attr} style="{extend_button_style}">I'm reviewing — extend 60min</button>
-      </form>
-      <p style="margin: 16px 0 0 0; color: {_BRAND["text-secondary"]}; font-size: 12px;">Approve link is single-use and expires in 30 minutes.</p>
-    </div>
-  </div>
-</body></html>"""
-
-
-def _magic_link_result_page(
-    *,
-    title: str,
-    body: str,
-    cockpit_url: str,
-    is_error: bool = False,
-) -> str:
-    accent = _BRAND["danger"] if is_error else _BRAND["success"]
-    return f"""<!DOCTYPE html>
-<html><head><meta charset="utf-8"><title>SRW — {title}</title></head>
-<body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: {_BRAND["app-bg"]}; color: {_BRAND["text-primary"]}; padding: 40px 20px;">
-  <div style="max-width: 600px; margin: 0 auto; background: {_BRAND["panel-bg"]}; border: 1px solid {_BRAND["border-color"]}; overflow: hidden;">
-    <div style="background: {_BRAND["surface-0"]}; padding: 16px 20px; border-bottom: 1px solid {_BRAND["border-color"]};">
-      <h2 style="margin: 0; color: {accent}; font-size: 16px;">{title}</h2>
-    </div>
-    <div style="padding: 20px; font-size: 14px; line-height: 1.6;">
-      <p>{body}</p>
-      <p style="margin-top: 16px;"><a href="{cockpit_url}" style="color: {_BRAND["accent-color"]};">Open the cockpit</a></p>
-    </div>
-  </div>
-</body></html>"""
-
-
-@app.get("/magic/approve/{token}")
-async def magic_link_get(token: str) -> HTMLResponse:
-    """Show a confirmation page for the magic-link token.
-
-    Does NOT consume the token (POST does). This separation is critical:
-    email link previewers (Outlook Safe Links, Gmail) auto-fetch URLs
-    server-side; a GET-executes link would be consumed by a bot before
-    the human ever clicks.
-    """
-    cockpit_external_url = email_service.cockpit_url or "http://localhost:4200"
-
-    row = await headless_notifications.validate_magic_link(postgres_db, token)
-    if row is None:
-        return HTMLResponse(
-            _magic_link_result_page(
-                title="Link expired or already used",
-                body=(
-                    "This approval link is no longer valid. It may have "
-                    "expired, been used already, or been invalidated by a "
-                    "newer approval. Open the cockpit to see the current "
-                    "state."
-                ),
-                cockpit_url=cockpit_external_url,
-                is_error=True,
-            ),
-            status_code=404,
-        )
-
-    # Fetch tool details for the confirmation page.
-    async with postgres_db.acquire() as conn:
-        permission_row = await conn.fetchrow(
-            "SELECT id, tool_name, tool_args, status "
-            "FROM thread_permission_requests WHERE id = $1",
-            row["approval_id"],
-        )
-
-    if permission_row is None or permission_row["status"] != "pending":
-        return HTMLResponse(
-            _magic_link_result_page(
-                title="Already decided",
-                body=(
-                    "The agent's request has already been resolved. No "
-                    "further action is needed."
-                ),
-                cockpit_url=cockpit_external_url,
-            ),
-            status_code=409,
-        )
-
-    tool_args = permission_row["tool_args"]
-    if isinstance(tool_args, str):
-        try:
-            tool_args = json.loads(tool_args)
-        except Exception:
-            tool_args = {}
-    elif tool_args is None:
-        tool_args = {}
-    args_preview = json.dumps(tool_args, indent=2, default=str)
-    if len(args_preview) > 600:
-        args_preview = args_preview[:600] + "\n… (truncated)"
-
-    page = _magic_link_confirmation_page(
-        tool_name=permission_row["tool_name"],
-        tool_args_preview=args_preview,
-        intended_decision=row.get("intended_decision"),
-        token=token,
-    )
-    return HTMLResponse(page)
-
-
-@app.post("/magic/approve/{token}")
-async def magic_link_post(token: str) -> HTMLResponse:
-    """Consume the token and resolve the permission request.
-
-    CAS UPDATE on magic_link_tokens (single-use) + a second UPDATE on
-    thread_permission_requests (which the agent's LISTEN picks up via
-    the existing trigger). Distinguishes 404 (invalid) from 409 (token
-    already used or request already decided) for clean UX on double-clicks.
-    """
-    cockpit_external_url = email_service.cockpit_url or "http://localhost:4200"
-
-    row = await headless_notifications.validate_magic_link(postgres_db, token)
-    if row is None:
-        return HTMLResponse(
-            _magic_link_result_page(
-                title="Link expired or already used",
-                body=(
-                    "This approval link is no longer valid. It may have "
-                    "expired or been used already."
-                ),
-                cockpit_url=cockpit_external_url,
-                is_error=True,
-            ),
-            status_code=404,
-        )
-
-    decision = row.get("intended_decision") or "approved"
-
-    consumed = await headless_notifications.consume_magic_link(
-        postgres_db, str(row["id"]), decision
-    )
-    if consumed is None:
-        return HTMLResponse(
-            _magic_link_result_page(
-                title="Already used",
-                body=(
-                    "This link has already been used. The agent's request "
-                    "is being processed."
-                ),
-                cockpit_url=cockpit_external_url,
-            ),
-            status_code=409,
-        )
-
-    # Resolve the permission request. CAS-style UPDATE so we don't race
-    # with the cockpit having already decided it.
-    decided_by_label = "magic_link"
-    if consumed.get("user_id"):
-        decided_by_label = f"user:{consumed['user_id']}"
-    async with postgres_db.acquire() as conn:
-        permission_row = await conn.fetchrow(
-            "UPDATE thread_permission_requests "
-            "SET status = $2, decided_at = now(), decided_by = $3 "
-            "WHERE id = $1 AND status = 'pending' "
-            "RETURNING id, status, tool_call_id, tool_name, thread_id",
-            consumed["approval_id"],
-            decision,
-            decided_by_label,
-        )
-
-    if permission_row is None:
-        return HTMLResponse(
-            _magic_link_result_page(
-                title="Already decided",
-                body=(
-                    "The agent's request was already resolved by another "
-                    "approval path (cockpit click, REST, or expired). "
-                    "Your action was not needed."
-                ),
-                cockpit_url=cockpit_external_url,
-            ),
-            status_code=409,
-        )
-
-    # Phase 5: if attention sleep fired since the email was sent, wake through
-    # the thread's existing execution plane. Pinned sessions retain workspace
-    # restore + agent-pod re-creation. Stateless sessions retain their exact
-    # queued/leased turn and converge the workspace without binding a pod. The
-    # permission-row id is the wake task's freshness fence.
-    asyncio.create_task(
-        _phase5_wake_if_suspended(
-            str(permission_row["thread_id"]),
-            permission_request_id=str(permission_row["id"]),
-        ),
-        name=f"phase5-wake-{str(permission_row['thread_id'])[:8]}",
-    )
-
-    pretty = "approved" if decision == "approved" else "denied"
-    return HTMLResponse(
-        _magic_link_result_page(
-            title=f"Tool {pretty}",
-            body=(
-                f"The agent's request to call "
-                f"<code>{permission_row['tool_name']}</code> has been "
-                f"{pretty}. The agent will resume shortly."
-            ),
-            cockpit_url=cockpit_external_url,
-        )
-    )
-
-
-@app.post("/magic/extend/{token}")
-async def magic_link_extend(token: str) -> HTMLResponse:
-    """Extend the attention-sleep window for the thread bound to this token.
-
-    Validates the token (same hash + expiry + single-use checks as
-    /magic/approve) but does NOT consume it — the user is signaling
-    "I'm still reviewing" without making the approve decision. Bumps
-    threads.awaiting_user_since forward by 60 minutes per click, capped
-    at HEADLESS_EXTEND_CAP (default 4 = 4h total ceiling).
-
-    Re-renders the confirmation page with a toast so the user can still
-    click approve/deny on the same screen. Status_code 200 throughout —
-    the page itself carries the success/cap/not-awaiting signal.
-
-    Why a separate route and not "extend ↔ approve same POST": the
-    approve handler consumes the token (single-use CAS). If extend
-    shared that path, every extend click would burn the approval token
-    and the user couldn't approve afterward.
-    """
-    cockpit_external_url = email_service.cockpit_url or "http://localhost:4200"
-
-    row = await headless_notifications.validate_magic_link(postgres_db, token)
-    if row is None:
-        return HTMLResponse(
-            _magic_link_result_page(
-                title="Link expired or already used",
-                body=(
-                    "This link is no longer valid. Open the cockpit to "
-                    "review the agent's current state."
-                ),
-                cockpit_url=cockpit_external_url,
-                is_error=True,
-            ),
-            status_code=404,
-        )
-
-    thread_id = row.get("thread_id")
-    if thread_id is None:
-        return HTMLResponse(
-            _magic_link_result_page(
-                title="Cannot extend",
-                body="This link is not bound to a thread.",
-                cockpit_url=cockpit_external_url,
-                is_error=True,
-            ),
-            status_code=400,
-        )
-
-    # Bump awaiting_user_since iff the thread is still in awaiting_user
-    # and extend_count < cap. The CAS UPDATE returns the new row state so
-    # we can show the right banner. status='active' or 'suspended' means
-    # there's nothing to extend — the agent has either woken up already
-    # or moved beyond awaiting_user.
-    async with postgres_db.acquire() as conn:
-        updated = await conn.fetchrow(
-            "UPDATE threads "
-            "SET awaiting_user_since = now(), "
-            "    extend_count = extend_count + 1 "
-            "WHERE id = $1 "
-            "  AND status = 'awaiting_user' "
-            "  AND extend_count < $2 "
-            "RETURNING extend_count",
-            str(thread_id),
-            _MAGIC_EXTEND_CAP,
-        )
-
-    if updated is None:
-        # Distinguish cap_reached from not_awaiting for the banner copy.
-        async with postgres_db.acquire() as conn:
-            row_state = await conn.fetchrow(
-                "SELECT status, extend_count FROM threads WHERE id = $1",
-                str(thread_id),
-            )
-        if row_state is None:
-            extend_status = "not_awaiting"
-        elif row_state["status"] != "awaiting_user":
-            extend_status = "not_awaiting"
-        elif row_state["extend_count"] >= _MAGIC_EXTEND_CAP:
-            extend_status = "cap_reached"
-        else:
-            # Edge case — concurrent change between our UPDATE and SELECT.
-            # Render not_awaiting which is the gentler banner.
-            extend_status = "not_awaiting"
-        extends_remaining = None
-    else:
-        extend_status = "extended"
-        extends_remaining = max(0, _MAGIC_EXTEND_CAP - int(updated["extend_count"]))
-
-    # Re-render the confirmation page with the banner. Load the permission
-    # row again (status may have changed underneath us).
-    approval_id = row.get("approval_id")
-    if approval_id is not None:
-        async with postgres_db.acquire() as conn:
-            permission_row = await conn.fetchrow(
-                "SELECT tool_name, tool_args, status FROM "
-                "thread_permission_requests WHERE id = $1",
-                approval_id,
-            )
-    else:
-        permission_row = None
-
-    if permission_row is None or permission_row["status"] != "pending":
-        return HTMLResponse(
-            _magic_link_result_page(
-                title="Already decided",
-                body=(
-                    "The agent's request has been resolved. No further "
-                    "action is needed."
-                ),
-                cockpit_url=cockpit_external_url,
-            ),
-            status_code=200,
-        )
-
-    tool_args = permission_row["tool_args"]
-    if isinstance(tool_args, str):
-        try:
-            tool_args = json.loads(tool_args)
-        except Exception:
-            tool_args = {}
-    elif tool_args is None:
-        tool_args = {}
-    args_preview = json.dumps(tool_args, indent=2, default=str)
-    if len(args_preview) > 600:
-        args_preview = args_preview[:600] + "\n… (truncated)"
-
-    page = _magic_link_confirmation_page(
-        tool_name=permission_row["tool_name"],
-        tool_args_preview=args_preview,
-        intended_decision=row.get("intended_decision"),
-        token=token,
-        extend_status=extend_status,
-        extends_remaining=extends_remaining,
-    )
-    return HTMLResponse(page)
-
-
-async def _phase5_wake_stateless_if_suspended(
-    thread_id: str,
-    *,
-    permission_request_id: str | None,
-) -> None:
-    """Wake one queue-served permission continuation without binding a pod.
-
-    A magic-link task can run well after its originating request was resolved.
-    Revalidate every authority under the global ``threads -> run_queue`` lock
-    order: exact stateless lane/class/tier, no pinned-agent binding, the exact
-    terminal permission row, and a queued/leased session turn whose human input
-    is still unconsumed.  ``done`` is deliberately not revived: no durable
-    permission-continuation watermark exists yet, so a done row would hit the
-    executor's skip-if-answered edge and falsely claim the tool resumed.
-
-    The queue row itself is left untouched.  A live lease keeps ownership; a
-    queued retry keeps its token/fairness/affinity.  Workspace convergence uses
-    the owner-keyed session provisioner, which restores a Kubernetes sandbox,
-    refreshes a virtual binding, and is a no-op for ``none``.  It never creates
-    a persistent agent pod.
-    """
-    from shared.run_queue import (
-        LANE_STATELESS,
-        STATE_LEASED,
-        STATE_QUEUED,
-        UNIT_KIND_SESSION_TURN,
-    )
-
-    if permission_request_id is None:
-        logger.warning(
-            "magic-link wake: refusing unfenced stateless wake for thread %s",
-            thread_id,
-        )
-        return
-
-    should_ensure_workspace = False
-    async with postgres_db.acquire() as conn:
-        async with conn.transaction():
-            locked_thread = await conn.fetchrow(
-                "SELECT id, execution_lane, agent_id, status, metadata "
-                "FROM threads WHERE id = $1::uuid FOR UPDATE",
-                thread_id,
-            )
-            if locked_thread is None:
-                return
-            thread = dict(locked_thread)
-            if (
-                thread.get("execution_lane") != LANE_STATELESS
-                or thread.get("agent_id") is not None
-            ):
-                logger.warning(
-                    "magic-link wake: stateless authority moved for thread %s "
-                    "(lane=%r agent_id=%r)",
-                    thread_id,
-                    thread.get("execution_lane"),
-                    thread.get("agent_id"),
-                )
-                return
-            try:
-                _require_stateless_workspace(thread)
-            except HTTPException as exc:
-                logger.warning(
-                    "magic-link wake: refusing stateless workspace/class for "
-                    "thread %s: %s",
-                    thread_id,
-                    exc.detail,
-                )
-                return
-
-            # Keep the repository-wide threads -> run_queue lock order.  The
-            # lock makes the pending-input test atomic with a concurrent claim,
-            # completion, release or reaper steal.
-            queue = await conn.fetchrow(
-                "SELECT state, input_seq, consumed_seq "
-                "FROM run_queue "
-                "WHERE unit_id = $1::uuid AND unit_kind = $2 "
-                "FOR UPDATE",
-                thread_id,
-                UNIT_KIND_SESSION_TURN,
-            )
-            if queue is None:
-                logger.warning(
-                    "magic-link wake: no session queue authority for thread %s",
-                    thread_id,
-                )
-                return
-            queue_state = str(queue["state"] or "")
-            input_seq = queue["input_seq"]
-            consumed_seq = queue["consumed_seq"]
-            has_unconsumed_input = input_seq is not None and (
-                consumed_seq is None or int(input_seq) > int(consumed_seq)
-            )
-            if (
-                queue_state not in {STATE_QUEUED, STATE_LEASED}
-                or not has_unconsumed_input
-            ):
-                logger.warning(
-                    "magic-link wake: refusing stale stateless continuation for "
-                    "thread %s (queue_state=%s input_seq=%r consumed_seq=%r)",
-                    thread_id,
-                    queue_state,
-                    input_seq,
-                    consumed_seq,
-                )
-                return
-
-            decision = await conn.fetchval(
-                "SELECT status FROM thread_permission_requests "
-                "WHERE id = $2::uuid AND thread_id = $1::uuid "
-                "  AND status IN ('approved', 'denied')",
-                thread_id,
-                permission_request_id,
-            )
-            if decision not in {"approved", "denied"}:
-                logger.warning(
-                    "magic-link wake: exact permission fence rejected thread %s "
-                    "request %s",
-                    thread_id,
-                    permission_request_id,
-                )
-                return
-
-            thread_status = str(thread.get("status") or "")
-            if thread_status not in {"active", "awaiting_user", "suspended"}:
-                logger.warning(
-                    "magic-link wake: thread %s is not resumable (status=%r)",
-                    thread_id,
-                    thread_status,
-                )
-                return
-
-            if thread_status in {"awaiting_user", "suspended"}:
-                updated = await conn.fetchval(
-                    "UPDATE threads "
-                    "SET status = 'active', "
-                    "    awaiting_user_since = NULL, "
-                    "    extend_count = 0, "
-                    "    control_admission_agent_id = NULL "
-                    "WHERE id = $1::uuid "
-                    "  AND execution_lane = $2 "
-                    "  AND agent_id IS NULL "
-                    "  AND status IN ('suspended', 'awaiting_user') "
-                    "RETURNING id",
-                    thread_id,
-                    LANE_STATELESS,
-                )
-                if updated is None:
-                    return
-            should_ensure_workspace = True
-
-    if not should_ensure_workspace:
-        return
-    # Queue/lifecycle admission commits before this potentially slow side
-    # effect.  A claimant may arrive first, but its attach path polls the same
-    # durable workspace lifecycle until it is ready.
-    await ensure_session_workspace(
-        thread_id,
-        db=postgres_db,
-        provisioner=container_provisioner,
-        suspension=workspace_suspension_service,
-    )
-    logger.info(
-        "magic-link wake: stateless permission continuation admitted for "
-        "thread %s request %s",
-        thread_id,
-        permission_request_id,
-    )
-
-
-async def _phase5_wake_if_suspended(
-    thread_id: str,
-    *,
-    permission_request_id: str | None = None,
-) -> None:
-    """Wake a suspended thread after a magic-link decision.
-
-    Fire-and-forget — the HTTP response has already returned. Stateless
-    sessions delegate to the queue-fenced, topology-neutral helper above.
-    Pinned sessions preserve the historical resume pattern: restore from S3,
-    then spawn the agent pod if the persistent provisioner is wired.
-    """
-    try:
-        thread = await postgres_db.get_thread(thread_id)
-        if not thread:
-            return
-        if thread.get("execution_lane") == "stateless":
-            await _phase5_wake_stateless_if_suspended(
-                thread_id,
-                permission_request_id=permission_request_id,
-            )
-            return
-        if not _thread_uses_pinned_execution(thread):
-            logger.warning(
-                "magic-link wake: refusing pinned wake for thread %s on "
-                "execution lane %r",
-                thread_id,
-                thread.get("execution_lane"),
-            )
-            return
-        wake_authority = thread_runtime_authority(thread)
-        if wake_authority is None:
-            return
-        metadata = thread.get("metadata") or {}
-        if isinstance(metadata, str):
-            try:
-                metadata = json.loads(metadata)
-            except (json.JSONDecodeError, TypeError):
-                metadata = {}
-        recycle = read_recycle_record(metadata)
-        if isinstance(recycle, dict) and recycle.get("phase") not in {
-            None,
-            "",
-            "complete",
-            "cancelled",
-        }:
-            if _persistent_thread_recycler is not None:
-                await _persistent_thread_recycler.request_and_reconcile(
-                    thread_id=thread_id,
-                    reason="resume_during_recycle",
-                    expected_build_sha=persistent_provisioner.expected_build_sha,
-                    expected_project_id=(
-                        str(thread.get("project_id"))
-                        if thread.get("project_id")
-                        else None
-                    ),
-                )
-            return
-        ws_ctx = metadata.get("workspace_container") or {}
-        ws_status = ws_ctx.get("status")
-        if ws_status == "suspended" and workspace_suspension_service.is_enabled:
-            logger.info(
-                "magic-link wake: restoring suspended workspace for thread %s",
-                thread_id,
-            )
-            restored = await ensure_session_workspace(
-                thread_id,
-                db=postgres_db,
-                provisioner=container_provisioner,
-                suspension=workspace_suspension_service,
-                expected_runtime_generation=wake_authority.generation,
-            )
-            if restored is None or restored.outcome is EnsureOutcome.FAILED:
-                logger.warning(
-                    "magic-link wake: workspace restore failed or lost authority "
-                    "for thread %s",
-                    thread_id,
-                )
-                return
-
-        # Publish wake only to the exact post-suspension generation. A G2
-        # restore delayed across another End/Resume cannot wake G3.
-        async with postgres_db.acquire() as conn:
-            woke = await conn.fetchval(
-                "UPDATE threads "
-                "SET status = 'active', "
-                "    awaiting_user_since = NULL, "
-                "    extend_count = 0, "
-                "    control_admission_agent_id = NULL "
-                "WHERE id = $1::uuid "
-                "  AND execution_lane='pinned' "
-                "  AND runtime_generation=$2::uuid "
-                "  AND runtime_retirement_token IS NULL "
-                "  AND status IN ('suspended', 'awaiting_user') "
-                "RETURNING id",
-                thread_id,
-                wake_authority.generation,
-            )
-        if woke is None and not same_thread_runtime_authority(
-            await postgres_db.get_thread(thread_id), wake_authority
-        ):
-            return
-
-        # Agent pod may also have been deleted on suspension
-        # (workspace_suspension.py:502-504). Re-provision if a persistent
-        # provisioner is configured. fire-and-forget — the agent's boot
-        # will restore the LangGraph checkpoint and re-enter permission_check
-        # for the same tool_call_id, where the select-first guard picks up
-        # the decision we just UPDATEd.
-        current = await postgres_db.get_thread(thread_id)
-        if not same_thread_runtime_authority(current, wake_authority):
-            return
-        if persistent_provisioner is not None and not current.get("agent_id"):
-            config_name = canonical_config_name(
-                thread.get("config_name", "session_base")
-            )
-
-            async def _create_after_magic_link() -> None:
-                # This closure sits lexically inside the wake handler's
-                # try/except, but it is scheduled as its own task — so that
-                # handler NEVER sees anything raised here. Its own guard is the
-                # only thing between a raise and a silently vanished wake.
-                try:
-                    result = await persistent_provisioner.create_agent_pod(
-                        thread_id,
-                        config_name=config_name,
-                        expected_runtime_generation=wake_authority.generation,
-                    )
-                    if not result.usable:
-                        logger.warning(
-                            "magic-link persistent provisioning for thread %s "
-                            "is %s (%s)",
-                            thread_id,
-                            result.status.value,
-                            result.failure_class or "no-detail",
-                        )
-                        await _emit_session_provisioning_failure(
-                            thread_id,
-                            str(thread.get("user_id") or "") or None,
-                            wake_authority,
-                            f"magic-link wake provisioning {result.status.value}"
-                            f" ({result.failure_class or 'no-detail'})",
-                        )
-                except Exception as exc:
-                    logger.exception(
-                        "magic-link persistent provisioning for thread %s raised: %s",
-                        thread_id,
-                        exc,
-                    )
-                    await _emit_session_provisioning_failure(
-                        thread_id,
-                        str(thread.get("user_id") or "") or None,
-                        wake_authority,
-                        str(exc),
-                    )
-
-            asyncio.create_task(
-                _create_after_magic_link(),
-                name=f"phase5-create-agent-{thread_id[:8]}",
-            )
-    except Exception as e:
-        logger.warning(
-            "magic-link wake task failed for thread %s: %s",
-            thread_id,
-            e,
-        )
-
-
-async def thread_permission_notify_sweeper(
-    shutdown_event: asyncio.Event,
-) -> None:
-    """Background task: a permission request that has waited longer than
-    HEADLESS_NOTIFY_AGE_S without a decision becomes a ``session_permission``
-    feed row for the thread owner — ``high``, so the mail (with the two magic
-    links) goes out now, and the row resolves when the gate is decided by any
-    path. In-session gates are answered within seconds through the agent's
-    LISTEN, so only abandoned ones ever get here.
-
-    Runs every HEADLESS_NOTIFY_INTERVAL_S (default 30s). Idempotent: the
-    feed row is keyed on the request id, and rows already recorded are
-    filtered out so the magic-link tokens are minted once.
-
-    Best-effort. Survives transient errors by logging and continuing.
-    """
-    interval_s = int(os.environ.get("HEADLESS_NOTIFY_INTERVAL_S", "30"))
-    age_threshold_s = int(os.environ.get("HEADLESS_NOTIFY_AGE_S", "30"))
-    logger.info(
-        "Headless permission-notify sweeper started (interval=%ds, age_threshold=%ds)",
-        interval_s,
-        age_threshold_s,
-    )
-    cockpit_external_url = email_service.cockpit_url or "http://localhost:4200"
-
-    while not shutdown_event.is_set():
-        try:
-            async with postgres_db.acquire() as conn:
-                rows = await conn.fetch(
-                    "SELECT r.id, r.thread_id, r.tool_name, r.tool_args, "
-                    "       r.requested_at, t.user_id, t.title "
-                    "FROM thread_permission_requests r "
-                    "JOIN threads t ON t.id = r.thread_id "
-                    "WHERE r.status = 'pending' "
-                    "  AND r.requested_at < now() - ($1::int * interval '1 second') "
-                    "  AND NOT EXISTS ("
-                    "    SELECT 1 FROM notifications n "
-                    "    WHERE n.source_kind = 'permission_request' "
-                    "      AND n.source_id = r.id::text"
-                    "  ) "
-                    "ORDER BY r.requested_at ASC "
-                    "LIMIT 50",
-                    age_threshold_s,
-                )
-            for row in rows:
-                try:
-                    result = await headless_notifications.record_permission_pending(
-                        postgres_db,
-                        notification_service,
-                        row=dict(row),
-                        cockpit_external_url=cockpit_external_url,
-                    )
-                    if result.get("status") == "recorded":
-                        logger.info(
-                            "Recorded permission-pending notification "
-                            "(thread=%s req=%s)",
-                            str(row["thread_id"])[:8],
-                            str(row["id"])[:8],
-                        )
-                except Exception as e:
-                    logger.warning(
-                        "Permission-pending notification failed (req=%s): %s",
-                        str(row["id"])[:8],
-                        e,
-                    )
-        except Exception as e:
-            logger.warning("headless permission-notify sweep error: %s", e)
-        try:
-            await asyncio.wait_for(shutdown_event.wait(), timeout=float(interval_s))
-            break
-        except asyncio.TimeoutError:
-            pass
-    logger.info("Headless permission-notify sweeper stopped")
-
-
-# =============================================================================
-# Phase 5 — Attention sleep watchdog
-# =============================================================================
-#
-# Suspends thread workspaces (and the bound agent pod) when the agent has
-# been in `awaiting_user` for longer than HEADLESS_ATTENTION_SLEEP_MINUTES.
-# State machine:
-#   active ─→ awaiting_user (agent: natural pause + no WS subscriber)
-#   awaiting_user ─→ suspended (this watchdog after TTL)
-#   awaiting_user ─→ active (agent: subscriber reattach, clears timer)
-#   suspended ─→ active (magic-link wake or REST reattach restores workspace)
-#
-# Magic-link "extend window" POSTs bump awaiting_user_since forward so the
-# watchdog re-arms; threads.extend_count caps the bumps at 4 (4h total).
-#
-# Today's "tethered" signal is WS-only — Phase 5 v1 ships before the
-# cockpit migrates from WS to SSE. SSE-only consumers (MCP, curl) do not
-# block suspension; they should rely on magic-link wake to bring the
-# session back. When cockpit moves to SSE, this watchdog will need to
-# consult the orchestrator's in-process SSE attach registry too.
-
-
-_ATTENTION_SLEEP_INTERVAL_S: int = int(
-    os.environ.get("HEADLESS_ATTENTION_SLEEP_INTERVAL_S", "60")
-)
-_ATTENTION_SLEEP_MINUTES: int = int(
-    os.environ.get("HEADLESS_ATTENTION_SLEEP_MINUTES", "60")
-)
-
-
-async def attention_sleep_sweeper(shutdown_event: asyncio.Event) -> None:
-    """Background task: suspend threads stuck in awaiting_user past their TTL.
-
-    Runs every HEADLESS_ATTENTION_SLEEP_INTERVAL_S (default 60s). Each
-    qualifying pinned generation enters the same durable retirement funnel as
-    owner End, settling to ``suspended`` only after generation-fenced staging
-    and exact resource cleanup. Resume stays closed for the entire operation.
-
-    Best-effort: a transient failure (DB unavailable, suspend service
-    error) is logged and retried on the next tick.
-    """
-    interval_s = _ATTENTION_SLEEP_INTERVAL_S
-    ttl_minutes = _ATTENTION_SLEEP_MINUTES
-    logger.info(
-        "Attention-sleep sweeper started (interval=%ds, ttl=%dmin)",
-        interval_s,
-        ttl_minutes,
-    )
-
-    while not shutdown_event.is_set():
-        try:
-            # A disconnect intentionally leaves a short TTL grace so reloads
-            # and multi-tab handoffs never flicker. If a turn reached its
-            # natural pause inside that grace, converge it once the queue is
-            # durably done and the final client TTL has expired. This is
-            # independent of workspace suspension being enabled.
-            try:
-                promoted = await promote_expired_stateless_pauses(postgres_db, limit=50)
-                if promoted:
-                    logger.info(
-                        "presence expiry promoted %d stateless thread(s) "
-                        "to awaiting_user",
-                        len(promoted),
-                    )
-            except Exception as exc:
-                # Presence convergence is additive. It must never suppress the
-                # pre-existing awaiting_user suspension sweep on the same tick.
-                logger.warning("presence expiry promotion failed: %s", exc)
-            if workspace_suspension_service.is_enabled:
-                async with postgres_db.acquire() as conn:
-                    # Phase 6: per-thread TTL resolution. Priority order is
-                    # (1) thread.metadata.config_override.headless overrides,
-                    # (2) users.settings.persistent_agent overrides,
-                    # (3) the global HEADLESS_ATTENTION_SLEEP_MINUTES default.
-                    # ttl <= 0 disables the watchdog for that thread, matching
-                    # the cockpit UX of "Never auto-suspend".
-                    rows = await conn.fetch(
-                        "SELECT t.id, t.status, t.execution_lane, "
-                        "       t.runtime_generation, t.agent_id, "
-                        "       t.runtime_attach_token "
-                        "FROM threads t "
-                        "LEFT JOIN users u ON u.id = t.user_id "
-                        "WHERE t.status = 'awaiting_user' "
-                        "  AND t.execution_lane <> 'stateless' "
-                        "  AND t.awaiting_user_since IS NOT NULL "
-                        # Officer sessions never sleep via attention-sleep —
-                        # their lifecycle belongs to the officer watchdog
-                        # (centurion.md §4). Belt-and-suspenders: the agent
-                        # side already skips the awaiting_user flip for them.
-                        "  AND COALESCE(t.metadata->'config_override'->'officer'"
-                        "->>'enabled','false') <> 'true' "
-                        "  AND COALESCE("
-                        "    NULLIF(t.metadata->'config_override'->'headless'->>'attention_sleep_minutes', '')::int, "
-                        "    NULLIF(u.settings->'persistent_agent'->>'headless_attention_sleep_minutes', '')::int, "
-                        "    $1::int"
-                        "  ) > 0 "
-                        "  AND t.awaiting_user_since < now() - make_interval(mins => COALESCE("
-                        "    NULLIF(t.metadata->'config_override'->'headless'->>'attention_sleep_minutes', '')::int, "
-                        "    NULLIF(u.settings->'persistent_agent'->>'headless_attention_sleep_minutes', '')::int, "
-                        "    $1::int"
-                        "  )) "
-                        "ORDER BY t.awaiting_user_since ASC "
-                        "LIMIT 50",
-                        int(ttl_minutes),
-                    )
-
-                for row in rows:
-                    thread_id = str(row["id"])
-                    try:
-                        result = await _thread_retirement_operations().end_thread_flow(
-                            thread_id,
-                            dict(row),
-                            permanent=False,
-                            force=False,
-                            expected_runtime_generation=str(row["runtime_generation"]),
-                            expected_agent_id=(
-                                str(row["agent_id"])
-                                if row["agent_id"] is not None
-                                else None
-                            ),
-                            expected_attach_token=(
-                                str(row["runtime_attach_token"])
-                                if row["runtime_attach_token"] is not None
-                                else None
-                            ),
-                            settle_status="suspended",
-                        )
-                        if result.get("status") == "suspended":
-                            logger.info(
-                                "attention-sleep: thread %s suspended (was "
-                                "awaiting_user >%dm)",
-                                thread_id,
-                                ttl_minutes,
-                            )
-                        else:
-                            logger.info(
-                                "attention-sleep: exact retirement declined "
-                                "for thread %s (%s)",
-                                thread_id,
-                                result.get("status"),
-                            )
-                    except Exception as e:
-                        logger.warning(
-                            "attention-sleep: suspend failed for thread %s: %s",
-                            thread_id,
-                            e,
-                        )
-        except Exception as e:
-            logger.warning("attention-sleep sweep error: %s", e)
-
-        try:
-            await asyncio.wait_for(shutdown_event.wait(), timeout=float(interval_s))
-            break
-        except asyncio.TimeoutError:
-            pass
-
-    logger.info("Attention-sleep sweeper stopped")
 
 
 # =============================================================================

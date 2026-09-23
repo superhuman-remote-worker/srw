@@ -18,6 +18,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from orchestrator.routers import thread_session
+from orchestrator.schemas.thread_session import ToolGroupPreviewRequest
 from shared.runtime.core.session_tool_overrides import SESSION_TOOL_OVERRIDE_NAMES
 from shared.runtime.core.tool_report import (
     MEASURED_ORIGINS,
@@ -31,6 +33,10 @@ from shared.runtime.core.tool_report import (
 )
 
 _AGENT_ROW = {"id": "agent-1", "pod_ip": "10.0.0.9", "pod_port": 8001}
+
+#: The tool view's own module-level collaborators (deployment gate, policy
+#: merge) are looked up here at call time, so they are patched here.
+_TOOL_VIEW = "orchestrator.services.session_tool_view"
 
 
 @pytest.fixture(autouse=True)
@@ -103,12 +109,37 @@ class _Client:
 
 
 def _agent_http(routes):
-    """Patch ``main.httpx.AsyncClient`` and return the recorded call list."""
+    """Patch the toolset probe's ``httpx.AsyncClient``; return the call list."""
     calls: list[str] = []
     return patch(
-        "orchestrator.main.httpx.AsyncClient",
+        "orchestrator.services.agent_toolset_probe.httpx.AsyncClient",
         MagicMock(side_effect=lambda **kw: _Client(routes, calls)),
     ), calls
+
+
+def _app_dependencies():
+    """The application's own dependency composition, rebuilt per call.
+
+    ``main._thread_session_dependencies()`` reads the app-owned collaborators
+    (``postgres_db``, ``require_approved_user``, ``_user_experts_enabled``,
+    ``_resolve_runner_grants``, ...) at call time, so patches of those still
+    steer the extracted route. Build it INSIDE the patch context.
+    """
+    import orchestrator.main as orch_main
+
+    return orch_main._thread_session_dependencies()
+
+
+async def _get_tool_groups(thread_id, request):
+    return await thread_session.get_thread_tool_groups(
+        thread_id, request, dependencies=_app_dependencies()
+    )
+
+
+async def _preview_tool_groups(body, request):
+    return await thread_session.preview_tool_groups(
+        body, request, dependencies=_app_dependencies()
+    )
 
 
 def _report(categories, *, observed_at="2026-08-02T12:00:00Z", backend=None):
@@ -129,8 +160,6 @@ def _report(categories, *, observed_at="2026-08-02T12:00:00Z", backend=None):
 
 async def _call(user, db, thread_row, fake_request, *, routes=None, grants=None):
     """Drive the endpoint with a fake agent transport and explicit grants."""
-    from orchestrator.main import get_thread_tool_groups
-
     db.get_thread = AsyncMock(return_value=thread_row)
     db.get_agent = AsyncMock(return_value=_AGENT_ROW)
     http_patch, calls = _agent_http(routes or {})
@@ -146,9 +175,7 @@ async def _call(user, db, thread_row, fake_request, *, routes=None, grants=None)
         )
         stack.enter_context(patch("orchestrator.main.postgres_db", db))
         stack.enter_context(
-            patch(
-                "orchestrator.main._is_experts_db_enabled", MagicMock(return_value=True)
-            )
+            patch(f"{_TOOL_VIEW}.is_experts_db_enabled", MagicMock(return_value=True))
         )
         stack.enter_context(
             patch(
@@ -162,7 +189,7 @@ async def _call(user, db, thread_row, fake_request, *, routes=None, grants=None)
             )
         )
         stack.enter_context(http_patch)
-        result = await get_thread_tool_groups(str(thread_row["id"]), fake_request)
+        result = await _get_tool_groups(str(thread_row["id"]), fake_request)
     return result, calls
 
 
@@ -381,8 +408,6 @@ class TestPredictionIsLabelled:
         self, user_a, fake_db, fake_request
     ):
         """A dead pod's row keeps its ``pod_ip``, and the pane blocks on us."""
-        from orchestrator.main import get_thread_tool_groups
-
         fake_db.get_thread = AsyncMock(return_value=_thread(agent_id="agent-1"))
         fake_db.get_agent = AsyncMock(return_value={**_AGENT_ROW, "status": "offline"})
         http_patch, calls = _agent_http({})
@@ -393,9 +418,7 @@ class TestPredictionIsLabelled:
                 AsyncMock(return_value=user_a),
             ),
             patch("orchestrator.main.postgres_db", fake_db),
-            patch(
-                "orchestrator.main._is_experts_db_enabled", MagicMock(return_value=True)
-            ),
+            patch(f"{_TOOL_VIEW}.is_experts_db_enabled", MagicMock(return_value=True)),
             patch(
                 "orchestrator.main._user_experts_enabled", AsyncMock(return_value=True)
             ),
@@ -404,7 +427,7 @@ class TestPredictionIsLabelled:
             ),
             http_patch,
         ):
-            result = await get_thread_tool_groups(str(_thread()["id"]), fake_request)
+            result = await _get_tool_groups(str(_thread()["id"]), fake_request)
 
         assert result["origin"] == ORIGIN_PREDICTION
         assert "offline" in result["prediction_reason"]
@@ -420,8 +443,6 @@ class TestPredictionIsLabelled:
         for the first minute of every session — the exact class of silently
         wrong answer this endpoint exists to remove.
         """
-        from orchestrator.main import get_thread_tool_groups
-
         fake_db.get_thread = AsyncMock(return_value=_thread(agent_id="agent-1"))
         fake_db.get_agent = AsyncMock(return_value={**_AGENT_ROW, "status": "ready"})
         http_patch, calls = _agent_http(
@@ -438,9 +459,7 @@ class TestPredictionIsLabelled:
                 AsyncMock(return_value=user_a),
             ),
             patch("orchestrator.main.postgres_db", fake_db),
-            patch(
-                "orchestrator.main._is_experts_db_enabled", MagicMock(return_value=True)
-            ),
+            patch(f"{_TOOL_VIEW}.is_experts_db_enabled", MagicMock(return_value=True)),
             patch(
                 "orchestrator.main._user_experts_enabled", AsyncMock(return_value=True)
             ),
@@ -449,7 +468,7 @@ class TestPredictionIsLabelled:
             ),
             http_patch,
         ):
-            result = await get_thread_tool_groups(str(_thread()["id"]), fake_request)
+            result = await _get_tool_groups(str(_thread()["id"]), fake_request)
 
         assert result["origin"] == ORIGIN_AGENT
         assert calls
@@ -604,8 +623,6 @@ class TestUnavailableCarriesAReason:
     ):
         """The PDP enforces; this only explains. Inventing a denial is its own
         D1 violation, so a lookup failure must read as no restriction."""
-        from orchestrator.main import get_thread_tool_groups
-
         fake_db.get_thread = AsyncMock(return_value=_thread())
         with (
             patch("orchestrator.main.require_approved_user", _approved(user_a)),
@@ -614,9 +631,7 @@ class TestUnavailableCarriesAReason:
                 AsyncMock(return_value=user_a),
             ),
             patch("orchestrator.main.postgres_db", fake_db),
-            patch(
-                "orchestrator.main._is_experts_db_enabled", MagicMock(return_value=True)
-            ),
+            patch(f"{_TOOL_VIEW}.is_experts_db_enabled", MagicMock(return_value=True)),
             patch(
                 "orchestrator.main._user_experts_enabled", AsyncMock(return_value=True)
             ),
@@ -625,7 +640,7 @@ class TestUnavailableCarriesAReason:
                 AsyncMock(side_effect=RuntimeError("db down")),
             ),
         ):
-            result = await get_thread_tool_groups(str(_thread()["id"]), fake_request)
+            result = await _get_tool_groups(str(_thread()["id"]), fake_request)
 
         assert result["categories"]["shell"]["reason"] is None
 
@@ -643,8 +658,6 @@ class TestResolveFailureWithAMeasurement:
         A session that is running has, by construction, already resolved — so
         a resolve failing now says nothing about what the agent holds.
         """
-        from orchestrator.main import get_thread_tool_groups
-
         fake_db.get_thread = AsyncMock(return_value=_thread(agent_id="agent-1"))
         fake_db.get_agent = AsyncMock(return_value=_AGENT_ROW)
         http_patch, _calls = _agent_http(
@@ -661,9 +674,7 @@ class TestResolveFailureWithAMeasurement:
                 AsyncMock(return_value=user_a),
             ),
             patch("orchestrator.main.postgres_db", fake_db),
-            patch(
-                "orchestrator.main._is_experts_db_enabled", MagicMock(return_value=True)
-            ),
+            patch(f"{_TOOL_VIEW}.is_experts_db_enabled", MagicMock(return_value=True)),
             patch(
                 "orchestrator.main._user_experts_enabled", AsyncMock(return_value=True)
             ),
@@ -671,12 +682,12 @@ class TestResolveFailureWithAMeasurement:
                 "orchestrator.main._resolve_runner_grants", AsyncMock(return_value=None)
             ),
             patch(
-                "orchestrator.main._merged_session_tool_policy",
+                f"{_TOOL_VIEW}.merged_session_tool_policy",
                 MagicMock(side_effect=RuntimeError("boom")),
             ),
             http_patch,
         ):
-            result = await get_thread_tool_groups(str(_thread()["id"]), fake_request)
+            result = await _get_tool_groups(str(_thread()["id"]), fake_request)
 
         assert result["source"] == "error"
         assert result["origin"] == ORIGIN_AGENT
@@ -689,8 +700,6 @@ class TestResolveFailureWithAMeasurement:
 class TestPreviewEndpoint:
     @pytest.mark.asyncio
     async def test_always_a_prediction(self, user_a, fake_db, fake_request):
-        from orchestrator.main import ToolGroupPreviewRequest, preview_tool_groups
-
         with (
             patch("orchestrator.main.require_approved_user", _approved(user_a)),
             patch("orchestrator.main.postgres_db", fake_db),
@@ -698,7 +707,7 @@ class TestPreviewEndpoint:
                 "orchestrator.main._resolve_runner_grants", AsyncMock(return_value=None)
             ),
         ):
-            result = await preview_tool_groups(
+            result = await _preview_tool_groups(
                 ToolGroupPreviewRequest(config_name="session_base"), fake_request
             )
 
@@ -709,8 +718,6 @@ class TestPreviewEndpoint:
 
     @pytest.mark.asyncio
     async def test_reflects_the_requested_override(self, user_a, fake_db, fake_request):
-        from orchestrator.main import ToolGroupPreviewRequest, preview_tool_groups
-
         with (
             patch("orchestrator.main.require_approved_user", _approved(user_a)),
             patch("orchestrator.main.postgres_db", fake_db),
@@ -718,14 +725,14 @@ class TestPreviewEndpoint:
                 "orchestrator.main._resolve_runner_grants", AsyncMock(return_value=None)
             ),
         ):
-            on = await preview_tool_groups(
+            on = await _preview_tool_groups(
                 ToolGroupPreviewRequest(
                     config_name="session_base",
                     config_override={"tools": {"canvas": ["get_canvas", "set_canvas"]}},
                 ),
                 fake_request,
             )
-            off = await preview_tool_groups(
+            off = await _preview_tool_groups(
                 ToolGroupPreviewRequest(
                     config_name="session_base",
                     config_override={"tools": {"canvas": []}},
@@ -754,8 +761,6 @@ class TestPreviewEndpoint:
         So this pins the base routing, and the mutation that breaks it is
         defaulting a worker request to ``session_base``.
         """
-        from orchestrator.main import ToolGroupPreviewRequest, preview_tool_groups
-
         with (
             patch("orchestrator.main.require_approved_user", _approved(user_a)),
             patch("orchestrator.main.postgres_db", fake_db),
@@ -763,10 +768,10 @@ class TestPreviewEndpoint:
                 "orchestrator.main._resolve_runner_grants", AsyncMock(return_value=None)
             ),
         ):
-            session = await preview_tool_groups(
+            session = await _preview_tool_groups(
                 ToolGroupPreviewRequest(expert_type="session"), fake_request
             )
-            worker = await preview_tool_groups(
+            worker = await _preview_tool_groups(
                 ToolGroupPreviewRequest(expert_type="worker"), fake_request
             )
 
@@ -792,8 +797,6 @@ class TestPreviewEndpoint:
         self, user_a, fake_db, fake_request
     ):
         """No `config_name` on the job form must mean worker_base, not session_base."""
-        from orchestrator.main import ToolGroupPreviewRequest, preview_tool_groups
-
         seen: dict = {}
 
         def _spy(**kwargs):
@@ -807,11 +810,11 @@ class TestPreviewEndpoint:
                 "orchestrator.main._resolve_runner_grants", AsyncMock(return_value=None)
             ),
             patch(
-                "orchestrator.main._merged_session_tool_policy",
+                f"{_TOOL_VIEW}.merged_session_tool_policy",
                 MagicMock(side_effect=_spy),
             ),
         ):
-            await preview_tool_groups(
+            await _preview_tool_groups(
                 ToolGroupPreviewRequest(expert_type="worker"), fake_request
             )
 
@@ -873,18 +876,16 @@ class TestPreviewEndpoint:
     ):
         from fastapi import HTTPException
 
-        from orchestrator.main import ToolGroupPreviewRequest, preview_tool_groups
-
         with (
             patch("orchestrator.main.require_approved_user", _approved(user_a)),
             patch("orchestrator.main.postgres_db", fake_db),
             patch(
-                "orchestrator.main._merged_session_tool_policy",
+                f"{_TOOL_VIEW}.merged_session_tool_policy",
                 MagicMock(side_effect=RuntimeError("boom")),
             ),
         ):
             with pytest.raises(HTTPException) as exc:
-                await preview_tool_groups(
+                await _preview_tool_groups(
                     ToolGroupPreviewRequest(config_name="session_base"), fake_request
                 )
         assert exc.value.status_code == 422
@@ -892,8 +893,6 @@ class TestPreviewEndpoint:
     @pytest.mark.asyncio
     async def test_requires_an_approved_user(self, fake_db, fake_request):
         from fastapi import HTTPException
-
-        from orchestrator.main import ToolGroupPreviewRequest, preview_tool_groups
 
         with (
             patch(
@@ -903,7 +902,7 @@ class TestPreviewEndpoint:
             patch("orchestrator.main.postgres_db", fake_db),
         ):
             with pytest.raises(HTTPException) as exc:
-                await preview_tool_groups(ToolGroupPreviewRequest(), fake_request)
+                await _preview_tool_groups(ToolGroupPreviewRequest(), fake_request)
         assert exc.value.status_code == 403
 
 
@@ -925,8 +924,6 @@ class TestEnumerateOnlyRidesBothReads:
 
     @pytest.mark.asyncio
     async def test_the_preview_read_serves_it(self, user_a, fake_db, fake_request):
-        from orchestrator.main import ToolGroupPreviewRequest, preview_tool_groups
-
         with (
             patch("orchestrator.main.require_approved_user", _approved(user_a)),
             patch("orchestrator.main.postgres_db", fake_db),
@@ -934,7 +931,7 @@ class TestEnumerateOnlyRidesBothReads:
                 "orchestrator.main._resolve_runner_grants", AsyncMock(return_value=None)
             ),
         ):
-            result = await preview_tool_groups(
+            result = await _preview_tool_groups(
                 ToolGroupPreviewRequest(config_name="session_base"), fake_request
             )
         assert result["enumerate_only"]["shell"]
@@ -974,13 +971,11 @@ class TestPreviewModelsTheLegacyPathToo:
     """
 
     async def _preview(self, user, db, req, *, experts, override=None):
-        from orchestrator.main import ToolGroupPreviewRequest, preview_tool_groups
-
         with (
             patch("orchestrator.main.require_approved_user", _approved(user)),
             patch("orchestrator.main.postgres_db", db),
             patch(
-                "orchestrator.main._is_experts_db_enabled",
+                f"{_TOOL_VIEW}.is_experts_db_enabled",
                 MagicMock(return_value=experts),
             ),
             patch(
@@ -991,7 +986,7 @@ class TestPreviewModelsTheLegacyPathToo:
                 "orchestrator.main._resolve_runner_grants", AsyncMock(return_value=None)
             ),
         ):
-            return await preview_tool_groups(
+            return await _preview_tool_groups(
                 ToolGroupPreviewRequest(
                     config_name="session_base", config_override=override
                 ),
@@ -1051,7 +1046,6 @@ class TestOneDeadlineForTheWholeProbe:
     async def test_a_slow_two_hop_probe_is_cut_off_and_labelled(
         self, user_a, fake_db, fake_request
     ):
-        import orchestrator.main as orch_main
         from orchestrator.services import agent_toolset_probe
 
         async def _crawl(url):
@@ -1073,9 +1067,7 @@ class TestOneDeadlineForTheWholeProbe:
                 AsyncMock(return_value=user_a),
             ),
             patch("orchestrator.main.postgres_db", fake_db),
-            patch(
-                "orchestrator.main._is_experts_db_enabled", MagicMock(return_value=True)
-            ),
+            patch(f"{_TOOL_VIEW}.is_experts_db_enabled", MagicMock(return_value=True)),
             patch(
                 "orchestrator.main._user_experts_enabled", AsyncMock(return_value=True)
             ),
@@ -1087,12 +1079,11 @@ class TestOneDeadlineForTheWholeProbe:
             # would leave this case green while the probe ran unbounded.
             patch.object(agent_toolset_probe, "AGENT_TOOLSET_BUDGET_S", 0.2),
             patch(
-                "orchestrator.main.httpx.AsyncClient", MagicMock(return_value=client)
+                "orchestrator.services.agent_toolset_probe.httpx.AsyncClient",
+                MagicMock(return_value=client),
             ),
         ):
-            result = await orch_main.get_thread_tool_groups(
-                str(_thread()["id"]), fake_request
-            )
+            result = await _get_tool_groups(str(_thread()["id"]), fake_request)
         elapsed = asyncio.get_event_loop().time() - started
 
         assert result["origin"] == ORIGIN_PREDICTION
@@ -1102,8 +1093,6 @@ class TestOneDeadlineForTheWholeProbe:
     @pytest.mark.asyncio
     async def test_a_booting_agent_is_not_probed(self, user_a, fake_db, fake_request):
         """Registered but not serving: nothing bound, so nothing to measure."""
-        from orchestrator.main import get_thread_tool_groups
-
         fake_db.get_thread = AsyncMock(return_value=_thread(agent_id="agent-1"))
         fake_db.get_agent = AsyncMock(return_value={**_AGENT_ROW, "status": "booting"})
         http_patch, calls = _agent_http({})
@@ -1114,9 +1103,7 @@ class TestOneDeadlineForTheWholeProbe:
                 AsyncMock(return_value=user_a),
             ),
             patch("orchestrator.main.postgres_db", fake_db),
-            patch(
-                "orchestrator.main._is_experts_db_enabled", MagicMock(return_value=True)
-            ),
+            patch(f"{_TOOL_VIEW}.is_experts_db_enabled", MagicMock(return_value=True)),
             patch(
                 "orchestrator.main._user_experts_enabled", AsyncMock(return_value=True)
             ),
@@ -1125,7 +1112,7 @@ class TestOneDeadlineForTheWholeProbe:
             ),
             http_patch,
         ):
-            result = await get_thread_tool_groups(str(_thread()["id"]), fake_request)
+            result = await _get_tool_groups(str(_thread()["id"]), fake_request)
 
         assert result["origin"] == ORIGIN_PREDICTION
         assert "booting" in result["prediction_reason"]
@@ -1243,7 +1230,6 @@ class TestPreviewRoster:
 
         import yaml
 
-        from orchestrator.main import ToolGroupPreviewRequest, preview_tool_groups
         from shared.manifests.resolution import content_revision
         from tests.conftest import _UID_A
 
@@ -1291,9 +1277,7 @@ class TestPreviewRoster:
                 AsyncMock(return_value=user_a),
             ),
             patch("orchestrator.main.postgres_db", fake_db),
-            patch(
-                "orchestrator.main._is_experts_db_enabled", MagicMock(return_value=True)
-            ),
+            patch(f"{_TOOL_VIEW}.is_experts_db_enabled", MagicMock(return_value=True)),
             patch(
                 "orchestrator.main._user_experts_enabled", AsyncMock(return_value=True)
             ),
@@ -1301,13 +1285,13 @@ class TestPreviewRoster:
                 "orchestrator.main._resolve_runner_grants", AsyncMock(return_value=None)
             ),
         ):
-            with_roster = await preview_tool_groups(
+            with_roster = await _preview_tool_groups(
                 ToolGroupPreviewRequest(
                     config_name="session_base", expert_id=expert_id
                 ),
                 fake_request,
             )
-            bare = await preview_tool_groups(
+            bare = await _preview_tool_groups(
                 ToolGroupPreviewRequest(config_name="session_base"), fake_request
             )
 
@@ -1323,8 +1307,6 @@ class TestPreviewRoster:
 async def test_explicit_workspace_preview_overrides_expert_recommendation(
     user_a, fake_db, fake_request, backend
 ):
-    from orchestrator.main import ToolGroupPreviewRequest, preview_tool_groups
-
     selected = (
         None if backend == "none" else {"template": {"inline": {"backend": backend}}}
     )
@@ -1333,7 +1315,7 @@ async def test_explicit_workspace_preview_overrides_expert_recommendation(
         patch("orchestrator.main.postgres_db", fake_db),
         patch("orchestrator.main._resolve_runner_grants", AsyncMock(return_value=None)),
     ):
-        result = await preview_tool_groups(
+        result = await _preview_tool_groups(
             ToolGroupPreviewRequest(
                 config_name="session_base",
                 workspace=selected,

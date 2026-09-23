@@ -678,6 +678,124 @@ class TestListByCapabilityAlphabetical:
         assert conn.fetch.await_args.args[1:] == ("auxiliary",)
 
 
+class TestPinDefaultIfUnset:
+    """The auto-pin's conditional write: one statement, so a pin set between
+    the auto-pin's read and this write is never overwritten."""
+
+    @pytest.mark.asyncio
+    async def test_writes_only_where_no_model_is_pinned(self):
+        conn = _conn()
+        conn.fetchrow = AsyncMock(return_value={"key": "llm.default_rerank_model"})
+        db = _make_db(conn)
+
+        pinned = await db.pin_default_llm_model_if_unset(
+            "rerank", "qwen3-reranker-8b", updated_by="auto:x", source="default"
+        )
+
+        assert pinned is True
+        sql = " ".join(conn.fetchrow.await_args.args[0].split())
+        assert "ON CONFLICT (key) DO UPDATE" in sql
+        # The update only fires over a row that names no model; a real pin
+        # (object or legacy bare-string form) makes it a no-op.
+        assert "WHERE COALESCE( NULLIF(system_settings.value->>'model', '')" in sql
+        assert "jsonb_typeof(system_settings.value) = 'string'" in sql
+        assert conn.fetchrow.await_args.args[1:] == (
+            "llm.default_rerank_model",
+            json.dumps({"model": "qwen3-reranker-8b"}),
+            "auto:x",
+            "default",
+        )
+
+    @pytest.mark.asyncio
+    async def test_reports_false_when_a_pin_already_exists(self):
+        conn = _conn()
+        conn.fetchrow = AsyncMock(return_value=None)
+        db = _make_db(conn)
+        assert (
+            await db.pin_default_llm_model_if_unset(
+                "chat", "m", updated_by="auto:x", source="default"
+            )
+            is False
+        )
+
+
+class TestCatalogWritesAutoPin:
+    """Admin → Models writes run the readiness auto-pin, so the first model
+    added for a required capability becomes its default."""
+
+    @staticmethod
+    def _arm(store, *, pins=(), fail=False):
+        store.get_system_api_key = AsyncMock(return_value="sk-test")
+        store.create_model = AsyncMock(return_value=_row())
+        store.update_model = AsyncMock(return_value=_row())
+        if fail:
+            store.list_default_pin_capabilities = AsyncMock(
+                side_effect=RuntimeError("db down")
+            )
+        else:
+            store.list_default_pin_capabilities = AsyncMock(return_value=list(pins))
+        store.list_models_by_capability_alphabetical = AsyncMock(
+            side_effect=lambda cap: (
+                [{"model_id": "claude-opus-4-7"}]
+                if cap in ("chat", "auxiliary")
+                else []
+            )
+        )
+        store.pin_default_llm_model_if_unset = AsyncMock(return_value=True)
+
+    @staticmethod
+    def _pinned_kinds(store):
+        return [c.args[0] for c in store.pin_default_llm_model_if_unset.await_args_list]
+
+    @pytest.mark.asyncio
+    async def test_create_pins_the_first_model_for_its_capabilities(
+        self, model_catalog_service
+    ):
+        store = model_catalog_service.store
+        self._arm(store)
+        await model_catalog_service.create_catalog_model(
+            CatalogModelCreate(
+                provider_kind="system",
+                provider_ref="anthropic",
+                model_id="claude-opus-4-7",
+                display_label="Claude Opus 4.7",
+                capabilities=["chat", "auxiliary"],
+                family="claude-opus",
+            )
+        )
+        assert self._pinned_kinds(store) == ["chat", "auxiliary"]
+
+    @pytest.mark.asyncio
+    async def test_update_runs_it_too(self, model_catalog_service):
+        # Enabling a row can give a required capability its first model.
+        store = model_catalog_service.store
+        self._arm(store, pins=["chat"])
+        await model_catalog_service.update_catalog_model(
+            "11111111-1111-1111-1111-111111111111",
+            CatalogModelUpdate(enabled=True),
+        )
+        assert self._pinned_kinds(store) == ["auxiliary"]
+
+    @pytest.mark.asyncio
+    async def test_a_failed_auto_pin_does_not_fail_the_write(
+        self, model_catalog_service
+    ):
+        store = model_catalog_service.store
+        self._arm(store, fail=True)
+        out = await model_catalog_service.create_catalog_model(
+            CatalogModelCreate(
+                provider_kind="system",
+                provider_ref="anthropic",
+                model_id="claude-opus-4-7",
+                display_label="Claude Opus 4.7",
+                capabilities=["chat"],
+                family="claude-opus",
+            )
+        )
+        assert out["model_id"] == "claude-opus-4-7"
+        store.pin_default_llm_model_if_unset.assert_not_awaited()
+
+
 class TestNormalizeCatalogModelId:
     """Write-time normalization of the ``openrouter/`` routing prefix.
 
