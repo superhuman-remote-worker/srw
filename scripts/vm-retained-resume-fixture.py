@@ -183,7 +183,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         raise FixtureHostRefusal("in-image fixture did not establish Ready")
     for key in ("job_id", "owner_id", "expert_id", "request_id",
                 "provision_generation", "vm_uid", "vmi_uid", "launcher_uid",
-                "pvc_uid", "pv_uid"):
+                "pvc_uid", "pv_uid", "pause_hold_id"):
         _uuid(value[key])
     if value.get("job_id") == value.get("owner_id"):
         raise FixtureHostRefusal("fixture owner and Job identities collide")

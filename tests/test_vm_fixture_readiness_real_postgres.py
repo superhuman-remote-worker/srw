@@ -322,3 +322,111 @@ async def test_a1_wait_adapter_uses_real_release_and_profile_proof(db, monkeypat
     assert await probe_ready_fixture(
         db, provisioner, run_id=run, vm_image=image, prepared=prepared,
     ) is None
+
+
+@pytest.mark.asyncio
+async def test_a1_public_pause_hold_on_real_ready_fixture_blocks_enabled_admission(
+    db, monkeypatch,  # noqa: F811
+):
+    import httpx
+    from fastapi import FastAPI
+
+    from orchestrator.operator_cli.vm_retained_resume_fixture import (
+        pause_ready_fixture, probe_ready_fixture,
+    )
+    from orchestrator.routers import job_lifecycle
+    from orchestrator.security.access import (
+        require_internal, require_internal_or_job_access, require_job_access,
+    )
+    from shared.vm_network_profile import NETWORK_PROFILE
+    from tests.test_operator_pause_hold_real_postgres import (
+        _admittable, _claim, _operations,
+    )
+
+    run = "srw-a1-pause-" + uuid4().hex[:8]
+    row, owner, _ = await fixture_ready(
+        db, monkeypatch, marker_key="vm_retained_resume_acceptance_gate",
+        run=run, profiled=True,
+    )
+    job_id = row["job_id"]
+    context = json.loads(await db.fetchval(
+        "SELECT context FROM jobs WHERE id=$1", job_id,
+    ))
+    vm = context["vm"]
+    vmi_uid = str(uuid4())
+    vm["provisioning"] = _boot_phase(job_id, vm, vmi_uid)
+    vm["network_profile_evidence"] = {
+        "profile": NETWORK_PROFILE,
+        "provision_generation": str(row["provision_generation"]),
+        "vm_uid": vm["vm_uid"], "pvc_uid": vm["rootdisk_pvc_uid"],
+        "vmi_uid": vmi_uid, "launcher_uid": vm["active_pod_uid"],
+        "guest_boot_id": str(uuid4()), "cloud_init_instance_id": "i-a1-pause",
+        "cloud_init_cached_instance_id": "i-a1-pause",
+        "network_file_sha256": "a" * 64, "name_only_dhcp": True,
+    }
+    image = json.loads(row["canonical_request"])["vm_image"]
+    await db.execute(
+        "UPDATE jobs SET context=$2::jsonb,config_override=$3::jsonb WHERE id=$1",
+        job_id, json.dumps(context), json.dumps({
+            "workspace": {"backend": "vm", "vm": {"image": image}},
+        }),
+    )
+    provisioner = SimpleNamespace(query_status=AsyncMock(return_value={
+        "ready": True, "vm_uid": vm["vm_uid"],
+        "rootdisk_pvc_uid": vm["rootdisk_pvc_uid"],
+        "active_pod_uid": vm["active_pod_uid"],
+        "provisioning": {"vmi_uid": vmi_uid},
+    }))
+    prepared = {
+        "job_id": str(job_id), "owner_id": str(owner),
+        "request_id": str(row["request_id"]),
+        "provision_generation": str(row["provision_generation"]),
+    }
+    assert await probe_ready_fixture(
+        db, provisioner, run_id=run, vm_image=image, prepared=prepared,
+    ) is not None
+    app = FastAPI()
+    app.include_router(job_lifecycle.router)
+    app.state.job_control_route_dependencies_factory = lambda: (
+        job_lifecycle.JobControlRouteDependencies(
+            operations=_operations(db, commands_enabled=True), store=db,
+            require_internal_or_job_access=require_internal_or_job_access,
+            require_job_access=require_job_access, require_internal=require_internal,
+        )
+    )
+    client_type = httpx.AsyncClient
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: client_type(
+        transport=httpx.ASGITransport(app=app), base_url="http://owner.test",
+        **kwargs,
+    ))
+    monkeypatch.setenv("STATELESS_WORKER_ENABLED", "false")
+    hold_id = await pause_ready_fixture(
+        db, provisioner, run_id=run, vm_image=image, prepared=prepared,
+    )
+    assert hold_id == await pause_ready_fixture(
+        db, provisioner, run_id=run, vm_image=image, prepared=prepared,
+    )
+    context = json.loads(await db.fetchval(
+        "SELECT context FROM jobs WHERE id=$1", job_id,
+    ))
+    assert context["_operator_pause_hold"]["hold_id"] == hold_id
+    assert await db.fetchval(
+        "SELECT count(*) FROM auth_tokens WHERE user_id=$1 AND kind='mcp' "
+        "AND origin='vm-retained-resume-fixture' AND revoked_at IS NOT NULL",
+        owner,
+    ) == 1
+    assert await db.fetchval(
+        "SELECT count(*) FROM worker_batch_attempts WHERE job_id=$1", job_id,
+    ) == 0
+    assert not await _admittable(db, str(job_id), commands_enabled=True)
+    admitted, _ = await db.admit_stateless_worker_job(
+        str(job_id), fair_key=None, priority=5, completion_commands_enabled=True,
+    )
+    assert not admitted
+    assert await _claim(db, commands_enabled=True) is None
+    queue = await db.fetchrow(
+        "SELECT state,leased_by,lease_token FROM run_queue WHERE unit_id=$1", job_id,
+    )
+    assert (queue["state"], queue["leased_by"], queue["lease_token"]) == (
+        "done", None, 0,
+    )

@@ -73,6 +73,8 @@ def require_execution_guard(values: Mapping[str, Any], env: Mapping[str, str]) -
     _uuid(values.get("expected_owner_id"))
     _uuid(values.get("expected_pvc_uid"))
     _uuid(values.get("cluster_uid"))
+    if not values.get("cleanup_only"):
+        _uuid(values.get("expected_pause_hold_id"))
     output = values.get("output")
     if not isinstance(output, Path):
         raise AcceptanceFailure("private output path is required")
@@ -89,9 +91,21 @@ def require_execution_guard(values: Mapping[str, Any], env: Mapping[str, str]) -
 
 def validate_fixture_snapshot(
     job: Mapping[str, Any], user: Mapping[str, Any], queue: Mapping[str, Any],
-    *, run_id: str, expected_owner_id: str, expected_pvc_uid: str, now: datetime,
+    *, run_id: str, expected_owner_id: str, expected_pvc_uid: str,
+    expected_pause_hold_id: str, now: datetime,
 ) -> None:
+    from orchestrator.operator_cli.vm_retained_resume_pause import (
+        OwnerPauseHoldError, owned_pause_hold_id,
+    )
+
     context = _object(job.get("context"))
+    try:
+        owned_pause_hold_id(
+            context, owner_id=expected_owner_id,
+            expected_hold_id=expected_pause_hold_id,
+        )
+    except OwnerPauseHoldError as exc:
+        raise AcceptanceFailure("fixture owner Pause hold changed") from exc
     vm = _object(context.get("vm"))
     created = job.get("created_at")
     _uuid(job.get("id"))
@@ -109,7 +123,7 @@ def validate_fixture_snapshot(
         or context.get("_vm_creation_pending") is not None
         or any(context.get(key) is not None for key in (
             "_workspace_dispatch_authority", "_completion_control_claim",
-            "_stateless_control_claim", "_operator_pause_hold",
+            "_stateless_control_claim", "last_operator_pause_hold",
         ))
         or vm.get("status") != "ready"
         or _uuid(vm.get("rootdisk_pvc_uid")) != expected_pvc_uid
@@ -267,6 +281,7 @@ class LiveScenario:
             job, user, queue, run_id=self.args.run_id,
             expected_owner_id=self.args.expected_owner_id,
             expected_pvc_uid=self.args.expected_pvc_uid,
+            expected_pause_hold_id=self.args.expected_pause_hold_id,
             now=await self.value("SELECT clock_timestamp()"),
         )
         if await self.value(
@@ -483,6 +498,23 @@ class LiveScenario:
         finally:
             if not await self.db.revoke_mcp_token(str(issued["id"]), str(owner)):
                 raise AcceptanceFailure("owner route token could not be revoked")
+
+    async def verify_owner_pause_lift(self) -> None:
+        context = _object(await self.value(
+            "SELECT context FROM jobs WHERE id=$1 AND user_id=$2",
+            UUID(self.args.job_id), UUID(self.args.expected_owner_id),
+        ))
+        last = _object(context.get("last_operator_pause_hold"))
+        if (
+            "_operator_pause_hold" in context
+            or context.get("vm_retained_resume_acceptance_gate") != self.args.run_id
+            or last.get("hold_id") != self.args.expected_pause_hold_id
+            or last.get("paused_by") != self.args.expected_owner_id
+            or last.get("source") != "public_pause"
+            or last.get("version") != 1
+            or not isinstance(last.get("lifted_at"), str)
+        ):
+            raise AcceptanceFailure("owner Resume did not lift the exact fixture Pause")
 
     async def retire_predecessor(self, vm: dict[str, Any]) -> dict[str, Any]:
         """Pause only the gate call before the production physical-stop transport."""
@@ -729,6 +761,7 @@ class LiveScenario:
         resumed = await self.owner_resume(expected_status=200)
         if resumed.get("vm_creation_retry_request_id") != request_id:
             raise AcceptanceFailure("ordinary Resume did not join the failed create")
+        await self.verify_owner_pause_lift()
         held = await self.retry_row(request_id)
         if any(before.get(key) != held.get(key) for key in _IMMUTABLE_RETRY_FIELDS):
             raise AcceptanceFailure("ordinary Resume changed frozen creation intent")
@@ -902,6 +935,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--job-id", required=True)
     parser.add_argument("--expected-owner-id", required=True)
+    parser.add_argument("--expected-pause-hold-id", default="")
     parser.add_argument("--expected-pvc-uid", required=True)
     parser.add_argument("--cluster-uid", required=True)
     parser.add_argument("--namespace", required=True)
