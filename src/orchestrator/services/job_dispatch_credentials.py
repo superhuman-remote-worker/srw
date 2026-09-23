@@ -357,7 +357,12 @@ async def inject_dispatch_credentials(
             logger.info(f"Dispatch: injected {_kind} model: {_model}")
 
         embedding_provider = user_settings.get("embedding_provider")
-        embedding_model = user_settings.get("default_embedding_model")
+        # A pinned EMBEDDING_MODEL (project/expert override) wins over the
+        # preference, as on the session path: resolving a different model's
+        # endpoint would pair the pin with the wrong host.
+        embedding_model = (config_override.get("env_keys") or {}).get(
+            "EMBEDDING_MODEL"
+        ) or user_settings.get("default_embedding_model")
         if not embedding_model:
             embedding_model = await postgres_db.resolve_default_for_capability(
                 "embedding"

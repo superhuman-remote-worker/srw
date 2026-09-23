@@ -700,6 +700,44 @@ class TestChildLLM:
         assert cfg.llm.model == "claude-haiku-4-5"
         assert cfg.llm.api_key is None
 
+    def test_pinned_entry_with_its_own_endpoint_does_not_borrow_the_key(self):
+        # A key follows its endpoint: same provider is not enough when the
+        # entry names a different host than the parent.
+        entry = _entry(
+            llm={
+                "model": "gpt-4.1-nano",
+                "provider": "openai",
+                "base_url": "https://elsewhere.example/v1",
+            }
+        )
+        live = LLMConfig(
+            model="gpt-4o-mini",
+            provider="openai",
+            api_key="sk-live",
+            base_url="https://live.example/v1",
+        )
+        cfg = build_child_config(entry, live_llm_config=live)
+        assert cfg.llm.base_url == "https://elsewhere.example/v1"
+        assert cfg.llm.api_key is None
+
+    def test_pinned_entry_on_the_parents_endpoint_still_borrows(self):
+        # Same origin, different spelling (case, trailing slash) still matches.
+        entry = _entry(
+            llm={
+                "model": "gpt-4.1-nano",
+                "provider": "openai",
+                "base_url": "https://LIVE.example/v1/",
+            }
+        )
+        live = LLMConfig(
+            model="gpt-4o-mini",
+            provider="openai",
+            api_key="sk-live",
+            base_url="https://live.example/v1",
+        )
+        cfg = build_child_config(entry, live_llm_config=live)
+        assert cfg.llm.api_key == "sk-live"
+
     def test_overlay_live_llm_same_model_copies_non_none_only(self):
         child = LLMConfig(model="m", provider="p", base_url="https://keep", api_key="k")
         live = LLMConfig(model="m", provider="p", base_url=None, api_key="k2")

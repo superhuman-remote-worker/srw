@@ -230,10 +230,15 @@ def resolve_reranker_transport(
         base_url = cfg.base_url
         api_key = cfg.api_key
         if not api_key:
-            wanted = base_url.rstrip("/")
+            from shared.runtime.core.transport_resolution import same_endpoint
+
             for prefix in ("RERANK", "EMBEDDING"):
-                paired = (env.get(f"{prefix}_BASE_URL") or "").rstrip("/")
-                if paired and paired == wanted and env.get(f"{prefix}_API_KEY"):
+                paired = env.get(f"{prefix}_BASE_URL")
+                if (
+                    paired
+                    and same_endpoint(paired, base_url)
+                    and env.get(f"{prefix}_API_KEY")
+                ):
                     api_key = env[f"{prefix}_API_KEY"]
                     break
     elif env.get("RERANK_BASE_URL"):

@@ -2062,9 +2062,13 @@ class LLMConfig:
         # A key follows its endpoint: when the overlay moves the call to a
         # different base_url without bringing its own key, the parent's key
         # must not ride along to the new host.
+        from shared.runtime.core.transport_resolution import same_endpoint
+
         if override.api_key is not None:
             api_key = override.api_key
-        elif override.base_url is not None and override.base_url != self.base_url:
+        elif override.base_url is not None and not same_endpoint(
+            override.base_url, self.base_url
+        ):
             api_key = None
         else:
             api_key = self.api_key
@@ -4243,8 +4247,9 @@ def _env_fallback_key(
     host; when ``config.base_url`` names a different host and the config
     brought no key of its own, return ``default`` instead of the env key.
     """
-    base = (config.base_url or "").rstrip("/")
-    if base and base != (canonical_base_url or "").rstrip("/"):
+    from shared.runtime.core.transport_resolution import same_endpoint
+
+    if config.base_url and not same_endpoint(config.base_url, canonical_base_url):
         return default
     value = os.getenv(env_name)
     return value if value else default
@@ -4271,7 +4276,10 @@ def _create_openai_llm(
 
     # Parse API keys (supports comma-separated list for fallback)
     raw_key = config.api_key or _env_fallback_key(
-        config, "OPENAI_API_KEY", "not-needed"
+        config,
+        "OPENAI_API_KEY",
+        "not-needed",
+        canonical_base_url="https://api.openai.com/v1",
     )
     keys = parse_key_string(raw_key) or ["not-needed"]
     cooldown = float(os.getenv("KEY_COOLDOWN_SECONDS", "1800"))
@@ -4592,7 +4600,9 @@ def _create_groq_llm(
     # Lazy import to avoid requiring the package when not used
     from langchain_groq import ChatGroq
 
-    api_key = config.api_key or _env_fallback_key(config, "GROQ_API_KEY")
+    api_key = config.api_key or _env_fallback_key(
+        config, "GROQ_API_KEY", canonical_base_url="https://api.groq.com"
+    )
     if not api_key:
         raise ValueError(
             "GROQ_API_KEY environment variable required for Groq provider. "

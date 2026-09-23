@@ -379,6 +379,15 @@ async def inject_env_key_credentials(
     """
     env_keys.setdefault(f"{prefix}_MODEL", model_id)
 
+    # A complete caller-supplied pair (an endpoint name AND its key, e.g. a
+    # project owner's BYO EMBEDDING_BASE_URL + EMBEDDING_API_KEY) involves no
+    # stored credential: leave it intact rather than overwrite half of it with
+    # a catalog row that belongs to a different model.
+    if env_keys.get(f"{prefix}_API_KEY") and any(
+        env_keys.get(name) for name in env_endpoint_names(prefix)
+    ):
+        return
+
     meta = None
     try:
         meta = await dependencies.resolve_model(

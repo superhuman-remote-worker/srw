@@ -380,6 +380,133 @@ class TestFactoryEnvFallbackBinding:
         with pytest.raises(ValueError, match="OPENROUTER_API_KEY"):
             _create_openrouter_llm(cfg, limits=None)
 
+    @pytest.mark.parametrize(
+        "spelling",
+        [
+            "https://OpenRouter.ai/api/v1",
+            "https://openrouter.ai/api",
+            "https://openrouter.ai/api/v1/",
+            "https://openrouter.ai:443/api/v1",
+        ],
+    )
+    def test_canonical_spellings_keep_the_env_key(self, monkeypatch, spelling):
+        from shared.runtime.core.loader import LLMConfig, _env_fallback_key
+
+        monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-system")
+        cfg = LLMConfig(model="openrouter/x/y", base_url=spelling)
+        assert (
+            _env_fallback_key(
+                cfg,
+                "OPENROUTER_API_KEY",
+                canonical_base_url="https://openrouter.ai/api/v1",
+            )
+            == "sk-or-system"
+        )
+
+
+class TestSameEndpoint:
+    @pytest.mark.parametrize(
+        "a, b",
+        [
+            ("https://Host.example/v1", "https://host.example/v1/"),
+            ("https://host.example/api", "https://host.example/api/v1"),
+            ("https://host.example:443/v1", "https://host.example/v1"),
+            (None, None),
+            ("", None),
+        ],
+    )
+    def test_same_origin(self, a, b):
+        from shared.runtime.core.transport_resolution import same_endpoint
+
+        assert same_endpoint(a, b)
+
+    @pytest.mark.parametrize(
+        "a, b",
+        [
+            ("https://host.example/v1", "https://other.example/v1"),
+            ("https://host.example/v1", "http://host.example/v1"),
+            ("https://host.example:8443/v1", "https://host.example/v1"),
+            ("https://host.example/v1", None),
+        ],
+    )
+    def test_different_origin(self, a, b):
+        from shared.runtime.core.transport_resolution import same_endpoint
+
+        assert not same_endpoint(a, b)
+
+
+class TestEnvKeyByoPair:
+    @pytest.mark.asyncio
+    async def test_complete_caller_pair_survives_an_endpoint_backed_default(self):
+        # A project owner's BYO EMBEDDING model + endpoint + key must not be
+        # half-overwritten by the catalog default's endpoint row.
+        emb_meta = ModelMeta(
+            model_id="sys-embed",
+            provider="openai",
+            family="embedding",
+            display_name="Embed",
+            origin="catalog",
+            endpoint_id=ENDPOINT_ID,
+            api_key_ref="openai",
+            capability="embedding",
+        )
+        env_keys = {
+            "EMBEDDING_MODEL": "owner-embed",
+            "EMBEDDING_BASE_URL": "https://owner.example/v1",
+            "EMBEDDING_API_KEY": "owner-key",
+        }
+        await dc.inject_env_key_credentials(
+            env_keys=env_keys,
+            prefix="EMBEDDING",
+            model_id="sys-embed",
+            user_id="u",
+            resolved_keys={"openai": ENDPOINT_KEY},
+            capability="embedding",
+            dependencies=_service_deps({"sys-embed": emb_meta}),
+        )
+        assert env_keys == {
+            "EMBEDDING_MODEL": "owner-embed",
+            "EMBEDDING_BASE_URL": "https://owner.example/v1",
+            "EMBEDDING_API_KEY": "owner-key",
+        }
+
+    @pytest.mark.asyncio
+    async def test_foreign_url_without_a_key_still_gets_no_stored_key(self):
+        env_keys = {
+            "EMBEDDING_MODEL": "router-chat",
+            "EMBEDDING_BASE_URL": CALLER_HOST,
+        }
+        await dc.inject_env_key_credentials(
+            env_keys=env_keys,
+            prefix="EMBEDDING",
+            model_id="router-chat",
+            user_id="u",
+            resolved_keys={"openrouter": SYSTEM_OR_KEY},
+            capability="embedding",
+            dependencies=_service_deps({"router-chat": ROUTER_META}),
+        )
+        assert "EMBEDDING_API_KEY" not in env_keys
+
+    @pytest.mark.asyncio
+    async def test_job_path_resolves_the_pinned_embedding_model(self):
+        # The job preference block resolves the pinned EMBEDDING_MODEL, not the
+        # account/system default, so the pin keeps its own endpoint.
+        seen = []
+
+        async def env_creds(**kwargs):
+            seen.append((kwargs["prefix"], kwargs["model_id"]))
+
+        deps = _composition_deps({})
+        deps = jdc.DispatchCredentialDependencies(
+            **{**deps.__dict__, "inject_env_key_credentials": env_creds}
+        )
+        override = {
+            "llm": {"model": "anything"},
+            "env_keys": {"EMBEDDING_MODEL": "pin"},
+        }
+        await jdc.inject_dispatch_credentials(_job(), override, dependencies=deps)
+        assert ("EMBEDDING", "pin") in seen
+
 
 class TestRerankerTransportBinding:
     def _cfg(self, **kw):
@@ -449,3 +576,12 @@ class TestExportableEnvKeys:
         assert "OPENAI_API_BASE" in dropped
         assert "OPENAI_API_KEY" in dropped
         assert "PATH" in dropped
+
+    def test_non_secret_tuning_names_export(self):
+        from shared.runtime.core.transport_resolution import exportable_env_keys
+
+        kept, dropped = exportable_env_keys(
+            {"WHISPER_LANGUAGE": "de", "EMBEDDING_MAX_BATCH_SIZE": "32"}
+        )
+        assert kept == {"WHISPER_LANGUAGE": "de", "EMBEDDING_MAX_BATCH_SIZE": "32"}
+        assert dropped == []

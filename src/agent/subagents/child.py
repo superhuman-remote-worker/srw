@@ -524,7 +524,8 @@ def build_child_config(entry: Mapping[str, Any], *, live_llm_config: Any = None)
     an ``inherit`` entry (``llm._inherit_llm``) is then overlaid with the
     parent's LIVE ``LLMConfig`` (dispatch-time credentials, a fallback swap);
     a pinned entry without credentials borrows the parent's when it runs on
-    the same provider. ``officer.enabled`` is forced off (D(4): a DB ``$ref``
+    the same provider and names no endpoint of its own (or the parent's).
+    ``officer.enabled`` is forced off (D(4): a DB ``$ref``
     to a centurion must never bring the officer loop guard into a child).
     """
     data = copy.deepcopy(dict(entry))
@@ -536,11 +537,19 @@ def build_child_config(entry: Mapping[str, Any], *, live_llm_config: Any = None)
     if raw_llm.get(ROSTER_INHERIT_MARKER):
         cfg.llm = overlay_live_llm(cfg.llm, live_llm_config)
     elif live_llm_config is not None and cfg.llm.api_key is None:
+        from shared.runtime.core.transport_resolution import same_endpoint
+
         same_provider = (cfg.llm.provider or None) in (
             None,
             getattr(live_llm_config, "provider", None),
         )
-        if same_provider:
+        # A key follows its endpoint (same rule as LLMConfig.with_override):
+        # borrow the parent's key only when the entry names no endpoint of its
+        # own or names the parent's.
+        same_host = cfg.llm.base_url is None or same_endpoint(
+            cfg.llm.base_url, getattr(live_llm_config, "base_url", None)
+        )
+        if same_provider and same_host:
             borrowed: Dict[str, Any] = {
                 "api_key": getattr(live_llm_config, "api_key", None)
             }

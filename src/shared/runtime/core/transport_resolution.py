@@ -152,6 +152,45 @@ ENV_ENDPOINT_ALIASES: dict[str, tuple[str, ...]] = {
 }
 
 
+_DEFAULT_PORTS = {"http": 80, "https": 443}
+
+
+def endpoint_origin(url: Optional[str]) -> Optional[tuple[str, str, int]]:
+    """``(scheme, host, port)`` of ``url``, lower-cased with default ports
+    filled in; ``None`` for an empty or unparseable URL. Path, query and case
+    are ignored, so ``https://OpenRouter.ai/api`` and
+    ``https://openrouter.ai/api/v1/`` share one origin."""
+    if not url or not str(url).strip():
+        return None
+    raw = str(url).strip()
+    if "://" not in raw:
+        raw = "https://" + raw
+    try:
+        parts = urlsplit(raw)
+        port = parts.port
+    except ValueError:
+        return None
+    scheme = (parts.scheme or "").lower()
+    host = (parts.hostname or "").lower()
+    if not host:
+        return None
+    return scheme, host, port if port is not None else _DEFAULT_PORTS.get(scheme, 0)
+
+
+def same_endpoint(a: Optional[str], b: Optional[str]) -> bool:
+    """True when two URLs name the same origin (scheme + host + port).
+
+    The one comparison behind "a key follows its endpoint": used by the chat
+    factories' env fallback, ``LLMConfig.with_override``, the reranker and the
+    subagent child builder, so they cannot disagree about what "the same
+    host" means. Two unset URLs are the same (both the provider default).
+    """
+    origin_a, origin_b = endpoint_origin(a), endpoint_origin(b)
+    if origin_a is None or origin_b is None:
+        return origin_a is None and origin_b is None
+    return origin_a == origin_b
+
+
 def env_endpoint_names(prefix: str) -> tuple[str, ...]:
     """Env names that carry the endpoint for ``prefix`` (reader order)."""
     return ENV_ENDPOINT_ALIASES.get(prefix, (f"{prefix}_BASE_URL",))
@@ -178,10 +217,25 @@ _DISPATCH_ENV_SUFFIXES = (
     "PROFILE_ID",
     "DIMENSIONS",
 )
+# Non-secret tuning an owner may set through a project override's env_keys.
+# Each carries neither a key nor a URL, so it cannot move a credential.
+_TUNING_ENV_KEY_NAMES = frozenset(
+    {
+        "WHISPER_LANGUAGE",
+        "WHISPER_TIMEOUT",
+        "VISION_TIMEOUT",
+        "EMBEDDING_MAX_BATCH",
+        "EMBEDDING_MAX_BATCH_SIZE",
+        "CITATION_REASONING_REQUIRED",
+        "OPENROUTER_REFERER",
+        "OPENROUTER_TITLE",
+    }
+)
 DISPATCH_ENV_KEY_NAMES = frozenset(
     {f"{p}_{s}" for p in _DISPATCH_ENV_PREFIXES for s in _DISPATCH_ENV_SUFFIXES}
     | {name for names in ENV_ENDPOINT_ALIASES.values() for name in names}
     | {"OPENROUTER_API_KEY"}
+    | _TUNING_ENV_KEY_NAMES
 )
 
 
