@@ -21,7 +21,11 @@ from orchestrator.seed.llm_config import (
     load_payload,
     seed,
 )
-from shared.helm_provenance import RECONCILE_MANIFEST_KEY, value_hash
+from shared.helm_provenance import (
+    AUTO_PIN_BREADCRUMB,
+    RECONCILE_MANIFEST_KEY,
+    value_hash,
+)
 from shared.subscription_routing import SUBSCRIPTION_PROXY_TRANSPORT
 
 
@@ -33,6 +37,7 @@ def _fake_db(
     catalog_rows: list[dict] | None = None,
     existing_defaults: dict[str, str] | None = None,
     existing_default_provenance: dict[str, tuple[str, str | None]] | None = None,
+    existing_default_updated_by: dict[str, str] | None = None,
 ):
     """Build a ``PostgresDB``-shaped mock that tracks mutations.
 
@@ -47,7 +52,8 @@ def _fake_db(
     defaults section sees what the same payload just seeded.
     ``existing_defaults`` pre-populates the ``llm.default_<kind>_model``
     pins; ``existing_default_provenance`` maps kind -> (source, hash) for
-    them (default ``('ui', None)``).
+    them (default ``('ui', None)``) and ``existing_default_updated_by`` maps
+    kind -> the pin's ``updated_by`` breadcrumb.
     """
     db = MagicMock()
     db.list_system_api_keys = AsyncMock(
@@ -127,6 +133,7 @@ def _fake_db(
 
     pins = dict(existing_defaults or {})
     pin_prov = dict(existing_default_provenance or {})
+    pin_by = dict(existing_default_updated_by or {})
     settings: dict[str, dict] = {}
 
     async def _get_default(kind):
@@ -136,8 +143,29 @@ def _fake_db(
         if model:
             pins[kind] = model
             pin_prov[kind] = (prov.get("source", "ui"), prov.get("helm_value_hash"))
+            pin_by[kind] = updated_by
         else:
             pins.pop(kind, None)
+
+    # The readiness auto-pin's three accessors (``seed(..., auto_pin=True)``).
+    async def _list_pin_capabilities():
+        return [kind for kind, model in pins.items() if model]
+
+    async def _list_alphabetical(capability):
+        matching = [
+            dict(row)
+            for row in rows
+            if capability in row["capabilities"] and row.get("enabled", True)
+        ]
+        return sorted(matching, key=lambda r: r.get("display_label") or r["model_id"])
+
+    async def _pin_if_unset(kind, model, *, updated_by, source):
+        if pins.get(kind):
+            return False
+        pins[kind] = model
+        pin_prov[kind] = (source, None)
+        pin_by[kind] = updated_by
+        return True
 
     async def _get_setting(key):
         prefix, suffix = "llm.default_", "_model"
@@ -151,6 +179,7 @@ def _fake_db(
                 "value": {"model": pins[kind]},
                 "source": source,
                 "helm_value_hash": h,
+                "updated_by": pin_by.get(kind),
             }
         return settings.get(key)
 
@@ -166,7 +195,13 @@ def _fake_db(
     db.set_default_llm_model = AsyncMock(side_effect=_set_default)
     db.get_system_setting = AsyncMock(side_effect=_get_setting)
     db.upsert_system_setting = AsyncMock(side_effect=_upsert_setting)
+    db.list_default_pin_capabilities = AsyncMock(side_effect=_list_pin_capabilities)
+    db.list_models_by_capability_alphabetical = AsyncMock(
+        side_effect=_list_alphabetical
+    )
+    db.pin_default_llm_model_if_unset = AsyncMock(side_effect=_pin_if_unset)
     db._pins = pins
+    db._pin_by = pin_by
     db._settings = settings
     db._rows = rows
     return db
@@ -899,6 +934,24 @@ class TestSeedDefaults:
         assert report.defaults_seeded == [("chat", "gpt-5-mini")]
 
     @pytest.mark.asyncio
+    async def test_declared_default_replaces_an_automatic_pin(self):
+        # Nobody chose an auto pin, so the chart's declaration wins even
+        # without `reconcile: true` — the insert-only rule protects choices.
+        db = _fake_db(
+            catalog_rows=[_chat_row("a-model"), _chat_row("gpt-5-mini")],
+            existing_defaults={"chat": "a-model"},
+            existing_default_provenance={"chat": ("default", None)},
+            existing_default_updated_by={"chat": AUTO_PIN_BREADCRUMB},
+        )
+        report = await seed(db, {"defaults": {"chat": "gpt-5-mini"}})
+
+        assert db._pins == {"chat": "gpt-5-mini"}
+        assert db._pin_by["chat"] == SEEDED_FROM_TAG
+        assert report.defaults_seeded == [("chat", "gpt-5-mini")]
+        assert report.defaults_skipped == []
+        assert report.reconciled == []
+
+    @pytest.mark.asyncio
     async def test_rows_seeded_in_the_same_payload_are_pinnable(self):
         db = _fake_db(existing_api_keys=[{"provider": "openai"}])
         payload = {
@@ -942,6 +995,71 @@ class TestSeedDefaults:
 # ---------------------------------------------------------------------------
 # seed — per-row params (models.params_json)
 # ---------------------------------------------------------------------------
+
+
+class TestSeedAutoPin:
+    """``seed(..., auto_pin=True)`` — the Helm Job's readiness auto-pin."""
+
+    @staticmethod
+    def _required_rows():
+        return [
+            _chat_row("b-chat"),
+            _chat_row("a-chat"),
+            {"model_id": "emb", "capabilities": ["embedding"], "enabled": True},
+            {"model_id": "rr", "capabilities": ["rerank"], "enabled": True},
+            {"model_id": "vis", "capabilities": ["vision"], "enabled": True},
+        ]
+
+    @pytest.mark.asyncio
+    async def test_pins_required_kinds_left_without_a_pin(self):
+        db = _fake_db(catalog_rows=self._required_rows())
+        report = await seed(db, {}, auto_pin=True)
+
+        # The resolver's fallback row (first by label), per required kind;
+        # optional kinds (vision) stay unpinned.
+        assert db._pins == {
+            "chat": "a-chat",
+            "auxiliary": "a-chat",
+            "embedding": "emb",
+            "rerank": "rr",
+        }
+        assert sorted(report.defaults_auto_pinned) == [
+            ("auxiliary", "a-chat"),
+            ("chat", "a-chat"),
+            ("embedding", "emb"),
+            ("rerank", "rr"),
+        ]
+        assert set(db._pin_by.values()) == {AUTO_PIN_BREADCRUMB}
+
+    @pytest.mark.asyncio
+    async def test_declared_defaults_apply_first_and_win(self):
+        db = _fake_db(catalog_rows=self._required_rows())
+        report = await seed(db, {"defaults": {"chat": "b-chat"}}, auto_pin=True)
+
+        assert db._pins["chat"] == "b-chat"
+        assert db._pin_by["chat"] == SEEDED_FROM_TAG
+        assert ("chat", "a-chat") not in report.defaults_auto_pinned
+        assert ("auxiliary", "a-chat") in report.defaults_auto_pinned
+
+    @pytest.mark.asyncio
+    async def test_an_admin_pin_is_never_replaced(self):
+        db = _fake_db(
+            catalog_rows=self._required_rows(),
+            existing_defaults={"chat": "b-chat"},
+        )
+        report = await seed(db, {}, auto_pin=True)
+
+        assert db._pins["chat"] == "b-chat"
+        assert all(kind != "chat" for kind, _ in report.defaults_auto_pinned)
+
+    @pytest.mark.asyncio
+    async def test_off_by_default(self):
+        db = _fake_db(catalog_rows=self._required_rows())
+        report = await seed(db, {})
+
+        assert db._pins == {}
+        assert report.defaults_auto_pinned == []
+        db.pin_default_llm_model_if_unset.assert_not_awaited()
 
 
 class TestSeedParams:

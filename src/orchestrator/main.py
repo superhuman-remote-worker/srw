@@ -4620,6 +4620,11 @@ async def lifespan(app: FastAPI):
             "ensure_elevenlabs_tts_endpoint failed at startup", exc_info=True
         )
 
+    # Pin a default for each required capability that has catalog rows but no
+    # pin (bare-metal init.py rows, installs upgraded with rows never pinned).
+    # Best-effort: logs and leaves the pin to the admin on failure.
+    await readiness_service.try_auto_pin_required_defaults(postgres_db)
+
     # Usage-metering ledger (Slice 4). Writes go to the auditdb usage_events
     # table (None → no-op when the audit tier is absent); rates resolve against
     # the app-DB usage_rates table created by the migration above. Built here so

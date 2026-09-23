@@ -117,7 +117,9 @@ import yaml
 
 from orchestrator.database.postgres import PostgresDB
 from orchestrator.security.crypto import credential_fingerprint
+from orchestrator.services.readiness import try_auto_pin_required_defaults
 from shared.helm_provenance import (
+    AUTO_PIN_BREADCRUMB,
     RECONCILE_MANIFEST_KEY,
     SOURCE_DEFAULT,
     SOURCE_HELM,
@@ -364,6 +366,9 @@ class SeedReport:
     models_skipped: list[tuple[str, str]] = field(default_factory=list)
     defaults_seeded: list[tuple[str, str]] = field(default_factory=list)
     defaults_skipped: list[tuple[str, str]] = field(default_factory=list)
+    # Required capabilities left without a pin, pinned to the resolver's
+    # fallback row after the declared defaults applied.
+    defaults_auto_pinned: list[tuple[str, str]] = field(default_factory=list)
     # (section, identity) rows rewritten by a ``reconcile: true`` entry, and
     # the subset whose previous writer was an admin (override reverted).
     reconciled: list[tuple[str, str]] = field(default_factory=list)
@@ -375,8 +380,8 @@ class SeedReport:
         logger.info(
             "seed summary — keys seeded=%d skipped=%d, endpoints seeded=%d "
             "skipped=%d, models seeded=%d skipped=%d, defaults seeded=%d "
-            "skipped=%d, reconciled=%d (admin overrides reverted=%d), "
-            "manifest written=%s",
+            "skipped=%d auto-pinned=%d, reconciled=%d (admin overrides "
+            "reverted=%d), manifest written=%s",
             len(self.api_keys_seeded),
             len(self.api_keys_skipped),
             len(self.endpoints_seeded),
@@ -385,6 +390,7 @@ class SeedReport:
             len(self.models_skipped),
             len(self.defaults_seeded),
             len(self.defaults_skipped),
+            len(self.defaults_auto_pinned),
             len(self.reconciled),
             len(self.reverted),
             self.manifest_written,
@@ -876,7 +882,11 @@ async def _seed_defaults(
 
     Insert-only like the other sections: an existing pin — set by an admin
     in Admin → Models → Defaults, or claimed by a boot-time seeder such as
-    Tavily/SearXNG for ``search``/``fetch`` — is never overwritten. The
+    Tavily/SearXNG for ``search``/``fetch`` — is never overwritten. The one
+    exception is a readiness auto-pin (``AUTO_PIN_BREADCRUMB``): nobody chose
+    it, so a declared default replaces it — otherwise a pin the system chose
+    on an earlier run (or when the first model was added in the Cockpit)
+    would silently block the chart's declared default. The
     declared model must be an enabled catalog row carrying the kind's
     capability (rows this same run just seeded count), so a typo in
     values.yaml is a logged skip rather than a dangling pin the resolver
@@ -904,8 +914,12 @@ async def _seed_defaults(
         declared_hash = value_hash(model)
         existing = await db.get_default_llm_model(kind)
         previous_source: str | None = None
+        replaces_auto_pin = False
         if existing:
-            if not reconcile:
+            row = await db.get_system_setting(f"llm.default_{kind}_model") or {}
+            previous_source = row.get("source")
+            replaces_auto_pin = row.get("updated_by") == AUTO_PIN_BREADCRUMB
+            if not reconcile and not replaces_auto_pin:
                 report.defaults_skipped.append((kind, existing))
                 logger.info(
                     "default %s already pinned to %s — leaving untouched",
@@ -913,8 +927,6 @@ async def _seed_defaults(
                     existing,
                 )
                 continue
-            row = await db.get_system_setting(f"llm.default_{kind}_model") or {}
-            previous_source = row.get("source")
             if (
                 previous_source == SOURCE_HELM
                 and row.get("helm_value_hash") == declared_hash
@@ -944,7 +956,15 @@ async def _seed_defaults(
             source=SOURCE_HELM,
             helm_value_hash=declared_hash,
         )
-        if existing:
+        if replaces_auto_pin:
+            report.defaults_seeded.append((kind, model))
+            logger.info(
+                "pinned default %s model to %s (replaced the automatic pin %s)",
+                kind,
+                model,
+                existing,
+            )
+        elif existing:
             _record_reconcile(report, "defaults", kind, previous_source)
             logger.info("reconciled default %s model to %s", kind, model)
         else:
@@ -979,12 +999,21 @@ async def _write_manifest(db: PostgresDB, report: SeedReport) -> None:
 
 
 async def seed(
-    db: PostgresDB, payload: dict[str, Any], *, record_manifest: bool = False
+    db: PostgresDB,
+    payload: dict[str, Any],
+    *,
+    record_manifest: bool = False,
+    auto_pin: bool = False,
 ) -> SeedReport:
     """Apply the seed payload against an already-connected ``PostgresDB``.
 
     ``record_manifest`` (the Helm Job) rewrites the ``helm.reconcile``
     manifest afterwards; the bare-metal init path leaves it alone.
+    ``auto_pin`` (the Helm Job) then pins every required capability that
+    still has rows but no default, so a chart that seeds models without a
+    ``defaults:`` block comes up ready. The Job runs after the orchestrator
+    boots, so the orchestrator's startup auto-pin cannot cover its rows; the
+    bare-metal path runs before boot and relies on that startup pass.
     """
     report = SeedReport()
     api_keys = payload.get("systemApiKeys") or []
@@ -1012,6 +1041,9 @@ async def seed(
     # Last on purpose: catalog rows seeded above are visible to the pin check.
     if defaults:
         await _seed_defaults(db, defaults, report)
+    # After the declared defaults, so a declared pin always wins.
+    if auto_pin:
+        report.defaults_auto_pinned = await try_auto_pin_required_defaults(db)
     if record_manifest:
         await _write_manifest(db, report)
     return report
@@ -1303,7 +1335,7 @@ async def run(payload_path: Path) -> SeedReport:
     db = PostgresDB()
     await db.connect()
     try:
-        report = await seed(db, payload, record_manifest=True)
+        report = await seed(db, payload, record_manifest=True, auto_pin=True)
     finally:
         await db.close()
     report.log()

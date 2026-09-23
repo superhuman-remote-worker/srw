@@ -110,6 +110,13 @@ def catalogue(monkeypatch, tmp_path):
         "delete_config_override",
     ):
         setattr(store, name, AsyncMock())
+    # The readiness auto-pin runs after catalog writes; with every required
+    # kind pinned it is a no-op unless a test clears the pins.
+    store.list_default_pin_capabilities = AsyncMock(
+        return_value=["chat", "auxiliary", "embedding", "rerank"]
+    )
+    store.list_models_by_capability_alphabetical = AsyncMock(return_value=[])
+    store.pin_default_llm_model_if_unset = AsyncMock(return_value=True)
     resolve_user = AsyncMock(
         return_value={"id": ADMIN_ID, "is_admin": False, "real_is_admin": True}
     )
@@ -545,6 +552,45 @@ async def test_subscription_import_passes_selection_and_keeps_partial_outcome(
         requested_ids=["new-model", "existing-model", "video-model"],
         include_review=True,
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("created", [["new-model"], []])
+async def test_subscription_import_auto_pins_only_when_it_created_rows(
+    catalogue, created
+):
+    from orchestrator.services.subscription_discovery import (
+        DiscoveryResult,
+        ImportOutcome,
+    )
+    from shared.subscription_routing import SUBSCRIPTION_PROXY_TRANSPORT
+
+    catalogue.store.get_system_llm_endpoint.return_value = endpoint_row(
+        transport_kind=SUBSCRIPTION_PROXY_TRANSPORT
+    )
+    catalogue.subscription_discover.return_value = DiscoveryResult(
+        True, "https://models.invalid/v1/models"
+    )
+    catalogue.subscription_import.return_value = ImportOutcome(created=created)
+    catalogue.store.list_default_pin_capabilities.return_value = []
+    catalogue.store.list_models_by_capability_alphabetical.side_effect = lambda cap: (
+        [{"model_id": "new-model"}] if cap in ("chat", "auxiliary") else []
+    )
+
+    response = await catalogue.request(
+        "POST", f"/api/admin/providers/endpoints/{ROW_ID}/models/import", json={}
+    )
+
+    assert response.status_code == 200
+    pinned = [
+        c.args[:2]
+        for c in catalogue.store.pin_default_llm_model_if_unset.await_args_list
+    ]
+    if created:
+        assert pinned == [("chat", "new-model"), ("auxiliary", "new-model")]
+    else:
+        assert pinned == []
+        catalogue.store.list_default_pin_capabilities.assert_not_awaited()
 
 
 @pytest.mark.asyncio

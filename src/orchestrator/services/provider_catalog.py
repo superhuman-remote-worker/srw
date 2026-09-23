@@ -15,6 +15,7 @@ from typing import Any, Protocol, TYPE_CHECKING
 from fastapi import HTTPException
 
 from shared.helm_provenance import (
+    AUTO_PIN_BREADCRUMB,
     RECONCILE_MANIFEST_KEY,
     SOURCE_UI,
     annotate,
@@ -31,6 +32,7 @@ from orchestrator.schemas.provider_catalog import (
     VALID_SYSTEM_API_KEY_PROVIDERS,
 )
 from shared.subscription_routing import is_subscription_endpoint
+from orchestrator.services.readiness import try_auto_pin_required_defaults
 
 if TYPE_CHECKING:
     from orchestrator.services.llm_endpoint_probe import ProbeResult
@@ -113,6 +115,13 @@ class ProviderCatalogStore(Protocol):
         seeded_from: str | None = None,
         on_conflict_do_nothing: bool = False,
     ) -> dict[str, Any] | None: ...
+    async def list_default_pin_capabilities(self) -> list[str]: ...
+    async def list_models_by_capability_alphabetical(
+        self, capability: str
+    ) -> list[dict[str, Any]]: ...
+    async def pin_default_llm_model_if_unset(
+        self, kind: str, model: str, *, updated_by: str, source: str
+    ) -> bool: ...
 
 
 class EndpointProbe(Protocol):
@@ -570,6 +579,8 @@ class ProviderCatalogService:
             requested_ids=body.model_ids,
             include_review=body.include_needs_review,
         )
+        if outcome.created:
+            await try_auto_pin_required_defaults(self.store)
         return outcome.to_public()
 
     async def list_provider_defaults(self) -> dict[str, str | None]:
@@ -645,6 +656,11 @@ class ProviderCatalogService:
                 manifest=manifest,
                 section="defaults",
                 identity=kind,
+            )
+            # The system chose this pin (readiness auto-pin), not an admin
+            # or the chart; Admin → Defaults labels it so.
+            defaults[kind]["auto_pinned"] = bool(model) and (
+                (setting or {}).get("updated_by") == AUTO_PIN_BREADCRUMB
             )
         return {
             "manifest": manifest

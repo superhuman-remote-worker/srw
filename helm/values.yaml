@@ -3217,7 +3217,9 @@ llm:
     # with its defaults chosen instead of waiting for an admin to click
     # through them. Same insert-only contract as everything above: a kind
     # that already has a pin (set by an admin, or claimed by the boot-time
-    # Tavily/SearXNG/Crawl4AI/ElevenLabs seeders) is left alone.
+    # Tavily/SearXNG/Crawl4AI/ElevenLabs seeders) is left alone. The one
+    # exception is an automatic pin (below): nobody chose it, so a declared
+    # default replaces it.
     #
     # The model must be an enabled catalog row carrying the kind's
     # capability — seeded via systemModels / systemEndpoints above, imported
@@ -3232,7 +3234,12 @@ llm:
     #   search, search_fallback        -> search
     #   fetch                          -> fetch
     # The readiness gate needs chat, auxiliary, embedding and rerank pinned
-    # before jobs and sessions can start.
+    # before jobs and sessions can start. You rarely need to declare them:
+    # when one of those four has enabled catalog rows but no pin, the Job
+    # (and the orchestrator at startup, and Admin → Models on every catalog
+    # write) pins the row dispatch would fall back to anyway — the first by
+    # display label, i.e. the only one when you seed one model per
+    # capability. Declare a kind here to choose among several.
     #
     # defaults:
     #   chat: "claude-opus-4-7"

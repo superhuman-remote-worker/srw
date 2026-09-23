@@ -48157,6 +48157,51 @@ class PostgresDB:
             key, {"model": model}, updated_by=updated_by, **extra
         )
 
+    async def pin_default_llm_model_if_unset(
+        self,
+        kind: str,
+        model: str,
+        *,
+        updated_by: str,
+        source: str,
+    ) -> bool:
+        """Pin ``model`` for ``kind`` only when no pin carries a model yet.
+
+        The write and the "is it unset" check are one statement, so an admin
+        pin landing between a caller's read and this write is never
+        overwritten. A row whose value names no model (``{}``, ``{"model":
+        ""}``, ``""``) counts as unset, matching
+        :meth:`list_default_pin_capabilities`. Returns True when it pinned.
+        """
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                INSERT INTO system_settings
+                    (key, value, updated_at, updated_by, source, source_updated_at)
+                VALUES ($1, $2::jsonb, CURRENT_TIMESTAMP, $3, $4, CURRENT_TIMESTAMP)
+                ON CONFLICT (key) DO UPDATE SET
+                    value = EXCLUDED.value,
+                    updated_at = CURRENT_TIMESTAMP,
+                    updated_by = EXCLUDED.updated_by,
+                    source = EXCLUDED.source,
+                    source_updated_at = CURRENT_TIMESTAMP
+                WHERE COALESCE(
+                    NULLIF(system_settings.value->>'model', ''),
+                    NULLIF(
+                        CASE WHEN jsonb_typeof(system_settings.value) = 'string'
+                             THEN system_settings.value #>> '{}' END,
+                        ''
+                    )
+                ) IS NULL
+                RETURNING key
+                """,
+                self._default_llm_model_key(kind),
+                json.dumps({"model": model}),
+                updated_by,
+                source,
+            )
+        return row is not None
+
     # Catalog capabilities that support a "first-enabled-alphabetical" fallback
     # when the admin pin is missing or dangling. Whisper/tts gained catalog
     # rows in v1.1; non-catalog kinds (none today) would pass through unchanged.
