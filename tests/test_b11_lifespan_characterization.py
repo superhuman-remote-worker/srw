@@ -661,14 +661,6 @@ async def test_startup_failure_stops_started_tasks_and_releases_pools(monkeypatc
 
 
 @pytest.mark.asyncio
-@pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason=(
-        "R1.B11 characterization: a dispatch triggered during the application's "
-        "life is never awaited or cancelled before the pools close"
-    ),
-)
 async def test_triggered_dispatch_is_stopped_before_the_pools_close(monkeypatch):
     from orchestrator.services import leader_election
 

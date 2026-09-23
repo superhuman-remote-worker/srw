@@ -3417,6 +3417,11 @@ async def lifespan(app: FastAPI):
     # Signal shutdown to background tasks and wait for each of them.
     await tasks.stop(_BACKGROUND_TASK_SHUTDOWN_ORDER)
 
+    # Dispatch passes and preemptions started by triggers belong to the
+    # application too: stop them before any store closes. The leader loop has
+    # exited above, so no new trigger can start one.
+    await _job_dispatch_state.drain()
+
     # Initial/manual datasource reindexes are request-spawned rather than loop
     # tasks. Cancel them before closing git/vector clients; the source context
     # removes temporary repositories and auth material in its cancellation path.

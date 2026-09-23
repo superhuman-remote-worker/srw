@@ -19,8 +19,9 @@ the former module globals were.
 
 Task creation and leader gating stay in the application lifecycle: the
 application starts :func:`auto_assign_dispatcher` as its background task, and
-:func:`trigger_dispatch` keeps its leadership gate and its untracked
-``asyncio.create_task`` as they were in ``main``. Nothing here imports the
+:func:`trigger_dispatch` keeps its leadership gate. The passes it starts and
+the pauses preemption initiates are tracked on the application's
+:class:`JobDispatchState` and drained at shutdown (R1.B11 correction). Nothing here imports the
 application module or looks collaborators up from a global.
 """
 
@@ -32,7 +33,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Coroutine
 
 from fastapi import HTTPException
 
@@ -86,10 +87,40 @@ logger = logging.getLogger(__name__)
 
 @dataclass(slots=True)
 class JobDispatchState:
-    """Serialization state one application's dispatcher owns."""
+    """Serialization state one application's dispatcher owns.
+
+    ``tasks`` holds the dispatch passes :func:`trigger_dispatch` starts and the
+    preemption pauses a pass initiates. They are the application's tasks, not
+    anonymous ones: a strong reference keeps each alive until it finishes, and
+    the application drains them on shutdown before its pools close.
+    """
 
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     pause_pending_job_ids: set[str] = field(default_factory=set)
+    tasks: set[asyncio.Task[Any]] = field(default_factory=set)
+
+    def spawn(self, coro: Coroutine[Any, Any, Any]) -> asyncio.Task[Any]:
+        """Run ``coro`` as one of this dispatcher's tracked tasks."""
+
+        task = asyncio.create_task(coro)
+        self.tasks.add(task)
+        task.add_done_callback(self.tasks.discard)
+        return task
+
+    async def drain(self) -> None:
+        """Cancel and await every tracked dispatch pass and preemption.
+
+        Called by the application after its background loops stopped (so
+        leadership, which gates new triggers, is already released) and before
+        its stores close. A pass cancelled after its claim leaves the job to
+        the existing orphan/lease recovery, exactly like a pod dying there.
+        """
+
+        pending = list(self.tasks)
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1023,7 +1054,7 @@ async def dispatch_pending_jobs(*, dependencies: JobDispatchDependencies) -> Non
 
                     # Initiate preemption (fire-and-forget)
                     dependencies.state.pause_pending_job_ids.add(candidate_id)
-                    asyncio.create_task(
+                    dependencies.state.spawn(
                         dependencies.job_delivery_operations().initiate_pause(candidate)
                     )
                     logger.info(
@@ -1079,4 +1110,4 @@ def trigger_dispatch(*, dependencies: JobDispatchDependencies) -> None:
     if (
         dependencies.auto_assign_enabled or dependencies.stateless_worker_enabled
     ) and is_leader.is_set():
-        asyncio.create_task(dispatch_pending_jobs(dependencies=dependencies))
+        dependencies.state.spawn(dispatch_pending_jobs(dependencies=dependencies))

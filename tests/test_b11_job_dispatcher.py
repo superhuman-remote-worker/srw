@@ -700,6 +700,8 @@ class TestTriggerDispatch:
         assert len(created) == expected_tasks
         if created:
             assert created[0].get_coro().__qualname__ == "dispatch_pending_jobs"
+            # Owned by the application's dispatch state until it finishes.
+            assert created[0] in deps.state.tasks
             await asyncio.wait_for(created[0], 1.0)
             # The scheduled pass ran against exactly these dependencies.
             assert store.calls
@@ -778,3 +780,49 @@ class TestAutoAssignDispatcher:
             and r.getMessage() == "Error in auto-assign dispatcher: store down"
             for r in caplog.records
         )
+
+
+# --------------------------------------------------------------------------- #
+# R1.B11 correction: dispatch passes and preemptions are the application's
+# tasks (strong reference while running, drained before the pools close).
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.asyncio
+async def test_spawned_tasks_are_tracked_until_they_finish():
+    state = job_dispatcher.JobDispatchState()
+    release = asyncio.Event()
+
+    async def work():
+        await release.wait()
+
+    task = state.spawn(work())
+    assert state.tasks == {task}
+    release.set()
+    await task
+    await asyncio.sleep(0)
+    assert state.tasks == set()
+
+
+@pytest.mark.asyncio
+async def test_drain_cancels_and_awaits_in_flight_passes():
+    state = job_dispatcher.JobDispatchState()
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def long_pass():
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    task = state.spawn(long_pass())
+    await started.wait()
+    await asyncio.wait_for(state.drain(), timeout=2)
+    assert cancelled.is_set()
+    assert task.cancelled()
+    assert state.tasks == set()
+    # Draining an idle dispatcher is a no-op.
+    await asyncio.wait_for(state.drain(), timeout=1)
