@@ -87,8 +87,9 @@ _REGEX_SHAPED_CHARS = frozenset("|*+?()[]{}^$\\")
 def _literal_query_note(query: str, has_shell: bool) -> str:
     """Why a regex-shaped query found nothing, and what to do instead.
 
-    Offers the shell only when one is actually bound, so a shell-less
-    (virtual) workspace is never told to use a capability it lacks.
+    Offers the shell only when a shell TOOL is bound (not merely a
+    shell-capable backend), so neither a virtual workspace nor an expert
+    granted ``shell: []`` is told to use a capability it lacks.
     knowledge-base/knowledge/issues/search_files_literal_query_contract.md
     """
     if not any(ch in _REGEX_SHAPED_CHARS for ch in query):
@@ -346,7 +347,7 @@ def create_filesystem_tools(context: ToolContext) -> List[Any]:
                 if path and not workspace.exists(path):
                     return f"Error: path not found: {path}"
                 return f"No matches found for: {query}" + _literal_query_note(
-                    query, context.has_shell()
+                    query, context.has_shell_tool()
                 )
 
             # Limit results

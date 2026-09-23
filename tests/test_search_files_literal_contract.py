@@ -211,7 +211,12 @@ def test_remote_path_is_never_shell_syntax(home):
 # ---------------------------------------------------------------------------
 
 
-def _tool(tmp_path, *, shell: bool):
+def _tool(tmp_path, *, bound=("search_files",)):
+    """The search tool on a shell-capable backend, with ``bound`` tools loaded.
+
+    A ShellManager is always present, as on every SSH workspace; whether a
+    shell TOOL is bound is what the ``bound`` names decide.
+    """
     ws = WorkspaceManager(
         job_id="literal-tool",
         base_path=tmp_path,
@@ -221,13 +226,13 @@ def _tool(tmp_path, *, shell: bool):
     for rel, text in FILES.items():
         ws.write_file(rel, text)
     ctx = ToolContext(workspace_manager=ws, config={"max_search_results": 50})
-    if shell:
-        ctx.shell_manager = object()  # presence is all has_shell() checks
+    ctx.shell_manager = object()
+    ctx._resolved_tool_names = list(bound)
     return next(t for t in create_filesystem_tools(ctx) if t.name == "search_files")
 
 
 def test_schema_states_the_literal_contract(tmp_path):
-    description = _tool(tmp_path, shell=False).description
+    description = _tool(tmp_path).description
     assert "literal" in description.lower()
     assert '"foo|bar"' in description
     assert "not a regex" in description.lower()
@@ -236,20 +241,42 @@ def test_schema_states_the_literal_contract(tmp_path):
 
 
 def test_literal_hit_renders_normally(tmp_path):
-    out = _tool(tmp_path, shell=False).invoke({"query": "foo|bar"})
+    out = _tool(tmp_path).invoke({"query": "foo|bar"})
     assert "gamma foo|bar" in out
     assert "alpha foo" not in out
 
 
 @pytest.mark.parametrize(
-    ("shell", "advice", "absent"),
+    ("bound", "advice", "absent"),
     [
-        pytest.param(True, "grep -E", None, id="shell-bound"),
-        pytest.param(False, "each one separately", "shell", id="no-shell"),
+        pytest.param(
+            ["search_files", "run_command"], "grep -E", None, id="run_command-bound"
+        ),
+        pytest.param(
+            ["search_files", "shell_execute", "shell_read"],
+            "grep -E",
+            None,
+            id="shell_execute-bound",
+        ),
+        # writer / general-worker / curator / centurion: search_files with
+        # `shell: []` on a shell-capable backend -- a ShellManager, no tool.
+        pytest.param(
+            ["search_files", "read_file"],
+            "each one separately",
+            "shell",
+            id="shell-backend-without-a-shell-tool",
+        ),
+        pytest.param(
+            ["search_files", "srw_cloud_status"],
+            "each one separately",
+            "shell",
+            id="cloud-status-is-not-a-shell",
+        ),
+        pytest.param([], "each one separately", "shell", id="not-yet-loaded"),
     ],
 )
-def test_regex_shaped_miss_says_it_was_literal(tmp_path, shell, advice, absent):
-    out = _tool(tmp_path, shell=shell).invoke({"query": "(alpha|beta) fo+"})
+def test_regex_shaped_miss_says_it_was_literal(tmp_path, bound, advice, absent):
+    out = _tool(tmp_path, bound=bound).invoke({"query": "(alpha|beta) fo+"})
     assert out.startswith("No matches found for: (alpha|beta) fo+")
     assert "matched literally" in out
     assert advice in out
@@ -258,16 +285,18 @@ def test_regex_shaped_miss_says_it_was_literal(tmp_path, shell, advice, absent):
 
 
 def test_plain_miss_carries_no_regex_note(tmp_path):
-    out = _tool(tmp_path, shell=True).invoke({"query": "zebra"})
+    out = _tool(tmp_path, bound=["search_files", "run_command"]).invoke(
+        {"query": "zebra"}
+    )
     assert out == "No matches found for: zebra"
 
 
 def test_missing_path_is_not_reported_as_no_matches(tmp_path):
-    out = _tool(tmp_path, shell=False).invoke({"query": "foo", "path": "no/such/dir"})
+    out = _tool(tmp_path).invoke({"query": "foo", "path": "no/such/dir"})
     assert out == "Error: path not found: no/such/dir"
 
 
 @pytest.mark.parametrize("query", ["", "alpha\nbeta"])
 def test_empty_or_multiline_query_is_refused(tmp_path, query):
-    out = _tool(tmp_path, shell=False).invoke({"query": query})
+    out = _tool(tmp_path).invoke({"query": query})
     assert out.startswith("Error:")

@@ -537,6 +537,19 @@ class ToolContext:
         """Check if ShellManager is available for persistent terminal sessions."""
         return self.shell_manager is not None
 
+    def has_shell_tool(self) -> bool:
+        """Whether a shell-execution tool is actually bound for this agent.
+
+        Not the same as :meth:`has_shell`: a ShellManager exists whenever the
+        backend supports a shell, including for experts granted no shell tool
+        (writer, curator, ... with ``shell: []``). This reads the bound tool
+        names with the predicate that gates the prompt's ``{% if has_shell %}``
+        blocks. Empty until tool loading finishes, so it never over-claims.
+        """
+        from shared.runtime.core.loader import _has_shell_tools
+
+        return _has_shell_tools(set(self._resolved_tool_names or ()))
+
     def has_knowledge(self) -> bool:
         """Check if the knowledge base is available.
 
