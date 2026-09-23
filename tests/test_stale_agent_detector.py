@@ -1246,6 +1246,44 @@ async def test_pending_retirement_retry_logs_when_recovery_cannot_prove_zero(
 
 
 @pytest.mark.asyncio
+async def test_early_nominated_retry_never_reaches_crash_recovery():
+    """A row nominated before the live-drain grace must carry its proof.
+
+    Step 3d admits already-proven rows before the full grace. If the exact
+    receipt no longer validates, the row waits for the full grace instead of
+    being handed to crash recovery early.
+    """
+    retirement, current = _lite_retirement()
+    context = dict(retirement["context"])
+    candidate = {
+        "id": context["thread_id"],
+        "runtime_generation": retirement["generation"],
+        "runtime_retirement_token": retirement["token"],
+        "runtime_retirement_permanent": False,
+        "runtime_retirement_context": context,
+        "nominated_before_grace": True,
+    }
+    db = AsyncMock()
+    db.get_thread = AsyncMock(return_value=current)
+    recover = AsyncMock(return_value=True)
+    with (
+        patch.object(main, "postgres_db", db),
+        patch.object(main, "_recover_captured_sandbox_process_zero", recover),
+    ):
+        assert await main._retry_pending_pinned_retirement(candidate) is False
+    recover.assert_not_awaited()
+
+    candidate["nominated_before_grace"] = False
+    recover.return_value = False
+    with (
+        patch.object(main, "postgres_db", db),
+        patch.object(main, "_recover_captured_sandbox_process_zero", recover),
+    ):
+        assert await main._retry_pending_pinned_retirement(candidate) is False
+    recover.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_recovery_logs_when_the_receipt_is_refused_after_the_pod_stop(
     monkeypatch, caplog
 ):

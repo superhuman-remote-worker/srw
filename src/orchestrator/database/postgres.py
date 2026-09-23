@@ -42533,7 +42533,11 @@ class PostgresDB:
         return [dict(row) for row in rows]
 
     async def list_retryable_pinned_retirements(
-        self, *, grace_seconds: int = 900, limit: int = 25
+        self,
+        *,
+        grace_seconds: int = 900,
+        limit: int = 25,
+        proven_grace_seconds: int | None = None,
     ) -> list[Dict[str, Any]]:
         """Return durable retirements whose local runtime can no longer finish.
 
@@ -42544,9 +42548,22 @@ class PostgresDB:
         after a generous grace and when the captured agent is absent/offline;
         a live process retains ownership of its local quiescence and final
         settlement call.
+
+        That grace covers a live runtime still draining *before* its final
+        settlement request. ``proven_grace_seconds`` (off by default) admits,
+        after that shorter grace, the two shapes where no such drain remains:
+        the exact agent already appended its local-quiescence receipt for
+        this token/generation, or a permanent delete of an ended, ownerless
+        generation that a soft settlement already quiesced. Such rows carry
+        ``nominated_before_grace`` so the caller never hands them to crash
+        recovery before the full grace; the End funnel revalidates both
+        proofs exactly under the lifecycle lock.
         """
 
         bounded_grace = max(0, int(grace_seconds))
+        bounded_proven_grace = (
+            None if proven_grace_seconds is None else max(0, int(proven_grace_seconds))
+        )
         bounded_limit = max(1, min(int(limit), 100))
         async with self.acquire() as conn:
             rows = await conn.fetch(
@@ -42557,20 +42574,60 @@ class PostgresDB:
                        t.runtime_retirement_started_at,
                        t.runtime_retirement_authorized_at,
                        t.runtime_retirement_context,
-                       a.status::text AS agent_status
+                       a.status::text AS agent_status,
+                       t.runtime_retirement_started_at
+                           > now() - make_interval(secs => $1::double precision)
+                           AS nominated_before_grace
                   FROM threads AS t
              LEFT JOIN agents AS a ON a.id = t.agent_id
                  WHERE t.execution_lane = 'pinned'
                    AND t.runtime_retirement_token IS NOT NULL
                    AND t.runtime_retirement_authorized_at IS NOT NULL
-                   AND t.runtime_retirement_started_at
-                       <= now() - make_interval(secs => $1::double precision)
+                   AND (
+                       t.runtime_retirement_started_at
+                           <= now() - make_interval(secs => $1::double precision)
+                       OR (
+                           $3::double precision IS NOT NULL
+                           AND t.runtime_retirement_started_at
+                               <= now()
+                                  - make_interval(secs => $3::double precision)
+                           AND (
+                               (
+                                   t.runtime_retirement_local_quiescence
+                                       ->> 'retirement_token'
+                                       = t.runtime_retirement_token::text
+                                   AND t.runtime_retirement_local_quiescence
+                                       ->> 'runtime_generation'
+                                       = t.runtime_generation::text
+                               )
+                               OR (
+                                   t.runtime_retirement_permanent = true
+                                   AND t.status = 'ended'
+                                   AND t.agent_id IS NULL
+                                   AND t.control_admission_agent_id IS NULL
+                                   AND t.runtime_attach_token IS NULL
+                                   AND EXISTS (
+                                       SELECT 1
+                                         FROM thread_runtime_retirement_outcomes
+                                              AS outcome
+                                        WHERE outcome.thread_id = t.id
+                                          AND outcome.runtime_generation
+                                              = t.runtime_generation
+                                          AND outcome.disposition = 'ended'
+                                          AND outcome.permanent = false
+                                          AND outcome.outcome = 'settled'
+                                   )
+                               )
+                           )
+                       )
+                   )
                    AND (t.agent_id IS NULL OR a.id IS NULL OR a.status = 'offline')
                  ORDER BY t.runtime_retirement_started_at ASC, t.id ASC
                  LIMIT $2
                 """,
                 float(bounded_grace),
                 bounded_limit,
+                None if bounded_proven_grace is None else float(bounded_proven_grace),
             )
         return [dict(row) for row in rows]
 

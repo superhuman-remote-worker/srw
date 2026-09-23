@@ -1195,6 +1195,14 @@ _PINNED_RETIREMENT_RETRY_GRACE_SECONDS = max(
 _PINNED_RETIREMENT_PREFLIGHT_GRACE_SECONDS = max(
     1, int(os.environ.get("PINNED_RETIREMENT_PREFLIGHT_GRACE_SECONDS", "300"))
 )
+# Once the exact agent's local-quiescence receipt exists, or a permanent
+# delete follows a same-generation soft settlement, no live drain remains for
+# the grace above to wait out. Such a row is only the orchestrator-side
+# "owner/reconciler retry" of the exit handoff; this short grace keeps the
+# sweep from racing the request that is still finishing it.
+_PINNED_RETIREMENT_PROVEN_RETRY_GRACE_SECONDS = max(
+    0, int(os.environ.get("PINNED_RETIREMENT_PROVEN_RETRY_GRACE_SECONDS", "60"))
+)
 
 # S36 explicitly overrides the workspace Pod's ordinary 120-second grace with
 # a 10-second UID-preconditioned delete. Keep the exact-absence proof below the
@@ -1355,6 +1363,10 @@ async def _retry_pending_pinned_retirement(candidate: Mapping[str, Any]) -> bool
             )
         )
     ):
+        if candidate.get("nominated_before_grace"):
+            # Nominated early for a proof it no longer shows exactly. Crash
+            # recovery stays behind the full live-drain grace.
+            return False
         recovered = await _recover_captured_sandbox_process_zero(
             {
                 "generation": generation,
@@ -1663,6 +1675,7 @@ async def stale_agent_detector(shutdown_event: asyncio.Event) -> None:
                 postgres_db.list_retryable_pinned_retirements(
                     grace_seconds=_PINNED_RETIREMENT_RETRY_GRACE_SECONDS,
                     limit=25,
+                    proven_grace_seconds=_PINNED_RETIREMENT_PROVEN_RETRY_GRACE_SECONDS,
                 ),
             )
             if pending_retirements:

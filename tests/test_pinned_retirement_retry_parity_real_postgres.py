@@ -433,41 +433,25 @@ async def _agent_receipted_permanent_handoff(db, monkeypatch) -> dict[str, str]:
     return ids
 
 
-_NOMINATION_XFAIL = pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason=(
-        "R1.B11 characterization: step 3d applies the 900 s live-drain grace "
-        "to rows whose process-zero proof is already durable"
-    ),
-)
-
-
 @pytest.mark.asyncio
-@_NOMINATION_XFAIL
 async def test_one_detector_pass_finishes_an_agent_receipted_exit_handoff(
     db, monkeypatch
 ):
     ids = await _agent_receipted_permanent_handoff(db, monkeypatch)
-    monkeypatch.setattr(
-        main, "_PINNED_RETIREMENT_PROVEN_RETRY_GRACE_SECONDS", 0, raising=False
-    )
+    monkeypatch.setattr(main, "_PINNED_RETIREMENT_PROVEN_RETRY_GRACE_SECONDS", 0)
     await _run_one_detector_pass()
     assert await db.get_thread(ids["thread"]) is None
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("backend", ["none", "virtual"])
-@_NOMINATION_XFAIL
 async def test_one_detector_pass_finishes_a_soft_settled_permanent_delete(
     db, monkeypatch, backend
 ):
     ids = await _owner_session(db, monkeypatch, backend=backend)
     await _soft_end(db, ids)
     await _first_permanent_delete_fails(db, monkeypatch, ids)
-    monkeypatch.setattr(
-        main, "_PINNED_RETIREMENT_PROVEN_RETRY_GRACE_SECONDS", 0, raising=False
-    )
+    monkeypatch.setattr(main, "_PINNED_RETIREMENT_PROVEN_RETRY_GRACE_SECONDS", 0)
     await _run_one_detector_pass()
     assert await db.get_thread(ids["thread"]) is None
 
@@ -496,8 +480,17 @@ async def test_one_detector_pass_does_not_nominate_an_unproven_row_early(
         "WHERE id=$1::uuid",
         ids["agent"],
     )
-    monkeypatch.setattr(
-        main, "_PINNED_RETIREMENT_PROVEN_RETRY_GRACE_SECONDS", 0, raising=False
+    monkeypatch.setattr(main, "_PINNED_RETIREMENT_PROVEN_RETRY_GRACE_SECONDS", 0)
+    # The query itself does not nominate it early (the retry's own guard is
+    # a second, independent layer).
+    await db.execute(
+        "UPDATE agents SET status='offline' WHERE id=$1::uuid", ids["agent"]
+    )
+    assert (
+        await db.list_retryable_pinned_retirements(
+            grace_seconds=900, proven_grace_seconds=0
+        )
+        == []
     )
     caplog.set_level("INFO")
     await _run_one_detector_pass()
