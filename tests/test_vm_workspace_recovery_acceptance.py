@@ -649,7 +649,14 @@ async def test_profiled_fixture_freezes_real_paused_job_snapshot_and_preflight(
     )
 
 
-async def _profiled_ready_lease_fixture(db, monkeypatch):
+async def _profiled_ready_lease_fixture(
+    db,
+    monkeypatch,
+    *,
+    observed_vm_uid=None,
+    observed_pvc_uid=None,
+    expect_qualified=True,
+):
     """Seed a completed controller observation after the real preflight."""
     import json
     from uuid import uuid4
@@ -748,8 +755,8 @@ async def _profiled_ready_lease_fixture(db, monkeypatch):
             else None
         ),
         admission,
-        vm_uid,
-        pvc_uid,
+        observed_vm_uid or vm_uid,
+        observed_pvc_uid or pvc_uid,
     )
     scenario.provisioner = SimpleNamespace(
         query_status=AsyncMock(
@@ -763,7 +770,11 @@ async def _profiled_ready_lease_fixture(db, monkeypatch):
             }
         )
     )
-    identity = await scenario._fixture_ready_identity(job)
+    identity = await (
+        scenario._fixture_ready_identity(job)
+        if expect_qualified
+        else scenario._ready_identity(job)
+    )
     assert identity is not None
     return scenario, job, identity
 
@@ -872,6 +883,74 @@ async def test_profiled_fixture_rechecks_live_runtime_before_using_ready_receipt
         )
         == "done"
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field", ["observed_vm_uid", "observed_pvc_uid"])
+async def test_profiled_fixture_rejects_different_adopted_vm_or_pvc_before_marker_and_lease(
+    gate_lease_db,
+    monkeypatch,
+    field,
+):
+    from uuid import uuid4
+
+    scenario, job, identity = await _profiled_ready_lease_fixture(
+        gate_lease_db,
+        monkeypatch,
+        **{field: uuid4(), "expect_qualified": False},
+    )
+    before = await gate_lease_db.fetchrow(
+        "SELECT job.status,job.context,queue.* FROM jobs job "
+        "JOIN run_queue queue ON queue.unit_id=job.id WHERE job.id=$1",
+        job,
+    )
+    assert await scenario._fixture_ready_identity(job) is None
+    with pytest.raises(acceptance.AcceptanceFailure, match="could not be issued"):
+        await scenario._issue_fixture_lease(job, identity)
+    assert (
+        await gate_lease_db.fetchrow(
+            "SELECT job.status,job.context,queue.* FROM jobs job "
+            "JOIN run_queue queue ON queue.unit_id=job.id WHERE job.id=$1",
+            job,
+        )
+        == before
+    )
+    assert (
+        await gate_lease_db.fetchval(
+            "SELECT count(*) FROM worker_batch_attempts WHERE job_id=$1",
+            job,
+        )
+        == 0
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field", ["observed_vm_uid", "observed_pvc_uid"])
+async def test_profiled_fixture_missing_adoption_uid_cannot_authorize_ready(
+    gate_lease_db,
+    monkeypatch,
+    field,
+):
+    scenario, job, identity = await _profiled_ready_lease_fixture(
+        gate_lease_db, monkeypatch
+    )
+    current = dict(
+        await gate_lease_db.fetchrow(
+            "SELECT id,status,execution_lane,assigned_agent_id,user_id,context,"
+            "config_override,freeze_data,lease_expires_at FROM jobs WHERE id=$1",
+            job,
+        )
+    )
+    retry = dict(
+        await gate_lease_db.fetchrow(
+            "SELECT * FROM vm_creation_retries WHERE request_id=$1",
+            acceptance.UUID(scenario.fixture_request_id),
+        )
+    )
+    retry.pop(field)
+    assert not scenario._fixture_authority_matches(job, current, retry, identity)
+    retry[field] = None
+    assert not scenario._fixture_authority_matches(job, current, retry, identity)
 
 
 @pytest.mark.asyncio

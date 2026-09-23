@@ -506,7 +506,8 @@ class LiveScenario:
                 )
                 retry = await conn.fetchrow(
                     "SELECT request_id,job_id,provision_generation,state,reason,ready_at,"
-                    "canonical_request,request_digest,execution_id,"
+                    "canonical_request,request_digest,observed_vm_uid,"
+                    "observed_pvc_uid,execution_id,"
                     "execution_revision,execution_generation "
                     "FROM vm_creation_retries "
                     "WHERE request_id=$1",
@@ -722,7 +723,8 @@ class LiveScenario:
         )
         retry = await self._row(
             "SELECT request_id,job_id,provision_generation,state,reason,ready_at,"
-            "canonical_request,request_digest,execution_id,"
+            "canonical_request,request_digest,observed_vm_uid,"
+            "observed_pvc_uid,execution_id,"
             "execution_revision,execution_generation FROM vm_creation_retries "
             "WHERE request_id=$1",
             UUID(self.fixture_request_id),
@@ -803,6 +805,8 @@ class LiveScenario:
             or retry.get("state") != "succeeded"
             or retry.get("reason") != "creation_adopted"
             or retry.get("ready_at") is None
+            or str(retry.get("observed_vm_uid")) != identity["vm_uid"]
+            or str(retry.get("observed_pvc_uid")) != identity["root_pvc_uid"]
             or canonical != preflight["request"]
             or not canonical
             or canonical_request_digest(canonical) != retry.get("request_digest")
