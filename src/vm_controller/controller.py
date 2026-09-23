@@ -1994,6 +1994,30 @@ class VMController:
                 cloud_document = yaml.safe_load(rendered_cloud_init) or {}
                 if not isinstance(cloud_document, dict):
                     raise ValueError("Unsupported profile cloud-init document")
+                commands = cloud_document.setdefault("runcmd", [])
+                if not isinstance(commands, list) or any(
+                    not isinstance(command, str)
+                    and not (
+                        isinstance(command, list)
+                        and command
+                        and all(isinstance(arg, str) for arg in command)
+                    )
+                    for command in commands
+                ):
+                    raise ValueError("Unsupported profile cloud-init runcmd")
+                # The pinned guest image already has agent-host and this read
+                # group. Do this before the existing SSH restart so new logins
+                # can hash the regenerated root:systemd-network network rule.
+                commands.insert(
+                    0,
+                    [
+                        "usermod",
+                        "--append",
+                        "--groups",
+                        "systemd-network",
+                        "agent-host",
+                    ],
+                )
                 files = cloud_document.setdefault("write_files", [])
                 if not isinstance(files, list) or any(
                     not isinstance(item, dict)

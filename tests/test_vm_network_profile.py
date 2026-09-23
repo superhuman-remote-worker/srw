@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
+import yaml
 
 from tests.test_vm_resource_template import shipped_template
 from vm_controller import controller as settings
@@ -56,6 +57,46 @@ def test_explicit_profile_renders_name_only_nocloud_dhcp_and_preserves_legacy(mo
     assert "macaddress" not in cloud_volume(opted)["networkData"]
     assert legacy["_srwCloudInitUserData"] == "#cloud-config"
     assert "/usr/local/bin/srw-network-profile-qualification" in opted["_srwCloudInitUserData"]
+
+
+def test_profile_first_boot_adds_existing_agent_to_network_read_group(monkeypatch):
+    """A new SSH session must inherit read access before readiness probes run."""
+    from shared.vm_network_profile import NETWORK_PROFILE
+
+    controller = _controller(monkeypatch)
+    controller.cloud_init_text = (
+        "#cloud-config\nusers:\n  - name: agent-host\n"
+        "    groups: docker\nruncmd:\n"
+        "  - [systemctl, daemon-reload]\n  - systemctl restart ssh\n"
+    )
+    request = _request()
+    legacy = controller.render_template(request)["_srwCloudInitUserData"]
+    profile = yaml.safe_load(
+        controller.render_template({**request, "network_profile": NETWORK_PROFILE})[
+            "_srwCloudInitUserData"
+        ]
+    )
+
+    assert legacy == controller.cloud_init_text
+    assert profile["users"] == [{"name": "agent-host", "groups": "docker"}]
+    assert profile["runcmd"] == [
+        ["usermod", "--append", "--groups", "systemd-network", "agent-host"],
+        ["systemctl", "daemon-reload"],
+        "systemctl restart ssh",
+    ]
+
+
+@pytest.mark.parametrize(
+    "runcmd",
+    ["runcmd: systemctl restart ssh\n", "runcmd:\n  - {command: reboot}\n"],
+)
+def test_profile_refuses_malformed_first_boot_commands(monkeypatch, runcmd):
+    from shared.vm_network_profile import NETWORK_PROFILE
+
+    controller = _controller(monkeypatch)
+    controller.cloud_init_text = "#cloud-config\n" + runcmd
+    with pytest.raises(ValueError, match="runcmd"):
+        controller.render_template({**_request(), "network_profile": NETWORK_PROFILE})
 
 
 @pytest.mark.asyncio
