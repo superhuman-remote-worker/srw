@@ -173,6 +173,22 @@
     }
   },
   "properties": {
+    "keycloak": {
+      "type": "object",
+      "properties": {
+        "bootstrapAdmin": {
+          "type": "object",
+          "properties": {
+            "username": {
+              "type": "string",
+              "maxLength": 64,
+              "pattern": "^$|^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$",
+              "description": "Initial bundled SRW realm administrator; empty preserves the existing identity, or defaults to test on a fresh install."
+            }
+          }
+        }
+      }
+    },
     "license": {
       "type": "object",
       "properties": {

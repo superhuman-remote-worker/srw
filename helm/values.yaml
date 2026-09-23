@@ -2322,6 +2322,14 @@ keycloak:
   # When false, fill in the externalIssuerUrl and externalInternalUrl fields below.
   internal: true
   image: quay.io/keycloak/keycloak:26.2
+  # -- Initial SRW login for the bundled Keycloak realm. Password comes from
+  # KC_REALM_ADMIN_PASSWORD. This does not configure the Keycloak master admin.
+  bootstrapAdmin:
+    # Empty preserves the existing realm ConfigMap's initial username during
+    # connected Helm upgrades; a fresh install defaults to the historical test.
+    # Set before first install: 1-64 ASCII letters/digits/._-, starting alnum.
+    # Keep the same explicit value for offline/GitOps renders (no lookup).
+    username: ""
   # -- Replica count for the bundled Keycloak. The pod runs in production mode
   # (`start`), so >1 is correctness-safe without extra infrastructure: the
   # Infinispan cluster discovers peers via `jdbc-ping` through the Keycloak
@@ -2363,7 +2371,7 @@ keycloak:
   # k3d developer shares one known set instead of hand-rolling accounts.
   # Enabling this on any reachable deployment hands anyone who has read the
   # repo full admin access.
-  # The bootstrap `test` admin is separate and always created; its password
+  # The bootstrapAdmin user is separate and always created; its password
   # comes from the required KC_REALM_ADMIN_PASSWORD secret, never from here.
   devUsers:
     enabled: false
@@ -2863,7 +2871,7 @@ searxng:
 crawl4ai:
   # -- Default-off because the browser service needs about 4 GiB at its
   # supported ceiling. Enabling this deploys the fixed-destination service;
-  # catalog/provider registration remains an explicit admin action.
+  # the research-provider seed hook registers it and fills an unset fetch default.
   enabled: false
   image: docker.io/unclecode/crawl4ai:0.9.2
   service:
