@@ -677,6 +677,7 @@ class GateFixturePurge:
     """Normal guarded purge plus durable exact-UID absence verification."""
 
     KEY = "vm_workspace_recovery_gate_purge"
+    ACCEPTED_KEY = "vm_workspace_recovery_gate_purge_accepted"
     KINDS = ("vm", "vmi", "dv", "pvc")
 
     def __init__(
@@ -778,6 +779,17 @@ class GateFixturePurge:
         ):
             raise GateStopError("purge_object_recreated")
 
+    @staticmethod
+    def _accepted_evidence(snapshot):
+        # A no-PVC fixture has no rootdisk delete admission. Bind the ordinary
+        # positive response to this exact immutable purge snapshot for replay.
+        digest = hashlib.sha256(
+            json.dumps(
+                snapshot, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+            ).encode("utf-8")
+        ).hexdigest()
+        return {"version": 1, "snapshot_digest": "sha256:" + digest}
+
     async def _cleanup_completed(self, job_id, snapshot):
         pvc_uid = snapshot["uids"]["pvc"]
         if pvc_uid is None:
@@ -820,7 +832,9 @@ class GateFixturePurge:
             raise GateStopError("purge_cleanup_receipt_changed")
         return True
 
-    async def _await_cleanup_completed(self, job_id, snapshot, stop_at):
+    async def _await_cleanup_completed(
+        self, job_id, snapshot, stop_at, *, await_missing=False
+    ):
         while True:
             current = self._identities(
                 job_id, await self.kube.fixture_objects(self.namespace, str(job_id))
@@ -828,10 +842,23 @@ class GateFixturePurge:
             self._matches(current, snapshot["uids"])
             if any(current.values()):
                 raise GateStopError("purge_resources_still_present")
-            if await self._cleanup_completed(job_id, snapshot):
+            missing_receipt = False
+            try:
+                completed = await self._cleanup_completed(job_id, snapshot)
+            except GateStopError as exc:
+                if not await_missing or str(exc) != "purge_cleanup_receipt_missing":
+                    raise
+                # The objects may disappear before the authenticated
+                # admission's completion row becomes visible.
+                missing_receipt, completed = True, False
+            if completed:
                 return
             if time.monotonic() >= stop_at:
-                raise GateStopError("purge_cleanup_unresolved")
+                raise GateStopError(
+                    "purge_cleanup_receipt_missing"
+                    if missing_receipt
+                    else "purge_cleanup_unresolved"
+                )
             await asyncio.sleep(self.interval)
 
     async def run(self, job_id):
@@ -939,7 +966,13 @@ class GateFixturePurge:
                     [self.KEY],
                     json.dumps(snapshot),
                 )
+            accepted_evidence = self._accepted_evidence(snapshot)
+            accepted_before = context.get(self.ACCEPTED_KEY)
+            if accepted_before is not None and accepted_before != accepted_evidence:
+                raise GateStopError("purge_snapshot_changed")
         if not any(identities.values()):
+            if snapshot["uids"]["pvc"] is None and accepted_before is None:
+                raise GateStopError("purge_request_unproven")
             await self._await_cleanup_completed(
                 job_id, snapshot, time.monotonic() + self.timeout
             )
@@ -950,8 +983,32 @@ class GateFixturePurge:
             accepted = await self.delete(str(job_id), purge_disk=True)
         except Exception:
             raise GateStopError("purge_request_failed") from None
-        if accepted is not True:
+        if (
+            accepted is not True
+            and snapshot["uids"]["pvc"] is None
+            and accepted_before is None
+        ):
             raise GateStopError("purge_request_refused")
+        if (
+            accepted is True
+            and snapshot["uids"]["pvc"] is None
+            and accepted_before is None
+        ):
+            async with self.db.acquire() as conn, conn.transaction():
+                _, context = await self._scope(conn, job_id)
+                if context.get(self.KEY) != snapshot or context.get(
+                    self.ACCEPTED_KEY
+                ) not in (
+                    None,
+                    accepted_evidence,
+                ):
+                    raise GateStopError("purge_snapshot_changed")
+                await conn.execute(
+                    "UPDATE jobs SET context=jsonb_set(context,$2::text[],$3::jsonb) WHERE id=$1",
+                    job_id,
+                    [self.ACCEPTED_KEY],
+                    json.dumps(accepted_evidence),
+                )
         stop_at = time.monotonic() + self.timeout
         while time.monotonic() < stop_at:
             current = self._identities(
@@ -959,7 +1016,12 @@ class GateFixturePurge:
             )
             self._matches(current, snapshot["uids"])
             if not any(current.values()):
-                await self._await_cleanup_completed(job_id, snapshot, stop_at)
+                await self._await_cleanup_completed(
+                    job_id,
+                    snapshot,
+                    stop_at,
+                    await_missing=accepted is not True,
+                )
                 return
             await asyncio.sleep(self.interval)
         raise GateStopError("purge_resources_still_present")

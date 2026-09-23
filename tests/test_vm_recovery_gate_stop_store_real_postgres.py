@@ -426,6 +426,294 @@ async def test_purge_requires_every_child_absent_and_resumes_from_snapshot(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    "settlement",
+    [
+        "completed",
+        "late_receipt",
+        "missing",
+        "pending",
+        "wrong_pvc",
+        "foreign_owner",
+        "wrong_source",
+        "stale_digest",
+        "wrong_outcome",
+        "remaining",
+        "recreated",
+    ],
+)
+async def test_false_purge_response_observes_only_exact_async_settlement(
+    app_pg, settlement
+):
+    from copy import deepcopy
+
+    from orchestrator.operator_cli.vm_recovery_gate_stop_control import (
+        GateFixturePurge,
+        GateStopError,
+    )
+
+    doc = await seeded(app_pg)
+    _, base = objects()
+    vm_name = "agent-vm-" + doc["job_id"]
+    root_name = vm_name + "-rootdisk"
+    live = {
+        "vm": base["vm"],
+        "vmi": None,
+        "dv": deepcopy(base["vm"]),
+        "pvc": deepcopy(base["vmi"]),
+    }
+    for kind in ("vm", "dv", "pvc"):
+        obj = live[kind]
+        obj["metadata"].update(
+            name=root_name if kind in ("dv", "pvc") else vm_name,
+            namespace=doc["namespace"],
+            uid=str(uuid4()),
+        )
+        obj["metadata"]["labels"]["srw.io/owner-id"] = doc["job_id"]
+    live["pvc"]["metadata"]["ownerReferences"] = [
+        dict(
+            controller=True,
+            apiVersion="cdi.kubevirt.io/v1beta1",
+            kind="DataVolume",
+            name=root_name,
+            uid=live["dv"]["metadata"]["uid"],
+        )
+    ]
+    anchor = {
+        "generation": doc["generation"],
+        "vm": live["vm"]["metadata"]["uid"],
+        "pvc": live["pvc"]["metadata"]["uid"],
+    }
+    dv_uid = live["dv"]["metadata"]["uid"]
+    reads = 0
+
+    class Kube:
+        async def fixture_objects(self, namespace, job):
+            nonlocal reads
+            reads += 1
+            if reads == 3:
+                if settlement == "recreated":
+                    live["vm"]["metadata"]["uid"] = str(uuid4())
+                elif settlement != "remaining":
+                    for kind in live:
+                        live[kind] = None
+            if reads == (4 if settlement == "late_receipt" else 3):
+                if settlement not in ("missing", "remaining", "recreated"):
+                    async with app_pg.acquire() as conn:
+                        await conn.execute(
+                            "INSERT INTO vm_workspace_cleanup_admissions"
+                            "(id,owner_kind,owner_id,pvc_uid,source,request_id,intent_digest,"
+                            "completed_at,outcome) VALUES($1,'job',$2,$3,$4,$5,$6,"
+                            "CASE WHEN $7::bool THEN clock_timestamp() ELSE NULL END,$8)",
+                            uuid4(),
+                            uuid4()
+                            if settlement == "foreign_owner"
+                            else UUID(doc["job_id"]),
+                            uuid4()
+                            if settlement == "wrong_pvc"
+                            else UUID(anchor["pvc"]),
+                            "controller_vm_create"
+                            if settlement == "wrong_source"
+                            else "controller_rootdisk_delete",
+                            uuid4(),
+                            "sha256:stale"
+                            if settlement == "stale_digest"
+                            else cleanup_digest(
+                                doc["job_id"], doc["generation"], dv_uid, anchor["pvc"]
+                            ),
+                            settlement != "pending",
+                            None
+                            if settlement == "pending"
+                            else (
+                                "retained"
+                                if settlement == "wrong_outcome"
+                                else "deleted"
+                            ),
+                        )
+            return deepcopy(live)
+
+    calls = []
+
+    async def delete(job, *, purge_disk):
+        calls.append((job, purge_disk))
+        return False
+
+    purge = GateFixturePurge(
+        app_pg,
+        Kube(),
+        delete,
+        doc["run_id"],
+        doc["namespace"],
+        anchor=anchor,
+        timeout=0.1,
+        interval=0,
+    )
+    if settlement in ("completed", "late_receipt"):
+        await purge.run(UUID(doc["job_id"]))
+    else:
+        with pytest.raises(GateStopError) as caught:
+            await purge.run(UUID(doc["job_id"]))
+        assert str(caught.value) != "purge_request_refused"
+    assert calls == [(doc["job_id"], True)]
+
+
+@pytest.mark.asyncio
+async def test_no_pvc_refusal_cannot_become_absent_replay_success(app_pg):
+    from copy import deepcopy
+
+    from orchestrator.operator_cli.vm_recovery_gate_stop_control import (
+        GateFixturePurge,
+        GateStopError,
+    )
+
+    doc = await seeded(app_pg)
+    _, base = objects()
+    vm = base["vm"]
+    vm["metadata"].update(
+        name="agent-vm-" + doc["job_id"],
+        namespace=doc["namespace"],
+        uid=doc["vm_uid"],
+    )
+    vm["metadata"]["labels"]["srw.io/owner-id"] = doc["job_id"]
+    live = {"vm": vm, "vmi": None, "dv": None, "pvc": None}
+
+    class Kube:
+        async def fixture_objects(self, namespace, job):
+            return deepcopy(live)
+
+    calls = []
+
+    async def refused(job, *, purge_disk):
+        calls.append(job)
+        live["vm"] = None
+        return False
+
+    anchor = {"generation": doc["generation"], "vm": doc["vm_uid"], "pvc": None}
+    with pytest.raises(GateStopError, match="purge_request_refused"):
+        await GateFixturePurge(
+            app_pg, Kube(), refused, doc["run_id"], doc["namespace"], anchor=anchor
+        ).run(UUID(doc["job_id"]))
+
+    async def unexpected_delete(job, *, purge_disk):
+        raise AssertionError("absence cannot authorize another delete")
+
+    with pytest.raises(GateStopError, match="purge_request_unproven"):
+        await GateFixturePurge(
+            app_pg,
+            Kube(),
+            unexpected_delete,
+            doc["run_id"],
+            doc["namespace"],
+            anchor=anchor,
+        ).run(UUID(doc["job_id"]))
+    assert calls == [doc["job_id"]]
+
+
+@pytest.mark.asyncio
+async def test_no_pvc_positive_response_is_bound_to_exact_snapshot_on_replay(app_pg):
+    from copy import deepcopy
+
+    from orchestrator.operator_cli.vm_recovery_gate_stop_control import (
+        GateFixturePurge,
+        GateStopError,
+    )
+
+    doc = await seeded(app_pg)
+    _, base = objects()
+    vm = base["vm"]
+    vm["metadata"].update(
+        name="agent-vm-" + doc["job_id"],
+        namespace=doc["namespace"],
+        uid=doc["vm_uid"],
+    )
+    vm["metadata"]["labels"]["srw.io/owner-id"] = doc["job_id"]
+    live = {"vm": vm, "vmi": None, "dv": None, "pvc": None}
+
+    class Kube:
+        async def fixture_objects(self, namespace, job):
+            return deepcopy(live)
+
+    calls = []
+
+    async def delete(job, *, purge_disk):
+        calls.append(job)
+        live["vm"] = None
+        return True
+
+    anchor = {"generation": doc["generation"], "vm": doc["vm_uid"], "pvc": None}
+    purge = GateFixturePurge(
+        app_pg, Kube(), delete, doc["run_id"], doc["namespace"], anchor=anchor
+    )
+    await purge.run(UUID(doc["job_id"]))
+    await purge.run(UUID(doc["job_id"]))
+    assert calls == [doc["job_id"]]
+    with pytest.raises(GateStopError, match="purge_object_recreated"):
+        await GateFixturePurge(
+            app_pg,
+            Kube(),
+            delete,
+            doc["run_id"],
+            doc["namespace"],
+            anchor={**anchor, "vm": str(uuid4())},
+        ).run(UUID(doc["job_id"]))
+    assert calls == [doc["job_id"]]
+    async with app_pg.acquire() as conn:
+        await conn.execute(
+            "UPDATE jobs SET context=jsonb_set(context,"
+            "'{vm_workspace_recovery_gate_purge,uids,vmi}',$2::jsonb) WHERE id=$1",
+            UUID(doc["job_id"]),
+            json.dumps(str(uuid4())),
+        )
+    with pytest.raises(GateStopError, match="purge_snapshot_changed"):
+        await purge.run(UUID(doc["job_id"]))
+    assert calls == [doc["job_id"]]
+
+
+@pytest.mark.asyncio
+async def test_purge_cancellation_does_not_record_accepted_response(app_pg):
+    import asyncio
+    from copy import deepcopy
+
+    from orchestrator.operator_cli.vm_recovery_gate_stop_control import GateFixturePurge
+
+    doc = await seeded(app_pg)
+    _, base = objects()
+    vm = base["vm"]
+    vm["metadata"].update(
+        name="agent-vm-" + doc["job_id"],
+        namespace=doc["namespace"],
+        uid=doc["vm_uid"],
+    )
+    vm["metadata"]["labels"]["srw.io/owner-id"] = doc["job_id"]
+
+    class Kube:
+        async def fixture_objects(self, namespace, job):
+            return deepcopy({"vm": vm, "vmi": None, "dv": None, "pvc": None})
+
+    calls = []
+
+    async def delete(job, *, purge_disk):
+        calls.append(job)
+        raise asyncio.CancelledError
+
+    with pytest.raises(asyncio.CancelledError):
+        await GateFixturePurge(
+            app_pg,
+            Kube(),
+            delete,
+            doc["run_id"],
+            doc["namespace"],
+            anchor={"generation": doc["generation"], "vm": doc["vm_uid"], "pvc": None},
+        ).run(UUID(doc["job_id"]))
+    assert calls == [doc["job_id"]]
+    async with app_pg.acquire() as conn:
+        context = await conn.fetchval(
+            "SELECT context FROM jobs WHERE id=$1", UUID(doc["job_id"])
+        )
+    assert "vm_workspace_recovery_gate_purge_accepted" not in context
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
     "receipt",
     ["missing", "pending", "wrong_pvc", "wrong_source", "stale_digest", "completed"],
 )
