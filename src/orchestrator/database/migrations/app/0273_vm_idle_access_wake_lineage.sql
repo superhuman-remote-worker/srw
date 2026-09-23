@@ -7,6 +7,9 @@ SET LOCAL lock_timeout = '2s';
 SET LOCAL statement_timeout = '30s';
 
 ALTER TABLE public.vm_idle_operations ADD COLUMN access_rebind_proof jsonb;
+-- A later explicit Resume is separate from the immutable access-only Ready
+-- receipt. It may join only its still-open, exact successor operation.
+ALTER TABLE public.vm_idle_operations ADD COLUMN post_ready_resume_requested boolean NOT NULL DEFAULT false;
 CREATE INDEX vm_idle_episode_history
     ON public.vm_idle_operations(owner_kind,owner_id,episode_id,episode_revision DESC,id DESC);
 CREATE UNIQUE INDEX vm_idle_one_access_rebind_revision
@@ -53,6 +56,41 @@ BEGIN
                   OLD.wake_execution_requested) THEN
             RAISE EXCEPTION 'Access wake lineage identity is immutable' USING ERRCODE='23514';
         END IF;
+        IF OLD.closed_at IS NOT NULL THEN
+            IF NEW.phase IS DISTINCT FROM OLD.phase
+               OR NEW.closed_at IS DISTINCT FROM OLD.closed_at THEN
+                RAISE EXCEPTION 'Closed access wake status is immutable' USING ERRCODE='23514';
+            END IF;
+        ELSIF NEW.closed_at IS NOT NULL OR NEW.phase IS DISTINCT FROM OLD.phase THEN
+            IF NOT (NEW.closed_at IS NULL AND NEW.phase IN ('waking','wake_held'))
+               AND NOT (NEW.closed_at IS NOT NULL AND NEW.phase='ready'
+                        AND OLD.phase IN ('waking','wake_held')) THEN
+                RAISE EXCEPTION 'Access wake may only close ready' USING ERRCODE='23514';
+            END IF;
+        END IF;
+        IF NEW.post_ready_resume_requested IS DISTINCT FROM OLD.post_ready_resume_requested THEN
+            IF OLD.post_ready_resume_requested OR NOT NEW.post_ready_resume_requested
+               OR OLD.closed_at IS NOT NULL OR NEW.closed_at IS NOT NULL
+               OR OLD.phase NOT IN ('waking','wake_held')
+               OR NEW.wake_execution_requested
+               OR NEW.wake_ready_at IS NULL THEN
+                RAISE EXCEPTION 'Post-ready Resume has no open access authority' USING ERRCODE='23514';
+            END IF;
+            SELECT * INTO current_job FROM public.jobs WHERE id=OLD.owner_id FOR SHARE;
+            IF current_job.id IS NULL
+               OR current_job.status IN ('completed','failed','cancelled')
+               OR current_job.workspace_idle_revision<>OLD.episode_revision+1
+               OR current_job.workspace_idle_episode->>'episode_id'<>OLD.episode_id::text
+               OR current_job.context->'vm'->>'idle_wake_operation_id' IS DISTINCT FROM OLD.id::text
+               OR current_job.context->'vm'->>'status'<>'ready'
+               OR current_job.context->'vm'->>'provision_generation' IS DISTINCT FROM OLD.wake_generation::text
+               OR current_job.context->'vm'->>'vm_uid' IS DISTINCT FROM OLD.access_rebind_proof->'successor'->>'vm_uid'
+               OR current_job.context->'vm'->>'vmi_uid' IS DISTINCT FROM OLD.access_rebind_proof->'successor'->>'vmi_uid'
+               OR current_job.context->'vm'->>'active_pod_uid' IS DISTINCT FROM OLD.access_rebind_proof->'successor'->>'launcher_uid'
+               OR current_job.context->'vm'->>'rootdisk_pvc_uid' IS DISTINCT FROM OLD.pvc_uid::text THEN
+                RAISE EXCEPTION 'Post-ready Resume successor is unproven' USING ERRCODE='23514';
+            END IF;
+        END IF;
         RETURN NEW;
     END IF;
     proof := NEW.access_rebind_proof;
@@ -65,7 +103,8 @@ BEGIN
        OR NEW.stop_verified_at IS NULL OR NEW.stop_evidence IS NULL
        OR NEW.wake_ready_at IS NULL OR NEW.wake_id IS NULL
        OR NEW.wake_generation IS NULL OR NEW.wake_request_id IS NULL
-       OR NEW.wake_execution_requested OR NEW.terminal_source_command_id IS NOT NULL
+       OR NEW.wake_execution_requested OR NEW.post_ready_resume_requested
+       OR NEW.terminal_source_command_id IS NOT NULL
        OR proof->>'operation_id' IS DISTINCT FROM NEW.id::text
        OR proof->>'episode_id' IS DISTINCT FROM NEW.episode_id::text
        OR proof->>'from_revision' IS DISTINCT FROM NEW.episode_revision::text
@@ -112,6 +151,7 @@ BEGIN
     ELSE
         IF prior.episode_revision<>NEW.episode_revision-1
            OR prior.phase<>'ready' OR prior.closed_at IS NULL
+           OR prior.post_ready_resume_requested
            OR prior.access_rebind_proof IS NULL
            OR prior.access_rebind_proof->>'to_revision' IS DISTINCT FROM NEW.episode_revision::text
            OR prior.access_rebind_proof->>'episode_id' IS DISTINCT FROM NEW.episode_id::text

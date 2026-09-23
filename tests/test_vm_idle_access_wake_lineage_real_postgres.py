@@ -32,7 +32,9 @@ def idle_env(monkeypatch):
         monkeypatch.setenv(key, value)
 
 
-async def access_only_cycle(db, owner, episode, identity, *, execution_requested=False):
+async def access_only_cycle(
+    db, owner, episode, identity, *, execution_requested=False, finish=True,
+):
     from orchestrator.services.vm_idle_lifecycle import (
         VMIdleLifecycleService, VMIdleLifecycleStore,
     )
@@ -142,7 +144,8 @@ async def access_only_cycle(db, owner, episode, identity, *, execution_requested
 
     service = VMIdleLifecycleService(db, ReadyProvisioner(), object())
     assert await service._wake(await store.get_operation(str(operation["id"])), current=lambda: True)
-    assert await store.finish_wake(str(operation["id"]))
+    if finish:
+        assert await store.finish_wake(str(operation["id"]))
     row = await db.fetchrow(
         "SELECT status,workspace_idle_episode,workspace_idle_revision FROM jobs WHERE id=$1", owner,
     )
@@ -283,6 +286,98 @@ async def test_native_access_lineage_receipt_is_immutable(db):
         )
     with pytest.raises(asyncpg.CheckViolationError):
         await db.execute("DELETE FROM vm_idle_operations WHERE id=$1", operation["id"])
+
+
+@pytest.mark.asyncio
+async def test_middle_closed_access_link_cannot_change_phase_or_close_time(db, monkeypatch, tmp_path):
+    await _schema(db)
+    owner, episode, identity, _ = await seed_final_review(db)
+    links = []
+    for _ in range(3):
+        operation, episode, identity = await access_only_cycle(db, owner, episode, identity)
+        links.append(operation)
+    middle = links[1]
+    original = await db.fetchrow(
+        "SELECT phase,closed_at FROM vm_idle_operations WHERE id=$1", middle["id"],
+    )
+    assert original["phase"] == "ready" and original["closed_at"] is not None
+    with pytest.raises(asyncpg.CheckViolationError):
+        await db.execute(
+            "UPDATE vm_idle_operations SET phase='superseded' WHERE id=$1", middle["id"],
+        )
+    with pytest.raises(asyncpg.CheckViolationError):
+        await db.execute(
+            "UPDATE vm_idle_operations SET closed_at=closed_at+interval '1 second' "
+            "WHERE id=$1", middle["id"],
+        )
+    with pytest.raises(asyncpg.CheckViolationError):
+        await db.execute("DELETE FROM vm_idle_operations WHERE id=$1", middle["id"])
+    from unittest.mock import AsyncMock
+
+    controls = await controls_for(db, monkeypatch, tmp_path)
+    monkeypatch.setattr(type(controls), "publish_terminal_review", AsyncMock())
+    assert (await controls.approve_job(
+        str(owner), user={"id": "reviewer"},
+        job=await db.get_job(str(owner)), request=None,
+    ))["status"] == "approved"
+
+
+@pytest.mark.asyncio
+async def test_explicit_resume_after_access_ready_before_close_queues_once(
+    db, monkeypatch, tmp_path,
+):
+    from orchestrator.services.vm_idle_lifecycle import VMIdleLifecycleStore
+
+    await _schema(db)
+    owner, episode, identity, _ = await seed_final_review(db)
+    operation, rebound, _ = await access_only_cycle(
+        db, owner, episode, identity, finish=False,
+    )
+    assert rebound.revision == episode.revision + 1
+    store = VMIdleLifecycleStore(db)
+    before = await store.get_operation(str(operation["id"]))
+    assert before["phase"] == "waking" and before["access_rebind_proof"] is not None
+    controls = await controls_for(db, monkeypatch, tmp_path)
+    from orchestrator.services import manifest_execution_snapshot
+
+    # The seeded execution snapshot is minimal; only the adapter parser is
+    # outside this idle-wake route boundary.
+    monkeypatch.setattr(
+        manifest_execution_snapshot, "srw_snapshot_config",
+        lambda snapshot: ({}, {}),
+    )
+    caller = await db.get_job(str(owner))
+    first = await controls.resume_job(
+        str(owner), user={"id": "reviewer"}, job=caller, request=None, req=None,
+    )
+    second = await controls.resume_job(
+        str(owner), user={"id": "reviewer"}, job=caller, request=None, req=None,
+    )
+    assert first["status"] == second["status"] == "waking"
+    reserved = await store.get_operation(str(operation["id"]))
+    assert reserved["access_rebind_proof"] == before["access_rebind_proof"]
+    assert reserved["wake_execution_requested"] is False
+    assert reserved["post_ready_resume_requested"] is True
+    sequence_before = await db.fetchval(
+        "SELECT COALESCE(input_seq,0) FROM run_queue WHERE unit_id=$1", owner,
+    )
+    assert await store.finish_wake(str(operation["id"]))
+    sequence_after = await db.fetchval(
+        "SELECT COALESCE(input_seq,0) FROM run_queue WHERE unit_id=$1", owner,
+    )
+    assert await store.finish_wake(str(operation["id"]))
+    assert await db.fetchval("SELECT status FROM jobs WHERE id=$1", owner) == "paused"
+    assert await db.fetchval("SELECT workspace_idle_episode FROM jobs WHERE id=$1", owner) is None
+    assert await db.fetchval("SELECT state FROM run_queue WHERE unit_id=$1", owner) == "queued"
+    assert sequence_after == sequence_before + 1
+    assert await db.fetchval(
+        "SELECT COALESCE(input_seq,0) FROM run_queue WHERE unit_id=$1", owner,
+    ) == sequence_after
+    with pytest.raises(asyncpg.CheckViolationError):
+        await db.execute(
+            "UPDATE vm_idle_operations SET post_ready_resume_requested=false WHERE id=$1",
+            operation["id"],
+        )
 
 
 @pytest.mark.asyncio

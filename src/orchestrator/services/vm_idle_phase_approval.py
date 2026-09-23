@@ -82,6 +82,7 @@ async def _source_runtime_continuity(
             and row["stop_verified_at"] is not None
             and row["wake_ready_at"] is not None
             and not row["wake_execution_requested"]
+            and not row["post_ready_resume_requested"]
             and row["terminal_source_command_id"] is None
             and proof.get("version") == 1
             and proof.get("operation_id") == str(row["id"])

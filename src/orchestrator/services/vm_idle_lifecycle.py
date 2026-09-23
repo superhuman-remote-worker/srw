@@ -747,6 +747,18 @@ class VMIdleLifecycleStore:
 
     @staticmethod
     async def _reserve_wake_on_conn(conn, operation, *, execution_requested: bool):
+        if operation["access_rebind_proof"] is not None:
+            # Ready access rebind already committed. The proof's original
+            # no-execution decision cannot be rewritten by a later Resume.
+            if not execution_requested:
+                return operation
+            return await conn.fetchrow(
+                "UPDATE vm_idle_operations SET post_ready_resume_requested=true,"
+                "retry_after=NULL,last_progress_at=clock_timestamp() "
+                "WHERE id=$1 AND closed_at IS NULL "
+                "RETURNING *",
+                operation["id"],
+            )
         return await conn.fetchrow(
             """
             UPDATE vm_idle_operations SET
@@ -1051,6 +1063,7 @@ class VMIdleLifecycleStore:
                     prior_proof = _object(prior["access_rebind_proof"])
                     if (
                         prior["phase"] != "ready" or prior["closed_at"] is None
+                        or prior["post_ready_resume_requested"]
                         or prior["episode_revision"] != operation["episode_revision"] - 1
                         or _object(prior_proof.get("successor")) != {
                             "generation": str(operation["provision_generation"]),
@@ -1231,10 +1244,11 @@ class VMIdleLifecycleStore:
                         return False
                 execute = bool(
                     operation["wake_execution_requested"]
+                    or operation["post_ready_resume_requested"]
                     or episode is None
                     or episode.episode_id != str(operation["episode_id"])
                 )
-                if not execute:
+                if not execute or operation["post_ready_resume_requested"]:
                     proof = _object(operation["access_rebind_proof"])
                     if (
                         proof.get("version") != 1
