@@ -212,7 +212,17 @@ class TestDelegationTimeout:
         )
         main_src = pathlib.Path("src/orchestrator/main.py").read_text()
         assert "completion_recovery_operations.delegation_timeout_sweeper" in main_src
-        assert "delegation_timeout_task" in main_src
+        # R1.B11: started (leader-gated) through the lifecycle's task set and
+        # awaited at shutdown under its key.
+        start = main_src.index(
+            '"delegation_timeout"', main_src.index("async def _start_background_tasks(")
+        )
+        assert main_src.rindex("tasks.start_leader_gated(", 0, start) > main_src.rfind(
+            "tasks.start(", 0, start
+        )
+        from orchestrator import main
+
+        assert "delegation_timeout" in main._BACKGROUND_TASK_SHUTDOWN_ORDER
 
 
 # ===========================================================================
