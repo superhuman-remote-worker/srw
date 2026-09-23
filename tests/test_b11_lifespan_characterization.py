@@ -299,11 +299,17 @@ def _lifespan_environment(monkeypatch, recorder: _Recorder, *, env=None):
     monkeypatch.setattr(
         main.readiness_service, "try_auto_pin_required_defaults", AsyncMock()
     )
-    monkeypatch.setattr(
-        main,
-        "probe_schema_capabilities",
-        AsyncMock(return_value=_NoCapabilities()),
-    )
+    # The capability probe is bound wherever the startup step that calls it
+    # lives (the lifespan at the base, the metering bootstrap afterwards).
+    import orchestrator.services.infrastructure_metering.bootstrap as metering
+
+    for owner in (main, metering):
+        monkeypatch.setattr(
+            owner,
+            "probe_schema_capabilities",
+            AsyncMock(return_value=_NoCapabilities()),
+            raising=False,
+        )
     monkeypatch.setattr(main, "initialize_main_cloud_instance_authority", AsyncMock())
     monkeypatch.setattr(main, "preload_retained_main_cloud_instances", AsyncMock())
     import orchestrator.seed.llm_config as llm_config

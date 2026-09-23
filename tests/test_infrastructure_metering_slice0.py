@@ -154,9 +154,9 @@ def _usage_dependencies(
 
 
 def test_cutover_wiring_uses_configured_inventory_freshness() -> None:
-    import orchestrator.main as orchestrator_main
+    from orchestrator.services.infrastructure_metering import bootstrap
 
-    source = inspect.getsource(orchestrator_main.lifespan)
+    source = inspect.getsource(bootstrap.bootstrap_infrastructure_metering)
     assert "max_scope_age=timedelta(" in source
     assert "seconds=infrastructure_metering_settings.stale_after_seconds" in source
     assert "max_collector_clock_skew=timedelta(" in source
