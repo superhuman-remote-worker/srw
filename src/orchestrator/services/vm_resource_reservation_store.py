@@ -167,7 +167,9 @@ def _expected_waiter_request_fields(retry, *, inventory, policy_document, cost):
 
     fields = {
         "request_id": retry["request_id"],
+        "owner_kind": retry["owner_kind"] if "owner_kind" in retry else "job",
         "job_id": retry["job_id"],
+        "thread_id": retry["thread_id"] if "thread_id" in retry else None,
         "provision_generation": retry["provision_generation"],
         "cluster_id": inventory.cluster_id,
         "policy_digest": inventory.policy_digest,
@@ -1165,6 +1167,52 @@ class VMResourceReservationStore:
         if not _waiter_request_fields_match(row, expected):
             raise ResourceAdmissionError("resource_waiter_changed")
         await self._deadline(conn, retry)
+        return dict(row)
+
+    async def _write_thread_waiter_on_conn(self, conn, *, retry):
+        """Project one genuine thread source under its locked owner transaction."""
+        if (
+            retry["owner_kind"] != "thread"
+            or retry["job_id"] is not None
+            or retry["thread_id"] is None
+            or retry["state"] != "queued"
+        ):
+            raise ResourceAdmissionError("creation_request_ineligible")
+        if await conn.fetchval(
+            "SELECT EXISTS(SELECT 1 FROM vm_creation_effects WHERE request_id=$1)",
+            retry["request_id"],
+        ):
+            raise ResourceAdmissionError("creation_effect_already_issued")
+        await self._lock_policy(conn)
+        expected = _expected_waiter_request_fields(
+            retry, inventory=self.inventory,
+            policy_document=self.policy_document, cost=self.cost,
+        )
+        owner_key = (
+            "system" if retry["thread_owner_user_id"] is None
+            else "user:" + str(retry["thread_owner_user_id"])
+        )
+        row = await conn.fetchrow(
+            "INSERT INTO vm_resource_waiters "
+            "(request_id,owner_kind,thread_id,provision_generation,cluster_id,"
+            "policy_digest,owner_key,project_id,priority,request_digest,"
+            "guest_vcpus,guest_memory_bytes,cpu_millicores,memory_bytes,"
+            "kvm_devices,placement,ephemeral_storage_bytes,tun_devices,"
+            "vhost_net_devices,resource_version) "
+            "VALUES($1,'thread',$2,$3,$4,$5,$6,$7,0,$8,$9,$10,$11,$12,$13,"
+            "$14::jsonb,$15,$16,$17,2) RETURNING *",
+            expected["request_id"], expected["thread_id"],
+            expected["provision_generation"], expected["cluster_id"],
+            expected["policy_digest"], owner_key,
+            retry["thread_owner_project_id"], expected["request_digest"],
+            expected["guest_vcpus"], expected["guest_memory_bytes"],
+            expected["cpu_millicores"], expected["memory_bytes"],
+            expected["kvm_devices"], json.dumps(expected["placement"]),
+            expected["ephemeral_storage_bytes"], expected["tun_devices"],
+            expected["vhost_net_devices"],
+        )
+        if not _waiter_request_fields_match(row, expected):
+            raise ResourceAdmissionError("resource_waiter_changed")
         return dict(row)
 
     async def _admit(self, conn, request_id):

@@ -21088,6 +21088,7 @@ class PostgresDB:
         poll: bool = False,
         preparation_only: bool = False,
         expected_preparation_context: Mapping[str, Any] | None = None,
+        creation_source: Mapping[str, Any] | None = None,
     ) -> bool | dict:
         """Install one VM provision generation before any controller effect.
 
@@ -21154,6 +21155,31 @@ class PostgresDB:
         ):
             return False
         proposed["provision_generation"] = provision_generation
+        parsed_request_id = None
+        if creation_source is not None:
+            from shared.vm_creation_issuance import canonical_configuration_digest
+            from shared.vm_creation_retry import canonical_request_digest
+
+            try:
+                parsed_request_id = UUID(str(creation_source["request_id"]))
+                request = creation_source["request"]
+                configuration = creation_source["controller_configuration"]
+                if (
+                    not isinstance(request, dict)
+                    or not isinstance(configuration, dict)
+                    or configuration.get("version") != 3
+                    or request.get("entity_type") != "thread"
+                    or request.get("job_id") != str(parsed_thread)
+                    or request.get("provision_generation") != provision_generation
+                    or canonical_request_digest(request)
+                        != creation_source["request_digest"]
+                    or canonical_configuration_digest(configuration)
+                        != creation_source["controller_configuration_digest"]
+                ):
+                    return False
+            except (KeyError, TypeError, ValueError, AttributeError):
+                return False
+            proposed["creation_request_id"] = str(parsed_request_id)
         if preparation_only:
             from shared.workspace_preparation import validate_request
 
@@ -21175,7 +21201,8 @@ class PostgresDB:
             async with conn.transaction():
                 row = await conn.fetchrow(
                     "SELECT status,execution_lane,runtime_generation,"
-                    "runtime_retirement_token,agent_id,runtime_attach_token,metadata "
+                    "runtime_retirement_token,agent_id,runtime_attach_token,metadata,"
+                    "pinned_idle_terminal_intent_at "
                     "FROM threads WHERE id=$1::uuid FOR UPDATE",
                     parsed_thread,
                 )
@@ -21287,6 +21314,7 @@ class PostgresDB:
                     and row["runtime_retirement_token"] is None
                     and row["agent_id"] == parsed_agent
                     and row["runtime_attach_token"] == parsed_attach
+                    and row["pinned_idle_terminal_intent_at"] is None
                 ):
                     return False
                 inverse_agents = await conn.fetch(
@@ -21381,7 +21409,38 @@ class PostgresDB:
                     json.dumps(metadata),
                     parsed_runtime_generation,
                 )
-                return result == "UPDATE 1"
+                if result != "UPDATE 1":
+                    return False
+                if creation_source is not None:
+                    from orchestrator.services.vm_resource_job_runtime import (
+                        installed_job_resource_store,
+                    )
+
+                    source = await conn.fetchrow(
+                        "INSERT INTO vm_creation_retries "
+                        "(request_id,owner_kind,thread_id,thread_runtime_generation,"
+                        "thread_agent_id,thread_attach_token,thread_wake_operation_id,"
+                        "provision_generation,origin,request_digest,canonical_request,"
+                        "controller_configuration_digest,controller_configuration,"
+                        "expected_pvc_uid) VALUES($1,'thread',$2,$3,$4,$5,$6,$7,'initial',"
+                        "$8,$9::jsonb,$10,$11::jsonb,$12) RETURNING *",
+                        parsed_request_id, parsed_thread, parsed_runtime_generation,
+                        parsed_agent, parsed_attach, parsed_wake,
+                        UUID(provision_generation), creation_source["request_digest"],
+                        json.dumps(request),
+                        creation_source["controller_configuration_digest"],
+                        json.dumps(configuration),
+                        open_idle["pvc_uid"] if open_idle is not None else None,
+                    )
+                    resource = await installed_job_resource_store(
+                        conn, self, configuration,
+                    )
+                    if resource is None:
+                        raise RuntimeError("Thread resource installation unavailable")
+                    await resource._write_thread_waiter_on_conn(
+                        conn, retry=source,
+                    )
+                return True
 
     async def merge_thread_preparation_if_current(
         self, thread_id, runtime_generation, expected, updates

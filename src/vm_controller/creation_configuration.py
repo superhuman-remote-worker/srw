@@ -67,8 +67,8 @@ def resolve_creation_configuration(
     # Validate the complete option vocabulary before adding resolved defaults.
     canonical_request_digest(request)
     payload = dict(request)
-    if payload.get("entity_type", "job") != "job":
-        raise ValueError("Creation retry only supports Job VMs")
+    if payload.get("entity_type", "job") not in {"job", "thread"}:
+        raise ValueError("Creation retry owner kind is unsupported")
     from uuid import UUID
 
     for key in ("job_id", "provision_generation"):
@@ -77,7 +77,7 @@ def resolve_creation_configuration(
             or str(UUID(payload[key])) != payload[key]
         ):
             raise ValueError("Creation identity incomplete")
-    payload["entity_type"] = "job"
+    payload["entity_type"] = payload.get("entity_type", "job")
     payload["vm_image"] = payload.get("vm_image") or settings.DEFAULT_VM_IMAGE
     payload["cpu_cores"] = payload.get("cpu_cores", settings.DEFAULT_CPU)
     payload["memory"] = payload.get("memory") or settings.DEFAULT_MEMORY
