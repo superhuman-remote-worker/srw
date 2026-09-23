@@ -166,17 +166,17 @@ def account_inventory(snapshot, reservations, *, headroom):
             held_vmis.add(reservation.vmi_uid)
         if reservation.launcher_uid is not None:
             launchers.add(reservation.launcher_uid)
+        charge = reservation.vector
+        if reservation.observed_high_water is not None:
+            charge = charge.maximum(reservation.observed_high_water)
         node = nodes.get(reservation.node_uid)
         if node is None:
-            orphaned[reservation.reservation_id] = reservation.vector
+            orphaned[reservation.reservation_id] = charge
             blocked_names.add(reservation.node_name)
             continue
         if node["name"] != reservation.node_name:
             raise ResourceAdmissionError("reservation_node_identity")
         pod = pods.get(reservation.launcher_uid)
-        charge = reservation.vector
-        if reservation.observed_high_water is not None:
-            charge = charge.maximum(reservation.observed_high_water)
         if _exact_launcher(reservation, pod, vmis, vms):
             charge = charge.maximum(ResourceVector(**pod["requests"]))
             excluded.add(pod["uid"])

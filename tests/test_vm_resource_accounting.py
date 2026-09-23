@@ -215,6 +215,36 @@ def test_new_same_name_node_is_available_only_after_caller_proves_release():
     assert node.blocked_reason is None and facts.orphaned_held == {}
 
 
+@pytest.mark.parametrize("state", ["reserved", "active", "warm", "teardown"])
+@pytest.mark.parametrize("replacement", [False, True])
+def test_missing_node_retains_observed_whole_launcher_high_water(state, replacement):
+    value, reservation = setup()
+    value["protocol"] = 2
+    reservation = replace(
+        reservation, version=2, state=state,
+        vector=ResourceVector(1000, 2 * 1024**3, 2, 50000000, 1, 2),
+        observed_high_water=ResourceVector(1500, 1024**3, 1, 70000000, 2, 1),
+    )
+    value["pods"] = value["vmis"] = value["vms"] = []
+    if replacement:
+        value["nodes"][0]["uid"] = str(uuid4())
+    else:
+        value["nodes"] = []
+    facts = result(value, [reservation])
+    assert facts.orphaned_held == {
+        reservation.reservation_id: ResourceVector(
+            1500, 2 * 1024**3, 2, 70000000, 2, 2,
+        ),
+    }
+    if replacement:
+        node = next(iter(facts.nodes.values()))
+        assert node.blocked_reason == "prior_node_identity_held"
+        assert node.available == ZERO
+    else:
+        assert facts.nodes == {}
+    assert result(value, [replace(reservation, state="released")]).orphaned_held == {}
+
+
 def test_extra_pod_with_copied_owner_annotations_still_counts_as_external():
     value, reservation = setup()
     copied = deepcopy(value["pods"][0])
