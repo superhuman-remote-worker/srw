@@ -38,6 +38,7 @@ from orchestrator.services.job_mutation_controls import (
     JobControlOperations,
 )
 from shared.operator_pause_hold import (
+    HELD_FEEDBACK_REASON,
     OPERATOR_PAUSE_HOLD_CONTEXT_KEY,
     operator_pause_lift_token,
 )
@@ -701,3 +702,176 @@ async def test_stateless_hold_survives_an_orchestrator_restart(db, pg_dsn):
         assert await _claim(restarted, commands_enabled=True) is None
     finally:
         await restarted.close()
+
+
+# ---------------------------------------------------------------------------
+# Review follow-ups: nothing queued behind a hold is lost (D1); children of a
+# held job stay parked (D2); an already-paused job can still be held (N2).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_feedback_queued_behind_a_pinned_hold_is_appended_in_order(db):
+    job_id, _agent_id = await _dispatched_job(db)
+    await _public_pause(db, job_id, commands_enabled=True)
+    for message in ("first urgent reply", "second urgent reply"):
+        assert await db.queue_job_for_resume(
+            job_id,
+            {"queued_feedback": message, "queued_feedback_reason": "urgent"},
+            expected_status="paused",
+            completion_commands_enabled=True,
+        )
+    token = operator_pause_lift_token(await db.get_job(job_id))
+
+    assert await db.queue_job_for_resume(
+        job_id,
+        {"queued_feedback": "operator resume feedback"},
+        expected_status="paused",
+        lift_operator_pause_hold=token,
+        completion_commands_enabled=True,
+    )
+
+    context = (await _row(db, job_id))["context"]
+    feedback = context["queued_feedback"]
+    assert (
+        feedback.index("first urgent reply")
+        < feedback.index("second urgent reply")
+        < feedback.index("operator resume feedback")
+    )
+    assert context["queued_feedback_reason"] == HELD_FEEDBACK_REASON
+
+
+@pytest.mark.asyncio
+async def test_feedback_queued_behind_a_stateless_hold_is_appended_in_order(db):
+    job_id, claim = await _running_stateless_job(db, commands_enabled=True)
+    await _stateless_pause(db, job_id, commands_enabled=True)
+    await _holder_stops(db, claim)
+    for message in ("first urgent reply", "second urgent reply"):
+        assert await db.queue_stateless_job_for_resume(
+            job_id,
+            {"queued_feedback": message},
+            expected_status="paused",
+            completion_commands_enabled=True,
+        )
+    token = operator_pause_lift_token(await db.get_job(job_id))
+
+    # Resume without new feedback still delivers everything that queued.
+    assert await db.queue_stateless_job_for_resume(
+        job_id,
+        expected_status="paused",
+        lift_operator_pause_hold=token,
+        completion_commands_enabled=True,
+    )
+
+    feedback = (await _row(db, job_id))["context"]["queued_feedback"]
+    assert feedback.index("first urgent reply") < feedback.index("second urgent reply")
+    resumed = await _claim(db, commands_enabled=True, pod="worker-b")
+    assert resumed is not None and resumed.resume
+
+
+async def _stateless_child(db: PostgresDB, parent_id: str, *, status: str) -> str:
+    async with db.acquire() as conn:
+        child_id = str(
+            await conn.fetchval(
+                "INSERT INTO jobs (description, status, execution_lane, "
+                "parent_job_id) VALUES ('held child', $1, 'stateless', $2::uuid) "
+                "RETURNING id",
+                status,
+                parent_id,
+            )
+        )
+        await seed_previous_release_row(
+            conn,
+            "jobs",
+            "UPDATE jobs SET context = $2::jsonb WHERE id = $1::uuid",
+            child_id,
+            json.dumps(_READY_SANDBOX),
+        )
+    return child_id
+
+
+@pytest.mark.parametrize("child_status", ["processing", "waiting_for_reply"])
+@pytest.mark.asyncio
+async def test_stateless_child_of_a_held_parent_stays_parked(db, child_status):
+    parent_id, parent_claim = await _running_stateless_job(db, commands_enabled=True)
+    if child_status == "processing":
+        child_id = await _stateless_child(db, parent_id, status="created")
+        admitted, _ = await db.admit_stateless_worker_job(
+            child_id, fair_key=None, priority=5, completion_commands_enabled=True
+        )
+        assert admitted
+        child_claim = await _claim(db, commands_enabled=True, pod="worker-child")
+        assert child_claim is not None and str(child_claim.unit_id) == child_id
+    else:
+        child_claim = None
+        child_id = await _stateless_child(db, parent_id, status="waiting_for_reply")
+
+    await _stateless_pause(db, parent_id, commands_enabled=True)
+    await _holder_stops(db, parent_claim)
+    if child_claim is not None:
+        await _holder_stops(db, child_claim)
+
+    # An urgent reply to the child: an internal resume that enqueues a wake.
+    assert await db.queue_stateless_job_for_resume(
+        child_id,
+        {"queued_feedback": "reply to the child"},
+        expected_status="paused" if child_claim else "waiting_for_reply",
+        completion_commands_enabled=True,
+    )
+    assert (await _queue_row(db, child_id))["state"] != "queued"
+    # Even a unit that reached the queue some other way is refused in SQL.
+    async with db.acquire() as conn:
+        async with conn.transaction():
+            await enqueue_worker_batch_wake(conn, job_id=child_id)
+    assert await _claim(db, commands_enabled=True, pod="worker-x") is None
+    child = await _row(db, child_id)
+    assert child["status"] == "paused"
+    assert child["context"]["queued_feedback"] == "reply to the child"
+
+    # Resuming the parent releases the child through ordinary admission.
+    token = operator_pause_lift_token(await db.get_job(parent_id))
+    assert await db.queue_stateless_job_for_resume(
+        parent_id,
+        expected_status="paused",
+        lift_operator_pause_hold=token,
+        completion_commands_enabled=True,
+    )
+    assert await _claim(db, commands_enabled=True, pod="worker-p") is not None
+    assert await _admittable(db, child_id, commands_enabled=True)
+
+
+@pytest.mark.parametrize("lane", ["pinned", "stateless"])
+@pytest.mark.asyncio
+async def test_operator_pause_holds_a_job_a_system_pause_already_parked(db, lane):
+    """Agent release / lease recovery won the race; the operator's pause holds."""
+    if lane == "pinned":
+        job_id, agent_id = await _dispatched_job(db)
+        assert await db.pause_job(
+            job_id, completion_commands_enabled=True, expected_agent_id=agent_id
+        )
+        assert await _dispatchable(db, job_id, commands_enabled=True)
+    else:
+        job_id, claim = await _running_stateless_job(db, commands_enabled=True)
+        assert await db.pause_stateless_job(
+            job_id,
+            completion_commands_enabled=True,
+            expected_lease_token=claim.lease_token,
+        )
+        await _holder_stops(db, claim)
+        admitted, _ = await db.admit_stateless_worker_job(
+            job_id, fair_key=None, priority=5, completion_commands_enabled=True
+        )
+        assert admitted
+
+    result = await _operations(db, commands_enabled=True).pause(
+        job_id, job=await db.get_job(job_id), paused_by=None
+    )
+
+    assert result == {"status": "paused", "job_id": job_id}
+    assert operator_pause_lift_token(await db.get_job(job_id))
+    if lane == "pinned":
+        assert not await _dispatchable(db, job_id, commands_enabled=True)
+    else:
+        assert not await _admittable(db, job_id, commands_enabled=True)
+        assert (await _queue_row(db, job_id))["state"] != "queued"
+        assert await _claim(db, commands_enabled=True, pod="worker-b") is None

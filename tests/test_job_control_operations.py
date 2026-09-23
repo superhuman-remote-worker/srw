@@ -341,34 +341,93 @@ async def test_command_mode_resume_lifts_only_the_observed_operator_pause_hold(
 
 
 @pytest.mark.asyncio
-async def test_direct_resume_lifts_the_hold_in_its_claim_then_requeues_unheld(
+async def test_legacy_resume_of_a_held_job_requeues_through_the_guarded_write(
     tmp_path: Path,
 ) -> None:
+    """Flag off: lifting a hold never takes the direct path's plain merge."""
     store = MagicMock()
-    store.get_agent = AsyncMock(
-        return_value={"id": "agent-a", "status": "ready", "pod_ip": "10.0.0.1"}
-    )
+    store.merge_job_context = AsyncMock()
     store.claim_job_for_agent = AsyncMock(return_value=True)
     store.queue_job_for_resume = AsyncMock(return_value=True)
     operations = _operations(tmp_path, store=store)
-    operations.dependencies.resume_job_on_agent.return_value = False
 
     result = await operations.resume_job_internal(
         JOB_ID,
         user={"id": "user-a"},
         job=_operator_paused_job(),
-        request=main.JobResumeRequest(agent_id="agent-a"),
+        request=main.JobResumeRequest(agent_id="agent-a", feedback="focus"),
     )
 
     assert result["status"] == "queued"
-    store.claim_job_for_agent.assert_awaited_once_with(
-        JOB_ID, "agent-a", allow_failed=True, lift_operator_pause_hold="hold-1"
+    # The guarded write appends this feedback to whatever queued behind the
+    # hold; the direct path's merge_job_context would have replaced it.
+    assert store.queue_job_for_resume.await_args.kwargs["lift_operator_pause_hold"] == (
+        "hold-1"
     )
-    # The claim consumed the hold; the fallback re-queue must find none, so
-    # a pause that lands in between still wins that CAS.
-    store.queue_job_for_resume.assert_awaited_once_with(
-        JOB_ID, None, expected_status="processing", lift_operator_pause_hold=""
+    store.merge_job_context.assert_not_awaited()
+    store.claim_job_for_agent.assert_not_awaited()
+    operations.dependencies.resume_job_on_agent.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "refreshed_context, feedback, joins",
+    [
+        # A double-click: the winner lifted this exact hold with the same text.
+        (
+            {
+                "last_operator_pause_hold": {"hold_id": "hold-1"},
+                "queued_feedback": "focus",
+            },
+            "focus",
+            True,
+        ),
+        ({"last_operator_pause_hold": {"hold_id": "hold-1"}}, None, True),
+        # A newer pause landed: a real conflict.
+        (
+            {
+                "last_operator_pause_hold": {"hold_id": "hold-1"},
+                "_operator_pause_hold": {"hold_id": "hold-2"},
+            },
+            None,
+            False,
+        ),
+        # The winner queued different feedback: this request's would be lost.
+        (
+            {
+                "last_operator_pause_hold": {"hold_id": "hold-1"},
+                "queued_feedback": "other",
+            },
+            "focus",
+            False,
+        ),
+    ],
+)
+async def test_concurrent_resume_of_the_same_hold_is_idempotent(
+    tmp_path: Path, refreshed_context, feedback, joins
+) -> None:
+    store = MagicMock()
+    store.queue_job_for_resume = AsyncMock(return_value=False)
+    store.get_job = AsyncMock(
+        return_value={**_operator_paused_job(), "context": refreshed_context}
     )
+    operations = _operations(tmp_path, store=store, completion_commands_enabled=True)
+    request = main.JobResumeRequest(feedback=feedback)
+
+    if joins:
+        result = await operations.resume_job_internal(
+            JOB_ID, user={"id": "user-a"}, job=_operator_paused_job(), request=request
+        )
+        assert result["status"] == "queued"
+    else:
+        with pytest.raises(HTTPException) as raised:
+            await operations.resume_job_internal(
+                JOB_ID,
+                user={"id": "user-a"},
+                job=_operator_paused_job(),
+                request=request,
+            )
+        assert raised.value.status_code == 409
 
 
 @pytest.mark.asyncio

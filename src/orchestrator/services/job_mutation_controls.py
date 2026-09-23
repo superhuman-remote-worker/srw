@@ -16,6 +16,7 @@ from uuid import UUID
 
 from fastapi import HTTPException
 
+from shared.operator_pause_hold import operator_pause_hold_present
 from orchestrator.services.manifest_runtime_ownership import (
     require_srw_runtime,
     uses_srw_runtime,
@@ -659,6 +660,23 @@ class JobControlOperations:
         d = self.dependencies
         require_srw_runtime(job)
         try:
+            if job["status"] == "paused" and not operator_pause_hold_present(
+                job.get("context")
+            ):
+                # A system pause (agent release, lease recovery, preemption)
+                # beat this operator pause to the row; it is still the
+                # operator's pause, so hold the job where it is instead of
+                # refusing and letting it redispatch.
+                if await d.store.hold_paused_job(job_id, paused_by=paused_by):
+                    d.logger.info(
+                        "Operator pause hold set on already-paused job %s "
+                        "(paused_by=%s)",
+                        job_id,
+                        paused_by or "internal",
+                    )
+                    await self.cascade_pause_to_children(job_id)
+                    return {"status": "paused", "job_id": job_id}
+                job = await d.store.get_job(job_id) or job
             if job["status"] != "processing":
                 raise HTTPException(
                     status_code=400,

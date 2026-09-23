@@ -116,10 +116,13 @@ from orchestrator.services.cloud_staging.source_identity import (
     ProtectedMountSourceIdentity,
 )
 from shared.operator_pause_hold import (
+    HELD_FEEDBACK_REASON,
     OPERATOR_PAUSE_HOLD_CONTEXT_KEY,
+    operator_pause_held_ancestor_sql,
     operator_pause_hold_jsonb_sql,
     operator_pause_hold_lift_sql,
     operator_pause_hold_matches_sql,
+    operator_pause_hold_merged_feedback_sql,
     operator_pause_hold_present_sql,
 )
 from orchestrator.services.ssh_handles import is_valid_handle, mint_ssh_handle
@@ -5389,6 +5392,61 @@ class PostgresDB:
                 )
 
         return result == "UPDATE 1"
+
+    async def hold_paused_job(self, job_id: str, *, paused_by: str | None) -> bool:
+        """Stamp the operator pause hold on a job a system pause already parked.
+
+        An agent shutdown release, lease recovery or preemption can win the
+        race with an operator's pause; the job is then ``paused`` but unheld and
+        would be redispatched. The operator's pause still applies: hold it in
+        place. Queue-first lock order; a stateless unit already re-admitted is
+        closed in the same transaction. False when the row is not paused or is
+        already held (the caller re-reads).
+        """
+
+        try:
+            job_uuid = UUID(job_id)
+        except ValueError:
+            return False
+        from shared.worker_queue import cancel_queued_worker_batch
+
+        hold = operator_pause_hold_jsonb_sql(
+            hold_id_parameter="$2", source_parameter="$3", paused_by_parameter="$4"
+        )
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                await conn.fetchrow(
+                    "SELECT unit_id FROM run_queue WHERE unit_id=$1::uuid FOR UPDATE",
+                    job_uuid,
+                )
+                row = await conn.fetchrow(
+                    f"""
+                    UPDATE jobs
+                       SET context = jsonb_set(
+                               COALESCE(context, '{{}}'::jsonb),
+                               '{{{OPERATOR_PAUSE_HOLD_CONTEXT_KEY}}}',
+                               {hold},
+                               true
+                           ),
+                           updated_at = CURRENT_TIMESTAMP
+                     WHERE id = $1::uuid
+                       AND status = 'paused'
+                       AND NOT {operator_pause_hold_present_sql("context")}
+                       AND NOT EXISTS (SELECT 1 FROM srw_execution_specs execution
+                           WHERE execution.work_kind='Job' AND execution.work_id=jobs.id
+                             AND execution.harness_adapter <> 'srw/v1')
+                    RETURNING execution_lane
+                    """,
+                    job_uuid,
+                    str(uuid4()),
+                    "public_pause",
+                    paused_by,
+                )
+                if row is None:
+                    return False
+                if row["execution_lane"] == "stateless":
+                    await cancel_queued_worker_batch(conn, job_id=job_uuid)
+        return True
 
     async def route_pinned_agent_release_to_lease_recovery(
         self,
@@ -29539,6 +29597,13 @@ class PostgresDB:
             hold_guard = " AND " + operator_pause_hold_matches_sql(
                 "context", f"${len(args)}"
             )
+        # Feedback queued behind a hold (by internal resumes, then the lifting
+        # resume) is appended in order rather than replaced; `context` here is
+        # the pre-update row, so the lifting write still sees its hold.
+        args += (HELD_FEEDBACK_REASON,)
+        held_feedback = operator_pause_hold_merged_feedback_sql(
+            "context", "$2::jsonb", f"${len(args)}"
+        )
         return await conn.fetchrow(
             f"""
             UPDATE jobs
@@ -29549,7 +29614,8 @@ class PostgresDB:
                                     ELSE jsonb_build_object(
                                         'last_freeze_data', freeze_data
                                     )
-                                END,
+                                END
+                             || {held_feedback},
                    status = 'paused',
                    assigned_agent_id = NULL,
                    freeze_data = NULL,
@@ -29560,7 +29626,8 @@ class PostgresDB:
                    WHERE execution.work_kind='Job' AND execution.work_id=jobs.id
                      AND execution.harness_adapter <> 'srw/v1')
             RETURNING id, priority, user_id,
-                      {operator_pause_hold_present_sql("context")}
+                      ({operator_pause_hold_present_sql("context")}
+                       OR {operator_pause_held_ancestor_sql("$1")})
                           AS operator_pause_held
             """,
             *args,
@@ -29947,11 +30014,14 @@ class PostgresDB:
                     if row is None:
                         raise _ResumeCASLostError
                     if row.get("operator_pause_held"):
-                        # The hold survived this (non-explicit) resume, decided
-                        # under the jobs-row lock this CAS took. Close the wake
-                        # it just enqueued in the same transaction so no worker
-                        # ever sees it; a live holder keeps its lease and stops
-                        # on renewal. The lifting resume enqueues a fresh wake.
+                        # The job is still behind an operator pause: its own
+                        # hold survived this (non-explicit) resume, decided
+                        # under the jobs-row lock this CAS took, or an ancestor
+                        # is held. Close the wake it just enqueued in the same
+                        # transaction so no worker ever sees it; a live holder
+                        # keeps its lease and stops on renewal. The lifting
+                        # resume, or admission once the parent runs again,
+                        # enqueues a fresh wake.
                         await cancel_queued_worker_batch(conn, job_id=job_uuid)
             return True
         except _ResumeCASLostError:

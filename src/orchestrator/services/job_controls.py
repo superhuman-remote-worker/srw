@@ -30,7 +30,10 @@ from orchestrator.services.manifest_runtime_ownership import (
     require_srw_runtime,
     uses_srw_runtime,
 )
-from shared.operator_pause_hold import operator_pause_lift_token
+from shared.operator_pause_hold import (
+    operator_pause_lift_already_consumed,
+    operator_pause_lift_token,
+)
 from orchestrator.services.vm_workspace_recovery_store import (
     acquire_vm_cleanup_permit,
     vm_cleanup_kwargs,
@@ -1214,6 +1217,24 @@ class JobControlOperations:
                             status_code=409,
                             detail="Job lifecycle cleanup is already in progress",
                         )
+                    if operator_pause_lift_already_consumed(
+                        refreshed, operator_pause_lift, feedback=feedback
+                    ):
+                        # A concurrent explicit resume (a double-click) lifted
+                        # this exact hold first, carrying the same feedback.
+                        # The job IS resumed; answer as the winner did.
+                        self.dependencies.logger.info(
+                            "Resume of job %s joined a concurrent resume of "
+                            "operator pause hold %s",
+                            job_id,
+                            operator_pause_lift,
+                        )
+                        return {
+                            "status": "queued",
+                            "message": "Operator pause hold already lifted by a "
+                            "concurrent resume; job queued for auto-dispatch",
+                            "job_id": job_id,
+                        }
                     raise HTTPException(
                         status_code=409,
                         detail="Job changed while it was being queued for resume",
@@ -1293,6 +1314,14 @@ class JobControlOperations:
                 # workspace-contract claim before any pod POST.
                 return await _queue_for_dispatch(
                     "Completion-safe resume queued for auto-dispatch"
+                )
+            if operator_pause_lift:
+                # Lifting a hold always re-queues through the guarded write:
+                # it appends this feedback to whatever queued behind the hold
+                # (the direct path's plain context merge would replace it),
+                # and the dispatcher's resume lane keeps the same workspace.
+                return await _queue_for_dispatch(
+                    "Operator pause hold lifted; job queued for auto-dispatch"
                 )
 
             # Determine which agent to use
@@ -1401,8 +1430,6 @@ class JobControlOperations:
                 return await _queue_for_dispatch(
                     "Job queued for authoritative resume dispatch"
                 )
-            # The claim consumed the hold; a re-queue below must now find none.
-            operator_pause_lift = ""
 
             # Delegate payload build + delivery to the dispatcher's resume path so
             # a user-triggered resume ships exactly what an auto re-dispatch ships:

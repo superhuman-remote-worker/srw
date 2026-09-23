@@ -45,6 +45,32 @@ def operator_pause_hold_present_sql(context_expression: str = "context") -> str:
     )
 
 
+def operator_pause_held_ancestor_sql(job_id_expression: str) -> str:
+    """SQL predicate: some ancestor of the job is paused under an operator hold.
+
+    The children a public pause cascades to (or that were waiting when it
+    landed) carry no hold of their own; they wait behind the held parent. The
+    dispatcher's ancestor guard covers admission; this covers every claim and
+    wake that reaches a child directly.
+    """
+
+    return f"""EXISTS (
+    WITH RECURSIVE held_lineage(ancestor_id) AS (
+        SELECT parent_job_id FROM jobs
+         WHERE id = {job_id_expression} AND parent_job_id IS NOT NULL
+        UNION
+        SELECT lineage_job.parent_job_id
+          FROM jobs AS lineage_job
+          JOIN held_lineage ON lineage_job.id = held_lineage.ancestor_id
+         WHERE lineage_job.parent_job_id IS NOT NULL
+    )
+    SELECT 1 FROM held_lineage
+      JOIN jobs AS held_ancestor ON held_ancestor.id = held_lineage.ancestor_id
+     WHERE held_ancestor.status = 'paused'
+       AND {operator_pause_hold_present_sql("held_ancestor.context")}
+)"""
+
+
 def operator_pause_hold_matches_sql(context_expression: str, parameter: str) -> str:
     """SQL predicate: the row's hold is exactly the one a lift token names.
 
@@ -71,6 +97,39 @@ def operator_pause_hold_lift_sql(context_expression: str) -> str:
         f"({context_expression})->'{OPERATOR_PAUSE_HOLD_CONTEXT_KEY}' "
         "|| jsonb_build_object('lifted_at', to_jsonb(now()))) "
         "ELSE '{}'::jsonb END)"
+    )
+
+
+HELD_FEEDBACK_REASON = (
+    "This job was held by an operator pause. Every message that arrived while "
+    "it was held is included below, oldest first, followed by any feedback "
+    "given with the resume."
+)
+
+
+def operator_pause_hold_merged_feedback_sql(
+    context_expression: str, merge_expression: str, reason_parameter: str
+) -> str:
+    """SQL ``jsonb`` overlay that appends held feedback instead of replacing it.
+
+    A resume write merges ``queued_feedback`` wholesale. While the row being
+    updated (``context_expression`` is the pre-update value) carries a hold,
+    each internal resume and the final explicit resume append to the feedback
+    already queued, oldest first, so nothing queued behind the hold is lost.
+    Returns ``'{}'`` (no overlay) otherwise.
+    """
+
+    held = operator_pause_hold_present_sql(context_expression)
+    return (
+        f"CASE WHEN {held} "
+        f"AND jsonb_typeof(({context_expression})->'queued_feedback') = 'string' "
+        f"AND jsonb_typeof(({merge_expression})->'queued_feedback') = 'string' "
+        "THEN jsonb_build_object("
+        "'queued_feedback', "
+        f"(({context_expression})->>'queued_feedback') || E'\\n\\n---\\n\\n' "
+        f"|| (({merge_expression})->>'queued_feedback'), "
+        f"'queued_feedback_reason', {reason_parameter}::text) "
+        "ELSE '{}'::jsonb END"
     )
 
 
@@ -104,6 +163,30 @@ def operator_pause_hold_present(context: Any) -> bool:
     return OPERATOR_PAUSE_HOLD_CONTEXT_KEY in _context(context)
 
 
+def operator_pause_lift_already_consumed(
+    job: Mapping[str, Any] | None, token: str, *, feedback: str | None
+) -> bool:
+    """Whether a losing explicit resume duplicated the one that lifted ``token``.
+
+    True only when that exact hold was lifted (and no newer one set) and this
+    request adds nothing the winner did not queue: no feedback, or feedback
+    still present in the queued text. Otherwise the loss is a real conflict.
+    """
+
+    if not token or job is None:
+        return False
+    context = _context(job.get("context"))
+    if OPERATOR_PAUSE_HOLD_CONTEXT_KEY in context:
+        return False
+    lifted = context.get(LAST_OPERATOR_PAUSE_HOLD_CONTEXT_KEY)
+    if not isinstance(lifted, Mapping) or lifted.get("hold_id") != token:
+        return False
+    if not feedback:
+        return True
+    queued = context.get("queued_feedback")
+    return isinstance(queued, str) and feedback in queued
+
+
 def operator_pause_lift_token(job: Mapping[str, Any] | None) -> str:
     """Hold id an explicit resume observed on ``job``; ``''`` when unheld."""
 
@@ -115,13 +198,17 @@ def operator_pause_lift_token(job: Mapping[str, Any] | None) -> str:
 
 
 __all__ = [
+    "HELD_FEEDBACK_REASON",
     "LAST_OPERATOR_PAUSE_HOLD_CONTEXT_KEY",
     "OPERATOR_PAUSE_HOLD_CONTEXT_KEY",
     "OPERATOR_PAUSE_HOLD_VERSION",
+    "operator_pause_held_ancestor_sql",
     "operator_pause_hold_jsonb_sql",
     "operator_pause_hold_lift_sql",
     "operator_pause_hold_matches_sql",
+    "operator_pause_hold_merged_feedback_sql",
     "operator_pause_hold_present",
     "operator_pause_hold_present_sql",
+    "operator_pause_lift_already_consumed",
     "operator_pause_lift_token",
 ]
