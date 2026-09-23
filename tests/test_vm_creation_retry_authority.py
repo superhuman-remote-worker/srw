@@ -63,6 +63,52 @@ def test_authorize_is_reservation_only_and_correlated(monkeypatch):
     assert unsigned_payload(response.json())["actuation_allowed"] is False
 
 
+def test_inspect_serializes_frozen_configuration_only_for_authenticated_caller(
+    monkeypatch,
+):
+    request_id = str(uuid4())
+    configuration = {"version": 1, "network_profile_policy": {"enabled": True}}
+    store = SimpleNamespace(
+        inspect=AsyncMock(
+            return_value={
+                "request_id": request_id,
+                "controller_configuration": configuration,
+                "controller_configuration_digest": "sha256:" + "a" * 64,
+            }
+        )
+    )
+    test_client = client(monkeypatch, store)
+    assert (
+        test_client.post(
+            "/api/internal/vm-creation-retries/inspect", json={"request_id": request_id}
+        ).status_code
+        == 401
+    )
+    store.inspect.assert_not_awaited()
+
+    value = sign_payload(
+        {"request_id": request_id},
+        direction="request",
+        operation="creation_retry_inspect",
+        secret=SECRET,
+    )
+    response = test_client.post("/api/internal/vm-creation-retries/inspect", json=value)
+    assert response.status_code == 200
+    assert verify_payload(
+        response.json(),
+        direction="response",
+        operation="creation_retry_inspect",
+        secret=SECRET,
+        expected_correlation_id=value[AUTH_FIELD]["request_id"],
+    )
+    assert unsigned_payload(response.json()) == {
+        "request_id": request_id,
+        "controller_configuration": configuration,
+        "controller_configuration_digest": "sha256:" + "a" * 64,
+    }
+    store.inspect.assert_awaited_once_with(request_id=request_id)
+
+
 @pytest.mark.parametrize(
     "path,operation,method",
     [
