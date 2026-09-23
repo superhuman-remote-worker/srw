@@ -1019,6 +1019,17 @@ pinned SSH; normal terminal cleanup may then remove the VM. Its local-path
 result proves a retained
 PVC and real worker flow; it is distinct from the Longhorn durability gate.
 
+For a fresh isolated A1 run, `scripts/vm-retained-resume-fixture.py` creates the
+dedicated paused Job through the ordinary PostgreSQL Job writer, freezes its
+Expert/model and VM image in the execution snapshot, and calls the real VM
+creation preflight. It waits for authenticated first-boot Ready, network-profile
+proof, and the bound PVC/PV before returning the Job, owner, and PVC UIDs needed
+by the acceptance wrapper. The fixture command requires the default-off gate
+flag, an empty Job database, an owned namespace and provider model, and exact
+cluster, orchestrator Pod, and image identities. It grants no worker lease.
+Keep the worker deployment at zero replicas until this fixture and the
+acceptance wrapper's queue isolation checks have passed.
+
 ### Verify
 
 ```bash
