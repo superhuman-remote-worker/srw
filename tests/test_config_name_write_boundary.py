@@ -716,8 +716,13 @@ class TestResumeReprovisionFailsLoudly:
 
 class TestMagicLinkWakeProvisioningFailsLoudly:
     """``_create_after_magic_link`` sits lexically inside
-    ``_phase5_wake_if_suspended``'s try/except, but it is scheduled as its own
-    task — so that handler never sees anything it raises."""
+    ``session_attention.wake_after_permission_decision``'s try/except, but it is
+    scheduled as its own task — so that handler never sees anything it raises.
+
+    The wake runs with the application's own composition
+    (``main._session_attention_dependencies()``), which reads the patched
+    ``main`` globals per call and routes the failure through the application's
+    ``_emit_session_provisioning_failure``."""
 
     @pytest.mark.asyncio
     async def test_refused_config_name_records_a_failed_state(self, monkeypatch):
@@ -748,11 +753,18 @@ class TestMagicLinkWakeProvisioningFailsLoudly:
         svc.is_enabled = True
         monkeypatch.setattr(orch_main, "workspace_suspension_service", svc)
 
+        from orchestrator.services import session_attention
+
         tasks = _CollectingCreateTask()
         recorder = _LifecycleRecorder()
-        with patch("orchestrator.main.asyncio.create_task", tasks):
+        with patch(
+            "orchestrator.services.session_attention.asyncio.create_task", tasks
+        ):
             with patch("orchestrator.services.session_lifecycle.emit", recorder):
-                await orch_main._phase5_wake_if_suspended(THREAD_ID)
+                await session_attention.wake_after_permission_decision(
+                    THREAD_ID,
+                    dependencies=orch_main._session_attention_dependencies(),
+                )
                 assert await tasks.drain("_create_after_magic_link") == 1
 
         assert len(recorder.failures) == 1

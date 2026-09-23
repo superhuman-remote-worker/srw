@@ -2,8 +2,9 @@
 
 Two separate claims, per the task-2 brief's CONTROLLER CORRECTIONS (C1/C2):
 
-C1: ``main._redact_thread_metadata`` is the single funnel both thread
-endpoints (list + single) run every row through before it leaves over REST.
+C1: ``thread_projection.redact_thread_metadata`` is the single funnel both
+thread endpoints (list + single) run every row through before it leaves over
+REST.
 It does not allow-list columns — it pops a fixed set of internal
 runtime/retirement keys and passes the rest of the row through unchanged —
 so a plain ``ssh_handle`` column should already survive it with zero code
@@ -23,30 +24,30 @@ of rendering a list is write amplification nobody asked for — so only the
 single-thread path is covered here.
 """
 
-from contextlib import ExitStack
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-import orchestrator.main
+from orchestrator.routers.thread_session import ThreadSessionDependencies, get_thread
+from orchestrator.security.access import require_thread_owner
+from orchestrator.services.thread_projection import redact_thread_metadata
 
 
 # ---------------------------------------------------------------------------
-# C1 -- _redact_thread_metadata already passes ssh_handle through unchanged
+# C1 -- redact_thread_metadata already passes ssh_handle through unchanged
 # ---------------------------------------------------------------------------
 
 
 class TestRedactThreadMetadataCarriesSshHandle:
     def test_present_handle_survives_redaction(self):
-        out = orchestrator.main._redact_thread_metadata(
-            {"id": "t", "ssh_handle": "s-7f3a91c2"}
-        )
+        out = redact_thread_metadata({"id": "t", "ssh_handle": "s-7f3a91c2"})
         assert out["ssh_handle"] == "s-7f3a91c2"
 
     def test_null_handle_survives_as_none(self):
         """A real ``SELECT *`` row for a thread predating 0202 carries the
         column with a NULL value, not an absent key."""
-        out = orchestrator.main._redact_thread_metadata({"id": "t", "ssh_handle": None})
+        out = redact_thread_metadata({"id": "t", "ssh_handle": None})
         assert out["ssh_handle"] is None
 
 
@@ -55,42 +56,47 @@ class TestRedactThreadMetadataCarriesSshHandle:
 # ---------------------------------------------------------------------------
 
 
-def _patch_caller_and_db(user, db):
-    """Mirrors tests/test_thread_access.py's helper of the same name: the
-    endpoint calls ``require_thread_owner`` (security/access.py), which
-    resolves the caller via its *own* module's ``require_approved_user``,
-    not ``main``'s — both must be patched — and reads the thread through
-    ``main.postgres_db``. ``_resolve_cloud_session_url`` is stubbed so these
-    tests don't also have to wire up mount rows."""
-    stack = ExitStack()
-    stack.enter_context(
-        patch("orchestrator.main.require_approved_user", AsyncMock(return_value=user))
+def _unused(name):
+    async def _fail(*_args, **_kwargs):
+        raise AssertionError(f"the thread view must not reach {name}")
+
+    return _fail
+
+
+def _dependencies(db):
+    """The endpoint's collaborators: the store it reads the thread and mounts
+    from, and the REAL ``require_thread_owner`` (security/access.py), which
+    resolves the caller via its *own* module's ``require_approved_user`` —
+    patched by :func:`_patch_caller`. ``resolve_cloud_session_url`` is stubbed
+    so these tests don't also have to wire up mount rows."""
+    return ThreadSessionDependencies(
+        store=db,
+        require_thread_owner=require_thread_owner,
+        require_approved_user=_unused("require_approved_user"),
+        resolve_cloud_session_url=MagicMock(return_value=None),
+        resolve_session_config=_unused("resolve_session_config"),
+        enforce_session_create_grants=_unused("enforce_session_create_grants"),
+        tool_view=SimpleNamespace(),
     )
-    stack.enter_context(
-        patch(
-            "orchestrator.security.access.require_approved_user",
-            AsyncMock(return_value=user),
-        )
+
+
+def _patch_caller(user):
+    return patch(
+        "orchestrator.security.access.require_approved_user",
+        AsyncMock(return_value=user),
     )
-    stack.enter_context(patch("orchestrator.main.postgres_db", db))
-    stack.enter_context(
-        patch(
-            "orchestrator.main._resolve_cloud_session_url", MagicMock(return_value=None)
-        )
-    )
-    return stack
 
 
 class TestGetThreadMintsSshHandleOnView:
     @pytest.mark.asyncio
     async def test_mints_a_handle_when_missing(self, user_a, thread_a, fake_db):
-        from orchestrator.main import get_thread
-
         thread_a["ssh_handle"] = None
         fake_db.ensure_thread_ssh_handle = AsyncMock(return_value="s-newlymnt")
 
-        with _patch_caller_and_db(user_a, fake_db):
-            result = await get_thread(str(thread_a["id"]), MagicMock())
+        with _patch_caller(user_a):
+            result = await get_thread(
+                str(thread_a["id"]), MagicMock(), dependencies=_dependencies(fake_db)
+            )
 
         assert result["ssh_handle"] == "s-newlymnt"
         fake_db.ensure_thread_ssh_handle.assert_awaited_once_with(str(thread_a["id"]))
@@ -101,15 +107,15 @@ class TestGetThreadMintsSshHandleOnView:
     ):
         """Minting is a write; a thread that already has a handle must not
         pay for one on every view."""
-        from orchestrator.main import get_thread
-
         thread_a["ssh_handle"] = "s-7f3a91c2"
         fake_db.ensure_thread_ssh_handle = AsyncMock(
             side_effect=AssertionError("must not mint: a handle already exists")
         )
 
-        with _patch_caller_and_db(user_a, fake_db):
-            result = await get_thread(str(thread_a["id"]), MagicMock())
+        with _patch_caller(user_a):
+            result = await get_thread(
+                str(thread_a["id"]), MagicMock(), dependencies=_dependencies(fake_db)
+            )
 
         assert result["ssh_handle"] == "s-7f3a91c2"
         fake_db.ensure_thread_ssh_handle.assert_not_awaited()
@@ -122,15 +128,15 @@ class TestGetThreadMintsSshHandleOnView:
         read-only view. A read-only replica or a full disk -- this
         deployment has actually had one -- must not turn the whole thread
         view into a 500 for the sake of one SSH-panel field."""
-        from orchestrator.main import get_thread
-
         thread_a["ssh_handle"] = None
         fake_db.ensure_thread_ssh_handle = AsyncMock(
             side_effect=RuntimeError("could not extend file: No space left on device")
         )
 
-        with _patch_caller_and_db(user_a, fake_db):
-            result = await get_thread(str(thread_a["id"]), MagicMock())
+        with _patch_caller(user_a):
+            result = await get_thread(
+                str(thread_a["id"]), MagicMock(), dependencies=_dependencies(fake_db)
+            )
 
         assert result["ssh_handle"] is None
         fake_db.ensure_thread_ssh_handle.assert_awaited_once_with(str(thread_a["id"]))

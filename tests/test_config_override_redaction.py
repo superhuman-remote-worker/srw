@@ -9,6 +9,7 @@ persistence, while every non-secret field is preserved verbatim.
 import copy
 
 from orchestrator.security import access
+from orchestrator.services.thread_projection import redact_thread_metadata
 
 
 def _full_config_override() -> dict:
@@ -127,56 +128,42 @@ class TestRedactConfigOverride:
 
 
 class TestRedactThreadMetadataShape:
-    """``main._redact_thread_metadata`` must return metadata as a parsed
-    OBJECT — asyncpg hands JSONB back as a JSON string, and the old
+    """``thread_projection.redact_thread_metadata`` must return metadata as a
+    parsed OBJECT — asyncpg hands JSONB back as a JSON string, and the old
     "preserve the original representation" behavior returned that string
     through the owner-facing thread endpoints, silently breaking every
     Cockpit consumer typed against ``metadata?: Record<string, unknown>``
     (settings-pane prefill, attached-datasource defaults, REST
     model/temperature seeding)."""
 
-    def _main(self):
-        import orchestrator.main as main
-
-        return main
-
     def test_string_metadata_returned_as_parsed_object(self):
         import json
 
-        main = self._main()
         md = {"config_override": {"llm": {"model": "m", "api_key": "sk-SECRET"}}}
-        out = main._redact_thread_metadata({"id": "t", "metadata": json.dumps(md)})
+        out = redact_thread_metadata({"id": "t", "metadata": json.dumps(md)})
         assert isinstance(out["metadata"], dict)
         assert out["metadata"]["config_override"]["llm"]["model"] == "m"
         assert "api_key" not in out["metadata"]["config_override"]["llm"]
 
     def test_dict_metadata_stays_object_and_redacts(self):
-        main = self._main()
         md = {
             "config_override": {"llm": {"api_key": "sk-SECRET"}},
             "datasource_ids": ["a"],
         }
-        out = main._redact_thread_metadata({"id": "t", "metadata": md})
+        out = redact_thread_metadata({"id": "t", "metadata": md})
         assert out["metadata"]["datasource_ids"] == ["a"]
         assert "api_key" not in out["metadata"]["config_override"]["llm"]
 
     def test_absent_or_unparseable_metadata_becomes_empty_object(self):
-        main = self._main()
-        assert main._redact_thread_metadata({"id": "t"})["metadata"] == {}
+        assert redact_thread_metadata({"id": "t"})["metadata"] == {}
         assert (
-            main._redact_thread_metadata({"id": "t", "metadata": "{not json"})[
-                "metadata"
-            ]
+            redact_thread_metadata({"id": "t", "metadata": "{not json"})["metadata"]
             == {}
         )
-        assert (
-            main._redact_thread_metadata({"id": "t", "metadata": None})["metadata"]
-            == {}
-        )
+        assert redact_thread_metadata({"id": "t", "metadata": None})["metadata"] == {}
 
     def test_workspace_binding_dropped(self):
-        main = self._main()
-        out = main._redact_thread_metadata(
+        out = redact_thread_metadata(
             {
                 "id": "t",
                 "metadata": {
@@ -193,7 +180,6 @@ class TestRedactThreadMetadataShape:
         assert out["metadata"]["keep"] is True
 
     def test_runtime_retirement_authority_is_redacted_to_safe_state(self):
-        main = self._main()
         internal = {
             "runtime_generation": "generation-secret",
             "runtime_attach_token": "attach-secret",
@@ -215,7 +201,7 @@ class TestRedactThreadMetadataShape:
                 "captured_resources": {"grant_handle": "private"}
             },
         }
-        out = main._redact_thread_metadata({"id": "t", "metadata": {}, **internal})
+        out = redact_thread_metadata({"id": "t", "metadata": {}, **internal})
         for key in internal:
             assert key not in out
         assert out["runtime_retirement_pending"] is True
@@ -224,8 +210,7 @@ class TestRedactThreadMetadataShape:
         assert "10.0.0.8" not in repr(out)
 
     def test_hidden_retirement_preflight_is_not_public_ending(self):
-        main = self._main()
-        out = main._redact_thread_metadata(
+        out = redact_thread_metadata(
             {
                 "id": "t",
                 "metadata": {},

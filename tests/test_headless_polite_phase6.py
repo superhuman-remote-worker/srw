@@ -237,7 +237,7 @@ class TestSweeperPerThreadTTL:
 
     @pytest.mark.asyncio
     async def test_sweeper_sql_joins_users_and_coalesces(self, monkeypatch):
-        import orchestrator.main as orch_main
+        from orchestrator.services import session_attention
 
         captured: dict = {}
         evt = asyncio.Event()
@@ -260,24 +260,36 @@ class TestSweeperPerThreadTTL:
             async def __aexit__(self_inner, exc_type, exc, tb):
                 return None
 
-        # monkeypatch, not bare assignment: these are module globals, and a
-        # leaked MagicMock `postgres_db` breaks every later test in the run
-        # that awaits a real DB method.
+        # The store and suspension service are the sweeper's dependencies; the
+        # presence promotion is a module-level name looked up in
+        # ``session_attention`` at call time (monkeypatch restores it).
         fake_db = MagicMock()
         fake_db.acquire = lambda: _Acquire()
-        monkeypatch.setattr(orch_main, "postgres_db", fake_db)
         monkeypatch.setattr(
-            orch_main,
+            session_attention,
             "promote_expired_stateless_pauses",
             AsyncMock(return_value=[]),
         )
+        # The default TTL is a module global read per sweep; a non-default
+        # value proves the bound parameter comes from it, not a literal 60.
+        monkeypatch.setattr(session_attention, "ATTENTION_SLEEP_MINUTES", 17)
 
         suspension = MagicMock()
         suspension.is_enabled = True
         suspension.suspend_thread_workspace = AsyncMock(return_value=False)
-        monkeypatch.setattr(orch_main, "workspace_suspension_service", suspension)
+        dependencies = session_attention.SessionAttentionDependencies(
+            store=fake_db,
+            container_provisioner=MagicMock(),
+            workspace_suspension=suspension,
+            persistent_provisioner=None,
+            persistent_thread_recycler=lambda: None,
+            emit_session_provisioning_failure=AsyncMock(),
+            thread_retirement_operations=MagicMock(),
+            notification_service=MagicMock(),
+            cockpit_url=lambda: "http://localhost:4200",
+        )
 
-        await orch_main.attention_sleep_sweeper(evt)
+        await session_attention.attention_sleep_sweeper(evt, dependencies=dependencies)
 
         q = captured.get("query", "")
         assert "LEFT JOIN users" in q
@@ -285,4 +297,4 @@ class TestSweeperPerThreadTTL:
         assert "t.metadata->'config_override'->'headless'" in q
         assert "u.settings->'persistent_agent'" in q
         # Global default is the only bound parameter, passed as int.
-        assert captured.get("args") == (int(orch_main._ATTENTION_SLEEP_MINUTES),)
+        assert captured.get("args") == (int(session_attention.ATTENTION_SLEEP_MINUTES),)

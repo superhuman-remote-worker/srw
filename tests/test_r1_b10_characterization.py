@@ -1,11 +1,17 @@
 """R1.B10 characterization: behaviour the extraction must keep, pinned first.
 
-These cases were written against the pre-extraction application (routes
-declared directly on ``orchestrator.main``) before any B10 code moved. They
-cover wire behaviour no existing suite asserted: the session citation read, the
-owner permission-decision endpoint, magic-link GET/POST refusals and decision
-labels, and the Officer daily-ceiling brake reached through the application's
-own usage ledger rather than an explicit test ledger.
+These cases were first written against the pre-extraction application (routes
+declared directly on ``orchestrator.main``) and committed before any B10 code
+moved. They cover wire behaviour no existing suite asserted: the session
+citation read, the owner permission-decision endpoint, magic-link GET/POST
+refusals and decision labels, and the Officer daily-ceiling brake reached
+through the application's own usage ledger rather than an explicit test ledger.
+
+After the extraction only the surfaces changed: the routes are mounted from
+their new routers with explicit per-application factories. Every assertion is
+unchanged. The ceiling brake still reaches the ledger through
+``session_wake``'s own application lookup here; closing that caller is the
+next, separate step.
 """
 
 from __future__ import annotations
@@ -22,9 +28,10 @@ from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 import orchestrator.main as main
+from orchestrator.routers import thread_history, thread_permissions
 from orchestrator.services import session_wake
 
-from ._mounted_router import mount_main_routes
+from ._mounted_router import mount_router
 
 THREAD_ID = "11111111-2222-4333-8444-555555555555"
 APPROVAL_ID = "99999999-8888-4777-8666-555555555555"
@@ -70,29 +77,42 @@ def _owner_gate(*, raises: HTTPException | None = None):
 
 
 # --------------------------------------------------------------------------- #
-# Application surfaces (pre-extraction: main's own route declarations)
+# Application surfaces (the extracted routers, one application each)
 # --------------------------------------------------------------------------- #
 
 
 def _history_client(monkeypatch, *, vector_store, gate):
-    monkeypatch.setattr(main, "vector_db", vector_store)
-    monkeypatch.setattr(main, "require_thread_owner", gate)
-    app = mount_main_routes(["/api/persistent/threads/{thread_id}/citations"])
+    del monkeypatch
+    app = mount_router(
+        thread_history.router,
+        factories={
+            "thread_history_dependencies_factory": (
+                lambda: thread_history.ThreadHistoryDependencies(
+                    store=object(),
+                    vector_db=vector_store,
+                    require_thread_owner=gate,
+                )
+            )
+        },
+    )
     return TestClient(app, raise_server_exceptions=False)
 
 
 def _permission_client(monkeypatch, *, store, gate, notifier, wake):
-    monkeypatch.setattr(main, "postgres_db", store)
-    monkeypatch.setattr(main, "require_thread_owner", gate)
-    monkeypatch.setattr(main, "notification_service", notifier)
-    monkeypatch.setattr(main, "_phase5_wake_if_suspended", wake)
-    monkeypatch.setattr(main.email_service, "cockpit_url", "https://cockpit.test")
-    app = mount_main_routes(
-        [
-            "/api/persistent/threads/{thread_id}/approve/{approval_id}",
-            "/magic/approve/{token}",
-            "/magic/extend/{token}",
-        ]
+    del monkeypatch
+    app = mount_router(
+        thread_permissions.router,
+        factories={
+            "thread_permission_dependencies_factory": (
+                lambda: thread_permissions.ThreadPermissionDependencies(
+                    store=store,
+                    require_thread_owner=gate,
+                    notification_service=notifier,
+                    cockpit_url=lambda: "https://cockpit.test",
+                    wake_after_permission_decision=wake,
+                )
+            )
+        },
     )
     return TestClient(app, raise_server_exceptions=False)
 

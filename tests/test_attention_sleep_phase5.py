@@ -14,6 +14,10 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from agent.persistent_graph import PermissionOutcome
+from orchestrator.routers import thread_permissions
+from orchestrator.routers.thread_permissions import ThreadPermissionDependencies
+from orchestrator.services import magic_link_pages, session_attention
+from orchestrator.services.session_attention import SessionAttentionDependencies
 
 
 # ---------------------------------------------------------------------------
@@ -301,9 +305,29 @@ class TestPermissionCheckWakePathGuard:
 # Section 3 — Attention-sleep watchdog
 # ===========================================================================
 #
-# attention_sleep_sweeper runs every 60s, selects stale awaiting_user threads,
-# and hands their exact live runtime identity to the durable retirement flow,
-# which settles the lifecycle to suspended after cleanup.
+# session_attention.attention_sleep_sweeper runs every 60s, selects stale
+# awaiting_user threads, and hands their exact live runtime identity to the
+# durable retirement flow, which settles the lifecycle to suspended after
+# cleanup. Its collaborators arrive as SessionAttentionDependencies;
+# promote_expired_stateless_pauses is a module-level name looked up in
+# session_attention at call time.
+
+
+def _attention_dependencies(**overrides) -> SessionAttentionDependencies:
+    """The application's attention collaborators, each replaceable per test."""
+    fields = {
+        "store": _make_db(),
+        "container_provisioner": MagicMock(),
+        "workspace_suspension": MagicMock(),
+        "persistent_provisioner": None,
+        "persistent_thread_recycler": lambda: None,
+        "emit_session_provisioning_failure": AsyncMock(),
+        "thread_retirement_operations": MagicMock(),
+        "notification_service": MagicMock(),
+        "cockpit_url": lambda: "http://localhost:4200",
+    }
+    fields.update(overrides)
+    return SessionAttentionDependencies(**fields)
 
 
 def _stale_pinned_runtime_row() -> dict:
@@ -317,47 +341,42 @@ def _stale_pinned_runtime_row() -> dict:
     }
 
 
+async def _run_one_sweep(dependencies: SessionAttentionDependencies) -> None:
+    shutdown = asyncio.Event()
+    # Run one tick: schedule the sweeper, give it a moment, signal shutdown.
+    task = asyncio.create_task(
+        session_attention.attention_sleep_sweeper(shutdown, dependencies=dependencies)
+    )
+    await asyncio.sleep(0.05)
+    shutdown.set()
+    await task
+
+
 class TestAttentionSleepSweeper:
-    def setup_method(self):
-        import orchestrator.main as om
-
-        # Save the originals so each test restores cleanly.
-        self._orig_db = om.postgres_db
-        self._orig_svc = om.workspace_suspension_service
-        self._orig_promote = om.promote_expired_stateless_pauses
-        self._orig_retirement_factory = om._thread_retirement_operations
-        om.promote_expired_stateless_pauses = AsyncMock(return_value=[])
-
-    def teardown_method(self):
-        import orchestrator.main as om
-
-        om.postgres_db = self._orig_db
-        om.workspace_suspension_service = self._orig_svc
-        om.promote_expired_stateless_pauses = self._orig_promote
-        om._thread_retirement_operations = self._orig_retirement_factory
+    @pytest.fixture(autouse=True)
+    def _presence(self, monkeypatch):
+        self.promote = AsyncMock(return_value=[])
+        monkeypatch.setattr(
+            session_attention, "promote_expired_stateless_pauses", self.promote
+        )
 
     @pytest.mark.asyncio
     async def test_suspends_stale_awaiting_user(self):
-        import orchestrator.main as om
-
         row = _stale_pinned_runtime_row()
         db = _make_db(fetch=[row])
         svc = MagicMock()
         svc.is_enabled = True
         end_thread_flow = AsyncMock(return_value={"status": "suspended"})
 
-        om.postgres_db = db
-        om.workspace_suspension_service = svc
-        om._thread_retirement_operations = lambda: MagicMock(
-            end_thread_flow=end_thread_flow
+        await _run_one_sweep(
+            _attention_dependencies(
+                store=db,
+                workspace_suspension=svc,
+                thread_retirement_operations=lambda: MagicMock(
+                    end_thread_flow=end_thread_flow
+                ),
+            )
         )
-
-        shutdown = asyncio.Event()
-        # Run one tick: schedule the sweeper, give it a moment, signal shutdown.
-        task = asyncio.create_task(om.attention_sleep_sweeper(shutdown))
-        await asyncio.sleep(0.05)
-        shutdown.set()
-        await task
 
         end_thread_flow.assert_awaited_once_with(
             str(row["id"]),
@@ -372,84 +391,126 @@ class TestAttentionSleepSweeper:
 
     @pytest.mark.asyncio
     async def test_skips_when_service_disabled(self):
-        import orchestrator.main as om
-
         db = _make_db(fetch=[{"id": "thread-abc"}])
         svc = MagicMock()
         svc.is_enabled = False
         end_thread_flow = AsyncMock(return_value={"status": "suspended"})
 
-        om.postgres_db = db
-        om.workspace_suspension_service = svc
-        om._thread_retirement_operations = lambda: MagicMock(
-            end_thread_flow=end_thread_flow
+        await _run_one_sweep(
+            _attention_dependencies(
+                store=db,
+                workspace_suspension=svc,
+                thread_retirement_operations=lambda: MagicMock(
+                    end_thread_flow=end_thread_flow
+                ),
+            )
         )
-
-        shutdown = asyncio.Event()
-        task = asyncio.create_task(om.attention_sleep_sweeper(shutdown))
-        await asyncio.sleep(0.05)
-        shutdown.set()
-        await task
 
         end_thread_flow.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_handles_suspend_failure_without_crashing(self):
-        import orchestrator.main as om
-
         row = _stale_pinned_runtime_row()
         db = _make_db(fetch=[row])
         svc = MagicMock()
         svc.is_enabled = True
         end_thread_flow = AsyncMock(side_effect=RuntimeError("retirement unavailable"))
 
-        om.postgres_db = db
-        om.workspace_suspension_service = svc
-        om._thread_retirement_operations = lambda: MagicMock(
-            end_thread_flow=end_thread_flow
+        await _run_one_sweep(
+            _attention_dependencies(
+                store=db,
+                workspace_suspension=svc,
+                thread_retirement_operations=lambda: MagicMock(
+                    end_thread_flow=end_thread_flow
+                ),
+            )
         )
-
-        shutdown = asyncio.Event()
-        task = asyncio.create_task(om.attention_sleep_sweeper(shutdown))
-        await asyncio.sleep(0.05)
-        shutdown.set()
-        await task
 
         end_thread_flow.assert_awaited_once()
 
     @pytest.mark.asyncio
-    async def test_presence_failure_does_not_skip_legacy_suspension(self):
-        import orchestrator.main as om
-
+    async def test_presence_failure_does_not_skip_legacy_suspension(self, monkeypatch):
         row = _stale_pinned_runtime_row()
         db = _make_db(fetch=[row])
         svc = MagicMock()
         svc.is_enabled = True
         end_thread_flow = AsyncMock(return_value={"status": "suspended"})
-        om.postgres_db = db
-        om.workspace_suspension_service = svc
-        om._thread_retirement_operations = lambda: MagicMock(
-            end_thread_flow=end_thread_flow
-        )
-        om.promote_expired_stateless_pauses = AsyncMock(
-            side_effect=RuntimeError("presence table unavailable")
+        monkeypatch.setattr(
+            session_attention,
+            "promote_expired_stateless_pauses",
+            AsyncMock(side_effect=RuntimeError("presence table unavailable")),
         )
 
-        shutdown = asyncio.Event()
-        task = asyncio.create_task(om.attention_sleep_sweeper(shutdown))
-        await asyncio.sleep(0.05)
-        shutdown.set()
-        await task
+        await _run_one_sweep(
+            _attention_dependencies(
+                store=db,
+                workspace_suspension=svc,
+                thread_retirement_operations=lambda: MagicMock(
+                    end_thread_flow=end_thread_flow
+                ),
+            )
+        )
 
         end_thread_flow.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_presence_expiry_is_promoted_even_with_suspension_disabled(self):
+        """Stateless presence convergence runs on every tick against the
+        application's store, independent of workspace suspension."""
+        db = _make_db(fetch=[_stale_pinned_runtime_row()])
+        svc = MagicMock()
+        svc.is_enabled = False
+        self.promote.return_value = ["thread-promoted"]
+        end_thread_flow = AsyncMock()
+
+        await _run_one_sweep(
+            _attention_dependencies(
+                store=db,
+                workspace_suspension=svc,
+                thread_retirement_operations=lambda: MagicMock(
+                    end_thread_flow=end_thread_flow
+                ),
+            )
+        )
+
+        self.promote.assert_awaited_once_with(db, limit=50)
+        end_thread_flow.assert_not_awaited()
 
 
 # ===========================================================================
 # Section 4 — Magic-link extend window
 # ===========================================================================
 #
-# magic_link_extend validates the token (without consuming), bumps
-# awaiting_user_since, increments extend_count, respects the cap.
+# thread_permissions.magic_link_extend validates the token (without
+# consuming), bumps awaiting_user_since, increments extend_count, respects the
+# cap. The router reads ``headless_notifications`` as a module-level name and
+# ``magic_link_pages.MAGIC_EXTEND_CAP`` at call time.
+
+
+def _permission_dependencies(store, *, wake=None) -> ThreadPermissionDependencies:
+    return ThreadPermissionDependencies(
+        store=store,
+        require_thread_owner=AsyncMock(),
+        notification_service=MagicMock(),
+        cockpit_url=lambda: "http://localhost:4200",
+        wake_after_permission_decision=wake if wake is not None else AsyncMock(),
+    )
+
+
+def _patch_token(monkeypatch, *, validated, consumed=None) -> MagicMock:
+    notifications = MagicMock()
+    notifications.validate_magic_link = AsyncMock(return_value=validated)
+    notifications.consume_magic_link = AsyncMock(return_value=consumed)
+    monkeypatch.setattr(thread_permissions, "headless_notifications", notifications)
+    return notifications
+
+
+_VALID_EXTEND_TOKEN = {
+    "id": "tok-1",
+    "approval_id": "appr-1",
+    "thread_id": "thread-abc",
+    "intended_decision": "approved",
+}
 
 
 class TestMagicLinkExtendCap:
@@ -458,24 +519,8 @@ class TestMagicLinkExtendCap:
     'extended', 'cap_reached', 'not_awaiting'.
     """
 
-    def setup_method(self):
-        import orchestrator.main as om
-
-        self._orig_db = om.postgres_db
-        self._orig_email = om.email_service
-        self._orig_hn = om.headless_notifications
-
-    def teardown_method(self):
-        import orchestrator.main as om
-
-        om.postgres_db = self._orig_db
-        om.email_service = self._orig_email
-        om.headless_notifications = self._orig_hn
-
     @pytest.mark.asyncio
-    async def test_extended_banner_when_under_cap(self):
-        import orchestrator.main as om
-
+    async def test_extended_banner_when_under_cap(self, monkeypatch):
         # Token valid; UPDATE returns a new extend_count of 1; the second
         # fetchrow loads the permission row for re-render.
         rows = iter(
@@ -489,32 +534,17 @@ class TestMagicLinkExtendCap:
             ]
         )
         db = _make_db(fetchrow=lambda *a, **kw: next(rows))
-        om.postgres_db = db
+        _patch_token(monkeypatch, validated=dict(_VALID_EXTEND_TOKEN))
 
-        # Stub the email_service so cockpit_url resolves.
-        om.email_service = MagicMock()
-        om.email_service.cockpit_url = "http://localhost:4200"
-
-        # Stub validate_magic_link to return a valid token row.
-        om.headless_notifications = MagicMock()
-        om.headless_notifications.validate_magic_link = AsyncMock(
-            return_value={
-                "id": "tok-1",
-                "approval_id": "appr-1",
-                "thread_id": "thread-abc",
-                "intended_decision": "approved",
-            }
+        resp = await thread_permissions.magic_link_extend(
+            "raw-token", dependencies=_permission_dependencies(db)
         )
-
-        resp = await om.magic_link_extend("raw-token")
         body = resp.body.decode()
         assert "extended by 60 minutes" in body.lower() or "Window extended" in body
         assert resp.status_code == 200
 
     @pytest.mark.asyncio
-    async def test_cap_reached_banner_when_update_misses(self):
-        import orchestrator.main as om
-
+    async def test_cap_reached_banner_when_update_misses(self, monkeypatch):
         # UPDATE returns None (cap blocked the WHERE clause). Then SELECT
         # reveals extend_count >= cap.
         rows = iter(
@@ -532,28 +562,17 @@ class TestMagicLinkExtendCap:
             ]
         )
         db = _make_db(fetchrow=lambda *a, **kw: next(rows))
-        om.postgres_db = db
-        om.email_service = MagicMock()
-        om.email_service.cockpit_url = "http://localhost:4200"
-        om.headless_notifications = MagicMock()
-        om.headless_notifications.validate_magic_link = AsyncMock(
-            return_value={
-                "id": "tok-1",
-                "approval_id": "appr-1",
-                "thread_id": "thread-abc",
-                "intended_decision": "approved",
-            }
-        )
+        _patch_token(monkeypatch, validated=dict(_VALID_EXTEND_TOKEN))
 
-        resp = await om.magic_link_extend("raw-token")
+        resp = await thread_permissions.magic_link_extend(
+            "raw-token", dependencies=_permission_dependencies(db)
+        )
         body = resp.body.decode()
         assert "Extend limit reached" in body
         assert "disabled" in body  # extend button disabled
 
     @pytest.mark.asyncio
-    async def test_not_awaiting_banner_when_thread_already_active(self):
-        import orchestrator.main as om
-
+    async def test_not_awaiting_banner_when_thread_already_active(self, monkeypatch):
         rows = iter(
             [
                 None,  # UPDATE failed (not in awaiting_user)
@@ -569,35 +588,110 @@ class TestMagicLinkExtendCap:
             ]
         )
         db = _make_db(fetchrow=lambda *a, **kw: next(rows))
-        om.postgres_db = db
-        om.email_service = MagicMock()
-        om.email_service.cockpit_url = "http://localhost:4200"
-        om.headless_notifications = MagicMock()
-        om.headless_notifications.validate_magic_link = AsyncMock(
-            return_value={
-                "id": "tok-1",
-                "approval_id": "appr-1",
-                "thread_id": "thread-abc",
-                "intended_decision": "approved",
-            }
-        )
+        _patch_token(monkeypatch, validated=dict(_VALID_EXTEND_TOKEN))
 
-        resp = await om.magic_link_extend("raw-token")
+        resp = await thread_permissions.magic_link_extend(
+            "raw-token", dependencies=_permission_dependencies(db)
+        )
         body = resp.body.decode()
         assert "No extend needed" in body or "already active" in body
 
     @pytest.mark.asyncio
-    async def test_invalid_token_returns_404(self):
-        import orchestrator.main as om
+    async def test_invalid_token_returns_404(self, monkeypatch):
+        _patch_token(monkeypatch, validated=None)
 
-        om.postgres_db = _make_db()
-        om.email_service = MagicMock()
-        om.email_service.cockpit_url = "http://localhost:4200"
-        om.headless_notifications = MagicMock()
-        om.headless_notifications.validate_magic_link = AsyncMock(return_value=None)
-
-        resp = await om.magic_link_extend("bad-token")
+        resp = await thread_permissions.magic_link_extend(
+            "bad-token", dependencies=_permission_dependencies(_make_db())
+        )
         assert resp.status_code == 404
+
+    @pytest.mark.asyncio
+    async def test_update_is_fenced_by_the_cap_read_at_call_time(self, monkeypatch):
+        """The bump is one CAS UPDATE whose WHERE clause carries the cap, bound
+        from ``magic_link_pages.MAGIC_EXTEND_CAP`` as read per request."""
+        monkeypatch.setattr(magic_link_pages, "MAGIC_EXTEND_CAP", 3)
+        rows = iter(
+            [
+                {"extend_count": 1},
+                {
+                    "tool_name": "run_command",
+                    "tool_args": "{}",
+                    "status": "pending",
+                },
+            ]
+        )
+        db = _make_db(fetchrow=lambda *a, **kw: next(rows))
+        _patch_token(monkeypatch, validated=dict(_VALID_EXTEND_TOKEN))
+
+        resp = await thread_permissions.magic_link_extend(
+            "raw-token", dependencies=_permission_dependencies(db)
+        )
+
+        update = db._fake_conn.fetchrow.await_args_list[0]
+        update_sql = " ".join(update.args[0].split())
+        assert update_sql.startswith("UPDATE threads")
+        assert "status = 'awaiting_user'" in update_sql
+        assert "extend_count < $2" in update_sql
+        assert update.args[1:] == ("thread-abc", 3)
+        assert "2 extends remaining" in resp.body.decode()
+
+
+class TestMagicLinkNeverConsumesOutsidePost:
+    """Only POST /magic/approve consumes the single-use token. GET is what
+    email link previewers prefetch; extend is "still reviewing". Either one
+    consuming would burn the approval before the human can click it."""
+
+    @pytest.mark.asyncio
+    async def test_get_renders_the_confirmation_without_consuming(self, monkeypatch):
+        db = _make_db(
+            fetchrow={
+                "id": "appr-1",
+                "tool_name": "run_command",
+                "tool_args": "{}",
+                "status": "pending",
+            }
+        )
+        notifications = _patch_token(
+            monkeypatch,
+            validated={"id": "tok-1", "approval_id": "appr-1"},
+            consumed={"approval_id": "appr-1"},
+        )
+
+        resp = await thread_permissions.magic_link_get(
+            "raw-token", dependencies=_permission_dependencies(db)
+        )
+
+        assert resp.status_code == 200
+        assert 'action="/magic/approve/raw-token"' in resp.body.decode()
+        notifications.consume_magic_link.assert_not_awaited()
+        for call in db._fake_conn.fetchrow.await_args_list:
+            assert call.args[0].lstrip().startswith("SELECT")
+
+    @pytest.mark.asyncio
+    async def test_extend_bumps_the_window_without_consuming(self, monkeypatch):
+        rows = iter(
+            [
+                {"extend_count": 1},
+                {
+                    "tool_name": "run_command",
+                    "tool_args": "{}",
+                    "status": "pending",
+                },
+            ]
+        )
+        db = _make_db(fetchrow=lambda *a, **kw: next(rows))
+        notifications = _patch_token(
+            monkeypatch,
+            validated=dict(_VALID_EXTEND_TOKEN),
+            consumed={"approval_id": "appr-1"},
+        )
+
+        resp = await thread_permissions.magic_link_extend(
+            "raw-token", dependencies=_permission_dependencies(db)
+        )
+
+        assert resp.status_code == 200
+        notifications.consume_magic_link.assert_not_awaited()
 
 
 # ===========================================================================
@@ -605,29 +699,20 @@ class TestMagicLinkExtendCap:
 # ===========================================================================
 #
 # magic_link_post fires a fire-and-forget task that restores the
-# workspace if it's suspended. We test the helper directly because the
+# workspace if it's suspended. We test the wake body
+# (session_attention.wake_after_permission_decision) directly because the
 # full POST handler depends on the consume CAS path already covered by
-# Phase 4 tests.
+# Phase 4 tests. ensure_session_workspace is a module-level name looked up in
+# session_attention at call time.
 
 
 class TestPhase5WakeIfSuspended:
-    def setup_method(self):
-        import orchestrator.main as om
-
-        self._orig_db = om.postgres_db
-        self._orig_svc = om.workspace_suspension_service
-        self._orig_prov = om.persistent_provisioner
-        self._orig_container_prov = om.container_provisioner
-        self._orig_ensure = om.ensure_session_workspace
-
-    def teardown_method(self):
-        import orchestrator.main as om
-
-        om.postgres_db = self._orig_db
-        om.workspace_suspension_service = self._orig_svc
-        om.persistent_provisioner = self._orig_prov
-        om.container_provisioner = self._orig_container_prov
-        om.ensure_session_workspace = self._orig_ensure
+    @pytest.fixture(autouse=True)
+    def _ensure(self, monkeypatch):
+        self.ensure_workspace = AsyncMock(return_value=None)
+        monkeypatch.setattr(
+            session_attention, "ensure_session_workspace", self.ensure_workspace
+        )
 
     @staticmethod
     def _stateless_thread(
@@ -680,8 +765,6 @@ class TestPhase5WakeIfSuspended:
 
     @pytest.mark.asyncio
     async def test_magic_post_carries_exact_permission_fence(self, monkeypatch):
-        import orchestrator.main as om
-
         permission_row = {
             "id": "permission-1",
             "status": "approved",
@@ -689,29 +772,24 @@ class TestPhase5WakeIfSuspended:
             "tool_name": "run_command",
             "thread_id": "thread-abc",
         }
-        om.postgres_db = _make_db(fetchrow=permission_row)
-        notifications = MagicMock()
-        notifications.validate_magic_link = AsyncMock(
-            return_value={
+        db = _make_db(fetchrow=permission_row)
+        _patch_token(
+            monkeypatch,
+            validated={
                 "id": "token-row-1",
                 "approval_id": "permission-1",
                 "intended_decision": "approved",
-            }
-        )
-        notifications.consume_magic_link = AsyncMock(
-            return_value={
+            },
+            consumed={
                 "approval_id": "permission-1",
                 "user_id": "user-1",
-            }
+            },
         )
-        monkeypatch.setattr(om, "headless_notifications", notifications)
-        email = MagicMock()
-        email.cockpit_url = "http://localhost:4200"
-        monkeypatch.setattr(om, "email_service", email)
         wake = AsyncMock()
-        monkeypatch.setattr(om, "_phase5_wake_if_suspended", wake)
 
-        response = await om.magic_link_post("raw-token")
+        response = await thread_permissions.magic_link_post(
+            "raw-token", dependencies=_permission_dependencies(db, wake=wake)
+        )
         await asyncio.sleep(0)
 
         assert response.status_code == 200
@@ -719,36 +797,53 @@ class TestPhase5WakeIfSuspended:
             "thread-abc", permission_request_id="permission-1"
         )
 
+    def test_application_wake_is_the_attention_owner_on_its_own_store(
+        self, monkeypatch
+    ):
+        """The POST's wake is the application's composition of
+        ``session_attention.wake_after_permission_decision`` over its own
+        attention collaborators, rebuilt from current state per request."""
+        import orchestrator.main as om
+
+        store = MagicMock()
+        monkeypatch.setattr(om, "postgres_db", store)
+
+        wake = om._thread_permission_dependencies().wake_after_permission_decision
+
+        assert wake.func is session_attention.wake_after_permission_decision
+        attention = wake.keywords["dependencies"]
+        assert isinstance(attention, SessionAttentionDependencies)
+        assert attention.store is store
+
     @pytest.mark.asyncio
     @pytest.mark.parametrize("backend", ["sandbox", "virtual", "none"])
     @pytest.mark.parametrize("decision", ["approved", "denied"])
     async def test_stateless_wake_is_queue_owned_and_topology_neutral(
         self, backend, decision
     ):
-        import orchestrator.main as om
-
         thread = self._stateless_thread(backend)
         queue = {"state": "leased", "input_seq": 12, "consumed_seq": 11}
         db, inner = self._stateless_db(thread, queue, decision=decision)
-        om.postgres_db = db
-
-        om.workspace_suspension_service = MagicMock()
-        om.container_provisioner = MagicMock()
-        ensure_workspace = AsyncMock(return_value=None)
-        om.ensure_session_workspace = ensure_workspace
         prov = MagicMock()
         prov.create_agent_pod = AsyncMock(return_value=True)
-        om.persistent_provisioner = prov
-
-        await om._phase5_wake_if_suspended(
-            "thread-abc", permission_request_id="permission-1"
+        dependencies = _attention_dependencies(
+            store=db,
+            workspace_suspension=MagicMock(),
+            container_provisioner=MagicMock(),
+            persistent_provisioner=prov,
         )
 
-        ensure_workspace.assert_awaited_once_with(
+        await session_attention.wake_after_permission_decision(
+            "thread-abc",
+            permission_request_id="permission-1",
+            dependencies=dependencies,
+        )
+
+        self.ensure_workspace.assert_awaited_once_with(
             "thread-abc",
             db=db,
-            provisioner=om.container_provisioner,
-            suspension=om.workspace_suspension_service,
+            provisioner=dependencies.container_provisioner,
+            suspension=dependencies.workspace_suspension,
         )
         prov.create_agent_pod.assert_not_awaited()
         calls = inner._fake_conn.fetchrow.await_args_list
@@ -770,6 +865,30 @@ class TestPhase5WakeIfSuspended:
         assert "control_admission_agent_id = NULL" in update_sql
 
     @pytest.mark.asyncio
+    async def test_stateless_wake_permission_fence_is_the_exact_decided_row(self):
+        thread = self._stateless_thread("virtual")
+        queue = {"state": "queued", "input_seq": 12, "consumed_seq": 11}
+        db, inner = self._stateless_db(thread, queue)
+
+        await session_attention.wake_after_permission_decision(
+            "thread-abc",
+            permission_request_id="permission-1",
+            dependencies=_attention_dependencies(store=db),
+        )
+
+        fence = next(
+            call
+            for call in inner._fake_conn.fetchval.await_args_list
+            if "FROM thread_permission_requests" in call.args[0]
+        )
+        fence_sql = " ".join(fence.args[0].split())
+        assert "id = $2::uuid" in fence_sql
+        assert "thread_id = $1::uuid" in fence_sql
+        assert "status IN ('approved', 'denied')" in fence_sql
+        assert fence.args[1:] == ("thread-abc", "permission-1")
+        self.ensure_workspace.assert_awaited_once()
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize(
         ("queue", "decision"),
         [
@@ -782,21 +901,19 @@ class TestPhase5WakeIfSuspended:
     async def test_stateless_wake_fences_stale_queue_or_permission(
         self, queue, decision
     ):
-        import orchestrator.main as om
-
         thread = self._stateless_thread("virtual")
         db, inner = self._stateless_db(thread, queue, decision=decision)
-        om.postgres_db = db
-        om.ensure_session_workspace = AsyncMock()
-        om.persistent_provisioner = MagicMock()
-        om.persistent_provisioner.create_agent_pod = AsyncMock()
+        prov = MagicMock()
+        prov.create_agent_pod = AsyncMock()
 
-        await om._phase5_wake_if_suspended(
-            "thread-abc", permission_request_id="permission-1"
+        await session_attention.wake_after_permission_decision(
+            "thread-abc",
+            permission_request_id="permission-1",
+            dependencies=_attention_dependencies(store=db, persistent_provisioner=prov),
         )
 
-        om.ensure_session_workspace.assert_not_awaited()
-        om.persistent_provisioner.create_agent_pod.assert_not_awaited()
+        self.ensure_workspace.assert_not_awaited()
+        prov.create_agent_pod.assert_not_awaited()
         assert not any(
             "UPDATE threads" in call.args[0]
             for call in inner._fake_conn.fetchval.await_args_list
@@ -804,8 +921,6 @@ class TestPhase5WakeIfSuspended:
 
     @pytest.mark.asyncio
     async def test_stateless_wake_refuses_lane_flip_under_thread_lock(self):
-        import orchestrator.main as om
-
         initial = self._stateless_thread("virtual")
         locked = self._stateless_thread("virtual", lane="pinned")
         db, inner = self._stateless_db(
@@ -813,63 +928,57 @@ class TestPhase5WakeIfSuspended:
             {"state": "queued", "input_seq": 12, "consumed_seq": 11},
         )
         db.get_thread = AsyncMock(return_value=initial)
-        om.postgres_db = db
-        om.ensure_session_workspace = AsyncMock()
-        om.persistent_provisioner = MagicMock()
-        om.persistent_provisioner.create_agent_pod = AsyncMock()
+        prov = MagicMock()
+        prov.create_agent_pod = AsyncMock()
 
-        await om._phase5_wake_if_suspended(
-            "thread-abc", permission_request_id="permission-1"
+        await session_attention.wake_after_permission_decision(
+            "thread-abc",
+            permission_request_id="permission-1",
+            dependencies=_attention_dependencies(store=db, persistent_provisioner=prov),
         )
 
-        om.ensure_session_workspace.assert_not_awaited()
-        om.persistent_provisioner.create_agent_pod.assert_not_awaited()
+        self.ensure_workspace.assert_not_awaited()
+        prov.create_agent_pod.assert_not_awaited()
         assert len(inner._fake_conn.fetchrow.await_args_list) == 1
 
     @pytest.mark.asyncio
     async def test_stateless_wake_refuses_unfenced_direct_call(self):
-        import orchestrator.main as om
-
         thread = self._stateless_thread("none")
         db, inner = self._stateless_db(
             thread,
             {"state": "queued", "input_seq": 12, "consumed_seq": 11},
         )
-        om.postgres_db = db
-        om.ensure_session_workspace = AsyncMock()
 
-        await om._phase5_wake_if_suspended("thread-abc")
+        await session_attention.wake_after_permission_decision(
+            "thread-abc", dependencies=_attention_dependencies(store=db)
+        )
 
-        om.ensure_session_workspace.assert_not_awaited()
+        self.ensure_workspace.assert_not_awaited()
         inner._fake_conn.fetchrow.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_stateless_officer_drift_stays_on_pinned_wake_plane(self):
-        import orchestrator.main as om
-
         thread = self._stateless_thread("none")
         thread["metadata"]["config_override"]["officer"]["enabled"] = True
         db, inner = self._stateless_db(
             thread,
             {"state": "queued", "input_seq": 12, "consumed_seq": 11},
         )
-        om.postgres_db = db
-        om.ensure_session_workspace = AsyncMock()
-        om.persistent_provisioner = MagicMock()
-        om.persistent_provisioner.create_agent_pod = AsyncMock()
+        prov = MagicMock()
+        prov.create_agent_pod = AsyncMock()
 
-        await om._phase5_wake_if_suspended(
-            "thread-abc", permission_request_id="permission-1"
+        await session_attention.wake_after_permission_decision(
+            "thread-abc",
+            permission_request_id="permission-1",
+            dependencies=_attention_dependencies(store=db, persistent_provisioner=prov),
         )
 
-        om.ensure_session_workspace.assert_not_awaited()
-        om.persistent_provisioner.create_agent_pod.assert_not_awaited()
+        self.ensure_workspace.assert_not_awaited()
+        prov.create_agent_pod.assert_not_awaited()
         assert len(inner._fake_conn.fetchrow.await_args_list) == 1
 
     @pytest.mark.asyncio
     async def test_restores_when_workspace_suspended(self):
-        import orchestrator.main as om
-
         thread = _stale_pinned_runtime_row()
         thread.update(
             {
@@ -885,28 +994,29 @@ class TestPhase5WakeIfSuspended:
         db.get_thread = AsyncMock(return_value=thread)
         db_inner = _make_db(fetchval=thread_id)
         db.acquire = db_inner.acquire
-        om.postgres_db = db
 
         svc = MagicMock()
         svc.is_enabled = True
-        om.workspace_suspension_service = svc
-        ensure_workspace = AsyncMock(
-            return_value=MagicMock(outcome=om.EnsureOutcome.READY)
+        self.ensure_workspace.return_value = MagicMock(
+            outcome=session_attention.EnsureOutcome.READY
         )
-        om.ensure_session_workspace = ensure_workspace
 
         prov = MagicMock()
         prov.create_agent_pod = AsyncMock(return_value=MagicMock(usable=True))
-        om.persistent_provisioner = prov
+        dependencies = _attention_dependencies(
+            store=db, workspace_suspension=svc, persistent_provisioner=prov
+        )
 
-        await om._phase5_wake_if_suspended(thread_id)
+        await session_attention.wake_after_permission_decision(
+            thread_id, dependencies=dependencies
+        )
         # Give the inner create_task room.
         await asyncio.sleep(0)
 
-        ensure_workspace.assert_awaited_once_with(
+        self.ensure_workspace.assert_awaited_once_with(
             thread_id,
             db=db,
-            provisioner=om.container_provisioner,
+            provisioner=dependencies.container_provisioner,
             suspension=svc,
             expected_runtime_generation=str(thread["runtime_generation"]),
         )
@@ -923,8 +1033,6 @@ class TestPhase5WakeIfSuspended:
 
     @pytest.mark.asyncio
     async def test_skips_when_workspace_not_suspended(self):
-        import orchestrator.main as om
-
         thread = _stale_pinned_runtime_row()
         thread.update(
             {
@@ -937,35 +1045,37 @@ class TestPhase5WakeIfSuspended:
         db.get_thread = AsyncMock(return_value=thread)
         db_inner = _make_db()
         db.acquire = db_inner.acquire
-        om.postgres_db = db
 
         svc = MagicMock()
         svc.is_enabled = True
-        om.workspace_suspension_service = svc
-        ensure_workspace = AsyncMock()
-        om.ensure_session_workspace = ensure_workspace
 
         prov = MagicMock()
         prov.create_agent_pod = AsyncMock()
-        om.persistent_provisioner = prov
 
-        await om._phase5_wake_if_suspended(thread_id)
+        await session_attention.wake_after_permission_decision(
+            thread_id,
+            dependencies=_attention_dependencies(
+                store=db, workspace_suspension=svc, persistent_provisioner=prov
+            ),
+        )
         await asyncio.sleep(0)
 
-        ensure_workspace.assert_not_awaited()
+        self.ensure_workspace.assert_not_awaited()
         # agent_id is already bound; no need to re-create.
         prov.create_agent_pod.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_handles_missing_thread_gracefully(self):
-        import orchestrator.main as om
-
         db = MagicMock()
         db.get_thread = AsyncMock(return_value=None)
         db.acquire = _make_db().acquire
-        om.postgres_db = db
-        om.workspace_suspension_service = MagicMock()
-        om.persistent_provisioner = MagicMock()
 
         # Should not raise.
-        await om._phase5_wake_if_suspended("missing-thread")
+        await session_attention.wake_after_permission_decision(
+            "missing-thread",
+            dependencies=_attention_dependencies(
+                store=db,
+                workspace_suspension=MagicMock(),
+                persistent_provisioner=MagicMock(),
+            ),
+        )

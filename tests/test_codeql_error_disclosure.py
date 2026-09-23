@@ -28,7 +28,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from fastapi.testclient import TestClient
 
-from tests._mounted_router import mount_main_routes, mount_router
+from tests._mounted_router import mount_router
 
 
 # The text of the exceptions raised below. No response body may contain it.
@@ -589,7 +589,12 @@ class _DB:
 def _magic_client(
     monkeypatch, *, tool_name: str = "run_command", rows=None, thread_id=None
 ):
-    import orchestrator.main as main
+    """The magic routes, mounted from their router with one application's store.
+
+    The router reads ``headless_notifications`` as a module at call time, so the
+    token validation is patched on that module object.
+    """
+    from orchestrator.routers import thread_permissions
 
     permission_row = {
         "id": "perm-1",
@@ -598,7 +603,7 @@ def _magic_client(
         "status": "pending",
     }
     monkeypatch.setattr(
-        main.headless_notifications,
+        thread_permissions.headless_notifications,
         "validate_magic_link",
         AsyncMock(
             return_value={
@@ -608,10 +613,21 @@ def _magic_client(
             }
         ),
     )
-    monkeypatch.setattr(
-        main, "postgres_db", _DB(rows if rows is not None else [permission_row])
+    store = _DB(rows if rows is not None else [permission_row])
+    app = mount_router(
+        thread_permissions.router,
+        factories={
+            "thread_permission_dependencies_factory": (
+                lambda: thread_permissions.ThreadPermissionDependencies(
+                    store=store,
+                    require_thread_owner=AsyncMock(),
+                    notification_service=MagicMock(),
+                    cockpit_url=lambda: "http://localhost:4200",
+                    wake_after_permission_decision=AsyncMock(),
+                )
+            )
+        },
     )
-    app = mount_main_routes(["/magic/approve/{token}", "/magic/extend/{token}"])
     return TestClient(app, raise_server_exceptions=False)
 
 

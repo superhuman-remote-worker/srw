@@ -13,7 +13,6 @@
 #
 # <file>  <enclosing qualname>  <kind>  <callee>  <fingerprint>  #<ordinal>  <classification>
 
-src/orchestrator/main.py  _forward_to_agent  http  client.post  354d7ac9ee96  #1  exact-runtime-recipient
 src/orchestrator/routers/thread_files.py  upload_files_to_thread  remote-effect  upload_files_to_attested_vm_workspace  8f1a01b30667  #1  fresh-k8s-attestation
 src/orchestrator/services/agent_cloud_mounts.py  _build_agent_cloud_mount  remote-effect  _build_rclone_mount_from_row  0e83b668f377  #1  local-only
 src/orchestrator/services/agent_cloud_mounts.py  _build_agent_cloud_mount  remote-effect  _build_rclone_session_mount  ee81a67b673b  #1  local-only
@@ -74,6 +73,7 @@ src/orchestrator/services/lifecycle/workspace_manager.py  WorkspaceInstanceManag
 src/orchestrator/services/nats_bridge.py  NatsBridge._notify_vm_ready  remote-effect  self._seed_vm_ide_config  b288ac12ec39  #1  vm-authority
 src/orchestrator/services/nats_bridge.py  NatsBridge._seed_vm_ide_config  remote-effect  seed_ide_config_for_user  27c74a329672  #1  vm-authority
 src/orchestrator/services/nats_bridge.py  NatsBridge._seed_vm_ide_config  remote-effect  seed_ide_profile  90e369e5ccad  #1  vm-authority
+src/orchestrator/services/pinned_forwarding.py  forward_to_agent  http  client.post  354d7ac9ee96  #1  exact-runtime-recipient
 src/orchestrator/services/pinned_retirement.py  PinnedRetirementOperations._recover_captured_sandbox_process_zero  remote-effect  RemoteBackend  0ff44667792a  #1  contained-k8s
 src/orchestrator/services/pinned_session_mutation_target.py  prepare_pinned_session_mutation_target  http  client.get  8c74982a3556  #1  read-only-probe
 src/orchestrator/services/session_attach_binding.py  send_session_attach_locked  http  client.post  ac47f8baff89  #1  exact-runtime-recipient

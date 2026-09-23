@@ -11,7 +11,8 @@ into a routable workspace target. It is the seam plan 1's design rests on:
   name this endpoint as the reason.
 * No wake-on-connect (D5): resolving a handle must never restore a suspended
   workspace as a side effect, so this deliberately does NOT reuse
-  ``_resolve_thread_for_forwarding`` (which does exactly that) or
+  ``resolve_thread_for_forwarding`` (``services/pinned_forwarding``, formerly
+  main's ``_resolve_thread_for_forwarding``; it does exactly that) or
   ``thread_runtime_is_preparable`` (which folds 'suspended' into "OK to
   prepare" and says by its own docstring that it is not a lifecycle
   predicate).
@@ -590,9 +591,11 @@ def _target_resolution_source() -> str:
 
 
 def test_endpoint_does_not_use_the_restoring_resolver():
-    """_resolve_thread_for_forwarding restores suspended workspaces as a side
+    """resolve_thread_for_forwarding restores suspended workspaces as a side
     effect. Using it here would silently implement wake-on-connect, which the
-    design rules out.
+    design rules out. R1.B10 moved it out of ``main`` and dropped the leading
+    underscore, so the forbidden token is the bare name — it also matches the
+    old spelling and any ``pinned_forwarding.`` qualified use.
 
     Scope note (fix round 1 / Minor 7): this inspects only the endpoint's own
     two source bodies, not transitively through the helpers they call
@@ -605,7 +608,8 @@ def test_endpoint_does_not_use_the_restoring_resolver():
     """
     source = _target_resolution_source()
     for forbidden in (
-        "_resolve_thread_for_forwarding",
+        "resolve_thread_for_forwarding",
+        "pinned_forwarding",
         "thread_runtime_is_preparable",
         "resolve_pod_ip",
     ):

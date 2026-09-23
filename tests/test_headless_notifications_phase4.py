@@ -237,7 +237,8 @@ class TestConsumeMagicLink:
 # The standalone dedup probe (`already_notified`) was retired 2026-05-13 —
 # the sweeper SQL is now the authoritative dedup, and an in-process probe
 # only duplicated logic that could drift apart. See
-# orchestrator/main.py:thread_permission_notify_sweeper for the widened
+# orchestrator/services/session_attention.py:thread_permission_notify_sweeper
+# for the widened
 # IN-set that absorbed the probe's responsibilities.
 
 
@@ -393,12 +394,35 @@ class TestTruncateArgsForEmail:
 # caught at unit-test time.
 
 
+def _notify_sweeper_dependencies(store, *, notification_service=None, cockpit_url=None):
+    """The permission-notify sweeper's application collaborators.
+
+    Only the store, the notification service and the cockpit URL are read by
+    this sweeper; the rest are inert placeholders.
+    """
+    from orchestrator.services import session_attention
+
+    return session_attention.SessionAttentionDependencies(
+        store=store,
+        container_provisioner=MagicMock(),
+        workspace_suspension=MagicMock(),
+        persistent_provisioner=None,
+        persistent_thread_recycler=lambda: None,
+        emit_session_provisioning_failure=AsyncMock(),
+        thread_retirement_operations=MagicMock(),
+        notification_service=(
+            notification_service if notification_service is not None else MagicMock()
+        ),
+        cockpit_url=cockpit_url or (lambda: "http://localhost:4200"),
+    )
+
+
 class TestPermissionNotifySweeperSQL:
     @pytest.mark.asyncio
     async def test_selects_aged_pending_gates_without_a_feed_row(self, monkeypatch):
         import asyncio
 
-        import orchestrator.main as orch_main
+        from orchestrator.services import session_attention
 
         captured: dict = {}
         evt = asyncio.Event()
@@ -421,14 +445,13 @@ class TestPermissionNotifySweeperSQL:
             async def __aexit__(self_inner, exc_type, exc, tb):
                 return None
 
-        # monkeypatch, not bare assignment: `postgres_db` is a module global,
-        # and a leaked MagicMock breaks every later test in the run that
-        # awaits a real DB method.
+        # The store is the sweeper's injected dependency, not a module global.
         fake_db = MagicMock()
         fake_db.acquire = lambda: _Acquire()
-        monkeypatch.setattr(orch_main, "postgres_db", fake_db)
 
-        await orch_main.thread_permission_notify_sweeper(evt)
+        await session_attention.thread_permission_notify_sweeper(
+            evt, dependencies=_notify_sweeper_dependencies(fake_db)
+        )
 
         q = captured.get("query", "")
         # Only gates still pending and older than the age threshold …
@@ -442,3 +465,61 @@ class TestPermissionNotifySweeperSQL:
         assert "thread_notifications" not in q
         args = captured.get("args", ())
         assert args == (30,)  # HEADLESS_NOTIFY_AGE_S default
+
+    @pytest.mark.asyncio
+    async def test_records_every_aged_gate_through_the_feed(self, monkeypatch):
+        """Each selected row becomes one ``record_permission_pending`` call on
+        the application's store and notifier, with the cockpit URL resolved
+        once per sweep. A failing row is logged and the next is still
+        recorded (best-effort)."""
+        import asyncio
+
+        from orchestrator.services import session_attention
+
+        evt = asyncio.Event()
+        rows = [
+            {"id": "req-1", "thread_id": "thread-1", "tool_name": "a"},
+            {"id": "req-2", "thread_id": "thread-2", "tool_name": "b"},
+        ]
+
+        async def _fake_fetch(query: str, *args):
+            evt.set()
+            return rows
+
+        fake_conn = MagicMock()
+        fake_conn.fetch = _fake_fetch
+
+        class _Acquire:
+            async def __aenter__(self_inner):
+                return fake_conn
+
+            async def __aexit__(self_inner, exc_type, exc, tb):
+                return None
+
+        fake_db = MagicMock()
+        fake_db.acquire = lambda: _Acquire()
+        notifier = MagicMock()
+        record = AsyncMock(
+            side_effect=[RuntimeError("smtp down"), {"status": "recorded"}]
+        )
+        # ``headless_notifications`` is looked up as a module-level name in
+        # ``session_attention`` at call time.
+        monkeypatch.setattr(
+            session_attention,
+            "headless_notifications",
+            MagicMock(record_permission_pending=record),
+        )
+
+        await session_attention.thread_permission_notify_sweeper(
+            evt,
+            dependencies=_notify_sweeper_dependencies(
+                fake_db,
+                notification_service=notifier,
+                cockpit_url=lambda: "https://cockpit.test",
+            ),
+        )
+
+        assert [call.kwargs["row"] for call in record.await_args_list] == rows
+        for call in record.await_args_list:
+            assert call.args == (fake_db, notifier)
+            assert call.kwargs["cockpit_external_url"] == "https://cockpit.test"

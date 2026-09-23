@@ -550,6 +550,35 @@ ignore_imports = [
 unmatched_ignore_imports_alerting = "warn"
 
 [[tool.importlinter.contracts]]
+name = "Session transport, projections, permissions and attention do not import application startup"
+type = "forbidden"
+source_modules = [
+    "orchestrator.routers.thread_history",
+    "orchestrator.routers.thread_permissions",
+    "orchestrator.routers.thread_session",
+    "orchestrator.routers.thread_transport",
+    "orchestrator.schemas.thread_session",
+    "orchestrator.schemas.thread_transport",
+    "orchestrator.services.magic_link_pages",
+    "orchestrator.services.pinned_forwarding",
+    "orchestrator.services.session_attention",
+    "orchestrator.services.session_tool_view",
+    "orchestrator.services.stateless_input_admission",
+    "orchestrator.services.thread_event_stream",
+    "orchestrator.services.thread_permissions",
+    "orchestrator.services.thread_projection",
+    "orchestrator.services.thread_turn_locks",
+]
+forbidden_modules = ["orchestrator.main"]
+ignore_imports = [
+    # The last ledgered edge, services/session_wake.py's lazy usage-ledger
+    # lookup, is reached through orchestrator.security.access ->
+    # services.sudo_gate. It is B10's own caller and closes next.
+    "orchestrator.services.session_wake -> orchestrator.main",
+]
+unmatched_ignore_imports_alerting = "warn"
+
+[[tool.importlinter.contracts]]
 name = "MCP and VM controller do not depend on shared runtime"
 type = "forbidden"
 source_modules = ["mcp_server", "vm_controller"]

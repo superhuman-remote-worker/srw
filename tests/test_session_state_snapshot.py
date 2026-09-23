@@ -788,9 +788,29 @@ async def test_config_resolver_receives_the_row_captured_with_the_event_cursor()
     assert "secret" not in json.dumps(result)
 
 
+def _route_dependencies(*, store, require_thread_owner, resolve_session_config):
+    """The session-state route's collaborators; everything else must stay unused."""
+    from types import SimpleNamespace
+
+    from orchestrator.routers.thread_session import ThreadSessionDependencies
+
+    async def _unused(*_args, **_kwargs):
+        raise AssertionError("the session-state read must not reach this")
+
+    return ThreadSessionDependencies(
+        store=store,
+        require_thread_owner=require_thread_owner,
+        require_approved_user=_unused,
+        resolve_cloud_session_url=_unused,
+        resolve_session_config=resolve_session_config,
+        enforce_session_create_grants=_unused,
+        tool_view=SimpleNamespace(),
+    )
+
+
 @pytest.mark.asyncio
 async def test_owner_gated_route_resolves_only_safe_display_config():
-    import orchestrator.main as orchestrator_main
+    from orchestrator.routers import thread_session
 
     thread = _thread(
         id="thread-1",
@@ -819,16 +839,20 @@ async def test_owner_gated_route_resolves_only_safe_display_config():
         return snapshot
 
     build = AsyncMock(side_effect=_build_with_captured_resolver)
+    store = MagicMock(name="store")
 
-    with (
-        patch.object(orchestrator_main, "require_thread_owner", owner),
-        patch.object(orchestrator_main, "_resolve_session_config", resolve),
-        patch.object(orchestrator_main, "build_session_state_snapshot", build),
-    ):
+    with patch.object(thread_session, "build_session_state_snapshot", build):
         response = MagicMock()
         response.headers = {}
-        result = await orchestrator_main.get_thread_session_state(
-            "thread-1", MagicMock(), response
+        result = await thread_session.get_thread_session_state(
+            "thread-1",
+            MagicMock(),
+            response,
+            dependencies=_route_dependencies(
+                store=store,
+                require_thread_owner=owner,
+                resolve_session_config=resolve,
+            ),
         )
 
     assert result is snapshot
@@ -839,7 +863,7 @@ async def test_owner_gated_route_resolves_only_safe_display_config():
         {"config_override": {"llm": {"model": "captured"}}},
     )
     build.assert_awaited_once_with(
-        orchestrator_main.postgres_db,
+        store,
         "thread-1",
         config_resolver=ANY,
     )
@@ -847,27 +871,24 @@ async def test_owner_gated_route_resolves_only_safe_display_config():
 
 @pytest.mark.asyncio
 async def test_owner_gated_route_returns_404_if_thread_vanishes_after_auth():
-    import orchestrator.main as orchestrator_main
+    from orchestrator.routers import thread_session
 
-    with (
-        patch.object(
-            orchestrator_main,
-            "require_thread_owner",
-            AsyncMock(return_value=({"id": "user-1"}, _thread())),
-        ),
-        patch.object(
-            orchestrator_main,
-            "_resolve_session_config",
-            AsyncMock(return_value=None),
-        ),
-        patch.object(
-            orchestrator_main,
-            "build_session_state_snapshot",
-            AsyncMock(return_value=None),
-        ),
+    with patch.object(
+        thread_session,
+        "build_session_state_snapshot",
+        AsyncMock(return_value=None),
     ):
         with pytest.raises(HTTPException) as exc:
-            await orchestrator_main.get_thread_session_state(
-                "thread-gone", MagicMock(), MagicMock()
+            await thread_session.get_thread_session_state(
+                "thread-gone",
+                MagicMock(),
+                MagicMock(),
+                dependencies=_route_dependencies(
+                    store=MagicMock(name="store"),
+                    require_thread_owner=AsyncMock(
+                        return_value=({"id": "user-1"}, _thread())
+                    ),
+                    resolve_session_config=AsyncMock(return_value=None),
+                ),
             )
     assert exc.value.status_code == 404

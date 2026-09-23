@@ -2592,7 +2592,7 @@ async def test_workspace_binding_is_idempotent_and_status_merges_do_not_rotate()
 
 
 def test_private_workspace_binding_is_removed_from_public_thread_shapes() -> None:
-    import orchestrator.main
+    from orchestrator.services.thread_projection import redact_thread_metadata
 
     private = _thread()["metadata"]["_workspace_binding"]
     for metadata in (
@@ -2622,9 +2622,7 @@ def test_private_workspace_binding_is_removed_from_public_thread_shapes() -> Non
             }
         ),
     ):
-        redacted = orchestrator.main._redact_thread_metadata(
-            {"id": THREAD_ID, "metadata": metadata}
-        )
+        redacted = redact_thread_metadata({"id": THREAD_ID, "metadata": metadata})
         serialized = json.dumps(redacted)
         assert "_workspace_binding" not in serialized
         assert "SHA256:test" not in serialized
