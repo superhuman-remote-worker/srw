@@ -1,6 +1,7 @@
 """Disposable gate metadata uses exact current Job/recovery and real SQL receipt."""
 
 import json
+import hashlib
 from datetime import datetime, timedelta, timezone
 from uuid import UUID, uuid4
 
@@ -14,6 +15,23 @@ from tests.test_vm_workspace_recovery_real_postgres import (  # noqa: F401
 from tests.test_vm_recovery_gate_stop_control import objects
 
 app_pg = _app_pg
+
+
+def cleanup_digest(job_id, generation, dv_uid, pvc_uid):
+    identity = {
+        "source": "controller_rootdisk_delete",
+        "owner_kind": "job",
+        "owner_id": job_id,
+        "dv_uid": dv_uid,
+        "pvc_uid": pvc_uid,
+        "provision_generation": generation,
+    }
+    return (
+        "sha256:"
+        + hashlib.sha256(
+            json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+    )
 
 
 async def seeded(pool, *, offset=timedelta(0)):
@@ -343,6 +361,7 @@ async def test_purge_requires_every_child_absent_and_resumes_from_snapshot(
         "vm": live["vm"]["metadata"]["uid"],
         "pvc": live["pvc"]["metadata"]["uid"],
     }
+    captured_dv_uid = live["dv"]["metadata"]["uid"]
 
     async def delete(job, *, purge_disk):
         calls.append(job)
@@ -378,6 +397,20 @@ async def test_purge_requires_every_child_absent_and_resumes_from_snapshot(
             interval=0,
         ).run(UUID(doc["job_id"]))
     assert len(calls) == 1
+    async with app_pg.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO vm_workspace_cleanup_admissions"
+            "(id,owner_kind,owner_id,pvc_uid,source,request_id,intent_digest,"
+            "completed_at,outcome) VALUES($1,'job',$2,$3,'controller_rootdisk_delete',"
+            "$4,$5,clock_timestamp(),'deleted')",
+            uuid4(),
+            UUID(doc["job_id"]),
+            UUID(anchor["pvc"]),
+            uuid4(),
+            cleanup_digest(
+                doc["job_id"], doc["generation"], captured_dv_uid, anchor["pvc"]
+            ),
+        )
     await GateFixturePurge(
         app_pg,
         Kube(),
@@ -389,6 +422,201 @@ async def test_purge_requires_every_child_absent_and_resumes_from_snapshot(
         interval=0,
     ).run(UUID(doc["job_id"]))
     assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "receipt",
+    ["missing", "pending", "wrong_pvc", "wrong_source", "stale_digest", "completed"],
+)
+@pytest.mark.parametrize("capture_available", [False, True])
+async def test_absent_purged_rootdisk_requires_matching_completed_admission(
+    app_pg, receipt, capture_available
+):
+    from orchestrator.operator_cli.vm_recovery_gate_stop_control import (
+        GateFixturePurge,
+        GateStopError,
+    )
+
+    doc = await seeded(app_pg)
+    dv_uid = str(uuid4())
+    snapshot = {
+        "version": 1,
+        "generation": doc["generation"],
+        "run_id": doc["run_id"],
+        "job_id": doc["job_id"],
+        "user_id": doc["user_id"],
+        "namespace": doc["namespace"],
+        "uids": {"vm": doc["vm_uid"], "vmi": None, "dv": dv_uid, "pvc": doc["pvc_uid"]},
+    }
+    async with app_pg.acquire() as conn:
+        await conn.execute(
+            "UPDATE jobs SET context=jsonb_set(context,"
+            "'{vm_workspace_recovery_gate_purge}',$2::jsonb) WHERE id=$1",
+            UUID(doc["job_id"]),
+            json.dumps(snapshot),
+        )
+    if receipt != "missing":
+        async with app_pg.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO vm_workspace_cleanup_admissions"
+                "(id,owner_kind,owner_id,pvc_uid,source,request_id,intent_digest,"
+                "completed_at,outcome) VALUES($1,'job',$2,$3,$4,$5,$6,"
+                "CASE WHEN $7::bool THEN clock_timestamp() ELSE NULL END,$8)",
+                uuid4(),
+                UUID(doc["job_id"]),
+                uuid4() if receipt == "wrong_pvc" else UUID(doc["pvc_uid"]),
+                "controller_vm_create"
+                if receipt == "wrong_source"
+                else "controller_rootdisk_delete",
+                uuid4(),
+                "sha256:stale"
+                if receipt == "stale_digest"
+                else cleanup_digest(
+                    doc["job_id"], doc["generation"], dv_uid, doc["pvc_uid"]
+                ),
+                receipt != "pending",
+                None
+                if receipt == "pending"
+                else ("adopted" if receipt == "wrong_source" else "deleted"),
+            )
+
+    class Kube:
+        async def fixture_objects(self, namespace, job):
+            return dict(vm=None, vmi=None, dv=None, pvc=None)
+
+    async def unexpected_delete(job, *, purge_disk):
+        raise AssertionError("absent resources cannot authorize another delete")
+
+    purge = GateFixturePurge(
+        app_pg,
+        Kube(),
+        unexpected_delete,
+        doc["run_id"],
+        doc["namespace"],
+        anchor={
+            "generation": doc["generation"],
+            "vm": doc["vm_uid"],
+            "pvc": doc["pvc_uid"],
+        }
+        if capture_available
+        else None,
+        timeout=0.01,
+        interval=0,
+    )
+    if receipt == "completed":
+        await purge.run(UUID(doc["job_id"]))
+    else:
+        with pytest.raises(GateStopError, match="purge_cleanup"):
+            await purge.run(UUID(doc["job_id"]))
+
+
+@pytest.mark.asyncio
+async def test_absent_objects_without_capture_or_prior_snapshot_do_not_prove_purge(
+    app_pg,
+):
+    from orchestrator.operator_cli.vm_recovery_gate_stop_control import (
+        GateFixturePurge,
+        GateStopError,
+    )
+
+    doc = await seeded(app_pg)
+
+    class Kube:
+        async def fixture_objects(self, namespace, job):
+            return dict(vm=None, vmi=None, dv=None, pvc=None)
+
+    async def unexpected_delete(job, *, purge_disk):
+        raise AssertionError("no new delete without a capture")
+
+    with pytest.raises(GateStopError, match="purge_identity_unproven"):
+        await GateFixturePurge(
+            app_pg,
+            Kube(),
+            unexpected_delete,
+            doc["run_id"],
+            doc["namespace"],
+            anchor=None,
+        ).run(UUID(doc["job_id"]))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("completed", [False, True])
+@pytest.mark.parametrize("capture_available", [False, True])
+async def test_cli_purge_reports_success_only_after_exact_cleanup_receipt(
+    app_pg, monkeypatch, completed, capture_available
+):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from orchestrator.operator_cli import vm_recovery_gate_stop_control as gate
+    from orchestrator.operator_cli.vm_workspace_recovery_acceptance import LiveScenario
+    from orchestrator.services.vm_provisioner import VMTeardownIdentity
+
+    doc = await seeded(app_pg)
+    dv_uid = str(uuid4())
+    snapshot = {
+        "version": 1,
+        "generation": doc["generation"],
+        "run_id": doc["run_id"],
+        "job_id": doc["job_id"],
+        "user_id": doc["user_id"],
+        "namespace": doc["namespace"],
+        "uids": {"vm": doc["vm_uid"], "vmi": None, "dv": dv_uid, "pvc": doc["pvc_uid"]},
+    }
+    async with app_pg.acquire() as conn:
+        await conn.execute(
+            "UPDATE jobs SET context=jsonb_set(context,"
+            "'{vm_workspace_recovery_gate_purge}',$2::jsonb) WHERE id=$1",
+            UUID(doc["job_id"]),
+            json.dumps(snapshot),
+        )
+    if completed:
+        async with app_pg.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO vm_workspace_cleanup_admissions"
+                "(id,owner_kind,owner_id,pvc_uid,source,request_id,intent_digest,"
+                "completed_at,outcome) VALUES($1,'job',$2,$3,'controller_rootdisk_delete',"
+                "$4,$5,clock_timestamp(),'deleted')",
+                uuid4(),
+                UUID(doc["job_id"]),
+                UUID(doc["pvc_uid"]),
+                uuid4(),
+                cleanup_digest(
+                    doc["job_id"], doc["generation"], dv_uid, doc["pvc_uid"]
+                ),
+            )
+
+    class Kube:
+        async def fixture_objects(self, namespace, job):
+            return dict(vm=None, vmi=None, dv=None, pvc=None)
+
+    monkeypatch.setattr(gate, "KubernetesStopObjects", lambda core: Kube())
+    release = AsyncMock(side_effect=AssertionError("no new delete from absence"))
+    scenario = object.__new__(LiveScenario)
+    scenario.db = app_pg
+    scenario.run_id = doc["run_id"]
+    scenario.namespace = doc["namespace"]
+    scenario._core = object()
+    scenario.provisioner = SimpleNamespace(
+        capture_vm_teardown_identity=AsyncMock(
+            return_value=VMTeardownIdentity(
+                doc["generation"], doc["vm_uid"], doc["pvc_uid"]
+            )
+            if capture_available
+            else None,
+            side_effect=None
+            if capture_available
+            else RuntimeError("capture unavailable"),
+        ),
+        release_vm_captured=release,
+    )
+    if completed:
+        await scenario._purge_fixture(UUID(doc["job_id"]))
+    else:
+        with pytest.raises(gate.GateStopError, match="purge_cleanup_receipt_missing"):
+            await scenario._purge_fixture(UUID(doc["job_id"]))
+    release.assert_not_awaited()
 
 
 @pytest.mark.asyncio

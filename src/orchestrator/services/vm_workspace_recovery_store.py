@@ -16,6 +16,7 @@ from orchestrator.services.vm_workspace_recovery_telemetry import (
     VMWorkspaceRecoveryTelemetry,
     workspace_recovery_telemetry,
 )
+from shared.vm_provisioning_phases import rebind_recovered_provisioning
 from shared.worker_queue import (
     get_worker_attempt_disposition,
     park_worker_batch_for_workspace_recovery,
@@ -3287,6 +3288,8 @@ class VMWorkspaceRecoveryStore:
                         == str(operation["vm_uid"])
                         and str(owner_vm.get("rootdisk_pvc_uid") or "")
                         == str(operation["root_pvc_uid"])
+                        and owner_vm.get("vmi_uid")
+                        in (None, str(operation["prior_vmi_uid"]))
                     )
                     if not projection_current:
                         await self._pause_claim_locked(
@@ -3367,6 +3370,54 @@ class VMWorkspaceRecoveryStore:
                         diagnostic={"projection_errors": projection_errors},
                     )
                     return False
+                if operation["owner_kind"] == "job":
+                    revision = owner_vm.get("provisioning_revision", 0)
+                    if type(revision) is not int or not 0 <= revision < 2**63 - 2:
+                        await self._pause_claim_locked(
+                            conn,
+                            operation_id=operation_id,
+                            version=version,
+                            claim_token=claim_token,
+                            worker_id=self.worker_id,
+                            code=WorkspaceRecoveryCode.IDENTITY_CONFLICT,
+                            diagnostic={"reason": "owner_vm_phase_revision_invalid"},
+                        )
+                        return False
+                    successor_phase = None
+                    if "provisioning" in owner_vm:
+                        phase_now = await conn.fetchval(
+                            "SELECT extract(epoch FROM clock_timestamp())::double precision"
+                        )
+                        try:
+                            successor_phase = rebind_recovered_provisioning(
+                                owner_vm["provisioning"],
+                                expected_identity={
+                                    "owner_kind": "job",
+                                    "owner_id": str(operation["owner_id"]),
+                                    "namespace": operation["namespace"],
+                                    "provision_generation": str(
+                                        operation["provision_generation"]
+                                    ),
+                                    "vm_uid": str(operation["vm_uid"]),
+                                    "vmi_uid": str(operation["prior_vmi_uid"]),
+                                    "rootdisk_pvc_uid": str(operation["root_pvc_uid"]),
+                                },
+                                successor_vmi_uid=str(successor["vmi_uid"]),
+                                now=phase_now,
+                            )
+                        except (ValueError, TypeError, KeyError):
+                            await self._pause_claim_locked(
+                                conn,
+                                operation_id=operation_id,
+                                version=version,
+                                claim_token=claim_token,
+                                worker_id=self.worker_id,
+                                code=WorkspaceRecoveryCode.IDENTITY_CONFLICT,
+                                diagnostic={
+                                    "reason": "owner_vm_phase_changed_or_invalid"
+                                },
+                            )
+                            return False
                 for participant in participants:
                     changed = await release_worker_batch_from_workspace_recovery(
                         conn,
@@ -3410,7 +3461,10 @@ class VMWorkspaceRecoveryStore:
                         "ssh_registration_id": successor.get("ssh_registration_id"),
                         "ssh_ready_source": "workspace_recovery",
                         "recovering": False,
+                        "provisioning_revision": revision + 1,
                     }
+                    if successor_phase is not None:
+                        projected["provisioning"] = successor_phase
                     bound = await conn.fetchval(
                         """
                         UPDATE jobs
@@ -3422,6 +3476,9 @@ class VMWorkspaceRecoveryStore:
                            AND context->'vm'->>'provision_generation'=$3
                            AND context->'vm'->>'vm_uid'=$4
                            AND context->'vm'->>'rootdisk_pvc_uid'=$5
+                           AND COALESCE(context->'vm'->'provisioning_revision',
+                                        '0'::jsonb)=$6::jsonb
+                           AND COALESCE(context->'vm'->>'vmi_uid','')=$7
                         RETURNING 1
                         """,
                         operation["owner_id"],
@@ -3429,18 +3486,13 @@ class VMWorkspaceRecoveryStore:
                         str(operation["provision_generation"]),
                         str(operation["vm_uid"]),
                         str(operation["root_pvc_uid"]),
+                        json.dumps(revision),
+                        str(owner_vm.get("vmi_uid") or ""),
                     )
                     if bound is None:
-                        await self._pause_claim_locked(
-                            conn,
-                            operation_id=operation_id,
-                            version=version,
-                            claim_token=claim_token,
-                            worker_id=self.worker_id,
-                            code=WorkspaceRecoveryCode.IDENTITY_CONFLICT,
-                            diagnostic={"reason": "owner_vm_projection_changed"},
-                        )
-                        return False
+                        # Participant releases above are in this transaction.
+                        # An unexpected projection CAS miss must roll them back.
+                        raise _RecoveryClaimLost
                 pin_released = await conn.fetchval(
                     """
                     UPDATE vm_workspace_recovery_retention_pins pin

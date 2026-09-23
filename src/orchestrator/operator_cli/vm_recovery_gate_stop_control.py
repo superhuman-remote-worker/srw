@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
+import hashlib
+import json
 import re
 import time
 from uuid import UUID
@@ -776,9 +778,63 @@ class GateFixturePurge:
         ):
             raise GateStopError("purge_object_recreated")
 
-    async def run(self, job_id):
-        import json
+    async def _cleanup_completed(self, job_id, snapshot):
+        pvc_uid = snapshot["uids"]["pvc"]
+        if pvc_uid is None:
+            return True
+        dv_uid = snapshot["uids"]["dv"]
+        if dv_uid is None:
+            raise GateStopError("purge_cleanup_identity_unproven")
+        identity = {
+            "source": "controller_rootdisk_delete",
+            "owner_kind": "job",
+            "owner_id": str(job_id),
+            "pvc_uid": pvc_uid,
+            "dv_uid": dv_uid,
+            "provision_generation": snapshot["generation"],
+        }
+        intent_digest = (
+            "sha256:"
+            + hashlib.sha256(
+                json.dumps(
+                    identity, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+                ).encode("utf-8")
+            ).hexdigest()
+        )
+        async with self.db.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT completed_at,outcome,intent_digest "
+                "FROM vm_workspace_cleanup_admissions "
+                "WHERE owner_kind='job' AND owner_id=$1 AND pvc_uid=$2 "
+                "AND source='controller_rootdisk_delete'",
+                job_id,
+                UUID(pvc_uid),
+            )
+        if len(rows) != 1:
+            raise GateStopError("purge_cleanup_receipt_missing")
+        if rows[0]["intent_digest"] != intent_digest:
+            raise GateStopError("purge_cleanup_receipt_changed")
+        if rows[0]["completed_at"] is None:
+            return False
+        if rows[0]["outcome"] != "deleted":
+            raise GateStopError("purge_cleanup_receipt_changed")
+        return True
 
+    async def _await_cleanup_completed(self, job_id, snapshot, stop_at):
+        while True:
+            current = self._identities(
+                job_id, await self.kube.fixture_objects(self.namespace, str(job_id))
+            )
+            self._matches(current, snapshot["uids"])
+            if any(current.values()):
+                raise GateStopError("purge_resources_still_present")
+            if await self._cleanup_completed(job_id, snapshot):
+                return
+            if time.monotonic() >= stop_at:
+                raise GateStopError("purge_cleanup_unresolved")
+            await asyncio.sleep(self.interval)
+
+    async def run(self, job_id):
         job_id = UUID(str(job_id))
         objects = await self.kube.fixture_objects(self.namespace, str(job_id))
         identities = self._identities(job_id, objects)
@@ -801,32 +857,51 @@ class GateFixturePurge:
             raise GateStopError("purge_identity_unproven")
         async with self.db.acquire() as conn, conn.transaction():
             row, context = await self._scope(conn, job_id)
-            if anchor is None:
-                # No identity is needed to verify all four resources absent;
-                # this branch never sends a delete or creates purge authority.
-                return
-            snapshot = {
-                "version": 1,
-                "generation": anchor["generation"],
-                "run_id": self.run_id,
-                "job_id": str(job_id),
-                "user_id": str(row["user_id"]),
-                "namespace": self.namespace,
-                "uids": {**identities, "vm": anchor["vm"], "pvc": anchor["pvc"]},
-            }
             previous = context.get(self.KEY)
+            if anchor is None:
+                # A failed current capture cannot erase a prior purge's
+                # durable identity or its still-open cleanup admission.
+                if previous is None:
+                    raise GateStopError("purge_identity_unproven")
+                snapshot = previous
+            else:
+                snapshot = {
+                    "version": 1,
+                    "generation": anchor["generation"],
+                    "run_id": self.run_id,
+                    "job_id": str(job_id),
+                    "user_id": str(row["user_id"]),
+                    "namespace": self.namespace,
+                    "uids": {**identities, "vm": anchor["vm"], "pvc": anchor["pvc"]},
+                }
             if previous is not None:
                 if (
                     not isinstance(previous, dict)
-                    or set(previous) != set(snapshot)
-                    or any(
-                        previous.get(k) != v for k, v in snapshot.items() if k != "uids"
+                    or set(previous)
+                    != {
+                        "version",
+                        "generation",
+                        "run_id",
+                        "job_id",
+                        "user_id",
+                        "namespace",
+                        "uids",
+                    }
+                    or previous.get("version") != 1
+                    or not isinstance(previous.get("generation"), str)
+                    or previous.get("run_id") != self.run_id
+                    or previous.get("job_id") != str(job_id)
+                    or previous.get("user_id") != str(row["user_id"])
+                    or previous.get("namespace") != self.namespace
+                    or (
+                        anchor is not None
+                        and previous.get("generation") != anchor["generation"]
                     )
                     or not isinstance(previous.get("uids"), dict)
                     or set(previous["uids"]) != set(self.KINDS)
                 ):
                     raise GateStopError("purge_snapshot_changed")
-                for value in previous["uids"].values():
+                for value in (previous["generation"], *previous["uids"].values()):
                     if value is not None:
                         try:
                             if str(UUID(value)) != value:
@@ -835,9 +910,10 @@ class GateFixturePurge:
                             raise GateStopError("purge_snapshot_changed") from None
                 snapshot = previous
                 self._matches(identities, snapshot["uids"])
-                self._matches(
-                    {"vm": anchor["vm"], "pvc": anchor["pvc"]}, snapshot["uids"]
-                )
+                if anchor is not None:
+                    self._matches(
+                        {"vm": anchor["vm"], "pvc": anchor["pvc"]}, snapshot["uids"]
+                    )
             else:
                 # Bind VM/PVC to the persisted fixture identity when one exists.
                 stop = context.get(CONTEXT_KEY)
@@ -864,6 +940,9 @@ class GateFixturePurge:
                     json.dumps(snapshot),
                 )
         if not any(identities.values()):
+            await self._await_cleanup_completed(
+                job_id, snapshot, time.monotonic() + self.timeout
+            )
             return
         # The normal provisioner retains its process-zero and cleanup-admission
         # checks. A request response is not proof of physical resource absence.
@@ -880,6 +959,7 @@ class GateFixturePurge:
             )
             self._matches(current, snapshot["uids"])
             if not any(current.values()):
+                await self._await_cleanup_completed(job_id, snapshot, stop_at)
                 return
             await asyncio.sleep(self.interval)
         raise GateStopError("purge_resources_still_present")

@@ -309,6 +309,15 @@ class VMProvisioningPhaseStore:
         for field in ("vm_uid", "rootdisk_pvc_uid", "namespace", "vm_name"):
             if vm.get(field) is not None and vm[field] != status.get(field):
                 return True
+        vmi_uid = status.get("vmi_uid")
+        if vmi_uid is not None and not _uuid(vmi_uid):
+            return True
+        if (
+            vm.get("vmi_uid") is not None
+            and vmi_uid is not None
+            and vm["vmi_uid"] != vmi_uid
+        ):
+            return True
         snapshot = _nested_object(vm.get("creation_request"))
         request = _nested_object(snapshot.get("request"))
         for storage in (
@@ -318,6 +327,12 @@ class VMProvisioningPhaseStore:
             if storage.get("pvc_uid") is not None and storage["pvc_uid"] != pvc_uid:
                 return True
         nested = status.get("provisioning")
+        if (
+            "vmi_uid" in status
+            and nested is not None
+            and (not isinstance(nested, Mapping) or nested.get("vmi_uid") != vmi_uid)
+        ):
+            return True
         if nested is not None:
             if not isinstance(nested, Mapping) or (
                 nested.get("owner_kind") != "job"
@@ -332,6 +347,12 @@ class VMProvisioningPhaseStore:
             ):
                 if nested.get(field) != status.get(field):
                     return True
+            if (
+                vm.get("vmi_uid") is not None
+                and nested.get("vmi_uid") is not None
+                and vm["vmi_uid"] != nested["vmi_uid"]
+            ):
+                return True
         return False
 
     async def apply_status(
@@ -431,8 +452,15 @@ class VMProvisioningPhaseStore:
                             # cannot leak into readiness after recording attention.
                             disposition, reason = "conflict", "vm_phase_unproven"
                     if disposition != "conflict":
+                        if (
+                            identity_updates is not None
+                            and "vmi_uid" in identity_updates
+                            and identity_updates["vmi_uid"] != status.get("vmi_uid")
+                        ):
+                            return "held"
                         for field in (
                             "vm_uid",
+                            "vmi_uid",
                             "vm_name",
                             "namespace",
                             "rootdisk_pvc_uid",
