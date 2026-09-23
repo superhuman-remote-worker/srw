@@ -17,8 +17,10 @@ from shared.vm_resource_admission import (
 )
 from shared.vm_resource_placement import _labels, _unmatched_taints, affinity_label_keys
 from shared.vm_resource_policy import (
+    EnforcementResourcePolicySnapshot,
     parse_host_cost_policy,
     parse_whole_launcher_host_cost_policy,
+    validate_enforcement_resource_policy_snapshot,
     validate_resource_policy_snapshot,
 )
 from shared.vm_launcher_profile import (
@@ -144,7 +146,11 @@ def validate_resource_configuration(value, configuration):
 
 def build_resource_configuration(snapshot, *, template, request, configuration):
     """Only the private resolver supplies the complete operator policy snapshot."""
-    snapshot = validate_resource_policy_snapshot(snapshot)
+    snapshot = (
+        validate_enforcement_resource_policy_snapshot(snapshot)
+        if type(snapshot) is EnforcementResourcePolicySnapshot
+        else validate_resource_policy_snapshot(snapshot)
+    )
     if snapshot.inventory.namespace != configuration["namespace"]:
         raise ResourceAdmissionError("invalid_resource_configuration")
     profile = inspect_resource_template(

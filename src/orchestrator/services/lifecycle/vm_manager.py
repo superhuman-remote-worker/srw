@@ -880,7 +880,7 @@ class VMInstanceManager:
                     # or authorized control can retry promptly.
                     permit.skip("vm_retirement_retry_pending", settled=True)
                 return False
-            if outcome.disposition == "completed" and replayed is None:
+            if outcome.disposition == "completed":
                 await self._complete_destructive_cleanup(cleanup, outcome="completed")
             return bool(outcome.deleted)
         except Exception:
@@ -991,7 +991,7 @@ class VMInstanceManager:
                             purge_disk=True,
                             **vm_cleanup_kwargs(cleanup),
                         )
-                if replayed is None and outcome.disposition in {
+                if outcome.disposition in {
                     "completed",
                     "identity_superseded",
                 }:
@@ -1113,7 +1113,7 @@ class VMInstanceManager:
                                 capture_snapshot=False,
                                 **vm_cleanup_kwargs(cleanup),
                             )
-                    if replayed is None and outcome.disposition in {
+                    if outcome.disposition in {
                         "completed",
                         "identity_superseded",
                     }:
@@ -1172,7 +1172,7 @@ class VMInstanceManager:
                                 purge_disk=True,
                                 **vm_cleanup_kwargs(cleanup),
                             )
-                    if replayed is None and outcome.disposition in {
+                    if outcome.disposition in {
                         "completed",
                         "identity_superseded",
                     }:
@@ -1278,9 +1278,18 @@ class VMInstanceManager:
                 permit.skip("workspace_cleanup_admission_unavailable", settled=True)
             return None
         if cleanup.allowed:
-            return bind_vm_cleanup_permit(
+            bound = bind_vm_cleanup_permit(
                 cleanup, request_id=request_id, intent=resource_intent
             )
+            if owner_kind == "job":
+                from orchestrator.services.vm_workspace_recovery_store import (
+                    prepare_vm_cleanup_resource,
+                )
+
+                await prepare_vm_cleanup_resource(
+                    self._workspace_recovery_store, bound,
+                )
+            return bound
         logger.info(
             "VM cleanup held for %s %s (%s)",
             owner_kind,
@@ -1298,16 +1307,25 @@ class VMInstanceManager:
         if admission_id is None:
             return
         try:
-            await self._workspace_recovery_store.complete_cleanup_permit(
-                admission_id, outcome=outcome
+            from orchestrator.services.vm_workspace_recovery_store import (
+                complete_vm_cleanup_permit,
             )
-        except Exception:
+
+            await complete_vm_cleanup_permit(
+                self._workspace_recovery_store, cleanup, outcome=outcome,
+                provisioner=self._provisioner,
+            )
+        except Exception as exc:
             # The controller result is already conclusive. Leaving the durable
             # admission open is the safe failure mode and keeps later recovery
             # or pruning from racing an unrecorded cleanup result.
             logger.exception(
                 "VM cleanup admission %s could not be completed", admission_id
             )
+            from shared.vm_resource_admission import ResourceAdmissionError
+
+            if isinstance(exc, ResourceAdmissionError):
+                raise
 
     # -------------------------------------------------------------------------
     # Internals

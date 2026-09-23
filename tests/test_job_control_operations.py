@@ -505,21 +505,21 @@ async def test_public_vm_delete_stands_down_before_recovery_owned_cleanup(
     )
     provisioner.release_vm_captured = AsyncMock()
     provisioner.delete_vm = AsyncMock(return_value=True)
-    operations.dependencies.recovery_store.acquire_cleanup_permit = AsyncMock(
-        return_value=SimpleNamespace(
-            allowed=False,
-            reason="workspace_recovery_unresolved",
+    with patch(
+        "orchestrator.services.job_controls.acquire_vm_cleanup_permit",
+        new_callable=AsyncMock,
+    ) as acquire:
+        acquire.return_value = SimpleNamespace(
+            allowed=False, reason="workspace_recovery_unresolved"
         )
-    )
-
-    with pytest.raises(HTTPException) as refused:
-        await operations.delete_vm(JOB_ID)
+        with pytest.raises(HTTPException) as refused:
+            await operations.delete_vm(JOB_ID)
 
     assert refused.value.status_code == 409
     provisioner.capture_vm_teardown_identity.assert_awaited_once_with(
         JOB_ID, entity_type="job"
     )
-    operations.dependencies.recovery_store.acquire_cleanup_permit.assert_awaited_once()
+    acquire.assert_awaited_once()
     provisioner.release_vm_captured.assert_not_awaited()
     provisioner.delete_vm.assert_not_awaited()
 
@@ -541,16 +541,18 @@ async def test_public_vm_delete_retains_cleanup_permit_on_ambiguous_outcome(
         return_value=SimpleNamespace(disposition="retry_pending")
     )
     recovery_store = operations.dependencies.recovery_store
-    recovery_store.acquire_cleanup_permit = AsyncMock(
-        return_value=SimpleNamespace(
-            allowed=True,
-            admission_id="dddddddd-dddd-4ddd-8ddd-dddddddddddd",
-        )
+    permit = SimpleNamespace(
+        allowed=True, admission_id="dddddddd-dddd-4ddd-8ddd-dddddddddddd",
     )
     recovery_store.complete_cleanup_permit = AsyncMock()
 
-    with pytest.raises(HTTPException) as pending:
-        await operations.delete_vm(JOB_ID)
+    with patch(
+        "orchestrator.services.job_controls.acquire_vm_cleanup_permit",
+        new_callable=AsyncMock,
+    ) as acquire:
+        acquire.return_value = permit
+        with pytest.raises(HTTPException) as pending:
+            await operations.delete_vm(JOB_ID)
 
     assert pending.value.status_code == 500
     provisioner.release_vm_captured.assert_awaited_once()

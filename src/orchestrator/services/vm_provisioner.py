@@ -1456,6 +1456,58 @@ class VMProvisioner:
             "controller_authenticated": True,
         }
 
+    async def attest_vm_cleanup_stop(
+        self, candidate: Mapping[str, Any]
+    ) -> dict[str, Any] | None:
+        """Probe an ordinary cleanup's exact compute absence outside SQL locks."""
+
+        try:
+            fields = {
+                key: str(UUID(str(candidate[key])))
+                for key in (
+                    "job_id", "provision_generation", "vm_uid", "vmi_uid",
+                    "launcher_uid", "pvc_uid",
+                )
+            }
+            if any(fields[key] != candidate[key] for key in fields):
+                return None
+        except (KeyError, TypeError, ValueError, AttributeError):
+            return None
+        if type(candidate.get("purge_disk")) is not bool:
+            return None
+        if (
+            await self._current_provision_generation("job", fields["job_id"])
+            != fields["provision_generation"]
+        ):
+            return None
+        probe = await self._probe_vm_teardown_identity(
+            fields["job_id"], fields["provision_generation"]
+        )
+        if (
+            probe.disposition != "absent"
+            or probe.identity is None
+            or not probe.rootdisk_identity_known
+            or not probe.runtime_absence_known
+            or not probe.vmi_absent
+            or not probe.launcher_absent
+            or probe.identity.rootdisk_pvc_uid
+            != (None if candidate["purge_disk"] else fields["pvc_uid"])
+        ):
+            return None
+        return {
+            "version": 1,
+            "kind": "vm_cleanup_physical_stop",
+            **fields,
+            "vm_absent": True,
+            "vmi_absent": True,
+            "launcher_absent": True,
+            "same_generation_replacement": False,
+            "pvc_disposition": (
+                "purged" if candidate["purge_disk"] else "retained"
+            ),
+            "controller_authenticated": True,
+        }
+
     async def revalidate_vm_teardown_identity(
         self,
         job_id: str,
@@ -1503,6 +1555,15 @@ class VMProvisioner:
                 if current.rootdisk_pvc_uid != identity.rootdisk_pvc_uid:
                     return "superseded"
             return "matched"
+        # A VM 404 can race KubeVirt VMI and virt-launcher deletion. Cleanup
+        # completion must prove the whole runtime absent before callers may
+        # settle a permit or debit a compute reservation.
+        if not (
+            probe.runtime_absence_known
+            and probe.vmi_absent
+            and probe.launcher_absent
+        ):
+            return "unknown"
         if not probe.rootdisk_identity_known:
             return "unknown"
         if current.rootdisk_pvc_uid is None:

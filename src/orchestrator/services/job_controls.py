@@ -19,6 +19,7 @@ from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 import httpx
 from fastapi import HTTPException, Request
+from shared.vm_resource_admission import ResourceAdmissionError
 
 from orchestrator.schemas.job_controls import (
     JobApproveRequest,
@@ -245,11 +246,33 @@ class JobControlOperations:
             )
             disposition = outcome.disposition
             if disposition in {"completed", "identity_superseded"}:
+                try:
+                    await complete_vm_cleanup_permit(
+                        self.dependencies.recovery_store,
+                        permit,
+                        outcome=disposition,
+                        provisioner=self.dependencies.vm_provisioner,
+                    )
+                except ResourceAdmissionError as exc:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="VM cleanup physical stop is not yet proven",
+                    ) from exc
+        elif disposition == "completed":
+            # A replayed cleanup outcome still owes its exact resource debit
+            # if the prior process died between controller stop and settlement.
+            try:
                 await complete_vm_cleanup_permit(
                     self.dependencies.recovery_store,
                     permit,
                     outcome=disposition,
+                    provisioner=self.dependencies.vm_provisioner,
                 )
+            except ResourceAdmissionError as exc:
+                raise HTTPException(
+                    status_code=409,
+                    detail="VM cleanup physical stop is not yet proven",
+                ) from exc
         if disposition != "completed":
             raise HTTPException(status_code=500, detail="Failed to delete VM")
         return {"status": "deleting", "job_id": job_id}

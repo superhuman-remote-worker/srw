@@ -14,7 +14,10 @@ from pathlib import Path
 from shared.vm_creation_retry import canonical_request_digest, _validate_json
 from shared.vm_creation_issuance import canonical_configuration_digest
 from shared.workspace_preparation_settings import PreparationSettings
-from shared.vm_resource_policy import CompleteResourcePolicySnapshot
+from shared.vm_resource_policy import (
+    CompleteResourcePolicySnapshot,
+    EnforcementResourcePolicySnapshot,
+)
 
 
 def _digest(value):
@@ -43,6 +46,23 @@ def resolve_creation_configuration(
     import shared
     from shared.workspace_initialization import validate_initialization_request
     from shared.workspace_preparation import validate_request
+
+    if _resource_policy_snapshot is None:
+        raw_resource = os.getenv("VM_RESOURCE_ADMISSION_CONFIG", "")
+        if raw_resource:
+            from shared.vm_resource_policy import validate_enforcement_resource_policy
+
+            try:
+                resource_document = json.loads(raw_resource)
+                flags = resource_document["policy"]
+                if flags["enforcementEnabled"] is True:
+                    _resource_policy_snapshot = validate_enforcement_resource_policy(
+                        resource_document
+                    )
+                elif flags["shadowEnabled"] is True:
+                    raise ValueError("Resource shadow mode is unavailable")
+            except (ValueError, TypeError, KeyError, UnicodeError):
+                raise ValueError("Invalid installed resource policy") from None
 
     # Validate the complete option vocabulary before adding resolved defaults.
     canonical_request_digest(request)
@@ -175,10 +195,15 @@ def resolve_creation_configuration(
     configuration = json.loads(json.dumps(configuration))
     if _resource_policy_snapshot is not None:
         from shared.vm_resource_configuration import build_resource_configuration
-        from shared.vm_resource_policy import validate_resource_policy_snapshot
+        from shared.vm_resource_policy import (
+            validate_enforcement_resource_policy_snapshot,
+            validate_resource_policy_snapshot,
+        )
 
-        _resource_policy_snapshot = validate_resource_policy_snapshot(
-            _resource_policy_snapshot
+        _resource_policy_snapshot = (
+            validate_enforcement_resource_policy_snapshot(_resource_policy_snapshot)
+            if type(_resource_policy_snapshot) is EnforcementResourcePolicySnapshot
+            else validate_resource_policy_snapshot(_resource_policy_snapshot)
         )
         configuration["version"] = (
             3 if _resource_policy_snapshot.inventory.protocol == 2 else 2

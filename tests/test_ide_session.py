@@ -13,6 +13,16 @@ IDE_CLAIM_TOKEN = 7
 IDE_WORK_TOKEN = 11
 
 
+@pytest.fixture(autouse=True)
+def legacy_resource_cleanup(monkeypatch):
+    """Synthetic IDE cleanup owners have no v3 resource charge."""
+    import orchestrator.services.vm_workspace_recovery_store as recovery
+
+    monkeypatch.setattr(
+        recovery, "prepare_vm_cleanup_resource", AsyncMock(return_value=None)
+    )
+
+
 class _ExactIdeRuntimeDB:
     """Small concrete DB seam so permissive mocks cannot invent CAS authority."""
 

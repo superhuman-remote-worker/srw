@@ -8,6 +8,7 @@ import re
 
 from shared.vm_inventory_transport import decode_document
 from shared.vm_lifecycle_auth import configured_secret
+from shared.vm_resource_admission import ResourceAdmissionError
 from shared.vm_resource_inventory import InventoryError
 
 
@@ -64,11 +65,18 @@ class InventorySettings:
             return None
         try:
             value = decode_document(raw.encode("utf-8"), max_bytes=16384)
-            settings = cls.from_document(value)
+            if value.get("policy", {}).get("enforcementEnabled") is True:
+                from shared.vm_resource_policy import (
+                    validate_enforcement_resource_policy,
+                )
+
+                settings = validate_enforcement_resource_policy(value).inventory
+            else:
+                settings = cls.from_document(value)
             if settings is not None and configured_secret(env) is None:
                 raise ValueError
             return settings
-        except (ValueError, TypeError, KeyError, UnicodeError):
+        except (ValueError, TypeError, KeyError, UnicodeError, ResourceAdmissionError):
             raise InventoryError("invalid_inventory_configuration") from None
 
     @classmethod

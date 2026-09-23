@@ -403,6 +403,15 @@ class VMCreationRetryStore:
             and canonical_configuration_digest(configuration) != config_digest
         ):
             raise VMCreationRetryConflict("creation_configuration_changed")
+        resource_writer = self._resource_waiter_writer
+        if resource_writer is None:
+            from orchestrator.services.vm_resource_job_runtime import (
+                installed_job_resource_store,
+            )
+
+            resource_writer = await installed_job_resource_store(
+                conn, self.db, configuration,
+            )
         storage = payload.get("workspace_storage")
         if job.get("_creation_lineage_scope") and (
             storage != job["_creation_lineage_scope"]["binding"]
@@ -441,8 +450,8 @@ class VMCreationRetryStore:
                     )
                 )
             if existing["state"] != "succeeded":
-                if self._resource_waiter_writer is not None:
-                    await self._resource_waiter_writer._write_waiter_on_conn(
+                if resource_writer is not None:
+                    await resource_writer._write_waiter_on_conn(
                         conn, retry=existing, job=job, create=False
                     )
                 if proposal.get("idle_wake_id") is not None:
@@ -493,8 +502,8 @@ class VMCreationRetryStore:
             json.dumps(configuration) if configuration is not None else None,
         )
         retry = _record(row)
-        if self._resource_waiter_writer is not None:
-            await self._resource_waiter_writer._write_waiter_on_conn(
+        if resource_writer is not None:
+            await resource_writer._write_waiter_on_conn(
                 conn, retry=retry, job=job, create=True
             )
         if proposal.get("idle_wake_id") is None:
@@ -649,6 +658,22 @@ class VMCreationRetryStore:
                         for key, value in expected.items()
                     ):
                         raise VMCreationRetryConflict("creation_request_changed")
+                    from orchestrator.services.vm_resource_job_runtime import (
+                        installed_job_resource_store,
+                    )
+                    from shared.vm_resource_admission import ResourceAdmissionError
+
+                    try:
+                        resource = await installed_job_resource_store(
+                            conn, self.db, row["controller_configuration"],
+                        )
+                        resource_grant = (
+                            await resource.grant_on_conn(
+                                conn, retry=row, job=job,
+                            ) if resource is not None else None
+                        )
+                    except ResourceAdmissionError as exc:
+                        raise VMCreationRetryConflict(str(exc)) from None
                     # _scope already owns all owner/PVC and cleanup/recovery locks.
                     # The helper reacquires those same locks, never another scope.
                     intent = _creation_intent(row)
@@ -689,6 +714,7 @@ class VMCreationRetryStore:
                         "admission_id": permit.admission_id,
                         "request_id": str(reservation_request),
                         "intent_digest": cleanup_intent_digest(intent),
+                        **({"resource_grant": resource_grant} if resource_grant else {}),
                     }
         except VMCreationRetryConflict as exc:
             return {"allowed": False, "reason": exc.reason}
@@ -836,7 +862,9 @@ class VMCreationRetryStore:
             or configuration["namespace"] != carrier["metadata"]["namespace"]
         ):
             raise VMCreationRetryConflict("creation_configuration_changed")
-        if values["version"] == 3:
+        if (configuration["version"] == 3) != (values["version"] in (4, 5)):
+            raise VMCreationRetryConflict("resource_carrier_changed")
+        if values["version"] in (3, 5):
             from shared.vm_creation_attachment import validate_attachment_intent
 
             try:
@@ -859,7 +887,7 @@ class VMCreationRetryStore:
                 != values["workspace_attachment"]
             ):
                 raise VMCreationRetryConflict("creation_attachment_changed")
-        if values["version"] in (2, 3) and values["effect_kind"] != "workspace_attach":
+        if values["version"] in (2, 3, 4, 5) and values["effect_kind"] != "workspace_attach":
             from shared.vm_creation_issuance import validate_rootdisk_source
 
             try:
@@ -1011,10 +1039,26 @@ class VMCreationRetryStore:
                         "disposition": "observe_only",
                         "effect_state": prior["state"],
                     }
+                from orchestrator.services.vm_resource_job_runtime import (
+                    installed_job_resource_store,
+                )
+                from shared.vm_resource_admission import ResourceAdmissionError
+
+                try:
+                    resource = await installed_job_resource_store(
+                        conn, self.db, row["controller_configuration"],
+                    )
+                    if resource is not None and (
+                        values.get("resource_grant")
+                        != await resource.grant_on_conn(conn, retry=row, job=job)
+                    ):
+                        raise ResourceAdmissionError("resource_reservation_changed")
+                except ResourceAdmissionError as exc:
+                    raise VMCreationRetryConflict(str(exc)) from None
                 stages = attachment_effect_kinds(row["canonical_request"])
                 if row["canonical_request"].get("workspace_storage") is not None:
                     if (
-                        values["version"] != 3
+                        values["version"] not in (3, 5)
                         or values["workspace_attachment"]["action"] == "observe"
                     ):
                         raise VMCreationRetryConflict(
@@ -1061,7 +1105,7 @@ class VMCreationRetryStore:
                 # Historical v1 effects remain observable above and through
                 # observe/settle, but cannot mint a fresh source-less grant for
                 # modes that require a frozen clone/retained-source document.
-                if values["version"] not in (2, 3) and (
+                if values["version"] not in (2, 3, 4, 5) and (
                     row["controller_configuration"]["golden_enabled"]
                     or row["canonical_request"].get("preparation") is not None
                 ):
@@ -1193,6 +1237,15 @@ class VMCreationRetryStore:
                         "UPDATE vm_workspace_cleanup_admissions SET completed_at=clock_timestamp(),outcome='never_issued' WHERE id=$1",
                         permit["id"],
                     )
+                from orchestrator.services.vm_resource_job_runtime import (
+                    installed_job_resource_store,
+                )
+
+                resource = await installed_job_resource_store(
+                    conn, self.db, row["controller_configuration"], fresh=False,
+                )
+                if resource is not None:
+                    await resource.release_never_issued_on_conn(conn, retry=row)
                 await conn.execute(
                     "UPDATE vm_creation_retries SET state='settled',revision=revision+1,claim_token=NULL,claim_expires_at=NULL,resolved_at=clock_timestamp(),reason='creation_never_issued',updated_at=clock_timestamp() WHERE request_id=$1",
                     row["request_id"],
@@ -1401,7 +1454,7 @@ class VMCreationRetryStore:
 
         values = self._carrier(carrier)
         expected_kinds = {"rootdisk", "cloud_init", "vm"}
-        if values["version"] == 3:
+        if values["version"] in (3, 5):
             expected_kinds.add("workspace_attach")
         if values["effect_kind"] != "vm" or set(observations) != expected_kinds:
             raise VMCreationRetryConflict("creation_adoption_unproven")

@@ -54,6 +54,10 @@ _SAFE_CREATION_REASON_CODES = frozenset(
         "creation_existing_disk_unproven",
         "creation_rootdisk_source_unproven",
         "creation_network_profile_unproven",
+        "resource_reservation_unproven",
+        "resource_reservation_changed",
+        "resource_node_changed",
+        "resource_inventory_unavailable",
     }
 )
 
@@ -76,6 +80,7 @@ _SAFE_CREATION_STAGES = frozenset(
         "stage_plan",
         "disk_pre_authorize",
         "authorize",
+        "resource_node",
         "source_prepare",
         "attachment_prepare",
         "effect_values",
@@ -124,6 +129,10 @@ _SAFE_CREATION_LOCATIONS = {
     "vm_controller.creation_configuration": (
         "creation_configuration",
         frozenset({"resolve_creation_configuration"}),
+    ),
+    "shared.vm_resource_effect_node": (
+        "resource_effect_node",
+        frozenset({"fresh_resource_effect_node", "validate_resource_effect_node"}),
     ),
     "vm_controller.creation_sources": (
         "creation_sources",
@@ -535,8 +544,19 @@ class CreationActuator:
             UUID(previous["effect_nonce"] if previous else row["request_id"]), kind
         )
         disk = prior.get("rootdisk")
+        resource_enabled = row["controller_configuration"]["version"] == 3
+        resource_grant = reservation.get("resource_grant")
+        if resource_enabled and not isinstance(resource_grant, dict):
+            raise CreationUnproven("resource_reservation_unproven")
+        if previous and previous.get("resource_grant") != resource_grant:
+            raise CreationUnproven("resource_reservation_changed")
         return {
-            "version": 3 if attachment is not None else 2,
+            "version": (5 if attachment is not None else 4)
+            if resource_enabled
+            else 3
+            if attachment is not None
+            else 2,
+            **({"resource_grant": resource_grant} if resource_enabled else {}),
             **(
                 {
                     "workspace_attachment": attachment,
@@ -661,6 +681,32 @@ class CreationActuator:
             }
         else:
             result = manifest
+            if "resource_grant" in values:
+                from shared.vm_resource_manifest import conjoin_required_hostname
+
+                required = row["controller_configuration"]["resource_admission"][
+                    "template_profile"
+                ]["required_affinity"]
+                result["spec"]["template"]["spec"].setdefault(
+                    "affinity", {}
+                ).setdefault("nodeAffinity", {})[
+                    "requiredDuringSchedulingIgnoredDuringExecution"
+                ] = conjoin_required_hostname(
+                    required, values["resource_grant"]["node_name"]
+                )
+                for meta in (
+                    result["metadata"],
+                    result["spec"]["template"].setdefault("metadata", {}),
+                ):
+                    meta.setdefault("annotations", {})[
+                        "srw.io/vm-resource-reservation"
+                    ] = values["resource_grant"]["id"]
+                    meta["annotations"]["srw.io/vm-resource-node-uid"] = values[
+                        "resource_grant"
+                    ]["node_uid"]
+                    meta["annotations"]["srw.io/provision-generation"] = row[
+                        "provision_generation"
+                    ]
         metadata = result["metadata"]
         frozen = values["rootdisk_source"]
         if values["effect_kind"] == "vm" and frozen["kind"] == "prepared":
@@ -933,6 +979,19 @@ class CreationActuator:
             )
             if reservation.get("allowed") is not True:
                 return pending
+            if reservation.get("resource_grant") is not None:
+                from shared.vm_resource_admission import ResourceAdmissionError
+                from shared.vm_resource_effect_node import fresh_resource_effect_node
+
+                try:
+                    _mark_creation_stage("resource_node")
+                    await fresh_resource_effect_node(
+                        self.controller,
+                        row,
+                        reservation["resource_grant"],
+                    )
+                except ResourceAdmissionError as exc:
+                    raise CreationUnproven(str(exc)) from None
             previous = latest["carrier_intent"] if latest else None
             kind = (
                 (
@@ -998,6 +1057,11 @@ class CreationActuator:
                     request=row["request"],
                     configuration=row["controller_configuration"],
                     effect_intent=values,
+                    reservation_hostname=(
+                        values["resource_grant"]["node_name"]
+                        if "resource_grant" in values
+                        else None
+                    ),
                 )
             _effect_stage(kind, "begin_effect")
             grant = await self.authority(
@@ -1008,6 +1072,19 @@ class CreationActuator:
             )
             if grant.get("actuation_allowed") is not True:
                 return pending
+            if "resource_grant" in values:
+                from shared.vm_resource_admission import ResourceAdmissionError
+                from shared.vm_resource_effect_node import fresh_resource_effect_node
+
+                try:
+                    _mark_creation_stage("resource_node")
+                    await fresh_resource_effect_node(
+                        self.controller,
+                        row,
+                        values["resource_grant"],
+                    )
+                except ResourceAdmissionError as exc:
+                    raise CreationUnproven(str(exc)) from None
             # The returned CAS grants only this one API call. Any subsequent
             # refusal/transport loss remains conservatively issued-unknown.
             _effect_stage(kind, "grant_carrier_read")

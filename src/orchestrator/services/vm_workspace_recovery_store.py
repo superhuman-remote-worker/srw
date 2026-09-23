@@ -16,6 +16,7 @@ from orchestrator.services.vm_workspace_recovery_telemetry import (
     VMWorkspaceRecoveryTelemetry,
     workspace_recovery_telemetry,
 )
+from shared.vm_resource_admission import ResourceAdmissionError
 from shared.vm_provisioning_phases import rebind_recovered_provisioning
 from shared.worker_queue import (
     get_worker_attempt_disposition,
@@ -511,7 +512,90 @@ async def acquire_vm_cleanup_permit(
         permit = await recovery_store.acquire_cleanup_permit(**arguments)
     else:
         permit = await recovery_store.acquire_cleanup_permit_on_conn(_conn, **arguments)
-    return bind_vm_cleanup_permit(permit, request_id=request_id, intent=resource_intent)
+    bound = bind_vm_cleanup_permit(permit, request_id=request_id, intent=resource_intent)
+    if bound.allowed and owner_kind == "job" and source != "vm_idle_release":
+        await prepare_vm_cleanup_resource(recovery_store, bound, _conn=_conn)
+    return bound
+
+
+async def _vm_cleanup_resource_scope(conn, recovery_store, permit):
+    """Lock the genuine Job source before selecting its installed resource policy."""
+    proof = getattr(permit, "parent_cleanup", None)
+    if not isinstance(proof, Mapping) or not isinstance(proof.get("intent"), Mapping):
+        return None
+    intent = proof["intent"]
+    if intent.get("owner_kind") != "job" or intent.get("source") == "vm_idle_release":
+        return None
+    if (
+        proof.get("admission_id") != str(permit.admission_id)
+        or cleanup_intent_digest(intent) != proof.get("intent_digest")
+        or intent.get("purge_disk") not in {True, False}
+    ):
+        raise ResourceAdmissionError("resource_cleanup_identity_unproven")
+    try:
+        owner_id = UUID(intent["owner_id"])
+        generation = UUID(intent["provision_generation"])
+        pvc_uid = UUID(intent["pvc_uid"])
+    except (KeyError, TypeError, ValueError, AttributeError):
+        raise ResourceAdmissionError("resource_cleanup_identity_unproven") from None
+    preliminary = await conn.fetchrow(
+        "SELECT request_id,controller_configuration FROM vm_creation_retries "
+        "WHERE job_id=$1 AND provision_generation=$2",
+        owner_id, generation,
+    )
+    if preliminary is None:
+        return None
+    configuration = _json(preliminary["controller_configuration"])
+    if not isinstance(configuration, dict) or configuration.get("version") != 3:
+        return None
+    from orchestrator.services.vm_creation_retry_store import VMCreationRetryStore
+    from orchestrator.services.vm_resource_job_runtime import installed_job_resource_store
+
+    creation = VMCreationRetryStore(recovery_store.db)
+    job = await creation._scope(
+        conn, owner_id, pvc_uid,
+        own_admission=permit.admission_id, hold_queue=False,
+    )
+    retry = await conn.fetchrow(
+        "SELECT * FROM vm_creation_retries WHERE request_id=$1 FOR UPDATE",
+        preliminary["request_id"],
+    )
+    cleanup = await conn.fetchrow(
+        "SELECT * FROM vm_workspace_cleanup_admissions WHERE id=$1 FOR UPDATE",
+        permit.admission_id,
+    )
+    if retry is None or cleanup is None:
+        raise ResourceAdmissionError("resource_cleanup_identity_unproven")
+    charge = await conn.fetchrow(
+        "SELECT state FROM vm_resource_reservations WHERE request_id=$1 "
+        "ORDER BY revision DESC LIMIT 1", retry["request_id"],
+    )
+    if charge is None:
+        raise ResourceAdmissionError("resource_cleanup_charge_unproven")
+    if charge["state"] == "released":
+        return None
+    resource = await installed_job_resource_store(
+        conn, recovery_store.db, retry["controller_configuration"], fresh=False,
+    )
+    if resource is None:
+        raise ResourceAdmissionError("resource_cleanup_policy_unproven")
+    return resource, retry, job, cleanup, proof
+
+
+async def prepare_vm_cleanup_resource(recovery_store, permit, *, _conn=None):
+    """Fence a charged ordinary cleanup before its external delete effect."""
+    if _conn is not None:
+        scope = await _vm_cleanup_resource_scope(_conn, recovery_store, permit)
+        if scope is None:
+            return None
+        resource, retry, job, cleanup, intent = scope
+        return await resource.mark_cleanup_teardown_on_conn(
+            _conn, retry=retry, job=job, cleanup=cleanup, intent=intent,
+        )
+    async with recovery_store.db.acquire() as conn, conn.transaction():
+        return await prepare_vm_cleanup_resource(
+            recovery_store, permit, _conn=conn,
+        )
 
 
 async def complete_vm_cleanup_permit(
@@ -519,10 +603,37 @@ async def complete_vm_cleanup_permit(
     permit: CleanupPermit | Any,
     *,
     outcome: str,
+    provisioner: Any = None,
 ) -> None:
     admission_id = getattr(permit, "admission_id", None)
-    if admission_id is not None:
+    if admission_id is None:
+        return
+    if outcome != "completed":
+        if await prepare_vm_cleanup_resource(recovery_store, permit) is not None:
+            raise ResourceAdmissionError("resource_cleanup_stop_unproven")
         await recovery_store.complete_cleanup_permit(admission_id, outcome=outcome)
+        return
+    candidate = await prepare_vm_cleanup_resource(recovery_store, permit)
+    if candidate is None:
+        if completed_cleanup_outcome(permit) != outcome:
+            await recovery_store.complete_cleanup_permit(admission_id, outcome=outcome)
+        return
+    if provisioner is None:
+        raise ResourceAdmissionError("resource_cleanup_stop_unproven")
+    # The authenticated controller probe happens outside the owner/policy row
+    # locks. The final transaction rechecks every identity and the permit.
+    evidence = await provisioner.attest_vm_cleanup_stop(candidate)
+    if evidence is None:
+        raise ResourceAdmissionError("resource_cleanup_stop_unproven")
+    async with recovery_store.db.acquire() as conn, conn.transaction():
+        scope = await _vm_cleanup_resource_scope(conn, recovery_store, permit)
+        if scope is None:
+            raise ResourceAdmissionError("resource_cleanup_identity_unproven")
+        resource, retry, job, cleanup, intent = scope
+        await resource.release_cleanup_compute_on_conn(
+            conn, retry=retry, job=job, cleanup=cleanup,
+            intent=intent, proof=evidence,
+        )
 
 
 class VMWorkspaceRecoveryStore:
@@ -3550,6 +3661,27 @@ class VMWorkspaceRecoveryStore:
                 )
                 if recovered is None:
                     raise _RecoveryClaimLost
+                if operation["owner_kind"] == "job":
+                    from orchestrator.services.vm_resource_job_runtime import (
+                        installed_job_resource_store,
+                    )
+
+                    resource_retry = await conn.fetchrow(
+                        "SELECT * FROM vm_creation_retries WHERE job_id=$1 "
+                        "AND provision_generation=$2 FOR UPDATE",
+                        operation["owner_id"], operation["provision_generation"],
+                    )
+                    resource = await installed_job_resource_store(
+                        conn, self.db,
+                        resource_retry["controller_configuration"]
+                        if resource_retry is not None else None,
+                        fresh=False,
+                    )
+                    if resource is not None:
+                        await resource.append_recovery_successor_on_conn(
+                            conn, retry=resource_retry, operation=operation,
+                            final_observation=final,
+                        )
                 slot_released = await conn.fetchval(
                     "DELETE FROM vm_workspace_recovery_probe_slots "
                     "WHERE recovery_id=$1 AND claim_token=$2 RETURNING 1",
@@ -3558,7 +3690,7 @@ class VMWorkspaceRecoveryStore:
                 )
                 if slot_released is None:
                     raise _RecoveryClaimLost
-        except _RecoveryClaimLost:
+        except (_RecoveryClaimLost, ResourceAdmissionError):
             return False
         return True
 

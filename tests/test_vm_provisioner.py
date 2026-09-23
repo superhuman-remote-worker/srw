@@ -102,10 +102,85 @@ def provisioner_with_nats(mock_nats_bridge, mock_db):
                 ),
                 "rootdisk_identity_known": True,
                 "credential_runtime_started": False,
+                "vmi_absent": deleted,
+                "launcher_absent": deleted,
+                "runtime_absence_known": deleted,
             }
 
         mock_nats_bridge.query_vm_status.side_effect = _query_exact_vm
         yield prov
+
+
+@pytest.mark.parametrize("vmi_absent,launcher_absent", [
+    (False, True), (True, False), (False, False),
+])
+def test_captured_vm_404_with_runtime_remnant_is_not_cleanup_completion(
+    vmi_absent, launcher_absent,
+):
+    from orchestrator.services.vm_provisioner import (
+        VMProvisioner, VMTeardownIdentity, _VMTeardownProbe,
+    )
+
+    identity = VMTeardownIdentity(
+        provision_generation=PROVISION_GENERATION,
+        vm_uid="captured-vm-uid",
+        rootdisk_pvc_uid="captured-root-uid",
+    )
+    probe = _VMTeardownProbe(
+        "absent",
+        VMTeardownIdentity(
+            provision_generation=PROVISION_GENERATION,
+            vm_uid=None,
+            rootdisk_pvc_uid=None,
+        ),
+        rootdisk_identity_known=True,
+        runtime_absence_known=vmi_absent and launcher_absent,
+        vmi_absent=vmi_absent,
+        launcher_absent=launcher_absent,
+    )
+    assert VMProvisioner._classify_captured_probe(
+        probe, identity, purge_disk=True,
+    ) == "unknown"
+
+
+@pytest.mark.asyncio
+async def test_cleanup_stop_attestation_requires_exact_runtime_and_pvc_disposition(
+    provisioner_with_nats, mock_nats_bridge,
+):
+    from uuid import uuid4
+
+    ids = {key: str(uuid4()) for key in (
+        "job_id", "vm_uid", "vmi_uid", "launcher_uid", "pvc_uid"
+    )}
+    candidate = {
+        **ids, "provision_generation": PROVISION_GENERATION,
+        "purge_disk": True,
+    }
+    reply = {
+        "_identity_authenticated": True,
+        "status": "not_found",
+        "provision_generation": PROVISION_GENERATION,
+        "rootdisk_identity_known": True,
+        "vmi_absent": True, "launcher_absent": False,
+        "runtime_absence_known": False,
+    }
+    mock_nats_bridge.query_vm_status.side_effect = None
+    mock_nats_bridge.query_vm_status.return_value = reply
+    assert await provisioner_with_nats.attest_vm_cleanup_stop(candidate) is None
+    mock_nats_bridge.query_vm_status.return_value = {
+        **reply, "vmi_absent": True, "launcher_absent": True,
+        "runtime_absence_known": True,
+        "rootdisk_pvc_uid": ids["pvc_uid"],
+    }
+    assert await provisioner_with_nats.attest_vm_cleanup_stop(candidate) is None
+    mock_nats_bridge.query_vm_status.return_value = {
+        **reply, "vmi_absent": True, "launcher_absent": True,
+        "runtime_absence_known": True,
+    }
+    proof = await provisioner_with_nats.attest_vm_cleanup_stop(candidate)
+    assert proof is not None
+    assert proof["vm_uid"] == ids["vm_uid"]
+    assert proof["pvc_disposition"] == "purged"
 
 
 @pytest.fixture
@@ -1711,6 +1786,9 @@ class TestCapturedVmTeardown:
                 credential_runtime_started=credential_runtime_started,
             ),
             rootdisk_identity_known=known,
+            runtime_absence_known=disposition == "absent" and known,
+            vmi_absent=disposition == "absent" and known,
+            launcher_absent=disposition == "absent" and known,
         )
 
     @pytest.mark.asyncio
