@@ -511,6 +511,10 @@ class JobResumeRequest(BaseModel):
             "the [FEEDBACK_RESUME] banner; omitted -> honest generic fallback."
         ),
     )
+    delegation_results: Optional[List[Dict[str, Any]]] = Field(
+        default=None,
+        description="Completed delegated job results for the resumed parent",
+    )
     datasources: Optional[List[Dict[str, Any]]] = Field(
         default=None,
         description="Resolved connector details (set by orchestrator)",

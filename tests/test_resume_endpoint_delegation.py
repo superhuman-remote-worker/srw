@@ -27,6 +27,7 @@ import os
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import ANY, AsyncMock, MagicMock
+from uuid import UUID
 
 import pytest
 from fastapi import HTTPException
@@ -339,6 +340,11 @@ class TestResumeJobOnAgentInjection:
         vm_job = _job(
             config_override={"workspace": {"backend": "vm"}},
             context={
+                "queued_feedback": "approved next step",
+                "queued_feedback_reason": "human reply",
+                "queued_feedback_delivery_id": "66666666-6666-4666-8666-666666666666",
+                "delegation_results": [{"job_id": "child-1", "status": "completed"}],
+                "delegation_results_delivery_id": "77777777-7777-4777-8777-777777777777",
                 "_workspace_contract": {
                     "version": 1, "requested_backend": "vm",
                     "assigned_backend": "vm", "assignment_source": "request",
@@ -356,6 +362,19 @@ class TestResumeJobOnAgentInjection:
         assert confirm.await_args.kwargs["pinned_projection_digest"] == (
             accepted_client.pinned_projection_digest
         )
+        posted = _posted_payload()
+        parsed = JobResumeRequest.model_validate(posted)
+        assert set(posted) == set(parsed.model_dump(mode="json", exclude_none=True))
+        assert parsed.delegation_results == [
+            {"job_id": "child-1", "status": "completed"}
+        ]
+        assert confirm.await_args.kwargs["consumed_context"] == {
+            "queued_feedback": "approved next step",
+            "queued_feedback_reason": "human reply",
+            "queued_feedback_delivery_id": "66666666-6666-4666-8666-666666666666",
+            "delegation_results": [{"job_id": "child-1", "status": "completed"}],
+            "delegation_results_delivery_id": "77777777-7777-4777-8777-777777777777",
+        }
 
     @pytest.mark.asyncio
     async def test_sandbox_resume_rebuilds_complete_ssh_config(
@@ -886,18 +905,19 @@ class TestResumeEndpointDelegation:
 
         # The explicit resume path also stamps the honest [FEEDBACK_RESUME]
         # banner cause (P1-A): a paused job -> the operator wording.
-        orchestrator.main.postgres_db.merge_job_context.assert_awaited_once_with(
-            JOB_ID,
-            {
-                "queued_feedback": "try again",
-                "queued_feedback_reason": (
-                    "An operator explicitly resumed this job with the feedback below."
-                ),
-            },
+        merged = orchestrator.main.postgres_db.merge_job_context.await_args.args
+        assert merged[0] == JOB_ID
+        assert merged[1]["queued_feedback"] == "try again"
+        assert merged[1]["queued_feedback_reason"] == (
+            "An operator explicitly resumed this job with the feedback below."
         )
+        UUID(merged[1]["queued_feedback_delivery_id"])
         delegated_job = endpoint_collaborators.delegate.await_args.args[0]
         assert delegated_job["context"]["queued_feedback"] == "try again"
         assert delegated_job["context"]["queued_feedback_reason"]
+        assert delegated_job["context"]["queued_feedback_delivery_id"] == (
+            merged[1]["queued_feedback_delivery_id"]
+        )
 
     @pytest.mark.asyncio
     async def test_declined_resume_falls_back_to_queue(self, endpoint_collaborators):

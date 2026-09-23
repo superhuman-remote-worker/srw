@@ -17,6 +17,7 @@ from typing import Any, Mapping
 from uuid import UUID, uuid4
 
 from fastapi import HTTPException
+from shared.pinned_job_delivery import stamp_pinned_resume_input_ids
 from shared.pinned_session_identity import PinnedJobRecipient
 from orchestrator.services.pinned_k8s_effect import pod_containers_are_terminal
 
@@ -1388,9 +1389,13 @@ class VMIdleLifecycleStore:
                 conn, operation, execution_requested=execution_requested,
             )
             if context_merge and not operation["wake_execution_requested"]:
+                merge = (
+                    stamp_pinned_resume_input_ids(context_merge)
+                    if job["execution_lane"] == "pinned" else dict(context_merge)
+                )
                 await conn.execute(
                     "UPDATE jobs SET context=COALESCE(context,'{}'::jsonb) || $2::jsonb "
-                    "WHERE id=$1", owner_id, json.dumps(dict(context_merge)),
+                    "WHERE id=$1", owner_id, json.dumps(merge),
                 )
             wake_id = row["wake_id"]
             if access_kind is not None:

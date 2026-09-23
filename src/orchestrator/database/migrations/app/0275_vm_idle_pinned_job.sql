@@ -15,6 +15,13 @@ CREATE TABLE public.pinned_job_deliveries (
     original_dispatch_marker jsonb NOT NULL,
     marker_digest text NOT NULL CHECK (marker_digest ~ '^sha256:[0-9a-f]{64}$'),
     projection_digest text NOT NULL CHECK (projection_digest ~ '^sha256:[0-9a-f]{64}$'),
+    consumed_context_digests jsonb NOT NULL DEFAULT '{}'::jsonb
+        CHECK (jsonb_typeof(consumed_context_digests)='object'
+            AND (consumed_context_digests - 'feedback' - 'delegation')='{}'::jsonb
+            AND (NOT consumed_context_digests ? 'feedback'
+                OR consumed_context_digests->>'feedback' ~ '^sha256:[0-9a-f]{64}$')
+            AND (NOT consumed_context_digests ? 'delegation'
+                OR consumed_context_digests->>'delegation' ~ '^sha256:[0-9a-f]{64}$')),
     runtime_authority_digest text NOT NULL CHECK (runtime_authority_digest ~ '^sha256:[0-9a-f]{64}$'),
     identity_digest text NOT NULL CHECK (identity_digest ~ '^sha256:[0-9a-f]{64}$'),
     original_lease_expires_at timestamptz NOT NULL,
@@ -67,14 +74,16 @@ BEGIN
         RAISE EXCEPTION 'Pinned delivery history is retained' USING ERRCODE='23514';
     END IF;
     IF ROW(NEW.id,NEW.job_id,NEW.agent_id,NEW.original_dispatch_marker,
-           NEW.marker_digest,NEW.projection_digest,NEW.runtime_authority_digest,
+           NEW.marker_digest,NEW.projection_digest,NEW.consumed_context_digests,
+           NEW.runtime_authority_digest,
            NEW.identity_digest,NEW.original_lease_expires_at,
            NEW.intent_lease_expires_at,NEW.process_generation,NEW.pod_name,
            NEW.pod_namespace,NEW.pod_uid,NEW.provision_generation,NEW.vm_uid,
            NEW.vmi_uid,NEW.launcher_uid,NEW.pvc_uid,NEW.intent_at)
        IS DISTINCT FROM
        ROW(OLD.id,OLD.job_id,OLD.agent_id,OLD.original_dispatch_marker,
-           OLD.marker_digest,OLD.projection_digest,OLD.runtime_authority_digest,
+           OLD.marker_digest,OLD.projection_digest,OLD.consumed_context_digests,
+           OLD.runtime_authority_digest,
            OLD.identity_digest,OLD.original_lease_expires_at,
            OLD.intent_lease_expires_at,OLD.process_generation,OLD.pod_name,
            OLD.pod_namespace,OLD.pod_uid,OLD.provision_generation,OLD.vm_uid,

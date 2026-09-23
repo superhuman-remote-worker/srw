@@ -1579,7 +1579,9 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
         if _shutdown_requested:
             raise HTTPException(503, "Agent is shutting down")
 
-        from agent.api.pinned_delivery import accepted_pinned_job_delivery
+        from agent.api.pinned_delivery import (
+            accepted_pinned_job_delivery, resume_feedback_with_delegation,
+        )
 
         if _pod_state == PodState.WORKING and _current_job_id == request.job_id:
             acknowledgement = accepted_pinned_job_delivery(
@@ -1614,6 +1616,9 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
             _current_job_id = request.job_id
 
         _clear_stop()
+        feedback, feedback_reason = resume_feedback_with_delegation(
+            request.feedback, request.feedback_reason, request.delegation_results,
+        )
 
         async def _do_resume():
             global _current_job_id, _pod_state
@@ -1652,6 +1657,8 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
                     resume_metadata["project_id"] = request.project_id
                 if request.runtime_actor:
                     resume_metadata["runtime_actor"] = request.runtime_actor
+                if request.delegation_results:
+                    resume_metadata["delegation_results"] = request.delegation_results
                 resume_metadata["workspace_runtime"] = request.workspace_runtime
                 for field in (
                     "workspace_provisioner",
@@ -1677,8 +1684,8 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
                     request.job_id,
                     metadata=resume_metadata if resume_metadata else None,
                     resume=True,
-                    feedback=request.feedback,
-                    feedback_reason=request.feedback_reason,
+                    feedback=feedback,
+                    feedback_reason=feedback_reason,
                     original_config_name=request.config_name,
                     previous_status=request.previous_status,
                     stream=True,

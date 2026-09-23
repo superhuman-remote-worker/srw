@@ -42,6 +42,7 @@ from shared.vm_lifecycle_auth import (
 async def _pinned_vm_delivery_intent(
     dependencies: "JobDeliveryDependencies", *, job_id: str, agent_id: str,
     recipient: Any, payload: dict[str, Any],
+    consumed_context: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     """Add a replayable exact delivery ID only for a supported VM recipient."""
 
@@ -63,6 +64,7 @@ async def _pinned_vm_delivery_intent(
     digest = pinned_job_projection_digest(payload)
     intent = await dependencies.store.prepare_pinned_job_delivery(
         job_id, agent_id, recipient=recipient, projection_digest=digest,
+        consumed_context=consumed_context,
     )
     if intent is None:
         return None, None
@@ -775,9 +777,25 @@ async def resume_job_on_agent(
         job_context = job.get("context") or {}
         if isinstance(job_context, str):
             job_context = json.loads(job_context)
+        original_context = dict(job_context)
         queued_feedback = job_context.pop("queued_feedback", None)
         queued_feedback_reason = job_context.pop("queued_feedback_reason", None)
         delegation_results = job_context.pop("delegation_results", None)
+        consumed_context = {}
+        if queued_feedback:
+            consumed_context.update({
+                key: original_context[key]
+                for key in (
+                    "queued_feedback", "queued_feedback_reason",
+                    "queued_feedback_delivery_id",
+                ) if key in original_context
+            })
+        if delegation_results:
+            consumed_context.update({
+                key: original_context[key]
+                for key in ("delegation_results", "delegation_results_delivery_id")
+                if key in original_context
+            })
 
         # The per-job Gitea remote. Without it the agent's pod-handoff clone
         # (resume onto a fresh workspace with no snapshot) can never fire and
@@ -881,6 +899,7 @@ async def resume_job_on_agent(
             dependencies, job_id=job_id, agent_id=agent_id,
             recipient=target.recipient,
             payload={k: v for k, v in resume_payload.items() if v is not None},
+            consumed_context=consumed_context,
         )
         if delivery_payload is None:
             return False
@@ -942,20 +961,11 @@ async def resume_job_on_agent(
         # confirmed below, so a future resume won't re-inject them.
         # `context - text[]` (not a full-dict rewrite) preserves any concurrent
         # merge into other context keys.
-        consumed_keys = [
-            key
-            for key, value in (
-                ("queued_feedback", queued_feedback),
-                ("queued_feedback_reason", queued_feedback_reason),
-                ("delegation_results", delegation_results),
-            )
-            if value
-        ]
         if dependencies.completion_commands_enabled():
             if not await dependencies.store.confirm_pinned_job_dispatch(
                 job_id,
                 agent_id,
-                consumed_context_keys=consumed_keys,
+                consumed_context=consumed_context,
                 pinned_delivery_id=accepted_delivery_id,
                 pinned_projection_digest=(
                     delivery_payload.get("pinned_projection_digest")
@@ -984,10 +994,12 @@ async def resume_job_on_agent(
                 agent_id,
             )
             return False
-        elif consumed_keys:
+        elif consumed_context:
             # Consumed only once ownership is confirmed, like the command
             # path: a lost CAS leaves the feedback for the next resume.
-            await dependencies.store.delete_job_context_keys(job_id, consumed_keys)
+            await dependencies.store.delete_job_context_keys(
+                job_id, list(consumed_context)
+            )
 
         await dependencies.store.heartbeat(
             agent_id=agent_id,

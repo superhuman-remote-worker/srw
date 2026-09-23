@@ -12,7 +12,9 @@ from uuid import UUID
 from orchestrator.services.vm_remote_operation import (
     VMRemoteOperationUnavailable, _identity_from_row,
 )
-from shared.pinned_job_delivery import pinned_job_delivery_proof
+from shared.pinned_job_delivery import (
+    pinned_job_delivery_proof, pinned_resume_consumed_keys,
+)
 from shared.vm_lifecycle_auth import LifecycleAuthConfigurationError, configured_secret
 from shared.workspace_contract import vm_mode_from_env, workspace_runtime_authority_digest
 
@@ -168,7 +170,7 @@ async def record_pinned_wait_receipt_on_conn(
     ):
         return None
     job = await conn.fetchrow(
-        "SELECT id,lease_expires_at FROM jobs WHERE id=$1 FOR UPDATE",
+        "SELECT id,lease_expires_at,context FROM jobs WHERE id=$1 FOR UPDATE",
         delivery["job_id"],
     )
     if job is None or job["lease_expires_at"] is None:
@@ -178,14 +180,26 @@ async def record_pinned_wait_receipt_on_conn(
         source_kind, UUID(str(source_id)),
     )
     if existing is not None:
-        return dict(existing) if existing["delivery_id"] == delivery["id"] else None
-    row = await conn.fetchrow(
-        "INSERT INTO pinned_job_wait_receipts "
-        "(delivery_id,job_id,source_kind,source_id,lease_expires_at) "
-        "VALUES($1,$2,$3,$4,$5) RETURNING *",
-        delivery["id"], delivery["job_id"], source_kind,
-        UUID(str(source_id)), job["lease_expires_at"],
+        if existing["delivery_id"] != delivery["id"]:
+            return None
+        row = existing
+    else:
+        row = await conn.fetchrow(
+            "INSERT INTO pinned_job_wait_receipts "
+            "(delivery_id,job_id,source_kind,source_id,lease_expires_at) "
+            "VALUES($1,$2,$3,$4,$5) RETURNING *",
+            delivery["id"], delivery["job_id"], source_kind,
+            UUID(str(source_id)), job["lease_expires_at"],
+        )
+    consumed_keys = pinned_resume_consumed_keys(
+        _object(job["context"]), _object(delivery.get("consumed_context_digests")),
     )
+    if consumed_keys:
+        await conn.execute(
+            "UPDATE jobs SET context=COALESCE(context,'{}'::jsonb) - $2::text[] "
+            "WHERE id=$1",
+            delivery["job_id"], consumed_keys,
+        )
     return dict(row)
 
 

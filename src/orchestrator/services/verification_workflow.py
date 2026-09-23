@@ -51,6 +51,7 @@ from orchestrator.services.verification_ledger import (
     validate_verdict_call,
 )
 from shared.run_queue import unpark_unit
+from shared.pinned_job_delivery import stamp_pinned_resume_input_ids
 from shared.worker_queue import enqueue_worker_batch_wake, reset_worker_batch_attempts
 
 logger = logging.getLogger(__name__)
@@ -340,7 +341,7 @@ async def materialize_critic_verdict_transactional(
                     resume_context = (
                         dependencies.transaction.stateless_resume_context(resume_values)
                         if queue_first
-                        else resume_values
+                        else stamp_pinned_resume_input_ids(resume_values)
                     )
                     if queue_first:
                         if (

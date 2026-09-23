@@ -101,6 +101,11 @@ from shared.workspace_contract import (
     workspace_contract_authority_identity,
     workspace_contract_projection,
 )
+from shared.pinned_job_delivery import (
+    pinned_resume_consumed_keys,
+    pinned_resume_input_digests,
+    stamp_pinned_resume_input_ids,
+)
 from orchestrator.services.cloud.backend_instance_authority import (
     MAIN_CLOUD_BACKEND_INSTANCE_VERSION,
     MainCloudBackendInstanceAuthority,
@@ -9446,6 +9451,8 @@ class PostgresDB:
             "required_pr_repositories",
         ):
             updates.pop(key, None)
+        # Every explicit new one-shot generation gets its own identity.
+        updates = stamp_pinned_resume_input_ids(updates)
         query = (
             "UPDATE jobs "
             "SET context = COALESCE(context, '{}'::jsonb) || $1::jsonb, "
@@ -9677,6 +9684,7 @@ class PostgresDB:
         *,
         recipient: PinnedJobRecipient,
         projection_digest: str,
+        consumed_context: Dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         """Freeze a non-authorizing exact VM delivery intent before HTTP POST.
 
@@ -9714,6 +9722,9 @@ class PostgresDB:
             if isinstance(context, str):
                 context = json.loads(context)
             if not isinstance(context, dict):
+                return None
+            consumed_digests = pinned_resume_input_digests(context, consumed_context)
+            if consumed_digests is None:
                 return None
             marker = context.get("_workspace_dispatch_authority")
             vm = context.get("vm")
@@ -9805,6 +9816,8 @@ class PostgresDB:
                 if (
                     existing["agent_id"] != agent_uuid
                     or existing["projection_digest"] != projection_digest
+                    or _json_object_or_empty(existing["consumed_context_digests"])
+                        != consumed_digests
                     or existing["runtime_authority_digest"] != authority_digest
                     or existing["identity_digest"] != identity_digest
                     or existing["process_generation"] != recipient.expected_process_generation
@@ -9820,14 +9833,15 @@ class PostgresDB:
             row = await conn.fetchrow(
                 "INSERT INTO pinned_job_deliveries "
                 "(job_id,agent_id,original_dispatch_marker,marker_digest,projection_digest,"
-                "runtime_authority_digest,identity_digest,"
+                "consumed_context_digests,runtime_authority_digest,identity_digest,"
                 "original_lease_expires_at,intent_lease_expires_at,process_generation,"
                 "pod_name,pod_namespace,pod_uid,provision_generation,vm_uid,vmi_uid,"
                 "launcher_uid,pvc_uid) "
-                "VALUES($1,$2,$3::jsonb,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18) "
+                "VALUES($1,$2,$3::jsonb,$4,$5,$6::jsonb,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19) "
                 "RETURNING *",
                 job_uuid, agent_uuid, json.dumps(marker), marker_digest,
-                projection_digest, authority_digest, identity_digest,
+                projection_digest, json.dumps(consumed_digests),
+                authority_digest, identity_digest,
                 original_lease, job["lease_expires_at"],
                 recipient.expected_process_generation, agent["hostname"],
                 namespace, agent["pod_uid"], generation, vm_uid, vmi_uid,
@@ -9840,7 +9854,7 @@ class PostgresDB:
         job_id: str,
         agent_id: str,
         *,
-        consumed_context_keys: List[str] | None = None,
+        consumed_context: Dict[str, Any] | None = None,
         pinned_delivery_id: str | None = None,
         pinned_projection_digest: str | None = None,
     ) -> bool:
@@ -9872,6 +9886,11 @@ class PostgresDB:
                 or job["assigned_agent_id"] != agent_uuid
             ):
                 return False
+            context = job["context"]
+            if isinstance(context, str):
+                context = json.loads(context)
+            context = context if isinstance(context, dict) else {}
+            consumed_keys: list[str] = []
             if delivery_uuid is not None:
                 delivery = await conn.fetchrow(
                     "SELECT * FROM pinned_job_deliveries "
@@ -9883,10 +9902,9 @@ class PostgresDB:
                     or delivery["projection_digest"] != pinned_projection_digest
                 ):
                     return False
-                context = job["context"]
-                if isinstance(context, str):
-                    context = json.loads(context)
-                context = context if isinstance(context, dict) else {}
+                consumed_keys = pinned_resume_consumed_keys(
+                    context, _json_object_or_empty(delivery["consumed_context_digests"])
+                )
                 vm = context.get("vm")
                 marker = context.get("_workspace_dispatch_authority")
                 if isinstance(marker, str):
@@ -9967,6 +9985,12 @@ class PostgresDB:
                         return False
                     # The genuine report won publication before our 202. Do
                     # not rewrite the wait or its server-owned entered_at.
+                    if consumed_keys:
+                        await conn.execute(
+                            "UPDATE jobs SET context=COALESCE(context, '{}'::jsonb) "
+                            "- $2::text[] WHERE id=$1",
+                            job_uuid, consumed_keys,
+                        )
                     return True
                 if job["status"] != "processing" or job["lease_expires_at"] is None:
                     return False
@@ -10002,6 +10026,9 @@ class PostgresDB:
                         "WHERE id=$1 AND accepted_at IS NULL",
                         delivery_uuid, job["lease_expires_at"],
                     )
+            else:
+                expected = pinned_resume_input_digests(context, consumed_context)
+                consumed_keys = pinned_resume_consumed_keys(context, expected)
             if job["status"] != "processing":
                 return False
             row = await conn.fetchrow(
@@ -10016,7 +10043,7 @@ class PostgresDB:
                   AND NOT ({_completion_control_active_sql("context")})
                 RETURNING id
                 """,
-                job_uuid, agent_uuid, list(consumed_context_keys or []),
+                job_uuid, agent_uuid, consumed_keys,
             )
             return row is not None
 
@@ -30316,7 +30343,7 @@ class PostgresDB:
             """
         args = (
             job_uuid,
-            json.dumps(dict(context_merge or {})),
+            json.dumps(stamp_pinned_resume_input_ids(context_merge) or {}),
             expected_status,
             generation,
             json.dumps(actor),
@@ -30607,6 +30634,7 @@ class PostgresDB:
             claim_id = str(UUID(completion_control_claim_id))
         except ValueError:
             return False
+        context_merge = stamp_pinned_resume_input_ids(context_merge)
 
         class _ResumeCASLostError(Exception):
             pass

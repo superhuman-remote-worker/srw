@@ -40,6 +40,7 @@ from shared.operator_pause_hold import (
     operator_pause_lift_already_consumed,
     operator_pause_lift_token,
 )
+from shared.pinned_job_delivery import stamp_pinned_resume_input_ids
 from orchestrator.services.vm_workspace_recovery_store import (
     acquire_vm_cleanup_permit,
     vm_cleanup_kwargs,
@@ -1158,6 +1159,8 @@ class JobControlOperations:
                     if feedback
                     else None
                 )
+                if job.get("execution_lane") == "pinned":
+                    context_merge = stamp_pinned_resume_input_ids(context_merge)
                 expected_status = expected_status_override or str(job["status"])
                 if (
                     job.get("execution_lane") == "stateless"
@@ -1501,15 +1504,18 @@ class JobControlOperations:
             # _resume_job_on_agent reads job["context"], not the DB. Idempotent
             # with the queue fallback below, which merges the same value.
             if request.feedback:
+                feedback_delivery_id = str(uuid4())
                 await self.dependencies.store.merge_job_context(
                     job_id,
                     {
                         "queued_feedback": request.feedback,
                         "queued_feedback_reason": feedback_reason,
+                        "queued_feedback_delivery_id": feedback_delivery_id,
                     },
                 )
                 job_context["queued_feedback"] = request.feedback
                 job_context["queued_feedback_reason"] = feedback_reason
+                job_context["queued_feedback_delivery_id"] = feedback_delivery_id
                 job = {**job, "context": job_context}
 
             # Restore S3 environment snapshot into the VM before resuming.
@@ -2673,6 +2679,8 @@ class JobControlOperations:
         # + paused (dispatchable) — fused so the dispatcher can never observe a
         # half-written decision.
         resume_context = {"sudo_denial": sudo_denial, "queued_feedback": feedback}
+        if job.get("execution_lane") != "stateless":
+            resume_context = stamp_pinned_resume_input_ids(resume_context)
         if job.get("execution_lane") == "stateless":
             try:
                 queued = await self.dependencies.store.queue_stateless_job_for_resume(
@@ -2832,6 +2840,8 @@ class JobControlOperations:
         if not uses_srw_runtime(job):
             return False
         observed_status = str(job.get("status") or "")
+        if job.get("execution_lane") == "pinned":
+            updates = stamp_pinned_resume_input_ids(updates)
         if expected_status is not None and observed_status != expected_status:
             self.dependencies.logger.warning(
                 "_internal_resume_job: expected status %s but job %s is %s",

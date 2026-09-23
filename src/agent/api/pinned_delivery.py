@@ -2,11 +2,35 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 from fastapi import HTTPException
 
 from shared.pinned_job_delivery import pinned_job_projection_digest
+
+
+def resume_feedback_with_delegation(
+    feedback: str | None,
+    feedback_reason: str | None,
+    delegation_results: list[dict[str, Any]] | None,
+) -> tuple[str | None, str | None]:
+    """Deliver completed child results through the existing graph resume input.
+
+    The structured results remain in metadata, but a checkpoint resume
+    otherwise never reads that metadata key. The graph's
+    feedback path is its durable, model-visible continuation input.
+    """
+
+    if not delegation_results:
+        return feedback, feedback_reason
+    child_results = "Completed delegated jobs:\n" + json.dumps(
+        delegation_results, sort_keys=True, ensure_ascii=False,
+    )
+    return (
+        f"{feedback}\n\n{child_results}" if feedback else child_results,
+        feedback_reason if feedback else "Completed delegated jobs returned to the parent.",
+    )
 
 
 def accepted_pinned_job_delivery(request: Any, client: Any, *, retry: bool) -> dict:

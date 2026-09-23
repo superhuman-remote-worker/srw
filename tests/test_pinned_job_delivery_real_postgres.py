@@ -14,14 +14,18 @@ import pytest
 
 from shared.pinned_session_identity import PinnedJobRecipient
 from tests.test_b05_lane_j_job_preparation import (
-    READY_VM, _bundle_job, _start_bundle_deps,
+    READY_VM, _bundle_job, _start_bundle_deps, bundle_env,  # noqa: F401
 )
-from tests.test_vm_idle_lifecycle_real_postgres import seed_wait
+from tests.test_vm_idle_lifecycle_real_postgres import (
+    db as _db_fixture,
+    postgres_db_fixture,  # noqa: F401
+    pg_dsn,  # noqa: F401
+    _schema_applied,  # noqa: F401
+    profiled_idle_image_policy,  # noqa: F401
+    seed_wait,
+)
 
-pytest_plugins = (
-    "tests.test_vm_idle_lifecycle_real_postgres",
-    "tests.test_b05_lane_j_job_preparation",
-)
+db = _db_fixture
 
 
 MIGRATION = (
@@ -95,7 +99,7 @@ async def test_vm_start_wire_accepts_current_delivery_intent(db, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_real_vm_start_dispatch_posts_accepted_receipt(db, monkeypatch, bundle_env):
+async def test_real_vm_start_dispatch_posts_accepted_receipt(db, monkeypatch, bundle_env):  # noqa: F811
     from agent.api.models import JobStartRequest
     from agent.api.pinned_delivery import accepted_pinned_job_delivery
     from orchestrator.services.job_control_delivery import (
@@ -175,7 +179,10 @@ async def test_real_vm_start_dispatch_posts_accepted_receipt(db, monkeypatch, bu
 
 
 @pytest.mark.asyncio
-async def test_vm_resume_wire_accepts_exact_current_claim(db, monkeypatch):
+@pytest.mark.parametrize("newer_group", [None, "feedback", "delegation", "both"])
+async def test_vm_resume_wire_accepts_exact_current_claim(
+    db, monkeypatch, newer_group,
+):
     """A checkpoint resume gets a new receipt after the dispatch marker rotates."""
     from agent.api.models import JobResumeRequest
     from agent.api.pinned_delivery import accepted_pinned_job_delivery
@@ -209,10 +216,24 @@ async def test_vm_resume_wire_accepts_exact_current_claim(db, monkeypatch):
         "UPDATE agents SET status='ready',current_job_id=NULL WHERE id=$1", agent_id,
     )
     assert await db.claim_job_for_agent(str(owner), str(agent_id))
-    changed = {**base, "feedback": "new reply"}
+    delivered = {
+        "queued_feedback": "new reply",
+        "queued_feedback_reason": "human reply",
+        "queued_feedback_delivery_id": str(uuid4()),
+        "delegation_results": [{"job_id": "child-1", "status": "completed"}],
+        "delegation_results_delivery_id": str(uuid4()),
+    }
+    await db.execute(
+        "UPDATE jobs SET context=context || $2::jsonb WHERE id=$1",
+        owner, json.dumps(delivered),
+    )
+    changed = {
+        **base, "feedback": "new reply", "feedback_reason": "human reply",
+        "delegation_results": delivered["delegation_results"],
+    }
     second_payload, second = await _pinned_vm_delivery_intent(
         SimpleNamespace(store=db), job_id=str(owner), agent_id=str(agent_id),
-        recipient=recipient, payload=changed,
+        recipient=recipient, payload=changed, consumed_context=delivered,
     )
     assert second is not None and second["id"] != first["id"]
     client = SimpleNamespace()
@@ -220,6 +241,33 @@ async def test_vm_resume_wire_accepts_exact_current_claim(db, monkeypatch):
         JobResumeRequest.model_validate(second_payload), client, retry=False,
     )
     assert acknowledgement["pinned_delivery_id"] == str(second["id"])
+    newer = {
+        "queued_feedback": "new reply",  # Even identical content is a new delivery.
+        "queued_feedback_reason": "human reply",
+        "queued_feedback_delivery_id": str(uuid4()),
+        "delegation_results": delivered["delegation_results"],
+        "delegation_results_delivery_id": str(uuid4()),
+    }
+    concurrent = {
+        key: value for key, value in newer.items()
+        if newer_group == "both"
+        or (newer_group == "feedback" and key.startswith("queued_feedback"))
+        or (newer_group == "delegation" and key.startswith("delegation_results"))
+    }
+    if concurrent:
+        assert await db.merge_job_context(
+            str(owner), {
+                key: value for key, value in concurrent.items()
+                if not key.endswith("_delivery_id")
+            },
+        )
+        produced = json.loads(await db.fetchval(
+            "SELECT context FROM jobs WHERE id=$1", owner,
+        ))
+        concurrent = {key: produced[key] for key in concurrent}
+        for key in concurrent:
+            if key.endswith("_delivery_id"):
+                assert concurrent[key] != delivered[key]
     route_id = UUID(json.loads(await db.fetchval(
         "SELECT workspace_idle_episode FROM jobs WHERE id=$1", owner,
     ))["wait_key"])
@@ -228,14 +276,49 @@ async def test_vm_resume_wire_accepts_exact_current_claim(db, monkeypatch):
         process_generation=generation, pod_uid=pod_uid,
         proof=second_payload["pinned_delivery_proof"], route_id=route_id,
     )
+    context_at_receipt = json.loads(await db.fetchval(
+        "SELECT context FROM jobs WHERE id=$1", owner,
+    ))
+    assert context_at_receipt.items() >= concurrent.items()
+    assert all(key not in context_at_receipt for key in delivered if key not in concurrent)
     assert await db.confirm_pinned_job_dispatch(
         str(owner), str(agent_id), pinned_delivery_id=acknowledgement["pinned_delivery_id"],
         pinned_projection_digest=acknowledgement["pinned_projection_digest"],
+        consumed_context=delivered,
     )
+    context_after = json.loads(await db.fetchval(
+        "SELECT context FROM jobs WHERE id=$1", owner,
+    ))
+    assert context_after.items() >= concurrent.items()
+    assert all(key not in context_after for key in delivered if key not in concurrent)
     assert await db.fetchval(
         "SELECT delivery_id FROM pinned_job_wait_receipts WHERE source_kind='route' "
         "AND source_id=$1", route_id,
     ) == second["id"]
+    later = {
+        "queued_feedback": "later reply",
+        "queued_feedback_reason": "later reason",
+        "queued_feedback_delivery_id": str(uuid4()),
+        "delegation_results": [{"job_id": "child-2", "status": "completed"}],
+        "delegation_results_delivery_id": str(uuid4()),
+    }
+    await db.execute(
+        "UPDATE jobs SET context=context || $2::jsonb WHERE id=$1",
+        owner, json.dumps(later),
+    )
+    assert await db.confirm_pinned_job_dispatch(
+        str(owner), str(agent_id), pinned_delivery_id=acknowledgement["pinned_delivery_id"],
+        pinned_projection_digest=acknowledgement["pinned_projection_digest"],
+        consumed_context=delivered,
+    )
+    assert json.loads(await db.fetchval(
+        "SELECT context FROM jobs WHERE id=$1", owner,
+    )).items() >= later.items()
+    assert not await db.confirm_pinned_job_dispatch(
+        str(owner), str(agent_id), pinned_delivery_id=acknowledgement["pinned_delivery_id"],
+        pinned_projection_digest="sha256:" + "0" * 64,
+        consumed_context=later,
+    )
     changed_payload, changed_intent = await _pinned_vm_delivery_intent(
         SimpleNamespace(store=db), job_id=str(owner), agent_id=str(agent_id),
         recipient=recipient, payload={**changed, "feedback": "different second projection"},
