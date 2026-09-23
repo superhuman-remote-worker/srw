@@ -1,5 +1,6 @@
 """Exact agent lifecycle projection for an authorized pinned retirement."""
 
+import asyncio
 import dataclasses
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -17,6 +18,7 @@ from agent.api.orchestrator_client import OrchestratorClient
 
 import orchestrator.main as main
 from orchestrator.routers import agent_cloud_stage as agent_cloud_stage_routes
+from orchestrator.services import pinned_k8s_reconciliation
 
 
 THREAD_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1"
@@ -30,6 +32,30 @@ CLAIM_GENERATION = "66666666-6666-4666-8666-666666666666"
 # A pinned status write must name the exact registered process; the
 # request model refuses an agent_id without it.
 PROCESS_GENERATION = "77777777-7777-4777-8777-777777777777"
+
+
+def _k8s_reconciliation_dependencies(
+    db, **provisioners
+) -> pinned_k8s_reconciliation.PinnedK8sReconciliationDependencies:
+    """Explicit collaborators for the pinned Kubernetes leader loops.
+
+    A provisioner the test does not name is present but unavailable, as an
+    unconfigured one is in the application.
+    """
+
+    fields = {
+        "agent_provisioner": MagicMock(name="agent_provisioner", is_available=False),
+        "persistent_provisioner": MagicMock(
+            name="persistent_provisioner", is_available=False
+        ),
+        "container_provisioner": MagicMock(
+            name="container_provisioner", is_available=False
+        ),
+    }
+    fields.update(provisioners)
+    return pinned_k8s_reconciliation.PinnedK8sReconciliationDependencies(
+        store=db, **fields
+    )
 
 
 @pytest.mark.asyncio
@@ -438,7 +464,7 @@ async def test_permanent_retirement_accepts_exact_claim_already_reclaimed():
 @pytest.mark.asyncio
 @pytest.mark.parametrize("foreign_kind", [None, "pvc", "pod"])
 async def test_restart_reconciler_promotes_only_exact_agent_create(foreign_kind):
-    shutdown = main.asyncio.Event()
+    shutdown = asyncio.Event()
     row = {
         "attempt_id": CLAIM_ATTEMPT,
         "thread_id": THREAD_ID,
@@ -501,11 +527,10 @@ async def test_restart_reconciler_promotes_only_exact_agent_create(foreign_kind)
     db.get_pinned_warm_binding_candidate = AsyncMock(return_value=None)
     db.publish_pinned_agent_workspace_claim = AsyncMock(return_value=True)
     db.publish_pinned_agent_pod_provision_intent = AsyncMock(return_value=True)
-    with (
-        patch.object(main, "agent_provisioner", provider),
-        patch.object(main, "postgres_db", db),
-    ):
-        await main.pinned_agent_create_intent_reconciler(shutdown)
+    await pinned_k8s_reconciliation.pinned_agent_create_intent_reconciler(
+        shutdown,
+        dependencies=_k8s_reconciliation_dependencies(db, agent_provisioner=provider),
+    )
 
     if foreign_kind == "pvc":
         db.publish_pinned_agent_workspace_claim.assert_not_awaited()
@@ -535,7 +560,7 @@ async def test_restart_reconciler_promotes_only_exact_agent_create(foreign_kind)
 
 @pytest.mark.asyncio
 async def test_leader_adopts_exact_legacy_authority_before_create_reconcile():
-    shutdown = main.asyncio.Event()
+    shutdown = asyncio.Event()
     observed_at = datetime(2026, 8, 27, tzinfo=timezone.utc)
     row = {
         "attempt_id": CLAIM_ATTEMPT,
@@ -590,13 +615,15 @@ async def test_leader_adopts_exact_legacy_authority_before_create_reconcile():
     db.list_pinned_agent_create_intents_for_reconcile = AsyncMock(
         side_effect=_list_create
     )
-    with (
-        patch.object(main, "persistent_provisioner", provider),
-        patch.object(main, "postgres_db", db),
-    ):
-        await main.asyncio.wait_for(
-            main.pinned_agent_create_intent_reconciler(shutdown), timeout=1
-        )
+    await asyncio.wait_for(
+        pinned_k8s_reconciliation.pinned_agent_create_intent_reconciler(
+            shutdown,
+            dependencies=_k8s_reconciliation_dependencies(
+                db, persistent_provisioner=provider
+            ),
+        ),
+        timeout=1,
+    )
 
     provider.protect_legacy_pinned_agent_authority.assert_awaited_once_with(row)
     db.adopt_legacy_pinned_agent_k8s_authority.assert_awaited_once_with(
@@ -617,7 +644,7 @@ async def test_leader_adopts_exact_legacy_authority_before_create_reconcile():
 @pytest.mark.asyncio
 @pytest.mark.parametrize("replacement", [False, True])
 async def test_post_horizon_pod_fence_gc_is_uid_exact(replacement):
-    shutdown = main.asyncio.Event()
+    shutdown = asyncio.Event()
     row = {
         "resource_kind": "pod",
         "authority_id": CLAIM_ATTEMPT,
@@ -652,11 +679,10 @@ async def test_post_horizon_pod_fence_gc_is_uid_exact(replacement):
 
     db.list_due_pinned_k8s_create_fences = AsyncMock(side_effect=_list)
     db.complete_pinned_k8s_create_fence_gc = AsyncMock(return_value=True)
-    with (
-        patch.object(main, "agent_provisioner", provider),
-        patch.object(main, "postgres_db", db),
-    ):
-        await main.pinned_k8s_create_fence_gc_sweeper(shutdown)
+    await pinned_k8s_reconciliation.pinned_k8s_create_fence_gc_sweeper(
+        shutdown,
+        dependencies=_k8s_reconciliation_dependencies(db, agent_provisioner=provider),
+    )
 
     if replacement:
         provider.delete_agent_pod_exact.assert_not_awaited()
@@ -677,7 +703,7 @@ async def test_post_horizon_pod_fence_gc_is_uid_exact(replacement):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("replacement", [False, True])
 async def test_post_horizon_pvc_fence_gc_is_uid_exact(replacement):
-    shutdown = main.asyncio.Event()
+    shutdown = asyncio.Event()
     row = {
         "resource_kind": "pvc",
         "authority_id": CLAIM_ID,
@@ -714,11 +740,12 @@ async def test_post_horizon_pvc_fence_gc_is_uid_exact(replacement):
 
     db.list_due_pinned_k8s_create_fences = AsyncMock(side_effect=_list)
     db.complete_pinned_k8s_create_fence_gc = AsyncMock(return_value=True)
-    with (
-        patch.object(main, "persistent_provisioner", provider),
-        patch.object(main, "postgres_db", db),
-    ):
-        await main.pinned_k8s_create_fence_gc_sweeper(shutdown)
+    await pinned_k8s_reconciliation.pinned_k8s_create_fence_gc_sweeper(
+        shutdown,
+        dependencies=_k8s_reconciliation_dependencies(
+            db, persistent_provisioner=provider
+        ),
+    )
 
     if replacement:
         provider.delete_agent_workspace_claim_exact.assert_not_awaited()
@@ -741,7 +768,7 @@ async def test_post_horizon_pvc_fence_gc_is_uid_exact(replacement):
 async def test_post_horizon_workspace_fence_gc_retires_only_after_exact_delete(
     replacement,
 ):
-    shutdown = main.asyncio.Event()
+    shutdown = asyncio.Event()
     row = {
         "attempt_id": CLAIM_ATTEMPT,
         "thread_id": THREAD_ID,
@@ -769,11 +796,12 @@ async def test_post_horizon_workspace_fence_gc_retires_only_after_exact_delete(
         side_effect=_list_workspace
     )
     db.retire_pinned_thread_workspace_provision_fence = AsyncMock(return_value=True)
-    with (
-        patch.object(main, "container_provisioner", provider),
-        patch.object(main, "postgres_db", db),
-    ):
-        await main.pinned_k8s_create_fence_gc_sweeper(shutdown)
+    await pinned_k8s_reconciliation.pinned_k8s_create_fence_gc_sweeper(
+        shutdown,
+        dependencies=_k8s_reconciliation_dependencies(
+            db, container_provisioner=provider
+        ),
+    )
 
     provider.delete_pinned_workspace_provision_fences_exact.assert_awaited_once_with(
         row
