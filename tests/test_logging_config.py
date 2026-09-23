@@ -303,6 +303,38 @@ class TestRedaction:
         msg = "job job-123 completed in 4200ms with status ok"
         assert mod.redact(msg) == msg
 
+    def test_credential_bearing_remote_keeps_its_host(self, mod):
+        # A failed push logs its remote; archived logs are read back by
+        # get_job_log (workspace_git_credentials_in_tool_and_audit_output).
+        token = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b"
+        out = mod.redact(
+            f"Tool git_push failed: fatal: unable to access "
+            f"'https://oauth2:{token}@gitea.local/org/repo.git/': error 403"
+        )
+        assert token not in out and "oauth2" not in out
+        assert f"https://{mod._REDACTED}@gitea.local/org/repo.git/" in out
+        # A password-only userinfo is still a credential.
+        assert "s3cretPass9" not in mod.redact("redis://:s3cretPass9@cache:6379/0")
+
+    def test_a_hostile_jwt_run_is_linear(self, mod):
+        # `\b` treats `-` as a boundary, so `eyJ-eyJ-…` started a JWT match at
+        # every repetition and each rescanned the record: 0.85 s for 80 KB.
+        import time
+
+        best = float("inf")
+        for _ in range(3):
+            started = time.perf_counter()
+            mod.redact("eyJ-" * 20_000)
+            best = min(best, time.perf_counter() - started)
+        assert best < 0.1
+
+    def test_plain_remotes_are_untouched(self, mod):
+        msg = (
+            "cloned https://gitea.local/org/repo.git and "
+            "ssh://git@gitea.local:2222/org/repo.git"
+        )
+        assert mod.redact(msg) == msg
+
     def test_json_message_is_redacted(self, mod):
         rec = _emit_json(mod, "dispatching with api_key=sk-LIVE1234567890abcdefXYZ")
         assert "sk-LIVE1234567890abcdefXYZ" not in json.dumps(rec)

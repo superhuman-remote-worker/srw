@@ -19,16 +19,27 @@ REDACTED = "***REDACTED***"
 _KV_SECRET = re.compile(
     r"(?i)\b(authorization|api[_-]?key|secret|client[_-]?secret|password|passwd|"
     r"token|access[_-]?key|private[_-]?key|refresh[_-]?token)"
-    r"(\"?\s*[:=]\s*\"?)"
-    r"([^\s\"',}{)]+)"
+    r"(\"?\s{0,16}[:=]\s{0,16}\"?)"
+    r"([^\s\"',}{)]{1,4096})"
 )
-# Standalone secret-shaped tokens.
+# Standalone secret-shaped tokens. Every quantifier is bounded and the JWT is
+# anchored by a lookbehind outside its own alphabet: `\b` treats `-` as a
+# boundary, so `eyJ-eyJ-…` started a match at every repetition and each one
+# rescanned the rest of the record.
 _STANDALONE = [
-    re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._\-]+"),  # bearer <opaque/jwt>
-    re.compile(r"\beyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+"),  # JWT
-    re.compile(r"\bsk-[A-Za-z0-9_\-]{16,}"),  # OpenAI / Anthropic style
-    re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{8,}"),  # Slack
-    re.compile(r"\bgh[pousr]_[A-Za-z0-9]{16,}"),  # GitHub
+    re.compile(r"(?i)\bbearer\s{1,16}[A-Za-z0-9._\-]{1,4096}"),  # bearer <opaque/jwt>
+    re.compile(
+        r"(?<![A-Za-z0-9_\-])eyJ[A-Za-z0-9_\-]{1,4096}\.[A-Za-z0-9_\-]{1,4096}"
+        r"\.[A-Za-z0-9_\-]{1,4096}"
+    ),  # JWT
+    re.compile(r"\bsk-[A-Za-z0-9_\-]{16,512}"),  # OpenAI / Anthropic style
+    re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{8,512}"),  # Slack
+    re.compile(r"\bgh[pousr]_[A-Za-z0-9]{16,255}"),  # GitHub
+    # scheme://user:password@host — the userinfo only, so the line still names
+    # the host. A failed fetch or push logs its credential-bearing remote, and
+    # archived agent logs are served back through get_job_log. Anchored after
+    # `://` and stopping at `/`, `@` and whitespace, so it is linear.
+    re.compile(r"(?<=://)[^\s/@:]{0,256}+:[^\s/@]{0,2048}+(?=@)"),
 ]
 
 
