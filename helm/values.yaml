@@ -230,6 +230,11 @@ orchestrator:
   # creates. Never enable it on a shared or production release.
   vmWorkspaceRecoveryAcceptanceGate:
     enabled: false
+  # -- Expose the disposable retained-disk Resume acceptance adapter only on
+  # an exclusively owned cluster. The host wrapper owns its temporary quota;
+  # the application receives no quota write permission.
+  vmRetainedResumeAcceptanceGate:
+    enabled: false
   resources:
     requests:
       memory: "256Mi"

@@ -47,6 +47,7 @@ SUPPORTED_SCENARIOS = frozenset(
         "search-job",
         "fetch-job",
         "worker-job",
+        "retained-sentinel-worker",
         "prepared-workspace-job",
     }
 )
@@ -72,10 +73,12 @@ class ArmScenarioRequest(BaseModel):
         "search-job",
         "fetch-job",
         "worker-job",
+        "retained-sentinel-worker",
         "prepared-workspace-job",
     ] = "reply"
     required_responses: int = Field(default=1, ge=1, le=100)
     chunk_delay_ms: int = Field(default=100, ge=0, le=2_000)
+    sentinel_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
 
 
 @dataclass(frozen=True)
@@ -117,6 +120,7 @@ class RunState:
     search_job_tool_steps: int = 0
     fetch_job_tool_steps: int = 0
     worker_job_tool_steps: int = 0
+    sentinel_sha256: str | None = None
     next_sequence: int = 1
     counters: Counter[tuple[str, str, bool, str]] = field(default_factory=Counter)
     calls: list[dict[str, Any]] = field(default_factory=list)
@@ -161,6 +165,12 @@ class ScenarioStore:
 
     async def arm(self, run_id: str, request: ArmScenarioRequest) -> dict[str, Any]:
         _validate_run_id(run_id)
+        if (request.scenario == "retained-sentinel-worker") != (
+            request.sentinel_sha256 is not None
+        ):
+            raise ScenarioError(
+                422, "sentinel_contract_invalid", "Sentinel hash is required only for retained worker scenario."
+            )
         async with self._lock:
             if run_id in self._runs:
                 raise ScenarioError(
@@ -173,6 +183,7 @@ class ScenarioStore:
                 scenario=request.scenario,
                 required_responses=request.required_responses,
                 chunk_delay_ms=request.chunk_delay_ms,
+                sentinel_sha256=request.sentinel_sha256,
             )
             return self._serialize(self._runs[run_id])
 
@@ -510,7 +521,7 @@ class ScenarioStore:
                 state.fetch_job_tool_steps += 1
             if (
                 outcome == "success"
-                and decision.scenario in {"worker-job", "prepared-workspace-job"}
+                and decision.scenario in {"worker-job", "prepared-workspace-job", "retained-sentinel-worker"}
                 and decision.tool_phase
             ):
                 state.worker_job_tool_steps += 1
@@ -586,6 +597,7 @@ class ScenarioStore:
             "search_job_tool_steps": state.search_job_tool_steps,
             "fetch_job_tool_steps": state.fetch_job_tool_steps,
             "worker_job_tool_steps": state.worker_job_tool_steps,
+            "sentinel_sha256": state.sentinel_sha256,
             "unexpected_count": state.unexpected_calls,
             "pending_calls": len(state.pending),
             "counters": counters,
@@ -745,6 +757,7 @@ def create_inference_app(
                     )
             elif structured_name is None and state["scenario"] in {
                 "worker-job",
+                "retained-sentinel-worker",
                 "prepared-workspace-job",
             }:
                 tool_names = _tool_names(payload)
@@ -753,10 +766,16 @@ def create_inference_app(
                     "todo_complete",
                     "next_phase_todos",
                     "job_complete",
+                    "run_command",
                 }:
                     if state["scenario"] == "prepared-workspace-job":
                         tool_call = _prepared_workspace_tool_call(
                             state["worker_job_tool_steps"], run_id, messages
+                        )
+                    elif state["scenario"] == "retained-sentinel-worker":
+                        tool_call = _retained_sentinel_tool_call(
+                            state["worker_job_tool_steps"], run_id,
+                            state["sentinel_sha256"], messages,
                         )
                     else:
                         tool_call = _worker_job_tool_call(
@@ -1582,6 +1601,51 @@ def _prepared_workspace_tool_call(
                 422,
                 "workspace_proof_missing",
                 "Prepared workspace execution did not return the required proof.",
+            )
+    return _worker_job_tool_call(step if step < 6 else step - 1, run_id)
+
+
+def _retained_sentinel_tool_call(
+    step: int, run_id: str, digest: str, messages: list[dict[str, Any]]
+) -> ToolCallSpec:
+    """Read the exact run-owned file in the real worker before completion."""
+    if step == 6:
+        path = f".srw-a1-gate/{run_id}/sentinel"
+        command = "\n".join(
+            (
+                "set -eu",
+                f"test -f {shlex.quote(path)}",
+                f"actual=$(sha256sum {shlex.quote(path)})",
+                f"test \"${{actual%% *}}\" = {shlex.quote(digest)}",
+                f"printf '%s\\n' {shlex.quote('SRW_A1_SENTINEL_PASS:' + run_id)}",
+            )
+        )
+        return ToolCallSpec(
+            name="run_command",
+            arguments=json.dumps(
+                {"command": command, "working_dir": ".", "timeout": 30},
+                separators=(",", ":"),
+            ),
+        )
+    if step == 7:
+        previous = next(
+            (
+                message
+                for message in reversed(messages)
+                if isinstance(message, dict) and message.get("role") == "tool"
+            ),
+            {},
+        )
+        output = previous.get("content")
+        if (
+            not isinstance(output, str)
+            or "Exit code: 0" not in output.splitlines()
+            or f"SRW_A1_SENTINEL_PASS:{run_id}" not in output.splitlines()
+        ):
+            raise ScenarioError(
+                422,
+                "workspace_proof_missing",
+                "Retained sentinel command did not return the required proof.",
             )
     return _worker_job_tool_call(step if step < 6 else step - 1, run_id)
 

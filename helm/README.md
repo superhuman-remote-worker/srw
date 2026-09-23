@@ -1000,6 +1000,22 @@ overlap, slow boot, deadline pause, forced deletion, missing stop evidence, and
 marker/checkpoint/PVC survival. The cluster is deleted on success and failure;
 `--keep-on-failure` is the explicit diagnostic exception.
 
+The separate A1 retained-disk Resume adapter is disabled by default at
+`orchestrator.vmRetainedResumeAcceptanceGate.enabled`. On an exclusively owned
+disposable cluster, enable it together with same-cluster VM mode, durable
+creation retries, the remote operation protocol, retained rootdisks, and the
+network profile's explicit immutable image allowlist. Run
+`scripts/vm-retained-resume-gate.py --help` for its exact context, cluster UID,
+Job, dedicated owner (display name `A1 retained Resume gate <run-id>`), PVC,
+provider Pod and private-output inputs. The wrapper installs a
+run-owned temporary VM-count ResourceQuota only after the predecessor's
+production cleanup settles; it removes that exact quota after the owner Resume
+has joined a rejected VM effect. The application service account receives no
+quota write permission. The adapter refuses any unrelated runnable worker
+batch, so older queued work must be resolved through normal owner controls
+before enabling the real worker pool. Its local-path result proves a retained
+PVC and real worker flow; it is distinct from the Longhorn durability gate.
+
 ### Verify
 
 ```bash

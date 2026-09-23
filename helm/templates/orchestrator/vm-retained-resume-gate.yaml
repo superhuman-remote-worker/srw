@@ -1,0 +1,71 @@
+{{- $vmRetainedResumeGate := .Values.orchestrator.vmRetainedResumeAcceptanceGate | default dict -}}
+{{- if (get $vmRetainedResumeGate "enabled" | default false) -}}
+{{- if not (include "srw.vmSameCluster" .) -}}
+{{- fail "vmRetainedResumeAcceptanceGate requires vm.mode=same-cluster" -}}
+{{- end -}}
+{{- if not (and .Values.orchestrator.vmProvisioning.creationRetryEnabled .Values.vmController.persistentRootdisk.enabled .Values.vmController.networkProfile.enabled .Values.orchestrator.vmRemoteOperationProtocol.enabled) -}}
+{{- fail "vmRetainedResumeAcceptanceGate requires durable creation, retained rootdisk, network profile and remote operation protocols" -}}
+{{- end -}}
+{{- if empty (.Values.vmController.networkProfile.imageAllowlist | default list) -}}
+{{- fail "vmRetainedResumeAcceptanceGate requires an explicit immutable image allowlist" -}}
+{{- end -}}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "srw.fullname" . }}-vm-retained-resume-gate-adapter
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "srw.componentLabels" (dict "context" . "component" "orchestrator") | nindent 4 }}
+    srw.io/vm-retained-resume-gate-adapter: "true"
+data:
+  protocolVersion: "1"
+  target: {{ printf "deploy/%s-orchestrator" (include "srw.fullname" .) | quote }}
+  container: orchestrator
+  commandJson: {{ list "python" "-m" "orchestrator.operator_cli.vm_retained_resume_acceptance" | toJson | quote }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "srw.fullname" . }}-vm-retained-resume-gate-pvc-read
+  namespace: {{ include "srw.vmControllerNamespace" . }}
+rules:
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "srw.fullname" . }}-vm-retained-resume-gate-pvc-read
+  namespace: {{ include "srw.vmControllerNamespace" . }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "srw.fullname" . }}-vm-retained-resume-gate-pvc-read
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "srw.orchestratorServiceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ printf "%s-%s-vm-retained-resume-pv" (include "srw.fullname" .) .Release.Namespace | trunc 63 | trimSuffix "-" }}
+rules:
+  - apiGroups: [""]
+    resources: ["persistentvolumes"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ printf "%s-%s-vm-retained-resume-pv" (include "srw.fullname" .) .Release.Namespace | trunc 63 | trimSuffix "-" }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ printf "%s-%s-vm-retained-resume-pv" (include "srw.fullname" .) .Release.Namespace | trunc 63 | trimSuffix "-" }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "srw.orchestratorServiceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}
