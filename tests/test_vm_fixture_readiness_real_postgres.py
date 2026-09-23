@@ -395,7 +395,13 @@ async def test_a1_public_pause_hold_on_real_ready_fixture_blocks_enabled_admissi
         )
     )
     client_type = httpx.AsyncClient
-    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: client_type(
+    issued_headers = []
+    class CaptureOwnerClient(client_type):
+        async def put(self, *args, **kwargs):
+            issued_headers.append(kwargs["headers"])
+            return await super().put(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: CaptureOwnerClient(
         transport=httpx.ASGITransport(app=app), base_url="http://owner.test",
         **kwargs,
     ))
@@ -415,6 +421,14 @@ async def test_a1_public_pause_hold_on_real_ready_fixture_blocks_enabled_admissi
         "AND origin='vm-retained-resume-fixture' AND revoked_at IS NOT NULL",
         owner,
     ) == 1
+    assert len(issued_headers) == 1
+    async with client_type(
+        transport=httpx.ASGITransport(app=app), base_url="http://owner.test",
+    ) as client:
+        refused = await client.put(
+            f"/api/jobs/{job_id}/pause", headers=issued_headers[0],
+        )
+    assert refused.status_code == 401
     assert await db.fetchval(
         "SELECT count(*) FROM worker_batch_attempts WHERE job_id=$1", job_id,
     ) == 0
