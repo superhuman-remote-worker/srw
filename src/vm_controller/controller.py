@@ -1175,6 +1175,32 @@ class VMController:
                 # evidence. Its durable DB reservation still excludes cleanup;
                 # only the original authenticated create may finish sealing.
                 continue
+            if CREATION_INTENT_ANNOTATION in annotations:
+                # The typed Lease LIST omits apiVersion/kind on its items. Read
+                # the exact captured object before verifying its full seal;
+                # a same-name replacement must never inherit the list UID.
+                name = _metadata_value(item, "name")
+                namespace = _metadata_value(item, "namespace")
+                uid = _metadata_value(item, "uid")
+                if (
+                    not all(isinstance(value, str) and value for value in (name, uid))
+                    or namespace != VM_NAMESPACE
+                ):
+                    raise RuntimeError("creation carrier list identity is incomplete")
+                current = await asyncio.to_thread(
+                    self.coordination_api.read_namespaced_lease,
+                    name=name,
+                    namespace=VM_NAMESPACE,
+                )
+                if (
+                    _metadata_value(current, "name") != name
+                    or _metadata_value(current, "namespace") != namespace
+                    or _metadata_value(current, "uid") != uid
+                    or CREATION_INTENT_ANNOTATION
+                    not in (_metadata_value(current, "annotations", {}) or {})
+                ):
+                    raise RuntimeError("creation carrier exact identity changed")
+                item = current
             carrier = self._parse_workspace_cleanup_carrier(item)
             if not carrier["carrier_sealed"]:
                 carrier = await self._refresh_workspace_cleanup_carrier(carrier)
