@@ -7,6 +7,7 @@ shares the app-owned completion-control boundary with job completion.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -14,7 +15,7 @@ import json
 import logging
 import os
 from typing import Any
-from uuid import NAMESPACE_URL, UUID, uuid5
+from uuid import NAMESPACE_URL, UUID, uuid4, uuid5
 
 import httpx
 from fastapi import HTTPException, Request
@@ -314,12 +315,68 @@ class JobControlOperations:
             job=job,
             request=request,
         )
+        if not result.pop("_terminal_notification_owned", False):
+            await self.dependencies.resolve_job_notifications(
+                job_id, user=user, hook="approve",
+            )
+        return result
+
+    async def publish_terminal_review(self, operation: dict[str, Any]) -> None:
+        """Replay frozen terminal artifacts after the exact DB approval commit."""
+        from orchestrator.services.vm_idle_lifecycle import _object
+
+        payload = _object(operation.get("terminal_publication"))
+        if payload.get("version") != 1 or operation.get("terminal_source_command_id") is None:
+            raise ValueError("terminal publication source missing")
+        job_id = str(operation["owner_id"])
+        if payload.get("job_id") != job_id:
+            raise ValueError("terminal publication owner changed")
+        job = await self.dependencies.store.get_job(job_id)
+        if job is None or job["status"] != "completed":
+            raise RuntimeError("terminal publication awaits committed completion")
+        completion_data = payload.get("completion_data")
+        repo_name, job_branch = payload.get("repo_name"), payload.get("job_branch")
+        if not isinstance(completion_data, dict) or not all(
+            isinstance(value, str) and value
+            for value in (repo_name, job_branch)
+        ):
+            raise ValueError("terminal publication payload invalid")
+        completion_json = json.dumps(completion_data, indent=2, ensure_ascii=False)
+        if not self.dependencies.forge.is_initialized:
+            raise RuntimeError("terminal completion artifact repository unavailable")
+        wrote = await self.dependencies.forge.create_or_update_file(
+            repo_name, "output/job_completion.json", completion_json,
+            "Approve job: write job_completion.json",
+        )
+        if not wrote:
+            raise RuntimeError("terminal completion artifact publication deferred")
+        await self.dependencies.forge.delete_file(
+            repo_name, "output/job_frozen.json",
+            "Approve job: remove job_frozen.json",
+        )
+        local_output = self.dependencies.workspace.base_path / "output"
+        if local_output.exists():
+            (local_output / "job_completion.json").write_text(completion_json)
+            frozen_path = local_output / "job_frozen.json"
+            if frozen_path.exists():
+                frozen_path.unlink()
+        from orchestrator.services.completion import apply_terminal_job_side_effects
+
+        await apply_terminal_job_side_effects(
+            job, "completed", gitea=self.dependencies.forge,
+            db=self.dependencies.store, vector_db=self.dependencies.vector_store,
+        )
+        await self.dependencies.maybe_wake_session(
+            self.dependencies.store, job_id, "completed",
+        )
+        self.dependencies.kick_session_wake_drain(self.dependencies.store)
+        actor_id = payload.get("actor_id")
         await self.dependencies.resolve_job_notifications(
             job_id,
-            user=user,
+            user={"id": actor_id} if isinstance(actor_id, str) and actor_id else None,
             hook="approve",
         )
-        return result
+        self.dependencies.trigger_dispatch()
 
     def subscribe_sudo_events(self):
         return self.dependencies.sudo_gate.subscribe_sse()
@@ -1565,9 +1622,23 @@ class JobControlOperations:
         require_srw_runtime(job)
         from orchestrator.services.vm_idle_phase_approval import (
             approval_source_snapshot,
+            review_source_snapshot,
         )
 
         phase_snapshot = approval_source_snapshot(job)
+        review_snapshot = review_source_snapshot(job)
+        idle_episode = job.get("workspace_idle_episode")
+        if isinstance(idle_episode, str):
+            try:
+                idle_episode = json.loads(idle_episode)
+            except (TypeError, ValueError):
+                idle_episode = None
+        if (
+            isinstance(idle_episode, dict)
+            and idle_episode.get("wait_kind") == "human_review"
+            and review_snapshot is None
+        ):
+            raise HTTPException(status_code=409, detail="terminal review source changed")
         if request is None:
             request = JobApproveRequest()
         await self.dependencies.completion_control.guard(
@@ -1796,6 +1867,95 @@ class JobControlOperations:
                 completion_data["reviewer_notes"] = request.notes
 
             completion_json = json.dumps(completion_data, indent=2, ensure_ascii=False)
+
+            if review_snapshot is not None:
+                if control_claim is None:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="Terminal review requires durable control authority",
+                    )
+                from orchestrator.services.completion_control import (
+                    CompletionControlClaimConflict,
+                )
+                from orchestrator.services.vm_idle_lifecycle import (
+                    VMIdleLifecycleStore,
+                )
+
+                idle_store = VMIdleLifecycleStore(self.dependencies.store)
+                publication = {
+                    "version": 1,
+                    "job_id": job_id,
+                    "completion_data": completion_data,
+                    "repo_name": repo_name,
+                    "job_branch": job_branch,
+                    "actor_id": str(user.get("id")) if user and user.get("id") else None,
+                }
+                try:
+                    async with self.dependencies.completion_control.finish_claim(
+                        control_claim
+                    ) as (conn, _locked_job):
+                        operation = await idle_store.approve_terminal_review_on_conn(
+                            conn, job_id=job_id,
+                            claim_id=str(control_claim.claim_id),
+                            expected_source=review_snapshot,
+                            publication=publication,
+                        )
+                        if operation is None:
+                            raise CompletionControlClaimConflict(
+                                "terminal review source or retained storage authority changed"
+                            )
+                        updated = await conn.fetchrow(
+                            "UPDATE jobs SET status='completed',freeze_data=NULL,"
+                            "assigned_agent_id=NULL,completed_at=COALESCE(completed_at,CURRENT_TIMESTAMP),"
+                            "updated_at=CURRENT_TIMESTAMP WHERE id=$1::uuid "
+                            "AND status='pending_review' AND execution_lane='stateless' "
+                            "RETURNING id", job_id,
+                        )
+                        if updated is None:
+                            raise CompletionControlClaimConflict(
+                                "job changed while terminal review was committed"
+                            )
+                except CompletionControlClaimConflict as exc:
+                    raise HTTPException(status_code=409, detail=str(exc)) from exc
+                control_claim_finished = True
+                claimant = f"approve-route:{uuid4()}"
+                claimed = await idle_store.claim_terminal_publication(
+                    str(operation["id"]), claimant=claimant,
+                )
+                publication_pending = claimed is None
+                if claimed is not None:
+                    try:
+                        await asyncio.wait_for(
+                            self.publish_terminal_review(claimed), timeout=10,
+                        )
+                        publication_pending = not await idle_store.mark_terminal_published(
+                            str(operation["id"]), token=claimed["claim_token"],
+                            claimant=claimant,
+                        )
+                    except Exception:
+                        publication_pending = True
+                        self.dependencies.logger.exception(
+                            "Terminal approval committed; publication will replay for %s",
+                            job_id,
+                        )
+                        await idle_store.defer_terminal_publication(
+                            str(operation["id"]), token=claimed["claim_token"],
+                            claimant=claimant,
+                        )
+                    finally:
+                        await idle_store.release_claim(
+                            str(operation["id"]), token=claimed["claim_token"],
+                            claimant=claimant,
+                        )
+                return {
+                    "status": "approved",
+                    "job_id": job_id,
+                    "summary": completion_data.get("summary", ""),
+                    "deliverables": completion_data.get("deliverables", []),
+                    "approved_at": completion_data["approved_at"],
+                    "publication_pending": publication_pending,
+                    "_terminal_notification_owned": True,
+                }
 
             stateless_approval_committed = False
             if job.get("execution_lane") == "stateless" and control_claim is None:

@@ -1463,6 +1463,20 @@ class VMWorkspaceRecoveryStore:
                         "Canonical workspace ownership changed during cleanup admission.",
                     )
                 owner_id = canonical_owner
+        if (
+            owner_kind == "job"
+            and source in {"completion_workspace_teardown", "kept_disk"}
+            and await conn.fetchval(
+                "SELECT to_regclass('public.vm_idle_operations') IS NOT NULL"
+            )
+            and await conn.fetchval(
+                "SELECT 1 FROM vm_idle_operations WHERE owner_kind='job' "
+                "AND owner_id=$1 AND ($2::uuid IS NULL OR pvc_uid=$2) "
+                "AND storage_disposition='retention_unknown' LIMIT 1",
+                owner_id, pvc_uid,
+            ) is not None
+        ):
+            return CleanupPermit(allowed=False, reason="terminal_retention_unknown")
         prior = await conn.fetchrow(
             "SELECT id,completed_at,pvc_uid,source,intent_digest,outcome,parent_admission_id "
             "FROM vm_workspace_cleanup_admissions "

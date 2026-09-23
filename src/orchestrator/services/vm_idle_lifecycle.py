@@ -56,6 +56,24 @@ def _uuid(value: Any) -> UUID | None:
         return None
 
 
+async def retained_terminal_rootdisk(db: Any, *, job_id: str,
+                                     generation: str | None,
+                                     pvc_uid: str | None) -> bool:
+    """Read a permanent exact-disk hold, independent of idle feature flags."""
+    owner, generation_id, pvc_id = (_uuid(job_id), _uuid(generation), _uuid(pvc_uid))
+    if None in (owner, generation_id, pvc_id):
+        return False
+    async with db.acquire() as conn:
+        if not await conn.fetchval("SELECT to_regclass('public.vm_idle_operations') IS NOT NULL"):
+            return False
+        return bool(await conn.fetchval(
+            "SELECT 1 FROM vm_idle_operations WHERE owner_kind='job' AND owner_id=$1 "
+            "AND provision_generation=$2 AND pvc_uid=$3 "
+            "AND storage_disposition='retention_unknown' LIMIT 1",
+            owner, generation_id, pvc_id,
+        ))
+
+
 class VMIdleLifecycleStore:
     def __init__(self, db: Any) -> None:
         self.db = db
@@ -65,6 +83,160 @@ class VMIdleLifecycleStore:
             return bool(await conn.fetchval(
                 "SELECT to_regclass('public.vm_idle_operations') IS NOT NULL"
             ))
+
+    async def approve_terminal_review_on_conn(
+        self, conn, *, job_id: str, claim_id: str,
+        expected_source: Mapping[str, Any] | None,
+        publication: Mapping[str, Any],
+    ) -> dict[str, Any] | None:
+        """Bind final approval, no-wake and retained storage before Job terminal exit.
+
+        CompletionControl.finish_claim owns the queue -> Job locks and the
+        surrounding transaction. This method performs no external I/O.
+        """
+        if not conn.is_in_transaction() or _uuid(job_id) is None or _uuid(claim_id) is None:
+            return None
+        owner_id = UUID(job_id)
+        job = await conn.fetchrow("SELECT * FROM jobs WHERE id=$1 FOR UPDATE", owner_id)
+        if job is None or job["status"] != "pending_review" or job["execution_lane"] != "stateless":
+            return None
+        context = _object(job["context"])
+        from orchestrator.services.completion_control import (
+            completion_control_claim_owned_active,
+        )
+        now = await conn.fetchval("SELECT clock_timestamp()")
+        if (
+            _object(context.get("_completion_control_claim")).get("source") != "public_approve"
+            or not completion_control_claim_owned_active(
+                context, claim_id, now_epoch=now.timestamp(),
+            )
+        ):
+            return None
+        episode = read_episode(
+            _episode_document(job["workspace_idle_episode"]),
+            revision=job["workspace_idle_revision"],
+        )
+        from orchestrator.services.vm_idle_phase_approval import (
+            finalized_review_source,
+        )
+        from orchestrator.services.vm_idle_phase_approval import (
+            review_source_snapshot,
+        )
+        if episode is None or review_source_snapshot(dict(job)) != expected_source:
+            return None
+        operation = await conn.fetchrow(
+            "SELECT * FROM vm_idle_operations WHERE owner_kind='job' AND owner_id=$1 "
+            "AND closed_at IS NULL FOR UPDATE", owner_id,
+        )
+        vm = _object(context.get("vm"))
+        if operation is not None:
+            if (
+                operation["phase"] not in {"releasing", "release_held", "suspended"}
+                or operation["episode_id"] != UUID(episode.episode_id)
+                or operation["episode_revision"] != episode.revision
+                or operation["terminal_source_command_id"] is not None
+                or _uuid(vm.get("provision_generation")) != operation["provision_generation"]
+                or _uuid(vm.get("vm_uid")) != operation["vm_uid"]
+                or _uuid(vm.get("rootdisk_pvc_uid")) != operation["pvc_uid"]
+                or vm.get("status") not in {"suspending", "suspended"}
+            ):
+                return None
+            generation, vm_uid, launcher_uid = (
+                operation["provision_generation"], operation["vm_uid"],
+                operation["launcher_uid"],
+            )
+        else:
+            if vm.get("status") != "ready":
+                return None
+            try:
+                identity = _identity_from_row(
+                    dict(job), owner_kind="job", owner_id=job_id,
+                    operation_kind="idle_policy",
+                )
+            except VMRemoteOperationUnavailable:
+                return None
+            generation = _uuid(identity.workspace_generation)
+            vm_uid = _uuid(identity.vm_uid)
+            launcher_uid = _uuid(identity.launcher_pod_uid)
+            if (
+                None in (generation, vm_uid, launcher_uid)
+                or _uuid(vm.get("vmi_uid")) is None
+                or _uuid(vm.get("rootdisk_pvc_uid")) is None
+            ):
+                return None
+        source = await finalized_review_source(
+            conn, job=job, episode=episode, generation=generation,
+            vm_uid=vm_uid, launcher_uid=launcher_uid,
+            pvc_uid=_uuid(vm.get("rootdisk_pvc_uid")),
+        )
+        if source is None or expected_source != {
+            "command_id": source["command_id"],
+            "episode_id": episode.episode_id,
+            "episode_revision": episode.revision,
+            "freeze_type": "job_complete",
+            "runtime_generation": str(generation),
+            "runtime_uid": str(vm_uid),
+        }:
+            return None
+        # A previously admitted destructive S36/kept-disk cleanup or captured
+        # S36 intent cannot be relabelled as retained. The conflict is visible
+        # as a 409 and leaves the approval source intact for operator review.
+        if await conn.fetchval(
+            "SELECT EXISTS(SELECT 1 FROM vm_workspace_cleanup_admissions "
+            "WHERE owner_kind='job' AND owner_id=$1 "
+            "AND (pvc_uid=$2 OR pvc_uid IS NULL) "
+            "AND source IN ('completion_workspace_teardown','kept_disk')) OR "
+            "EXISTS(SELECT 1 FROM completion_effects WHERE scope_id=$1 "
+            "AND effect_name='workspace_archive_teardown' AND intent_at IS NOT NULL)",
+            owner_id, _uuid(vm.get("rootdisk_pvc_uid")),
+        ):
+            return None
+        if operation is None:
+            # This is a terminal, no-successor release. Do not ask for a new
+            # VM budget or reusable network profile. Ordinary waiting release
+            # keeps those stricter prerequisites in admit_release.
+            if not vm_remote_operation_protocol_enabled() or not vm_persistent_rootdisk_enabled():
+                return None
+            if await conn.fetchval(
+                "SELECT EXISTS(SELECT 1 FROM vm_idle_access_leases WHERE owner_kind='job' "
+                "AND owner_id=$1 AND closed_at IS NULL AND expires_at>clock_timestamp()) "
+                "OR EXISTS(SELECT 1 FROM vm_remote_operation_leases WHERE owner_kind='job' "
+                "AND owner_id=$1 AND settled_at IS NULL) "
+                "OR EXISTS(SELECT 1 FROM vm_workspace_recoveries WHERE owner_kind='job' "
+                "AND owner_id=$1 AND resolved_at IS NULL) "
+                "OR EXISTS(SELECT 1 FROM vm_workspace_recovery_jobs WHERE job_id=$1 "
+                "AND resolved_at IS NULL) "
+                "OR EXISTS(SELECT 1 FROM vm_workspace_cleanup_admissions WHERE owner_kind='job' "
+                "AND owner_id=$1 AND completed_at IS NULL) "
+                "OR EXISTS(SELECT 1 FROM jobs WHERE parent_job_id=$1 "
+                "AND status NOT IN ('completed','failed','cancelled') "
+                "AND context->>'inherits_parent_workspace'='true')", owner_id,
+            ):
+                return None
+            operation = await conn.fetchrow(
+                "INSERT INTO vm_idle_operations "
+                "(owner_kind,owner_id,phase,episode_id,episode_revision,"
+                "provision_generation,vm_uid,vmi_uid,launcher_uid,pvc_uid,retained_kind) "
+                "VALUES('job',$1,'releasing',$2,$3,$4,$5,$6,$7,$8,'rootdisk') RETURNING *",
+                owner_id, UUID(episode.episode_id), episode.revision,
+                generation, vm_uid, _uuid(vm["vmi_uid"]), launcher_uid,
+                _uuid(vm["rootdisk_pvc_uid"]),
+            )
+            vm.update(status="suspending", _suspend_remote_io_closed=str(operation["id"]))
+            context["vm"] = vm
+            await conn.execute(
+                "UPDATE jobs SET context=$2::jsonb WHERE id=$1",
+                owner_id, json.dumps(context),
+            )
+        operation = await conn.fetchrow(
+            "UPDATE vm_idle_operations SET terminal_source_command_id=$2,"
+            "terminal_decided_at=clock_timestamp(),storage_disposition='retention_unknown',"
+            "terminal_publication=$3::jsonb,reason=NULL,retry_after=NULL "
+            "WHERE id=$1 RETURNING *",
+            operation["id"], UUID(source["command_id"]),
+            json.dumps(dict(publication)),
+        )
+        return dict(operation)
 
     async def admit_release(
         self,
@@ -160,7 +332,7 @@ class VMIdleLifecycleStore:
             )
             if (
                 episode is None
-                or episode.wait_kind not in {"human_message", "human_approval"}
+                or episode.wait_kind not in {"human_message", "human_approval", "human_review"}
                 or episode.episode_id != episode_id
                 or episode.revision != revision
                 or vm.get("status") != "ready"
@@ -188,6 +360,7 @@ class VMIdleLifecycleStore:
             ):
                 return None
             phase_source = None
+            review_source = None
             if episode.wait_kind == "human_approval":
                 from orchestrator.services.vm_idle_phase_approval import (
                     finalized_phase_source,
@@ -199,6 +372,19 @@ class VMIdleLifecycleStore:
                     launcher_uid=expected["launcher_uid"],
                 )
                 if phase_source is None:
+                    return None
+            if episode.wait_kind == "human_review":
+                from orchestrator.services.vm_idle_phase_approval import (
+                    finalized_review_source,
+                )
+
+                review_source = await finalized_review_source(
+                    conn, job=row, episode=episode,
+                    generation=expected["generation"], vm_uid=expected["vm_uid"],
+                    launcher_uid=expected["launcher_uid"],
+                    pvc_uid=expected["pvc_uid"],
+                )
+                if review_source is None:
                     return None
             from orchestrator.services.vm_creation_preflight import (
                 _execution_binding,
@@ -331,6 +517,7 @@ class VMIdleLifecycleStore:
                     and freeze.get("route_id") == episode.wait_key
                 )
                 or phase_source is not None
+                or review_source is not None
             )
             now = await conn.fetchval("SELECT clock_timestamp()")
             from orchestrator.services.completion_control import (
@@ -502,9 +689,12 @@ class VMIdleLifecycleStore:
                 revision=job["workspace_idle_revision"],
             )
             wake_requested = bool(
-                current_episode is None
-                or current_episode.episode_id != str(operation["episode_id"])
-                or current_episode.revision != operation["episode_revision"]
+                operation["terminal_source_command_id"] is None
+                and (
+                    current_episode is None
+                    or current_episode.episode_id != str(operation["episode_id"])
+                    or current_episode.revision != operation["episode_revision"]
+                )
             )
             await conn.execute(
                 "UPDATE vm_idle_operations SET phase='suspended',"
@@ -677,7 +867,7 @@ class VMIdleLifecycleStore:
             )
             if operation is None or operation["phase"] not in {
                 "releasing", "release_held", "suspended", "waking", "wake_held",
-            }:
+            } or operation["terminal_source_command_id"] is not None:
                 return None
             vm = _object(_object(job["context"]).get("vm"))
             context = _object(job["context"])
@@ -767,7 +957,9 @@ class VMIdleLifecycleStore:
             operation = await conn.fetchrow(
                 "SELECT * FROM vm_idle_operations WHERE id=$1 FOR UPDATE", UUID(operation_id)
             )
-            if job is None or operation is None or operation["phase"] not in {"waking", "wake_held"}:
+            if (job is None or job["status"] in {"completed", "failed", "cancelled"}
+                or operation is None or operation["terminal_source_command_id"] is not None
+                or operation["phase"] not in {"waking", "wake_held"}):
                 return False
             vm = _object(_object(job["context"]).get("vm"))
             if (
@@ -852,6 +1044,9 @@ class VMIdleLifecycleStore:
                     UUID(operation_id),
                 )
                 if job is None or operation is None:
+                    return False
+                if (job["status"] in {"completed", "failed", "cancelled"}
+                    or operation["terminal_source_command_id"] is not None):
                     return False
                 if operation["phase"] == "ready":
                     return True
@@ -1115,6 +1310,62 @@ class VMIdleLifecycleStore:
                 rows = await conn.fetch(query, limit, None)
             return [dict(row) for row in rows]
 
+    async def pending_terminal_publications(self, *, limit: int = 16) -> list[str]:
+        async with self.db.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT id FROM vm_idle_operations WHERE terminal_source_command_id IS NOT NULL "
+                "AND terminal_published_at IS NULL "
+                "AND (terminal_publication_retry_after IS NULL OR "
+                "terminal_publication_retry_after<=clock_timestamp()) "
+                "AND (claim_expires_at IS NULL OR claim_expires_at<=clock_timestamp()) "
+                "ORDER BY COALESCE(terminal_publication_retry_after,terminal_decided_at),id "
+                "LIMIT $1", limit,
+            )
+            return [str(row["id"]) for row in rows]
+
+    async def claim_terminal_publication(
+        self, operation_id: str, *, claimant: str,
+    ) -> dict[str, Any] | None:
+        """Claim publication even after compute operation closure or flag-off."""
+        if _uuid(operation_id) is None or not 1 <= len(claimant) <= 256:
+            return None
+        async with self.db.acquire() as conn:
+            row = await conn.fetchrow(
+                "UPDATE vm_idle_operations SET claim_token=claim_token+1,"
+                "claimed_by=$2,claim_expires_at=clock_timestamp()+interval '30 seconds' "
+                "WHERE id=$1 AND terminal_source_command_id IS NOT NULL "
+                "AND terminal_published_at IS NULL "
+                "AND (terminal_publication_retry_after IS NULL OR "
+                "terminal_publication_retry_after<=clock_timestamp()) "
+                "AND (claim_expires_at IS NULL OR claim_expires_at<=clock_timestamp()) "
+                "RETURNING *", UUID(operation_id), claimant,
+            )
+            return dict(row) if row else None
+
+    async def defer_terminal_publication(
+        self, operation_id: str, *, token: int, claimant: str,
+    ) -> None:
+        async with self.db.acquire() as conn:
+            await conn.execute(
+                "UPDATE vm_idle_operations SET "
+                "terminal_publication_retry_after=clock_timestamp()+interval '1 minute' "
+                "WHERE id=$1 AND claim_token=$2 AND claimed_by=$3 "
+                "AND terminal_published_at IS NULL",
+                UUID(operation_id), token, claimant,
+            )
+
+    async def mark_terminal_published(self, operation_id: str, *, token: int,
+                                      claimant: str) -> bool:
+        async with self.db.acquire() as conn:
+            return bool(await conn.fetchval(
+                "UPDATE vm_idle_operations SET terminal_published_at=clock_timestamp(),"
+                "terminal_publication_retry_after=NULL,claimed_by=NULL,claim_expires_at=NULL "
+                "WHERE id=$1 AND terminal_source_command_id IS NOT NULL "
+                "AND terminal_published_at IS NULL AND claim_token=$2 "
+                "AND claimed_by=$3 AND claim_expires_at>clock_timestamp() RETURNING true",
+                UUID(operation_id), token, claimant,
+            ))
+
     async def get_operation(self, operation_id: str) -> dict[str, Any] | None:
         if _uuid(operation_id) is None:
             return None
@@ -1193,13 +1444,15 @@ class VMIdleLifecycleService:
     """Bounded, replayable Job adapter for the existing VM cleanup authority."""
 
     def __init__(self, db: Any, provisioner: Any, recovery_store: Any, *,
-                 claimant: str = "vm-idle", before_first_start: Any = None) -> None:
+                 claimant: str = "vm-idle", before_first_start: Any = None,
+                 terminal_publication_handler: Any = None) -> None:
         self.store = VMIdleLifecycleStore(db)
         self.db = db
         self.provisioner = provisioner
         self.recovery_store = recovery_store
         self.claimant = claimant
         self.before_first_start = before_first_start
+        self.terminal_publication_handler = terminal_publication_handler
         # Selection is process-local, while operation claims and admission are
         # database-authoritative. The long-lived sweeper advances these cursors
         # even when a whole page is ineligible, then wraps at the end.
@@ -1295,6 +1548,38 @@ class VMIdleLifecycleService:
                         str(operation["id"]), token=operation["claim_token"],
                         claimant=self.claimant, reason="effect_unavailable",
                     )
+        # Publication is replayable and less urgent than stopping compute.
+        # A failing forge gets a short bounded attempt after physical work;
+        # release the claim so later rows cannot be starved by one outage.
+        if self.terminal_publication_handler is not None:
+            for operation_id in await self.store.pending_terminal_publications(
+                limit=min(limit, 4),
+            ):
+                operation = await self.store.claim_terminal_publication(
+                    operation_id, claimant=self.claimant,
+                )
+                if operation is None:
+                    continue
+                try:
+                    await asyncio.wait_for(
+                        self.terminal_publication_handler(operation), timeout=10,
+                    )
+                    if await self.store.mark_terminal_published(
+                        operation_id, token=operation["claim_token"],
+                        claimant=self.claimant,
+                    ):
+                        advanced += 1
+                except Exception:
+                    logger.exception("Terminal review publication held for %s", operation_id)
+                    await self.store.defer_terminal_publication(
+                        operation_id, token=operation["claim_token"],
+                        claimant=self.claimant,
+                    )
+                finally:
+                    await self.store.release_claim(
+                        operation_id, token=operation["claim_token"],
+                        claimant=self.claimant,
+                    )
         return advanced
 
     async def _release(self, operation: Mapping[str, Any], *, current: Any) -> bool:
@@ -1350,6 +1635,8 @@ class VMIdleLifecycleService:
         )
 
     async def _wake(self, operation: Mapping[str, Any], *, current: Any) -> bool:
+        if operation["terminal_source_command_id"] is not None:
+            return False
         operation_id = str(operation["id"])
         owner_id = str(operation["owner_id"])
         if operation["phase"] == "suspended":

@@ -73,6 +73,7 @@ def completion_runtime_evidence(job):
             "runtime_uid": identity.vm_uid,
         },
         "launcher_uid": identity.launcher_pod_uid,
+        "rootdisk_pvc_uid": vm.get("rootdisk_pvc_uid"),
         "identity_digest": identity_digest,
         "runtime_authority_digest": delivered_digest,
     }

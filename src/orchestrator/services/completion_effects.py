@@ -218,6 +218,15 @@ async def run_completion_workspace_teardown(
                 or any(character.isspace() for character in ssh_host_key_fingerprint)
             ):
                 raise RuntimeError("VM teardown intent has invalid SSH host key")
+            from orchestrator.services.vm_idle_lifecycle import (
+                retained_terminal_rootdisk,
+            )
+
+            if await retained_terminal_rootdisk(
+                postgres_db, job_id=job_id, generation=generation,
+                pvc_uid=rootdisk_uid,
+            ):
+                raise RuntimeError("terminal_retention_unknown: exact rootdisk held")
             cleanup = await _admit_destructive_cleanup(
                 rootdisk_uid,
                 resource="vm",
@@ -376,6 +385,28 @@ async def run_completion_workspace_teardown(
                         "teardown_disposition": "deferred",
                         "higher_report_seq": authorization.higher_report_seq,
                     }
+
+            # A legacy/default-off S36 callback has no captured VM intent.
+            # A newly managed terminal rootdisk still retains its independent
+            # disposition after the idle flag is disabled.
+            if effect_runner is None and hasattr(postgres_db, "acquire"):
+                current_job = await postgres_db.get_job(job_id)
+                current_vm = (
+                    _get_vm_context(current_job) if current_job is not None else {}
+                )
+                if isinstance(current_vm, Mapping):
+                    from orchestrator.services.vm_idle_lifecycle import (
+                        retained_terminal_rootdisk,
+                    )
+
+                    if await retained_terminal_rootdisk(
+                        postgres_db, job_id=job_id,
+                        generation=current_vm.get("provision_generation"),
+                        pvc_uid=current_vm.get("rootdisk_pvc_uid"),
+                    ):
+                        raise RuntimeError(
+                            "terminal_retention_unknown: exact rootdisk held"
+                        )
 
             use_uid_fenced_kubernetes_teardown = False
             use_identity_fenced_vm_teardown = False

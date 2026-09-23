@@ -1041,6 +1041,11 @@ class VMInstanceManager:
                         WHERE status = ANY($1::text[])
                           AND context->'vm'->>'rootdisk' = 'kept'
                           AND execution_lane IS DISTINCT FROM 'stateless'
+                          AND NOT EXISTS (SELECT 1 FROM vm_idle_operations retained
+                              WHERE retained.owner_kind='job' AND retained.owner_id=jobs.id
+                                AND retained.provision_generation::text=jobs.context->'vm'->>'provision_generation'
+                                AND retained.pvc_uid::text=jobs.context->'vm'->>'rootdisk_pvc_uid'
+                                AND retained.storage_disposition='retention_unknown')
                         LIMIT 100
                         """,
                         list(_TERMINAL_JOB_STATUSES),
@@ -1055,6 +1060,11 @@ class VMInstanceManager:
                         WHERE status = ANY($1::text[])
                           AND context->'vm'->>'rootdisk' = 'kept'
                           AND execution_lane IS DISTINCT FROM 'stateless'
+                          AND NOT EXISTS (SELECT 1 FROM vm_idle_operations retained
+                              WHERE retained.owner_kind='job' AND retained.owner_id=jobs.id
+                                AND retained.provision_generation::text=jobs.context->'vm'->>'provision_generation'
+                                AND retained.pvc_uid::text=jobs.context->'vm'->>'rootdisk_pvc_uid'
+                                AND retained.storage_disposition='retention_unknown')
                         LIMIT 100
                         """,
                         list(_TERMINAL_JOB_STATUSES),
@@ -1200,6 +1210,21 @@ class VMInstanceManager:
         permit: LifecycleActionPermit | None = None,
     ) -> Any | None:
         """Serialize an exact VM delete/prune before controller side effects."""
+
+        if purge_disk and owner_kind == "job":
+            from orchestrator.services.vm_idle_lifecycle import (
+                retained_terminal_rootdisk,
+            )
+
+            if await retained_terminal_rootdisk(
+                self._db, job_id=owner_id,
+                generation=identity.provision_generation,
+                pvc_uid=identity.rootdisk_pvc_uid,
+            ):
+                logger.info(
+                    "Kept rootdisk purge held for terminal review job %s", owner_id
+                )
+                return None
 
         try:
             parsed_owner_id = UUID(str(owner_id))

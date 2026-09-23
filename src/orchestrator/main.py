@@ -2064,6 +2064,9 @@ async def workspace_idle_sweeper(shutdown_event: asyncio.Event) -> None:
         vm_idle_service = VMIdleLifecycleService(
             postgres_db, vm_provisioner, VMWorkspaceRecoveryStore(postgres_db),
             claimant=f"{os.getenv('HOSTNAME', 'orchestrator')}:vm-idle",
+            terminal_publication_handler=lambda operation: (
+                _job_control_operations().publish_terminal_review(operation)
+            ),
         )
     while not shutdown_event.is_set():
         # Session workspace reconcile (safety-net): recreate failed/missing
