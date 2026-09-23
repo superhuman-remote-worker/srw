@@ -1495,7 +1495,7 @@ class VMIdleLifecycleStore:
         if thread is None or operation is None or operation["owner_id"] != owner_id:
             return False
         if operation["phase"] == "suspended":
-            return operation["stop_evidence"] == dict(evidence)
+            return _object(operation["stop_evidence"]) == dict(evidence)
         if operation["phase"] not in {"releasing", "release_held"}:
             return False
         expected = {

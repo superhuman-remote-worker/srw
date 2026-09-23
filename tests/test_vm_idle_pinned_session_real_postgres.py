@@ -525,6 +525,11 @@ async def test_two_connections_join_one_thread_wake_and_preserve_pause_clock(
         str(operation["id"]), evidence=pod_absent,
     )
     assert await idle.complete_release(str(operation["id"]), evidence=evidence)
+    assert await idle.complete_release(str(operation["id"]), evidence=evidence)
+    assert not await idle.complete_release(
+        str(operation["id"]),
+        evidence={**evidence, "launcher_uid": str(uuid4())},
+    )
     assert await db.fetchval(
         "SELECT phase FROM vm_idle_operations WHERE id=$1", operation["id"],
     ) == "suspended"
