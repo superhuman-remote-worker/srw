@@ -121,6 +121,7 @@ class RunState:
     fetch_job_tool_steps: int = 0
     worker_job_tool_steps: int = 0
     sentinel_sha256: str | None = None
+    completion_release: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
     next_sequence: int = 1
     counters: Counter[tuple[str, str, bool, str]] = field(default_factory=Counter)
     calls: list[dict[str, Any]] = field(default_factory=list)
@@ -190,7 +191,10 @@ class ScenarioStore:
     async def reset(self, run_id: str) -> bool:
         _validate_run_id(run_id)
         async with self._lock:
-            return self._runs.pop(run_id, None) is not None
+            state = self._runs.pop(run_id, None)
+            if state is not None:
+                state.completion_release.set()
+            return state is not None
 
     async def state(self, run_id: str) -> dict[str, Any]:
         _validate_run_id(run_id)
@@ -199,6 +203,38 @@ class ScenarioStore:
             if state is None:
                 raise ScenarioError(404, "scenario_not_found", "No scenario is armed.")
             return self._serialize(state)
+
+    async def release_retained_completion(self, run_id: str) -> dict[str, Any]:
+        """Release only a validated sentinel run before its terminal tool."""
+        _validate_run_id(run_id)
+        async with self._lock:
+            state = self._runs.get(run_id)
+            if state is None:
+                raise ScenarioError(404, "scenario_not_found", "No scenario is armed.")
+            if (
+                state.scenario != "retained-sentinel-worker"
+                or not 8 <= state.worker_job_tool_steps <= 10
+                or state.unexpected_calls != 0
+                or state.completion_release.is_set()
+            ):
+                raise ScenarioError(409, "completion_proof_missing", "Retained completion is not releasable.")
+            state.completion_release.set()
+            return self._serialize(state)
+
+    async def wait_retained_completion_release(self, run_id: str) -> None:
+        _validate_run_id(run_id)
+        async with self._lock:
+            state = self._runs.get(run_id)
+            if state is None or state.scenario != "retained-sentinel-worker":
+                raise ScenarioError(409, "scenario_changed", "Retained run changed.")
+            event = state.completion_release
+        try:
+            await asyncio.wait_for(event.wait(), timeout=90)
+        except asyncio.TimeoutError:
+            raise ScenarioError(409, "completion_barrier_timeout", "Retained completion was not released.") from None
+        async with self._lock:
+            if self._runs.get(run_id) is not state:
+                raise ScenarioError(409, "scenario_changed", "Retained run changed.")
 
     async def overview(self) -> dict[str, Any]:
         async with self._lock:
@@ -598,6 +634,7 @@ class ScenarioStore:
             "fetch_job_tool_steps": state.fetch_job_tool_steps,
             "worker_job_tool_steps": state.worker_job_tool_steps,
             "sentinel_sha256": state.sentinel_sha256,
+            "completion_released": state.completion_release.is_set(),
             "unexpected_count": state.unexpected_calls,
             "pending_calls": len(state.pending),
             "counters": counters,
@@ -718,6 +755,14 @@ def create_inference_app(
                 )
 
             state = await store.state(run_id)
+            if (
+                state["scenario"] == "retained-sentinel-worker"
+                and state["worker_job_tool_steps"] >= 10
+            ):
+                # The worker's next reply would be job_complete. Hold it
+                # until the host proves the real claimant and pinned file.
+                await store.wait_retained_completion_release(run_id)
+                state = await store.state(run_id)
             tool_call: ToolCallSpec | None = None
             if structured_name is None and state["scenario"] == "tool-call":
                 has_tool_result = any(
@@ -1003,6 +1048,13 @@ def create_control_app(store: ScenarioStore, *, control_token: str) -> FastAPI:
     async def run_state(run_id: str):
         try:
             return await store.state(run_id)
+        except ScenarioError as exc:
+            return _scenario_error_response(exc)
+
+    @app.post("/control/scenarios/{run_id}/release-completion")
+    async def release_completion(run_id: str):
+        try:
+            return await store.release_retained_completion(run_id)
         except ScenarioError as exc:
             return _scenario_error_response(exc)
 

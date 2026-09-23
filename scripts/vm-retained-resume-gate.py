@@ -272,24 +272,56 @@ def _port_forward(args: argparse.Namespace, token: str) -> tuple[subprocess.Pope
         port = listener.getsockname()[1]
     process = subprocess.Popen(
         _kubectl(args, "-n", args.provider_namespace, "port-forward",
-                 f"pod/{args.provider_pod}", f"127.0.0.1:{port}:8001"),
+                 "--address", "127.0.0.1", f"pod/{args.provider_pod}", f"{port}:8001"),
         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
-    until = time.monotonic() + 15
-    while time.monotonic() < until:
-        if process.poll() is not None:
-            raise GateFailure("provider control port-forward exited")
-        try:
-            state = _provider_request(port, token, "GET", "/control/health")
-        except GateFailure:
+    ready = False
+    try:
+        until = time.monotonic() + 15
+        while time.monotonic() < until:
+            if process.poll() is not None:
+                raise GateFailure("provider control port-forward exited")
+            try:
+                state = _provider_request(port, token, "GET", "/control/health")
+            except GateFailure:
+                time.sleep(0.2)
+                continue
+            if state.get("status") == "ok":
+                ready = True
+                return process, port
             time.sleep(0.2)
-            continue
-        if state.get("status") == "ok":
-            return process, port
-        time.sleep(0.2)
-    process.terminate()
-    raise GateFailure("provider control port-forward did not become ready")
+        raise GateFailure("provider control port-forward did not become ready")
+    finally:
+        if not ready:
+            _reap_forward(process)
+
+
+def _reap_forward(process: subprocess.Popen[bytes]) -> None:
+    if process.poll() is None:
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)
+    else:
+        process.wait(timeout=5)
+
+
+def validate_provider_barrier_state(state: Mapping[str, Any], *, run_id: str,
+                                    sentinel_sha256: str) -> None:
+    steps = state.get("worker_job_tool_steps")
+    if (
+        state.get("run_id") != run_id
+        or state.get("scenario") != "retained-sentinel-worker"
+        or state.get("sentinel_sha256") != sentinel_sha256
+        or type(steps) is not int or not 8 <= steps <= 10
+        or state.get("completion_released") is not False
+        or state.get("unexpected_count") != 0
+        or state.get("pending_calls") not in {0, 1}
+    ):
+        raise GateFailure("provider has not held the proven sentinel before completion")
 
 
 def validate_provider_result(state: Mapping[str, Any], *, run_id: str,
@@ -298,8 +330,9 @@ def validate_provider_result(state: Mapping[str, Any], *, run_id: str,
         state.get("run_id") != run_id
         or state.get("scenario") != "retained-sentinel-worker"
         or state.get("sentinel_sha256") != sentinel_sha256
-        or not isinstance(state.get("worker_job_tool_steps"), int)
-        or state["worker_job_tool_steps"] < 11
+        or type(state.get("worker_job_tool_steps")) is not int
+        or state["worker_job_tool_steps"] != 11
+        or state.get("completion_released") is not True
         or state.get("unexpected_count") != 0
         or state.get("pending_calls") != 0
     ):
@@ -415,7 +448,8 @@ def run_gate(args: argparse.Namespace) -> dict[str, Any]:
             _image_command(args), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL, text=True, bufsize=1,
         )
-        stages = ("ARM", "QUOTA_INSTALL", "QUOTA_RELEASE", "PROVIDER_VERIFY")
+        stages = ("ARM", "QUOTA_INSTALL", "QUOTA_RELEASE",
+                  "PROVIDER_BARRIER", "PROVIDER_VERIFY")
         index = 0
         deadline = time.monotonic() + 3600
         while image.poll() is None and time.monotonic() < deadline:
@@ -455,6 +489,22 @@ def run_gate(args: argparse.Namespace) -> dict[str, Any]:
                     raise GateFailure("owned quota was unavailable at release")
                 wait_quota_absent(core, args, quota_uid)
                 quota_released = True
+            elif stage == "PROVIDER_BARRIER":
+                if value != sentinel_sha256:
+                    raise GateFailure("pre-terminal sentinel digest changed")
+                state = _provider_request(
+                    port, token, "GET", f"/control/scenarios/{args.run_id}",
+                )
+                validate_provider_barrier_state(
+                    state, run_id=args.run_id, sentinel_sha256=value,
+                )
+                released = _provider_request(
+                    port, token, "POST",
+                    f"/control/scenarios/{args.run_id}/release-completion",
+                )
+                if (released.get("run_id") != args.run_id
+                    or released.get("completion_released") is not True):
+                    raise GateFailure("provider completion barrier did not release")
             else:
                 if value != sentinel_sha256:
                     raise GateFailure("post-worker sentinel digest changed")
@@ -505,12 +555,8 @@ def run_gate(args: argparse.Namespace) -> dict[str, Any]:
         if quota_uid is not None and not quota_released:
             remove_quota(core, args, quota_uid)
             wait_quota_absent(core, args, quota_uid)
-        if forward is not None and forward.poll() is None:
-            forward.terminate()
-            try:
-                forward.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                forward.kill()
+        if forward is not None:
+            _reap_forward(forward)
 
 
 def build_parser() -> argparse.ArgumentParser:

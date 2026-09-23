@@ -61,7 +61,7 @@ def test_quota_manifest_and_result_refuse_other_run_or_synthetic_provider(tmp_pa
                                                  "labels": {"srw.io/a1-gate-run": "other"}}}, value)
     state = {"run_id": value.run_id, "scenario": "retained-sentinel-worker",
              "sentinel_sha256": "a" * 64, "worker_job_tool_steps": 11,
-             "unexpected_count": 0, "pending_calls": 0}
+             "completion_released": True, "unexpected_count": 0, "pending_calls": 0}
     assert gate.validate_provider_result(state, run_id=value.run_id,
                                          sentinel_sha256="a" * 64)["worker_job_tool_steps"] == 11
     with pytest.raises(gate.GateFailure):
@@ -70,6 +70,20 @@ def test_quota_manifest_and_result_refuse_other_run_or_synthetic_provider(tmp_pa
     with pytest.raises(gate.GateFailure):
         gate.validate_provider_result({**state, "sentinel_sha256": "b" * 64},
                                       run_id=value.run_id, sentinel_sha256="a" * 64)
+    barrier = {**state, "worker_job_tool_steps": 8,
+               "completion_released": False}
+    gate.validate_provider_barrier_state(
+        barrier, run_id=value.run_id, sentinel_sha256="a" * 64,
+    )
+    for invalid in (
+        {**barrier, "worker_job_tool_steps": 7},
+        {**barrier, "completion_released": True},
+        {**barrier, "sentinel_sha256": "b" * 64},
+    ):
+        with pytest.raises(gate.GateFailure):
+            gate.validate_provider_barrier_state(
+                invalid, run_id=value.run_id, sentinel_sha256="a" * 64,
+            )
 
 
 def test_quota_deletion_uses_exact_uid_resource_version(tmp_path, monkeypatch):
@@ -124,6 +138,49 @@ def test_quota_active_proof_requires_exact_status_and_uid(tmp_path, monkeypatch)
         gate.wait_quota_active(Core(Quota(uid, active=False)), value, uid)
 
 
+def test_provider_port_forward_uses_kubectl_address_option_and_reaps_failures(
+    tmp_path, monkeypatch,
+):
+    value = args(tmp_path)
+    commands = []
+
+    class Process:
+        def __init__(self):
+            self.stopped = False
+            self.waited = False
+        def poll(self):
+            return 0 if self.stopped else None
+        def terminate(self):
+            self.stopped = True
+        def wait(self, **_):
+            self.waited = True
+            return 0
+
+    process = Process()
+    monkeypatch.setattr(gate.subprocess, "Popen", lambda argv, **_: (
+        commands.append(argv) or process
+    ))
+    monkeypatch.setattr(gate, "_provider_request", lambda *_, **__: {"status": "ok"})
+    returned, port = gate._port_forward(value, "private-token")
+    assert returned is process
+    assert commands[0][-5:] == [
+        "port-forward", "--address", "127.0.0.1",
+        f"pod/{value.provider_pod}", f"{port}:8001",
+    ]
+    assert "127.0.0.1:" not in commands[0][-1]
+    gate._reap_forward(process)
+    assert process.stopped and process.waited
+
+    failed = Process()
+    monkeypatch.setattr(gate.subprocess, "Popen", lambda argv, **_: failed)
+    monkeypatch.setattr(gate, "_provider_request", lambda *_, **__: (_ for _ in ()).throw(
+        RuntimeError("bounded fake failure")
+    ))
+    with pytest.raises(RuntimeError, match="bounded fake failure"):
+        gate._port_forward(value, "private-token")
+    assert failed.stopped and failed.waited
+
+
 def test_host_phases_keep_quota_after_real_cleanup_and_remove_before_worker_proof(
     tmp_path, monkeypatch,
 ):
@@ -146,6 +203,7 @@ def test_host_phases_keep_quota_after_real_cleanup_and_remove_before_worker_proo
         "SRW_A1_ARM:" + "a" * 64 + "\n"
         "SRW_A1_QUOTA_INSTALL:" + str(uuid4()) + "\n"
         "SRW_A1_QUOTA_RELEASE:" + str(uuid4()) + "\n"
+        "SRW_A1_PROVIDER_BARRIER:" + "a" * 64 + "\n"
         "SRW_A1_PROVIDER_VERIFY:" + "a" * 64 + "\n"
     )
     monkeypatch.setattr(config, "load_kube_config", lambda **_: None)
@@ -162,13 +220,16 @@ def test_host_phases_keep_quota_after_real_cleanup_and_remove_before_worker_proo
         "metadata": {"uid": "deploy-uid"}, "spec": {"selector": {"matchLabels": {}}},
     })
     monkeypatch.setattr(gate, "_port_forward", lambda *_: (None, 12345))
-    monkeypatch.setattr(gate, "_provider_request", lambda _, __, method, path, body=None: (
-        events.append((method, path)) or {
+    def provider_request(_, __, method, path, body=None):
+        events.append((method, path))
+        released = ("POST", f"/control/scenarios/{value.run_id}/release-completion") in events
+        return {
             "scenario": "retained-sentinel-worker", "sentinel_sha256": "a" * 64,
-            "run_id": value.run_id, "worker_job_tool_steps": 11,
+            "run_id": value.run_id, "worker_job_tool_steps": 11 if released else 10,
+            "completion_released": released,
             "unexpected_count": 0, "pending_calls": 0,
         }
-    ))
+    monkeypatch.setattr(gate, "_provider_request", provider_request)
     monkeypatch.setattr(gate.subprocess, "Popen", lambda *_, **__: process)
     monkeypatch.setattr(gate.select, "select", lambda files, *_: (files, [], []))
     monkeypatch.setattr(gate, "install_quota", lambda *_: (
@@ -188,9 +249,12 @@ def test_host_phases_keep_quota_after_real_cleanup_and_remove_before_worker_proo
     assert events.index(("POST", f"/control/scenarios/{value.run_id}/arm")) < events.index("install")
     assert events.index("active") < events.index("remove") < events.index("absent")
     assert events.index("absent") < events.index(("GET", f"/control/scenarios/{value.run_id}"))
+    assert events.index(("GET", f"/control/scenarios/{value.run_id}")) < events.index(
+        ("POST", f"/control/scenarios/{value.run_id}/release-completion"))
     assert process.stdin.getvalue().splitlines() == [
         "SRW_A1_ACK:ARM", "SRW_A1_ACK:QUOTA_INSTALL",
-        "SRW_A1_ACK:QUOTA_RELEASE", "SRW_A1_ACK:PROVIDER_VERIFY",
+        "SRW_A1_ACK:QUOTA_RELEASE", "SRW_A1_ACK:PROVIDER_BARRIER",
+        "SRW_A1_ACK:PROVIDER_VERIFY",
     ]
     assert value.output.stat().st_mode & 0o077 == 0
 

@@ -644,7 +644,7 @@ async def test_worker_job_scenario_fails_closed_without_a_required_tool(
     assert response.json()["error"]["type"] == "required_tool_missing"
 
 
-@pytest.mark.parametrize("proof", ["valid", "wrong-run", "failed-command", "absent"])
+@pytest.mark.parametrize("proof", ["valid", "reset", "wrong-run", "failed-command", "absent"])
 async def test_retained_sentinel_worker_requires_real_tool_result(
     control: httpx.AsyncClient,
     inference: httpx.AsyncClient,
@@ -661,6 +661,9 @@ async def test_retained_sentinel_worker_requires_real_tool_result(
         json={"scenario": "retained-sentinel-worker", "sentinel_sha256": digest},
     )
     assert armed.status_code == 201
+    assert (await control.post(
+        f"/control/scenarios/{run_id}/release-completion"
+    )).status_code == 409
     tools = [
         {"type": "function", "function": {"name": name, "parameters": {"type": "object"}}}
         for name in ("read_file", "todo_complete", "next_phase_todos", "job_complete", "run_command")
@@ -685,12 +688,31 @@ async def test_retained_sentinel_worker_requires_real_tool_result(
     payload = chat_request(run_id, extra={"tools": tools})
     payload["messages"].append({"role": "tool", "tool_call_id": "sentinel", "content": output})
     response = await inference.post("/v1/chat/completions", json=payload)
-    if proof == "valid":
+    if proof in {"valid", "reset"}:
         assert response.status_code == 200
         assert response.json()["choices"][0]["message"]["tool_calls"][0]["function"]["name"] == "todo_complete"
-        remaining = []
-        for _ in range(3):
-            remaining.append(await inference.post("/v1/chat/completions", json=payload))
+        remaining = [
+            await inference.post("/v1/chat/completions", json=payload)
+            for _ in range(2)
+        ]
+        waiting_completion = asyncio.create_task(
+            inference.post("/v1/chat/completions", json=payload)
+        )
+        await asyncio.sleep(0.05)
+        assert not waiting_completion.done()
+        held = (await control.get(f"/control/scenarios/{run_id}")).json()
+        assert held["worker_job_tool_steps"] == 10
+        assert held["completion_released"] is False
+        if proof == "reset":
+            assert (await control.delete(f"/control/scenarios/{run_id}")).status_code == 200
+            refused = await asyncio.wait_for(waiting_completion, timeout=5)
+            assert refused.status_code == 409
+            assert refused.json()["error"]["type"] == "scenario_changed"
+            return
+        released = await control.post(f"/control/scenarios/{run_id}/release-completion")
+        assert released.status_code == 200
+        assert released.json()["completion_released"] is True
+        remaining.append(await asyncio.wait_for(waiting_completion, timeout=5))
         assert [
             item.json()["choices"][0]["message"]["tool_calls"][0]["function"]["name"]
             for item in remaining
@@ -698,9 +720,13 @@ async def test_retained_sentinel_worker_requires_real_tool_result(
         state = await control.get(f"/control/scenarios/{run_id}")
         assert state.json()["worker_job_tool_steps"] == 11
         assert state.json()["sentinel_sha256"] == digest
+        assert state.json()["completion_released"] is True
     else:
         assert response.status_code == 422
         assert response.json()["error"]["type"] == "workspace_proof_missing"
+        assert (await control.post(
+            f"/control/scenarios/{run_id}/release-completion"
+        )).status_code == 409
 
 
 async def test_search_job_scenario_drives_search_completion_and_todos(

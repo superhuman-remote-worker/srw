@@ -754,6 +754,11 @@ class LiveScenario:
                 raise AcceptanceFailure("Ready successor changed the retained PVC/PV")
             await self.sentinel_verify(observed["identity"], digest)
             worker = await worker_task
+            # The provider holds job_complete until this real claimant and
+            # pinned-SSH file proof are captured. Normal S36 completion may
+            # purge the guest immediately after that barrier is released.
+            await self.sentinel_verify(observed["identity"], digest)
+            host_exchange("PROVIDER_BARRIER", digest)
         finally:
             if not worker_task.done():
                 worker_task.cancel()
@@ -764,7 +769,6 @@ class LiveScenario:
         terminal = await self.wait(
             "terminal Job result", lambda: self.terminal_worker(worker), seconds=900,
         )
-        await self.sentinel_verify(observed["identity"], digest)
         host_exchange("PROVIDER_VERIFY", digest)
         return {
             "protocol_version": 1, "run_id": self.args.run_id,
@@ -796,7 +800,8 @@ class LiveScenario:
                 "quota_vm_effect_rejected": True,
                 "frozen_request_preserved": True,
                 "same_pvc_pv": True,
-                "pinned_ssh_sentinel_before_after_worker": True,
+                "pinned_ssh_sentinel_pre_terminal_worker": True,
+                "normal_terminal_cleanup_allowed": True,
                 "real_worker_bundle_and_terminal_result": True,
                 "provider_tool_sequence_verified_by_host": True,
             },
@@ -877,7 +882,8 @@ class LiveScenario:
 
 def host_exchange(stage: str, value: str) -> str:
     """One bounded host-owned control barrier; no token or content in stdout."""
-    if stage not in {"ARM", "QUOTA_INSTALL", "QUOTA_RELEASE", "PROVIDER_VERIFY"}:
+    if stage not in {"ARM", "QUOTA_INSTALL", "QUOTA_RELEASE",
+                     "PROVIDER_BARRIER", "PROVIDER_VERIFY"}:
         raise AcceptanceFailure("unsupported host barrier")
     if len(value) > 128 or "\n" in value or "\r" in value:
         raise AcceptanceFailure("host barrier value is malformed")

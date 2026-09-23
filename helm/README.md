@@ -1013,7 +1013,10 @@ production cleanup settles; it removes that exact quota after the owner Resume
 has joined a rejected VM effect. The application service account receives no
 quota write permission. The adapter refuses any unrelated runnable worker
 batch, so older queued work must be resolved through normal owner controls
-before enabling the real worker pool. Its local-path result proves a retained
+before enabling the real worker pool. The provider holds `job_complete` until
+the gate captures the actual worker and re-reads the retained sentinel over
+pinned SSH; normal terminal cleanup may then remove the VM. Its local-path
+result proves a retained
 PVC and real worker flow; it is distinct from the Longhorn durability gate.
 
 ### Verify
