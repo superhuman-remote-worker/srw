@@ -199,6 +199,10 @@ def redact_job_config_override(
     """Strip credentials and private workspace lease identity from a job."""
 
     job = dict(job)
+    # get_job loads native idle authority for approval's route-load fence; it
+    # is not part of the public Job projection.
+    job.pop("workspace_idle_episode", None)
+    job.pop("workspace_idle_revision", None)
     if (
         not isinstance(job.get("workspace_contract"), dict)
         or "state" not in job["workspace_contract"]

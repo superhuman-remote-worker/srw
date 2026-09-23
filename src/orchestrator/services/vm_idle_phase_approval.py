@@ -7,6 +7,7 @@ from orchestrator.services.workspace_idle_completion_events import (
     ACCEPTED_IDLE_WAIT_SOURCE_KEY,
 )
 from shared.workspace_idle_completion import classify_completion_wait
+from shared.workspace_idle_policy import IdlePolicyError, read_episode
 
 
 def _object(value):
@@ -16,6 +17,39 @@ def _object(value):
         except (TypeError, ValueError):
             return {}
     return value if isinstance(value, dict) else {}
+
+
+def approval_source_snapshot(job):
+    """Freeze the route-loaded phase A identity before any control await."""
+    if (
+        not isinstance(job, dict)
+        or job.get("status") != "pending_review"
+        or job.get("execution_lane") != "stateless"
+    ):
+        return None
+    freeze = _object(job.get("freeze_data"))
+    if freeze.get("freeze_type") != "phase_boundary":
+        return None
+    try:
+        episode = read_episode(
+            _object(job.get("workspace_idle_episode")),
+            revision=job.get("workspace_idle_revision"),
+        )
+        if episode is None or episode.wait_kind != "human_approval":
+            return None
+        command_id = str(UUID(episode.wait_key))
+    except (IdlePolicyError, TypeError, ValueError):
+        return None
+    return {
+        "command_id": command_id,
+        "episode_id": episode.episode_id,
+        "episode_revision": episode.revision,
+        "freeze_type": "phase_boundary",
+        "phase_type": freeze.get("phase_type"),
+        "phase_number": freeze.get("phase_number"),
+        "runtime_generation": episode.runtime_identity.runtime_generation,
+        "runtime_uid": episode.runtime_identity.runtime_uid,
+    }
 
 
 async def finalized_phase_source(

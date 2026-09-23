@@ -243,6 +243,8 @@ def test_job_projection_preserves_shape_extensions_and_input(as_text):
         "context": json.dumps(context) if as_text else context,
         "config_override": json.dumps(config) if as_text else config,
         "workspace_contract": {"state": "ready", "extension": "retained"},
+        "workspace_idle_episode": {"runtime_identity": "synthetic-private"},
+        "workspace_idle_revision": 7,
         "response_extension": {"id": UUID(int=7), "nullable": None},
     }
     before = deepcopy(source)
@@ -252,6 +254,8 @@ def test_job_projection_preserves_shape_extensions_and_input(as_text):
     assert source == before
     assert result is not source
     assert "synthetic-private" not in repr(result)
+    assert "workspace_idle_episode" not in result
+    assert "workspace_idle_revision" not in result
     assert result["response_extension"] == before["response_extension"]
     assert result["workspace_contract"] == before["workspace_contract"]
     assert isinstance(result["context"], str if as_text else dict)

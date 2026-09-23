@@ -1563,6 +1563,11 @@ class JobControlOperations:
         """Core of :func:`approve_job` after the access gate — request-free so the
         notification ``review_queue.approve`` handler can call it directly."""
         require_srw_runtime(job)
+        from orchestrator.services.vm_idle_phase_approval import (
+            approval_source_snapshot,
+        )
+
+        phase_snapshot = approval_source_snapshot(job)
         if request is None:
             request = JobApproveRequest()
         await self.dependencies.completion_control.guard(
@@ -1694,6 +1699,7 @@ class JobControlOperations:
                                     wake = await idle_store.approve_phase_wake_on_conn(
                                         conn, job_id=job_id,
                                         claim_id=str(control_claim.claim_id),
+                                        expected_source=phase_snapshot,
                                     )
                                     if wake is None:
                                         raise CompletionControlClaimConflict(

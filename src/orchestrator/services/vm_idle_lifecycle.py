@@ -446,6 +446,7 @@ class VMIdleLifecycleStore:
 
     async def approve_phase_wake_on_conn(
         self, conn, *, job_id: str, claim_id: str,
+        expected_source: Mapping[str, Any] | None,
     ) -> dict[str, Any] | None:
         """Commit an exact phase approval under CompletionControl.finish_claim."""
         if not conn.is_in_transaction() or _uuid(job_id) is None or _uuid(claim_id) is None:
@@ -498,6 +499,17 @@ class VMIdleLifecycleStore:
             vm_uid=operation["vm_uid"], launcher_uid=operation["launcher_uid"],
         )
         if source is None:
+            return None
+        if expected_source != {
+            "command_id": source["command_id"],
+            "episode_id": episode.episode_id,
+            "episode_revision": episode.revision,
+            "freeze_type": "phase_boundary",
+            "phase_type": source["semantics"]["freeze"]["phase_type"],
+            "phase_number": source["semantics"]["freeze"]["phase_number"],
+            "runtime_generation": str(operation["provision_generation"]),
+            "runtime_uid": str(operation["vm_uid"]),
+        }:
             return None
         vm = _object(context.get("vm"))
         predecessor = _object(context.get("last_vm"))

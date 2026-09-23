@@ -3881,6 +3881,7 @@ class PostgresDB:
                        j.project_id, j.parent_job_id, j.priority,
                        j.branch_name, j.repo_name, j.merge_status, j.repo_merge_statuses,
                        j.freeze_data,
+                       j.workspace_idle_episode, j.workspace_idle_revision,
                        j.cloud_diff_baseline_commit, j.diff_status,
                        j.exported_folder_handle, j.exported_at,
                        j.creation_order, j.worktree_path, j.delegation_context,

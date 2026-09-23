@@ -14,7 +14,7 @@ from tests.test_vm_idle_lifecycle_real_postgres import (
     _schema_applied,  # noqa: F401
     seed_wait,
 )
-from shared.workspace_idle_policy import IdleEpisode, episode_document
+from shared.workspace_idle_policy import IdleEpisode, RuntimeIdentity, episode_document
 
 
 db = _db_fixture
@@ -263,25 +263,33 @@ async def test_claimed_phase_approval_joins_access_wake_and_executes_only_at_rea
     )
     assert access is not None and not access["wake_execution_requested"]
     control = CompletionControl(db, SimpleNamespace(enqueue_job=None))
+    from orchestrator.services.vm_idle_phase_approval import approval_source_snapshot
+
+    expected_source = approval_source_snapshot(await db.get_job(str(owner)))
+    assert expected_source is not None
     claim = await control.claim_job(
         str(owner),
         source="public_approve",
         expected_status="pending_review",
         expected_lane="stateless",
     )
+
     async def approve():
         async with control.finish_claim(claim) as (conn, _job):
             return await store.approve_phase_wake_on_conn(
                 conn,
                 job_id=str(owner),
                 claim_id=claim.claim_id,
+                expected_source=expected_source,
             )
 
     approved, concurrent_access = await asyncio.gather(
         approve(),
         store.request_wake(
-            str(owner), execution_requested=False,
-            access_kind="ide", access_claimant="reviewer",
+            str(owner),
+            execution_requested=False,
+            access_kind="ide",
+            access_claimant="reviewer",
         ),
     )
     assert approved is not None
@@ -466,7 +474,9 @@ async def test_authorized_approval_entrypoint_defers_exact_phase_until_ready(
     )
     assert result["status"] == "waking"
     controls.dependencies.resolve_job_notifications.assert_awaited_once_with(
-        str(owner), user={"id": "reviewer"}, hook="approve",
+        str(owner),
+        user={"id": "reviewer"},
+        hook="approve",
     )
     state = await store.get_operation(str(operation["id"]))
     assert state["wake_id"] == access["wake_id"]
@@ -630,3 +640,215 @@ async def test_approval_claim_wins_release_race_and_queues_without_stopping(
         )
         == "done"
     )
+
+
+@pytest.mark.asyncio
+async def test_stale_authorized_approval_cannot_approve_new_phase_with_same_status(
+    db,
+    monkeypatch,
+    tmp_path,
+):
+    import logging
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    from fastapi import HTTPException
+    from orchestrator.services.completion_control import CompletionControl
+    from orchestrator.services.completion_runtime import CompletionControlBoundary
+    from tests.test_job_control_operations import _operations
+
+    for key, value in {
+        "WORKSPACE_IDLE_RELEASE_ENABLED": "true",
+        "VM_CREATION_RETRY_ENABLED": "true",
+        "VM_REMOTE_OPERATION_PROTOCOL_ENABLED": "true",
+        "VM_MODE": "same-cluster",
+        "VM_PERSISTENT_ROOTDISK": "true",
+    }.items():
+        monkeypatch.setenv(key, value)
+    await _schema(db)
+    owner, episode_a, identity_a, command_a = await seed_phase_wait(db)
+    store, operation_a = await suspend_phase_wait(db, owner, episode_a, identity_a)
+    snapshot_a = await db.get_job(str(owner))
+    assert snapshot_a["workspace_idle_revision"] == episode_a.revision
+    assert json.loads(snapshot_a["workspace_idle_episode"])["wait_key"] == str(
+        command_a
+    )
+    control = CompletionControl(db, SimpleNamespace(enqueue_job=None))
+    boundary = CompletionControlBoundary(
+        SimpleNamespace(
+            dependencies=SimpleNamespace(
+                commands_enabled=lambda: True,
+                logger=logging.getLogger(__name__),
+            ),
+            control=lambda: control,
+        )
+    )
+    controls = _operations(tmp_path, store=db, completion_control=boundary)
+    controls.dependencies.subjob_output.resolve_job_repo = AsyncMock(
+        return_value=("repo", "job/branch"),
+    )
+    identity_b = {key: str(uuid4()) for key in identity_a}
+    episode_b = IdleEpisode(
+        str(uuid4()),
+        episode_a.revision + 1,
+        "human_approval",
+        str(uuid4()),
+        episode_a.entered_at,
+        None,
+        0,
+        RuntimeIdentity(
+            "job",
+            str(owner),
+            "vm",
+            identity_b["generation"],
+            identity_b["vm_uid"],
+        ),
+    )
+    command_b = UUID(episode_b.wait_key)
+    freeze_b = {
+        "job_id": str(owner),
+        "status": "pending_review",
+        "freeze_type": "phase_boundary",
+        "phase_type": "strategic",
+        "phase_number": 3,
+    }
+
+    async def advance_to_b(*_args, **_kwargs):
+        # A is replaced after the route loaded it but before the control claim.
+        context = json.loads(
+            await db.fetchval(
+                "SELECT context FROM jobs WHERE id=$1",
+                owner,
+            )
+        )
+        context["last_vm"] = context["vm"]
+        context["vm"].update(
+            status="suspended",
+            provision_generation=identity_b["generation"],
+            vm_uid=identity_b["vm_uid"],
+            vmi_uid=identity_b["vmi_uid"],
+            active_pod_uid=identity_b["launcher_uid"],
+            rootdisk_pvc_uid=identity_b["pvc_uid"],
+        )
+        await db.execute(
+            "UPDATE vm_idle_operations SET phase='ready',closed_at=clock_timestamp() "
+            "WHERE id=$1",
+            operation_a["id"],
+        )
+        await db.execute(
+            "UPDATE jobs SET context=$2::jsonb,freeze_data=$3::jsonb,"
+            "workspace_idle_episode=$4::jsonb,workspace_idle_revision=$5,"
+            "completion_seq_hwm=2 WHERE id=$1",
+            owner,
+            json.dumps(context),
+            json.dumps(freeze_b),
+            json.dumps(episode_document(episode_b)),
+            episode_b.revision,
+        )
+        payload = json.loads(
+            await db.fetchval(
+                "SELECT payload FROM job_completion_commands WHERE id=$1",
+                command_a,
+            )
+        )
+        payload["freeze_data"] = freeze_b
+        source = payload["_accepted_idle_wait_source"]
+        source["semantics"]["freeze"]["phase_number"] = 3
+        source["runtime_identity"]["runtime_generation"] = identity_b["generation"]
+        source["runtime_identity"]["runtime_uid"] = identity_b["vm_uid"]
+        source["launcher_uid"] = identity_b["launcher_uid"]
+        await db.execute(
+            "INSERT INTO job_completion_commands "
+            "(id,job_id,report_seq,client_report_id,payload,payload_digest,"
+            "accepted_lease_token,requested_by,state,outcome,finalized_at,"
+            "deadline_at,code_version) VALUES($1,$2,2,$3,$4::jsonb,$5,71,"
+            "'phase-b','done','{}'::jsonb,clock_timestamp(),"
+            "clock_timestamp()+interval '1 hour','phase-b')",
+            command_b,
+            owner,
+            uuid4(),
+            json.dumps(payload),
+            "sha256:" + "b" * 64,
+        )
+        await db.execute(
+            "INSERT INTO completion_effects "
+            "(producer_kind,producer_id,scope_id,effect_name,effect_group,state,completed_at) "
+            "VALUES('job_completion',$1,$2,'main_status_write','status','done',clock_timestamp())",
+            command_b,
+            owner,
+        )
+        await db.execute(
+            "INSERT INTO vm_idle_operations "
+            "(owner_kind,owner_id,phase,episode_id,episode_revision,"
+            "provision_generation,vm_uid,vmi_uid,launcher_uid,pvc_uid,retained_kind,"
+            "stop_evidence,stop_verified_at) VALUES('job',$1,'suspended',$2,$3,$4,$5,$6,$7,$8,"
+            "'rootdisk',$9::jsonb,clock_timestamp())",
+            owner,
+            UUID(episode_b.episode_id),
+            episode_b.revision,
+            *(
+                UUID(identity_b[key])
+                for key in (
+                    "generation",
+                    "vm_uid",
+                    "vmi_uid",
+                    "launcher_uid",
+                    "pvc_uid",
+                )
+            ),
+            json.dumps(
+                {
+                    "version": 1,
+                    "kind": "vm_idle_physical_stop",
+                    "generation": identity_b["generation"],
+                    "vm_uid": identity_b["vm_uid"],
+                    "vmi_uid": identity_b["vmi_uid"],
+                    "launcher_uid": identity_b["launcher_uid"],
+                    "pvc_uid": identity_b["pvc_uid"],
+                    "vm_absent": True,
+                    "vmi_absent": True,
+                    "launcher_absent": True,
+                    "retained_pvc": True,
+                    "same_generation_replacement": False,
+                    "controller_authenticated": True,
+                }
+            ),
+        )
+        return None
+
+    monkeypatch.setattr(type(controls), "_unmerged_pr_gate_reason", advance_to_b)
+    with pytest.raises(HTTPException) as stale:
+        await controls.approve_job(
+            str(owner),
+            user={"id": "reviewer"},
+            job=snapshot_a,
+            request=None,
+        )
+    assert stale.value.status_code == 409
+    assert (
+        await db.fetchval("SELECT state FROM run_queue WHERE unit_id=$1", owner)
+        == "done"
+    )
+    current = await store.get_open_for_owner(str(owner))
+    assert current is not None
+    assert current["episode_id"] == UUID(episode_b.episode_id)
+    assert not current["wake_execution_requested"]
+    assert "_vm_idle_phase_approval" not in json.loads(
+        await db.fetchval("SELECT context FROM jobs WHERE id=$1", owner)
+    )
+    controls.dependencies.resolve_job_notifications.assert_not_awaited()
+
+    # A newly loaded request may approve B after the stale request fails.
+    monkeypatch.setattr(
+        type(controls),
+        "_unmerged_pr_gate_reason",
+        AsyncMock(return_value=None),
+    )
+    fresh = await controls.approve_job(
+        str(owner),
+        user={"id": "reviewer"},
+        job=await db.get_job(str(owner)),
+        request=None,
+    )
+    assert fresh["status"] == "waking"
+    assert (await store.get_open_for_owner(str(owner)))["wake_execution_requested"]
