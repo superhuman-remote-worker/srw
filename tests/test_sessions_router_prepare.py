@@ -564,6 +564,58 @@ async def test_do_prepare_emits_phases_for_warm_thread(monkeypatch, metadata):
 
 
 @pytest.mark.parametrize("mutation_phase", ["post_ready", "post_route"])
+@pytest.mark.asyncio
+async def test_do_prepare_end_intent_fences_route_and_ready(
+    monkeypatch, mutation_phase,
+):
+    from orchestrator.routers import sessions as sessions_mod
+
+    db = AsyncMock()
+    thread = _connection_thread()
+    db.get_thread.return_value = thread
+    db.get_pinned_session_binding.return_value = _connection_binding()
+    lock_cm = AsyncMock()
+    lock_cm.__aenter__.return_value = None
+    lock_cm.__aexit__.return_value = False
+    db.thread_advisory_lock = MagicMock(return_value=lock_cm)
+    fake_main = _fake_main(db)
+
+    async def ready_probe(*_args, **_kwargs):
+        if mutation_phase == "post_ready":
+            thread["pinned_idle_terminal_intent_at"] = "end-intent"
+        return True
+
+    async def ensure_route(**_kwargs):
+        if mutation_phase == "post_route":
+            thread["pinned_idle_terminal_intent_at"] = "end-intent"
+
+    monkeypatch.setattr(sessions_mod, "wait_for_ready", ready_probe)
+    fake_main.session_router = MagicMock()
+    fake_main.session_router.ensure_route = AsyncMock(side_effect=ensure_route)
+    fake_main.session_router.teardown_route = AsyncMock(return_value=True)
+    emitted = []
+    monkeypatch.setattr(
+        sessions_mod, "lifecycle_emit",
+        lambda _uid, _tid, state, **_extra: emitted.append(state),
+    )
+    assert await sessions_mod._do_prepare(
+        thread_id=CONNECTION_THREAD_ID,
+        user_id="u1", config_name="session_base", config_override=None,
+        runtime_authority=sessions_mod.ThreadRuntimeAuthority(
+            thread_id=CONNECTION_THREAD_ID, generation=CONNECTION_GENERATION,
+        ),
+        dependencies=fake_main.dependencies,
+    ) is None
+    assert emitted == ["provisioning", "booting"]
+    if mutation_phase == "post_ready":
+        fake_main.session_router.ensure_route.assert_not_awaited()
+        fake_main.session_router.teardown_route.assert_not_awaited()
+    else:
+        fake_main.session_router.ensure_route.assert_awaited_once()
+        fake_main.session_router.teardown_route.assert_awaited_once()
+
+
+@pytest.mark.parametrize("mutation_phase", ["post_ready", "post_route"])
 @pytest.mark.parametrize(
     "changed_binding",
     [

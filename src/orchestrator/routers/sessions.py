@@ -316,6 +316,33 @@ async def prepare_session(
         raise HTTPException(status_code=404, detail="thread not found")
     if str(thread.get("user_id") or "") != str(user["id"]):
         raise HTTPException(status_code=403, detail="thread access denied")
+    if thread.get("execution_lane") == LANE_PINNED:
+        from orchestrator.services.vm_idle_lifecycle import VMIdleLifecycleStore
+
+        idle = VMIdleLifecycleStore(db)
+        if (
+            await idle.get_open_for_thread(thread_id) is not None
+            or await idle.get_pending_access_continuation(thread_id) is not None
+        ):
+            _require_supported_protected_prepare_override(
+                thread, body.config_override,
+            )
+            if body.config_name is not None:
+                try:
+                    validate_config_name(body.config_name)
+                except InvalidConfigNameError as exc:
+                    raise HTTPException(status_code=422, detail=str(exc)) from exc
+            session_tool_policy.with_validated_tool_overrides(
+                body.config_override,
+            )
+            wake = await idle.request_thread_wake(
+                thread_id, execution_requested=True,
+            )
+            if wake is None:
+                raise HTTPException(
+                    status_code=409, detail={"code": "session_idle_wake_held"},
+                )
+            return PrepareResponse(state="waking")
     _require_preparable_thread(thread)
     runtime_authority = thread_runtime_authority(thread)
     if runtime_authority is None:
@@ -394,7 +421,7 @@ async def _do_prepare(
     runtime_authority: ThreadRuntimeAuthority,
     *,
     dependencies: SessionsDependencies,
-) -> None:
+) -> bool | None:
     """Run the actual provisioning + readiness work asynchronously.
 
     Serializes concurrent prepares on the same thread via advisory lock.
@@ -634,6 +661,9 @@ async def _do_prepare(
             current_binding is None
             or current_binding.target_key != binding.target_key
             or current_binding.agent_status not in startup_statuses
+            or not same_thread_runtime_authority(
+                await db.get_thread(thread_id), runtime_authority
+            )
         ):
             return
 
@@ -655,11 +685,15 @@ async def _do_prepare(
                 current_binding is None
                 or current_binding.target_key != binding.target_key
                 or current_binding.agent_status not in startup_statuses
+                or not same_thread_runtime_authority(
+                    await db.get_thread(thread_id), runtime_authority
+                )
             ):
                 return
 
             _emit("ready")
             route_published = True
+            return True
         finally:
             # ``ensure_route`` may create the deterministic Service before an
             # Ingress failure. Any path that does not publish ready therefore
@@ -680,6 +714,83 @@ async def _do_prepare(
         current = await db.get_thread(thread_id)
         if same_thread_runtime_authority(current, runtime_authority):
             _emit("failed", reason=str(e))
+
+
+async def prepare_woken_pinned_session(
+    thread_id: str, operation_id: str, *, dependencies: SessionsDependencies,
+) -> bool:
+    """Replay the existing prepare path only for one Ready, authorized wake."""
+    from orchestrator.services.vm_idle_lifecycle import VMIdleLifecycleStore
+
+    thread = await dependencies.store.get_thread(thread_id)
+    idle = VMIdleLifecycleStore(dependencies.store)
+    operation = await idle.get_open_for_thread(thread_id)
+    access_continuation = None
+    if operation is None:
+        access_continuation = await idle.get_pending_access_continuation(thread_id)
+        if (
+            access_continuation is not None
+            and str(access_continuation["operation_id"]) == operation_id
+        ):
+            operation = await idle.get_operation(operation_id)
+    if (
+        thread is None or operation is None
+        or str(operation["id"]) != operation_id
+        or operation["release_kind"] != "pinned_thread"
+        or operation["wake_ready_at"] is None
+        or not (
+            operation["wake_execution_requested"]
+            or (
+                access_continuation is not None
+                and operation["phase"] == "ready"
+                and operation["closed_at"] is not None
+                and not operation["wake_execution_requested"]
+            )
+        )
+        or operation["thread_terminal_intent_at"] is not None
+        or thread.get("status") != "created"
+        or thread.get("runtime_retirement_token") is not None
+    ):
+        return False
+    authority = thread_runtime_authority(thread)
+    metadata = thread.get("metadata") or {}
+    if isinstance(metadata, str):
+        try:
+            metadata = json.loads(metadata)
+        except (TypeError, ValueError):
+            return False
+    vm = metadata.get("vm") if isinstance(metadata, dict) else None
+    proof = operation["thread_wake_ready_identity"]
+    if isinstance(proof, str):
+        try:
+            proof = json.loads(proof)
+        except (TypeError, ValueError):
+            return False
+    if (
+        authority is None or thread.get("execution_lane") != LANE_PINNED
+        or not isinstance(vm, dict) or not isinstance(proof, dict)
+        or vm.get("status") != "ready"
+        or vm.get("identity_authenticated") is not True
+        or vm.get("provision_generation") != proof.get("generation")
+        or vm.get("vm_uid") != proof.get("vm_uid")
+        or vm.get("vmi_uid") != proof.get("vmi_uid")
+        or vm.get("active_pod_uid") != proof.get("launcher_uid")
+        or vm.get("rootdisk_pvc_uid") != proof.get("pvc_uid")
+        or vm.get("idle_wake_operation_id") != operation_id
+    ):
+        return False
+    try:
+        _require_supported_protected_prepare_override(thread, None)
+        boot_name = thread.get("config_name") or "session_base"
+        if _is_expert_uuid(boot_name):
+            boot_name = "session_base"
+        validate_config_name(boot_name)
+    except (HTTPException, InvalidConfigNameError):
+        return False
+    return bool(await _do_prepare(
+        thread_id, str(thread["user_id"]), boot_name, None, authority,
+        dependencies=dependencies,
+    ))
 
 
 async def _provision_agent_for_thread(

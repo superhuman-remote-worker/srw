@@ -1043,6 +1043,7 @@ async def end_thread_flow(
     settle_status: Literal["ended", "suspended"] = "ended",
     local_runtime_quiesced: bool = False,
     retiring_agent_response_pending: bool = False,
+    require_physical_agent_stop: bool = False,
     dependencies: ThreadRetirementDependencies,
 ) -> dict[str, Any]:
     """The End funnel body — everything ``end_thread`` does after auth.
@@ -1116,11 +1117,32 @@ async def end_thread_flow(
 
     if permanent and settle_status != "ended":
         raise ValueError("permanent retirement cannot settle suspended")
+    if require_physical_agent_stop and (
+        permanent or settle_status != "suspended" or retiring_agent_response_pending
+    ):
+        raise ValueError("idle physical stop requires an orchestrator soft retirement")
     if retiring_agent_response_pending and not local_runtime_quiesced:
         raise ValueError("retiring agent response requires local quiescence")
     stateless = thread.get("execution_lane") == "stateless"
     initial_status = thread.get("status")
     initial_stateless_authority: dict[str, Any] | None = None
+
+    if not stateless and permanent:
+        terminal_join = await postgres_db.reserve_pinned_thread_idle_terminal_end(
+            thread_id,
+        )
+        if terminal_join == "waiting_for_release":
+            return {
+                "status": "ending", "retirement_disposition": "ended",
+                "retirement_permanent": True,
+            }
+        if terminal_join in {"wake_won", "held"}:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "pinned_idle_terminal_join_held"},
+            )
+        if terminal_join == "missing":
+            return {"status": "deleted"}
 
     async def _stand_down(
         authoritative_thread: dict[str, Any],
@@ -1309,6 +1331,23 @@ async def end_thread_flow(
                     "reason": retirement.get("reason") or state,
                 },
             )
+        # Idle admission installs this row atomically with the same pinned
+        # retirement token. A watchdog, owner retry or another replica must
+        # recover the physical-Pod-stop requirement from durable authority,
+        # never from the initiating caller's in-memory option.
+        idle_stop = await postgres_db.fetchrow(
+            "SELECT id FROM vm_idle_operations WHERE owner_kind='thread' "
+            "AND owner_id=$1::uuid AND release_kind='pinned_thread' "
+            "AND thread_runtime_generation=$2::uuid "
+            "AND thread_retirement_token=$3::uuid AND closed_at IS NULL",
+            thread_id, retirement["generation"], retirement["token"],
+        )
+        if require_physical_agent_stop and idle_stop is None:
+            raise HTTPException(
+                status_code=409,
+                detail={"code": "pinned_idle_retirement_source_changed"},
+            )
+        require_physical_agent_stop = idle_stop is not None
         already_authorized = retirement.get("authorized_at") is not None
 
         async def _abort_hidden_preflight() -> str:
@@ -1668,6 +1707,13 @@ async def end_thread_flow(
                     "retirement_permanent": bool(permanent),
                 }
 
+            if require_physical_agent_stop and local_runtime_quiesced:
+                # The reporting agent's own HTTP response cannot wait for
+                # exact deletion of its Pod. Its durable local-zero ACK is
+                # now visible; the independent idle reconciler stops the
+                # captured Pod and continues this same token after response.
+                return _ending_response(retry_after_ms=250)
+
             try:
                 staged_event: dict[str, Any] | None = None
                 authoritative_metadata = thread_metadata_object(authoritative_thread)
@@ -1819,8 +1865,10 @@ async def end_thread_flow(
                 )
                 await _cleanup_pinned_thread_retirement(
                     retirement,
+                    stop_agent_before_workspace=require_physical_agent_stop,
                     cleanup_agent_pod=(
-                        not runtime_exposed
+                        require_physical_agent_stop
+                        or not runtime_exposed
                         or (
                             permanent
                             and not retiring_agent_response_pending

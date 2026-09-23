@@ -19,7 +19,7 @@ import logging
 import math
 import os
 import re
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
@@ -21084,6 +21084,7 @@ class PostgresDB:
         expected_attach_token: str | None,
         expected_vm_context: Mapping[str, Any] | None,
         provision_context: Mapping[str, Any],
+        wake_operation_id: str | None = None,
         poll: bool = False,
         preparation_only: bool = False,
         expected_preparation_context: Mapping[str, Any] | None = None,
@@ -21110,6 +21111,10 @@ class PostgresDB:
         try:
             parsed_thread = UUID(str(thread_id))
             parsed_runtime_generation = UUID(str(expected_runtime_generation))
+            parsed_wake = (
+                UUID(str(wake_operation_id))
+                if wake_operation_id is not None else None
+            )
             parsed_agent = (
                 UUID(str(expected_agent_id)) if expected_agent_id is not None else None
             )
@@ -21191,6 +21196,58 @@ class PostgresDB:
                     dict(raw_current_vm) if raw_current_vm is not None else None
                 )
                 if current_vm != expected_vm:
+                    return False
+                open_idle = await conn.fetchrow(
+                    "SELECT id,release_kind,phase,stop_verified_at,wake_generation,"
+                    "wake_request_id,provision_generation,vm_uid,pvc_uid,"
+                    "thread_runtime_generation,thread_retirement_token,"
+                    "thread_terminal_intent_at "
+                    "FROM vm_idle_operations WHERE owner_kind='thread' "
+                    "AND owner_id=$1 AND closed_at IS NULL FOR UPDATE",
+                    parsed_thread,
+                )
+                if open_idle is not None:
+                    if (
+                        parsed_wake is None or open_idle["id"] != parsed_wake
+                        or open_idle["release_kind"] != "pinned_thread"
+                        or open_idle["thread_terminal_intent_at"] is not None
+                        or open_idle["phase"] not in {"waking", "wake_held"}
+                        or open_idle["stop_verified_at"] is None
+                        or row["status"] != "suspended"
+                        or (current_vm or {}).get("status") != "suspended"
+                        or (current_vm or {}).get("rootdisk") != "kept"
+                        or str((current_vm or {}).get("provision_generation"))
+                            != str(open_idle["provision_generation"])
+                        or str((current_vm or {}).get("vm_uid"))
+                            != str(open_idle["vm_uid"])
+                        or str((current_vm or {}).get("rootdisk_pvc_uid"))
+                            != str(open_idle["pvc_uid"])
+                        or provision_generation != str(open_idle["wake_generation"])
+                        or proposed.get("idle_wake_operation_id")
+                            != str(open_idle["id"])
+                        or proposed.get("idle_wake_request_id")
+                            != str(open_idle["wake_request_id"])
+                        or proposed.get("idle_predecessor_pvc_uid")
+                            != str(open_idle["pvc_uid"])
+                    ):
+                        return False
+                    settled_retirement = await conn.fetchval(
+                        "SELECT EXISTS(SELECT 1 FROM "
+                        "thread_runtime_retirement_outcomes WHERE thread_id=$1 "
+                        "AND runtime_generation=$2 AND retirement_token=$3 "
+                        "AND disposition='suspended' AND permanent=false "
+                        "AND outcome='settled')",
+                        parsed_thread, open_idle["thread_runtime_generation"],
+                        open_idle["thread_retirement_token"],
+                    )
+                    if not settled_retirement:
+                        return False
+                elif parsed_wake is not None or any(
+                    proposed.get(key) is not None for key in (
+                        "idle_wake_operation_id", "idle_wake_request_id",
+                        "idle_predecessor_pvc_uid",
+                    )
+                ):
                     return False
                 current_vm_status = str((current_vm or {}).get("status") or "")
                 if poll:
@@ -34360,7 +34417,8 @@ class PostgresDB:
             async with conn.transaction():
                 row = await conn.fetchrow(
                     "SELECT status, execution_lane, runtime_generation, "
-                    "runtime_retirement_token, agent_id, "
+                    "runtime_retirement_token, pinned_idle_terminal_intent_at, "
+                    "agent_id, "
                     "control_admission_agent_id, runtime_attach_token, metadata "
                     "FROM threads WHERE id=$1::uuid FOR UPDATE",
                     parsed_thread,
@@ -34379,6 +34437,7 @@ class PostgresDB:
                     str(row["execution_lane"] or "") == "pinned"
                     and str(row["runtime_generation"] or "") == str(parsed_generation)
                     and row["runtime_retirement_token"] is None
+                    and row["pinned_idle_terminal_intent_at"] is None
                     and str(row["status"] or "")
                     in {"created", "active", "awaiting_user", "suspended"}
                     and row["agent_id"] is None
@@ -36436,7 +36495,8 @@ class PostgresDB:
             async with conn.transaction():
                 thread = await conn.fetchrow(
                     "SELECT status, execution_lane, runtime_generation, "
-                    "runtime_retirement_token, agent_id, runtime_attach_token, "
+                    "runtime_retirement_token, pinned_idle_terminal_intent_at, "
+                    "agent_id, runtime_attach_token, "
                     "metadata FROM threads WHERE id=$1::uuid FOR UPDATE",
                     parsed_thread,
                 )
@@ -36521,6 +36581,7 @@ class PostgresDB:
                     and str(thread["runtime_generation"] or "")
                     == str(parsed_generation)
                     and thread["runtime_retirement_token"] is None
+                    and thread["pinned_idle_terminal_intent_at"] is None
                     and str(thread["status"] or "")
                     in {"created", "active", "awaiting_user", "suspended"}
                     and thread["agent_id"] is None
@@ -36537,6 +36598,7 @@ class PostgresDB:
                     "runtime_authority_exposed=true, last_activity=now() "
                     "WHERE id=$1::uuid AND runtime_generation=$2::uuid "
                     "AND runtime_retirement_token IS NULL "
+                    "AND pinned_idle_terminal_intent_at IS NULL "
                     "AND NOT EXISTS (SELECT 1 FROM agents "
                     "WHERE thread_id=$1::uuid OR hostname=$4 OR pod_uid=$5)",
                     parsed_thread,
@@ -36873,6 +36935,137 @@ class PostgresDB:
                     raise RuntimeError("agent Pod provision zero publication lost")
                 return receipt
 
+    async def reserve_pinned_thread_idle_terminal_end(
+        self, thread_id: str,
+    ) -> str:
+        """Serialize authorized permanent End with an admitted soft idle stop."""
+        try:
+            owner_id = UUID(str(thread_id))
+        except (TypeError, ValueError):
+            return "missing"
+        async with self.acquire() as conn, conn.transaction():
+            thread = await conn.fetchrow(
+                "SELECT status,runtime_generation,runtime_retirement_token,"
+                "runtime_retirement_permanent,runtime_retirement_context,"
+                "agent_id,runtime_attach_token,metadata FROM threads WHERE id=$1 "
+                "FOR UPDATE", owner_id,
+            )
+            if thread is None:
+                return "missing"
+            operation = await conn.fetchrow(
+                "SELECT * FROM vm_idle_operations WHERE owner_kind='thread' "
+                "AND owner_id=$1 AND closed_at IS NULL FOR UPDATE", owner_id,
+            )
+            if operation is None:
+                return "none"
+            if operation["release_kind"] != "pinned_thread":
+                return "held"
+            if operation["phase"] not in {
+                "releasing", "release_held", "suspended", "waking",
+                "wake_held",
+            }:
+                return "held"
+            joined_permanent = False
+            if operation["phase"] in {"suspended", "waking", "wake_held"}:
+                pending_context = thread["runtime_retirement_context"] or {}
+                if isinstance(pending_context, str):
+                    try:
+                        pending_context = json.loads(pending_context)
+                    except (TypeError, ValueError):
+                        pending_context = {}
+                joined_permanent = bool(
+                    operation["thread_terminal_intent_at"] is not None
+                    and thread["runtime_retirement_permanent"] is True
+                    and isinstance(pending_context, dict)
+                    and pending_context.get("generation")
+                        == str(thread["runtime_generation"])
+                    and pending_context.get("settle_status") == "ended"
+                )
+                if (
+                    thread["status"] not in {"suspended", "created"}
+                    or thread["runtime_retirement_token"] is not None
+                    and not joined_permanent
+                    or operation["stop_verified_at"] is None
+                    or operation["thread_agent_stop_verified_at"] is None
+                ):
+                    return "held"
+                if operation["phase"] == "suspended" and (
+                    thread["status"] != "suspended"
+                    or thread["agent_id"] is not None
+                    or thread["runtime_attach_token"] is not None
+                ):
+                    return "held"
+            elif (
+                thread["status"] != "awaiting_user"
+                or thread["runtime_generation"]
+                    != operation["thread_runtime_generation"]
+                or thread["runtime_retirement_token"]
+                    != operation["thread_retirement_token"]
+            ):
+                return "held"
+            if operation["thread_terminal_intent_at"] is None:
+                stamped = await conn.fetchrow(
+                    "UPDATE vm_idle_operations SET "
+                    "thread_terminal_intent_at=clock_timestamp(),"
+                    "thread_terminal_intent_generation=$2 "
+                    "WHERE id=$1 AND thread_terminal_intent_at IS NULL "
+                    "RETURNING thread_terminal_intent_at",
+                    operation["id"], thread["runtime_generation"],
+                )
+                if stamped is None:
+                    return "held"
+                mirrored = await conn.execute(
+                    "UPDATE threads SET pinned_idle_terminal_intent_at=$2 "
+                    "WHERE id=$1 AND pinned_idle_terminal_intent_at IS NULL",
+                    owner_id, stamped["thread_terminal_intent_at"],
+                )
+                if mirrored != "UPDATE 1":
+                    raise RuntimeError("pinned idle terminal intent mirror lost")
+            metadata = thread["metadata"] or {}
+            if isinstance(metadata, str):
+                try:
+                    metadata = json.loads(metadata)
+                except (TypeError, ValueError):
+                    metadata = {}
+            vm = metadata.get("vm") if isinstance(metadata, dict) else None
+            vm = vm if isinstance(vm, dict) else {}
+            issued_successor_ready = bool(
+                operation["phase"] in {"suspended", "waking", "wake_held"}
+                and operation["wake_generation"] is not None
+                and vm.get("status") == "ready"
+                and vm.get("identity_authenticated") is True
+                and vm.get("identity_provision_generation")
+                    == str(operation["wake_generation"])
+                and vm.get("provision_generation")
+                    == str(operation["wake_generation"])
+                and vm.get("idle_wake_operation_id") == str(operation["id"])
+                and vm.get("idle_predecessor_pvc_uid")
+                    == str(operation["pvc_uid"])
+                and vm.get("rootdisk_pvc_uid") == str(operation["pvc_uid"])
+                and all(vm.get(key) for key in (
+                    "vm_uid", "vmi_uid", "active_pod_uid",
+                ))
+            )
+            unissued_successor = bool(
+                operation["phase"] in {"suspended", "waking", "wake_held"}
+                and operation["wake_ready_at"] is None
+                and operation["thread_wake_ready_identity"] is None
+                and thread["status"] == "suspended"
+                and vm.get("status") == "suspended"
+                and vm.get("rootdisk") == "kept"
+                and vm.get("provision_generation")
+                    == str(operation["provision_generation"])
+                and vm.get("rootdisk_pvc_uid") == str(operation["pvc_uid"])
+            )
+            return (
+                "ready_for_destructive_retirement"
+                if joined_permanent
+                or (operation["phase"] == "suspended"
+                    and not operation["wake_requested"])
+                or issued_successor_ready or unissued_successor
+                else "waiting_for_release"
+            )
+
     async def begin_pinned_thread_retirement(
         self,
         thread_id: str,
@@ -36886,6 +37079,7 @@ class PostgresDB:
         initiator: str = "owner",
         require_agent_offline: bool = False,
         authorize_immediately: bool = False,
+        _connection: Any | None = None,
     ) -> Dict[str, Any]:
         """Atomically close one pinned runtime and capture cleanup authority.
 
@@ -36910,7 +37104,9 @@ class PostgresDB:
         except (TypeError, ValueError):
             return {"state": "missing"}
 
-        async with self.acquire() as conn:
+        async with (
+            self.acquire() if _connection is None else nullcontext(_connection)
+        ) as conn:
             async with conn.transaction():
                 row = await conn.fetchrow(
                     """
@@ -38034,6 +38230,7 @@ class PostgresDB:
         token: str,
         generation: str,
         settle_status: str,
+        _connection: Any | None = None,
     ) -> bool:
         """Append the durable post-preflight authorization once."""
 
@@ -38045,7 +38242,9 @@ class PostgresDB:
             parsed_generation = UUID(str(generation))
         except (TypeError, ValueError):
             return False
-        async with self.acquire() as conn:
+        async with (
+            self.acquire() if _connection is None else nullcontext(_connection)
+        ) as conn:
             row = await conn.fetchval(
                 "UPDATE threads SET runtime_retirement_authorized_at="
                 "COALESCE(runtime_retirement_authorized_at, now()) "

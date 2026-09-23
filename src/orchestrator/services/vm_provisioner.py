@@ -1421,9 +1421,11 @@ class VMProvisioner:
                 return None
         except (KeyError, TypeError, ValueError, AttributeError):
             return None
-        if (
-            await self._current_provision_generation("job", fields["owner_id"])
-            != fields["provision_generation"]
+        owner_kind = operation.get("owner_kind")
+        if owner_kind not in {"job", "thread"} or (
+            await self._current_provision_generation(
+                owner_kind, fields["owner_id"]
+            ) != fields["provision_generation"]
         ):
             return None
         probe = await self._probe_vm_teardown_identity(
@@ -3265,6 +3267,7 @@ class VMProvisioner:
         expected_agent_id: str | None = None,
         expected_attach_token: str | None = None,
         expected_vm_context: Mapping[str, Any] | None = None,
+        wake_operation_id: str | None = None,
         poll: bool = False,
     ) -> bool | dict[str, Any]:
         """Create a VM for a persistent thread.
@@ -3275,6 +3278,10 @@ class VMProvisioner:
         Returns:
             True if the request was accepted, False otherwise.
         """
+        if wake_operation_id is not None and (
+            poll or preparation is not None or initialization is not None
+        ):
+            return False
         if preparation is not None:
             preparation = await self._validate_preparation(
                 thread_id, "thread", preparation
@@ -3311,6 +3318,26 @@ class VMProvisioner:
         # request.  A stale route read, End, Resume, rebind, or DB failure is a
         # hard refusal with zero external calls.
         fresh_context = self._fresh_provision_ctx()
+        if wake_operation_id is not None:
+            try:
+                wake_id = UUID(str(wake_operation_id))
+            except (TypeError, ValueError):
+                return False
+            wake = await self._db.fetchrow(
+                "SELECT wake_generation,wake_request_id,pvc_uid FROM "
+                "vm_idle_operations WHERE id=$1 AND owner_kind='thread' "
+                "AND owner_id=$2 AND release_kind='pinned_thread' "
+                "AND closed_at IS NULL", wake_id, UUID(thread_id),
+            ) if self._db is not None else None
+            if (
+                wake is None or wake["wake_generation"] is None
+                or wake["wake_request_id"] is None
+            ):
+                return False
+            fresh_context["provision_generation"] = str(wake["wake_generation"])
+            fresh_context["idle_wake_operation_id"] = str(wake_id)
+            fresh_context["idle_wake_request_id"] = str(wake["wake_request_id"])
+            fresh_context["idle_predecessor_pvc_uid"] = str(wake["pvc_uid"])
         fresh_context.update(
             initialization=initialization,
             preparation_request=preparation,
@@ -3359,6 +3386,7 @@ class VMProvisioner:
                 expected_attach_token=expected_attach_token,
                 expected_vm_context=expected_vm_context,
                 provision_context=fresh_context,
+                wake_operation_id=wake_operation_id,
                 **({"poll": True} if poll else {}),
                 **(
                     {"expected_preparation_context": preparation_context}

@@ -13,6 +13,7 @@ application-owned :class:`ThreadTurnLocks`.
 
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -140,6 +141,42 @@ async def thread_input(
             body.content,
             body.expected_conversation_revision,
             dependencies=dependencies.stateless_input,
+        )
+
+    if not body.content or not isinstance(body.content, str):
+        raise HTTPException(status_code=400, detail="content must be a non-empty string")
+    from orchestrator.services.vm_idle_lifecycle import VMIdleLifecycleStore
+
+    idle = VMIdleLifecycleStore(store)
+    open_idle = await idle.get_open_for_thread(thread_id)
+    metadata = lane_thread.get("metadata") or {}
+    if isinstance(metadata, str):
+        try:
+            metadata = json.loads(metadata)
+        except (ValueError, TypeError):
+            metadata = {}
+    vm = metadata.get("vm") if isinstance(metadata, dict) else None
+    retained_ready = bool(
+        lane_thread.get("status") == "suspended"
+        and isinstance(vm, dict)
+        and vm.get("idle_wake_operation_id") is not None
+    )
+    continuation = await idle.get_pending_access_continuation(thread_id)
+    if open_idle is not None or retained_ready or continuation is not None:
+        wake = await idle.request_thread_wake(
+            thread_id, execution_requested=True,
+        )
+        if wake is None:
+            raise HTTPException(
+                status_code=409, detail={"code": "session_idle_wake_held"},
+            )
+        return JSONResponse(
+            status_code=202,
+            content={
+                "accepted": False, "state": "waking",
+                "wake_id": str(wake["wake_id"]),
+                "thread_id": thread_id,
+            },
         )
 
     thread, binding = await pinned_forwarding.resolve_thread_for_forwarding(

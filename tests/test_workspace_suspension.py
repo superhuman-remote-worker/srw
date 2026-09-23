@@ -2064,6 +2064,33 @@ class TestVmSuspendRidesThePersistentRootdisk:
         assert merged.get("rootdisk") == "kept"
 
     @pytest.mark.asyncio
+    async def test_stopped_vm_projection_failure_stays_suspending(self, monkeypatch):
+        monkeypatch.setenv("VM_PERSISTENT_ROOTDISK", "true")
+        svc, vm_prov = make_vm_service()
+        svc._db.get_thread = AsyncMock(return_value=make_vm_thread())
+        initial_attestation = vm_prov.attest_workspace_runtime.return_value
+        async def attest_until_stopped(*_args, **_kwargs):
+            if vm_prov.delete_thread_vm.await_count:
+                raise RuntimeError("VM absent after stop")
+            return initial_attestation
+
+        vm_prov.attest_workspace_runtime.side_effect = attest_until_stopped
+        svc._db.merge_thread_vm_context_if_provision_generation.side_effect = [
+            True, True, False,
+        ]
+
+        assert await svc.suspend_thread_workspace("tid-vm") is False
+        vm_prov.delete_thread_vm.assert_awaited_once_with(
+            "tid-vm", purge_disk=False,
+        )
+        projected = [
+            call.args[2] for call in
+            svc._db.merge_thread_vm_context_if_provision_generation.await_args_list
+        ]
+        assert projected[0]["status"] == "suspending"
+        assert not any(item.get("status") == "ready" for item in projected[1:])
+
+    @pytest.mark.asyncio
     async def test_flag_off_stays_fail_closed(self, monkeypatch):
         """Without the controller-side flag the disk cascade-deletes, so a
         failed snapshot must still keep the workspace alive — suspending would
