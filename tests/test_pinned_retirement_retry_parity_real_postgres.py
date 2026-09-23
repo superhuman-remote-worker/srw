@@ -262,3 +262,246 @@ async def test_durable_retry_keeps_refusing_a_live_permanent_delete_without_proo
     assert pending is not None
     assert str(pending["runtime_retirement_token"]) == permanent["token"]
     assert pending["runtime_retirement_local_quiescence"] is None
+
+
+# ---------------------------------------------------------------------------
+# Nomination: the live-drain grace versus rows whose proof is already durable
+# ---------------------------------------------------------------------------
+
+
+class _OneDetectorPass:
+    """A shutdown event that lets ``stale_agent_detector`` run exactly once."""
+
+    def __init__(self) -> None:
+        self.checks = 0
+
+    def is_set(self) -> bool:
+        self.checks += 1
+        return self.checks > 1
+
+    async def wait(self) -> bool:
+        return True
+
+
+async def _run_one_detector_pass() -> None:
+    await main.stale_agent_detector(_OneDetectorPass())
+
+
+async def _agent_receipted_permanent_handoff(db, monkeypatch) -> dict[str, str]:
+    """A live dedicated-PVC session the owner deleted, after the agent's ACK.
+
+    The owner's DELETE returned ``ending``; the agent drained, appended its
+    exact local-quiescence receipt through the status ACK, received
+    ``retiring_agent_exit_authorized`` and exited. Its heartbeats stopped
+    five minutes ago. Everything left is an orchestrator-only effect.
+    """
+
+    ids = await fixtures._seed(db, bind_agent=False, publish_agent_pod=False)
+    generation = str((await db.get_thread(ids["thread"]))["runtime_generation"])
+    attempt_id = str(uuid4())
+    pod_name = f"srw-agent-s-{attempt_id[:8]}"
+    pod_uid = str(uuid4())
+    pvc_name = f"pvc-agent-s-{ids['thread'][:12]}"
+    pvc_uid = str(uuid4())
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE threads SET status='created' WHERE id=$1::uuid",
+            UUID(ids["thread"]),
+        )
+    intent = await db.reserve_pinned_agent_pod_provision_intent(
+        ids["thread"],
+        expected_runtime_generation=generation,
+        attempt_id=attempt_id,
+        pod_name=pod_name,
+        provisioner="agent",
+        namespace="test",
+        pvc_name=pvc_name,
+    )
+    assert intent is not None
+    claim_id = str(intent["workspace_claim"]["claim_id"])
+    assert await db.publish_pinned_agent_workspace_claim(
+        ids["thread"],
+        expected_runtime_generation=generation,
+        claim_id=claim_id,
+        pvc_name=pvc_name,
+        pvc_uid=pvc_uid,
+        namespace="test",
+    )
+    assert await db.publish_pinned_agent_pod_provision_intent(
+        ids["thread"],
+        expected_runtime_generation=generation,
+        attempt_id=attempt_id,
+        pod_name=pod_name,
+        pod_uid=pod_uid,
+        namespace="test",
+    )
+    async with db.acquire() as conn:
+        metadata = fixtures._json(
+            await conn.fetchval(
+                "SELECT metadata FROM threads WHERE id=$1::uuid",
+                UUID(ids["thread"]),
+            )
+        )
+        metadata["config_override"]["officer"]["enabled"] = False
+        await conn.execute(
+            "DELETE FROM project_officers WHERE thread_id=$1", UUID(ids["thread"])
+        )
+        await conn.execute(
+            "INSERT INTO agents "
+            "(id,config_name,hostname,pod_ip,pod_uid,status,agent_mode,last_heartbeat) "
+            "VALUES ($1,'assistant',$2,'127.0.0.1',$3,'session','persistent',now())",
+            UUID(ids["agent"]),
+            pod_name,
+            pod_uid,
+        )
+        async with conn.transaction():
+            await conn.execute(
+                "UPDATE threads SET status='active',agent_id=$2::uuid,"
+                "control_admission_agent_id=$2::uuid,runtime_attach_token=$3::uuid,"
+                "metadata=$4::jsonb WHERE id=$1::uuid",
+                UUID(ids["thread"]),
+                UUID(ids["agent"]),
+                UUID(ids["attach_token"]),
+                json.dumps(metadata),
+            )
+            await conn.execute(
+                "UPDATE agents SET thread_id=$2::uuid WHERE id=$1::uuid",
+                UUID(ids["agent"]),
+                UUID(ids["thread"]),
+            )
+
+    provisioner = MagicMock(is_available=True)
+    provisioner.delete_agent_pod_exact = AsyncMock(return_value=True)
+    # The exited agent's Pod is Completed, then gone once its finalizer lifts.
+    provisioner.agent_pod_authority = AsyncMock(
+        side_effect=["exact_terminal", "exact_absent"]
+    )
+    provisioner.release_agent_pod_finalizer_exact = AsyncMock(return_value=True)
+    fences = iter(
+        [
+            {"state": "exact_original", "pvc_uid": pvc_uid},
+            {"state": "exact_fence", "pvc_uid": "pvc-fence-uid"},
+        ]
+    )
+    provisioner.fence_agent_workspace_claim = AsyncMock(
+        side_effect=lambda *_a, **_k: next(fences)
+    )
+    provisioner.delete_agent_workspace_claim_exact = AsyncMock(return_value=True)
+    provisioner.release_agent_workspace_claim_finalizer_exact = AsyncMock(
+        return_value=True
+    )
+    monkeypatch.setattr(main, "postgres_db", db)
+    monkeypatch.setattr(main, "agent_provisioner", provisioner)
+    monkeypatch.setattr(
+        main.session_router, "teardown_route", AsyncMock(return_value=True)
+    )
+
+    # Owner DELETE while the agent is live: admission closes, nothing is touched.
+    owner = await main._thread_retirement_operations().end_thread_flow(
+        ids["thread"],
+        dict(await db.get_thread(ids["thread"])),
+        permanent=True,
+        force=True,
+    )
+    assert owner["status"] == "ending"
+    pending = await db.get_thread(ids["thread"])
+    retirement = {
+        "token": str(pending["runtime_retirement_token"]),
+        "generation": generation,
+        "context": fixtures._json(pending["runtime_retirement_context"]),
+    }
+    # The agent's drain ends in the exact receipt and the exit handoff.
+    await fixtures._authorize_and_ack(db, ids, retirement)
+    handoff = await main._thread_retirement_operations().end_thread_flow(
+        ids["thread"],
+        dict(await db.get_thread(ids["thread"])),
+        permanent=True,
+        force=True,
+        expected_runtime_generation=generation,
+        expected_agent_id=ids["agent"],
+        expected_attach_token=ids["attach_token"],
+        local_runtime_quiesced=True,
+        retiring_agent_response_pending=True,
+    )
+    assert handoff.get("retiring_agent_exit_authorized") is True
+    # The exited agent's heartbeats aged out; the detector marks it offline.
+    await db.execute(
+        "UPDATE agents SET last_heartbeat=now() - interval '5 minutes' "
+        "WHERE id=$1::uuid",
+        ids["agent"],
+    )
+    return ids
+
+
+_NOMINATION_XFAIL = pytest.mark.xfail(
+    strict=True,
+    raises=AssertionError,
+    reason=(
+        "R1.B11 characterization: step 3d applies the 900 s live-drain grace "
+        "to rows whose process-zero proof is already durable"
+    ),
+)
+
+
+@pytest.mark.asyncio
+@_NOMINATION_XFAIL
+async def test_one_detector_pass_finishes_an_agent_receipted_exit_handoff(
+    db, monkeypatch
+):
+    ids = await _agent_receipted_permanent_handoff(db, monkeypatch)
+    monkeypatch.setattr(
+        main, "_PINNED_RETIREMENT_PROVEN_RETRY_GRACE_SECONDS", 0, raising=False
+    )
+    await _run_one_detector_pass()
+    assert await db.get_thread(ids["thread"]) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("backend", ["none", "virtual"])
+@_NOMINATION_XFAIL
+async def test_one_detector_pass_finishes_a_soft_settled_permanent_delete(
+    db, monkeypatch, backend
+):
+    ids = await _owner_session(db, monkeypatch, backend=backend)
+    await _soft_end(db, ids)
+    await _first_permanent_delete_fails(db, monkeypatch, ids)
+    monkeypatch.setattr(
+        main, "_PINNED_RETIREMENT_PROVEN_RETRY_GRACE_SECONDS", 0, raising=False
+    )
+    await _run_one_detector_pass()
+    assert await db.get_thread(ids["thread"]) is None
+
+
+@pytest.mark.asyncio
+async def test_one_detector_pass_does_not_nominate_an_unproven_row_early(
+    db, monkeypatch, caplog
+):
+    """No receipt, no soft settlement: the live-drain grace still binds.
+
+    The agent went quiet mid-drain (no ACK). Even with every early-nomination
+    grace at zero, the row is not handed to crash recovery before the full
+    live-drain grace.
+    """
+
+    ids = await _owner_session(db, monkeypatch, backend="virtual")
+    permanent = await db.begin_pinned_thread_retirement(ids["thread"], permanent=True)
+    assert await db.authorize_pinned_thread_retirement(
+        ids["thread"],
+        token=permanent["token"],
+        generation=permanent["generation"],
+        settle_status="ended",
+    )
+    await db.execute(
+        "UPDATE agents SET last_heartbeat=now() - interval '5 minutes' "
+        "WHERE id=$1::uuid",
+        ids["agent"],
+    )
+    monkeypatch.setattr(
+        main, "_PINNED_RETIREMENT_PROVEN_RETRY_GRACE_SECONDS", 0, raising=False
+    )
+    caplog.set_level("INFO")
+    await _run_one_detector_pass()
+    pending = await db.get_thread(ids["thread"])
+    assert str(pending["runtime_retirement_token"]) == permanent["token"]
+    assert "no process-zero actuator" not in caplog.text
+    assert "crash recovery could not prove process zero" not in caplog.text
