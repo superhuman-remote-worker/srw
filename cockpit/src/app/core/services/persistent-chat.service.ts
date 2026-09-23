@@ -1237,6 +1237,9 @@ export class PersistentChatService {
    * it until it is retried — never rendered as "waiting".
    */
   private readonly _queueState = signal<{ threadId: string; queue: SessionQueueState } | null>(null);
+  /** Bumped each time a live turn.started clears the block; a queue read
+   *  that straddles a bump is dropped (see _pollQueueState). */
+  private queueStateClears = 0;
   readonly queueState = computed<SessionQueueState | null>(() => {
     const q = this._queueState();
     if (!q || q.threadId == null) return null;
@@ -1314,6 +1317,7 @@ export class PersistentChatService {
   private async _pollQueueState(): Promise<void> {
     const tid = this.threadId();
     if (!tid) return;
+    const clears = this.queueStateClears;
     let queue: SessionQueueState | null = null;
     try {
       queue = await firstValueFrom(this.api.getThreadQueue(tid));
@@ -1323,7 +1327,21 @@ export class PersistentChatService {
       return;
     }
     if (this.threadId() !== tid) return;
+    // A live turn.started landed while the read was in flight: the read may
+    // predate the claim, and re-applying it would resurrect a parked block.
+    if (this.queueStateClears !== clears) return;
     this._applyQueueState(tid, queue);
+  }
+
+  /**
+   * Re-read the queue block after a snapshot reload that does not go back
+   * through /connection (horizon, rewind, snapshot retry). Those reloads
+   * make the replayed turn.started covered, so it no longer clears a parked
+   * block — a unit claimed while this tab was away would otherwise keep its
+   * parked bubble until a full reload (nothing polls while parked).
+   */
+  private _refreshQueueStateAfterSnapshot(): void {
+    void this._pollQueueState();
   }
 
   /**
@@ -1335,6 +1353,10 @@ export class PersistentChatService {
   async retryParked(): Promise<'ok' | 'refused'> {
     const tid = this.threadId();
     if (!tid) return 'refused';
+    // A unit parked with no pending input (a push remainder, say) settles on
+    // retry without starting a turn, so only a pending input earns a waiting
+    // stretch. Unknown (no block yet) keeps the old assumption.
+    const pendingInput = this.queueState()?.pending_input !== false;
     const outcome = await firstValueFrom(this.api.retryThreadQueue(tid));
     if (this.threadId() !== tid) return 'refused';
     if (outcome.kind === 'ok') {
@@ -1344,12 +1366,16 @@ export class PersistentChatService {
         parked_at: null,
         retryable: false,
         attempts: 0,
-        pending_input: true,
+        pending_input: pendingInput,
       });
-      this.pendingTurnCount.update((c) => Math.max(c, 1));
+      if (pendingInput) this.pendingTurnCount.update((c) => Math.max(c, 1));
       return 'ok';
     }
     this.toast.danger(this.transloco.translate('chat.parked.retryFailed', { code: outcome.code }));
+    // A refusal can mean the block is stale (another tab or an operator
+    // already retried and the unit settled): re-read it rather than leave a
+    // parked bubble that nothing else will ever refresh.
+    void this._pollQueueState();
     return 'refused';
   }
   /**
@@ -3318,6 +3344,7 @@ export class PersistentChatService {
     if (!this._isCurrentConnect(tid, generation)) return;
     await this._loadSessionState(tid, generation);
     if (!this._isCurrentConnect(tid, generation)) return;
+    this._refreshQueueStateAfterSnapshot();
     await this._openSse(tid);
   }
 
@@ -3349,6 +3376,7 @@ export class PersistentChatService {
     if (!this._isCurrentConnect(tid, generation)) return;
     await this._loadSessionState(tid, generation);
     if (!this._isCurrentConnect(tid, generation)) return;
+    this._refreshQueueStateAfterSnapshot();
     if (this.sse) {
       this.sse.close();
       this.sse = null;
@@ -4422,6 +4450,7 @@ export class PersistentChatService {
   ): Promise<void> {
     await this._loadSessionState(threadId, generation, preservedReplayCursor, true);
     if (!this._isCurrentConnect(threadId, generation) || this.intentionalClose) return;
+    this._refreshQueueStateAfterSnapshot();
     if (
       this.terminalControlThreadId !== threadId &&
       this.sessionSnapshotLoaded &&
@@ -6680,8 +6709,14 @@ export class PersistentChatService {
         // awaiting state. Clamped: a turn can start without a tracked
         // accept (other tab, injected input, reload mid-queue).
         this.pendingTurnCount.update((c) => Math.max(0, c - 1));
-        // A live turn means the unit is leased: any parked/queued block is stale.
-        this._queueState.set(null);
+        // A live turn means the unit is leased: any parked/queued block is
+        // stale. A frame the snapshot covers is history (the replay floor
+        // re-sends the latest turn's start) and says nothing about the lease,
+        // so it must not wipe the block /connection just read.
+        if (!coveredBySnapshot) {
+          this.queueStateClears++;
+          this._queueState.set(null);
+        }
         const turnId = String(params['turn_id'] ?? makeLocalId('turn'));
         const pendingInterrupt = this.pendingInterruptRequest;
         const pendingWasActive =
