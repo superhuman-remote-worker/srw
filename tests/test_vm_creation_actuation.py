@@ -352,7 +352,10 @@ async def test_profile_only_refuses_bad_network_data_before_vm_post(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("field", ["policy", "image", "request", "template", "effect"])
+@pytest.mark.parametrize(
+    "field",
+    ["policy", "missing_configuration", "image", "request", "template", "effect"],
+)
 async def test_profile_only_refuses_identity_drift_before_vm_post(
     profiled_setup, field, monkeypatch
 ):
@@ -363,6 +366,8 @@ async def test_profile_only_refuses_identity_drift_before_vm_post(
         authority.row["controller_configuration"]["network_profile_policy"]["image"] = (
             "registry.example/other@sha256:" + "b" * 64
         )
+    elif field == "missing_configuration":
+        authority.row.pop("controller_configuration")
     elif field == "image":
         payload["vm_image"] = "registry.example/other@sha256:" + "b" * 64
     elif field == "request":

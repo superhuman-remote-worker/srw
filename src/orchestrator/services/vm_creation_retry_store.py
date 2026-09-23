@@ -1362,6 +1362,7 @@ class VMCreationRetryStore:
                         )
                     },
                     "request": row["canonical_request"],
+                    "controller_configuration": row["controller_configuration"],
                     "cancellation_disposition": _json(row["cancellation_disposition"]),
                     "cancellation_progress": _json(row["cancellation_progress"]),
                     "cancellation_completion": _json(row["cancellation_completion"]),
