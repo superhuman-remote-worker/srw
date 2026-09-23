@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
 import logging
+import os
 from typing import Any
 from uuid import NAMESPACE_URL, UUID, uuid5
 
@@ -1257,6 +1258,36 @@ class JobControlOperations:
                 )
                 self.dependencies.trigger_dispatch()
                 return {"status": "queued", "message": message, "job_id": job_id}
+
+            if (
+                job.get("execution_lane") == "stateless"
+                and (
+                    os.getenv("WORKSPACE_IDLE_RELEASE_ENABLED", "false").lower() == "true"
+                    or self.dependencies.get_vm_context(job).get("_suspend_remote_io_closed")
+                    or self.dependencies.get_vm_context(job).get("idle_wake_operation_id")
+                )
+            ):
+                from orchestrator.services.vm_idle_lifecycle import VMIdleLifecycleStore
+
+                idle_store = VMIdleLifecycleStore(self.dependencies.store)
+                if (
+                    await idle_store.schema_available()
+                    and await idle_store.get_open_for_owner(job_id) is not None
+                ):
+                    wake = await idle_store.request_wake(
+                        job_id, execution_requested=True
+                    )
+                    if wake is None:
+                        raise HTTPException(
+                            status_code=409,
+                            detail={"code": "vm_idle_wake_unavailable",
+                                    "message": "The stopped VM has no current wake authority."},
+                        )
+                    return {
+                        "status": "waking",
+                        "message": "Retained VM wake is pending attested readiness",
+                        "job_id": job_id,
+                    }
 
             (
                 workspace_action,

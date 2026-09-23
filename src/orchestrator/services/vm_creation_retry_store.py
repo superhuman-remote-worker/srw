@@ -445,7 +445,13 @@ class VMCreationRetryStore:
                     await self._resource_waiter_writer._write_waiter_on_conn(
                         conn, retry=existing, job=job, create=False
                     )
-                await self._resume_on_conn(conn, job, existing["request_id"])
+                if proposal.get("idle_wake_id") is not None:
+                    await self._validate_idle_wake_on_conn(
+                        conn, job, proposal["idle_wake_id"],
+                        generation, request_uuid,
+                    )
+                else:
+                    await self._resume_on_conn(conn, job, existing["request_id"])
             return existing
         if (
             proposal.get("origin") != "initial"
@@ -454,6 +460,10 @@ class VMCreationRetryStore:
             raise VMCreationRetryConflict("creation_request_unproven")
         if job["status"] != proposal.get("expected_status"):
             raise VMCreationRetryConflict("job_changed")
+        if proposal.get("idle_wake_id") is not None:
+            await self._validate_idle_wake_on_conn(
+                conn, job, proposal["idle_wake_id"], generation, request_uuid,
+            )
         predecessor, predecessor_id = await self._predecessor(
             conn, job, pvc_uid, proposal
         )
@@ -487,8 +497,44 @@ class VMCreationRetryStore:
             await self._resource_waiter_writer._write_waiter_on_conn(
                 conn, retry=retry, job=job, create=True
             )
-        await self._resume_on_conn(conn, job, request_uuid)
+        if proposal.get("idle_wake_id") is None:
+            await self._resume_on_conn(conn, job, request_uuid)
         return retry
+
+    async def _validate_idle_wake_on_conn(
+        self, conn, job, operation_id, generation, request_id
+    ):
+        """A human-wait create is permitted only by its exact stopped operation."""
+        try:
+            operation_uuid = UUID(str(operation_id))
+            if str(operation_uuid) != operation_id:
+                raise ValueError
+        except (TypeError, ValueError) as exc:
+            raise VMCreationRetryConflict("idle_wake_unproven") from exc
+        context = _json(job["context"]) or {}
+        vm = context.get("vm") or {}
+        old = context.get("last_vm") or {}
+        operation = await conn.fetchrow(
+            "SELECT * FROM vm_idle_operations WHERE id=$1 AND owner_kind='job' "
+            "AND owner_id=$2 AND closed_at IS NULL FOR UPDATE",
+            operation_uuid, job["id"],
+        )
+        if (
+            operation is None
+            or operation["phase"] not in {"waking", "wake_held"}
+            or operation["stop_verified_at"] is None
+            or operation["wake_generation"] != generation
+            or operation["wake_request_id"] != request_id
+            or job["status"] not in {"waiting_for_reply", "pending_review", "paused"}
+            or job["assigned_agent_id"] is not None
+            or vm.get("idle_wake_operation_id") != operation_id
+            or vm.get("provision_generation") != str(generation)
+            or old.get("provision_generation") != str(operation["provision_generation"])
+            or old.get("vm_uid") != str(operation["vm_uid"])
+            or old.get("rootdisk_pvc_uid") != str(operation["pvc_uid"])
+            or context.get("_vm_creation_pending") != str(request_id)
+        ):
+            raise VMCreationRetryConflict("idle_wake_unproven")
 
     async def _validate_resume_on_conn(self, conn, job, request_uuid):
         """Recheck public Resume authority after the canonical scope/job wait."""

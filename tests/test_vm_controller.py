@@ -4906,6 +4906,34 @@ class TestLifecycleIdentityGeneration:
         assert status["rootdisk_pvc_uid"] == f"root-pvc-uid-{job_id}"
 
     @pytest.mark.asyncio
+    async def test_idle_stop_probe_requires_vm_vmi_and_launcher_absence(
+        self, controller
+    ):
+        """A missing VM alone cannot return its compute budget while a VMI remains."""
+        job_id = SAMPLE_JOB_CONFIG["job_id"]
+        controller.k8s_client.get_namespaced_custom_object.side_effect = _FakeApiException(404)
+        controller._rootdisk_pvc_probe = AsyncMock(
+            return_value=(True, f"root-pvc-uid-{job_id}")
+        )
+        controller.core_api.list_namespaced_pod.return_value = MagicMock(items=[])
+        status = await controller._do_status(
+            job_id, PROVISION_GENERATION, exact_absence=True
+        )
+        assert status["status"] == "not_found"
+        assert status["runtime_absence_known"] is True
+        assert status["vmi_absent"] is True
+        assert status["launcher_absent"] is True
+
+        controller.k8s_client.get_namespaced_custom_object.side_effect = [
+            _FakeApiException(404),
+            {"metadata": {"uid": "same-generation-vmi"}},
+        ]
+        status = await controller._do_status(
+            job_id, PROVISION_GENERATION, exact_absence=True
+        )
+        assert status["runtime_absence_known"] is False
+
+    @pytest.mark.asyncio
     async def test_authenticated_delete_uses_admitted_uid_precondition(
         self, controller
     ):

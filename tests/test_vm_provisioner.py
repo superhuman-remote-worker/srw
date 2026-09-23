@@ -123,6 +123,76 @@ def provisioner_disabled():
         yield prov
 
 
+@pytest.mark.asyncio
+async def test_idle_stop_receipt_needs_authenticated_vm_vmi_launcher_absence(
+    provisioner_with_nats, mock_nats_bridge, mock_db
+):
+    """An authenticated VM 404 without VMI/launcher proof cannot free compute."""
+    from uuid import uuid4
+
+    ids = {key: str(uuid4()) for key in (
+        "id", "owner_id", "generation", "vm_uid", "vmi_uid", "launcher_uid", "pvc_uid"
+    )}
+    operation = {
+        "id": ids["id"],
+        "owner_id": ids["owner_id"],
+        "provision_generation": ids["generation"],
+        "vm_uid": ids["vm_uid"],
+        "vmi_uid": ids["vmi_uid"],
+        "launcher_uid": ids["launcher_uid"],
+        "pvc_uid": ids["pvc_uid"],
+    }
+    mock_db.get_job.return_value = {
+        "context": {"vm": {"provision_generation": ids["generation"]}}
+    }
+    reply = {
+        "_identity_authenticated": True,
+        "status": "not_found",
+        "provision_generation": ids["generation"],
+        "rootdisk_identity_known": True,
+        "rootdisk_pvc_uid": ids["pvc_uid"],
+        "vmi_absent": False,
+        "launcher_absent": True,
+        "runtime_absence_known": False,
+    }
+    mock_nats_bridge.query_vm_status.side_effect = None
+    mock_nats_bridge.query_vm_status.return_value = reply
+    assert await provisioner_with_nats.attest_vm_idle_stop(operation) is None
+    mock_nats_bridge.query_vm_status.return_value = {
+        **reply,
+        "vmi_absent": True,
+        "runtime_absence_known": True,
+    }
+    evidence = await provisioner_with_nats.attest_vm_idle_stop(operation)
+    assert evidence is not None
+    assert evidence["operation_id"] == ids["id"]
+    assert evidence["pvc_uid"] == ids["pvc_uid"]
+    assert evidence["controller_authenticated"] is True
+
+
+@pytest.mark.asyncio
+async def test_authenticated_status_retains_exact_vmi_uid_for_idle_release(
+    provisioner_with_db, mock_db
+):
+    """Without the observed VMI UID, idle release must hold the VM running."""
+    from uuid import uuid4
+
+    vmi_uid = str(uuid4())
+    assert await provisioner_with_db._persist_status_identity(
+        "job",
+        "job-1",
+        {
+            "_identity_authenticated": True,
+            "provision_generation": PROVISION_GENERATION,
+            "vm_uid": "captured-vm-uid",
+            "vmi_uid": vmi_uid,
+        },
+    )
+    assert mock_db.merge_vm_context_if_provision_generation.await_args.args[2][
+        "vmi_uid"
+    ] == vmi_uid
+
+
 @pytest.fixture
 def provisioner_with_db(mock_db):
     with patch.dict(os.environ, {"VM_MODE": "off"}):
@@ -340,11 +410,14 @@ class TestVmWorkspaceRuntimeAttestation:
     async def test_matching_live_incarnation_returns_endpoint_pair_and_pin(
         self, mock_db
     ):
+        from uuid import uuid4
+
+        vmi_uid, pvc_uid = str(uuid4()), str(uuid4())
         with patch.dict(os.environ, {"VM_MODE": "same-cluster"}):
             provisioner = self._provisioner(
                 mock_db,
-                self._context(),
-                self._status(),
+                self._context(vmi_uid=vmi_uid, rootdisk_pvc_uid=pvc_uid),
+                self._status(vmi_uid=vmi_uid, rootdisk_pvc_uid=pvc_uid),
             )
             attested = await provisioner.attest_workspace_runtime("job-1")
 
@@ -355,6 +428,8 @@ class TestVmWorkspaceRuntimeAttestation:
         assert attested.host == "10.42.1.23"
         assert attested.pod_ip == "10.42.1.23"
         assert attested.port == 22
+        assert attested.vmi_uid == vmi_uid
+        assert attested.rootdisk_pvc_uid == pvc_uid
         provisioner._query_http.assert_awaited_once_with(
             "job-1",
             provision_generation=PROVISION_GENERATION,

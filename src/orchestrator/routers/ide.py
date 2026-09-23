@@ -113,9 +113,25 @@ async def start_ide_session(
     Idempotent: if a session is already active, returns it.
     If restoring, returns current progress status.
     """
-    await dependencies.require_job_access(request, dependencies.store, job_id)
+    user, job = await dependencies.require_job_access(
+        request, dependencies.store, job_id
+    )
     if body is None:
         body = IdeSessionRequest()
+
+    from orchestrator.services.vm_idle_lifecycle import VMIdleLifecycleStore
+
+    idle = VMIdleLifecycleStore(dependencies.store)
+    if await idle.schema_available():
+        if await idle.get_open_for_owner(job_id) is not None:
+            wake = await idle.request_wake(
+                job_id, execution_requested=False,
+                access_kind="ide", access_claimant=str(user["id"]),
+            )
+            if wake is None:
+                raise HTTPException(status_code=409, detail="VM wake authority changed")
+            return {"status": "restoring", "estimated_seconds": 120}
+        await idle.renew_access(job_id, kind="ide", claimant=str(user["id"]))
 
     try:
         result = await dependencies.ide_sessions.start_session(
@@ -141,7 +157,17 @@ async def get_ide_session(
     Used by the cockpit to poll session state and determine
     IDE button visibility/behavior.
     """
-    await dependencies.require_job_access(request, dependencies.store, job_id)
+    user, _job = await dependencies.require_job_access(
+        request, dependencies.store, job_id
+    )
+    from orchestrator.services.vm_idle_lifecycle import VMIdleLifecycleStore
+
+    idle = VMIdleLifecycleStore(dependencies.store)
+    if await idle.schema_available():
+        active = await idle.get_open_for_owner(job_id)
+        if active is not None and active["wake_ready_at"] is None:
+            return {"status": "restoring", "estimated_seconds": 120}
+        await idle.renew_access(job_id, kind="ide", claimant=str(user["id"]))
     try:
         return await dependencies.ide_sessions.get_session_status(job_id)
     except Exception as e:

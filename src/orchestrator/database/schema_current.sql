@@ -21784,6 +21784,77 @@ CREATE TABLE public.vm_creation_effects (
 
 
 --
+-- Name: vm_idle_access_leases; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.vm_idle_access_leases (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    owner_kind text NOT NULL,
+    owner_id uuid NOT NULL,
+    provision_generation uuid NOT NULL,
+    vm_uid uuid NOT NULL,
+    wake_id uuid,
+    kind text NOT NULL,
+    claimed_by text NOT NULL,
+    acquired_at timestamp with time zone DEFAULT clock_timestamp() NOT NULL,
+    expires_at timestamp with time zone NOT NULL,
+    max_expires_at timestamp with time zone NOT NULL,
+    closed_at timestamp with time zone,
+    CONSTRAINT vm_idle_access_leases_check CHECK (((expires_at > acquired_at) AND (max_expires_at >= expires_at))),
+    CONSTRAINT vm_idle_access_leases_claimed_by_check CHECK (((length(claimed_by) >= 1) AND (length(claimed_by) <= 256))),
+    CONSTRAINT vm_idle_access_leases_kind_check CHECK ((kind = ANY (ARRAY['ssh'::text, 'sftp'::text, 'ide'::text]))),
+    CONSTRAINT vm_idle_access_leases_owner_kind_check CHECK ((owner_kind = ANY (ARRAY['job'::text, 'thread'::text])))
+);
+
+
+--
+-- Name: vm_idle_operations; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.vm_idle_operations (
+    id uuid DEFAULT gen_random_uuid() NOT NULL,
+    owner_kind text NOT NULL,
+    owner_id uuid NOT NULL,
+    phase text NOT NULL,
+    episode_id uuid NOT NULL,
+    episode_revision bigint NOT NULL,
+    provision_generation uuid NOT NULL,
+    vm_uid uuid NOT NULL,
+    vmi_uid uuid NOT NULL,
+    launcher_uid uuid NOT NULL,
+    pvc_uid uuid NOT NULL,
+    retained_kind text NOT NULL,
+    admitted_at timestamp with time zone DEFAULT clock_timestamp() NOT NULL,
+    last_progress_at timestamp with time zone DEFAULT clock_timestamp() NOT NULL,
+    retry_after timestamp with time zone,
+    reason text,
+    stop_evidence jsonb,
+    stop_verified_at timestamp with time zone,
+    wake_id uuid,
+    wake_generation uuid,
+    wake_request_id uuid,
+    wake_attempt integer DEFAULT 0 NOT NULL,
+    wake_requested boolean DEFAULT false NOT NULL,
+    wake_execution_requested boolean DEFAULT false NOT NULL,
+    wake_ready_at timestamp with time zone,
+    wake_reservation_ref text,
+    claim_token bigint DEFAULT 0 NOT NULL,
+    claimed_by text,
+    claim_expires_at timestamp with time zone,
+    closed_at timestamp with time zone,
+    CONSTRAINT vm_idle_claim_shape CHECK (((claimed_by IS NULL) = (claim_expires_at IS NULL))),
+    CONSTRAINT vm_idle_closed_shape CHECK (((closed_at IS NULL) = (phase <> ALL (ARRAY['ready'::text, 'superseded'::text])))),
+    CONSTRAINT vm_idle_operations_episode_revision_check CHECK ((episode_revision > 0)),
+    CONSTRAINT vm_idle_operations_owner_kind_check CHECK ((owner_kind = ANY (ARRAY['job'::text, 'thread'::text]))),
+    CONSTRAINT vm_idle_operations_phase_check CHECK ((phase = ANY (ARRAY['releasing'::text, 'release_held'::text, 'suspended'::text, 'waking'::text, 'wake_held'::text, 'ready'::text, 'superseded'::text]))),
+    CONSTRAINT vm_idle_operations_retained_kind_check CHECK ((retained_kind = ANY (ARRAY['rootdisk'::text, 'snapshot'::text]))),
+    CONSTRAINT vm_idle_operations_wake_attempt_check CHECK ((wake_attempt >= 0)),
+    CONSTRAINT vm_idle_stop_shape CHECK (((stop_evidence IS NULL) = (stop_verified_at IS NULL))),
+    CONSTRAINT vm_idle_wake_shape CHECK ((((wake_id IS NULL) AND (wake_generation IS NULL) AND (wake_request_id IS NULL)) OR ((wake_id IS NOT NULL) AND (wake_generation IS NOT NULL) AND (wake_request_id IS NOT NULL))))
+);
+
+
+--
 -- Name: vm_remote_operation_claim_seq; Type: SEQUENCE; Schema: public; Owner: -
 --
 
@@ -24561,6 +24632,22 @@ ALTER TABLE ONLY public.vm_creation_retries
 
 
 --
+-- Name: vm_idle_access_leases vm_idle_access_leases_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_idle_access_leases
+    ADD CONSTRAINT vm_idle_access_leases_pkey PRIMARY KEY (id);
+
+
+--
+-- Name: vm_idle_operations vm_idle_operations_pkey; Type: CONSTRAINT; Schema: public; Owner: -
+--
+
+ALTER TABLE ONLY public.vm_idle_operations
+    ADD CONSTRAINT vm_idle_operations_pkey PRIMARY KEY (id);
+
+
+--
 -- Name: vm_remote_operation_leases vm_remote_operation_leases_pkey; Type: CONSTRAINT; Schema: public; Owner: -
 --
 
@@ -26832,6 +26919,27 @@ CREATE UNIQUE INDEX vm_creation_effect_one_outstanding ON public.vm_creation_eff
 --
 
 CREATE INDEX vm_creation_retries_due ON public.vm_creation_retries USING btree (next_probe_at, request_id) WHERE (state = ANY (ARRAY['queued'::text, 'reconciling'::text, 'cancel_requested'::text]));
+
+
+--
+-- Name: vm_idle_active_access; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX vm_idle_active_access ON public.vm_idle_access_leases USING btree (owner_kind, owner_id, expires_at) WHERE (closed_at IS NULL);
+
+
+--
+-- Name: vm_idle_due; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX vm_idle_due ON public.vm_idle_operations USING btree (phase, retry_after, admitted_at) WHERE (closed_at IS NULL);
+
+
+--
+-- Name: vm_idle_one_open_owner; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX vm_idle_one_open_owner ON public.vm_idle_operations USING btree (owner_kind, owner_id) WHERE (closed_at IS NULL);
 
 
 --

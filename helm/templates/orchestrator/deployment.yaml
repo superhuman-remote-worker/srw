@@ -1447,6 +1447,22 @@ spec:
               value: {{ .Values.orchestrator.vmProvisioning.rootdiskStallTimeoutSeconds | quote }}
             - name: VM_CREATION_RETRY_ENABLED
               value: {{ .Values.orchestrator.vmProvisioning.creationRetryEnabled | default false | quote }}
+            {{- if .Values.orchestrator.vmIdleRelease.enabled }}
+            {{- if not (include "srw.vmSameCluster" .) }}
+            {{- fail "vmIdleRelease requires vm.mode=same-cluster" }}
+            {{- end }}
+            {{- if not .Values.vmController.persistentRootdisk.enabled }}
+            {{- fail "vmIdleRelease requires persistentRootdisk.enabled" }}
+            {{- end }}
+            {{- if not .Values.orchestrator.vmProvisioning.creationRetryEnabled }}
+            {{- fail "vmIdleRelease requires creationRetryEnabled" }}
+            {{- end }}
+            {{- if not .Values.orchestrator.vmRemoteOperationProtocol.enabled }}
+            {{- fail "vmIdleRelease requires vmRemoteOperationProtocol.enabled" }}
+            {{- end }}
+            {{- end }}
+            - name: WORKSPACE_IDLE_RELEASE_ENABLED
+              value: {{ .Values.orchestrator.vmIdleRelease.enabled | default false | quote }}
             - name: VM_WORKSPACE_RECOVERY_ACCEPTANCE_GATE_ENABLED
               value: {{ .Values.orchestrator.vmWorkspaceRecoveryAcceptanceGate.enabled | quote }}
             {{- if .Values.orchestrator.vmWorkspaceRecoveryAcceptanceGate.enabled }}

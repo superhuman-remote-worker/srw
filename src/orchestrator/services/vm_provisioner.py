@@ -74,6 +74,9 @@ class _VMTeardownProbe:
     disposition: str
     identity: VMTeardownIdentity | None = None
     rootdisk_identity_known: bool = False
+    runtime_absence_known: bool = False
+    vmi_absent: bool = False
+    launcher_absent: bool = False
 
 
 def _provision_generation(value: object) -> str | None:
@@ -370,6 +373,8 @@ class VMProvisioner:
             )
         if (root_uid := _safe_vm_uid(data.get("rootdisk_pvc_uid"))) is not None:
             updates["rootdisk_pvc_uid"] = root_uid
+        if (vmi_uid := _provision_generation(data.get("vmi_uid"))) is not None:
+            updates["vmi_uid"] = vmi_uid
         if (
             fingerprint := _safe_ssh_host_key_fingerprint(
                 data.get("ssh_host_key_fingerprint")
@@ -631,6 +636,35 @@ class VMProvisioner:
         if launcher_uid != expected_launcher_uid:
             raise WorkspaceRuntimeAuthorityError("VM launcher Pod UID changed")
 
+        observed_vmi_uid = _provision_generation(observed.get("vmi_uid"))
+        expected_vmi_uid = _provision_generation(context.get("vmi_uid"))
+        if (
+            observed_vmi_uid is not None
+            and expected_vmi_uid is not None
+            and observed_vmi_uid != expected_vmi_uid
+        ):
+            raise WorkspaceRuntimeRecoveryRequired(
+                "VM VMI UID changed",
+                recovery_code=WorkspaceRecoveryCode.REPLACEMENT_OBSERVED,
+            )
+        exact_vmi_uid = (
+            observed_vmi_uid if observed_vmi_uid == expected_vmi_uid else None
+        )
+        observed_pvc_uid = _provision_generation(observed.get("rootdisk_pvc_uid"))
+        expected_pvc_uid = _provision_generation(context.get("rootdisk_pvc_uid"))
+        if (
+            observed_pvc_uid is not None
+            and expected_pvc_uid is not None
+            and observed_pvc_uid != expected_pvc_uid
+        ):
+            raise WorkspaceRuntimeRecoveryRequired(
+                "VM rootdisk PVC UID changed",
+                recovery_code=WorkspaceRecoveryCode.REPLACEMENT_OBSERVED,
+            )
+        exact_pvc_uid = (
+            observed_pvc_uid if observed_pvc_uid == expected_pvc_uid else None
+        )
+
         observed_pod_ip = observed.get("pod_ip")
         if (
             not isinstance(observed_pod_ip, str)
@@ -700,6 +734,8 @@ class VMProvisioner:
             != generation
             or _safe_vm_uid(current.get("vm_uid")) != expected_vm_uid
             or _provision_generation(current.get("active_pod_uid")) != launcher_uid
+            or _provision_generation(current.get("vmi_uid")) != expected_vmi_uid
+            or _provision_generation(current.get("rootdisk_pvc_uid")) != expected_pvc_uid
             or current.get("ssh_registration_id") != expected_registration_id
             or _safe_ssh_host_key_fingerprint(current.get("ssh_host_key_fingerprint"))
             != fingerprint
@@ -718,6 +754,8 @@ class VMProvisioner:
             port=port,
             vm_uid=expected_vm_uid,
             launcher_pod_uid=launcher_uid,
+            vmi_uid=exact_vmi_uid,
+            rootdisk_pvc_uid=exact_pvc_uid,
         )
 
     async def _storage_context(self, job_id):
@@ -896,6 +934,7 @@ class VMProvisioner:
         initialization: dict | None = None,
         workspace_storage: dict | None = None,
         preparation: dict | None = None,
+        idle_wake_id: str | None = None,
     ) -> bool | dict[str, Any]:
         """Create a VM for a job.
 
@@ -927,6 +966,10 @@ class VMProvisioner:
             self.mode == "same-cluster"
             and os.getenv("VM_CREATION_RETRY_ENABLED", "false").lower() == "true"
         )
+        if idle_wake_id is not None and (not protocol_enabled or not fresh):
+            from orchestrator.services.vm_creation_retry_store import VMCreationRetryConflict
+
+            raise VMCreationRetryConflict("idle_wake_unproven")
         if protocol_enabled or (
             self.mode == "same-cluster"
             and getattr(self._db, "supports_vm_creation_retry", False) is True
@@ -955,6 +998,11 @@ class VMProvisioner:
                 raise VMCreationRetryConflict("creation_request_unproven")
             previous = _preflight(vm)
             if previous and (vm.get("status") != "deleted" or not protocol_enabled):
+                if vm.get("idle_wake_operation_id") != idle_wake_id and (
+                    vm.get("idle_wake_operation_id") is not None
+                    or idle_wake_id is not None
+                ):
+                    raise VMCreationRetryConflict("idle_wake_unproven")
                 # Existing operations keep their own authority even if admission
                 # was disabled or today's defaults differ. No queue mutation.
                 return creation_preflight_response(previous)
@@ -993,6 +1041,23 @@ class VMProvisioner:
             return False
         if protocol_enabled:
             fresh_context = self._fresh_provision_ctx()
+            if idle_wake_id is not None:
+                try:
+                    wake_uuid = UUID(idle_wake_id)
+                    if str(wake_uuid) != idle_wake_id:
+                        raise ValueError
+                except (TypeError, ValueError) as exc:
+                    raise VMCreationRetryConflict("idle_wake_unproven") from exc
+                async with self._db.acquire() as conn:
+                    wake_generation = await conn.fetchval(
+                        "SELECT wake_generation FROM vm_idle_operations "
+                        "WHERE id=$1 AND owner_kind='job' AND owner_id=$2 "
+                        "AND phase IN ('waking','wake_held') AND closed_at IS NULL",
+                        wake_uuid, UUID(job_id),
+                    )
+                if wake_generation is None:
+                    raise VMCreationRetryConflict("idle_wake_unproven")
+                fresh_context["provision_generation"] = str(wake_generation)
             network_tier = (
                 await self._db.get_workspace_network_tier(job_id, "job")
                 or DEFAULT_NETWORK_TIER
@@ -1017,6 +1082,7 @@ class VMProvisioner:
                 request=request,
                 fresh_context=fresh_context,
                 max_attempts=int(os.getenv("VM_PROVISION_MAX_ATTEMPTS", "3")),
+                idle_wake_id=idle_wake_id,
             )
             return creation_preflight_response(preflight)
         # A (re)provisioned VM must start with a CLEAN reap counter and no stale
@@ -1280,6 +1346,9 @@ class VMProvisioner:
                 "absent",
                 identity,
                 rootdisk_identity_known=rootdisk_known,
+                runtime_absence_known=result.get("runtime_absence_known") is True,
+                vmi_absent=result.get("vmi_absent") is True,
+                launcher_absent=result.get("launcher_absent") is True,
             )
         if status in {"query_failed", "delete_failed"} or identity.vm_uid is None:
             return _VMTeardownProbe("unknown")
@@ -1288,6 +1357,60 @@ class VMProvisioner:
             identity,
             rootdisk_identity_known=rootdisk_known,
         )
+
+    async def attest_vm_idle_stop(
+        self, operation: Mapping[str, Any]
+    ) -> dict[str, Any] | None:
+        """Return exact physical-absence evidence from an authenticated controller probe."""
+
+        try:
+            from uuid import UUID
+
+            fields = {
+                key: str(UUID(str(operation[key])))
+                for key in (
+                    "id", "owner_id", "provision_generation", "vm_uid",
+                    "vmi_uid", "launcher_uid", "pvc_uid",
+                )
+            }
+            if any(fields[key] != str(operation[key]) for key in fields):
+                return None
+        except (KeyError, TypeError, ValueError, AttributeError):
+            return None
+        if (
+            await self._current_provision_generation("job", fields["owner_id"])
+            != fields["provision_generation"]
+        ):
+            return None
+        probe = await self._probe_vm_teardown_identity(
+            fields["owner_id"], fields["provision_generation"]
+        )
+        if (
+            probe.disposition != "absent"
+            or not probe.rootdisk_identity_known
+            or not probe.runtime_absence_known
+            or not probe.vmi_absent
+            or not probe.launcher_absent
+            or probe.identity is None
+            or probe.identity.rootdisk_pvc_uid != fields["pvc_uid"]
+        ):
+            return None
+        return {
+            "version": 1,
+            "kind": "vm_idle_physical_stop",
+            "operation_id": fields["id"],
+            "generation": fields["provision_generation"],
+            "vm_uid": fields["vm_uid"],
+            "vmi_uid": fields["vmi_uid"],
+            "launcher_uid": fields["launcher_uid"],
+            "pvc_uid": fields["pvc_uid"],
+            "vm_absent": True,
+            "vmi_absent": True,
+            "launcher_absent": True,
+            "same_generation_replacement": False,
+            "retained_pvc": True,
+            "controller_authenticated": True,
+        }
 
     async def revalidate_vm_teardown_identity(
         self,

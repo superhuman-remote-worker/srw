@@ -79,6 +79,7 @@ spec:
       # drains and replaces executors with the same gate as the orchestrator.
       annotations:
         checksum/vm-workspace-recovery: {{ toJson .Values.orchestrator.vmWorkspaceRecovery | sha256sum | quote }}
+        checksum/vm-idle-release: {{ toJson .Values.orchestrator.vmIdleRelease | sha256sum | quote }}
       {{- if .Values.agent.stateless.processZeroFinalizer }}
       # Retention boundary for claimant-loss settlement. A stolen claim's debt
       # settles only on the exact Pod UID observed with every container

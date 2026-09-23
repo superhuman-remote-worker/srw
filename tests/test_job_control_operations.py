@@ -312,6 +312,34 @@ async def test_command_mode_resume_queues_stateless_before_agent_delivery(
     operations.dependencies.trigger_dispatch.assert_called_once_with()
 
 
+@pytest.mark.asyncio
+async def test_resume_joins_idle_vm_wake_before_missing_workspace_shed(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    monkeypatch.setenv("WORKSPACE_IDLE_RELEASE_ENABLED", "false")
+    store = MagicMock()
+    store.prepare_stateless_job_for_workspace_resume = AsyncMock(return_value=True)
+    operations = _operations(tmp_path, store=store)
+    job = {
+        **_frozen_job(execution_lane="stateless"),
+        "context": {"vm": {"status": "suspended", "_suspend_remote_io_closed": REQUEST_ID}},
+    }
+    operations.dependencies.get_vm_context.return_value = job["context"]["vm"]
+    with patch("orchestrator.services.vm_idle_lifecycle.VMIdleLifecycleStore") as idle_class:
+        idle = idle_class.return_value
+        idle.schema_available = AsyncMock(return_value=True)
+        idle.get_open_for_owner = AsyncMock(return_value={"id": REQUEST_ID})
+        idle.request_wake = AsyncMock(return_value={"phase": "waking"})
+        result = await operations.resume_job_internal(
+            JOB_ID, user={"id": "user-a"}, job=job,
+        )
+
+    assert result["status"] == "waking"
+    idle.request_wake.assert_awaited_once_with(JOB_ID, execution_requested=True)
+    operations.dependencies.prepare_job_workspace_runtime.assert_not_awaited()
+    store.prepare_stateless_job_for_workspace_resume.assert_not_awaited()
+
+
 def _operator_paused_job() -> dict:
     return {
         "id": JOB_ID,

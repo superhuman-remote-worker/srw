@@ -235,6 +235,8 @@ class WorkspaceRuntimeAttestation:
     # launcher generations so a same-endpoint replacement cannot inherit I/O.
     vm_uid: str | None = None
     launcher_pod_uid: str | None = None
+    vmi_uid: str | None = None
+    rootdisk_pvc_uid: str | None = None
 
 
 @dataclass(frozen=True)

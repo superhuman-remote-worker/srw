@@ -218,7 +218,10 @@ class VMCreationPreflightStore:
                 return proposal
         raise VMCreationRetryConflict("predecessor_cleanup_pending")
 
-    async def begin(self, *, job_id, request, fresh_context, max_attempts=3):
+    async def begin(
+        self, *, job_id, request, fresh_context, max_attempts=3,
+        idle_wake_id: str | None = None,
+    ):
         """Freeze a first initial request, or return the existing preflight."""
         if type(max_attempts) is not int or max_attempts < 1:
             raise ValueError("Invalid VM boot attempt limit")
@@ -231,6 +234,40 @@ class VMCreationPreflightStore:
         async with self.db.acquire() as conn:
             async with conn.transaction():
                 job, context, old_vm, prior = await self._lock(conn, owner)
+                idle_wake = None
+                if idle_wake_id is not None:
+                    try:
+                        wake_uuid = UUID(idle_wake_id)
+                        if str(wake_uuid) != idle_wake_id:
+                            raise ValueError
+                    except (TypeError, ValueError) as exc:
+                        raise VMCreationRetryConflict("idle_wake_unproven") from exc
+                    idle_wake = await conn.fetchrow(
+                        "SELECT * FROM vm_idle_operations WHERE id=$1 AND owner_kind='job' "
+                        "AND owner_id=$2 AND closed_at IS NULL FOR UPDATE",
+                        wake_uuid, owner,
+                    )
+                    if (
+                        idle_wake is None
+                        or idle_wake["phase"] not in {"waking", "wake_held"}
+                        or idle_wake["stop_verified_at"] is None
+                        or idle_wake["retained_kind"] != "rootdisk"
+                        or idle_wake["wake_generation"] is None
+                        or str(idle_wake["wake_generation"])
+                           != fresh_context.get("provision_generation")
+                        or old_vm.get("idle_wake_operation_id") not in {None, idle_wake_id}
+                        or (
+                            old_vm.get("status") == "suspended"
+                            and (
+                                old_vm.get("provision_generation")
+                                != str(idle_wake["provision_generation"])
+                                or old_vm.get("vm_uid") != str(idle_wake["vm_uid"])
+                                or old_vm.get("rootdisk_pvc_uid")
+                                != str(idle_wake["pvc_uid"])
+                            )
+                        )
+                    ):
+                        raise VMCreationRetryConflict("idle_wake_unproven")
                 # Completed provenance belongs to the retired generation. Its
                 # successor still needs the exact receipt and retained-disk
                 # cleanup chain below; keeping provenance must not bar it.
@@ -239,6 +276,10 @@ class VMCreationPreflightStore:
                     and old_vm.get("retirement_cleanup_pending") is not True
                 )
                 if prior and not (retired and prior["state"] == "admitted"):
+                    if (old_vm.get("idle_wake_operation_id") or idle_wake_id) and (
+                        old_vm.get("idle_wake_operation_id") != idle_wake_id
+                    ):
+                        raise VMCreationRetryConflict("idle_wake_unproven")
                     await self.retry._current(
                         conn,
                         job,
@@ -246,13 +287,19 @@ class VMCreationPreflightStore:
                         retry=_execution_binding(prior),
                     )
                     return prior
-                if (
-                    job["status"] not in {"created", "paused"}
-                    or job["assigned_agent_id"] is not None
+                idle_first = bool(
+                    idle_wake is not None
+                    and old_vm.get("status") == "suspended"
+                    and job["status"] in {"waiting_for_reply", "pending_review", "paused"}
+                )
+                if idle_wake is not None and not idle_first:
+                    raise VMCreationRetryConflict("idle_wake_unproven")
+                if (not idle_first and job["status"] not in {"created", "paused"}) or (
+                    job["assigned_agent_id"] is not None
                 ):
                     raise VMCreationRetryConflict("job_changed")
                 if old_vm and (
-                    old_vm.get("status") != "deleted"
+                    old_vm.get("status") != "deleted" and not idle_first
                     or old_vm.get("retirement_cleanup_pending") is True
                 ):
                     raise VMCreationRetryConflict("creation_request_unproven")
@@ -300,6 +347,8 @@ class VMCreationPreflightStore:
                     "preparation_request": request.get("preparation"),
                     "provision_attempts": attempts,
                 }
+                if idle_first:
+                    vm["idle_wake_operation_id"] = idle_wake_id
                 context["vm"] = vm
                 _, _, execution = await self.retry._current(
                     conn,
@@ -317,7 +366,10 @@ class VMCreationPreflightStore:
                 )
                 value = {
                     "version": 1,
-                    "request_id": str(uuid4()),
+                    "request_id": (
+                        str(idle_wake["wake_request_id"])
+                        if idle_first else str(uuid4())
+                    ),
                     "job_id": job_id,
                     "request": deepcopy(request),
                     "request_digest": digest,
@@ -352,6 +404,20 @@ class VMCreationPreflightStore:
         # LIMIT forever. Only scan jobs present when this pass began.
         async with self.db.acquire() as conn:
             scan_started = await conn.fetchval("SELECT clock_timestamp()")
+            idle_schema = await conn.fetchval(
+                "SELECT to_regclass('public.vm_idle_operations') IS NOT NULL"
+            )
+        due_status = "status IN ('created','paused')"
+        if idle_schema:
+            due_status = (
+                "(status IN ('created','paused') OR (status IN ('waiting_for_reply','pending_review') "
+                "AND EXISTS(SELECT 1 FROM vm_idle_operations i WHERE i.owner_kind='job' "
+                "AND i.owner_id=jobs.id AND i.closed_at IS NULL AND i.phase IN ('waking','wake_held') "
+                "AND i.id::text=jobs.context->'vm'->>'idle_wake_operation_id' "
+                "AND i.wake_generation::text=jobs.context->'vm'->>'provision_generation' "
+                "AND i.wake_request_id::text=jobs.context->'vm'->'creation_preflight'->>'request_id' "
+                "AND i.stop_verified_at IS NOT NULL)))"
+            )
         result = []
         cursor_time = None
         cursor_id = None
@@ -359,7 +425,8 @@ class VMCreationPreflightStore:
             async with self.db.acquire() as conn:
                 candidates = await conn.fetch(
                     "SELECT id,created_at FROM jobs WHERE context->'vm'->'creation_preflight'->>'state' IN ('queued','resolving') "
-                    "AND status IN ('created','paused') AND NOT EXISTS(SELECT 1 FROM vm_creation_retries r "
+                    "AND " + due_status + " "
+                    "AND NOT EXISTS(SELECT 1 FROM vm_creation_retries r "
                     "WHERE r.job_id=jobs.id AND r.provision_generation::text=context->'vm'->>'provision_generation') "
                     "AND CASE WHEN jsonb_typeof(context->'vm'->'creation_preflight'->'next_probe_at')='number' "
                     "THEN (context->'vm'->'creation_preflight'->>'next_probe_at')::double precision <= extract(epoch FROM clock_timestamp()) ELSE false END "
@@ -536,6 +603,10 @@ class VMCreationPreflightStore:
                     raise VMCreationRetryConflict("creation_request_unproven")
                 proposal = {
                     "origin": "initial",
+                    "idle_wake_id": (
+                        (_object(_object(job["context"]).get("vm")))
+                        .get("idle_wake_operation_id")
+                    ),
                     "expected_status": job["status"],
                     "request_digest": snapshot["request_digest"],
                     "controller_configuration_digest": snapshot[

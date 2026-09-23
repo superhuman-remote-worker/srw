@@ -2040,18 +2040,31 @@ def _schedule_stateless_workspace_ensure(thread_id: str) -> asyncio.Task[None]:
 
 
 async def workspace_idle_sweeper(shutdown_event: asyncio.Event) -> None:
-    """Background loop: reconciles failed/missing session workspaces.
+    """Reconcile session recovery and durable stateless VM idle operations.
 
     Idle suspension and teardown now live in the lifecycle reconciler's reap
     path (``services/lifecycle/reconciler.py`` → ``WorkspaceInstanceManager``),
     which snapshots-then-deletes reapable workspaces and force-deletes ones it
     can never reach (bounded retry) instead of keeping them alive forever.
 
-    This loop retains only the session-workspace recovery reconcile —
-    recreating failed/missing workspaces for active sessions — which is
-    independent of idle policy. Runs every 60 seconds.
+    Session recovery remains independent of idle policy. When migration 0270
+    exists, the bounded VM Job release/wake adapter also runs here every
+    60 seconds, including operations admitted before the new-release flag
+    was disabled.
     """
-    logger.info("Workspace idle sweeper started (reconcile-only)")
+    logger.info("Workspace idle sweeper started")
+    vm_idle_service = None
+    async with postgres_db.acquire() as idle_conn:
+        idle_schema = await idle_conn.fetchval(
+            "SELECT to_regclass('public.vm_idle_operations') IS NOT NULL"
+        )
+    if idle_schema:
+        from orchestrator.services.vm_idle_lifecycle import VMIdleLifecycleService
+
+        vm_idle_service = VMIdleLifecycleService(
+            postgres_db, vm_provisioner, VMWorkspaceRecoveryStore(postgres_db),
+            claimant=f"{os.getenv('HOSTNAME', 'orchestrator')}:vm-idle",
+        )
     while not shutdown_event.is_set():
         # Session workspace reconcile (safety-net): recreate failed/missing
         # workspaces for active sessions. Runs regardless of whether idle
@@ -2068,6 +2081,12 @@ async def workspace_idle_sweeper(shutdown_event: asyncio.Event) -> None:
             )
         except Exception as e:
             logger.error("Error in session workspace reconcile: %s", e)
+
+        if vm_idle_service is not None:
+            try:
+                await vm_idle_service.reconcile_once(limit=16)
+            except Exception:
+                logger.exception("VM idle reconcile held")
 
         try:
             await asyncio.wait_for(shutdown_event.wait(), timeout=60.0)

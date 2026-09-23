@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import os
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime
@@ -939,6 +940,32 @@ async def claim_worker_batch(
                     )
             prior_status = str(job["status"]) if job is not None else None
             job_context = _json_object(job.get("context")) if job is not None else {}
+            vm_context = _json_object(job_context.get("vm"))
+            if (
+                job is not None
+                and (
+                    os.getenv("WORKSPACE_IDLE_RELEASE_ENABLED", "false").lower() == "true"
+                    or vm_context.get("_suspend_remote_io_closed")
+                    or vm_context.get("idle_wake_operation_id")
+                )
+                and await conn.fetchval(
+                    "SELECT to_regclass('public.vm_idle_operations') IS NOT NULL"
+                )
+                and await conn.fetchval(
+                    "SELECT EXISTS(SELECT 1 FROM vm_idle_operations WHERE owner_kind='job' "
+                    "AND owner_id=$1 AND closed_at IS NULL AND wake_ready_at IS NULL)",
+                    unit.unit_id,
+                )
+            ):
+                # A reply may enqueue while the VM is physically absent. The
+                # durable wake operation will enqueue again after attested
+                # readiness; this tentative claim cannot run on the old VM.
+                await conn.fetchrow(_CLOSE_WORKER_PREFLIGHT_SQL, unit.unit_id, True)
+                await conn.execute(
+                    "UPDATE run_queue SET attempts_since_completion=attempts_since_completion-1 "
+                    "WHERE unit_id=$1", unit.unit_id,
+                )
+                return None
             behind_operator_pause = job is not None and (
                 operator_pause_hold_present(job_context)
                 or bool(job.get("operator_pause_held_ancestor"))

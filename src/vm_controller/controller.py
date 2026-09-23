@@ -3013,11 +3013,42 @@ class VMController:
                 and not await self._retained_storage().unused(workspace_storage)
             ):
                 rootdisk_known = False
+            # VM deletion can precede VMI and virt-launcher termination.  The
+            # exact-absence probe must not promote a VM 404 to compute-stop
+            # evidence while either same-name runtime object remains.
+            vmi_absent = False
+            launcher_absent = False
+            try:
+                await asyncio.to_thread(
+                    self.k8s_client.get_namespaced_custom_object,
+                    group=KUBEVIRT_GROUP,
+                    version=KUBEVIRT_VERSION,
+                    namespace=VM_NAMESPACE,
+                    plural=KUBEVIRT_VMI_PLURAL,
+                    name=vm_name,
+                )
+            except ApiException as vmi_error:
+                if vmi_error.status == 404:
+                    vmi_absent = True
+            if self.core_api is not None:
+                try:
+                    pods = await asyncio.to_thread(
+                        self.core_api.list_namespaced_pod,
+                        namespace=VM_NAMESPACE,
+                        label_selector=f"vm.kubevirt.io/name={vm_name}",
+                    )
+                    items = getattr(pods, "items", None)
+                    launcher_absent = isinstance(items, list) and not items
+                except Exception:
+                    launcher_absent = False
             return {
                 "job_id": job_id,
                 "status": "not_found",
                 "provision_generation": _provision_generation(provision_generation),
                 "rootdisk_identity_known": rootdisk_known,
+                "vmi_absent": vmi_absent,
+                "launcher_absent": launcher_absent,
+                "runtime_absence_known": vmi_absent and launcher_absent,
                 **(
                     {"rootdisk_pvc_uid": rootdisk_uid}
                     if rootdisk_uid is not None
@@ -3069,6 +3100,9 @@ class VMController:
             vmi = None
         else:
             vmi_observed = True
+            vmi_uid = _safe_uid(_metadata_value(vmi, "uid"))
+            if vmi_uid is not None:
+                result["vmi_uid"] = vmi_uid
             vmi_status = vmi.get("status", {})
             result["vmi_phase"] = vmi_status.get("phase")
             interfaces = vmi_status.get("interfaces") or []
