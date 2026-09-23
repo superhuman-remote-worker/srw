@@ -151,28 +151,43 @@ class VMCreationRetryService:
         from orchestrator.services.vm_resource_waiter_maintenance import (
             VMResourceWaiterMaintenance,
         )
+        from shared.vm_resource_admission import ResourceAdmissionError
 
-        selected = configured_enforcement_policy()
+        try:
+            selected = configured_enforcement_policy()
+        except ResourceAdmissionError:
+            # A malformed currently selected policy must not turn the
+            # reconciliation loop off. Each frozen v3 claim independently
+            # fails closed at admission/issuance, while old effects replay.
+            logger.warning("VM resource waiter maintenance held (invalid policy)")
+            return
         if selected is None:
             return
-        async with self.db.acquire() as conn:
-            mode = await conn.fetchval(
-                "SELECT mode FROM vm_resource_admission_policy WHERE cluster_id=$1",
-                selected.inventory.cluster_id,
-            )
-            if mode == "off":
-                return
-            resource = await installed_job_resource_store(
-                conn, self.db, {
-                    "version": 3,
-                    "resource_admission": {
-                        "cluster_id": selected.inventory.cluster_id,
-                        "policy_digest": selected.policy_digest,
-                    },
-                }, fresh=False,
-            )
-        maintenance = VMResourceWaiterMaintenance(resource)
-        candidates = await maintenance.candidates(limit=8)
+        try:
+            async with self.db.acquire() as conn:
+                mode = await conn.fetchval(
+                    "SELECT mode FROM vm_resource_admission_policy WHERE cluster_id=$1",
+                    selected.inventory.cluster_id,
+                )
+                if mode not in {"enforce", "drain"}:
+                    return
+                resource = await installed_job_resource_store(
+                    conn, self.db, {
+                        "version": 3,
+                        "resource_admission": {
+                            "cluster_id": selected.inventory.cluster_id,
+                            "policy_digest": selected.policy_digest,
+                        },
+                    }, fresh=False,
+                )
+            maintenance = VMResourceWaiterMaintenance(resource)
+            candidates = await maintenance.candidates(limit=8)
+        except ResourceAdmissionError:
+            # A mode/policy race changes no candidate's owner authority. The
+            # actual retry scan still runs and independently refuses new v3
+            # grants until the installed policy matches.
+            logger.warning("VM resource waiter maintenance held (policy changed)")
+            return
         await self._bounded([
             maintenance.maintain(request_id=request_id)
             for request_id in candidates

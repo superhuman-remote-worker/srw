@@ -802,6 +802,77 @@ async def test_retry_service_runs_bounded_real_waiter_maintenance(db, monkeypatc
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "durable_mode", ["shadow", "off", "missing", "unconfigured", "invalid_config"],
+)
+async def test_unready_resource_mode_does_not_abort_unrelated_retry_scans(
+    db, monkeypatch, durable_mode,
+):
+    policy, inventory, _, _ = await environment(db)
+    monkeypatch.setenv(
+        "VM_RESOURCE_ADMISSION_CONFIG", json.dumps(policy.policy_document),
+    )
+    if durable_mode == "missing":
+        await db.execute(
+            "DELETE FROM vm_resource_admission_policy WHERE cluster_id=$1",
+            inventory.cluster_id,
+        )
+    elif durable_mode in {"shadow", "off"}:
+        await db.execute(
+            "UPDATE vm_resource_admission_policy SET mode=$2,revision=revision+1 "
+            "WHERE cluster_id=$1", inventory.cluster_id, durable_mode,
+        )
+    elif durable_mode == "unconfigured":
+        monkeypatch.delenv("VM_RESOURCE_ADMISSION_CONFIG")
+    else:
+        monkeypatch.setenv("VM_RESOURCE_ADMISSION_CONFIG", "{")
+    service = VMCreationRetryService(db, SimpleNamespace())
+    service.preflight.settle_cancelled = AsyncMock()
+    service.preflight.claim_due = AsyncMock(return_value=[])
+    service.store.claim_due = AsyncMock(return_value=[])
+
+    await service.reconcile_once()
+
+    service.preflight.claim_due.assert_awaited_once()
+    service.store.claim_due.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("durable_mode", ["enforce", "drain"])
+async def test_changed_installed_policy_holds_v3_create_but_scans_retry(
+    db, monkeypatch, durable_mode,
+):
+    policy, inventory, _, _ = await environment(db)
+    retry = await waiter(db, policy, inventory)
+    if durable_mode == "drain":
+        await db.execute(
+            "UPDATE vm_resource_admission_policy SET mode='drain',revision=revision+1 "
+            "WHERE cluster_id=$1", inventory.cluster_id,
+        )
+    changed = deepcopy(policy.policy_document)
+    changed["policy"]["ownerBudget"]["cpuMillicores"] += 1
+    monkeypatch.setenv("VM_RESOURCE_ADMISSION_CONFIG", json.dumps(changed))
+    client = UnexpectedCreate()
+    service = VMCreationRetryService(
+        db,
+        SimpleNamespace(_http_client=client, _lifecycle_hmac_secret=b"test-key"),
+    )
+
+    await service.reconcile_once()
+
+    current = await db.fetchrow(
+        "SELECT state,reason FROM vm_creation_retries WHERE request_id=$1",
+        retry["request_id"],
+    )
+    assert tuple(current) == ("attention", "vm_creation_retry_blocked")
+    assert client.calls == 0
+    assert await db.fetchval(
+        "SELECT count(*) FROM vm_resource_reservations WHERE request_id=$1",
+        retry["request_id"],
+    ) == 0
+
+
+@pytest.mark.asyncio
 async def test_enforcement_transition_refuses_unclassified_live_vm(db):
     from orchestrator.services.vm_resource_policy_lifecycle_store import (
         VMResourcePolicyLifecycleStore,
