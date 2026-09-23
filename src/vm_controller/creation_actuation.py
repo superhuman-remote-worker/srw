@@ -7,6 +7,7 @@ release database transactions before controller I/O; unknown results stay held.
 import asyncio
 from copy import deepcopy
 import json
+import logging
 from uuid import UUID, uuid5
 
 from kubernetes.client import ApiClient
@@ -28,6 +29,32 @@ from vm_controller.creation_configuration import resolve_creation_configuration
 
 class CreationUnproven(ValueError):
     pass
+
+
+_SAFE_CREATION_REASON_CODES = frozenset(
+    {
+        "creation_carrier_missing",
+        "creation_carrier_deleting",
+        "creation_carrier_changed",
+        "retained_disk_changed",
+        "workspace_recovery_held",
+        "workspace_attachment_unproven",
+        "creation_observed_object_missing",
+        "creation_observed_object_changed",
+        "creation_headscale_unavailable",
+        "creation_rootdisk_template_unproven",
+        "creation_secret_unproven",
+        "creation_object_name_changed",
+        "creation_existing_vm_unproven",
+        "creation_protocol_unproven",
+        "creation_request_changed",
+        "creation_source_not_active",
+        "creation_configuration_changed",
+        "creation_existing_disk_unproven",
+        "creation_rootdisk_source_unproven",
+        "creation_network_profile_unproven",
+    }
+)
 
 
 def document(value):
@@ -539,7 +566,16 @@ class CreationActuator:
             return {**base, "status": "creation_pending", "reason": "preparation_wait"}
         except GoldenWaiting:
             return {**base, "status": "creation_pending", "reason": "golden_wait"}
-        except (CreationUnproven, ValueError, KeyError, TypeError):
+        except (CreationUnproven, ValueError, KeyError, TypeError) as exc:
+            if (
+                type(exc) is CreationUnproven
+                and len(exc.args) == 1
+                and type(exc.args[0]) is str
+                and exc.args[0] in _SAFE_CREATION_REASON_CODES
+            ):
+                logging.getLogger(__name__).warning(
+                    "VM creation evidence refusal: %s", exc.args[0]
+                )
             return {
                 **base,
                 "status": "creation_attention",
@@ -760,8 +796,6 @@ class CreationActuator:
             ):
                 await sources.validate(row, rootdisk_source)
             if kind == "vm" and row["request"].get("network_profile") is not None:
-                if row["controller_configuration"]["version"] != 2:
-                    raise CreationUnproven("creation_network_profile_unproven")
                 from shared.vm_resource_manifest import validate_final_vm_manifest
 
                 validate_final_vm_manifest(

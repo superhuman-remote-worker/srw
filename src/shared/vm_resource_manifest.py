@@ -96,9 +96,12 @@ def _contract(template_text, request, configuration, effect_intent, kind):
     from shared.vm_workspace_storage import storage_binding, storage_name
 
     values = _values(effect_intent)
+    profile_only_vm = (
+        kind == "vm" and configuration["version"] == 1 and "network_profile" in request
+    )
     if (
         values["effect_kind"] != kind
-        or configuration["version"] != 2
+        or (configuration["version"] != 2 and not profile_only_vm)
         or canonical_configuration_digest(configuration)
         != values["controller_configuration_digest"]
         or canonical_request_digest(request) != values["request_digest"]
@@ -115,7 +118,7 @@ def _contract(template_text, request, configuration, effect_intent, kind):
         tolerations=configuration["tolerations"],
         storage_class=configuration["storage_class"],
     )
-    if _encoded(profile) != _encoded(
+    if configuration["version"] == 2 and _encoded(profile) != _encoded(
         configuration["resource_admission"]["template_profile"]
     ):
         raise ValueError
