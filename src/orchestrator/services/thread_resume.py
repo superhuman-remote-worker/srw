@@ -326,6 +326,29 @@ async def resume_thread(
             status_code=409,
             detail="Session execution lane does not support resume",
         )
+    if execution_lane == LANE_PINNED and thread.get("status") in {
+        "awaiting_user", "suspended", "created",
+    }:
+        from orchestrator.services.vm_idle_lifecycle import VMIdleLifecycleStore
+
+        idle = VMIdleLifecycleStore(postgres_db)
+        open_idle = await idle.get_open_for_thread(thread_id)
+        continuation = await idle.get_pending_access_continuation(thread_id)
+        if (
+            open_idle is not None or continuation is not None
+            or thread.get("status") == "suspended"
+        ):
+            wake = await idle.request_thread_wake(
+                thread_id, execution_requested=True,
+            )
+            if wake is None and open_idle is not None:
+                raise HTTPException(
+                    status_code=409, detail={"code": "session_idle_wake_held"},
+                )
+            if wake is not None:
+                return {
+                    "status": "resuming", "wake_id": str(wake["wake_id"]),
+                }
     if thread.get("status") != "ended":
         if (
             execution_lane == LANE_PINNED

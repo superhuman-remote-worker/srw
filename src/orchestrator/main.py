@@ -2032,6 +2032,14 @@ async def workspace_idle_sweeper(shutdown_event: asyncio.Event) -> None:
             postgres_db, vm_provisioner, VMWorkspaceRecoveryStore(postgres_db),
             claimant=f"{os.getenv('HOSTNAME', 'orchestrator')}:vm-idle",
             agent_provisioner=agent_provisioner,
+            thread_retirement=_thread_retirement_operations(),
+            thread_workspace_suspension=workspace_suspension_service,
+            thread_prepare=lambda thread_id, operation_id: (
+                sessions_routes.prepare_woken_pinned_session(
+                    thread_id, operation_id,
+                    dependencies=_sessions_dependencies(),
+                )
+            ),
             terminal_publication_handler=lambda operation: (
                 _job_control_operations().publish_terminal_review(operation)
             ),

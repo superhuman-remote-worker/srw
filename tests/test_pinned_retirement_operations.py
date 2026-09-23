@@ -382,6 +382,72 @@ async def test_vm_recovery_stops_exact_pod_before_releasing_captured_vm() -> Non
 
 
 @pytest.mark.asyncio
+async def test_idle_soft_retirement_stops_captured_pod_before_vm_effect() -> None:
+    events: list[str] = []
+    retirement = _vm_retirement()
+    retirement["permanent"] = False
+    retirement["context"]["generation"] = RUNTIME_GENERATION
+    retirement["context"]["settle_status"] = "suspended"
+    store = MagicMock()
+    store.get_thread = AsyncMock(return_value={
+        **_current_vm_thread(), "runtime_retirement_permanent": False,
+    })
+    actor = MagicMock()
+    actor.is_available = True
+
+    async def delete_pod(*_args, **_kwargs):
+        events.append("agent_stop")
+        return True
+
+    async def release_vm(*_args, **_kwargs):
+        events.append("vm_stop")
+        return VMTeardownResult("completed", True)
+
+    actor.delete_agent_pod_exact = AsyncMock(side_effect=delete_pod)
+    actor.agent_pod_authority = AsyncMock(
+        side_effect=["exact_terminal", "exact_absent"]
+    )
+    actor.release_agent_pod_finalizer_exact = AsyncMock(return_value=True)
+    vm = MagicMock()
+    vm.lifecycle_available = True
+    vm.release_vm_captured = AsyncMock(side_effect=release_vm)
+    operations = _operations(
+        store=store, agent_provisioner=actor, vm_provisioner=vm,
+    )
+    operations.dependencies.session_router.teardown_route = AsyncMock(
+        return_value=True,
+    )
+    with (
+        patch.object(
+            PinnedRetirementOperations,
+            "_reconcile_workspace_provision_intent_for_retirement",
+            AsyncMock(return_value=False),
+        ),
+        patch.object(
+            PinnedRetirementOperations, "_admit_vm_cleanup",
+            AsyncMock(return_value=SimpleNamespace(allowed=True)),
+        ),
+        patch.object(
+            PinnedRetirementOperations, "_complete_vm_cleanup", AsyncMock(),
+        ),
+        patch.object(
+            PinnedRetirementOperations,
+            "_reconcile_agent_workspace_claim_for_retirement", AsyncMock(),
+        ),
+    ):
+        await operations.cleanup_pinned_thread_retirement(
+            retirement, cleanup_agent_pod=True,
+            stop_agent_before_workspace=True,
+        )
+    assert events == ["agent_stop", "vm_stop"]
+    actor.delete_agent_pod_exact.assert_awaited_once_with(
+        "srw-agent-pinned",
+        expected_pod_uid="55555555-5555-4555-8555-555555555555",
+        namespace="agents-a",
+    )
+
+
+@pytest.mark.asyncio
 async def test_vm_recovery_hold_blocks_pinned_retirement_vm_release() -> None:
     store = MagicMock()
     store.get_thread = AsyncMock(

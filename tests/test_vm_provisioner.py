@@ -199,8 +199,9 @@ def provisioner_disabled():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("owner_kind", ["job", "thread"])
 async def test_idle_stop_receipt_needs_authenticated_vm_vmi_launcher_absence(
-    provisioner_with_nats, mock_nats_bridge, mock_db
+    provisioner_with_nats, mock_nats_bridge, mock_db, owner_kind
 ):
     """An authenticated VM 404 without VMI/launcher proof cannot free compute."""
     from uuid import uuid4
@@ -211,6 +212,7 @@ async def test_idle_stop_receipt_needs_authenticated_vm_vmi_launcher_absence(
     operation = {
         "id": ids["id"],
         "owner_id": ids["owner_id"],
+        "owner_kind": owner_kind,
         "provision_generation": ids["generation"],
         "vm_uid": ids["vm_uid"],
         "vmi_uid": ids["vmi_uid"],
@@ -219,6 +221,9 @@ async def test_idle_stop_receipt_needs_authenticated_vm_vmi_launcher_absence(
     }
     mock_db.get_job.return_value = {
         "context": {"vm": {"provision_generation": ids["generation"]}}
+    }
+    mock_db.get_thread.return_value = {
+        "metadata": {"vm": {"provision_generation": ids["generation"]}}
     }
     reply = {
         "_identity_authenticated": True,

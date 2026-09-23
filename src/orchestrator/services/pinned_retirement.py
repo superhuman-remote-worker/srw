@@ -2040,6 +2040,7 @@ class PinnedRetirementOperations:
         retirement: Mapping[str, Any],
         *,
         cleanup_agent_pod: bool = True,
+        stop_agent_before_workspace: bool = False,
         defer_agent_workspace_claim_until_caller_exit: bool = False,
     ) -> None:
         """Actuate only identities captured by ``begin_pinned_thread_retirement``.
@@ -2115,6 +2116,11 @@ class PinnedRetirementOperations:
                 expected_owner_uid=route_owner_uid,
             ):
                 raise RuntimeError("exact session route cleanup is retryable")
+
+        if stop_agent_before_workspace:
+            if not cleanup_agent_pod or permanent:
+                raise RuntimeError("idle Pod stop authority is malformed")
+            await self._stop_captured_retirement_agent(retirement)
 
         workspace_provision_intent_zero = (
             await self._reconcile_workspace_provision_intent_for_retirement(retirement)
@@ -2453,7 +2459,8 @@ class PinnedRetirementOperations:
             captured_agent_pods = self._captured_retirement_agent_pods(retirement)
             if len(captured_agent_pods) > 1:
                 raise RuntimeError("captured retirement agent identities disagree")
-            await self._stop_captured_retirement_agent(retirement)
+            if not stop_agent_before_workspace:
+                await self._stop_captured_retirement_agent(retirement)
             if captured_agent_pods:
                 (
                     stopped_agent_pod_name,

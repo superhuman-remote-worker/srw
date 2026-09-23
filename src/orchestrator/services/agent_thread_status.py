@@ -34,7 +34,7 @@ import logging
 from dataclasses import dataclass
 from collections.abc import Mapping
 from typing import Any, Awaitable, Callable
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from fastapi import HTTPException
 
@@ -49,6 +49,12 @@ from orchestrator.services.session_runtime_admission import (
     thread_runtime_refusal_detail,
 )
 from orchestrator.services.stateless_workspace_gate import thread_metadata_object
+from orchestrator.services.vm_remote_operation import (
+    VMRemoteOperationUnavailable,
+    _identity_from_row,
+)
+from shared.workspace_idle_policy import RuntimeIdentity
+from shared.workspace_idle_store import apply_idle_transition_on_conn
 
 logger = logging.getLogger(__name__)
 
@@ -247,7 +253,8 @@ async def update_thread_status(
                 thread_record = await conn.fetchrow(
                     "SELECT id, agent_id, execution_lane, status, metadata, "
                     "project_id, title, runtime_generation, "
-                    "runtime_attach_token, runtime_retirement_token "
+                    "runtime_attach_token, runtime_retirement_token, "
+                    "workspace_idle_revision, workspace_idle_episode "
                     "FROM threads WHERE id = $1::uuid FOR UPDATE",
                     thread_id,
                 )
@@ -375,6 +382,43 @@ async def update_thread_status(
                         status_code=409,
                         detail="Pinned session ownership changed before teardown",
                     )
+                if (
+                    result_status == "awaiting_user"
+                    and thread_record["status"] == "active"
+                    and thread_record["workspace_idle_episode"] is None
+                ):
+                    metadata = thread_metadata_object(thread_row)
+                    vm = metadata.get("vm")
+                    try:
+                        authority = _identity_from_row(
+                            thread_row, owner_kind="thread",
+                            owner_id=str(thread_id), operation_kind="idle_policy",
+                        )
+                        if (
+                            not isinstance(vm, dict)
+                            or vm.get("status") != "ready"
+                            or str(UUID(str(vm.get("vm_uid")))) != authority.vm_uid
+                            or str(UUID(str(vm.get("vmi_uid")))) != vm.get("vmi_uid")
+                            or str(UUID(str(vm.get("active_pod_uid"))))
+                                != authority.launcher_pod_uid
+                            or str(UUID(str(vm.get("rootdisk_pvc_uid"))))
+                                != vm.get("rootdisk_pvc_uid")
+                        ):
+                            raise ValueError("unproven VM tuple")
+                    except (VMRemoteOperationUnavailable, ValueError, TypeError):
+                        pass
+                    else:
+                        await apply_idle_transition_on_conn(
+                            conn,
+                            runtime=RuntimeIdentity(
+                                "thread", str(thread_id), "vm",
+                                authority.workspace_generation, authority.vm_uid,
+                            ),
+                            event="enter",
+                            expected_revision=thread_record["workspace_idle_revision"],
+                            expected_episode_id=None,
+                            wait_kind="natural_pause", wait_key=str(uuid4()),
+                        )
 
         if result_status == "begin_retirement":
             retirement = await dependencies.begin_pinned_thread_retirement(
