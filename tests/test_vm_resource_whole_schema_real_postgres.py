@@ -1,6 +1,5 @@
 """Versioned six-resource ledger guards run in real PostgreSQL."""
 
-from pathlib import Path
 from uuid import UUID, uuid4
 
 import asyncpg
@@ -18,19 +17,10 @@ from tests.test_vm_creation_retry_real_postgres import (
 from tests.test_vm_resource_inventory_real_postgres import setup, publish
 
 
-MIGRATION = (
-    Path(__file__).parent.parent
-    / "src/orchestrator/database/migrations/app/0274_vm_resource_whole_launcher.sql"
-)
-
-
 @pytest_asyncio.fixture(scope="module")
-async def whole_schema(pg_dsn, _schema_applied):  # noqa: F811
-    conn = await asyncpg.connect(pg_dsn)
-    try:
-        await conn.execute(MIGRATION.read_text())
-    finally:
-        await conn.close()
+async def whole_schema(_schema_applied):  # noqa: F811
+    # The regenerated snapshot replays both 0273 and 0274.
+    yield
 
 
 @pytest_asyncio.fixture
