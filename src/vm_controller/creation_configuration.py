@@ -166,6 +166,7 @@ def resolve_creation_configuration(
         )
     _validate_json(configuration)
     return {
+        "creation_retry_protocol": 1,
         "request": payload,
         "request_digest": canonical_request_digest(payload),
         "controller_configuration": configuration,

@@ -67,6 +67,8 @@ class CreationDisposer:
                 raise ValueError("Cancellation identity changed")
             if row["state"] == "settled" and row["reason"] == "creation_adopted":
                 return {**identity, "status": "creation_adopted"}
+            if row["state"] == "settled" and row["reason"] == "creation_disposed":
+                return {**identity, "status": "creation_disposed"}
             if row["state"] != "cancel_requested" or not row["creation_admission_id"]:
                 raise ValueError("Cancellation admission is unavailable")
             name = "srw-cleanup-" + UUID(row["creation_admission_id"]).hex
@@ -135,10 +137,39 @@ class CreationDisposer:
 
             await DispositionResources(self.actuator, row, lease, disposition).run()
             from vm_controller.creation_disposition_sources import DispositionSources
+            from shared.vm_creation_source_completion import validate_source_completion
 
-            # A stored source intent is a replay instruction, never completion.
-            # Always inspect/reconcile its exact external CAS and allocation.
-            await DispositionSources(self.actuator, row, lease, disposition).run()
+            completed = row.get("cancellation_completion", {}).get("source")
+            if completed is None:
+                # A planned key is never completion. Only a separately accepted
+                # actual receipt may survive source GC without replaying its CAS.
+                actual = await DispositionSources(
+                    self.actuator, row, lease, disposition
+                ).run()
+                recorded = await self.actuator.authority(
+                    "record-disposition",
+                    request_id=row["request_id"],
+                    carrier=lease,
+                    stage="source",
+                    evidence=actual,
+                )
+                if recorded.get("recorded") is not True:
+                    return pending
+                validate_source_completion(actual["plan"], recorded["evidence"])
+            else:
+                validate_source_completion(
+                    row["cancellation_progress"]["source"], completed
+                )
+            from vm_controller.creation_disposition_attachment import (
+                DispositionAttachment,
+            )
+
+            await DispositionAttachment(self.actuator, row, lease, disposition).run()
+            settled = await self.actuator.authority(
+                "settle-disposition", request_id=row["request_id"], carrier=lease
+            )
+            if settled.get("settled") is True and settled.get("disposition") == "creation_disposed":
+                return {**identity, "status": "creation_disposed"}
             return {**pending, "disposition_id": disposition["disposition_id"]}
         return pending
 

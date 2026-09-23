@@ -213,7 +213,41 @@ class VMCreationDispositionStore:
             raise VMCreationRetryConflict("creation_disposition_stage_unavailable")
         resource = disposition["objects"].get(stage)
         if resource is None:
-            raise VMCreationRetryConflict("creation_disposition_stage_unavailable")
+            if any(
+                e["effect_kind"] == stage and e["state"] != "rejected"
+                for e in disposition["effects"]
+            ) or (
+                stage == "rootdisk"
+                and (
+                    row["expected_pvc_uid"] is not None
+                    or row["observed_pvc_uid"] is not None
+                )
+            ):
+                raise VMCreationRetryConflict("creation_disposition_stage_unavailable")
+            from shared.vm_workspace_storage import storage_name
+
+            binding = row["canonical_request"].get("workspace_storage")
+            name = (
+                storage_name(binding)
+                if stage == "rootdisk" and binding
+                else (
+                    "agent-vm-"
+                    + str(row["job_id"])
+                    + ("-rootdisk" if stage == "rootdisk" else "-cloudinit")
+                )
+            )
+            return {
+                "operation": "confirm_absent",
+                "completion": {
+                    "version": 1,
+                    "disposition_id": disposition["disposition_id"],
+                    "kind": "rootdisk_never_issued"
+                    if stage == "rootdisk"
+                    else "secret_never_issued",
+                    "name": name,
+                    "namespace": disposition["namespace"],
+                },
+            }
         common = {
             "version": 1,
             "disposition_id": disposition["disposition_id"],
@@ -226,6 +260,16 @@ class VMCreationDispositionStore:
                 "operation": "delete_secret",
                 "resource": resource,
                 "completion": {**common, "kind": "secret_absent"},
+            }
+        if disposition["disk_policy"] == "retain":
+            return {
+                "operation": "retain_rootdisk",
+                "resource": resource,
+                "completion": {
+                    **common,
+                    "kind": "rootdisk_retained",
+                    "pvc_uid": resource["pvc_uid"],
+                },
             }
         from orchestrator.services.vm_creation_disposition_cleanup import root_cleanup
 
@@ -397,6 +441,12 @@ class VMCreationDispositionStore:
         async with self.db.acquire() as conn:
             async with conn.transaction():
                 row, disposition = await self._locked(conn, request_id, carrier)
+                if stage == "workspace_attachment":
+                    if source is not None:
+                        raise VMCreationRetryConflict(
+                            "creation_disposition_stage_unavailable"
+                        )
+                    return await self._attachment_intent(conn, row, disposition, target)
                 if stage == "source":
                     return await self._source_intent(
                         conn, row, disposition, source, target
@@ -420,6 +470,12 @@ class VMCreationDispositionStore:
         async with self.db.acquire() as conn:
             async with conn.transaction():
                 row, disposition = await self._locked(conn, request_id, carrier)
+                if stage == "workspace_attachment":
+                    return await self._record_attachment(
+                        conn, row, disposition, evidence
+                    )
+                if stage == "source":
+                    return await self._record_source(conn, row, disposition, evidence)
                 grant = await self._grant(
                     conn, row, disposition, stage, create_child=False
                 )
@@ -430,7 +486,7 @@ class VMCreationDispositionStore:
                     raise VMCreationRetryConflict(
                         "creation_disposition_evidence_changed"
                     )
-                if stage == "rootdisk":
+                if grant["operation"] == "purge_rootdisk":
                     child = await conn.fetchrow(
                         "SELECT completed_at,outcome FROM vm_workspace_cleanup_admissions WHERE id=$1",
                         UUID(grant["cleanup"]["admission_id"]),
@@ -448,4 +504,194 @@ class VMCreationDispositionStore:
                         row["request_id"],
                         json.dumps({stage: evidence}),
                     )
+                completed = _json(row["cancellation_completion"])
+                if stage in completed and completed[stage] != evidence:
+                    raise VMCreationRetryConflict(
+                        "creation_disposition_evidence_changed"
+                    )
+                if stage not in completed:
+                    await conn.execute(
+                        "UPDATE vm_creation_retries SET cancellation_completion=cancellation_completion || $2::jsonb,revision=revision+1,updated_at=clock_timestamp() WHERE request_id=$1",
+                        row["request_id"],
+                        json.dumps({stage: evidence}),
+                    )
                 return {"recorded": True, "stage": stage, "evidence": evidence}
+
+    async def _record_source(self, conn, row, disposition, evidence):
+        from shared.vm_creation_source_completion import validate_source_completion
+        from shared.vm_creation_source_disposition import source_disposition_plan
+
+        progress = _json(row["cancellation_progress"])
+        plan = progress.get("source")
+        try:
+            if (
+                plan is None
+                or source_disposition_plan(
+                    row, disposition, plan["source"], plan["target"]
+                )
+                != plan
+            ):
+                raise ValueError("Source intent no longer matches its authority")
+            validate_source_completion(plan, evidence)
+        except (ValueError, TypeError, KeyError) as exc:
+            raise VMCreationRetryConflict(
+                "creation_disposition_evidence_changed"
+            ) from exc
+        target = plan["target"]
+        if target and target["kind"] == "rootdisk_purged":
+            grant = await self._grant(
+                conn, row, disposition, "rootdisk", create_child=False
+            )
+            child = await conn.fetchrow(
+                "SELECT completed_at,outcome FROM vm_workspace_cleanup_admissions WHERE id=$1",
+                UUID(grant["cleanup"]["admission_id"]),
+            )
+            if (
+                target != grant["completion"]
+                or progress.get("rootdisk") != target
+                or child["completed_at"] is None
+                or child["outcome"] != "deleted"
+            ):
+                raise VMCreationRetryConflict("creation_disposition_incomplete")
+        elif target and target["kind"] == "rootdisk_completed":
+            root = disposition["objects"].get("rootdisk")
+            if (
+                disposition["disk_policy"] != "retain"
+                or root is None
+                or any(
+                    target[key] != root[key]
+                    for key in ("name", "namespace", "uid", "pvc_uid")
+                )
+            ):
+                raise VMCreationRetryConflict("creation_disposition_incomplete")
+        elif target and target["kind"] == "rootdisk_never_issued":
+            if (
+                row["expected_pvc_uid"] is not None
+                or row["observed_pvc_uid"] is not None
+                or disposition["objects"].get("rootdisk") is not None
+                or any(
+                    e["effect_kind"] == "rootdisk" and e["state"] != "rejected"
+                    for e in disposition["effects"]
+                )
+            ):
+                raise VMCreationRetryConflict("creation_disposition_incomplete")
+        completion = _json(row["cancellation_completion"])
+        prior = completion.get("source")
+        if prior is not None:
+            validate_source_completion(plan, prior)
+            # Accepted actual proof is durable; later GC or an unrelated source
+            # RV does not replace it. The caller's full current proof still had
+            # to validate against the same immutable plan above.
+            return {"recorded": True, "stage": "source", "evidence": prior}
+        await conn.execute(
+            "UPDATE vm_creation_retries SET cancellation_completion=cancellation_completion || $2::jsonb,revision=revision+1,updated_at=clock_timestamp() WHERE request_id=$1",
+            row["request_id"],
+            json.dumps({"source": evidence}),
+        )
+        return {"recorded": True, "stage": "source", "evidence": evidence}
+
+    async def _attachment_intent(self, conn, row, disposition, target):
+        from shared.vm_creation_attachment_disposition import attachment_plan
+        from orchestrator.services.vm_creation_attachment_store import (
+            attachment_instance_on_conn,
+        )
+
+        if disposition["workspace_storage"] is not None:
+            await attachment_instance_on_conn(conn, row, adoption=True)
+        prior = _json(row["cancellation_progress"]).get("workspace_attachment")
+        if prior is not None:
+            return {"operation": "dispose_attachment", "plan": prior}
+        try:
+            plan = attachment_plan(
+                row, disposition, _json(row["cancellation_completion"]), target
+            )
+        except (ValueError, TypeError, KeyError, StopIteration) as exc:
+            raise VMCreationRetryConflict(
+                "creation_disposition_attachment_unproven"
+            ) from exc
+        await conn.execute(
+            "UPDATE vm_creation_retries SET cancellation_progress=cancellation_progress || $2::jsonb,revision=revision+1,updated_at=clock_timestamp() WHERE request_id=$1",
+            row["request_id"],
+            json.dumps({"workspace_attachment": plan}),
+        )
+        return {"operation": "dispose_attachment", "plan": plan}
+
+    async def _record_attachment(self, conn, row, disposition, evidence):
+        from shared.vm_creation_attachment_disposition import attachment_completion
+        from orchestrator.services.vm_creation_attachment_store import (
+            attachment_instance_on_conn,
+        )
+
+        if disposition["workspace_storage"] is not None:
+            await attachment_instance_on_conn(conn, row, adoption=True)
+        plan = _json(row["cancellation_progress"]).get("workspace_attachment")
+        if plan is None:
+            raise VMCreationRetryConflict("creation_disposition_attachment_unproven")
+        try:
+            actual = attachment_completion(plan, evidence)
+        except (ValueError, TypeError, KeyError) as exc:
+            raise VMCreationRetryConflict(
+                "creation_disposition_evidence_changed"
+            ) from exc
+        prior = _json(row["cancellation_completion"]).get("workspace_attachment")
+        if prior is not None:
+            if prior != actual:
+                raise VMCreationRetryConflict("creation_disposition_evidence_changed")
+        else:
+            await conn.execute(
+                "UPDATE vm_creation_retries SET cancellation_completion=cancellation_completion || $2::jsonb,revision=revision+1,updated_at=clock_timestamp() WHERE request_id=$1",
+                row["request_id"],
+                json.dumps({"workspace_attachment": actual}),
+            )
+        return {"recorded": True, "evidence": actual}
+
+    async def settle(self, *, request_id: str, carrier: dict) -> dict:
+        """Commit exact instance, original admission and no-VM retry together."""
+        from orchestrator.services.vm_creation_attachment_store import attachment_instance_on_conn
+
+        async with self.db.acquire() as conn:
+            async with conn.transaction():
+                row, _ = await self.retries._effect_scope(conn, request_id)
+                values = self.retries._carrier(carrier)
+                await self.retries._check_carrier(conn, row, carrier, values, allow_completed=True)
+                if row["state"] == "settled":
+                    if row["reason"] != "creation_disposed":
+                        raise VMCreationRetryConflict("creation_already_settled")
+                    return {"settled": True, "disposition": "creation_disposed"}
+                row, disposition = await self._locked(conn, request_id, carrier)
+                if not await conn.fetchval(
+                    "SELECT public.valid_vm_creation_disposition_evidence(r) FROM vm_creation_retries r WHERE request_id=$1",
+                    row["request_id"],
+                ):
+                    raise VMCreationRetryConflict("creation_disposition_incomplete")
+                completed = _json(row["cancellation_completion"])
+                attachment = completed["workspace_attachment"]
+                if disposition["workspace_storage"] is not None:
+                    instance = await attachment_instance_on_conn(conn, row, adoption=True)
+                    receipt = {
+                        "version": 1,
+                        "kind": "retained_creation_disposition",
+                        "request_id": str(row["request_id"]),
+                        "disposition_id": disposition["disposition_id"],
+                        "provision_generation": str(row["provision_generation"]),
+                        "execution_id": str(row["execution_id"]),
+                        "attachment": attachment,
+                        "rootdisk": completed["rootdisk"],
+                    }
+                    pvc = completed["rootdisk"].get("pvc_uid")
+                    await conn.execute(
+                        "UPDATE srw_workspace_instances SET status=$2,execution_id=NULL,pvc_uid=$3,"
+                        "backend_state=backend_state || jsonb_build_object('retained_creation_disposition',$4::jsonb),updated_at=clock_timestamp() WHERE id=$1",
+                        instance["id"],
+                        "Detached" if attachment["outcome"] == "detached" else "Released",
+                        pvc, json.dumps(receipt),
+                    )
+                await conn.execute(
+                    "UPDATE vm_workspace_cleanup_admissions SET completed_at=clock_timestamp(),outcome='creation_disposed' WHERE id=$1",
+                    row["creation_admission_id"],
+                )
+                await conn.execute(
+                    "UPDATE vm_creation_retries SET state='settled',reason='creation_disposed',revision=revision+1,claim_token=NULL,claim_expires_at=NULL,resolved_at=clock_timestamp(),updated_at=clock_timestamp() WHERE request_id=$1",
+                    row["request_id"],
+                )
+                return {"settled": True, "disposition": "creation_disposed"}

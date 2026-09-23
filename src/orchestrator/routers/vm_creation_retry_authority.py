@@ -135,3 +135,10 @@ async def record_disposition(request: Request) -> JSONResponse:
     return await _dispatch(
         request, "creation_retry_record_disposition", "record_disposition"
     )
+
+
+@router.post("/settle-disposition")
+async def settle_disposition(request: Request) -> JSONResponse:
+    return await _dispatch(
+        request, "creation_retry_settle_disposition", "settle_disposition"
+    )

@@ -28,6 +28,7 @@ def controller():
 def test_resolution_freezes_all_options_and_effective_render_inputs(monkeypatch):
     original = request()
     resolved = resolve_creation_configuration(controller(), original)
+    assert resolved["creation_retry_protocol"] == 1
     assert resolved["request_digest"] == canonical_request_digest(resolved["request"])
     assert resolved["request"]["initialization"] is None
     assert resolved["request"]["vm_image"] == module.DEFAULT_VM_IMAGE

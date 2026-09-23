@@ -2,6 +2,7 @@
 
 import asyncio
 from collections.abc import Mapping
+from copy import deepcopy
 
 from kubernetes.client.exceptions import ApiException
 
@@ -163,6 +164,18 @@ class DispositionResources:
             expected = disposition["objects"].get(stage)
             if expected is None:
                 continue
+            if stage == "rootdisk" and disposition["disk_policy"] == "retain":
+                from shared.vm_creation_source_disposition import (
+                    completed_source_target,
+                )
+
+                _, dv, pvc = await self.actuator.disk(
+                    self.row, expected=expected, require_attachment=False
+                )
+                completed_source_target(
+                    disposition, {"outcome": "observed", "object": dv, "pvc": pvc}
+                )
+                continue
             current = await self.actuator.read(stage, expected["name"])
             if current is not None:
                 metadata = current["metadata"]
@@ -219,28 +232,44 @@ class DispositionResources:
             raise CreationUnproven("creation_resource_recovery_pinned")
 
     async def run(self):
-        if (
-            self.disposition["disk_policy"] != "purge_new_job_disk"
-            or self.disposition["workspace_storage"] is not None
-        ):
-            return
-        if not self.disposition["objects"]:
-            return
         await self.check()
         for stage in ("cloud_init", "rootdisk"):
-            if (
-                stage not in self.disposition["objects"]
-                or stage in self.row["cancellation_progress"]
-            ):
-                continue
             grant = await self.actuator.authority(
                 "authorize-disposition",
                 request_id=self.row["request_id"],
                 carrier=self.lease,
                 stage=stage,
             )
-            if grant.get("resource") != self.disposition["objects"][stage]:
+            if grant.get("operation") == "confirm_absent":
+                if stage in self.disposition["objects"]:
+                    raise CreationUnproven("creation_disposition_grant_changed")
+                completion = grant["completion"]
+                if await self.actuator.read(stage, completion["name"]) is not None or (
+                    stage == "rootdisk"
+                    and await self.actuator.read("pvc", completion["name"]) is not None
+                ):
+                    raise CreationUnproven("creation_resource_identity_changed")
+                scan = deepcopy(self.disposition)
+                scan["objects"][stage] = {"name": completion["name"]}
+                await require_no_consumers(self.actuator, scan)
+                await self.record(stage, completion)
+                continue
+            if grant.get("resource") != self.disposition["objects"].get(stage):
                 raise CreationUnproven("creation_disposition_grant_changed")
+            if grant.get("operation") == "retain_rootdisk":
+                await self.check()
+                await self.record(stage, grant["completion"])
+                continue
+            if stage in self.row["cancellation_progress"]:
+                await self.check()
+                name = grant["resource"]["name"]
+                if await self.actuator.read(stage, name) is not None or (
+                    stage == "rootdisk"
+                    and await self.actuator.read("pvc", name) is not None
+                ):
+                    raise CreationUnproven("creation_disposition_incomplete")
+                await self.record(stage, grant["completion"])
+                continue
             if stage == "cloud_init":
                 if grant.get("operation") != "delete_secret":
                     raise CreationUnproven("creation_disposition_grant_changed")
@@ -309,15 +338,18 @@ class DispositionResources:
                     carrier, outcome="deleted"
                 )
             await self.check()
-            recorded = await self.actuator.authority(
-                "record-disposition",
-                request_id=self.row["request_id"],
-                carrier=self.lease,
-                stage=stage,
-                evidence=grant["completion"],
-            )
-            if (
-                recorded.get("recorded") is not True
-                or recorded.get("evidence") != grant["completion"]
-            ):
-                raise CreationUnproven("creation_disposition_progress_unproven")
+            await self.record(stage, grant["completion"])
+
+    async def record(self, stage, completion):
+        recorded = await self.actuator.authority(
+            "record-disposition",
+            request_id=self.row["request_id"],
+            carrier=self.lease,
+            stage=stage,
+            evidence=completion,
+        )
+        if (
+            recorded.get("recorded") is not True
+            or recorded.get("evidence") != completion
+        ):
+            raise CreationUnproven("creation_disposition_progress_unproven")

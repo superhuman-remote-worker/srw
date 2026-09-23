@@ -122,14 +122,14 @@ async def test_typed_secret_progress_cannot_be_replaced_by_boolean_or_other_uid(
 
 
 @pytest.mark.asyncio
-async def test_no_secret_effect_is_not_a_secret_delete_grant(db, monkeypatch):
+async def test_no_secret_effect_is_a_distinct_never_issued_receipt(db, monkeypatch):
     service, row, carrier, _ = await partial(db, monkeypatch)
-    with pytest.raises(
-        VMCreationRetryConflict, match="creation_disposition_stage_unavailable"
-    ):
-        await service.authorize(
-            request_id=str(row["request_id"]), carrier=carrier, stage="cloud_init"
-        )
+    grant = await service.authorize(
+        request_id=str(row["request_id"]), carrier=carrier, stage="cloud_init"
+    )
+    assert grant["operation"] == "confirm_absent"
+    assert grant["completion"]["kind"] == "secret_never_issued"
+    assert "resource" not in grant
 
 
 @pytest.mark.asyncio

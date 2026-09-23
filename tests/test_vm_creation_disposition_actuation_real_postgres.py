@@ -133,18 +133,20 @@ async def runtime(db, setup, monkeypatch):
 @pytest.mark.parametrize(
     "lost", [None, "Secret", "DataVolume", "PersistentVolumeClaim"]
 )
-async def test_fixed_partial_resources_are_disposed_once_while_parent_stays_held(
+async def test_fixed_partial_resources_are_disposed_once_and_parent_settles(
     db, setup, monkeypatch, lost
 ):
     ctrl, api, store, row, _ = await runtime(db, setup, monkeypatch)
     if lost:
         api.lost_deletes.add(lost)
-    for _ in range(3):
+    for _ in range(8):
         result = await CreationDisposer(ctrl).run(disposition_identity(row))
-        assert result["status"] == "creation_disposition_pending"
+        if result["status"] == "creation_disposed":
+            break
+    assert result["status"] == "creation_disposed"
     state = await store.inspect(request_id=str(row["request_id"]))
-    assert set(state["cancellation_progress"]) == {"cloud_init", "rootdisk", "source"}
-    assert state["state"] == "cancel_requested"
+    assert set(state["cancellation_completion"]) == {"cloud_init", "rootdisk", "source", "workspace_attachment"}
+    assert state["state"] == "settled"
     assert [item[0] for item in api.deletes if item[0] != "Lease"] == [
         "Secret",
         "DataVolume",
@@ -153,7 +155,7 @@ async def test_fixed_partial_resources_are_disposed_once_while_parent_stays_held
     assert set(api.writes) <= {"Lease"}
     async with db.acquire() as conn:
         assert await conn.fetchval(
-            "SELECT completed_at IS NULL FROM vm_workspace_cleanup_admissions WHERE id=$1",
+            "SELECT completed_at IS NOT NULL AND outcome='creation_disposed' FROM vm_workspace_cleanup_admissions WHERE id=$1",
             UUID(state["creation_admission_id"]),
         )
         assert (
@@ -273,7 +275,8 @@ async def test_lost_root_grant_progress_or_carrier_reply_replays_one_child(
     for _ in range(3):
         await CreationDisposer(ctrl).run(disposition_identity(row))
     current = await store.inspect(request_id=str(row["request_id"]))
-    assert set(current["cancellation_progress"]) == {"cloud_init", "rootdisk", "source"}
+    assert set(current["cancellation_completion"]) == {"cloud_init", "rootdisk", "source", "workspace_attachment"}
+    assert current["state"] == "settled"
     assert len([value for value in api.deletes if value[0] != "Lease"]) == 3
     async with db.acquire() as conn:
         assert (

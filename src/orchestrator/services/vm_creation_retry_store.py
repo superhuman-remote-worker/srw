@@ -1183,6 +1183,15 @@ class VMCreationRetryStore:
 
         return await VMCreationDispositionStore(self).record(**payload)
 
+    async def settle_disposition(self, *, request_id: str, carrier: dict) -> dict:
+        from orchestrator.services.vm_creation_disposition_store import (
+            VMCreationDispositionStore,
+        )
+
+        return await VMCreationDispositionStore(self).settle(
+            request_id=request_id, carrier=carrier
+        )
+
     async def observe_effect(
         self, *, request_id: str, carrier: dict, observation: dict
     ) -> dict:
@@ -1308,6 +1317,7 @@ class VMCreationRetryStore:
                     "request": row["canonical_request"],
                     "cancellation_disposition": _json(row["cancellation_disposition"]),
                     "cancellation_progress": _json(row["cancellation_progress"]),
+                    "cancellation_completion": _json(row["cancellation_completion"]),
                     **(
                         {
                             "prepared_origin": prepared_origin(

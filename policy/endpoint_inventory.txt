@@ -236,6 +236,7 @@ POST   /api/internal/vm-creation-retries/observe-effect                         
 POST   /api/internal/vm-creation-retries/prepare-disposition                            pat=refused         internal:require_vm_cleanup_authority
 POST   /api/internal/vm-creation-retries/record-disposition                             pat=refused         internal:require_vm_cleanup_authority
 POST   /api/internal/vm-creation-retries/settle-adopted                                 pat=refused         internal:require_vm_cleanup_authority
+POST   /api/internal/vm-creation-retries/settle-disposition                             pat=refused         internal:require_vm_cleanup_authority
 POST   /api/internal/vm-creation-retries/settle-never-issued                            pat=refused         internal:require_vm_cleanup_authority
 POST   /api/internal/vm-resource-inventory/publish                                      pat=refused         internal:require_vm_inventory_authority
 POST   /api/internal/vm-workspace-cleanup-authority/acquire                             pat=refused         internal:require_vm_cleanup_authority
