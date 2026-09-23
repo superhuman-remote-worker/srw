@@ -534,9 +534,10 @@ def _bad_request_verdict(exc: BaseException) -> Optional[str]:
     ``invalid_request_error`` / ``bad_request_error`` label (as ``type``, or as
     ``code`` where a provider files it there) or an untyped "no such model"
     message. The overloads keep retrying: rate limits and Groq's
-    ``tool_use_failed`` disguised as 400s, and a dropped stream mislabeled as
-    one. ``None`` — no parseable body, or one naming nothing we recognise — is
-    left to the caller's conservative default.
+    ``tool_use_failed`` disguised as 400s, a dropped stream mislabeled as
+    one, and the subscription proxy's not-yet-loaded "unknown provider for
+    model" answer. ``None`` — no parseable body, or one naming nothing we
+    recognise — is left to the caller's conservative default.
     """
     err_obj = _api_error_object(exc)
     if err_obj is None:
@@ -551,6 +552,21 @@ def _bad_request_verdict(exc: BaseException) -> Optional[str]:
     if _is_stream_disconnect(message):
         # A dropped stream mislabeled as a 400 invalid_request_error —
         # transient transport, not a deterministic input rejection.
+        return "transient"
+    if (
+        code == "model_not_found"
+        and "unknown provider for model" in message
+        and _is_codex_proxy_error(exc)
+    ):
+        # The subscription proxy's restart window: CLIProxyAPI starts serving
+        # before its client load completes, and meanwhile answers every chat
+        # request with exactly this invalid_request_error 400. The chart runs
+        # it Recreate with no readiness gate (none is possible: /healthz and
+        # /v1/models already 200 inside the window), so an image bump or
+        # credential reload must not fail every subscription job. A model the
+        # proxy genuinely cannot route still fails at the outer layer: the
+        # orchestrator's 4xx fingerprint after two identical pause cycles
+        # (pinned), the run queue's attempt cap (stateless).
         return "transient"
     # 'invalid_request_error' is the OpenAI/Anthropic vocabulary; MiniMax says
     # 'bad_request_error' (e.g. "invalid function arguments json string" — the

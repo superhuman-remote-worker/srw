@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import copy
 import json
+from datetime import datetime, timezone
 from typing import Any, Callable
 from unittest.mock import patch
 
@@ -38,7 +39,10 @@ import shared.runtime.llm.reasoning_chat as reasoning_chat
 from agent.api.turn_executor import StatelessTurnExecutor
 from agent.core.context import ToolRetryManager
 from agent.persistent_graph import _is_retryable_llm_error
-from orchestrator.services.completion import determine_job_status
+from orchestrator.services.completion import (
+    determine_job_status,
+    llm_outage_fingerprint,
+)
 from shared.runtime.core import loader
 from shared.runtime.core.llm_retry import (
     RetryPolicy,
@@ -81,6 +85,19 @@ UNSUPPORTED_EFFORT = {
 OPENROUTER_INVALID_MODEL = {
     "error": {"message": f"{CONTRIBUTOR} is not a valid model ID", "code": 400}
 }
+# The subscription proxy (CLIProxyAPI) answers every chat request with this
+# between "API server started" and "full client load complete" -- verbatim
+# from a v7.2.129 request log. The chart runs it Recreate with no readiness
+# gate, so every restart, image bump or credential reload opens this window.
+PROXY_URL = "http://srw-codex-proxy:8317/v1"
+PROXY_NOT_LOADED = {
+    "error": {
+        "message": "unknown provider for model claude-opus-5",
+        "type": "invalid_request_error",
+        "code": "model_not_found",
+        "param": "model",
+    }
+}
 PROVIDER_OUTAGE = {
     "error": {"message": "The server is overloaded", "type": "server_error"}
 }
@@ -95,11 +112,13 @@ EDGE_400 = (
 # ---------------------------------------------------------------------------
 
 
-def _through_openai(handler: Callable[[httpx.Request], Any], *, stream=False):
+def _through_openai(
+    handler: Callable[[httpx.Request], Any], *, stream=False, base_url=BASE_URL
+):
     """The exception the real openai SDK raises for one canned exchange."""
     client = openai.OpenAI(
         api_key=FIXTURE_KEY,
-        base_url=BASE_URL,
+        base_url=base_url,
         max_retries=0,
         http_client=httpx.Client(transport=httpx.MockTransport(handler)),
     )
@@ -118,13 +137,15 @@ def _through_openai(handler: Callable[[httpx.Request], Any], *, stream=False):
     raise AssertionError("fixture exchange did not raise")
 
 
-def _openai_status(status: int, payload: Any = None, *, text: str | None = None):
+def _openai_status(
+    status: int, payload: Any = None, *, text: str | None = None, base_url=BASE_URL
+):
     def handler(request):
         if text is not None:
             return httpx.Response(status, text=text)
         return httpx.Response(status, json=payload)
 
-    return _through_openai(handler)
+    return _through_openai(handler, base_url=base_url)
 
 
 def _openai_transport(error_cls):
@@ -225,6 +246,11 @@ _CASES = [
     (
         "openrouter invalid model id (untyped, int code)",
         lambda: _openai_status(400, OPENROUTER_INVALID_MODEL),
+        "permanent",
+    ),
+    (
+        "proxy-shaped model_not_found from an ordinary endpoint",
+        lambda: _openai_status(400, PROXY_NOT_LOADED),
         "permanent",
     ),
     (
@@ -379,6 +405,18 @@ _CASES = [
     (
         "400 plain-text body",
         lambda: _openai_status(400, text="Bad Request"),
+        "transient",
+    ),
+    (
+        "subscription proxy restart window",
+        lambda: _openai_status(400, PROXY_NOT_LOADED, base_url=PROXY_URL),
+        "transient",
+    ),
+    (
+        "subscription proxy restart window, localhost default port",
+        lambda: _openai_status(
+            400, PROXY_NOT_LOADED, base_url="http://localhost:8317/v1"
+        ),
         "transient",
     ),
     ("400 edge html page", lambda: _openai_status(400, text=EDGE_400), "transient"),
@@ -538,6 +576,9 @@ def test_session_turns_share_the_worker_verdict():
     assert not _is_retryable_llm_error(_openai_status(400, UNSUPPORTED_EFFORT))
     assert not _is_retryable_llm_error(_openai_status(400, OPENROUTER_INVALID_MODEL))
     assert _is_retryable_llm_error(_openai_status(503, PROVIDER_OUTAGE))
+    assert _is_retryable_llm_error(
+        _openai_status(400, PROXY_NOT_LOADED, base_url=PROXY_URL)
+    )
     assert _is_retryable_llm_error(_openai_interrupted_stream())
 
 
@@ -576,7 +617,7 @@ async def test_shared_retry_loop_replays_only_retryable_failures(
 # ---------------------------------------------------------------------------
 
 
-def _wire_llm(tmp_path, monkeypatch, respond):
+def _wire_llm(tmp_path, monkeypatch, respond, base_url=BASE_URL):
     """The production ReasoningChatOpenAI over an offline transport.
 
     Same seam as test_muse_spark_1_3_family.test_serialized_request.
@@ -605,7 +646,7 @@ def _wire_llm(tmp_path, monkeypatch, respond):
                     "model": CONTRIBUTOR,
                     "provider": "openai",
                     "api_key": FIXTURE_KEY,
-                    "base_url": BASE_URL,
+                    "base_url": base_url,
                     "reasoning_level": "xhigh",
                     "max_retries": 0,
                     "streaming": False,
@@ -618,15 +659,45 @@ def _wire_llm(tmp_path, monkeypatch, respond):
     return llm, llm.bind_tools(copy.deepcopy(TOOL_SCHEMAS)), config
 
 
-async def _execute_once(request, tmp_path, monkeypatch, status, payload):
-    """One worker execute invocation; returns (node result, wire requests)."""
+_COMPLETION = {
+    "id": "fixture",
+    "object": "chat.completion",
+    "created": 0,
+    "model": CONTRIBUTOR,
+    "choices": [
+        {
+            "index": 0,
+            "finish_reason": "stop",
+            "message": {"role": "assistant", "content": "Recovered."},
+        }
+    ],
+    "usage": {"prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12},
+}
+
+
+async def _execute_once(
+    request,
+    tmp_path,
+    monkeypatch,
+    status,
+    payload,
+    *,
+    base_url=BASE_URL,
+    recover_after=None,
+):
+    """One worker execute invocation; returns (node result, wire requests).
+
+    ``recover_after``: answer 200 once that many requests have failed.
+    """
     wire = []
 
     def respond(http_request):
         wire.append(json.loads(http_request.content))
+        if recover_after is not None and len(wire) > recover_after:
+            return httpx.Response(200, json=_COMPLETION)
         return httpx.Response(status, json=payload)
 
-    llm, bound, config = _wire_llm(tmp_path, monkeypatch, respond)
+    llm, bound, config = _wire_llm(tmp_path, monkeypatch, respond, base_url)
     node = _make_node(
         request.getfixturevalue("env"),
         bound,
@@ -723,6 +794,57 @@ async def test_provider_outage_keeps_inner_retries_and_outer_redispatch(
     await executor._serve_worker_claim(claim)
     client.report_completion.assert_not_awaited()
     release.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_proxy_restart_window_is_ridden_out_by_the_inner_retry(
+    request, tmp_path, monkeypatch
+):
+    """Two not-yet-loaded 400s from the proxy, then it is up: the turn succeeds."""
+    result, wire = await _execute_once(
+        request,
+        tmp_path,
+        monkeypatch,
+        400,
+        PROXY_NOT_LOADED,
+        base_url=PROXY_URL,
+        recover_after=2,
+    )
+
+    assert len(wire) == 3
+    assert result.get("error") is None
+    assert not result.get("should_stop")
+    assert result.get("freeze_data") is None
+
+
+@pytest.mark.asyncio
+async def test_model_the_proxy_never_routes_still_fails_at_the_outer_layer(
+    request, tmp_path, monkeypatch
+):
+    """The same 400 for good: inner retries, one pause, then the pinned lane's
+    4xx fingerprint fails the job on the second identical cycle."""
+    result, wire = await _execute_once(
+        request, tmp_path, monkeypatch, 400, PROXY_NOT_LOADED, base_url=PROXY_URL
+    )
+    assert len(wire) == 6
+    freeze = result["freeze_data"]
+    assert freeze["freeze_type"] == "llm_unavailable"
+
+    job = {"id": "job", "status": "processing", "context": {}}
+    assert determine_job_status(job, result) == ("paused", None)
+
+    now = datetime.now(timezone.utc).isoformat()
+    job["context"] = {
+        "llm_outage": {
+            "attempt": 1,
+            "first_failed_at": now,
+            "last_failed_at": now,
+            "fingerprint": llm_outage_fingerprint(freeze),
+        }
+    }
+    status, message = determine_job_status(job, result)
+    assert status == "failed"
+    assert "unknown provider for model" in message
 
 
 # ---------------------------------------------------------------------------
