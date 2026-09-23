@@ -485,6 +485,32 @@ forbidden_modules = ["orchestrator.main"]
 # orchestrator.security.access -> services.sudo_gate.
 
 [[tool.importlinter.contracts]]
+name = "Scheduling, reconciliation, startup and task ownership do not import application startup"
+type = "forbidden"
+source_modules = [
+    "orchestrator.services.agent_provisioner",
+    "orchestrator.services.application_tasks",
+    "orchestrator.services.ide_session",
+    "orchestrator.services.ide_settings",
+    "orchestrator.services.imap_poller",
+    "orchestrator.services.infrastructure_metering.bootstrap",
+    "orchestrator.services.job_dispatcher",
+    "orchestrator.services.lifecycle.reconciler",
+    "orchestrator.services.pinned_k8s_reconciliation",
+    "orchestrator.services.retention_sweepers",
+    "orchestrator.services.ro_reader_reconciler",
+    "orchestrator.services.session_provisioner",
+    "orchestrator.services.snapshot_service",
+    "orchestrator.services.stale_agent_detector",
+    "orchestrator.services.startup_backfills",
+    "orchestrator.services.sudo_gate",
+]
+forbidden_modules = ["orchestrator.main"]
+# No exception: R1.B11 moved the loop bodies, dispatch scheduling, agent
+# reconciliation, the metering bootstrap and the startup backfills out of the
+# application; the application lifespan owns creation, gating and shutdown.
+
+[[tool.importlinter.contracts]]
 name = "MCP and VM controller do not depend on shared runtime"
 type = "forbidden"
 source_modules = ["mcp_server", "vm_controller"]

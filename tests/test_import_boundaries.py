@@ -76,6 +76,15 @@ def boundary_tree(tmp_path):
             if path.is_dir() or path.with_suffix(".py").exists():
                 continue
             path.parent.mkdir(parents=True, exist_ok=True)
+            # A module inside a sub-package (R1.B11 names
+            # services.lifecycle.reconciler) needs every package level to be
+            # a regular package, or the linter cannot resolve it.
+            package = path.parent
+            while (
+                package != tmp_path / "src" and not (package / "__init__.py").exists()
+            ):
+                (package / "__init__.py").write_text("")
+                package = package.parent
             path.with_suffix(".py").write_text("from shared.value import VALUE\n")
     return tmp_path
 
@@ -101,8 +110,9 @@ def test_allowed_runtime_and_lightweight_dependencies_pass(boundary_tree):
     assert result.returncode == 0, result.stdout + result.stderr
     # The generic manifest path also excludes the legacy harness adapter.
     # 24 since R1.B09 added its contract over control, delivery and retirement;
-    # 25 since R1.B10 added session transport, projections and permissions.
-    assert "Contracts: 25 kept, 0 broken" in result.stdout
+    # 25 since R1.B10 added session transport, projections and permissions;
+    # 26 since R1.B11 added scheduling, reconciliation and task ownership.
+    assert "Contracts: 26 kept, 0 broken" in result.stdout
 
 
 @pytest.mark.parametrize(
@@ -221,6 +231,20 @@ def test_allowed_runtime_and_lightweight_dependencies_pass(boundary_tree):
         ("orchestrator/routers/media.py", "orchestrator.main"),
         ("orchestrator/routers/projects.py", "orchestrator.main"),
         ("orchestrator/schemas/media.py", "orchestrator.main"),
+        # R1.B11: scheduling, reconciliation, startup and task ownership.
+        ("orchestrator/services/application_tasks.py", "orchestrator.main"),
+        ("orchestrator/services/job_dispatcher.py", "orchestrator.main"),
+        ("orchestrator/services/stale_agent_detector.py", "orchestrator.main"),
+        ("orchestrator/services/pinned_k8s_reconciliation.py", "orchestrator.main"),
+        ("orchestrator/services/retention_sweepers.py", "orchestrator.main"),
+        ("orchestrator/services/startup_backfills.py", "orchestrator.main"),
+        (
+            "orchestrator/services/infrastructure_metering/bootstrap.py",
+            "orchestrator.main",
+        ),
+        ("orchestrator/services/lifecycle/reconciler.py", "orchestrator.main"),
+        ("orchestrator/services/sudo_gate.py", "orchestrator.main"),
+        ("orchestrator/services/ide_settings.py", "orchestrator.main"),
         ("vm_controller/app.py", "headscale_client"),
     ],
 )
