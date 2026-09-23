@@ -156,6 +156,7 @@ async def prepare_fixture(
         or len(f"srw-a1-provider-{run_id}") > 63
         or namespace != run_id
         or os.environ.get("VM_RETAINED_RESUME_ACCEPTANCE_GATE_ENABLED") != "true"
+        or os.environ.get("STATELESS_WORKER_ENABLED") != "false"
         or os.environ.get("VM_CREATION_RETRY_ENABLED") != "true"
         or os.environ.get("VM_NETWORK_PROFILE_ENABLED") != "true"
         or provisioner.mode != "same-cluster"
@@ -365,6 +366,9 @@ async def probe_ready_fixture(
 ) -> dict[str, str] | None:
     """Read authenticated controller state; never manufacture Ready authority."""
     from orchestrator.services.vm_creation_preflight import _preflight
+    from orchestrator.operator_cli.vm_retained_resume_pause import (
+        OwnerPauseHoldError, owned_pause_hold_id,
+    )
     from shared.vm_creation_retry import canonical_request_digest
     from shared.vm_network_profile import NETWORK_PROFILE, reusable_profile_evidence
 
@@ -376,6 +380,10 @@ async def probe_ready_fixture(
     if not row:
         raise FixtureRefusal("A1 fixture Job disappeared")
     context = _json(row["context"])
+    try:
+        owned_pause_hold_id(context, owner_id=prepared["owner_id"])
+    except OwnerPauseHoldError as exc:
+        raise FixtureRefusal("A1 fixture owner Pause hold changed") from exc
     vm = _json(context.get("vm"))
     workspace = _json(_json(row["config_override"]).get("workspace"))
     preflight = _preflight(vm)
@@ -385,9 +393,10 @@ async def probe_ready_fixture(
         or row["execution_lane"] != "stateless"
         or row["assigned_agent_id"] is not None
         or context.get("vm_retained_resume_acceptance_gate") != run_id
+        or context.get("last_operator_pause_hold") is not None
         or any(context.get(key) is not None for key in (
             "_workspace_dispatch_authority", "_completion_control_claim",
-            "_stateless_control_claim", "_operator_pause_hold",
+            "_stateless_control_claim",
         ))
         or workspace.get("backend") != "vm"
         or _json(workspace.get("vm")).get("image") != vm_image
@@ -533,6 +542,75 @@ async def wait_ready_fixture(
     raise FixtureRefusal("A1 first-boot Ready proof did not arrive")
 
 
+async def pause_ready_fixture(
+    db: Any, provisioner: Any, *, run_id: str, vm_image: str,
+    prepared: dict[str, str],
+) -> str:
+    """Use the real owner route to hold the proved, never-leased Ready Job."""
+    import hashlib
+    from datetime import datetime, timedelta, timezone
+    import secrets
+
+    import httpx
+
+    from orchestrator.operator_cli.vm_retained_resume_pause import (
+        OwnerPauseHoldError, owned_pause_hold_id,
+    )
+
+    if os.environ.get("STATELESS_WORKER_ENABLED") != "false":
+        raise FixtureRefusal("A1 stateless admission must remain disabled during fixture")
+    if await probe_ready_fixture(
+        db, provisioner, run_id=run_id, vm_image=vm_image,
+        prepared=prepared,
+    ) is None:
+        raise FixtureRefusal("A1 first-boot Ready source changed before owner Pause")
+    job_id, owner_id = UUID(prepared["job_id"]), UUID(prepared["owner_id"])
+    context = _json(await db.fetchval("SELECT context FROM jobs WHERE id=$1", job_id))
+    if context.get("last_operator_pause_hold") is not None:
+        raise FixtureRefusal("A1 fixture was already resumed")
+    try:
+        existing = owned_pause_hold_id(context, owner_id=str(owner_id))
+    except OwnerPauseHoldError as exc:
+        raise FixtureRefusal("A1 owner Pause hold changed") from exc
+    if existing is None:
+        raw_token = "srw_" + secrets.token_urlsafe(32)
+        issued = await db.create_mcp_token(
+            user_id=str(owner_id), name=f"a1-fixture-pause-{run_id}",
+            token_hash=hashlib.sha256(raw_token.encode()).hexdigest(),
+            token_prefix=raw_token[:12], scope="user",
+            expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
+            origin="vm-retained-resume-fixture",
+        )
+        base = os.environ.get("ORCHESTRATOR_URL", "http://127.0.0.1:8085").rstrip("/")
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                response = await client.put(
+                    f"{base}/api/jobs/{job_id}/pause",
+                    headers={"Authorization": f"Bearer {raw_token}"},
+                )
+            if response.status_code != 200 or _json(response.json()) != {
+                "status": "paused", "job_id": str(job_id),
+            }:
+                raise FixtureRefusal("A1 owner Pause route refused the fixture")
+        finally:
+            if not await db.revoke_mcp_token(str(issued["id"]), str(owner_id)):
+                raise FixtureRefusal("A1 owner Pause token could not be revoked")
+    # This also checks current runtime/profile, adoption, queue and attempts.
+    if await probe_ready_fixture(
+        db, provisioner, run_id=run_id, vm_image=vm_image,
+        prepared=prepared,
+    ) is None:
+        raise FixtureRefusal("A1 first-boot Ready source changed after owner Pause")
+    context = _json(await db.fetchval("SELECT context FROM jobs WHERE id=$1", job_id))
+    try:
+        hold_id = owned_pause_hold_id(context, owner_id=str(owner_id))
+    except OwnerPauseHoldError as exc:
+        raise FixtureRefusal("A1 owner Pause hold changed") from exc
+    if hold_id is None or (existing is not None and hold_id != existing):
+        raise FixtureRefusal("A1 owner Pause route did not retain its hold")
+    return hold_id
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--run-id", required=True)
@@ -561,6 +639,7 @@ async def _async_main(args: argparse.Namespace) -> int:
             f"/tmp/srw-vm-retained-resume-gate/{args.run_id}"
         )
         or args.output.name != "fixture.json"
+        or os.environ.get("STATELESS_WORKER_ENABLED") != "false"
     ):
         raise FixtureRefusal("A1 in-image fixture scope is not exact")
     db = PostgresDB(min_connections=1, max_connections=4)
@@ -586,9 +665,14 @@ async def _async_main(args: argparse.Namespace) -> int:
             namespace=args.namespace, vm_image=args.vm_image,
             prepared=prepared,
         )
+        pause_hold_id = await pause_ready_fixture(
+            db, provisioner, run_id=args.run_id, vm_image=args.vm_image,
+            prepared=prepared,
+        )
         _atomic_result(args.output, {
             "protocol_version": 1, "run_id": args.run_id,
             "outcome": "ready", **prepared, **ready,
+            "pause_hold_id": pause_hold_id,
         })
         return 0
     except Exception as exc:

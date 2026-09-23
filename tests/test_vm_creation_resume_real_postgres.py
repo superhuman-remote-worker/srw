@@ -174,6 +174,7 @@ async def test_owner_resume_route_merges_held_feedback_and_revokes_token(
         "VM_NETWORK_PROFILE_ENABLED": "true",
         "VM_NETWORK_PROFILE_IMAGE_ALLOWLIST": image,
         "VM_RETAINED_RESUME_ACCEPTANCE_GATE_ENABLED": "true",
+        "STATELESS_WORKER_ENABLED": "false",
     }.items():
         monkeypatch.setenv(name, value)
     run = "srw-a1-route-" + uuid4().hex[:8]

@@ -54,6 +54,8 @@ def require_host_guard(args: argparse.Namespace) -> None:
     for value in (args.cluster_uid, args.job_id, args.expected_owner_id,
                   args.expected_pvc_uid):
         _uuid(value)
+    if not args.cleanup_only:
+        _uuid(args.expected_pause_hold_id)
     if not re.fullmatch(r"[a-z0-9-]+-orchestrator", args.orchestrator_deploy):
         raise GateFailure("orchestrator target is malformed")
     if not re.fullmatch(r"[a-z0-9-]{3,63}", args.orchestrator_pod):
@@ -354,6 +356,7 @@ def _image_command(args: argparse.Namespace) -> list[str]:
         "--run-id", args.run_id,
         "--job-id", args.job_id,
         "--expected-owner-id", args.expected_owner_id,
+        "--expected-pause-hold-id", args.expected_pause_hold_id,
         "--expected-pvc-uid", args.expected_pvc_uid,
         "--cluster-uid", args.cluster_uid,
         "--namespace", args.namespace,
@@ -567,6 +570,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--run-id", required=True)
     parser.add_argument("--job-id", required=True)
     parser.add_argument("--expected-owner-id", required=True)
+    parser.add_argument("--expected-pause-hold-id", default="")
     parser.add_argument("--expected-pvc-uid", required=True)
     parser.add_argument("--context", required=True)
     parser.add_argument("--cluster-uid", required=True)

@@ -17,10 +17,11 @@ from orchestrator.operator_cli import vm_retained_resume_acceptance as gate
 
 
 def test_execution_guard_requires_exact_disposable_context(tmp_path: Path) -> None:
-    job_id, pvc_uid, cluster_uid = (str(uuid4()) for _ in range(3))
+    job_id, pvc_uid, cluster_uid, hold_id = (str(uuid4()) for _ in range(4))
     values = dict(
         run_id="srw-a1-owned-20260923", job_id=job_id,
         expected_owner_id=str(uuid4()), expected_pvc_uid=pvc_uid,
+        expected_pause_hold_id=hold_id,
         cluster_uid=cluster_uid, namespace="srw-a1-owned", context="srw-a1-owned",
         confirm=gate.CONFIRMATION, protocol_version=1,
         output=gate.OUTPUT_ROOT / "srw-a1-owned-20260923" / "result.json",
@@ -31,6 +32,7 @@ def test_execution_guard_requires_exact_disposable_context(tmp_path: Path) -> No
         ("run_id", "../other"), ("job_id", str(uuid4())),
         ("namespace", "production"), ("context", "shared"),
         ("protocol_version", 2), ("confirm", "yes"),
+        ("expected_pause_hold_id", "bad-hold"),
         ("output", tmp_path / "result.json"),
     ):
         changed = dict(values, **{key: invalid})
@@ -43,12 +45,15 @@ def test_execution_guard_requires_exact_disposable_context(tmp_path: Path) -> No
 
 
 def test_fixture_snapshot_refuses_historical_or_leased_job() -> None:
-    job_id, owner, pvc_uid, gen = (str(uuid4()) for _ in range(4))
+    job_id, owner, pvc_uid, gen, hold_id = (str(uuid4()) for _ in range(5))
     now = datetime.now(timezone.utc)
     job = {
         "id": job_id, "user_id": owner, "status": "paused",
         "execution_lane": "stateless", "assigned_agent_id": None,
-        "created_at": now, "context": {"vm_retained_resume_acceptance_gate": "srw-a1-owned-20260923", "vm": {
+        "created_at": now, "context": {"vm_retained_resume_acceptance_gate": "srw-a1-owned-20260923", "_operator_pause_hold": {
+            "version": 1, "source": "public_pause", "paused_by": owner,
+            "hold_id": hold_id, "paused_at": now.isoformat(),
+        }, "vm": {
             "status": "ready", "provision_generation": gen,
             "rootdisk_pvc_uid": pvc_uid,
         }},
@@ -58,18 +63,23 @@ def test_fixture_snapshot_refuses_historical_or_leased_job() -> None:
     queue = {"state": "done", "leased_by": None, "lease_token": 0}
     gate.validate_fixture_snapshot(job, user, queue, run_id="srw-a1-owned-20260923",
                                    expected_owner_id=owner,
-                                   expected_pvc_uid=pvc_uid, now=now)
+                                   expected_pvc_uid=pvc_uid,
+                                   expected_pause_hold_id=hold_id, now=now)
     for changed_job, changed_queue in (
         ({**job, "created_at": now - timedelta(days=2)}, queue),
         ({**job, "context": {}}, queue),
         (job, {**queue, "state": "leased", "leased_by": "worker-x"}),
         (job, {**queue, "lease_token": 1}),
+        ({**job, "context": {**job["context"], "_operator_pause_hold": {
+            **job["context"]["_operator_pause_hold"], "hold_id": str(uuid4()),
+        }}}, queue),
     ):
         with pytest.raises(gate.AcceptanceFailure):
             gate.validate_fixture_snapshot(changed_job, user, changed_queue,
                                            run_id="srw-a1-owned-20260923",
                                            expected_owner_id=owner,
-                                           expected_pvc_uid=pvc_uid, now=now)
+                                           expected_pvc_uid=pvc_uid,
+                                           expected_pause_hold_id=hold_id, now=now)
 
 
 def test_retry_snapshot_exact_immutable_equality_and_retained_pvc() -> None:
@@ -137,6 +147,7 @@ async def test_execute_proves_worker_sentinel_before_terminal_vm_teardown(
     scenario = gate.LiveScenario.__new__(gate.LiveScenario)
     scenario.args = SimpleNamespace(
         job_id=job_id, expected_owner_id=owner_id, expected_pvc_uid=pvc_uid,
+        expected_pause_hold_id=str(uuid4()),
         run_id="srw-a1-owned-20260923", cluster_uid=str(uuid4()), namespace="srw",
     )
     before = {
@@ -167,6 +178,7 @@ async def test_execute_proves_worker_sentinel_before_terminal_vm_teardown(
     scenario.begin_replacement = AsyncMock(return_value=before)
     scenario.rejected_vm_effect = AsyncMock(return_value=True)
     scenario.owner_resume = AsyncMock(return_value={"vm_creation_retry_request_id": request_id})
+    scenario.verify_owner_pause_lift = AsyncMock()
     scenario.retry_row = AsyncMock(side_effect=[before, after])
     worker_name = "a1-worker-owned"
     authorized_at = datetime.now(timezone.utc)
@@ -309,6 +321,37 @@ async def test_execute_proves_worker_sentinel_before_terminal_vm_teardown(
             await scenario.execute()
         assert "PROVIDER_BARRIER" not in stages
         assert state["terminal"] is False
+
+
+@pytest.mark.asyncio
+async def test_owner_resume_lift_observation_requires_exact_public_hold():
+    job_id, owner_id, hold_id = (str(uuid4()) for _ in range(3))
+    scenario = gate.LiveScenario.__new__(gate.LiveScenario)
+    scenario.args = SimpleNamespace(
+        job_id=job_id, expected_owner_id=owner_id,
+        expected_pause_hold_id=hold_id, run_id="srw-a1-owned-20260923",
+    )
+    context = {
+        "vm_retained_resume_acceptance_gate": scenario.args.run_id,
+        "last_operator_pause_hold": {
+            "version": 1, "hold_id": hold_id, "paused_by": owner_id,
+            "source": "public_pause", "lifted_at": datetime.now(timezone.utc).isoformat(),
+        },
+    }
+    scenario.value = AsyncMock(return_value=context)
+    await scenario.verify_owner_pause_lift()
+    for changed in (
+        {**context, "_operator_pause_hold": {}},
+        {**context, "last_operator_pause_hold": {
+            **context["last_operator_pause_hold"], "hold_id": str(uuid4()),
+        }},
+        {**context, "last_operator_pause_hold": {
+            **context["last_operator_pause_hold"], "source": "internal_pause",
+        }},
+    ):
+        scenario.value.return_value = changed
+        with pytest.raises(gate.AcceptanceFailure):
+            await scenario.verify_owner_pause_lift()
 
 
 @pytest.mark.asyncio

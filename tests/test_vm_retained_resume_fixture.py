@@ -52,6 +52,7 @@ async def test_a1_fixture_uses_real_paused_job_snapshot_and_creation_preflight(
         "VM_NETWORK_PROFILE_ENABLED": "true",
         "VM_NETWORK_PROFILE_IMAGE_ALLOWLIST": IMAGE,
         "VM_RETAINED_RESUME_ACCEPTANCE_GATE_ENABLED": "true",
+        "STATELESS_WORKER_ENABLED": "false",
     }.items():
         monkeypatch.setenv(key, value)
     run = f"{RUN}-{uuid4().hex[:8]}"
@@ -130,6 +131,12 @@ async def test_a1_fixture_uses_real_paused_job_snapshot_and_creation_preflight(
     assert await db.fetchval(
         "SELECT count(*) FROM vm_creation_retries WHERE job_id=$1", job_id,
     ) == 0  # Resolver has not yet consumed the queued preflight.
+    assert await db.hold_paused_job(str(job_id), paused_by=str(owner_id))
+    held_replay = await prepare_fixture(
+        db, provisioner, run_id=run, namespace=run,
+        vm_image=IMAGE, model_id=model,
+    )
+    assert held_replay == prepared
 
 
 @pytest.mark.asyncio
@@ -146,6 +153,7 @@ async def test_a1_fixture_refuses_unowned_model_and_does_not_create_job(
     monkeypatch.setenv("VM_NETWORK_PROFILE_ENABLED", "true")
     monkeypatch.setenv("VM_NETWORK_PROFILE_IMAGE_ALLOWLIST", IMAGE)
     monkeypatch.setenv("VM_RETAINED_RESUME_ACCEPTANCE_GATE_ENABLED", "true")
+    monkeypatch.setenv("STATELESS_WORKER_ENABLED", "false")
     provisioner = VMProvisioner()
     provisioner._db = db
     missing_run = "srw-a1-missing-model-20260923a"
@@ -200,12 +208,46 @@ async def test_a1_fixture_refuses_provider_without_worker_auth_key(db, monkeypat
         "VM_NETWORK_PROFILE_ENABLED": "true",
         "VM_NETWORK_PROFILE_IMAGE_ALLOWLIST": IMAGE,
         "VM_RETAINED_RESUME_ACCEPTANCE_GATE_ENABLED": "true",
+        "STATELESS_WORKER_ENABLED": "false",
     }.items():
         monkeypatch.setenv(key, value)
     await _model(db, run, model, api_key=None)
     provisioner = VMProvisioner()
     provisioner._db = db
     with pytest.raises(FixtureRefusal, match="endpoint"):
+        await prepare_fixture(
+            db, provisioner, run_id=run, namespace=run,
+            vm_image=IMAGE, model_id=model,
+        )
+    assert await db.fetchval(
+        "SELECT count(*) FROM jobs WHERE context->>'vm_retained_resume_acceptance_gate'=$1",
+        run,
+    ) == 0
+
+
+@pytest.mark.asyncio
+async def test_a1_fixture_refuses_enabled_dispatch_before_any_job_side_effect(
+    db, monkeypatch,  # noqa: F811
+):
+    from orchestrator.operator_cli.vm_retained_resume_fixture import (
+        FixtureRefusal, prepare_fixture,
+    )
+    from orchestrator.services.vm_provisioner import VMProvisioner
+
+    run = f"srw-a1-dispatch-on-{uuid4().hex[:8]}"
+    model = f"e2e-vm-dispatch-on-{uuid4().hex[:8]}"
+    for key, value in {
+        "VM_MODE": "same-cluster", "VM_CREATION_RETRY_ENABLED": "true",
+        "VM_NETWORK_PROFILE_ENABLED": "true",
+        "VM_NETWORK_PROFILE_IMAGE_ALLOWLIST": IMAGE,
+        "VM_RETAINED_RESUME_ACCEPTANCE_GATE_ENABLED": "true",
+        "STATELESS_WORKER_ENABLED": "true",
+    }.items():
+        monkeypatch.setenv(key, value)
+    await _model(db, run, model)
+    provisioner = VMProvisioner()
+    provisioner._db = db
+    with pytest.raises(FixtureRefusal, match="exclusively enabled"):
         await prepare_fixture(
             db, provisioner, run_id=run, namespace=run,
             vm_image=IMAGE, model_id=model,

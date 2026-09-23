@@ -27,6 +27,7 @@ def args(tmp_path: Path, *, cleanup_only: bool = False) -> argparse.Namespace:
         execute=not cleanup_only, cleanup_only=cleanup_only,
         run_id="srw-a1-owned-20260923", job_id=str(uuid4()),
         expected_owner_id=str(uuid4()),
+        expected_pause_hold_id=str(uuid4()),
         expected_pvc_uid=str(uuid4()), context="srw-a1-disposable",
         cluster_uid=str(uuid4()), namespace="srw", vm_namespace="srw",
         orchestrator_deploy="srw-orchestrator", orchestrator_pod="srw-orchestrator-abc",
@@ -44,6 +45,7 @@ def test_host_guard_requires_exclusive_context_private_output_and_exact_ids(tmp_
         ("context", "production"), ("vm_namespace", "shared-vms"),
         ("cluster_uid", "not-a-uuid"), ("orchestrator_pod_uid", "bad"),
         ("protocol_version", 2), ("confirm", "yes"),
+        ("expected_pause_hold_id", "bad-hold"),
     ):
         with pytest.raises(gate.GateFailure):
             gate.require_host_guard(argparse.Namespace(**{**vars(value), key: invalid}))
