@@ -237,6 +237,41 @@ def setup(monkeypatch):
     return ctrl, api, authority, payload
 
 
+@pytest.fixture
+def profiled_setup(setup, monkeypatch):
+    from shared.vm_network_profile import NETWORK_PROFILE
+    from tests.test_vm_resource_template import shipped_template
+
+    image = "registry.example/srw-vm@sha256:" + "a" * 64
+    monkeypatch.setenv("VM_NETWORK_PROFILE_ENABLED", "true")
+    monkeypatch.setenv("VM_NETWORK_PROFILE_IMAGE_ALLOWLIST", image)
+    monkeypatch.setattr(settings, "VM_NODE_SELECTOR", {})
+    monkeypatch.setattr(settings, "VM_TOLERATIONS", [])
+    monkeypatch.setattr(
+        settings, "_inject_ssh_host_key", lambda value: (value, "SHA256:" + "A" * 43)
+    )
+    ctrl, api, authority, payload = setup
+    ctrl.template_text = shipped_template()
+    ctrl.cloud_init_text = "#cloud-config"
+    ctrl.render_template = settings.VMController.render_template.__get__(ctrl)
+    request = {
+        **authority.row["request"],
+        "vm_image": image,
+        "network_profile": NETWORK_PROFILE,
+        "cpu_cores": 2,
+        "memory": "512Mi",
+        "disk_size": "32Gi",
+    }
+    resolved = resolve_creation_configuration(ctrl, request)
+    authority.row.update(resolved)
+    payload.update(resolved["request"])
+    payload["creation_retry"].update(
+        request_digest=resolved["request_digest"],
+        controller_configuration_digest=resolved["controller_configuration_digest"],
+    )
+    return ctrl, api, authority, payload
+
+
 @pytest.mark.asyncio
 async def test_protocol_authority_denial_performs_no_job_effect(setup):
     ctrl, api, authority, payload = setup
@@ -254,6 +289,152 @@ async def test_new_disk_secret_vm_each_have_one_durable_effect(setup):
     assert api.writes == ["Lease", "DataVolume", "Secret", "VirtualMachine"]
     assert authority.settled
     assert [x["state"] for x in authority.row["effects"]] == ["observed"] * 3
+
+
+@pytest.mark.asyncio
+async def test_profile_only_v1_reaches_first_vm_effect_with_ordinary_resolver(
+    profiled_setup,
+):
+    from shared.vm_network_profile import NETWORK_DATA
+
+    ctrl, api, authority, payload = profiled_setup
+    resolved = resolve_creation_configuration(ctrl, authority.row["request"])
+    assert resolved["controller_configuration"]["version"] == 1
+    assert "resource_admission" not in resolved["controller_configuration"]
+
+    result = await ctrl._do_create_serialized(payload)
+
+    assert result["status"] == "created", (
+        api.writes,
+        [effect["state"] for effect in authority.row["effects"]],
+        result,
+    )
+    assert api.writes == ["Lease", "DataVolume", "Secret", "VirtualMachine"]
+    cloud = next(
+        volume["cloudInitNoCloud"]
+        for volume in api.read("VirtualMachine", "agent-vm-" + payload["job_id"])[
+            "spec"
+        ]["template"]["spec"]["volumes"]
+        if "cloudInitNoCloud" in volume
+    )
+    assert cloud["networkData"] == NETWORK_DATA
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mutation", ["missing", "changed"])
+async def test_profile_only_refuses_bad_network_data_before_vm_post(
+    profiled_setup, mutation
+):
+    ctrl, api, authority, payload = profiled_setup
+    original = ctrl.render_template
+
+    def changed_render(*args):
+        manifest = original(*args)
+        cloud = next(
+            volume["cloudInitNoCloud"]
+            for volume in manifest["spec"]["template"]["spec"]["volumes"]
+            if "cloudInitNoCloud" in volume
+        )
+        if mutation == "missing":
+            cloud.pop("networkData")
+        else:
+            cloud["networkData"] = cloud["networkData"].replace("enp1s0", "eth0")
+        return manifest
+
+    ctrl.render_template = changed_render
+    result = await ctrl._do_create_serialized(payload)
+    assert result["status"] == "creation_attention"
+    assert api.writes == ["Lease", "DataVolume", "Secret"]
+    assert [
+        effect["carrier_intent"]["effect_kind"] for effect in authority.row["effects"]
+    ] == ["rootdisk", "cloud_init"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field", ["policy", "image", "request", "template", "effect"])
+async def test_profile_only_refuses_identity_drift_before_vm_post(
+    profiled_setup, field, monkeypatch
+):
+    from vm_controller.creation_actuation import CreationActuator
+
+    ctrl, api, authority, payload = profiled_setup
+    if field == "policy":
+        authority.row["controller_configuration"]["network_profile_policy"]["image"] = (
+            "registry.example/other@sha256:" + "b" * 64
+        )
+    elif field == "image":
+        payload["vm_image"] = "registry.example/other@sha256:" + "b" * 64
+    elif field == "request":
+        payload["disk_size"] = "64Gi"
+    elif field == "template":
+        ctrl.template_text += "\n# changed"
+    else:
+        original = CreationActuator.body
+
+        async def changed_body(self, row, values):
+            body = await original(self, row, values)
+            if values["effect_kind"] == "vm":
+                body["metadata"]["annotations"]["srw.io/vm-create-effect-nonce"] = str(
+                    uuid4()
+                )
+            return body
+
+        monkeypatch.setattr(CreationActuator, "body", changed_body)
+    result = await ctrl._do_create_serialized(payload)
+    assert result["status"] == "creation_attention"
+    assert "VirtualMachine" not in api.writes
+    assert not any(
+        effect["carrier_intent"]["effect_kind"] == "vm"
+        for effect in authority.row["effects"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_creation_attention_logs_only_allowlisted_reason_code(
+    setup, monkeypatch, caplog
+):
+    from vm_controller.creation_actuation import CreationActuator, CreationUnproven
+
+    ctrl, _api, _authority, payload = setup
+    actuator = CreationActuator(ctrl)
+
+    async def recognized(_payload):
+        raise CreationUnproven("creation_network_profile_unproven")
+
+    monkeypatch.setattr(actuator, "_run", recognized)
+    result = await actuator.run(payload)
+    assert result["status"] == "creation_attention"
+    assert result["reason"] == "creation_evidence_unproven"
+    assert "creation_network_profile_unproven" in caplog.text
+
+    caplog.clear()
+
+    async def unknown(_payload):
+        raise CreationUnproven("token=private-auth-value")
+
+    monkeypatch.setattr(actuator, "_run", unknown)
+    result = await actuator.run(payload)
+    assert result["reason"] == "creation_evidence_unproven"
+    assert "token=private-auth-value" not in caplog.text
+    assert "creation_network_profile_unproven" not in caplog.text
+
+    caplog.clear()
+
+    async def arbitrary(_payload):
+        raise ValueError("https://private.example/?token=private-auth-value")
+
+    monkeypatch.setattr(actuator, "_run", arbitrary)
+    result = await actuator.run(payload)
+    assert result["reason"] == "creation_evidence_unproven"
+    assert "private-auth-value" not in caplog.text
+
+    async def malformed(_payload):
+        raise CreationUnproven({"token": "private-auth-value"})
+
+    monkeypatch.setattr(actuator, "_run", malformed)
+    result = await actuator.run(payload)
+    assert result["reason"] == "creation_evidence_unproven"
+    assert "private-auth-value" not in caplog.text
 
 
 @pytest.mark.asyncio

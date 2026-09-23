@@ -137,6 +137,66 @@ async def test_actual_vm_effect_manifest_and_observation_bind_network_data(
         )
 
 
+@pytest.mark.asyncio
+async def test_profile_only_v1_final_vm_contract_rejects_drift(
+    monkeypatch, final_case,  # noqa: F811
+):
+    from shared.vm_creation_issuance import canonical_configuration_digest
+    from shared.vm_network_profile import NETWORK_DATA, NETWORK_PROFILE
+    from shared.vm_resource_admission import ResourceAdmissionError
+    from shared.vm_resource_manifest import validate_final_vm_manifest
+
+    monkeypatch.setenv("VM_NETWORK_PROFILE_ENABLED", "true")
+    monkeypatch.setenv("VM_NETWORK_PROFILE_IMAGE_ALLOWLIST", IMAGE)
+    ctrl, actuator, row, intent = final_case
+    request = {**row["request"], "vm_image": IMAGE, "network_profile": NETWORK_PROFILE}
+    row.update(resolve_creation_configuration(ctrl, request))
+    values = intent("vm")
+    values["rootdisk_source"] = {"kind": "registry", "image": IMAGE}
+    body = await actuator.body(row, values)
+
+    def validate(manifest=body, *, req=None, config=None, effect=None, template=None):
+        return validate_final_vm_manifest(
+            manifest,
+            template_text=template or ctrl.template_text,
+            request=req or row["request"],
+            configuration=config or row["controller_configuration"],
+            effect_intent=effect or values,
+        )
+
+    validate()
+    for replacement in (None, NETWORK_DATA.replace("enp1s0", "eth0")):
+        changed = deepcopy(body)
+        cloud = next(
+            volume["cloudInitNoCloud"]
+            for volume in changed["spec"]["template"]["spec"]["volumes"]
+            if "cloudInitNoCloud" in volume
+        )
+        if replacement is None:
+            del cloud["networkData"]
+        else:
+            cloud["networkData"] = replacement
+        with pytest.raises(ResourceAdmissionError):
+            validate(changed)
+
+    wrong_policy = deepcopy(row["controller_configuration"])
+    wrong_policy["network_profile_policy"]["image"] = (
+        "registry.example/other@sha256:" + "b" * 64
+    )
+    matching_effect = deepcopy(values)
+    matching_effect["controller_configuration_digest"] = canonical_configuration_digest(
+        wrong_policy
+    )
+    with pytest.raises(ResourceAdmissionError):
+        validate(config=wrong_policy, effect=matching_effect)
+    with pytest.raises(ResourceAdmissionError):
+        validate(req={**row["request"], "job_id": str(uuid4())})
+    with pytest.raises(ResourceAdmissionError):
+        validate(template=ctrl.template_text + "\n# changed")
+    with pytest.raises(ResourceAdmissionError):
+        validate(effect={**values, "effect_nonce": str(uuid4())})
+
+
 def test_guest_probe_requires_selected_name_only_networkd_rule():
     from shared.vm_network_probe_guest import parse_networkd_rule
 
