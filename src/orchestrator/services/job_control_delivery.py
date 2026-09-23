@@ -42,12 +42,15 @@ from shared.vm_lifecycle_auth import (
 async def _pinned_vm_delivery_intent(
     dependencies: "JobDeliveryDependencies", *, job_id: str, agent_id: str,
     recipient: Any, payload: dict[str, Any],
-) -> tuple[dict[str, Any], dict[str, Any] | None]:
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     """Add a replayable exact delivery ID only for a supported VM recipient."""
 
     if (
         os.getenv("WORKSPACE_IDLE_RELEASE_ENABLED", "false").lower() != "true"
-        or payload.get("workspace_provisioner") != "k8s"
+        or not isinstance(payload.get("workspace_runtime"), dict)
+        or payload["workspace_runtime"].get("assigned_backend") != "vm"
+        or payload["workspace_runtime"].get("effective_backend") != "vm"
+        or payload["workspace_runtime"].get("state") != "ready"
         or not getattr(recipient, "expected_pod_uid", None)
     ):
         return payload, None
@@ -62,7 +65,7 @@ async def _pinned_vm_delivery_intent(
         job_id, agent_id, recipient=recipient, projection_digest=digest,
     )
     if intent is None:
-        return payload, None
+        return None, None
     proof = pinned_job_delivery_proof(
         secret, delivery_id=str(intent["id"]), agent_id=agent_id,
         process_generation=recipient.expected_process_generation,
@@ -257,6 +260,8 @@ async def dispatch_job_to_agent(
             recipient=target.recipient,
             payload=job_start.model_dump(mode="json", exclude_none=True),
         )
+        if delivery_payload is None:
+            return False
         agent_url = (
             f"http://{target.agent['pod_ip']}:{target.agent['pod_port']}/job/start"
         )
@@ -872,13 +877,20 @@ async def resume_job_on_agent(
         if target is None:
             return False
         resume_payload["recipient"] = target.recipient.model_dump(mode="json")
+        delivery_payload, delivery_intent = await _pinned_vm_delivery_intent(
+            dependencies, job_id=job_id, agent_id=agent_id,
+            recipient=target.recipient,
+            payload={k: v for k, v in resume_payload.items() if v is not None},
+        )
+        if delivery_payload is None:
+            return False
         agent_url = (
             f"http://{target.agent['pod_ip']}:{target.agent['pod_port']}/job/resume"
         )
         async with dependencies.http_client_factory(timeout=30.0) as client:
             response = await client.post(
                 agent_url,
-                json={k: v for k, v in resume_payload.items() if v is not None},
+                json=delivery_payload,
             )
 
         if response.status_code not in (200, 202):
@@ -907,6 +919,25 @@ async def resume_job_on_agent(
                     )
             return False
 
+        accepted_delivery_id = None
+        if delivery_intent is not None:
+            try:
+                acknowledgement = response.json()
+            except (ValueError, TypeError):
+                acknowledgement = {}
+            if (
+                isinstance(acknowledgement, dict)
+                and acknowledgement.get("pinned_delivery_id") == str(delivery_intent["id"])
+                and acknowledgement.get("pinned_projection_digest")
+                    == delivery_payload["pinned_projection_digest"]
+            ):
+                accepted_delivery_id = str(delivery_intent["id"])
+            else:
+                dependencies.logger.warning(
+                    "Resume dispatch: pinned delivery acknowledgment unavailable for job %s",
+                    job_id,
+                )
+
         # Agent accepted — drop the keys we consumed, once ownership is
         # confirmed below, so a future resume won't re-inject them.
         # `context - text[]` (not a full-dict rewrite) preserves any concurrent
@@ -925,6 +956,11 @@ async def resume_job_on_agent(
                 job_id,
                 agent_id,
                 consumed_context_keys=consumed_keys,
+                pinned_delivery_id=accepted_delivery_id,
+                pinned_projection_digest=(
+                    delivery_payload.get("pinned_projection_digest")
+                    if accepted_delivery_id else None
+                ),
             ):
                 dependencies.logger.warning(
                     "Resume dispatch: stale success from agent %s for job %s; "

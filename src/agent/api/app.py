@@ -1314,11 +1314,17 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
         if _shutdown_requested:
             raise HTTPException(status_code=503, detail="Agent is shutting down")
 
+        from agent.api.pinned_delivery import accepted_pinned_job_delivery
+
         if _current_job_id == request.job_id:
+            acknowledgement = accepted_pinned_job_delivery(
+                request, _orchestrator_client, retry=True,
+            )
             return JobStartResponse(
                 job_id=request.job_id,
                 status="accepted",
                 message="Job resume was already accepted by this runtime",
+                **acknowledgement,
             )
 
         try:
@@ -1345,6 +1351,9 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
             )
 
         # Accept the resume request
+        acknowledgement = accepted_pinned_job_delivery(
+            request, _orchestrator_client, retry=False,
+        )
         _current_job_id = request.job_id
 
         # Capture for closure
@@ -1503,6 +1512,7 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
             job_id=request.job_id,
             status="accepted",
             message="Job resume started",
+            **acknowledgement,
         )
 
     @app.get("/job/current", tags=["Orchestrator"])

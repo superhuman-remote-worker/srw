@@ -2002,6 +2002,25 @@ class TestJobStartBundle:
         assert bundle_env.status_writes == []
 
     @pytest.mark.asyncio
+    async def test_ready_vm_bundle_identifies_the_vm_runtime(self, bundle_env):
+        job = _bundle_job(backend="vm")
+        job["context"]["vm"] = {
+            **READY_VM,
+            "provision_generation": "22222222-2222-2222-2222-222222222222",
+            "ssh_ready_source": "provisioner_probe",
+        }
+
+        bundle = await job_start_bundle.build_job_start_request(
+            job, dependencies=_start_bundle_deps()
+        )
+
+        assert bundle is not None
+        assert bundle.workspace_provisioner == "kubevirt"
+        assert bundle.workspace_runtime["assigned_backend"] == "vm"
+        assert bundle.workspace_runtime["effective_backend"] == "vm"
+        assert bundle.workspace_runtime["state"] == "ready"
+
+    @pytest.mark.asyncio
     async def test_connector_revocation_fails_the_job_closed(
         self, bundle_env, monkeypatch
     ):

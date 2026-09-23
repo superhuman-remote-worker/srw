@@ -30105,7 +30105,14 @@ class PostgresDB:
             agent_expr="assigned_agent_id",
             lease_expr="lease_expires_at",
         )
-        async with self.acquire() as conn:
+        async with self.acquire() as conn, conn.transaction():
+            # An idle nomination takes the agent row before this Job row.
+            # Observe its committed operation in the following statement,
+            # rather than evaluating NOT EXISTS from a pre-wait UPDATE snapshot.
+            await conn.fetchrow(
+                "SELECT id FROM jobs WHERE id=$1::uuid FOR UPDATE",
+                UUID(job_id) if isinstance(job_id, str) else job_id,
+            )
             updated = await conn.fetchval(
                 f"""
                 UPDATE jobs

@@ -295,6 +295,69 @@ def _posted_payload() -> dict:
 
 class TestResumeJobOnAgentInjection:
     @pytest.mark.asyncio
+    async def test_vm_resume_dispatch_binds_agent_receipt_before_confirmation(
+        self, resume_collaborators, monkeypatch
+    ):
+        """A resumed VM claim must give its recipient a new report identity."""
+        from uuid import uuid4
+
+        from agent.api.models import JobResumeRequest
+        from agent.api.pinned_delivery import accepted_pinned_job_delivery
+
+        delivery_id = uuid4()
+        monkeypatch.setenv("WORKSPACE_IDLE_RELEASE_ENABLED", "true")
+        monkeypatch.setenv("VM_LIFECYCLE_HMAC_SECRET", "x" * 64)
+        monkeypatch.setattr(orchestrator.main, "COMPLETION_COMMANDS_ENABLED", True)
+        monkeypatch.setattr(
+            orchestrator.main.postgres_db, "prepare_pinned_job_delivery",
+            AsyncMock(return_value={"id": delivery_id}),
+        )
+        confirm = AsyncMock(return_value=True)
+        monkeypatch.setattr(
+            orchestrator.main.postgres_db, "confirm_pinned_job_dispatch", confirm,
+        )
+        recipient = orchestrator.main.PinnedJobRecipient(
+            expected_agent_id=AGENT_ID,
+            expected_pod_uid="44444444-4444-4444-8444-444444444444",
+            expected_process_generation="55555555-5555-4555-8555-555555555555",
+            expected_job_id=JOB_ID,
+        )
+        monkeypatch.setattr(
+            orchestrator.main, "_prepare_pinned_job_mutation_target",
+            AsyncMock(return_value=orchestrator.main._PinnedJobMutationTarget(_agent(), recipient)),
+        )
+        accepted_client = SimpleNamespace()
+
+        async def accepted_post(_self, url, json=None):
+            assert url.endswith("/job/resume")
+            wire = JobResumeRequest.model_validate(json)
+            echo = accepted_pinned_job_delivery(wire, accepted_client, retry=False)
+            _FakeAsyncClient.posts.append((url, json))
+            return _FakeResponse(202, payload=echo)
+
+        monkeypatch.setattr(_FakeAsyncClient, "post", accepted_post)
+        vm_job = _job(
+            config_override={"workspace": {"backend": "vm"}},
+            context={
+                "_workspace_contract": {
+                    "version": 1, "requested_backend": "vm",
+                    "assigned_backend": "vm", "assignment_source": "request",
+                },
+                "vm": {
+                    "status": "ready", "provisioner": "vm",
+                    "ssh_host": "100.64.0.7", "ssh_port": 22,
+                    "provision_generation": WORKSPACE_RUNTIME,
+                },
+            },
+        )
+        assert await control_seams.resume_job_on_agent(vm_job, _agent()) is True
+        assert str(accepted_client.pinned_delivery_id) == str(delivery_id)
+        assert confirm.await_args.kwargs["pinned_delivery_id"] == str(delivery_id)
+        assert confirm.await_args.kwargs["pinned_projection_digest"] == (
+            accepted_client.pinned_projection_digest
+        )
+
+    @pytest.mark.asyncio
     async def test_sandbox_resume_rebuilds_complete_ssh_config(
         self, resume_collaborators, monkeypatch
     ):

@@ -1579,11 +1579,17 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
         if _shutdown_requested:
             raise HTTPException(503, "Agent is shutting down")
 
+        from agent.api.pinned_delivery import accepted_pinned_job_delivery
+
         if _pod_state == PodState.WORKING and _current_job_id == request.job_id:
+            acknowledgement = accepted_pinned_job_delivery(
+                request, _orchestrator_client, retry=True,
+            )
             return JobStartResponse(
                 job_id=request.job_id,
                 status="accepted",
                 message="Job resume was already accepted by this runtime",
+                **acknowledgement,
             )
 
         try:
@@ -1601,6 +1607,9 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
                     409,
                     f"Pod is in {_pod_state.value} state, cannot accept resume",
                 )
+            acknowledgement = accepted_pinned_job_delivery(
+                request, _orchestrator_client, retry=False,
+            )
             _pod_state = PodState.WORKING
             _current_job_id = request.job_id
 
@@ -1745,6 +1754,7 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
             job_id=request.job_id,
             status="accepted",
             message="Job resume started",
+            **acknowledgement,
         )
 
     @app.get("/job/current", tags=["Worker"])

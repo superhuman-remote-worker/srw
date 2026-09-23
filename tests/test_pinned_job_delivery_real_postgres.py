@@ -4,15 +4,24 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 from uuid import UUID, uuid4
 
 import pytest
 
 from shared.pinned_session_identity import PinnedJobRecipient
+from tests.test_b05_lane_j_job_preparation import (
+    READY_VM, _bundle_job, _start_bundle_deps,
+)
 from tests.test_vm_idle_lifecycle_real_postgres import seed_wait
 
-pytest_plugins = ("tests.test_vm_idle_lifecycle_real_postgres",)
+pytest_plugins = (
+    "tests.test_vm_idle_lifecycle_real_postgres",
+    "tests.test_b05_lane_j_job_preparation",
+)
 
 
 MIGRATION = (
@@ -42,6 +51,196 @@ async def _pinned_claim(db):
     )
     assert await db.claim_job_for_agent(str(owner), str(agent_id))
     return owner, agent_id, process_generation, pod_uid, identity
+
+
+@pytest.mark.asyncio
+async def test_vm_start_wire_accepts_current_delivery_intent(db, monkeypatch):
+    """A VM bundle must reach the exact wire receipt, not the sandbox discriminator."""
+    from agent.api.models import JobStartRequest
+    from agent.api.pinned_delivery import accepted_pinned_job_delivery
+    from orchestrator.services.job_control_delivery import _pinned_vm_delivery_intent
+
+    await _schema(db)
+    monkeypatch.setenv("WORKSPACE_IDLE_RELEASE_ENABLED", "true")
+    monkeypatch.setenv("VM_LIFECYCLE_HMAC_SECRET", "x" * 64)
+    owner, agent_id, generation, pod_uid, _ = await _pinned_claim(db)
+    recipient = PinnedJobRecipient(
+        expected_agent_id=str(agent_id), expected_pod_uid=str(pod_uid),
+        expected_process_generation=str(generation), expected_job_id=str(owner),
+    )
+    bundle = JobStartRequest(
+        job_id=str(owner), description="real VM dispatch",
+        workspace_runtime={"effective_backend": "vm", "assigned_backend": "vm", "state": "ready"},
+        workspace_provisioner="vm", recipient=recipient,
+    )
+    payload, intent = await _pinned_vm_delivery_intent(
+        SimpleNamespace(store=db), job_id=str(owner), agent_id=str(agent_id),
+        recipient=recipient, payload=bundle.model_dump(mode="json", exclude_none=True),
+    )
+    assert intent is not None
+    wire = JobStartRequest.model_validate(payload)
+    acknowledgement = accepted_pinned_job_delivery(
+        wire, SimpleNamespace(), retry=False,
+    )
+    assert acknowledgement["pinned_delivery_id"] == str(intent["id"])
+    assert await db.confirm_pinned_job_dispatch(
+        str(owner), str(agent_id), pinned_delivery_id=acknowledgement["pinned_delivery_id"],
+        pinned_projection_digest=acknowledgement["pinned_projection_digest"],
+    )
+    changed_payload, changed_intent = await _pinned_vm_delivery_intent(
+        SimpleNamespace(store=db), job_id=str(owner), agent_id=str(agent_id),
+        recipient=recipient, payload={**payload, "description": "changed projection"},
+    )
+    assert changed_payload is None and changed_intent is None
+
+
+@pytest.mark.asyncio
+async def test_real_vm_start_dispatch_posts_accepted_receipt(db, monkeypatch, bundle_env):
+    from agent.api.models import JobStartRequest
+    from agent.api.pinned_delivery import accepted_pinned_job_delivery
+    from orchestrator.services.job_control_delivery import (
+        JobDeliveryDependencies, dispatch_job_to_agent,
+    )
+    from orchestrator.services.job_start_bundle import build_job_start_request
+
+    await _schema(db)
+    monkeypatch.setenv("WORKSPACE_IDLE_RELEASE_ENABLED", "true")
+    monkeypatch.setenv("VM_LIFECYCLE_HMAC_SECRET", "x" * 64)
+    owner, agent_id, generation, pod_uid, _ = await _pinned_claim(db)
+    recipient = PinnedJobRecipient(
+        expected_agent_id=str(agent_id), expected_pod_uid=str(pod_uid),
+        expected_process_generation=str(generation), expected_job_id=str(owner),
+    )
+    job = _bundle_job(
+        backend="vm", id=str(owner), runtime_kind="srw", execution_lane="pinned",
+    )
+    job["context"]["vm"] = {
+        **READY_VM,
+        "provision_generation": "22222222-2222-2222-2222-222222222222",
+        "ssh_ready_source": "provisioner_probe",
+    }
+    bundle = await build_job_start_request(job, dependencies=_start_bundle_deps())
+    assert bundle is not None
+    assert bundle.workspace_provisioner == "kubevirt"
+    assert bundle.workspace_runtime["effective_backend"] == "vm"
+    client_state = SimpleNamespace()
+
+    class AcceptedAgent:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def post(self, url, json):
+            assert url.endswith("/job/start")
+            receipt = accepted_pinned_job_delivery(
+                JobStartRequest.model_validate(json), client_state, retry=False,
+            )
+            return SimpleNamespace(status_code=202, json=lambda: receipt)
+
+    store = SimpleNamespace(
+        prepare_pinned_job_delivery=db.prepare_pinned_job_delivery,
+        confirm_pinned_job_dispatch=db.confirm_pinned_job_dispatch,
+        managed_repository_authorities_are_current=AsyncMock(return_value=True),
+        heartbeat=db.heartbeat,
+    )
+    values = {
+        field: MagicMock() for field in JobDeliveryDependencies.__dataclass_fields__
+    }
+    values.update(
+        store=store, logger=logging.getLogger(__name__),
+        completion_commands_enabled=lambda: True,
+        pause_pending_job_ids=set(),
+        prepare_job_workspace_runtime=AsyncMock(side_effect=lambda job: ("proceed", job, None)),
+        attest_pinned_k8s_job_workspace=AsyncMock(side_effect=lambda job: (job, None)),
+        build_job_start_request=AsyncMock(return_value=bundle),
+        pinned_k8s_job_workspace_authority_is_current=AsyncMock(return_value=True),
+        prepare_pinned_job_mutation_target=AsyncMock(return_value=SimpleNamespace(
+            agent={"pod_ip": "10.0.0.2", "pod_port": 8001}, recipient=recipient,
+        )),
+        redispatch_livelock_trip=lambda _job: None,
+        bind_log_context=lambda **_kwargs: None,
+        reset_log_context=lambda _token: None,
+        http_client_factory=lambda **_kwargs: AcceptedAgent(),
+    )
+    assert await dispatch_job_to_agent(
+        job,
+        {"id": str(agent_id), "pod_ip": "10.0.0.2"},
+        dependencies=JobDeliveryDependencies(**values),
+    )
+    assert client_state.pinned_delivery_id == str(await db.fetchval(
+        "SELECT id FROM pinned_job_deliveries WHERE job_id=$1", owner,
+    ))
+
+
+@pytest.mark.asyncio
+async def test_vm_resume_wire_accepts_exact_current_claim(db, monkeypatch):
+    """A checkpoint resume gets a new receipt after the dispatch marker rotates."""
+    from agent.api.models import JobResumeRequest
+    from agent.api.pinned_delivery import accepted_pinned_job_delivery
+    from orchestrator.services.job_control_delivery import _pinned_vm_delivery_intent
+
+    await _schema(db)
+    monkeypatch.setenv("WORKSPACE_IDLE_RELEASE_ENABLED", "true")
+    monkeypatch.setenv("VM_LIFECYCLE_HMAC_SECRET", "x" * 64)
+    owner, agent_id, generation, pod_uid, _ = await _pinned_claim(db)
+    recipient = PinnedJobRecipient(
+        expected_agent_id=str(agent_id), expected_pod_uid=str(pod_uid),
+        expected_process_generation=str(generation), expected_job_id=str(owner),
+    )
+    base = JobResumeRequest(
+        job_id=str(owner), previous_status="paused",
+        workspace_runtime={"effective_backend": "vm", "assigned_backend": "vm", "state": "ready"},
+        workspace_provisioner="vm", recipient=recipient,
+    ).model_dump(mode="json", exclude_none=True)
+    first_payload, first = await _pinned_vm_delivery_intent(
+        SimpleNamespace(store=db), job_id=str(owner), agent_id=str(agent_id),
+        recipient=recipient, payload=base,
+    )
+    assert first is not None
+    assert accepted_pinned_job_delivery(
+        JobResumeRequest.model_validate(first_payload), SimpleNamespace(), retry=False,
+    )["pinned_delivery_id"] == str(first["id"])
+    await db.execute(
+        "UPDATE jobs SET status='paused',assigned_agent_id=NULL WHERE id=$1", owner,
+    )
+    await db.execute(
+        "UPDATE agents SET status='ready',current_job_id=NULL WHERE id=$1", agent_id,
+    )
+    assert await db.claim_job_for_agent(str(owner), str(agent_id))
+    changed = {**base, "feedback": "new reply"}
+    second_payload, second = await _pinned_vm_delivery_intent(
+        SimpleNamespace(store=db), job_id=str(owner), agent_id=str(agent_id),
+        recipient=recipient, payload=changed,
+    )
+    assert second is not None and second["id"] != first["id"]
+    client = SimpleNamespace()
+    acknowledgement = accepted_pinned_job_delivery(
+        JobResumeRequest.model_validate(second_payload), client, retry=False,
+    )
+    assert acknowledgement["pinned_delivery_id"] == str(second["id"])
+    route_id = UUID(json.loads(await db.fetchval(
+        "SELECT workspace_idle_episode FROM jobs WHERE id=$1", owner,
+    ))["wait_key"])
+    assert await _publish_fast_route(
+        db, owner=owner, agent_id=agent_id, intent=second,
+        process_generation=generation, pod_uid=pod_uid,
+        proof=second_payload["pinned_delivery_proof"], route_id=route_id,
+    )
+    assert await db.confirm_pinned_job_dispatch(
+        str(owner), str(agent_id), pinned_delivery_id=acknowledgement["pinned_delivery_id"],
+        pinned_projection_digest=acknowledgement["pinned_projection_digest"],
+    )
+    assert await db.fetchval(
+        "SELECT delivery_id FROM pinned_job_wait_receipts WHERE source_kind='route' "
+        "AND source_id=$1", route_id,
+    ) == second["id"]
+    changed_payload, changed_intent = await _pinned_vm_delivery_intent(
+        SimpleNamespace(store=db), job_id=str(owner), agent_id=str(agent_id),
+        recipient=recipient, payload={**changed, "feedback": "different second projection"},
+    )
+    assert changed_payload is None and changed_intent is None
 
 
 @pytest.mark.asyncio
@@ -116,6 +315,315 @@ async def test_fast_authenticated_report_accepts_intent_before_post_reply(db, mo
         "SELECT accepted_at IS NOT NULL FROM pinned_job_deliveries WHERE id=$1",
         intent["id"],
     )
+
+
+async def _publish_fast_route(db, *, owner, agent_id, intent, process_generation,
+                              pod_uid, proof, route_id):
+    from orchestrator.services.pinned_job_delivery import (
+        accept_pinned_report_on_conn, record_pinned_wait_receipt_on_conn,
+    )
+
+    async with db.acquire() as conn, conn.transaction():
+        await conn.fetchrow("SELECT id FROM jobs WHERE id=$1 FOR UPDATE", owner)
+        delivery = await accept_pinned_report_on_conn(
+            conn, job_id=owner, agent_id=agent_id,
+            delivery_id=intent["id"], projection_digest=intent["projection_digest"],
+            process_generation=str(process_generation), pod_uid=str(pod_uid),
+            delivery_proof=proof, source_kind="route",
+        )
+        if delivery is None:
+            return False
+        await conn.execute(
+            "INSERT INTO job_message_routes(route_id,job_id,thread_id,state,blocking) "
+            "VALUES($1,$2,'fast-pinned-route','user_direct',true)", route_id, owner,
+        )
+        await conn.execute(
+            "UPDATE jobs SET status='waiting_for_reply',"
+            "freeze_data=jsonb_build_object('route_id',$2::text) WHERE id=$1",
+            owner, str(route_id),
+        )
+        return await record_pinned_wait_receipt_on_conn(
+            conn, delivery=delivery, source_kind="route", source_id=route_id,
+        ) is not None
+
+
+@pytest.mark.asyncio
+async def test_two_connection_fast_report_precedes_late_post_confirmation(db, monkeypatch):
+    from shared.pinned_job_delivery import pinned_job_delivery_proof
+
+    await _schema(db)
+    monkeypatch.setenv("VM_LIFECYCLE_HMAC_SECRET", "x" * 64)
+    owner, agent_id, generation, pod_uid, _ = await _pinned_claim(db)
+    recipient = PinnedJobRecipient(
+        expected_agent_id=str(agent_id), expected_pod_uid=str(pod_uid),
+        expected_process_generation=str(generation), expected_job_id=str(owner),
+    )
+    intent = await db.prepare_pinned_job_delivery(
+        str(owner), str(agent_id), recipient=recipient,
+        projection_digest="sha256:" + "a" * 64,
+    )
+    assert intent is not None
+    proof = pinned_job_delivery_proof(
+        b"x" * 64, delivery_id=str(intent["id"]), agent_id=str(agent_id),
+        process_generation=str(generation), pod_uid=str(pod_uid),
+        projection_digest=intent["projection_digest"],
+    )
+    episode_before = await db.fetchval(
+        "SELECT workspace_idle_episode FROM jobs WHERE id=$1", owner,
+    )
+    route_id = UUID(json.loads(episode_before)["wait_key"])
+    async with db.acquire() as blocker, blocker.transaction():
+        await blocker.fetchrow("SELECT id FROM jobs WHERE id=$1 FOR UPDATE", owner)
+        report = asyncio.create_task(_publish_fast_route(
+            db, owner=owner, agent_id=agent_id, intent=intent,
+            process_generation=generation, pod_uid=pod_uid,
+            proof=proof, route_id=route_id,
+        ))
+        await asyncio.sleep(0.05)
+        confirmation = asyncio.create_task(db.confirm_pinned_job_dispatch(
+            str(owner), str(agent_id), pinned_delivery_id=str(intent["id"]),
+            pinned_projection_digest=intent["projection_digest"],
+        ))
+        await asyncio.sleep(0.05)
+        assert not report.done() and not confirmation.done()
+    reported, confirmed = await asyncio.wait_for(
+        asyncio.gather(report, confirmation), timeout=5,
+    )
+    assert reported and confirmed
+    row = await db.fetchrow(
+        "SELECT status,freeze_data,workspace_idle_episode FROM jobs WHERE id=$1", owner,
+    )
+    assert row["status"] == "waiting_for_reply"
+    assert json.loads(row["freeze_data"])["route_id"] == str(route_id)
+    assert row["workspace_idle_episode"] == episode_before
+    assert await db.fetchval(
+        "SELECT accepted_via FROM pinned_job_deliveries WHERE id=$1", intent["id"],
+    ) == "route"
+
+
+@pytest.mark.asyncio
+async def test_two_connection_renewed_heartbeat_and_report_keep_original_marker(
+    db, monkeypatch,
+):
+    from shared.pinned_job_delivery import pinned_job_delivery_proof
+
+    await _schema(db)
+    monkeypatch.setenv("VM_LIFECYCLE_HMAC_SECRET", "x" * 64)
+    owner, agent_id, generation, pod_uid, _ = await _pinned_claim(db)
+    recipient = PinnedJobRecipient(
+        expected_agent_id=str(agent_id), expected_pod_uid=str(pod_uid),
+        expected_process_generation=str(generation), expected_job_id=str(owner),
+    )
+    intent = await db.prepare_pinned_job_delivery(
+        str(owner), str(agent_id), recipient=recipient,
+        projection_digest="sha256:" + "a" * 64,
+    )
+    proof = pinned_job_delivery_proof(
+        b"x" * 64, delivery_id=str(intent["id"]), agent_id=str(agent_id),
+        process_generation=str(generation), pod_uid=str(pod_uid),
+        projection_digest=intent["projection_digest"],
+    )
+    route_id = UUID(json.loads(await db.fetchval(
+        "SELECT workspace_idle_episode FROM jobs WHERE id=$1", owner,
+    ))["wait_key"])
+    original_marker = await db.fetchval(
+        "SELECT context->'_workspace_dispatch_authority' FROM jobs WHERE id=$1", owner,
+    )
+    await db.execute(
+        "UPDATE jobs SET lease_expires_at=clock_timestamp()-interval '1 hour' WHERE id=$1", owner,
+    )
+    assert await db.heartbeat(
+        str(agent_id), "working", current_job_id=str(owner),
+    )
+    assert await db.fetchval(
+        "SELECT lease_expires_at > clock_timestamp() FROM jobs WHERE id=$1", owner,
+    )
+    await db.execute(
+        "UPDATE jobs SET lease_expires_at=clock_timestamp()+interval '30 seconds' WHERE id=$1",
+        owner,
+    )
+    async with db.acquire() as blocker, blocker.transaction():
+        await blocker.fetchrow("SELECT id FROM jobs WHERE id=$1 FOR UPDATE", owner)
+        report = asyncio.create_task(_publish_fast_route(
+            db, owner=owner, agent_id=agent_id, intent=intent,
+            process_generation=generation, pod_uid=pod_uid,
+            proof=proof, route_id=route_id,
+        ))
+        await asyncio.sleep(0.05)
+        heartbeat = asyncio.create_task(db.heartbeat(
+            str(agent_id), "working", current_job_id=str(owner),
+        ))
+        await asyncio.sleep(0.05)
+        assert not heartbeat.done() and not report.done()
+    beat, reported = await asyncio.wait_for(
+        asyncio.gather(heartbeat, report), timeout=5,
+    )
+    assert beat is not None and reported
+    assert await db.fetchval(
+        "SELECT context->'_workspace_dispatch_authority' FROM jobs WHERE id=$1", owner,
+    ) == original_marker
+    lease_proof = await db.fetchrow(
+        "SELECT accepted_lease_expires_at > clock_timestamp() AS accepted_live,"
+        "accepted_lease_expires_at <> original_lease_expires_at AS renewed,"
+        "accepted_via FROM pinned_job_deliveries WHERE id=$1", intent["id"],
+    )
+    assert lease_proof["accepted_live"] and lease_proof["renewed"], dict(lease_proof)
+    assert await db.fetchval(
+        "SELECT status FROM jobs WHERE id=$1", owner,
+    ) == "waiting_for_reply"
+
+
+@pytest.mark.asyncio
+async def test_two_connection_heartbeat_cannot_undo_pinned_nomination(db, monkeypatch):
+    from orchestrator.services.vm_idle_lifecycle import VMIdleLifecycleStore
+
+    owner, agent_id, _, revision, episode, identity = await _due_pinned_route(
+        db, monkeypatch,
+    )
+    before = await db.fetchrow(
+        "SELECT context,workspace_idle_episode,lease_expires_at FROM jobs WHERE id=$1", owner,
+    )
+    store = VMIdleLifecycleStore(db)
+    async with db.acquire() as blocker, blocker.transaction():
+        await blocker.fetchrow("SELECT id FROM agents WHERE id=$1 FOR UPDATE", agent_id)
+        nominee = asyncio.create_task(store.admit_release(
+            str(owner), episode_id=episode["episode_id"],
+            revision=revision, identity=identity,
+        ))
+        await asyncio.sleep(0.05)
+        heartbeat = asyncio.create_task(db.heartbeat(
+            str(agent_id), "working", current_job_id=str(owner),
+        ))
+        await asyncio.sleep(0.05)
+        assert not nominee.done() and not heartbeat.done()
+    admitted, beat = await asyncio.wait_for(
+        asyncio.gather(nominee, heartbeat), timeout=5,
+    )
+    assert admitted is not None and beat is not None
+    assert await db.fetchval("SELECT status FROM agents WHERE id=$1", agent_id) == "draining"
+    after = await db.fetchrow(
+        "SELECT context,workspace_idle_episode,lease_expires_at FROM jobs WHERE id=$1", owner,
+    )
+    before_context = json.loads(before["context"])
+    after_context = json.loads(after["context"])
+    assert after_context["_workspace_dispatch_authority"] == (
+        before_context["_workspace_dispatch_authority"]
+    )
+    for key in (
+        "provision_generation", "vm_uid", "vmi_uid", "active_pod_uid", "rootdisk_pvc_uid",
+    ):
+        assert after_context["vm"][key] == before_context["vm"][key]
+    assert after["workspace_idle_episode"] == before["workspace_idle_episode"]
+    assert after["lease_expires_at"] == before["lease_expires_at"]
+
+
+@pytest.mark.asyncio
+async def test_two_connection_lease_recovery_loses_to_fast_route_report(db, monkeypatch):
+    from shared.pinned_job_delivery import pinned_job_delivery_proof
+
+    await _schema(db)
+    monkeypatch.setenv("VM_LIFECYCLE_HMAC_SECRET", "x" * 64)
+    owner, agent_id, generation, pod_uid, _ = await _pinned_claim(db)
+    recipient = PinnedJobRecipient(
+        expected_agent_id=str(agent_id), expected_pod_uid=str(pod_uid),
+        expected_process_generation=str(generation), expected_job_id=str(owner),
+    )
+    intent = await db.prepare_pinned_job_delivery(
+        str(owner), str(agent_id), recipient=recipient,
+        projection_digest="sha256:" + "a" * 64,
+    )
+    proof = pinned_job_delivery_proof(
+        b"x" * 64, delivery_id=str(intent["id"]), agent_id=str(agent_id),
+        process_generation=str(generation), pod_uid=str(pod_uid),
+        projection_digest=intent["projection_digest"],
+    )
+    route_id = UUID(json.loads(await db.fetchval(
+        "SELECT workspace_idle_episode FROM jobs WHERE id=$1", owner,
+    ))["wait_key"])
+    await db.execute(
+        "UPDATE jobs SET lease_expires_at=clock_timestamp()-interval '1 hour' WHERE id=$1", owner,
+    )
+    async with db.acquire() as blocker, blocker.transaction():
+        await blocker.fetchrow("SELECT id FROM jobs WHERE id=$1 FOR UPDATE", owner)
+        report = asyncio.create_task(_publish_fast_route(
+            db, owner=owner, agent_id=agent_id, intent=intent,
+            process_generation=generation, pod_uid=pod_uid,
+            proof=proof, route_id=route_id,
+        ))
+        await asyncio.sleep(0.05)
+        recovery = asyncio.create_task(db.recover_expired_lease_jobs(
+            completion_commands_enabled=True,
+        ))
+        await asyncio.sleep(0.05)
+        assert not report.done()
+    reported, _ = await asyncio.wait_for(
+        asyncio.gather(report, recovery), timeout=10,
+    )
+    assert reported
+    row = await db.fetchrow(
+        "SELECT status,assigned_agent_id,context FROM jobs WHERE id=$1", owner,
+    )
+    assert row["status"] == "waiting_for_reply"
+    assert row["assigned_agent_id"] == agent_id
+    assert await db.fetchval(
+        "SELECT count(*) FROM pinned_job_wait_receipts WHERE delivery_id=$1", intent["id"],
+    ) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("resume_kind", ["in_process", "queued"])
+async def test_two_connection_resume_and_nomination_have_one_owner(
+    db, monkeypatch, resume_kind,
+):
+    from orchestrator.services.vm_idle_lifecycle import VMIdleLifecycleStore
+
+    owner, agent_id, _, revision, episode, identity = await _due_pinned_route(
+        db, monkeypatch,
+    )
+    before = await db.fetchrow(
+        "SELECT context,workspace_idle_episode FROM jobs WHERE id=$1", owner,
+    )
+    store = VMIdleLifecycleStore(db)
+    async with db.acquire() as blocker, blocker.transaction():
+        await blocker.fetchrow("SELECT id FROM jobs WHERE id=$1 FOR UPDATE", owner)
+        nomination = asyncio.create_task(store.admit_release(
+            str(owner), episode_id=episode["episode_id"],
+            revision=revision, identity=identity,
+        ))
+        await asyncio.sleep(0.05)
+        if resume_kind == "in_process":
+            resume = asyncio.create_task(db.resume_pinned_job_in_process(str(owner)))
+        else:
+            resume = asyncio.create_task(db.queue_job_for_resume(
+                str(owner), expected_status="waiting_for_reply",
+                expected_route_id=episode["wait_key"],
+                completion_commands_enabled=True,
+            ))
+        await asyncio.sleep(0.05)
+        assert not nomination.done() and not resume.done()
+    admitted, resumed = await asyncio.wait_for(
+        asyncio.gather(nomination, resume), timeout=5,
+    )
+    assert (admitted is not None) != resumed
+    after = await db.fetchrow(
+        "SELECT status,context,workspace_idle_episode FROM jobs WHERE id=$1", owner,
+    )
+    if admitted is not None:
+        assert after["status"] == "waiting_for_reply"
+        assert after["workspace_idle_episode"] == before["workspace_idle_episode"]
+        assert json.loads(after["context"])["_workspace_dispatch_authority"] == (
+            json.loads(before["context"])["_workspace_dispatch_authority"]
+        )
+        assert await db.fetchval(
+            "SELECT count(*) FROM vm_idle_operations WHERE owner_kind='job' "
+            "AND owner_id=$1 AND closed_at IS NULL", owner,
+        ) == 1
+    else:
+        assert after["status"] in {"processing", "paused"}
+        assert await db.fetchval(
+            "SELECT count(*) FROM vm_idle_operations WHERE owner_kind='job' "
+            "AND owner_id=$1 AND closed_at IS NULL", owner,
+        ) == 0
 
 
 async def _due_pinned_route(db, monkeypatch):
