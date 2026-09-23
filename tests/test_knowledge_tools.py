@@ -2534,6 +2534,59 @@ def kb_update_tools_kgless(ks, materializer):
     return {tool.name: (lambda _tool=tool, **kw: _invoke(_tool, kw)) for tool in tools}
 
 
+class TestKbRedactionMarkerGuard:
+    """A note read back through a tool result is credential-redacted; writing
+    it back from that view would commit `[REDACTED]` over the real value
+    (agent.core.redaction_write_guard). The KB write tools refuse, compared
+    against the note's current content."""
+
+    def test_kb_write_refuses_to_commit_the_marker(self, kb_tools, materializer):
+        result = kb_tools["kb_write"](
+            type="learning",
+            title="Remote",
+            content="clone from https://[REDACTED]@gitea.local/o/r.git",
+        )
+        assert result.startswith("Error: kb_write refused")
+        materializer.assert_not_called()
+
+    @pytest.mark.parametrize("tier", ["kb_update_tools", "kb_update_tools_kgless"])
+    @pytest.mark.parametrize(
+        "change",
+        [
+            {"content": "rewritten: https://[REDACTED]@gitea.local/o/r.git"},
+            {"append": "also https://[REDACTED]@mirror/x.git"},
+        ],
+        ids=["content", "append"],
+    )
+    def test_kb_update_refuses_to_commit_the_marker(
+        self, request, tier, change, materializer
+    ):
+        tools = request.getfixturevalue(tier)
+        result = tools["kb_update"](note="an-existing-note", **change)
+        assert result.startswith("Error: kb_update refused")
+        materializer.assert_not_called()
+
+    def test_a_note_that_already_quotes_the_marker_stays_editable(
+        self, ks, materializer
+    ):
+        ctx = _make_context()
+        ctx.knowledge_store = ks
+        ctx.knowledge_graph.read_note.return_value = _graph_existing(
+            content='The redactor prints "[REDACTED]".'
+        )
+        ctx.knowledge_graph.update_note.return_value = True
+        tools, _ = _make_tools(ctx)
+        kb_update = _get_tool(tools, "kb_update")
+        result = _invoke(
+            kb_update,
+            {
+                "note": "an-existing-note",
+                "content": 'The redactor prints "[REDACTED]" — see OC-05.',
+            },
+        )
+        assert result.startswith("Updated **")
+
+
 class TestKbUpdateDoesNotWriteTheRow:
     """Slice A leaves exactly one writer of ``knowledge_index``: the
     materialisation endpoint. kb_update's own ``upsert_note`` would clobber

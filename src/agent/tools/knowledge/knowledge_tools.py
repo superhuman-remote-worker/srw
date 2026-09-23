@@ -46,6 +46,10 @@ from shared.runtime.services.knowledge_graph import (
     PRIORITY_WORDS,
     slugify,
 )
+from agent.core.redaction_write_guard import (
+    adds_redaction_marker,
+    redaction_marker_refusal,
+)
 from agent.services.knowledge.bindings import KnowledgeBinding, split_note_handle
 from agent.tools.context import ToolContext
 from shared.runtime.knowledge.chunker import embedding_version_for_service
@@ -185,6 +189,31 @@ _GRAPH_TIER_MSG = (
 def _content_hash(text: str) -> str:
     """Stable content fingerprint for exact-duplicate detection."""
     return hashlib.sha256((text or "").encode()).hexdigest()
+
+
+def _marker_refusal(
+    existing: Dict[str, Any],
+    content: Optional[str],
+    append: Optional[str],
+    note: str,
+) -> Optional[str]:
+    """kb_update's refusal to commit a redaction marker the note lacks.
+
+    A note read back through a tool result is credential-redacted; rewriting
+    it from that view would commit ``[REDACTED]`` over the real value
+    (agent.core.redaction_write_guard). Compared against the note's current
+    content, so a note that already quotes the marker stays editable.
+    """
+    prior = existing.get("content") or ""
+    if content is not None:
+        prospective = content
+    elif append is not None:
+        prospective = prior + "\n\n" + append
+    else:
+        return None
+    if adds_redaction_marker(prior, prospective):
+        return redaction_marker_refusal(f"note '{note}'", "kb_update")
+    return None
 
 
 def _runtime_actor_for_project(
@@ -1763,6 +1792,9 @@ def create_kb_tools(
             existing = _run_async(ks.get_note_by_slug(uuid.UUID(project_id), note))
             if not existing:
                 return f"Error: Note '{note}' not found in project."
+            refusal = _marker_refusal(existing, content, append, note)
+            if refusal:
+                return refusal
 
             if (existing.get("type") or "") == "charter":
                 denied = _charter_write_denied(context, project_id)
@@ -1944,6 +1976,9 @@ def create_kb_tools(
                 )
             if not isinstance(existing, dict):
                 return f"Error: Note '{note}' not found in project."
+            refusal = _marker_refusal(existing, content, append, note)
+            if refusal:
+                return refusal
             if (existing.get("type") or "") == "charter":
                 denied = _charter_write_denied(context, project_id)
                 if denied:
@@ -2223,6 +2258,9 @@ def create_kb_tools(
             )
         else:
             existing = kg.read_note(project_id, candidate_slug)
+        prior_content = existing.get("content") if isinstance(existing, dict) else ""
+        if adds_redaction_marker(prior_content, content):
+            return redaction_marker_refusal(f"note '{candidate_slug}'", "kb_write")
         if isinstance(existing, dict) and _content_hash(content) == _content_hash(
             existing.get("content", "")
         ):
