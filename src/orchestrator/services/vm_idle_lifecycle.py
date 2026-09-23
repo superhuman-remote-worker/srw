@@ -15,6 +15,8 @@ import os
 from typing import Any, Mapping
 from uuid import UUID, uuid4
 
+from fastapi import HTTPException
+
 from orchestrator.services.vm_provisioner import (
     VMTeardownIdentity,
     vm_persistent_rootdisk_enabled,
@@ -134,21 +136,20 @@ class VMIdleLifecycleStore:
             # A parked VM is only safe to stop when its successor can enter
             # the already deployed creation protocol within the original
             # execution deadline. Do not strand an active human wait.
-            executable = await conn.fetchval(
+            execution = await conn.fetchrow(
                 """
-                SELECT EXISTS(
-                  SELECT 1 FROM srw_execution_specs s
-                  WHERE s.work_kind='Job' AND s.work_id=$1
-                    AND s.harness_adapter='srw/v1'
-                    AND (s.resolved->'spec'->>'timeoutSeconds' IS NULL
-                         OR s.created_at +
-                            ((s.resolved->'spec'->>'timeoutSeconds')::double precision
-                             * interval '1 second') > clock_timestamp())
-                )
+                SELECT id,revision,generation,
+                  CASE WHEN resolved->'spec'->>'timeoutSeconds' IS NULL THEN NULL
+                  ELSE created_at +
+                       ((resolved->'spec'->>'timeoutSeconds')::double precision
+                        * interval '1 second') END AS deadline
+                FROM srw_execution_specs
+                WHERE work_kind='Job' AND work_id=$1 AND harness_adapter='srw/v1'
+                FOR SHARE
                 """,
                 owner_id,
             )
-            if not executable:
+            if execution is None:
                 return None
             context = _object(row["context"])
             vm = _object(context.get("vm"))
@@ -186,11 +187,47 @@ class VMIdleLifecycleStore:
                 or _uuid(vm.get("rootdisk_pvc_uid")) != expected["pvc_uid"]
             ):
                 return None
+            from orchestrator.services.vm_creation_preflight import (
+                _execution_binding,
+                idle_wake_predecessor,
+            )
+            from orchestrator.services.vm_creation_retry_store import VMCreationRetryConflict
+
+            try:
+                max_attempts = int(os.getenv("VM_PROVISION_MAX_ATTEMPTS", "3"))
+                raw_request = _object(_object(vm.get("creation_preflight")).get("request"))
+                current_storage = None
+                if raw_request.get("workspace_storage") is not None:
+                    from orchestrator.services.retained_vm_workspaces import provision_binding
+
+                    current_storage = await provision_binding(conn, job_id)
+                prior = idle_wake_predecessor(
+                    vm, job_id=job_id, pvc_uid=str(expected["pvc_uid"]),
+                    max_attempts=max_attempts, current_storage=current_storage,
+                )
+                binding = _execution_binding(prior)
+            except (
+                ValueError, TypeError, KeyError, HTTPException,
+                VMCreationRetryConflict,
+            ) as exc:
+                logger.info("VM idle release held for job %s: %s", job_id, exc)
+                return None
+            if (
+                execution["id"] != binding["execution_id"]
+                or execution["revision"] != binding["execution_revision"]
+                or execution["generation"] != binding["execution_generation"]
+                or execution["deadline"] != binding["admission_deadline"]
+            ):
+                logger.info("VM idle release held for job %s: execution_manifest_changed", job_id)
+                return None
             human_wait_current = bool(
                 row["status"] == "waiting_for_reply"
                 and freeze.get("route_id") == episode.wait_key
             )
             now = await conn.fetchval("SELECT clock_timestamp()")
+            if execution["deadline"] is not None and execution["deadline"] <= now:
+                logger.info("VM idle release held for job %s: job_admission_expired", job_id)
+                return None
             decision = evaluate_idle(
                 episode,
                 now=now,
@@ -644,6 +681,14 @@ class VMIdleLifecycleStore:
                         raise _WakeChanged
                     if updated.get("operator_pause_held"):
                         await cancel_queued_worker_batch(conn, job_id=owner_id)
+                # The operation ID authorizes this successor only while the
+                # wake is open. Remove its marker in the same close transaction
+                # so a later idle episode can reserve a different successor.
+                await conn.execute(
+                    "UPDATE jobs SET context=context #- '{vm,idle_wake_operation_id}' "
+                    "WHERE id=$1 AND context->'vm'->>'idle_wake_operation_id'=$2",
+                    owner_id, operation_id,
+                )
                 await conn.execute(
                     "UPDATE vm_idle_operations SET phase='ready',closed_at=clock_timestamp(),"
                     "last_progress_at=clock_timestamp() WHERE id=$1",
@@ -751,11 +796,13 @@ class VMIdleLifecycleStore:
                 UUID(operation_id), token, claimant,
             )
 
-    async def due_job_ids(self, *, limit: int = 16) -> list[str]:
+    async def due_job_ids(
+        self, *, limit: int = 16, after_id: UUID | None = None,
+    ) -> list[str]:
         if not 1 <= limit <= 64:
             raise ValueError("Invalid idle scan limit")
         async with self.db.acquire() as conn:
-            rows = await conn.fetch(
+            query = (
                 """
                 SELECT j.id FROM jobs j JOIN run_queue q ON q.unit_id=j.id
                 WHERE j.execution_lane='stateless' AND j.assigned_agent_id IS NULL
@@ -767,24 +814,34 @@ class VMIdleLifecycleStore:
                     SELECT 1 FROM vm_idle_operations o
                     WHERE o.owner_kind='job' AND o.owner_id=j.id AND o.closed_at IS NULL
                   )
+                  AND ($2::uuid IS NULL OR j.id>$2)
                 ORDER BY j.id LIMIT $1
-                """,
-                limit,
+                """
             )
+            rows = await conn.fetch(query, limit, after_id)
+            if not rows and after_id is not None:
+                rows = await conn.fetch(query, limit, None)
             return [str(row["id"]) for row in rows]
 
-    async def pending_operations(self, *, limit: int = 16) -> list[dict[str, Any]]:
+    async def pending_operations(
+        self, *, limit: int = 16, after_id: UUID | None = None,
+    ) -> list[dict[str, Any]]:
+        if not 1 <= limit <= 64:
+            raise ValueError("Invalid idle scan limit")
         async with self.db.acquire() as conn:
-            rows = await conn.fetch(
+            query = (
                 """
                 SELECT * FROM vm_idle_operations
                 WHERE closed_at IS NULL AND (retry_after IS NULL OR retry_after<=clock_timestamp())
                   AND (claim_expires_at IS NULL OR claim_expires_at<=clock_timestamp())
                   AND (phase<>'suspended' OR wake_requested)
-                ORDER BY admitted_at LIMIT $1
-                """,
-                limit,
+                  AND ($2::uuid IS NULL OR id>$2)
+                ORDER BY id LIMIT $1
+                """
             )
+            rows = await conn.fetch(query, limit, after_id)
+            if not rows and after_id is not None:
+                rows = await conn.fetch(query, limit, None)
             return [dict(row) for row in rows]
 
     async def get_operation(self, operation_id: str) -> dict[str, Any] | None:
@@ -872,6 +929,11 @@ class VMIdleLifecycleService:
         self.recovery_store = recovery_store
         self.claimant = claimant
         self.before_first_start = before_first_start
+        # Selection is process-local, while operation claims and admission are
+        # database-authoritative. The long-lived sweeper advances these cursors
+        # even when a whole page is ineligible, then wraps at the end.
+        self._nomination_cursor: UUID | None = None
+        self._operation_cursor: UUID | None = None
 
     async def nominate(self, *, limit: int = 16) -> int:
         if (
@@ -884,12 +946,24 @@ class VMIdleLifecycleService:
         ):
             return 0
         admitted = 0
-        for job_id in await self.store.due_job_ids(limit=limit):
+        due = await self.store.due_job_ids(
+            limit=limit, after_id=self._nomination_cursor,
+        )
+        self._nomination_cursor = UUID(due[-1]) if due else None
+        for job_id in due:
             try:
-                job = await self.db.get_job(job_id)
+                # get_job's public projection does not carry the native idle
+                # revision/episode columns. Read the source row for nomination;
+                # admit_release still performs the authoritative locked check.
+                job = await self.db.fetchrow(
+                    "SELECT workspace_idle_episode,workspace_idle_revision "
+                    "FROM jobs WHERE id=$1", UUID(job_id)
+                )
+                if job is None:
+                    continue
                 episode = read_episode(
-                    _episode_document(job.get("workspace_idle_episode")),
-                    revision=job.get("workspace_idle_revision"),
+                    _episode_document(job["workspace_idle_episode"]),
+                    revision=job["workspace_idle_revision"],
                 )
                 if episode is None:
                     continue
@@ -922,7 +996,11 @@ class VMIdleLifecycleService:
         """Advance only bounded due operations; every remote effect is outside locks."""
         await self.nominate(limit=limit)
         advanced = 0
-        for candidate in await self.store.pending_operations(limit=limit):
+        pending = await self.store.pending_operations(
+            limit=limit, after_id=self._operation_cursor,
+        )
+        self._operation_cursor = pending[-1]["id"] if pending else None
+        for candidate in pending:
             operation = await self.store.claim(
                 str(candidate["id"]), claimant=self.claimant, seconds=30
             )

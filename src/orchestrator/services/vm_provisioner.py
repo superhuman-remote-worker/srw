@@ -978,6 +978,8 @@ class VMProvisioner:
                 VMCreationPreflightStore,
                 _preflight,
                 creation_preflight_response,
+                idle_wake_predecessor,
+                idle_wake_request,
             )
             from orchestrator.services.vm_creation_retry_store import (
                 VMCreationRetryConflict,
@@ -997,11 +999,63 @@ class VMProvisioner:
             if not isinstance(vm, dict):
                 raise VMCreationRetryConflict("creation_request_unproven")
             previous = _preflight(vm)
+            if idle_wake_id is None and (
+                vm.get("status") in {"suspending", "suspended"}
+                or vm.get("_suspend_remote_io_closed") is not None
+                or vm.get("idle_wake_operation_id") is not None
+            ):
+                raise VMCreationRetryConflict("idle_wake_unproven")
+            if idle_wake_id is not None:
+                try:
+                    wake_uuid = UUID(idle_wake_id)
+                    if str(wake_uuid) != idle_wake_id:
+                        raise ValueError
+                except (TypeError, ValueError) as exc:
+                    raise VMCreationRetryConflict("idle_wake_unproven") from exc
+                async with self._db.acquire() as conn:
+                    wake = await conn.fetchrow(
+                        "SELECT wake_generation,wake_request_id,pvc_uid FROM vm_idle_operations "
+                        "WHERE id=$1 AND owner_kind='job' AND owner_id=$2 "
+                        "AND phase IN ('waking','wake_held') AND closed_at IS NULL",
+                        wake_uuid, UUID(job_id),
+                    )
+                if wake is None or wake["wake_generation"] is None:
+                    raise VMCreationRetryConflict("idle_wake_unproven")
+                generation = str(wake["wake_generation"])
+                if vm.get("idle_wake_operation_id") == idle_wake_id:
+                    if (
+                        previous is None
+                        or previous["request"]["provision_generation"] != generation
+                        or previous["request_id"] != str(wake["wake_request_id"])
+                    ):
+                        raise VMCreationRetryConflict("idle_wake_unproven")
+                    request = previous["request"]
+                else:
+                    if vm.get("status") != "suspended" or vm.get("idle_wake_operation_id") is not None:
+                        raise VMCreationRetryConflict("idle_wake_unproven")
+                    current_storage = None
+                    if previous and previous["request"].get("workspace_storage") is not None:
+                        from orchestrator.services.retained_vm_workspaces import provision_binding
+
+                        current_storage = await provision_binding(self._db, job_id)
+                    prior = idle_wake_predecessor(
+                        vm, job_id=job_id, pvc_uid=str(wake["pvc_uid"]),
+                        max_attempts=int(os.getenv("VM_PROVISION_MAX_ATTEMPTS", "3")),
+                        current_storage=current_storage,
+                    )
+                    request = idle_wake_request(
+                        prior, generation=generation, current_storage=current_storage,
+                    )
+                fresh_context = self._fresh_provision_ctx()
+                fresh_context["provision_generation"] = generation
+                preflight = await VMCreationPreflightStore(self._db).begin(
+                    job_id=job_id, request=request, fresh_context=fresh_context,
+                    max_attempts=int(os.getenv("VM_PROVISION_MAX_ATTEMPTS", "3")),
+                    idle_wake_id=idle_wake_id,
+                )
+                return creation_preflight_response(preflight)
             if previous and (vm.get("status") != "deleted" or not protocol_enabled):
-                if vm.get("idle_wake_operation_id") != idle_wake_id and (
-                    vm.get("idle_wake_operation_id") is not None
-                    or idle_wake_id is not None
-                ):
+                if vm.get("idle_wake_operation_id") is not None:
                     raise VMCreationRetryConflict("idle_wake_unproven")
                 # Existing operations keep their own authority even if admission
                 # was disabled or today's defaults differ. No queue mutation.
@@ -1041,23 +1095,6 @@ class VMProvisioner:
             return False
         if protocol_enabled:
             fresh_context = self._fresh_provision_ctx()
-            if idle_wake_id is not None:
-                try:
-                    wake_uuid = UUID(idle_wake_id)
-                    if str(wake_uuid) != idle_wake_id:
-                        raise ValueError
-                except (TypeError, ValueError) as exc:
-                    raise VMCreationRetryConflict("idle_wake_unproven") from exc
-                async with self._db.acquire() as conn:
-                    wake_generation = await conn.fetchval(
-                        "SELECT wake_generation FROM vm_idle_operations "
-                        "WHERE id=$1 AND owner_kind='job' AND owner_id=$2 "
-                        "AND phase IN ('waking','wake_held') AND closed_at IS NULL",
-                        wake_uuid, UUID(job_id),
-                    )
-                if wake_generation is None:
-                    raise VMCreationRetryConflict("idle_wake_unproven")
-                fresh_context["provision_generation"] = str(wake_generation)
             network_tier = (
                 await self._db.get_workspace_network_tier(job_id, "job")
                 or DEFAULT_NETWORK_TIER

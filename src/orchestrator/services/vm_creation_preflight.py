@@ -110,6 +110,72 @@ def creation_preflight_response(value):
     }
 
 
+def idle_wake_predecessor(
+    vm, *, job_id: str, pvc_uid: str, max_attempts: int,
+    current_storage: dict | None = None,
+):
+    """Validate the immutable first-create intent before retiring a usable VM.
+
+    A stopped workspace may reuse its disk, but it does not receive a fresh
+    provision-attempt or execution deadline budget. The original preflight
+    remains the predecessor record; its request is never edited in place.
+    """
+    prior = _preflight(vm)
+    attempts = vm.get("provision_attempts")
+    if (
+        prior is None
+        or prior["state"] not in {"admitted", "settled"}
+        or vm.get("creation_request_id") != prior["request_id"]
+        or vm.get("identity_authenticated") is not True
+        or vm.get("identity_provision_generation") != vm.get("provision_generation")
+        or vm.get("rootdisk_pvc_uid") != pvc_uid
+        or prior["request"].get("job_id") != job_id
+        or prior["request"].get("entity_type") != "job"
+        or type(attempts) is not int
+        or not 0 <= attempts < max_attempts
+    ):
+        raise VMCreationRetryConflict(
+            "vm_provisioning_exhausted"
+            if type(attempts) is int and attempts >= max_attempts
+            else "idle_wake_predecessor_unproven"
+        )
+    original_storage = prior["request"].get("workspace_storage")
+    if original_storage is not None:
+        from shared.vm_workspace_storage import storage_binding
+
+        try:
+            old_storage = storage_binding(original_storage)
+            current = storage_binding(current_storage)
+        except (TypeError, ValueError, AttributeError) as exc:
+            raise VMCreationRetryConflict("retained_disk_changed") from exc
+        if (
+            current["pvc_uid"] != pvc_uid
+            or old_storage["pvc_uid"] not in {None, pvc_uid}
+            or any(
+                old_storage[key] != current[key]
+                for key in ("uid", "generation", "owner_id", "owner_kind")
+            )
+        ):
+            raise VMCreationRetryConflict("retained_disk_changed")
+    elif current_storage is not None:
+        raise VMCreationRetryConflict("retained_disk_changed")
+    return prior
+
+
+def idle_wake_request(prior, *, generation: str, current_storage=None):
+    """Build a successor from captured options, changing only its generation.
+
+    A retained binding may gain the controller-attested PVC UID after its
+    initial create. Every other storage/accounting field stays immutable.
+    """
+    request = deepcopy(prior["request"])
+    request["provision_generation"] = generation
+    if current_storage is not None:
+        request["workspace_storage"] = deepcopy(current_storage)
+    canonical_request_digest(request)
+    return request
+
+
 class VMCreationPreflightStore:
     def __init__(self, db):
         self.db = db
@@ -235,6 +301,12 @@ class VMCreationPreflightStore:
             async with conn.transaction():
                 job, context, old_vm, prior = await self._lock(conn, owner)
                 idle_wake = None
+                if idle_wake_id is None and (
+                    old_vm.get("status") in {"suspending", "suspended"}
+                    or old_vm.get("_suspend_remote_io_closed") is not None
+                    or old_vm.get("idle_wake_operation_id") is not None
+                ):
+                    raise VMCreationRetryConflict("idle_wake_unproven")
                 if idle_wake_id is not None:
                     try:
                         wake_uuid = UUID(idle_wake_id)
@@ -268,6 +340,27 @@ class VMCreationPreflightStore:
                         )
                     ):
                         raise VMCreationRetryConflict("idle_wake_unproven")
+                idle_first = bool(
+                    idle_wake is not None
+                    and old_vm.get("status") == "suspended"
+                    and job["status"] in {"waiting_for_reply", "pending_review", "paused"}
+                )
+                if idle_first:
+                    current_storage = None
+                    if prior and prior["request"].get("workspace_storage") is not None:
+                        from orchestrator.services.retained_vm_workspaces import provision_binding
+
+                        current_storage = await provision_binding(conn, job_id)
+                    predecessor = idle_wake_predecessor(
+                        old_vm, job_id=job_id, pvc_uid=str(idle_wake["pvc_uid"]),
+                        max_attempts=max_attempts, current_storage=current_storage,
+                    )
+                    if request != idle_wake_request(
+                        predecessor,
+                        generation=str(idle_wake["wake_generation"]),
+                        current_storage=current_storage,
+                    ):
+                        raise VMCreationRetryConflict("idle_wake_request_changed")
                 # Completed provenance belongs to the retired generation. Its
                 # successor still needs the exact receipt and retained-disk
                 # cleanup chain below; keeping provenance must not bar it.
@@ -275,7 +368,7 @@ class VMCreationPreflightStore:
                     old_vm.get("status") == "deleted"
                     and old_vm.get("retirement_cleanup_pending") is not True
                 )
-                if prior and not (retired and prior["state"] == "admitted"):
+                if prior and not idle_first and not (retired and prior["state"] == "admitted"):
                     if (old_vm.get("idle_wake_operation_id") or idle_wake_id) and (
                         old_vm.get("idle_wake_operation_id") != idle_wake_id
                     ):
@@ -287,11 +380,6 @@ class VMCreationPreflightStore:
                         retry=_execution_binding(prior),
                     )
                     return prior
-                idle_first = bool(
-                    idle_wake is not None
-                    and old_vm.get("status") == "suspended"
-                    and job["status"] in {"waiting_for_reply", "pending_review", "paused"}
-                )
                 if idle_wake is not None and not idle_first:
                     raise VMCreationRetryConflict("idle_wake_unproven")
                 if (not idle_first and job["status"] not in {"created", "paused"}) or (
