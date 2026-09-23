@@ -2247,10 +2247,13 @@ _BACKGROUND_TASK_SHUTDOWN_ORDER: tuple[str, ...] = (
 )
 
 
-async def _start_application(tasks: ApplicationTaskSet) -> None:
-    """Connect the stores, run migrations and bootstraps, bind the services and
-    start the lifecycle's background tasks (R1.B11 split of ``lifespan``)."""
-    global _persistent_thread_recycler
+async def _open_stores() -> tuple[bool, Any]:
+    """Connect the databases, run migrations and seeds, build the usage ledger
+    and the metering bootstrap, and run the startup backfills.
+
+    Returns whether the audit tier is ready and the metering schema
+    capabilities; the background tasks need both.
+    """
 
     # Connect to databases
     await postgres_db.connect()
@@ -2452,6 +2455,12 @@ async def _start_application(tasks: ApplicationTaskSet) -> None:
 
     # Idempotent data backfills (R1.B11: moved to services/startup_backfills).
     await run_startup_backfills(postgres_db)
+    return audit_ready, metering_capabilities
+
+
+async def _bind_services() -> None:
+    """Bind clients, provisioners and notification services to the stores."""
+    global _persistent_thread_recycler
 
     # Wire the model registry's catalog lookup to the DB. The registry lives
     # in src/core/ and must not import orchestrator/, so the hook is injected
@@ -2700,6 +2709,15 @@ async def _start_application(tasks: ApplicationTaskSet) -> None:
         return strategy
 
     imap_poller.connect(db=postgres_db, reply_handler=_imap_reply_handler)
+
+
+async def _start_background_tasks(
+    tasks: ApplicationTaskSet,
+    *,
+    audit_ready: bool,
+    metering_capabilities: Any,
+) -> None:
+    """Start the lifecycle's background tasks, in their fixed order."""
 
     # Start background tasks. The lifecycle's task set owns them: leader-only
     # loops go through run_when_leader, and shutdown awaits every started task
@@ -3377,6 +3395,19 @@ async def _start_application(tasks: ApplicationTaskSet) -> None:
     tasks.start(
         "main_cloud_listen",
         run_listen_loop(postgres_db, _main_cloud_reload_callback, _shutdown_event),
+    )
+
+
+async def _start_application(tasks: ApplicationTaskSet) -> None:
+    """Startup, in order: stores, service binding, background tasks
+    (R1.B11 split of ``lifespan``)."""
+
+    audit_ready, metering_capabilities = await _open_stores()
+    await _bind_services()
+    await _start_background_tasks(
+        tasks,
+        audit_ready=audit_ready,
+        metering_capabilities=metering_capabilities,
     )
 
 

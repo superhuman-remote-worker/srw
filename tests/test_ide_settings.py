@@ -1570,7 +1570,7 @@ class TestSweeperRegistrationShape:
 
         import orchestrator.main as orchestrator_main
 
-        tree = ast.parse(inspect.getsource(orchestrator_main._start_application))
+        tree = ast.parse(inspect.getsource(orchestrator_main._start_background_tasks))
         gated = []
         for node in ast.walk(tree):
             if not (
@@ -1585,7 +1585,7 @@ class TestSweeperRegistrationShape:
                 target = target.args[0]
             gated.append(ast.unparse(target))
         assert "code_server_settings_sweeper" in gated
-        mentions = inspect.getsource(orchestrator_main._start_application).count(
+        mentions = inspect.getsource(orchestrator_main._start_background_tasks).count(
             "code_server_settings_sweeper"
         )
         assert mentions == 1

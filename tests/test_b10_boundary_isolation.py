@@ -370,14 +370,23 @@ async def test_unbinding_forgets_only_that_store() -> None:
     )
 
 
-def _lifespan() -> ast.AsyncFunctionDef:
-    """The application's startup body (R1.B11 moved it from ``lifespan``
-    into ``_start_application``; ``lifespan`` now only sequences it)."""
+def _lifespan() -> ast.Module:
+    """The application's startup, in order (R1.B11 moved it from ``lifespan``
+    into three phases: stores, service binding, background tasks)."""
     tree = ast.parse(MAIN.read_text())
-    return next(
-        node
+    phases = {
+        node.name: node
         for node in tree.body
-        if isinstance(node, ast.AsyncFunctionDef) and node.name == "_start_application"
+        if isinstance(node, ast.AsyncFunctionDef)
+        and node.name in {"_open_stores", "_bind_services", "_start_background_tasks"}
+    }
+    return ast.Module(
+        body=[
+            *phases["_open_stores"].body,
+            *phases["_bind_services"].body,
+            *phases["_start_background_tasks"].body,
+        ],
+        type_ignores=[],
     )
 
 
