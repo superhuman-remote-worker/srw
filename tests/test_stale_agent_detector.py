@@ -215,7 +215,9 @@ async def test_permanent_retirement_recovers_from_exact_absent_sandbox_pod(
         patch.object(main, "container_provisioner", container_provisioner),
     ):
         assert (
-            await main._recover_captured_sandbox_process_zero(retirement)
+            await main._pinned_retirement_operations().recover_captured_process_zero(
+                retirement
+            )
             is expected_recovery
         )
 
@@ -302,7 +304,9 @@ async def test_soft_retirement_recovers_never_delivered_warm_runtime():
         patch.object(main, "postgres_db", db),
         patch.object(main, "agent_provisioner", provisioner),
     ):
-        assert await main._recover_captured_sandbox_process_zero(retirement)
+        assert await main._pinned_retirement_operations().recover_captured_process_zero(
+            retirement
+        )
 
     db.acknowledge_pinned_thread_local_quiescence.assert_awaited_once_with(
         thread_id,
@@ -1018,7 +1022,9 @@ async def test_lite_backend_retirement_recovers_through_agent_runtime_zero(
         patch.object(main, "postgres_db", db),
         patch.object(main, "agent_provisioner", provisioner),
     ):
-        assert await main._recover_captured_sandbox_process_zero(retirement)
+        assert await main._pinned_retirement_operations().recover_captured_process_zero(
+            retirement
+        )
 
     provisioner.delete_agent_pod_exact.assert_awaited_once_with(
         "persistent-lite", expected_pod_uid="lite-pod-uid", namespace="agents-a"
@@ -1078,7 +1084,9 @@ async def test_non_sandbox_recovery_uses_the_captured_vm_actuator(monkeypatch, b
         patch.object(main, "agent_provisioner", provisioner),
         patch.object(main, "vm_provisioner", vm_provisioner),
     ):
-        assert await main._recover_captured_sandbox_process_zero(retirement)
+        assert await main._pinned_retirement_operations().recover_captured_process_zero(
+            retirement
+        )
 
     provisioner.delete_agent_pod_exact.assert_awaited_once_with(
         "persistent-lite", expected_pod_uid="lite-pod-uid", namespace="agents-a"
@@ -1132,7 +1140,9 @@ async def test_unactuated_backend_recovery_refusal_is_logged(
         patch.object(main, "postgres_db", db),
         patch.object(main, "agent_provisioner", provisioner),
     ):
-        assert not await main._recover_captured_sandbox_process_zero(retirement)
+        assert not await main._pinned_retirement_operations().recover_captured_process_zero(
+            retirement
+        )
 
     provisioner.delete_agent_pod_exact.assert_not_awaited()
     db.acknowledge_pinned_thread_local_quiescence.assert_not_awaited()
@@ -1358,7 +1368,9 @@ async def test_recovery_logs_when_the_receipt_is_refused_after_the_pod_stop(
         patch.object(main, "postgres_db", db),
         patch.object(main, "agent_provisioner", provisioner),
     ):
-        assert not await main._recover_captured_sandbox_process_zero(retirement)
+        assert not await main._pinned_retirement_operations().recover_captured_process_zero(
+            retirement
+        )
 
     # Both contracts were consulted for this used-or-created lite life.
     db.acknowledge_pinned_thread_local_quiescence.assert_awaited_once()

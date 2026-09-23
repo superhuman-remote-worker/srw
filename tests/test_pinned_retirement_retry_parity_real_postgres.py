@@ -17,6 +17,7 @@ state, and that a permanent retirement *without* that proof stays refused.
 
 from __future__ import annotations
 
+from orchestrator.services import stale_agent_detector as stale_agent_detector_service
 import json
 from unittest.mock import AsyncMock, MagicMock
 from uuid import UUID, uuid4
@@ -202,7 +203,9 @@ async def test_durable_retry_settles_a_soft_ended_permanent_delete(
     await _first_permanent_delete_fails(db, monkeypatch, ids)
 
     candidate = await _durable_candidate(db, ids)
-    assert await main._retry_pending_pinned_retirement(candidate)
+    assert await stale_agent_detector_service.retry_pending_pinned_retirement(
+        candidate, dependencies=main._stale_agent_detector_dependencies()
+    )
     assert await db.get_thread(ids["thread"]) is None
     assert await db.list_retryable_pinned_retirements(grace_seconds=0) == []
 
@@ -256,7 +259,9 @@ async def test_durable_retry_keeps_refusing_a_live_permanent_delete_without_proo
 
     candidate = await _durable_candidate(db, ids)
     caplog.set_level("WARNING")
-    assert not await main._retry_pending_pinned_retirement(candidate)
+    assert not await stale_agent_detector_service.retry_pending_pinned_retirement(
+        candidate, dependencies=main._stale_agent_detector_dependencies()
+    )
     assert "no process-zero actuator" in caplog.text
     pending = await db.get_thread(ids["thread"])
     assert pending is not None
@@ -284,7 +289,9 @@ class _OneDetectorPass:
 
 
 async def _run_one_detector_pass() -> None:
-    await main.stale_agent_detector(_OneDetectorPass())
+    await stale_agent_detector_service.stale_agent_detector(
+        _OneDetectorPass(), dependencies=main._stale_agent_detector_dependencies()
+    )
 
 
 async def _agent_receipted_permanent_handoff(db, monkeypatch) -> dict[str, str]:
@@ -438,7 +445,9 @@ async def test_one_detector_pass_finishes_an_agent_receipted_exit_handoff(
     db, monkeypatch
 ):
     ids = await _agent_receipted_permanent_handoff(db, monkeypatch)
-    monkeypatch.setattr(main, "_PINNED_RETIREMENT_PROVEN_RETRY_GRACE_SECONDS", 0)
+    monkeypatch.setattr(
+        stale_agent_detector_service, "PINNED_RETIREMENT_PROVEN_RETRY_GRACE_SECONDS", 0
+    )
     await _run_one_detector_pass()
     assert await db.get_thread(ids["thread"]) is None
 
@@ -451,7 +460,9 @@ async def test_one_detector_pass_finishes_a_soft_settled_permanent_delete(
     ids = await _owner_session(db, monkeypatch, backend=backend)
     await _soft_end(db, ids)
     await _first_permanent_delete_fails(db, monkeypatch, ids)
-    monkeypatch.setattr(main, "_PINNED_RETIREMENT_PROVEN_RETRY_GRACE_SECONDS", 0)
+    monkeypatch.setattr(
+        stale_agent_detector_service, "PINNED_RETIREMENT_PROVEN_RETRY_GRACE_SECONDS", 0
+    )
     await _run_one_detector_pass()
     assert await db.get_thread(ids["thread"]) is None
 
@@ -480,7 +491,9 @@ async def test_one_detector_pass_does_not_nominate_an_unproven_row_early(
         "WHERE id=$1::uuid",
         ids["agent"],
     )
-    monkeypatch.setattr(main, "_PINNED_RETIREMENT_PROVEN_RETRY_GRACE_SECONDS", 0)
+    monkeypatch.setattr(
+        stale_agent_detector_service, "PINNED_RETIREMENT_PROVEN_RETRY_GRACE_SECONDS", 0
+    )
     # The query itself does not nominate it early (the retry's own guard is
     # a second, independent layer).
     await db.execute(

@@ -45,7 +45,7 @@ configure_logging(
 from datetime import date, datetime, timedelta, timezone  # noqa: E402
 from decimal import Decimal  # noqa: E402
 from collections.abc import Mapping  # noqa: E402
-from typing import Any, Literal, Optional  # noqa: E402
+from typing import Any, Optional  # noqa: E402
 from uuid import UUID  # noqa: E402
 
 from fastapi import (  # noqa: E402
@@ -680,7 +680,6 @@ from orchestrator.services.session_wake import (  # noqa: E402
     maybe_wake_session,
     notify_all_officers,
     notify_officer,
-    notify_owning_officers,
     session_wake_sweeper_loop,
 )
 from shared.pinned_session_identity import PinnedSessionBinding  # noqa: E402
@@ -709,6 +708,10 @@ from orchestrator.services.infrastructure_metering import (  # noqa: E402
 )
 from orchestrator.services.startup_backfills import run_startup_backfills  # noqa: E402
 from orchestrator.services import job_dispatcher  # noqa: E402
+from orchestrator.services import (  # noqa: E402
+    pinned_k8s_reconciliation as pinned_k8s_reconciliation_service,
+)
+from orchestrator.services import stale_agent_detector as stale_agent_detector_service  # noqa: E402
 from orchestrator.services.infrastructure_metering.bootstrap import (  # noqa: E402
     bootstrap_infrastructure_metering,
 )
@@ -826,7 +829,6 @@ from orchestrator.services.persistent_recycler import (  # noqa: E402
     PersistentThreadRecycler,
 )
 from orchestrator.services.pinned_agent_authority import (  # noqa: E402
-    reconcile_legacy_pinned_agent_authority,
     release_pinned_warm_binding_protection,
     reserve_pinned_warm_agent_binding,
 )
@@ -1144,25 +1146,6 @@ COMPLETION_FINALIZER_INLINE_DELAY_SECONDS = max(
     float(os.environ.get("COMPLETION_FINALIZER_INLINE_DELAY_SECONDS", "0")),
 )
 
-# Durable pinned retirement is retried only after the exact local agent is
-# absent/offline and this grace has elapsed.  This is deliberately longer than
-# ordinary local teardown: a live runtime owns memory/git/event-writer drain
-# after Begin and before its final settlement request.
-_PINNED_RETIREMENT_RETRY_GRACE_SECONDS = max(
-    0, int(os.environ.get("PINNED_RETIREMENT_RETRY_GRACE_SECONDS", "900"))
-)
-_PINNED_RETIREMENT_PREFLIGHT_GRACE_SECONDS = max(
-    1, int(os.environ.get("PINNED_RETIREMENT_PREFLIGHT_GRACE_SECONDS", "300"))
-)
-# Once the exact agent's local-quiescence receipt exists, or a permanent
-# delete follows a same-generation soft settlement, no live drain remains for
-# the grace above to wait out. Such a row is only the orchestrator-side
-# "owner/reconciler retry" of the exit handoff; this short grace keeps the
-# sweep from racing the request that is still finishing it.
-_PINNED_RETIREMENT_PROVEN_RETRY_GRACE_SECONDS = max(
-    0, int(os.environ.get("PINNED_RETIREMENT_PROVEN_RETRY_GRACE_SECONDS", "60"))
-)
-
 # S36 explicitly overrides the workspace Pod's ordinary 120-second grace with
 # a 10-second UID-preconditioned delete. Keep the exact-absence proof below the
 # pinned agent's 60-second report timeout while leaving room for API latency.
@@ -1193,638 +1176,26 @@ _project_repair_state = project_provisioning_operations.ProjectRepairState()
 cloud_task_registry = CloudTaskRegistry()
 
 
-async def _retire_orphaned_pinned_runtime(candidate: Mapping[str, Any]) -> bool:
-    """Retire one offline incarnation through the normal pinned End funnel.
+def _stale_agent_detector_dependencies() -> (
+    stale_agent_detector_service.StaleAgentDetectorDependencies
+):
+    """Bind agent reconciliation and the durable retirement retry (R1.B11).
 
-    The candidate is a read-only hint. ``begin_pinned_thread_retirement``
-    rechecks the exact generation, agent, attach attempt and offline state in
-    its row transaction before closing admission. A recovered/rebound agent is
-    therefore preserved even when it changes immediately after the sweep.
+    Retirement operations are providers: they are recomposed per call from
+    current application state, exactly as the former in-module calls did.
     """
 
-    thread_id = str(candidate.get("id") or "")
-    generation = str(candidate.get("runtime_generation") or "")
-    agent_id = str(candidate.get("agent_id") or "")
-    attach_token = (
-        str(candidate.get("runtime_attach_token"))
-        if candidate.get("runtime_attach_token") is not None
-        else None
+    return stale_agent_detector_service.StaleAgentDetectorDependencies(
+        store=postgres_db,
+        agent_provisioner=agent_provisioner,
+        docker_provisioner=docker_provisioner,
+        audit_reader=audit_reader,
+        completion_commands_enabled=COMPLETION_COMMANDS_ENABLED,
+        trigger_dispatch=_trigger_dispatch,
+        schedule_attach_abort_successor=_schedule_attach_abort_successor,
+        thread_retirement_operations=_thread_retirement_operations,
+        pinned_retirement_operations=_pinned_retirement_operations,
     )
-    if not thread_id or not generation or not agent_id:
-        return False
-    settle_status: Literal["ended", "suspended"] = (
-        "suspended"
-        if str(candidate.get("status") or "") in {"awaiting_user", "suspended"}
-        else "ended"
-    )
-
-    thread = await postgres_db.get_thread(thread_id)
-    if not isinstance(thread, Mapping):
-        return False
-    try:
-        await _thread_retirement_operations().end_thread_flow(
-            thread_id,
-            dict(thread),
-            permanent=False,
-            force=True,
-            expected_runtime_generation=generation,
-            expected_agent_id=agent_id,
-            expected_attach_token=attach_token,
-            require_expected_agent_offline=True,
-            settle_status=settle_status,
-        )
-    except HTTPException as exc:
-        if exc.status_code == 409:
-            logger.info(
-                "Offline-runtime retirement lost authority for thread %s; "
-                "preserving the current runtime",
-                thread_id,
-            )
-            return False
-        raise
-    return True
-
-
-async def _retry_pending_pinned_retirement(candidate: Mapping[str, Any]) -> bool:
-    """Retry one exact durable retirement after its local actor disappeared."""
-
-    context = candidate.get("runtime_retirement_context") or {}
-    if isinstance(context, str):
-        try:
-            context = json.loads(context)
-        except (TypeError, ValueError):
-            return False
-    if not isinstance(context, Mapping):
-        return False
-    thread_id = str(candidate.get("id") or "")
-    generation = str(candidate.get("runtime_generation") or "")
-    token = str(candidate.get("runtime_retirement_token") or "")
-    settle_status = str(context.get("settle_status") or "")
-    if (
-        not thread_id
-        or not generation
-        or not token
-        or settle_status
-        not in {
-            "ended",
-            "suspended",
-        }
-    ):
-        return False
-    if str(context.get("generation") or "") != generation:
-        return False
-    permanent = bool(candidate.get("runtime_retirement_permanent"))
-    if permanent and settle_status != "ended":
-        return False
-    expected_agent_id = (
-        str(context.get("agent_id")) if context.get("agent_id") is not None else None
-    )
-    expected_attach_token = (
-        str(context.get("runtime_attach_token"))
-        if context.get("runtime_attach_token") is not None
-        else None
-    )
-    thread = await postgres_db.get_thread(thread_id)
-    if not isinstance(thread, Mapping):
-        return False
-    runtime_exposed = _retirement_context_runtime_exposed(
-        {
-            "generation": generation,
-            "token": token,
-            "permanent": permanent,
-            "context": context,
-        }
-    )
-    if (
-        runtime_exposed
-        and not _retirement_has_exact_local_quiescence(
-            {
-                "generation": generation,
-                "token": token,
-                "permanent": permanent,
-                "context": context,
-            },
-            thread,
-        )
-        # A same-generation soft settlement already proved this life reached
-        # process zero, and admission has stayed closed since. The End funnel
-        # accepts that proof for a permanent delete (it rechecks it under the
-        # lifecycle lock), so the retry must not demand a second, fresh one:
-        # a soft-Ended session has no captured actor left to stop and would
-        # otherwise stay pending until an owner retried by hand.
-        and not (
-            permanent
-            and await postgres_db.pinned_thread_has_prior_soft_settlement(
-                thread_id,
-                runtime_generation=generation,
-                retirement_token=token,
-            )
-        )
-    ):
-        if candidate.get("nominated_before_grace"):
-            # Nominated early for a proof it no longer shows exactly. Crash
-            # recovery stays behind the full live-drain grace.
-            return False
-        recovered = await _recover_captured_sandbox_process_zero(
-            {
-                "generation": generation,
-                "token": token,
-                "permanent": permanent,
-                "context": context,
-            }
-        )
-        if not recovered:
-            logger.warning(
-                "Pinned retirement crash recovery could not prove process zero "
-                "for thread %s (backend %r); the durable marker stays pending",
-                thread_id,
-                context.get("workspace_backend"),
-            )
-            return False
-        thread = await postgres_db.get_thread(thread_id)
-        if thread is None:
-            return True
-        if str(thread.get("runtime_retirement_token") or "") != token:
-            return str(thread.get("status") or "") in {"ended", "suspended"}
-    try:
-        result = await _thread_retirement_operations().end_thread_flow(
-            thread_id,
-            dict(thread),
-            permanent=permanent,
-            force=True,
-            expected_runtime_generation=generation,
-            expected_agent_id=expected_agent_id,
-            expected_attach_token=expected_attach_token,
-            # Exact physical process zero above supersedes the lossy `offline`
-            # status hint.  A token itself rejects heartbeats, so offline can
-            # never be used as a quiescence proof.
-            require_expected_agent_offline=False,
-            settle_status=settle_status,
-            local_runtime_quiesced=runtime_exposed,
-        )
-    except HTTPException as exc:
-        # Exact authority loss is a successful refusal; a retryable cleanup
-        # failure remains represented by the durable marker for a later pass.
-        # Either way it is worth a line — an all-refusing sweep used to be
-        # indistinguishable from an idle one.
-        if exc.status_code in {409, 503}:
-            logger.warning(
-                "Durable pinned retirement retry refused for thread %s (HTTP %s): %s",
-                thread_id,
-                exc.status_code,
-                exc.detail,
-            )
-            return False
-        raise
-    return str(result.get("status") or "") in {
-        "deleted" if permanent else settle_status
-    }
-
-
-async def stale_agent_detector(shutdown_event: asyncio.Event) -> None:
-    """Background task that reconciles agent state every 60 seconds.
-
-    Two dimensions of reconciliation:
-
-    1. Heartbeat freshness — agents that stopped reporting get marked offline,
-       which in turn flips their threads to 'ended' and pauses their jobs.
-    2. Self-reported consistency — agents that *are* heartbeating but report
-       internally inconsistent state (working with no job, session bound to
-       an ended thread) get flipped back to 'ready' so the dispatcher can
-       reuse the slot. These zombies pass the heartbeat check and would
-       otherwise hold pool slots indefinitely.
-
-    Finally, offline agents older than 24h are GC'd to keep the table small.
-    """
-    logger.info("Stale agent detector started")
-
-    async def _step(name: str, coro) -> Any:
-        """Run one reconciliation step isolated from its siblings.
-
-        Every step here repairs an INDEPENDENT inconsistency; a bug in one
-        must degrade only that dimension. The 2026-07-11 incident proved the
-        alternative: a bind-type bug in the graph-progress sweep silently
-        disabled orphan-job recovery (and everything else after it) for ~36h
-        because all steps shared one try block. See
-        knowledge-history/done/stale_agent_detector_sql_crash_disables_recovery_sweeps.md.
-        Returns None on failure — callers treat that as "no rows".
-        """
-        try:
-            return await coro
-        except Exception as e:
-            logger.error(f"Stale agent detector step '{name}' failed: {e}")
-            return None
-
-    while not shutdown_event.is_set():
-        try:
-            # 1. Heartbeat-based: mark non-responsive agents offline
-            offline_agents = await _step(
-                "offline_marking",
-                postgres_db.mark_stale_agents_offline(timeout_minutes=3),
-            )
-            if offline_agents:
-                logger.info(
-                    f"Marked {len(offline_agents)} agent(s) as offline due to "
-                    "missed heartbeats"
-                )
-                # Officer wake (centurion S4), scoped to the project each dead
-                # agent was serving (derived from its assigned/last job): a
-                # failing agent in one project is that officer's news, not the
-                # whole roster's (owner ruling, 2026-08). Agents with no
-                # derivable project keep the historical fleet-wide fan-out —
-                # a warm-pool agent dying genuinely is capacity news for every
-                # officer. 10-min debounce on 'fleet' keeps a flapping node
-                # from spamming.
-                offline_by_project: dict[str, int] = {}
-                unattributed_offline = 0
-                for agent_row in offline_agents:
-                    agent_project = agent_row.get("project_id")
-                    if agent_project:
-                        offline_by_project[str(agent_project)] = (
-                            offline_by_project.get(str(agent_project), 0) + 1
-                        )
-                    else:
-                        unattributed_offline += 1
-                if offline_by_project:
-                    await _step(
-                        "officer_fleet_offline",
-                        notify_owning_officers(
-                            postgres_db,
-                            {
-                                project_id: {
-                                    "summary": (
-                                        f"{n} agent(s) marked offline "
-                                        "(missed heartbeats)"
-                                    )
-                                }
-                                for project_id, n in offline_by_project.items()
-                            },
-                            source="fleet",
-                            dedup_key="fleet:agents_offline",
-                        ),
-                    )
-                if unattributed_offline:
-                    await _step(
-                        "officer_fleet_offline",
-                        notify_all_officers(
-                            postgres_db,
-                            source="fleet",
-                            dedup_key="fleet:agents_offline",
-                            payload={
-                                "summary": (
-                                    f"{unattributed_offline} agent(s) marked "
-                                    "offline (missed heartbeats)"
-                                )
-                            },
-                        ),
-                    )
-                _kick_officer_event_drain(postgres_db)
-
-            # 2. Consistency-based: release slots held by zombie agents
-            stuck_working = await _step(
-                "stuck_working", postgres_db.mark_stuck_working_agents_ready()
-            )
-            if stuck_working:
-                logger.info(
-                    f"Released {stuck_working} agent(s) stuck in 'working' with no job"
-                )
-                _trigger_dispatch()
-            stalled_working = await _step(
-                "graph_progress_stall",
-                postgres_db.mark_stalled_working_agents_by_graph_progress(
-                    stall_minutes=10
-                ),
-            )
-            if stalled_working:
-                logger.info(
-                    "Released %d working agent(s) with no graph-progress "
-                    "for the stall interval",
-                    stalled_working,
-                )
-                _trigger_dispatch()
-            stuck_session = await _step(
-                "stuck_session", postgres_db.mark_stuck_session_agents_ready()
-            )
-            if stuck_session:
-                logger.info(
-                    f"Released {stuck_session} agent(s) stuck in 'session' "
-                    f"on ended thread"
-                )
-
-            # 2b. STOPGAP — reap session agents wedged with NO bound thread/job.
-            # mark_stuck_session_agents_ready (above) can't reach these: its
-            # predicate needs thread_id IS NOT NULL, and a *live* agent
-            # re-asserts 'session' on every 5s heartbeat so a flip-to-ready
-            # never sticks — deleting the pod is the only actuation that does.
-            # Scoped to thread_id + current_job_id both NULL (holds nothing
-            # user-visible), so it never touches a thread-bound live session
-            # (the 2026-06-10 incident). Proper fix = the intent/observed split
-            # in knowledge-base/knowledge/features/unified_instance_lifecycle.md. Tracking:
-            # knowledge-base/knowledge/issues/lifecycle_session_agents_without_thread_never_drain.md
-            orphaned_sessions = await _step(
-                "orphaned_session_reap",
-                postgres_db.reap_orphaned_session_agents(grace_minutes=5),
-            )
-            for orphan in orphaned_sessions or []:
-                deleted = await _step(
-                    "orphaned_session_pod_delete",
-                    agent_provisioner.delete_agent_pod(
-                        orphan["hostname"],
-                        expected_pod_uid=str(orphan.get("pod_uid") or ""),
-                    ),
-                )
-                logger.warning(
-                    "Reaped orphaned session agent %s (pod=%s, deleted=%s): "
-                    "'session' with no thread/job past grace",
-                    orphan["id"],
-                    orphan["hostname"],
-                    deleted,
-                )
-
-            # 2c. A failed warm attach rotates G1 -> unbound G2 and records an
-            # append-only outcome. The request-local scheduler is only the
-            # latency fast path; this durable scan is the restart/transient-
-            # failure owner for headless sessions. Every task remains keyed to
-            # the exact retired tuple and may provision only the named G2.
-            attach_abort_successors = await _step(
-                "attach_abort_successors",
-                postgres_db.list_retryable_thread_attach_abort_successors(limit=25),
-            )
-            for successor in attach_abort_successors or []:
-                if not isinstance(successor, Mapping):
-                    continue
-                _schedule_attach_abort_successor(
-                    str(successor.get("thread_id") or ""),
-                    retired_runtime_generation=str(
-                        successor.get("retired_runtime_generation") or ""
-                    ),
-                    retired_attach_token=str(
-                        successor.get("retired_attach_token") or ""
-                    ),
-                    retired_agent_id=str(successor.get("retired_agent_id") or ""),
-                )
-
-            # 3. Propagate: exact pinned runtimes bound to offline agents go
-            # through begin -> exact cleanup -> settle. The old set-based
-            # status write made Resume visible before cleanup and let stale
-            # name deletes destroy its successor.
-            ended_candidates = await _step(
-                "orphaned_threads_ended", postgres_db.mark_orphaned_threads_ended()
-            )
-            if ended_candidates:
-                retired = 0
-                for candidate in ended_candidates:
-                    if isinstance(candidate, Mapping) and await _step(
-                        "retire_orphaned_pinned_runtime",
-                        _retire_orphaned_pinned_runtime(candidate),
-                    ):
-                        retired += 1
-                if retired:
-                    logger.info(
-                        "Retired %d offline pinned runtime(s) through exact End",
-                        retired,
-                    )
-
-            # 3b. Paused offline runtimes use the same safe funnel. They settle
-            # as resumable ended sessions rather than exposing an automatic
-            # suspended wake before exact cleanup has completed.
-            suspended_candidates = await _step(
-                "orphaned_threads_suspended",
-                postgres_db.mark_orphaned_threads_suspended(),
-            )
-            if suspended_candidates:
-                retired = 0
-                for candidate in suspended_candidates:
-                    if isinstance(candidate, Mapping) and await _step(
-                        "retire_orphaned_paused_runtime",
-                        _retire_orphaned_pinned_runtime(candidate),
-                    ):
-                        retired += 1
-                if retired:
-                    logger.info(
-                        "Retired %d paused offline pinned runtime(s) through exact End",
-                        retired,
-                    )
-
-            # 3c. A hidden Begin is a short-lived admission preflight, not an
-            # End instruction. If its owner dies before the append-only
-            # authorization edge, exact expiry reopens the same runtime. The
-            # row lock makes authorize-vs-expire choose exactly one outcome.
-            expired_preflights = await _step(
-                "stale_pinned_retirement_preflights",
-                postgres_db.abort_stale_pinned_retirement_preflights(
-                    grace_seconds=_PINNED_RETIREMENT_PREFLIGHT_GRACE_SECONDS,
-                    limit=25,
-                ),
-            )
-            if expired_preflights:
-                logger.warning(
-                    "Reopened %d abandoned pinned retirement preflight(s)",
-                    len(expired_preflights),
-                )
-
-            # 3d. Authorized Begin is durable.  If an orchestrator/agent dies after it
-            # closes admission, Resume must remain blocked until another
-            # replica finishes the immutable captured disposition.  Only
-            # sufficiently old markers whose exact actor is absent/offline
-            # are nominated; the shared advisory lock serializes replicas.
-            pending_retirements = await _step(
-                "pending_pinned_retirements",
-                postgres_db.list_retryable_pinned_retirements(
-                    grace_seconds=_PINNED_RETIREMENT_RETRY_GRACE_SECONDS,
-                    limit=25,
-                    proven_grace_seconds=_PINNED_RETIREMENT_PROVEN_RETRY_GRACE_SECONDS,
-                ),
-            )
-            if pending_retirements:
-                retired = 0
-                for candidate in pending_retirements:
-                    if isinstance(candidate, Mapping) and await _step(
-                        "retry_pending_pinned_retirement",
-                        _retry_pending_pinned_retirement(candidate),
-                    ):
-                        retired += 1
-                if retired:
-                    logger.info(
-                        "Completed %d durable pinned retirement retry(s)", retired
-                    )
-                unresolved = len(pending_retirements) - retired
-                if unresolved:
-                    logger.warning(
-                        "%d durable pinned retirement(s) remain unresolved after "
-                        "this pass; each refusal is logged above",
-                        unresolved,
-                    )
-
-            # Static Docker containers survive owner termination.  Their
-            # exact inventory lease plus the terminal job/thread row is the
-            # durable retry owner for managed-repository ssh-agent process
-            # retirement.  This sweep closes crashes between a terminal DB
-            # transition and cleanup, retries typed retirement failures, and
-            # reclaims an external operation whose bounded deadline elapsed.
-            docker_retirement_claims = await _step(
-                "terminal_docker_workspace_retirement_claim",
-                postgres_db.claim_terminal_docker_workspace_retirements(),
-            )
-            for claim in docker_retirement_claims or []:
-                await _step(
-                    "terminal_docker_workspace_retirement_settle",
-                    docker_provisioner.settle_claimed_terminal_workspace_retirement(
-                        claim
-                    ),
-                )
-
-            # 4. Legacy compatibility: pre-lease pinned jobs assigned to
-            # offline/non-working agents -> paused. The database predicate
-            # excludes every non-NULL lease; ordering cannot steal a leased
-            # row from the authoritative expiry circuit below.
-            recovered = await _step(
-                "orphaned_job_recovery",
-                postgres_db.recover_orphaned_jobs(
-                    completion_commands_enabled=COMPLETION_COMMANDS_ENABLED
-                ),
-            )
-            if recovered:
-                logger.info(
-                    f"Recovered {recovered.count} orphaned job(s) from offline agents"
-                )
-                # Scoped to each job's owning project officer (owner ruling,
-                # 2026-08): a recovered job is not fleet news. Jobs with no
-                # project — or projects with no commissioned officer — notify
-                # nobody.
-                orphans_by_project: dict[str, list[str]] = {}
-                for job in recovered.recovered_jobs:
-                    if job.project_id:
-                        orphans_by_project.setdefault(job.project_id, []).append(
-                            job.job_id
-                        )
-                if orphans_by_project:
-                    await _step(
-                        "officer_fleet_orphans",
-                        notify_owning_officers(
-                            postgres_db,
-                            {
-                                project_id: {
-                                    "summary": (
-                                        f"{len(job_ids)} orphaned job(s) "
-                                        "auto-paused for re-dispatch "
-                                        "(agent offline): "
-                                        + ", ".join(
-                                            str(job_id)[:8] for job_id in job_ids[:5]
-                                        )
-                                    )
-                                }
-                                for project_id, job_ids in orphans_by_project.items()
-                            },
-                            source="fleet",
-                            dedup_key="fleet:orphans_recovered",
-                        ),
-                    )
-                    _kick_officer_event_drain(postgres_db)
-                _trigger_dispatch()
-
-            # 4b. Job execution lease: expired lease == orphaned, decided
-            # purely by the DB clock — no agents-table join, no dependency on
-            # step 1 having run. This is the sole automatic
-            # infrastructure-loss authority for leased pinned rows; step 4 is
-            # constrained to genuine pre-lease NULL-lease compatibility rows.
-            lease_recovery_kwargs: dict[str, Any] = {
-                "completion_commands_enabled": COMPLETION_COMMANDS_ENABLED,
-            }
-            if getattr(audit_reader, "is_available", False):
-                lease_recovery_kwargs["audit_fingerprint_provider"] = (
-                    audit_reader.get_audit_counts_strict
-                )
-            lease_recovery = await _step(
-                "lease_expiry_recovery",
-                postgres_db.recover_expired_lease_jobs(**lease_recovery_kwargs),
-            )
-            recovered_lease_ids = (
-                lease_recovery.recovered_job_ids if lease_recovery is not None else ()
-            )
-            circuit_trips = (
-                lease_recovery.circuit_trips if lease_recovery is not None else ()
-            )
-            for _job_id in recovered_lease_ids:
-                logger.warning(
-                    "Job %s recovered by lease expiry — its agent stopped "
-                    "renewing (pod died, wedged, or a failed dispatch handoff); "
-                    "re-queued for dispatch",
-                    _job_id,
-                )
-            if recovered_lease_ids:
-                # Recoveries below the containment threshold notify only each
-                # job's owning project officer (owner ruling, 2026-08: one
-                # livelocked job must not wake every officer each sweep —
-                # ~10-min all night, in one observed case). Jobs with no
-                # project, or projects with no commissioned officer, notify
-                # nobody. The circuit-trip event below is unchanged: it is
-                # inserted transactionally at the owning project's post.
-                leases_by_project: dict[str, list[str]] = {}
-                for job in lease_recovery.recovered_jobs:
-                    if job.project_id:
-                        leases_by_project.setdefault(job.project_id, []).append(
-                            job.job_id
-                        )
-                if leases_by_project:
-                    await _step(
-                        "officer_fleet_leases",
-                        notify_owning_officers(
-                            postgres_db,
-                            {
-                                project_id: {
-                                    "summary": (
-                                        f"{len(job_ids)} job(s) recovered by "
-                                        "lease expiry: "
-                                        + ", ".join(
-                                            str(job_id)[:8] for job_id in job_ids[:5]
-                                        )
-                                    )
-                                }
-                                for project_id, job_ids in leases_by_project.items()
-                            },
-                            source="fleet",
-                            dedup_key="fleet:lease_recovered",
-                        ),
-                    )
-                    _kick_officer_event_drain(postgres_db)
-            for trip in circuit_trips:
-                logger.error(
-                    "Job %s parked by redispatch circuit after %s unchanged "
-                    "lease recoveries (project=%s, officer_route=%s, queued=%s)",
-                    trip.job_id,
-                    trip.unchanged_recoveries,
-                    trip.project_id,
-                    trip.officer_destination,
-                    trip.notification_queued,
-                )
-            if circuit_trips:
-                # The recovery transaction already inserted the owning
-                # project's durable outbox row. This is only a fast drain kick;
-                # vacant posts retain the same incident in their durable ledger.
-                _kick_officer_event_drain(postgres_db)
-            if recovered_lease_ids:
-                _trigger_dispatch()
-
-            # 5. GC: drop offline agent rows older than 24h
-            gc_count = await _step(
-                "offline_gc", postgres_db.gc_offline_agents(retention_hours=24)
-            )
-            if gc_count:
-                logger.info(f"GC'd {gc_count} offline agent record(s) > 24h old")
-        except Exception as e:
-            # Last resort — individual steps are isolated above, so anything
-            # landing here is a bug in the loop scaffolding itself.
-            logger.error(f"Error in stale agent detector: {e}")
-
-        # Wait 60 seconds or until shutdown
-        try:
-            await asyncio.wait_for(shutdown_event.wait(), timeout=60.0)
-            break  # Shutdown signaled
-        except asyncio.TimeoutError:
-            pass  # Continue loop
-
-    logger.info("Stale agent detector stopped")
 
 
 async def agent_pool_reconciler(shutdown_event: asyncio.Event) -> None:
@@ -2269,160 +1640,15 @@ async def snapshot_gc_sweeper(shutdown_event: asyncio.Event) -> None:
     logger.info("Snapshot GC sweeper stopped")
 
 
-async def pinned_agent_create_intent_reconciler(
-    shutdown_event: asyncio.Event,
-) -> None:
-    """Promote exact response-lost Pod/PVC creates after process restart.
-
-    This leader never originates a credential-bearing Kubernetes effect.  It
-    only observes the immutable labels/UID of an already-committed object and
-    lets the row-locked publication CAS adopt it while T/G remains open.
-    Retirement owns the complementary revoke/fence path.
-    """
-
-    interval_s = max(
-        5,
-        int(os.getenv("PINNED_AGENT_CREATE_RECONCILE_INTERVAL_SECONDS", "15")),
+def _pinned_k8s_reconciliation_dependencies() -> (
+    pinned_k8s_reconciliation_service.PinnedK8sReconciliationDependencies
+):
+    return pinned_k8s_reconciliation_service.PinnedK8sReconciliationDependencies(
+        store=postgres_db,
+        agent_provisioner=agent_provisioner,
+        persistent_provisioner=persistent_provisioner,
+        container_provisioner=container_provisioner,
     )
-    logger.info("Pinned agent create-intent reconciler started")
-    while not shutdown_event.is_set():
-        try:
-            legacy = await reconcile_legacy_pinned_agent_authority(
-                postgres_db,
-                agent_provisioner=agent_provisioner,
-                persistent_provisioner=persistent_provisioner,
-                limit=50,
-            )
-            if legacy.unresolved:
-                logger.warning(
-                    "Pinned legacy Kubernetes authority remains unresolved "
-                    "for %d row(s)",
-                    legacy.unresolved,
-                )
-            rows = await postgres_db.list_pinned_agent_create_intents_for_reconcile(
-                limit=50
-            )
-            for row in rows:
-                try:
-                    provisioner = str(row.get("provisioner") or "")
-                    provider = (
-                        persistent_provisioner
-                        if provisioner == "persistent"
-                        else agent_provisioner
-                        if provisioner == "agent"
-                        else None
-                    )
-                    if provider is None or not provider.is_available:
-                        continue
-                    thread_id = str(row.get("thread_id") or "")
-                    generation = str(row.get("runtime_generation") or "")
-                    attempt_id = str(row.get("attempt_id") or "")
-                    pod_name = str(row.get("pod_name") or "")
-                    namespace = str(row.get("namespace") or "")
-                    if (
-                        not all(
-                            (thread_id, generation, attempt_id, pod_name, namespace)
-                        )
-                        or str(row.get("protection_protocol") or "") != "finalizer_v1"
-                    ):
-                        continue
-
-                    claim = row.get("workspace_claim")
-                    if claim is not None:
-                        if not isinstance(claim, Mapping):
-                            continue
-                        claim_id = str(claim.get("claim_id") or "")
-                        claim_generation = str(
-                            claim.get("created_runtime_generation") or ""
-                        )
-                        claim_attempt = str(claim.get("create_attempt") or "")
-                        claim_name = str(claim.get("pvc_name") or "")
-                        claim_status = str(claim.get("status") or "")
-                        claim_uid = str(claim.get("pvc_uid") or "")
-                        claim_namespace = str(claim.get("namespace") or "")
-                        if (
-                            not all(
-                                (
-                                    claim_id,
-                                    claim_generation,
-                                    claim_attempt,
-                                    claim_name,
-                                    claim_namespace,
-                                )
-                            )
-                            or claim_status not in {"planned", "ready"}
-                            or not (
-                                claim_namespace == namespace
-                                and str(claim.get("protection_protocol") or "")
-                                == "finalizer_v1"
-                            )
-                        ):
-                            continue
-                        observed_claim = await provider.agent_workspace_claim_authority(
-                            claim_name,
-                            expected_thread_id=thread_id,
-                            expected_runtime_generation=claim_generation,
-                            expected_claim_id=claim_id,
-                            expected_create_attempt=claim_attempt,
-                            namespace=claim_namespace,
-                            expected_pvc_uid=claim_uid or None,
-                        )
-                        observed_claim_uid = str(
-                            (observed_claim or {}).get("pvc_uid") or ""
-                        )
-                        if not (
-                            str((observed_claim or {}).get("state") or "")
-                            == "exact_present"
-                            and observed_claim_uid
-                            and (not claim_uid or observed_claim_uid == claim_uid)
-                        ):
-                            continue
-                        if (
-                            claim_status == "planned"
-                            and not await postgres_db.publish_pinned_agent_workspace_claim(
-                                thread_id,
-                                expected_runtime_generation=generation,
-                                claim_id=claim_id,
-                                pvc_name=claim_name,
-                                pvc_uid=observed_claim_uid,
-                                namespace=claim_namespace,
-                            )
-                        ):
-                            continue
-
-                    observed_pod = await provider.agent_pod_provision_intent_authority(
-                        pod_name,
-                        expected_thread_id=thread_id,
-                        expected_runtime_generation=generation,
-                        expected_attempt_id=attempt_id,
-                        namespace=namespace,
-                    )
-                    pod_uid = str((observed_pod or {}).get("pod_uid") or "")
-                    if not (
-                        str((observed_pod or {}).get("state") or "") == "exact_present"
-                        and pod_uid
-                    ):
-                        continue
-                    await postgres_db.publish_pinned_agent_pod_provision_intent(
-                        thread_id,
-                        expected_runtime_generation=generation,
-                        attempt_id=attempt_id,
-                        pod_name=pod_name,
-                        pod_uid=pod_uid,
-                        namespace=namespace,
-                    )
-                except Exception:
-                    logger.exception(
-                        "Pinned agent create-intent reconciliation failed for %s",
-                        row.get("attempt_id"),
-                    )
-        except Exception:
-            logger.exception("Pinned agent create-intent reconciliation pass failed")
-        try:
-            await asyncio.wait_for(shutdown_event.wait(), timeout=interval_s)
-        except TimeoutError:
-            pass
-    logger.info("Pinned agent create-intent reconciler stopped")
 
 
 async def _begin_pinned_thread_retirement(
@@ -2431,189 +1657,6 @@ async def _begin_pinned_thread_retirement(
     return await _pinned_retirement_operations().begin_pinned_thread_retirement(
         thread_id, **kwargs
     )
-
-
-async def pinned_k8s_create_fence_gc_sweeper(
-    shutdown_event: asyncio.Event,
-) -> None:
-    """Exact-delete post-horizon Pod/PVC name fences and retire their rows.
-
-    Fence rows deliberately survive thread deletion and process restart. A
-    due timestamp is necessary but not sufficient: the sweeper reattests the
-    immutable labels and recorded UID, issues a UID-preconditioned delete, and
-    marks the work item terminal only after the Kubernetes name is absent.
-    """
-
-    interval_s = max(
-        5,
-        int(os.getenv("PINNED_K8S_CREATE_FENCE_GC_INTERVAL_SECONDS", "30")),
-    )
-    logger.info("Pinned Kubernetes create-fence GC started (interval=%ds)", interval_s)
-    while not shutdown_event.is_set():
-        try:
-            rows = await postgres_db.list_due_pinned_k8s_create_fences(limit=50)
-            for row in rows:
-                provisioner = str(row.get("provisioner") or "")
-                provider = (
-                    persistent_provisioner
-                    if provisioner == "persistent"
-                    else agent_provisioner
-                    if provisioner == "agent"
-                    else None
-                )
-                if provider is None or not provider.is_available:
-                    continue
-                resource_kind = str(row.get("resource_kind") or "")
-                resource_name = str(row.get("resource_name") or "")
-                resource_uid = str(row.get("resource_uid") or "")
-                thread_id = str(row.get("thread_id") or "")
-                generation = str(row.get("runtime_generation") or "")
-                create_attempt = str(row.get("create_attempt") or "")
-                authority_id = str(row.get("authority_id") or "")
-                namespace = str(row.get("namespace") or "")
-                if (
-                    not all(
-                        (
-                            resource_name,
-                            resource_uid,
-                            thread_id,
-                            generation,
-                            create_attempt,
-                            authority_id,
-                            namespace,
-                        )
-                    )
-                    or str(row.get("protection_protocol") or "") != "finalizer_v1"
-                ):
-                    continue
-                if resource_kind == "pod":
-                    observed = await provider.agent_pod_provision_intent_authority(
-                        resource_name,
-                        expected_thread_id=thread_id,
-                        expected_runtime_generation=generation,
-                        expected_attempt_id=create_attempt,
-                        namespace=namespace,
-                    )
-                    state = str((observed or {}).get("state") or "")
-                    observed_uid = str((observed or {}).get("pod_uid") or "")
-                    if state == "exact_fence" and observed_uid == resource_uid:
-                        deleted = (
-                            await persistent_provisioner.delete_agent_pod_exact(
-                                thread_id,
-                                expected_pod_uid=resource_uid,
-                                namespace=namespace,
-                            )
-                            if provisioner == "persistent"
-                            else await agent_provisioner.delete_agent_pod_exact(
-                                resource_name,
-                                expected_pod_uid=resource_uid,
-                                namespace=namespace,
-                            )
-                        )
-                        if not deleted:
-                            continue
-                        released = (
-                            await persistent_provisioner.release_agent_pod_finalizer_exact(
-                                thread_id,
-                                expected_pod_uid=resource_uid,
-                                namespace=namespace,
-                                terminal_required=False,
-                            )
-                            if provisioner == "persistent"
-                            else await agent_provisioner.release_agent_pod_finalizer_exact(
-                                resource_name,
-                                expected_pod_uid=resource_uid,
-                                namespace=namespace,
-                                terminal_required=False,
-                            )
-                        )
-                        if not released:
-                            continue
-                        observed = await provider.agent_pod_provision_intent_authority(
-                            resource_name,
-                            expected_thread_id=thread_id,
-                            expected_runtime_generation=generation,
-                            expected_attempt_id=create_attempt,
-                            namespace=namespace,
-                        )
-                        state = str((observed or {}).get("state") or "")
-                    if state != "exact_absent":
-                        continue
-                elif resource_kind == "pvc":
-                    observed = await provider.agent_workspace_claim_authority(
-                        resource_name,
-                        expected_thread_id=thread_id,
-                        expected_runtime_generation=generation,
-                        expected_claim_id=authority_id,
-                        expected_create_attempt=create_attempt,
-                        namespace=namespace,
-                        expected_pvc_uid=resource_uid,
-                    )
-                    state = str((observed or {}).get("state") or "")
-                    observed_uid = str((observed or {}).get("pvc_uid") or "")
-                    if state == "exact_fence" and observed_uid == resource_uid:
-                        if not await provider.delete_agent_workspace_claim_exact(
-                            resource_name,
-                            expected_pvc_uid=resource_uid,
-                            namespace=namespace,
-                        ):
-                            continue
-                        if not await provider.release_agent_workspace_claim_finalizer_exact(
-                            resource_name,
-                            expected_pvc_uid=resource_uid,
-                            namespace=namespace,
-                        ):
-                            continue
-                        observed = await provider.agent_workspace_claim_authority(
-                            resource_name,
-                            expected_thread_id=thread_id,
-                            expected_runtime_generation=generation,
-                            expected_claim_id=authority_id,
-                            expected_create_attempt=create_attempt,
-                            namespace=namespace,
-                            expected_pvc_uid=resource_uid,
-                        )
-                        state = str((observed or {}).get("state") or "")
-                    if state != "exact_absent":
-                        continue
-                else:
-                    continue
-                await postgres_db.complete_pinned_k8s_create_fence_gc(
-                    resource_kind=resource_kind,
-                    authority_id=authority_id,
-                    expected_resource_uid=resource_uid,
-                )
-            if container_provisioner.is_available:
-                workspace_rows = await postgres_db.list_pinned_thread_workspace_provision_fences_for_gc(
-                    limit=50
-                )
-                for workspace_row in workspace_rows:
-                    if not await container_provisioner.delete_pinned_workspace_provision_fences_exact(
-                        workspace_row
-                    ):
-                        continue
-                    await postgres_db.retire_pinned_thread_workspace_provision_fence(
-                        str(workspace_row.get("attempt_id") or ""),
-                        expected_fence_pod_uid=str(
-                            workspace_row.get("fence_pod_uid") or ""
-                        ),
-                        expected_fence_pvc_uid=(
-                            str(workspace_row.get("fence_pvc_uid") or "") or None
-                        ),
-                        expected_fence_configmap_uid=(
-                            str(workspace_row.get("fence_configmap_uid") or "") or None
-                        ),
-                        expected_fence_service_uid=(
-                            str(workspace_row.get("fence_service_uid") or "") or None
-                        ),
-                    )
-        except Exception:
-            logger.exception("Pinned Kubernetes create-fence GC pass failed")
-        try:
-            await asyncio.wait_for(shutdown_event.wait(), timeout=interval_s)
-        except TimeoutError:
-            pass
-    logger.info("Pinned Kubernetes create-fence GC stopped")
 
 
 async def imap_poll_loop(shutdown_event: asyncio.Event) -> None:
@@ -3415,30 +2458,6 @@ from orchestrator.services.vm_workspace_policy import (  # noqa: E402
 )
 
 
-def _retirement_context_runtime_exposed(
-    retirement: Mapping[str, Any],
-) -> bool:
-    return _pinned_retirement_operations().retirement_context_runtime_exposed(
-        retirement
-    )
-
-
-def _retirement_has_exact_local_quiescence(
-    retirement: Mapping[str, Any], thread: Mapping[str, Any]
-) -> bool:
-    return _pinned_retirement_operations().retirement_has_exact_local_quiescence(
-        retirement, thread
-    )
-
-
-async def _recover_captured_sandbox_process_zero(
-    retirement: Mapping[str, Any],
-) -> bool:
-    return await _pinned_retirement_operations().recover_captured_process_zero(
-        retirement
-    )
-
-
 # Threads with a suspend currently in flight. Two triggers can race on the
 # same thread within a second (e.g. the disconnect watchdog and the agent's
 # own status→ended PUT); without this guard the loser found the workspace
@@ -4186,7 +3205,13 @@ async def lifespan(app: FastAPI):
         )
     )
     stale_detector_task = asyncio.create_task(
-        run_when_leader(stale_agent_detector, _shutdown_event)
+        run_when_leader(
+            functools.partial(
+                stale_agent_detector_service.stale_agent_detector,
+                dependencies=_stale_agent_detector_dependencies(),
+            ),
+            _shutdown_event,
+        )
     )
     token_cleanup_task = asyncio.create_task(
         cleanup_expired_tokens(postgres_db, _shutdown_event)
@@ -4435,10 +3460,22 @@ async def lifespan(app: FastAPI):
     )
     gc_sweeper_task = asyncio.create_task(snapshot_gc_sweeper(_shutdown_event))
     pinned_create_intent_reconciler_task = asyncio.create_task(
-        run_when_leader(pinned_agent_create_intent_reconciler, _shutdown_event)
+        run_when_leader(
+            functools.partial(
+                pinned_k8s_reconciliation_service.pinned_agent_create_intent_reconciler,
+                dependencies=_pinned_k8s_reconciliation_dependencies(),
+            ),
+            _shutdown_event,
+        )
     )
     pinned_create_fence_gc_task = asyncio.create_task(
-        run_when_leader(pinned_k8s_create_fence_gc_sweeper, _shutdown_event)
+        run_when_leader(
+            functools.partial(
+                pinned_k8s_reconciliation_service.pinned_k8s_create_fence_gc_sweeper,
+                dependencies=_pinned_k8s_reconciliation_dependencies(),
+            ),
+            _shutdown_event,
+        )
     )
     imap_task = asyncio.create_task(run_when_leader(imap_poll_loop, _shutdown_event))
     # Unified feed: run the deferred channel steps ("mail after the officer's

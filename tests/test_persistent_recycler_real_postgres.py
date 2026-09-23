@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from orchestrator.services.workspace_lifecycle import WorkspaceOwner
 from tests import _b09_control_seams as control_seams
 
 import asyncio
@@ -2130,7 +2131,7 @@ async def test_permanent_delete_reclaims_same_generation_retained_k8s_pvc(db):
         )
 
     provisioner.release_workspace.assert_awaited_once_with(
-        orch_main.WorkspaceOwner.session(ids["thread"]),
+        WorkspaceOwner.session(ids["thread"]),
         reclaim_volume=True,
         capture_snapshot=True,
         strict=True,
@@ -3550,7 +3551,7 @@ async def test_pre_registration_recovery_proves_physical_workspace_zero(db):
         )
 
     container_provisioner.delete_workspace.assert_awaited_once_with(
-        orch_main.WorkspaceOwner.session(ids["thread"]),
+        WorkspaceOwner.session(ids["thread"]),
         expected_runtime_incarnation=workspace_runtime,
         wait_for_exact_absence=True,
         exact_absence_timeout_seconds=120.0,
@@ -6331,7 +6332,9 @@ async def test_never_delivered_warm_attach_soft_end_releases_exact_authority(
         patch.object(orch_main, "postgres_db", db),
         patch.object(orch_main, "agent_provisioner", provisioner),
     ):
-        assert await orch_main._recover_captured_sandbox_process_zero(authority)
+        assert await orch_main._pinned_retirement_operations().recover_captured_process_zero(
+            authority
+        )
         assert await db.settle_pinned_thread_retirement(
             ids["thread"],
             token=retirement["token"],

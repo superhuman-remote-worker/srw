@@ -17,6 +17,7 @@ Before 0226 every such retirement stayed pending forever while the sweep
 retried it every minute in silence.
 """
 
+from orchestrator.services import stale_agent_detector as stale_agent_detector_service
 from types import SimpleNamespace as NS
 from unittest.mock import MagicMock
 from uuid import uuid4
@@ -176,7 +177,9 @@ async def test_created_lite_actor_exit_settles_through_zero_admission(
     ids, retirement, k8s = await _retired_lite_actor(
         db, monkeypatch, permanent=permanent, status="created"
     )
-    assert await main._recover_captured_sandbox_process_zero(retirement)
+    assert await main._pinned_retirement_operations().recover_captured_process_zero(
+        retirement
+    )
     assert not k8s.pods
     thread = await db.get_thread(ids["thread"])
     receipt = _receipt(thread)
@@ -185,9 +188,13 @@ async def test_created_lite_actor_exit_settles_through_zero_admission(
     assert receipt["workspace_generation"] is None
     assert receipt["workspace_runtime_incarnation"] is None
     assert "recovery_protocol" not in receipt
-    assert main._retirement_has_exact_local_quiescence(retirement, thread)
+    assert main._pinned_retirement_operations().retirement_has_exact_local_quiescence(
+        retirement, thread
+    )
     # Replay is idempotent: the receipt stands and nothing is re-actuated.
-    assert await main._recover_captured_sandbox_process_zero(retirement)
+    assert await main._pinned_retirement_operations().recover_captured_process_zero(
+        retirement
+    )
 
 
 @pytest.mark.asyncio
@@ -199,7 +206,9 @@ async def test_used_lite_actor_exit_settles_after_exact_pod_stop(
         db, monkeypatch, permanent=permanent, input_state="settled"
     )
     assert ids["process_generation"] != ids["generation"]
-    assert await main._recover_captured_sandbox_process_zero(retirement)
+    assert await main._pinned_retirement_operations().recover_captured_process_zero(
+        retirement
+    )
     assert not k8s.pods
     thread = await db.get_thread(ids["thread"])
     receipt = _receipt(thread)
@@ -219,8 +228,12 @@ async def test_used_lite_actor_exit_settles_after_exact_pod_stop(
         )
         == receipt
     )
-    assert main._retirement_has_exact_local_quiescence(retirement, thread)
-    assert await main._recover_captured_sandbox_process_zero(retirement)
+    assert main._pinned_retirement_operations().retirement_has_exact_local_quiescence(
+        retirement, thread
+    )
+    assert await main._pinned_retirement_operations().recover_captured_process_zero(
+        retirement
+    )
 
 
 @pytest.mark.asyncio
@@ -237,7 +250,9 @@ async def test_used_lite_actor_with_unfinished_input_stays_pending(
     ids, retirement, _ = await _retired_lite_actor(
         db, monkeypatch, status="active", input_state=input_state
     )
-    assert not await main._recover_captured_sandbox_process_zero(retirement)
+    assert not await main._pinned_retirement_operations().recover_captured_process_zero(
+        retirement
+    )
     assert (await db.get_thread(ids["thread"]))[
         "runtime_retirement_local_quiescence"
     ] is None
@@ -256,7 +271,9 @@ async def test_lite_actor_exit_lets_the_durable_retry_finish_the_thread(
     )
     candidates = await db.list_retryable_pinned_retirements(grace_seconds=0)
     assert [str(c["id"]) for c in candidates] == [ids["thread"]]
-    assert await main._retry_pending_pinned_retirement(candidates[0])
+    assert await stale_agent_detector_service.retry_pending_pinned_retirement(
+        candidates[0], dependencies=main._stale_agent_detector_dependencies()
+    )
     for read in (
         ids["route_core_api"].read_namespaced_service,
         ids["route_networking_api"].read_namespaced_ingress,
@@ -404,7 +421,9 @@ async def _retired_warm_lite_actor(
 @pytest.mark.asyncio
 async def test_used_warm_actor_exit_settles_after_exact_pod_stop(db, monkeypatch):
     ids, retirement, api = await _retired_warm_lite_actor(db, monkeypatch)
-    assert await main._recover_captured_sandbox_process_zero(retirement)
+    assert await main._pinned_retirement_operations().recover_captured_process_zero(
+        retirement
+    )
     assert ("agents-a", ids["pod_name"]) not in api.pods
     thread = await db.get_thread(ids["thread"])
     receipt = _receipt(thread)
@@ -412,8 +431,12 @@ async def test_used_warm_actor_exit_settles_after_exact_pod_stop(db, monkeypatch
     assert receipt["quiescence_protocol"] == "agent_runtime_zero_v1"
     assert receipt["agent_pod_uid"] == ids["pod_uid"]
     assert receipt["settled_input_count"] == 1
-    assert main._retirement_has_exact_local_quiescence(retirement, thread)
-    assert await main._recover_captured_sandbox_process_zero(retirement)
+    assert main._pinned_retirement_operations().retirement_has_exact_local_quiescence(
+        retirement, thread
+    )
+    assert await main._pinned_retirement_operations().recover_captured_process_zero(
+        retirement
+    )
 
 
 @pytest.mark.asyncio
@@ -426,7 +449,9 @@ async def test_warm_actor_exit_lets_the_durable_retry_finish_the_thread(
     )
     candidates = await db.list_retryable_pinned_retirements(grace_seconds=0)
     assert [str(c["id"]) for c in candidates] == [ids["thread"]]
-    assert await main._retry_pending_pinned_retirement(candidates[0])
+    assert await stale_agent_detector_service.retry_pending_pinned_retirement(
+        candidates[0], dependencies=main._stale_agent_detector_dependencies()
+    )
     thread = await db.get_thread(ids["thread"])
     assert thread["status"] == "ended"
     assert thread["runtime_retirement_token"] is None
@@ -436,7 +461,9 @@ async def test_warm_actor_exit_lets_the_durable_retry_finish_the_thread(
 async def test_warm_actor_exit_requires_the_bound_protection(db, monkeypatch):
     """A warm marker nobody vouches for is not an exact Pod authority."""
     ids, retirement, _ = await _retired_warm_lite_actor(db, monkeypatch, vouched=False)
-    assert not await main._recover_captured_sandbox_process_zero(retirement)
+    assert not await main._pinned_retirement_operations().recover_captured_process_zero(
+        retirement
+    )
     assert (await db.get_thread(ids["thread"]))[
         "runtime_retirement_local_quiescence"
     ] is None

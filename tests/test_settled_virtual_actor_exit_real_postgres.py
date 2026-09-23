@@ -138,7 +138,9 @@ async def test_used_virtual_actor_exit_settles_after_exact_pod_stop(
 ):
     ids, retirement, k8s = await _used_virtual(db, monkeypatch, permanent=permanent)
     assert ids["process_generation"] != ids["generation"]
-    assert await main._recover_captured_sandbox_process_zero(retirement)
+    assert await main._pinned_retirement_operations().recover_captured_process_zero(
+        retirement
+    )
     assert not k8s.pods
     thread = await db.get_thread(ids["thread"])
     receipt = fixtures._json(thread["runtime_retirement_local_quiescence"])
@@ -155,8 +157,12 @@ async def test_used_virtual_actor_exit_settles_after_exact_pod_stop(
         )
         == receipt
     )
-    assert main._retirement_has_exact_local_quiescence(retirement, thread)
-    assert await main._recover_captured_sandbox_process_zero(retirement)
+    assert main._pinned_retirement_operations().retirement_has_exact_local_quiescence(
+        retirement, thread
+    )
+    assert await main._pinned_retirement_operations().recover_captured_process_zero(
+        retirement
+    )
     with pytest.raises(asyncpg.CheckViolationError):
         await db.execute(
             "UPDATE threads SET runtime_retirement_local_quiescence=NULL WHERE id=$1::uuid",
@@ -262,7 +268,11 @@ async def test_process_generation_difference_never_turns_used_life_into_zero_adm
     ids, retirement, _ = await _used_virtual(
         db, monkeypatch, input_state=input_state, status=status
     )
-    recovered = await main._recover_captured_sandbox_process_zero(retirement)
+    recovered = (
+        await main._pinned_retirement_operations().recover_captured_process_zero(
+            retirement
+        )
+    )
     # Queued work was never admitted; the existing created-life protocol may
     # still settle it. An admitted input from a distinct process UUID cannot.
     if status == "created" and input_state == "queued":
