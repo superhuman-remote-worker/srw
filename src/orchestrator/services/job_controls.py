@@ -1668,6 +1668,53 @@ class JobControlOperations:
                     self.dependencies.workspace.base_path / "output" / "job_frozen.json"
                 )
                 if job.get("execution_lane") == "stateless":
+                    if freeze_type == "phase_boundary":
+                        from orchestrator.services.vm_idle_lifecycle import (
+                            VMIdleLifecycleStore,
+                        )
+
+                        idle_store = VMIdleLifecycleStore(self.dependencies.store)
+                        if (
+                            await idle_store.schema_available()
+                            and await idle_store.get_open_for_owner(job_id) is not None
+                        ):
+                            if control_claim is None:
+                                raise HTTPException(
+                                    status_code=409,
+                                    detail="Idle phase approval requires durable control authority",
+                                )
+                            from orchestrator.services.completion_control import (
+                                CompletionControlClaimConflict,
+                            )
+
+                            try:
+                                async with self.dependencies.completion_control.finish(
+                                    control_claim
+                                ) as (conn, _locked_job):
+                                    wake = await idle_store.approve_phase_wake_on_conn(
+                                        conn, job_id=job_id,
+                                        claim_id=str(control_claim.claim_id),
+                                    )
+                                    if wake is None:
+                                        raise CompletionControlClaimConflict(
+                                            "idle phase approval source changed"
+                                        )
+                            except CompletionControlClaimConflict as exc:
+                                raise HTTPException(status_code=409, detail=str(exc)) from exc
+                            control_claim_finished = True
+                            self.dependencies.logger.info(
+                                "Job %s phase boundary approved; exact VM wake %s "
+                                "must attest Ready before execution",
+                                job_id, wake["wake_id"],
+                            )
+                            return {
+                                "status": "waking",
+                                "job_id": job_id,
+                                "freeze_type": freeze_type,
+                                "phase_type": frozen_data.get("phase_type"),
+                                "phase_number": frozen_data.get("phase_number"),
+                                "command": frozen_data.get("command"),
+                            }
                     queued = (
                         await self.dependencies.store.queue_stateless_job_for_resume(
                             job_id,

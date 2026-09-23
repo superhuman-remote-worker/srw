@@ -160,7 +160,7 @@ class VMIdleLifecycleStore:
             )
             if (
                 episode is None
-                or episode.wait_kind != "human_message"
+                or episode.wait_kind not in {"human_message", "human_approval"}
                 or episode.episode_id != episode_id
                 or episode.revision != revision
                 or vm.get("status") != "ready"
@@ -187,6 +187,19 @@ class VMIdleLifecycleStore:
                 or _uuid(vm.get("rootdisk_pvc_uid")) != expected["pvc_uid"]
             ):
                 return None
+            phase_source = None
+            if episode.wait_kind == "human_approval":
+                from orchestrator.services.vm_idle_phase_approval import (
+                    finalized_phase_source,
+                )
+
+                phase_source = await finalized_phase_source(
+                    conn, job=row, episode=episode,
+                    generation=expected["generation"], vm_uid=expected["vm_uid"],
+                    launcher_uid=expected["launcher_uid"],
+                )
+                if phase_source is None:
+                    return None
             from orchestrator.services.vm_creation_preflight import (
                 _execution_binding,
                 idle_wake_predecessor,
@@ -221,10 +234,19 @@ class VMIdleLifecycleStore:
                 logger.info("VM idle release held for job %s: execution_manifest_changed", job_id)
                 return None
             human_wait_current = bool(
-                row["status"] == "waiting_for_reply"
-                and freeze.get("route_id") == episode.wait_key
+                (
+                    row["status"] == "waiting_for_reply"
+                    and freeze.get("route_id") == episode.wait_key
+                )
+                or phase_source is not None
             )
             now = await conn.fetchval("SELECT clock_timestamp()")
+            from orchestrator.services.completion_control import (
+                completion_control_claim_active,
+            )
+
+            if completion_control_claim_active(context, now_epoch=now.timestamp()):
+                return None
             if execution["deadline"] is not None and execution["deadline"] <= now:
                 logger.info("VM idle release held for job %s: job_admission_expired", job_id)
                 return None
@@ -405,6 +427,117 @@ class VMIdleLifecycleStore:
             )
             return True
 
+    @staticmethod
+    async def _reserve_wake_on_conn(conn, operation, *, execution_requested: bool):
+        return await conn.fetchrow(
+            """
+            UPDATE vm_idle_operations SET
+              phase=CASE WHEN phase='suspended' THEN 'waking' ELSE phase END,
+              wake_requested=true,
+              wake_execution_requested=wake_execution_requested OR $2,
+              wake_id=COALESCE(wake_id,$3),
+              wake_generation=COALESCE(wake_generation,$4),
+              wake_request_id=COALESCE(wake_request_id,$5),
+              retry_after=NULL,last_progress_at=clock_timestamp()
+            WHERE id=$1 AND closed_at IS NULL RETURNING *
+            """,
+            operation["id"], execution_requested, uuid4(), uuid4(), uuid4(),
+        )
+
+    async def approve_phase_wake_on_conn(
+        self, conn, *, job_id: str, claim_id: str,
+    ) -> dict[str, Any] | None:
+        """Commit an exact phase approval under CompletionControl.finish_claim."""
+        if not conn.is_in_transaction() or _uuid(job_id) is None or _uuid(claim_id) is None:
+            return None
+        owner_id = UUID(job_id)
+        job = await conn.fetchrow("SELECT * FROM jobs WHERE id=$1 FOR UPDATE", owner_id)
+        if job is None or job["status"] != "pending_review" or job["execution_lane"] != "stateless":
+            return None
+        context = _object(job["context"])
+        from orchestrator.services.completion_control import (
+            completion_control_claim_owned_active,
+        )
+
+        now = await conn.fetchval("SELECT clock_timestamp()")
+        marker = _object(context.get("_completion_control_claim"))
+        if (
+            marker.get("source") != "public_approve"
+            or not completion_control_claim_owned_active(
+                context, claim_id, now_epoch=now.timestamp(),
+            )
+        ):
+            return None
+        operation = await conn.fetchrow(
+            "SELECT * FROM vm_idle_operations WHERE owner_kind='job' AND owner_id=$1 "
+            "AND closed_at IS NULL FOR UPDATE",
+            owner_id,
+        )
+        episode = read_episode(
+            _episode_document(job["workspace_idle_episode"]),
+            revision=job["workspace_idle_revision"],
+        )
+        if (
+            operation is None
+            or operation["phase"] not in {
+                "releasing", "release_held", "suspended", "waking", "wake_held",
+            }
+            or episode is None
+            or episode.episode_id != str(operation["episode_id"])
+            or episode.revision != operation["episode_revision"]
+            or episode.wait_kind != "human_approval"
+        ):
+            return None
+        from orchestrator.services.vm_idle_phase_approval import (
+            finalized_phase_source,
+        )
+
+        source = await finalized_phase_source(
+            conn, job=job, episode=episode,
+            generation=operation["provision_generation"],
+            vm_uid=operation["vm_uid"], launcher_uid=operation["launcher_uid"],
+        )
+        if source is None:
+            return None
+        vm = _object(context.get("vm"))
+        predecessor = _object(context.get("last_vm"))
+        original = (
+            vm.get("status") in {"suspending", "suspended"}
+            and _uuid(vm.get("provision_generation")) == operation["provision_generation"]
+            and _uuid(vm.get("vm_uid")) == operation["vm_uid"]
+            and _uuid(vm.get("rootdisk_pvc_uid")) == operation["pvc_uid"]
+        )
+        successor = (
+            operation["wake_generation"] is not None
+            and _uuid(vm.get("provision_generation")) == operation["wake_generation"]
+            and vm.get("idle_wake_operation_id") == str(operation["id"])
+            and _uuid(predecessor.get("vm_uid")) == operation["vm_uid"]
+            and _uuid(predecessor.get("rootdisk_pvc_uid")) == operation["pvc_uid"]
+        )
+        if not (original or successor):
+            return None
+        wake = await self._reserve_wake_on_conn(
+            conn, operation, execution_requested=True,
+        )
+        if wake is None:
+            return None
+        intent = {
+            "version": 1,
+            "operation_id": str(operation["id"]),
+            "command_id": source["command_id"],
+            "episode_id": episode.episode_id,
+            "episode_revision": episode.revision,
+            "phase_type": source["semantics"]["freeze"]["phase_type"],
+            "phase_number": source["semantics"]["freeze"]["phase_number"],
+            "generation": str(operation["provision_generation"]),
+        }
+        await conn.execute(
+            "UPDATE jobs SET context=jsonb_set(context,"
+            "'{_vm_idle_phase_approval}',$2::jsonb,true) WHERE id=$1",
+            owner_id, json.dumps(intent),
+        )
+        return dict(wake)
+
     async def request_wake(
         self, job_id: str, *, execution_requested: bool,
         access_kind: str | None = None, access_claimant: str | None = None,
@@ -457,24 +590,10 @@ class VMIdleLifecycleStore:
             )
             if not (original or successor):
                 return None
-            wake_id = operation["wake_id"] or uuid4()
-            generation = operation["wake_generation"] or uuid4()
-            request_id = operation["wake_request_id"] or uuid4()
-            phase = (
-                "waking" if operation["phase"] == "suspended"
-                else operation["phase"]
+            row = await self._reserve_wake_on_conn(
+                conn, operation, execution_requested=execution_requested,
             )
-            row = await conn.fetchrow(
-                """
-                UPDATE vm_idle_operations SET phase=$2,wake_requested=true,
-                  wake_execution_requested=wake_execution_requested OR $3,
-                  wake_id=$4,wake_generation=$5,wake_request_id=$6,
-                  retry_after=NULL,last_progress_at=clock_timestamp()
-                WHERE id=$1 RETURNING *
-                """,
-                operation["id"], phase, execution_requested,
-                wake_id, generation, request_id,
-            )
+            wake_id = row["wake_id"]
             if access_kind is not None:
                 lease = await conn.fetchrow(
                     """
@@ -634,7 +753,8 @@ class VMIdleLifecycleStore:
                     return True
                 if operation["wake_ready_at"] is None or operation["phase"] not in {"waking", "wake_held"}:
                     return False
-                vm = _object(_object(job["context"]).get("vm"))
+                context = _object(job["context"])
+                vm = _object(context.get("vm"))
                 if (
                     vm.get("status") != "ready"
                     or vm.get("idle_wake_operation_id") != operation_id
@@ -646,6 +766,43 @@ class VMIdleLifecycleStore:
                     _episode_document(job["workspace_idle_episode"]),
                     revision=job["workspace_idle_revision"],
                 )
+                approval_intent = None
+                if "_vm_idle_phase_approval" in context:
+                    approval_intent = _object(context["_vm_idle_phase_approval"])
+                    from orchestrator.services.vm_idle_phase_approval import (
+                        finalized_phase_source,
+                    )
+
+                    source = await finalized_phase_source(
+                        conn, job=job, episode=episode,
+                        generation=operation["provision_generation"],
+                        vm_uid=operation["vm_uid"],
+                        launcher_uid=operation["launcher_uid"],
+                    )
+                    if (
+                        source is None
+                        or not operation["wake_execution_requested"]
+                        or approval_intent.get("version") != 1
+                        or approval_intent.get("operation_id") != operation_id
+                        or approval_intent.get("command_id") != source["command_id"]
+                        or approval_intent.get("episode_id") != episode.episode_id
+                        or approval_intent.get("episode_revision") != episode.revision
+                        or episode.revision != operation["episode_revision"]
+                        or approval_intent.get("phase_type")
+                           != source["semantics"]["freeze"]["phase_type"]
+                        or approval_intent.get("phase_number")
+                           != source["semantics"]["freeze"]["phase_number"]
+                        or approval_intent.get("generation")
+                           != str(operation["provision_generation"])
+                    ):
+                        await conn.execute(
+                            "UPDATE vm_idle_operations SET phase='wake_held',"
+                            "reason='phase_approval_source_changed',"
+                            "retry_after=clock_timestamp()+interval '1 minute' "
+                            "WHERE id=$1",
+                            operation["id"],
+                        )
+                        return False
                 execute = bool(
                     operation["wake_execution_requested"]
                     or episode is None
@@ -681,6 +838,16 @@ class VMIdleLifecycleStore:
                         raise _WakeChanged
                     if updated.get("operator_pause_held"):
                         await cancel_queued_worker_batch(conn, job_id=owner_id)
+                    if approval_intent is not None:
+                        await conn.execute(
+                            "UPDATE jobs SET context="
+                            "(context-'_vm_idle_phase_approval') || "
+                            "jsonb_build_object('_vm_idle_last_phase_approval',"
+                            "$2::jsonb || jsonb_build_object("
+                            "'approved_at',to_jsonb(clock_timestamp()))) "
+                            "WHERE id=$1",
+                            owner_id, json.dumps(approval_intent),
+                        )
                 # The operation ID authorizes this successor only while the
                 # wake is open. Remove its marker in the same close transaction
                 # so a later idle episode can reserve a different successor.
