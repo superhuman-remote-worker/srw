@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -30,6 +31,49 @@ from orchestrator.services.workspace_tier_policy import LiteWorkspaceConfigError
 from shared.backend_kinds import LITE_BACKENDS
 from shared.runtime.core.loader import canonical_config_name
 from shared.workspace_contract import WORKSPACE_RUNTIME_CONTEXT_KEY
+from shared.pinned_job_delivery import (
+    pinned_job_delivery_proof, pinned_job_projection_digest,
+)
+from shared.vm_lifecycle_auth import (
+    LifecycleAuthConfigurationError, configured_secret,
+)
+
+
+async def _pinned_vm_delivery_intent(
+    dependencies: "JobDeliveryDependencies", *, job_id: str, agent_id: str,
+    recipient: Any, payload: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """Add a replayable exact delivery ID only for a supported VM recipient."""
+
+    if (
+        os.getenv("WORKSPACE_IDLE_RELEASE_ENABLED", "false").lower() != "true"
+        or payload.get("workspace_provisioner") != "k8s"
+        or not getattr(recipient, "expected_pod_uid", None)
+    ):
+        return payload, None
+    try:
+        secret = configured_secret()
+    except LifecycleAuthConfigurationError:
+        secret = None
+    if secret is None:
+        return payload, None
+    digest = pinned_job_projection_digest(payload)
+    intent = await dependencies.store.prepare_pinned_job_delivery(
+        job_id, agent_id, recipient=recipient, projection_digest=digest,
+    )
+    if intent is None:
+        return payload, None
+    proof = pinned_job_delivery_proof(
+        secret, delivery_id=str(intent["id"]), agent_id=agent_id,
+        process_generation=recipient.expected_process_generation,
+        pod_uid=recipient.expected_pod_uid, projection_digest=digest,
+    )
+    return {
+        **payload,
+        "pinned_delivery_id": str(intent["id"]),
+        "pinned_projection_digest": digest,
+        "pinned_delivery_proof": proof,
+    }, intent
 
 
 @dataclass(frozen=True, slots=True)
@@ -208,13 +252,18 @@ async def dispatch_job_to_agent(
         if target is None:
             return False
         job_start = job_start.model_copy(update={"recipient": target.recipient})
+        delivery_payload, delivery_intent = await _pinned_vm_delivery_intent(
+            dependencies, job_id=job_id, agent_id=agent_id,
+            recipient=target.recipient,
+            payload=job_start.model_dump(mode="json", exclude_none=True),
+        )
         agent_url = (
             f"http://{target.agent['pod_ip']}:{target.agent['pod_port']}/job/start"
         )
         async with dependencies.http_client_factory(timeout=30.0) as client:
             response = await client.post(
                 agent_url,
-                json=job_start.model_dump(exclude_none=True),
+                json=delivery_payload,
             )
         if response.status_code not in (200, 202):
             dependencies.logger.warning(
@@ -225,9 +274,33 @@ async def dispatch_job_to_agent(
             )
             return False
 
+        accepted_delivery_id = None
+        if delivery_intent is not None:
+            try:
+                acknowledgement = response.json()
+            except (ValueError, TypeError):
+                acknowledgement = {}
+            if (
+                isinstance(acknowledgement, dict)
+                and acknowledgement.get("pinned_delivery_id") == str(delivery_intent["id"])
+                and acknowledgement.get("pinned_projection_digest")
+                    == delivery_payload["pinned_projection_digest"]
+            ):
+                accepted_delivery_id = str(delivery_intent["id"])
+            else:
+                dependencies.logger.warning(
+                    "Dispatch: pinned delivery acknowledgment unavailable for job %s",
+                    job_id,
+                )
+
         if dependencies.completion_commands_enabled():
             if not await dependencies.store.confirm_pinned_job_dispatch(
-                job_id, agent_id
+                job_id, agent_id,
+                pinned_delivery_id=accepted_delivery_id,
+                pinned_projection_digest=(
+                    delivery_payload.get("pinned_projection_digest")
+                    if accepted_delivery_id else None
+                ),
             ):
                 dependencies.logger.warning(
                     "Dispatch: stale success from agent %s for job %s; "

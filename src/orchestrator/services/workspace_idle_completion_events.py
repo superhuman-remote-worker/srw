@@ -86,13 +86,13 @@ def completion_runtime_evidence(job):
 
 
 async def capture_completion_wait_on_conn(
-    conn, *, job, report, lease_token, decision_tool_call_id=None
+    conn, *, job, report, lease_token, pinned_delivery=None,
+    decision_tool_call_id=None
 ):
     """Capture once at fresh admission, under the already-held queue/Job locks."""
     if os.getenv("WORKSPACE_IDLE_RELEASE_ENABLED", "false").lower() != "true":
         return None
-    if job["execution_lane"] != "stateless" or lease_token is None:
-        # Pinned dispatch has no durable delivered-generation receipt yet.
+    if job["execution_lane"] not in {"stateless", "pinned"}:
         return None
     semantics = classify_completion_wait(
         job=dict(job), report=report, decision_tool_call_id=decision_tool_call_id
@@ -102,18 +102,38 @@ async def capture_completion_wait_on_conn(
     runtime = completion_runtime_evidence(job)
     if runtime is None:
         return None
-    authorized = await conn.fetchval(
-        "SELECT 1 FROM worker_batch_attempts WHERE job_id=$1 AND lease_token=$2 "
-        "AND bundle_authorized_at IS NOT NULL AND authority_digest=$3 "
-        "AND refunded_at IS NULL AND recovery_id IS NULL AND NOT EXISTS ("
-        "SELECT 1 FROM vm_workspace_recovery_jobs WHERE job_id=$1 AND resolved_at IS NULL)",
-        job["id"],
-        lease_token,
-        runtime["runtime_authority_digest"],
-    )
-    if authorized is None:
+    if job["execution_lane"] == "stateless":
+        if lease_token is None:
+            return None
+        authorized = await conn.fetchval(
+            "SELECT 1 FROM worker_batch_attempts WHERE job_id=$1 AND lease_token=$2 "
+            "AND bundle_authorized_at IS NOT NULL AND authority_digest=$3 "
+            "AND refunded_at IS NULL AND recovery_id IS NULL AND NOT EXISTS ("
+            "SELECT 1 FROM vm_workspace_recovery_jobs WHERE job_id=$1 AND resolved_at IS NULL)",
+            job["id"], lease_token, runtime["runtime_authority_digest"],
+        )
+        if authorized is None:
+            return None
+        return {"version": 1, "semantics": semantics, **runtime}
+    if (
+        pinned_delivery is None
+        or pinned_delivery["job_id"] != job["id"]
+        or pinned_delivery["agent_id"] != job["assigned_agent_id"]
+        or pinned_delivery["accepted_at"] is None
+        or str(pinned_delivery["provision_generation"])
+            != runtime["runtime_identity"]["runtime_generation"]
+        or str(pinned_delivery["vm_uid"])
+            != runtime["runtime_identity"]["runtime_uid"]
+        or str(pinned_delivery["launcher_uid"]) != runtime["launcher_uid"]
+        or str(pinned_delivery["pvc_uid"]) != runtime["rootdisk_pvc_uid"]
+        or pinned_delivery["runtime_authority_digest"]
+            != "sha256:" + runtime["runtime_authority_digest"]
+    ):
         return None
-    return {"version": 1, "semantics": semantics, **runtime}
+    return {
+        "version": 1, "semantics": semantics, **runtime,
+        "pinned_delivery_id": str(pinned_delivery["id"]),
+    }
 
 
 def completion_wait_branch(command, status):
@@ -154,9 +174,10 @@ async def record_completion_wait_on_conn(
     if row is None or row["status"] != "pending_review":
         return False
     command = await conn.fetchrow(
-        "SELECT payload,report_seq FROM job_completion_commands WHERE id=$1 AND job_id=$2 "
+        "SELECT payload,report_seq,accepted_lease_token,accepted_agent_id "
+        "FROM job_completion_commands WHERE id=$1 AND job_id=$2 "
         "AND state='finalizing' AND finalizing_by=$3 AND lease_expires_at>clock_timestamp() "
-        "AND accepted_lease_token IS NOT NULL",
+        "AND (accepted_lease_token IS NOT NULL OR accepted_agent_id IS NOT NULL)",
         UUID(str(command_id)),
         UUID(str(job_id)),
         str(finalizing_by),
@@ -170,6 +191,24 @@ async def record_completion_wait_on_conn(
         return False
     source = payload.get(ACCEPTED_IDLE_WAIT_SOURCE_KEY)
     if not isinstance(source, dict) or source.get("version") != 1:
+        return False
+    if row["execution_lane"] == "pinned":
+        from orchestrator.services.pinned_job_delivery import (
+            pinned_wait_receipt_on_conn,
+        )
+
+        linked = await pinned_wait_receipt_on_conn(
+            conn, job=row, source_kind="completion",
+            source_id=UUID(str(command_id)),
+        )
+        if (
+            linked is None
+            or command["accepted_agent_id"] != row["assigned_agent_id"]
+            or source.get("pinned_delivery_id")
+                != str(linked["delivery"]["id"])
+        ):
+            return False
+    elif row["execution_lane"] != "stateless" or command["accepted_lease_token"] is None:
         return False
     semantics = source.get("semantics")
     if not isinstance(semantics, dict) or semantics.get("branch") != branch:

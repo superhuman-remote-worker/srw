@@ -604,7 +604,13 @@ async def test_reply_queue_cannot_claim_worker_through_releasing_vm(db, monkeypa
     assert await db.queue_stateless_job_for_resume(
         str(owner), expected_status="waiting_for_reply"
     )
-    assert await claim_worker_batch(db, pod_name="idle-race-worker") is None
+    # The shared PG fixture can retain earlier orphan queue units after its
+    # jobs-only teardown. Drain them until this owner's queued unit is the
+    # one the real worker claimant rejects; every claim must stay non-runnable.
+    for _ in range(32):
+        assert await claim_worker_batch(db, pod_name="idle-race-worker") is None
+        if await db.fetchval("SELECT state FROM run_queue WHERE unit_id=$1", owner) == "done":
+            break
     assert await db.fetchval("SELECT state FROM run_queue WHERE unit_id=$1", owner) == "done"
     assert await db.fetchval("SELECT phase FROM vm_idle_operations WHERE id=$1", op["id"]) == "releasing"
     await db.execute(

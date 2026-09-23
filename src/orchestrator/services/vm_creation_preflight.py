@@ -508,8 +508,20 @@ class VMCreationPreflightStore:
                     return prior
                 if idle_wake is not None and not idle_first:
                     raise VMCreationRetryConflict("idle_wake_unproven")
+                pinned_idle_owner = False
+                if (idle_first and "release_kind" in idle_wake
+                        and idle_wake["release_kind"] == "pinned_job"):
+                    from orchestrator.services.vm_idle_lifecycle import (
+                        _pinned_stop_valid_on_conn,
+                    )
+
+                    pinned_idle_owner = bool(
+                        job["execution_lane"] == "pinned"
+                        and job["assigned_agent_id"] == idle_wake["pinned_agent_id"]
+                        and await _pinned_stop_valid_on_conn(conn, idle_wake)
+                    )
                 if (not idle_first and job["status"] not in {"created", "paused"}) or (
-                    job["assigned_agent_id"] is not None
+                    job["assigned_agent_id"] is not None and not pinned_idle_owner
                 ):
                     raise VMCreationRetryConflict("job_changed")
                 if old_vm and (

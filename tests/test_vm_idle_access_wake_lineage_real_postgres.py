@@ -34,6 +34,7 @@ def idle_env(monkeypatch):
 
 async def access_only_cycle(
     db, owner, episode, identity, *, execution_requested=False, finish=True,
+    pinned=False,
 ):
     from orchestrator.services.vm_idle_lifecycle import (
         VMIdleLifecycleService, VMIdleLifecycleStore,
@@ -47,6 +48,19 @@ async def access_only_cycle(
         identity=identity,
     )
     assert operation is not None
+    if pinned:
+        assert operation["release_kind"] == "pinned_job"
+        if operation["pinned_stop_verified_at"] is None:
+            claimed = await store.claim(str(operation["id"]), claimant="access-cycle")
+            assert claimed is not None
+            assert await store.record_pinned_terminal(claimed, claimant="access-cycle")
+            assert await store.record_pinned_stop(
+                claimed, claimant="access-cycle", absence="exact_absent",
+            )
+            await store.release_claim(
+                str(operation["id"]), token=claimed["claim_token"],
+                claimant="access-cycle",
+            )
     await db.execute(
         "INSERT INTO managed_repository_process_zero_receipts "
         "(owner_kind,owner_id,scope,provisioner,runtime_incarnation) "
@@ -75,6 +89,14 @@ async def access_only_cycle(
     )
     wake = await store.request_wake(str(owner), execution_requested=execution_requested)
     assert wake is not None and wake["wake_execution_requested"] is execution_requested
+    if pinned:
+        state = await db.fetchrow(
+            "SELECT status,assigned_agent_id,context->'vm'->>'status' AS vm_status "
+            "FROM jobs WHERE id=$1", owner,
+        )
+        assert (wake["phase"], state["status"], state["vm_status"]) == (
+            "waking", "waiting_for_reply", "suspended",
+        )
     provisioner = VMProvisioner()
     provisioner._db = db
     create_result = await provisioner.create_vm(
@@ -157,12 +179,13 @@ async def access_only_cycle(
         ) is None
         return operation, None, successor
     rebound = read_episode(json.loads(row["workspace_idle_episode"]), revision=row["workspace_idle_revision"])
-    assert row["status"] == "pending_review"
+    assert row["status"] == ("waiting_for_reply" if pinned else "pending_review")
     assert rebound.episode_id == episode.episode_id
     assert rebound.wait_key == episode.wait_key
     assert rebound.entered_at == episode.entered_at
     assert rebound.revision == episode.revision + 1
-    assert await db.fetchval("SELECT state FROM run_queue WHERE unit_id=$1", owner) == "done"
+    if not pinned:
+        assert await db.fetchval("SELECT state FROM run_queue WHERE unit_id=$1", owner) == "done"
     return operation, rebound, successor
 
 

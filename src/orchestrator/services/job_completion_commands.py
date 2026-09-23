@@ -314,6 +314,11 @@ async def accept_completion_command(
     agent_id: str | None,
     client_report_id: str | None,
     requested_by: str,
+    pinned_delivery_id: UUID | None = None,
+    pinned_projection_digest: str | None = None,
+    pinned_delivery_proof: str | None = None,
+    pinned_process_generation: str | None = None,
+    pinned_pod_uid: str | None = None,
     code_version: str | None = None,
     status_reorder_enabled: bool = False,
 ) -> CompletionAcceptResult:
@@ -417,6 +422,18 @@ async def accept_completion_command(
             ):
                 raise CompletionControlInProgress
 
+            if (
+                job["execution_lane"] == "pinned"
+                and await conn.fetchval(
+                    "SELECT EXISTS(SELECT 1 FROM vm_idle_operations "
+                    "WHERE owner_kind='job' AND owner_id=$1 "
+                    "AND closed_at IS NULL)", job_uuid,
+                )
+            ):
+                raise CompletionFenceRejected(
+                    "pinned idle operation owns this Job's report authority"
+                )
+
             lane = str(job["execution_lane"] or "pinned")
             accepted_token: int | None = None
             accepted_agent: UUID | None = None
@@ -463,6 +480,22 @@ async def accept_completion_command(
                         "completion report does not match the assigned agent"
                     )
 
+            pinned_delivery = None
+            if accepted_agent is not None and pinned_delivery_id is not None:
+                from orchestrator.services.pinned_job_delivery import (
+                    accept_pinned_report_on_conn,
+                )
+
+                pinned_delivery = await accept_pinned_report_on_conn(
+                    conn, job_id=job_uuid, agent_id=accepted_agent,
+                    delivery_id=pinned_delivery_id,
+                    projection_digest=pinned_projection_digest,
+                    process_generation=pinned_process_generation,
+                    pod_uid=pinned_pod_uid,
+                    delivery_proof=pinned_delivery_proof,
+                    source_kind="completion",
+                )
+
             # An authorized S36 callback may resume after every finalizer clock
             # has expired.  The jobs-row lock shared with its authorization is
             # the linearization point: exact-key replays above remain
@@ -508,6 +541,7 @@ async def accept_completion_command(
                 job=job,
                 report=canonical_payload,
                 lease_token=accepted_token,
+                pinned_delivery=pinned_delivery,
                 # Preserve legacy marker behavior above, but never invent new
                 # idle evidence by stringifying malformed historical JSON.
                 decision_tool_call_id=(
@@ -555,6 +589,16 @@ async def accept_completion_command(
                 COMPLETION_INLINE_GRACE_SECONDS,
                 bool(status_reorder_enabled),
             )
+            if idle_source is not None and pinned_delivery is not None:
+                from orchestrator.services.pinned_job_delivery import (
+                    record_pinned_wait_receipt_on_conn,
+                )
+
+                if await record_pinned_wait_receipt_on_conn(
+                    conn, delivery=pinned_delivery, source_kind="completion",
+                    source_id=command["id"],
+                ) is None:
+                    raise CompletionFenceRejected("pinned completion source changed")
             await conn.execute(
                 """
                 UPDATE jobs

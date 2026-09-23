@@ -135,7 +135,7 @@ def approval_source_snapshot(job):
     if (
         not isinstance(job, dict)
         or job.get("status") != "pending_review"
-        or job.get("execution_lane") != "stateless"
+        or job.get("execution_lane") not in {"stateless", "pinned"}
     ):
         return None
     freeze = _object(job.get("freeze_data"))
@@ -168,7 +168,7 @@ def review_source_snapshot(job):
     if (
         not isinstance(job, dict)
         or job.get("status") != "pending_review"
-        or job.get("execution_lane") != "stateless"
+        or job.get("execution_lane") not in {"stateless", "pinned"}
     ):
         return None
     freeze = _object(job.get("freeze_data"))
@@ -253,6 +253,15 @@ async def finalized_phase_source(
         or current.get("wait_kind") != "human_approval"
     ):
         return None
+    if job["execution_lane"] == "pinned":
+        from orchestrator.services.pinned_job_delivery import (
+            pinned_source_origin_on_conn,
+        )
+
+        if not await pinned_source_origin_on_conn(
+            conn, job_id=job["id"], source_id=command_id, source=source,
+        ):
+            return None
     vm = _object(_object(job["context"]).get("vm"))
     if not await _source_runtime_continuity(
         conn, job=job, episode=episode, source=source,
@@ -314,6 +323,15 @@ async def finalized_review_source(
         or decision.get("tool_call_id") != semantics.get("decision_tool_call_id")
     ):
         return None
+    if job["execution_lane"] == "pinned":
+        from orchestrator.services.pinned_job_delivery import (
+            pinned_source_origin_on_conn,
+        )
+
+        if not await pinned_source_origin_on_conn(
+            conn, job_id=job["id"], source_id=command_id, source=source,
+        ):
+            return None
     if not await _source_runtime_continuity(
         conn, job=job, episode=episode, source=source,
         generation=generation, vm_uid=vm_uid,

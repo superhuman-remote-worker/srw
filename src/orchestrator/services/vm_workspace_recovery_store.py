@@ -1463,6 +1463,24 @@ class VMWorkspaceRecoveryStore:
                         "Canonical workspace ownership changed during cleanup admission.",
                     )
                 owner_id = canonical_owner
+        if owner_kind == "job" and source.startswith("lifecycle_vm_"):
+            # The idle releaser owns the exact agent-first, then VM-stop path.
+            # Share its Job row lock so a cleanup admitted first is seen by
+            # nomination, and nomination first makes ordinary cleanup stand
+            # down even when it is replaying an earlier request ID.
+            await conn.fetchrow("SELECT id FROM jobs WHERE id=$1 FOR UPDATE", owner_id)
+            if (
+                await conn.fetchval(
+                    "SELECT to_regclass('public.pinned_job_deliveries') IS NOT NULL"
+                )
+                and await conn.fetchval(
+                    "SELECT 1 FROM vm_idle_operations WHERE owner_kind='job' "
+                    "AND owner_id=$1 AND release_kind='pinned_job' "
+                    "AND closed_at IS NULL LIMIT 1",
+                    owner_id,
+                ) is not None
+            ):
+                return CleanupPermit(allowed=False, reason="pinned_job_idle_owned")
         if (
             owner_kind == "job"
             and source in {"completion_workspace_teardown", "kept_disk"}

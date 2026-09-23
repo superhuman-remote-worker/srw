@@ -21,7 +21,7 @@ import os
 import re
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import (
@@ -71,7 +71,7 @@ from orchestrator.security.crypto import (
 from shared.db_url import build_postgres_url, postgres_database_name
 from shared.job_freeze_types import AUTO_REDISPATCH_FREEZE_TYPES
 from shared.job_steering import context_delivery_key, queued_reply_key
-from shared.pinned_session_identity import PinnedSessionBinding
+from shared.pinned_session_identity import PinnedJobRecipient, PinnedSessionBinding
 from shared.session_retirement import stateless_settled_retirement_authority
 from shared.subagent_parent_authority import (
     ParentExecutionAuthority,
@@ -9670,12 +9670,179 @@ class PostgresDB:
 
         return result == "UPDATE 1"
 
+    async def prepare_pinned_job_delivery(
+        self,
+        job_id: str,
+        agent_id: str,
+        *,
+        recipient: PinnedJobRecipient,
+        projection_digest: str,
+    ) -> dict[str, Any] | None:
+        """Freeze a non-authorizing exact VM delivery intent before HTTP POST.
+
+        The Job lock verifies the original claim marker and runtime. The agent
+        row is read only: no Job -> agent lock is added to the claim/heartbeat
+        order. Its exact Pod/process fields must also match the freshly
+        attested recipient supplied by the dispatcher.
+        """
+
+        if (
+            not isinstance(recipient, PinnedJobRecipient)
+            or not re.fullmatch(r"sha256:[0-9a-f]{64}", projection_digest)
+        ):
+            return None
+        try:
+            job_uuid, agent_uuid = UUID(job_id), UUID(agent_id)
+            if (
+                recipient.expected_job_id != job_id
+                or recipient.expected_agent_id != agent_id
+                or not recipient.expected_pod_uid
+            ):
+                return None
+        except (ValueError, TypeError):
+            return None
+        async with self.acquire() as conn, conn.transaction():
+            job = await conn.fetchrow("SELECT * FROM jobs WHERE id=$1 FOR UPDATE", job_uuid)
+            if (
+                job is None or job["execution_lane"] != "pinned"
+                or job["status"] != "processing"
+                or job["assigned_agent_id"] != agent_uuid
+                or job["lease_expires_at"] is None
+            ):
+                return None
+            context = job["context"]
+            if isinstance(context, str):
+                context = json.loads(context)
+            if not isinstance(context, dict):
+                return None
+            marker = context.get("_workspace_dispatch_authority")
+            vm = context.get("vm")
+            if (
+                not isinstance(marker, dict) or not isinstance(vm, dict)
+                or marker.get("version") != 1
+                or marker.get("dispatch_kind") != "pinned"
+                or marker.get("assigned_backend") != "vm"
+                or marker.get("agent_id") != agent_id
+                or vm.get("status") != "ready"
+            ):
+                return None
+            try:
+                original_lease = datetime.fromisoformat(marker["lease_expires_at"])
+                generation = UUID(vm["provision_generation"])
+                vm_uid = UUID(vm["vm_uid"])
+                vmi_uid = UUID(vm["vmi_uid"])
+                launcher_uid = UUID(vm["active_pod_uid"])
+                pvc_uid = UUID(vm["rootdisk_pvc_uid"])
+                if original_lease.tzinfo is None:
+                    return None
+            except (KeyError, ValueError, TypeError, AttributeError):
+                return None
+            from orchestrator.services.vm_remote_operation import (
+                VMRemoteOperationUnavailable, _identity_from_row,
+            )
+            from shared.workspace_contract import (
+                vm_mode_from_env, workspace_runtime_authority_digest,
+            )
+
+            try:
+                runtime_identity = _identity_from_row(
+                    dict(job), owner_kind="job", owner_id=job_id,
+                    operation_kind="idle_policy",
+                )
+            except VMRemoteOperationUnavailable:
+                return None
+            if (
+                runtime_identity.workspace_generation != str(generation)
+                or runtime_identity.vm_uid != str(vm_uid)
+                or runtime_identity.launcher_pod_uid != str(launcher_uid)
+            ):
+                return None
+            authority_digest = workspace_runtime_authority_digest(
+                dict(job), vm_mode=vm_mode_from_env(),
+            )
+            if authority_digest is None:
+                return None
+            authority_digest = "sha256:" + authority_digest
+            identity_digest = "sha256:" + hashlib.sha256(
+                json.dumps(
+                    asdict(runtime_identity), sort_keys=True, separators=(",", ":"),
+                ).encode()
+            ).hexdigest()
+            agent = await conn.fetchrow(
+                "SELECT id,hostname,pod_uid,status,current_job_id,metadata "
+                "FROM agents WHERE id=$1", agent_uuid,
+            )
+            if agent is None or not agent["hostname"] or not agent["pod_uid"]:
+                return None
+            metadata = agent["metadata"]
+            if isinstance(metadata, str):
+                metadata = json.loads(metadata)
+            if (
+                not isinstance(metadata, dict)
+                or metadata.get("dispatch_process_generation")
+                != recipient.expected_process_generation
+                or agent["pod_uid"] != recipient.expected_pod_uid
+                or not (
+                    (agent["status"] == "ready" and agent["current_job_id"] is None)
+                    or (agent["status"] == "working" and agent["current_job_id"] == job_uuid)
+                )
+            ):
+                return None
+            namespace = os.getenv(
+                "AGENT_NAMESPACE", os.getenv("WORKSPACE_NAMESPACE", "superhuman-remote-worker")
+            )
+            if not namespace or len(namespace) > 63:
+                return None
+            marker_digest = "sha256:" + hashlib.sha256(
+                b"srw:pinned-job-marker:v1\0"
+                + json.dumps(marker, sort_keys=True, separators=(",", ":")).encode()
+            ).hexdigest()
+            existing = await conn.fetchrow(
+                "SELECT * FROM pinned_job_deliveries WHERE job_id=$1 "
+                "AND marker_digest=$2 FOR UPDATE", job_uuid, marker_digest,
+            )
+            if existing is not None:
+                if (
+                    existing["agent_id"] != agent_uuid
+                    or existing["projection_digest"] != projection_digest
+                    or existing["runtime_authority_digest"] != authority_digest
+                    or existing["identity_digest"] != identity_digest
+                    or existing["process_generation"] != recipient.expected_process_generation
+                    or existing["pod_uid"] != recipient.expected_pod_uid
+                    or existing["provision_generation"] != generation
+                    or existing["vm_uid"] != vm_uid
+                    or existing["vmi_uid"] != vmi_uid
+                    or existing["launcher_uid"] != launcher_uid
+                    or existing["pvc_uid"] != pvc_uid
+                ):
+                    return None
+                return dict(existing)
+            row = await conn.fetchrow(
+                "INSERT INTO pinned_job_deliveries "
+                "(job_id,agent_id,original_dispatch_marker,marker_digest,projection_digest,"
+                "runtime_authority_digest,identity_digest,"
+                "original_lease_expires_at,intent_lease_expires_at,process_generation,"
+                "pod_name,pod_namespace,pod_uid,provision_generation,vm_uid,vmi_uid,"
+                "launcher_uid,pvc_uid) "
+                "VALUES($1,$2,$3::jsonb,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18) "
+                "RETURNING *",
+                job_uuid, agent_uuid, json.dumps(marker), marker_digest,
+                projection_digest, authority_digest, identity_digest,
+                original_lease, job["lease_expires_at"],
+                recipient.expected_process_generation, agent["hostname"],
+                namespace, agent["pod_uid"], generation, vm_uid, vmi_uid,
+                launcher_uid, pvc_uid,
+            )
+            return dict(row)
+
     async def confirm_pinned_job_dispatch(
         self,
         job_id: str,
         agent_id: str,
         *,
         consumed_context_keys: List[str] | None = None,
+        pinned_delivery_id: str | None = None,
+        pinned_projection_digest: str | None = None,
     ) -> bool:
         """Validate post-POST ownership and consume payload keys atomically.
 
@@ -9690,7 +9857,153 @@ class PostgresDB:
             agent_uuid = UUID(agent_id)
         except ValueError:
             return False
-        async with self.acquire() as conn:
+        try:
+            delivery_uuid = UUID(pinned_delivery_id) if pinned_delivery_id else None
+        except (TypeError, ValueError):
+            return False
+        if (delivery_uuid is None) != (pinned_projection_digest is None):
+            return False
+        async with self.acquire() as conn, conn.transaction():
+            job = await conn.fetchrow(
+                "SELECT * FROM jobs WHERE id=$1 FOR UPDATE", job_uuid,
+            )
+            if (
+                job is None or job["execution_lane"] != "pinned"
+                or job["assigned_agent_id"] != agent_uuid
+            ):
+                return False
+            if delivery_uuid is not None:
+                delivery = await conn.fetchrow(
+                    "SELECT * FROM pinned_job_deliveries "
+                    "WHERE id=$1 AND job_id=$2 FOR UPDATE",
+                    delivery_uuid, job_uuid,
+                )
+                if (
+                    delivery is None or delivery["agent_id"] != agent_uuid
+                    or delivery["projection_digest"] != pinned_projection_digest
+                ):
+                    return False
+                context = job["context"]
+                if isinstance(context, str):
+                    context = json.loads(context)
+                context = context if isinstance(context, dict) else {}
+                vm = context.get("vm")
+                marker = context.get("_workspace_dispatch_authority")
+                if isinstance(marker, str):
+                    marker = json.loads(marker)
+                if isinstance(delivery["original_dispatch_marker"], str):
+                    original_marker = json.loads(delivery["original_dispatch_marker"])
+                else:
+                    original_marker = delivery["original_dispatch_marker"]
+                if (
+                    marker != original_marker or not isinstance(vm, dict)
+                    or vm.get("status") != "ready"
+                    or vm.get("provision_generation") != str(delivery["provision_generation"])
+                    or vm.get("vm_uid") != str(delivery["vm_uid"])
+                    or vm.get("vmi_uid") != str(delivery["vmi_uid"])
+                    or vm.get("active_pod_uid") != str(delivery["launcher_uid"])
+                    or vm.get("rootdisk_pvc_uid") != str(delivery["pvc_uid"])
+                ):
+                    return False
+                from orchestrator.services.vm_remote_operation import (
+                    VMRemoteOperationUnavailable, _identity_from_row,
+                )
+                from shared.workspace_contract import (
+                    vm_mode_from_env, workspace_runtime_authority_digest,
+                )
+
+                try:
+                    runtime_identity = _identity_from_row(
+                        dict(job), owner_kind="job", owner_id=job_id,
+                        operation_kind="idle_policy",
+                    )
+                except VMRemoteOperationUnavailable:
+                    return False
+                runtime_digest = workspace_runtime_authority_digest(
+                    dict(job), vm_mode=vm_mode_from_env(),
+                )
+                identity_digest = "sha256:" + hashlib.sha256(
+                    json.dumps(
+                        asdict(runtime_identity), sort_keys=True,
+                        separators=(",", ":"),
+                    ).encode()
+                ).hexdigest()
+                if (
+                    runtime_digest is None
+                    or "sha256:" + runtime_digest
+                        != delivery["runtime_authority_digest"]
+                    or identity_digest != delivery["identity_digest"]
+                ):
+                    return False
+                if job["status"] in {"waiting_for_reply", "pending_review"}:
+                    source = await conn.fetchrow(
+                        "SELECT source_kind,source_id FROM pinned_job_wait_receipts "
+                        "WHERE delivery_id=$1 AND job_id=$2 ORDER BY observed_at DESC LIMIT 1",
+                        delivery_uuid, job_uuid,
+                    )
+                    if source is None or delivery["accepted_at"] is None:
+                        return False
+                    if source["source_kind"] == "route":
+                        freeze = job["freeze_data"]
+                        if isinstance(freeze, str):
+                            freeze = json.loads(freeze)
+                        if (
+                            job["status"] != "waiting_for_reply"
+                            or not isinstance(freeze, dict)
+                            or freeze.get("route_id") != str(source["source_id"])
+                        ):
+                            return False
+                    elif source["source_kind"] == "completion":
+                        if (
+                            job["status"] != "pending_review"
+                            or not await conn.fetchval(
+                                "SELECT 1 FROM job_completion_commands "
+                                "WHERE id=$1 AND job_id=$2 AND accepted_agent_id=$3",
+                                source["source_id"], job_uuid, agent_uuid,
+                            )
+                        ):
+                            return False
+                    else:
+                        return False
+                    # The genuine report won publication before our 202. Do
+                    # not rewrite the wait or its server-owned entered_at.
+                    return True
+                if job["status"] != "processing" or job["lease_expires_at"] is None:
+                    return False
+                from orchestrator.services.completion_control import (
+                    completion_control_claim_active,
+                )
+
+                now_epoch = await conn.fetchval(
+                    "SELECT extract(epoch FROM clock_timestamp())::float8"
+                )
+                if completion_control_claim_active(context, now_epoch=now_epoch):
+                    return False
+                agent = await conn.fetchrow(
+                    "SELECT hostname,pod_uid,metadata,current_job_id FROM agents WHERE id=$1",
+                    agent_uuid,
+                )
+                metadata = agent["metadata"] if agent is not None else None
+                if isinstance(metadata, str):
+                    metadata = json.loads(metadata)
+                if (
+                    agent is None or agent["hostname"] != delivery["pod_name"]
+                    or agent["pod_uid"] != delivery["pod_uid"]
+                    or not isinstance(metadata, dict)
+                    or metadata.get("dispatch_process_generation")
+                        != delivery["process_generation"]
+                    or agent["current_job_id"] not in {None, job_uuid}
+                ):
+                    return False
+                if delivery["accepted_at"] is None:
+                    await conn.execute(
+                        "UPDATE pinned_job_deliveries SET accepted_at=clock_timestamp(),"
+                        "accepted_via='post',accepted_lease_expires_at=$2 "
+                        "WHERE id=$1 AND accepted_at IS NULL",
+                        delivery_uuid, job["lease_expires_at"],
+                    )
+            if job["status"] != "processing":
+                return False
             row = await conn.fetchrow(
                 f"""
                 UPDATE jobs
@@ -9703,11 +10016,9 @@ class PostgresDB:
                   AND NOT ({_completion_control_active_sql("context")})
                 RETURNING id
                 """,
-                job_uuid,
-                agent_uuid,
-                list(consumed_context_keys or []),
+                job_uuid, agent_uuid, list(consumed_context_keys or []),
             )
-        return row is not None
+            return row is not None
 
     async def set_completion_decision(
         self, job_id: str, decision: Dict[str, Any]
@@ -23932,7 +24243,55 @@ class PostgresDB:
                        {hold_guard}
                     RETURNING id
                     """
-            if not completion_commands_enabled:
+            # A flag stops new idle nominations, never the dispatch fence of
+            # an already-admitted operation. After 0275, all pinned claims
+            # share the agent-first lock order even when admission is off.
+            pinned_idle_claim = bool(await conn.fetchval(
+                "SELECT to_regclass('public.pinned_job_deliveries') IS NOT NULL"
+            ))
+            if (
+                not pinned_idle_claim
+                and os.getenv("WORKSPACE_IDLE_RELEASE_ENABLED", "false").lower()
+                    == "true"
+            ):
+                return False
+            if pinned_idle_claim:
+                # A ready-agent selection is advisory. Serialize the final
+                # claim with idle nomination on this same agent row, before
+                # taking the Job row (also the heartbeat lock order).
+                async with conn.transaction():
+                    agent = await conn.fetchrow(
+                        "SELECT status,current_job_id FROM agents "
+                        "WHERE id=$1 FOR UPDATE", agent_uuid,
+                    )
+                    if (
+                        agent is None or agent["status"] != "ready"
+                        or agent["current_job_id"] is not None
+                    ):
+                        return False
+                    if await conn.fetchval(
+                        "SELECT EXISTS(SELECT 1 FROM vm_idle_operations "
+                        "WHERE release_kind='pinned_job' AND closed_at IS NULL "
+                        "AND pinned_agent_id=$1)", agent_uuid,
+                    ):
+                        return False
+                    locked = await conn.fetchval(
+                        "SELECT id FROM jobs WHERE id=$1::uuid FOR UPDATE",
+                        job_uuid,
+                    )
+                    if locked is None:
+                        return False
+                    if completion_commands_enabled and await conn.fetchval(
+                        "SELECT EXISTS (SELECT 1 "
+                        "FROM job_completion_sweep_exclusions "
+                        "WHERE job_id=$1::uuid)", job_uuid,
+                    ):
+                        return False
+                    row = await conn.fetchrow(
+                        query, job_uuid, agent_uuid, JOB_LEASE_PICKUP_SECONDS,
+                        *hold_args,
+                    )
+            elif not completion_commands_enabled:
                 row = await conn.fetchrow(
                     query,
                     job_uuid,
@@ -28642,6 +29001,11 @@ class PostgresDB:
         expected_lane: str,
         lease_token: int | None = None,
         agent_id: str | None = None,
+        pinned_delivery_id: UUID | None = None,
+        pinned_projection_digest: str | None = None,
+        pinned_delivery_proof: str | None = None,
+        pinned_process_generation: str | None = None,
+        pinned_pod_uid: str | None = None,
         completion_commands_enabled: bool = False,
     ) -> Optional[str]:
         """The M2 unit: message + route + wake intent + freeze, one transaction.
@@ -28783,6 +29147,12 @@ class PostgresDB:
                     )
                     if job is None:
                         raise _Abort()
+                    if expected_lane == "pinned" and await conn.fetchval(
+                        "SELECT EXISTS(SELECT 1 FROM vm_idle_operations "
+                        "WHERE owner_kind='job' AND owner_id=$1 "
+                        "AND closed_at IS NULL)", job_uuid,
+                    ):
+                        raise _Abort()
                     if completion_commands_enabled:
                         command_blocked = await conn.fetchval(
                             "SELECT EXISTS (SELECT 1 "
@@ -28808,6 +29178,26 @@ class PostgresDB:
                         job["assigned_agent_id"] or ""
                     ) != str(agent_uuid):
                         raise _Abort()
+
+                    pinned_delivery = None
+                    if (
+                        expected_lane == "pinned"
+                        and agent_uuid is not None
+                        and pinned_delivery_id is not None
+                    ):
+                        from orchestrator.services.pinned_job_delivery import (
+                            accept_pinned_report_on_conn,
+                        )
+
+                        pinned_delivery = await accept_pinned_report_on_conn(
+                            conn, job_id=job_uuid, agent_id=agent_uuid,
+                            delivery_id=pinned_delivery_id,
+                            projection_digest=pinned_projection_digest,
+                            process_generation=pinned_process_generation,
+                            pod_uid=pinned_pod_uid,
+                            delivery_proof=pinned_delivery_proof,
+                            source_kind="route",
+                        )
 
                     message_row = await conn.fetchrow(
                         """
@@ -28907,6 +29297,16 @@ class PostgresDB:
                     )
                     if updated is None:
                         raise _Abort()
+                    if pinned_delivery is not None:
+                        from orchestrator.services.pinned_job_delivery import (
+                            record_pinned_wait_receipt_on_conn,
+                        )
+
+                        if await record_pinned_wait_receipt_on_conn(
+                            conn, delivery=pinned_delivery,
+                            source_kind="route", source_id=route_uuid,
+                        ) is None:
+                            raise _Abort()
                     # A human-addressed route is semantic wait evidence. An
                     # officer-only question is still autonomous work. Legacy
                     # unfenced pinned publishers do not gain idle capability.
@@ -29623,6 +30023,10 @@ class PostgresDB:
                    {idle_exit}
                    updated_at = CURRENT_TIMESTAMP
              WHERE id = $1{lane_guard}{lifecycle_guard}{status_guard}{route_guard}{completion_guard}{control_guard}{trip_guard}{hold_guard}
+               AND (jobs.execution_lane <> 'pinned' OR NOT EXISTS (
+                   SELECT 1 FROM vm_idle_operations idle
+                   WHERE idle.owner_kind='job' AND idle.owner_id=jobs.id
+                     AND idle.closed_at IS NULL))
                AND NOT EXISTS (SELECT 1 FROM srw_execution_specs execution
                    WHERE execution.work_kind='Job' AND execution.work_id=jobs.id
                      AND execution.harness_adapter <> 'srw/v1')
@@ -29715,6 +30119,9 @@ class PostgresDB:
                        ),
                        updated_at = CURRENT_TIMESTAMP
                  WHERE id = $1::uuid
+                   AND NOT EXISTS (SELECT 1 FROM vm_idle_operations idle
+                       WHERE idle.owner_kind='job' AND idle.owner_id=jobs.id
+                         AND idle.closed_at IS NULL)
                    AND NOT EXISTS (SELECT 1 FROM srw_execution_specs execution
                        WHERE execution.work_kind='Job' AND execution.work_id=jobs.id
                          AND execution.harness_adapter <> 'srw/v1')

@@ -12,10 +12,13 @@ import json
 import inspect
 import logging
 import os
+import httpx
 from typing import Any, Mapping
 from uuid import UUID, uuid4
 
 from fastapi import HTTPException
+from shared.pinned_session_identity import PinnedJobRecipient
+from orchestrator.services.pinned_k8s_effect import pod_containers_are_terminal
 
 from orchestrator.services.vm_provisioner import (
     VMTeardownIdentity,
@@ -54,6 +57,73 @@ def _uuid(value: Any) -> UUID | None:
         return parsed if str(parsed) == str(value) else None
     except (TypeError, ValueError, AttributeError):
         return None
+
+
+def _release_kind(operation: Mapping[str, Any]) -> str:
+    # During the 0275 rollout an older 0270-0273 schema has only stateless
+    # operations. Never index the new field before the migration is present.
+    return operation["release_kind"] if "release_kind" in operation else "stateless"
+
+
+async def _pinned_stop_valid_on_conn(conn: Any, operation: Mapping[str, Any]) -> bool:
+    """Check one direct stop or one immutable prior access-only stop link."""
+    if _release_kind(operation) != "pinned_job":
+        return False
+    stop = _object(operation["pinned_stop_evidence"])
+    if (
+        operation["pinned_terminal_observed_at"] is None
+        or operation["pinned_stop_verified_at"] is None
+        or stop.get("version") != 1
+        or stop.get("kind") not in {
+            "pinned_job_agent_stop", "pinned_job_agent_stop_reuse",
+        }
+        or stop.get("operation_id") != str(operation["id"])
+        or stop.get("job_id") != str(operation["owner_id"])
+        or stop.get("agent_id") != str(operation["pinned_agent_id"])
+        or stop.get("process_generation") != operation["pinned_process_generation"]
+        or stop.get("pod_name") != operation["pinned_agent_pod_name"]
+        or stop.get("pod_namespace") != operation["pinned_agent_pod_namespace"]
+        or stop.get("pod_uid") != operation["pinned_agent_pod_uid"]
+        or stop.get("delivery_id") != str(operation["pinned_delivery_id"])
+        or stop.get("terminal_containers_observed") is not True
+        or stop.get("final_absence") not in {"exact_absent", "replacement"}
+    ):
+        return False
+    if stop["kind"] == "pinned_job_agent_stop":
+        return stop.get("prior_operation_id") is None
+    prior_id = _uuid(stop.get("prior_operation_id"))
+    if prior_id is None:
+        return False
+    prior = await conn.fetchrow(
+        "SELECT * FROM vm_idle_operations WHERE id=$1 AND owner_kind='job' "
+        "AND owner_id=$2 AND episode_id=$3",
+        prior_id, operation["owner_id"], operation["episode_id"],
+    )
+    if prior is None:
+        return False
+    prior_stop = _object(prior["pinned_stop_evidence"])
+    successor = _object(_object(prior["access_rebind_proof"]).get("successor"))
+    return bool(
+        prior["release_kind"] == "pinned_job"
+        and prior["phase"] == "ready" and prior["closed_at"] is not None
+        and prior["episode_revision"] + 1 == operation["episode_revision"]
+        and prior["pinned_delivery_id"] == operation["pinned_delivery_id"]
+        and prior["pinned_wait_receipt_id"] == operation["pinned_wait_receipt_id"]
+        and prior["pinned_agent_id"] == operation["pinned_agent_id"]
+        and prior["pinned_agent_pod_uid"] == operation["pinned_agent_pod_uid"]
+        and prior["pinned_terminal_observed_at"] == operation["pinned_terminal_observed_at"]
+        and prior["pinned_stop_verified_at"] == operation["pinned_stop_verified_at"]
+        and prior_stop.get("operation_id") == str(prior["id"])
+        and prior_stop.get("pod_uid") == stop["pod_uid"]
+        and prior_stop.get("final_absence") == stop["final_absence"]
+        and successor == {
+            "generation": str(operation["provision_generation"]),
+            "vm_uid": str(operation["vm_uid"]),
+            "vmi_uid": str(operation["vmi_uid"]),
+            "launcher_uid": str(operation["launcher_uid"]),
+            "pvc_uid": str(operation["pvc_uid"]),
+        }
+    )
 
 
 async def retained_terminal_rootdisk(db: Any, *, job_id: str,
@@ -100,7 +170,7 @@ class VMIdleLifecycleStore:
             return None
         owner_id = UUID(job_id)
         job = await conn.fetchrow("SELECT * FROM jobs WHERE id=$1 FOR UPDATE", owner_id)
-        if job is None or job["status"] != "pending_review" or job["execution_lane"] != "stateless":
+        if job is None or job["status"] != "pending_review" or job["execution_lane"] not in {"stateless", "pinned"}:
             return None
         context = _object(job["context"])
         from orchestrator.services.completion_control import (
@@ -130,6 +200,10 @@ class VMIdleLifecycleStore:
             "SELECT * FROM vm_idle_operations WHERE owner_kind='job' AND owner_id=$1 "
             "AND closed_at IS NULL FOR UPDATE", owner_id,
         )
+        if operation is not None and _release_kind(operation) != (
+            "pinned_job" if job["execution_lane"] == "pinned" else "stateless"
+        ):
+            return None
         vm = _object(context.get("vm"))
         if operation is not None:
             if (
@@ -201,6 +275,100 @@ class VMIdleLifecycleStore:
             owner_id, _uuid(vm.get("rootdisk_pvc_uid")),
         ):
             return None
+        if operation is None and job["execution_lane"] == "pinned":
+            from orchestrator.services.pinned_job_delivery import (
+                pinned_wait_receipt_on_conn,
+            )
+
+            if (
+                not vm_remote_operation_protocol_enabled()
+                or not vm_persistent_rootdisk_enabled()
+                or vm.get("status") != "ready"
+                or job["assigned_agent_id"] is None
+                or _object(context.get("ide_session")).get("status")
+                    in {"active", "idle", "restoring"}
+            ):
+                return None
+            if await conn.fetchval(
+                "SELECT EXISTS(SELECT 1 FROM vm_idle_access_leases "
+                "WHERE owner_kind='job' AND owner_id=$1 AND closed_at IS NULL "
+                "AND expires_at>clock_timestamp()) OR "
+                "EXISTS(SELECT 1 FROM vm_remote_operation_leases "
+                "WHERE owner_kind='job' AND owner_id=$1 AND settled_at IS NULL) OR "
+                "EXISTS(SELECT 1 FROM vm_workspace_recoveries "
+                "WHERE owner_kind='job' AND owner_id=$1 AND resolved_at IS NULL) OR "
+                "EXISTS(SELECT 1 FROM vm_workspace_recovery_jobs "
+                "WHERE job_id=$1 AND resolved_at IS NULL) OR "
+                "EXISTS(SELECT 1 FROM vm_workspace_cleanup_admissions "
+                "WHERE owner_kind='job' AND owner_id=$1 AND completed_at IS NULL) OR "
+                "EXISTS(SELECT 1 FROM jobs WHERE parent_job_id=$1 "
+                "AND status NOT IN ('completed','failed','cancelled') "
+                "AND context->>'inherits_parent_workspace'='true') OR "
+                "EXISTS(SELECT 1 FROM job_completion_commands WHERE job_id=$1 "
+                "AND state IN ('pending','finalizing','parked'))",
+                owner_id,
+            ):
+                return None
+            source_receipt = await pinned_wait_receipt_on_conn(
+                conn, job=job, source_kind="completion",
+                source_id=UUID(source["command_id"]), episode=episode,
+            )
+            if source_receipt is None:
+                return None
+            delivery, receipt = (
+                source_receipt["delivery"], source_receipt["receipt"]
+            )
+            agent = await conn.fetchrow(
+                "SELECT * FROM agents WHERE id=$1 FOR UPDATE",
+                delivery["agent_id"],
+            )
+            if (
+                agent is None
+                or job["assigned_agent_id"] != delivery["agent_id"]
+                or agent["hostname"] != delivery["pod_name"]
+                or agent["pod_uid"] != delivery["pod_uid"]
+                or _object(agent["metadata"]).get("dispatch_process_generation")
+                    != delivery["process_generation"]
+                or agent["current_job_id"] not in {None, owner_id}
+                or agent["status"] not in {"ready", "working", "draining", "offline"}
+                or await conn.fetchval(
+                    "SELECT EXISTS(SELECT 1 FROM jobs WHERE assigned_agent_id=$1 "
+                    "AND id<>$2 AND execution_lane='pinned' "
+                    "AND status NOT IN ('completed','failed','cancelled'))",
+                    delivery["agent_id"], owner_id,
+                )
+            ):
+                return None
+            operation = await conn.fetchrow(
+                "INSERT INTO vm_idle_operations "
+                "(owner_kind,owner_id,phase,episode_id,episode_revision,"
+                "provision_generation,vm_uid,vmi_uid,launcher_uid,pvc_uid,retained_kind,"
+                "release_kind,pinned_delivery_id,pinned_wait_receipt_id,"
+                "pinned_agent_id,pinned_process_generation,pinned_agent_pod_name,"
+                "pinned_agent_pod_namespace,pinned_agent_pod_uid,"
+                "pinned_original_dispatch_marker,pinned_lease_observed_at,"
+                "pinned_lease_expires_at) "
+                "VALUES('job',$1,'releasing',$2,$3,$4,$5,$6,$7,$8,'rootdisk',"
+                "'pinned_job',$9,$10,$11,$12,$13,$14,$15,$16::jsonb,$17,$18) "
+                "RETURNING *",
+                owner_id, UUID(episode.episode_id), episode.revision,
+                generation, vm_uid, _uuid(vm["vmi_uid"]), launcher_uid,
+                _uuid(vm["rootdisk_pvc_uid"]), delivery["id"], receipt["id"],
+                delivery["agent_id"], delivery["process_generation"],
+                delivery["pod_name"], delivery["pod_namespace"], delivery["pod_uid"],
+                json.dumps(_object(delivery["original_dispatch_marker"])),
+                receipt["observed_at"], receipt["lease_expires_at"],
+            )
+            await conn.execute(
+                "UPDATE agents SET status='draining' WHERE id=$1",
+                delivery["agent_id"],
+            )
+            vm.update(status="suspending", _suspend_remote_io_closed=str(operation["id"]))
+            context["vm"] = vm
+            await conn.execute(
+                "UPDATE jobs SET context=$2::jsonb WHERE id=$1",
+                owner_id, json.dumps(context),
+            )
         if operation is None:
             # This is a terminal, no-successor release. Do not ask for a new
             # VM budget or reusable network profile. Ordinary waiting release
@@ -281,7 +449,7 @@ class VMIdleLifecycleStore:
         identity: Mapping[str, str],
         warm_seconds: int = 900,
     ) -> dict[str, Any] | None:
-        """Reserve one stateless Job release after a fresh, locked recheck."""
+        """Reserve one exact Job release after a fresh, locked source recheck."""
 
         if (
             os.getenv("WORKSPACE_IDLE_RELEASE_ENABLED", "false").lower() != "true"
@@ -302,18 +470,55 @@ class VMIdleLifecycleStore:
         if any(value is None for value in expected.values()):
             return None
         owner_id = UUID(job_id)
+        # Candidate nomination is advisory. A pinned agent is always locked
+        # before queue/Job, then rechecked under the Job lock, matching the
+        # heartbeat's agent -> Job order and final dispatch claim order.
+        async with self.db.acquire() as probe:
+            candidate = await probe.fetchrow(
+                "SELECT execution_lane,assigned_agent_id FROM jobs WHERE id=$1",
+                owner_id,
+            )
+        if candidate is None or candidate["execution_lane"] not in {"stateless", "pinned"}:
+            return None
+        if candidate["execution_lane"] == "pinned":
+            async with self.db.acquire() as probe:
+                if not await probe.fetchval(
+                    "SELECT to_regclass('public.pinned_job_deliveries') IS NOT NULL"
+                ):
+                    return None
+        candidate_agent_id = (
+            candidate["assigned_agent_id"]
+            if candidate["execution_lane"] == "pinned" else None
+        )
+        if candidate["execution_lane"] == "pinned" and candidate_agent_id is None:
+            return None
         async with self.db.acquire() as conn, conn.transaction():
+            pinned_agent = None
+            if candidate_agent_id is not None:
+                pinned_agent = await conn.fetchrow(
+                    "SELECT * FROM agents WHERE id=$1 FOR UPDATE",
+                    candidate_agent_id,
+                )
+                if pinned_agent is None:
+                    return None
             queue = await conn.fetchrow(
                 "SELECT state,unit_kind,lease_token,leased_until FROM run_queue "
                 "WHERE unit_id=$1 FOR UPDATE",
                 owner_id,
             )
-            if queue is None or queue["unit_kind"] != "worker_batch":
+            if candidate_agent_id is None and (
+                queue is None or queue["unit_kind"] != "worker_batch"
+            ):
                 return None
             row = await conn.fetchrow(
                 "SELECT * FROM jobs WHERE id=$1 FOR UPDATE", owner_id
             )
-            if row is None:
+            if (
+                row is None
+                or row["execution_lane"] != candidate["execution_lane"]
+                or row["assigned_agent_id"] != candidate_agent_id
+                or (candidate_agent_id is not None and queue is not None)
+            ):
                 return None
             operation = await conn.fetchrow(
                 "SELECT * FROM vm_idle_operations WHERE owner_kind='job' "
@@ -337,7 +542,7 @@ class VMIdleLifecycleStore:
                 ):
                     return dict(operation)
                 return None
-            if row["execution_lane"] != "stateless" or row["assigned_agent_id"] is not None:
+            if row["execution_lane"] == "stateless" and row["assigned_agent_id"] is not None:
                 return None
             # A parked VM is only safe to stop when its successor can enter
             # the already deployed creation protocol within the original
@@ -370,7 +575,7 @@ class VMIdleLifecycleStore:
                 or episode.episode_id != episode_id
                 or episode.revision != revision
                 or vm.get("status") != "ready"
-                or queue["state"] not in {"done", "parked"}
+                or (candidate_agent_id is None and queue["state"] not in {"done", "parked"})
             ):
                 return None
             owner, ambiguous = _job_workspace_owner(owner_id, dict(row))
@@ -421,6 +626,41 @@ class VMIdleLifecycleStore:
                     vmi_uid=expected["vmi_uid"],
                 )
                 if review_source is None:
+                    return None
+            pinned_source = None
+            if candidate_agent_id is not None:
+                from orchestrator.services.pinned_job_delivery import (
+                    pinned_wait_receipt_on_conn,
+                )
+
+                try:
+                    source_id = UUID(episode.wait_key)
+                except (TypeError, ValueError):
+                    return None
+                source_kind = (
+                    "route" if episode.wait_kind == "human_message"
+                    else "completion"
+                )
+                if source_kind == "route":
+                    route = await conn.fetchrow(
+                        "SELECT job_id,project_id,state,blocking FROM job_message_routes "
+                        "WHERE route_id=$1", source_id,
+                    )
+                    if (
+                        route is None or route["job_id"] != owner_id
+                        or route["project_id"] != row["project_id"]
+                        or not route["blocking"]
+                        or route["state"] not in {
+                            "user_direct", "pending_both", "escalated_to_user",
+                        }
+                        or freeze.get("route_id") != episode.wait_key
+                    ):
+                        return None
+                pinned_source = await pinned_wait_receipt_on_conn(
+                    conn, job=row, source_kind=source_kind, source_id=source_id,
+                    episode=episode,
+                )
+                if pinned_source is None:
                     return None
             from orchestrator.services.vm_creation_preflight import (
                 _execution_binding,
@@ -612,23 +852,130 @@ class VMIdleLifecycleStore:
             ide = _object(context.get("ide_session"))
             if holds or ide.get("status") in {"active", "idle", "restoring"}:
                 return None
-            operation = await conn.fetchrow(
-                """
-                INSERT INTO vm_idle_operations
-                    (owner_kind,owner_id,phase,episode_id,episode_revision,
-                     provision_generation,vm_uid,vmi_uid,launcher_uid,pvc_uid,retained_kind)
-                VALUES ('job',$1,'releasing',$2,$3,$4,$5,$6,$7,$8,'rootdisk')
-                RETURNING *
-                """,
-                owner_id,
-                UUID(episode_id),
-                revision,
-                expected["generation"],
-                expected["vm_uid"],
-                expected["vmi_uid"],
-                expected["launcher_uid"],
-                expected["pvc_uid"],
-            )
+            if pinned_source is not None:
+                delivery = pinned_source["delivery"]
+                receipt = pinned_source["receipt"]
+                prior_stop = None
+                if pinned_source["access_rebound"]:
+                    prior = await conn.fetchrow(
+                        "SELECT * FROM vm_idle_operations WHERE owner_kind='job' "
+                        "AND owner_id=$1 AND episode_id=$2 "
+                        "AND episode_revision=$3 ORDER BY id DESC LIMIT 1 FOR SHARE",
+                        owner_id, UUID(episode_id), revision - 1,
+                    )
+                    prior_evidence = _object(prior["pinned_stop_evidence"]) if prior else {}
+                    if (
+                        prior is None or prior["release_kind"] != "pinned_job"
+                        or prior["phase"] != "ready" or prior["closed_at"] is None
+                        or prior["pinned_delivery_id"] != delivery["id"]
+                        or prior["pinned_wait_receipt_id"] != receipt["id"]
+                        or prior["pinned_agent_id"] != candidate_agent_id
+                        or prior["pinned_agent_pod_uid"] != delivery["pod_uid"]
+                        or prior["pinned_terminal_observed_at"] is None
+                        or prior["pinned_stop_verified_at"] is None
+                        or prior_evidence.get("operation_id") != str(prior["id"])
+                        or prior_evidence.get("pod_uid") != delivery["pod_uid"]
+                        or prior_evidence.get("terminal_containers_observed") is not True
+                        or prior_evidence.get("final_absence")
+                            not in {"exact_absent", "replacement"}
+                    ):
+                        return None
+                    prior_stop = prior
+                namespace = os.getenv(
+                    "AGENT_NAMESPACE",
+                    os.getenv("WORKSPACE_NAMESPACE", "superhuman-remote-worker"),
+                )
+                if (
+                    delivery["agent_id"] != candidate_agent_id
+                    or delivery["pod_namespace"] != namespace
+                    or pinned_agent["hostname"] != delivery["pod_name"]
+                    or pinned_agent["pod_uid"] != delivery["pod_uid"]
+                    or _object(pinned_agent["metadata"]).get("dispatch_process_generation")
+                        != delivery["process_generation"]
+                    or pinned_agent["current_job_id"] not in {None, owner_id}
+                    or pinned_agent["status"] not in {
+                        "ready", "working", "draining", "offline",
+                    }
+                    or _object(context.get("_workspace_dispatch_authority"))
+                        != _object(delivery["original_dispatch_marker"])
+                ):
+                    return None
+                if await conn.fetchval(
+                    "SELECT EXISTS(SELECT 1 FROM jobs WHERE assigned_agent_id=$1 "
+                    "AND id<>$2 AND execution_lane='pinned' "
+                    "AND status NOT IN ('completed','failed','cancelled')) "
+                    "OR EXISTS(SELECT 1 FROM vm_idle_operations "
+                    "WHERE release_kind='pinned_job' AND pinned_agent_id=$1 "
+                    "AND closed_at IS NULL)",
+                    candidate_agent_id, owner_id,
+                ):
+                    return None
+                new_operation_id = uuid4()
+                reuse_evidence = None
+                if prior_stop is not None:
+                    reuse_evidence = {
+                        "version": 1,
+                        "kind": "pinned_job_agent_stop_reuse",
+                        "operation_id": str(new_operation_id),
+                        "prior_operation_id": str(prior_stop["id"]),
+                        "job_id": str(owner_id),
+                        "agent_id": str(candidate_agent_id),
+                        "process_generation": delivery["process_generation"],
+                        "pod_name": delivery["pod_name"],
+                        "pod_namespace": delivery["pod_namespace"],
+                        "pod_uid": delivery["pod_uid"],
+                        "delivery_id": str(delivery["id"]),
+                        "terminal_containers_observed": True,
+                        "final_absence": _object(
+                            prior_stop["pinned_stop_evidence"]
+                        )["final_absence"],
+                    }
+                operation = await conn.fetchrow(
+                    "INSERT INTO vm_idle_operations "
+                    "(owner_kind,owner_id,phase,episode_id,episode_revision,"
+                    "provision_generation,vm_uid,vmi_uid,launcher_uid,pvc_uid,retained_kind,"
+                    "release_kind,pinned_delivery_id,pinned_wait_receipt_id,"
+                    "pinned_agent_id,pinned_process_generation,pinned_agent_pod_name,"
+                    "pinned_agent_pod_namespace,pinned_agent_pod_uid,"
+                    "pinned_original_dispatch_marker,pinned_lease_observed_at,"
+                    "pinned_lease_expires_at,id,pinned_terminal_observed_at,"
+                    "pinned_stop_evidence,pinned_stop_verified_at) "
+                    "VALUES('job',$1,'releasing',$2,$3,$4,$5,$6,$7,$8,'rootdisk',"
+                    "'pinned_job',$9,$10,$11,$12,$13,$14,$15,$16::jsonb,$17,$18,"
+                    "$19,$20,$21::jsonb,$22) "
+                    "RETURNING *",
+                    owner_id, UUID(episode_id), revision,
+                    expected["generation"], expected["vm_uid"],
+                    expected["vmi_uid"], expected["launcher_uid"],
+                    expected["pvc_uid"], delivery["id"], receipt["id"],
+                    candidate_agent_id, delivery["process_generation"],
+                    delivery["pod_name"], delivery["pod_namespace"],
+                    delivery["pod_uid"],
+                    json.dumps(_object(delivery["original_dispatch_marker"])),
+                    receipt["observed_at"], receipt["lease_expires_at"],
+                    new_operation_id,
+                    prior_stop["pinned_terminal_observed_at"] if prior_stop else None,
+                    json.dumps(reuse_evidence) if reuse_evidence else None,
+                    prior_stop["pinned_stop_verified_at"] if prior_stop else None,
+                )
+                await conn.execute(
+                    "UPDATE agents SET status='draining' WHERE id=$1",
+                    candidate_agent_id,
+                )
+            else:
+                operation = await conn.fetchrow(
+                    """
+                    INSERT INTO vm_idle_operations
+                        (owner_kind,owner_id,phase,episode_id,episode_revision,
+                         provision_generation,vm_uid,vmi_uid,launcher_uid,pvc_uid,retained_kind)
+                    VALUES ('job',$1,'releasing',$2,$3,$4,$5,$6,$7,$8,'rootdisk')
+                    RETURNING *
+                    """,
+                    owner_id, UUID(episode_id), revision,
+                    expected["generation"], expected["vm_uid"],
+                    expected["vmi_uid"], expected["launcher_uid"],
+                    expected["pvc_uid"],
+                )
             vm.update(status="suspending", _suspend_remote_io_closed=str(operation["id"]))
             context["vm"] = vm
             await conn.execute(
@@ -637,6 +984,83 @@ class VMIdleLifecycleStore:
                 json.dumps(context),
             )
             return dict(operation)
+
+    async def record_pinned_terminal(
+        self, operation: Mapping[str, Any], *, claimant: str,
+    ) -> bool:
+        """Remember the exact Pod's terminal-container observation before finalizer release."""
+        async with self.db.acquire() as conn:
+            row = await conn.fetchrow(
+                "UPDATE vm_idle_operations SET "
+                "pinned_terminal_observed_at=COALESCE(pinned_terminal_observed_at,"
+                "clock_timestamp()) WHERE id=$1 AND release_kind='pinned_job' "
+                "AND phase IN ('releasing','release_held') "
+                "AND claim_token=$2 AND claimed_by=$3 "
+                "AND claim_expires_at>clock_timestamp() AND closed_at IS NULL "
+                "RETURNING pinned_terminal_observed_at",
+                operation["id"], operation["claim_token"], claimant,
+            )
+            return row is not None
+
+    async def record_pinned_stop(
+        self, operation: Mapping[str, Any], *, claimant: str,
+        absence: str,
+    ) -> bool:
+        """Append one Job-scoped process-stop receipt after terminal and absence."""
+        if absence not in {"exact_absent", "replacement"}:
+            return False
+        expected = {
+            "version": 1,
+            "kind": "pinned_job_agent_stop",
+            "operation_id": str(operation["id"]),
+            "job_id": str(operation["owner_id"]),
+            "agent_id": str(operation["pinned_agent_id"]),
+            "process_generation": operation["pinned_process_generation"],
+            "pod_name": operation["pinned_agent_pod_name"],
+            "pod_namespace": operation["pinned_agent_pod_namespace"],
+            "pod_uid": operation["pinned_agent_pod_uid"],
+            "delivery_id": str(operation["pinned_delivery_id"]),
+            "terminal_containers_observed": True,
+            "final_absence": absence,
+        }
+        async with self.db.acquire() as conn:
+            row = await conn.fetchrow(
+                "UPDATE vm_idle_operations SET pinned_stop_evidence=$4::jsonb,"
+                "pinned_stop_verified_at=clock_timestamp() "
+                "WHERE id=$1 AND release_kind='pinned_job' "
+                "AND phase IN ('releasing','release_held') "
+                "AND claim_token=$2 AND claimed_by=$3 "
+                "AND claim_expires_at>clock_timestamp() AND closed_at IS NULL "
+                "AND pinned_terminal_observed_at IS NOT NULL "
+                "AND pinned_stop_evidence IS NULL RETURNING id",
+                operation["id"], operation["claim_token"], claimant,
+                json.dumps(expected),
+            )
+            if row is not None:
+                return True
+            stored = await conn.fetchrow(
+                "SELECT pinned_stop_evidence,pinned_stop_verified_at "
+                "FROM vm_idle_operations WHERE id=$1 AND claim_token=$2 "
+                "AND claimed_by=$3 AND claim_expires_at>clock_timestamp()",
+                operation["id"], operation["claim_token"], claimant,
+            )
+            return bool(
+                stored and stored["pinned_stop_verified_at"] is not None
+                and _object(stored["pinned_stop_evidence"]) == expected
+            )
+
+    async def pinned_stop_valid(self, operation_id: str, *, token: int,
+                                claimant: str) -> bool:
+        if _uuid(operation_id) is None:
+            return False
+        async with self.db.acquire() as conn:
+            operation = await conn.fetchrow(
+                "SELECT * FROM vm_idle_operations WHERE id=$1 AND claim_token=$2 "
+                "AND claimed_by=$3 AND claim_expires_at>clock_timestamp() "
+                "AND closed_at IS NULL",
+                UUID(operation_id), token, claimant,
+            )
+            return bool(operation and await _pinned_stop_valid_on_conn(conn, operation))
 
     async def complete_release(
         self, operation_id: str, *, evidence: Mapping[str, Any]
@@ -671,6 +1095,9 @@ class VMIdleLifecycleStore:
                 return True
             if operation["phase"] not in {"releasing", "release_held"}:
                 return False
+            if _release_kind(operation) == "pinned_job":
+                if not await _pinned_stop_valid_on_conn(conn, operation):
+                    return False
             expected = {
                 "operation_id": str(operation["id"]),
                 "generation": str(operation["provision_generation"]),
@@ -783,7 +1210,7 @@ class VMIdleLifecycleStore:
             return None
         owner_id = UUID(job_id)
         job = await conn.fetchrow("SELECT * FROM jobs WHERE id=$1 FOR UPDATE", owner_id)
-        if job is None or job["status"] != "pending_review" or job["execution_lane"] != "stateless":
+        if job is None or job["status"] != "pending_review" or job["execution_lane"] not in {"stateless", "pinned"}:
             return None
         context = _object(job["context"])
         from orchestrator.services.completion_control import (
@@ -810,6 +1237,9 @@ class VMIdleLifecycleStore:
         )
         if (
             operation is None
+            or _release_kind(operation) != (
+                "pinned_job" if job["execution_lane"] == "pinned" else "stateless"
+            )
             or operation["phase"] not in {
                 "releasing", "release_held", "suspended", "waking", "wake_held",
             }
@@ -884,6 +1314,8 @@ class VMIdleLifecycleStore:
     async def request_wake(
         self, job_id: str, *, execution_requested: bool,
         access_kind: str | None = None, access_claimant: str | None = None,
+        context_merge: Mapping[str, Any] | None = None,
+        expected_route_id: str | None = None,
     ) -> dict[str, Any] | None:
         """Share one exact successor for access and execution across replicas."""
         owner_id = _uuid(job_id)
@@ -893,6 +1325,10 @@ class VMIdleLifecycleStore:
             execution_requested or access_kind not in {"ssh", "sftp", "ide"}
             or not isinstance(access_claimant, str)
             or not 1 <= len(access_claimant) <= 256
+        ):
+            return None
+        if context_merge is not None and (
+            not execution_requested or not isinstance(context_merge, Mapping)
         ):
             return None
         async with self.db.acquire() as conn, conn.transaction():
@@ -905,8 +1341,7 @@ class VMIdleLifecycleStore:
                 owner_id,
             )
             if (
-                queue is None or queue["unit_kind"] != "worker_batch"
-                or job is None or job["execution_lane"] != "stateless"
+                job is None or job["execution_lane"] not in {"stateless", "pinned"}
                 or job["status"] in {"completed", "failed", "cancelled"}
             ):
                 return None
@@ -917,6 +1352,22 @@ class VMIdleLifecycleStore:
             if operation is None or operation["phase"] not in {
                 "releasing", "release_held", "suspended", "waking", "wake_held",
             } or operation["terminal_source_command_id"] is not None:
+                return None
+            if (
+                (job["execution_lane"] == "stateless" and (
+                    queue is None or queue["unit_kind"] != "worker_batch"
+                    or _release_kind(operation) != "stateless"
+                ))
+                or (job["execution_lane"] == "pinned" and (
+                    queue is not None or _release_kind(operation) != "pinned_job"
+                ))
+            ):
+                return None
+            if expected_route_id is not None and (
+                _object(await conn.fetchval(
+                    "SELECT freeze_data FROM jobs WHERE id=$1", owner_id,
+                )).get("route_id") != expected_route_id
+            ):
                 return None
             vm = _object(_object(job["context"]).get("vm"))
             context = _object(job["context"])
@@ -936,6 +1387,11 @@ class VMIdleLifecycleStore:
             row = await self._reserve_wake_on_conn(
                 conn, operation, execution_requested=execution_requested,
             )
+            if context_merge and not operation["wake_execution_requested"]:
+                await conn.execute(
+                    "UPDATE jobs SET context=COALESCE(context,'{}'::jsonb) || $2::jsonb "
+                    "WHERE id=$1", owner_id, json.dumps(dict(context_merge)),
+                )
             wake_id = row["wake_id"]
             if access_kind is not None:
                 lease = await conn.fetchrow(
@@ -1274,24 +1730,48 @@ class VMIdleLifecycleStore:
                         reset_worker_batch_attempts,
                     )
                     from shared.run_queue import unpark_unit
-
-                    admitted = await enqueue_worker_batch_wake(
-                        conn, job_id=owner_id,
-                        fair_key=str(job["user_id"]) if job["user_id"] else None,
-                        priority=int(job["priority"] or 0),
-                    )
-                    if await reset_worker_batch_attempts(conn, job_id=owner_id) is None:
-                        raise _WakeChanged
-                    if admitted.state == "parked" and not await unpark_unit(
-                        conn, unit_id=owner_id
-                    ):
-                        raise _WakeChanged
-                    updated = await self.db._queue_job_for_resume_on_conn(
-                        conn, owner_id, _stateless_resume_context(None),
-                        void_completion_decision=True, stateless_only=True,
-                        expected_status=job["status"],
-                        completion_commands_enabled=True,
-                    )
+                    if _release_kind(operation) == "pinned_job":
+                        if (
+                            operation["pinned_stop_verified_at"] is None
+                            or operation["stop_verified_at"] is None
+                            or job["execution_lane"] != "pinned"
+                            or job["assigned_agent_id"] != operation["pinned_agent_id"]
+                            or await conn.fetchval(
+                                "SELECT 1 FROM run_queue WHERE unit_id=$1", owner_id,
+                            ) is not None
+                        ):
+                            raise _WakeChanged
+                        # Close the old physical owner before the paused write.
+                        # Both writes are one transaction, so a failed CAS
+                        # rolls the closure back and the old fence remains.
+                        await conn.execute(
+                            "UPDATE vm_idle_operations SET phase='ready',"
+                            "closed_at=clock_timestamp(),last_progress_at=clock_timestamp() "
+                            "WHERE id=$1", operation["id"],
+                        )
+                        updated = await self.db._queue_job_for_resume_on_conn(
+                            conn, owner_id, None, void_completion_decision=True,
+                            expected_status=job["status"],
+                            completion_commands_enabled=True,
+                        )
+                    else:
+                        admitted = await enqueue_worker_batch_wake(
+                            conn, job_id=owner_id,
+                            fair_key=str(job["user_id"]) if job["user_id"] else None,
+                            priority=int(job["priority"] or 0),
+                        )
+                        if await reset_worker_batch_attempts(conn, job_id=owner_id) is None:
+                            raise _WakeChanged
+                        if admitted.state == "parked" and not await unpark_unit(
+                            conn, unit_id=owner_id
+                        ):
+                            raise _WakeChanged
+                        updated = await self.db._queue_job_for_resume_on_conn(
+                            conn, owner_id, _stateless_resume_context(None),
+                            void_completion_decision=True, stateless_only=True,
+                            expected_status=job["status"],
+                            completion_commands_enabled=True,
+                        )
                     if updated is None:
                         raise _WakeChanged
                     if updated.get("operator_pause_held"):
@@ -1316,7 +1796,7 @@ class VMIdleLifecycleStore:
                 )
                 await conn.execute(
                     "UPDATE vm_idle_operations SET phase='ready',closed_at=clock_timestamp(),"
-                    "last_progress_at=clock_timestamp() WHERE id=$1",
+                    "last_progress_at=clock_timestamp() WHERE id=$1 AND closed_at IS NULL",
                     operation["id"],
                 )
                 return True
@@ -1429,12 +1909,16 @@ class VMIdleLifecycleStore:
         async with self.db.acquire() as conn:
             query = (
                 """
-                SELECT j.id FROM jobs j JOIN run_queue q ON q.unit_id=j.id
-                WHERE j.execution_lane='stateless' AND j.assigned_agent_id IS NULL
+                SELECT j.id FROM jobs j LEFT JOIN run_queue q ON q.unit_id=j.id
+                WHERE (
+                    (j.execution_lane='stateless' AND j.assigned_agent_id IS NULL
+                     AND q.unit_kind='worker_batch' AND q.state IN ('done','parked'))
+                    OR (j.execution_lane='pinned' AND j.assigned_agent_id IS NOT NULL
+                        AND q.unit_id IS NULL)
+                  )
                   AND j.workspace_idle_episode IS NOT NULL
                   AND j.status IN ('waiting_for_reply','pending_review')
                   AND j.context->'vm'->>'status'='ready'
-                  AND q.unit_kind='worker_batch' AND q.state IN ('done','parked')
                   AND NOT EXISTS (
                     SELECT 1 FROM vm_idle_operations o
                     WHERE o.owner_kind='job' AND o.owner_id=j.id AND o.closed_at IS NULL
@@ -1604,7 +2088,8 @@ class VMIdleLifecycleService:
 
     def __init__(self, db: Any, provisioner: Any, recovery_store: Any, *,
                  claimant: str = "vm-idle", before_first_start: Any = None,
-                 terminal_publication_handler: Any = None) -> None:
+                 terminal_publication_handler: Any = None,
+                 agent_provisioner: Any = None) -> None:
         self.store = VMIdleLifecycleStore(db)
         self.db = db
         self.provisioner = provisioner
@@ -1612,6 +2097,7 @@ class VMIdleLifecycleService:
         self.claimant = claimant
         self.before_first_start = before_first_start
         self.terminal_publication_handler = terminal_publication_handler
+        self.agent_provisioner = agent_provisioner
         # Selection is process-local, while operation claims and admission are
         # database-authoritative. The long-lived sweeper advances these cursors
         # even when a whole page is ineligible, then wraps at the end.
@@ -1741,7 +2227,155 @@ class VMIdleLifecycleService:
                     )
         return advanced
 
+    async def _stop_pinned_agent(
+        self, operation: Mapping[str, Any], *, current: Any,
+    ) -> bool:
+        """Stop only the captured agent Pod, then append its Job-specific proof."""
+        actor = self.agent_provisioner
+        if actor is None or not actor.is_available or not current():
+            return False
+        fresh = await self.store.get_operation(str(operation["id"]))
+        if (
+            fresh is None or fresh["claim_token"] != operation["claim_token"]
+            or fresh["claimed_by"] != self.claimant
+            or fresh["phase"] not in {"releasing", "release_held"}
+        ):
+            return False
+        if fresh["pinned_stop_verified_at"] is not None:
+            return await self.store.pinned_stop_valid(
+                str(operation["id"]), token=operation["claim_token"],
+                claimant=self.claimant,
+            )
+        agent = await self.db.fetchrow(
+            "SELECT id,hostname,pod_uid,pod_ip,pod_port,current_job_id,metadata "
+            "FROM agents WHERE id=$1", operation["pinned_agent_id"],
+        )
+        job = await self.db.fetchrow(
+            "SELECT status,assigned_agent_id,context FROM jobs WHERE id=$1",
+            operation["owner_id"],
+        )
+        terminal_detached = bool(
+            job is not None
+            and operation["terminal_source_command_id"] is not None
+            and job["status"] == "completed"
+            and job["assigned_agent_id"] is None
+        )
+        if (
+            agent is None or job is None
+            or (job["assigned_agent_id"] != operation["pinned_agent_id"]
+                and not terminal_detached)
+            or _object(job["context"]).get("_workspace_dispatch_authority")
+                != _object(operation["pinned_original_dispatch_marker"])
+            or agent["hostname"] != operation["pinned_agent_pod_name"]
+            or agent["pod_uid"] != operation["pinned_agent_pod_uid"]
+            or _object(agent["metadata"]).get("dispatch_process_generation")
+                != operation["pinned_process_generation"]
+            or agent["current_job_id"] not in {None, operation["owner_id"]}
+        ):
+            return False
+        name = operation["pinned_agent_pod_name"]
+        uid = operation["pinned_agent_pod_uid"]
+        namespace = operation["pinned_agent_pod_namespace"]
+        try:
+            state, pod = await actor.observe_agent_pod_exact(
+                name, expected_pod_uid=uid, namespace=namespace,
+            )
+        except Exception:
+            return False
+        if state not in {"exact_live", "exact_terminal", "exact_absent", "replacement"}:
+            return False
+        if state == "exact_terminal" and not pod_containers_are_terminal(pod):
+            return False
+        # A 200 is cooperative quiescence only, never physical stop. A lost
+        # response or timeout does not change the immutable Pod target.
+        if state == "exact_live" and agent["current_job_id"] == operation["owner_id"]:
+            ip, port = agent["pod_ip"], agent["pod_port"]
+            if ip and port and await actor.attest_pinned_job_recipient(
+                name, expected_pod_uid=uid, expected_pod_ip=ip,
+            ):
+                recipient = PinnedJobRecipient(
+                    expected_agent_id=str(agent["id"]),
+                    expected_pod_uid=uid,
+                    expected_process_generation=operation["pinned_process_generation"],
+                    expected_job_id=str(operation["owner_id"]),
+                )
+                try:
+                    async with httpx.AsyncClient(timeout=125.0) as client:
+                        await client.post(
+                            f"http://{ip}:{port}/job/pause",
+                            json={"recipient": recipient.model_dump(mode="json")},
+                        )
+                except Exception:
+                    pass
+        if not current():
+            return False
+        if state == "exact_live":
+            if not await actor.delete_agent_pod_exact(
+                name, expected_pod_uid=uid, namespace=namespace,
+            ):
+                return False
+        terminal_seen = fresh["pinned_terminal_observed_at"] is not None
+        for _ in range(8):
+            if not current():
+                return False
+            try:
+                state, pod = await actor.observe_agent_pod_exact(
+                    name, expected_pod_uid=uid, namespace=namespace,
+                )
+            except Exception:
+                return False
+            if state == "exact_terminal":
+                if not pod_containers_are_terminal(pod):
+                    return False
+                if not await self.store.record_pinned_terminal(
+                    operation, claimant=self.claimant,
+                ):
+                    return False
+                terminal_seen = True
+                break
+            if state in {"exact_absent", "replacement"}:
+                break
+            await asyncio.sleep(0.25)
+        if not terminal_seen:
+            return False
+        if state == "exact_terminal" and not await actor.release_agent_pod_finalizer_exact(
+            name, expected_pod_uid=uid, namespace=namespace,
+            terminal_required=True,
+        ):
+            return False
+        for _ in range(8):
+            if not current():
+                return False
+            try:
+                state, _ = await actor.observe_agent_pod_exact(
+                    name, expected_pod_uid=uid, namespace=namespace,
+                )
+            except Exception:
+                return False
+            if state in {"exact_absent", "replacement"}:
+                return await self.store.record_pinned_stop(
+                    operation, claimant=self.claimant, absence=state,
+                )
+            await asyncio.sleep(0.25)
+        return False
+
     async def _release(self, operation: Mapping[str, Any], *, current: Any) -> bool:
+        if _release_kind(operation) == "pinned_job":
+            if not await self._stop_pinned_agent(operation, current=current):
+                await self.store.hold(
+                    str(operation["id"]), token=operation["claim_token"],
+                    claimant=self.claimant, reason="pinned_agent_stop_unproven",
+                )
+                return False
+            if not await self.store.pinned_stop_valid(
+                str(operation["id"]), token=operation["claim_token"],
+                claimant=self.claimant,
+            ):
+                await self.store.hold(
+                    str(operation["id"]), token=operation["claim_token"],
+                    claimant=self.claimant, reason="pinned_agent_stop_receipt_changed",
+                )
+                return False
         owner_id = str(operation["owner_id"])
         identity = await self.provisioner.capture_vm_teardown_identity(owner_id)
         if (

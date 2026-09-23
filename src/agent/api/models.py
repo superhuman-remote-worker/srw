@@ -7,6 +7,7 @@ request validation and response serialization.
 from datetime import datetime
 from enum import Enum
 from typing import Any, Dict, List, Literal, Optional
+from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, StrictInt
 
@@ -298,6 +299,17 @@ class JobStartRequest(BaseModel):
     """Request from orchestrator to start a job."""
 
     job_id: str = Field(..., description="Job UUID assigned by orchestrator")
+    pinned_delivery_id: Optional[UUID] = Field(
+        default=None, description="Exact server-frozen pinned Job delivery intent",
+    )
+    pinned_projection_digest: Optional[str] = Field(
+        default=None, pattern=r"^sha256:[0-9a-f]{64}$",
+        description="Digest of the accepted pinned Job wire projection",
+    )
+    pinned_delivery_proof: Optional[str] = Field(
+        default=None, repr=False, pattern=r"^[0-9a-f]{64}$",
+        description="Hidden proof to echo only in authenticated agent reports",
+    )
     description: str = Field(
         ..., description="Job description - what the agent should accomplish"
     )
@@ -428,6 +440,8 @@ class JobStartResponse(BaseModel):
     """Response after accepting a job from orchestrator."""
 
     job_id: str = Field(..., description="Accepted job ID")
+    pinned_delivery_id: Optional[UUID] = None
+    pinned_projection_digest: Optional[str] = None
     status: str = Field(default="accepted", description="Acceptance status")
     message: str = Field(
         default="Job processing started",

@@ -38,7 +38,8 @@ class StatusCommitted(BaseException):
 
 
 async def through_status(
-    monkeypatch, db, runner, report, *, before_status=None, forge=None
+    monkeypatch, db, runner, report, *, before_status=None, forge=None,
+    agent_id=None,
 ):
     monkeypatch.setattr(main, "postgres_db", db)
     monkeypatch.setattr(
@@ -65,7 +66,10 @@ async def through_status(
         await complete_job_legacy(
             None,
             str(runner.command["job_id"]),
-            JobCompleteRequest(**report, lease_token=71),
+            JobCompleteRequest(
+                **report, lease_token=None if agent_id else 71,
+                agent_id=agent_id,
+            ),
             dependencies=dependencies,
             _authorized=True,
             _effect_runner=runner,

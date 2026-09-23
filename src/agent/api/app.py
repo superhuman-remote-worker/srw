@@ -1068,11 +1068,17 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
         if _shutdown_requested:
             raise HTTPException(status_code=503, detail="Agent is shutting down")
 
+        from agent.api.pinned_delivery import accepted_pinned_job_delivery
+
         if _current_job_id == request.job_id:
+            acknowledgement = accepted_pinned_job_delivery(
+                request, _orchestrator_client, retry=True,
+            )
             return JobStartResponse(
                 job_id=request.job_id,
                 status="accepted",
                 message="Job was already accepted by this runtime",
+                **acknowledgement,
             )
 
         try:
@@ -1090,6 +1096,10 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
                 status_code=409,
                 detail=f"Agent is busy processing job {_current_job_id}",
             )
+
+        acknowledgement = accepted_pinned_job_delivery(
+            request, _orchestrator_client, retry=False,
+        )
 
         # Accept the job — reset stop state
         _current_job_id = request.job_id
@@ -1140,6 +1150,7 @@ def create_app(config_path: Optional[str] = None) -> FastAPI:
             job_id=request.job_id,
             status="accepted",
             message="Job processing started",
+            **acknowledgement,
         )
 
     @app.post(

@@ -23,10 +23,12 @@ from tests.test_vm_remote_operation_real_postgres import _vm_identity
 db = _db_fixture
 
 
-async def seeded(db):
+async def seeded(db, *, delivered=False, monkeypatch=None):
     seed = await _seed(db)
     vm, identities = _vm_identity()
     vm["ssh_ready_source"] = "provisioner_probe"
+    vm["vmi_uid"] = str(uuid4())
+    vm["rootdisk_pvc_uid"] = str(uuid4())
     async with db.acquire() as conn:
         agent = await _agent(conn)
         # Installing fixture authority follows the established prior-release
@@ -56,6 +58,48 @@ async def seeded(db):
             lease,
         )
     seed["agent_id"] = str(agent)
+    if delivered:
+        from pathlib import Path
+        from shared.pinned_session_identity import PinnedJobRecipient
+        from shared.pinned_job_delivery import pinned_job_delivery_proof
+
+        assert monkeypatch is not None
+        monkeypatch.setenv("VM_LIFECYCLE_HMAC_SECRET", "x" * 64)
+        migration = (
+            Path(__file__).resolve().parents[1]
+            / "src/orchestrator/database/migrations/app/0275_vm_idle_pinned_job.sql"
+        )
+        if not await db.fetchval(
+            "SELECT to_regclass('public.pinned_job_deliveries') IS NOT NULL"
+        ):
+            await db.execute(migration.read_text())
+        process_generation, pod_uid = uuid4(), uuid4()
+        await db.execute(
+            "UPDATE agents SET status='ready',pod_uid=$2,"
+            "metadata=jsonb_build_object('dispatch_process_generation',$3::text) "
+            "WHERE id=$1", agent, str(pod_uid), str(process_generation),
+        )
+        digest = "sha256:" + "a" * 64
+        intent = await db.prepare_pinned_job_delivery(
+            seed["job_id"], str(agent),
+            recipient=PinnedJobRecipient(
+                expected_agent_id=str(agent), expected_pod_uid=str(pod_uid),
+                expected_process_generation=str(process_generation),
+                expected_job_id=seed["job_id"],
+            ),
+            projection_digest=digest,
+        )
+        assert intent is not None
+        seed["delivery"] = {
+            "id": intent["id"], "digest": digest,
+            "process_generation": str(process_generation),
+            "pod_uid": str(pod_uid),
+            "proof": pinned_job_delivery_proof(
+                b"x" * 64, delivery_id=str(intent["id"]),
+                agent_id=str(agent), process_generation=str(process_generation),
+                pod_uid=str(pod_uid), projection_digest=digest,
+            ),
+        }
     return seed, identities
 
 
@@ -69,6 +113,11 @@ async def publish(db, seed, *, state="user_direct", agent=None, lease_token=None
         expected_lane="stateless" if lease_token is not None else "pinned",
         lease_token=lease_token,
         agent_id=agent or seed["agent_id"],
+        pinned_delivery_id=seed.get("delivery", {}).get("id"),
+        pinned_projection_digest=seed.get("delivery", {}).get("digest"),
+        pinned_delivery_proof=seed.get("delivery", {}).get("proof"),
+        pinned_process_generation=seed.get("delivery", {}).get("process_generation"),
+        pinned_pod_uid=seed.get("delivery", {}).get("pod_uid"),
         completion_commands_enabled=True,
     )
     return result, route
@@ -90,7 +139,7 @@ async def test_human_route_records_episode_with_exact_vm_and_reply_closes_it(
 ):
     monkeypatch.setenv("WORKSPACE_IDLE_RELEASE_ENABLED", "true")
     monkeypatch.setenv("VM_MODE", "same-cluster")
-    seed, identities = await seeded(db)
+    seed, identities = await seeded(db, delivered=True, monkeypatch=monkeypatch)
     result, route = await publish(db, seed)
     assert result is not None
     revision, stored = await episode(db, seed["job_id"])
@@ -115,6 +164,53 @@ async def test_human_route_records_episode_with_exact_vm_and_reply_closes_it(
 
 
 @pytest.mark.asyncio
+async def test_route_report_before_202_confirmation_joins_without_restamping(db, monkeypatch):
+    monkeypatch.setenv("WORKSPACE_IDLE_RELEASE_ENABLED", "true")
+    monkeypatch.setenv("VM_MODE", "same-cluster")
+    seed, _ = await seeded(db, delivered=True, monkeypatch=monkeypatch)
+    route_result, route = await publish(db, seed)
+    assert route_result is not None
+    before = await episode(db, seed["job_id"])
+    assert before[1]["wait_key"] == route["route_id"]
+    assert await db.confirm_pinned_job_dispatch(
+        seed["job_id"], seed["agent_id"],
+        pinned_delivery_id=str(seed["delivery"]["id"]),
+        pinned_projection_digest=seed["delivery"]["digest"],
+    )
+    assert await episode(db, seed["job_id"]) == before
+    assert not await db.confirm_pinned_job_dispatch(
+        seed["job_id"], seed["agent_id"],
+        pinned_delivery_id=str(uuid4()),
+        pinned_projection_digest=seed["delivery"]["digest"],
+    )
+
+
+@pytest.mark.asyncio
+async def test_202_confirmation_before_route_keeps_same_delivery(db, monkeypatch):
+    monkeypatch.setenv("WORKSPACE_IDLE_RELEASE_ENABLED", "true")
+    monkeypatch.setenv("VM_MODE", "same-cluster")
+    seed, _ = await seeded(db, delivered=True, monkeypatch=monkeypatch)
+    assert await db.confirm_pinned_job_dispatch(
+        seed["job_id"], seed["agent_id"],
+        pinned_delivery_id=str(seed["delivery"]["id"]),
+        pinned_projection_digest=seed["delivery"]["digest"],
+    )
+    first = await db.fetchrow(
+        "SELECT accepted_at,accepted_via FROM pinned_job_deliveries WHERE id=$1",
+        seed["delivery"]["id"],
+    )
+    assert first["accepted_at"] is not None and first["accepted_via"] == "post"
+    result, route = await publish(db, seed)
+    assert result is not None
+    assert (await episode(db, seed["job_id"]))[1]["wait_key"] == route["route_id"]
+    second = await db.fetchrow(
+        "SELECT accepted_at,accepted_via FROM pinned_job_deliveries WHERE id=$1",
+        seed["delivery"]["id"],
+    )
+    assert second == first
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "case",
     [
@@ -134,7 +230,7 @@ async def test_only_authorized_proven_human_wait_enters_policy(db, monkeypatch, 
         "WORKSPACE_IDLE_RELEASE_ENABLED", "false" if case == "disabled" else "true"
     )
     monkeypatch.setenv("VM_MODE", "same-cluster")
-    seed, _ = await seeded(db)
+    seed, _ = await seeded(db, delivered=True, monkeypatch=monkeypatch)
     if case == "unattested":
         await db.execute(
             "UPDATE jobs SET context=jsonb_set(context,'{vm,identity_authenticated}','false') WHERE id=$1",
@@ -181,7 +277,7 @@ async def test_disabling_tracking_does_not_keep_old_episode_after_authorized_res
 ):
     monkeypatch.setenv("WORKSPACE_IDLE_RELEASE_ENABLED", "true")
     monkeypatch.setenv("VM_MODE", "same-cluster")
-    seed, _ = await seeded(db)
+    seed, _ = await seeded(db, delivered=True, monkeypatch=monkeypatch)
     _, route = await publish(db, seed)
     assert (await episode(db, seed["job_id"]))[0] == 1
     monkeypatch.setenv("WORKSPACE_IDLE_RELEASE_ENABLED", "false")
@@ -238,7 +334,7 @@ async def test_episode_and_message_publication_roll_back_together(db, monkeypatc
 
     monkeypatch.setenv("WORKSPACE_IDLE_RELEASE_ENABLED", "true")
     monkeypatch.setenv("VM_MODE", "same-cluster")
-    seed, _ = await seeded(db)
+    seed, _ = await seeded(db, delivered=True, monkeypatch=monkeypatch)
     real = workspace_idle_events.record_human_route_wait_on_conn
 
     async def fault_after_episode(conn, **kwargs):
@@ -263,7 +359,7 @@ async def test_episode_and_message_publication_roll_back_together(db, monkeypatc
 async def test_reprovisioning_does_not_close_pending_human_episode(db, monkeypatch):
     monkeypatch.setenv("WORKSPACE_IDLE_RELEASE_ENABLED", "true")
     monkeypatch.setenv("VM_MODE", "same-cluster")
-    seed, _ = await seeded(db)
+    seed, _ = await seeded(db, delivered=True, monkeypatch=monkeypatch)
     _, route = await publish(db, seed)
     previous = await episode(db, seed["job_id"])
     assert await db.queue_job_for_resume(

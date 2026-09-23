@@ -2064,6 +2064,7 @@ async def workspace_idle_sweeper(shutdown_event: asyncio.Event) -> None:
         vm_idle_service = VMIdleLifecycleService(
             postgres_db, vm_provisioner, VMWorkspaceRecoveryStore(postgres_db),
             claimant=f"{os.getenv('HOSTNAME', 'orchestrator')}:vm-idle",
+            agent_provisioner=agent_provisioner,
             terminal_publication_handler=lambda operation: (
                 _job_control_operations().publish_terminal_review(operation)
             ),

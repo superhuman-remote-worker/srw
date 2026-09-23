@@ -142,7 +142,11 @@ async def complete_job(
 
     payload = body.model_dump(
         mode="json",
-        exclude={"lease_token", "agent_id", "client_report_id"},
+        exclude={
+            "lease_token", "agent_id", "client_report_id", "pinned_delivery_id",
+            "pinned_projection_digest", "pinned_delivery_proof",
+            "pinned_process_generation", "pinned_pod_uid",
+        },
     )
     try:
         accepted = await dependencies.accept_command(
@@ -152,6 +156,11 @@ async def complete_job(
             status_reorder_enabled=dependencies.status_reorder_enabled(),
             lease_token=body.lease_token,
             agent_id=str(body.agent_id) if body.agent_id is not None else None,
+            pinned_delivery_id=body.pinned_delivery_id,
+            pinned_projection_digest=body.pinned_projection_digest,
+            pinned_delivery_proof=body.pinned_delivery_proof,
+            pinned_process_generation=body.pinned_process_generation,
+            pinned_pod_uid=body.pinned_pod_uid,
             client_report_id=(
                 str(body.client_report_id)
                 if body.client_report_id is not None

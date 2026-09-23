@@ -3458,6 +3458,14 @@ class OrchestratorClient:
             payload["agent_id"] = str(agent_id)
         if client_report_id is not None:
             payload["client_report_id"] = str(client_report_id)
+        if getattr(self, "pinned_delivery_job_id", None) == job_id:
+            payload.update({
+                "pinned_delivery_id": getattr(self, "pinned_delivery_id", None),
+                "pinned_projection_digest": getattr(self, "pinned_projection_digest", None),
+                "pinned_delivery_proof": getattr(self, "pinned_delivery_proof", None),
+                "pinned_process_generation": self.dispatch_process_generation,
+                "pinned_pod_uid": os.environ.get("POD_UID"),
+            })
 
         try:
             # Stateless terminal handling can include workspace/archive and

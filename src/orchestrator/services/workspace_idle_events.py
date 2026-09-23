@@ -49,6 +49,21 @@ async def record_human_route_wait_on_conn(conn, *, job_id, route_id):
         return False
     if not isinstance(row["context"], dict):
         return False
+    if row["execution_lane"] == "pinned":
+        if not await conn.fetchval(
+            "SELECT to_regclass('public.pinned_job_wait_receipts') IS NOT NULL"
+        ):
+            return False
+        from orchestrator.services.pinned_job_delivery import (
+            pinned_wait_receipt_on_conn,
+        )
+
+        if await pinned_wait_receipt_on_conn(
+            conn, job=row, source_kind="route", source_id=UUID(str(route_id)),
+        ) is None:
+            return False
+    elif row["execution_lane"] != "stateless":
+        return False
     owner, ambiguous = _job_workspace_owner(UUID(str(job_id)), row)
     if ambiguous or owner != UUID(str(job_id)):
         return False

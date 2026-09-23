@@ -1329,7 +1329,7 @@ class JobControlOperations:
                 return {"status": "queued", "message": message, "job_id": job_id}
 
             if (
-                job.get("execution_lane") == "stateless"
+                job.get("execution_lane") in {"stateless", "pinned"}
                 and (
                     os.getenv("WORKSPACE_IDLE_RELEASE_ENABLED", "false").lower() == "true"
                     or self.dependencies.get_vm_context(job).get("_suspend_remote_io_closed")
@@ -1344,7 +1344,14 @@ class JobControlOperations:
                     and await idle_store.get_open_for_owner(job_id) is not None
                 ):
                     wake = await idle_store.request_wake(
-                        job_id, execution_requested=True
+                        job_id, execution_requested=True,
+                        **(
+                            {"context_merge": {
+                                "queued_feedback": request.feedback,
+                                "queued_feedback_reason": feedback_reason,
+                            }}
+                            if request and request.feedback else {}
+                        ),
                     )
                     if wake is None:
                         raise HTTPException(
@@ -1767,6 +1774,52 @@ class JobControlOperations:
                 local_frozen = (
                     self.dependencies.workspace.base_path / "output" / "job_frozen.json"
                 )
+                if (
+                    freeze_type == "phase_boundary"
+                    and job.get("execution_lane") == "pinned"
+                    and (
+                        self.dependencies.get_vm_context(job).get("_suspend_remote_io_closed")
+                        or self.dependencies.get_vm_context(job).get("idle_wake_operation_id")
+                    )
+                ):
+                    from orchestrator.services.vm_idle_lifecycle import VMIdleLifecycleStore
+                    from orchestrator.services.completion_control import (
+                        CompletionControlClaimConflict,
+                    )
+
+                    idle_store = VMIdleLifecycleStore(self.dependencies.store)
+                    if (
+                        await idle_store.schema_available()
+                        and await idle_store.get_open_for_owner(job_id) is not None
+                    ):
+                        if control_claim is None:
+                            raise HTTPException(
+                                status_code=409,
+                                detail="Pinned idle phase approval requires durable control authority",
+                            )
+                        try:
+                            async with self.dependencies.completion_control.finish(
+                                control_claim
+                            ) as (conn, _locked_job):
+                                wake = await idle_store.approve_phase_wake_on_conn(
+                                    conn, job_id=job_id,
+                                    claim_id=str(control_claim.claim_id),
+                                    expected_source=phase_snapshot,
+                                )
+                                if wake is None:
+                                    raise CompletionControlClaimConflict(
+                                        "pinned idle phase approval source changed"
+                                    )
+                        except CompletionControlClaimConflict as exc:
+                            raise HTTPException(status_code=409, detail=str(exc)) from exc
+                        control_claim_finished = True
+                        return {
+                            "status": "waking", "job_id": job_id,
+                            "freeze_type": freeze_type,
+                            "phase_type": frozen_data.get("phase_type"),
+                            "phase_number": frozen_data.get("phase_number"),
+                            "command": frozen_data.get("command"),
+                        }
                 if job.get("execution_lane") == "stateless":
                     if freeze_type == "phase_boundary":
                         from orchestrator.services.vm_idle_lifecycle import (
@@ -1937,7 +1990,8 @@ class JobControlOperations:
                             "UPDATE jobs SET status='completed',freeze_data=NULL,"
                             "assigned_agent_id=NULL,completed_at=COALESCE(completed_at,CURRENT_TIMESTAMP),"
                             "updated_at=CURRENT_TIMESTAMP WHERE id=$1::uuid "
-                            "AND status='pending_review' AND execution_lane='stateless' "
+                            "AND status='pending_review' "
+                            "AND execution_lane IN ('stateless','pinned') "
                             "RETURNING id", job_id,
                         )
                         if updated is None:
@@ -2798,6 +2852,19 @@ class JobControlOperations:
             await self.dependencies.completion_control.guard(
                 job_id, source="internal_resume"
             )
+
+        if job.get("execution_lane") == "pinned":
+            from orchestrator.services.vm_idle_lifecycle import VMIdleLifecycleStore
+
+            idle_store = VMIdleLifecycleStore(self.dependencies.store)
+            if (
+                await idle_store.schema_available()
+                and await idle_store.get_open_for_owner(job_id) is not None
+            ):
+                return await idle_store.request_wake(
+                    job_id, execution_requested=True,
+                    context_merge=updates, expected_route_id=expected_route_id,
+                ) is not None
 
         if job.get("execution_lane") == "stateless":
             queued = await self.dependencies.store.queue_stateless_job_for_resume(
