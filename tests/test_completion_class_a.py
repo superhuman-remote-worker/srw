@@ -767,6 +767,69 @@ class TestCompleteJobClassA:
         verification.assert_not_awaited()
 
     @pytest.mark.asyncio
+    async def test_a_held_full_autonomy_seal_is_neither_silent_nor_unexplained(
+        self,
+    ):
+        """worker_git_versioning_stops_midjob_seal_pins_stale_revision.md.
+
+        A full-autonomy completion carries no freeze_type, so a seal the gate
+        held as delivery-unproven used to land in pending_review with no
+        notification and no reason anywhere a human or officer reads. The
+        reason now rides the same status write as error_message, and the
+        owner gets a review-queue item that names it.
+        """
+        from orchestrator.services.deliverable_gate import DeliverableGateResult
+
+        reason = (
+            "the worker could not read its workspace HEAD when it sealed "
+            "(head_commit is null)"
+        )
+        job = _job(context={"required_deliverables": ["output/report.md"]})
+        db = _EndpointDB(job)
+        body = orchestrator.main.JobCompleteRequest(
+            should_stop=True,
+            goal_achieved=True,
+            freeze_data={
+                "status": "job_completed",
+                "summary": "done",
+                "head_commit": None,
+            },
+        )
+        notify = AsyncMock()
+
+        with ExitStack() as stack:
+            _patch_completion(stack, db)
+            stack.enter_context(
+                patch(
+                    "orchestrator.services.completion.apply_deliverable_gate",
+                    AsyncMock(
+                        return_value=DeliverableGateResult(
+                            "pending_review",
+                            [f"deliverable gate: delivery unproven ({reason})"],
+                            False,
+                            hold_reason=reason,
+                        )
+                    ),
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "orchestrator.main.job_freeze_notification_service.notify_operator_freeze",
+                    notify,
+                )
+            )
+            handled = await b08_helpers.complete_job(MagicMock(), JOB_ID, body)
+
+        assert handled["new_status"] == "pending_review"
+        [(_sql, args)] = db.class_a_statements()
+        assert args[0] == "pending_review"
+        assert f"Delivery unproven: {reason}" in args
+        notify.assert_awaited_once()
+        _job_arg, _job_id, freeze_type, freeze_arg = notify.await_args.args[:4]
+        assert freeze_type == "job_complete"
+        assert freeze_arg["delivery_hold"] == reason
+
+    @pytest.mark.asyncio
     async def test_evidence_record_failure_never_persists_private_coordinates(
         self, caplog
     ):

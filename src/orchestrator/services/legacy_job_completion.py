@@ -38,6 +38,10 @@ from orchestrator.services.vm_workspace_recovery_store import (
 CompletionCallback = Callable[..., Any]
 
 
+def _string_or_none(value: Any) -> str | None:
+    return value if isinstance(value, str) and value else None
+
+
 @dataclass(frozen=True, slots=True)
 class LegacyPersistenceDependencies:
     store: Any
@@ -1470,6 +1474,9 @@ async def complete_job_legacy(
                     gate_decision, "preserves_human_wait", False
                 )
                 is True,
+                "hold_reason": _string_or_none(
+                    getattr(gate_decision, "hold_reason", None)
+                ),
             }
 
         gate_result = await _run_completion_effect(
@@ -1508,6 +1515,12 @@ async def complete_job_legacy(
                 "Delivery contract could not be satisfied; work ended "
                 "blocked/undelivered without a verified pull request."
             )
+        # A seal held because its delivery could not be proven says why, on
+        # the row every surface reads (job list, officer sitrep, get_job) —
+        # a full-autonomy hold would otherwise sit in pending_review silently.
+        delivery_hold_reason = gate_result.get("hold_reason")
+        if delivery_hold_reason and not error_message:
+            error_message = f"Delivery unproven: {delivery_hold_reason}"[:1000]
 
         # 1·evidence (E4, officer_supervision_surface §3.3): a completion
         # CLAIM that survived the gate gets its typed evidence manifest —
@@ -2215,6 +2228,18 @@ async def complete_job_legacy(
             if isinstance(fd, str):
                 fd = json.loads(fd)
             ft = fd.get("freeze_type")
+            if (
+                ft is None
+                and new_status == "pending_review"
+                and fd.get("status") == "job_completed"
+            ):
+                # A full-autonomy completion carries no freeze_type. One that
+                # lands on review anyway (a seal held as undelivered, the
+                # deliverable-gate bounce cap) waits on a human exactly like a
+                # job_complete freeze — and would otherwise wait unannounced.
+                ft = "job_complete"
+            if delivery_hold_reason:
+                fd = {**fd, "delivery_hold": delivery_hold_reason}
             if ft in _NOTIFIABLE_FREEZE_TYPES:
                 sudo_request_id = None
                 auto_denied = False

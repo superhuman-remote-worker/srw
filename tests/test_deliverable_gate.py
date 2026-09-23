@@ -991,7 +991,7 @@ class TestUnprovenDeliveryIsNotAccepted:
         db = make_db()
         queue_resume = AsyncMock()
 
-        new_status, actions, bounced = await run_deliverable_gate(
+        decision = await run_deliverable_gate(
             job,
             completion_result(),
             "completed",
@@ -999,6 +999,7 @@ class TestUnprovenDeliveryIsNotAccepted:
             gitea=make_gitea(self.STALE_TIP),
             queue_resume=queue_resume,
         )
+        new_status, actions, bounced = decision
 
         assert (new_status, bounced) == ("pending_review", False)
         queue_resume.assert_not_awaited()
@@ -1007,6 +1008,9 @@ class TestUnprovenDeliveryIsNotAccepted:
         assert stamp["undelivered"] is True
         assert not any("gate passed" in a for a in actions)
         assert any("delivery unproven" in a for a in actions)
+        # The completion authority turns this into error_message and the
+        # review notification's reason — a hold must never be silent.
+        assert "head_commit is null" in decision.hold_reason
 
     @pytest.mark.asyncio
     async def test_null_head_commit_keeps_a_loop_job_terminal(self):

@@ -382,6 +382,13 @@ async def _jobs_section(
                     "blocked_undelivered",
                 ):
                     line += f" | error: {_truncate(error, 160)}"
+                elif error and status == "pending_review":
+                    # Why it is waiting on review instead of sealed — e.g. a
+                    # seal held as delivery-unproven. Officer backlog jobs run
+                    # at full autonomy, so without this the officer would see
+                    # a bare transition and the claim would sit until the
+                    # stale page.
+                    line += f" | held: {_truncate(error, 200)}"
                 changed.append(line)
 
         # E3: the one shared liveness computation — the sitrep can never call

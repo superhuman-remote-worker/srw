@@ -66,6 +66,50 @@ class TestNotifyOperatorFreeze:
         assert "awaiting review" in kwargs["body"]
 
     @pytest.mark.asyncio
+    async def test_a_held_seal_says_why_before_anyone_reads_the_branch(self, record):
+        """worker_git_versioning_stops_midjob_seal_pins_stale_revision.md: a
+        seal held because delivery could not be proven is still a review item,
+        but the reviewer must learn the branch may be stale first."""
+        await b08_helpers.notify_operator_freeze(
+            _job(),
+            JOB_ID,
+            "job_complete",
+            {
+                "summary": "three reports",
+                "confidence": 0.9,
+                "delivery_hold": (
+                    "At job completion, the final commit did not land, so "
+                    "deliverable path(s) output/obstacles.md are not in the "
+                    "pushed revision."
+                ),
+            },
+            dedup_key="freeze_notification:cmd-hold",
+        )
+        kwargs = record.call_args.kwargs
+        assert kwargs["category"] == "review_queue"
+        assert "delivery unproven" in kwargs["subject"]
+        assert "output/obstacles.md are not in the pushed revision" in kwargs["body"]
+        assert kwargs["payload"]["delivery_hold"].startswith("At job completion")
+
+    @pytest.mark.asyncio
+    async def test_the_agents_own_delivery_error_is_named_too(self, record):
+        await b08_helpers.notify_operator_freeze(
+            _job(),
+            JOB_ID,
+            "job_complete",
+            {
+                "summary": "done",
+                "delivery_failed": True,
+                "delivery_error": "The job-ending git push failed at job freeze "
+                "(retried once).",
+            },
+            dedup_key="freeze_notification:cmd-df",
+        )
+        kwargs = record.call_args.kwargs
+        assert "delivery unproven" in kwargs["subject"]
+        assert "(retried once)" in kwargs["body"]
+
+    @pytest.mark.asyncio
     async def test_vm_upgrade_points_at_the_sudo_request(self, record):
         await b08_helpers.notify_operator_freeze(
             _job(),

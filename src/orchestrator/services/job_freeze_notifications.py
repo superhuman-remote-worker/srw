@@ -37,6 +37,28 @@ class JobFreezeNotificationDependencies:
     notifier: Any
 
 
+_DELIVERY_HOLD_CHARS = 600
+
+
+def delivery_hold_reason(freeze_data: dict[str, Any] | None) -> str | None:
+    """Why this completion's delivery is unproven, or None.
+
+    ``delivery_hold`` is the deliverable gate's verdict (set by the completion
+    authority); ``delivery_error`` is the agent's own report of a failed
+    job-ending commit or push. Either one means the branch may be stale.
+    """
+    fd = freeze_data or {}
+    reason = fd.get("delivery_hold")
+    if not reason and fd.get("delivery_failed"):
+        reason = fd.get("delivery_error") or "the job-ending push failed"
+    if not isinstance(reason, str) or not reason.strip():
+        return None
+    reason = " ".join(reason.split())
+    if len(reason) > _DELIVERY_HOLD_CHARS:
+        reason = reason[: _DELIVERY_HOLD_CHARS - 1] + "…"
+    return reason
+
+
 def format_freeze_notification(
     freeze_type: str,
     freeze_data: dict[str, Any],
@@ -79,6 +101,22 @@ def format_freeze_notification(
             f"**Confidence:** {confidence_str}\n\n"
             f"**Deliverables:**\n{deliverables_str}"
         )
+        hold = delivery_hold_reason(freeze_data)
+        if hold:
+            # The seal was held because the repository cannot be shown to
+            # hold the work — the reviewer must know that before reading the
+            # branch, which may be a stale revision.
+            subject = f"Job {short_id} held — delivery unproven"
+            message_md = (
+                f"**Job `{short_id}`** (`{config_name}`) finished, but its "
+                f"deliverables could not be shown to have reached the job "
+                f"repository, so it was held for review instead of sealed.\n\n"
+                f"**Delivery:** {hold}\n\n"
+                f"The workspace may hold the only copy of the latest work. "
+                f"Recover it before approving what the branch shows.\n\n"
+                f"**Summary:** {summary}\n\n"
+                f"**Deliverables:**\n{deliverables_str}"
+            )
 
     elif freeze_type == "budget_exceeded":
         phase_number = freeze_data.get("phase_number", "?")
@@ -205,6 +243,7 @@ async def notify_operator_freeze(
             "freeze_type": freeze_type,
             "phase_number": (freeze_data or {}).get("phase_number"),
             "sudo_request_id": str(sudo_request_id) if sudo_request_id else None,
+            "delivery_hold": delivery_hold_reason(freeze_data),
         },
     )
     logger.info(
@@ -220,6 +259,7 @@ async def notify_operator_freeze(
 __all__ = [
     "FREEZE_CATEGORY",
     "JobFreezeNotificationDependencies",
+    "delivery_hold_reason",
     "format_freeze_notification",
     "notify_operator_freeze",
     "resolve_job_notifications",

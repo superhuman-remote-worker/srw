@@ -8,6 +8,7 @@ import {
   formatCount,
   formatDurationSeconds,
   formatUsd,
+  heldForReviewReason,
   jobModelLabel,
   liveSubjobCount,
   JobDetailPanelComponent,
@@ -109,6 +110,72 @@ describe('workspace recovery detail', () => {
     expect(text).toContain('Workspace cleanup remains pending');
     expect(text).not.toContain('10.0.0.9');
     expect(text).not.toContain('controller credential material');
+  });
+});
+
+describe('held-for-review reason', () => {
+  const reason = 'Delivery unproven: the final commit did not land, so deliverable path(s) output/report.md are not in the pushed revision.';
+
+  it('names why a job is waiting on review instead of sealed', () => {
+    expect(heldForReviewReason({status: 'pending_review', error_message: reason})).toBe(reason);
+  });
+
+  it('stays silent for ordinary review items and other statuses', () => {
+    expect(heldForReviewReason({status: 'pending_review', error_message: null})).toBeNull();
+    expect(heldForReviewReason({status: 'pending_review', error_message: '  '})).toBeNull();
+    // A failed job's reason already renders on the row itself.
+    expect(heldForReviewReason({status: 'failed', error_message: reason})).toBeNull();
+    expect(heldForReviewReason(null)).toBeNull();
+  });
+
+  it('defers to the VM-creation block, which already shows error_message', () => {
+    expect(
+      heldForReviewReason({
+        status: 'pending_review',
+        error_message: reason,
+        vm_creation: {state: 'attention', message: 'x'} as unknown as JobSummary['vm_creation'],
+      }),
+    ).toBeNull();
+  });
+
+  describe('rendered', () => {
+    beforeAll(async () => {
+      await ɵresolveComponentResources(() => Promise.resolve(''));
+    });
+    afterEach(() => TestBed.resetTestingModule());
+
+    it('shows the hold on the panel', () => {
+      TestBed.configureTestingModule({
+        imports: [
+          JobDetailPanelComponent,
+          TranslocoTestingModule.forRoot({
+            langs: {en},
+            translocoConfig: {availableLangs: ['en'], defaultLang: 'en'},
+          }),
+        ],
+        providers: [provideRouter([])],
+      });
+      const transloco = TestBed.inject(TranslocoService);
+      transloco.setTranslation(en, 'en');
+      transloco.setActiveLang('en');
+      const fixture = TestBed.createComponent(JobDetailPanelComponent);
+      Object.defineProperty(fixture.componentInstance, 'job', {
+        value: signal({
+          id: 'job-2',
+          description: 'Probe the stack',
+          status: 'pending_review',
+          created_at: '2026-09-16T08:00:00Z',
+          error_message: reason,
+        } as unknown as JobSummary),
+      });
+      Object.defineProperty(fixture.componentInstance, 'data', {value: signal(null)});
+
+      fixture.detectChanges();
+
+      const text = (fixture.nativeElement as HTMLElement).textContent ?? '';
+      expect(text).toContain('Held for review');
+      expect(text).toContain('output/report.md are not in the pushed revision');
+    });
   });
 });
 

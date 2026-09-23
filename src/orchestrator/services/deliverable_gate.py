@@ -145,6 +145,10 @@ class DeliverableGateResult:
     outcome_kind: str | None = None
     # Typed source continuity, independent of display actions and legacy tuples.
     preserves_human_wait: bool = False
+    # Why the seal was held because its delivery could not be proven — the
+    # completion authority records it as the job's error_message and names it
+    # in the review notification, so the hold is never silent.
+    hold_reason: str | None = None
 
     def __iter__(self) -> Iterator[Any]:
         # Existing collaborators/tests intentionally keep their historical
@@ -802,8 +806,11 @@ async def run_deliverable_gate(
         # early-returns past the verification escalation that reports the real
         # reason. Never a pass either: a ``completed`` seal merges the stale
         # branch, so it is held the way the bounce cap holds an unmet manifest.
-        # Review-bound seals keep their lane (verification escalates
-        # ``delivery_failed`` to a human; a critic reads this stamp).
+        # Review-bound seals keep their lane: verification escalates
+        # ``delivery_failed`` to a human before any critic runs. A null
+        # ``head_commit`` from an agent predating the delivery proof carries no
+        # such flag, so its critic still reviews the branch tip; the hold reason
+        # below (error_message, notification) is what tells a human why.
         reason = str(report.get("reason"))
         final_status = new_status
         if new_status == "completed":
@@ -833,6 +840,7 @@ async def run_deliverable_gate(
                 f"sealing as {final_status}"
             ],
             False,
+            hold_reason=reason,
         )
 
     if report.get("skipped"):

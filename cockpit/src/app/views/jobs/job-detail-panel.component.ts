@@ -236,6 +236,20 @@ export function subjobBlockedKey(
     : 'jobs.detail.waitingNoLiveSubjobs';
 }
 
+/**
+ * Why a job sits in review instead of having sealed, when the server said so.
+ * A seal held because its delivery could not be proven records the reason as
+ * the row's `error_message`; a full-autonomy job there otherwise looks like
+ * any other review item. VM-creation messages already render above.
+ */
+export function heldForReviewReason(
+  job: Pick<JobSummary, 'status' | 'error_message' | 'vm_creation'> | null,
+): string | null {
+  if (!job || job.status !== 'pending_review' || job.vm_creation) return null;
+  const reason = (job.error_message ?? '').trim();
+  return reason || null;
+}
+
 @Component({
   selector: 'app-job-detail-panel',
   standalone: true,
@@ -322,6 +336,12 @@ export function subjobBlockedKey(
       } @else if (job().vm_creation; as creation) {
         <section class="recovery-detail vm-creation" [class.attention]="creation.state === 'attention'">
           <strong>{{ job().error_message || creation.message }}</strong>
+        </section>
+      }
+      @if (heldForReviewReason(job()); as held) {
+        <section class="recovery-detail attention held-detail">
+          <strong>{{ 'jobs.detail.heldForReview' | transloco }}</strong>
+          <span>{{ held }}</span>
         </section>
       }
 
@@ -932,6 +952,7 @@ export class JobDetailPanelComponent {
   }
 
   protected readonly formatCount = formatCount;
+  protected readonly heldForReviewReason = heldForReviewReason;
   protected readonly formatUsd = formatUsd;
   protected readonly shortId = shortJobId;
   protected readonly isTerminal = isTerminalJobStatus;
