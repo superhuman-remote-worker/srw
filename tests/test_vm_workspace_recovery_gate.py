@@ -369,6 +369,7 @@ def test_live_deadline_gate_helm_install_keeps_claim_alive_past_probe_timeout(
             return ""
 
     shell = FakeShell()
+    guest_image = "registry.example/guest@sha256:" + "a" * 64
     gate.deploy_application(
         shell,
         context="k3d-gate",
@@ -379,10 +380,14 @@ def test_live_deadline_gate_helm_install_keeps_claim_alive_past_probe_timeout(
             "agent": "localhost/srw-agent:gate",
             "vm_controller": "localhost/srw-vm-controller:gate",
         },
-        guest_image="registry.example/guest@sha256:" + "a" * 64,
+        guest_image=guest_image,
     )
 
     helm = next(call for call in shell.calls if call[:2] == ["helm", "upgrade"])
     assert "orchestrator.vmWorkspaceRecovery.claimTtlSeconds=90" in helm
     assert "orchestrator.vmWorkspaceRecovery.permitTtlSeconds=90" in helm
     assert "orchestrator.vmWorkspaceRecovery.externalCallTimeoutSeconds=60" in helm
+    assert "orchestrator.vmProvisioning.creationRetryEnabled=true" in helm
+    assert "vmController.networkProfile.enabled=true" in helm
+    assert f"vmController.networkProfile.imageAllowlist[0]={guest_image}" in helm
+    assert f"vmController.defaultVmImage={guest_image}" in helm

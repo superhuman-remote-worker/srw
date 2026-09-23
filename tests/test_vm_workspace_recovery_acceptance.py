@@ -6,8 +6,9 @@ from contextlib import asynccontextmanager
 import asyncio
 from datetime import datetime, timedelta, timezone
 import inspect
+import json
 from types import SimpleNamespace
-from unittest.mock import ANY
+from unittest.mock import ANY, AsyncMock
 
 import pytest
 
@@ -59,6 +60,35 @@ def test_acceptance_command_requires_chart_gate_and_exact_confirmation() -> None
         confirmation=CONFIRMATION,
         protocol_version=1,
     )
+
+
+@pytest.mark.parametrize(
+    ("profiled", "retry", "mode", "image", "allowlisted"),
+    [
+        (True, False, "same-cluster", None, False),
+        (True, True, "remote", "digest", True),
+        (True, True, "same-cluster", None, False),
+        (True, True, "same-cluster", "digest", False),
+    ],
+)
+def test_profiled_gate_fails_fast_on_incompatible_creation_settings(
+    monkeypatch,
+    profiled,
+    retry,
+    mode,
+    image,
+    allowlisted,
+) -> None:
+    digest = "registry.example/guest@sha256:" + "a" * 64
+    monkeypatch.setenv(
+        "VM_NETWORK_PROFILE_IMAGE_ALLOWLIST", digest if allowlisted else ""
+    )
+    scenario = object.__new__(LiveScenario)
+    scenario.profiled_fixture, scenario.protocol_fixture = profiled, retry
+    scenario.fixture_image = digest if image else None
+    scenario.provisioner = SimpleNamespace(mode=mode)
+    with pytest.raises(acceptance.AcceptanceFailure):
+        scenario._require_fixture_configuration()
 
 
 def test_acceptance_gate_process_owns_the_reconciler() -> None:
@@ -534,6 +564,401 @@ async def test_fixture_job_has_no_preboot_queue_or_attempt(gate_lease_db):
             await conn.fetchval("SELECT status FROM jobs WHERE id=$1", job)
             == "processing"
         )
+
+
+@pytest.mark.asyncio
+async def test_profiled_fixture_freezes_real_paused_job_snapshot_and_preflight(
+    gate_lease_db,
+    monkeypatch,
+):
+    import json
+    from orchestrator.services.manifest_execution_snapshot import (
+        read_execution,
+        srw_snapshot_config,
+    )
+    from orchestrator.services.vm_provisioner import VMProvisioner
+    from shared.vm_network_profile import NETWORK_PROFILE
+
+    image = "registry.example/srw-vm@sha256:" + "a" * 64
+    for key, value in {
+        "VM_MODE": "same-cluster",
+        "VM_CREATION_RETRY_ENABLED": "true",
+        "VM_NETWORK_PROFILE_ENABLED": "true",
+        "VM_NETWORK_PROFILE_IMAGE_ALLOWLIST": image,
+    }.items():
+        monkeypatch.setenv(key, value)
+    scenario = object.__new__(LiveScenario)
+    scenario.db, scenario.run_id = gate_lease_db, "profiled-fixture"
+    scenario.gate_user_id, scenario.job_id = None, None
+    scenario.protocol_fixture = True
+    scenario.profiled_fixture = True
+    scenario.fixture_image = image
+    job = await scenario._create_job()
+    user = await gate_lease_db.fetchrow(
+        "SELECT is_approved,is_admin,can_use_vm FROM users WHERE id=$1",
+        scenario.gate_user_id,
+    )
+    assert user["is_approved"] is True
+    assert user["is_admin"] is False
+    assert user["can_use_vm"] is True
+    assert (
+        await gate_lease_db.fetchval(
+            "SELECT count(*) FROM capability_grants WHERE scope_kind='user' "
+            "AND scope_id=$1 AND key='vm_workspace' AND value_json='true'::jsonb",
+            scenario.gate_user_id,
+        )
+        == 1
+    )
+    assert (
+        await gate_lease_db.fetchval(
+            "SELECT count(*) FROM jobs WHERE user_id=$1", scenario.gate_user_id
+        )
+        == 1
+    )
+    assert (
+        await gate_lease_db.fetchval("SELECT status FROM jobs WHERE id=$1", job)
+        == "paused"
+    )
+    snapshot = await read_execution(gate_lease_db, "Job", str(job))
+    _, policy = srw_snapshot_config(snapshot)
+    assert policy["workspace"]["backend"] == "vm"
+    assert policy["workspace"]["vm"]["image"] == image
+    provisioner = VMProvisioner()
+    provisioner._db = gate_lease_db
+    response = await provisioner.create_vm(
+        str(job),
+        cpu_cores=2,
+        memory="2Gi",
+        disk_size="12Gi",
+        vm_image=image,
+    )
+    assert response["status"] == "creation_pending"
+    context = json.loads(
+        await gate_lease_db.fetchval("SELECT context FROM jobs WHERE id=$1", job)
+    )
+    preflight = context["vm"]["creation_preflight"]
+    assert preflight["request"]["vm_image"] == image
+    assert preflight["request"]["network_profile"] == NETWORK_PROFILE
+    assert context["_vm_creation_pending"] == response["request_id"]
+    assert (
+        await gate_lease_db.fetchval(
+            "SELECT state FROM run_queue WHERE unit_id=$1",
+            job,
+        )
+        == "done"
+    )
+
+
+async def _profiled_ready_lease_fixture(db, monkeypatch):
+    """Seed a completed controller observation after the real preflight."""
+    import json
+    from uuid import uuid4
+
+    from orchestrator.services.vm_provisioner import VMProvisioner
+    from shared.vm_network_profile import NETWORK_PROFILE
+
+    image = "registry.example/srw-vm@sha256:" + "a" * 64
+    monkeypatch.setenv("VM_MODE", "same-cluster")
+    monkeypatch.setenv("VM_CREATION_RETRY_ENABLED", "true")
+    monkeypatch.setenv("VM_NETWORK_PROFILE_ENABLED", "true")
+    monkeypatch.setenv("VM_NETWORK_PROFILE_IMAGE_ALLOWLIST", image)
+    scenario = object.__new__(LiveScenario)
+    scenario.db, scenario.run_id = db, "profiled-ready-lease"
+    scenario.namespace = "agent-vms"
+    scenario.gate_user_id, scenario.job_id = None, None
+    scenario.protocol_fixture = scenario.profiled_fixture = True
+    scenario.fixture_image = image
+    job = await scenario._create_job()
+    provisioner = VMProvisioner()
+    provisioner._db = db
+    ack = await provisioner.create_vm(
+        str(job),
+        cpu_cores=2,
+        memory="2Gi",
+        disk_size="12Gi",
+        vm_image=image,
+    )
+    await scenario._require_creation_ack(job, ack)
+    context = json.loads(await db.fetchval("SELECT context FROM jobs WHERE id=$1", job))
+    vm = context["vm"]
+    preflight = vm["creation_preflight"]
+    generation = scenario.fixture_generation
+    vm_uid, pvc_uid, vmi_uid, launcher_uid = (str(uuid4()) for _ in range(4))
+    registration = str(uuid4())
+    vm.update(
+        status="ready",
+        vm_uid=vm_uid,
+        rootdisk_pvc_uid=pvc_uid,
+        active_pod_uid=launcher_uid,
+        pod_ip="10.42.0.2",
+        ssh_registration_id=registration,
+        ssh_host_key_fingerprint="SHA256:" + "A" * 43,
+        identity_authenticated=True,
+        identity_provision_generation=generation,
+        creation_request_id=scenario.fixture_request_id,
+        provisioning={"identity": {"vmi_uid": vmi_uid}},
+        network_profile_evidence={
+            "profile": NETWORK_PROFILE,
+            "provision_generation": generation,
+            "vm_uid": vm_uid,
+            "pvc_uid": pvc_uid,
+            "vmi_uid": vmi_uid,
+            "launcher_uid": launcher_uid,
+            "guest_boot_id": str(uuid4()),
+            "cloud_init_instance_id": "i-profiled-gate",
+            "cloud_init_cached_instance_id": "i-profiled-gate",
+            "network_file_sha256": "a" * 64,
+            "name_only_dhcp": True,
+        },
+    )
+    context.pop("_vm_creation_pending")
+    await db.execute(
+        "UPDATE jobs SET context=$2::jsonb WHERE id=$1", job, json.dumps(context)
+    )
+    admission = uuid4()
+    await db.execute(
+        "INSERT INTO vm_workspace_cleanup_admissions "
+        "(id,owner_kind,owner_id,pvc_uid,source,request_id,intent_digest,completed_at,outcome) "
+        "VALUES($1,'job',$2,$3,'controller_vm_create',$4,'test',clock_timestamp(),'adopted')",
+        admission,
+        job,
+        pvc_uid,
+        uuid4(),
+    )
+    await db.execute(
+        "INSERT INTO vm_creation_retries "
+        "(request_id,job_id,provision_generation,origin,request_digest,canonical_request,"
+        "controller_configuration_digest,execution_id,execution_revision,execution_generation,"
+        "admission_deadline,creation_admission_id,state,reason,boot_counted,"
+        "observed_vm_uid,observed_pvc_uid,ready_at,resolved_at) "
+        "VALUES($1,$2,$3,'initial',$4,$5::jsonb,$6,$7,$8,$9,$10,$11,"
+        "'succeeded','creation_adopted',true,$12,$13,clock_timestamp(),clock_timestamp())",
+        scenario.fixture_request_id,
+        job,
+        generation,
+        preflight["request_digest"],
+        json.dumps(preflight["request"]),
+        "sha256:" + "b" * 64,
+        preflight["execution_id"],
+        preflight["execution_revision"],
+        preflight["execution_generation"],
+        (
+            datetime.fromisoformat(preflight["admission_deadline"])
+            if preflight["admission_deadline"]
+            else None
+        ),
+        admission,
+        vm_uid,
+        pvc_uid,
+    )
+    scenario.provisioner = SimpleNamespace(
+        query_status=AsyncMock(
+            return_value={
+                "ready": True,
+                "vm_uid": vm_uid,
+                "provision_generation": generation,
+                "rootdisk_pvc_uid": pvc_uid,
+                "active_pod_uid": launcher_uid,
+                "provisioning": {"vmi_uid": vmi_uid},
+            }
+        )
+    )
+    identity = await scenario._fixture_ready_identity(job)
+    assert identity is not None
+    return scenario, job, identity
+
+
+@pytest.mark.asyncio
+async def test_profiled_fixture_atomically_claims_preflight_hold_with_native_marker(
+    gate_lease_db,
+    monkeypatch,
+):
+    scenario, job, identity = await _profiled_ready_lease_fixture(
+        gate_lease_db, monkeypatch
+    )
+    before = await gate_lease_db.fetchrow(
+        "SELECT state,lease_token FROM run_queue WHERE unit_id=$1", job
+    )
+    assert before["state"] == "done"
+    assert await scenario._issue_fixture_lease(job, identity) == 27
+    row = await gate_lease_db.fetchrow(
+        "SELECT job.status,job.context,queue.state,queue.lease_token,queue.leased_by,"
+        "queue.leased_until FROM jobs job JOIN run_queue queue ON queue.unit_id=job.id "
+        "WHERE job.id=$1",
+        job,
+    )
+    assert row["status"] == "processing" and row["state"] == "leased"
+    assert (
+        row["lease_token"] == 27
+        and row["leased_by"] == f"vm-recovery-gate:{scenario.run_id}"
+    )
+    marker = json.loads(row["context"])["_workspace_dispatch_authority"]
+    assert marker["dispatch_kind"] == "stateless"
+    assert marker["queue_lease_token"] == 27
+    assert marker["worker_pod"] == row["leased_by"]
+    assert (
+        await gate_lease_db.fetchval(
+            "SELECT count(*) FROM worker_batch_attempts WHERE job_id=$1 AND lease_token=27",
+            job,
+        )
+        == 1
+    )
+
+
+@pytest.mark.asyncio
+async def test_profiled_fixture_native_dispatch_rejection_rolls_back_queue(
+    gate_lease_db,
+    monkeypatch,
+):
+    import asyncpg
+    from shared import worker_queue
+
+    scenario, job, identity = await _profiled_ready_lease_fixture(
+        gate_lease_db, monkeypatch
+    )
+    before = await gate_lease_db.fetchrow(
+        "SELECT * FROM run_queue WHERE unit_id=$1",
+        job,
+    )
+    # Deliberately corrupt only the in-test claimant's marker: the database
+    # trigger must reject it after the queue update, rolling back both writes.
+    monkeypatch.setattr(
+        worker_queue,
+        "_CAS_JOB_SQL",
+        worker_queue._CAS_JOB_SQL.replace(
+            "'worker_pod', $3::text", "'worker_pod', ($3::text || '-wrong')"
+        ),
+    )
+    with pytest.raises(asyncpg.CheckViolationError):
+        await scenario._issue_fixture_lease(job, identity)
+    assert (
+        await gate_lease_db.fetchrow(
+            "SELECT * FROM run_queue WHERE unit_id=$1",
+            job,
+        )
+        == before
+    )
+    assert (
+        await gate_lease_db.fetchval("SELECT status FROM jobs WHERE id=$1", job)
+        == "paused"
+    )
+    assert (
+        await gate_lease_db.fetchval(
+            "SELECT count(*) FROM worker_batch_attempts WHERE job_id=$1", job
+        )
+        == 0
+    )
+
+
+@pytest.mark.asyncio
+async def test_profiled_fixture_rechecks_live_runtime_before_using_ready_receipt(
+    gate_lease_db,
+    monkeypatch,
+):
+    from uuid import uuid4
+
+    scenario, job, _identity = await _profiled_ready_lease_fixture(
+        gate_lease_db, monkeypatch
+    )
+    original = scenario.provisioner.query_status.return_value
+    scenario.provisioner.query_status.side_effect = [
+        original,
+        {**original, "vm_uid": str(uuid4())},
+    ]
+    assert await scenario._fixture_ready_identity(job) is None
+    assert (
+        await gate_lease_db.fetchval(
+            "SELECT state FROM run_queue WHERE unit_id=$1", job
+        )
+        == "done"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "change",
+    [
+        "changed_identity",
+        "prior_attempt",
+        "parked",
+        "leased",
+        "prior_token",
+        "control_input",
+        "wrong_kind",
+        "workspace_image",
+        "missing_receipt",
+    ],
+)
+async def test_profiled_fixture_rejects_changed_or_used_hold_without_mutation(
+    gate_lease_db,
+    monkeypatch,
+    change,
+):
+    import json
+    from uuid import uuid4
+
+    scenario, job, identity = await _profiled_ready_lease_fixture(
+        gate_lease_db, monkeypatch
+    )
+    if change == "changed_identity":
+        identity = {**identity, "prior_vmi_uid": str(uuid4())}
+    elif change == "prior_attempt":
+        await gate_lease_db.execute(
+            "INSERT INTO worker_batch_attempts(job_id,lease_token,claimed_attempt) VALUES($1,4,1)",
+            job,
+        )
+    elif change == "parked":
+        await gate_lease_db.execute(
+            "UPDATE run_queue SET state='parked' WHERE unit_id=$1", job
+        )
+    elif change == "leased":
+        await gate_lease_db.execute(
+            "UPDATE run_queue SET state='leased',lease_token=1,leased_by='other',"
+            "leased_until=clock_timestamp()+interval '5 minutes' WHERE unit_id=$1",
+            job,
+        )
+    elif change == "prior_token":
+        await gate_lease_db.execute(
+            "UPDATE run_queue SET lease_token=1 WHERE unit_id=$1", job
+        )
+    elif change == "control_input":
+        await gate_lease_db.execute(
+            "UPDATE run_queue SET control_input_seq=1 WHERE unit_id=$1", job
+        )
+    elif change == "wrong_kind":
+        await gate_lease_db.execute(
+            "UPDATE run_queue SET unit_kind='session_turn' WHERE unit_id=$1", job
+        )
+    elif change == "workspace_image":
+        await gate_lease_db.execute(
+            "UPDATE jobs SET config_override=jsonb_set(config_override,"
+            "'{workspace,vm,image}',to_jsonb($2::text)) WHERE id=$1",
+            job,
+            "registry.example/other@sha256:" + "b" * 64,
+        )
+    else:
+        context = json.loads(
+            await gate_lease_db.fetchval("SELECT context FROM jobs WHERE id=$1", job)
+        )
+        context["vm"].pop("network_profile_evidence")
+        await gate_lease_db.execute(
+            "UPDATE jobs SET context=$2::jsonb WHERE id=$1", job, json.dumps(context)
+        )
+    before = await gate_lease_db.fetchrow(
+        "SELECT job.status,job.context,queue.state,queue.lease_token,queue.leased_by "
+        "FROM jobs job JOIN run_queue queue ON queue.unit_id=job.id WHERE job.id=$1",
+        job,
+    )
+    with pytest.raises(acceptance.AcceptanceFailure, match="could not be issued"):
+        await scenario._issue_fixture_lease(job, identity)
+    assert (
+        await gate_lease_db.fetchrow(
+            "SELECT job.status,job.context,queue.state,queue.lease_token,queue.leased_by "
+            "FROM jobs job JOIN run_queue queue ON queue.unit_id=job.id WHERE job.id=$1",
+            job,
+        )
+        == before
+    )
 
 
 @pytest.mark.asyncio

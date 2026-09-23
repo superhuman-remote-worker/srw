@@ -1472,6 +1472,8 @@ spec:
             {{- if .Values.orchestrator.vmWorkspaceRecoveryAcceptanceGate.enabled }}
             - name: VM_WORKSPACE_RECOVERY_GATE_SLOW_BOOT_SECONDS
               value: "15"
+            - name: VM_WORKSPACE_RECOVERY_GATE_VM_IMAGE
+              value: {{ .Values.vmController.defaultVmImage | quote }}
             {{- end }}
             # Budget for the WS proxy's /ready poll. Must outlast the agent's
             # own _poll_workspace_ready (120s) plus margin for cold image pulls.

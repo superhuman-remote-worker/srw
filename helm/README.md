@@ -925,13 +925,19 @@ controller and orchestrator as `VM_NETWORK_PROFILE_ENABLED` and
 `VM_NETWORK_PROFILE_IMAGE_ALLOWLIST` (a comma-separated list). Only admit clean
 images whose `enp1s0` network behavior has been verified. Prepared VM artifacts
 need their own exact compatible provenance and are held by this initial policy.
-A selected profile
-is frozen in creation intent and inherited by retries, idle wakes and retained
-workspace handoffs even if new admission is later disabled. Reuse also requires
-authenticated first-boot evidence of the effective name-only DHCP rule and
-current guest network identity. Existing disks without that immutable profile
-and proof remain warm at idle release and enter a visible recoverable hold on
-retained successor admission, regardless of the fresh-admission switch;
+New profile selection also requires same-cluster mode and
+`orchestrator.vmProvisioning.creationRetryEnabled: true`; the legacy direct
+create path cannot select it. The disposable recovery gate reads its explicit
+image from `vmController.defaultVmImage`, which must be the exact allowlisted
+digest when the profile is enabled.
+
+A selected profile is frozen in creation intent and inherited by retries, idle
+wakes and retained workspace handoffs even if new admission is later disabled.
+Reuse also requires authenticated first-boot evidence of the effective
+name-only DHCP rule and current guest network identity. Existing disks without
+that immutable profile and proof remain warm at idle release and enter a visible
+recoverable hold on retained successor admission, regardless of the fresh
+admission switch;
 the setting does not migrate or edit their guest configuration.
 
 Durable recovery is installed reader-first. Its database records, job projection,

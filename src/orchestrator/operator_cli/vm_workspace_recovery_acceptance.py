@@ -235,6 +235,11 @@ class LiveScenario:
         self.provisioner = VMProvisioner()
         self.namespace = os.environ.get("VM_NAMESPACE", "agent-vms")
         self.settings = VMWorkspaceRecoverySettings.from_env()
+        self.protocol_fixture = os.environ.get("VM_CREATION_RETRY_ENABLED") == "true"
+        self.profiled_fixture = os.environ.get("VM_NETWORK_PROFILE_ENABLED") == "true"
+        self.fixture_image = (
+            os.environ.get("VM_WORKSPACE_RECOVERY_GATE_VM_IMAGE") or None
+        )
         self.slow_boot_delay_seconds = int(
             os.environ.get("VM_WORKSPACE_RECOVERY_GATE_SLOW_BOOT_SECONDS", "15")
         )
@@ -344,38 +349,247 @@ class LiveScenario:
         if self.gate_user_id is not None:
             return self.gate_user_id
         user_id = uuid4()
-        async with self.db.acquire() as conn:
-            await conn.execute(
-                "INSERT INTO users(id,display_name,is_approved,is_admin) "
-                "VALUES ($1,$2,true,false)",
-                user_id,
-                f"VM recovery gate {self.run_id}",
-            )
+        async with self.db.acquire() as conn, conn.transaction():
+            if getattr(self, "protocol_fixture", False):
+                await conn.execute(
+                    "INSERT INTO users(id,display_name,is_approved,is_admin,can_use_vm) "
+                    "VALUES ($1,$2,true,false,true)",
+                    user_id,
+                    f"VM recovery gate {self.run_id}",
+                )
+                await conn.execute(
+                    "INSERT INTO capability_grants(scope_kind,scope_id,key,value_json) "
+                    "VALUES ('user',$1,'vm_workspace','true'::jsonb)",
+                    user_id,
+                )
+            else:
+                await conn.execute(
+                    "INSERT INTO users(id,display_name,is_approved,is_admin) "
+                    "VALUES ($1,$2,true,false)",
+                    user_id,
+                    f"VM recovery gate {self.run_id}",
+                )
         self.gate_user_id = user_id
         return user_id
 
     async def _create_job(self) -> UUID:
         gate_user_id = await self._ensure_gate_user()
         job_id = uuid4()
+        options: dict[str, Any] = {}
+        if getattr(self, "protocol_fixture", False):
+            if getattr(self, "fixture_image", None):
+                options["config_override"] = {
+                    "workspace": {
+                        "backend": "vm",
+                        "vm": {
+                            "image": self.fixture_image,
+                            "cpu_cores": 2,
+                            "memory": "2Gi",
+                            "disk_size": "12Gi",
+                        },
+                    }
+                }
+                options["requested_workspace_backend"] = "vm"
         created = await self.db.create_job(
             description=f"[vm-recovery-gate:{self.run_id}] retained disk fixture",
             context={"vm_workspace_recovery_acceptance_gate": self.run_id},
             origin="lifecycle",
-            status="processing",
+            status="processing"
+            if not getattr(self, "protocol_fixture", False)
+            else "paused",
             execution_lane="stateless",
             user_id=str(gate_user_id),
             job_id=job_id,
+            **options,
         )
         if UUID(str(created["id"])) != job_id:
             raise AcceptanceFailure("job helper changed the preallocated fixture ID")
         self.job_id = job_id
         return job_id
 
-    async def _issue_fixture_lease(self, job_id: UUID) -> int:
+    def _require_fixture_configuration(self) -> None:
+        from shared.vm_network_profile import compatible_image
+
+        if self.profiled_fixture and not self.protocol_fixture:
+            raise AcceptanceFailure(
+                "profiled recovery gate requires VM_CREATION_RETRY_ENABLED=true"
+            )
+        if self.protocol_fixture and (
+            self.provisioner.mode != "same-cluster" or not self.fixture_image
+        ):
+            raise AcceptanceFailure(
+                "creation-retry recovery gate requires same-cluster mode and "
+                "vmController.defaultVmImage"
+            )
+        if self.profiled_fixture and not compatible_image(self.fixture_image):
+            raise AcceptanceFailure(
+                "profiled recovery gate image must be an exact allowlisted digest"
+            )
+
+    async def _require_creation_ack(self, job_id: UUID, created: object) -> None:
+        from orchestrator.services.manifest_execution_snapshot import (
+            read_execution,
+            srw_snapshot_config,
+        )
+        from orchestrator.services.vm_creation_preflight import _preflight
+        from shared.vm_network_profile import NETWORK_PROFILE
+
+        if not isinstance(created, Mapping) or (
+            created.get("creation_retry_protocol") != 1
+            or created.get("status") != "creation_pending"
+            or created.get("job_id") != str(job_id)
+        ):
+            raise AcceptanceFailure(
+                "fixture did not enter durable VM creation preflight"
+            )
+        context = _object(
+            (await self._row("SELECT context FROM jobs WHERE id=$1", job_id)).get(
+                "context"
+            )
+        )
+        vm = _object(context.get("vm"))
+        preflight = _preflight(vm)
+        request = preflight["request"] if preflight else {}
+        snapshot = await read_execution(self.db, "Job", str(job_id))
+        try:
+            if snapshot is None:
+                raise ValueError("execution snapshot missing")
+            _, policy = srw_snapshot_config(snapshot)
+            frozen_image = (policy.get("workspace") or {}).get("vm", {}).get("image")
+        except (TypeError, KeyError, ValueError) as exc:
+            raise AcceptanceFailure("fixture has no frozen VM workspace image") from exc
+        if (
+            preflight is None
+            or preflight["request_id"] != created.get("request_id")
+            or request.get("provision_generation")
+            != created.get("provision_generation")
+            or request.get("job_id") != str(job_id)
+            or request.get("vm_image") != self.fixture_image
+            or frozen_image != self.fixture_image
+            or str(snapshot.get("id")) != preflight["execution_id"]
+            or snapshot.get("revision") != preflight["execution_revision"]
+            or snapshot.get("generation") != preflight["execution_generation"]
+            or snapshot.get("work_kind") != "Job"
+            or snapshot.get("work_id") != job_id
+            or snapshot.get("owner_id") != self.gate_user_id
+            or (
+                self.profiled_fixture
+                and request.get("network_profile") != NETWORK_PROFILE
+            )
+            or context.get("_vm_creation_pending") != preflight["request_id"]
+        ):
+            raise AcceptanceFailure("fixture frozen creation image/profile changed")
+        self.fixture_request_id = preflight["request_id"]
+        self.fixture_generation = request["provision_generation"]
+
+    async def _issue_fixture_lease(
+        self, job_id: UUID, identity: Mapping[str, Any] | None = None
+    ) -> int:
         """Issue the synthetic worker lease only after VM and SSH readiness."""
 
         lease_token = 27
+        worker = f"vm-recovery-gate:{self.run_id}"
         async with self.db.acquire() as conn, conn.transaction():
+            if getattr(self, "protocol_fixture", False):
+                from shared.worker_queue import _CAS_JOB_SQL
+
+                # Preflight installed this hold. Reusing it preserves the
+                # monotonic queue token and closes the dispatch gap.
+                queue = await conn.fetchrow(
+                    "SELECT * FROM run_queue WHERE unit_id=$1 FOR UPDATE", job_id
+                )
+                current = await conn.fetchrow(
+                    "SELECT id,status,execution_lane,assigned_agent_id,user_id,"
+                    "context,config_override,freeze_data,lease_expires_at "
+                    "FROM jobs WHERE id=$1 FOR UPDATE",
+                    job_id,
+                )
+                retry = await conn.fetchrow(
+                    "SELECT request_id,job_id,provision_generation,state,reason,ready_at,"
+                    "canonical_request,request_digest,execution_id,"
+                    "execution_revision,execution_generation "
+                    "FROM vm_creation_retries "
+                    "WHERE request_id=$1",
+                    UUID(self.fixture_request_id),
+                )
+                if (
+                    identity is None
+                    or queue is None
+                    or current is None
+                    or queue["unit_kind"] != "worker_batch"
+                    or queue["state"] != "done"
+                    or queue["leased_by"] is not None
+                    or queue["leased_until"] is not None
+                    or queue["last_leased_by"] is not None
+                    or queue["attempts_since_completion"] != 0
+                    or queue["lease_token"] != 0
+                    or queue["input_seq"] is not None
+                    or queue["consumed_seq"] is not None
+                    or queue["control_input_seq"] != 0
+                    or queue["control_consumed_seq"] != 0
+                    or queue["interrupt_admission_lease_token"] is not None
+                    or queue["interrupt_admission_turn_id"] is not None
+                    or queue["input_delivery_capable_lease_token"] is not None
+                    or queue["park_reason"] is not None
+                    or queue["parked_at"] is not None
+                    or current["freeze_data"] is not None
+                    or current["lease_expires_at"] is not None
+                    or not self._fixture_authority_matches(
+                        job_id, dict(current), dict(retry) if retry else {}, identity
+                    )
+                    or await conn.fetchval(
+                        "SELECT EXISTS(SELECT 1 FROM worker_batch_attempts WHERE job_id=$1) "
+                        "OR EXISTS(SELECT 1 FROM vm_workspace_recovery_jobs "
+                        "WHERE job_id=$1 AND resolved_at IS NULL) "
+                        "OR EXISTS(SELECT 1 FROM job_completion_sweep_exclusions "
+                        "WHERE job_id=$1)",
+                        job_id,
+                    )
+                ):
+                    raise AcceptanceFailure(
+                        "synthetic worker lease could not be issued after readiness"
+                    )
+                leased_until = await conn.fetchval(
+                    "UPDATE run_queue SET state='leased',lease_token=$2,leased_by=$3,"
+                    "last_leased_by=$3,leased_until=clock_timestamp()+interval '5 minutes',"
+                    "run_after=clock_timestamp(),input_seq=1,consumed_seq=0,"
+                    "attempts_since_completion=1 "
+                    "WHERE unit_id=$1 AND unit_kind='worker_batch' AND state='done' "
+                    "AND lease_token=0 AND leased_by IS NULL AND leased_until IS NULL "
+                    "AND last_leased_by IS NULL AND attempts_since_completion=0 "
+                    "AND input_seq IS NULL AND consumed_seq IS NULL "
+                    "AND control_input_seq=0 AND control_consumed_seq=0 "
+                    "AND interrupt_admission_lease_token IS NULL "
+                    "AND interrupt_admission_turn_id IS NULL "
+                    "AND input_delivery_capable_lease_token IS NULL "
+                    "AND park_reason IS NULL AND parked_at IS NULL "
+                    "RETURNING leased_until",
+                    job_id,
+                    lease_token,
+                    worker,
+                )
+                if (
+                    leased_until is None
+                    or await conn.fetchval(
+                        _CAS_JOB_SQL,
+                        job_id,
+                        "paused",
+                        worker,
+                        lease_token,
+                        leased_until,
+                    )
+                    != job_id
+                ):
+                    raise AcceptanceFailure(
+                        "synthetic worker lease could not be issued after readiness"
+                    )
+                await conn.execute(
+                    "INSERT INTO worker_batch_attempts "
+                    "(job_id,lease_token,claimed_attempt) VALUES ($1,$2,1)",
+                    job_id,
+                    lease_token,
+                )
+                return lease_token
             current = await conn.fetchrow(
                 "SELECT status,execution_lane,user_id,"
                 "context->>'vm_workspace_recovery_acceptance_gate' AS gate_run "
@@ -404,7 +618,7 @@ class LiveScenario:
                 "RETURNING lease_token",
                 job_id,
                 lease_token,
-                f"vm-recovery-gate:{self.run_id}",
+                worker,
                 self.gate_user_id,
                 self.run_id,
             )
@@ -485,6 +699,132 @@ class LiveScenario:
         ):
             _require_uuid(identity[key], key)
         return identity
+
+    async def _fixture_ready_identity(self, job_id: UUID) -> dict[str, Any] | None:
+        identity = await self._ready_identity(job_id)
+        if identity is None or not getattr(self, "protocol_fixture", False):
+            return identity
+        live = _object(await self.provisioner.query_status(str(job_id), timeout=10))
+        if (
+            live.get("ready") is not True
+            or live.get("provision_generation") != identity["provision_generation"]
+            or live.get("vm_uid") != identity["vm_uid"]
+            or live.get("rootdisk_pvc_uid") != identity["root_pvc_uid"]
+            or live.get("active_pod_uid") != identity["prior_launcher_uid"]
+            or _object(live.get("provisioning")).get("vmi_uid")
+            != identity["prior_vmi_uid"]
+        ):
+            return None
+        job = await self._row(
+            "SELECT id,status,execution_lane,assigned_agent_id,user_id,context,"
+            "config_override,freeze_data,lease_expires_at FROM jobs WHERE id=$1",
+            job_id,
+        )
+        retry = await self._row(
+            "SELECT request_id,job_id,provision_generation,state,reason,ready_at,"
+            "canonical_request,request_digest,execution_id,"
+            "execution_revision,execution_generation FROM vm_creation_retries "
+            "WHERE request_id=$1",
+            UUID(self.fixture_request_id),
+        )
+        return (
+            identity
+            if self._fixture_authority_matches(job_id, job, retry, identity)
+            else None
+        )
+
+    def _fixture_authority_matches(
+        self,
+        job_id: UUID,
+        job: Mapping[str, Any],
+        retry: Mapping[str, Any],
+        identity: Mapping[str, Any],
+    ) -> bool:
+        """Match one frozen, authenticated Ready result to this gate Job."""
+        from orchestrator.services.vm_creation_preflight import _preflight
+        from shared.vm_creation_retry import canonical_request_digest
+        from shared.vm_network_profile import NETWORK_PROFILE, reusable_profile_evidence
+
+        context = _object(job.get("context"))
+        vm = _object(context.get("vm"))
+        contract = _object(context.get("_workspace_contract"))
+        workspace = _object(_object(job.get("config_override")).get("workspace"))
+        vm_config = _object(workspace.get("vm"))
+        preflight = _preflight(vm)
+        if (
+            job.get("id") != job_id
+            or job.get("status") != "paused"
+            or job.get("execution_lane") != "stateless"
+            or job.get("assigned_agent_id") is not None
+            or job.get("user_id") != self.gate_user_id
+            or context.get("vm_workspace_recovery_acceptance_gate") != self.run_id
+            or contract.get("version") != 1
+            or contract.get("assigned_backend") != "vm"
+            or contract.get("requested_backend") != "vm"
+            or workspace.get("backend") != "vm"
+            or vm_config.get("image") != self.fixture_image
+            or vm_config.get("cpu_cores") != 2
+            or vm_config.get("memory") != "2Gi"
+            or vm_config.get("disk_size") != "12Gi"
+            or any(
+                key in context
+                for key in (
+                    "_workspace_dispatch_authority",
+                    "_completion_control_claim",
+                    "_stateless_control_claim",
+                    "_operator_pause_hold",
+                )
+            )
+            or context.get("_vm_creation_pending") is not None
+            or vm.get("status") != "ready"
+            or preflight is None
+            or preflight["request_id"] != self.fixture_request_id
+            or preflight["request"].get("provision_generation")
+            != self.fixture_generation
+            or preflight["request"].get("vm_image") != self.fixture_image
+            or vm.get("creation_request_id") != self.fixture_request_id
+            or vm.get("identity_authenticated") is not True
+            or vm.get("identity_provision_generation") != self.fixture_generation
+            or identity.get("owner_kind") != "job"
+            or identity.get("owner_id") != str(job_id)
+            or identity.get("provision_generation") != self.fixture_generation
+            or vm.get("vm_uid") != identity.get("vm_uid")
+            or vm.get("rootdisk_pvc_uid") != identity.get("root_pvc_uid")
+            or vm.get("active_pod_uid") != identity.get("prior_launcher_uid")
+            or _object(_object(vm.get("provisioning")).get("identity")).get("vmi_uid")
+            != identity.get("prior_vmi_uid")
+        ):
+            return False
+        canonical = _object(retry.get("canonical_request"))
+        if (
+            str(retry.get("request_id")) != self.fixture_request_id
+            or retry.get("job_id") != job_id
+            or str(retry.get("provision_generation")) != self.fixture_generation
+            or retry.get("state") != "succeeded"
+            or retry.get("reason") != "creation_adopted"
+            or retry.get("ready_at") is None
+            or canonical != preflight["request"]
+            or not canonical
+            or canonical_request_digest(canonical) != retry.get("request_digest")
+            or str(retry.get("execution_id")) != preflight["execution_id"]
+            or retry.get("execution_revision") != preflight["execution_revision"]
+            or retry.get("execution_generation") != preflight["execution_generation"]
+        ):
+            return False
+        if getattr(self, "profiled_fixture", False) and (
+            canonical.get("network_profile") != NETWORK_PROFILE
+            or not reusable_profile_evidence(
+                vm.get("network_profile_evidence"),
+                NETWORK_PROFILE,
+                provision_generation=self.fixture_generation,
+                vm_uid=identity["vm_uid"],
+                pvc_uid=identity["root_pvc_uid"],
+                vmi_uid=identity["prior_vmi_uid"],
+                launcher_uid=identity["prior_launcher_uid"],
+            )
+        ):
+            return False
+        return True
 
     async def _application_api_evidence(self, job_id: UUID) -> dict[str, Any]:
         import httpx
@@ -1445,14 +1785,30 @@ class LiveScenario:
     async def execute(self) -> dict[str, Any]:
         from shared.workspace_recovery import WorkspaceRecoveryCode
 
+        if getattr(self, "profiled_fixture", False) or getattr(
+            self, "protocol_fixture", False
+        ):
+            self._require_fixture_configuration()
         job_id = await self._create_job()
         created = await self.provisioner.create_vm(
-            str(job_id), cpu_cores=2, memory="2Gi", disk_size="12Gi"
+            str(job_id),
+            cpu_cores=2,
+            memory="2Gi",
+            disk_size="12Gi",
+            **(
+                {"vm_image": self.fixture_image}
+                if getattr(self, "protocol_fixture", False)
+                else {}
+            ),
         )
         if not created:
             raise AcceptanceFailure("controller refused the real VM fixture")
+        if getattr(self, "protocol_fixture", False):
+            await self._require_creation_ack(job_id, created)
         identity = await self._wait(
-            "initial VM readiness", lambda: self._ready_identity(job_id), timeout=1200
+            "initial VM readiness",
+            lambda: self._fixture_ready_identity(job_id),
+            timeout=1200,
         )
         application_api_evidence = await self._application_api_evidence(job_id)
         if application_api_evidence["job_visible"] is not True:
@@ -1471,7 +1827,10 @@ class LiveScenario:
         await self._ssh_file(identity, marker_path, marker)
         await self._ssh_file(identity, checkpoint_path, checkpoint)
 
-        lease_token = await self._issue_fixture_lease(job_id)
+        if getattr(self, "protocol_fixture", False):
+            lease_token = await self._issue_fixture_lease(job_id, identity)
+        else:
+            lease_token = await self._issue_fixture_lease(job_id)
         request_id = uuid4()
         disposition = await self._admit(
             identity=identity,
