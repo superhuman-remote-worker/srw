@@ -25,9 +25,11 @@ async def test_exact_recovery_ack_closes_episode_even_after_tracking_disabled(
 ):
     monkeypatch.setenv("WORKSPACE_IDLE_RELEASE_ENABLED", "true")
     monkeypatch.setenv("VM_MODE", "same-cluster")
-    seed, _ = await seeded(db)
-    await publish(db, seed)
+    seed, _ = await seeded(db, delivered=True, monkeypatch=monkeypatch)
+    result, route = await publish(db, seed)
+    assert result is not None
     before = await episode(db, seed["job_id"])
+    assert before[1]["wait_key"] == route["route_id"]
     generation = str(uuid4())
     await db.execute(
         "UPDATE jobs SET status='paused',context=context||$2::jsonb,"

@@ -784,7 +784,7 @@ data:
   # otherwise the user-supplied .Values.nats.url (empty disables VM lifecycle).
   NATS_URL: {{ include "srw.natsUrl" . | quote }}
   VM_MODE: {{ include "srw.vmMode" . | quote }}
-  WORKSPACE_IDLE_RELEASE_ENABLED: {{ .Values.orchestrator.vmIdleRelease.enabled | default false | quote }}
+  WORKSPACE_IDLE_RELEASE_ENABLED: {{ (.Values.orchestrator.vmIdleRelease | default dict).enabled | default false | quote }}
   {{- if eq (include "srw.vmMode" .) "external" }}
   # Per-orchestrator id used to scope vm.lifecycle.* NATS subjects. Must match
   # the paired VM controller chart's orchestratorId.

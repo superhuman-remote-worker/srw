@@ -75,6 +75,8 @@ _mock_k8s_config.load_incluster_config = MagicMock()  # type: ignore[attr-define
 
 from kubernetes.client import ApiClient as KubernetesApiClient  # noqa: E402
 
+_mock_k8s_client.ApiClient = KubernetesApiClient  # type: ignore[attr-defined]
+
 _K8S_STUB_MODULES = {
     "kubernetes": _mock_k8s,
     "kubernetes.client": _mock_k8s_client,
