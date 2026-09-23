@@ -29932,6 +29932,7 @@ class PostgresDB:
         completion_owner: str | None = None,
         completion_control_claim_id: str | None = None,
         lift_operator_pause_hold: str | None = None,
+        idle_phase_source_snapshot: Mapping[str, Any] | None = None,
     ) -> bool:
         """Atomically shed a stateless freeze and revive its worker unit.
 
@@ -29980,6 +29981,62 @@ class PostgresDB:
                         fair_key=fair_key,
                         priority=int(priority),
                     )
+                    if idle_phase_source_snapshot is not None:
+                        from orchestrator.services.vm_idle_phase_approval import (
+                            approval_source_snapshot, finalized_phase_source,
+                        )
+                        from orchestrator.services.vm_remote_operation import (
+                            VMRemoteOperationUnavailable, _identity_from_row,
+                        )
+                        from shared.workspace_idle_policy import IdlePolicyError, read_episode
+
+                        locked = await conn.fetchrow(
+                            "SELECT * FROM jobs WHERE id=$1 FOR UPDATE", job_uuid,
+                        )
+                        if (
+                            locked is None
+                            or completion_control_claim_id is None
+                            or approval_source_snapshot(dict(locked)) != idle_phase_source_snapshot
+                            or await conn.fetchval(
+                                "SELECT 1 FROM vm_idle_operations WHERE owner_kind='job' "
+                                "AND owner_id=$1 AND closed_at IS NULL", job_uuid,
+                            ) is not None
+                        ):
+                            raise _ResumeCASLostError
+                        try:
+                            document = locked["workspace_idle_episode"]
+                            if isinstance(document, str):
+                                document = json.loads(document)
+                            episode = read_episode(
+                                document, revision=locked["workspace_idle_revision"],
+                            )
+                            identity = _identity_from_row(
+                                dict(locked), owner_kind="job", owner_id=job_id,
+                                operation_kind="idle_policy",
+                            )
+                            context = locked["context"]
+                            if isinstance(context, str):
+                                context = json.loads(context)
+                            vm = context["vm"]
+                            vmi_uid = UUID(vm["vmi_uid"])
+                            pvc_uid = UUID(vm["rootdisk_pvc_uid"])
+                            if (
+                                episode is None
+                                or episode.wait_kind != "human_approval"
+                                or await finalized_phase_source(
+                                    conn, job=locked, episode=episode,
+                                    generation=identity.workspace_generation,
+                                    vm_uid=identity.vm_uid,
+                                    launcher_uid=identity.launcher_pod_uid,
+                                    vmi_uid=vmi_uid, pvc_uid=pvc_uid,
+                                ) is None
+                            ):
+                                raise _ResumeCASLostError
+                        except (
+                            IdlePolicyError, VMRemoteOperationUnavailable,
+                            KeyError, TypeError, ValueError, AttributeError,
+                        ) as exc:
+                            raise _ResumeCASLostError from exc
                     if (
                         completion_commands_enabled
                         and await self._completion_resume_blocked_on_conn(

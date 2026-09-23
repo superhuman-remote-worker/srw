@@ -1,5 +1,6 @@
 """Controller effects use real provenance validators and fault-injected API stores."""
 
+import asyncio
 from copy import deepcopy
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -351,7 +352,10 @@ async def test_profile_only_refuses_bad_network_data_before_vm_post(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("field", ["policy", "image", "request", "template", "effect"])
+@pytest.mark.parametrize(
+    "field",
+    ["policy", "missing_configuration", "image", "request", "template", "effect"],
+)
 async def test_profile_only_refuses_identity_drift_before_vm_post(
     profiled_setup, field, monkeypatch
 ):
@@ -362,6 +366,8 @@ async def test_profile_only_refuses_identity_drift_before_vm_post(
         authority.row["controller_configuration"]["network_profile_policy"]["image"] = (
             "registry.example/other@sha256:" + "b" * 64
         )
+    elif field == "missing_configuration":
+        authority.row.pop("controller_configuration")
     elif field == "image":
         payload["vm_image"] = "registry.example/other@sha256:" + "b" * 64
     elif field == "request":
@@ -435,6 +441,265 @@ async def test_creation_attention_logs_only_allowlisted_reason_code(
     result = await actuator.run(payload)
     assert result["reason"] == "creation_evidence_unproven"
     assert "private-auth-value" not in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failure_at", "error", "stage", "family"),
+    [
+        (
+            "publish",
+            ValueError("token=private-auth-value"),
+            "vm_carrier_publish",
+            "value_error",
+        ),
+        (
+            "previous",
+            KeyError("token=private-auth-value"),
+            "vm_postpublish_previous",
+            "key_error",
+        ),
+        (
+            "disk",
+            TypeError("token=private-auth-value"),
+            "vm_postpublish_disk",
+            "type_error",
+        ),
+        (
+            "absent",
+            ValueError("token=private-auth-value"),
+            "vm_postpublish_absence",
+            "value_error",
+        ),
+        ("body", TypeError("token=private-auth-value"), "vm_render_body", "type_error"),
+        (
+            "manifest",
+            ValueError("token=private-auth-value"),
+            "vm_final_manifest",
+            "value_error",
+        ),
+        ("grant", KeyError("token=private-auth-value"), "vm_begin_effect", "key_error"),
+    ],
+)
+async def test_vm_creation_run_logs_closed_stage_and_family_without_secret_or_grant(
+    profiled_setup,
+    monkeypatch,
+    caplog,
+    failure_at,
+    error,
+    stage,
+    family,
+):
+    from vm_controller.creation_actuation import CreationActuator
+
+    ctrl, api, authority, payload = profiled_setup
+    actuator = CreationActuator(ctrl)
+    original_publish = CreationActuator.publish
+    original_previous = CreationActuator.exact_previous
+    original_disk = CreationActuator.disk
+    original_absent = CreationActuator.require_vm_absent
+    original_body = CreationActuator.body
+    original_authority = actuator.authority
+    postpublish_previous_complete = False
+
+    def vm_carrier_exists():
+        name = "srw-cleanup-" + authority.row["creation_admission_id"].replace("-", "")
+        lease = api.objects.get(("Lease", name))
+        return (
+            lease is not None
+            and verify_creation_carrier(
+                lease,
+                secret=SECRET,
+            )["effect_kind"]
+            == "vm"
+        )
+
+    async def publish(self, values, prior=None):
+        nonlocal postpublish_previous_complete
+        if failure_at == "publish" and values["effect_kind"] == "vm":
+            raise error
+        if values["effect_kind"] == "vm":
+            postpublish_previous_complete = False
+        return await original_publish(self, values, prior=prior)
+
+    async def previous(self, row, lease):
+        nonlocal postpublish_previous_complete
+        if failure_at == "previous" and vm_carrier_exists():
+            raise error
+        result = await original_previous(self, row, lease)
+        if vm_carrier_exists():
+            postpublish_previous_complete = True
+        return result
+
+    async def disk(self, row, *, expected=None, require_attachment=True):
+        if failure_at == "disk" and postpublish_previous_complete:
+            raise error
+        return await original_disk(
+            self,
+            row,
+            expected=expected,
+            require_attachment=require_attachment,
+        )
+
+    async def absent(self, row):
+        if failure_at == "absent" and vm_carrier_exists():
+            raise error
+        return await original_absent(self, row)
+
+    async def body(self, row, values):
+        if failure_at == "body" and values["effect_kind"] == "vm":
+            raise error
+        return await original_body(self, row, values)
+
+    async def authority_call(method, **values):
+        if failure_at == "grant" and method == "begin-effect" and vm_carrier_exists():
+            raise error
+        return await original_authority(method, **values)
+
+    monkeypatch.setattr(CreationActuator, "publish", publish)
+    monkeypatch.setattr(CreationActuator, "exact_previous", previous)
+    monkeypatch.setattr(CreationActuator, "disk", disk)
+    monkeypatch.setattr(CreationActuator, "require_vm_absent", absent)
+    monkeypatch.setattr(CreationActuator, "body", body)
+    monkeypatch.setattr(actuator, "authority", authority_call)
+    if failure_at == "manifest":
+
+        def reject_manifest(*_args, **_kwargs):
+            raise error
+
+        monkeypatch.setattr(
+            "shared.vm_resource_manifest.validate_final_vm_manifest",
+            reject_manifest,
+        )
+
+    result = await actuator.run(payload)
+
+    assert result["status"] == "creation_attention"
+    assert result["reason"] == "creation_evidence_unproven"
+    assert api.writes == ["Lease", "DataVolume", "Secret"]
+    assert [
+        effect["carrier_intent"]["effect_kind"] for effect in authority.row["effects"]
+    ] == [
+        "rootdisk",
+        "cloud_init",
+    ]
+    messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "vm_controller.creation_actuation"
+    ]
+    assert len(messages) == 1
+    assert f"stage={stage}" in messages[0]
+    assert f"family={family}" in messages[0]
+    assert "location=creation_actuation._run:" in messages[0]
+    assert "private-auth-value" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_creation_source_validation_refusal_has_closed_stage_without_grant(
+    profiled_setup,
+    monkeypatch,
+    caplog,
+):
+    from vm_controller.creation_actuation import CreationActuator
+    from vm_controller.creation_sources import GoldenSources
+
+    ctrl, api, authority, payload = profiled_setup
+
+    async def reject_source(self, row, source):
+        raise KeyError("token=private-auth-value")
+
+    monkeypatch.setattr(GoldenSources, "validate", reject_source)
+    result = await CreationActuator(ctrl).run(payload)
+
+    assert result["status"] == "creation_attention"
+    assert result["reason"] == "creation_evidence_unproven"
+    assert api.writes == ["Lease"]
+    assert authority.row["effects"] == []
+    messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "vm_controller.creation_actuation"
+    ]
+    assert len(messages) == 1
+    assert "stage=rootdisk_source_validate" in messages[0]
+    assert "family=key_error" in messages[0]
+    assert "location=creation_actuation._run:" in messages[0]
+    assert "private-auth-value" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_creation_run_stages_are_isolated_across_concurrent_invocations(
+    profiled_setup,
+    monkeypatch,
+    caplog,
+):
+    from vm_controller.creation_actuation import CreationActuator
+
+    ctrl, api, authority, payload = profiled_setup
+    actuator = CreationActuator(ctrl)
+    original_body = CreationActuator.body
+
+    async def seed_previous_effects(self, row, values):
+        if values["effect_kind"] == "vm":
+            raise ValueError("seed-only refusal")
+        return await original_body(self, row, values)
+
+    monkeypatch.setattr(CreationActuator, "body", seed_previous_effects)
+    assert (await actuator.run(payload))["status"] == "creation_attention"
+    assert len(authority.row["effects"]) == 2
+    caplog.clear()
+    entered_body = asyncio.Event()
+    release_body = asyncio.Event()
+    original_authority = actuator.authority
+
+    async def concurrent_body(self, row, values):
+        if (
+            values["effect_kind"] == "vm"
+            and asyncio.current_task().get_name() == "body-task"
+        ):
+            entered_body.set()
+            await release_body.wait()
+            raise ValueError("token=private-auth-value")
+        return await original_body(self, row, values)
+
+    async def concurrent_authority(method, **values):
+        if (
+            method == "begin-effect"
+            and asyncio.current_task().get_name() == "grant-task"
+        ):
+            release_body.set()
+            raise TypeError("token=private-auth-value")
+        return await original_authority(method, **values)
+
+    monkeypatch.setattr(CreationActuator, "body", concurrent_body)
+    monkeypatch.setattr(actuator, "authority", concurrent_authority)
+    body_task = asyncio.create_task(actuator.run(payload), name="body-task")
+    await asyncio.wait_for(entered_body.wait(), timeout=5)
+    grant_task = asyncio.create_task(actuator.run(payload), name="grant-task")
+    results = await asyncio.wait_for(asyncio.gather(body_task, grant_task), timeout=5)
+
+    assert [result["status"] for result in results] == [
+        "creation_attention",
+        "creation_attention",
+    ]
+    messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "vm_controller.creation_actuation"
+    ]
+    assert len(messages) == 2
+    assert any(
+        "stage=vm_render_body" in message and "family=value_error" in message
+        for message in messages
+    )
+    assert any(
+        "stage=vm_begin_effect" in message and "family=type_error" in message
+        for message in messages
+    )
+    assert "private-auth-value" not in caplog.text
+    assert api.writes == ["Lease", "DataVolume", "Secret"]
+    assert len(authority.row["effects"]) == 2
 
 
 @pytest.mark.asyncio

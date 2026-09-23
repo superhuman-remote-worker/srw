@@ -33,7 +33,7 @@ from orchestrator.services.vm_workspace_recovery_store import (
     completed_cleanup_outcome,
     vm_cleanup_kwargs,
 )
-from shared.workspace_idle_policy import RuntimeIdentity, evaluate_idle, read_episode
+from shared.workspace_idle_policy import IdlePolicyError, RuntimeIdentity, evaluate_idle, read_episode
 
 logger = logging.getLogger(__name__)
 
@@ -177,6 +177,7 @@ class VMIdleLifecycleStore:
             conn, job=job, episode=episode, generation=generation,
             vm_uid=vm_uid, launcher_uid=launcher_uid,
             pvc_uid=_uuid(vm.get("rootdisk_pvc_uid")),
+            vmi_uid=operation["vmi_uid"] if operation is not None else _uuid(vm.get("vmi_uid")),
         )
         if source is None or expected_source != {
             "command_id": source["command_id"],
@@ -403,6 +404,7 @@ class VMIdleLifecycleStore:
                     conn, job=row, episode=episode,
                     generation=expected["generation"], vm_uid=expected["vm_uid"],
                     launcher_uid=expected["launcher_uid"],
+                    vmi_uid=expected["vmi_uid"], pvc_uid=expected["pvc_uid"],
                 )
                 if phase_source is None:
                     return None
@@ -416,6 +418,7 @@ class VMIdleLifecycleStore:
                     generation=expected["generation"], vm_uid=expected["vm_uid"],
                     launcher_uid=expected["launcher_uid"],
                     pvc_uid=expected["pvc_uid"],
+                    vmi_uid=expected["vmi_uid"],
                 )
                 if review_source is None:
                     return None
@@ -744,6 +747,18 @@ class VMIdleLifecycleStore:
 
     @staticmethod
     async def _reserve_wake_on_conn(conn, operation, *, execution_requested: bool):
+        if operation["access_rebind_proof"] is not None:
+            # Ready access rebind already committed. The proof's original
+            # no-execution decision cannot be rewritten by a later Resume.
+            if not execution_requested:
+                return operation
+            return await conn.fetchrow(
+                "UPDATE vm_idle_operations SET post_ready_resume_requested=true,"
+                "retry_after=NULL,last_progress_at=clock_timestamp() "
+                "WHERE id=$1 AND closed_at IS NULL "
+                "RETURNING *",
+                operation["id"],
+            )
         return await conn.fetchrow(
             """
             UPDATE vm_idle_operations SET
@@ -812,6 +827,7 @@ class VMIdleLifecycleStore:
             conn, job=job, episode=episode,
             generation=operation["provision_generation"],
             vm_uid=operation["vm_uid"], launcher_uid=operation["launcher_uid"],
+            vmi_uid=operation["vmi_uid"], pvc_uid=operation["pvc_uid"],
         )
         if source is None:
             return None
@@ -1015,15 +1031,61 @@ class VMIdleLifecycleStore:
                 _episode_document(job["workspace_idle_episode"]),
                 revision=job["workspace_idle_revision"],
             )
+            existing_proof = _object(operation["access_rebind_proof"])
+            if existing_proof:
+                return bool(
+                    episode is not None
+                    and episode.episode_id == str(operation["episode_id"])
+                    and episode.revision == operation["episode_revision"] + 1
+                    and existing_proof.get("successor") == {
+                        "generation": generation, "vm_uid": vm_uid,
+                        "vmi_uid": vmi_uid, "launcher_uid": launcher_uid,
+                        "pvc_uid": pvc_uid,
+                    }
+                )
             episode_changed = bool(
                 episode is None
                 or episode.episode_id != str(operation["episode_id"])
                 or episode.revision != operation["episode_revision"]
             )
-            await conn.execute(
+            anchor = None
+            if not operation["wake_execution_requested"] and not episode_changed:
+                prior = await conn.fetchrow(
+                    "SELECT * FROM vm_idle_operations WHERE owner_kind='job' "
+                    "AND owner_id=$1 AND episode_id=$2 AND id<>$3 "
+                    "AND episode_revision<=$4 ORDER BY episode_revision DESC,id DESC LIMIT 1",
+                    owner_id, operation["episode_id"], operation["id"],
+                    operation["episode_revision"],
+                )
+                if prior is None:
+                    anchor = (str(operation["id"]), operation["episode_revision"], 1)
+                else:
+                    prior_proof = _object(prior["access_rebind_proof"])
+                    if (
+                        prior["phase"] != "ready" or prior["closed_at"] is None
+                        or prior["post_ready_resume_requested"]
+                        or prior["episode_revision"] != operation["episode_revision"] - 1
+                        or _object(prior_proof.get("successor")) != {
+                            "generation": str(operation["provision_generation"]),
+                            "vm_uid": str(operation["vm_uid"]),
+                            "vmi_uid": str(operation["vmi_uid"]),
+                            "launcher_uid": str(operation["launcher_uid"]),
+                            "pvc_uid": str(operation["pvc_uid"]),
+                        }
+                        or type(prior_proof.get("chain_length")) is not int
+                        or prior_proof["chain_length"] < 1
+                    ):
+                        return False
+                    anchor = (
+                        prior_proof.get("root_operation_id"),
+                        prior_proof.get("root_revision"),
+                        prior_proof["chain_length"] + 1,
+                    )
+            ready = await conn.fetchrow(
                 "UPDATE vm_idle_operations SET wake_ready_at=clock_timestamp(),"
                 "wake_execution_requested=wake_execution_requested OR $2,"
-                "retry_after=NULL,last_progress_at=clock_timestamp() WHERE id=$1",
+                "retry_after=NULL,last_progress_at=clock_timestamp() WHERE id=$1 "
+                "RETURNING wake_ready_at",
                 operation["id"], episode_changed,
             )
             await conn.execute(
@@ -1039,7 +1101,7 @@ class VMIdleLifecycleStore:
             if not operation["wake_execution_requested"] and not episode_changed and episode is not None:
                 from shared.workspace_idle_store import apply_idle_transition_on_conn
 
-                await apply_idle_transition_on_conn(
+                rebound = await apply_idle_transition_on_conn(
                     conn,
                     runtime=RuntimeIdentity(
                         "job", str(owner_id), "vm", generation, vm_uid,
@@ -1047,6 +1109,50 @@ class VMIdleLifecycleStore:
                     event="rebind",
                     expected_revision=episode.revision,
                     expected_episode_id=episode.episode_id,
+                )
+                if (
+                    rebound.episode is None
+                    or rebound.revision != episode.revision + 1
+                    or rebound.episode.episode_id != episode.episode_id
+                    or rebound.episode.wait_key != episode.wait_key
+                    or rebound.episode.wait_kind != episode.wait_kind
+                    or rebound.episode.entered_at != episode.entered_at
+                ):
+                    raise IdlePolicyError("episode_changed")
+                proof = {
+                    "version": 1,
+                    "operation_id": operation_id,
+                    "episode_id": episode.episode_id,
+                    "wait_kind": episode.wait_kind,
+                    "wait_key": episode.wait_key,
+                    "entered_at": episode.entered_at.isoformat(),
+                    "from_revision": episode.revision,
+                    "to_revision": rebound.revision,
+                    "root_operation_id": anchor[0],
+                    "root_revision": anchor[1],
+                    "chain_length": anchor[2],
+                    "wake_id": str(operation["wake_id"]),
+                    "stop_verified_at": operation["stop_verified_at"].isoformat(),
+                    "ready_at": ready["wake_ready_at"].isoformat(),
+                    "predecessor": {
+                        "generation": str(operation["provision_generation"]),
+                        "vm_uid": str(operation["vm_uid"]),
+                        "vmi_uid": str(operation["vmi_uid"]),
+                        "launcher_uid": str(operation["launcher_uid"]),
+                        "pvc_uid": str(operation["pvc_uid"]),
+                    },
+                    "successor": {
+                        "generation": generation,
+                        "vm_uid": vm_uid,
+                        "vmi_uid": vmi_uid,
+                        "launcher_uid": launcher_uid,
+                        "pvc_uid": pvc_uid,
+                    },
+                }
+                await conn.execute(
+                    "UPDATE vm_idle_operations SET access_rebind_proof=$2::jsonb "
+                    "WHERE id=$1 AND access_rebind_proof IS NULL",
+                    operation["id"], json.dumps(proof),
                 )
             return True
 
@@ -1110,6 +1216,7 @@ class VMIdleLifecycleStore:
                         generation=operation["provision_generation"],
                         vm_uid=operation["vm_uid"],
                         launcher_uid=operation["launcher_uid"],
+                        vmi_uid=operation["vmi_uid"], pvc_uid=operation["pvc_uid"],
                     )
                     if (
                         source is None
@@ -1137,9 +1244,28 @@ class VMIdleLifecycleStore:
                         return False
                 execute = bool(
                     operation["wake_execution_requested"]
+                    or operation["post_ready_resume_requested"]
                     or episode is None
                     or episode.episode_id != str(operation["episode_id"])
                 )
+                if not execute or operation["post_ready_resume_requested"]:
+                    proof = _object(operation["access_rebind_proof"])
+                    if (
+                        proof.get("version") != 1
+                        or proof.get("episode_id") != episode.episode_id
+                        or proof.get("wait_key") != episode.wait_key
+                        or proof.get("wait_kind") != episode.wait_kind
+                        or proof.get("entered_at") != episode.entered_at.isoformat()
+                        or proof.get("to_revision") != episode.revision
+                        or _object(proof.get("successor")) != {
+                            "generation": vm.get("provision_generation"),
+                            "vm_uid": vm.get("vm_uid"),
+                            "vmi_uid": vm.get("vmi_uid"),
+                            "launcher_uid": vm.get("active_pod_uid"),
+                            "pvc_uid": vm.get("rootdisk_pvc_uid"),
+                        }
+                    ):
+                        return False
                 if execute:
                     from orchestrator.database.postgres import _stateless_resume_context
                     from shared.worker_queue import (
