@@ -7475,13 +7475,7 @@ BEGIN
     IF NEW.cancellation_completion ? 'source' THEN
         evidence := NEW.cancellation_completion->'source';
         IF NEW.cancellation_disposition IS NULL OR NOT (
-            public.valid_vm_creation_source_completion(NEW.cancellation_progress->'source',evidence)
-            AND evidence->'plan'->>'request_id'=NEW.request_id::text
-            AND evidence->'plan'->>'job_id'=NEW.job_id::text
-            AND evidence->'plan'->>'provision_generation'=NEW.provision_generation::text
-            AND evidence->'plan'->>'request_digest'=NEW.request_digest
-            AND evidence->'plan'->>'controller_configuration_digest'=NEW.controller_configuration_digest
-            AND evidence->'plan'->'disposition_id'=NEW.cancellation_disposition->'disposition_id'
+            public.valid_vm_creation_source_authority(NEW)
         ) IS TRUE THEN
             RAISE EXCEPTION 'Creation source completion is unproven' USING ERRCODE='23514';
         END IF;
@@ -14057,8 +14051,7 @@ BEGIN
         AND NOT EXISTS(SELECT 1 FROM public.vm_creation_effects e
             WHERE e.request_id=retry.request_id
               AND (e.state='issued' OR (e.effect_kind='vm' AND e.state<>'rejected')))
-        AND public.valid_vm_creation_source_completion(
-            retry.cancellation_progress->'source',retry.cancellation_completion->'source')
+        AND public.valid_vm_creation_source_authority(retry)
         AND public.valid_vm_creation_attachment_completion(
             retry,retry.cancellation_completion->'workspace_attachment')
     ) IS TRUE THEN RETURN false; END IF;
@@ -14159,6 +14152,81 @@ BEGIN
               AND a.request_id::text=evidence->>'request_id' AND a.intent_digest=evidence->>'intent_digest'
               AND a.owner_kind='job' AND a.owner_id=retry.job_id AND a.pvc_uid::text=evidence->>'pvc_uid'
               AND a.source='controller_creation_rootdisk_delete' AND a.completed_at IS NOT NULL AND a.outcome='deleted')) IS TRUE;
+END;
+$$;
+
+
+--
+-- Name: valid_vm_creation_source_authority(public.vm_creation_retries); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.valid_vm_creation_source_authority(retry public.vm_creation_retries) RETURNS boolean
+    LANGUAGE plpgsql STABLE
+    AS $$
+DECLARE
+    disposition jsonb := retry.cancellation_disposition;
+    plan jsonb := retry.cancellation_progress->'source';
+    completion jsonb := retry.cancellation_completion->'source';
+    source jsonb := retry.cancellation_progress->'source'->'source';
+    frozen_source jsonb := retry.cancellation_disposition->'source';
+    root jsonb := retry.cancellation_disposition->'objects'->'rootdisk';
+    root_completion jsonb := retry.cancellation_completion->'rootdisk';
+    target jsonb := retry.cancellation_progress->'source'->'target';
+    resolution text := retry.cancellation_disposition->>'source_resolution';
+    expected_name text;
+BEGIN
+    IF NOT (public.valid_vm_creation_source_completion(plan,completion)
+        AND resolution IN ('required','unknown','not_required')
+        AND plan->>'request_id'=retry.request_id::text
+        AND plan->>'job_id'=retry.job_id::text
+        AND plan->>'provision_generation'=retry.provision_generation::text
+        AND plan->>'request_digest'=retry.request_digest
+        AND plan->>'controller_configuration_digest'=retry.controller_configuration_digest
+        AND plan->'disposition_id'=disposition->'disposition_id'
+        AND (frozen_source='null'::jsonb OR source=frozen_source)
+        AND (resolution<>'required' OR
+            (frozen_source<>'null'::jsonb AND frozen_source->>'kind' IN ('golden','prepared')))
+        AND (resolution<>'unknown' OR
+            (frozen_source='null'::jsonb AND source<>'null'::jsonb))
+        AND (resolution<>'not_required' OR
+            (source=frozen_source AND (frozen_source='null'::jsonb OR
+                frozen_source->>'kind' IN ('registry','retained'))))
+    ) IS TRUE THEN RETURN false; END IF;
+    -- An unresolved source may have published a hold before the first create
+    -- effect. Only the frozen no-source decision can prove no disposition is
+    -- needed; a subsequently supplied source must still prove its own result.
+    IF completion->>'outcome'='not_required' AND NOT (
+        resolution='not_required' OR
+        (resolution='required' AND source=frozen_source
+            AND source->>'kind'='prepared' AND source->>'mode'='retained')
+    ) IS TRUE THEN RETURN false; END IF;
+    IF resolution='unknown' AND NOT (
+        (COALESCE(retry.canonical_request->'preparation','null'::jsonb)='null'::jsonb
+            AND source->>'kind'='golden') OR
+        (COALESCE(retry.canonical_request->'preparation','null'::jsonb)<>'null'::jsonb
+            AND source->>'kind' IN ('prepared','preparation_never_delivered'))
+    ) IS TRUE THEN RETURN false; END IF;
+    IF source='null'::jsonb OR source->>'kind' IN ('registry','retained') OR
+       (source->>'kind'='prepared' AND source->>'mode'='retained') THEN
+        RETURN (target='null'::jsonb AND plan->'tombstone'='null'::jsonb) IS TRUE;
+    END IF;
+    IF root IS NULL THEN
+        expected_name := CASE WHEN retry.canonical_request->'workspace_storage'<>'null'::jsonb
+            THEN 'srw-ws-' || replace(retry.canonical_request->'workspace_storage'->>'uid','-','')
+            ELSE 'agent-vm-' || retry.job_id::text || '-rootdisk' END;
+        RETURN (target=jsonb_build_object('kind','rootdisk_never_issued',
+                'name',expected_name,'namespace',disposition->>'namespace')
+            AND retry.expected_pvc_uid IS NULL AND retry.observed_pvc_uid IS NULL
+            AND NOT EXISTS(SELECT 1 FROM jsonb_array_elements(disposition->'effects') effect
+                WHERE effect->>'effect_kind'='rootdisk' AND effect->>'state'<>'rejected')) IS TRUE;
+    END IF;
+    IF disposition->>'disk_policy'='retain' THEN
+        RETURN (target=jsonb_build_object('kind','rootdisk_completed',
+                'name',root->>'name','namespace',root->>'namespace',
+                'uid',root->>'uid','pvc_uid',root->>'pvc_uid')) IS TRUE;
+    END IF;
+    RETURN (root_completion->>'kind'='rootdisk_purged'
+        AND target=root_completion) IS TRUE;
 END;
 $$;
 

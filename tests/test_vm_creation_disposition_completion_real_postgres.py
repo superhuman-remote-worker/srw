@@ -22,6 +22,123 @@ from vm_controller.creation_disposition_sources import DispositionSources
 db, setup = _db_fixture, _setup_fixture
 
 
+def false_not_required_source(row, disposition):
+    plan = {
+        "version": 1,
+        "kind": "source_disposition_planned",
+        "disposition_id": disposition["disposition_id"],
+        **{
+            key: row[key]
+            for key in (
+                "request_id",
+                "job_id",
+                "provision_generation",
+                "request_digest",
+                "controller_configuration_digest",
+            )
+        },
+        "source": None,
+        "target": None,
+        "tombstone": None,
+    }
+    receipt = {
+        "version": 1,
+        "kind": "source_disposition_completed",
+        "outcome": "not_required",
+        "plan": plan,
+        "source_observation": None,
+        "allocation": None,
+    }
+    return plan, receipt
+
+
+@pytest.mark.asyncio
+async def test_native_source_completion_rejects_false_not_required_under_unknown_resolution(
+    db, monkeypatch
+):
+    service, row, _, disposition, _ = await frozen_golden(db, monkeypatch)
+    assert disposition["source_resolution"] == "unknown"
+    plan, receipt = false_not_required_source(row, disposition)
+    async with db.acquire() as conn:
+        with pytest.raises(
+            asyncpg.CheckViolationError, match="source completion is unproven"
+        ):
+            await conn.execute(
+                "UPDATE vm_creation_retries SET "
+                "cancellation_progress=cancellation_progress || $2::jsonb, "
+                "cancellation_completion=cancellation_completion || $3::jsonb "
+                "WHERE request_id=$1",
+                UUID(row["request_id"]),
+                json.dumps({"source": plan}),
+                json.dumps({"source": receipt}),
+            )
+    current = await service.retries.inspect(request_id=row["request_id"])
+    assert current["cancellation_progress"] == {}
+    assert current["cancellation_completion"] == {}
+
+
+@pytest.mark.asyncio
+async def test_controller_replay_cannot_skip_unresolved_source_after_false_receipt_attempt(
+    db, monkeypatch, setup
+):
+    from shared.vm_creation_disposition import disposition_identity
+    from vm_controller.creation_disposition import CreationDisposer
+
+    service, row, carrier, disposition, source = await frozen_golden(db, monkeypatch)
+    ctrl, api = source_runtime(setup, service, row, source, monkeypatch)
+    api.objects["Lease", carrier["metadata"]["name"]] = carrier
+    plan, receipt = false_not_required_source(row, disposition)
+    async with db.acquire() as conn:
+        with pytest.raises(asyncpg.CheckViolationError):
+            await conn.execute(
+                "UPDATE vm_creation_retries SET "
+                "cancellation_progress=cancellation_progress || $2::jsonb, "
+                "cancellation_completion=cancellation_completion || $3::jsonb "
+                "WHERE request_id=$1",
+                UUID(row["request_id"]),
+                json.dumps({"source": plan}),
+                json.dumps({"source": receipt}),
+            )
+    for _ in range(4):
+        result = await CreationDisposer(ctrl).run(disposition_identity(row))
+        if result["status"] == "creation_disposed":
+            break
+    current = await service.retries.inspect(request_id=row["request_id"])
+    assert result["status"] == "creation_disposed"
+    assert current["cancellation_completion"]["source"]["outcome"] == "pin_disposed"
+    assert current["state"] == "settled"
+    assert len(api.replacements) == 1
+
+
+@pytest.mark.asyncio
+async def test_native_source_completion_rejects_target_that_omits_frozen_rootdisposition(
+    db, monkeypatch, setup
+):
+    _, row, _, _, evidence = await completed_source(db, monkeypatch, setup)
+    forged = deepcopy(evidence)
+    forged["plan"]["target"] = None
+    forged["plan"]["tombstone"]["target"] = None
+    forged["source_observation"]["pin"] = deepcopy(forged["plan"]["tombstone"])
+    async with db.acquire() as conn:
+        assert await conn.fetchval(
+            "SELECT valid_vm_creation_source_completion($1::jsonb,$2::jsonb)",
+            json.dumps(forged["plan"]),
+            json.dumps(forged),
+        )
+        with pytest.raises(
+            asyncpg.CheckViolationError, match="source completion is unproven"
+        ):
+            await conn.execute(
+                "UPDATE vm_creation_retries SET "
+                "cancellation_progress=cancellation_progress || $2::jsonb, "
+                "cancellation_completion=cancellation_completion || $3::jsonb "
+                "WHERE request_id=$1",
+                UUID(row["request_id"]),
+                json.dumps({"source": forged["plan"]}),
+                json.dumps({"source": forged}),
+            )
+
+
 async def completed_source(db, monkeypatch, setup):
     service, row, carrier, disposition, source = await frozen_golden(db, monkeypatch)
     ctrl, api = source_runtime(setup, service, row, source, monkeypatch)
