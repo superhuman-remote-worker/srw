@@ -26,6 +26,7 @@ from pathlib import Path
 
 import pytest
 
+from agent.core.backends.overlay import EntryMeta, VirtualOverlayBackend
 from agent.core.backends.scratch import ScratchBackend
 from agent.core.backends.virtual import VirtualWorkspaceBackend
 from agent.core.workspace import WorkspaceManager
@@ -48,6 +49,7 @@ FILES = {
         ]
     ),
     "node_modules/dep/b.txt": "foo in a dependency",
+    ".git/h.txt": "hiddenneedle",
 }
 
 
@@ -165,6 +167,51 @@ def test_exclude_dirs_skips_directory_names_at_any_depth(seeded):
     assert _paths(seeded.search_files("foo", exclude_dirs=["node_*"])) == {
         "notes/a.txt"
     }
+
+
+def test_hidden_directory_glob_skips_only_hidden_directories(seeded):
+    """``.*`` (skip .git, .venv, ...) must not also swallow the search root.
+
+    Pinned because the obvious way to make grep search an explicitly named
+    root that matches an exclude -- passing it as "<dir>/." -- turns this
+    everyday glob into zero results on SSH workspaces.
+    """
+    assert _paths(seeded.search_files("hiddenneedle")) == {".git/h.txt"}
+    assert seeded.search_files("hiddenneedle", exclude_dirs=[".*"]) == []
+    assert _paths(seeded.search_files("foo", exclude_dirs=[".*"])) == {
+        "notes/a.txt",
+        "node_modules/dep/b.txt",
+    }
+
+
+class _ToolsProvider:
+    """A flat read-only virtual directory, as registered on a lite session."""
+
+    prefix = "tools"
+    is_dir = True
+    writable = False
+
+    def __init__(self):
+        self.read_calls = 0
+
+    def entries(self):
+        return {"read_file.md": EntryMeta(size=24)}
+
+    def read(self, name):
+        self.read_calls += 1
+        return "# read_file\nfoo inside\n"
+
+
+@pytest.mark.parametrize("glob", ["tools", "too*", "[t]ools"])
+def test_overlay_excludes_virtual_directories_by_glob(tmp_path, glob):
+    provider = _ToolsProvider()
+    overlay = VirtualOverlayBackend(FilesystemTestBackend(tmp_path))
+    overlay.register(provider)
+    assert _paths(overlay.search_files("foo")) == {"tools/read_file.md"}
+    provider.read_calls = 0
+
+    assert overlay.search_files("foo", exclude_dirs=[glob]) == []
+    assert provider.read_calls == 0  # an excluded virtual dir is never read
 
 
 # ---------------------------------------------------------------------------
