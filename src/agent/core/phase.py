@@ -1014,6 +1014,18 @@ def _deliverables_left_behind(pending: List[str], wanted: set) -> List[str]:
     return hits
 
 
+def _names_workspace_path(workspace, canonical: str) -> bool:
+    """Whether a declared deliverable names a path that exists (either
+    ``repo/`` spelling). An unanswerable probe counts as no: this only ever
+    decides whether a FAILED commit may pass, so doubt must refuse."""
+    from agent.core.deliverables import resolve_workspace_deliverable
+
+    try:
+        return resolve_workspace_deliverable(workspace, canonical)[1] is True
+    except Exception:  # noqa: BLE001 — see docstring
+        return False
+
+
 def _seal_deliverables(final_data: Any, metadata: Any) -> List[str]:
     """What this seal promises: the declared deliverables plus the manifest."""
     declared = final_data.get("deliverables") if isinstance(final_data, dict) else None
@@ -1164,6 +1176,12 @@ def _verify_job_ending_delivery(
             for canonical in (_canonical_tree_path(d, roots) for d in deliverables)
             if canonical
         }
+        if not commit_landed:
+            # A declaration only vouches for the rest of the tree if it names a
+            # real path: prose ("Final report (output/r.md)") or a bare name
+            # ("r.md") matches nothing, and would otherwise let a failed commit
+            # seal a stale tip on a warning.
+            wanted = {w for w in wanted if _names_workspace_path(workspace, w)}
         left_behind = _deliverables_left_behind(pending, wanted)
         sample = ", ".join((left_behind or pending)[:5])
         count = len(left_behind or pending)
@@ -1191,7 +1209,8 @@ def _verify_job_ending_delivery(
                 label,
                 f"the final commit did not land and {count} path(s) were left "
                 f"uncommitted ({sample}{more}); no deliverable was declared "
-                f"that would show the rest is safe to ignore.",
+                f"as an existing path that would show the rest is safe to "
+                f"ignore.",
             )
             return
         _record_delivery_warning(

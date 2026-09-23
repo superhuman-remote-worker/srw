@@ -656,6 +656,48 @@ class TestLeftoverDirtRefusesOnlyForDeliverables:
         assert result.freeze_data[DELIVERY_FAILED_KEY] is True
         assert "no deliverable was declared" in result.freeze_data[DELIVERY_ERROR_KEY]
 
+    @pytest.mark.parametrize(
+        "declared", ["Final report (output/report.md)", "report.md", "the report"]
+    )
+    def test_a_failed_commit_with_only_unmatchable_declarations_refuses(
+        self, delivery_repo, declared
+    ):
+        """A declaration that names no real path (prose, a bare file name)
+        cannot vouch for the rest of the tree: with the final commit failed it
+        is as good as nothing declared, not a licence to seal on a warning."""
+        ws, root, remote = delivery_repo
+        stale_tip = _remote_head(remote)
+        (root / "output" / "report.md").write_text("final report\n")
+        (root / ".git" / "index.lock").write_text("")
+        seed_final_phase_data(
+            "test-job",
+            {"summary": "done", "deliverables": [declared], "confidence": 1.0},
+        )
+
+        result = finalize_job(make_state(), ws, MagicMock(), config=make_config("full"))
+
+        assert _remote_head(remote) == stale_tip
+        assert result.freeze_data[DELIVERY_FAILED_KEY] is True
+        assert DELIVERED_COMMIT_KEY not in result.freeze_data
+
+    def test_an_existing_declared_path_still_vouches_for_the_rest(self, delivery_repo):
+        """Contrast: the existing-path check must not turn every failed commit
+        with stray dirt into a hold. The declared report was committed and
+        pushed earlier; only a nested repo left behind blocks ``add -A``."""
+        ws, root, remote = delivery_repo
+        (root / "output" / "report.md").write_text("final report\n")
+        _git(root, "commit", "-q", "-am", "final report")
+        _git(root, "push", "-q")
+        scratch = root / "scratch_proj"
+        scratch.mkdir()
+        _git(scratch, "init", "-q")
+        seed_final_data()  # declares output/report.md, which exists
+
+        result = finalize_job(make_state(), ws, MagicMock(), config=make_config("full"))
+
+        assert DELIVERY_FAILED_KEY not in result.freeze_data
+        assert result.freeze_data[DELIVERED_COMMIT_KEY] == _remote_head(remote)
+
     def test_an_absolute_deliverable_path_still_counts(self, delivery_repo):
         """Agents declare the absolute spelling their write results print."""
         ws, root, remote = delivery_repo
