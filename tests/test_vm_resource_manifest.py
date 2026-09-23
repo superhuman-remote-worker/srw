@@ -225,6 +225,7 @@ async def test_actual_actuator_body_satisfies_pure_final_contract(final_case, ki
 
 @pytest.mark.asyncio
 async def test_v3_whole_launcher_requires_exact_final_vm_body(final_case):
+    from uuid import uuid4
     from vm_controller.creation_configuration import resolve_creation_configuration
     from shared.vm_resource_policy import validate_complete_resource_policy
     from tests.test_vm_resource_policy import whole_launcher_policy
@@ -239,11 +240,26 @@ async def test_v3_whole_launcher_requires_exact_final_vm_body(final_case):
     row.update(resolved)
     assert row["controller_configuration"]["version"] == 3
     values = intent("vm")
+    resource = row["controller_configuration"]["resource_admission"]
+    values["version"] = 4
+    values["resource_grant"] = {
+        "version": 1, "id": str(uuid4()), "revision": 1,
+        "cluster_id": resource["cluster_id"],
+        "policy_digest": resource["policy_digest"],
+        "node_uid": str(uuid4()), "node_name": "node-a",
+        "vector": resource["host_mapping"]["vector"],
+        "headroom": {
+            "cpu_millicores": 0, "memory_bytes": 0,
+            "ephemeral_storage_bytes": 0, "kvm_devices": 0,
+            "tun_devices": 0, "vhost_net_devices": 0,
+        },
+        "snapshot_id": str(uuid4()), "snapshot_digest": "sha256:" + "a" * 64,
+    }
     body = await actuator.body(row, values)
-    validate_final("vm", body, ctrl, row, values)
+    validate_final("vm", body, ctrl, row, values, reservation_hostname="node-a")
     body["spec"]["template"]["spec"]["domain"]["devices"]["interfaces"] = []
     with pytest.raises(ResourceAdmissionError):
-        validate_final("vm", body, ctrl, row, values)
+        validate_final("vm", body, ctrl, row, values, reservation_hostname="node-a")
 
 
 @pytest.mark.asyncio

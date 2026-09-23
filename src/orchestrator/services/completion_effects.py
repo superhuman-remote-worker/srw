@@ -16,6 +16,8 @@ from orchestrator.services.vm_workspace_recovery_store import (
     vm_cleanup_kwargs,
     cleanup_intent_digest,
     completed_cleanup_outcome,
+    complete_vm_cleanup_permit,
+    prepare_vm_cleanup_resource,
 )
 from orchestrator.services.workspace_lifecycle import WorkspaceOwner
 
@@ -163,16 +165,26 @@ async def run_completion_workspace_teardown(
                 raise RuntimeError(
                     "workspace teardown held for unresolved workspace recovery"
                 )
-            return bind_vm_cleanup_permit(
+            bound = bind_vm_cleanup_permit(
                 permit, request_id=request_id, intent=resource_intent
             )
+            if resource == "vm":
+                await prepare_vm_cleanup_resource(recovery_store, bound)
+            return bound
 
         async def _complete_destructive_cleanup(permit: Any, outcome: str) -> None:
             admission_id = getattr(permit, "admission_id", None)
             if admission_id is not None:
-                await recovery_store.complete_cleanup_permit(
-                    admission_id, outcome=outcome
-                )
+                intent = (getattr(permit, "parent_cleanup", None) or {}).get("intent")
+                if isinstance(intent, Mapping) and intent.get("resource") == "vm":
+                    await complete_vm_cleanup_permit(
+                        recovery_store, permit, outcome=outcome,
+                        provisioner=vm_provisioner,
+                    )
+                else:
+                    await recovery_store.complete_cleanup_permit(
+                        admission_id, outcome=outcome
+                    )
 
         async def _release_captured_vm(intent: Mapping[str, Any]) -> Any:
             from orchestrator.services.vm_provisioner import (
@@ -239,6 +251,8 @@ async def run_completion_workspace_teardown(
             replayed = completed_cleanup_outcome(cleanup)
             if replayed is not None:
                 outcome = VMTeardownResult(replayed, replayed == "completed")
+                if replayed == "completed":
+                    await _complete_destructive_cleanup(cleanup, "completed")
             else:
                 outcome = await vm_provisioner.release_vm_captured(
                     job_id,

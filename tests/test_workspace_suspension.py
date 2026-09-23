@@ -50,6 +50,16 @@ VM_SESSION_ATTACH = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
 VM_OPERATION_ID = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
 
 
+@pytest.fixture(autouse=True)
+def legacy_resource_cleanup(monkeypatch):
+    """Synthetic suspension fixtures intentionally have no v3 charge."""
+    import orchestrator.services.vm_workspace_recovery_store as recovery
+
+    monkeypatch.setattr(
+        recovery, "prepare_vm_cleanup_resource", AsyncMock(return_value=None)
+    )
+
+
 # =============================================================================
 # Fixtures
 # =============================================================================

@@ -12,6 +12,7 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
+import asyncpg
 import pytest
 
 from orchestrator.services.lifecycle import (
@@ -23,6 +24,16 @@ from orchestrator.services.lifecycle import (
     expected_vm_shas,
 )
 from orchestrator.services.vm_provisioner import VMTeardownIdentity, VMTeardownResult
+
+
+@pytest.fixture(autouse=True)
+def legacy_resource_cleanup(monkeypatch):
+    """These synthetic lifecycle owners have no v3 creation/retry charge."""
+    import orchestrator.services.vm_workspace_recovery_store as recovery
+
+    monkeypatch.setattr(
+        recovery, "prepare_vm_cleanup_resource", AsyncMock(return_value=None)
+    )
 
 
 # =============================================================================
@@ -1009,6 +1020,28 @@ class TestSignalDrainPending:
 
 class TestDelete:
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "failure", [asyncpg.CheckViolationError, asyncpg.ConnectionDoesNotExistError]
+    )
+    async def test_settlement_failure_cannot_report_deleted_then_exact_replay_succeeds(
+        self, monkeypatch, failure
+    ):
+        import orchestrator.services.vm_workspace_recovery_store as recovery
+
+        mgr, provisioner, *_ = _make_manager()
+        inst = Instance(kind="vm", id="x", bound_to="job-1", metadata={"scope": "job"})
+        settle = AsyncMock(side_effect=[failure("settlement refused"), None])
+        monkeypatch.setattr(recovery, "complete_vm_cleanup_permit", settle)
+
+        assert not await mgr._delete_owned(inst, purge_disk=True)
+        provisioner.release_vm_captured.assert_awaited_once()
+        assert await mgr._delete_owned(inst, purge_disk=True)
+        assert settle.await_count == 2
+        assert {call.args[1].admission_id for call in settle.await_args_list} == {
+            "cleanup-1"
+        }
+
+    @pytest.mark.asyncio
     async def test_job_vm_uses_exact_retirement_release(self):
         mgr, provisioner, *_ = _make_manager()
         inst = Instance(kind="vm", id="x", bound_to="job-1", metadata={"scope": "job"})
@@ -1902,6 +1935,29 @@ class TestKeptDiskSweep:
         db.merge_vm_context = AsyncMock(return_value=True)
         provisioner.list_vms = AsyncMock(return_value=[])
         return mgr, provisioner, db
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "failure", [asyncpg.CheckViolationError, asyncpg.ConnectionDoesNotExistError]
+    )
+    async def test_settlement_failure_preserves_kept_disk_marker_until_exact_replay(
+        self, monkeypatch, failure
+    ):
+        import orchestrator.services.vm_workspace_recovery_store as recovery
+
+        mgr, provisioner, db = self._mgr_with_kept([{"id": "job-1"}])
+        settle = AsyncMock(side_effect=[failure("settlement refused"), None])
+        monkeypatch.setattr(recovery, "complete_vm_cleanup_permit", settle)
+
+        assert await mgr.purge_kept_disks() == 0
+        db.merge_vm_context.assert_not_awaited()
+        provisioner.release_vm_captured.assert_awaited_once()
+        assert await mgr.purge_kept_disks() == 1
+        db.merge_vm_context.assert_awaited_once_with("job-1", {"rootdisk": None})
+        assert settle.await_count == 2
+        assert {call.args[1].admission_id for call in settle.await_args_list} == {
+            "cleanup-1"
+        }
 
     @pytest.mark.asyncio
     async def test_terminal_job_kept_disk_is_purged(self):

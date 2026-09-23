@@ -207,6 +207,26 @@ def validate_enforcement_resource_policy(document):
     )
 
 
+def configured_enforcement_required(source=None):
+    """An operator-installed controller flag cannot be disabled by a create body."""
+    import os
+
+    env = os.environ if source is None else source
+    raw = env.get("VM_RESOURCE_ADMISSION_CONFIG", "")
+    if not raw:
+        return False
+    try:
+        document = json.loads(raw)
+        enabled = document["policy"]["enforcementEnabled"]
+        if type(enabled) is not bool:
+            raise ValueError
+        if enabled:
+            validate_enforcement_resource_policy(document)
+        return enabled
+    except (ValueError, TypeError, KeyError, UnicodeError, RecursionError):
+        raise ResourceAdmissionError("invalid_resource_policy") from None
+
+
 def _same_typed_value(actual, expected):
     """Dataclass equality alone accepts float/int and bool/int substitutions."""
     if type(actual) is not type(expected):

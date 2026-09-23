@@ -404,7 +404,685 @@ class VMResourceReservationStore:
         except (VMCreationRetryConflict, ResourceAdmissionError, InventoryError) as exc:
             return {"action": "unavailable", "reason": str(exc)}
 
-    async def _lock_policy(self, conn, *, allow_drain=False):
+    async def grant_on_conn(self, conn, *, retry, job):
+        """Recheck an already-held v2 grant after source locks, before issuance.
+
+        This never allocates capacity. The caller must own the retry's exact
+        Job/source/effect scope; policy serialization follows that scope.
+        """
+        await self._lock_policy(conn)
+        head = await conn.fetchrow(
+            "SELECT * FROM vm_resource_inventory_heads WHERE cluster_id=$1 "
+            "AND policy_digest=$2 FOR UPDATE",
+            self.inventory.cluster_id, self.inventory.policy_digest,
+        )
+        if head is None or head["current_snapshot_id"] is None or head["observation_conflict"]:
+            raise ResourceAdmissionError("inventory_missing")
+        observation = await conn.fetchrow(
+            "SELECT * FROM vm_resource_inventory_snapshots WHERE snapshot_id=$1",
+            head["current_snapshot_id"],
+        )
+        if observation is None:
+            raise ResourceAdmissionError("inventory_missing")
+        snapshot = self.inventory._snapshot(
+            _json(observation["document"]), observation["digest"]
+        )
+        expected = _expected_waiter_request_fields(
+            retry, inventory=self.inventory,
+            policy_document=self.policy_document, cost=self.cost,
+        )
+        waiter = await conn.fetchrow(
+            "SELECT * FROM vm_resource_waiters WHERE request_id=$1 FOR UPDATE",
+            retry["request_id"],
+        )
+        if waiter is None or not _waiter_request_fields_match(waiter, expected):
+            raise ResourceAdmissionError("resource_waiter_changed")
+        owner_key = "system" if job["user_id"] is None else "user:" + str(job["user_id"])
+        if waiter["owner_key"] != owner_key:
+            raise ResourceAdmissionError("resource_owner_changed")
+        held = await conn.fetchrow(
+            "SELECT * FROM vm_resource_reservations WHERE request_id=$1 "
+            "AND state<>'released' FOR UPDATE", retry["request_id"],
+        )
+        if held is None:
+            raise ResourceAdmissionError("resource_reservation_missing")
+        if (
+            waiter["state"] != "admitted"
+            or
+            held["state"] != "reserved"
+            or held["resource_version"] != 2
+            or held["cluster_id"] != self.inventory.cluster_id
+            or held["policy_digest"] != self.inventory.policy_digest
+            or _row_vector(held, six=True) != _row_vector(expected, six=True)
+        ):
+            raise ResourceAdmissionError("resource_reservation_changed")
+        node = await conn.fetchrow(
+            "SELECT node_name FROM vm_resource_nodes WHERE cluster_id=$1 "
+            "AND node_uid=$2", held["cluster_id"], held["node_uid"],
+        )
+        if node is None or node["node_name"] != held["node_name"]:
+            raise ResourceAdmissionError("reservation_node_identity")
+        now = await self._deadline(conn, retry)
+        if not snapshot["complete"] or not snapshot_is_fresh(
+            snapshot, received_at=observation["received_at"], now=now,
+            stale_after_seconds=self.inventory.stale_after_seconds,
+        ):
+            raise ResourceAdmissionError("inventory_stale")
+        grant = {
+            "version": 1,
+            "id": str(held["id"]),
+            "revision": held["revision"],
+            "cluster_id": held["cluster_id"],
+            "policy_digest": held["policy_digest"],
+            "node_uid": str(held["node_uid"]),
+            "node_name": held["node_name"],
+            "vector": _row_vector(held, six=True).to_six_dict(),
+            "headroom": self.headroom.to_six_dict(),
+            "snapshot_id": str(held["snapshot_id"]),
+            "snapshot_digest": held["snapshot_digest"],
+        }
+        from shared.vm_resource_effect_node import validate_resource_effect_node
+
+        validate_resource_effect_node(
+            snapshot, grant=grant,
+            resource=retry["controller_configuration"]["resource_admission"],
+            expected_pvc_uid=(
+                str(retry["expected_pvc_uid"])
+                if retry["expected_pvc_uid"] else None
+            ),
+        )
+        return grant
+
+    async def bind_ready_on_conn(self, conn, *, retry, vm, job_id, generation):
+        """Bind one genuine signed-inventory launcher before Job Ready commits.
+
+        The caller already owns the Job lock and its Ready identity CAS. A
+        refusal can still commit observed high-water, so this returns False
+        instead of raising when authentic demand exceeds the reservation.
+        """
+        await self._lock_policy(conn, allow_off=True)
+        if retry["state"] != "succeeded":
+            return False
+        head = await conn.fetchrow(
+            "SELECT * FROM vm_resource_inventory_heads WHERE cluster_id=$1 "
+            "AND policy_digest=$2 FOR UPDATE",
+            self.inventory.cluster_id, self.inventory.policy_digest,
+        )
+        if head is None or head["current_snapshot_id"] is None or head["observation_conflict"]:
+            return False
+        observation = await conn.fetchrow(
+            "SELECT * FROM vm_resource_inventory_snapshots WHERE snapshot_id=$1",
+            head["current_snapshot_id"],
+        )
+        if observation is None:
+            return False
+        snapshot = self.inventory._snapshot(
+            _json(observation["document"]), observation["digest"]
+        )
+        waiter = await conn.fetchrow(
+            "SELECT * FROM vm_resource_waiters WHERE request_id=$1 FOR UPDATE",
+            retry["request_id"],
+        )
+        reservation = await conn.fetchrow(
+            "SELECT * FROM vm_resource_reservations WHERE request_id=$1 "
+            "AND state<>'released' FOR UPDATE", retry["request_id"],
+        )
+        if waiter is None or reservation is None or (
+            waiter["state"] != "admitted"
+            or reservation["resource_version"] != 2
+            or reservation["state"] not in {"reserved", "active", "warm"}
+        ):
+            return False
+        expected = _expected_waiter_request_fields(
+            retry, inventory=self.inventory,
+            policy_document=self.policy_document, cost=self.cost,
+        )
+        if not _waiter_request_fields_match(waiter, expected) or (
+            _row_vector(reservation, six=True) != _row_vector(expected, six=True)
+        ):
+            return False
+        successor = await conn.fetchrow(
+            "SELECT successor_vmi_uid,successor_launcher_uid "
+            "FROM vm_resource_recovery_successors WHERE reservation_id=$1 "
+            "ORDER BY ordinal DESC LIMIT 1", reservation["id"],
+        )
+        current_vmi_uid = (
+            successor["successor_vmi_uid"] if successor else reservation["vmi_uid"]
+        )
+        current_launcher_uid = (
+            successor["successor_launcher_uid"] if successor
+            else reservation["launcher_uid"]
+        )
+        now = await conn.fetchval("SELECT clock_timestamp()")
+        if not snapshot["complete"] or not snapshot_is_fresh(
+            snapshot, received_at=observation["received_at"], now=now,
+            stale_after_seconds=self.inventory.stale_after_seconds,
+        ):
+            return False
+        vm_uid = vm.get("vm_uid")
+        vmi_uid = vm.get("vmi_uid")
+        launcher_uid = vm.get("active_pod_uid")
+        pvc_uid = vm.get("rootdisk_pvc_uid")
+        if not all(isinstance(value, str) for value in (
+            vm_uid, vmi_uid, launcher_uid, pvc_uid,
+        )) or (
+            vm_uid != str(retry["observed_vm_uid"])
+            or pvc_uid != str(retry["observed_pvc_uid"] or retry["expected_pvc_uid"])
+        ):
+            return False
+        matches = tuple(
+            next((item for item in snapshot[key] if item["uid"] == uid), None)
+            for key, uid in (
+                ("vms", vm_uid), ("vmis", vmi_uid), ("pods", launcher_uid),
+            )
+        )
+        actual_vm, actual_vmi, pod = matches
+        node_uid = str(reservation["node_uid"])
+        if (
+            actual_vm is None or actual_vmi is None or pod is None
+            or actual_vm["owner_kind"] != "job"
+            or actual_vm["owner_id"] != job_id
+            or actual_vm["provision_generation"] != generation
+            or actual_vm["name"] != "agent-vm-" + job_id
+            or actual_vm["deleting"]
+            or actual_vmi["vm_uid"] != vm_uid
+            or actual_vmi["node_uid"] != node_uid
+            or actual_vmi["node_name"] != reservation["node_name"]
+            or actual_vmi["deleting"]
+            or pod["terminal"] or pod["deleting"]
+            or pod["vmi_uid"] != vmi_uid
+            or pod["reservation_id"] != str(reservation["id"])
+            or pod["provision_generation"] != generation
+            or pod["node_uid"] != node_uid
+            or pod["node_name"] != reservation["node_name"]
+        ):
+            return False
+        if (
+            reservation["vm_uid"] is not None
+            and str(reservation["vm_uid"]) != vm_uid
+            or current_vmi_uid is not None and str(current_vmi_uid) != vmi_uid
+            or current_launcher_uid is not None
+            and str(current_launcher_uid) != launcher_uid
+        ):
+            return False
+        demand = ResourceVector.from_six_dict(pod["requests"])
+        high = (
+            ResourceVector(
+                reservation["observed_cpu_millicores"],
+                reservation["observed_memory_bytes"],
+                reservation["observed_kvm_devices"],
+                reservation["observed_ephemeral_storage_bytes"],
+                reservation["observed_tun_devices"],
+                reservation["observed_vhost_net_devices"],
+            ) if reservation["observed_cpu_millicores"] is not None
+            else ResourceVector(0, 0, 0)
+        ).maximum(demand)
+        fits = high.fits(_row_vector(reservation, six=True))
+        await conn.execute(
+            "UPDATE vm_resource_reservations SET "
+            "vm_uid=COALESCE(vm_uid,$2),vmi_uid=COALESCE(vmi_uid,$3),"
+            "launcher_uid=COALESCE(launcher_uid,$4),"
+            "observed_cpu_millicores=$5,observed_memory_bytes=$6,"
+            "observed_kvm_devices=$7,observed_ephemeral_storage_bytes=$8,"
+            "observed_tun_devices=$9,observed_vhost_net_devices=$10,"
+            "state=CASE WHEN $11 THEN 'active' ELSE state END "
+            "WHERE id=$1",
+            reservation["id"], UUID(vm_uid), UUID(vmi_uid), UUID(launcher_uid),
+            high.cpu_millicores, high.memory_bytes, high.kvm_devices,
+            high.ephemeral_storage_bytes, high.tun_devices,
+            high.vhost_net_devices, fits,
+        )
+        return fits
+
+    async def release_never_issued_on_conn(
+        self, conn, *, retry, disposition_complete=False,
+    ):
+        """Release a held generation only after its source proves no effect began.
+
+        The caller owns the normal creation source locks and commits the retry
+        settlement in this transaction. Reconciliation remains valid in drain
+        or off mode; changing the flag cannot abandon an existing charge.
+        """
+        if retry["state"] != "cancel_requested" or retry["observed_vm_uid"]:
+            raise ResourceAdmissionError("creation_effect_unresolved")
+        effects_present = await conn.fetchval(
+            "SELECT EXISTS(SELECT 1 FROM vm_creation_effects WHERE request_id=$1)",
+            retry["request_id"],
+        )
+        if effects_present:
+            if not disposition_complete or not await conn.fetchval(
+                "SELECT public.valid_vm_creation_disposition_evidence(r) "
+                "FROM vm_creation_retries r WHERE request_id=$1",
+                retry["request_id"],
+            ) or await conn.fetchval(
+                "SELECT EXISTS(SELECT 1 FROM vm_creation_effects WHERE request_id=$1 "
+                "AND effect_kind='vm' AND state<>'rejected')",
+                retry["request_id"],
+            ):
+                raise ResourceAdmissionError("creation_effect_unresolved")
+            permit = await conn.fetchrow(
+                "SELECT completed_at,outcome FROM vm_workspace_cleanup_admissions "
+                "WHERE id=$1", retry["creation_admission_id"],
+            )
+            if permit is None or permit["completed_at"] is None or (
+                permit["outcome"] != "creation_disposed"
+            ):
+                raise ResourceAdmissionError("creation_disposition_unproven")
+        await self._lock_policy(conn, allow_off=True)
+        waiter = await conn.fetchrow(
+            "SELECT * FROM vm_resource_waiters WHERE request_id=$1 FOR UPDATE",
+            retry["request_id"],
+        )
+        reservation = await conn.fetchrow(
+            "SELECT * FROM vm_resource_reservations WHERE request_id=$1 "
+            "AND state<>'released' FOR UPDATE", retry["request_id"],
+        )
+        if waiter is None or waiter["cluster_id"] != self.inventory.cluster_id:
+            raise ResourceAdmissionError("resource_waiter_changed")
+        expected = _expected_waiter_request_fields(
+            retry, inventory=self.inventory,
+            policy_document=self.policy_document, cost=self.cost,
+        )
+        if not _waiter_request_fields_match(waiter, expected):
+            raise ResourceAdmissionError("resource_waiter_changed")
+        if reservation is None:
+            return False
+        if (
+            reservation["state"] != "reserved"
+            or reservation["vm_uid"] is not None
+            or reservation["vmi_uid"] is not None
+            or reservation["launcher_uid"] is not None
+            or reservation["resource_version"] != 2
+            or reservation["cluster_id"] != self.inventory.cluster_id
+            or reservation["policy_digest"] != self.inventory.policy_digest
+            or _row_vector(reservation, six=True) != _row_vector(expected, six=True)
+            or waiter["state"] != "admitted"
+        ):
+            raise ResourceAdmissionError("reservation_release_unproven")
+        evidence = {
+            "kind": "never_vm_issued",
+            "request_id": str(retry["request_id"]),
+            "job_id": str(retry["job_id"]),
+            "provision_generation": str(retry["provision_generation"]),
+        }
+        if effects_present:
+            disposition = _json(retry["cancellation_disposition"])
+            if not isinstance(disposition, dict) or not isinstance(
+                disposition.get("disposition_id"), str
+            ):
+                raise ResourceAdmissionError("creation_disposition_unproven")
+            evidence.update(
+                disposition_id=disposition["disposition_id"],
+                creation_admission_id=str(retry["creation_admission_id"]),
+            )
+        await conn.execute(
+            "UPDATE vm_resource_reservations SET state='released',"
+            "released_at=clock_timestamp(),release_evidence=$2::jsonb WHERE id=$1",
+            reservation["id"], json.dumps(evidence),
+        )
+        await conn.execute(
+            "UPDATE vm_resource_waiters SET state='released',revision=revision+1 "
+            "WHERE request_id=$1", retry["request_id"],
+        )
+        return True
+
+    async def append_recovery_successor_on_conn(
+        self, conn, *, retry, operation, final_observation,
+    ):
+        """Bind the final authenticated successor to this one charged lineage.
+
+        Called after recovery's final resolved CAS and owner projection, but
+        before its transaction commits. The native append-only guard checks the
+        operation, exact stop receipt and previous successor chain again.
+        """
+        await self._lock_policy(conn, allow_off=True)
+        reservation = await conn.fetchrow(
+            "SELECT * FROM vm_resource_reservations WHERE request_id=$1 "
+            "AND state<>'released' FOR UPDATE", retry["request_id"],
+        )
+        if reservation is None or (
+            reservation["resource_version"] != 2
+            or reservation["state"] not in {"active", "warm"}
+            or retry["state"] != "succeeded"
+            or retry["job_id"] != operation["owner_id"]
+            or retry["provision_generation"] != operation["provision_generation"]
+            or retry["observed_vm_uid"] != operation["vm_uid"]
+            or retry["observed_pvc_uid"] != operation["root_pvc_uid"]
+            or reservation["vm_uid"] != operation["vm_uid"]
+        ):
+            raise ResourceAdmissionError("resource_successor_unproven")
+        prior = await conn.fetchrow(
+            "SELECT ordinal,successor_vmi_uid,successor_launcher_uid "
+            "FROM vm_resource_recovery_successors WHERE reservation_id=$1 "
+            "ORDER BY ordinal DESC LIMIT 1", reservation["id"],
+        )
+        vmi = prior["successor_vmi_uid"] if prior else reservation["vmi_uid"]
+        launcher = (
+            prior["successor_launcher_uid"] if prior else reservation["launcher_uid"]
+        )
+        successor = final_observation.get("successor")
+        if not isinstance(successor, dict) or (
+            vmi is None or launcher is None
+            or vmi != operation["prior_vmi_uid"]
+            or launcher != operation["prior_launcher_uid"]
+        ):
+            raise ResourceAdmissionError("resource_successor_predecessor_changed")
+        try:
+            next_vmi = UUID(successor["vmi_uid"])
+            next_launcher = UUID(successor["launcher_uid"])
+        except (ValueError, TypeError, KeyError, AttributeError):
+            raise ResourceAdmissionError("resource_successor_unproven") from None
+        if next_vmi == vmi and next_launcher == launcher:
+            return False
+        if next_vmi == vmi or next_launcher == launcher:
+            raise ResourceAdmissionError("resource_successor_unproven")
+        stop_digest = final_observation.get("stop_receipt_digest")
+        if not isinstance(stop_digest, str):
+            raise ResourceAdmissionError("resource_successor_unproven")
+        digest = "sha256:" + hashlib.sha256(_encoded(final_observation)).hexdigest()
+        await conn.execute(
+            "INSERT INTO vm_resource_recovery_successors "
+            "(recovery_id,reservation_id,ordinal,owner_id,provision_generation,"
+            "vm_uid,root_pvc_uid,prior_vmi_uid,prior_launcher_uid,"
+            "successor_vmi_uid,successor_launcher_uid,stop_receipt_digest,"
+            "final_attestation_digest) "
+            "VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)",
+            operation["id"], reservation["id"],
+            prior["ordinal"] + 1 if prior else 1,
+            operation["owner_id"], operation["provision_generation"],
+            operation["vm_uid"], operation["root_pvc_uid"],
+            vmi, launcher, next_vmi, next_launcher, stop_digest, digest,
+        )
+        return True
+
+    async def _idle_charge_on_conn(self, conn, *, retry, operation):
+        # C owns the operation lock before calling this helper. Re-read that
+        # durable row ahead of the policy lock; a caller-supplied identity is
+        # never itself cleanup authority, and this preserves source->policy.
+        if not isinstance(operation.get("id"), UUID):
+            raise ResourceAdmissionError("resource_idle_operation_changed")
+        current = await conn.fetchrow(
+            "SELECT * FROM vm_idle_operations WHERE id=$1 FOR UPDATE",
+            operation["id"],
+        )
+        if (
+            current is None or current["closed_at"] is not None
+            or current["phase"] not in {"releasing", "release_held", "suspended"}
+            or any(current[key] != operation.get(key) for key in (
+                "owner_kind", "owner_id", "phase", "provision_generation",
+                "vm_uid", "vmi_uid", "launcher_uid", "pvc_uid",
+                "stop_evidence", "stop_verified_at",
+            ))
+        ):
+            raise ResourceAdmissionError("resource_idle_operation_changed")
+        await self._lock_policy(conn, allow_off=True)
+        charge = await conn.fetchrow(
+            "SELECT * FROM vm_resource_reservations WHERE request_id=$1 "
+            "AND state<>'released' FOR UPDATE", retry["request_id"],
+        )
+        if charge is None or (
+            charge["resource_version"] != 2
+            or retry["state"] != "succeeded"
+            or retry["job_id"] != operation["owner_id"]
+            or retry["provision_generation"] != operation["provision_generation"]
+            or retry["observed_vm_uid"] != operation["vm_uid"]
+            or retry["observed_pvc_uid"] != operation["pvc_uid"]
+            or charge["vm_uid"] != operation["vm_uid"]
+            or operation["owner_kind"] != "job"
+        ):
+            raise ResourceAdmissionError("resource_idle_identity_unproven")
+        successor = await conn.fetchrow(
+            "SELECT successor_vmi_uid,successor_launcher_uid "
+            "FROM vm_resource_recovery_successors WHERE reservation_id=$1 "
+            "ORDER BY ordinal DESC LIMIT 1", charge["id"],
+        )
+        current_vmi = (
+            successor["successor_vmi_uid"] if successor else charge["vmi_uid"]
+        )
+        current_launcher = (
+            successor["successor_launcher_uid"] if successor
+            else charge["launcher_uid"]
+        )
+        if (
+            current_vmi is None or current_launcher is None
+            or current_vmi != operation["vmi_uid"]
+            or current_launcher != operation["launcher_uid"]
+        ):
+            raise ResourceAdmissionError("resource_idle_identity_unproven")
+        return charge
+
+    async def mark_idle_teardown_on_conn(self, conn, *, retry, operation):
+        """Keep the charge while one exact idle release owns cleanup."""
+        charge = await self._idle_charge_on_conn(
+            conn, retry=retry, operation=operation,
+        )
+        if operation["phase"] not in {"releasing", "release_held"}:
+            raise ResourceAdmissionError("resource_idle_release_unproven")
+        if charge["state"] == "teardown":
+            return False
+        if charge["state"] not in {"active", "warm"}:
+            raise ResourceAdmissionError("resource_idle_release_unproven")
+        await conn.execute(
+            "UPDATE vm_resource_reservations SET state='teardown' WHERE id=$1",
+            charge["id"],
+        )
+        return True
+
+    async def release_idle_compute_on_conn(self, conn, *, retry, operation):
+        """Debit only after C commits authenticated physical absence on this conn."""
+        charge = await self._idle_charge_on_conn(
+            conn, retry=retry, operation=operation,
+        )
+        evidence = _json(operation["stop_evidence"])
+        if (
+            charge["state"] != "teardown"
+            or operation["phase"] != "suspended"
+            or operation["stop_verified_at"] is None
+            or not isinstance(evidence, dict)
+            or evidence.get("version") != 1
+            or evidence.get("kind") != "vm_idle_physical_stop"
+            or any(evidence.get(key) != str(operation[source]) for key, source in (
+                ("operation_id", "id"), ("generation", "provision_generation"),
+                ("vm_uid", "vm_uid"), ("vmi_uid", "vmi_uid"),
+                ("launcher_uid", "launcher_uid"), ("pvc_uid", "pvc_uid"),
+            ))
+            or any(evidence.get(key) is not True for key in (
+                "vm_absent", "vmi_absent", "launcher_absent", "retained_pvc",
+                "controller_authenticated",
+            ))
+            or evidence.get("same_generation_replacement") is not False
+        ):
+            raise ResourceAdmissionError("resource_physical_release_unproven")
+        if not await conn.fetchval(
+            "SELECT EXISTS(SELECT 1 FROM managed_repository_process_zero_receipts "
+            "WHERE owner_kind='job' AND owner_id=$1 AND scope='vm' "
+            "AND provisioner='vm' AND runtime_incarnation=$2)",
+            operation["owner_id"], str(operation["provision_generation"]),
+        ):
+            raise ResourceAdmissionError("resource_physical_release_unproven")
+        digest = await conn.fetchval(
+            "SELECT 'sha256:'||encode(sha256(convert_to(stop_evidence::text,'UTF8')),'hex') "
+            "FROM vm_idle_operations WHERE id=$1", operation["id"],
+        )
+        release = {
+            "kind": "exact_compute_absent",
+            "operation_id": str(operation["id"]),
+            "job_id": str(operation["owner_id"]),
+            "provision_generation": str(operation["provision_generation"]),
+            "vm_uid": str(operation["vm_uid"]),
+            "vmi_uid": str(operation["vmi_uid"]),
+            "launcher_uid": str(operation["launcher_uid"]),
+            "pvc_uid": str(operation["pvc_uid"]),
+            "stop_evidence_digest": digest,
+        }
+        await conn.execute(
+            "UPDATE vm_resource_reservations SET state='released',"
+            "released_at=clock_timestamp(),release_evidence=$2::jsonb WHERE id=$1",
+            charge["id"], json.dumps(release),
+        )
+        await conn.execute(
+            "UPDATE vm_resource_waiters SET state='released',revision=revision+1 "
+            "WHERE request_id=$1 AND state='admitted'", retry["request_id"],
+        )
+        return True
+
+    async def _cleanup_charge_on_conn(self, conn, *, retry, job, cleanup, intent):
+        """Recheck an ordinary cleanup against the charged current incarnation."""
+        if (
+            cleanup is None or cleanup["owner_kind"] != "job"
+            or cleanup["owner_id"] != job["id"]
+            or cleanup["id"] != UUID(str(intent["admission_id"]))
+            or cleanup["request_id"] != UUID(str(intent["request_id"]))
+            or cleanup["intent_digest"] != intent["intent_digest"]
+            or retry["job_id"] != job["id"]
+            or retry["state"] != "succeeded"
+            or str(retry["provision_generation"])
+            != intent["intent"]["provision_generation"]
+            or str(retry["observed_vm_uid"]) != intent["intent"]["vm_uid"]
+            or str(retry["observed_pvc_uid"]) != intent["intent"]["pvc_uid"]
+            or cleanup["pvc_uid"] != retry["observed_pvc_uid"]
+            or cleanup["source"] != intent["intent"]["source"]
+            or cleanup["source"] == "vm_idle_release"
+        ):
+            raise ResourceAdmissionError("resource_cleanup_identity_unproven")
+        context = _json(job["context"])
+        vm = context.get("vm") if isinstance(context, dict) else None
+        if not isinstance(vm, dict) or any(
+            vm.get(key) != value for key, value in (
+                ("provision_generation", str(retry["provision_generation"])),
+                ("vm_uid", str(retry["observed_vm_uid"])),
+                ("rootdisk_pvc_uid", str(retry["observed_pvc_uid"])),
+            )
+        ):
+            raise ResourceAdmissionError("resource_cleanup_identity_unproven")
+        await self._lock_policy(conn, allow_off=True)
+        charge = await conn.fetchrow(
+            "SELECT * FROM vm_resource_reservations WHERE request_id=$1 "
+            "AND state<>'released' FOR UPDATE", retry["request_id"],
+        )
+        if charge is None or (
+            charge["resource_version"] != 2
+            or charge["vm_uid"] != retry["observed_vm_uid"]
+            or charge["state"] not in {"active", "warm", "teardown"}
+        ):
+            raise ResourceAdmissionError("resource_cleanup_charge_unproven")
+        successor = await conn.fetchrow(
+            "SELECT successor_vmi_uid,successor_launcher_uid "
+            "FROM vm_resource_recovery_successors WHERE reservation_id=$1 "
+            "ORDER BY ordinal DESC LIMIT 1", charge["id"],
+        )
+        vmi = successor["successor_vmi_uid"] if successor else charge["vmi_uid"]
+        launcher = (
+            successor["successor_launcher_uid"] if successor else charge["launcher_uid"]
+        )
+        if (
+            vmi is None or launcher is None
+            or vm.get("vmi_uid") != str(vmi)
+            or vm.get("active_pod_uid") != str(launcher)
+        ):
+            raise ResourceAdmissionError("resource_cleanup_successor_changed")
+        return charge, vmi, launcher
+
+    async def mark_cleanup_teardown_on_conn(
+        self, conn, *, retry, job, cleanup, intent,
+    ):
+        charge, vmi, launcher = await self._cleanup_charge_on_conn(
+            conn, retry=retry, job=job, cleanup=cleanup, intent=intent,
+        )
+        if cleanup["completed_at"] is not None and cleanup["outcome"] != "completed":
+            raise ResourceAdmissionError("resource_cleanup_outcome_changed")
+        if charge["state"] in {"active", "warm"}:
+            await conn.execute(
+                "UPDATE vm_resource_reservations SET state='teardown' WHERE id=$1",
+                charge["id"],
+            )
+        return {
+            "job_id": str(job["id"]),
+            "provision_generation": str(retry["provision_generation"]),
+            "vm_uid": str(charge["vm_uid"]),
+            "vmi_uid": str(vmi),
+            "launcher_uid": str(launcher),
+            "pvc_uid": str(retry["observed_pvc_uid"]),
+            "purge_disk": intent["intent"]["purge_disk"],
+        }
+
+    async def release_cleanup_compute_on_conn(
+        self, conn, *, retry, job, cleanup, intent, proof,
+    ):
+        charge, vmi, launcher = await self._cleanup_charge_on_conn(
+            conn, retry=retry, job=job, cleanup=cleanup, intent=intent,
+        )
+        expected = {
+            "version": 1, "kind": "vm_cleanup_physical_stop",
+            "job_id": str(job["id"]),
+            "provision_generation": str(retry["provision_generation"]),
+            "vm_uid": str(charge["vm_uid"]),
+            "vmi_uid": str(vmi), "launcher_uid": str(launcher),
+            "pvc_uid": str(retry["observed_pvc_uid"]),
+            "vm_absent": True, "vmi_absent": True,
+            "launcher_absent": True,
+            "same_generation_replacement": False,
+            "pvc_disposition": (
+                "purged" if intent["intent"]["purge_disk"] else "retained"
+            ),
+            "controller_authenticated": True,
+        }
+        if (
+            charge["state"] != "teardown"
+            or proof != expected
+            or cleanup["completed_at"] is not None
+            and cleanup["outcome"] != "completed"
+            or not await conn.fetchval(
+                "SELECT EXISTS(SELECT 1 FROM managed_repository_process_zero_receipts "
+                "WHERE owner_kind='job' AND owner_id=$1 AND scope='vm' "
+                "AND provisioner='vm' AND runtime_incarnation=$2)",
+                job["id"], str(retry["provision_generation"]),
+            )
+        ):
+            raise ResourceAdmissionError("resource_cleanup_stop_unproven")
+        if cleanup["completed_at"] is None:
+            await conn.execute(
+                "UPDATE vm_workspace_cleanup_admissions SET "
+                "completed_at=clock_timestamp(),outcome='completed' WHERE id=$1",
+                cleanup["id"],
+            )
+        await conn.execute(
+            "INSERT INTO vm_resource_cleanup_stop_receipts "
+            "(cleanup_admission_id,reservation_id,request_id,job_id,"
+            "provision_generation,vm_uid,vmi_uid,launcher_uid,pvc_uid,"
+            "intent_digest,stop_evidence) "
+            "VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11::jsonb)",
+            cleanup["id"], charge["id"], retry["request_id"], job["id"],
+            retry["provision_generation"], charge["vm_uid"], vmi, launcher,
+            retry["observed_pvc_uid"], cleanup["intent_digest"], json.dumps(proof),
+        )
+        digest = await conn.fetchval(
+            "SELECT 'sha256:'||encode(sha256(convert_to(stop_evidence::text,'UTF8')),'hex') "
+            "FROM vm_resource_cleanup_stop_receipts WHERE cleanup_admission_id=$1",
+            cleanup["id"],
+        )
+        evidence = {
+            "kind": "exact_cleanup_compute_absent",
+            "cleanup_admission_id": str(cleanup["id"]),
+            "job_id": str(job["id"]),
+            "provision_generation": str(retry["provision_generation"]),
+            "vm_uid": str(charge["vm_uid"]),
+            "vmi_uid": str(vmi), "launcher_uid": str(launcher),
+            "pvc_uid": str(retry["observed_pvc_uid"]),
+            "stop_evidence_digest": digest,
+        }
+        await conn.execute(
+            "UPDATE vm_resource_reservations SET state='released',"
+            "released_at=clock_timestamp(),release_evidence=$2::jsonb WHERE id=$1",
+            charge["id"], json.dumps(evidence),
+        )
+        await conn.execute(
+            "UPDATE vm_resource_waiters SET state='released',revision=revision+1 "
+            "WHERE request_id=$1 AND state='admitted'", retry["request_id"],
+        )
+        return True
+
+    async def _lock_policy(self, conn, *, allow_drain=False, allow_off=False):
         policy = await conn.fetchrow(
             "SELECT * FROM vm_resource_admission_policy WHERE cluster_id=$1 FOR UPDATE",
             self.inventory.cluster_id,
@@ -416,7 +1094,10 @@ class VMResourceReservationStore:
             or policy["revision"] != self.policy_revision
             or _encoded(_json(policy["document"])) != self.policy_encoded
             or policy["mode"]
-            not in ({"enforce", "drain"} if allow_drain else {"enforce"})
+            not in (
+                {"enforce", "drain", "off"} if allow_off else
+                {"enforce", "drain"} if allow_drain else {"enforce"}
+            )
         ):
             raise ResourceAdmissionError("resource_policy_changed")
         return policy
@@ -577,7 +1258,16 @@ class VMResourceReservationStore:
             inventory.policy_digest,
         )
         reservations = await conn.fetch(
-            "SELECT r.*,w.job_id,w.provision_generation,w.owner_key FROM vm_resource_reservations r JOIN vm_resource_waiters w ON w.request_id=r.request_id WHERE r.cluster_id=$1 AND r.state<>'released' ORDER BY r.id FOR UPDATE OF r",
+            "SELECT r.*,w.job_id,w.provision_generation,w.owner_key,"
+            "COALESCE(successor.successor_vmi_uid,r.vmi_uid) AS current_vmi_uid,"
+            "COALESCE(successor.successor_launcher_uid,r.launcher_uid) AS current_launcher_uid "
+            "FROM vm_resource_reservations r "
+            "JOIN vm_resource_waiters w ON w.request_id=r.request_id "
+            "LEFT JOIN LATERAL (SELECT successor_vmi_uid,successor_launcher_uid "
+            "FROM vm_resource_recovery_successors WHERE reservation_id=r.id "
+            "ORDER BY ordinal DESC LIMIT 1) successor ON true "
+            "WHERE r.cluster_id=$1 AND r.state<>'released' "
+            "ORDER BY r.id FOR UPDATE OF r",
             inventory.cluster_id,
         )
         owners = await conn.fetch(
@@ -639,10 +1329,14 @@ class VMResourceReservationStore:
                         row["observed_tun_devices"], row["observed_vhost_net_devices"],
                     ) if inventory.protocol == 2 and row["observed_cpu_millicores"] is not None else None
                 ),
-                **{
-                    key: str(row[key]) if row[key] else None
-                    for key in ("vm_uid", "vmi_uid", "launcher_uid")
-                },
+                vm_uid=str(row["vm_uid"]) if row["vm_uid"] else None,
+                vmi_uid=(
+                    str(row["current_vmi_uid"]) if row["current_vmi_uid"] else None
+                ),
+                launcher_uid=(
+                    str(row["current_launcher_uid"])
+                    if row["current_launcher_uid"] else None
+                ),
             )
             for row in reservations
         ]

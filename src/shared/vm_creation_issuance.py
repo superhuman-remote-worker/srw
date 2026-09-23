@@ -274,24 +274,26 @@ def _validate_prepared_source(source, *, request, configuration, expected_pvc_ui
 def _values(value):
     version = value.get("version") if isinstance(value, Mapping) else None
     fields = _FIELDS
-    if version in (2, 3):
+    if version in (2, 3, 4, 5):
         fields |= {"rootdisk_source"}
-    if version == 3:
+    if version in (3, 5):
         fields |= {"workspace_attachment", "current_attachment_uid"}
+    if version in (4, 5):
+        fields |= {"resource_grant"}
     if not isinstance(value, Mapping) or set(value) != fields:
         raise ValueError("Incomplete creation carrier intent")
     value = dict(value)
     if (
         type(value["version"]) is not int
-        or value["version"] not in (1, 2, 3)
+        or value["version"] not in (1, 2, 3, 4, 5)
         or value["source"] != CREATION_SOURCE
         or value["effect_kind"] not in (*EFFECT_KINDS, "workspace_attach")
     ):
         raise ValueError("Unsupported creation carrier source")
     attachment = value["effect_kind"] == "workspace_attach"
-    if attachment and version != 3:
+    if attachment and version not in (3, 5):
         raise ValueError("Attachment effects require their full carrier contract")
-    if version == 3:
+    if version in (3, 5):
         from shared.vm_creation_attachment import validate_attachment_intent
         from shared.vm_workspace_storage import storage_name
 
@@ -319,6 +321,30 @@ def _values(value):
             raise ValueError("Observed attachment and root source are required")
         if value["current_attachment_uid"] is not None:
             _uuid(value["current_attachment_uid"])
+    if version in (4, 5):
+        from shared.vm_resource_admission import ResourceVector
+
+        grant = value["resource_grant"]
+        if not isinstance(grant, Mapping) or set(grant) != {
+            "version", "id", "revision", "cluster_id", "policy_digest",
+            "node_uid", "node_name", "vector", "snapshot_id", "snapshot_digest",
+            "headroom",
+        } or type(grant["version"]) is not int or grant["version"] != 1 or (
+            type(grant["revision"]) is not int or not 1 <= grant["revision"] < 2**63
+        ):
+            raise ValueError("Resource creation grant is incomplete")
+        for key in ("id", "node_uid", "snapshot_id"):
+            _uuid(grant[key])
+        for key in ("policy_digest", "snapshot_digest"):
+            if not isinstance(grant[key], str) or not re.fullmatch(
+                r"sha256:[0-9a-f]{64}", grant[key]
+            ):
+                raise ValueError("Resource creation grant digest is invalid")
+        for key in ("cluster_id", "node_name"):
+            if not isinstance(grant[key], str) or not 1 <= len(grant[key]) <= 253:
+                raise ValueError("Resource creation grant node is invalid")
+        ResourceVector.from_six_dict(grant["vector"])
+        ResourceVector.from_six_dict(grant["headroom"])
     for key in (
         "admission_id",
         "reservation_request_id",
@@ -556,7 +582,7 @@ def public_effect_observation(
         labels = metadata.get("labels") or {}
         annotations = metadata.get("annotations") or {}
         owner = values["job_id"]
-        if kind == "rootdisk" and values["version"] == 3:
+        if kind == "rootdisk" and values["version"] in (3, 5):
             from shared.vm_creation_lineage import disk_owner
 
             owner = disk_owner(
@@ -589,7 +615,7 @@ def public_effect_observation(
             "namespace": metadata["namespace"],
         }
         if kind == "rootdisk":
-            if values["version"] in (2, 3) and not retained:
+            if values["version"] in (2, 3, 4, 5) and not retained:
                 source = values["rootdisk_source"]
                 expected_source = (
                     {"pvc": {"namespace": source["namespace"], "name": source["name"]}}
@@ -632,7 +658,21 @@ def public_effect_observation(
                 raise ValueError("Creation Secret host key identity missing")
             result["ssh_host_key_fingerprint"] = fingerprint
         else:
-            if values["version"] == 3:
+            if values["version"] in (4, 5):
+                grant = values["resource_grant"]
+                for meta in (
+                    metadata,
+                    obj["spec"]["template"]["metadata"],
+                ):
+                    stamped = meta.get("annotations") or {}
+                    if (
+                        stamped.get("srw.io/vm-resource-reservation") != grant["id"]
+                        or stamped.get("srw.io/vm-resource-node-uid") != grant["node_uid"]
+                        or stamped.get("srw.io/provision-generation")
+                        != values["provision_generation"]
+                    ):
+                        raise ValueError("Observed VM resource identity changed")
+            if values["version"] in (3, 5):
                 from shared.vm_workspace_storage import storage_labels
 
                 expected_labels = storage_labels(
