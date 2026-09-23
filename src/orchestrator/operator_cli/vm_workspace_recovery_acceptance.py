@@ -729,6 +729,25 @@ class LiveScenario:
             "WHERE request_id=$1",
             UUID(self.fixture_request_id),
         )
+        if retry.get("ready_at") is None:
+            from orchestrator.operator_cli.vm_fixture_readiness import (
+                settle_owned_fixture_ready,
+            )
+
+            if not self._fixture_authority_matches(
+                job_id, job, retry, identity, require_ready=False,
+            ) or not await settle_owned_fixture_ready(
+                db=self.db, job_id=str(job_id), owner_id=str(self.gate_user_id),
+                run_id=self.run_id,
+                marker_key="vm_workspace_recovery_acceptance_gate",
+                request_id=self.fixture_request_id,
+                generation=self.fixture_generation,
+                vm_uid=identity["vm_uid"], pvc_uid=identity["root_pvc_uid"],
+            ):
+                return None
+            # Re-read both rows and current runtime after the production
+            # release so the ordinary fixture checks see the new receipt.
+            return await self._fixture_ready_identity(job_id)
         return (
             identity
             if self._fixture_authority_matches(job_id, job, retry, identity)
@@ -741,6 +760,7 @@ class LiveScenario:
         job: Mapping[str, Any],
         retry: Mapping[str, Any],
         identity: Mapping[str, Any],
+        *, require_ready: bool = True,
     ) -> bool:
         """Match one frozen, authenticated Ready result to this gate Job."""
         from orchestrator.services.vm_creation_preflight import _preflight
@@ -777,7 +797,8 @@ class LiveScenario:
                     "_operator_pause_hold",
                 )
             )
-            or context.get("_vm_creation_pending") is not None
+            or context.get("_vm_creation_pending")
+            != (None if require_ready else self.fixture_request_id)
             or vm.get("status") != "ready"
             or preflight is None
             or preflight["request_id"] != self.fixture_request_id
@@ -804,7 +825,7 @@ class LiveScenario:
             or str(retry.get("provision_generation")) != self.fixture_generation
             or retry.get("state") != "succeeded"
             or retry.get("reason") != "creation_adopted"
-            or retry.get("ready_at") is None
+            or (retry.get("ready_at") is not None) != require_ready
             or str(retry.get("observed_vm_uid")) != identity["vm_uid"]
             or str(retry.get("observed_pvc_uid")) != identity["root_pvc_uid"]
             or canonical != preflight["request"]
