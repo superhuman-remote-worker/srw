@@ -47,6 +47,59 @@ def configuration():
     return {**json.loads(V1_JSON), "version": 2, "resource_admission": envelope()}
 
 
+def whole_launcher_configuration():
+    from shared.vm_launcher_profile import LAUNCHER_ALGORITHM, predict_launcher
+    from shared.vm_resource_policy import validate_complete_resource_policy
+    from shared.vm_resource_admission import WHOLE_LAUNCHER_HOST_COST_ALGORITHM
+    from tests.test_vm_resource_policy import whole_launcher_policy
+
+    policy = whole_launcher_policy()
+    frozen = validate_complete_resource_policy(policy)
+    doc = configuration()
+    doc["version"] = 3
+    resource = doc["resource_admission"]
+    resource["version"] = 2
+    resource["policy_digest"] = frozen.policy_digest
+    resource["launcher_profile"] = frozen.launcher_profile
+    resource["launcher_prediction"] = {
+        "algorithm": LAUNCHER_ALGORITHM,
+        "vector": predict_launcher(
+            frozen.launcher_profile, guest_vcpus=2, guest_memory_bytes=4 * 1024**3
+        ).to_six_dict(),
+    }
+    resource["host_mapping"] = {
+        "algorithm": WHOLE_LAUNCHER_HOST_COST_ALGORITHM,
+        "policy": policy["policy"]["hostCost"],
+        "vector": frozen.host_cost.cost(2, "4Gi").to_six_dict(),
+    }
+    return doc
+
+
+def test_v3_inner_v2_recomputes_prediction_reserve_and_preserves_old_digest():
+    doc = whole_launcher_configuration()
+    digest = canonical_configuration_digest(doc)
+    assert digest != V1_DIGEST
+    assert canonical_configuration_digest(json.loads(V1_JSON)) == V1_DIGEST
+    for path, value in [
+        (("launcher_profile", "cpuAllocationRatio"), 5),
+        (("launcher_prediction", "vector", "ephemeral_storage_bytes"), 0),
+        (("host_mapping", "vector", "tun_devices"), 0),
+        (("host_mapping", "policy", "cpuMillicoresPerVcpuDenominator"), 1),
+    ]:
+        changed = deepcopy(doc)
+        target = changed["resource_admission"]
+        for key in path[:-1]:
+            target = target[key]
+        target[path[-1]] = value
+        with pytest.raises(ValueError):
+            canonical_configuration_digest(changed)
+    under = deepcopy(doc)
+    under["resource_admission"]["host_mapping"]["policy"]["ephemeralStorageReserveBytes"] = 1
+    under["resource_admission"]["host_mapping"]["vector"]["ephemeral_storage_bytes"] = 1
+    with pytest.raises(ValueError):
+        canonical_configuration_digest(under)
+
+
 def test_literal_v1_canonical_bytes_and_digest_are_unchanged():
     doc = json.loads(V1_JSON)
     assert (

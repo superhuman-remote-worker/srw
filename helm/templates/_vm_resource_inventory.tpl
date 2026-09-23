@@ -20,5 +20,10 @@
 {{- if not (has "kubernetes.io/hostname" $policy.inventory.nodeLabelKeys) -}}
 {{- fail "vm.resourceAdmission.inventory.nodeLabelKeys must explicitly include kubernetes.io/hostname and every placement/topology key" -}}
 {{- end -}}
+{{- if $policy.launcherProfile -}}
+{{- if or (not (has "kubernetes.io/arch" $policy.inventory.nodeLabelKeys)) (empty $policy.inventory.kubevirtNamespace) (empty $policy.inventory.kubevirtName) -}}
+{{- fail "vm.resourceAdmission launcher profile requires kubernetes.io/arch and exact KubeVirt namespace/name" -}}
+{{- end -}}
+{{- end -}}
 {{- end -}}
 {{- end -}}

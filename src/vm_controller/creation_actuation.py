@@ -985,7 +985,10 @@ class CreationActuator:
             ):
                 _effect_stage(kind, "source_validate")
                 await sources.validate(row, rootdisk_source)
-            if kind == "vm" and row["request"].get("network_profile") is not None:
+            if kind == "vm" and (
+                row["request"].get("network_profile") is not None
+                or row["controller_configuration"]["version"] == 3
+            ):
                 from shared.vm_resource_manifest import validate_final_vm_manifest
 
                 _effect_stage(kind, "final_manifest")

@@ -20,7 +20,14 @@ from shared.kubernetes_quantities import (
 
 
 KVM_RESOURCE = "devices.kubevirt.io/kvm"
+TUN_RESOURCE = "devices.kubevirt.io/tun"
+VHOST_NET_RESOURCE = "devices.kubevirt.io/vhost-net"
+EPHEMERAL_RESOURCE = "ephemeral-storage"
+_SUPPORTED_LAUNCHER_RESOURCES = frozenset(
+    {"cpu", "memory", EPHEMERAL_RESOURCE, KVM_RESOURCE, TUN_RESOURCE, VHOST_NET_RESOURCE}
+)
 HOST_COST_ALGORITHM = "srw-vm-host-cost-v1"
+WHOLE_LAUNCHER_HOST_COST_ALGORITHM = "srw-vm-host-cost-v2"
 
 
 class ResourceAdmissionError(ValueError):
@@ -42,6 +49,9 @@ class ResourceVector:
     cpu_millicores: int
     memory_bytes: int
     kvm_devices: int
+    ephemeral_storage_bytes: int = 0
+    tun_devices: int = 0
+    vhost_net_devices: int = 0
 
     def __post_init__(self):
         for value in self.components:
@@ -49,7 +59,14 @@ class ResourceVector:
 
     @property
     def components(self):
-        return self.cpu_millicores, self.memory_bytes, self.kvm_devices
+        return (
+            self.cpu_millicores,
+            self.memory_bytes,
+            self.kvm_devices,
+            self.ephemeral_storage_bytes,
+            self.tun_devices,
+            self.vhost_net_devices,
+        )
 
     def __add__(self, other):
         return ResourceVector(
@@ -71,7 +88,25 @@ class ResourceVector:
         return all(a <= b for a, b in zip(self.components, available.components))
 
     def to_dict(self):
+        # Frozen v1/v2 and inventory-protocol-1 payloads have exactly three
+        # fields. New versioned callers must explicitly ask for all six.
+        return {
+            "cpu_millicores": self.cpu_millicores,
+            "memory_bytes": self.memory_bytes,
+            "kvm_devices": self.kvm_devices,
+        }
+
+    def to_six_dict(self):
         return asdict(self)
+
+    @classmethod
+    def from_six_dict(cls, value):
+        if not isinstance(value, dict) or set(value) != {
+            "cpu_millicores", "memory_bytes", "ephemeral_storage_bytes",
+            "kvm_devices", "tun_devices", "vhost_net_devices",
+        }:
+            raise ResourceAdmissionError("invalid_resource_vector")
+        return cls(**value)
 
 
 @dataclass(frozen=True, slots=True)
@@ -118,6 +153,53 @@ class HostCostPolicy:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class WholeLauncherHostCostPolicy:
+    """Operator reserve, independent of the installed launcher prediction."""
+
+    base: HostCostPolicy
+    ephemeral_storage_reserve_bytes: int
+    kvm_devices: int
+    tun_devices: int
+    vhost_net_devices: int
+
+    def __post_init__(self):
+        for value in (
+            self.ephemeral_storage_reserve_bytes,
+            self.kvm_devices,
+            self.tun_devices,
+            self.vhost_net_devices,
+        ):
+            _integer(value, positive=True)
+
+    @property
+    def digest(self):
+        encoded = json.dumps(
+            {
+                "algorithm": WHOLE_LAUNCHER_HOST_COST_ALGORITHM,
+                "base": asdict(self.base),
+                "ephemeral_storage_reserve_bytes": self.ephemeral_storage_reserve_bytes,
+                "kvm_devices": self.kvm_devices,
+                "tun_devices": self.tun_devices,
+                "vhost_net_devices": self.vhost_net_devices,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+        return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+    def cost(self, guest_vcpus, guest_memory):
+        base = self.base.cost(guest_vcpus, guest_memory)
+        return ResourceVector(
+            base.cpu_millicores,
+            base.memory_bytes,
+            self.kvm_devices,
+            self.ephemeral_storage_reserve_bytes,
+            self.tun_devices,
+            self.vhost_net_devices,
+        )
+
+
 def managed_charge(reserved: ResourceVector, observed: ResourceVector | None):
     """For an already authenticated exact launcher, charge once, conservatively.
 
@@ -148,7 +230,27 @@ def normalize_kvm_devices(value):
     return _integer(int(value))
 
 
-def _kvm_request(raw):
+def _resource_value(value, resource):
+    if resource == EPHEMERAL_RESOURCE:
+        try:
+            return _integer(normalize_byte_quantity(value).normalized_value)
+        except QuantityNormalizationError:
+            raise ResourceAdmissionError("invalid_ephemeral_storage") from None
+    try:
+        parsed = parse_kubernetes_quantity(value, resource=resource).value
+    except QuantityNormalizationError:
+        raise ResourceAdmissionError("invalid_extended_device") from None
+    if parsed > SIGNED_BIGINT_MAX or parsed != parsed.to_integral_value():
+        raise ResourceAdmissionError("invalid_extended_device")
+    return _integer(int(parsed))
+
+
+def _request_value(resources, resource):
+    requests = _mapping(_mapping(resources).get("requests", {}))
+    return _resource_value(requests.get(resource, 0), resource)
+
+
+def _scalar_request(raw, resource):
     """Extended devices use the scheduler's app/sidecar/init maximum.
 
     See component-helpers v0.35.0 resource/helpers.go AggregateContainerRequests.
@@ -157,8 +259,9 @@ def _kvm_request(raw):
     """
     spec = _mapping(raw["spec"])
     status = _mapping(raw.get("status", {}))
-    if _devices(spec.get("resources", {})):
-        raise ResourceAdmissionError("unsupported_pod_level_kvm")
+    pod_requests = _mapping(_mapping(spec.get("resources", {})).get("requests", {}))
+    if resource != EPHEMERAL_RESOURCE and resource in pod_requests:
+        raise ResourceAdmissionError("unsupported_pod_level_device")
     statuses = {}
     for name in ("containerStatuses", "initContainerStatuses"):
         for item in status.get(name, []):
@@ -167,13 +270,13 @@ def _kvm_request(raw):
             statuses[item.get("name")] = item
 
     def demand(container):
-        value = _devices(container.get("resources", {}))
+        value = _request_value(container.get("resources", {}), resource)
         current = statuses.get(container.get("name"), {})
-        if "resources" in current and _devices(current["resources"]) != value:
-            raise ResourceAdmissionError("unsupported_kvm_resize")
+        if "resources" in current and _request_value(current["resources"], resource) != value:
+            raise ResourceAdmissionError("unsupported_resource_resize")
         allocated = _mapping(current.get("allocatedResources", {}))
-        if KVM_RESOURCE in allocated and _devices({"requests": allocated}) != value:
-            raise ResourceAdmissionError("unsupported_kvm_resize")
+        if resource in allocated and _resource_value(allocated[resource], resource) != value:
+            raise ResourceAdmissionError("unsupported_resource_resize")
         return value
 
     total = sum(demand(container) for container in spec["containers"])
@@ -187,16 +290,54 @@ def _kvm_request(raw):
         else:
             current += sidecars
         peak_init = max(peak_init, current)
-    return _integer(
-        max(total, peak_init) + _devices({"requests": spec.get("overhead", {})})
-    )
+    total = max(total, peak_init)
+    if resource in pod_requests:
+        total = _resource_value(pod_requests[resource], resource)
+        pod_status = _mapping(status.get("resources", {}))
+        status_requests = _mapping(pod_status.get("requests", {}))
+        if resource in status_requests and _resource_value(status_requests[resource], resource) != total:
+            raise ResourceAdmissionError("unsupported_resource_resize")
+        allocated = _mapping(status.get("allocatedResources", {}))
+        if resource in allocated and _resource_value(allocated[resource], resource) != total:
+            raise ResourceAdmissionError("unsupported_resource_resize")
+    return _integer(total + _resource_value(_mapping(spec.get("overhead", {})).get(resource, 0), resource))
 
 
-def _pod_resources(raw):
+def _launcher_resources_supported(raw):
+    spec = _mapping(raw["spec"])
+    status = _mapping(raw.get("status", {}))
+    def supported(resources):
+        resources = _mapping(resources)
+        for source in ("requests", "limits"):
+            if set(_mapping(resources.get(source, {}))) - _SUPPORTED_LAUNCHER_RESOURCES:
+                raise ResourceAdmissionError("unsupported_launcher_resource")
+    resources = [spec.get("resources", {}), *(
+        container.get("resources", {})
+        for kind in ("containers", "initContainers")
+        for container in spec.get(kind, [])
+    )]
+    for entry in resources:
+        supported(entry)
+    supported(status.get("resources", {}))
+    if set(_mapping(status.get("allocatedResources", {}))) - _SUPPORTED_LAUNCHER_RESOURCES:
+        raise ResourceAdmissionError("unsupported_launcher_resource")
+    for kind in ("containerStatuses", "initContainerStatuses"):
+        for item in status.get(kind, []):
+            item = _mapping(item)
+            supported(item.get("resources", {}))
+            if set(_mapping(item.get("allocatedResources", {}))) - _SUPPORTED_LAUNCHER_RESOURCES:
+                raise ResourceAdmissionError("unsupported_launcher_resource")
+    if set(_mapping(spec.get("overhead", {}))) - _SUPPORTED_LAUNCHER_RESOURCES:
+        raise ResourceAdmissionError("unsupported_launcher_resource")
+
+
+def _pod_resources(raw, *, managed_launcher=False):
     try:
         pod = normalize_pod(raw)
     except PodNormalizationError:
         raise ResourceAdmissionError("invalid_pod_identity") from None
+    if managed_launcher:
+        _launcher_resources_supported(raw)
     request = pod.effective_request
     if (
         not pod.valid_for_metering
@@ -205,12 +346,17 @@ def _pod_resources(raw):
     ):
         raise ResourceAdmissionError("pod_request_unproven")
     return pod, ResourceVector(
-        request.cpu_millicores, request.memory_bytes, _kvm_request(raw)
+        request.cpu_millicores,
+        request.memory_bytes,
+        _scalar_request(raw, KVM_RESOURCE),
+        _scalar_request(raw, EPHEMERAL_RESOURCE),
+        _scalar_request(raw, TUN_RESOURCE),
+        _scalar_request(raw, VHOST_NET_RESOURCE),
     )
 
 
-def effective_pod_request(raw) -> ResourceVector:
-    return _pod_resources(raw)[1]
+def effective_pod_request(raw, *, managed_launcher=False) -> ResourceVector:
+    return _pod_resources(raw, managed_launcher=managed_launcher)[1]
 
 
 def scheduled_pod_charge(raw) -> ResourceVector:

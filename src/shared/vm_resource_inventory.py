@@ -50,6 +50,8 @@ _FIELDS = frozenset(
         *INVENTORY_KINDS,
     }
 )
+_V2_FIELDS = _FIELDS | {"installed_profile"}
+_V2_VERSIONS = frozenset(INVENTORY_KINDS) | {"kubevirt", "limitranges"}
 
 
 class InventoryError(ValueError):
@@ -129,9 +131,40 @@ def snapshot_digest(value):
     return "sha256:" + hashlib.sha256(_encoded(value)).hexdigest()
 
 
-def _resources(value):
-    _record(value, ("cpu_millicores", "memory_bytes", "kvm_devices"))
-    ResourceVector(**value)
+def _resources(value, *, protocol):
+    if protocol == 1:
+        _record(value, ("cpu_millicores", "memory_bytes", "kvm_devices"))
+        ResourceVector(**value)
+    else:
+        ResourceVector.from_six_dict(value)
+
+
+def _installed_profile(value):
+    from shared.vm_launcher_profile import validate_launcher_profile
+
+    _record(
+        value,
+        (
+            "uid", "namespace", "name", "generation", "observedGeneration",
+            "targetVersion", "observedVersion", "targetDeploymentID",
+            "observedDeploymentID", "profile",
+        ),
+    )
+    _uuid(value["uid"])
+    _text(value["namespace"])
+    _text(value["name"])
+    _text(value["targetDeploymentID"])
+    _text(value["observedDeploymentID"])
+    _integer(value["generation"], positive=True)
+    _integer(value["observedGeneration"], positive=True)
+    if (
+        value["generation"] != value["observedGeneration"]
+        or value["targetVersion"] != "v1.6.6"
+        or value["observedVersion"] != value["targetVersion"]
+        or value["observedDeploymentID"] != value["targetDeploymentID"]
+    ):
+        raise InventoryError("invalid_inventory")
+    validate_launcher_profile(value["profile"])
 
 
 def _affinity(value, label_keys):
@@ -139,7 +172,7 @@ def _affinity(value, label_keys):
         raise InventoryError("label_coverage")
 
 
-def _node(value, label_keys):
+def _node(value, label_keys, *, protocol):
     _record(
         value,
         ("uid", "name", "labels", "ready", "unschedulable", "taints", "allocatable"),
@@ -155,10 +188,12 @@ def _node(value, label_keys):
     for taint in _list(value["taints"]):
         _record(taint, ("key", "value", "effect"))
     preferred_taint_count({"spec": {"taints": value["taints"]}}, [])
-    _resources(value["allocatable"])
+    if protocol == 2 and labels.get("kubernetes.io/arch") not in {"amd64", "arm64", "ppc64le", "s390x"}:
+        raise InventoryError("identity_unproven")
+    _resources(value["allocatable"], protocol=protocol)
 
 
-def _pod(value):
+def _pod(value, *, protocol):
     _record(
         value,
         (
@@ -178,7 +213,7 @@ def _pod(value):
     _text(value["namespace"])
     _boolean(value["terminal"])
     _boolean(value["deleting"])
-    _resources(value["requests"])
+    _resources(value["requests"], protocol=protocol)
     for key in ("node_uid", "vmi_uid", "reservation_id", "provision_generation"):
         _uuid(value[key], nullable=True)
     if value["node_name"] is not None:
@@ -321,9 +356,10 @@ def canonical_snapshot(value, *, max_items: int, max_bytes: int):
         raise InventoryError("byte_limit")
     result = json.loads(encoded)
     try:
-        _record(result, _FIELDS)
-        if type(result["protocol"]) is not int or result["protocol"] != 1:
+        protocol = result["protocol"]
+        if type(protocol) is not int or protocol not in (1, 2):
             raise InventoryError("invalid_inventory")
+        _record(result, _FIELDS if protocol == 1 else _V2_FIELDS)
         _uuid(result["snapshot_id"])
         _uuid(result["controller_id"])
         _integer(result["sequence"], positive=True)
@@ -350,13 +386,20 @@ def canonical_snapshot(value, *, max_items: int, max_bytes: int):
         for key in keys:
             _text(key)
         label_keys = frozenset(keys)
+        if protocol == 2:
+            if "kubernetes.io/arch" not in label_keys:
+                raise InventoryError("label_coverage")
+            if result["complete"]:
+                _installed_profile(result["installed_profile"])
+            elif result["installed_profile"] is not None:
+                raise InventoryError("invalid_inventory")
         result["label_keys"] = sorted(keys)
         count = sum(len(_list(result[kind])) for kind in INVENTORY_KINDS)
         if count > max_items:
             raise InventoryError("item_limit")
         versions = result["resource_versions"]
         if result["complete"]:
-            _record(versions, INVENTORY_KINDS)
+            _record(versions, INVENTORY_KINDS if protocol == 1 else _V2_VERSIONS)
             for resource_version in versions.values():
                 _text(resource_version)
             if result["reason"] is not None:
@@ -364,8 +407,8 @@ def canonical_snapshot(value, *, max_items: int, max_bytes: int):
         elif result["reason"] not in INCOMPLETE_REASONS or count or versions != {}:
             raise InventoryError("invalid_inventory")
         validators = {
-            "nodes": lambda item: _node(item, label_keys),
-            "pods": _pod,
+            "nodes": lambda item: _node(item, label_keys, protocol=protocol),
+            "pods": lambda item: _pod(item, protocol=protocol),
             "vms": _vm,
             "vmis": _vmi,
             "pvcs": _pvc,

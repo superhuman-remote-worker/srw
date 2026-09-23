@@ -729,11 +729,11 @@ def canonical_configuration_digest(configuration):
     if (
         not isinstance(configuration, dict)
         or type(configuration.get("version")) is not int
-        or configuration["version"] not in (1, 2)
+        or configuration["version"] not in (1, 2, 3)
         or set(configuration)
         != (
             _CONFIGURATION_FIELDS
-            | ({"resource_admission"} if configuration["version"] == 2 else set())
+            | ({"resource_admission"} if configuration["version"] in (2, 3) else set())
             | ({"network_profile_policy"} if "network_profile_policy" in configuration else set())
         )
     ):
@@ -761,7 +761,7 @@ def canonical_configuration_digest(configuration):
             or not compatible_image(policy["image"], allowlist=policy["image"])
         ):
             raise ValueError("Unsupported VM network profile policy")
-    if configuration["version"] == 2:
+    if configuration["version"] in (2, 3):
         from shared.vm_resource_configuration import validate_resource_configuration
 
         validate_resource_configuration(

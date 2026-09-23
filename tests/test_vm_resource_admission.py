@@ -71,6 +71,75 @@ def test_vector_arithmetic_and_independent_dimensions():
         ResourceVector(2**63 - 1, 0, 0) + a
 
 
+def test_six_dimensional_vector_charges_each_independent_resource():
+    demand = ResourceVector(205, 861277888, 1, 50000000, 1, 1)
+    assert demand.to_six_dict() == {
+        "cpu_millicores": 205,
+        "memory_bytes": 861277888,
+        "ephemeral_storage_bytes": 50000000,
+        "kvm_devices": 1,
+        "tun_devices": 1,
+        "vhost_net_devices": 1,
+    }
+    assert not demand.fits(ResourceVector(205, 861277888, 1, 49999999, 1, 1))
+    assert not demand.fits(ResourceVector(205, 861277888, 1, 50000000, 0, 1))
+    assert not demand.fits(ResourceVector(205, 861277888, 1, 50000000, 1, 0))
+    assert demand + ResourceVector(1, 2, 0, 3, 0, 1) == ResourceVector(
+        206, 861277890, 1, 50000003, 1, 2
+    )
+
+
+def test_captured_ordinary_launcher_has_all_six_requests():
+    import json
+    from pathlib import Path
+
+    fixture = json.loads(
+        (
+            Path(__file__).parent
+            / "fixtures/vm_launcher_cost/kubevirt-1.6.6-amd64-default.json"
+        ).read_text()
+    )
+    assert effective_pod_request(fixture["pod"]) == ResourceVector(
+        205, 861277888, 1, 50000000, 1, 1
+    )
+
+
+def test_ephemeral_and_device_peaks_follow_restartable_init_and_overhead():
+    pod = _pod(
+        containers=[{
+            "name": "main",
+            "resources": {"requests": {
+                "cpu": "100m", "memory": "100",
+                "ephemeral-storage": "10M",
+                "devices.kubevirt.io/kvm": "1",
+                "devices.kubevirt.io/tun": "1",
+            }},
+        }],
+        init_containers=[
+            {"name": "sidecar", "restartPolicy": "Always", "resources": {
+                "requests": {"ephemeral-storage": "2M", "devices.kubevirt.io/tun": "1"}
+            }},
+            {"name": "init", "resources": {
+                "requests": {"ephemeral-storage": "20M", "devices.kubevirt.io/vhost-net": "2"}
+            }},
+        ],
+        overhead={"ephemeral-storage": "1M"},
+    )
+    assert effective_pod_request(pod) == ResourceVector(
+        100, 100, 1, 23000000, 2, 2
+    )
+
+
+def test_managed_launcher_refuses_unknown_device_even_in_status_allocation():
+    pod = _pod()
+    pod["status"]["containerStatuses"] = [{
+        "name": pod["spec"]["containers"][0]["name"],
+        "allocatedResources": {"vendor.example/gpu": "1"},
+    }]
+    with pytest.raises(ResourceAdmissionError, match="unsupported_launcher_resource"):
+        effective_pod_request(pod, managed_launcher=True)
+
+
 def test_managed_charge_holds_reservation_and_uses_component_maximum():
     reservation = ResourceVector(500, 1000, 1)
     assert managed_charge(reservation, None) == reservation

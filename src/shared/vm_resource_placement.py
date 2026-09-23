@@ -18,7 +18,10 @@ from shared.kubernetes_quantities import (
     QuantityNormalizationError,
 )
 from shared.vm_resource_admission import (
+    EPHEMERAL_RESOURCE,
     KVM_RESOURCE,
+    TUN_RESOURCE,
+    VHOST_NET_RESOURCE,
     ResourceAdmissionError,
     ResourceVector,
     normalize_kvm_devices,
@@ -61,13 +64,22 @@ def _labels(value):
     return result
 
 
-def node_allocatable(node):
+def node_allocatable(node, *, six=False):
     values = _mapping(_mapping(node.get("status", {})).get("allocatable", {}))
     try:
+        if six and any(
+            key not in values
+            for key in (EPHEMERAL_RESOURCE, KVM_RESOURCE, TUN_RESOURCE, VHOST_NET_RESOURCE)
+        ):
+            raise ResourceAdmissionError("invalid_placement")
         return ResourceVector(
             normalize_cpu_millicores(values["cpu"]).normalized_value,
             normalize_byte_quantity(values["memory"]).normalized_value,
             normalize_kvm_devices(values.get(KVM_RESOURCE, 0)),
+            normalize_byte_quantity(values[EPHEMERAL_RESOURCE]).normalized_value
+            if six else 0,
+            normalize_kvm_devices(values[TUN_RESOURCE]) if six else 0,
+            normalize_kvm_devices(values[VHOST_NET_RESOURCE]) if six else 0,
         )
     except (KeyError, QuantityNormalizationError):
         raise ResourceAdmissionError("invalid_placement") from None

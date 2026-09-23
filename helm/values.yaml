@@ -3563,6 +3563,8 @@ vm:
       publicationTimeoutSeconds: null
       historyLimit: null
       nodeLabelKeys: []
+      kubevirtNamespace: null
+      kubevirtName: null
     hostCost:
       cpuMillicoresPerVcpuNumerator: null
       cpuMillicoresPerVcpuDenominator: null
@@ -3570,10 +3572,35 @@ vm:
       fixedMemoryOverheadBytes: null
       perVcpuMemoryOverheadBytes: null
       memoryOverheadBasisPoints: null
+      version: null
+      ephemeralStorageReserveBytes: null
+      kvmDevices: null
+      tunDevices: null
+      vhostNetDevices: null
     nodeHeadroom:
       cpuMillicores: null
       memoryBytes: null
       kvmDevices: null
+      ephemeralStorageBytes: null
+      tunDevices: null
+      vhostNetDevices: null
+    # Installed launcher expectation and hard budgets are operator inputs.
+    # All remain unset while resource admission is disabled.
+    launcherProfile: null
+    installationBudget:
+      cpuMillicores: null
+      memoryBytes: null
+      ephemeralStorageBytes: null
+      kvmDevices: null
+      tunDevices: null
+      vhostNetDevices: null
+    ownerBudget:
+      cpuMillicores: null
+      memoryBytes: null
+      ephemeralStorageBytes: null
+      kvmDevices: null
+      tunDevices: null
+      vhostNetDevices: null
     fairness:
       maxBypasses: null
       priorityAgingSeconds: null

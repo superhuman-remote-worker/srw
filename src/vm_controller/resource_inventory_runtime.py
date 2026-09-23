@@ -160,6 +160,9 @@ async def _observer_resources(settings, *, base_url, secret):
                 max_bytes=settings.max_bytes,
                 request_timeout_seconds=settings.request_timeout_seconds,
                 collection_timeout_seconds=settings.collection_timeout_seconds,
+                protocol=settings.protocol,
+                kubevirt_namespace=settings.kubevirt_namespace,
+                kubevirt_name=settings.kubevirt_name,
             )
             yield ResourceInventoryObserver(
                 collector=collector,

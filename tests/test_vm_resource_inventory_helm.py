@@ -1,4 +1,6 @@
 import shutil
+import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -37,6 +39,56 @@ def test_default_off_has_no_broad_observer_role_or_policy_env():
         doc["metadata"]["name"].endswith("resource-observer") for doc in docs
     )
     assert "VM_RESOURCE_ADMISSION_CONFIG" not in _env(docs, _orchestrator(docs))
+    assert not any(
+        doc["kind"] == "Role" and doc["metadata"]["name"].endswith("resource-installation")
+        for doc in docs
+    )
+
+
+def test_whole_launcher_policy_is_one_digest_and_exact_namespaced_rbac(tmp_path):
+    import json
+    import yaml
+
+    from tests.test_vm_resource_policy import whole_launcher_policy
+
+    policy = whole_launcher_policy()["policy"]
+    policy["stableClusterId"] = "test-cluster"
+    policy["inventory"]["maxItems"] = 1000
+    value = {
+        "vm": {
+            "mode": "same-cluster",
+            "lifecycleAuthSecretName": "vm-lifecycle",
+            "resourceAdmission": policy,
+        },
+        "agent": {"tailscale": {"enabled": False}},
+    }
+    path = tmp_path / "whole-resource-values.yaml"
+    path.write_text(yaml.safe_dump(value))
+    result = subprocess.run(
+        ["helm", "template", "native-test", str(Path(__file__).resolve().parents[1] / "helm"),
+         "-n", "control-plane", "-f", str(Path(__file__).resolve().parents[1] / "helm/ci/test-values.yaml"),
+         "-f", str(path)],
+        capture_output=True, text=True, check=True,
+    )
+    docs = [doc for doc in yaml.safe_load_all(result.stdout) if doc]
+    controller = next(doc for doc in docs if doc["kind"] == "Deployment" and doc["metadata"]["name"].endswith("vm-controller"))
+    left = _env(docs, _orchestrator(docs))["VM_RESOURCE_ADMISSION_CONFIG"]
+    right = _env(docs, controller)["VM_RESOURCE_ADMISSION_CONFIG"]
+    assert left == right
+    canonical = json.loads(left)
+    assert canonical["policy"] == policy
+    settings = InventorySettings.from_environment({
+        "VM_RESOURCE_ADMISSION_CONFIG": left, "VM_LIFECYCLE_HMAC_SECRET": "s" * 32,
+    })
+    assert settings.protocol == 2
+    for deployment in (controller, _orchestrator(docs)):
+        assert deployment["spec"]["template"]["metadata"]["annotations"]["checksum/vm-resource-policy"] == settings.policy_digest.removeprefix("sha256:")
+    installation = next(doc for doc in docs if doc["kind"] == "Role" and doc["metadata"]["name"].endswith("resource-installation"))
+    assert installation["metadata"]["namespace"] == "kubevirt"
+    assert installation["rules"] == [{
+        "apiGroups": ["kubevirt.io"], "resources": ["kubevirts"],
+        "resourceNames": ["kubevirt"], "verbs": ["get"],
+    }]
 
 
 def test_enabled_policy_matches_both_processes_and_rbac_is_list_only():

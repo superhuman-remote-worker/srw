@@ -101,7 +101,7 @@ def _contract(template_text, request, configuration, effect_intent, kind):
     )
     if (
         values["effect_kind"] != kind
-        or (configuration["version"] != 2 and not profile_only_vm)
+        or (configuration["version"] not in (2, 3) and not profile_only_vm)
         or canonical_configuration_digest(configuration)
         != values["controller_configuration_digest"]
         or canonical_request_digest(request) != values["request_digest"]
@@ -118,7 +118,7 @@ def _contract(template_text, request, configuration, effect_intent, kind):
         tolerations=configuration["tolerations"],
         storage_class=configuration["storage_class"],
     )
-    if configuration["version"] == 2 and _encoded(profile) != _encoded(
+    if configuration["version"] in (2, 3) and _encoded(profile) != _encoded(
         configuration["resource_admission"]["template_profile"]
     ):
         raise ValueError

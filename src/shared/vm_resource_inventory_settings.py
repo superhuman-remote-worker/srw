@@ -21,6 +21,7 @@ _LIMITS = {
     "publicationTimeoutSeconds",
     "historyLimit",
 }
+_INSTALLATION_FIELDS = {"kubevirtNamespace", "kubevirtName"}
 _POLICY_FIELDS = {
     "observerEnabled",
     "shadowEnabled",
@@ -31,6 +32,9 @@ _POLICY_FIELDS = {
     "hostCost",
     "nodeHeadroom",
     "fairness",
+}
+_WHOLE_POLICY_FIELDS = _POLICY_FIELDS | {
+    "launcherProfile", "installationBudget", "ownerBudget"
 }
 
 
@@ -48,6 +52,9 @@ class InventorySettings:
     request_timeout_seconds: int
     collection_timeout_seconds: int
     publication_timeout_seconds: int
+    protocol: int = 1
+    kubevirt_namespace: str | None = None
+    kubevirt_name: str | None = None
 
     @classmethod
     def from_environment(cls, source=None):
@@ -90,7 +97,9 @@ class InventorySettings:
             }:
                 raise ValueError
             policy = value["policy"]
-            if not isinstance(policy, dict) or set(policy) != _POLICY_FIELDS:
+            if not isinstance(policy, dict) or set(policy) not in (
+                _POLICY_FIELDS, _WHOLE_POLICY_FIELDS
+            ):
                 raise ValueError
             for field in (
                 "observerEnabled",
@@ -118,6 +127,9 @@ class InventorySettings:
                 raise ValueError
             if value["mode"] != "same-cluster":
                 raise ValueError
+            protocol = 2 if policy.get("launcherProfile") is not None else 1
+            if protocol == 2 and set(policy) != _WHOLE_POLICY_FIELDS:
+                raise ValueError
             cluster, namespace = policy["stableClusterId"], value["namespace"]
             for identifier, limit in ((cluster, 253), (namespace, 63)):
                 if (
@@ -128,7 +140,22 @@ class InventorySettings:
                 ):
                     raise ValueError
             inv = policy["inventory"]
-            if not isinstance(inv, dict) or set(inv) != _LIMITS | {"nodeLabelKeys"}:
+            if not isinstance(inv, dict) or set(inv) not in (
+                _LIMITS | {"nodeLabelKeys"},
+                _LIMITS | {"nodeLabelKeys"} | _INSTALLATION_FIELDS,
+            ):
+                raise ValueError
+            kubevirt_namespace = inv.get("kubevirtNamespace")
+            kubevirt_name = inv.get("kubevirtName")
+            if protocol == 2:
+                if (
+                    not isinstance(kubevirt_namespace, str)
+                    or not isinstance(kubevirt_name, str)
+                    or not kubevirt_namespace or not kubevirt_name
+                    or len(kubevirt_namespace) > 63 or len(kubevirt_name) > 253
+                ):
+                    raise ValueError
+            elif kubevirt_namespace is not None or kubevirt_name is not None:
                 raise ValueError
             for key in _LIMITS:
                 if type(inv[key]) is not int or not 1 <= inv[key] < 2**63:
@@ -147,6 +174,7 @@ class InventorySettings:
             if (
                 len(set(labels)) != len(labels)
                 or "kubernetes.io/hostname" not in labels
+                or (protocol == 2 and "kubernetes.io/arch" not in labels)
             ):
                 raise ValueError
             for section in ("hostCost", "nodeHeadroom", "fairness"):
@@ -172,6 +200,9 @@ class InventorySettings:
                 request_timeout_seconds=inv["requestTimeoutSeconds"],
                 collection_timeout_seconds=inv["collectionTimeoutSeconds"],
                 publication_timeout_seconds=inv["publicationTimeoutSeconds"],
+                protocol=protocol,
+                kubevirt_namespace=kubevirt_namespace,
+                kubevirt_name=kubevirt_name,
             )
         except (ValueError, TypeError, KeyError, UnicodeError):
             raise InventoryError("invalid_inventory_configuration") from None

@@ -38,6 +38,8 @@ class ReservationCharge:
     vm_uid: str | None = None
     vmi_uid: str | None = None
     launcher_uid: str | None = None
+    version: int = 1
+    observed_high_water: ResourceVector | None = None
 
     def __post_init__(self):
         for key in ("reservation_id", "node_uid", "owner_id", "provision_generation"):
@@ -48,6 +50,13 @@ class ReservationCharge:
             self.owner_kind not in {"job", "thread"}
             or self.state not in _HELD | {"released"}
             or not isinstance(self.vector, ResourceVector)
+            or type(self.version) is not int
+            or self.version not in (1, 2)
+            or (
+                self.observed_high_water is not None
+                and not isinstance(self.observed_high_water, ResourceVector)
+            )
+            or (self.version == 1 and self.observed_high_water is not None)
             or not isinstance(self.node_name, str)
             or not 1 <= len(self.node_name) <= 253
             or self.node_name != self.node_name.strip()
@@ -120,11 +129,18 @@ def account_inventory(snapshot, reservations, *, headroom):
     }
     seen, launchers, excluded, blocked_names, orphaned = set(), set(), set(), set(), {}
     held_vms, held_vmis, held_generations = set(), set(), set()
+    held_by_vm = {}
     for reservation in reservations:
         if not isinstance(reservation, ReservationCharge):
             raise ResourceAdmissionError("reservation_identity")
         if reservation.state == "released":
             continue
+        if (snapshot["protocol"] == 2 and reservation.version != 2) or (
+            snapshot["protocol"] == 1 and reservation.version != 1
+        ):
+            # A historical three-field charge cannot become zero ephemeral or
+            # device demand by silently joining a six-field inventory.
+            raise ResourceAdmissionError("legacy_occupancy_unclassified")
         generation_key = (
             reservation.owner_kind,
             reservation.owner_id,
@@ -145,6 +161,7 @@ def account_inventory(snapshot, reservations, *, headroom):
         held_generations.add(generation_key)
         if reservation.vm_uid is not None:
             held_vms.add(reservation.vm_uid)
+            held_by_vm[reservation.vm_uid] = reservation
         if reservation.vmi_uid is not None:
             held_vmis.add(reservation.vmi_uid)
         if reservation.launcher_uid is not None:
@@ -158,11 +175,70 @@ def account_inventory(snapshot, reservations, *, headroom):
             raise ResourceAdmissionError("reservation_node_identity")
         pod = pods.get(reservation.launcher_uid)
         charge = reservation.vector
+        if reservation.observed_high_water is not None:
+            charge = charge.maximum(reservation.observed_high_water)
         if _exact_launcher(reservation, pod, vmis, vms):
             charge = charge.maximum(ResourceVector(**pod["requests"]))
             excluded.add(pod["uid"])
         category = "unbound" if reservation.state == "reserved" else reservation.state
         charges[reservation.node_uid][category] += charge
+    if snapshot["protocol"] == 2:
+        # A known SRW VM is installation/owner occupancy, even when its Pod
+        # vanished. External Pod arithmetic alone cannot charge those budgets.
+        attributable = {}
+        attributable_by_name = {}
+        for vm in snapshot["vms"]:
+            if vm["owner_kind"] not in {"job", "thread"}:
+                continue
+            reservation = held_by_vm.get(vm["uid"])
+            if (
+                reservation is None
+                or reservation.version != 2
+                or reservation.owner_kind != vm["owner_kind"]
+                or reservation.owner_id != vm["owner_id"]
+                or reservation.provision_generation != vm["provision_generation"]
+            ):
+                raise ResourceAdmissionError("legacy_occupancy_unclassified")
+            attributable[vm["uid"]] = reservation
+            attributable_by_name[vm["name"]] = vm["uid"]
+        attributable_vmis = {}
+        for vmi in snapshot["vmis"]:
+            if (
+                vmi["name"] in attributable_by_name
+                and vmi["vm_uid"] != attributable_by_name[vmi["name"]]
+            ):
+                raise ResourceAdmissionError("legacy_occupancy_unclassified")
+            reservation = attributable.get(vmi["vm_uid"])
+            if reservation is None:
+                continue
+            if (
+                reservation.vmi_uid != vmi["uid"]
+                or (
+                    vmi["node_uid"] is not None
+                    and (
+                        reservation.node_uid != vmi["node_uid"]
+                        or reservation.node_name != vmi["node_name"]
+                    )
+                )
+            ):
+                raise ResourceAdmissionError("legacy_occupancy_unclassified")
+            attributable_vmis[vmi["uid"]] = reservation
+        for pod in snapshot["pods"]:
+            if pod["terminal"]:
+                continue
+            reservation = attributable_vmis.get(pod["vmi_uid"])
+            if reservation is not None:
+                if _exact_launcher(reservation, pod, vmis, vms):
+                    continue
+                raise ResourceAdmissionError("legacy_occupancy_unclassified")
+            if (
+                pod["reservation_id"] is not None
+                or pod["provision_generation"] is not None
+            ):
+                # These are SRW-specific launcher markers. A missing VMI/VM
+                # owner link cannot turn marked occupancy into external-only
+                # node charge while logical budgets are enforced.
+                raise ResourceAdmissionError("legacy_occupancy_unclassified")
     pending = ZERO
     for pod in snapshot["pods"]:
         if pod["terminal"] or pod["uid"] in excluded:

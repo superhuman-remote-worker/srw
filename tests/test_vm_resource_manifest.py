@@ -224,6 +224,29 @@ async def test_actual_actuator_body_satisfies_pure_final_contract(final_case, ki
 
 
 @pytest.mark.asyncio
+async def test_v3_whole_launcher_requires_exact_final_vm_body(final_case):
+    from vm_controller.creation_configuration import resolve_creation_configuration
+    from shared.vm_resource_policy import validate_complete_resource_policy
+    from tests.test_vm_resource_policy import whole_launcher_policy
+
+    ctrl, actuator, row, intent = final_case
+    resolved = resolve_creation_configuration(
+        ctrl, row["request"],
+        _resource_policy_snapshot=validate_complete_resource_policy(
+            whole_launcher_policy()
+        ),
+    )
+    row.update(resolved)
+    assert row["controller_configuration"]["version"] == 3
+    values = intent("vm")
+    body = await actuator.body(row, values)
+    validate_final("vm", body, ctrl, row, values)
+    body["spec"]["template"]["spec"]["domain"]["devices"]["interfaces"] = []
+    with pytest.raises(ResourceAdmissionError):
+        validate_final("vm", body, ctrl, row, values)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "path,value",
     [

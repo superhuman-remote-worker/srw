@@ -24,7 +24,10 @@ from shared.vm_resource_admission import (
     ResourceVector,
 )
 from shared.vm_resource_fairness import Waiter, choose_waiter
-from shared.vm_resource_policy import parse_resource_policy_values
+from shared.vm_resource_policy import (
+    parse_resource_policy_values,
+    parse_whole_launcher_policy_values,
+)
 from shared.vm_resource_inventory import InventoryError, snapshot_is_fresh
 from shared.vm_resource_configuration import validate_resource_configuration
 from shared.vm_resource_placement import (
@@ -82,7 +85,15 @@ def _policy_values(document, inventory):
             raise ResourceAdmissionError("invalid_resource_policy")
     if sorted(limits["nodeLabelKeys"]) != inventory.label_keys:
         raise ResourceAdmissionError("invalid_resource_policy")
-    return parse_resource_policy_values(policy)
+    if inventory.protocol == 2 and (
+        limits["kubevirtNamespace"] != inventory.kubevirt_namespace
+        or limits["kubevirtName"] != inventory.kubevirt_name
+    ):
+        raise ResourceAdmissionError("invalid_resource_policy")
+    return (
+        parse_whole_launcher_policy_values(policy)
+        if inventory.protocol == 2 else parse_resource_policy_values(policy)
+    )
 
 
 def _expected_waiter_request_fields(retry, *, inventory, policy_document, cost):
@@ -101,7 +112,7 @@ def _expected_waiter_request_fields(retry, *, inventory, policy_document, cost):
     if (
         not isinstance(configuration, dict)
         or type(configuration.get("version")) is not int
-        or configuration["version"] != 2
+        or configuration["version"] != (3 if inventory.protocol == 2 else 2)
     ):
         raise ResourceAdmissionError("resource_configuration_unavailable")
     try:
@@ -124,11 +135,22 @@ def _expected_waiter_request_fields(retry, *, inventory, policy_document, cost):
             or profile["guest_vcpus"] != request["cpu_cores"]
         ):
             raise ValueError
+        if inventory.protocol == 2 and (
+            resource["version"] != 2
+            or _encoded(resource["launcher_profile"])
+            != _encoded(policy_document["policy"]["launcherProfile"])
+            or _encoded(resource["host_mapping"]["policy"])
+            != _encoded(policy_document["policy"]["hostCost"])
+        ):
+            raise ValueError
         memory = normalize_byte_quantity(request["memory"]).normalized_value
         if profile["guest_memory_bytes"] != memory:
             raise ValueError
         expected_vector = cost.cost(request["cpu_cores"], request["memory"])
-        frozen_vector = ResourceVector(**mapping["vector"])
+        frozen_vector = (
+            ResourceVector.from_six_dict(mapping["vector"])
+            if inventory.protocol == 2 else ResourceVector(**mapping["vector"])
+        )
         if any(type(value) is not int for value in frozen_vector.components) or (
             frozen_vector != expected_vector
         ):
@@ -143,7 +165,7 @@ def _expected_waiter_request_fields(retry, *, inventory, policy_document, cost):
     ):
         raise ResourceAdmissionError("resource_configuration_changed") from None
 
-    return {
+    fields = {
         "request_id": retry["request_id"],
         "job_id": retry["job_id"],
         "provision_generation": retry["provision_generation"],
@@ -152,7 +174,10 @@ def _expected_waiter_request_fields(retry, *, inventory, policy_document, cost):
         "request_digest": retry["request_digest"],
         "guest_vcpus": profile["guest_vcpus"],
         "guest_memory_bytes": profile["guest_memory_bytes"],
-        **expected_vector.to_dict(),
+        **(
+            expected_vector.to_six_dict()
+            if inventory.protocol == 2 else expected_vector.to_dict()
+        ),
         "placement": {
             "version": 1,
             "selector": deepcopy(profile["selector"]),
@@ -166,6 +191,9 @@ def _expected_waiter_request_fields(retry, *, inventory, policy_document, cost):
             ),
         },
     }
+    if inventory.protocol == 2:
+        fields["resource_version"] = 2
+    return fields
 
 
 def _waiter_request_fields_match(actual, expected):
@@ -183,6 +211,17 @@ def _waiter_request_fields_match(actual, expected):
 
 def _node_document(node):
     vector = node["allocatable"]
+    allocatable = {
+        "cpu": str(vector["cpu_millicores"]) + "m",
+        "memory": str(vector["memory_bytes"]),
+        "devices.kubevirt.io/kvm": str(vector["kvm_devices"]),
+    }
+    if "ephemeral_storage_bytes" in vector:
+        allocatable.update({
+            "ephemeral-storage": str(vector["ephemeral_storage_bytes"]),
+            "devices.kubevirt.io/tun": str(vector["tun_devices"]),
+            "devices.kubevirt.io/vhost-net": str(vector["vhost_net_devices"]),
+        })
     return {
         "metadata": {
             "uid": node["uid"],
@@ -194,11 +233,7 @@ def _node_document(node):
             "conditions": [
                 {"type": "Ready", "status": "True" if node["ready"] else "False"}
             ],
-            "allocatable": {
-                "cpu": str(vector["cpu_millicores"]) + "m",
-                "memory": str(vector["memory_bytes"]),
-                "devices.kubevirt.io/kvm": str(vector["kvm_devices"]),
-            },
+            "allocatable": allocatable,
         },
     }
 
@@ -256,9 +291,8 @@ def _fit(snapshot, waiter, accounting, headroom):
         if pv is None or pv["name"] != pvc["pv_name"] or pv["claim_uid"] != retained:
             return [], False
         pv_affinity = pv["required_affinity"]
-    demand = ResourceVector(
-        waiter["cpu_millicores"], waiter["memory_bytes"], waiter["kvm_devices"]
-    )
+    six = snapshot["protocol"] == 2
+    demand = _row_vector(waiter, six=six)
     eligible, fits, transient = [], [], False
     for node in snapshot["nodes"]:
         raw = _node_document(node)
@@ -289,12 +323,15 @@ def _fit(snapshot, waiter, accounting, headroom):
         if node["labels"].get("kubernetes.io/hostname") != node["name"]:
             transient = True
             continue
+        if six and node["labels"].get("kubernetes.io/arch") != "amd64":
+            continue
         # Static capacity excludes occupancy, but includes explicit headroom.
         capacity = ResourceVector(
             *(
                 max(0, a - b)
                 for a, b in zip(
-                    ResourceVector(**node["allocatable"]).components,
+                    ResourceVector.from_six_dict(node["allocatable"]).components
+                    if six else ResourceVector(**node["allocatable"]).components,
                     headroom.components,
                 )
             )
@@ -309,6 +346,30 @@ def _fit(snapshot, waiter, accounting, headroom):
     ) and not transient
 
 
+def _row_vector(row, *, six):
+    value = {
+        key: row[key] for key in ("cpu_millicores", "memory_bytes", "kvm_devices")
+    }
+    if six:
+        value.update({
+            key: row[key]
+            for key in ("ephemeral_storage_bytes", "tun_devices", "vhost_net_devices")
+        })
+        return ResourceVector.from_six_dict(value)
+    return ResourceVector(**value)
+
+
+def _charge_vector(row):
+    vector = _row_vector(row, six=row["resource_version"] == 2)
+    if row["resource_version"] != 2 or row["observed_cpu_millicores"] is None:
+        return vector
+    return vector.maximum(ResourceVector(
+        row["observed_cpu_millicores"], row["observed_memory_bytes"],
+        row["observed_kvm_devices"], row["observed_ephemeral_storage_bytes"],
+        row["observed_tun_devices"], row["observed_vhost_net_devices"],
+    ))
+
+
 class VMResourceReservationStore:
     def __init__(self, db, *, inventory, policy_document, policy_revision):
         self.db, self.inventory = db, inventory
@@ -321,9 +382,16 @@ class VMResourceReservationStore:
                 != inventory.policy_digest
             ):
                 raise ResourceAdmissionError("resource_policy_changed")
-            self.cost, self.headroom, self.max_bypasses, self.aging_seconds = (
-                _policy_values(self.policy_document, inventory)
-            )
+            parsed = _policy_values(self.policy_document, inventory)
+            if inventory.protocol == 2:
+                (
+                    self.cost, self.headroom, self.installation_budget,
+                    self.owner_budget, self.max_bypasses, self.aging_seconds,
+                    self.launcher_profile,
+                ) = parsed
+            else:
+                self.cost, self.headroom, self.max_bypasses, self.aging_seconds = parsed
+                self.installation_budget = self.owner_budget = self.launcher_profile = None
             self.policy_encoded = encoded
         except (ValueError, TypeError, KeyError):
             raise ResourceAdmissionError("invalid_resource_policy") from None
@@ -387,25 +455,30 @@ class VMResourceReservationStore:
             owner_key = (
                 "system" if job["user_id"] is None else "user:" + str(job["user_id"])
             )
-            row = await conn.fetchrow(
-                "INSERT INTO vm_resource_waiters(request_id,job_id,provision_generation,cluster_id,policy_digest,owner_key,project_id,priority,request_digest,guest_vcpus,guest_memory_bytes,cpu_millicores,memory_bytes,kvm_devices,placement) "
-                "VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15::jsonb) RETURNING *",
-                expected["request_id"],
-                expected["job_id"],
-                expected["provision_generation"],
-                expected["cluster_id"],
-                expected["policy_digest"],
-                owner_key,
-                job["project_id"],
-                job["priority"],
-                expected["request_digest"],
-                expected["guest_vcpus"],
-                expected["guest_memory_bytes"],
-                expected["cpu_millicores"],
-                expected["memory_bytes"],
-                expected["kvm_devices"],
-                json.dumps(expected["placement"]),
+            values = (
+                expected["request_id"], expected["job_id"],
+                expected["provision_generation"], expected["cluster_id"],
+                expected["policy_digest"], owner_key, job["project_id"],
+                job["priority"], expected["request_digest"],
+                expected["guest_vcpus"], expected["guest_memory_bytes"],
+                expected["cpu_millicores"], expected["memory_bytes"],
+                expected["kvm_devices"], json.dumps(expected["placement"]),
             )
+            if self.inventory.protocol == 2:
+                row = await conn.fetchrow(
+                    "INSERT INTO vm_resource_waiters(request_id,job_id,provision_generation,cluster_id,policy_digest,owner_key,project_id,priority,request_digest,guest_vcpus,guest_memory_bytes,cpu_millicores,memory_bytes,kvm_devices,placement,ephemeral_storage_bytes,tun_devices,vhost_net_devices,resource_version) "
+                    "VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15::jsonb,$16,$17,$18,2) RETURNING *",
+                    *values,
+                    expected["ephemeral_storage_bytes"],
+                    expected["tun_devices"],
+                    expected["vhost_net_devices"],
+                )
+            else:
+                row = await conn.fetchrow(
+                    "INSERT INTO vm_resource_waiters(request_id,job_id,provision_generation,cluster_id,policy_digest,owner_key,project_id,priority,request_digest,guest_vcpus,guest_memory_bytes,cpu_millicores,memory_bytes,kvm_devices,placement) "
+                    "VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15::jsonb) RETURNING *",
+                    *values,
+                )
         elif row is None:
             raise ResourceAdmissionError("resource_waiter_missing")
         if not _waiter_request_fields_match(row, expected):
@@ -454,9 +527,9 @@ class VMResourceReservationStore:
                 raise ResourceAdmissionError("resource_policy_changed")
             if (
                 held["request_id"] != expected_waiter["request_id"]
-                or held["cpu_millicores"] != expected_waiter["cpu_millicores"]
-                or held["memory_bytes"] != expected_waiter["memory_bytes"]
-                or held["kvm_devices"] != expected_waiter["kvm_devices"]
+                or (inventory.protocol == 2 and held["resource_version"] != 2)
+                or _row_vector(held, six=inventory.protocol == 2)
+                != _row_vector(expected_waiter, six=inventory.protocol == 2)
             ):
                 raise ResourceAdmissionError("resource_waiter_changed")
             if held["state"] == "teardown":
@@ -504,7 +577,7 @@ class VMResourceReservationStore:
             inventory.policy_digest,
         )
         reservations = await conn.fetch(
-            "SELECT r.*,w.job_id,w.provision_generation FROM vm_resource_reservations r JOIN vm_resource_waiters w ON w.request_id=r.request_id WHERE r.cluster_id=$1 AND r.state<>'released' ORDER BY r.id FOR UPDATE OF r",
+            "SELECT r.*,w.job_id,w.provision_generation,w.owner_key FROM vm_resource_reservations r JOIN vm_resource_waiters w ON w.request_id=r.request_id WHERE r.cluster_id=$1 AND r.state<>'released' ORDER BY r.id FOR UPDATE OF r",
             inventory.cluster_id,
         )
         owners = await conn.fetch(
@@ -525,6 +598,14 @@ class VMResourceReservationStore:
             stale_after_seconds=inventory.stale_after_seconds,
         ):
             raise ResourceAdmissionError("inventory_stale")
+        if inventory.protocol == 2:
+            installed = snapshot["installed_profile"]
+            if (
+                installed["namespace"] != inventory.kubevirt_namespace
+                or installed["name"] != inventory.kubevirt_name
+                or _encoded(installed["profile"]) != _encoded(self.launcher_profile)
+            ):
+                raise ResourceAdmissionError("installed_launcher_profile_changed")
         target = next(
             (row for row in waiters if row["request_id"] == retry["request_id"]), None
         )
@@ -532,11 +613,14 @@ class VMResourceReservationStore:
             raise ResourceAdmissionError("resource_waiter_missing")
         if not _waiter_request_fields_match(target, expected_waiter):
             raise ResourceAdmissionError("resource_waiter_changed")
-        expected = ResourceVector(
-            expected_waiter["cpu_millicores"],
-            expected_waiter["memory_bytes"],
-            expected_waiter["kvm_devices"],
-        )
+        owner_key = "system" if job["user_id"] is None else "user:" + str(job["user_id"])
+        if inventory.protocol == 2 and target["owner_key"] != owner_key:
+            raise ResourceAdmissionError("resource_waiter_changed")
+        if inventory.protocol == 2 and any(
+            row["resource_version"] != 2 for row in reservations
+        ):
+            raise ResourceAdmissionError("legacy_occupancy_unclassified")
+        expected = _row_vector(expected_waiter, six=inventory.protocol == 2)
         charges = [
             ReservationCharge(
                 reservation_id=str(row["id"]),
@@ -545,10 +629,16 @@ class VMResourceReservationStore:
                 owner_kind="job",
                 owner_id=str(row["job_id"]),
                 provision_generation=str(row["provision_generation"]),
-                vector=ResourceVector(
-                    row["cpu_millicores"], row["memory_bytes"], row["kvm_devices"]
-                ),
+                vector=_row_vector(row, six=inventory.protocol == 2),
                 state=row["state"],
+                version=row["resource_version"] if inventory.protocol == 2 else 1,
+                observed_high_water=(
+                    ResourceVector(
+                        row["observed_cpu_millicores"], row["observed_memory_bytes"],
+                        row["observed_kvm_devices"], row["observed_ephemeral_storage_bytes"],
+                        row["observed_tun_devices"], row["observed_vhost_net_devices"],
+                    ) if inventory.protocol == 2 and row["observed_cpu_millicores"] is not None else None
+                ),
                 **{
                     key: str(row[key]) if row[key] else None
                     for key in ("vm_uid", "vmi_uid", "launcher_uid")
@@ -557,6 +647,15 @@ class VMResourceReservationStore:
             for row in reservations
         ]
         accounting = account_inventory(snapshot, charges, headroom=self.headroom)
+        installation_held = ResourceVector(0, 0, 0)
+        owner_held = {}
+        if inventory.protocol == 2:
+            for row in reservations:
+                charge = _charge_vector(row)
+                installation_held += charge
+                owner_held[row["owner_key"]] = owner_held.get(
+                    row["owner_key"], ResourceVector(0, 0, 0)
+                ) + charge
         candidates, fits, nonfit = [], {}, set()
         for row in waiters:
             if (
@@ -566,6 +665,12 @@ class VMResourceReservationStore:
                 continue
             identity = str(row["request_id"])
             fit, impossible = _fit(snapshot, row, accounting, self.headroom)
+            if inventory.protocol == 2:
+                row_demand = _row_vector(row, six=True)
+                if not (installation_held + row_demand).fits(self.installation_budget) or not (
+                    owner_held.get(row["owner_key"], ResourceVector(0, 0, 0)) + row_demand
+                ).fits(self.owner_budget):
+                    fit = []
             fits[identity] = fit
             if impossible:
                 nonfit.add(identity)
@@ -615,24 +720,43 @@ class VMResourceReservationStore:
             )
             return {"action": "protected"}
         if choice.action != "admit":
+            if inventory.protocol == 2:
+                if not (installation_held + expected).fits(self.installation_budget):
+                    return {"action": "wait", "reason": "installation_budget"}
+                if not (
+                    owner_held.get(target["owner_key"], ResourceVector(0, 0, 0)) + expected
+                ).fits(self.owner_budget):
+                    return {"action": "wait", "reason": "owner_budget"}
             return {"action": "wait"}
+        if inventory.protocol == 2:
+            if not (installation_held + expected).fits(self.installation_budget):
+                return {"action": "wait", "reason": "installation_budget"}
+            if not (
+                owner_held.get(target["owner_key"], ResourceVector(0, 0, 0)) + expected
+            ).fits(self.owner_budget):
+                return {"action": "wait", "reason": "owner_budget"}
         sequence = policy["admission_sequence"] + 1
         _positive(sequence)
-        reservation = await conn.fetchrow(
-            "INSERT INTO vm_resource_reservations(id,request_id,revision,cluster_id,policy_digest,node_uid,node_name,cpu_millicores,memory_bytes,kvm_devices,snapshot_id,snapshot_digest) "
-            "VALUES($1,$2,(SELECT COALESCE(max(revision),0)+1 FROM vm_resource_reservations WHERE request_id=$2),$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *",
-            uuid4(),
-            retry["request_id"],
-            inventory.cluster_id,
-            inventory.policy_digest,
-            UUID(choice.node_uid),
-            node_names[choice.node_uid],
-            expected.cpu_millicores,
-            expected.memory_bytes,
-            expected.kvm_devices,
-            observation["snapshot_id"],
-            observation["digest"],
+        values = (
+            uuid4(), retry["request_id"], inventory.cluster_id,
+            inventory.policy_digest, UUID(choice.node_uid),
+            node_names[choice.node_uid], expected.cpu_millicores,
+            expected.memory_bytes, expected.kvm_devices,
+            observation["snapshot_id"], observation["digest"],
         )
+        if inventory.protocol == 2:
+            reservation = await conn.fetchrow(
+                "INSERT INTO vm_resource_reservations(id,request_id,revision,cluster_id,policy_digest,node_uid,node_name,cpu_millicores,memory_bytes,kvm_devices,snapshot_id,snapshot_digest,ephemeral_storage_bytes,tun_devices,vhost_net_devices,resource_version) "
+                "VALUES($1,$2,(SELECT COALESCE(max(revision),0)+1 FROM vm_resource_reservations WHERE request_id=$2),$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,2) RETURNING *",
+                *values, expected.ephemeral_storage_bytes,
+                expected.tun_devices, expected.vhost_net_devices,
+            )
+        else:
+            reservation = await conn.fetchrow(
+                "INSERT INTO vm_resource_reservations(id,request_id,revision,cluster_id,policy_digest,node_uid,node_name,cpu_millicores,memory_bytes,kvm_devices,snapshot_id,snapshot_digest) "
+                "VALUES($1,$2,(SELECT COALESCE(max(revision),0)+1 FROM vm_resource_reservations WHERE request_id=$2),$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *",
+                *values,
+            )
         await conn.execute(
             "UPDATE vm_resource_waiters SET state='admitted',reason=NULL,evaluated_snapshot_id=$2,revision=revision+1 WHERE request_id=$1",
             retry["request_id"],

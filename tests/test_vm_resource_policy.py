@@ -43,6 +43,61 @@ def enforcement_policy():
     return value
 
 
+def whole_launcher_policy():
+    from shared.vm_launcher_profile import default_launcher_profile
+
+    value = complete_policy()
+    inv = value["policy"]["inventory"]
+    inv["nodeLabelKeys"].append("kubernetes.io/arch")
+    inv.update(kubevirtNamespace="kubevirt", kubevirtName="kubevirt")
+    value["policy"]["hostCost"].update(
+        version=2,
+        launcherCpuOverheadMillicores=5,
+        fixedMemoryOverheadBytes=260 * 1024**2 + 35000000,
+        ephemeralStorageReserveBytes=50000000,
+        kvmDevices=1,
+        tunDevices=1,
+        vhostNetDevices=1,
+    )
+    value["policy"]["nodeHeadroom"].update(
+        ephemeralStorageBytes=0, tunDevices=0, vhostNetDevices=0,
+    )
+    budget = {
+        "cpuMillicores": 10000,
+        "memoryBytes": 64 * 1024**3,
+        "ephemeralStorageBytes": 100000000000,
+        "kvmDevices": 100,
+        "tunDevices": 100,
+        "vhostNetDevices": 100,
+    }
+    value["policy"].update(
+        launcherProfile=default_launcher_profile(),
+        installationBudget=budget,
+        ownerBudget=budget.copy(),
+    )
+    return value
+
+
+def test_whole_launcher_policy_freezes_independent_reserve_and_budgets():
+    from shared.vm_resource_policy import validate_complete_resource_policy
+
+    value = whole_launcher_policy()
+    result = validate_complete_resource_policy(value)
+    assert result.inventory.protocol == 2
+    assert result.launcher_profile == value["policy"]["launcherProfile"]
+    assert result.host_cost.cost(2, "512Mi").to_six_dict() == {
+        "cpu_millicores": 205,
+        "memory_bytes": 512 * 1024**2 + 276 * 1024**2 + 35000000,
+        "ephemeral_storage_bytes": 50000000,
+        "kvm_devices": 1,
+        "tun_devices": 1,
+        "vhost_net_devices": 1,
+    }
+    assert result.installation_budget.cpu_millicores == 10000
+    value["policy"]["ownerBudget"]["cpuMillicores"] = 9999
+    assert validate_complete_resource_policy(value).policy_digest != result.policy_digest
+
+
 def enforcement_snapshot(value=None):
     from shared.vm_resource_policy import validate_enforcement_resource_policy
 
