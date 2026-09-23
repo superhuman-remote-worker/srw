@@ -442,6 +442,39 @@ async def test_srw_marked_launcher_without_vm_owner_link_refuses_cutover(db):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("marked", [True, False])
+async def test_pod_without_vmi_owner_link_only_blocks_when_srw_marked(db, marked):
+    store, inventory, value, _ = await environment(db, installation_count=2)
+    observed = deepcopy(value)
+    observed["snapshot_id"] = str(uuid4())
+    observed["sequence"] += 1
+    observed["started_at"] = observed["finished_at"] = datetime.now(timezone.utc).isoformat()
+    node = observed["nodes"][0]
+    observed["pods"] = [{
+        "uid": str(uuid4()), "namespace": observed["namespace"],
+        "name": "virt-launcher-owner-link-absent", "node_uid": node["uid"],
+        "node_name": node["name"], "terminal": False, "deleting": False,
+        "requests": {
+            "cpu_millicores": 205, "memory_bytes": 861277888,
+            "ephemeral_storage_bytes": 50000000, "kvm_devices": 1,
+            "tun_devices": 1, "vhost_net_devices": 1,
+        },
+        "vmi_uid": None,
+        "reservation_id": str(uuid4()) if marked else None,
+        "provision_generation": str(uuid4()) if marked else None,
+    }]
+    await publish(inventory, observed)
+    target = await waiter(db, store, inventory, user_id=uuid4())
+    result = await store.admit(request_id=str(target["request_id"]))
+    if marked:
+        assert result == {
+            "action": "unavailable", "reason": "legacy_occupancy_unclassified",
+        }
+    else:
+        assert result["action"] == "admitted"
+
+
+@pytest.mark.asyncio
 async def test_exact_bound_live_launcher_uses_one_v2_charge(db):
     store, inventory, value, demand = await environment(
         db, installation_count=2, owner_count=2,

@@ -231,7 +231,7 @@ def account_inventory(snapshot, reservations, *, headroom):
                 if _exact_launcher(reservation, pod, vmis, vms):
                     continue
                 raise ResourceAdmissionError("legacy_occupancy_unclassified")
-            if pod["vmi_uid"] is not None and (
+            if (
                 pod["reservation_id"] is not None
                 or pod["provision_generation"] is not None
             ):
