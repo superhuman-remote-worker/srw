@@ -137,6 +137,40 @@ async def waiter(db, store, inventory, *, user_id=None):
 
 
 @pytest.mark.asyncio
+async def test_ordinary_retry_admission_creates_v3_waiter_without_private_injection(db):
+    store, inventory, _, _ = await environment(db)
+    config = whole_launcher_configuration()
+    config.update(namespace="workers", storage_class="local")
+    resource = config["resource_admission"]
+    resource["cluster_id"] = inventory.cluster_id
+    resource["policy_digest"] = inventory.policy_digest
+    resource["template_profile"].update(
+        storage_class="local", guest_vcpus=8, guest_memory_bytes=16 * 1024**3,
+    )
+    resource["launcher_prediction"]["vector"] = predict_launcher(
+        store.launcher_profile, guest_vcpus=8, guest_memory_bytes=16 * 1024**3,
+    ).to_six_dict()
+    resource["host_mapping"]["vector"] = store.cost.cost(8, "16Gi").to_six_dict()
+    job, generation, proposal = await admitted_job(db, controller_configuration=config)
+    request_id = str(uuid4())
+
+    async with db.acquire() as conn, conn.transaction():
+        await VMCreationRetryStore(db).admit_on_conn(
+            conn, job_id=str(job), expected_generation=str(generation),
+            request_id=request_id, proposal=proposal,
+        )
+
+    row = await db.fetchrow(
+        "SELECT resource_version,cluster_id,policy_digest FROM vm_resource_waiters "
+        "WHERE request_id=$1", request_id,
+    )
+    assert row is not None
+    assert (row["resource_version"], row["cluster_id"], row["policy_digest"]) == (
+        2, inventory.cluster_id, inventory.policy_digest,
+    )
+
+
+@pytest.mark.asyncio
 async def test_atomic_final_installation_slot_and_exact_replay(db):
     store, inventory, _, demand = await environment(db)
     first = await waiter(db, store, inventory, user_id=uuid4())

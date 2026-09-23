@@ -64,6 +64,18 @@ def test_inventory_off_requires_no_policy_or_hmac():
     assert load(value, secret="") is None
 
 
+def test_enforced_whole_launcher_inventory_uses_the_installed_policy_identity():
+    from tests.test_vm_resource_policy import whole_launcher_policy
+
+    value = whole_launcher_policy()
+    value["policy"].update(shadowEnabled=True, enforcementEnabled=True)
+    settings = load(value)
+    assert settings.protocol == 2
+    assert settings.kubevirt_namespace == "kubevirt"
+    assert settings.kubevirt_name == "kubevirt"
+    assert settings.policy_digest.startswith("sha256:")
+
+
 def test_policy_digest_is_canonical_and_covers_scope_and_label_coverage():
     value = configuration()
     first = load(value)

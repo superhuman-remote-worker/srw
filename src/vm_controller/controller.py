@@ -2229,6 +2229,10 @@ class VMController:
 
     async def _do_create_serialized(self, job_config: dict) -> dict:
         """Create while holding the reusable entity-name lifecycle lock."""
+        from shared.vm_resource_policy import configured_enforcement_required
+
+        if "creation_retry" not in job_config and configured_enforcement_required():
+            raise ValueError("VM resource admission requires durable creation authority")
         if "creation_retry" in job_config:
             from vm_controller.creation_actuation import CreationActuator
 
@@ -5983,8 +5987,14 @@ class VMController:
             base_url=ORCHESTRATOR_URL,
             secret=LIFECYCLE_HMAC_SECRET,
             stop=self._shutdown,
-        ):
-            await self._run_transports()
+        ) as observer:
+            self.resource_inventory_collector = (
+                observer.collector if observer is not None else None
+            )
+            try:
+                await self._run_transports()
+            finally:
+                self.resource_inventory_collector = None
 
     async def _run_transports(self):
         """Serve lifecycle requests within the inventory observer lifetime."""

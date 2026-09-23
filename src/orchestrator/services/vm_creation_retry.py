@@ -20,6 +20,7 @@ logger = logging.getLogger(__name__)
 
 class VMCreationRetryService:
     def __init__(self, db, provisioner):
+        self.db = db
         self.provisioner = provisioner
         self.preflight = VMCreationPreflightStore(db)
         self.store = VMCreationRetryStore(db)
@@ -60,6 +61,48 @@ class VMCreationRetryService:
                     "reason": "creation_evidence_unproven",
                 }
         else:
+            from orchestrator.services.vm_resource_job_runtime import (
+                installed_job_resource_store,
+            )
+            from shared.vm_resource_admission import ResourceAdmissionError
+
+            try:
+                async with self.db.acquire() as conn:
+                    # A previously issued effect must reach the controller's
+                    # exact observation path even after the installed policy
+                    # is drained or disabled. This read grants no new effect;
+                    # authorize/begin-effect still guard any later issuance.
+                    issued = await conn.fetchval(
+                        "SELECT EXISTS(SELECT 1 FROM vm_creation_effects "
+                        "WHERE request_id=$1 AND state IN ('issued','observed'))",
+                        claim["request_id"],
+                    )
+                    resource = (
+                        None if issued else await installed_job_resource_store(
+                            conn, self.db, claim.get("controller_configuration"),
+                        )
+                    )
+                if resource is not None:
+                    admission = await resource.admit(request_id=str(claim["request_id"]))
+                    if admission["action"] != "admitted":
+                        await self.store.apply_observation(
+                            request_id=str(claim["request_id"]),
+                            claim_token=str(claim["claim_token"]),
+                            expected_revision=claim["revision"],
+                            observation={
+                                "outcome": "capacity_wait",
+                                "reason": admission.get("reason", "resource_wait"),
+                            },
+                        )
+                        return
+            except ResourceAdmissionError:
+                await self.store.apply_observation(
+                    request_id=str(claim["request_id"]),
+                    claim_token=str(claim["claim_token"]),
+                    expected_revision=claim["revision"],
+                    observation={"outcome": "blocked", "reason": "resource_policy_changed"},
+                )
+                return
             try:
                 observation = await replay_vm_creation(
                     self.provisioner._http_client,

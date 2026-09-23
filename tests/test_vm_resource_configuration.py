@@ -259,6 +259,24 @@ def test_resolver_opt_in_is_private_typed_and_no_policy_keeps_v1(resolver_inputs
     vm.custom_api.assert_not_called()
 
 
+def test_operator_enforcement_selects_v3_on_actual_configuration_resolver(
+    resolver_inputs, monkeypatch,
+):
+    from tests.test_vm_resource_policy import whole_launcher_policy
+    from vm_controller.creation_configuration import resolve_creation_configuration
+
+    policy = whole_launcher_policy()
+    policy["policy"].update(shadowEnabled=True, enforcementEnabled=True)
+    monkeypatch.setenv("VM_RESOURCE_ADMISSION_CONFIG", json.dumps(policy))
+    vm, request = resolver_inputs
+
+    result = resolve_creation_configuration(vm, request)
+
+    assert result["controller_configuration"]["version"] == 3
+    assert result["controller_configuration"]["resource_admission"]["version"] == 2
+    assert result["controller_configuration"]["resource_admission"]["cluster_id"] == "test-cluster"
+
+
 @pytest.mark.parametrize("invalid", [{}, "sha256:" + "a" * 64, False])
 def test_explicit_invalid_policy_does_not_downgrade(resolver_inputs, invalid):
     from vm_controller.creation_configuration import resolve_creation_configuration

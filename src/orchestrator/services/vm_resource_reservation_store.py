@@ -404,7 +404,225 @@ class VMResourceReservationStore:
         except (VMCreationRetryConflict, ResourceAdmissionError, InventoryError) as exc:
             return {"action": "unavailable", "reason": str(exc)}
 
-    async def _lock_policy(self, conn, *, allow_drain=False):
+    async def grant_on_conn(self, conn, *, retry, job):
+        """Recheck an already-held v2 grant after source locks, before issuance.
+
+        This never allocates capacity. The caller must own the retry's exact
+        Job/source/effect scope; policy serialization follows that scope.
+        """
+        await self._lock_policy(conn)
+        head = await conn.fetchrow(
+            "SELECT * FROM vm_resource_inventory_heads WHERE cluster_id=$1 "
+            "AND policy_digest=$2 FOR UPDATE",
+            self.inventory.cluster_id, self.inventory.policy_digest,
+        )
+        if head is None or head["current_snapshot_id"] is None or head["observation_conflict"]:
+            raise ResourceAdmissionError("inventory_missing")
+        observation = await conn.fetchrow(
+            "SELECT * FROM vm_resource_inventory_snapshots WHERE snapshot_id=$1",
+            head["current_snapshot_id"],
+        )
+        if observation is None:
+            raise ResourceAdmissionError("inventory_missing")
+        snapshot = self.inventory._snapshot(
+            _json(observation["document"]), observation["digest"]
+        )
+        expected = _expected_waiter_request_fields(
+            retry, inventory=self.inventory,
+            policy_document=self.policy_document, cost=self.cost,
+        )
+        waiter = await conn.fetchrow(
+            "SELECT * FROM vm_resource_waiters WHERE request_id=$1 FOR UPDATE",
+            retry["request_id"],
+        )
+        if waiter is None or not _waiter_request_fields_match(waiter, expected):
+            raise ResourceAdmissionError("resource_waiter_changed")
+        owner_key = "system" if job["user_id"] is None else "user:" + str(job["user_id"])
+        if waiter["owner_key"] != owner_key:
+            raise ResourceAdmissionError("resource_owner_changed")
+        held = await conn.fetchrow(
+            "SELECT * FROM vm_resource_reservations WHERE request_id=$1 "
+            "AND state<>'released' FOR UPDATE", retry["request_id"],
+        )
+        if held is None:
+            raise ResourceAdmissionError("resource_reservation_missing")
+        if (
+            waiter["state"] != "admitted"
+            or
+            held["state"] != "reserved"
+            or held["resource_version"] != 2
+            or held["cluster_id"] != self.inventory.cluster_id
+            or held["policy_digest"] != self.inventory.policy_digest
+            or _row_vector(held, six=True) != _row_vector(expected, six=True)
+        ):
+            raise ResourceAdmissionError("resource_reservation_changed")
+        node = await conn.fetchrow(
+            "SELECT node_name FROM vm_resource_nodes WHERE cluster_id=$1 "
+            "AND node_uid=$2", held["cluster_id"], held["node_uid"],
+        )
+        if node is None or node["node_name"] != held["node_name"]:
+            raise ResourceAdmissionError("reservation_node_identity")
+        now = await self._deadline(conn, retry)
+        if not snapshot["complete"] or not snapshot_is_fresh(
+            snapshot, received_at=observation["received_at"], now=now,
+            stale_after_seconds=self.inventory.stale_after_seconds,
+        ):
+            raise ResourceAdmissionError("inventory_stale")
+        grant = {
+            "version": 1,
+            "id": str(held["id"]),
+            "revision": held["revision"],
+            "cluster_id": held["cluster_id"],
+            "policy_digest": held["policy_digest"],
+            "node_uid": str(held["node_uid"]),
+            "node_name": held["node_name"],
+            "vector": _row_vector(held, six=True).to_six_dict(),
+            "headroom": self.headroom.to_six_dict(),
+            "snapshot_id": str(held["snapshot_id"]),
+            "snapshot_digest": held["snapshot_digest"],
+        }
+        from shared.vm_resource_effect_node import validate_resource_effect_node
+
+        validate_resource_effect_node(
+            snapshot, grant=grant,
+            resource=retry["controller_configuration"]["resource_admission"],
+            expected_pvc_uid=(
+                str(retry["expected_pvc_uid"])
+                if retry["expected_pvc_uid"] else None
+            ),
+        )
+        return grant
+
+    async def bind_ready_on_conn(self, conn, *, retry, vm, job_id, generation):
+        """Bind one genuine signed-inventory launcher before Job Ready commits.
+
+        The caller already owns the Job lock and its Ready identity CAS. A
+        refusal can still commit observed high-water, so this returns False
+        instead of raising when authentic demand exceeds the reservation.
+        """
+        await self._lock_policy(conn, allow_off=True)
+        if retry["state"] != "succeeded":
+            return False
+        head = await conn.fetchrow(
+            "SELECT * FROM vm_resource_inventory_heads WHERE cluster_id=$1 "
+            "AND policy_digest=$2 FOR UPDATE",
+            self.inventory.cluster_id, self.inventory.policy_digest,
+        )
+        if head is None or head["current_snapshot_id"] is None or head["observation_conflict"]:
+            return False
+        observation = await conn.fetchrow(
+            "SELECT * FROM vm_resource_inventory_snapshots WHERE snapshot_id=$1",
+            head["current_snapshot_id"],
+        )
+        if observation is None:
+            return False
+        snapshot = self.inventory._snapshot(
+            _json(observation["document"]), observation["digest"]
+        )
+        waiter = await conn.fetchrow(
+            "SELECT * FROM vm_resource_waiters WHERE request_id=$1 FOR UPDATE",
+            retry["request_id"],
+        )
+        reservation = await conn.fetchrow(
+            "SELECT * FROM vm_resource_reservations WHERE request_id=$1 "
+            "AND state<>'released' FOR UPDATE", retry["request_id"],
+        )
+        if waiter is None or reservation is None or (
+            waiter["state"] != "admitted"
+            or reservation["resource_version"] != 2
+            or reservation["state"] not in {"reserved", "active", "warm"}
+        ):
+            return False
+        expected = _expected_waiter_request_fields(
+            retry, inventory=self.inventory,
+            policy_document=self.policy_document, cost=self.cost,
+        )
+        if not _waiter_request_fields_match(waiter, expected) or (
+            _row_vector(reservation, six=True) != _row_vector(expected, six=True)
+        ):
+            return False
+        now = await conn.fetchval("SELECT clock_timestamp()")
+        if not snapshot["complete"] or not snapshot_is_fresh(
+            snapshot, received_at=observation["received_at"], now=now,
+            stale_after_seconds=self.inventory.stale_after_seconds,
+        ):
+            return False
+        vm_uid = vm.get("vm_uid")
+        vmi_uid = vm.get("vmi_uid")
+        launcher_uid = vm.get("active_pod_uid")
+        pvc_uid = vm.get("rootdisk_pvc_uid")
+        if not all(isinstance(value, str) for value in (
+            vm_uid, vmi_uid, launcher_uid, pvc_uid,
+        )) or (
+            vm_uid != str(retry["observed_vm_uid"])
+            or pvc_uid != str(retry["observed_pvc_uid"] or retry["expected_pvc_uid"])
+        ):
+            return False
+        matches = tuple(
+            next((item for item in snapshot[key] if item["uid"] == uid), None)
+            for key, uid in (
+                ("vms", vm_uid), ("vmis", vmi_uid), ("pods", launcher_uid),
+            )
+        )
+        actual_vm, actual_vmi, pod = matches
+        node_uid = str(reservation["node_uid"])
+        if (
+            actual_vm is None or actual_vmi is None or pod is None
+            or actual_vm["owner_kind"] != "job"
+            or actual_vm["owner_id"] != job_id
+            or actual_vm["provision_generation"] != generation
+            or actual_vm["name"] != "agent-vm-" + job_id
+            or actual_vm["deleting"]
+            or actual_vmi["vm_uid"] != vm_uid
+            or actual_vmi["node_uid"] != node_uid
+            or actual_vmi["node_name"] != reservation["node_name"]
+            or actual_vmi["deleting"]
+            or pod["terminal"] or pod["deleting"]
+            or pod["vmi_uid"] != vmi_uid
+            or pod["reservation_id"] != str(reservation["id"])
+            or pod["provision_generation"] != generation
+            or pod["node_uid"] != node_uid
+            or pod["node_name"] != reservation["node_name"]
+        ):
+            return False
+        if any(
+            reservation[field] is not None and str(reservation[field]) != uid
+            for field, uid in (
+                ("vm_uid", vm_uid), ("vmi_uid", vmi_uid),
+                ("launcher_uid", launcher_uid),
+            )
+        ):
+            return False
+        demand = ResourceVector.from_six_dict(pod["requests"])
+        high = (
+            ResourceVector(
+                reservation["observed_cpu_millicores"],
+                reservation["observed_memory_bytes"],
+                reservation["observed_kvm_devices"],
+                reservation["observed_ephemeral_storage_bytes"],
+                reservation["observed_tun_devices"],
+                reservation["observed_vhost_net_devices"],
+            ) if reservation["observed_cpu_millicores"] is not None
+            else ResourceVector(0, 0, 0)
+        ).maximum(demand)
+        fits = high.fits(_row_vector(reservation, six=True))
+        await conn.execute(
+            "UPDATE vm_resource_reservations SET "
+            "vm_uid=COALESCE(vm_uid,$2),vmi_uid=COALESCE(vmi_uid,$3),"
+            "launcher_uid=COALESCE(launcher_uid,$4),"
+            "observed_cpu_millicores=$5,observed_memory_bytes=$6,"
+            "observed_kvm_devices=$7,observed_ephemeral_storage_bytes=$8,"
+            "observed_tun_devices=$9,observed_vhost_net_devices=$10,"
+            "state=CASE WHEN $11 THEN 'active' ELSE state END "
+            "WHERE id=$1",
+            reservation["id"], UUID(vm_uid), UUID(vmi_uid), UUID(launcher_uid),
+            high.cpu_millicores, high.memory_bytes, high.kvm_devices,
+            high.ephemeral_storage_bytes, high.tun_devices,
+            high.vhost_net_devices, fits,
+        )
+        return fits
+
+    async def _lock_policy(self, conn, *, allow_drain=False, allow_off=False):
         policy = await conn.fetchrow(
             "SELECT * FROM vm_resource_admission_policy WHERE cluster_id=$1 FOR UPDATE",
             self.inventory.cluster_id,
@@ -416,7 +634,10 @@ class VMResourceReservationStore:
             or policy["revision"] != self.policy_revision
             or _encoded(_json(policy["document"])) != self.policy_encoded
             or policy["mode"]
-            not in ({"enforce", "drain"} if allow_drain else {"enforce"})
+            not in (
+                {"enforce", "drain", "off"} if allow_off else
+                {"enforce", "drain"} if allow_drain else {"enforce"}
+            )
         ):
             raise ResourceAdmissionError("resource_policy_changed")
         return policy

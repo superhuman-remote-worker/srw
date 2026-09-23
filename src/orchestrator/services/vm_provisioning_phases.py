@@ -142,6 +142,34 @@ class VMProvisioningPhaseStore:
                         UUID(job_id),
                         UUID(generation),
                     )
+                    resource_retry = await conn.fetchrow(
+                        "SELECT * FROM vm_creation_retries WHERE job_id=$1 "
+                        "AND provision_generation=$2 FOR UPDATE",
+                        UUID(job_id), UUID(generation),
+                    )
+                    from orchestrator.services.vm_resource_job_runtime import (
+                        installed_job_resource_store,
+                    )
+                    from shared.vm_resource_admission import ResourceAdmissionError
+                    from shared.vm_resource_inventory import InventoryError
+
+                    try:
+                        resource = await installed_job_resource_store(
+                            conn, self.db,
+                            resource_retry["controller_configuration"]
+                            if resource_retry is not None else None,
+                            fresh=False,
+                        )
+                        if resource is not None and (
+                            resource_retry is None
+                            or not await resource.bind_ready_on_conn(
+                                conn, retry=resource_retry, vm=vm,
+                                job_id=job_id, generation=generation,
+                            )
+                        ):
+                            return False
+                    except (ResourceAdmissionError, InventoryError):
+                        return False
                     delta = dict(updates)
                     if not a1_owned:
                         delta.update(

@@ -102,6 +102,7 @@ def _contract(template_text, request, configuration, effect_intent, kind):
     if (
         values["effect_kind"] != kind
         or (configuration["version"] not in (2, 3) and not profile_only_vm)
+        or (configuration["version"] == 3) != (values["version"] in (4, 5))
         or canonical_configuration_digest(configuration)
         != values["controller_configuration_digest"]
         or canonical_request_digest(request) != values["request_digest"]
@@ -147,7 +148,7 @@ def _contract(template_text, request, configuration, effect_intent, kind):
     if binding is not None:
         binding = storage_binding(binding)
         if (
-            values["version"] == 3
+            values["version"] in (3, 5)
             and values["workspace_attachment"]["binding"] != binding
         ):
             raise ValueError
@@ -221,6 +222,13 @@ def validate_final_vm_manifest(
                 meta.setdefault("labels", {}).update(
                     storage_labels(binding, request["job_id"])
                 )
+            if "resource_grant" in effect_intent:
+                grant = effect_intent["resource_grant"]
+                meta.setdefault("annotations", {}).update({
+                    "srw.io/vm-resource-reservation": grant["id"],
+                    "srw.io/vm-resource-node-uid": grant["node_uid"],
+                    "srw.io/provision-generation": request["provision_generation"],
+                })
         _stamp(metadata, request, effect_intent)
         _stamp(template_metadata, request)
         if source["kind"] == "prepared":
@@ -235,6 +243,9 @@ def validate_final_vm_manifest(
             vmi["nodeSelector"] = deepcopy(profile["selector"])
         if configuration["tolerations"]:
             vmi["tolerations"] = deepcopy(profile["tolerations"])
+        if "resource_grant" in effect_intent:
+            if reservation_hostname != effect_intent["resource_grant"]["node_name"]:
+                raise ValueError
         if reservation_hostname is not None:
             vmi.setdefault("affinity", {}).setdefault("nodeAffinity", {})[
                 "requiredDuringSchedulingIgnoredDuringExecution"
