@@ -39,7 +39,7 @@ async def test_a1_fixture_uses_real_paused_job_snapshot_and_creation_preflight(
     db, monkeypatch,  # noqa: F811
 ):
     from orchestrator.operator_cli.vm_retained_resume_fixture import (
-        prepare_fixture, probe_ready_fixture,
+        FixtureRefusal, prepare_fixture, probe_ready_fixture, seed_model,
     )
     from orchestrator.services.manifest_execution_snapshot import (
         read_execution, srw_snapshot_config,
@@ -56,7 +56,20 @@ async def test_a1_fixture_uses_real_paused_job_snapshot_and_creation_preflight(
         monkeypatch.setenv(key, value)
     run = f"{RUN}-{uuid4().hex[:8]}"
     model = f"{MODEL}-{uuid4().hex[:8]}"
-    await _model(db, run, model)
+    endpoint_id = await seed_model(
+        db, run_id=run, namespace=run, model_id=model,
+        inference_key="a1-fixture-test-key-20260923a",
+    )
+    assert await seed_model(
+        db, run_id=run, namespace=run, model_id=model,
+        inference_key="a1-fixture-test-key-20260923a",
+    ) == endpoint_id
+    with pytest.raises(FixtureRefusal, match="endpoint or key"):
+        await seed_model(
+            db, run_id=run, namespace=run, model_id=model,
+            inference_key="different-a1-provider-key-20260923a",
+        )
+    assert await db.fetchval("SELECT count(*) FROM jobs") == 0
     provisioner = VMProvisioner()
     provisioner._db = db
 

@@ -68,11 +68,14 @@ def guard(args: argparse.Namespace) -> None:
         raise FixtureHostRefusal("A1 private output is not fresh")
 
 
-def _kubectl(args: argparse.Namespace, *parts: str, timeout: int = 30) -> str:
+def _kubectl(
+    args: argparse.Namespace, *parts: str, timeout: int = 30,
+    input_bytes: bytes | None = None,
+) -> str:
     try:
         result = subprocess.run(
             ["kubectl", "--context", args.context, *parts],
-            capture_output=True, check=False, timeout=timeout,
+            input=input_bytes, capture_output=True, check=False, timeout=timeout,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise FixtureHostRefusal("bounded kubectl invocation failed") from exc
@@ -142,9 +145,18 @@ def verify_host_source(args: argparse.Namespace) -> None:
 def run(args: argparse.Namespace) -> dict[str, Any]:
     guard(args)
     verify_host_source(args)
+    key_file = args.inference_key_file
+    if (
+        not key_file.is_file() or key_file.is_symlink()
+        or stat.S_IMODE(key_file.stat().st_mode) & 0o077
+    ):
+        raise FixtureHostRefusal("provider inference key file is not private")
+    inference_key = key_file.read_bytes().strip()
+    if not 16 <= len(inference_key) <= 256 or b"\n" in inference_key:
+        raise FixtureHostRefusal("provider inference key is malformed")
     remote = f"/tmp/srw-vm-retained-resume-gate/{args.run_id}/fixture.json"
     command = (
-        "-n", args.namespace, "exec", "pod/" + args.pod,
+        "-n", args.namespace, "exec", "-i", "pod/" + args.pod,
         "-c", "orchestrator", "--", "python", "-m",
         "orchestrator.operator_cli.vm_retained_resume_fixture",
         "--run-id", args.run_id, "--namespace", args.namespace,
@@ -152,7 +164,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "--confirm", _CONFIRM, "--output", remote,
     )
     try:
-        _kubectl(args, *command, timeout=1020)
+        _kubectl(args, *command, timeout=1020,
+                 input_bytes=inference_key + b"\n")
     finally:
         # The Pod/cluster identity is rechecked before any persisted outcome is
         # trusted, including after an interrupted in-image wait.
@@ -207,6 +220,7 @@ def parser() -> argparse.ArgumentParser:
                  "model-id", "confirm"):
         result.add_argument("--" + name, required=True)
     result.add_argument("--output", type=Path, required=True)
+    result.add_argument("--inference-key-file", type=Path, required=True)
     return result
 
 

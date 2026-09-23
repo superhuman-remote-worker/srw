@@ -29,6 +29,7 @@ def _args(tmp_path):
         model_id="e2e-vm-a1-20260923a",
         confirm="disposable-vm-retained-resume-fixture-v1",
         output=output_dir / "fixture.json",
+        inference_key_file=output_dir / "inference.key",
     )
 
 
@@ -49,4 +50,12 @@ def test_host_factory_does_not_call_kubectl_for_shared_namespace(tmp_path, monke
     args.context = "shared"
     monkeypatch.setattr(HOST, "_kubectl", lambda *_a, **_kw: pytest.fail("kubectl called"))
     with pytest.raises(HOST.FixtureHostRefusal):
+        HOST.run(args)
+
+
+def test_host_factory_requires_private_inference_key_before_exec(tmp_path, monkeypatch):
+    args = _args(tmp_path)
+    monkeypatch.setattr(HOST, "verify_host_source", lambda _args: None)
+    monkeypatch.setattr(HOST, "_kubectl", lambda *_a, **_kw: pytest.fail("kubectl called"))
+    with pytest.raises(HOST.FixtureHostRefusal, match="key file"):
         HOST.run(args)

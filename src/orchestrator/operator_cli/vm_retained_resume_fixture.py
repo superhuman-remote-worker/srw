@@ -8,10 +8,12 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import hmac
 import json
 import os
 from pathlib import Path
 import re
+import sys
 import time
 from typing import Any
 from uuid import NAMESPACE_URL, UUID, uuid5
@@ -57,6 +59,79 @@ def _expert_config(model_id: str) -> dict[str, Any]:
         "scholar": {"enabled": False},
         "delegation": {"enabled": False},
     }
+
+
+async def seed_model(
+    db: Any, *, run_id: str, namespace: str, model_id: str,
+    inference_key: str,
+) -> str:
+    """Register/replay only the run-owned authenticated provider transport."""
+    if (
+        not _OWNED.fullmatch(run_id)
+        or len(f"srw-a1-provider-{run_id}") > 63
+        or namespace != run_id
+        or not re.fullmatch(r"e2e-vm-[a-z0-9-]{3,55}", model_id)
+        or not isinstance(inference_key, str)
+        or not 16 <= len(inference_key) <= 256
+        or "\n" in inference_key
+        or os.environ.get("VM_RETAINED_RESUME_ACCEPTANCE_GATE_ENABLED") != "true"
+    ):
+        raise FixtureRefusal("A1 deterministic provider seed is not exact")
+    job_id = uuid5(NAMESPACE_URL, f"srw-a1-job:{run_id}")
+    if await db.fetchval("SELECT EXISTS(SELECT 1 FROM jobs WHERE id<>$1)", job_id):
+        raise FixtureRefusal("A1 fixture database contains another Job")
+    label = f"srw-a1-provider-{run_id}"
+    base_url = f"http://srw-a1-provider.{namespace}.svc.cluster.local:8000/v1"
+    existing_model = await db.resolve_catalog_model(model_id, capability="chat")
+    endpoint_row = await db.fetchrow(
+        "SELECT id FROM llm_endpoints WHERE label=$1", label,
+    )
+    if endpoint_row is None:
+        if existing_model or await db.fetchval(
+            "SELECT EXISTS(SELECT 1 FROM models WHERE model_id=$1)", model_id,
+        ):
+            raise FixtureRefusal("A1 model has no matching owned endpoint")
+        endpoint = await db.create_system_llm_endpoint(
+            label=label, base_url=base_url, api_key=inference_key,
+            key_prefix=None, source="ui",
+        )
+    else:
+        endpoint = await db.get_system_llm_endpoint(str(endpoint_row["id"]))
+        if (
+            not endpoint
+            or endpoint["label"] != label
+            or endpoint["base_url"] != base_url
+            or not isinstance(endpoint.get("api_key"), str)
+            or not hmac.compare_digest(endpoint["api_key"], inference_key)
+            or endpoint.get("transport_kind") is not None
+        ):
+            raise FixtureRefusal("A1 provider endpoint or key changed")
+    endpoint_id = str(endpoint["id"])
+    if existing_model is None:
+        if await db.fetchval(
+            "SELECT EXISTS(SELECT 1 FROM models WHERE model_id=$1)", model_id,
+        ):
+            raise FixtureRefusal("A1 model authority changed")
+        await db.create_model(
+            provider_kind="endpoint", provider_ref=endpoint_id,
+            model_id=model_id, display_label=f"A1 deterministic model {run_id}",
+            capabilities=["chat", "auxiliary"], family="e2e", source="ui",
+        )
+    model = await db.resolve_catalog_model(model_id, capability="chat")
+    if (
+        not model
+        or model.get("provider_kind") != "endpoint"
+        or model.get("provider_ref") != endpoint_id
+        or model.get("endpoint_label") != label
+        or model.get("endpoint_base_url") != base_url
+        or not isinstance(model.get("api_key"), str)
+        or not hmac.compare_digest(model["api_key"], inference_key)
+        or set(model.get("capabilities") or []) != {"chat", "auxiliary"}
+        or model.get("family") != "e2e"
+        or model.get("display_label") != f"A1 deterministic model {run_id}"
+    ):
+        raise FixtureRefusal("A1 deterministic model changed")
+    return endpoint_id
 
 
 async def prepare_fixture(
@@ -475,6 +550,11 @@ async def _async_main(args: argparse.Namespace) -> int:
         config.load_incluster_config()
         api_client = client.ApiClient()
         core = client.CoreV1Api(api_client)
+        inference_key = sys.stdin.readline(258).strip()
+        await seed_model(
+            db, run_id=args.run_id, namespace=args.namespace,
+            model_id=args.model_id, inference_key=inference_key,
+        )
         prepared = await prepare_fixture(
             db, provisioner, run_id=args.run_id, namespace=args.namespace,
             vm_image=args.vm_image, model_id=args.model_id,

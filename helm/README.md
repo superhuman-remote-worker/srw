@@ -1027,6 +1027,8 @@ proof, and the bound PVC/PV before returning the Job, owner, and PVC UIDs needed
 by the acceptance wrapper. The fixture command requires the default-off gate
 flag, an empty Job database, an owned namespace and provider model, and exact
 cluster, orchestrator Pod, and image identities. It grants no worker lease.
+It seeds or verifies the run-owned provider endpoint/model through normal
+database writers, passing the provider inference key only through private stdin.
 Keep the worker deployment at zero replicas until this fixture and the
 acceptance wrapper's queue isolation checks have passed.
 
