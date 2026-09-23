@@ -720,6 +720,24 @@ class TestChildLLM:
         assert cfg.llm.base_url == "https://elsewhere.example/v1"
         assert cfg.llm.api_key is None
 
+    def test_pinned_entry_on_a_sibling_tenant_path_does_not_borrow(self):
+        # Same shared host, another tenant's path: not the parent's endpoint.
+        entry = _entry(
+            llm={
+                "model": "gpt-4.1-nano",
+                "provider": "openai",
+                "base_url": "https://gateway.ai.cloudflare.com/v1/acctB/gw",
+            }
+        )
+        live = LLMConfig(
+            model="gpt-4o-mini",
+            provider="openai",
+            api_key="sk-live",
+            base_url="https://gateway.ai.cloudflare.com/v1/acctA/gw",
+        )
+        cfg = build_child_config(entry, live_llm_config=live)
+        assert cfg.llm.api_key is None
+
     def test_pinned_entry_on_the_parents_endpoint_still_borrows(self):
         # Same origin, different spelling (case, trailing slash) still matches.
         entry = _entry(

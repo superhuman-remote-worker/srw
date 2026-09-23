@@ -537,7 +537,7 @@ def build_child_config(entry: Mapping[str, Any], *, live_llm_config: Any = None)
     if raw_llm.get(ROSTER_INHERIT_MARKER):
         cfg.llm = overlay_live_llm(cfg.llm, live_llm_config)
     elif live_llm_config is not None and cfg.llm.api_key is None:
-        from shared.runtime.core.transport_resolution import same_endpoint
+        from shared.runtime.core.transport_resolution import endpoint_within
 
         same_provider = (cfg.llm.provider or None) in (
             None,
@@ -546,7 +546,7 @@ def build_child_config(entry: Mapping[str, Any], *, live_llm_config: Any = None)
         # A key follows its endpoint (same rule as LLMConfig.with_override):
         # borrow the parent's key only when the entry names no endpoint of its
         # own or names the parent's.
-        same_host = cfg.llm.base_url is None or same_endpoint(
+        same_host = cfg.llm.base_url is None or endpoint_within(
             cfg.llm.base_url, getattr(live_llm_config, "base_url", None)
         )
         if same_provider and same_host:

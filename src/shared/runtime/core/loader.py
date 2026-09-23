@@ -2062,11 +2062,11 @@ class LLMConfig:
         # A key follows its endpoint: when the overlay moves the call to a
         # different base_url without bringing its own key, the parent's key
         # must not ride along to the new host.
-        from shared.runtime.core.transport_resolution import same_endpoint
+        from shared.runtime.core.transport_resolution import endpoint_within
 
         if override.api_key is not None:
             api_key = override.api_key
-        elif override.base_url is not None and not same_endpoint(
+        elif override.base_url is not None and not endpoint_within(
             override.base_url, self.base_url
         ):
             api_key = None

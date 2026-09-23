@@ -435,6 +435,65 @@ class TestSameEndpoint:
         assert not same_endpoint(a, b)
 
 
+GW_A = "https://gateway.ai.cloudflare.com/v1/acctA/gw"
+GW_B = "https://gateway.ai.cloudflare.com/v1/acctB/gw"
+
+
+class TestEndpointWithin:
+    """Two-URL comparisons on shared hosts that tenant by path."""
+
+    @pytest.mark.parametrize(
+        "candidate, parent",
+        [
+            (GW_A, GW_A),  # same path
+            (GW_A + "/openai", GW_A),  # sub-path
+            ("https://Gateway.AI.cloudflare.com/v1/ACCTA/gw/", GW_A),  # case+slash
+            ("https://host.example/api", "https://host.example/api/v1"),  # /v1 opt.
+            ("https://host.example/v1", "https://host.example"),
+            (None, None),
+        ],
+    )
+    def test_allowed(self, candidate, parent):
+        from shared.runtime.core.transport_resolution import endpoint_within
+
+        assert endpoint_within(candidate, parent)
+
+    @pytest.mark.parametrize(
+        "candidate, parent",
+        [
+            (GW_B, GW_A),  # sibling tenant path
+            ("https://gateway.ai.cloudflare.com/v1/acctA", GW_A),  # parent's parent
+            ("https://other.example/v1/acctA/gw", GW_A),  # other host
+            (GW_A, None),
+        ],
+    )
+    def test_refused(self, candidate, parent):
+        from shared.runtime.core.transport_resolution import endpoint_within
+
+        assert not endpoint_within(candidate, parent)
+
+    def test_with_override_sibling_path_drops_parent_key(self):
+        from shared.runtime.core.loader import LLMConfig, PhaseLLMOverride
+
+        base = LLMConfig(model="m", base_url=GW_A, api_key="PARENT-KEY")
+        assert base.with_override(PhaseLLMOverride(base_url=GW_B)).api_key is None
+        assert (
+            base.with_override(PhaseLLMOverride(base_url=GW_A + "/")).api_key
+            == "PARENT-KEY"
+        )
+
+    def test_reranker_sibling_path_gets_no_paired_key(self):
+        from types import SimpleNamespace
+
+        from agent.services.memory.plugins.reranker import resolve_reranker_transport
+
+        cfg = SimpleNamespace(model=None, base_url=GW_B, api_key=None)
+        env = {"EMBEDDING_BASE_URL": GW_A, "EMBEDDING_API_KEY": "emb-key"}
+        assert resolve_reranker_transport(cfg, env=env)[2] is None
+        cfg.base_url = GW_A + "/rerank-sub"
+        assert resolve_reranker_transport(cfg, env=env)[2] == "emb-key"
+
+
 class TestEnvKeyByoPair:
     @pytest.mark.asyncio
     async def test_complete_caller_pair_survives_an_endpoint_backed_default(self):

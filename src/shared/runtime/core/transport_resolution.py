@@ -180,15 +180,53 @@ def endpoint_origin(url: Optional[str]) -> Optional[tuple[str, str, int]]:
 def same_endpoint(a: Optional[str], b: Optional[str]) -> bool:
     """True when two URLs name the same origin (scheme + host + port).
 
-    The one comparison behind "a key follows its endpoint": used by the chat
-    factories' env fallback, ``LLMConfig.with_override``, the reranker and the
-    subagent child builder, so they cannot disagree about what "the same
-    host" means. Two unset URLs are the same (both the provider default).
+    The canonical-host check behind "a key follows its endpoint": the chat
+    factories' env fallback compares a configured URL with a provider's own
+    origin, where any path on that origin reaches the provider. Two-URL
+    comparisons on possibly shared hosts use :func:`endpoint_within`, which
+    also compares paths. Two unset URLs are the same (both the provider
+    default).
     """
     origin_a, origin_b = endpoint_origin(a), endpoint_origin(b)
     if origin_a is None or origin_b is None:
         return origin_a is None and origin_b is None
     return origin_a == origin_b
+
+
+def _normalised_path(url: str) -> tuple[str, ...]:
+    raw = str(url).strip()
+    if "://" not in raw:
+        raw = "https://" + raw
+    try:
+        path = urlsplit(raw).path
+    except ValueError:
+        path = ""
+    segments = tuple(seg for seg in path.lower().split("/") if seg)
+    # A leading or trailing ``/v1`` is the API-version marker, optional by
+    # convention; a ``v1`` anywhere else is part of the tenant path.
+    if segments and segments[0] == "v1":
+        segments = segments[1:]
+    if segments and segments[-1] == "v1":
+        segments = segments[:-1]
+    return segments
+
+
+def endpoint_within(candidate: Optional[str], parent: Optional[str]) -> bool:
+    """True when ``candidate`` is the ``parent`` endpoint or below it.
+
+    For the two-URL comparisons — an overlay/child/reranker URL against the
+    endpoint whose key it would reuse. Shared hosts tenant by path (e.g. an
+    AI gateway's ``/v1/<account>/<gateway>/``), so the same origin is not
+    enough: the candidate's normalised path (lower-case, trailing slash and a
+    trailing ``/v1`` stripped) must equal or extend the parent's. A sibling
+    path never matches. Two unset URLs match (both the provider default).
+    """
+    if not same_endpoint(candidate, parent):
+        return False
+    if candidate is None or parent is None or not str(candidate).strip():
+        return True
+    cand, base = _normalised_path(candidate), _normalised_path(parent)
+    return cand[: len(base)] == base
 
 
 def env_endpoint_names(prefix: str) -> tuple[str, ...]:
