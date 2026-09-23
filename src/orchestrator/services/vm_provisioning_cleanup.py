@@ -94,10 +94,23 @@ async def recycle_provisioning_vm(
         # strand an admission for a generation the dispatcher no longer owns.
         # The delete transport can publish `deleted` before physical absence;
         # this marker keeps replacement fenced until admission completion.
-        elif not await db.merge_vm_context_if_provision_generation(
-            job_id, generation, {"retirement_cleanup_pending": True}
-        ):
-            return "authority_changed"
+        else:
+            if vm.get("status") == "ready":
+                # A deliberate recycle of a Ready VM must exclude a worker
+                # Resume that won the queue first. Ordinary provisioning
+                # cleanup retains its existing generation-only CAS.
+                admitted = await db.begin_ready_vm_retirement_if_quiescent(
+                    job_id,
+                    provision_generation=generation,
+                    vm_uid=identity.vm_uid,
+                    pvc_uid=identity.rootdisk_pvc_uid,
+                )
+            else:
+                admitted = await db.merge_vm_context_if_provision_generation(
+                    job_id, generation, {"retirement_cleanup_pending": True}
+                )
+            if not admitted:
+                return "authority_changed"
         if not phase_timeout:
             cleanup = await acquire_vm_cleanup_permit(
                 recovery_store,

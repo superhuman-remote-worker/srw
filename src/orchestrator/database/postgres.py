@@ -11020,6 +11020,71 @@ class PostgresDB:
 
         return result == "UPDATE 1"
 
+    async def begin_ready_vm_retirement_if_quiescent(
+        self,
+        job_id: str,
+        *,
+        provision_generation: str,
+        vm_uid: str,
+        pvc_uid: str,
+    ) -> bool:
+        """Fence an exact Ready VM before a deliberate retained-disk recycle.
+
+        A worker Resume takes the queue lock before its jobs-row CAS. Take the
+        same order here so a prior Resume wins cleanly, while a later one sees
+        the retirement marker and rolls its queued wake back. No external VM
+        effect or process-zero claim occurs under these locks.
+        """
+        try:
+            job_uuid = UUID(str(job_id))
+            generation = str(UUID(str(provision_generation)))
+            vm = str(UUID(str(vm_uid)))
+            pvc = str(UUID(str(pvc_uid)))
+        except (TypeError, ValueError):
+            return False
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                queue = await conn.fetchrow(
+                    "SELECT state,leased_by FROM run_queue WHERE unit_id=$1 FOR UPDATE",
+                    job_uuid,
+                )
+                if queue is not None and (
+                    queue["state"] != "done" or queue["leased_by"] is not None
+                ):
+                    return False
+                job = await conn.fetchrow(
+                    "SELECT status::text AS status,assigned_agent_id,"
+                    "context FROM jobs WHERE id=$1 FOR UPDATE", job_uuid,
+                )
+                if (
+                    job is None
+                    or job["status"] != "paused"
+                    or job["assigned_agent_id"] is not None
+                ):
+                    return False
+                try:
+                    context = _strict_json_object(job["context"], label="job context")
+                except RuntimeError:
+                    return False
+                current = context.get("vm")
+                if (
+                    not isinstance(current, dict)
+                    or current.get("status") != "ready"
+                    or current.get("provision_generation") != generation
+                    or current.get("vm_uid") != vm
+                    or current.get("rootdisk_pvc_uid") != pvc
+                    or current.get("identity_authenticated") is not True
+                    or current.get("identity_provision_generation") != generation
+                    or context.get("_vm_creation_pending") is not None
+                ):
+                    return False
+                updated = await conn.execute(
+                    "UPDATE jobs SET context=jsonb_set(context,'{vm}',"
+                    "context->'vm'||'{\"retirement_cleanup_pending\":true}'::jsonb),"
+                    "updated_at=clock_timestamp() WHERE id=$1", job_uuid,
+                )
+                return updated == "UPDATE 1"
+
     async def list_job_vm_readiness_candidates(self, *, ready: bool = False) -> list:
         status_clause = (
             'context @> \'{"vm":{"status":"ready"}}\'::jsonb'
@@ -30017,6 +30082,14 @@ class PostgresDB:
             f" AND COALESCE(context->'{_LEASE_RECOVERY_CONTEXT_KEY}'->>'state', '')"
             " <> 'tripped'"
         )
+        # A Ready predecessor is still owned by the cleanup service until its
+        # exact permit and physical stop settle. Evaluate this on the locked
+        # pre-update jobs row, after the caller's queue lock, so a concurrent
+        # human Resume cannot expose a worker while retirement is in flight.
+        retirement_guard = (
+            " AND COALESCE(context->'vm'->>'retirement_cleanup_pending', '')"
+            " <> 'true'"
+        )
         context_base = "COALESCE(context, '{}'::jsonb)"
         hold_guard = ""
         if lift_operator_pause_hold is not None:
@@ -30049,7 +30122,7 @@ class PostgresDB:
                    freeze_data = NULL,
                    {idle_exit}
                    updated_at = CURRENT_TIMESTAMP
-             WHERE id = $1{lane_guard}{lifecycle_guard}{status_guard}{route_guard}{completion_guard}{control_guard}{trip_guard}{hold_guard}
+             WHERE id = $1{lane_guard}{lifecycle_guard}{status_guard}{route_guard}{completion_guard}{control_guard}{trip_guard}{retirement_guard}{hold_guard}
                AND (jobs.execution_lane <> 'pinned' OR NOT EXISTS (
                    SELECT 1 FROM vm_idle_operations idle
                    WHERE idle.owner_kind='job' AND idle.owner_id=jobs.id
@@ -30585,6 +30658,15 @@ class PostgresDB:
                          WHERE id = $1
                            AND execution_lane = 'stateless'
                            AND status = $3
+                           -- The route may have classified an older unready
+                           -- VM before an exact Ready retirement won the
+                           -- queue/Job locks. Refuse on this pre-shed row:
+                           -- moving the marker to last_vm would erase the
+                           -- ordinary Resume guard and can trip the native
+                           -- process-zero fence instead of returning 409.
+                           AND ($2::text <> 'vm' OR COALESCE(
+                               context->'vm'->>'retirement_cleanup_pending', ''
+                           ) <> 'true')
                            AND ($2::text <> 'vm' OR NOT (COALESCE(context, '{}'::jsonb) ? '_vm_creation_pending'))
                         RETURNING id
                         """,
