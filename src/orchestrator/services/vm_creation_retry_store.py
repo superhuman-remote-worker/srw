@@ -336,6 +336,8 @@ class VMCreationRetryStore:
         expected_generation: str,
         request_id: str,
         proposal: dict,
+        lift_operator_pause_hold: str | None = None,
+        resume_context_merge: dict | None = None,
     ) -> dict:
         """Admit inside the caller transaction, before any protocol-on initial I/O.
 
@@ -451,7 +453,11 @@ class VMCreationRetryStore:
                         generation, request_uuid,
                     )
                 else:
-                    await self._resume_on_conn(conn, job, existing["request_id"])
+                    await self._resume_on_conn(
+                        conn, job, existing["request_id"],
+                        lift_operator_pause_hold=lift_operator_pause_hold,
+                        context_merge=resume_context_merge,
+                    )
             return existing
         if (
             proposal.get("origin") != "initial"
@@ -555,15 +561,20 @@ class VMCreationRetryStore:
         ):
             raise VMCreationRetryConflict("workspace_recovery_held")
 
-    async def _resume_on_conn(self, conn, job, request_uuid):
+    async def _resume_on_conn(
+        self, conn, job, request_uuid, *,
+        lift_operator_pause_hold: str | None = None,
+        context_merge: dict | None = None,
+    ):
         queued = await self.db._queue_job_for_resume_on_conn(
             conn,
             job["id"],
-            {"_vm_creation_pending": str(request_uuid)},
+            {**(context_merge or {}), "_vm_creation_pending": str(request_uuid)},
             void_completion_decision=False,
             stateless_only=job["execution_lane"] == "stateless",
             expected_status=str(job["status"]),
             completion_commands_enabled=True,
+            lift_operator_pause_hold=lift_operator_pause_hold,
         )
         if queued is None:
             raise VMCreationRetryConflict("job_control_busy")

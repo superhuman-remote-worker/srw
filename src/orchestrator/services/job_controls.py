@@ -1044,6 +1044,7 @@ class JobControlOperations:
                         job_id=job_id,
                         feedback=request.feedback,
                         feedback_reason=feedback_reason,
+                        lift_operator_pause_hold=operator_pause_lift,
                     )
                 except VMCreationRetryConflict as exc:
                     raise HTTPException(

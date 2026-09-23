@@ -1,6 +1,5 @@
 """Resume existing creation intent without replacing its execution authority."""
 
-import json
 import os
 from uuid import UUID, uuid4
 
@@ -21,13 +20,26 @@ def _object(value):
     return value
 
 
-async def resume_pending_creation(db, *, job_id, feedback=None, feedback_reason=None):
+async def resume_pending_creation(
+    db, *, job_id, feedback=None, feedback_reason=None,
+    lift_operator_pause_hold: str | None = None,
+):
     """Return an acknowledgement, or None for ordinary runtime Resume.
 
     Caller owns public access and grant checks. The database transaction owns
     current control, worker-lease, recovery and immutable execution checks. No
     public request can supply a generation, disk, configuration or create UUID.
+    Only the authorized public caller passes its observed operator hold token;
+    background/reconciler admission keeps any hold intact.
     """
+    feedback_merge = (
+        {
+            "queued_feedback": feedback,
+            "queued_feedback_reason": feedback_reason,
+            "queued_feedback_delivery_id": str(uuid4()),
+        }
+        if feedback else None
+    )
     try:
         async with db.acquire() as conn:
             async with conn.transaction():
@@ -96,6 +108,8 @@ async def resume_pending_creation(db, *, job_id, feedback=None, feedback_reason=
                             if row["expected_pvc_uid"]
                             else None,
                         },
+                        lift_operator_pause_hold=lift_operator_pause_hold,
+                        resume_context_merge=feedback_merge,
                     )
                 else:
                     preflight = VMCreationPreflightStore(db)
@@ -135,20 +149,10 @@ async def resume_pending_creation(db, *, job_id, feedback=None, feedback_reason=
                             reason=None,
                         )
                         await preflight._write(conn, job_uuid, value)
-                    await preflight.retry._resume_on_conn(conn, job, request_id)
-                if feedback:
-                    # Existing stateless delivery deduplicates feedback by this
-                    # server-created identity. No worker claim is made here.
-                    await conn.execute(
-                        "UPDATE jobs SET context=context || $2::jsonb,updated_at=clock_timestamp() WHERE id=$1",
-                        job_uuid,
-                        json.dumps(
-                            {
-                                "queued_feedback": feedback,
-                                "queued_feedback_reason": feedback_reason,
-                                "queued_feedback_delivery_id": str(uuid4()),
-                            }
-                        ),
+                    await preflight.retry._resume_on_conn(
+                        conn, job, request_id,
+                        lift_operator_pause_hold=lift_operator_pause_hold,
+                        context_merge=feedback_merge,
                     )
                 return {
                     "status": "queued",
