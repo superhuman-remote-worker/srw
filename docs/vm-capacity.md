@@ -7,11 +7,16 @@ resource admission.
 
 ## Configuration and rollout boundary
 
-The chart currently permits resource observation only. It rejects
-`vm.resourceAdmission.shadowEnabled: true` and
-`vm.resourceAdmission.enforcementEnabled: true` while runtime qualification is
-unfinished. Both default to `false`, as does `observerEnabled`. The presence of
-capacity tables or reservation records does not enable enforcement.
+Resource admission remains disabled by default. Observation alone uses
+`observerEnabled: true` with `shadowEnabled` and `enforcementEnabled` false.
+The full resource policy requires all three flags true, explicit
+`clusterWidePodReadAcknowledged: true`, and
+`orchestrator.vmProvisioning.creationRetryEnabled: true`. The flags install
+one versioned policy document in both services; they do not activate the
+durable admission mode automatically. A shadow-only flag combination is
+unsupported. **Shadow is the durable policy's installation and audit state:**
+while the full policy is deployed in that state, new VM creation waits for
+activation. Capacity tables or reservation records alone grant no authority.
 
 Configure observation under `vm.resourceAdmission` in your Helm values:
 
@@ -22,13 +27,87 @@ Configure observation under `vm.resourceAdmission` in your Helm values:
 | `clusterWidePodReadAcknowledged` | Explicitly permit the observer's cluster-wide Pod inventory. |
 | `inventory` | Explicit freshness, timeout, item/byte/history bounds and placement label keys. |
 | `launcherProfile` | Expected installed KubeVirt launcher shape; requires the exact KubeVirt namespace/name and architecture label. |
-| `hostCost`, `nodeHeadroom`, `installationBudget`, `ownerBudget`, `fairness` | Operator-supplied admission policy inputs; left unset by default. They do not bypass the chart's enforcement gate. |
+| `hostCost`, `nodeHeadroom`, `installationBudget`, `ownerBudget`, `fairness` | Explicit six-dimensional admission inputs; left unset by default. The full policy cannot render with missing values. |
 
 Observation requires `vm.mode: same-cluster`, a configured lifecycle HMAC
 Secret, and all required inventory settings. See the comments in
 [the chart values](../helm/values.yaml) for the complete fields. Set resource
 budgets from the actual launcher requests and node overhead; guest CPU and
 memory alone do not describe host demand.
+
+Choose the installation and owner budgets from eligible-node capacity and
+other workload reservations. The chart does not derive them. Review the exact
+JSON rendered as `VM_RESOURCE_ADMISSION_CONFIG` in both Deployments; it must
+have one policy digest and match the supported KubeVirt installation and
+launcher profile. Use the same document for each operator transition. Install
+the new application code and required migrations while resource admission is
+still disabled, then use the configured orchestrator environment to run the
+explicit policy command. Its input is a local file containing that reviewed
+JSON policy, plus the expected stable cluster ID and policy digest:
+
+```text
+python -m orchestrator.operator_cli.vm_resource_policy ensure-shadow \
+  --policy-file resource-policy.json --cluster-id CLUSTER_ID \
+  --policy-digest sha256:POLICY_DIGEST
+```
+
+The command emits a JSON receipt with `cluster_id`, `namespace`,
+`policy_digest`, `revision`, and `mode`. Save the complete receipt. Every later
+transition requires it through `--expected-receipt-file`; a changed policy or
+stale receipt is refused. The command never selects budgets, changes Helm
+flags, or starts admission in the background.
+
+If a transition may have committed but its output was lost, read the installed
+receipt with the same reviewed policy file, cluster ID, and digest:
+
+```text
+python -m orchestrator.operator_cli.vm_resource_policy current-receipt \
+  --policy-file resource-policy.json --cluster-id CLUSTER_ID \
+  --policy-digest sha256:POLICY_DIGEST
+```
+
+This read-only command refuses a missing row or any document/identity mismatch.
+Compare the returned mode and revision with the intended transition before
+choosing the next action. It does not retry or reverse a transition. Keep the
+full receipt as the expected input for the next transition; an old receipt is
+never silently accepted.
+
+```text
+python -m orchestrator.operator_cli.vm_resource_policy activate-enforce \
+  --policy-file resource-policy.json --cluster-id CLUSTER_ID \
+  --policy-digest sha256:POLICY_DIGEST \
+  --expected-receipt-file shadow-receipt.json
+```
+
+Use the new receipt from each successful transition for `begin-drain` and
+`finalize-off`, with the same policy file, cluster ID and digest.
+
+After installing the shadow row, deploy the **same** reviewed all-true policy
+to both services with durable creation retry enabled. New creates hold while
+the durable mode is `shadow`. Confirm a fresh, complete, authenticated
+whole-cluster inventory, the exact installed launcher profile, and the
+absence of any SRW-attributable VM, VMI or launcher and any unresolved
+reservation.
+Then invoke `activate-enforce` with the saved shadow receipt and save its new
+receipt. The service checks those conditions again under the policy lock.
+Genuine Job and pinned-session creates then use the same durable reservation
+ledger; Kubernetes still makes the final placement decision. Validate both
+owner paths and physical release before treating a live cluster as qualified.
+
+To turn enforcement off, invoke `begin-drain` with the enforce receipt first.
+This stops fresh grants while existing v3 effects and charged cleanup continue
+to reconcile. **Keep the original all-true Helm policy and inventory publisher
+in place during drain.** Wait for reservations and live waiters to settle and
+for the fresh inventory to show no attributable SRW runtime, then invoke
+`finalize-off` with the drain receipt. Only after its off receipt may the Helm
+flags be returned to observer-only or disabled. Turning the process flag off
+while the durable row still says `enforce` does not revoke already frozen v3
+requests; changing the policy document during drain also removes the fresh
+inventory needed to finish it. Do not roll back to an image that cannot
+reconcile the existing reservation ledger.
+The current lifecycle treats `off` as terminal for that installed cluster
+policy; `ensure-shadow` does not re-enable an off row. A later rollout needs a
+separately reviewed policy-epoch transition, not a replay of this command.
 
 The separate object-count backstop is `vmController.maxConcurrentVms`, passed
 to the controller as `VM_MAX_CONCURRENT`. Its chart default is `4`; a deployment

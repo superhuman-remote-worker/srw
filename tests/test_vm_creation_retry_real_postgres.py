@@ -507,6 +507,38 @@ async def test_store_backoff_uses_db_time_and_capacity_clears_transport_outage(d
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("observation_reason", "stored_reason", "wait_kind"),
+    [
+        ("capacity_wait", "controller_count_wait", "count"),
+        ("unrecognized_controller_reason", "capacity_wait", "unknown"),
+    ],
+)
+async def test_controller_capacity_provenance_is_bounded_for_owner(
+    db, observation_reason, stored_reason, wait_kind,
+):
+    job, generation, proposal = await admitted_job(db)
+    await admit(db, job, generation, proposal)
+    store = VMCreationRetryStore(db)
+    claim = (await store.claim_due(limit=1))[0]
+    assert await store.apply_observation(
+        request_id=str(claim["request_id"]),
+        claim_token=str(claim["claim_token"]),
+        expected_revision=claim["revision"],
+        observation={"outcome": "capacity_wait", "reason": observation_reason},
+    )
+    row = await db.fetchrow(
+        "SELECT reason FROM vm_creation_retries WHERE request_id=$1",
+        claim["request_id"],
+    )
+    assert row["reason"] == stored_reason
+    from tests.test_job_projection import redact
+
+    owner_view = redact(await db.get_job(str(job)))
+    assert owner_view["vm_creation"]["wait"]["kind"] == wait_kind
+
+
+@pytest.mark.asyncio
 async def test_admission_cannot_fence_an_active_worker_lease(db):
     job, generation, proposal = await admitted_job(db, lane="stateless")
     async with db.acquire() as conn:

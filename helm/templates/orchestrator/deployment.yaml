@@ -33,7 +33,7 @@ spec:
         srw.io/vm-remote-operation-protocol: v1
         {{- end }}
       annotations:
-        {{- if .Values.vm.resourceAdmission.observerEnabled }}
+        {{- if (get (.Values.vm.resourceAdmission | default dict) "observerEnabled" | default false) }}
         checksum/vm-resource-policy: {{ include "srw.vmResourceInventoryConfig" . | sha256sum | quote }}
         {{- end }}
         checksum/infrastructure-metering-gates: {{ toJson .Values.infrastructureMetering | sha256sum | quote }}
@@ -1323,7 +1323,7 @@ spec:
                   key: NTFY_TOKEN
                   optional: true
             # VM lifecycle (optional)
-            {{- if .Values.vm.resourceAdmission.observerEnabled }}
+            {{- if (get (.Values.vm.resourceAdmission | default dict) "observerEnabled" | default false) }}
             - name: VM_RESOURCE_ADMISSION_CONFIG
               value: {{ include "srw.vmResourceInventoryConfig" . | quote }}
             {{- end }}

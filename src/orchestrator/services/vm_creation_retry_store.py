@@ -940,11 +940,14 @@ class VMCreationRetryStore:
                     # local resource admission result. Keep only the bounded
                     # source. Historical `capacity_wait` rows lack provenance
                     # and must remain unknown in the owner projection.
-                    reason = (
-                        "controller_count_wait"
-                        if observation.get("reason") == "capacity_wait"
-                        else "resource_wait"
-                    )
+                    if observation.get("source") == "resource_admission":
+                        reason = (
+                            "resource_wait"
+                            if observation.get("reason") == "resource_wait"
+                            else "resource_unavailable"
+                        )
+                    elif observation.get("reason") == "capacity_wait":
+                        reason = "controller_count_wait"
                 if outcome == "dependency_wait" and observation.get("reason") in (
                     "golden_wait",
                     "preparation_wait",

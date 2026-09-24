@@ -3550,8 +3550,10 @@ vm:
   # same-cluster mode, by the VM controller.
   lifecycleAuthSecretName: ""
   lifecycleAuthSecretKey: VM_LIFECYCLE_HMAC_SECRET
-  # Observe VM resource occupancy; capacity enforcement is not implemented yet.
-  # Explicit limits and cluster-wide read acknowledgement are required to enable.
+  # Default-off VM resource policy. Full admission requires one explicit whole-
+  # launcher document, durable creation retry, and receipt-bound operator
+  # activation after fresh inventory audit; these flags do not activate it.
+  # Explicit limits and cluster-wide read acknowledgement are required.
   resourceAdmission:
     observerEnabled: false
     shadowEnabled: false

@@ -85,13 +85,20 @@ class VMCreationRetryService:
                 if resource is not None:
                     admission = await resource.admit(request_id=str(claim["request_id"]))
                     if admission["action"] != "admitted":
+                        local_wait = admission["action"] in {
+                            "wait", "nonfit", "protected", "nominate",
+                        }
                         await self.store.apply_observation(
                             request_id=str(claim["request_id"]),
                             claim_token=str(claim["claim_token"]),
                             expected_revision=claim["revision"],
                             observation={
                                 "outcome": "capacity_wait",
-                                "reason": admission.get("reason", "resource_wait"),
+                                "source": "resource_admission",
+                                "reason": (
+                                    "resource_wait" if local_wait
+                                    else "resource_unavailable"
+                                ),
                             },
                         )
                         return

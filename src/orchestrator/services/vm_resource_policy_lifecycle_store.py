@@ -1,4 +1,4 @@
-"""Explicit installed-policy transitions for the Job resource runtime."""
+"""Explicit installed-policy transitions for the shared VM resource runtime."""
 
 from dataclasses import dataclass
 import json
@@ -79,6 +79,15 @@ class VMResourcePolicyLifecycleStore:
             )
         except (ValueError, TypeError, KeyError, UnicodeError, json.JSONDecodeError):
             raise ResourceAdmissionError("resource_policy_changed") from None
+
+    async def current_receipt(self) -> ResourcePolicyReceipt:
+        """Read only the receipt for the caller's exact installed document."""
+        async with self.db.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT * FROM vm_resource_admission_policy WHERE cluster_id=$1",
+                self.snapshot.inventory.cluster_id,
+            )
+        return self._receipt(row)
 
     async def ensure_shadow(self) -> ResourcePolicyReceipt:
         """Install once, or replay only the same already-shadow policy."""

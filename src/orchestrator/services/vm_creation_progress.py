@@ -13,6 +13,7 @@ _MESSAGES = {
     "capacity_wait": "Waiting for VM capacity.",
     "controller_count_wait": "Waiting for the VM controller count limit.",
     "resource_wait": "Waiting for VM workspace resources.",
+    "resource_unavailable": "VM resource admission could not be verified.",
     "golden_wait": "Waiting for the VM base disk.",
     "preparation_wait": "Waiting for workspace preparation.",
     "headscale_wait": "Waiting for VM network registration.",
@@ -105,6 +106,9 @@ def _owner_wait(raw, reason):
                 "guest_vcpus": None, "guest_memory_bytes": None}
     if reason == "controller_count_wait":
         return {"kind": "count", "since": None, "size_nonfit": False,
+                "guest_vcpus": None, "guest_memory_bytes": None}
+    if reason == "resource_unavailable":
+        return {"kind": "unknown", "since": None, "size_nonfit": False,
                 "guest_vcpus": None, "guest_memory_bytes": None}
     if reason not in {"resource_wait", "capacity_wait", "vm_creation_retry_pending"}:
         return None

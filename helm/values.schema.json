@@ -2099,7 +2099,39 @@
                 }
               }
             }
-          }
+          },
+          "allOf": [
+            {
+              "if": {
+                "required": ["enforcementEnabled"],
+                "properties": {"enforcementEnabled": {"const": true}}
+              },
+              "then": {
+                "required": [
+                  "observerEnabled", "shadowEnabled", "enforcementEnabled",
+                  "clusterWidePodReadAcknowledged", "stableClusterId",
+                  "inventory", "hostCost", "nodeHeadroom", "launcherProfile",
+                  "installationBudget", "ownerBudget", "fairness"
+                ],
+                "properties": {
+                  "observerEnabled": {"const": true},
+                  "shadowEnabled": {"const": true},
+                  "clusterWidePodReadAcknowledged": {"const": true},
+                  "launcherProfile": {"type": "object", "minProperties": 1}
+                }
+              }
+            },
+            {
+              "if": {
+                "required": ["shadowEnabled"],
+                "properties": {"shadowEnabled": {"const": true}}
+              },
+              "then": {
+                "required": ["enforcementEnabled"],
+                "properties": {"enforcementEnabled": {"const": true}}
+              }
+            }
+          ]
         },
         "preflight": {
           "type": "object",

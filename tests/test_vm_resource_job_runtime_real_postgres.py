@@ -725,12 +725,12 @@ async def test_retry_scan_preserves_waiter_and_never_posts_with_conflicted_inven
         "SELECT state,reason,request_digest,provision_generation "
         "FROM vm_creation_retries WHERE request_id=$1", retry["request_id"],
     )
-    assert (row["state"], row["reason"]) == ("queued", "resource_wait")
+    assert (row["state"], row["reason"]) == ("queued", "resource_unavailable")
     from tests.test_job_projection import redact
 
     owner_view = redact(await db.get_job(str(retry["job_id"])))
-    assert owner_view["vm_creation"]["wait"]["kind"] == "resource"
-    assert owner_view["vm_creation"]["wait"]["guest_vcpus"] == 8
+    assert owner_view["vm_creation"]["wait"]["kind"] == "unknown"
+    assert owner_view["vm_creation"]["wait"]["guest_vcpus"] is None
     assert "cluster_id" not in json.dumps(owner_view["vm_creation"])
     assert "installation_budget" not in json.dumps(owner_view["vm_creation"])
     assert row["request_digest"] == retry["request_digest"]
@@ -739,6 +739,35 @@ async def test_retry_scan_preserves_waiter_and_never_posts_with_conflicted_inven
         "SELECT count(*) FROM vm_resource_reservations WHERE request_id=$1",
         retry["request_id"],
     ) == 0
+    assert client.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_retry_scan_reports_genuine_budget_wait_as_resource_wait(db):
+    policy, inventory, _, _ = await environment(db, installation_count=1)
+    first = await waiter(db, policy, inventory)
+    assert (await policy.admit(request_id=str(first["request_id"])))["action"] == "admitted"
+    second = await waiter(db, policy, inventory)
+    claims = await VMCreationRetryStore(db).claim_due(limit=2)
+    claim = next(row for row in claims if row["request_id"] == second["request_id"])
+    client = UnexpectedCreate()
+    service = VMCreationRetryService(
+        db,
+        SimpleNamespace(_http_client=client, _lifecycle_hmac_secret=b"test-key"),
+    )
+
+    await service._replay(claim)
+
+    retry = await db.fetchrow(
+        "SELECT state,reason FROM vm_creation_retries WHERE request_id=$1",
+        second["request_id"],
+    )
+    assert (retry["state"], retry["reason"]) == ("queued", "resource_wait")
+    from tests.test_job_projection import redact
+
+    owner_view = redact(await db.get_job(str(second["job_id"])))
+    assert owner_view["vm_creation"]["wait"]["kind"] == "resource"
+    assert owner_view["vm_creation"]["wait"]["guest_vcpus"] == 8
     assert client.calls == 0
 
 

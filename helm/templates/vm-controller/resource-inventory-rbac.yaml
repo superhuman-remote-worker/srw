@@ -1,4 +1,5 @@
-{{- if and (include "srw.vmSameCluster" .) .Values.vm.resourceAdmission.observerEnabled .Values.vm.resourceAdmission.clusterWidePodReadAcknowledged }}
+{{- $policy := .Values.vm.resourceAdmission | default dict -}}
+{{- if and (include "srw.vmSameCluster" .) $policy.observerEnabled $policy.clusterWidePodReadAcknowledged }}
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -27,24 +28,24 @@ roleRef:
   kind: ClusterRole
   name: {{ include "srw.vmControllerName" . }}-resource-observer
   apiGroup: rbac.authorization.k8s.io
-{{- if .Values.vm.resourceAdmission.launcherProfile }}
+{{- if $policy.launcherProfile }}
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
   name: {{ include "srw.vmControllerName" . }}-resource-installation
-  namespace: {{ .Values.vm.resourceAdmission.inventory.kubevirtNamespace | quote }}
+  namespace: {{ $policy.inventory.kubevirtNamespace | quote }}
 rules:
   - apiGroups: ["kubevirt.io"]
     resources: ["kubevirts"]
-    resourceNames: [{{ .Values.vm.resourceAdmission.inventory.kubevirtName | quote }}]
+    resourceNames: [{{ $policy.inventory.kubevirtName | quote }}]
     verbs: ["get"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
   name: {{ include "srw.vmControllerName" . }}-resource-installation
-  namespace: {{ .Values.vm.resourceAdmission.inventory.kubevirtNamespace | quote }}
+  namespace: {{ $policy.inventory.kubevirtNamespace | quote }}
 subjects:
   - kind: ServiceAccount
     name: {{ include "srw.vmControllerName" . }}
