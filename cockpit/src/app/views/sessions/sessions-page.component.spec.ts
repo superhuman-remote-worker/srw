@@ -624,7 +624,7 @@ describe('SessionsPageComponent', () => {
             vi.useRealTimers();
         });
 
-        it.fails('re-reads the list while a card is ending and shows it ended, with no loading placeholder', async () => {
+        it('re-reads the list while a card is ending and shows it ended, with no loading placeholder', async () => {
             const inFlight = new Subject<unknown>();
             serveThreadLists(mockHttp, [makeThread({id: 't-end', status: 'ending'})], inFlight);
 
@@ -649,7 +649,7 @@ describe('SessionsPageComponent', () => {
             expect(component.loading()).toBe(false);
         });
 
-        it.fails('re-reads a retirement-pending card and drops it once the server no longer lists it', async () => {
+        it('re-reads a retirement-pending card and drops it once the server no longer lists it', async () => {
             const kept = makeThread({id: 't-keep', status: 'active'});
             serveThreadLists(
                 mockHttp,
@@ -685,7 +685,7 @@ describe('SessionsPageComponent', () => {
             expect(vi.getTimerCount()).toBe(0);
         });
 
-        it.fails('stops polling once no card is ending', async () => {
+        it('stops polling once no card is ending', async () => {
             serveThreadLists(
                 mockHttp,
                 [makeThread({id: 't-end', status: 'ending'})],
@@ -706,7 +706,7 @@ describe('SessionsPageComponent', () => {
             expect(threadListReads(mockHttp)).toBe(3);
         });
 
-        it.fails('stops polling when the page is destroyed', async () => {
+        it('stops polling when the page is destroyed', async () => {
             serveThreadLists(mockHttp, [makeThread({id: 't-end', status: 'ending'})]);
 
             component.ngOnInit();
@@ -720,7 +720,7 @@ describe('SessionsPageComponent', () => {
             expect(threadListReads(mockHttp)).toBe(1);
         });
 
-        it.fails('does not re-arm from a re-read that lands after the page is destroyed', async () => {
+        it('does not re-arm from a re-read that lands after the page is destroyed', async () => {
             const inFlight = new Subject<unknown>();
             serveThreadLists(mockHttp, [makeThread({id: 't-end', status: 'ending'})], inFlight);
 
@@ -738,7 +738,7 @@ describe('SessionsPageComponent', () => {
             expect(threadListReads(mockHttp)).toBe(2);
         });
 
-        it.fails('backs off 2 s → 4 s → 8 s → 15 s and holds the 15 s cap', async () => {
+        it('backs off 2 s → 4 s → 8 s → 15 s and holds the 15 s cap', async () => {
             serveThreadLists(mockHttp, [makeThread({id: 't-end', status: 'ending'})]);
 
             component.ngOnInit();
@@ -910,7 +910,7 @@ describe('SessionsPageComponent (rendered): a fenced permanent delete', () => {
         return card(host, id).querySelector('app-icon-button[variant="danger"]') as IconButton;
     }
 
-    it.fails('keeps Delete enabled as a retry on the ending card, re-sends it on click, and drops the retry on a 200', async () => {
+    it('keeps Delete enabled as a retry on the ending card, re-sends it on click, and drops the retry on a 200', async () => {
         const live = makeThread({id: 't-del', status: 'active'});
         // What the list reports once the fenced delete has begun retirement.
         const retiring = makeThread({id: 't-del', status: 'active', runtime_retirement_pending: true});
@@ -960,7 +960,7 @@ describe('SessionsPageComponent (rendered): a fenced permanent delete', () => {
         expect(deleteButton(host, 't-del').tooltip).toBe('sessions.tooltip.delete');
     });
 
-    it.fails('retries a fenced force delete as a force delete, and drops the retry once the card leaves ending', async () => {
+    it('retries a fenced force delete as a force delete, and drops the retry once the card leaves ending', async () => {
         const live = makeThread({id: 't-live', status: 'active'});
         const retiring = makeThread({id: 't-live', status: 'active', runtime_retirement_pending: true});
         serveThreadLists(mocks.mockHttp, [live], [retiring]);
@@ -1017,7 +1017,7 @@ describe('SessionsPageComponent (rendered): a fenced permanent delete', () => {
         expect(mocks.mockHttp.delete).toHaveBeenCalledTimes(3);
     });
 
-    it.fails('drops the retry when a retried delete fails for a reason that is not the fence', async () => {
+    it('drops the retry when a retried delete fails for a reason that is not the fence', async () => {
         const live = makeThread({id: 't-del', status: 'active'});
         const retiring = makeThread({id: 't-del', status: 'active', runtime_retirement_pending: true});
         serveThreadLists(mocks.mockHttp, [live], [retiring]);

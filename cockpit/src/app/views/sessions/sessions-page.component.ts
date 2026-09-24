@@ -1,4 +1,4 @@
-import {Component, computed, inject, OnInit, signal} from '@angular/core';
+import {Component, computed, DestroyRef, inject, OnInit, signal} from '@angular/core';
 import {Router} from '@angular/router';
 import {HttpClient} from '@angular/common/http';
 import {TitleCasePipe} from '@angular/common';
@@ -35,6 +35,16 @@ interface Project {
     description?: string;
     is_default?: boolean;
 }
+
+/**
+ * While any card is `ending` (a pinned retirement after End or a permanent
+ * Delete, about 60–75 s) the list is re-read in the background: first 2 s
+ * after the card is seen, doubling, capped at 15 s — so a settled card updates
+ * within the server's settlement time plus at most one 15 s interval. The poll
+ * stops as soon as no card is ending, and on destroy.
+ */
+const ENDING_POLL_INITIAL_MS = 2_000;
+const ENDING_POLL_MAX_MS = 15_000;
 
 @Component({
     selector: 'app-sessions-page',
@@ -229,9 +239,9 @@ interface Project {
                 </app-icon-button>
                 <app-icon-button
                   variant="danger"
-                  [ariaLabel]="'sessions.tooltip.delete' | transloco"
-                  [tooltip]="'sessions.tooltip.delete' | transloco"
-                  [disabled]="thread.status === 'ending'"
+                  [ariaLabel]="(isDeleteRetry(thread) ? 'sessions.tooltip.retryDelete' : 'sessions.tooltip.delete') | transloco"
+                  [tooltip]="(isDeleteRetry(thread) ? 'sessions.tooltip.retryDelete' : 'sessions.tooltip.delete') | transloco"
+                  [disabled]="thread.status === 'ending' && !isDeleteRetry(thread)"
                   (clicked)="deleteSession(thread)"
                 >
                   <app-icon size="sm">delete</app-icon>
@@ -586,6 +596,18 @@ export class SessionsPageComponent implements OnInit {
     confirmForceOpen = signal(false);
     pendingDelete = signal<Thread | null>(null);
 
+    /**
+     * Thread id → the `force` flag of a confirmed permanent Delete that the
+     * server fenced with a retryable 503. Such a card keeps its Delete control
+     * while `ending`, as a retry of that same request. Dropped on a 2xx, on a
+     * non-503 failure, and once the card leaves `ending` (or the list).
+     */
+    readonly deleteRetries = signal<ReadonlyMap<string, boolean>>(new Map());
+
+    private endingPollTimer: ReturnType<typeof setTimeout> | null = null;
+    private endingPollDelayMs = ENDING_POLL_INITIAL_MS;
+    private destroyed = false;
+
     showCreate = false;
     /** In-dialog server rejection, so a bad config is correctable in place. */
     readonly createError = signal<string | null>(null);
@@ -608,6 +630,13 @@ export class SessionsPageComponent implements OnInit {
     readonly activeCount = computed(() => this.threads().filter(t => t.status !== 'ended').length);
     readonly endedCount = computed(() => this.threads().filter(t => t.status === 'ended').length);
 
+    constructor() {
+        inject(DestroyRef).onDestroy(() => {
+            this.destroyed = true;
+            this.cancelEndingPoll();
+        });
+    }
+
     ngOnInit(): void {
         this.loadThreads();
         this.loadProjects();
@@ -616,11 +645,21 @@ export class SessionsPageComponent implements OnInit {
 
     async loadThreads(): Promise<void> {
         this.loading.set(true);
+        await this.refreshThreads();
+        this.loading.set(false);
+    }
+
+    /**
+     * Re-read the list without the loading placeholder (which would swap the
+     * whole list out on every poll), then re-arm or stop the ending poll.
+     */
+    private async refreshThreads(): Promise<void> {
         // No try/catch: SessionListService.refresh() never rejects — both its
         // success and failure paths resolve, updating its own signals either
         // way (a failed fetch leaves sessionList.threads() as whatever it
         // already had, so re-reading it below is safe on either outcome).
         await this.sessionList.refresh();
+        if (this.destroyed) return;
         this.threads.set(
             this.sessionList.threads()
                 // The server filters children, but keep the mutation-heavy
@@ -632,7 +671,59 @@ export class SessionsPageComponent implements OnInit {
                         : thread,
                 ),
         );
-        this.loading.set(false);
+        this.dropSettledDeleteRetries();
+        this.syncEndingPoll();
+    }
+
+    /**
+     * Keep one background re-read scheduled while any card is `ending`, each
+     * gap doubling up to the cap; stop and reset the backoff once none is.
+     * House idiom: a cleared setTimeout, not rxjs.
+     */
+    private syncEndingPoll(): void {
+        if (this.destroyed || !this.threads().some(t => t.status === 'ending')) {
+            this.cancelEndingPoll();
+            this.endingPollDelayMs = ENDING_POLL_INITIAL_MS;
+            return;
+        }
+        if (this.endingPollTimer !== null) return;
+        const delay = this.endingPollDelayMs;
+        this.endingPollDelayMs = Math.min(delay * 2, ENDING_POLL_MAX_MS);
+        this.endingPollTimer = setTimeout(() => {
+            this.endingPollTimer = null;
+            void this.refreshThreads();
+        }, delay);
+    }
+
+    private cancelEndingPoll(): void {
+        if (this.endingPollTimer !== null) clearTimeout(this.endingPollTimer);
+        this.endingPollTimer = null;
+    }
+
+    /** A delete retry only means something on a card that is still `ending`. */
+    private dropSettledDeleteRetries(): void {
+        const retries = this.deleteRetries();
+        if (retries.size === 0) return;
+        const ending = new Set(
+            this.threads().filter(t => t.status === 'ending').map(t => t.id),
+        );
+        const kept = new Map([...retries].filter(([id]) => ending.has(id)));
+        if (kept.size !== retries.size) this.deleteRetries.set(kept);
+    }
+
+    private setDeleteRetry(threadId: string, force: boolean | null): void {
+        const retries = new Map(this.deleteRetries());
+        if (force === null) {
+            if (!retries.delete(threadId)) return;
+        } else {
+            retries.set(threadId, force);
+        }
+        this.deleteRetries.set(retries);
+    }
+
+    /** True while this card's last confirmed permanent Delete was fenced (503). */
+    isDeleteRetry(thread: Thread): boolean {
+        return this.deleteRetries().has(thread.id);
     }
 
     async loadProjects(): Promise<void> {
@@ -816,6 +907,14 @@ export class SessionsPageComponent implements OnInit {
     }
 
     deleteSession(thread: Thread): void {
+        // A card whose confirmed permanent Delete hit the retryable 503 fence
+        // re-sends that same request (force kept): the user already confirmed
+        // it, and the server contract for the fence is "retry".
+        const force = this.deleteRetries().get(thread.id);
+        if (force !== undefined) {
+            void this.sendPermanentDelete(thread, force);
+            return;
+        }
         // Open the themed confirmation dialog instead of a native confirm().
         this.pendingDelete.set(thread);
         this.confirmDeleteOpen.set(true);
@@ -825,40 +924,53 @@ export class SessionsPageComponent implements OnInit {
         const thread = this.pendingDelete();
         if (!thread) return;
         this.confirmDeleteOpen.set(false);
-        try {
-            await firstValueFrom(
-                this.http.delete(`${environment.apiUrl}/persistent/threads/${thread.id}?permanent=true`)
-            );
-            this.loadThreads();
-        } catch (e: any) {
-            // Mid-turn guard (session_silent_failure_audit.md #11): a
-            // cleanup sweep used to tear down live sessions silently.
-            if (
-                e?.status === 409 &&
-                e?.error?.detail?.code === 'turn_in_flight'
-            ) {
-                // Live/mid-turn session — escalate to a force-delete confirm.
-                this.confirmForceOpen.set(true);
-                return;
-            }
-            this.toast.danger(this.errors.translate(e, 'errors.sessions.deleteFailed'));
-        }
+        await this.sendPermanentDelete(thread, false);
     }
 
     async confirmForceDelete(): Promise<void> {
         const thread = this.pendingDelete();
         if (!thread) return;
         this.confirmForceOpen.set(false);
+        await this.sendPermanentDelete(thread, true);
+    }
+
+    private async sendPermanentDelete(thread: Thread, force: boolean): Promise<void> {
+        const query = force ? 'permanent=true&force=true' : 'permanent=true';
         try {
             await firstValueFrom(
-                this.http.delete(
-                    `${environment.apiUrl}/persistent/threads/${thread.id}?permanent=true&force=true`
-                )
+                this.http.delete(`${environment.apiUrl}/persistent/threads/${thread.id}?${query}`)
             );
-            this.loadThreads();
-        } catch (e2: any) {
-            this.toast.danger(this.errors.translate(e2, 'errors.sessions.deleteFailed'));
+            this.setDeleteRetry(thread.id, null);
+        } catch (e: any) {
+            // Mid-turn guard (session_silent_failure_audit.md #11): a
+            // cleanup sweep used to tear down live sessions silently.
+            if (
+                !force &&
+                e?.status === 409 &&
+                e?.error?.detail?.code === 'turn_in_flight'
+            ) {
+                // Live/mid-turn session — escalate to a force-delete confirm.
+                this.pendingDelete.set(thread);
+                this.confirmForceOpen.set(true);
+                return;
+            }
+            if (e?.status !== 503) {
+                this.setDeleteRetry(thread.id, null);
+                this.toast.danger(this.errors.translate(e, 'errors.sessions.deleteFailed'));
+                return;
+            }
+            // The retirement fence: the delete may already have begun the
+            // card's retirement (it turns `ending`), so keep Delete usable on
+            // it as the retry the server asks for.
+            this.setDeleteRetry(thread.id, force);
+            this.toast.warning(this.transloco.translate('errors.sessions.deleteRetryable'));
         }
+        // Accepted or fenced, the card has moved (gone, or `ending` while the
+        // server finishes): re-read quietly and restart the poll from its
+        // shortest interval.
+        this.cancelEndingPoll();
+        this.endingPollDelayMs = ENDING_POLL_INITIAL_MS;
+        await this.refreshThreads();
     }
 
     goToDraft(): void {

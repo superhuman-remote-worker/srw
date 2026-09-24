@@ -581,6 +581,7 @@
       "sessionFiles": "Sitzungsdateien",
       "resume": "Fortsetzen",
       "delete": "Löschen",
+      "retryDelete": "Löschen erneut versuchen",
       "talk": "Mit dem Offizier sprechen"
     },
     "create": {
@@ -3763,6 +3764,7 @@
       "stillEnding": "Diese Sitzung wird noch beendet. Lass diese Seite geöffnet und versuche Fortsetzen danach erneut.",
       "endFailed": "Sitzung konnte nicht beendet werden.",
       "deleteFailed": "Sitzung konnte nicht gelöscht werden.",
+      "deleteRetryable": "Diese Sitzung wird noch heruntergefahren und konnte daher noch nicht gelöscht werden. Nutze gleich „Löschen erneut versuchen“ auf ihrer Karte.",
       "createFailed": "Sitzung konnte nicht erstellt werden.",
       "renameFailed": "Sitzung konnte nicht umbenannt werden.",
       "bindingInvalid": "Diese Sitzungsverbindung ist nicht mehr autoritativ. Warte auf die Wiederherstellung der Sitzung oder wende dich an einen Administrator."

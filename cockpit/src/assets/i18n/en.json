@@ -581,6 +581,7 @@
       "sessionFiles": "Session Files",
       "resume": "Resume",
       "delete": "Delete",
+      "retryDelete": "Retry delete",
       "talk": "Talk to the officer"
     },
     "create": {
@@ -3763,6 +3764,7 @@
       "stillEnding": "This session is still finishing. Keep this page open, then try Resume again.",
       "endFailed": "Couldn't end the session.",
       "deleteFailed": "Couldn't delete the session.",
+      "deleteRetryable": "This session is still shutting down, so it couldn't be deleted yet. Use Retry delete on its card in a moment.",
       "createFailed": "Couldn't create the session.",
       "renameFailed": "Couldn't rename the session.",
       "bindingInvalid": "This session connection is no longer authoritative. Wait for the session to recover or contact an administrator."
