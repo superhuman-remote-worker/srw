@@ -43,6 +43,16 @@ async def disposition_schema(pg_dsn, thread_schema):  # noqa: F811
                 / "src/orchestrator/database/migrations/app/0279_vm_thread_creation_disposition.sql"
             )
             await conn.execute(migration.read_text())
+        migration = (
+            Path(__file__).resolve().parents[1]
+            / "src/orchestrator/database/migrations/app/0280_vm_thread_cancel_carrier.sql"
+        )
+        if not await conn.fetchval(
+            "SELECT EXISTS(SELECT 1 FROM information_schema.columns "
+            "WHERE table_name='vm_creation_retries' "
+            "AND column_name='disposition_carrier_uid')"
+        ):
+            await conn.execute(migration.read_text())
     finally:
         await conn.close()
 
@@ -164,6 +174,92 @@ async def controller_runtime(db, setup, monkeypatch, last_effect):
     ctrl._workspace_cleanup_authority_request = authority
     row = await store.inspect(request_id=str(request_id))
     return ctrl, api, store, row, thread_id, admitted, observations, carrier
+
+
+async def missing_carrier_runtime(db, setup, monkeypatch, *, pin=True):
+    """Real typed grant and source DV/PVC, without any creation Lease/effect."""
+    from vm_controller import controller as settings
+    from vm_controller.creation_sources import GoldenSources
+
+    (
+        _, _, _, _, thread_id, runtime, _, request_id,
+        admitted, _, carrier,
+    ) = await _adopted_charged_thread(
+        db, monkeypatch, stop_before_effect=True, adopt=False,
+        golden_enabled=True,
+    )
+    assert carrier is None
+    ctrl, api, _, _ = setup
+    monkeypatch.setattr(settings, "VM_NAMESPACE", "workers")
+    monkeypatch.setattr(settings, "VM_STORAGE_CLASS", "local")
+    monkeypatch.setattr(settings, "VM_GOLDEN_DISK_SIZE", "10Gi")
+    monkeypatch.setattr(settings, "VM_GOLDEN_IMAGE_ENABLED", True)
+    store = VMCreationRetryStore(db)
+
+    async def authority(path, body, *, operation):
+        method = path.rsplit("/", 1)[-1].replace("-", "_")
+        assert operation == "creation_retry_" + method
+        return await getattr(store, method)(**body)
+
+    ctrl._workspace_cleanup_authority_request = authority
+    row = await store.inspect(request_id=str(request_id))
+    name = settings._golden_name(row["request"]["vm_image"])
+    dv = ctrl._golden_dv_manifest(name, row["request"]["vm_image"])
+    dv["metadata"].update(uid=str(UUID(int=2)), resourceVersion="1")
+    dv["status"] = {"phase": "Succeeded"}
+    api.objects["DataVolume", name] = dv
+    api.objects["PersistentVolumeClaim", name] = {
+        "apiVersion": "v1", "kind": "PersistentVolumeClaim",
+        "metadata": {
+            "name": name, "namespace": "workers", "uid": str(UUID(int=3)),
+            "resourceVersion": "1", "ownerReferences": [{
+                "kind": "DataVolume", "uid": dv["metadata"]["uid"],
+                "controller": True,
+            }],
+        },
+        "spec": {"volumeMode": "Filesystem"}, "status": {"phase": "Bound"},
+    }
+    api.replacements = []
+
+    def replace_source(**kwargs):
+        old = api.read("DataVolume", kwargs["name"])
+        body = deepcopy(kwargs["body"])
+        if any(
+            body["metadata"][key] != old["metadata"][key]
+            for key in ("uid", "resourceVersion")
+        ):
+            raise ApiException(status=409)
+        body["metadata"]["resourceVersion"] = str(
+            int(old["metadata"]["resourceVersion"]) + 1
+        )
+        api.objects["DataVolume", kwargs["name"]] = body
+        api.replacements.append(deepcopy(body))
+        if "DataVolume" in api.lost:
+            api.lost.remove("DataVolume")
+            raise TimeoutError("accepted source CAS reply lost")
+        return body
+
+    ctrl.k8s_client.replace_namespaced_custom_object = replace_source
+    ctrl.k8s_client.list_namespaced_custom_object = lambda **_: {
+        "metadata": {"resourceVersion": "1"}, "items": [],
+    }
+    ctrl.core_api.list_namespaced_pod = lambda **_: {
+        "metadata": {"resourceVersion": "1"}, "items": [],
+    }
+    if pin:
+        source, observed = await GoldenSources(ctrl).facts(row, name)
+        assert await GoldenSources(ctrl).hold(row, source, observed) == source
+    retirement = await db.begin_pinned_thread_retirement(
+        str(thread_id), permanent=True,
+        expected_runtime_generation=str(runtime),
+        expected_agent_id=None, expected_attach_token=None,
+    )
+    assert retirement["state"] == "pending"
+    assert await db.authorize_pinned_thread_retirement(
+        str(thread_id), token=retirement["token"],
+        generation=retirement["generation"], settle_status="ended",
+    )
+    return ctrl, api, store, await store.inspect(request_id=str(request_id)), admitted, name
 
 
 @pytest.mark.asyncio
@@ -314,9 +410,251 @@ async def test_missing_typed_carrier_with_unresolved_golden_source_stays_charged
     assert await VMCreationRetryStore(db).settle_never_issued(
         request_id=str(request_id),
     ) == {"settled": False, "reason": "creation_source_unresolved"}
-    with pytest.raises(VMCreationRetryConflict, match="creation_carrier_required"):
-        await VMCreationDispositionStore(VMCreationRetryStore(db)).prepare(
-            request_id=str(request_id),
+    prepared = await VMCreationDispositionStore(VMCreationRetryStore(db)).prepare(
+        request_id=str(request_id),
+    )
+    assert prepared["actuation_allowed"] is False
+    assert prepared["carrier_intent"]["kind"] == "thread_creation_cancel"
+    assert prepared["carrier_intent"]["thread_runtime_generation"] == str(runtime)
+    assert prepared["carrier_intent"]["reservation_id"] == str(admitted["reservation_id"])
+    assert await db.fetchval(
+        "SELECT state FROM vm_resource_reservations WHERE id=$1",
+        admitted["reservation_id"],
+    ) == "reserved"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lost_stage", ["create", "seal"])
+async def test_controller_publishes_separate_thread_cancel_lease_after_lost_reply(
+    db, setup, monkeypatch, lost_stage,
+):
+    from shared.vm_creation_cancel_carrier import (
+        carrier_name, verify_cancel_carrier,
+    )
+    from tests.test_vm_creation_actuation import SECRET
+
+    (
+        _, _, _, _, thread_id, runtime, _, request_id,
+        admitted, _, carrier,
+    ) = await _adopted_charged_thread(
+        db, monkeypatch, stop_before_effect=True, adopt=False,
+        golden_enabled=True,
+    )
+    assert carrier is None
+    retirement = await db.begin_pinned_thread_retirement(
+        str(thread_id), permanent=True,
+        expected_runtime_generation=str(runtime),
+        expected_agent_id=None, expected_attach_token=None,
+    )
+    assert await db.authorize_pinned_thread_retirement(
+        str(thread_id), token=retirement["token"],
+        generation=retirement["generation"], settle_status="ended",
+    )
+    ctrl, api, _, _ = setup
+    from vm_controller import controller as settings
+
+    monkeypatch.setattr(settings, "VM_NAMESPACE", "workers")
+    store = VMCreationRetryStore(db)
+
+    async def authority(path, body, *, operation):
+        method = path.rsplit("/", 1)[-1].replace("-", "_")
+        assert operation == "creation_retry_" + method
+        return await getattr(store, method)(**body)
+
+    ctrl._workspace_cleanup_authority_request = authority
+    row = await store.inspect(request_id=str(request_id))
+    if lost_stage == "create":
+        api.lost.add("Lease")
+    else:
+        original_replace = api.replace
+        lost = False
+
+        def replace_with_lost_reply(body):
+            nonlocal lost
+            result = original_replace(body)
+            if not lost:
+                lost = True
+                raise TimeoutError("accepted Lease seal reply lost")
+            return result
+
+        api.replace = replace_with_lost_reply
+    result = await CreationDisposer(ctrl).run(disposition_identity(row))
+    frozen = await store.inspect(request_id=str(request_id))
+    assert frozen["cancellation_disposition"] is not None, result
+    assert frozen["cancellation_disposition"]["carrier_kind"] == "thread_creation_cancel"
+    lease = api.read("Lease", carrier_name(frozen["creation_admission_id"]))
+    values = verify_cancel_carrier(lease, secret=SECRET)
+    assert values["reservation_id"] == str(admitted["reservation_id"])
+    assert frozen["disposition_carrier_uid"] == lease["metadata"]["uid"]
+    assert frozen["creation_carrier_uid"] is None
+    assert await db.fetchval(
+        "SELECT state FROM vm_resource_reservations WHERE id=$1",
+        admitted["reservation_id"],
+    ) == "reserved"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lost_reply", [False, True])
+async def test_missing_carrier_source_pin_cas_acknowledges_before_release(
+    db, setup, monkeypatch, lost_reply,
+):
+    from shared.vm_creation_cancel_carrier import carrier_name
+    from vm_controller.creation_sources import GoldenSources, pins
+
+    ctrl, api, store, row, admitted, source_name = await missing_carrier_runtime(
+        db, setup, monkeypatch,
+    )
+    request_id = row["request_id"]
+    assert pins(api.read("DataVolume", source_name))[request_id]["state"] == "active"
+    assert await db.fetchval(
+        "SELECT state FROM vm_resource_reservations WHERE id=$1",
+        admitted["reservation_id"],
+    ) == "reserved"
+    prepared = await store.prepare_disposition(request_id=request_id)
+    lease = await CreationDisposer(ctrl)._publish_thread_cancel(prepared["carrier_intent"])
+    assert (await store.freeze_disposition(
+        request_id=request_id, carrier=lease,
+    ))["frozen"] is True
+    source, _ = await GoldenSources(ctrl).facts(row, source_name)
+    plan = await store.authorize_disposition(
+        request_id=request_id, carrier=lease, stage="source", source=source,
+    )
+    assert plan["plan"]["tombstone"]["state"] == "disposed"
+    with pytest.raises(VMCreationRetryConflict, match="creation_disposition_incomplete"):
+        await store.settle_disposition(request_id=request_id, carrier=lease)
+    assert await db.fetchval(
+        "SELECT state FROM vm_resource_reservations WHERE id=$1",
+        admitted["reservation_id"],
+    ) == "reserved"
+    if lost_reply:
+        await db.execute(
+            "UPDATE vm_resource_admission_policy SET mode='off' "
+            "WHERE cluster_id=(SELECT cluster_id FROM vm_resource_reservations "
+            "WHERE id=$1)", admitted["reservation_id"],
+        )
+        api.lost.add("DataVolume")
+    result = await CreationDisposer(ctrl).run(disposition_identity(row))
+    assert result["status"] == "creation_disposed", result
+    current = await store.inspect(request_id=request_id)
+    assert current["state"] == "settled"
+    assert current["reason"] == "creation_disposed"
+    assert current["cancellation_completion"]["source"]["outcome"] == "pin_disposed"
+    assert pins(api.read("DataVolume", source_name))[request_id]["state"] == "disposed"
+    assert len(api.replacements) == 2
+    assert current["creation_carrier_uid"] is None
+    assert current["disposition_carrier_uid"] == api.read(
+        "Lease", carrier_name(current["creation_admission_id"])
+    )["metadata"]["uid"]
+    assert await store.settle_disposition(
+        request_id=request_id, carrier=lease,
+    ) == {"settled": True, "disposition": "creation_disposed"}
+    assert await db.fetchval(
+        "SELECT state FROM vm_resource_reservations WHERE id=$1",
+        admitted["reservation_id"],
+    ) == "released"
+
+
+@pytest.mark.asyncio
+async def test_foreign_thread_cancel_lease_does_not_freeze_or_release(
+    db, setup, monkeypatch,
+):
+    from shared.vm_creation_cancel_carrier import carrier_name
+    from vm_controller.creation_sources import pins
+
+    ctrl, api, store, row, admitted, source_name = await missing_carrier_runtime(
+        db, setup, monkeypatch,
+    )
+    name = carrier_name(row["creation_admission_id"])
+    api.objects["Lease", name] = {
+        "apiVersion": "coordination.k8s.io/v1", "kind": "Lease",
+        "metadata": {
+            "name": name, "namespace": "workers", "uid": str(UUID(int=4)),
+            "resourceVersion": "1", "labels": {}, "annotations": {},
+        },
+        "spec": {"holderIdentity": row["creation_admission_id"]},
+    }
+    result = await CreationDisposer(ctrl).run(disposition_identity(row))
+    assert result["status"] == "creation_attention"
+    assert (await store.inspect(request_id=row["request_id"]))["cancellation_disposition"] is None
+    assert pins(api.read("DataVolume", source_name))[row["request_id"]]["state"] == "active"
+    assert await db.fetchval(
+        "SELECT state FROM vm_resource_reservations WHERE id=$1",
+        admitted["reservation_id"],
+    ) == "reserved"
+
+
+@pytest.mark.asyncio
+async def test_replaced_signed_thread_cancel_lease_uid_remains_held(
+    db, setup, monkeypatch,
+):
+    from shared.vm_creation_cancel_carrier import carrier_name
+    from vm_controller.creation_sources import pins
+
+    ctrl, api, store, row, admitted, source_name = await missing_carrier_runtime(
+        db, setup, monkeypatch,
+    )
+    prepared = await store.prepare_disposition(request_id=row["request_id"])
+    disposer = CreationDisposer(ctrl)
+    lease = await disposer._publish_thread_cancel(prepared["carrier_intent"])
+    assert (await store.freeze_disposition(
+        request_id=row["request_id"], carrier=lease,
+    ))["frozen"] is True
+    name = carrier_name(row["creation_admission_id"])
+    replaced = deepcopy(api.read("Lease", name))
+    replaced["metadata"]["uid"] = str(UUID(int=5))
+    api.objects["Lease", name] = replaced
+    result = await disposer.run(disposition_identity(row))
+    assert result["status"] == "creation_attention"
+    assert (await store.inspect(request_id=row["request_id"]))["state"] == "cancel_requested"
+    assert pins(api.read("DataVolume", source_name))[row["request_id"]]["state"] == "active"
+    assert await db.fetchval(
+        "SELECT state FROM vm_resource_reservations WHERE id=$1",
+        admitted["reservation_id"],
+    ) == "reserved"
+
+
+@pytest.mark.asyncio
+async def test_thread_cancel_carrier_has_no_create_authority_and_needs_authorized_end(
+    db, monkeypatch,
+):
+    from shared.vm_creation_issuance import verify_creation_carrier
+    from shared.vm_creation_cancel_carrier import seal_cancel_carrier
+    from tests.test_vm_creation_actuation import SECRET
+
+    (
+        _, _, _, _, thread_id, runtime, _, request_id,
+        admitted, _, _,
+    ) = await _adopted_charged_thread(
+        db, monkeypatch, stop_before_effect=True, adopt=False,
+        golden_enabled=True,
+    )
+    retirement = await db.begin_pinned_thread_retirement(
+        str(thread_id), permanent=True,
+        expected_runtime_generation=str(runtime),
+        expected_agent_id=None, expected_attach_token=None,
+    )
+    store = VMCreationRetryStore(db)
+    with pytest.raises(VMCreationRetryConflict):
+        await store.prepare_disposition(request_id=str(request_id))
+    assert not await db.authorize_pinned_thread_retirement(
+        str(thread_id), token=str(UUID(int=6)),
+        generation=retirement["generation"], settle_status="ended",
+    )
+    assert await db.authorize_pinned_thread_retirement(
+        str(thread_id), token=retirement["token"],
+        generation=retirement["generation"], settle_status="ended",
+    )
+    prepared = await store.prepare_disposition(request_id=str(request_id))
+    carrier = seal_cancel_carrier(
+        prepared["carrier_intent"], namespace="workers",
+        uid=str(UUID(int=7)), resource_version="1", secret=SECRET,
+    )
+    with pytest.raises(ValueError):
+        verify_creation_carrier(carrier, secret=SECRET)
+    with pytest.raises(ValueError):
+        await store.begin_effect(
+            request_id=str(request_id), claim_token=str(UUID(int=8)),
+            carrier=carrier,
         )
     assert await db.fetchval(
         "SELECT state FROM vm_resource_reservations WHERE id=$1",

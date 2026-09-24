@@ -1643,6 +1643,10 @@ class VMCreationRetryStore:
                             "creation_carrier_uid",
                         )
                     },
+                    "disposition_carrier_uid": (
+                        str(row["disposition_carrier_uid"])
+                        if row.get("disposition_carrier_uid") else None
+                    ),
                     **(
                         {
                             "job_id": str(row["thread_id"]),
