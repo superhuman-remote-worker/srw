@@ -1,8 +1,10 @@
+import json
 import shutil
 import subprocess
 from pathlib import Path
 
 import pytest
+import yaml
 
 from shared.vm_resource_inventory_settings import InventorySettings
 from tests.test_manifest_hosting_helm import render
@@ -31,6 +33,124 @@ def enabled(*overrides):
         *overrides,
         check=False,
     )
+
+
+def full_policy_values(tmp_path, *, mutate=None):
+    from tests.test_vm_resource_policy import whole_launcher_policy
+
+    policy = whole_launcher_policy()["policy"]
+    policy.update(
+        stableClusterId="test-cluster", shadowEnabled=True,
+        enforcementEnabled=True,
+    )
+    policy["inventory"]["maxItems"] = 1000
+    value = {
+        "vm": {
+            "mode": "same-cluster",
+            "lifecycleAuthSecretName": "vm-lifecycle",
+            "resourceAdmission": policy,
+        },
+        "orchestrator": {"vmProvisioning": {"creationRetryEnabled": True}},
+        "agent": {"tailscale": {"enabled": False}},
+    }
+    if mutate is not None:
+        mutate(value)
+    path = tmp_path / "full-resource-values.yaml"
+    path.write_text(yaml.safe_dump(value))
+    return path
+
+
+def render_full_policy(tmp_path, *, mutate=None):
+    path = full_policy_values(tmp_path, mutate=mutate)
+    return subprocess.run(
+        [
+            "helm", "template", "resource-test",
+            str(Path(__file__).resolve().parents[1] / "helm"),
+            "-n", "control-plane", "-f",
+            str(Path(__file__).resolve().parents[1] / "helm/ci/test-values.yaml"),
+            "-f", str(path),
+        ],
+        capture_output=True, text=True,
+    )
+
+
+def test_explicit_whole_resource_policy_renders_one_valid_shared_document(tmp_path):
+    from shared.vm_resource_policy import validate_enforcement_resource_policy
+    from tests.test_helm_vm_workspace_recovery import _env, _orchestrator
+
+    rendered = render_full_policy(tmp_path)
+    assert rendered.returncode == 0, rendered.stderr
+    docs = [doc for doc in yaml.safe_load_all(rendered.stdout) if doc]
+    controller = next(
+        doc for doc in docs if doc["kind"] == "Deployment"
+        and doc["metadata"]["name"].endswith("vm-controller")
+    )
+    orchestrator = _orchestrator(docs)
+    left = _env(docs, orchestrator)["VM_RESOURCE_ADMISSION_CONFIG"]
+    right = _env(docs, controller)["VM_RESOURCE_ADMISSION_CONFIG"]
+    assert left == right
+    policy = validate_enforcement_resource_policy(json.loads(left))
+    assert policy.inventory.protocol == 2
+    for deployment in (orchestrator, controller):
+        assert deployment["spec"]["template"]["metadata"]["annotations"][
+            "checksum/vm-resource-policy"
+        ] == policy.policy_digest.removeprefix("sha256:")
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "shadow_only", "enforcement_only", "retry_disabled", "ack_missing",
+        "budget_missing", "host_cost_zero", "profile_missing",
+        "profile_unsupported", "arch_label_missing", "installation_missing",
+    ],
+)
+def test_incomplete_whole_resource_policy_is_rejected(tmp_path, case):
+    def mutate(value):
+        policy = value["vm"]["resourceAdmission"]
+        if case == "shadow_only":
+            policy["enforcementEnabled"] = False
+        elif case == "enforcement_only":
+            policy["shadowEnabled"] = False
+        elif case == "retry_disabled":
+            value["orchestrator"]["vmProvisioning"]["creationRetryEnabled"] = False
+        elif case == "ack_missing":
+            policy["clusterWidePodReadAcknowledged"] = False
+        elif case == "budget_missing":
+            policy["installationBudget"]["memoryBytes"] = None
+        elif case == "host_cost_zero":
+            policy["hostCost"]["cpuMillicoresPerVcpuDenominator"] = 0
+        elif case == "profile_missing":
+            policy["launcherProfile"] = None
+        elif case == "profile_unsupported":
+            policy["launcherProfile"]["architecture"] = "arm64"
+        elif case == "arch_label_missing":
+            policy["inventory"]["nodeLabelKeys"].remove("kubernetes.io/arch")
+        elif case == "installation_missing":
+            policy["inventory"]["kubevirtName"] = None
+
+    rendered = render_full_policy(tmp_path, mutate=mutate)
+    assert rendered.returncode != 0, case
+
+
+def test_reused_values_without_resource_admission_map_render_disabled(tmp_path):
+    chart = tmp_path / "helm"
+    shutil.copytree(Path(__file__).resolve().parents[1] / "helm", chart)
+    values_path = chart / "values.yaml"
+    values = values_path.read_text()
+    start = values.index("  resourceAdmission:\n")
+    end = values.index("  preflight:\n", start)
+    values_path.write_text(values[:start] + values[end:])
+    rendered = subprocess.run(
+        [
+            "helm", "template", "legacy-resource", str(chart),
+            "-f", str(chart / "ci/test-values.yaml"),
+        ],
+        capture_output=True, text=True,
+    )
+    assert rendered.returncode == 0, rendered.stderr
+    docs = [doc for doc in yaml.safe_load_all(rendered.stdout) if doc]
+    assert "VM_RESOURCE_ADMISSION_CONFIG" not in _env(docs, _orchestrator(docs))
 
 
 def test_default_off_has_no_broad_observer_role_or_policy_env():

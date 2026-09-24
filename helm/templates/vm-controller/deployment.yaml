@@ -16,7 +16,7 @@ spec:
       {{- include "srw.componentSelectorLabels" (dict "context" . "component" "vm-controller") | nindent 6 }}
   template:
     metadata:
-      {{- if .Values.vm.resourceAdmission.observerEnabled }}
+      {{- if (get (.Values.vm.resourceAdmission | default dict) "observerEnabled" | default false) }}
       annotations:
         checksum/vm-resource-policy: {{ include "srw.vmResourceInventoryConfig" . | sha256sum | quote }}
       {{- end }}
@@ -33,7 +33,7 @@ spec:
           image: "{{ .Values.vmController.image.repository }}:{{ .Values.vmController.image.tag }}"
           imagePullPolicy: {{ .Values.vmController.image.pullPolicy }}
           env:
-            {{- if .Values.vm.resourceAdmission.observerEnabled }}
+            {{- if (get (.Values.vm.resourceAdmission | default dict) "observerEnabled" | default false) }}
             - name: VM_RESOURCE_ADMISSION_CONFIG
               value: {{ include "srw.vmResourceInventoryConfig" . | quote }}
             {{- end }}

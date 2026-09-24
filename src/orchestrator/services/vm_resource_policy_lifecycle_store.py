@@ -1,4 +1,4 @@
-"""Explicit installed-policy transitions for the Job resource runtime."""
+"""Explicit installed-policy transitions for the shared VM resource runtime."""
 
 from dataclasses import dataclass
 import json
