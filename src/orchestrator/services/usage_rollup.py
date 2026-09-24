@@ -617,10 +617,16 @@ async def usage_rollup_loop(
     """Lifespan task body: roll up at startup (catch up days missed while down),
     then every ~6h with 0-30min jitter. Every pass is wrapped so a failure
     ERROR-logs and the loop continues — the rollup must never crash the
-    orchestrator. No-op when the rollup is unavailable.
+    orchestrator. No-op when the rollup is unavailable: it logs once and waits
+    for ``shutdown_event``.
     """
     if rollup is None or not rollup.is_available:
         logger.info("usage rollup loop disabled (rollup unavailable)")
+        # Park until shutdown instead of returning: run_when_leader re-creates
+        # a loop that returns on its next poll, which re-logged this line about
+        # once a second for the whole leadership tenure (R1.B12). The rollup's
+        # pools are fixed for the lifecycle, so nothing is lost.
+        await shutdown_event.wait()
         return
 
     logger.info(

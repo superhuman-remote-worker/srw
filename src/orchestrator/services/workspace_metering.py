@@ -287,11 +287,17 @@ async def workspace_metering_loop(
 ) -> None:
     """Lifespan task: periodically materialize closed intervals + reconcile leaks.
 
-    No-op when the app DB or the ledger is absent (metering disabled). Never
-    raises into the loop — a pass failure is logged and retried.
+    No-op when the app DB or the ledger is absent (metering disabled): it logs
+    once and waits for ``shutdown_event``. Never raises into the loop — a pass
+    failure is logged and retried.
     """
     if db is None or ledger is None or not ledger.is_available:
         logger.info("workspace metering loop disabled (no db/ledger)")
+        # Park until shutdown instead of returning: run_when_leader re-creates
+        # a loop that returns on its next poll, which re-logged this line about
+        # once a second for the whole leadership tenure (R1.B12). The ledger's
+        # availability is fixed for the lifecycle, so nothing is lost.
+        await shutdown_event.wait()
         return
     logger.info("workspace metering loop starting (interval=%ss)", interval)
     try:

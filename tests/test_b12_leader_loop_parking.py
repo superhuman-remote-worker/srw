@@ -29,15 +29,6 @@ from orchestrator.services import (
     workspace_metering,
 )
 
-_XFAIL = pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason=(
-        "R1.B12 T3: a disabled metering/rollup loop returns, so run_when_leader "
-        "restarts it every poll"
-    ),
-)
-
 _POLL_SECONDS = 0.01
 
 
@@ -90,7 +81,6 @@ def _disabled_lines(caplog, logger: logging.Logger, message: str) -> int:
     )
 
 
-@_XFAIL
 @pytest.mark.asyncio
 @pytest.mark.parametrize("case", sorted(_DISABLED))
 async def test_a_disabled_loop_starts_once_per_leadership_tenure(
@@ -132,7 +122,6 @@ async def test_a_disabled_loop_starts_once_per_leadership_tenure(
         await asyncio.wait_for(tasks.stop([case]), timeout=5)
 
 
-@_XFAIL
 @pytest.mark.asyncio
 @pytest.mark.parametrize("case", sorted(_DISABLED))
 async def test_a_parked_loop_returns_promptly_once_stop_is_set(case):
