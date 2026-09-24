@@ -42,7 +42,8 @@ interface Project {
  * after the card is seen, doubling, capped at 15 s — so a settled card updates
  * within the server's settlement time plus at most one 15 s interval. The poll
  * stops as soon as no card is ending, and on destroy. A stateless retirement a
- * retryable fence left pending never settles by itself, so it does not poll.
+ * retryable fence left pending polls too: a still-running End or Delete (or
+ * another tab) can settle it, and the poll only re-reads — it never retries.
  */
 const ENDING_POLL_INITIAL_MS = 2_000;
 const ENDING_POLL_MAX_MS = 15_000;
@@ -679,15 +680,10 @@ export class SessionsPageComponent implements OnInit {
     /**
      * Keep one background re-read scheduled while any card is `ending`, each
      * gap doubling up to the cap; stop and reset the backoff once none is.
-     * A stateless pending retirement moves only on the user's retry (which
-     * re-reads the list itself), so it never arms the poll on its own.
      * House idiom: a cleared setTimeout, not rxjs.
      */
     private syncEndingPoll(): void {
-        const settling = this.threads().some(
-            t => t.status === 'ending' && !this.isStatelessPendingRetirement(t),
-        );
-        if (this.destroyed || !settling) {
+        if (this.destroyed || !this.threads().some(t => t.status === 'ending')) {
             this.cancelEndingPoll();
             this.endingPollDelayMs = ENDING_POLL_INITIAL_MS;
             return;
