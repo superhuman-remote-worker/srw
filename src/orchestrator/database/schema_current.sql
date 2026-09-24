@@ -7665,10 +7665,26 @@ CREATE FUNCTION public.guard_vm_creation_disposition() RETURNS trigger
     AS $$
 BEGIN
     IF TG_OP='INSERT' THEN
-        IF NEW.cancellation_disposition IS NOT NULL OR NEW.cancellation_progress<>'{}'::jsonb THEN
+        IF NEW.cancellation_disposition IS NOT NULL OR NEW.cancellation_progress<>'{}'::jsonb
+           OR NEW.disposition_carrier_uid IS NOT NULL THEN
             RAISE EXCEPTION 'Creation disposition requires locked cancellation' USING ERRCODE='23514';
         END IF;
         RETURN NEW;
+    END IF;
+    IF OLD.disposition_carrier_uid IS NOT NULL AND (
+       NEW.disposition_carrier_uid IS DISTINCT FROM OLD.disposition_carrier_uid OR
+       NEW.disposition_carrier_namespace IS DISTINCT FROM OLD.disposition_carrier_namespace) THEN
+        RAISE EXCEPTION 'Thread cancellation carrier is immutable' USING ERRCODE='23514';
+    END IF;
+    IF NEW.disposition_carrier_uid IS NOT NULL AND (
+       NEW.owner_kind<>'thread' OR NEW.creation_carrier_uid IS NOT NULL OR
+       NEW.cancellation_disposition IS NULL OR
+       NEW.cancellation_disposition->>'carrier_kind'<>'thread_creation_cancel' OR
+       NEW.cancellation_disposition->>'carrier_uid' IS DISTINCT FROM NEW.disposition_carrier_uid::text OR
+       NEW.cancellation_disposition->>'namespace' IS DISTINCT FROM NEW.disposition_carrier_namespace OR
+       EXISTS(SELECT 1 FROM public.vm_creation_effects WHERE request_id=NEW.request_id)
+    ) THEN
+        RAISE EXCEPTION 'Thread cancellation carrier cannot create' USING ERRCODE='23514';
     END IF;
     IF OLD.cancellation_disposition IS NOT NULL AND
        NEW.cancellation_disposition IS DISTINCT FROM OLD.cancellation_disposition THEN
@@ -7676,7 +7692,8 @@ BEGIN
     END IF;
     IF NEW.cancellation_disposition IS NOT NULL AND OLD.cancellation_disposition IS NULL THEN
         IF OLD.state<>'cancel_requested' OR NEW.state<>'cancel_requested' OR
-           NEW.creation_admission_id IS NULL OR NEW.creation_carrier_uid IS NULL OR
+           NEW.creation_admission_id IS NULL OR
+           (NEW.creation_carrier_uid IS NULL AND NEW.disposition_carrier_uid IS NULL) OR
            (NEW.owner_kind='thread' AND NOT public.valid_vm_creation_thread_disposition_identity(NEW,true)) OR
            EXISTS(SELECT 1 FROM public.vm_creation_effects WHERE request_id=NEW.request_id
                   AND (state='issued' OR (effect_kind='vm' AND state<>'rejected'))) THEN
@@ -15379,6 +15396,8 @@ CREATE TABLE public.vm_creation_retries (
     thread_wake_operation_id uuid,
     thread_owner_user_id uuid,
     thread_owner_project_id uuid,
+    disposition_carrier_uid uuid,
+    disposition_carrier_namespace text,
     CONSTRAINT vm_creation_carrier_pair CHECK ((((creation_carrier_uid IS NULL) = (creation_carrier_namespace IS NULL)) AND ((creation_carrier_namespace IS NULL) OR (creation_carrier_namespace <> ''::text)))),
     CONSTRAINT vm_creation_retries_backoff_attempt_check CHECK ((backoff_attempt >= 0)),
     CONSTRAINT vm_creation_retries_canonical_request_check CHECK ((jsonb_typeof(canonical_request) = 'object'::text)),
@@ -15396,7 +15415,9 @@ CREATE TABLE public.vm_creation_retries (
     CONSTRAINT vm_creation_retries_request_digest_check CHECK ((request_digest ~ '^sha256:[0-9a-f]{64}$'::text)),
     CONSTRAINT vm_creation_retries_revision_check CHECK ((revision >= 0)),
     CONSTRAINT vm_creation_retries_state_check CHECK ((state = ANY (ARRAY['queued'::text, 'reconciling'::text, 'succeeded'::text, 'attention'::text, 'cancel_requested'::text, 'settled'::text]))),
-    CONSTRAINT vm_creation_retry_exact_owner CHECK ((((owner_kind = 'job'::text) AND (job_id IS NOT NULL) AND (thread_id IS NULL) AND (thread_runtime_generation IS NULL) AND (thread_agent_id IS NULL) AND (thread_attach_token IS NULL) AND (thread_wake_operation_id IS NULL) AND (thread_owner_user_id IS NULL) AND (thread_owner_project_id IS NULL) AND (execution_id IS NOT NULL) AND (execution_revision IS NOT NULL) AND (execution_generation IS NOT NULL)) OR ((owner_kind = 'thread'::text) AND (job_id IS NULL) AND (thread_id IS NOT NULL) AND (thread_runtime_generation IS NOT NULL) AND ((thread_agent_id IS NULL) = (thread_attach_token IS NULL)) AND (execution_id IS NULL) AND (execution_revision IS NULL) AND (execution_generation IS NULL) AND (admission_deadline IS NULL) AND (predecessor_cleanup_admission_id IS NULL) AND (controller_configuration IS NOT NULL))))
+    CONSTRAINT vm_creation_retry_exact_owner CHECK ((((owner_kind = 'job'::text) AND (job_id IS NOT NULL) AND (thread_id IS NULL) AND (thread_runtime_generation IS NULL) AND (thread_agent_id IS NULL) AND (thread_attach_token IS NULL) AND (thread_wake_operation_id IS NULL) AND (thread_owner_user_id IS NULL) AND (thread_owner_project_id IS NULL) AND (execution_id IS NOT NULL) AND (execution_revision IS NOT NULL) AND (execution_generation IS NOT NULL)) OR ((owner_kind = 'thread'::text) AND (job_id IS NULL) AND (thread_id IS NOT NULL) AND (thread_runtime_generation IS NOT NULL) AND ((thread_agent_id IS NULL) = (thread_attach_token IS NULL)) AND (execution_id IS NULL) AND (execution_revision IS NULL) AND (execution_generation IS NULL) AND (admission_deadline IS NULL) AND (predecessor_cleanup_admission_id IS NULL) AND (controller_configuration IS NOT NULL)))),
+    CONSTRAINT vm_thread_cancel_carrier_exclusive CHECK (((disposition_carrier_uid IS NULL) OR ((owner_kind = 'thread'::text) AND (creation_carrier_uid IS NULL)))),
+    CONSTRAINT vm_thread_cancel_carrier_pair CHECK ((((disposition_carrier_uid IS NULL) = (disposition_carrier_namespace IS NULL)) AND ((disposition_carrier_namespace IS NULL) OR (disposition_carrier_namespace <> ''::text))))
 );
 
 
@@ -15803,6 +15824,15 @@ CREATE FUNCTION public.valid_vm_creation_thread_disposition_identity(retry publi
        AND retry.cancellation_disposition->>'thread_agent_id' IS NOT DISTINCT FROM retry.thread_agent_id::text
        AND retry.cancellation_disposition->>'thread_attach_token' IS NOT DISTINCT FROM retry.thread_attach_token::text
        AND retry.cancellation_disposition->>'thread_wake_operation_id' IS NOT DISTINCT FROM retry.thread_wake_operation_id::text
+       AND ((retry.disposition_carrier_uid IS NULL
+             AND retry.creation_carrier_uid IS NOT NULL
+             AND retry.cancellation_disposition->>'carrier_uid'=retry.creation_carrier_uid::text
+             AND retry.cancellation_disposition->>'namespace'=retry.creation_carrier_namespace)
+            OR (retry.disposition_carrier_uid IS NOT NULL
+             AND retry.creation_carrier_uid IS NULL
+             AND retry.cancellation_disposition->>'carrier_kind'='thread_creation_cancel'
+             AND retry.cancellation_disposition->>'carrier_uid'=retry.disposition_carrier_uid::text
+             AND retry.cancellation_disposition->>'namespace'=retry.disposition_carrier_namespace))
        AND retry.cancellation_disposition->>'disk_policy'='purge_new_thread_disk'
        AND retry.cancellation_disposition->'workspace_storage'='null'::jsonb
        AND retry.cancellation_disposition->'workspace_instance_id'='null'::jsonb

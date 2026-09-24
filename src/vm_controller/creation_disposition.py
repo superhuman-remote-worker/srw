@@ -4,6 +4,8 @@ Observed new per-Job resources use fixed-UID teardown and typed progress.
 Source and retained attachment release and terminal settlement remain held.
 """
 
+import asyncio
+import json
 from collections.abc import Mapping
 from uuid import UUID
 
@@ -17,13 +19,85 @@ from shared.vm_creation_issuance import (
 )
 from shared.vm_creation_retry import canonical_request_digest
 from shared.vm_lifecycle_auth import AUTH_FIELD, sign_payload, unsigned_payload
-from vm_controller.creation_actuation import CreationActuator, carrier_record
+from vm_controller.creation_actuation import CreationActuator, carrier_record, document
 
 
 class CreationDisposer:
     def __init__(self, controller):
         self.controller = controller
         self.actuator = CreationActuator(controller)
+
+    async def _publish_thread_cancel(self, values, *, expected_uid=None):
+        """Publish/read one distinct cancellation Lease; never a create carrier."""
+        from shared.vm_creation_cancel_carrier import (
+            INTENT_ANNOTATION, SIGNATURE_ANNOTATION, LABEL,
+            carrier_name, seal_cancel_carrier, validate_intent,
+            verify_cancel_carrier,
+        )
+
+        values = validate_intent(values)
+        name = carrier_name(values["admission_id"])
+        lease = await self.actuator.read("lease", name)
+        if lease is None:
+            if expected_uid is not None:
+                raise ValueError("Thread cancellation Lease is missing")
+            body = {
+                "apiVersion": "coordination.k8s.io/v1", "kind": "Lease",
+                "metadata": {
+                    "name": name, "namespace": self.actuator.namespace,
+                    "labels": {LABEL: "true"},
+                    "annotations": {INTENT_ANNOTATION: json.dumps(
+                        values, sort_keys=True, separators=(",", ":"),
+                    )},
+                },
+                "spec": {"holderIdentity": values["admission_id"]},
+            }
+            try:
+                lease = document(await asyncio.to_thread(
+                    self.controller.coordination_api.create_namespaced_lease,
+                    namespace=self.actuator.namespace, body=body,
+                ))
+            except Exception:
+                lease = await self.actuator.read("lease", name)
+                if lease is None:
+                    raise
+        metadata = lease["metadata"]
+        if expected_uid is not None and metadata["uid"] != expected_uid:
+            raise ValueError("Thread cancellation Lease UID changed")
+        if metadata.get("deletionTimestamp") is not None:
+            raise ValueError("Thread cancellation Lease is deleting")
+        annotations = metadata.get("annotations") or {}
+        if SIGNATURE_ANNOTATION in annotations:
+            if verify_cancel_carrier(lease, secret=self.actuator.secret) != values:
+                raise ValueError("Thread cancellation Lease changed")
+            return lease
+        if (
+            annotations.get(INTENT_ANNOTATION) != json.dumps(
+                values, sort_keys=True, separators=(",", ":"),
+            )
+            or metadata.get("labels", {}).get(LABEL) != "true"
+            or lease.get("spec", {}).get("holderIdentity") != values["admission_id"]
+        ):
+            raise ValueError("Thread cancellation Lease changed")
+        body = seal_cancel_carrier(
+            values, namespace=self.actuator.namespace, uid=metadata["uid"],
+            resource_version=metadata["resourceVersion"], secret=self.actuator.secret,
+        )
+        try:
+            result = document(await asyncio.to_thread(
+                self.controller.coordination_api.replace_namespaced_lease,
+                name=name, namespace=self.actuator.namespace, body=body,
+            ))
+        except Exception:
+            result = await self.actuator.read("lease", name)
+            if result is None:
+                raise
+        if (
+            result["metadata"]["uid"] != metadata["uid"]
+            or verify_cancel_carrier(result, secret=self.actuator.secret) != values
+        ):
+            raise ValueError("Thread cancellation Lease changed")
+        return result
 
     async def run(self, payload):
         identity = validate_disposition_request(payload)
@@ -77,9 +151,29 @@ class CreationDisposer:
                 lease is None or lease["metadata"]["uid"] != row["creation_carrier_uid"]
             ):
                 raise ValueError("Cancellation carrier changed")
-            if lease is None or not lease["metadata"].get("annotations", {}).get(
+            if row.get("disposition_carrier_uid") and lease is not None:
+                raise ValueError("Competing original creation Lease appeared")
+            cancel_carrier = False
+            if lease is None and row.get("owner_kind") == "thread":
+                prepared = await self.actuator.authority(
+                    "prepare-disposition", request_id=row["request_id"]
+                )
+                if (
+                    prepared.get("actuation_allowed") is not False
+                    or prepared["namespace"] != self.actuator.namespace
+                    or prepared["carrier_intent"].get("kind") != "thread_creation_cancel"
+                ):
+                    raise ValueError("Thread cancellation authority is unproven")
+                lease = await self._publish_thread_cancel(
+                    prepared["carrier_intent"],
+                    expected_uid=row.get("disposition_carrier_uid"),
+                )
+                cancel_carrier = True
+            elif lease is None or not lease["metadata"].get("annotations", {}).get(
                 CREATION_SIGNATURE_ANNOTATION
             ):
+                if row.get("owner_kind") == "thread":
+                    raise ValueError("Original thread creation Lease is unproven")
                 prepared = await self.actuator.authority(
                     "prepare-disposition", request_id=row["request_id"]
                 )
@@ -91,13 +185,20 @@ class CreationDisposer:
                 lease = await self.actuator.publish(prepared["carrier_intent"])
             if lease["metadata"].get("deletionTimestamp") is not None:
                 raise ValueError("Cancellation carrier is deleting")
-            values = verify_creation_carrier(lease, secret=self.actuator.secret)
+            if cancel_carrier:
+                from shared.vm_creation_cancel_carrier import verify_cancel_carrier
+
+                values = verify_cancel_carrier(lease, secret=self.actuator.secret)
+            else:
+                values = verify_creation_carrier(lease, secret=self.actuator.secret)
             if (
                 values["retry_request_id"] != row["request_id"]
                 or values["admission_id"] != row["creation_admission_id"]
             ):
                 raise ValueError("Cancellation carrier identity changed")
             latest = row["effects"][-1] if row["effects"] else None
+            if cancel_carrier and latest is not None:
+                raise ValueError("Cancellation-only carrier cannot observe creation effects")
             if latest and (
                 latest["state"] == "issued"
                 or latest["state"] == "observed"
