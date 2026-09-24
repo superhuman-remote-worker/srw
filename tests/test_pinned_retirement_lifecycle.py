@@ -19,6 +19,13 @@ from agent.api.orchestrator_client import OrchestratorClient
 import orchestrator.main as main
 from orchestrator.routers import agent_cloud_stage as agent_cloud_stage_routes
 from orchestrator.services import pinned_k8s_reconciliation
+from orchestrator.application import controls as controls_composition
+from orchestrator.application import sessions as sessions_composition
+from orchestrator.application import workspace as workspace_composition
+from orchestrator.schemas import agent_thread_status as agent_thread_status_module
+from orchestrator.security import access as access_module
+from orchestrator.services import agent_provisioner as agent_provisioner_module
+import functools
 
 
 THREAD_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1"
@@ -93,8 +100,14 @@ async def test_authorized_lifecycle_projects_exact_permanent_intent(permanent):
     }
     internal = AsyncMock()
     with (
-        patch.object(main.postgres_db, "get_thread", AsyncMock(return_value=initial)),
-        patch.object(main.postgres_db, "acquire", side_effect=acquire),
+        patch.object(
+            main.app.state.resources.postgres_db,
+            "get_thread",
+            AsyncMock(return_value=initial),
+        ),
+        patch.object(
+            main.app.state.resources.postgres_db, "acquire", side_effect=acquire
+        ),
     ):
         # ``require_internal`` is a dataclass FIELD DEFAULT on
         # AgentCloudStageDependencies, bound at class-creation time, so
@@ -103,7 +116,10 @@ async def test_authorized_lifecycle_projects_exact_permanent_intent(permanent):
             request,
             THREAD_ID,
             dependencies=dataclasses.replace(
-                main._agent_cloud_stage_dependencies(), require_internal=internal
+                workspace_composition.agent_cloud_stage_dependencies(
+                    main.app.state.resources
+                ),
+                require_internal=internal,
             ),
         )
     internal.assert_awaited()
@@ -146,8 +162,14 @@ async def test_hidden_preflight_does_not_advertise_permanent_end_intent():
     }
     internal = AsyncMock()
     with (
-        patch.object(main.postgres_db, "get_thread", AsyncMock(return_value=initial)),
-        patch.object(main.postgres_db, "acquire", side_effect=acquire),
+        patch.object(
+            main.app.state.resources.postgres_db,
+            "get_thread",
+            AsyncMock(return_value=initial),
+        ),
+        patch.object(
+            main.app.state.resources.postgres_db, "acquire", side_effect=acquire
+        ),
     ):
         # ``require_internal`` is a dataclass FIELD DEFAULT on
         # AgentCloudStageDependencies, bound at class-creation time, so
@@ -156,7 +178,10 @@ async def test_hidden_preflight_does_not_advertise_permanent_end_intent():
             request,
             THREAD_ID,
             dependencies=dataclasses.replace(
-                main._agent_cloud_stage_dependencies(), require_internal=internal
+                workspace_composition.agent_cloud_stage_dependencies(
+                    main.app.state.resources
+                ),
+                require_internal=internal,
             ),
         )
     internal.assert_awaited()
@@ -239,8 +264,8 @@ async def test_agent_ending_installs_and_authorizes_retirement_atomically(
     db.authorize_pinned_thread_retirement = AsyncMock()
 
     with (
-        patch.object(main, "require_internal", AsyncMock()),
-        patch.object(main, "postgres_db", db),
+        patch.object(access_module, "require_internal", AsyncMock()),
+        patch.object(main.app.state.resources, "postgres_db", db),
     ):
         if through_client:
             # R1.B06: the route moved to routers/agent_thread_status. Mount the
@@ -250,8 +275,9 @@ async def test_agent_ending_installs_and_authorizes_retirement_atomically(
 
             app = FastAPI()
             app.include_router(status_routes.router)
-            app.state.agent_thread_status_dependencies_factory = (
-                main._agent_thread_status_dependencies
+            app.state.agent_thread_status_dependencies_factory = functools.partial(
+                sessions_composition.agent_thread_status_dependencies,
+                main.app.state.resources,
             )
             client = OrchestratorClient(
                 orchestrator_url="http://test",
@@ -275,7 +301,7 @@ async def test_agent_ending_installs_and_authorizes_retirement_atomically(
         else:
             response = await agent_thread_status.update_thread_status(
                 THREAD_ID,
-                main.AgentThreadStatusRequest(
+                agent_thread_status_module.AgentThreadStatusRequest(
                     status="ending",
                     agent_id=AGENT_ID,
                     process_generation=PROCESS_GENERATION,
@@ -284,7 +310,9 @@ async def test_agent_ending_installs_and_authorizes_retirement_atomically(
                     session_runtime_attach_token=ATTACH_TOKEN,
                     retirement_disposition="ended",
                 ),
-                dependencies=main._agent_thread_status_dependencies(),
+                dependencies=sessions_composition.agent_thread_status_dependencies(
+                    main.app.state.resources
+                ),
             )
 
     assert response == {
@@ -337,16 +365,16 @@ async def test_soft_retirement_retain_publishes_exact_claim_uid():
     provider.is_available = True
     provider.ensure_agent_workspace_claim = AsyncMock(return_value="retained-pvc-uid")
     with (
-        patch.object(main, "agent_provisioner", provider),
+        patch.object(agent_provisioner_module, "agent_provisioner", provider),
         patch.object(
-            main.postgres_db,
+            main.app.state.resources.postgres_db,
             "publish_pinned_agent_workspace_claim",
             AsyncMock(return_value=True),
         ) as publish,
     ):
-        await main._pinned_retirement_operations().reconcile_agent_workspace_claim_for_retirement(
-            retirement
-        )
+        await controls_composition.pinned_retirement_operations(
+            main.app.state.resources
+        ).reconcile_agent_workspace_claim_for_retirement(retirement)
 
     provider.ensure_agent_workspace_claim.assert_awaited_once_with(
         "pvc-agent-s-aaaaaaaa-aaa",
@@ -399,13 +427,13 @@ async def test_permanent_retirement_deletes_original_before_pvc_fence():
     )
     db.fetch = AsyncMock(return_value=[])
     with (
-        patch.object(main, "agent_provisioner", provider),
-        patch.object(main, "postgres_db", db),
-        patch.object(main.asyncio, "sleep", AsyncMock()),
+        patch.object(agent_provisioner_module, "agent_provisioner", provider),
+        patch.object(main.app.state.resources, "postgres_db", db),
+        patch.object(asyncio, "sleep", AsyncMock()),
     ):
-        await main._pinned_retirement_operations().reconcile_agent_workspace_claim_for_retirement(
-            retirement
-        )
+        await controls_composition.pinned_retirement_operations(
+            main.app.state.resources
+        ).reconcile_agent_workspace_claim_for_retirement(retirement)
 
     provider.delete_agent_workspace_claim_exact.assert_awaited_once_with(
         "pvc-agent-s-aaaaaaaa-aaa",
@@ -449,12 +477,12 @@ async def test_permanent_retirement_accepts_exact_claim_already_reclaimed():
     db.fetch = AsyncMock(return_value=[])
 
     with (
-        patch.object(main, "agent_provisioner", provider),
-        patch.object(main, "postgres_db", db),
+        patch.object(agent_provisioner_module, "agent_provisioner", provider),
+        patch.object(main.app.state.resources, "postgres_db", db),
     ):
-        await main._pinned_retirement_operations().reconcile_agent_workspace_claim_for_retirement(
-            retirement
-        )
+        await controls_composition.pinned_retirement_operations(
+            main.app.state.resources
+        ).reconcile_agent_workspace_claim_for_retirement(retirement)
 
     provider.agent_workspace_claim_authority.assert_not_awaited()
     provider.fence_agent_workspace_claim.assert_not_awaited()

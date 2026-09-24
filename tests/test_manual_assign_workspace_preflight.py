@@ -2,12 +2,20 @@
 
 from tests import _b09_control_seams as control_seams
 
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import ANY, AsyncMock, MagicMock
 from types import SimpleNamespace
 
 import pytest
 
 import orchestrator.main as main
+from orchestrator.application import access as access_composition
+from orchestrator.application import controls as controls_composition
+from orchestrator.services import job_dispatcher as job_dispatcher_module
+from orchestrator.services import (
+    job_workspace_authority as job_workspace_authority_module,
+)
+import fastapi as fastapi_module
+import httpx
 
 
 JOB_ID = "00000000-0000-0000-0000-000000000101"
@@ -56,27 +64,35 @@ def _agent() -> dict:
 
 @pytest.fixture
 def collaborators(monkeypatch):
-    monkeypatch.setattr(main, "_require_admin", AsyncMock())
-    monkeypatch.setattr(main.postgres_db, "get_job", AsyncMock())
-    monkeypatch.setattr(main.postgres_db, "get_agent", AsyncMock())
-    monkeypatch.setattr(main.postgres_db, "shed_workspace_context", AsyncMock())
+    monkeypatch.setattr(access_composition, "require_admin", AsyncMock())
+    monkeypatch.setattr(main.app.state.resources.postgres_db, "get_job", AsyncMock())
+    monkeypatch.setattr(main.app.state.resources.postgres_db, "get_agent", AsyncMock())
     monkeypatch.setattr(
-        main.postgres_db,
+        main.app.state.resources.postgres_db, "shed_workspace_context", AsyncMock()
+    )
+    monkeypatch.setattr(
+        main.app.state.resources.postgres_db,
         "prepare_pinned_job_for_workspace_resume",
         AsyncMock(return_value=True),
     )
     monkeypatch.setattr(
-        main.postgres_db, "claim_job_for_agent", AsyncMock(return_value=True)
+        main.app.state.resources.postgres_db,
+        "claim_job_for_agent",
+        AsyncMock(return_value=True),
     )
     monkeypatch.setattr(
-        main.postgres_db, "queue_job_for_resume", AsyncMock(return_value=True)
+        main.app.state.resources.postgres_db,
+        "queue_job_for_resume",
+        AsyncMock(return_value=True),
     )
-    monkeypatch.setattr(main, "_trigger_dispatch", MagicMock())
+    monkeypatch.setattr(job_dispatcher_module, "trigger_dispatch", MagicMock())
     delivery = SimpleNamespace(
         dispatch=AsyncMock(return_value=True),
         resume=AsyncMock(return_value=True),
     )
-    monkeypatch.setattr(main, "_job_delivery_operations", lambda: delivery)
+    monkeypatch.setattr(
+        controls_composition, "job_delivery_operations", lambda _resources: delivery
+    )
     return delivery
 
 
@@ -85,20 +101,26 @@ async def test_flag_on_manual_assign_guard_blocks_before_workspace_or_agent_io(
     collaborators, monkeypatch
 ):
     job = _job("paused", workspace_status="failed")
-    main.postgres_db.get_job.return_value = job
-    monkeypatch.setattr(main, "COMPLETION_COMMANDS_ENABLED", True)
-    blocked = main.HTTPException(status_code=409, detail="completion finalizing")
+    main.app.state.resources.postgres_db.get_job.return_value = job
+    monkeypatch.setattr(
+        main.app.state.resources.settings, "completion_commands_enabled", True
+    )
+    blocked = fastapi_module.HTTPException(
+        status_code=409, detail="completion finalizing"
+    )
     guard = AsyncMock(side_effect=blocked)
-    monkeypatch.setattr(main._completion_control_boundary, "guard", guard)
+    monkeypatch.setattr(
+        main.app.state.resources.completion_control_boundary, "guard", guard
+    )
 
-    with pytest.raises(main.HTTPException) as exc:
+    with pytest.raises(fastapi_module.HTTPException) as exc:
         await control_seams.assign_job_to_agent(MagicMock(), JOB_ID, AGENT_ID)
 
     assert exc.value.status_code == 409
     guard.assert_awaited_once_with(JOB_ID, source="manual_assign")
-    main.postgres_db.shed_workspace_context.assert_not_awaited()
-    main.postgres_db.prepare_pinned_job_for_workspace_resume.assert_not_awaited()
-    main.postgres_db.get_agent.assert_not_awaited()
+    main.app.state.resources.postgres_db.shed_workspace_context.assert_not_awaited()
+    main.app.state.resources.postgres_db.prepare_pinned_job_for_workspace_resume.assert_not_awaited()
+    main.app.state.resources.postgres_db.get_agent.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -106,27 +128,33 @@ async def test_flag_on_missing_workspace_uses_claimed_atomic_preflight(
     collaborators, monkeypatch
 ):
     job = _job("failed", workspace_status="failed")
-    main.postgres_db.get_job.return_value = job
-    monkeypatch.setattr(main, "COMPLETION_COMMANDS_ENABLED", True)
-    monkeypatch.setattr(main._completion_control_boundary, "guard", AsyncMock())
+    main.app.state.resources.postgres_db.get_job.return_value = job
+    monkeypatch.setattr(
+        main.app.state.resources.settings, "completion_commands_enabled", True
+    )
+    monkeypatch.setattr(
+        main.app.state.resources.completion_control_boundary, "guard", AsyncMock()
+    )
     claim = SimpleNamespace(claim_id="00000000-0000-0000-0000-000000000301")
     claim_control = AsyncMock(return_value=claim)
-    monkeypatch.setattr(main._completion_control_boundary, "claim", claim_control)
+    monkeypatch.setattr(
+        main.app.state.resources.completion_control_boundary, "claim", claim_control
+    )
 
     result = await control_seams.assign_job_to_agent(MagicMock(), JOB_ID, AGENT_ID)
 
     assert result["status"] == "queued"
     claim_control.assert_awaited_once_with(job, source="manual_assign_workspace")
-    main.postgres_db.prepare_pinned_job_for_workspace_resume.assert_awaited_once_with(
+    main.app.state.resources.postgres_db.prepare_pinned_job_for_workspace_resume.assert_awaited_once_with(
         JOB_ID,
         "workspace_container",
         expected_status="failed",
         completion_control_claim_id=claim.claim_id,
         lift_operator_pause_hold="",
     )
-    main.postgres_db.shed_workspace_context.assert_not_awaited()
-    main.postgres_db.queue_job_for_resume.assert_not_awaited()
-    main.postgres_db.get_agent.assert_not_awaited()
+    main.app.state.resources.postgres_db.shed_workspace_context.assert_not_awaited()
+    main.app.state.resources.postgres_db.queue_job_for_resume.assert_not_awaited()
+    main.app.state.resources.postgres_db.get_agent.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -134,12 +162,16 @@ async def test_flag_on_live_workspace_claims_before_agent_post(
     collaborators, monkeypatch
 ):
     job = _job("failed", workspace_status="ready")
-    main.postgres_db.get_job.return_value = job
-    main.postgres_db.get_agent.return_value = _agent()
-    monkeypatch.setattr(main, "COMPLETION_COMMANDS_ENABLED", True)
-    monkeypatch.setattr(main._completion_control_boundary, "guard", AsyncMock())
+    main.app.state.resources.postgres_db.get_job.return_value = job
+    main.app.state.resources.postgres_db.get_agent.return_value = _agent()
+    monkeypatch.setattr(
+        main.app.state.resources.settings, "completion_commands_enabled", True
+    )
+    monkeypatch.setattr(
+        main.app.state.resources.completion_control_boundary, "guard", AsyncMock()
+    )
     order: list[str] = []
-    main.postgres_db.claim_job_for_agent.side_effect = (
+    main.app.state.resources.postgres_db.claim_job_for_agent.side_effect = (
         lambda *_args, **_kwargs: order.append("claim") or True
     )
     collaborators.dispatch.side_effect = (
@@ -150,7 +182,7 @@ async def test_flag_on_live_workspace_claims_before_agent_post(
 
     assert result["status"] == "assigned"
     assert order == ["claim", "post"]
-    main.postgres_db.claim_job_for_agent.assert_awaited_once_with(
+    main.app.state.resources.postgres_db.claim_job_for_agent.assert_awaited_once_with(
         JOB_ID,
         AGENT_ID,
         completion_commands_enabled=True,
@@ -168,22 +200,26 @@ async def test_manual_assign_waits_for_legacy_runtime_adoption_before_claim(
         {"provisioner": "k8s", "pod_ip": "10.42.0.17"}
     )
     job["context"]["workspace_container"].pop("_runtime_incarnation")
-    main.postgres_db.get_job.return_value = job
-    monkeypatch.setattr(main._completion_control_boundary, "guard", AsyncMock())
+    main.app.state.resources.postgres_db.get_job.return_value = job
+    monkeypatch.setattr(
+        main.app.state.resources.completion_control_boundary, "guard", AsyncMock()
+    )
     prepare = AsyncMock(
         return_value=("wait", job, "kubernetes_attestation_unavailable")
     )
-    monkeypatch.setattr(main, "_prepare_job_workspace_runtime", prepare)
+    monkeypatch.setattr(
+        job_workspace_authority_module, "prepare_job_workspace_runtime", prepare
+    )
 
-    with pytest.raises(main.HTTPException) as raised:
+    with pytest.raises(fastapi_module.HTTPException) as raised:
         await control_seams.assign_job_to_agent(MagicMock(), JOB_ID, AGENT_ID)
 
     assert raised.value.status_code == 409
     assert raised.value.detail["code"] == "workspace_runtime_adoption_pending"
     assert raised.value.detail["retryable"] is True
-    prepare.assert_awaited_once_with(job)
-    main.postgres_db.claim_job_for_agent.assert_not_awaited()
-    main.postgres_db.get_agent.assert_not_awaited()
+    prepare.assert_awaited_once_with(job, dependencies=ANY)
+    main.app.state.resources.postgres_db.claim_job_for_agent.assert_not_awaited()
+    main.app.state.resources.postgres_db.get_agent.assert_not_awaited()
     collaborators.dispatch.assert_not_awaited()
 
 
@@ -192,57 +228,57 @@ class TestManualAssignWorkspacePreflight:
     async def test_stateless_job_rejects_direct_assignment(self, collaborators):
         job = _job("created", workspace_status="ready")
         job["execution_lane"] = "stateless"
-        main.postgres_db.get_job.return_value = job
+        main.app.state.resources.postgres_db.get_job.return_value = job
 
-        with pytest.raises(main.HTTPException) as exc:
+        with pytest.raises(fastapi_module.HTTPException) as exc:
             await control_seams.assign_job_to_agent(MagicMock(), JOB_ID, AGENT_ID)
 
         assert exc.value.status_code == 409
-        main.postgres_db.get_agent.assert_not_awaited()
+        main.app.state.resources.postgres_db.get_agent.assert_not_awaited()
         collaborators.dispatch.assert_not_awaited()
         collaborators.resume.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_created_job_without_workspace_is_queued(self, collaborators):
-        main.postgres_db.get_job.return_value = _job("created")
+        main.app.state.resources.postgres_db.get_job.return_value = _job("created")
 
         result = await control_seams.assign_job_to_agent(MagicMock(), JOB_ID, AGENT_ID)
 
         assert result["status"] == "queued"
         assert "not reserved" in result["message"]
-        main.postgres_db.shed_workspace_context.assert_awaited_once_with(
+        main.app.state.resources.postgres_db.shed_workspace_context.assert_awaited_once_with(
             JOB_ID, "workspace_container"
         )
-        main.postgres_db.queue_job_for_resume.assert_not_awaited()
-        main.postgres_db.get_agent.assert_not_awaited()
+        main.app.state.resources.postgres_db.queue_job_for_resume.assert_not_awaited()
+        main.app.state.resources.postgres_db.get_agent.assert_not_awaited()
         collaborators.dispatch.assert_not_awaited()
-        main._trigger_dispatch.assert_called_once_with()
+        job_dispatcher_module.trigger_dispatch.assert_called_once_with(dependencies=ANY)
 
     @pytest.mark.asyncio
     async def test_failed_job_without_workspace_is_made_dispatchable(
         self, collaborators
     ):
-        main.postgres_db.get_job.return_value = _job(
+        main.app.state.resources.postgres_db.get_job.return_value = _job(
             "failed", workspace_status="failed"
         )
 
         result = await control_seams.assign_job_to_agent(MagicMock(), JOB_ID, AGENT_ID)
 
         assert result["status"] == "queued"
-        main.postgres_db.queue_job_for_resume.assert_awaited_once_with(
+        main.app.state.resources.postgres_db.queue_job_for_resume.assert_awaited_once_with(
             JOB_ID, lift_operator_pause_hold=""
         )
-        main.postgres_db.get_agent.assert_not_awaited()
-        main._trigger_dispatch.assert_called_once_with()
+        main.app.state.resources.postgres_db.get_agent.assert_not_awaited()
+        job_dispatcher_module.trigger_dispatch.assert_called_once_with(dependencies=ANY)
 
     @pytest.mark.asyncio
     async def test_live_workspace_still_allows_direct_admin_override(
         self, collaborators
     ):
-        main.postgres_db.get_job.return_value = _job(
+        main.app.state.resources.postgres_db.get_job.return_value = _job(
             "created", workspace_status="ready"
         )
-        main.postgres_db.get_agent.return_value = _agent()
+        main.app.state.resources.postgres_db.get_agent.return_value = _agent()
 
         result = await control_seams.assign_job_to_agent(MagicMock(), JOB_ID, AGENT_ID)
 
@@ -251,8 +287,8 @@ class TestManualAssignWorkspacePreflight:
             "agent_id": AGENT_ID,
             "job_id": JOB_ID,
         }
-        main.postgres_db.shed_workspace_context.assert_not_awaited()
-        main.postgres_db.claim_job_for_agent.assert_awaited_once_with(
+        main.app.state.resources.postgres_db.shed_workspace_context.assert_not_awaited()
+        main.app.state.resources.postgres_db.claim_job_for_agent.assert_awaited_once_with(
             JOB_ID,
             AGENT_ID,
             completion_commands_enabled=False,
@@ -260,7 +296,7 @@ class TestManualAssignWorkspacePreflight:
             lift_operator_pause_hold="",
         )
         collaborators.dispatch.assert_awaited_once()
-        main._trigger_dispatch.assert_not_called()
+        job_dispatcher_module.trigger_dispatch.assert_not_called()
 
 
 class TestAssignLaneChoice:
@@ -275,10 +311,14 @@ class TestAssignLaneChoice:
         self, collaborators, monkeypatch
     ):
         monkeypatch.setattr(
-            main.postgres_db, "job_has_checkpoint", AsyncMock(return_value=True)
+            main.app.state.resources.postgres_db,
+            "job_has_checkpoint",
+            AsyncMock(return_value=True),
         )
-        main.postgres_db.get_job.return_value = _job("paused", workspace_status="ready")
-        main.postgres_db.get_agent.return_value = _agent()
+        main.app.state.resources.postgres_db.get_job.return_value = _job(
+            "paused", workspace_status="ready"
+        )
+        main.app.state.resources.postgres_db.get_agent.return_value = _agent()
 
         result = await control_seams.assign_job_to_agent(MagicMock(), JOB_ID, AGENT_ID)
 
@@ -291,10 +331,14 @@ class TestAssignLaneChoice:
         self, collaborators, monkeypatch
     ):
         monkeypatch.setattr(
-            main.postgres_db, "job_has_checkpoint", AsyncMock(return_value=False)
+            main.app.state.resources.postgres_db,
+            "job_has_checkpoint",
+            AsyncMock(return_value=False),
         )
-        main.postgres_db.get_job.return_value = _job("paused", workspace_status="ready")
-        main.postgres_db.get_agent.return_value = _agent()
+        main.app.state.resources.postgres_db.get_job.return_value = _job(
+            "paused", workspace_status="ready"
+        )
+        main.app.state.resources.postgres_db.get_agent.return_value = _agent()
 
         result = await control_seams.assign_job_to_agent(MagicMock(), JOB_ID, AGENT_ID)
 
@@ -319,13 +363,15 @@ class TestPinnedDispatchDefenseInDepth:
         prepare = AsyncMock(
             return_value=("wait", job, "kubernetes_attestation_unavailable")
         )
-        monkeypatch.setattr(main, "_prepare_job_workspace_runtime", prepare)
+        monkeypatch.setattr(
+            job_workspace_authority_module, "prepare_job_workspace_runtime", prepare
+        )
         network = MagicMock(side_effect=AssertionError("agent I/O attempted"))
-        monkeypatch.setattr(main.httpx, "AsyncClient", network)
+        monkeypatch.setattr(httpx, "AsyncClient", network)
 
         assert await getattr(control_seams, helper_name)(job, _agent()) is False
 
-        prepare.assert_awaited_once_with(job)
+        prepare.assert_awaited_once_with(job, dependencies=ANY)
         network.assert_not_called()
 
     @pytest.mark.asyncio

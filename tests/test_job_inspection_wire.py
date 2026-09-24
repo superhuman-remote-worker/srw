@@ -661,18 +661,23 @@ async def test_four_router_factories_stay_with_their_own_app_under_concurrent_re
     second.forge.list_contents.side_effect = None
     second.forge.list_contents.return_value = []
 
-    class ForbiddenMainCollaborator:
-        def __getattr__(self, name):
-            raise AssertionError(f"router used main collaborator: {name}")
+    from orchestrator.services import email as email_module
+    from orchestrator.services import workspace as workspace_module
 
-    for name in (
-        "postgres_db",
-        "audit_reader",
-        "workspace_service",
-        "email_service",
-        "gitea_client",
+    class ForbiddenApplicationCollaborator:
+        def __getattr__(self, name):
+            raise AssertionError(f"router used application collaborator: {name}")
+
+    # The default application's resources (the former main globals) and the
+    # process-wide singletons on their owning modules.
+    for owner, name in (
+        (main.app.state.resources, "postgres_db"),
+        (main.app.state.resources, "audit_reader"),
+        (workspace_module, "workspace_service"),
+        (email_module, "email_service"),
+        (main.app.state.resources, "gitea_client"),
     ):
-        monkeypatch.setattr(main, name, ForbiddenMainCollaborator())
+        monkeypatch.setattr(owner, name, ForbiddenApplicationCollaborator())
     paths = (
         "/api/me/active-jobs",
         f"{JOB_PATH}/audit",

@@ -23,6 +23,7 @@ from orchestrator.services.cloud.identity import (
     peek_home_browser_url,
     resolve_user_identity_cached,
 )
+from orchestrator.application import projects as projects_composition
 
 BACKEND_ID = "opencloud"
 
@@ -182,21 +183,25 @@ class TestHomeBrowserUrlCached:
 def _repair_state():
     import orchestrator.main
 
-    return orchestrator.main._project_repair_state
+    return orchestrator.main.app.state.resources.project_repair_state
 
 
 def _provisioning_deps():
     """main's own factory, read inside the patch context it is called in."""
-    from orchestrator.main import _project_provisioning_dependencies
+    import orchestrator.main
 
-    return _project_provisioning_dependencies()
+    return projects_composition.project_provisioning_dependencies(
+        orchestrator.main.app.state.resources
+    )
 
 
 def _projects_deps():
     """main's own factory, read inside the patch context it is called in."""
-    from orchestrator.main import _projects_dependencies
+    import orchestrator.main
 
-    return _projects_dependencies()
+    return projects_composition.projects_dependencies(
+        orchestrator.main.app.state.resources
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -265,7 +270,10 @@ def _patch_caller_and_db(user: dict, db):
 
     stack = ExitStack()
     stack.enter_context(
-        patch("orchestrator.main.require_approved_user", AsyncMock(return_value=user))
+        patch(
+            "orchestrator.security.auth.require_approved_user",
+            AsyncMock(return_value=user),
+        )
     )
     stack.enter_context(
         patch(
@@ -273,7 +281,7 @@ def _patch_caller_and_db(user: dict, db):
             AsyncMock(return_value=user),
         )
     )
-    stack.enter_context(patch("orchestrator.main.postgres_db", db))
+    stack.enter_context(patch("orchestrator.main.app.state.resources.postgres_db", db))
     return stack
 
 
@@ -301,7 +309,7 @@ class TestGetProjectOffCriticalPath:
                 ".ensure_project_cloud_resources",
                 slow_heal,
             ),
-            patch("orchestrator.main.main_cloud_router") as router,
+            patch("orchestrator.main.app.state.resources.main_cloud_router") as router,
         ):
             router.for_project_optional.return_value.is_initialized = False
             result = await get_project(
@@ -328,7 +336,7 @@ class TestGetProjectOffCriticalPath:
                 ".ensure_project_cloud_resources",
                 heal,
             ),
-            patch("orchestrator.main.main_cloud_router") as router,
+            patch("orchestrator.main.app.state.resources.main_cloud_router") as router,
         ):
             router.for_project_optional.return_value.is_initialized = False
             await get_project(
@@ -362,7 +370,7 @@ class TestGetProjectOffCriticalPath:
 
         with (
             _patch_caller_and_db(user_a, fake_db),
-            patch("orchestrator.main.main_cloud_router") as router,
+            patch("orchestrator.main.app.state.resources.main_cloud_router") as router,
         ):
             router.for_project_optional.return_value = backend
             result = await get_project(
@@ -397,7 +405,7 @@ class TestGetProjectOffCriticalPath:
 
         with (
             _patch_caller_and_db(user_a, fake_db),
-            patch("orchestrator.main.main_cloud_router") as router,
+            patch("orchestrator.main.app.state.resources.main_cloud_router") as router,
         ):
             router.for_project_optional.return_value = backend
             result = await get_project(

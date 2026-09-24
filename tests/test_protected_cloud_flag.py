@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-import importlib
 
 import pytest
+from orchestrator.services import deployment_gates as deployment_gates_module
 
 
 @pytest.mark.parametrize(
@@ -20,11 +20,9 @@ import pytest
 )
 def test_protected_cloud_mode_flag_parsing(monkeypatch, value, expected):
     monkeypatch.setenv("PROTECTED_CLOUD_MODE_ENABLED", value)
-    main = importlib.import_module("orchestrator.main")
-    assert main._is_protected_cloud_mode_enabled() is expected
+    assert deployment_gates_module.is_protected_cloud_mode_enabled() is expected
 
 
 def test_protected_cloud_mode_flag_absent_defaults_false(monkeypatch):
     monkeypatch.delenv("PROTECTED_CLOUD_MODE_ENABLED", raising=False)
-    main = importlib.import_module("orchestrator.main")
-    assert main._is_protected_cloud_mode_enabled() is False
+    assert deployment_gates_module.is_protected_cloud_mode_enabled() is False

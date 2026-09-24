@@ -9,6 +9,8 @@ import pytest
 from orchestrator import main
 from orchestrator.services.config_resolver import resolve_config
 from orchestrator.services.default_experts import load_seed_bundle
+from orchestrator.application import preparation as preparation_composition
+from orchestrator.services import grant_enforcement as grant_enforcement_module
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -39,7 +41,7 @@ def default_grants_user(monkeypatch):
         "project": [],
         "global": [],
     }
-    monkeypatch.setattr(main, "postgres_db", db)
+    monkeypatch.setattr(main.app.state.resources, "postgres_db", db)
     return db
 
 
@@ -50,7 +52,14 @@ async def test_seeded_default_passes_session_create_grants(
 ):
     fragment = _resolved_assistant({"workspace": {"backend": backend}})
 
-    await main._enforce_session_create_grants(fragment, user_id=USER_ID, project_ids=[])
+    await grant_enforcement_module.enforce_session_create_grants(
+        fragment,
+        user_id=USER_ID,
+        project_ids=[],
+        dependencies=preparation_composition.grant_enforcement_dependencies(
+            main.app.state.resources
+        ),
+    )
 
     roster = fragment["subagents"]["roster"]
     assert set(roster) == {"explorer", "reader", "implementer"}
@@ -73,8 +82,13 @@ async def test_explicit_shell_request_still_fails_session_admission(
     fragment = _resolved_assistant(override)
 
     with pytest.raises(HTTPException) as exc:
-        await main._enforce_session_create_grants(
-            fragment, user_id=USER_ID, project_ids=[]
+        await grant_enforcement_module.enforce_session_create_grants(
+            fragment,
+            user_id=USER_ID,
+            project_ids=[],
+            dependencies=preparation_composition.grant_enforcement_dependencies(
+                main.app.state.resources
+            ),
         )
 
     assert exc.value.status_code == 422

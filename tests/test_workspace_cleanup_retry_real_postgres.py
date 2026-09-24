@@ -24,6 +24,7 @@ from tests.test_non_pinned_workspace_lifecycle_real_postgres import (
     _create_settled_authoritative_runtime,
     _execute_pre_0195,
 )
+from orchestrator.services import container_provisioner as container_provisioner_module
 
 
 pg_dsn = lifecycle_tests.pg_dsn
@@ -516,8 +517,8 @@ async def test_completed_job_cleanup_replays_captured_generation_after_pod_loss(
             ),
         ]
     before = await _receipts(db, job)
-    monkeypatch.setattr(main, "postgres_db", db)
-    monkeypatch.setattr(main, "container_provisioner", p)
+    monkeypatch.setattr(main.app.state.resources, "postgres_db", db)
+    monkeypatch.setattr(container_provisioner_module, "container_provisioner", p)
     if failure is None:
         actions = await control_seams.archive_and_cleanup_workspace(str(job))
         assert actions == ["k8s workspace released"]

@@ -26,6 +26,12 @@ import pytest
 
 import tests.conftest  # noqa: F401 — license/crypto/env shims + sys.path
 import orchestrator.main as main
+from orchestrator.application import preparation as preparation_composition
+from orchestrator.services import (
+    job_workspace_authority as job_workspace_authority_module,
+)
+from orchestrator.services import job_workspace_runtime as job_workspace_runtime_module
+from orchestrator.services import workspace_lifecycle as workspace_lifecycle_module
 
 
 def _ensure(outcome, status):
@@ -73,42 +79,73 @@ class TestScholarProvisionMarker:
 class TestScholarShouldProvision:
     def test_sandbox_backend_provisions(self):
         assert (
-            main._scholar_should_provision_parent_container(
-                {"workspace": {"backend": "sandbox"}}
+            job_workspace_runtime_module.scholar_should_provision_parent_container(
+                {"workspace": {"backend": "sandbox"}},
+                dependencies=preparation_composition.job_workspace_runtime_dependencies(
+                    main.app.state.resources
+                ),
             )
             is True
         )
 
     def test_unset_backend_provisions(self):
         # No explicit backend defaults to the sandbox container path.
-        assert main._scholar_should_provision_parent_container({}) is True
-        assert main._scholar_should_provision_parent_container(None) is True
+        assert (
+            job_workspace_runtime_module.scholar_should_provision_parent_container(
+                {},
+                dependencies=preparation_composition.job_workspace_runtime_dependencies(
+                    main.app.state.resources
+                ),
+            )
+            is True
+        )
+        assert (
+            job_workspace_runtime_module.scholar_should_provision_parent_container(
+                None,
+                dependencies=preparation_composition.job_workspace_runtime_dependencies(
+                    main.app.state.resources
+                ),
+            )
+            is True
+        )
 
     def test_vm_backend_does_not_provision(self):
         # VM/remote parents keep today's behavior (out of Slice 1 scope).
         assert (
-            main._scholar_should_provision_parent_container(
-                {"workspace": {"backend": "vm"}}
+            job_workspace_runtime_module.scholar_should_provision_parent_container(
+                {"workspace": {"backend": "vm"}},
+                dependencies=preparation_composition.job_workspace_runtime_dependencies(
+                    main.app.state.resources
+                ),
             )
             is False
         )
         assert (
-            main._scholar_should_provision_parent_container(
-                {"workspace": {"backend": "remote"}}
+            job_workspace_runtime_module.scholar_should_provision_parent_container(
+                {"workspace": {"backend": "remote"}},
+                dependencies=preparation_composition.job_workspace_runtime_dependencies(
+                    main.app.state.resources
+                ),
             )
             is False
         )
 
     def test_lite_backend_does_not_provision(self):
         assert (
-            main._scholar_should_provision_parent_container(
-                {"workspace": {"backend": "virtual"}}
+            job_workspace_runtime_module.scholar_should_provision_parent_container(
+                {"workspace": {"backend": "virtual"}},
+                dependencies=preparation_composition.job_workspace_runtime_dependencies(
+                    main.app.state.resources
+                ),
             )
             is False
         )
         assert (
-            main._scholar_should_provision_parent_container(
-                {"workspace": {"backend": "none"}}
+            job_workspace_runtime_module.scholar_should_provision_parent_container(
+                {"workspace": {"backend": "none"}},
+                dependencies=preparation_composition.job_workspace_runtime_dependencies(
+                    main.app.state.resources
+                ),
             )
             is False
         )
@@ -156,16 +193,22 @@ class TestProvisionParentWorkspaceForScholar:
         state = {"merge": [], "conn": _FakeConn(), "fail": AsyncMock()}
 
         monkeypatch.setattr(
-            main.postgres_db,
+            main.app.state.resources.postgres_db,
             "merge_job_context",
             AsyncMock(
                 side_effect=lambda jid, delta: state["merge"].append((jid, delta))
             ),
         )
         monkeypatch.setattr(
-            main.postgres_db, "acquire", lambda: _FakeAcquire(state["conn"])
+            main.app.state.resources.postgres_db,
+            "acquire",
+            lambda: _FakeAcquire(state["conn"]),
         )
-        monkeypatch.setattr(main, "_fail_subjob_and_unblock_parent", state["fail"])
+        monkeypatch.setattr(
+            job_workspace_authority_module,
+            "fail_subjob_and_unblock_parent",
+            state["fail"],
+        )
         return state
 
     @pytest.mark.asyncio
@@ -175,15 +218,23 @@ class TestProvisionParentWorkspaceForScholar:
             "context": {"workspace_container": {"status": "creating"}},
             "config_override": {},
         }
-        monkeypatch.setattr(main.postgres_db, "get_job", AsyncMock(return_value=parent))
         monkeypatch.setattr(
-            main,
+            main.app.state.resources.postgres_db,
+            "get_job",
+            AsyncMock(return_value=parent),
+        )
+        monkeypatch.setattr(
+            workspace_lifecycle_module,
             "ensure_workspace",
             AsyncMock(return_value=_ensure(EnsureOutcome.PENDING, "creating")),
         )
 
-        result = await main._provision_parent_workspace_for_scholar(
-            scholar_job, "parent-uuid"
+        result = await job_workspace_authority_module.provision_parent_workspace_for_scholar(
+            scholar_job,
+            "parent-uuid",
+            dependencies=preparation_composition.job_workspace_authority_dependencies(
+                main.app.state.resources
+            ),
         )
 
         assert result == "wait"
@@ -194,15 +245,23 @@ class TestProvisionParentWorkspaceForScholar:
         self, monkeypatch, scholar_job, wire
     ):
         parent = {"id": "parent-uuid", "context": {}, "config_override": {}}
-        monkeypatch.setattr(main.postgres_db, "get_job", AsyncMock(return_value=parent))
         monkeypatch.setattr(
-            main,
+            main.app.state.resources.postgres_db,
+            "get_job",
+            AsyncMock(return_value=parent),
+        )
+        monkeypatch.setattr(
+            workspace_lifecycle_module,
             "ensure_workspace",
             AsyncMock(return_value=_ensure(EnsureOutcome.FAILED, "failed")),
         )
 
-        result = await main._provision_parent_workspace_for_scholar(
-            scholar_job, "parent-uuid"
+        result = await job_workspace_authority_module.provision_parent_workspace_for_scholar(
+            scholar_job,
+            "parent-uuid",
+            dependencies=preparation_composition.job_workspace_authority_dependencies(
+                main.app.state.resources
+            ),
         )
 
         assert result == "fail"
@@ -213,12 +272,20 @@ class TestProvisionParentWorkspaceForScholar:
     async def test_missing_parent_returns_fail_without_provisioning(
         self, monkeypatch, scholar_job, wire
     ):
-        monkeypatch.setattr(main.postgres_db, "get_job", AsyncMock(return_value=None))
+        monkeypatch.setattr(
+            main.app.state.resources.postgres_db,
+            "get_job",
+            AsyncMock(return_value=None),
+        )
         ensure = AsyncMock()
-        monkeypatch.setattr(main, "ensure_workspace", ensure)
+        monkeypatch.setattr(workspace_lifecycle_module, "ensure_workspace", ensure)
 
-        result = await main._provision_parent_workspace_for_scholar(
-            scholar_job, "gone-uuid"
+        result = await job_workspace_authority_module.provision_parent_workspace_for_scholar(
+            scholar_job,
+            "gone-uuid",
+            dependencies=preparation_composition.job_workspace_authority_dependencies(
+                main.app.state.resources
+            ),
         )
 
         assert result == "fail"
@@ -242,18 +309,22 @@ class TestProvisionParentWorkspaceForScholar:
             "config_override": {},
         }
         monkeypatch.setattr(
-            main.postgres_db,
+            main.app.state.resources.postgres_db,
             "get_job",
             AsyncMock(side_effect=[parent_creating, parent_ready]),
         )
         monkeypatch.setattr(
-            main,
+            workspace_lifecycle_module,
             "ensure_workspace",
             AsyncMock(return_value=_ensure(EnsureOutcome.READY, "ready")),
         )
 
-        result = await main._provision_parent_workspace_for_scholar(
-            scholar_job, "parent-uuid"
+        result = await job_workspace_authority_module.provision_parent_workspace_for_scholar(
+            scholar_job,
+            "parent-uuid",
+            dependencies=preparation_composition.job_workspace_authority_dependencies(
+                main.app.state.resources
+            ),
         )
 
         assert result == "promoted"

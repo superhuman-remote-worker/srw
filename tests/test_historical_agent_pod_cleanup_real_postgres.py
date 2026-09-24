@@ -25,6 +25,8 @@ from tests.test_persistent_recycler_real_postgres import (
     _authorize_and_ack,
     _json,
 )
+from orchestrator.application import controls as controls_composition
+from orchestrator.services import agent_provisioner as agent_provisioner_module
 
 db = authority_fixtures.db
 pg_dsn = authority_fixtures.pg_dsn
@@ -234,8 +236,8 @@ async def _scenario(
     provider = AgentProvisioner()
     provider._k8s_available = True
     provider._core_api = k8s
-    monkeypatch.setattr(main, "postgres_db", db)
-    monkeypatch.setattr(main, "agent_provisioner", provider)
+    monkeypatch.setattr(main.app.state.resources, "postgres_db", db)
+    monkeypatch.setattr(agent_provisioner_module, "agent_provisioner", provider)
     # The stopped actor's route is already absent. Keep route teardown on
     # injected APIs so this SQL/Kubernetes model never reads ambient kubeconfig.
     core_api = MagicMock()
@@ -245,7 +247,7 @@ async def _scenario(
         404
     )
     monkeypatch.setattr(
-        main,
+        main.app.state.resources,
         "session_router",
         SessionRouterService(
             namespace="agents-a",
@@ -257,9 +259,9 @@ async def _scenario(
 
     soft = await db.begin_pinned_thread_retirement(ids["thread"], permanent=False)
     await _authorize_and_ack(db, old, soft)
-    await main._pinned_retirement_operations().reconcile_agent_workspace_claim_for_retirement(
-        soft
-    )
+    await controls_composition.pinned_retirement_operations(
+        main.app.state.resources
+    ).reconcile_agent_workspace_claim_for_retirement(soft)
     assert await db.settle_pinned_thread_retirement(
         ids["thread"],
         token=soft["token"],
@@ -292,7 +294,9 @@ async def _scenario(
             settle_status="ended",
         )
     k8s.mark_terminal("agents-a", current["pod_name"])
-    await main._pinned_retirement_operations().stop_captured_retirement_agent(permanent)
+    await controls_composition.pinned_retirement_operations(
+        main.app.state.resources
+    ).stop_captured_retirement_agent(permanent)
     assert old_pod.metadata.finalizers == [PINNED_AUTHORITY_FINALIZER]
     assert k8s.removed_pods == [current["pod_uid"]]
     return old, current, permanent, k8s, provider
@@ -308,9 +312,9 @@ async def test_used_resumed_generation_reclaims_historical_claimant(
         monkeypatch,
         retain_old_agent=retain_old_agent,
     )
-    await main._pinned_retirement_operations().cleanup_pinned_thread_retirement(
-        permanent
-    )
+    await controls_composition.pinned_retirement_operations(
+        main.app.state.resources
+    ).cleanup_pinned_thread_retirement(permanent)
     assert k8s.removed_pods == [current["pod_uid"], old["pod_uid"]]
     assert not k8s.pods
     assert k8s.deleted_pvcs == [f"pvc-{old['thread']}"]
@@ -387,9 +391,9 @@ async def test_historical_claimant_refuses_incomplete_or_changed_authority(
             "UPDATE agents SET status='ready' WHERE id=$1::uuid", old["agent"]
         )
     with pytest.raises(RuntimeError):
-        await main._pinned_retirement_operations().reconcile_agent_workspace_claim_for_retirement(
-            permanent
-        )
+        await controls_composition.pinned_retirement_operations(
+            main.app.state.resources
+        ).reconcile_agent_workspace_claim_for_retirement(permanent)
     assert pod.metadata.finalizers == [PINNED_AUTHORITY_FINALIZER]
     assert not k8s.deleted_pvcs
 
@@ -413,14 +417,14 @@ async def test_lost_historical_finalizer_response_retries_without_touching_succe
     old, current, permanent, k8s, _ = await _scenario(db, monkeypatch)
     k8s.lose_next_pod_patch_response = True
     with pytest.raises(RuntimeError, match="historical claimant Pod retirement"):
-        await main._pinned_retirement_operations().reconcile_agent_workspace_claim_for_retirement(
-            permanent
-        )
+        await controls_composition.pinned_retirement_operations(
+            main.app.state.resources
+        ).reconcile_agent_workspace_claim_for_retirement(permanent)
     assert not k8s.pods
     assert not k8s.deleted_pvcs
-    await main._pinned_retirement_operations().cleanup_pinned_thread_retirement(
-        permanent
-    )
+    await controls_composition.pinned_retirement_operations(
+        main.app.state.resources
+    ).cleanup_pinned_thread_retirement(permanent)
     assert k8s.removed_pods == [current["pod_uid"]]
     assert k8s.deleted_pvcs == [f"pvc-{old['thread']}"]
     assert await db.pinned_retirement_external_cleanup_complete(
@@ -448,8 +452,8 @@ async def test_historical_patch_refuses_a_status_change_at_its_resource_version(
 
     monkeypatch.setattr(k8s, "patch_namespaced_pod", changed_before_patch)
     with pytest.raises(RuntimeError, match="historical claimant Pod retirement"):
-        await main._pinned_retirement_operations().reconcile_agent_workspace_claim_for_retirement(
-            permanent
-        )
+        await controls_composition.pinned_retirement_operations(
+            main.app.state.resources
+        ).reconcile_agent_workspace_claim_for_retirement(permanent)
     assert pod.metadata.finalizers == [PINNED_AUTHORITY_FINALIZER]
     assert not k8s.deleted_pvcs

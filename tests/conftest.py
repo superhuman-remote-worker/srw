@@ -121,57 +121,78 @@ def _isolate_declared_provenance_env(monkeypatch):
 
 
 # =============================================================================
-# Orchestrator module-singleton hygiene
+# Orchestrator application-state hygiene
 # =============================================================================
 #
-# orchestrator/main.py owns process-wide singletons (``postgres_db`` and
-# friends). A test that swaps one in with a bare assignment rather than
-# monkeypatch leaks it into every test that runs after it in the same process,
-# and the failure surfaces hundreds of tests later in a file that never touched
-# the global — e.g. a leaked ``MagicMock`` postgres_db turning an unrelated
-# ``await postgres_db.<method>()`` into "MagicMock can't be used in 'await'".
-# Snapshot the identities around every test and put them back, so a missing
-# restore stays local to the test that made it.
-#
-# All tests and applications use the installed canonical package, so there is
-# one orchestrator module and one set of process-wide singletons to guard.
+# The entrypoint's application (``orchestrator.main.app``) owns its resources
+# (``app.state.resources``: stores, clients, registries, deployment settings),
+# and the process-wide service singletons live in their owning modules. A test
+# that swaps one in with a bare assignment rather than monkeypatch leaks it into
+# every test that runs after it in the same process, and the failure surfaces
+# hundreds of tests later in a file that never touched it — e.g. a leaked
+# ``MagicMock`` store turning an unrelated ``await store.<method>()`` into
+# "MagicMock can't be used in 'await'". Snapshot the identities around every
+# test and put them back, so a missing restore stays local to the test that
+# made it.
 
-_ORCH_MAIN_MODULE_NAMES = ("orchestrator.main",)
-_ORCH_MAIN_SINGLETONS = (
-    "postgres_db",
-    "workspace_suspension_service",
-    "persistent_provisioner",
-    "email_service",
-    "headless_notifications",
+_OWNER_SINGLETONS = (
+    ("orchestrator.services.agent_provisioner", "agent_provisioner"),
+    ("orchestrator.services.container_provisioner", "container_provisioner"),
+    ("orchestrator.services.docker_provisioner", "docker_provisioner"),
+    ("orchestrator.services.email", "email_service"),
+    ("orchestrator.services.ide_proxy", "ide_proxy_service"),
+    ("orchestrator.services.ide_session", "ide_session_service"),
+    ("orchestrator.services.imap_poller", "imap_poller"),
+    ("orchestrator.services.nats_bridge", "nats_bridge"),
+    ("orchestrator.services.notification_service", "notification_service"),
+    ("orchestrator.services.persistent_provisioner", "persistent_provisioner"),
+    ("orchestrator.services.snapshot_service", "snapshot_service"),
+    ("orchestrator.services.sudo_gate", "sudo_gate"),
+    ("orchestrator.services.vm_provisioner", "vm_provisioner"),
+    ("orchestrator.services.workspace", "workspace_service"),
+    ("orchestrator.services.workspace_suspension", "workspace_suspension_service"),
+    # Process-wide seams ``create_app()`` binds to the most recently built
+    # application; a test that builds its own application must not leave them
+    # pointing at it.
+    ("orchestrator.security.auth", "_cloud_router_provider"),
+    ("orchestrator.security.auth", "_forge_provider"),
+    ("orchestrator.routers.vm_workspace_cleanup_authority", "_store_factory"),
+    ("orchestrator.routers.vm_creation_retry_authority", "_store_factory"),
+    ("orchestrator.routers.vm_resource_inventory", "_configuration"),
 )
 
 
 @pytest.fixture(autouse=True)
 def _restore_orchestrator_singletons():
-    modules = []
-    for name in _ORCH_MAIN_MODULE_NAMES:
-        module = sys.modules.get(name)
-        if module is not None and not any(module is seen for seen in modules):
-            modules.append(module)
+    import dataclasses
 
-    snapshots = [
-        (
-            module,
-            {
-                name: getattr(module, name)
-                for name in _ORCH_MAIN_SINGLETONS
-                if hasattr(module, name)
-            },
+    snapshots = []
+    main = sys.modules.get("orchestrator.main")
+    resources = getattr(
+        getattr(getattr(main, "app", None), "state", None), "_state", {}
+    )
+    resources = resources.get("resources") if isinstance(resources, dict) else None
+    if resources is not None:
+        fields = [f.name for f in dataclasses.fields(resources)]
+        snapshots.append(
+            (
+                resources,
+                {n: getattr(resources, n) for n in fields if hasattr(resources, n)},
+            )
         )
-        for module in modules
-    ]
+        settings = resources.settings
+        snapshots.append((settings, dataclasses.asdict(settings)))
+    for module_name, attribute in _OWNER_SINGLETONS:
+        module = sys.modules.get(module_name)
+        if module is not None and hasattr(module, attribute):
+            snapshots.append((module, {attribute: getattr(module, attribute)}))
     try:
         yield
     finally:
-        for module, snapshot in snapshots:
+        for owner, snapshot in snapshots:
             for name, value in snapshot.items():
-                if getattr(module, name, None) is not value:
-                    setattr(module, name, value)
+                if getattr(owner, name, None) is not value:
+                    setattr(owner, name, value)
 
 
 # =============================================================================

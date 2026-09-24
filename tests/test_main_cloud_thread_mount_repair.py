@@ -20,6 +20,8 @@ import pytest
 
 from orchestrator.routers.main_cloud_settings import repair_thread_mount_transport
 from orchestrator.services.cloud.errors import FeatureNotAvailable
+from orchestrator.application import access as access_composition
+from orchestrator.application import workspace as workspace_composition
 
 
 INSTANCE = "4e72e665-1f70-4b69-9804-d981b51416e6"
@@ -110,25 +112,35 @@ def _db(*, partial, projects):
 
 @contextmanager
 def _run(db, router):
-    """Call the endpoint with the admin gate stubbed and main's globals patched.
+    """Call the endpoint with the admin gate stubbed and the application's
+    store and cloud router replaced.
 
     The route reads its collaborators from ``MainCloudSettingsRouteDependencies``,
-    which ``main`` builds from the same globals this patches — including the
-    ``_thread_mount_dependencies`` factory the repair rebuilds rows through, so
-    the real builder runs against the fake store and router wired here.
+    which the workspace composition builds from the application's resources
+    this patches — including the ``thread_mount_dependencies`` factory the
+    repair rebuilds rows through, so the real builder runs against the fake
+    store and router wired here. The admin gate is the access composition's,
+    bound to the same application.
     """
     import orchestrator.main
 
+    resources = orchestrator.main.app.state.resources
     admin_gate = AsyncMock(return_value={"id": "admin"})
-    with patch.multiple(
-        orchestrator.main,
-        _require_admin=admin_gate,
-        postgres_db=db,
-        main_cloud_router=router,
+
+    async def require_admin(bound_resources, request):
+        assert bound_resources is resources
+        return await admin_gate(request)
+
+    with (
+        patch.object(access_composition, "require_admin", require_admin),
+        patch.object(resources, "postgres_db", db),
+        patch.object(resources, "main_cloud_router", router),
     ):
-        dependencies = orchestrator.main._main_cloud_settings_dependencies()
+        dependencies = workspace_composition.main_cloud_settings_dependencies(resources)
         assert dependencies.operations.store is db
-        assert dependencies.require_admin is admin_gate
+        assert dependencies.operations.cloud_router is router
+        assert dependencies.require_admin.func is require_admin
+        assert dependencies.require_admin.args == (resources,)
         yield SimpleNamespace(dependencies=dependencies, admin_gate=admin_gate)
 
 

@@ -17,6 +17,7 @@ from orchestrator.routers.preferences import (
     router,
 )
 from orchestrator.security import auth
+from orchestrator.routers import preferences as preferences_module
 
 
 PATH = "/api/settings/preferences"
@@ -208,15 +209,26 @@ assert not [name for name in sys.modules if is_forbidden(name)]
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-def test_main_keeps_existing_model_and_workspace_policy_exports():
+def test_workspace_policy_constants_are_consumed_from_their_owner():
+    """R1.B12: ``orchestrator.main`` is only the entrypoint and re-exports
+    nothing; the preferences router and the defaults resolver must read the
+    tier constants from ``session_workspace_policy`` itself, not a copy."""
     from orchestrator import main
     from orchestrator.routers.preferences import UserSettingsUpdate
-    from orchestrator.services import session_workspace_policy
+    from orchestrator.services import preference_defaults, session_workspace_policy
 
-    assert main.UserSettingsUpdate is UserSettingsUpdate
+    assert preferences_module.UserSettingsUpdate is UserSettingsUpdate
+    assert (
+        preferences_module.SESSION_WORKSPACE_BACKENDS
+        is session_workspace_policy.SESSION_WORKSPACE_BACKENDS
+    )
+    assert (
+        preference_defaults.SESSION_DEFAULT_WORKSPACE_BACKEND
+        is session_workspace_policy.SESSION_DEFAULT_WORKSPACE_BACKEND
+    )
     for name in (
         "SESSION_WORKSPACE_BACKENDS",
         "SESSION_DEFAULT_WORKSPACE_BACKEND",
         "SESSION_CREATE_WORKSPACE_BACKENDS",
     ):
-        assert getattr(main, name) is getattr(session_workspace_policy, name)
+        assert not hasattr(main, name)

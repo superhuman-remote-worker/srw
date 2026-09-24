@@ -61,6 +61,7 @@ from orchestrator.services import ssh_access as ssh_access_operations
 from orchestrator.services.ssh_public_keys import SshKeyRejected
 from tests._ssh_access_harness import SECRET, SshAccessHarness
 from tests._route_inventory import mounted_routes
+from orchestrator.application import workflows as workflows_composition
 
 
 class _Body:
@@ -1099,7 +1100,9 @@ async def test_ssh_key_added_open_action_navigates_and_resolves():
     from orchestrator.services.notification_catalog import ActionContext, action_handler
 
     register_notification_actions(
-        dependencies=orchestrator.main._notification_action_dependencies()
+        dependencies=workflows_composition.notification_action_dependencies(
+            orchestrator.main.app.state.resources
+        )
     )
     handler = action_handler("ssh_key_added", "open")
     assert handler is not None

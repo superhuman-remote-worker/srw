@@ -18,6 +18,7 @@ import pytest
 from fastapi import HTTPException
 
 from orchestrator.services import stateless_claimant_attestation as sca
+from orchestrator.application import sessions as sessions_composition
 
 UNIT_ID = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
 POD_NAME = "srw-agent-stateless-d9d86bd6f-pll7v"
@@ -306,5 +307,7 @@ def test_stateless_pool_labels_match_attestation_contract():
 def test_unit_claim_dependencies_expose_attestor():
     from orchestrator import main as orch_main
 
-    deps = orch_main._unit_claim_bundle_dependencies()
+    deps = sessions_composition.unit_claim_bundle_dependencies(
+        orch_main.app.state.resources
+    )
     assert callable(deps.attest_stateless_claimant)

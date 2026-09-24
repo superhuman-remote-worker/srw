@@ -17,6 +17,12 @@ import pytest
 
 # R1.B06: this operation moved to services/agent_thread_status.
 from orchestrator.services import agent_thread_status  # noqa: E402
+from orchestrator.application import sessions as sessions_composition
+from orchestrator.schemas import agent_thread_status as agent_thread_status_module
+from orchestrator.security import access as access_module
+from orchestrator.services import officer_conference as officer_conference_module
+from orchestrator.services import thread_retirement as thread_retirement_module
+from orchestrator.services import workspace_suspension as workspace_suspension_module
 
 
 # =============================================================================
@@ -571,10 +577,10 @@ class TestOrchestratorInactiveCapabilityFence:
         db.get_pinned_warm_binding_candidate = AsyncMock(return_value=None)
         end_flow = AsyncMock(return_value={"status": "suspended"})
         with (
-            patch.object(orch_main, "require_internal", AsyncMock()),
-            patch.object(orch_main, "postgres_db", db),
+            patch.object(access_module, "require_internal", AsyncMock()),
+            patch.object(orch_main.app.state.resources, "postgres_db", db),
             patch.object(
-                orch_main.thread_retirement_operations.ThreadRetirementOperations,
+                thread_retirement_module.ThreadRetirementOperations,
                 "end_thread_flow",
                 end_flow,
             ),
@@ -591,7 +597,9 @@ class TestOrchestratorInactiveCapabilityFence:
             result = await agent_thread_status.suspend_thread(
                 "tid-drain-1",
                 headers=getattr(request, "headers", {}),
-                dependencies=orch_main._agent_thread_status_dependencies(),
+                dependencies=sessions_composition.agent_thread_status_dependencies(
+                    orch_main.app.state.resources
+                ),
             )
 
         assert result == {"suspended": True, "status": "suspended"}
@@ -625,15 +633,21 @@ class TestOrchestratorInactiveCapabilityFence:
         request = MagicMock()
         request.headers = {"X-Agent-ID": "agent-current"}
         with (
-            patch.object(orch_main, "require_internal", AsyncMock()),
-            patch.object(orch_main, "postgres_db", db),
-            patch.object(orch_main, "_persistent_thread_recycler", recycler),
-            patch.object(orch_main, "workspace_suspension_service", suspension),
+            patch.object(access_module, "require_internal", AsyncMock()),
+            patch.object(orch_main.app.state.resources, "postgres_db", db),
+            patch.object(
+                orch_main.app.state.resources, "persistent_thread_recycler", recycler
+            ),
+            patch.object(
+                workspace_suspension_module, "workspace_suspension_service", suspension
+            ),
         ):
             result = await agent_thread_status.suspend_thread(
                 "tid-drain-1",
                 headers=getattr(request, "headers", {}),
-                dependencies=orch_main._agent_thread_status_dependencies(),
+                dependencies=sessions_composition.agent_thread_status_dependencies(
+                    orch_main.app.state.resources
+                ),
             )
 
         assert result == {
@@ -683,15 +697,21 @@ class TestOrchestratorInactiveCapabilityFence:
             }
         )
         with (
-            patch.object(orch_main, "require_internal", AsyncMock()),
-            patch.object(orch_main, "postgres_db", db),
-            patch.object(orch_main, "_persistent_thread_recycler", recycler),
-            patch.object(orch_main, "workspace_suspension_service", suspension),
+            patch.object(access_module, "require_internal", AsyncMock()),
+            patch.object(orch_main.app.state.resources, "postgres_db", db),
+            patch.object(
+                orch_main.app.state.resources, "persistent_thread_recycler", recycler
+            ),
+            patch.object(
+                workspace_suspension_module, "workspace_suspension_service", suspension
+            ),
         ):
             result = await agent_thread_status.suspend_thread(
                 "tid-drain-1",
                 headers=getattr(request, "headers", {}),
-                dependencies=orch_main._agent_thread_status_dependencies(),
+                dependencies=sessions_composition.agent_thread_status_dependencies(
+                    orch_main.app.state.resources
+                ),
             )
 
         assert result["reason"] == "persistent_recycle"
@@ -732,16 +752,22 @@ class TestOrchestratorInactiveCapabilityFence:
             }
         )
         with (
-            patch.object(orch_main, "require_internal", AsyncMock()),
-            patch.object(orch_main, "postgres_db", db),
-            patch.object(orch_main, "_persistent_thread_recycler", recycler),
-            patch.object(orch_main, "workspace_suspension_service", suspension),
+            patch.object(access_module, "require_internal", AsyncMock()),
+            patch.object(orch_main.app.state.resources, "postgres_db", db),
+            patch.object(
+                orch_main.app.state.resources, "persistent_thread_recycler", recycler
+            ),
+            patch.object(
+                workspace_suspension_module, "workspace_suspension_service", suspension
+            ),
             pytest.raises(HTTPException) as exc,
         ):
             await agent_thread_status.suspend_thread(
                 "tid-drain-1",
                 headers=getattr(request, "headers", {}),
-                dependencies=orch_main._agent_thread_status_dependencies(),
+                dependencies=sessions_composition.agent_thread_status_dependencies(
+                    orch_main.app.state.resources
+                ),
             )
 
         assert exc.value.status_code == 409
@@ -762,19 +788,23 @@ class TestOrchestratorInactiveCapabilityFence:
         )
         suspend_resources = AsyncMock()
         with (
-            patch.object(orch_main, "require_internal", AsyncMock()),
-            patch.object(orch_main, "postgres_db", db),
-            patch.object(orch_main, "_persistent_thread_recycler", recycler),
+            patch.object(access_module, "require_internal", AsyncMock()),
+            patch.object(orch_main.app.state.resources, "postgres_db", db),
             patch.object(
-                orch_main.thread_retirement_operations.ThreadRetirementOperations,
+                orch_main.app.state.resources, "persistent_thread_recycler", recycler
+            ),
+            patch.object(
+                thread_retirement_module.ThreadRetirementOperations,
                 "suspend_thread_resources",
                 suspend_resources,
             ),
         ):
             result = await agent_thread_status.update_thread_status(
                 "tid-drain-1",
-                orch_main.AgentThreadStatusRequest(status="ended"),
-                dependencies=orch_main._agent_thread_status_dependencies(),
+                agent_thread_status_module.AgentThreadStatusRequest(status="ended"),
+                dependencies=sessions_composition.agent_thread_status_dependencies(
+                    orch_main.app.state.resources
+                ),
             )
 
         assert result == {"status": "suspended"}
@@ -808,16 +838,22 @@ class TestOrchestratorInactiveCapabilityFence:
             }
         )
         with (
-            patch.object(orch_main, "require_internal", AsyncMock()),
-            patch.object(orch_main, "postgres_db", db),
-            patch.object(orch_main, "_persistent_thread_recycler", recycler),
-            patch.object(orch_main, "workspace_suspension_service", suspension),
+            patch.object(access_module, "require_internal", AsyncMock()),
+            patch.object(orch_main.app.state.resources, "postgres_db", db),
+            patch.object(
+                orch_main.app.state.resources, "persistent_thread_recycler", recycler
+            ),
+            patch.object(
+                workspace_suspension_module, "workspace_suspension_service", suspension
+            ),
             pytest.raises(HTTPException) as exc,
         ):
             await agent_thread_status.suspend_thread(
                 "tid-drain-1",
                 headers=getattr(request, "headers", {}),
-                dependencies=orch_main._agent_thread_status_dependencies(),
+                dependencies=sessions_composition.agent_thread_status_dependencies(
+                    orch_main.app.state.resources
+                ),
             )
 
         assert exc.value.status_code == 409
@@ -836,19 +872,23 @@ class TestOrchestratorInactiveCapabilityFence:
         suspend_resources = AsyncMock()
         conclude = AsyncMock()
         with (
-            patch.object(orch_main, "require_internal", AsyncMock()),
-            patch.object(orch_main, "postgres_db", db),
+            patch.object(access_module, "require_internal", AsyncMock()),
+            patch.object(orch_main.app.state.resources, "postgres_db", db),
             patch.object(
-                orch_main.thread_retirement_operations.ThreadRetirementOperations,
+                thread_retirement_module.ThreadRetirementOperations,
                 "suspend_thread_resources",
                 suspend_resources,
             ),
-            patch.object(orch_main, "_conclude_conference_if_any", conclude),
+            patch.object(
+                officer_conference_module, "conclude_conference_if_any", conclude
+            ),
         ):
             result = await agent_thread_status.update_thread_status(
                 "tid-drain-1",
-                orch_main.AgentThreadStatusRequest(status="ended"),
-                dependencies=orch_main._agent_thread_status_dependencies(),
+                agent_thread_status_module.AgentThreadStatusRequest(status="ended"),
+                dependencies=sessions_composition.agent_thread_status_dependencies(
+                    orch_main.app.state.resources
+                ),
             )
             await asyncio.sleep(0)
 

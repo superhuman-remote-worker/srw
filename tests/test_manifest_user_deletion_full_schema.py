@@ -24,6 +24,9 @@ from tests.test_manifest_native_full_schema import (
     admit,
     assignment,
 )
+from orchestrator.application import controls as controls_composition
+from orchestrator.services import officer_conference as officer_conference_module
+from orchestrator.services import snapshot_service as snapshot_service_module
 
 database = full_schema.database
 postgres_url = full_schema.postgres_url
@@ -288,14 +291,22 @@ async def test_project_delete_ignores_only_settled_ownerless_session_history(
         initial_metadata={"config_override": {"workspace": {"backend": "none"}}},
     )
     thread = await database.get_thread(thread_id)
-    monkeypatch.setattr(main, "postgres_db", database)
-    monkeypatch.setattr(main, "_conclude_conference_if_any", AsyncMock())
-    monkeypatch.setattr(main, "snapshot_service", SimpleNamespace(is_available=False))
-    monkeypatch.setattr(main, "gitea_client", SimpleNamespace(is_initialized=False))
+    monkeypatch.setattr(main.app.state.resources, "postgres_db", database)
+    monkeypatch.setattr(
+        officer_conference_module, "conclude_conference_if_any", AsyncMock()
+    )
+    monkeypatch.setattr(
+        snapshot_service_module, "snapshot_service", SimpleNamespace(is_available=False)
+    )
+    monkeypatch.setattr(
+        main.app.state.resources, "gitea_client", SimpleNamespace(is_initialized=False)
+    )
 
-    assert await main._end_thread_flow(
-        thread_id, thread, permanent=False, force=True
-    ) == {"status": "ended"}
+    assert await controls_composition.thread_retirement_operations(
+        main.app.state.resources
+    ).end_thread_flow(thread_id, thread, permanent=False, force=True) == {
+        "status": "ended"
+    }
     ended = await database.get_thread(thread_id)
     assert ended["status"] == "ended"
     assert ended["runtime_retirement_token"] is None

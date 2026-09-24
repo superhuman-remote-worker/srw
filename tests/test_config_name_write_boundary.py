@@ -45,6 +45,17 @@ from orchestrator.services.agent_pod_entrypoint import (
     validate_config_name,
 )
 from orchestrator.services.session_runtime_admission import ThreadRuntimeAuthority
+from orchestrator.application import projects as projects_composition
+from orchestrator.application import sessions as sessions_composition
+from orchestrator.application import transport as transport_composition
+from orchestrator.services import (
+    commissioned_officer_provisioning as commissioned_officer_provisioning_module,
+)
+from orchestrator.services import (
+    persistent_provisioner as persistent_provisioner_module,
+)
+from orchestrator.services import thread_admission as thread_admission_module
+from orchestrator.services import workspace_suspension as workspace_suspension_module
 
 
 # Each of these breaks a different rule in the allow-list, and each is the
@@ -110,7 +121,10 @@ class TestValidatorVocabulary:
 def _patch_caller(user: dict, db) -> ExitStack:
     stack = ExitStack()
     stack.enter_context(
-        patch("orchestrator.main.require_approved_user", AsyncMock(return_value=user))
+        patch(
+            "orchestrator.security.auth.require_approved_user",
+            AsyncMock(return_value=user),
+        )
     )
     stack.enter_context(
         patch(
@@ -118,7 +132,7 @@ def _patch_caller(user: dict, db) -> ExitStack:
             AsyncMock(return_value=user),
         )
     )
-    stack.enter_context(patch("orchestrator.main.postgres_db", db))
+    stack.enter_context(patch("orchestrator.main.app.state.resources.postgres_db", db))
     return stack
 
 
@@ -130,15 +144,22 @@ class TestThreadCreateWriteBoundary:
     async def test_hostile_name_is_refused_before_any_insert(
         self, name, user_a, fake_db, fake_request
     ):
-        from orchestrator.main import ThreadCreateRequest, create_thread
+        from orchestrator.schemas.thread_admission import ThreadCreateRequest
+        import orchestrator.main
 
         fake_db.create_thread = AsyncMock()
         fake_db.get_user_settings = AsyncMock(return_value={})
         with _patch_caller(user_a, fake_db):
-            with patch("orchestrator.main._enforce_readiness_gate", AsyncMock()):
+            with patch(
+                "orchestrator.application.access.enforce_readiness_gate", AsyncMock()
+            ):
                 with pytest.raises(HTTPException) as exc:
-                    await create_thread(
-                        ThreadCreateRequest(config_name=name), fake_request
+                    await thread_admission_module.create_thread(
+                        ThreadCreateRequest(config_name=name),
+                        fake_request,
+                        dependencies=sessions_composition.thread_admission_dependencies(
+                            orchestrator.main.app.state.resources
+                        ),
                     )
 
         assert exc.value.status_code == 422
@@ -156,14 +177,21 @@ class TestThreadCreateWriteBoundary:
         that it is no longer the config_name check that refuses, i.e. no 422
         naming the field.
         """
-        from orchestrator.main import ThreadCreateRequest, create_thread
+        from orchestrator.schemas.thread_admission import ThreadCreateRequest
+        import orchestrator.main
 
         fake_db.get_user_settings = AsyncMock(return_value={})
         with _patch_caller(user_a, fake_db):
-            with patch("orchestrator.main._enforce_readiness_gate", AsyncMock()):
+            with patch(
+                "orchestrator.application.access.enforce_readiness_gate", AsyncMock()
+            ):
                 try:
-                    await create_thread(
-                        ThreadCreateRequest(config_name=name), fake_request
+                    await thread_admission_module.create_thread(
+                        ThreadCreateRequest(config_name=name),
+                        fake_request,
+                        dependencies=sessions_composition.thread_admission_dependencies(
+                            orchestrator.main.app.state.resources
+                        ),
                     )
                 except HTTPException as exc:
                     assert not (
@@ -180,17 +208,19 @@ class TestAgentThreadCreateWriteBoundary:
     @pytest.mark.asyncio
     async def test_hostile_name_is_refused_before_any_insert(self, fake_db):
         import orchestrator.main as main
-        from orchestrator.main import AgentThreadCreateRequest
+        from orchestrator.schemas.agent_child_threads import AgentThreadCreateRequest
         from orchestrator.services.agent_child_threads import agent_create_thread
 
         fake_db.create_thread = AsyncMock()
-        with patch("orchestrator.main.postgres_db", fake_db):
-            with patch("orchestrator.main.require_internal", AsyncMock()):
+        with patch("orchestrator.main.app.state.resources.postgres_db", fake_db):
+            with patch("orchestrator.security.access.require_internal", AsyncMock()):
                 with pytest.raises(HTTPException) as exc:
                     await agent_create_thread(
                         MagicMock(),
                         AgentThreadCreateRequest(config_name="a; rm -rf /"),
-                        dependencies=main._agent_child_threads_dependencies(),
+                        dependencies=sessions_composition.agent_child_threads_dependencies(
+                            main.app.state.resources
+                        ),
                     )
 
         assert exc.value.status_code == 422
@@ -206,7 +236,7 @@ class TestJobCreateWriteBoundary:
     async def test_hostile_name_is_refused_before_any_insert(
         self, name, user_a, fake_db, fake_request
     ):
-        from orchestrator.main import JobCreate
+        from orchestrator.schemas.job_create import JobCreate
         from tests._b09_control_seams import create_job
 
         fake_db.create_job = AsyncMock()
@@ -214,7 +244,9 @@ class TestJobCreateWriteBoundary:
         # unscoped job create, not only inside a project.
         fake_db.get_user = AsyncMock(return_value=user_a)
         with _patch_caller(user_a, fake_db):
-            with patch("orchestrator.main._enforce_readiness_gate", AsyncMock()):
+            with patch(
+                "orchestrator.application.access.enforce_readiness_gate", AsyncMock()
+            ):
                 with pytest.raises(HTTPException) as exc:
                     await create_job(
                         fake_request,
@@ -247,7 +279,9 @@ class TestProjectDefaultConfigNameWriteBoundary:
                         default_config_name="scholar && curl evil",
                     ),
                     fake_request,
-                    dependencies=orch_main._projects_dependencies(),
+                    dependencies=projects_composition.projects_dependencies(
+                        orch_main.app.state.resources
+                    ),
                 )
 
         assert exc.value.status_code == 422
@@ -263,7 +297,7 @@ class TestProjectDefaultConfigNameWriteBoundary:
         fake_db.update_project = AsyncMock(return_value=True)
         with _patch_caller(user_a, fake_db):
             with patch(
-                "orchestrator.main.require_project_owner",
+                "orchestrator.security.access.require_project_owner",
                 AsyncMock(return_value=(user_a, project_a)),
             ):
                 with pytest.raises(HTTPException) as exc:
@@ -271,7 +305,9 @@ class TestProjectDefaultConfigNameWriteBoundary:
                         str(project_a["id"]),
                         ProjectUpdate(default_config_name="../../etc/passwd"),
                         fake_request,
-                        dependencies=orch_main._projects_dependencies(),
+                        dependencies=projects_composition.projects_dependencies(
+                            orch_main.app.state.resources
+                        ),
                     )
 
         assert exc.value.status_code == 422
@@ -473,20 +509,27 @@ class TestCommissionedOfficerProvisioningFailsLoudly:
     async def test_refused_config_name_records_a_failed_state(self, monkeypatch):
         db = MagicMock()
         db.get_thread = AsyncMock(return_value=_preparable_thread())
-        monkeypatch.setattr(orch_main, "postgres_db", db)
+        monkeypatch.setattr(orch_main.app.state.resources, "postgres_db", db)
         monkeypatch.setattr(
-            orch_main, "persistent_provisioner", _refusing_persistent_provisioner()
+            persistent_provisioner_module,
+            "persistent_provisioner",
+            _refusing_persistent_provisioner(),
         )
         recorder = _LifecycleRecorder()
 
         with patch("orchestrator.services.session_lifecycle.emit", recorder):
             # Must not raise: in production this IS the task body, and a raise
             # here is dropped by asyncio with nothing else recording it.
-            await orch_main._provision_commissioned_officer(
-                THREAD_ID,
-                user_id=USER_ID,
-                config_name="a; id",
-                runtime_authority=_authority(),
+            await (
+                commissioned_officer_provisioning_module.provision_commissioned_officer(
+                    THREAD_ID,
+                    user_id=USER_ID,
+                    config_name="a; id",
+                    runtime_authority=_authority(),
+                    dependencies=sessions_composition.commissioned_officer_dependencies(
+                        orch_main.app.state.resources
+                    ),
+                )
             )
 
         assert len(recorder.failures) == 1
@@ -499,7 +542,7 @@ class TestCommissionedOfficerProvisioningFailsLoudly:
     async def test_unusable_result_also_records_a_failed_state(self, monkeypatch):
         db = MagicMock()
         db.get_thread = AsyncMock(return_value=_preparable_thread())
-        monkeypatch.setattr(orch_main, "postgres_db", db)
+        monkeypatch.setattr(orch_main.app.state.resources, "postgres_db", db)
         prov = MagicMock()
         prov.create_agent_pod = AsyncMock(
             return_value=SimpleNamespace(
@@ -508,15 +551,22 @@ class TestCommissionedOfficerProvisioningFailsLoudly:
                 failure_class="pvc_creation_failed",
             )
         )
-        monkeypatch.setattr(orch_main, "persistent_provisioner", prov)
+        monkeypatch.setattr(
+            persistent_provisioner_module, "persistent_provisioner", prov
+        )
         recorder = _LifecycleRecorder()
 
         with patch("orchestrator.services.session_lifecycle.emit", recorder):
-            await orch_main._provision_commissioned_officer(
-                THREAD_ID,
-                user_id=USER_ID,
-                config_name="centurion",
-                runtime_authority=_authority(),
+            await (
+                commissioned_officer_provisioning_module.provision_commissioned_officer(
+                    THREAD_ID,
+                    user_id=USER_ID,
+                    config_name="centurion",
+                    runtime_authority=_authority(),
+                    dependencies=sessions_composition.commissioned_officer_dependencies(
+                        orch_main.app.state.resources
+                    ),
+                )
             )
 
         assert len(recorder.failures) == 1
@@ -530,18 +580,25 @@ class TestCommissionedOfficerProvisioningFailsLoudly:
                 runtime_generation="33333333-3333-4333-8333-333333333333"
             )
         )
-        monkeypatch.setattr(orch_main, "postgres_db", db)
+        monkeypatch.setattr(orch_main.app.state.resources, "postgres_db", db)
         monkeypatch.setattr(
-            orch_main, "persistent_provisioner", _refusing_persistent_provisioner()
+            persistent_provisioner_module,
+            "persistent_provisioner",
+            _refusing_persistent_provisioner(),
         )
         recorder = _LifecycleRecorder()
 
         with patch("orchestrator.services.session_lifecycle.emit", recorder):
-            await orch_main._provision_commissioned_officer(
-                THREAD_ID,
-                user_id=USER_ID,
-                config_name="a; id",
-                runtime_authority=_authority(),
+            await (
+                commissioned_officer_provisioning_module.provision_commissioned_officer(
+                    THREAD_ID,
+                    user_id=USER_ID,
+                    config_name="a; id",
+                    runtime_authority=_authority(),
+                    dependencies=sessions_composition.commissioned_officer_dependencies(
+                        orch_main.app.state.resources
+                    ),
+                )
             )
 
         assert recorder.events == []
@@ -618,35 +675,38 @@ def _resume_stack(user: dict, db, thread_row: dict) -> ExitStack:
     stack = ExitStack()
     stack.enter_context(
         patch(
-            "orchestrator.main.require_thread_owner",
+            "orchestrator.security.access.require_thread_owner",
             AsyncMock(return_value=(user, thread_row)),
         )
     )
-    stack.enter_context(patch("orchestrator.main.postgres_db", db))
-    stack.enter_context(
-        patch("orchestrator.main.ensure_session_workspace", AsyncMock())
-    )
+    stack.enter_context(patch("orchestrator.main.app.state.resources.postgres_db", db))
     stack.enter_context(
         patch(
-            "orchestrator.main.thread_resume_operations.thread_config_drift",
-            AsyncMock(return_value=[]),
-        )
-    )
-    stack.enter_context(
-        patch(
-            "orchestrator.main.thread_resume_operations.await_late_cloud_setup",
+            "orchestrator.services.session_provisioner.ensure_session_workspace",
             AsyncMock(),
         )
     )
     stack.enter_context(
         patch(
-            "orchestrator.main._await_protected_cloud_runtime_ready",
+            "orchestrator.services.thread_resume.thread_config_drift",
+            AsyncMock(return_value=[]),
+        )
+    )
+    stack.enter_context(
+        patch(
+            "orchestrator.services.thread_resume.await_late_cloud_setup",
+            AsyncMock(),
+        )
+    )
+    stack.enter_context(
+        patch(
+            "orchestrator.services.protected_cloud_engage._await_protected_cloud_runtime_ready",
             AsyncMock(return_value=True),
         )
     )
     stack.enter_context(
         patch(
-            "orchestrator.main._find_idle_persistent_agent",
+            "orchestrator.services.session_attach_binding.find_idle_persistent_agent",
             AsyncMock(return_value=None),
         )
     )
@@ -683,8 +743,10 @@ class TestResumeReprovisionFailsLoudly:
         )
 
         with _resume_stack(user_a, db, thread_row):
-            with patch("orchestrator.main.agent_provisioner", provisioner):
-                with patch("orchestrator.main.asyncio.create_task", tasks):
+            with patch(
+                "orchestrator.services.agent_provisioner.agent_provisioner", provisioner
+            ):
+                with patch("asyncio.create_task", tasks):
                     with patch(
                         "orchestrator.services.session_lifecycle.emit", recorder
                     ):
@@ -714,14 +776,14 @@ class TestResumeReprovisionFailsLoudly:
 
         with _resume_stack(user_a, db, thread_row):
             with patch(
-                "orchestrator.main.agent_provisioner",
+                "orchestrator.services.agent_provisioner.agent_provisioner",
                 SimpleNamespace(is_available=False, in_cluster=False),
             ):
                 with patch(
-                    "orchestrator.main.persistent_provisioner",
+                    "orchestrator.services.persistent_provisioner.persistent_provisioner",
                     _refusing_persistent_provisioner(),
                 ):
-                    with patch("orchestrator.main.asyncio.create_task", tasks):
+                    with patch("asyncio.create_task", tasks):
                         with patch(
                             "orchestrator.services.session_lifecycle.emit", recorder
                         ):
@@ -762,14 +824,20 @@ class TestMagicLinkWakeProvisioningFailsLoudly:
                 return None
 
         db.acquire = lambda: _Acquire()
-        monkeypatch.setattr(orch_main, "postgres_db", db)
+        monkeypatch.setattr(orch_main.app.state.resources, "postgres_db", db)
         monkeypatch.setattr(
-            orch_main, "persistent_provisioner", _refusing_persistent_provisioner()
+            persistent_provisioner_module,
+            "persistent_provisioner",
+            _refusing_persistent_provisioner(),
         )
-        monkeypatch.setattr(orch_main, "_persistent_thread_recycler", None)
+        monkeypatch.setattr(
+            orch_main.app.state.resources, "persistent_thread_recycler", None
+        )
         svc = MagicMock()
         svc.is_enabled = True
-        monkeypatch.setattr(orch_main, "workspace_suspension_service", svc)
+        monkeypatch.setattr(
+            workspace_suspension_module, "workspace_suspension_service", svc
+        )
 
         from orchestrator.services import session_attention
 
@@ -781,7 +849,9 @@ class TestMagicLinkWakeProvisioningFailsLoudly:
             with patch("orchestrator.services.session_lifecycle.emit", recorder):
                 await session_attention.wake_after_permission_decision(
                     THREAD_ID,
-                    dependencies=orch_main._session_attention_dependencies(),
+                    dependencies=transport_composition.session_attention_dependencies(
+                        orch_main.app.state.resources
+                    ),
                 )
                 assert await tasks.drain("_create_after_magic_link") == 1
 

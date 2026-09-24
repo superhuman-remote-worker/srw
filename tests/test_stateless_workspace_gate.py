@@ -27,6 +27,16 @@ from orchestrator.services.stateless_workspace_gate import (
     stateless_workspace_check,
 )
 from orchestrator.services import grant_enforcement  # noqa: E402
+from orchestrator.application import preparation as preparation_composition
+from orchestrator.application import sessions as sessions_composition
+from orchestrator.schemas import thread_admission as thread_admission_module
+from orchestrator.schemas import thread_config as thread_config_module
+from orchestrator.security import access as access_module
+from orchestrator.services import config_overrides as config_overrides_module
+from orchestrator.services import container_provisioner as container_provisioner_module
+from orchestrator.services import grant_enforcement as grant_enforcement_module
+from orchestrator.services import virtual_workspace as virtual_workspace_module
+from orchestrator.services import vm_provisioner as vm_provisioner_module
 
 
 THREAD_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
@@ -489,14 +499,18 @@ def test_classifier_refuses_unattested_or_non_k8s_sandbox(metadata, reason):
 def test_session_admission_defaults_to_pinned_while_pool_is_off(monkeypatch):
     from orchestrator import main as orch_main
 
-    monkeypatch.setattr(orch_main, "STATELESS_SESSION_ENABLED", False)
+    monkeypatch.setattr(
+        orch_main.app.state.resources.settings, "stateless_session_enabled", False
+    )
 
     for backend in ("sandbox", "virtual", "none", "vm"):
         assert (
             session_class_policy.resolve_thread_execution_lane(
                 workspace_backend=backend,
                 effective_config={"workspace": {"backend": backend}},
-                dependencies=orch_main._execution_lane_dependencies(),
+                dependencies=preparation_composition.execution_lane_dependencies(
+                    orch_main.app.state.resources
+                ),
             )
             == "pinned"
         )
@@ -506,15 +520,17 @@ def test_session_admission_defaults_to_pinned_while_pool_is_off(monkeypatch):
 def test_enabled_pool_auto_admits_supported_ordinary_tiers(monkeypatch, backend):
     from orchestrator import main as orch_main
 
-    monkeypatch.setattr(orch_main, "STATELESS_SESSION_ENABLED", True)
     monkeypatch.setattr(
-        orch_main,
+        orch_main.app.state.resources.settings, "stateless_session_enabled", True
+    )
+    monkeypatch.setattr(
+        container_provisioner_module,
         "container_provisioner",
         SimpleNamespace(is_available=True, in_cluster=True),
     )
     monkeypatch.setattr(
-        orch_main,
-        "_virtual_workspace_rclone_spec",
+        virtual_workspace_module,
+        "virtual_workspace_rclone_spec",
         lambda: {"type": "s3", "root": "workspaces"},
     )
 
@@ -522,7 +538,9 @@ def test_enabled_pool_auto_admits_supported_ordinary_tiers(monkeypatch, backend)
         session_class_policy.resolve_thread_execution_lane(
             workspace_backend=backend,
             effective_config={"workspace": {"backend": backend}},
-            dependencies=orch_main._execution_lane_dependencies(),
+            dependencies=preparation_composition.execution_lane_dependencies(
+                orch_main.app.state.resources
+            ),
         )
         == "stateless"
     )
@@ -531,21 +549,27 @@ def test_enabled_pool_auto_admits_supported_ordinary_tiers(monkeypatch, backend)
 def test_enabled_pool_falls_back_to_pinned_when_supported_tier_is_unready(monkeypatch):
     from orchestrator import main as orch_main
 
-    monkeypatch.setattr(orch_main, "STATELESS_SESSION_ENABLED", True)
     monkeypatch.setattr(
-        orch_main,
+        orch_main.app.state.resources.settings, "stateless_session_enabled", True
+    )
+    monkeypatch.setattr(
+        container_provisioner_module,
         "container_provisioner",
         SimpleNamespace(is_available=True, in_cluster=False),
     )
     monkeypatch.setattr(
-        orch_main, "_virtual_workspace_rclone_spec", lambda: {"type": "memory"}
+        virtual_workspace_module,
+        "virtual_workspace_rclone_spec",
+        lambda: {"type": "memory"},
     )
 
     assert (
         session_class_policy.resolve_thread_execution_lane(
             workspace_backend="sandbox",
             effective_config={"workspace": {"backend": "sandbox"}},
-            dependencies=orch_main._execution_lane_dependencies(),
+            dependencies=preparation_composition.execution_lane_dependencies(
+                orch_main.app.state.resources
+            ),
         )
         == "pinned"
     )
@@ -553,31 +577,37 @@ def test_enabled_pool_falls_back_to_pinned_when_supported_tier_is_unready(monkey
         session_class_policy.resolve_thread_execution_lane(
             workspace_backend="virtual",
             effective_config={"workspace": {"backend": "virtual"}},
-            dependencies=orch_main._execution_lane_dependencies(),
+            dependencies=preparation_composition.execution_lane_dependencies(
+                orch_main.app.state.resources
+            ),
         )
         == "pinned"
     )
 
 
 def test_public_create_contract_has_no_execution_lane_selector():
-    from orchestrator import main as orch_main
-
-    assert "execution_lane" not in orch_main.ThreadCreateRequest.model_fields
+    assert (
+        "execution_lane" not in thread_admission_module.ThreadCreateRequest.model_fields
+    )
     with pytest.raises(ValueError, match="orchestrator-managed"):
-        orch_main.ThreadCreateRequest(execution_lane="pinned")
+        thread_admission_module.ThreadCreateRequest(execution_lane="pinned")
 
 
 @pytest.mark.parametrize("backend", ["vm", "remote", "future"])
 def test_enabled_pool_keeps_unsupported_tiers_pinned_on_omission(monkeypatch, backend):
     from orchestrator import main as orch_main
 
-    monkeypatch.setattr(orch_main, "STATELESS_SESSION_ENABLED", True)
+    monkeypatch.setattr(
+        orch_main.app.state.resources.settings, "stateless_session_enabled", True
+    )
 
     assert (
         session_class_policy.resolve_thread_execution_lane(
             workspace_backend=backend,
             effective_config={"workspace": {"backend": backend}},
-            dependencies=orch_main._execution_lane_dependencies(),
+            dependencies=preparation_composition.execution_lane_dependencies(
+                orch_main.app.state.resources
+            ),
         )
         == "pinned"
     )
@@ -587,14 +617,18 @@ def test_enabled_pool_keeps_unsupported_tiers_pinned_on_omission(monkeypatch, ba
 def test_pinned_only_session_classes_do_not_auto_admit(monkeypatch, officer):
     from orchestrator import main as orch_main
 
-    monkeypatch.setattr(orch_main, "STATELESS_SESSION_ENABLED", True)
+    monkeypatch.setattr(
+        orch_main.app.state.resources.settings, "stateless_session_enabled", True
+    )
     config = {"workspace": {"backend": "none"}, "officer": officer}
 
     assert (
         session_class_policy.resolve_thread_execution_lane(
             workspace_backend="none",
             effective_config=config,
-            dependencies=orch_main._execution_lane_dependencies(),
+            dependencies=preparation_composition.execution_lane_dependencies(
+                orch_main.app.state.resources
+            ),
         )
         == "pinned"
     )
@@ -614,14 +648,18 @@ def test_pinned_only_session_classes_do_not_auto_admit(monkeypatch, officer):
 def test_malformed_session_class_pins_and_cannot_be_materialized(monkeypatch, officer):
     from orchestrator import main as orch_main
 
-    monkeypatch.setattr(orch_main, "STATELESS_SESSION_ENABLED", True)
+    monkeypatch.setattr(
+        orch_main.app.state.resources.settings, "stateless_session_enabled", True
+    )
     config = {"workspace": {"backend": "none"}, "officer": officer}
 
     assert (
         session_class_policy.resolve_thread_execution_lane(
             workspace_backend="none",
             effective_config=config,
-            dependencies=orch_main._execution_lane_dependencies(),
+            dependencies=preparation_composition.execution_lane_dependencies(
+                orch_main.app.state.resources
+            ),
         )
         == "pinned"
     )
@@ -631,8 +669,6 @@ def test_malformed_session_class_pins_and_cannot_be_materialized(monkeypatch, of
 
 
 def test_materialized_ordinary_class_wins_over_later_expert_and_account_changes():
-    from orchestrator import main as orch_main
-
     materialized = {
         "officer": session_class_policy.materialized_session_class_override(
             {"officer": {"enabled": False, "conference": False}}
@@ -642,7 +678,9 @@ def test_materialized_ordinary_class_wins_over_later_expert_and_account_changes(
         {"officer": {"enabled": True}},  # account default edited later
         {"officer": {"conference": True}},  # selected expert edited later
     ):
-        effective = orch_main._deep_merge_dicts(mutable_lower_layer, materialized)
+        effective = config_overrides_module.deep_merge_dicts(
+            mutable_lower_layer, materialized
+        )
         assert session_class_policy.session_class_pinned_refusal(effective) is None
 
 
@@ -667,7 +705,7 @@ async def test_stateless_config_patch_cannot_enable_pinned_only_session_class(
     db.thread_configuration_transaction.return_value.__aenter__.return_value.fetchrow = AsyncMock(
         return_value=thread
     )
-    monkeypatch.setattr(orch_main, "postgres_db", db)
+    monkeypatch.setattr(orch_main.app.state.resources, "postgres_db", db)
 
     with pytest.raises(HTTPException, match="pinned-only") as exc:
         await control_seams.apply_thread_config_update(
@@ -701,16 +739,18 @@ async def test_stateless_vm_upgrade_refuses_before_grants_or_provisioning():
     grants = AsyncMock()
 
     with (
-        patch.object(orch_main, "require_internal", AsyncMock()),
-        patch.object(orch_main, "postgres_db", db),
-        patch.object(orch_main, "vm_provisioner", provisioner),
+        patch.object(access_module, "require_internal", AsyncMock()),
+        patch.object(orch_main.app.state.resources, "postgres_db", db),
+        patch.object(vm_provisioner_module, "vm_provisioner", provisioner),
         patch.object(grant_enforcement, "enforce_workspace_upgrade_grants", grants),
     ):
         with pytest.raises(HTTPException) as exc:
             await thread_config_update.agent_upgrade_thread_to_vm(
                 MagicMock(),
                 THREAD_ID,
-                dependencies=orch_main._thread_config_update_dependencies(),
+                dependencies=sessions_composition.thread_config_update_dependencies(
+                    orch_main.app.state.resources
+                ),
             )
 
     assert exc.value.status_code == 409
@@ -738,17 +778,23 @@ async def test_stateless_sandbox_upgrade_refuses_before_any_workspace_write():
     grants = AsyncMock()
 
     with (
-        patch.object(orch_main, "require_internal", AsyncMock()),
-        patch.object(orch_main, "postgres_db", db),
-        patch.object(orch_main, "container_provisioner", provisioner),
+        patch.object(access_module, "require_internal", AsyncMock()),
+        patch.object(orch_main.app.state.resources, "postgres_db", db),
+        patch.object(
+            container_provisioner_module, "container_provisioner", provisioner
+        ),
         patch.object(grant_enforcement, "enforce_workspace_upgrade_grants", grants),
     ):
         with pytest.raises(HTTPException) as exc:
             await thread_config_update.agent_upgrade_thread_to_workspace(
                 MagicMock(),
                 THREAD_ID,
-                orch_main.ThreadWorkspaceUpgradeRequest(target_tier="sandbox"),
-                dependencies=orch_main._thread_config_update_dependencies(),
+                thread_config_module.ThreadWorkspaceUpgradeRequest(
+                    target_tier="sandbox"
+                ),
+                dependencies=sessions_composition.thread_config_update_dependencies(
+                    orch_main.app.state.resources
+                ),
             )
 
     assert exc.value.status_code == 409
@@ -776,8 +822,8 @@ async def test_stateless_config_cannot_mutate_workspace_tier():
     )
 
     with (
-        patch.object(orch_main, "postgres_db", db),
-        patch.object(orch_main, "log_security_event", audit),
+        patch.object(orch_main.app.state.resources, "postgres_db", db),
+        patch.object(access_module, "log_security_event", audit),
     ):
         with pytest.raises(HTTPException) as exc:
             await control_seams.apply_thread_config_update(
@@ -832,18 +878,22 @@ async def test_protected_workspace_upgrade_refuses_before_every_effect(
     grants = AsyncMock()
 
     with (
-        patch.object(orch_main, "require_internal", AsyncMock()),
-        patch.object(orch_main, "postgres_db", db),
-        patch.object(orch_main, "vm_provisioner", vm),
-        patch.object(orch_main, "container_provisioner", container),
+        patch.object(access_module, "require_internal", AsyncMock()),
+        patch.object(orch_main.app.state.resources, "postgres_db", db),
+        patch.object(vm_provisioner_module, "vm_provisioner", vm),
+        patch.object(container_provisioner_module, "container_provisioner", container),
         patch.object(grant_enforcement, "enforce_workspace_upgrade_grants", grants),
     ):
         with pytest.raises(HTTPException) as exc:
             await thread_config_update.agent_upgrade_thread_to_workspace(
                 MagicMock(),
                 THREAD_ID,
-                orch_main.ThreadWorkspaceUpgradeRequest(target_tier=target_tier),
-                dependencies=orch_main._thread_config_update_dependencies(),
+                thread_config_module.ThreadWorkspaceUpgradeRequest(
+                    target_tier=target_tier
+                ),
+                dependencies=sessions_composition.thread_config_update_dependencies(
+                    orch_main.app.state.resources
+                ),
             )
 
     assert exc.value.status_code == 409
@@ -887,9 +937,9 @@ async def test_protected_config_cannot_mutate_runtime_class(fragment):
     )
 
     with (
-        patch.object(orch_main, "postgres_db", db),
-        patch.object(orch_main, "log_security_event", audit),
-        patch.object(orch_main, "_enforce_session_create_grants", grants),
+        patch.object(orch_main.app.state.resources, "postgres_db", db),
+        patch.object(access_module, "log_security_event", audit),
+        patch.object(grant_enforcement_module, "enforce_session_create_grants", grants),
     ):
         with pytest.raises(HTTPException) as exc:
             await control_seams.apply_thread_config_update(
@@ -928,8 +978,8 @@ async def test_malformed_protected_authority_blocks_config_before_persist(metada
     )
 
     with (
-        patch.object(orch_main, "postgres_db", db),
-        patch.object(orch_main, "log_security_event", audit),
+        patch.object(orch_main.app.state.resources, "postgres_db", db),
+        patch.object(access_module, "log_security_event", audit),
     ):
         with pytest.raises(HTTPException) as exc:
             await control_seams.apply_thread_config_update(

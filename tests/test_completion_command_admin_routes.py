@@ -24,6 +24,9 @@ from orchestrator.services.completion_command_resolution import (
     CompletionResolutionNotFound,
     CompletionUnparkResult,
 )
+from orchestrator.application import access as access_composition
+from orchestrator.application import sessions as sessions_composition
+import uuid as uuid_module
 
 
 COMMAND_ID = "22222222-bbbb-4222-8222-222222222222"
@@ -37,10 +40,16 @@ def operator(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
     service.unpark = AsyncMock()
     service.force_resolve = AsyncMock()
     monkeypatch.setattr(
-        main, "_require_admin", AsyncMock(return_value={"id": ADMIN_ID})
+        access_composition, "require_admin", AsyncMock(return_value={"id": ADMIN_ID})
     )
-    monkeypatch.setattr(main, "COMPLETION_COMMANDS_ENABLED", True)
-    monkeypatch.setattr(main._completion_runtime, "command_resolution", lambda: service)
+    monkeypatch.setattr(
+        main.app.state.resources.settings, "completion_commands_enabled", True
+    )
+    monkeypatch.setattr(
+        main.app.state.resources.completion_runtime,
+        "command_resolution",
+        lambda: service,
+    )
     return service
 
 
@@ -61,10 +70,14 @@ async def test_admin_unpark_delegates_exact_command_and_serializes_deadline(
     result = await run_queue_admin.unpark_completion_command(
         COMMAND_ID,
         admin={"id": ADMIN_ID},
-        dependencies=main._run_queue_admin_dependencies(),
+        dependencies=sessions_composition.run_queue_admin_dependencies(
+            main.app.state.resources
+        ),
     )
 
-    operator.unpark.assert_awaited_once_with(main.UUID(COMMAND_ID), actor=ADMIN_ID)
+    operator.unpark.assert_awaited_once_with(
+        uuid_module.UUID(COMMAND_ID), actor=ADMIN_ID
+    )
     assert result == {
         "command_id": COMMAND_ID,
         "job_id": JOB_ID,
@@ -96,7 +109,9 @@ async def test_admin_force_resolve_prunes_checkpoint_after_durable_commit(
         outcome=outcome,
     )
     prune = AsyncMock()
-    monkeypatch.setattr(main.postgres_db, "delete_checkpoint_thread", prune)
+    monkeypatch.setattr(
+        main.app.state.resources.postgres_db, "delete_checkpoint_thread", prune
+    )
     body = CompletionCommandForceResolveRequest(
         expected_state="parked",
         terminal_status="failed",
@@ -109,11 +124,13 @@ async def test_admin_force_resolve_prunes_checkpoint_after_durable_commit(
         terminal_status=(body).terminal_status,
         reason=(body).reason,
         admin={"id": ADMIN_ID},
-        dependencies=main._run_queue_admin_dependencies(),
+        dependencies=sessions_composition.run_queue_admin_dependencies(
+            main.app.state.resources
+        ),
     )
 
     operator.force_resolve.assert_awaited_once_with(
-        main.UUID(COMMAND_ID),
+        uuid_module.UUID(COMMAND_ID),
         expected_state="parked",
         terminal_status="failed",
         actor=ADMIN_ID,
@@ -163,7 +180,9 @@ async def test_admin_operator_errors_have_stable_http_status(
             await run_queue_admin.unpark_completion_command(
                 COMMAND_ID,
                 admin={"id": ADMIN_ID},
-                dependencies=main._run_queue_admin_dependencies(),
+                dependencies=sessions_composition.run_queue_admin_dependencies(
+                    main.app.state.resources
+                ),
             )
         else:
             await run_queue_admin.force_resolve_completion_command(
@@ -190,7 +209,9 @@ async def test_admin_operator_errors_have_stable_http_status(
                     )
                 ).reason,
                 admin={"id": ADMIN_ID},
-                dependencies=main._run_queue_admin_dependencies(),
+                dependencies=sessions_composition.run_queue_admin_dependencies(
+                    main.app.state.resources
+                ),
             )
 
     assert exc.value.status_code == status
@@ -205,7 +226,9 @@ async def test_invalid_command_id_is_404_after_admin_authorization(
         await run_queue_admin.unpark_completion_command(
             "not-a-uuid",
             admin={"id": ADMIN_ID},
-            dependencies=main._run_queue_admin_dependencies(),
+            dependencies=sessions_composition.run_queue_admin_dependencies(
+                main.app.state.resources
+            ),
         )
 
     assert exc.value.status_code == 404
@@ -219,14 +242,18 @@ async def test_commands_off_authorizes_then_stays_service_dark(
     monkeypatch: pytest.MonkeyPatch,
     operation: str,
 ) -> None:
-    monkeypatch.setattr(main, "COMPLETION_COMMANDS_ENABLED", False)
+    monkeypatch.setattr(
+        main.app.state.resources.settings, "completion_commands_enabled", False
+    )
 
     with pytest.raises(HTTPException) as exc:
         if operation == "unpark":
             await run_queue_admin.unpark_completion_command(
                 COMMAND_ID,
                 admin={"id": ADMIN_ID},
-                dependencies=main._run_queue_admin_dependencies(),
+                dependencies=sessions_composition.run_queue_admin_dependencies(
+                    main.app.state.resources
+                ),
             )
         else:
             await run_queue_admin.force_resolve_completion_command(
@@ -253,7 +280,9 @@ async def test_commands_off_authorizes_then_stays_service_dark(
                     )
                 ).reason,
                 admin={"id": ADMIN_ID},
-                dependencies=main._run_queue_admin_dependencies(),
+                dependencies=sessions_composition.run_queue_admin_dependencies(
+                    main.app.state.resources
+                ),
             )
 
     assert exc.value.status_code == 404
@@ -267,20 +296,28 @@ def test_safety_preclaim_and_router_reconciliation_follow_reorder_gate(
     monkeypatch: pytest.MonkeyPatch,
     reorder_enabled: bool,
 ) -> None:
-    monkeypatch.setattr(main, "COMPLETION_STATUS_REORDER_ENABLED", reorder_enabled)
-    monkeypatch.setattr(main._completion_runtime, "_finalizer", None)
-    monkeypatch.setattr(main._completion_runtime, "_sweep_router", None)
-    monkeypatch.setattr(main._completion_runtime, "_command_resolution", None)
+    monkeypatch.setattr(
+        main.app.state.resources.settings,
+        "completion_status_reorder_enabled",
+        reorder_enabled,
+    )
+    monkeypatch.setattr(main.app.state.resources.completion_runtime, "_finalizer", None)
+    monkeypatch.setattr(
+        main.app.state.resources.completion_runtime, "_sweep_router", None
+    )
+    monkeypatch.setattr(
+        main.app.state.resources.completion_runtime, "_command_resolution", None
+    )
 
-    finalizer = main._completion_runtime.finalizer()
-    router = main._completion_runtime.sweep_router()
+    finalizer = main.app.state.resources.completion_runtime.finalizer()
+    router = main.app.state.resources.completion_runtime.sweep_router()
 
     if reorder_enabled:
-        resolution = main._completion_runtime._command_resolution
+        resolution = main.app.state.resources.completion_runtime._command_resolution
         assert resolution is not None
         assert finalizer.preclaim.__self__ is resolution
         assert router.safety_net is resolution
     else:
         assert finalizer.preclaim is None
         assert router.safety_net is None
-        assert main._completion_runtime._command_resolution is None
+        assert main.app.state.resources.completion_runtime._command_resolution is None

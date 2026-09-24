@@ -18,7 +18,10 @@ import orchestrator.main as orch_main
 from orchestrator.services import thread_mount_rows as thread_mount_rows_service
 
 import orchestrator.main
-from orchestrator.main import _build_protected_cloud_mount
+from orchestrator.application import preparation as preparation_composition
+from orchestrator.application import workspace as workspace_composition
+from orchestrator.services import agent_cloud_mounts as agent_cloud_mounts_module
+from orchestrator.services import thread_mount_rows as thread_mount_rows_module
 
 
 _BACKEND_INSTANCE_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
@@ -114,11 +117,15 @@ async def test_default_project_emits_user_home_row():
     router.for_project_optional.return_value = backend
 
     with (
-        patch("orchestrator.main.postgres_db", fake_db),
-        patch("orchestrator.main.main_cloud_router", router),
+        patch("orchestrator.main.app.state.resources.postgres_db", fake_db),
+        patch("orchestrator.main.app.state.resources.main_cloud_router", router),
     ):
         row = await build_default_project_mount_row(
-            "p-default", project, dependencies=orch_main._thread_mount_dependencies()
+            "p-default",
+            project,
+            dependencies=preparation_composition.thread_mount_dependencies(
+                orch_main.app.state.resources
+            ),
         )
 
     assert row is not None
@@ -151,11 +158,15 @@ async def test_default_project_no_owner_returns_none():
     router.for_project_optional.return_value = _b
 
     with (
-        patch("orchestrator.main.postgres_db", fake_db),
-        patch("orchestrator.main.main_cloud_router", router),
+        patch("orchestrator.main.app.state.resources.postgres_db", fake_db),
+        patch("orchestrator.main.app.state.resources.main_cloud_router", router),
     ):
         row = await build_default_project_mount_row(
-            "p", project, dependencies=orch_main._thread_mount_dependencies()
+            "p",
+            project,
+            dependencies=preparation_composition.thread_mount_dependencies(
+                orch_main.app.state.resources
+            ),
         )
     assert row is None
 
@@ -182,11 +193,15 @@ async def test_default_project_owner_missing_keycloak_sub_returns_none():
     router.for_project_optional.return_value = _b
 
     with (
-        patch("orchestrator.main.postgres_db", fake_db),
-        patch("orchestrator.main.main_cloud_router", router),
+        patch("orchestrator.main.app.state.resources.postgres_db", fake_db),
+        patch("orchestrator.main.app.state.resources.main_cloud_router", router),
     ):
         row = await build_default_project_mount_row(
-            "p", project, dependencies=orch_main._thread_mount_dependencies()
+            "p",
+            project,
+            dependencies=preparation_composition.thread_mount_dependencies(
+                orch_main.app.state.resources
+            ),
         )
     assert row is None
 
@@ -214,11 +229,15 @@ async def test_default_project_user_home_unresolvable_returns_none():
     router.for_project_optional.return_value = backend
 
     with (
-        patch("orchestrator.main.postgres_db", fake_db),
-        patch("orchestrator.main.main_cloud_router", router),
+        patch("orchestrator.main.app.state.resources.postgres_db", fake_db),
+        patch("orchestrator.main.app.state.resources.main_cloud_router", router),
     ):
         row = await build_default_project_mount_row(
-            "p", project, dependencies=orch_main._thread_mount_dependencies()
+            "p",
+            project,
+            dependencies=preparation_composition.thread_mount_dependencies(
+                orch_main.app.state.resources
+            ),
         )
     assert row is None
 
@@ -239,11 +258,15 @@ async def test_default_project_backend_uninitialized_returns_none():
     router.for_project_optional.return_value = backend
 
     with (
-        patch("orchestrator.main.postgres_db", fake_db),
-        patch("orchestrator.main.main_cloud_router", router),
+        patch("orchestrator.main.app.state.resources.postgres_db", fake_db),
+        patch("orchestrator.main.app.state.resources.main_cloud_router", router),
     ):
         row = await build_default_project_mount_row(
-            "p", project, dependencies=orch_main._thread_mount_dependencies()
+            "p",
+            project,
+            dependencies=preparation_composition.thread_mount_dependencies(
+                orch_main.app.state.resources
+            ),
         )
     assert row is None
 
@@ -277,12 +300,14 @@ async def test_build_thread_mount_rows_mixes_default_and_non_default():
     router.for_backend.return_value = backend
 
     with (
-        patch("orchestrator.main.postgres_db", fake_db),
-        patch("orchestrator.main.main_cloud_router", router),
+        patch("orchestrator.main.app.state.resources.postgres_db", fake_db),
+        patch("orchestrator.main.app.state.resources.main_cloud_router", router),
     ):
         rows = await build_thread_mount_rows(
             ["p-default", "p-other"],
-            dependencies=orch_main._thread_mount_dependencies(),
+            dependencies=preparation_composition.thread_mount_dependencies(
+                orch_main.app.state.resources
+            ),
         )
 
     assert len(rows) == 2
@@ -323,14 +348,19 @@ async def test_thread_project_ids_preserves_scope_when_default_mount_is_unavaila
     fake_db.replace_thread_mounts = AsyncMock()
 
     with (
-        patch("orchestrator.main.postgres_db", fake_db),
+        patch("orchestrator.main.app.state.resources.postgres_db", fake_db),
         patch.object(
             thread_mount_rows_service,
             "build_thread_mount_rows",
             AsyncMock(return_value=[]),
         ),
     ):
-        project_ids = await orchestrator.main._thread_project_ids("thread-1")
+        project_ids = await thread_mount_rows_module.thread_project_ids(
+            "thread-1",
+            dependencies=preparation_composition.thread_mount_dependencies(
+                orchestrator.main.app.state.resources
+            ),
+        )
 
     assert project_ids == ["p-default"]
     fake_db.replace_thread_mounts.assert_not_awaited()
@@ -346,7 +376,7 @@ def test_should_skip_session_folder_with_project_default_mount():
     home is mounted at workspace root — session folder is redundant.
     (Phase 2 behavior, preserved by Phase 4.)
     """
-    from orchestrator.main import _should_skip_session_folder
+    import orchestrator.main
 
     rows = [
         {
@@ -355,14 +385,22 @@ def test_should_skip_session_folder_with_project_default_mount():
             "webdav_url": "https://oc.test/dav/spaces/drive-xyz/",
         }
     ]
-    assert _should_skip_session_folder(rows) is True
+    assert (
+        thread_mount_rows_module.should_skip_session_folder(
+            rows,
+            dependencies=preparation_composition.thread_mount_dependencies(
+                orchestrator.main.app.state.resources
+            ),
+        )
+        is True
+    )
 
 
 def test_rclone_driver_keeps_session_folder_fallback(monkeypatch):
     """With the lazy mount driver enabled, keep the regular session folder
     provisioned so unsupported user-home auth has a safe fallback.
     """
-    from orchestrator.main import _should_skip_session_folder
+    import orchestrator.main
 
     monkeypatch.setenv("CLOUD_WORKSPACE_DRIVER", "rclone_mount")
     rows = [
@@ -372,7 +410,15 @@ def test_rclone_driver_keeps_session_folder_fallback(monkeypatch):
             "webdav_url": "https://nc.test/remote.php/dav/files/alice/",
         }
     ]
-    assert _should_skip_session_folder(rows) is False
+    assert (
+        thread_mount_rows_module.should_skip_session_folder(
+            rows,
+            dependencies=preparation_composition.thread_mount_dependencies(
+                orchestrator.main.app.state.resources
+            ),
+        )
+        is False
+    )
 
 
 def test_should_skip_session_folder_with_non_default_project_mount():
@@ -382,7 +428,7 @@ def test_should_skip_session_folder_with_non_default_project_mount():
     behavior; pre-Phase-4 this returned False and the session folder
     was unnecessarily provisioned alongside.
     """
-    from orchestrator.main import _should_skip_session_folder
+    import orchestrator.main
 
     rows = [
         {
@@ -391,7 +437,15 @@ def test_should_skip_session_folder_with_non_default_project_mount():
             "webdav_url": "https://oc.test/dav/spaces/drive-abc/",
         }
     ]
-    assert _should_skip_session_folder(rows) is True
+    assert (
+        thread_mount_rows_module.should_skip_session_folder(
+            rows,
+            dependencies=preparation_composition.thread_mount_dependencies(
+                orchestrator.main.app.state.resources
+            ),
+        )
+        is True
+    )
 
 
 def test_should_skip_session_folder_with_repo_mount():
@@ -400,7 +454,7 @@ def test_should_skip_session_folder_with_repo_mount():
     is mount-kind-agnostic — any mount with a working webdav_url
     short-circuits the session folder.
     """
-    from orchestrator.main import _should_skip_session_folder
+    import orchestrator.main
 
     rows = [
         {
@@ -409,7 +463,15 @@ def test_should_skip_session_folder_with_repo_mount():
             "webdav_url": "https://gitea.test/some/repo",
         }
     ]
-    assert _should_skip_session_folder(rows) is True
+    assert (
+        thread_mount_rows_module.should_skip_session_folder(
+            rows,
+            dependencies=preparation_composition.thread_mount_dependencies(
+                orchestrator.main.app.state.resources
+            ),
+        )
+        is True
+    )
 
 
 def test_should_skip_session_folder_empty_mounts():
@@ -418,9 +480,17 @@ def test_should_skip_session_folder_empty_mounts():
     Phase 4 deliberately preserves (unattached sessions still get a
     folder).
     """
-    from orchestrator.main import _should_skip_session_folder
+    import orchestrator.main
 
-    assert _should_skip_session_folder([]) is False
+    assert (
+        thread_mount_rows_module.should_skip_session_folder(
+            [],
+            dependencies=preparation_composition.thread_mount_dependencies(
+                orchestrator.main.app.state.resources
+            ),
+        )
+        is False
+    )
 
 
 def test_should_skip_session_folder_mount_without_webdav_url():
@@ -430,7 +500,7 @@ def test_should_skip_session_folder_mount_without_webdav_url():
     sync target, so don't skip the fallback. (Same observable-state
     safety net Phase 2 introduced.)
     """
-    from orchestrator.main import _should_skip_session_folder
+    import orchestrator.main
 
     rows = [
         {
@@ -444,7 +514,15 @@ def test_should_skip_session_folder_mount_without_webdav_url():
             "webdav_url": "",  # empty string is also falsy
         },
     ]
-    assert _should_skip_session_folder(rows) is False
+    assert (
+        thread_mount_rows_module.should_skip_session_folder(
+            rows,
+            dependencies=preparation_composition.thread_mount_dependencies(
+                orchestrator.main.app.state.resources
+            ),
+        )
+        is False
+    )
 
 
 def test_should_skip_session_folder_returns_true_on_first_usable_mount():
@@ -452,7 +530,7 @@ def test_should_skip_session_folder_returns_true_on_first_usable_mount():
     OR semantics. Verifies a mix of failed + working rows still
     skips the session folder.
     """
-    from orchestrator.main import _should_skip_session_folder
+    import orchestrator.main
 
     rows = [
         {"mount_kind": "project", "target_path": "projects/a", "webdav_url": None},
@@ -462,7 +540,15 @@ def test_should_skip_session_folder_returns_true_on_first_usable_mount():
             "webdav_url": "https://oc.test/dav/spaces/drive-b/",
         },
     ]
-    assert _should_skip_session_folder(rows) is True
+    assert (
+        thread_mount_rows_module.should_skip_session_folder(
+            rows,
+            dependencies=preparation_composition.thread_mount_dependencies(
+                orchestrator.main.app.state.resources
+            ),
+        )
+        is True
+    )
 
 
 @pytest.mark.asyncio
@@ -470,7 +556,7 @@ async def test_build_agent_cloud_mount_falls_back_to_session_folder(monkeypatch)
     """If a default user-home row lacks safe rclone credentials, the rclone
     payload uses the regular session folder instead of the eager home clone.
     """
-    from orchestrator.main import _build_agent_cloud_mount
+    import orchestrator.main
     from orchestrator.services.cloud import (
         CloudBackendError,
         CloudBackendErrorKind,
@@ -525,11 +611,14 @@ async def test_build_agent_cloud_mount_falls_back_to_session_folder(monkeypatch)
         }
     ]
 
-    with patch("orchestrator.main.main_cloud_router", router):
-        payload = await _build_agent_cloud_mount(
+    with patch("orchestrator.main.app.state.resources.main_cloud_router", router):
+        payload = await agent_cloud_mounts_module._build_agent_cloud_mount(
             thread,
             mount_rows=rows,
             metadata={"vm": {"status": "ready", "ssh_host": "10.0.0.5"}},
+            dependencies=workspace_composition.agent_cloud_mount_dependencies(
+                orchestrator.main.app.state.resources
+            ),
         )
 
     assert payload is not None
@@ -545,7 +634,7 @@ async def test_build_agent_cloud_mount_falls_back_to_session_folder(monkeypatch)
 
 @pytest.mark.asyncio
 async def test_build_agent_cloud_mount_uses_supported_thread_mount(monkeypatch):
-    from orchestrator.main import _build_agent_cloud_mount
+    import orchestrator.main
     from orchestrator.services.cloud import RcloneMountSpec
 
     class Backend:
@@ -581,11 +670,14 @@ async def test_build_agent_cloud_mount_uses_supported_thread_mount(monkeypatch):
         }
     ]
 
-    with patch("orchestrator.main.main_cloud_router", router):
-        payload = await _build_agent_cloud_mount(
+    with patch("orchestrator.main.app.state.resources.main_cloud_router", router):
+        payload = await agent_cloud_mounts_module._build_agent_cloud_mount(
             {"id": "thread-1"},
             mount_rows=rows,
             metadata={"vm": {"status": "ready", "ssh_host": "10.0.0.5"}},
+            dependencies=workspace_composition.agent_cloud_mount_dependencies(
+                orchestrator.main.app.state.resources
+            ),
         )
 
     assert payload is not None
@@ -600,7 +692,7 @@ async def test_build_agent_cloud_mount_vm_runtime_is_readonly_and_public(monkeyp
     """A cross-cluster VM runtime mounts read-only (root tier) and requests the
     public WebDAV URL — the internal service URL isn't reachable from the vm
     cluster (knowledge-base/knowledge/issues/workspace_upgrade_drops_cloud_mount.md)."""
-    from orchestrator.main import _build_agent_cloud_mount
+    import orchestrator.main
     from orchestrator.services.cloud import RcloneMountSpec
 
     captured: dict = {}
@@ -635,11 +727,14 @@ async def test_build_agent_cloud_mount_vm_runtime_is_readonly_and_public(monkeyp
         "main_cloud_session_handle": "sessions/t1",
     }
 
-    with patch("orchestrator.main.main_cloud_router", router):
-        payload = await _build_agent_cloud_mount(
+    with patch("orchestrator.main.app.state.resources.main_cloud_router", router):
+        payload = await agent_cloud_mounts_module._build_agent_cloud_mount(
             thread,
             mount_rows=[],
             metadata={"vm": {"status": "ready", "ssh_host": "100.64.0.5"}},
+            dependencies=workspace_composition.agent_cloud_mount_dependencies(
+                orchestrator.main.app.state.resources
+            ),
         )
 
     assert payload is not None
@@ -654,7 +749,7 @@ async def test_build_agent_cloud_mount_pod_runtime_is_readwrite_and_internal(
 ):
     """A same-cluster workspace pod keeps read-write + the internal URL (no
     public-edge hairpin, works on local k3d)."""
-    from orchestrator.main import _build_agent_cloud_mount
+    import orchestrator.main
     from orchestrator.services.cloud import RcloneMountSpec
 
     captured: dict = {}
@@ -690,13 +785,16 @@ async def test_build_agent_cloud_mount_pod_runtime_is_readwrite_and_internal(
         "main_cloud_session_handle": "sessions/t1",
     }
 
-    with patch("orchestrator.main.main_cloud_router", router):
-        payload = await _build_agent_cloud_mount(
+    with patch("orchestrator.main.app.state.resources.main_cloud_router", router):
+        payload = await agent_cloud_mounts_module._build_agent_cloud_mount(
             thread,
             mount_rows=[],
             metadata={
                 "workspace_container": {"status": "ready", "pod_ip": "10.42.0.10"}
             },
+            dependencies=workspace_composition.agent_cloud_mount_dependencies(
+                orchestrator.main.app.state.resources
+            ),
         )
 
     assert payload is not None
@@ -707,7 +805,7 @@ async def test_build_agent_cloud_mount_pod_runtime_is_readwrite_and_internal(
 
 @pytest.mark.asyncio
 async def test_build_agent_cloud_mount_uses_container_runtime_by_default(monkeypatch):
-    from orchestrator.main import _build_agent_cloud_mount
+    import orchestrator.main
     from orchestrator.services.cloud import RcloneMountSpec
 
     class Backend:
@@ -740,8 +838,8 @@ async def test_build_agent_cloud_mount_uses_container_runtime_by_default(monkeyp
         "main_cloud_session_handle": "sessions/thread-1",
     }
 
-    with patch("orchestrator.main.main_cloud_router", router):
-        payload = await _build_agent_cloud_mount(
+    with patch("orchestrator.main.app.state.resources.main_cloud_router", router):
+        payload = await agent_cloud_mounts_module._build_agent_cloud_mount(
             thread,
             mount_rows=[],
             metadata={
@@ -750,6 +848,9 @@ async def test_build_agent_cloud_mount_uses_container_runtime_by_default(monkeyp
                     "pod_ip": "10.42.0.10",
                 }
             },
+            dependencies=workspace_composition.agent_cloud_mount_dependencies(
+                orchestrator.main.app.state.resources
+            ),
         )
 
     assert payload is not None
@@ -765,7 +866,7 @@ async def test_build_agent_cloud_mount_reconstructs_only_exact_terminal_runtime(
     """End may retire an existing mount after Begin projects process-zero,
     without making that terminal workspace eligible for ordinary delivery.
     """
-    from orchestrator.main import _build_agent_cloud_mount
+    import orchestrator.main
     from orchestrator.services.cloud import RcloneMountSpec
 
     runtime_incarnation = "33333333-3333-4333-8333-333333333333"
@@ -835,33 +936,45 @@ async def test_build_agent_cloud_mount_reconstructs_only_exact_terminal_runtime(
     monkeypatch.setenv("CLOUD_WORKSPACE_DRIVER", "rclone_mount")
     monkeypatch.delenv("CLOUD_RCLONE_ALLOW_CONTAINER", raising=False)
 
-    with patch("orchestrator.main.main_cloud_router", router):
-        ordinary_payload = await _build_agent_cloud_mount(
+    with patch("orchestrator.main.app.state.resources.main_cloud_router", router):
+        ordinary_payload = await agent_cloud_mounts_module._build_agent_cloud_mount(
             thread,
             mount_rows=[],
             metadata=metadata,
+            dependencies=workspace_composition.agent_cloud_mount_dependencies(
+                orchestrator.main.app.state.resources
+            ),
         )
-        wrong_token_payload = await _build_agent_cloud_mount(
+        wrong_token_payload = await agent_cloud_mounts_module._build_agent_cloud_mount(
             thread,
             mount_rows=[],
             metadata=metadata,
             terminal_retirement_token=9,
+            dependencies=workspace_composition.agent_cloud_mount_dependencies(
+                orchestrator.main.app.state.resources
+            ),
         )
-        terminal_payload = await _build_agent_cloud_mount(
+        terminal_payload = await agent_cloud_mounts_module._build_agent_cloud_mount(
             thread,
             mount_rows=[],
             metadata=metadata,
             terminal_retirement_token=8,
+            dependencies=workspace_composition.agent_cloud_mount_dependencies(
+                orchestrator.main.app.state.resources
+            ),
         )
 
         metadata["_stateless_claim_retirement"]["runtime_incarnation"] = (
             "44444444-4444-4444-8444-444444444444"
         )
-        mismatched_payload = await _build_agent_cloud_mount(
+        mismatched_payload = await agent_cloud_mounts_module._build_agent_cloud_mount(
             thread,
             mount_rows=[],
             metadata=metadata,
             terminal_retirement_token=8,
+            dependencies=workspace_composition.agent_cloud_mount_dependencies(
+                orchestrator.main.app.state.resources
+            ),
         )
 
     assert ordinary_payload is None
@@ -874,11 +987,11 @@ async def test_build_agent_cloud_mount_reconstructs_only_exact_terminal_runtime(
 
 @pytest.mark.asyncio
 async def test_build_agent_cloud_mount_container_runtime_can_be_disabled(monkeypatch):
-    from orchestrator.main import _build_agent_cloud_mount
+    import orchestrator.main
 
     monkeypatch.setenv("CLOUD_WORKSPACE_DRIVER", "rclone_mount")
     monkeypatch.setenv("CLOUD_RCLONE_ALLOW_CONTAINER", "false")
-    payload = await _build_agent_cloud_mount(
+    payload = await agent_cloud_mounts_module._build_agent_cloud_mount(
         {
             "id": "thread-1",
             "main_cloud_backend": "nextcloud",
@@ -891,6 +1004,9 @@ async def test_build_agent_cloud_mount_container_runtime_can_be_disabled(monkeyp
                 "pod_ip": "10.42.0.10",
             }
         },
+        dependencies=workspace_composition.agent_cloud_mount_dependencies(
+            orchestrator.main.app.state.resources
+        ),
     )
 
     assert payload is None
@@ -940,11 +1056,17 @@ async def test_collision_two_same_named_projects_get_distinct_paths():
     backend = _backend()
 
     with (
-        patch("orchestrator.main.postgres_db", fake_db),
-        patch("orchestrator.main.main_cloud_router", _router_for_backend(backend)),
+        patch("orchestrator.main.app.state.resources.postgres_db", fake_db),
+        patch(
+            "orchestrator.main.app.state.resources.main_cloud_router",
+            _router_for_backend(backend),
+        ),
     ):
         rows = await build_thread_mount_rows(
-            ["p-1", "p-2"], dependencies=orch_main._thread_mount_dependencies()
+            ["p-1", "p-2"],
+            dependencies=preparation_composition.thread_mount_dependencies(
+                orch_main.app.state.resources
+            ),
         )
 
     assert len(rows) == 2
@@ -971,11 +1093,17 @@ async def test_collision_case_insensitive():
     backend = _backend()
 
     with (
-        patch("orchestrator.main.postgres_db", fake_db),
-        patch("orchestrator.main.main_cloud_router", _router_for_backend(backend)),
+        patch("orchestrator.main.app.state.resources.postgres_db", fake_db),
+        patch(
+            "orchestrator.main.app.state.resources.main_cloud_router",
+            _router_for_backend(backend),
+        ),
     ):
         rows = await build_thread_mount_rows(
-            ["p-1", "p-2"], dependencies=orch_main._thread_mount_dependencies()
+            ["p-1", "p-2"],
+            dependencies=preparation_composition.thread_mount_dependencies(
+                orch_main.app.state.resources
+            ),
         )
 
     assert [r["target_path"] for r in rows] == [
@@ -1002,11 +1130,17 @@ async def test_collision_three_same_named_projects():
     backend = _backend()
 
     with (
-        patch("orchestrator.main.postgres_db", fake_db),
-        patch("orchestrator.main.main_cloud_router", _router_for_backend(backend)),
+        patch("orchestrator.main.app.state.resources.postgres_db", fake_db),
+        patch(
+            "orchestrator.main.app.state.resources.main_cloud_router",
+            _router_for_backend(backend),
+        ),
     ):
         rows = await build_thread_mount_rows(
-            ["p-1", "p-2", "p-3"], dependencies=orch_main._thread_mount_dependencies()
+            ["p-1", "p-2", "p-3"],
+            dependencies=preparation_composition.thread_mount_dependencies(
+                orch_main.app.state.resources
+            ),
         )
 
     assert [r["target_path"] for r in rows] == [
@@ -1033,11 +1167,17 @@ async def test_no_collision_unique_names_unaffected():
     backend = _backend()
 
     with (
-        patch("orchestrator.main.postgres_db", fake_db),
-        patch("orchestrator.main.main_cloud_router", _router_for_backend(backend)),
+        patch("orchestrator.main.app.state.resources.postgres_db", fake_db),
+        patch(
+            "orchestrator.main.app.state.resources.main_cloud_router",
+            _router_for_backend(backend),
+        ),
     ):
         rows = await build_thread_mount_rows(
-            ["p-1", "p-2", "p-3"], dependencies=orch_main._thread_mount_dependencies()
+            ["p-1", "p-2", "p-3"],
+            dependencies=preparation_composition.thread_mount_dependencies(
+                orch_main.app.state.resources
+            ),
         )
 
     assert [r["target_path"] for r in rows] == [
@@ -1063,11 +1203,17 @@ async def test_dedupe_repeated_project_id():
     backend = _backend()
 
     with (
-        patch("orchestrator.main.postgres_db", fake_db),
-        patch("orchestrator.main.main_cloud_router", _router_for_backend(backend)),
+        patch("orchestrator.main.app.state.resources.postgres_db", fake_db),
+        patch(
+            "orchestrator.main.app.state.resources.main_cloud_router",
+            _router_for_backend(backend),
+        ),
     ):
         rows = await build_thread_mount_rows(
-            ["p-1", "p-1", "p-1"], dependencies=orch_main._thread_mount_dependencies()
+            ["p-1", "p-1", "p-1"],
+            dependencies=preparation_composition.thread_mount_dependencies(
+                orch_main.app.state.resources
+            ),
         )
 
     assert len(rows) == 1
@@ -1094,12 +1240,17 @@ async def test_collision_with_default_project_present():
     backend = _backend()
 
     with (
-        patch("orchestrator.main.postgres_db", fake_db),
-        patch("orchestrator.main.main_cloud_router", _router_for_backend(backend)),
+        patch("orchestrator.main.app.state.resources.postgres_db", fake_db),
+        patch(
+            "orchestrator.main.app.state.resources.main_cloud_router",
+            _router_for_backend(backend),
+        ),
     ):
         rows = await build_thread_mount_rows(
             ["p-default", "p-1", "p-2"],
-            dependencies=orch_main._thread_mount_dependencies(),
+            dependencies=preparation_composition.thread_mount_dependencies(
+                orch_main.app.state.resources
+            ),
         )
 
     assert len(rows) == 3
@@ -1120,7 +1271,9 @@ def test_protected_cloud_mount_payload_is_ro_lower_plus_overlay():
         "auth_kind": "basic",
         "status": "active",
     }
-    payload = _build_protected_cloud_mount(row, thread_id="thread-1")
+    payload = agent_cloud_mounts_module._build_protected_cloud_mount(
+        row, thread_id="thread-1"
+    )
     assert payload["driver"] == "rclone"
     assert payload["protected"] is True
     assert payload["required"] is True
@@ -1146,13 +1299,13 @@ def test_protected_cloud_mount_payload_is_ro_lower_plus_overlay():
 
 def test_protected_cloud_mount_none_for_inactive_or_non_nextcloud():
     assert (
-        _build_protected_cloud_mount(
+        agent_cloud_mounts_module._build_protected_cloud_mount(
             {"status": "revoked", "backend": "nextcloud"}, thread_id="t"
         )
         is None
     )
     assert (
-        _build_protected_cloud_mount(
+        agent_cloud_mounts_module._build_protected_cloud_mount(
             {"status": "active", "backend": "opencloud"}, thread_id="t"
         )
         is None
@@ -1199,14 +1352,15 @@ async def test_build_agent_cloud_mount_protected_marker_flag_off_returns_none(
     monkeypatch,
 ):
     """(a) marker present + flag OFF -> None, never the live builders."""
-    from orchestrator.main import _build_agent_cloud_mount
+    import orchestrator.main
 
     monkeypatch.setenv("CLOUD_WORKSPACE_DRIVER", "rclone_mount")
     monkeypatch.delenv("CLOUD_RCLONE_ALLOW_CONTAINER", raising=False)
     with patch(
-        "orchestrator.main._is_protected_cloud_mode_enabled", return_value=False
+        "orchestrator.services.deployment_gates.is_protected_cloud_mode_enabled",
+        return_value=False,
     ):
-        payload = await _build_agent_cloud_mount(
+        payload = await agent_cloud_mounts_module._build_agent_cloud_mount(
             {
                 "id": _THREAD_ID,
                 "status": "active",
@@ -1218,6 +1372,9 @@ async def test_build_agent_cloud_mount_protected_marker_flag_off_returns_none(
                 "protected_cloud": True,
                 "workspace_container": {"status": "ready", "pod_ip": "10.42.0.10"},
             },
+            dependencies=workspace_composition.agent_cloud_mount_dependencies(
+                orchestrator.main.app.state.resources
+            ),
         )
     assert payload is None
 
@@ -1228,17 +1385,23 @@ async def test_build_agent_cloud_mount_protected_marker_vm_tier_returns_none(
 ):
     """(b) marker + flag ON + VM-ready metadata -> None (v1 is
     container-runtime-only; the reader webdav_url is internal-only)."""
-    from orchestrator.main import _build_agent_cloud_mount
+    import orchestrator.main
 
     monkeypatch.setenv("CLOUD_WORKSPACE_DRIVER", "rclone_mount")
-    with patch("orchestrator.main._is_protected_cloud_mode_enabled", return_value=True):
-        payload = await _build_agent_cloud_mount(
+    with patch(
+        "orchestrator.services.deployment_gates.is_protected_cloud_mode_enabled",
+        return_value=True,
+    ):
+        payload = await agent_cloud_mounts_module._build_agent_cloud_mount(
             {"id": "thread-1"},
             mount_rows=_LIVE_MOUNT_ROWS,
             metadata={
                 "protected_cloud": True,
                 "vm": {"status": "ready", "ssh_host": "10.0.0.5"},
             },
+            dependencies=workspace_composition.agent_cloud_mount_dependencies(
+                orchestrator.main.app.state.resources
+            ),
         )
     assert payload is None
 
@@ -1249,18 +1412,21 @@ async def test_build_agent_cloud_mount_protected_marker_active_row_returns_paylo
 ):
     """(c) marker + flag ON + container runtime + active NC row -> the
     RO-lower + overlay payload, protected=True."""
-    from orchestrator.main import _build_agent_cloud_mount
+    import orchestrator.main
 
     monkeypatch.setenv("CLOUD_WORKSPACE_DRIVER", "rclone_mount")
     monkeypatch.delenv("CLOUD_RCLONE_ALLOW_CONTAINER", raising=False)
     with (
-        patch("orchestrator.main._is_protected_cloud_mode_enabled", return_value=True),
         patch(
-            "orchestrator.main.postgres_db.get_ro_mount_by_thread",
+            "orchestrator.services.deployment_gates.is_protected_cloud_mode_enabled",
+            return_value=True,
+        ),
+        patch(
+            "orchestrator.main.app.state.resources.postgres_db.get_ro_mount_by_thread",
             new=AsyncMock(return_value=_ACTIVE_NC_ROW),
         ),
     ):
-        payload = await _build_agent_cloud_mount(
+        payload = await agent_cloud_mounts_module._build_agent_cloud_mount(
             {
                 "id": _THREAD_ID,
                 "status": "active",
@@ -1272,6 +1438,9 @@ async def test_build_agent_cloud_mount_protected_marker_active_row_returns_paylo
                 "protected_cloud": True,
                 "workspace_container": {"status": "ready", "pod_ip": "10.42.0.10"},
             },
+            dependencies=workspace_composition.agent_cloud_mount_dependencies(
+                orchestrator.main.app.state.resources
+            ),
         )
     assert payload is not None
     assert payload["protected"] is True
@@ -1293,25 +1462,28 @@ async def test_build_agent_cloud_mount_protected_marker_no_row_returns_none(
     ``asyncio.sleep`` is patched so the 9s worst case doesn't slow the suite.
     Fail-closed: exhausting the poll still returns None, never a live mount.
     """
-    from orchestrator.main import _build_agent_cloud_mount
+    import orchestrator.main
 
     monkeypatch.setenv("CLOUD_WORKSPACE_DRIVER", "rclone_mount")
     monkeypatch.delenv("CLOUD_RCLONE_ALLOW_CONTAINER", raising=False)
     # Defensive: no in-flight engage task registered for this thread_id (a
     # leaked registration from another test would take the await-task branch
     # instead of the poll branch this test targets).
-    orchestrator.main.cloud_task_registry.protected_engage_tasks.pop(
+    orchestrator.main.app.state.resources.cloud_task_registry.protected_engage_tasks.pop(
         (_THREAD_ID, _RUNTIME_GENERATION), None
     )
     with (
-        patch("orchestrator.main._is_protected_cloud_mode_enabled", return_value=True),
         patch(
-            "orchestrator.main.postgres_db.get_ro_mount_by_thread",
+            "orchestrator.services.deployment_gates.is_protected_cloud_mode_enabled",
+            return_value=True,
+        ),
+        patch(
+            "orchestrator.main.app.state.resources.postgres_db.get_ro_mount_by_thread",
             new=AsyncMock(return_value=None),
         ) as get_row,
-        patch("orchestrator.main.asyncio.sleep", new=AsyncMock()) as sleep,
+        patch("asyncio.sleep", new=AsyncMock()) as sleep,
     ):
-        payload = await _build_agent_cloud_mount(
+        payload = await agent_cloud_mounts_module._build_agent_cloud_mount(
             {
                 "id": _THREAD_ID,
                 "status": "active",
@@ -1323,6 +1495,9 @@ async def test_build_agent_cloud_mount_protected_marker_no_row_returns_none(
                 "protected_cloud": True,
                 "workspace_container": {"status": "ready", "pod_ip": "10.42.0.10"},
             },
+            dependencies=workspace_composition.agent_cloud_mount_dependencies(
+                orchestrator.main.app.state.resources
+            ),
         )
     assert payload is None
     # Initial lookup + 3 poll attempts.

@@ -7,6 +7,8 @@ import inspect
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from orchestrator.schemas import thread_lifecycle as thread_lifecycle_module
+from orchestrator.security import access as access_module
 
 
 def test_orchestrator_live_readers_filter_tombstones():
@@ -178,19 +180,19 @@ def test_apply_thread_rewind_locks_sweeps_bumps_and_journals():
 
 @pytest.mark.asyncio
 async def test_rewind_endpoint_rejects_live_agent(monkeypatch):
-    from orchestrator import main as orch_main
-
     async def _fake_owner(request, db, thread_id):
         return ({"id": "user-1"}, {"id": thread_id, "agent_id": "agent-9"})
 
-    monkeypatch.setattr(orch_main, "require_thread_owner", _fake_owner)
+    monkeypatch.setattr(access_module, "require_thread_owner", _fake_owner)
     from fastapi import HTTPException
 
     with pytest.raises(HTTPException) as exc:
         await control_seams.rewind_thread_detached(
             "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
             MagicMock(),
-            orch_main.ThreadRewindRequest(message_id="m1", mode="conversation"),
+            thread_lifecycle_module.ThreadRewindRequest(
+                message_id="m1", mode="conversation"
+            ),
         )
     assert exc.value.status_code == 409
 
@@ -215,14 +217,16 @@ async def test_detached_rewind_rejects_stateless_thread_without_agent_id(monkeyp
             },
         )
 
-    monkeypatch.setattr(orch_main, "require_thread_owner", _fake_owner)
-    monkeypatch.setattr(orch_main, "postgres_db", fake_db)
+    monkeypatch.setattr(access_module, "require_thread_owner", _fake_owner)
+    monkeypatch.setattr(orch_main.app.state.resources, "postgres_db", fake_db)
 
     with pytest.raises(HTTPException) as exc:
         await control_seams.rewind_thread_detached(
             "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
             MagicMock(),
-            orch_main.ThreadRewindRequest(message_id="m1", mode="conversation"),
+            thread_lifecycle_module.ThreadRewindRequest(
+                message_id="m1", mode="conversation"
+            ),
         )
 
     assert exc.value.status_code == 409
@@ -244,7 +248,7 @@ async def test_rewind_endpoint_allows_ended_thread_with_stale_agent_id(monkeypat
             {"id": thread_id, "agent_id": "agent-9", "status": "ended"},
         )
 
-    monkeypatch.setattr(orch_main, "require_thread_owner", _fake_owner)
+    monkeypatch.setattr(access_module, "require_thread_owner", _fake_owner)
     fake_db = MagicMock()
     fake_db.get_live_thread_message = AsyncMock(
         return_value={"seq": 8, "role": "human", "content": "the prompt"}
@@ -252,12 +256,14 @@ async def test_rewind_endpoint_allows_ended_thread_with_stale_agent_id(monkeypat
     fake_db.apply_thread_rewind = AsyncMock(
         return_value={"rewind_id": "r1", "swept": 3, "surviving_turn": 1}
     )
-    monkeypatch.setattr(orch_main, "postgres_db", fake_db)
+    monkeypatch.setattr(orch_main.app.state.resources, "postgres_db", fake_db)
 
     out = await control_seams.rewind_thread_detached(
         "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
         MagicMock(),
-        orch_main.ThreadRewindRequest(message_id="m1", mode="conversation"),
+        thread_lifecycle_module.ThreadRewindRequest(
+            message_id="m1", mode="conversation"
+        ),
     )
     assert out == {"rewind_id": "r1", "swept": 3, "prompt": "the prompt"}
     fake_db.apply_thread_rewind.assert_awaited_once_with(
@@ -267,19 +273,17 @@ async def test_rewind_endpoint_allows_ended_thread_with_stale_agent_id(monkeypat
 
 @pytest.mark.asyncio
 async def test_rewind_endpoint_rejects_code_mode(monkeypatch):
-    from orchestrator import main as orch_main
-
     async def _fake_owner(request, db, thread_id):
         return ({"id": "user-1"}, {"id": thread_id, "agent_id": None})
 
-    monkeypatch.setattr(orch_main, "require_thread_owner", _fake_owner)
+    monkeypatch.setattr(access_module, "require_thread_owner", _fake_owner)
     from fastapi import HTTPException
 
     with pytest.raises(HTTPException) as exc:
         await control_seams.rewind_thread_detached(
             "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
             MagicMock(),
-            orch_main.ThreadRewindRequest(message_id="m1", mode="both"),
+            thread_lifecycle_module.ThreadRewindRequest(message_id="m1", mode="both"),
         )
     assert exc.value.status_code == 400
     assert "resume" in str(exc.value.detail).lower()
@@ -292,7 +296,7 @@ async def test_rewind_endpoint_happy_path(monkeypatch):
     async def _fake_owner(request, db, thread_id):
         return ({"id": "user-1"}, {"id": thread_id, "agent_id": None})
 
-    monkeypatch.setattr(orch_main, "require_thread_owner", _fake_owner)
+    monkeypatch.setattr(access_module, "require_thread_owner", _fake_owner)
     fake_db = MagicMock()
     fake_db.get_live_thread_message = AsyncMock(
         return_value={"seq": 8, "role": "human", "content": "the prompt"}
@@ -300,12 +304,14 @@ async def test_rewind_endpoint_happy_path(monkeypatch):
     fake_db.apply_thread_rewind = AsyncMock(
         return_value={"rewind_id": "r1", "swept": 3, "surviving_turn": 1}
     )
-    monkeypatch.setattr(orch_main, "postgres_db", fake_db)
+    monkeypatch.setattr(orch_main.app.state.resources, "postgres_db", fake_db)
 
     out = await control_seams.rewind_thread_detached(
         "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
         MagicMock(),
-        orch_main.ThreadRewindRequest(message_id="m1", mode="conversation"),
+        thread_lifecycle_module.ThreadRewindRequest(
+            message_id="m1", mode="conversation"
+        ),
     )
     assert out == {"rewind_id": "r1", "swept": 3, "prompt": "the prompt"}
     fake_db.apply_thread_rewind.assert_awaited_once_with(

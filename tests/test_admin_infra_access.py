@@ -33,7 +33,10 @@ from fastapi import HTTPException
 def _patch_caller_and_db(user: dict, db):
     stack = ExitStack()
     stack.enter_context(
-        patch("orchestrator.main.require_approved_user", AsyncMock(return_value=user))
+        patch(
+            "orchestrator.security.auth.require_approved_user",
+            AsyncMock(return_value=user),
+        )
     )
     stack.enter_context(
         patch(
@@ -41,7 +44,7 @@ def _patch_caller_and_db(user: dict, db):
             AsyncMock(return_value=user),
         )
     )
-    stack.enter_context(patch("orchestrator.main.postgres_db", db))
+    stack.enter_context(patch("orchestrator.main.app.state.resources.postgres_db", db))
     return stack
 
 
@@ -102,7 +105,7 @@ class TestAdminInfraGates:
 
         with (
             _patch_caller_and_db(user_a, fake_db),
-            patch("orchestrator.main.sudo_gate", _exploding("sudo_gate")),
+            patch("orchestrator.services.sudo_gate.sudo_gate", _exploding("sudo_gate")),
         ):
             with pytest.raises(HTTPException) as exc:
                 await list_sudo_rules(fake_request)
@@ -118,7 +121,7 @@ class TestAdminInfraGates:
         )
         with (
             _patch_caller_and_db(user_a, fake_db),
-            patch("orchestrator.main.sudo_gate", _exploding("sudo_gate")),
+            patch("orchestrator.services.sudo_gate.sudo_gate", _exploding("sudo_gate")),
         ):
             with pytest.raises(HTTPException) as exc:
                 await create_sudo_rule(fake_request, body)
@@ -130,7 +133,7 @@ class TestAdminInfraGates:
 
         with (
             _patch_caller_and_db(user_a, fake_db),
-            patch("orchestrator.main.sudo_gate", _exploding("sudo_gate")),
+            patch("orchestrator.services.sudo_gate.sudo_gate", _exploding("sudo_gate")),
         ):
             with pytest.raises(HTTPException) as exc:
                 await delete_sudo_rule(fake_request, "rule-abc")

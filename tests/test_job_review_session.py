@@ -9,6 +9,11 @@ import pytest
 from fastapi import HTTPException, params
 
 import orchestrator.main
+from orchestrator.application import preparation as preparation_composition
+from orchestrator.application import workspace as workspace_composition
+from orchestrator.services import (
+    agent_datasource_payload as agent_datasource_payload_module,
+)
 
 
 JOB_ID = "29c28492-df7c-4eb3-847f-38892557ac4e"
@@ -76,9 +81,12 @@ def _database() -> dict:
 
 def _authorized(user: dict, db):
     stack = ExitStack()
-    stack.enter_context(patch("orchestrator.main.postgres_db", db))
+    stack.enter_context(patch("orchestrator.main.app.state.resources.postgres_db", db))
     stack.enter_context(
-        patch("orchestrator.main.require_approved_user", AsyncMock(return_value=user))
+        patch(
+            "orchestrator.security.auth.require_approved_user",
+            AsyncMock(return_value=user),
+        )
     )
     stack.enter_context(
         patch(
@@ -105,12 +113,14 @@ class TestReviewSessionEndpoint:
 
         with (
             _authorized(user_a, fake_db),
-            patch("orchestrator.main.create_thread", created),
+            patch("orchestrator.services.thread_admission.create_thread", created),
         ):
             result = await create_job_review_session(
                 fake_request,
                 JOB_ID,
-                dependencies=orchestrator.main._job_review_dependencies(),
+                dependencies=workspace_composition.job_review_dependencies(
+                    orchestrator.main.app.state.resources
+                ),
             )
 
         body, forwarded_request = created.await_args.args
@@ -173,13 +183,15 @@ class TestReviewSessionEndpoint:
 
         with (
             _authorized(user_a, fake_db),
-            patch("orchestrator.main.create_thread", created),
+            patch("orchestrator.services.thread_admission.create_thread", created),
         ):
             with pytest.raises(HTTPException) as exc:
                 await create_job_review_session(
                     fake_request,
                     JOB_ID,
-                    dependencies=orchestrator.main._job_review_dependencies(),
+                    dependencies=workspace_composition.job_review_dependencies(
+                        orchestrator.main.app.state.resources
+                    ),
                 )
 
         assert exc.value.status_code == 409
@@ -198,13 +210,15 @@ class TestReviewSessionEndpoint:
 
         with (
             _authorized(user_b, fake_db),
-            patch("orchestrator.main.create_thread", created),
+            patch("orchestrator.services.thread_admission.create_thread", created),
         ):
             with pytest.raises(HTTPException) as exc:
                 await create_job_review_session(
                     fake_request,
                     JOB_ID,
-                    dependencies=orchestrator.main._job_review_dependencies(),
+                    dependencies=workspace_composition.job_review_dependencies(
+                        orchestrator.main.app.state.resources
+                    ),
                 )
 
         assert exc.value.status_code == 403
@@ -225,13 +239,15 @@ class TestReviewSessionEndpoint:
 
         with (
             _authorized(user_a, fake_db),
-            patch("orchestrator.main.create_thread", created),
+            patch("orchestrator.services.thread_admission.create_thread", created),
         ):
             with pytest.raises(HTTPException) as exc:
                 await create_job_review_session(
                     fake_request,
                     JOB_ID,
-                    dependencies=orchestrator.main._job_review_dependencies(),
+                    dependencies=workspace_composition.job_review_dependencies(
+                        orchestrator.main.app.state.resources
+                    ),
                 )
 
         assert exc.value.status_code == 409
@@ -252,13 +268,17 @@ class TestReviewSessionEndpoint:
 
         with (
             _authorized(user_a, fake_db),
-            patch("orchestrator.main.create_thread", AsyncMock()) as created,
+            patch(
+                "orchestrator.services.thread_admission.create_thread", AsyncMock()
+            ) as created,
         ):
             with pytest.raises(HTTPException) as exc:
                 await create_job_review_session(
                     fake_request,
                     JOB_ID,
-                    dependencies=orchestrator.main._job_review_dependencies(),
+                    dependencies=workspace_composition.job_review_dependencies(
+                        orchestrator.main.app.state.resources
+                    ),
                 )
 
         assert exc.value.status_code == 409
@@ -282,7 +302,7 @@ class TestReviewSessionEndpoint:
         ]
 
     def test_json_cannot_populate_the_private_server_seed(self):
-        from orchestrator.main import ThreadCreateRequest
+        from orchestrator.schemas.thread_admission import ThreadCreateRequest
 
         body = ThreadCreateRequest.model_validate(
             {
@@ -320,7 +340,7 @@ class TestReviewSessionEndpoint:
 
 class TestReviewDeliveryAttach:
     def test_exact_repository_gets_the_persisted_branch_without_mutating_db_rows(self):
-        from orchestrator.main import _build_datasources_payload
+        import orchestrator.main
         from orchestrator.services.job_delivery import apply_review_delivery_branch
 
         repository = _repository()
@@ -342,7 +362,12 @@ class TestReviewDeliveryAttach:
         assert resolved[1]["default_branch"] == "design/hotel-rheinland-theme"
         assert resolved[1]["require_default_branch"] is True
         assert repository["default_branch"] == "main"
-        payload = _build_datasources_payload(resolved)
+        payload = agent_datasource_payload_module.build_datasources_payload(
+            resolved,
+            dependencies=preparation_composition.datasource_payload_dependencies(
+                orchestrator.main.app.state.resources
+            ),
+        )
         assert payload[1]["default_branch"] == "design/hotel-rheinland-theme"
         assert payload[1]["require_default_branch"] is True
 

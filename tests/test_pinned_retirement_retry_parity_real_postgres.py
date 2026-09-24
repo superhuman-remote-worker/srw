@@ -30,6 +30,9 @@ from orchestrator.services.agent_provisioner import AgentProvisioner
 from orchestrator.services.managed_repository_authority import _deploy_keypair
 from orchestrator.services.session_router import SessionRouterService
 from tests import test_persistent_recycler_real_postgres as fixtures
+from orchestrator.application import controls as controls_composition
+from orchestrator.services import agent_provisioner as agent_provisioner_module
+import fastapi as fastapi_module
 
 db = fixtures.db
 pg_dsn = fixtures.pg_dsn
@@ -104,10 +107,10 @@ async def _owner_session(db, monkeypatch, *, backend: str) -> dict[str, str]:
     route_networking_api = MagicMock()
     route_core_api.read_namespaced_service.side_effect = fixtures._K8sError(404)
     route_networking_api.read_namespaced_ingress.side_effect = fixtures._K8sError(404)
-    monkeypatch.setattr(main, "postgres_db", db)
-    monkeypatch.setattr(main, "agent_provisioner", provider)
+    monkeypatch.setattr(main.app.state.resources, "postgres_db", db)
+    monkeypatch.setattr(agent_provisioner_module, "agent_provisioner", provider)
     monkeypatch.setattr(
-        main,
+        main.app.state.resources,
         "session_router",
         SessionRouterService(
             namespace="agents-a",
@@ -124,7 +127,7 @@ async def _owner_session(db, monkeypatch, *, backend: str) -> dict[str, str]:
     forge.is_initialized = True
     forge.delete_repo_deploy_key = AsyncMock(return_value=True)
     forge.delete_repo = AsyncMock(return_value=True)
-    monkeypatch.setattr(main, "gitea_client", forge)
+    monkeypatch.setattr(main.app.state.resources, "gitea_client", forge)
     monkeypatch.setattr(
         thread_uploads,
         "purge_attested_pinned_virtual_workspace",
@@ -170,10 +173,10 @@ async def _first_permanent_delete_fails(db, monkeypatch, ids: dict[str, str]) ->
 
     monkeypatch.setattr(db, "delete_thread", _blip_once)
     thread = await db.get_thread(ids["thread"])
-    with pytest.raises(main.HTTPException) as refused:
-        await main._thread_retirement_operations().end_thread_flow(
-            ids["thread"], dict(thread), permanent=True, force=False
-        )
+    with pytest.raises(fastapi_module.HTTPException) as refused:
+        await controls_composition.thread_retirement_operations(
+            main.app.state.resources
+        ).end_thread_flow(ids["thread"], dict(thread), permanent=True, force=False)
     assert refused.value.status_code == 503
     pending = await db.get_thread(ids["thread"])
     assert pending is not None
@@ -204,7 +207,10 @@ async def test_durable_retry_settles_a_soft_ended_permanent_delete(
 
     candidate = await _durable_candidate(db, ids)
     assert await stale_agent_detector_service.retry_pending_pinned_retirement(
-        candidate, dependencies=main._stale_agent_detector_dependencies()
+        candidate,
+        dependencies=controls_composition.stale_agent_detector_dependencies(
+            main.app.state.resources
+        ),
     )
     assert await db.get_thread(ids["thread"]) is None
     assert await db.list_retryable_pinned_retirements(grace_seconds=0) == []
@@ -220,9 +226,9 @@ async def test_owner_retry_settles_the_same_durable_state(db, monkeypatch, backe
     await _first_permanent_delete_fails(db, monkeypatch, ids)
 
     thread = await db.get_thread(ids["thread"])
-    result = await main._thread_retirement_operations().end_thread_flow(
-        ids["thread"], dict(thread), permanent=True, force=False
-    )
+    result = await controls_composition.thread_retirement_operations(
+        main.app.state.resources
+    ).end_thread_flow(ids["thread"], dict(thread), permanent=True, force=False)
     assert result == {"status": "deleted"}
     assert await db.get_thread(ids["thread"]) is None
 
@@ -260,7 +266,10 @@ async def test_durable_retry_keeps_refusing_a_live_permanent_delete_without_proo
     candidate = await _durable_candidate(db, ids)
     caplog.set_level("WARNING")
     assert not await stale_agent_detector_service.retry_pending_pinned_retirement(
-        candidate, dependencies=main._stale_agent_detector_dependencies()
+        candidate,
+        dependencies=controls_composition.stale_agent_detector_dependencies(
+            main.app.state.resources
+        ),
     )
     assert "no process-zero actuator" in caplog.text
     pending = await db.get_thread(ids["thread"])
@@ -290,7 +299,10 @@ class _OneDetectorPass:
 
 async def _run_one_detector_pass() -> None:
     await stale_agent_detector_service.stale_agent_detector(
-        _OneDetectorPass(), dependencies=main._stale_agent_detector_dependencies()
+        _OneDetectorPass(),
+        dependencies=controls_composition.stale_agent_detector_dependencies(
+            main.app.state.resources
+        ),
     )
 
 
@@ -397,14 +409,18 @@ async def _agent_receipted_permanent_handoff(db, monkeypatch) -> dict[str, str]:
     provisioner.release_agent_workspace_claim_finalizer_exact = AsyncMock(
         return_value=True
     )
-    monkeypatch.setattr(main, "postgres_db", db)
-    monkeypatch.setattr(main, "agent_provisioner", provisioner)
+    monkeypatch.setattr(main.app.state.resources, "postgres_db", db)
+    monkeypatch.setattr(agent_provisioner_module, "agent_provisioner", provisioner)
     monkeypatch.setattr(
-        main.session_router, "teardown_route", AsyncMock(return_value=True)
+        main.app.state.resources.session_router,
+        "teardown_route",
+        AsyncMock(return_value=True),
     )
 
     # Owner DELETE while the agent is live: admission closes, nothing is touched.
-    owner = await main._thread_retirement_operations().end_thread_flow(
+    owner = await controls_composition.thread_retirement_operations(
+        main.app.state.resources
+    ).end_thread_flow(
         ids["thread"],
         dict(await db.get_thread(ids["thread"])),
         permanent=True,
@@ -419,7 +435,9 @@ async def _agent_receipted_permanent_handoff(db, monkeypatch) -> dict[str, str]:
     }
     # The agent's drain ends in the exact receipt and the exit handoff.
     await fixtures._authorize_and_ack(db, ids, retirement)
-    handoff = await main._thread_retirement_operations().end_thread_flow(
+    handoff = await controls_composition.thread_retirement_operations(
+        main.app.state.resources
+    ).end_thread_flow(
         ids["thread"],
         dict(await db.get_thread(ids["thread"])),
         permanent=True,

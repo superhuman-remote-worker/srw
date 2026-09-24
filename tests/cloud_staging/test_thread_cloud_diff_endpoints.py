@@ -49,6 +49,8 @@ from orchestrator.services.cloud_staging.source_identity import (
     ProtectedMountSourceIdentity,
 )
 from tests.cloud.fake import FakeMainCloudBackend
+from orchestrator.application import workspace as workspace_composition
+from orchestrator.services import snapshot_service as snapshot_service_module
 
 THREAD_ID = "thread-cd-1"
 _RUNTIME_GENERATION = "44444444-4444-4444-8444-444444444444"
@@ -238,25 +240,30 @@ def _patch_endpoint(
     db = MagicMock()
     db.get_ro_mount_by_thread = AsyncMock(return_value=ro_mount_row)
     db.list_thread_mounts = AsyncMock(return_value=thread_mounts or [])
-    stack.enter_context(patch("orchestrator.main.postgres_db", db))
+    stack.enter_context(patch("orchestrator.main.app.state.resources.postgres_db", db))
     stack.enter_context(
         patch(
-            "orchestrator.main.snapshot_service",
+            "orchestrator.services.snapshot_service.snapshot_service",
             snapshot_service or _snapshot_service(),
         )
     )
     stack.enter_context(
         patch(
-            "orchestrator.main.main_cloud_router",
+            "orchestrator.main.app.state.resources.main_cloud_router",
             _cloud_router(backend if backend is not None else FakeMainCloudBackend()),
         )
     )
     stack.enter_context(
-        patch("orchestrator.main._is_protected_cloud_mode_enabled", lambda: True)
+        patch(
+            "orchestrator.services.deployment_gates.is_protected_cloud_mode_enabled",
+            lambda: True,
+        )
     )
     with stack:
         dependencies = replace(
-            orchestrator.main._thread_cloud_diff_dependencies(),
+            workspace_composition.thread_cloud_diff_dependencies(
+                orchestrator.main.app.state.resources
+            ),
             require_thread_owner=gate,
         )
         # Proof the patches intercept: the factory resolves these globals at
@@ -556,7 +563,9 @@ class TestCloudDiffRestage:
         # ``_cloud_stage_tasks`` is now the ``stage`` half of the
         # application-owned ``CloudTaskRegistry``; the property is the live
         # dict, so seeding and eviction are observed exactly as before.
-        stage_tasks = orchestrator.main.cloud_task_registry.cloud_stage_tasks
+        stage_tasks = (
+            orchestrator.main.app.state.resources.cloud_task_registry.cloud_stage_tasks
+        )
         stage_tasks.clear()
         with (
             _patch_endpoint(
@@ -581,8 +590,14 @@ class TestCloudDiffRestage:
             # are only the patched fakes while the stack is still active.
             call = stage_mock.await_args
             assert call.kwargs["thread_id"] == THREAD_ID
-            assert call.kwargs["postgres_db"] is orchestrator.main.postgres_db
-            assert call.kwargs["snapshot_service"] is orchestrator.main.snapshot_service
+            assert (
+                call.kwargs["postgres_db"]
+                is orchestrator.main.app.state.resources.postgres_db
+            )
+            assert (
+                call.kwargs["snapshot_service"]
+                is snapshot_service_module.snapshot_service
+            )
             assert call.kwargs["authority"]["source_binding_sha256"] == _SOURCE.sha256
         assert not stage_tasks
 
@@ -590,7 +605,9 @@ class TestCloudDiffRestage:
     async def test_restage_409_without_workspace(self, fake_request):
         user = _make_user()
         thread = _make_thread(workspace=False)
-        stage_tasks = orchestrator.main.cloud_task_registry.cloud_stage_tasks
+        stage_tasks = (
+            orchestrator.main.app.state.resources.cloud_task_registry.cloud_stage_tasks
+        )
         stage_tasks.clear()
         with (
             _patch_endpoint(user=user, thread=thread) as wired,

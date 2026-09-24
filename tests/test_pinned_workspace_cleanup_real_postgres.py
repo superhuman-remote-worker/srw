@@ -18,6 +18,13 @@ from orchestrator.services.container_provisioner import (
 from orchestrator.services.workspace_lifecycle import WorkspaceOwner
 from tests import test_persistent_recycler_real_postgres as authority
 from tests.test_workspace_cleanup_retry_real_postgres import _absent_pod_provisioner
+from orchestrator.application import controls as controls_composition
+from orchestrator.application import preparation as preparation_composition
+from orchestrator.services import container_provisioner as container_provisioner_module
+from orchestrator.services import dispatch_credentials as dispatch_credentials_module
+from orchestrator.services import (
+    thread_workspace_delivery as thread_workspace_delivery_module,
+)
 
 
 db = authority.db
@@ -150,10 +157,12 @@ async def _scenario(db, monkeypatch):
     p._core_api.read_namespaced_pod.side_effect = read_pod
     p._core_api.delete_namespaced_pod.side_effect = delete_pod
     p._core_api.patch_namespaced_pod.side_effect = patch_pod
-    monkeypatch.setattr(main, "postgres_db", db)
-    monkeypatch.setattr(main, "container_provisioner", p)
+    monkeypatch.setattr(main.app.state.resources, "postgres_db", db)
+    monkeypatch.setattr(container_provisioner_module, "container_provisioner", p)
     monkeypatch.setattr(
-        main.session_router, "teardown_route", AsyncMock(return_value=True)
+        main.app.state.resources.session_router,
+        "teardown_route",
+        AsyncMock(return_value=True),
     )
     return ids, owner, p, resources, effects
 
@@ -194,13 +203,19 @@ async def test_delivered_pinned_workspace_generation_can_ack_retirement(
     # Credential resolution is independent of the workspace-generation wire
     # contract. Preserve the config without constructing live provider clients.
     inject_credentials = AsyncMock(side_effect=lambda config, **_kwargs: config)
-    monkeypatch.setattr(main, "_inject_thread_dispatch_credentials", inject_credentials)
-    payload = await main.thread_workspace_delivery.agent_get_thread_workspace_locked(
+    monkeypatch.setattr(
+        dispatch_credentials_module,
+        "inject_thread_dispatch_credentials",
+        inject_credentials,
+    )
+    payload = await thread_workspace_delivery_module.agent_get_thread_workspace_locked(
         owner.id,
         presented_agent_id=ids["agent"],
         presented_runtime_generation=str(thread["runtime_generation"]),
         presented_attach_token=ids["attach_token"],
-        dependencies=main._thread_workspace_delivery_dependencies(),
+        dependencies=preparation_composition.thread_workspace_delivery_dependencies(
+            main.app.state.resources
+        ),
     )
     # Delivery materializes both the compatibility override and the canonical
     # resolved blob. Both credential lookups must retain the same recipient.
@@ -241,9 +256,9 @@ async def test_pinned_workspace_end_and_permanent_delete(
     pvc_uid = resources["pvc"].metadata.uid
     pod_uid = resources["pod"].metadata.uid
     retirement = await _begin(db, ids, permanent_first)
-    await main._pinned_retirement_operations().cleanup_pinned_thread_retirement(
-        retirement, cleanup_agent_pod=False
-    )
+    await controls_composition.pinned_retirement_operations(
+        main.app.state.resources
+    ).cleanup_pinned_thread_retirement(retirement, cleanup_agent_pod=False)
     assert effects == [("delete", pod_uid), ("finalizer", pod_uid)]
     assert (
         await db.fetchval(
@@ -280,9 +295,9 @@ async def test_pinned_workspace_end_and_permanent_delete(
             generation=retirement["generation"],
             settle_status="ended",
         )
-        await main._pinned_retirement_operations().cleanup_pinned_thread_retirement(
-            retirement, cleanup_agent_pod=False
-        )
+        await controls_composition.pinned_retirement_operations(
+            main.app.state.resources
+        ).cleanup_pinned_thread_retirement(retirement, cleanup_agent_pod=False)
     assert not resources
     await db.delete_thread(
         owner.id,
@@ -331,9 +346,9 @@ async def test_pinned_workspace_refuses_incomplete_cleanup_authority(
     elif fault == "absent_without_receipt":
         del resources["pod"]
     with pytest.raises(RuntimeError):
-        await main._pinned_retirement_operations().cleanup_pinned_thread_retirement(
-            retirement, cleanup_agent_pod=False
-        )
+        await controls_composition.pinned_retirement_operations(
+            main.app.state.resources
+        ).cleanup_pinned_thread_retirement(retirement, cleanup_agent_pod=False)
     assert effects == []
     assert "pvc" in resources and "service" in resources
     assert not p._core_api.delete_namespaced_persistent_volume_claim.called
@@ -348,9 +363,9 @@ async def test_pinned_workspace_replays_lost_responses(db, monkeypatch, fault):
     ids, owner, p, resources, effects = await _scenario(db, monkeypatch)
     retirement = await _begin(db, ids, False)
     if fault == "retained_pvc_ack":
-        await main._pinned_retirement_operations().cleanup_pinned_thread_retirement(
-            retirement, cleanup_agent_pod=False
-        )
+        await controls_composition.pinned_retirement_operations(
+            main.app.state.resources
+        ).cleanup_pinned_thread_retirement(retirement, cleanup_agent_pod=False)
         assert await db.settle_pinned_thread_retirement(
             owner.id,
             token=retirement["token"],
@@ -396,13 +411,13 @@ async def test_pinned_workspace_replays_lost_responses(db, monkeypatch, fault):
 
         monkeypatch.setattr(p, "_set_context", lose_projection)
     with pytest.raises(RuntimeError):
-        await main._pinned_retirement_operations().cleanup_pinned_thread_retirement(
-            retirement, cleanup_agent_pod=False
-        )
+        await controls_composition.pinned_retirement_operations(
+            main.app.state.resources
+        ).cleanup_pinned_thread_retirement(retirement, cleanup_agent_pod=False)
     assert lost
-    await main._pinned_retirement_operations().cleanup_pinned_thread_retirement(
-        retirement, cleanup_agent_pod=False
-    )
+    await controls_composition.pinned_retirement_operations(
+        main.app.state.resources
+    ).cleanup_pinned_thread_retirement(retirement, cleanup_agent_pod=False)
     assert len(effects) == 2
     assert set(resources) == (set() if fault == "retained_pvc_ack" else {"pvc"})
     current = await db.get_thread(owner.id)
@@ -434,14 +449,14 @@ async def test_pinned_snapshot_pins_host_key_and_rechecks_pod_before_delete(
     )
     if replaced_during_snapshot:
         with pytest.raises(RuntimeError, match="workspace cleanup is retryable"):
-            await main._pinned_retirement_operations().cleanup_pinned_thread_retirement(
-                retirement, cleanup_agent_pod=False
-            )
+            await controls_composition.pinned_retirement_operations(
+                main.app.state.resources
+            ).cleanup_pinned_thread_retirement(retirement, cleanup_agent_pod=False)
         assert not effects
         assert set(resources) == {"pod", "pvc", "service"}
     else:
-        await main._pinned_retirement_operations().cleanup_pinned_thread_retirement(
-            retirement, cleanup_agent_pod=False
-        )
+        await controls_composition.pinned_retirement_operations(
+            main.app.state.resources
+        ).cleanup_pinned_thread_retirement(retirement, cleanup_agent_pod=False)
         assert set(resources) == {"pvc"}
     p._snapshot_service.capture_vm_snapshot.assert_awaited_once()

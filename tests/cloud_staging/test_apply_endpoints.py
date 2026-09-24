@@ -42,6 +42,8 @@ from orchestrator.services import thread_cloud_diff as diff_ops
 # ...``), so tests raising ``StagedApplyError`` for its ``except`` clause to
 # catch must use the identical import path.
 from orchestrator.services.cloud_staging.apply import StagedApplyError
+from orchestrator.application import workspace as workspace_composition
+from orchestrator.services import snapshot_service as snapshot_service_module
 
 THREAD_ID = "11111111-1111-4111-8111-111111111111"
 AGENT_ID = "22222222-2222-4222-8222-222222222222"
@@ -124,11 +126,18 @@ def _patch_endpoint(
     db.get_ro_mount_by_thread = AsyncMock(
         return_value={"staged_epoch": 5, "staged_summary": _staged_summary()}
     )
-    stack.enter_context(patch("orchestrator.main.postgres_db", db))
-    stack.enter_context(patch("orchestrator.main.snapshot_service", MagicMock()))
-    stack.enter_context(patch("orchestrator.main.main_cloud_router", MagicMock()))
+    stack.enter_context(patch("orchestrator.main.app.state.resources.postgres_db", db))
     stack.enter_context(
-        patch("orchestrator.main._is_protected_cloud_mode_enabled", lambda: True)
+        patch("orchestrator.services.snapshot_service.snapshot_service", MagicMock())
+    )
+    stack.enter_context(
+        patch("orchestrator.main.app.state.resources.main_cloud_router", MagicMock())
+    )
+    stack.enter_context(
+        patch(
+            "orchestrator.services.deployment_gates.is_protected_cloud_mode_enabled",
+            lambda: True,
+        )
     )
     reset_overlay = AsyncMock(return_value=reset_overlay_result)
     # ``_reset_thread_overlay`` moved with the endpoint bodies; apply/reject
@@ -137,7 +146,9 @@ def _patch_endpoint(
     stack.enter_context(patch.object(diff_ops, "_reset_thread_overlay", reset_overlay))
     with stack:
         dependencies = replace(
-            orchestrator.main._thread_cloud_diff_dependencies(),
+            workspace_composition.thread_cloud_diff_dependencies(
+                orchestrator.main.app.state.resources
+            ),
             require_thread_owner=gate,
         )
         # Proof the patches intercept: the factory reads these globals live,
@@ -199,9 +210,17 @@ class TestApplyEndpoint:
             _, kwargs = engine_mock.call_args
             assert kwargs["thread_id"] == THREAD_ID
             assert kwargs["epoch"] == 5
-            assert kwargs["postgres_db"] is orchestrator.main.postgres_db
-            assert kwargs["main_cloud_router"] is orchestrator.main.main_cloud_router
-            assert kwargs["snapshot_service"] is orchestrator.main.snapshot_service
+            assert (
+                kwargs["postgres_db"]
+                is orchestrator.main.app.state.resources.postgres_db
+            )
+            assert (
+                kwargs["main_cloud_router"]
+                is orchestrator.main.app.state.resources.main_cloud_router
+            )
+            assert (
+                kwargs["snapshot_service"] is snapshot_service_module.snapshot_service
+            )
             assert callable(kwargs["reset_agent_overlay"])
 
             # Verify the closure is actually wired to _reset_thread_overlay,
@@ -450,8 +469,13 @@ class TestRejectEndpoint:
             _, kwargs = engine_mock.call_args
             assert kwargs["thread_id"] == THREAD_ID
             assert kwargs["epoch"] == 5
-            assert kwargs["postgres_db"] is orchestrator.main.postgres_db
-            assert kwargs["snapshot_service"] is orchestrator.main.snapshot_service
+            assert (
+                kwargs["postgres_db"]
+                is orchestrator.main.app.state.resources.postgres_db
+            )
+            assert (
+                kwargs["snapshot_service"] is snapshot_service_module.snapshot_service
+            )
             assert "main_cloud_router" not in kwargs
             assert callable(kwargs["reset_agent_overlay"])
 
@@ -558,7 +582,9 @@ class TestResetThreadOverlay:
         global live, and ``_reset_thread_overlay`` reaches the store only
         through ``dependencies.store``.
         """
-        return orchestrator.main._thread_cloud_diff_dependencies().operations
+        return workspace_composition.thread_cloud_diff_dependencies(
+            orchestrator.main.app.state.resources
+        ).operations
 
     @staticmethod
     def _authority() -> dict[str, str]:
@@ -591,7 +617,7 @@ class TestResetThreadOverlay:
         db = self._db()
         client = _FakeAsyncClient(response=_FakeResponse(200))
         with (
-            patch("orchestrator.main.postgres_db", db),
+            patch("orchestrator.main.app.state.resources.postgres_db", db),
             patch(
                 "orchestrator.services.thread_cloud_diff.httpx.AsyncClient",
                 return_value=client,
@@ -620,7 +646,7 @@ class TestResetThreadOverlay:
         fatal; it's still just a normal False."""
         db = self._db()
         with (
-            patch("orchestrator.main.postgres_db", db),
+            patch("orchestrator.main.app.state.resources.postgres_db", db),
             patch(
                 "orchestrator.services.thread_cloud_diff.httpx.AsyncClient",
                 return_value=_FakeAsyncClient(response=_FakeResponse(404)),
@@ -638,7 +664,7 @@ class TestResetThreadOverlay:
         """Dead/unreachable pod -> exception -> False, never raises."""
         db = self._db()
         with (
-            patch("orchestrator.main.postgres_db", db),
+            patch("orchestrator.main.app.state.resources.postgres_db", db),
             patch(
                 "orchestrator.services.thread_cloud_diff.httpx.AsyncClient",
                 return_value=_FakeAsyncClient(exc=ConnectionError("dead pod")),
@@ -661,7 +687,7 @@ class TestResetThreadOverlay:
     @pytest.mark.asyncio
     async def test_reset_overlay_false_when_agent_has_no_pod_ip(self):
         db = self._db(agent={"id": AGENT_ID, "thread_id": THREAD_ID, "pod_ip": None})
-        with patch("orchestrator.main.postgres_db", db):
+        with patch("orchestrator.main.app.state.resources.postgres_db", db):
             deps = self._deps()
             assert deps.store is db  # the patch intercepts
             out = await diff_ops._reset_thread_overlay(
@@ -676,7 +702,7 @@ class TestResetThreadOverlay:
         db = self._db(thread=successor)
         client = _FakeAsyncClient(response=_FakeResponse(200))
         with (
-            patch("orchestrator.main.postgres_db", db),
+            patch("orchestrator.main.app.state.resources.postgres_db", db),
             patch(
                 "orchestrator.services.thread_cloud_diff.httpx.AsyncClient",
                 return_value=client,
@@ -715,7 +741,7 @@ class TestResetThreadOverlay:
         db.get_thread = AsyncMock(side_effect=[_make_thread(), successor])
         client = _FakeAsyncClient(response=_FakeResponse(200))
         with (
-            patch("orchestrator.main.postgres_db", db),
+            patch("orchestrator.main.app.state.resources.postgres_db", db),
             patch(
                 "orchestrator.services.thread_cloud_diff.httpx.AsyncClient",
                 return_value=client,

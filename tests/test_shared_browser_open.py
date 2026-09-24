@@ -169,8 +169,19 @@ def route_client(monkeypatch):
     monkeypatch.setattr(routes, "_represent", represent)
     app = FastAPI()
     app.state.store = db
+    kicked: list[tuple[str, object]] = []
+    # The application's one collaborator for this router (R1.B12): the
+    # workspace reconcile the cold ``open`` path kicks without waiting.
+    app.state.shared_browser_dependencies_factory = lambda: (
+        routes.SharedBrowserDependencies(
+            kick_workspace_provisioning=lambda thread_id, received_db: kicked.append(
+                (thread_id, received_db)
+            )
+        )
+    )
     app.include_router(routes.router)
     return SimpleNamespace(
+        kicked=kicked,
         client=TestClient(app),
         db=db,
         owner_calls=owner_calls,
@@ -272,16 +283,10 @@ def test_public_open_rejects_caller_selected_baton(route_client):
 
 def test_cold_open_kicks_provisioning_with_retry_hint(route_client, monkeypatch):
     route_client.db.thread = _thread(ready=False)
-    kicked = []
     monkeypatch.setattr(
         routes,
         "browser_capability",
         lambda thread: _capability(ready=False),
-    )
-    monkeypatch.setattr(
-        routes,
-        "_kick_workspace_provisioning",
-        lambda thread_id, db: kicked.append((thread_id, db)),
     )
 
     response = route_client.client.post(
@@ -292,7 +297,7 @@ def test_cold_open_kicks_provisioning_with_retry_hint(route_client, monkeypatch)
     assert response.status_code == 202
     assert response.json() == {"status": "provisioning"}
     assert response.headers["retry-after"] == "1"
-    assert kicked == [(_THREAD_ID, route_client.db)]
+    assert route_client.kicked == [(_THREAD_ID, route_client.db)]
     assert route_client.prepared_calls == []
 
 

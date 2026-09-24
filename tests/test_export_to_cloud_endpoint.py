@@ -31,6 +31,8 @@ import orchestrator.main
 from orchestrator.routers import job_review as job_review_routes
 from orchestrator.services import job_export
 from tests.cloud.fake import FakeMainCloudBackend
+from orchestrator.application import jobs as jobs_composition
+from orchestrator.application import workspace as workspace_composition
 
 
 # --------------------------------------------------------------------------- #
@@ -78,7 +80,9 @@ def _patch_endpoint(*, user, job, backend, gitea_files, repo=("job-682baab8", "m
 
     router = MagicMock()
     router.for_owner = MagicMock(return_value=backend)
-    stack.enter_context(patch("orchestrator.main.main_cloud_router", router))
+    stack.enter_context(
+        patch("orchestrator.main.app.state.resources.main_cloud_router", router)
+    )
 
     gitea = MagicMock()
     gitea.is_initialized = True
@@ -107,18 +111,20 @@ def _patch_endpoint(*, user, job, backend, gitea_files, repo=("job-682baab8", "m
         return out
 
     gitea.list_contents = AsyncMock(side_effect=_list_contents)
-    stack.enter_context(patch("orchestrator.main.gitea_client", gitea))
+    stack.enter_context(
+        patch("orchestrator.main.app.state.resources.gitea_client", gitea)
+    )
 
     stack.enter_context(
         patch(
-            "orchestrator.main.subjob_output_operations.resolve_job_repo",
+            "orchestrator.services.subjob_output.resolve_job_repo",
             AsyncMock(return_value=repo),
         )
     )
 
     db = MagicMock()
     db.update_job_exported_folder = AsyncMock(return_value=True)
-    stack.enter_context(patch("orchestrator.main.postgres_db", db))
+    stack.enter_context(patch("orchestrator.main.app.state.resources.postgres_db", db))
 
     return stack, backend, db
 
@@ -132,7 +138,9 @@ def _deps(user: dict, job: dict):
     ``main``'s globals when it runs.
     """
     return dataclasses.replace(
-        orchestrator.main._job_review_dependencies(),
+        workspace_composition.job_review_dependencies(
+            orchestrator.main.app.state.resources
+        ),
         require_job_access=AsyncMock(return_value=(user, job)),
     )
 
@@ -149,27 +157,33 @@ def _copied_paths(backend: FakeMainCloudBackend) -> set[str]:
 
 class TestCloudReviewMode:
     def test_open_folder_when_no_cloud_folder(self):
-        out = orchestrator.main._with_cloud_review_mode(
-            {"id": "x", "project_has_cloud_folder": False}
+        out = jobs_composition.with_cloud_review_mode(
+            orchestrator.main.app.state.resources,
+            {"id": "x", "project_has_cloud_folder": False},
         )
         assert out["cloud_review_mode"] == "open_folder"
         assert "project_has_cloud_folder" not in out
 
     def test_diff_when_project_has_cloud_folder(self):
-        out = orchestrator.main._with_cloud_review_mode(
-            {"id": "x", "project_has_cloud_folder": True}
+        out = jobs_composition.with_cloud_review_mode(
+            orchestrator.main.app.state.resources,
+            {"id": "x", "project_has_cloud_folder": True},
         )
         assert out["cloud_review_mode"] == "diff"
         assert "project_has_cloud_folder" not in out
 
     def test_open_folder_when_column_absent(self):
         # Loose jobs / rows without the join column default to open_folder.
-        out = orchestrator.main._with_cloud_review_mode({"id": "x"})
+        out = jobs_composition.with_cloud_review_mode(
+            orchestrator.main.app.state.resources, {"id": "x"}
+        )
         assert out["cloud_review_mode"] == "open_folder"
 
     def test_does_not_mutate_input(self):
         src = {"id": "x", "project_has_cloud_folder": True}
-        orchestrator.main._with_cloud_review_mode(src)
+        jobs_composition.with_cloud_review_mode(
+            orchestrator.main.app.state.resources, src
+        )
         assert src["project_has_cloud_folder"] is True
         assert "cloud_review_mode" not in src
 
@@ -641,26 +655,29 @@ class TestExportedFolderUrl:
     def _with_backend(self, backend):
         router = MagicMock()
         router.for_backend = MagicMock(return_value=backend)
-        return patch("orchestrator.main.main_cloud_router", router)
+        return patch("orchestrator.main.app.state.resources.main_cloud_router", router)
 
     def test_resolves_handle_to_url(self):
         with self._with_backend(FakeMainCloudBackend()):
-            out = orchestrator.main._with_cloud_review_mode(
-                {"id": "x", "exported_folder_handle": "sessions/job-abc"}
+            out = jobs_composition.with_cloud_review_mode(
+                orchestrator.main.app.state.resources,
+                {"id": "x", "exported_folder_handle": "sessions/job-abc"},
             )
         assert out["exported_folder_url"] == "fake://session/sessions/job-abc"
 
     def test_null_when_never_exported(self):
         with self._with_backend(FakeMainCloudBackend()):
-            out = orchestrator.main._with_cloud_review_mode(
-                {"id": "x", "exported_folder_handle": None}
+            out = jobs_composition.with_cloud_review_mode(
+                orchestrator.main.app.state.resources,
+                {"id": "x", "exported_folder_handle": None},
             )
         assert out["exported_folder_url"] is None
 
     def test_null_when_backend_down(self):
         # Cloud outage must degrade to "no button", not a broken link.
         with self._with_backend(FakeMainCloudBackend(start_initialized=False)):
-            out = orchestrator.main._with_cloud_review_mode(
-                {"id": "x", "exported_folder_handle": "sessions/job-abc"}
+            out = jobs_composition.with_cloud_review_mode(
+                orchestrator.main.app.state.resources,
+                {"id": "x", "exported_folder_handle": "sessions/job-abc"},
             )
         assert out["exported_folder_url"] is None

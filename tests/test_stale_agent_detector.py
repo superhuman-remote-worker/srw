@@ -5,26 +5,37 @@ import json
 import logging
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
-
-from tests._workspace_recovery_fakes import idle_recovery_store
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi import HTTPException
-from unittest.mock import AsyncMock, MagicMock, patch
 
 import orchestrator.main as main
+from orchestrator.application import controls as controls_composition
+from orchestrator.application import sessions as sessions_composition
+from orchestrator.application.resources import bound
 from orchestrator.database.postgres import (
     LeaseRecoveryBatch,
     LeaseRecoveryCircuitTrip,
     OrphanRecoveryBatch,
     RecoveredJob,
 )
+from orchestrator.services import agent_provisioner as agent_provisioner_module
+from orchestrator.services import container_provisioner as container_provisioner_module
+from orchestrator.services import (
+    session_attach_recovery as session_attach_recovery_module,
+)
 from orchestrator.services import stale_agent_detector as detector
+from orchestrator.services import vm_provisioner as vm_provisioner_module
+from orchestrator.services import (
+    vm_workspace_recovery_store as vm_workspace_recovery_store_module,
+)
 from orchestrator.services.pinned_retirement import (
     PinnedRetirementDependencies,
     PinnedRetirementOperations,
 )
 from orchestrator.services.stale_agent_detector import StaleAgentDetectorDependencies
+from tests._workspace_recovery_fakes import idle_recovery_store
 
 
 def _mock_db(shutdown_event: asyncio.Event, stall_return: int = 0):
@@ -210,14 +221,16 @@ async def test_permanent_retirement_recovers_from_exact_absent_sandbox_pod(
     )
 
     with (
-        patch.object(main, "postgres_db", db),
-        patch.object(main, "agent_provisioner", agent_provisioner),
-        patch.object(main, "container_provisioner", container_provisioner),
+        patch.object(main.app.state.resources, "postgres_db", db),
+        patch.object(agent_provisioner_module, "agent_provisioner", agent_provisioner),
+        patch.object(
+            container_provisioner_module, "container_provisioner", container_provisioner
+        ),
     ):
         assert (
-            await main._pinned_retirement_operations().recover_captured_process_zero(
-                retirement
-            )
+            await controls_composition.pinned_retirement_operations(
+                main.app.state.resources
+            ).recover_captured_process_zero(retirement)
             is expected_recovery
         )
 
@@ -301,12 +314,12 @@ async def test_soft_retirement_recovers_never_delivered_warm_runtime():
     )
 
     with (
-        patch.object(main, "postgres_db", db),
-        patch.object(main, "agent_provisioner", provisioner),
+        patch.object(main.app.state.resources, "postgres_db", db),
+        patch.object(agent_provisioner_module, "agent_provisioner", provisioner),
     ):
-        assert await main._pinned_retirement_operations().recover_captured_process_zero(
-            retirement
-        )
+        assert await controls_composition.pinned_retirement_operations(
+            main.app.state.resources
+        ).recover_captured_process_zero(retirement)
 
     db.acknowledge_pinned_thread_local_quiescence.assert_awaited_once_with(
         thread_id,
@@ -347,23 +360,23 @@ def test_virtual_binding_agent_zero_requires_exact_nonphysical_shape(
         "ssh_host_key_fingerprint": None,
         **binding_patch,
     }
-    assert not main._pinned_retirement_operations().captured_virtual_binding_agent_zero_only(
-        context, workspace, binding
-    )
+    assert not controls_composition.pinned_retirement_operations(
+        main.app.state.resources
+    ).captured_virtual_binding_agent_zero_only(context, workspace, binding)
 
 
 def test_virtual_binding_agent_zero_accepts_exact_project_cloud_shape():
-    assert (
-        main._pinned_retirement_operations().captured_virtual_binding_agent_zero_only(
-            {"workspace_backend": "virtual"},
-            {},
-            {
-                "generation": "66666666-6666-4666-8666-666666666666",
-                "kind": "virtual",
-                "backing_id": f"rclone:{'a' * 64}",
-                "ssh_host_key_fingerprint": None,
-            },
-        )
+    assert controls_composition.pinned_retirement_operations(
+        main.app.state.resources
+    ).captured_virtual_binding_agent_zero_only(
+        {"workspace_backend": "virtual"},
+        {},
+        {
+            "generation": "66666666-6666-4666-8666-666666666666",
+            "kind": "virtual",
+            "backing_id": f"rclone:{'a' * 64}",
+            "ssh_host_key_fingerprint": None,
+        },
     )
 
 
@@ -397,15 +410,15 @@ async def test_captured_agent_stop_retries_after_exact_pod_disappeared(
         )
         return state if state in allowed else None
 
-    monkeypatch.setattr(main, "agent_provisioner", provisioner)
+    monkeypatch.setattr(agent_provisioner_module, "agent_provisioner", provisioner)
     monkeypatch.setattr(
         PinnedRetirementOperations,
         "_wait_for_captured_agent_pod_retired",
         immediate_observation,
     )
-    await main._pinned_retirement_operations().stop_captured_retirement_agent(
-        retirement
-    )
+    await controls_composition.pinned_retirement_operations(
+        main.app.state.resources
+    ).stop_captured_retirement_agent(retirement)
     provisioner.delete_agent_pod_exact.assert_awaited_once_with(
         "captured-agent",
         expected_pod_uid="captured-uid",
@@ -450,16 +463,16 @@ async def test_captured_agent_stop_refuses_unproven_initial_absence(
         )
         return state if state in allowed else None
 
-    monkeypatch.setattr(main, "agent_provisioner", provisioner)
+    monkeypatch.setattr(agent_provisioner_module, "agent_provisioner", provisioner)
     monkeypatch.setattr(
         PinnedRetirementOperations,
         "_wait_for_captured_agent_pod_retired",
         immediate_observation,
     )
     with pytest.raises(RuntimeError, match="exact agent Pod termination is retryable"):
-        await main._pinned_retirement_operations().stop_captured_retirement_agent(
-            retirement
-        )
+        await controls_composition.pinned_retirement_operations(
+            main.app.state.resources
+        ).stop_captured_retirement_agent(retirement)
     provisioner.release_agent_pod_finalizer_exact.assert_not_awaited()
 
 
@@ -491,14 +504,22 @@ async def test_detector_retries_durable_attach_abort_after_request_task_failure(
 
     db.acquire = MagicMock(side_effect=acquire)
     reconcile = AsyncMock(side_effect=[RuntimeError("transient"), True])
-    main._attach_abort_successor_tasks.clear()
+    main.app.state.resources.attach_abort_successor_tasks.clear()
     # The scheduler is the application's collaborator; the detector only
     # receives it through its dependencies.
-    original_schedule = main._schedule_attach_abort_successor
+    original_schedule = bound(
+        session_attach_recovery_module.schedule_attach_abort_successor,
+        sessions_composition.session_attach_recovery_dependencies,
+        main.app.state.resources,
+    )
 
     with (
-        patch.object(main, "postgres_db", db),
-        patch.object(main, "_reconcile_attach_abort_successor", reconcile),
+        patch.object(main.app.state.resources, "postgres_db", db),
+        patch.object(
+            session_attach_recovery_module,
+            "reconcile_attach_abort_successor",
+            reconcile,
+        ),
     ):
         first = original_schedule(
             candidate["thread_id"],
@@ -507,7 +528,7 @@ async def test_detector_retries_durable_attach_abort_after_request_task_failure(
             retired_agent_id=candidate["retired_agent_id"],
         )
         await first
-        assert not main._attach_abort_successor_tasks
+        assert not main.app.state.resources.attach_abort_successor_tasks
 
         scheduled = []
         scheduled_calls = []
@@ -1019,12 +1040,12 @@ async def test_lite_backend_retirement_recovers_through_agent_runtime_zero(
         immediate_observation,
     )
     with (
-        patch.object(main, "postgres_db", db),
-        patch.object(main, "agent_provisioner", provisioner),
+        patch.object(main.app.state.resources, "postgres_db", db),
+        patch.object(agent_provisioner_module, "agent_provisioner", provisioner),
     ):
-        assert await main._pinned_retirement_operations().recover_captured_process_zero(
-            retirement
-        )
+        assert await controls_composition.pinned_retirement_operations(
+            main.app.state.resources
+        ).recover_captured_process_zero(retirement)
 
     provisioner.delete_agent_pod_exact.assert_awaited_once_with(
         "persistent-lite", expected_pod_uid="lite-pod-uid", namespace="agents-a"
@@ -1052,8 +1073,12 @@ async def test_non_sandbox_recovery_uses_the_captured_vm_actuator(monkeypatch, b
     import orchestrator.services.vm_workspace_recovery_store as recovery
     from orchestrator.services.vm_provisioner import VMTeardownResult
 
+    # The retirement composition constructs the recovery store it hands the
+    # operations (``controls.pinned_retirement_operations``).
     monkeypatch.setattr(
-        main, "VMWorkspaceRecoveryStore", lambda db: idle_recovery_store()
+        vm_workspace_recovery_store_module,
+        "VMWorkspaceRecoveryStore",
+        lambda db: idle_recovery_store(),
     )
     # This pinned-thread owner has no v3 Job creation/retry resource charge.
     monkeypatch.setattr(
@@ -1080,13 +1105,13 @@ async def test_non_sandbox_recovery_uses_the_captured_vm_actuator(monkeypatch, b
         immediate_observation,
     )
     with (
-        patch.object(main, "postgres_db", db),
-        patch.object(main, "agent_provisioner", provisioner),
-        patch.object(main, "vm_provisioner", vm_provisioner),
+        patch.object(main.app.state.resources, "postgres_db", db),
+        patch.object(agent_provisioner_module, "agent_provisioner", provisioner),
+        patch.object(vm_provisioner_module, "vm_provisioner", vm_provisioner),
     ):
-        assert await main._pinned_retirement_operations().recover_captured_process_zero(
-            retirement
-        )
+        assert await controls_composition.pinned_retirement_operations(
+            main.app.state.resources
+        ).recover_captured_process_zero(retirement)
 
     provisioner.delete_agent_pod_exact.assert_awaited_once_with(
         "persistent-lite", expected_pod_uid="lite-pod-uid", namespace="agents-a"
@@ -1137,12 +1162,12 @@ async def test_unactuated_backend_recovery_refusal_is_logged(
     db, provisioner = _lite_recovery_mocks(current)
     caplog.set_level(logging.WARNING)
     with (
-        patch.object(main, "postgres_db", db),
-        patch.object(main, "agent_provisioner", provisioner),
+        patch.object(main.app.state.resources, "postgres_db", db),
+        patch.object(agent_provisioner_module, "agent_provisioner", provisioner),
     ):
-        assert not await main._pinned_retirement_operations().recover_captured_process_zero(
-            retirement
-        )
+        assert not await controls_composition.pinned_retirement_operations(
+            main.app.state.resources
+        ).recover_captured_process_zero(retirement)
 
     provisioner.delete_agent_pod_exact.assert_not_awaited()
     db.acknowledge_pinned_thread_local_quiescence.assert_not_awaited()
@@ -1365,12 +1390,12 @@ async def test_recovery_logs_when_the_receipt_is_refused_after_the_pod_stop(
     )
     caplog.set_level(logging.WARNING)
     with (
-        patch.object(main, "postgres_db", db),
-        patch.object(main, "agent_provisioner", provisioner),
+        patch.object(main.app.state.resources, "postgres_db", db),
+        patch.object(agent_provisioner_module, "agent_provisioner", provisioner),
     ):
-        assert not await main._pinned_retirement_operations().recover_captured_process_zero(
-            retirement
-        )
+        assert not await controls_composition.pinned_retirement_operations(
+            main.app.state.resources
+        ).recover_captured_process_zero(retirement)
 
     # Both contracts were consulted for this used-or-created lite life.
     db.acknowledge_pinned_thread_local_quiescence.assert_awaited_once()

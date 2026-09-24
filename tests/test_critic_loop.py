@@ -665,7 +665,11 @@ class TestRoundLimitEnforcement:
         )
 
         update_mock = AsyncMock()
-        monkeypatch.setattr(main_module.postgres_db, "update_job_status", update_mock)
+        monkeypatch.setattr(
+            main_module.app.state.resources.postgres_db,
+            "update_job_status",
+            update_mock,
+        )
 
         rounds = _rounds_with_open_blocking(3)
         # A content_tree distinct from every prior round's — proves this

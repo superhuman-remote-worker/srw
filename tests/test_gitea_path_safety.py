@@ -24,8 +24,13 @@ import pytest
 
 os.environ.setdefault("VECTOR_DB_URL", "postgresql://test@localhost/test")
 
+from orchestrator.application import http as http_composition  # noqa: E402
+from orchestrator.application import workspace as workspace_composition  # noqa: E402
 from orchestrator.routers import job_repo as job_repo_routes  # noqa: E402
 from orchestrator.services import gitea as gitea_mod  # noqa: E402
+from orchestrator.services import (  # noqa: E402
+    subjob_output as subjob_output_operations,
+)
 from orchestrator.services.gitea import (  # noqa: E402
     GiteaPathError,
     encode_compare_ref,
@@ -297,7 +302,7 @@ class TestEncodedUrlOnTheWire:
 
 
 # ---------------------------------------------------------------------------
-# The proxy routes and the 400 mapping in main.py
+# The proxy routes and the 400 mapping the application installs
 # ---------------------------------------------------------------------------
 
 
@@ -320,10 +325,11 @@ class TestProxyRoutes:
     ):
         gc, seen = _client()
         admin = {"id": "00000000-0000-0000-0000-000000000099", "is_admin": True}
+        resources = orch_main.app.state.resources
         with (
-            patch.object(orch_main, "gitea_client", gc),
+            patch.object(resources, "gitea_client", gc),
             patch.object(
-                orch_main.subjob_output_operations,
+                subjob_output_operations,
                 "resolve_job_repo",
                 AsyncMock(return_value=(REPO, None)),
             ),
@@ -332,9 +338,10 @@ class TestProxyRoutes:
             # dependencies, so the gate is replaced there rather than patched
             # on a module the router never reads.
             deps = dataclasses.replace(
-                orch_main._job_repo_dependencies(),
+                workspace_composition.job_repo_dependencies(resources),
                 require_job_access=AsyncMock(return_value=(admin, {"id": "job-1"})),
             )
+            assert deps.repo_reads.forge is gc
             with pytest.raises(GiteaPathError):
                 await job_repo_routes.get_repo_file(
                     _request(),
@@ -360,7 +367,7 @@ class TestProxyRoutes:
     @pytest.mark.asyncio
     async def test_gitea_path_error_is_a_400_not_a_500(self, orch_main):
         handler = orch_main.app.exception_handlers[GiteaPathError]
-        assert handler is orch_main._gitea_path_error_handler
+        assert handler is http_composition.gitea_path_error_handler
         response = await handler(_request(), GiteaPathError("nope"))
         assert response.status_code == 400
         assert json.loads(response.body) == {"detail": "nope"}

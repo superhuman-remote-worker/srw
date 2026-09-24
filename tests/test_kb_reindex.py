@@ -2739,8 +2739,25 @@ class TestPostJobReindexTriggerResolvesItsOwnRepo:
             pathlib.Path(__file__).resolve().parents[1].joinpath("src", *parts)
         ).read_text(encoding="utf-8")
 
-    def _main_src(self) -> str:
-        return self._src("orchestrator", "main.py")
+    def _composition_src(self, module: str | None = None) -> str:
+        """The application composition that ``main.py`` held before R1.B12.
+
+        One module's source, or the whole ``orchestrator.application``
+        package concatenated when ``module`` is omitted.
+        """
+        import pathlib
+
+        package = (
+            pathlib.Path(__file__)
+            .resolve()
+            .parents[1]
+            .joinpath("src", "orchestrator", "application")
+        )
+        if module is not None:
+            return package.joinpath(module).read_text(encoding="utf-8")
+        return "\n".join(
+            path.read_text(encoding="utf-8") for path in sorted(package.glob("*.py"))
+        )
 
     def test_trigger_does_not_pin_repo_name(self):
         # R1.B03 moved the callee into orchestrator.services.knowledge_index;
@@ -2769,7 +2786,9 @@ class TestPostJobReindexTriggerResolvesItsOwnRepo:
         )
         # The other half: the application binds that port, and a repo_name
         # smuggled into the binding would be just as silent.
-        binding = _function_body(self._main_src(), "def _project_loop_dependencies")
+        binding = _function_body(
+            self._composition_src("workflows.py"), "def project_loop_dependencies"
+        )
         compact_binding = re.sub(r"\s+", "", binding)
         assert "reindex_project_kb=(lambdaproject_id:" in compact_binding, (
             "The loop engine's KB port must be bound to a one-argument "
@@ -2783,7 +2802,8 @@ class TestPostJobReindexTriggerResolvesItsOwnRepo:
     def test_no_caller_pins_repo_name_to_the_jobs_repo(self):
         # The other half of the trap: repo_name is a legitimate parameter, but
         # feeding it the *job's* repo is never right for a project-scoped KB.
-        src = self._main_src()
+        src = self._composition_src()
+        assert "def project_loop_dependencies" in src
         assert 'repo_name=job.get("repo_name")' not in src, (
             "A caller is passing the job's execution repo into a KB reindex. "
             "Project KB resolution must win. See §10a."

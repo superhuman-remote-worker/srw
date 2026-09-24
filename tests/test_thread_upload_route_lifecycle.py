@@ -7,6 +7,8 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 from fastapi import HTTPException
+from orchestrator.application import workspace as workspace_composition
+from orchestrator.services import container_provisioner as container_provisioner_module
 
 
 THREAD_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
@@ -142,7 +144,7 @@ def _dependencies(db, owner):
     from orchestrator import main
 
     return replace(
-        main._thread_files_dependencies(),
+        workspace_composition.thread_files_dependencies(main.app.state.resources),
         store=db,
         require_thread_owner=owner,
     )
@@ -150,7 +152,6 @@ def _dependencies(db, owner):
 
 @pytest.mark.asyncio
 async def test_pinned_k8s_upload_requires_fresh_exact_attestation():
-    from orchestrator import main
     from orchestrator.routers.thread_files import upload_files_to_thread
     from orchestrator.services import thread_uploads
 
@@ -171,7 +172,7 @@ async def test_pinned_k8s_upload_requires_fresh_exact_attestation():
     with (
         patch.object(thread_uploads, "resolve_ssh_key_path", return_value="/ssh/key"),
         patch.object(
-            main.container_provisioner,
+            container_provisioner_module.container_provisioner,
             "attest_workspace_runtime",
             AsyncMock(return_value=_workspace_attestation()),
         ) as attest,
@@ -199,7 +200,6 @@ async def test_pinned_k8s_upload_requires_fresh_exact_attestation():
 @pytest.mark.asyncio
 @pytest.mark.parametrize("operation", ["upload", "delete"])
 async def test_pinned_k8s_same_ip_successor_gets_no_legacy_io(operation):
-    from orchestrator import main
     from orchestrator.routers.thread_files import (
         delete_thread_upload,
         upload_files_to_thread,
@@ -218,7 +218,7 @@ async def test_pinned_k8s_same_ip_successor_gets_no_legacy_io(operation):
     with (
         patch.object(thread_uploads, "resolve_ssh_key_path", return_value="/ssh/key"),
         patch.object(
-            main.container_provisioner,
+            container_provisioner_module.container_provisioner,
             "attest_workspace_runtime",
             AsyncMock(return_value=_workspace_attestation(REPLACEMENT_RUNTIME)),
         ),
@@ -275,7 +275,6 @@ async def test_pinned_k8s_same_ip_successor_gets_no_legacy_io(operation):
 
 @pytest.mark.asyncio
 async def test_stateless_upload_holds_lifecycle_lock_through_final_write():
-    from orchestrator import main
     from orchestrator.routers.thread_files import upload_files_to_thread
     from orchestrator.services import thread_uploads
 
@@ -298,7 +297,7 @@ async def test_stateless_upload_holds_lifecycle_lock_through_final_write():
     with (
         patch.object(thread_uploads, "resolve_ssh_key_path", return_value="/ssh/key"),
         patch.object(
-            main.container_provisioner,
+            container_provisioner_module.container_provisioner,
             "workspace_pod_authority",
             AsyncMock(return_value="exact_live"),
         ),
@@ -359,7 +358,6 @@ async def test_retirement_marker_wins_before_upload_materialization():
 
 @pytest.mark.asyncio
 async def test_stateless_delete_holds_lifecycle_lock_through_exact_delete():
-    from orchestrator import main
     from orchestrator.routers.thread_files import delete_thread_upload
     from orchestrator.services import thread_uploads
 
@@ -375,7 +373,7 @@ async def test_stateless_delete_holds_lifecycle_lock_through_exact_delete():
     with (
         patch.object(thread_uploads, "resolve_ssh_key_path", return_value="/ssh/key"),
         patch.object(
-            main.container_provisioner,
+            container_provisioner_module.container_provisioner,
             "workspace_pod_authority",
             AsyncMock(return_value="exact_live"),
         ),

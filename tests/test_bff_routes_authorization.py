@@ -68,7 +68,9 @@ def client(store, monkeypatch):
     """Mount the router and bind the store to both the old and new seams."""
     import orchestrator.main as orchestrator_main
 
-    monkeypatch.setattr(orchestrator_main, "postgres_db", store, raising=False)
+    monkeypatch.setattr(
+        orchestrator_main.app.state.resources, "postgres_db", store, raising=False
+    )
 
     monkeypatch.setattr(
         bff,

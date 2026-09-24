@@ -55,6 +55,8 @@ from orchestrator.schemas.projects import (
     ProjectRepositoryUpdate,
     ProjectUpdate,
 )
+from orchestrator.application import jobs as jobs_composition
+from orchestrator.routers import job_reads as job_reads_module
 
 
 # =============================================================================
@@ -65,15 +67,19 @@ from orchestrator.schemas.projects import (
 def _patch_caller_and_db(user: dict, db):
     """Stack the patches every endpoint test needs.
 
-    Still the right shape for the handlers that remain in ``main``
-    (``list_project_jobs``, ``create_project_job``, the expert-catalogue
-    routes). Routes extracted in R1.B03 read their caller gate and their store
-    off a dependency dataclass instead — those tests use ``_patch_caller``
-    plus ``_proj_deps`` / ``_citation_deps``.
+    Still the right shape for handlers whose dependencies the application
+    builds from its resources at call time (``list_project_jobs``,
+    ``create_project_job`` via ``_with_job_lifecycle_factory``, the
+    expert-catalogue routes). Routes extracted in R1.B03 read their caller gate
+    and their store off a dependency dataclass instead — those tests use
+    ``_patch_caller`` plus ``_proj_deps`` / ``_citation_deps``.
     """
     stack = ExitStack()
     stack.enter_context(
-        patch("orchestrator.main.require_approved_user", AsyncMock(return_value=user))
+        patch(
+            "orchestrator.security.auth.require_approved_user",
+            AsyncMock(return_value=user),
+        )
     )
     stack.enter_context(
         patch(
@@ -81,8 +87,23 @@ def _patch_caller_and_db(user: dict, db):
             AsyncMock(return_value=user),
         )
     )
-    stack.enter_context(patch("orchestrator.main.postgres_db", db))
+    stack.enter_context(patch("orchestrator.main.app.state.resources.postgres_db", db))
     return stack
+
+
+def _with_job_lifecycle_factory(fake_request):
+    """Serve the application's per-request job lifecycle dependency factory.
+
+    ``create_project_job`` reads ``request.app.state``; the application's
+    factory builds the dependencies from its resources at call time, so it
+    sees the patched ``postgres_db``.
+    """
+    import orchestrator.main
+
+    fake_request.app.state.job_lifecycle_route_dependencies_factory = (
+        orchestrator.main.app.state.job_lifecycle_route_dependencies_factory
+    )
+    return fake_request
 
 
 def _patch_caller(user: dict):
@@ -497,7 +518,10 @@ class TestProjectReadGates:
     ):
         with (
             _patch_caller_and_db(user_b, fake_db),
-            patch("orchestrator.main.gitea_client", _explode("gitea_client")),
+            patch(
+                "orchestrator.main.app.state.resources.gitea_client",
+                _explode("gitea_client"),
+            ),
         ):
             with pytest.raises(HTTPException) as exc:
                 await catalogue_route(expert_routes.list_project_experts)(
@@ -511,7 +535,10 @@ class TestProjectReadGates:
     ):
         with (
             _patch_caller_and_db(user_b, fake_db),
-            patch("orchestrator.main.gitea_client", _explode("gitea_client")),
+            patch(
+                "orchestrator.main.app.state.resources.gitea_client",
+                _explode("gitea_client"),
+            ),
         ):
             with pytest.raises(HTTPException) as exc:
                 await catalogue_route(expert_routes.get_project_expert)(
@@ -540,7 +567,7 @@ class TestProjectReadGates:
     async def test_list_project_jobs_blocked_cross_user(
         self, user_b, project_a, fake_db, fake_request
     ):
-        from orchestrator.main import list_project_jobs
+        import orchestrator.main
 
         # acquire shouldn't be reached
         fake_db.acquire = MagicMock(
@@ -548,8 +575,14 @@ class TestProjectReadGates:
         )
         with _patch_caller_and_db(user_b, fake_db):
             with pytest.raises(HTTPException) as exc:
-                await list_project_jobs(
-                    fake_request, str(project_a["id"]), status=None, limit=100
+                await job_reads_module.list_project_jobs(
+                    fake_request,
+                    str(project_a["id"]),
+                    status=None,
+                    limit=100,
+                    dependencies=jobs_composition.job_reads_dependencies(
+                        orchestrator.main.app.state.resources
+                    ),
                 )
         assert exc.value.status_code == 403
 
@@ -811,39 +844,49 @@ class TestProjectMutationRoles:
     async def test_create_project_job_viewer_403(
         self, user_b, project_a, fake_db, fake_request
     ):
-        from orchestrator.main import JobCreate, create_project_job
+        from orchestrator.schemas.job_create import JobCreate
+        from orchestrator.routers.project_jobs import create_project_job
 
         _set_role(fake_db, project_a["id"], user_b["id"], "viewer")
         body = JobCreate(description="x")
         with (
             _patch_caller_and_db(user_b, fake_db),
             patch(
-                "orchestrator.main.job_lifecycle_routes.admit_job_request",
+                "orchestrator.routers.job_lifecycle.admit_job_request",
                 AsyncMock(
                     side_effect=AssertionError("create_job called past the gate")
                 ),
             ),
         ):
             with pytest.raises(HTTPException) as exc:
-                await create_project_job(fake_request, str(project_a["id"]), body)
+                await create_project_job(
+                    _with_job_lifecycle_factory(fake_request),
+                    str(project_a["id"]),
+                    body,
+                )
         assert exc.value.status_code == 403
 
     @pytest.mark.asyncio
     async def test_create_project_job_editor_passes(
         self, user_b, project_a, fake_db, fake_request
     ):
-        from orchestrator.main import JobCreate, create_project_job
+        from orchestrator.schemas.job_create import JobCreate
+        from orchestrator.routers.project_jobs import create_project_job
 
         _set_role(fake_db, project_a["id"], user_b["id"], "editor")
         body = JobCreate(description="x")
         with (
             _patch_caller_and_db(user_b, fake_db),
             patch(
-                "orchestrator.main.job_lifecycle_routes.admit_job_request",
+                "orchestrator.routers.job_lifecycle.admit_job_request",
                 AsyncMock(return_value={"id": "new-job"}),
             ),
         ):
-            result = await create_project_job(fake_request, str(project_a["id"]), body)
+            result = await create_project_job(
+                _with_job_lifecycle_factory(fake_request),
+                str(project_a["id"]),
+                body,
+            )
         assert result == {"id": "new-job"}
         assert body.project_id == str(project_a["id"])
 
@@ -1184,13 +1227,14 @@ class TestCreateProjectJobOnAnArchivedProject:
     async def test_editor_is_refused(
         self, user_b, archived_project, fake_db, fake_request
     ):
-        from orchestrator.main import JobCreate, create_project_job
+        from orchestrator.schemas.job_create import JobCreate
+        from orchestrator.routers.project_jobs import create_project_job
 
         _set_role(fake_db, archived_project["id"], user_b["id"], "editor")
         with (
             _patch_caller_and_db(user_b, fake_db),
             patch(
-                "orchestrator.main.job_lifecycle_routes.admit_job_request",
+                "orchestrator.routers.job_lifecycle.admit_job_request",
                 AsyncMock(
                     side_effect=AssertionError("create_job called past the gate")
                 ),
@@ -1198,7 +1242,7 @@ class TestCreateProjectJobOnAnArchivedProject:
         ):
             with pytest.raises(HTTPException) as exc:
                 await create_project_job(
-                    fake_request,
+                    _with_job_lifecycle_factory(fake_request),
                     str(archived_project["id"]),
                     JobCreate(description="x"),
                 )
@@ -1216,16 +1260,22 @@ class TestArchivedProjectStaysReadableAndTearableDown:
     async def test_listing_its_jobs_still_works(
         self, user_b, archived_project, fake_db, fake_request
     ):
-        from orchestrator.main import list_project_jobs
+        import orchestrator.main
 
         fake_db.acquire = MagicMock(return_value=_patch_admin_list_fetch([]))
         fake_db.get_project_members = AsyncMock(return_value=[])
         with (
             _patch_caller_and_db(user_b, fake_db),
-            patch("orchestrator.main.audit_reader") as audit,
+            patch("orchestrator.main.app.state.resources.audit_reader") as audit,
         ):
             audit.is_available = False
-            result = await list_project_jobs(fake_request, str(archived_project["id"]))
+            result = await job_reads_module.list_project_jobs(
+                fake_request,
+                str(archived_project["id"]),
+                dependencies=jobs_composition.job_reads_dependencies(
+                    orchestrator.main.app.state.resources
+                ),
+            )
         assert result == []
 
     @pytest.mark.asyncio

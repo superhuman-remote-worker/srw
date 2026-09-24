@@ -21,6 +21,8 @@ import os
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from orchestrator.application import preparation as preparation_composition
+from shared.runtime.core import model_registry as model_registry_module
 
 os.environ.setdefault("VECTOR_DB_URL", "postgresql://test@localhost/test")
 
@@ -36,9 +38,9 @@ def _deps() -> dispatch_credentials.DispatchCredentialDependencies:
     resolved per invocation rather than captured at import (R1.B05 §P1).
     """
     return dispatch_credentials.DispatchCredentialDependencies(
-        store=orchestrator.main.postgres_db,
-        logger=orchestrator.main.logger,
-        resolve_model=orchestrator.main._resolve_model,
+        store=orchestrator.main.app.state.resources.postgres_db,
+        logger=preparation_composition.logger,
+        resolve_model=model_registry_module.resolve_model,
     )
 
 

@@ -31,6 +31,9 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from orchestrator.application import preparation as preparation_composition
+from orchestrator.services import dispatch_credentials as dispatch_credentials_module
+from shared.runtime.core import model_registry as model_registry_module
 
 os.environ.setdefault("VECTOR_DB_URL", "postgresql://test@localhost/test")
 
@@ -141,7 +144,7 @@ def patched_main(monkeypatch):
             raise UnknownModelError(model_id) from None
 
     resolver = AsyncMock(side_effect=fake_resolve)
-    monkeypatch.setattr(orchestrator.main, "_resolve_model", resolver, raising=True)
+    monkeypatch.setattr(model_registry_module, "resolve_model", resolver, raising=True)
 
     async def fake_get_endpoint(endpoint_id):
         if endpoint_id == ENDPOINT_ID:
@@ -164,14 +167,24 @@ def patched_main(monkeypatch):
     keys = AsyncMock(side_effect=fake_resolve_keys)
     defaults = AsyncMock(return_value=None)
     monkeypatch.setattr(
-        orchestrator.main.postgres_db, "get_user_llm_endpoint", endpoints
-    )
-    monkeypatch.setattr(orchestrator.main.postgres_db, "resolve_api_keys_for_job", keys)
-    monkeypatch.setattr(
-        orchestrator.main.postgres_db, "resolve_default_for_capability", defaults
+        orchestrator.main.app.state.resources.postgres_db,
+        "get_user_llm_endpoint",
+        endpoints,
     )
     monkeypatch.setattr(
-        orchestrator.main.postgres_db, "get_user_settings", AsyncMock(return_value={})
+        orchestrator.main.app.state.resources.postgres_db,
+        "resolve_api_keys_for_job",
+        keys,
+    )
+    monkeypatch.setattr(
+        orchestrator.main.app.state.resources.postgres_db,
+        "resolve_default_for_capability",
+        defaults,
+    )
+    monkeypatch.setattr(
+        orchestrator.main.app.state.resources.postgres_db,
+        "get_user_settings",
+        AsyncMock(return_value={}),
     )
     return SimpleNamespace(
         resolver=resolver, endpoints=endpoints, keys=keys, defaults=defaults
@@ -187,9 +200,9 @@ def _deps() -> dc.DispatchCredentialDependencies:
     the patch was reached and not silently bypassed (R1.B05 §P3).
     """
     return dc.DispatchCredentialDependencies(
-        store=orchestrator.main.postgres_db,
-        logger=orchestrator.main.logger,
-        resolve_model=orchestrator.main._resolve_model,
+        store=orchestrator.main.app.state.resources.postgres_db,
+        logger=preparation_composition.logger,
+        resolve_model=model_registry_module.resolve_model,
     )
 
 
@@ -1198,7 +1211,7 @@ class TestProviderFallbackIsNotADefault:
 
         _main("_dispatch_llm_provider_fallback")  # skip once it is gone from main
         monkeypatch.setattr(
-            orchestrator.main, "_dispatch_llm_provider_fallback", tripwire
+            dispatch_credentials_module, "dispatch_llm_provider_fallback", tripwire
         )
         with patch(
             "orchestrator.services.capability_credentials.resolve_capability_credentials",

@@ -18,6 +18,8 @@ import pytest
 
 import orchestrator.main
 from orchestrator.routers import user_administration as user_administration_routes
+from orchestrator.application import administration as administration_composition
+from orchestrator.services import deployment_gates as deployment_gates_module
 
 
 def _patch_capabilities(
@@ -30,27 +32,36 @@ def _patch_capabilities(
 ) -> ExitStack:
     stack = ExitStack()
     stack.enter_context(
-        patch("orchestrator.main.require_approved_user", AsyncMock(return_value=user))
-    )
-    stack.enter_context(
-        patch("orchestrator.main._is_protected_cloud_mode_enabled", lambda: flag)
+        patch(
+            "orchestrator.security.auth.require_approved_user",
+            AsyncMock(return_value=user),
+        )
     )
     stack.enter_context(
         patch(
-            "orchestrator.main._datasource_scope_auto_attach_v1_enabled",
+            "orchestrator.services.deployment_gates.is_protected_cloud_mode_enabled",
+            lambda: flag,
+        )
+    )
+    stack.enter_context(
+        patch(
+            "orchestrator.services.deployment_gates.datasource_scope_auto_attach_v1_enabled",
             lambda: datasource_scope_flag,
         )
     )
     stack.enter_context(
         patch(
-            "orchestrator.main._datasource_defaults_on_omission",
+            "orchestrator.services.deployment_gates.datasource_defaults_on_omission",
             lambda: datasource_defaults_flag,
         )
     )
     # _grant_project_ids -> user_visible_project_ids -> postgres_db; short-
     # circuit it so the non-admin branch doesn't need a real db.
     stack.enter_context(
-        patch("orchestrator.main._grant_project_ids", AsyncMock(return_value=[]))
+        patch(
+            "orchestrator.services.grant_enforcement.grant_project_ids",
+            AsyncMock(return_value=[]),
+        )
     )
     stack.enter_context(
         patch(
@@ -68,7 +79,9 @@ class TestCapabilitiesFeatures:
         with stack:
             result = await user_administration_routes.my_capabilities(
                 fake_request,
-                dependencies=orchestrator.main._user_administration_dependencies(),
+                dependencies=administration_composition.user_administration_dependencies(
+                    orchestrator.main.app.state.resources
+                ),
             )
         assert result["is_admin"] is True
         assert result["features"] == {
@@ -83,7 +96,9 @@ class TestCapabilitiesFeatures:
         with stack:
             result = await user_administration_routes.my_capabilities(
                 fake_request,
-                dependencies=orchestrator.main._user_administration_dependencies(),
+                dependencies=administration_composition.user_administration_dependencies(
+                    orchestrator.main.app.state.resources
+                ),
             )
         assert result["is_admin"] is True
         assert result["features"] == {
@@ -98,7 +113,9 @@ class TestCapabilitiesFeatures:
         with stack:
             result = await user_administration_routes.my_capabilities(
                 fake_request,
-                dependencies=orchestrator.main._user_administration_dependencies(),
+                dependencies=administration_composition.user_administration_dependencies(
+                    orchestrator.main.app.state.resources
+                ),
             )
         assert result["is_admin"] is False
         assert result["features"] == {
@@ -113,7 +130,9 @@ class TestCapabilitiesFeatures:
         with stack:
             result = await user_administration_routes.my_capabilities(
                 fake_request,
-                dependencies=orchestrator.main._user_administration_dependencies(),
+                dependencies=administration_composition.user_administration_dependencies(
+                    orchestrator.main.app.state.resources
+                ),
             )
         assert result["is_admin"] is False
         assert result["features"] == {
@@ -134,7 +153,9 @@ class TestCapabilitiesFeatures:
         with stack:
             result = await user_administration_routes.my_capabilities(
                 fake_request,
-                dependencies=orchestrator.main._user_administration_dependencies(),
+                dependencies=administration_composition.user_administration_dependencies(
+                    orchestrator.main.app.state.resources
+                ),
             )
 
         assert result["features"]["datasource_scope_auto_attach_v1"] is True
@@ -142,9 +163,9 @@ class TestCapabilitiesFeatures:
 
 def test_datasource_scope_feature_gate_defaults_off(monkeypatch):
     monkeypatch.delenv("DATASOURCE_SCOPE_AUTO_ATTACH_V1_ENABLED", raising=False)
-    assert orchestrator.main._datasource_scope_auto_attach_v1_enabled() is False
+    assert deployment_gates_module.datasource_scope_auto_attach_v1_enabled() is False
 
 
 def test_datasource_scope_feature_gate_accepts_true(monkeypatch):
     monkeypatch.setenv("DATASOURCE_SCOPE_AUTO_ATTACH_V1_ENABLED", "true")
-    assert orchestrator.main._datasource_scope_auto_attach_v1_enabled() is True
+    assert deployment_gates_module.datasource_scope_auto_attach_v1_enabled() is True

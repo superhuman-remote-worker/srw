@@ -31,6 +31,11 @@ from orchestrator.services.thread_control_inbox import (
     ControlAdmissionNotReady,
     admit_thread_control,
 )
+from orchestrator.application import sessions as sessions_composition
+from orchestrator.schemas import agent_thread_status as agent_thread_status_module
+from orchestrator.security import access as access_module
+from orchestrator.services import officer_conference as officer_conference_module
+from orchestrator.services import thread_retirement as thread_retirement_module
 
 
 THREAD_ID = UUID("11111111-aaaa-4444-8888-111111111111")
@@ -616,20 +621,22 @@ async def test_exact_pinned_ended_status_refuses_successor_binding():
     )
 
     with (
-        patch.object(orchestrator_main, "require_internal", AsyncMock()),
-        patch.object(orchestrator_main, "postgres_db", db),
+        patch.object(access_module, "require_internal", AsyncMock()),
+        patch.object(orchestrator_main.app.state.resources, "postgres_db", db),
     ):
         with pytest.raises(HTTPException) as exc:
             await agent_thread_status.update_thread_status(
                 str(THREAD_ID),
-                orchestrator_main.AgentThreadStatusRequest(
+                agent_thread_status_module.AgentThreadStatusRequest(
                     status="ended",
                     agent_id=AGENT_ID,
                     # A pinned status write names its exact registered process;
                     # the refusal under test is the endpoint's, not the model's.
                     process_generation=PROCESS_GENERATION,
                 ),
-                dependencies=orchestrator_main._agent_thread_status_dependencies(),
+                dependencies=sessions_composition.agent_thread_status_dependencies(
+                    orchestrator_main.app.state.resources
+                ),
             )
 
     assert exc.value.status_code == 409
@@ -665,18 +672,20 @@ async def test_exact_pinned_live_status_refuses_stale_pre_resume_agent(status):
     )
 
     with (
-        patch.object(orchestrator_main, "require_internal", AsyncMock()),
-        patch.object(orchestrator_main, "postgres_db", db),
+        patch.object(access_module, "require_internal", AsyncMock()),
+        patch.object(orchestrator_main.app.state.resources, "postgres_db", db),
     ):
         with pytest.raises(HTTPException) as exc:
             await agent_thread_status.update_thread_status(
                 str(THREAD_ID),
-                orchestrator_main.AgentThreadStatusRequest(
+                agent_thread_status_module.AgentThreadStatusRequest(
                     status=status,
                     agent_id=AGENT_ID,
                     process_generation=PROCESS_GENERATION,
                 ),
-                dependencies=orchestrator_main._agent_thread_status_dependencies(),
+                dependencies=sessions_composition.agent_thread_status_dependencies(
+                    orchestrator_main.app.state.resources
+                ),
             )
 
     assert exc.value.status_code == 409
@@ -721,27 +730,29 @@ async def test_exact_pinned_live_status_preserves_runtime_resources(status):
     conclude_conference = AsyncMock()
 
     with (
-        patch.object(orchestrator_main, "require_internal", AsyncMock()),
-        patch.object(orchestrator_main, "postgres_db", db),
+        patch.object(access_module, "require_internal", AsyncMock()),
+        patch.object(orchestrator_main.app.state.resources, "postgres_db", db),
         patch.object(
-            orchestrator_main.thread_retirement_operations.ThreadRetirementOperations,
+            thread_retirement_module.ThreadRetirementOperations,
             "suspend_thread_resources",
             suspend_resources,
         ),
         patch.object(
-            orchestrator_main, "_conclude_conference_if_any", conclude_conference
+            officer_conference_module, "conclude_conference_if_any", conclude_conference
         ),
     ):
         result = await agent_thread_status.update_thread_status(
             str(THREAD_ID),
-            orchestrator_main.AgentThreadStatusRequest(
+            agent_thread_status_module.AgentThreadStatusRequest(
                 status=status,
                 agent_id=AGENT_ID,
                 process_generation=PROCESS_GENERATION,
                 session_runtime_generation=RUNTIME_GENERATION,
                 session_runtime_attach_token=ATTACH_TOKEN,
             ),
-            dependencies=orchestrator_main._agent_thread_status_dependencies(),
+            dependencies=sessions_composition.agent_thread_status_dependencies(
+                orchestrator_main.app.state.resources
+            ),
         )
 
     assert result == {"status": status}
@@ -760,14 +771,18 @@ async def test_strict_pinned_status_phase_rejects_missing_identity(monkeypatch):
     )
     monkeypatch.setenv("REQUIRE_PINNED_STATUS_IDENTITY", "true")
     with (
-        patch.object(orchestrator_main, "require_internal", AsyncMock()),
-        patch.object(orchestrator_main, "postgres_db", db),
+        patch.object(access_module, "require_internal", AsyncMock()),
+        patch.object(orchestrator_main.app.state.resources, "postgres_db", db),
     ):
         with pytest.raises(HTTPException) as exc:
             await agent_thread_status.update_thread_status(
                 str(THREAD_ID),
-                orchestrator_main.AgentThreadStatusRequest(status="awaiting_user"),
-                dependencies=orchestrator_main._agent_thread_status_dependencies(),
+                agent_thread_status_module.AgentThreadStatusRequest(
+                    status="awaiting_user"
+                ),
+                dependencies=sessions_composition.agent_thread_status_dependencies(
+                    orchestrator_main.app.state.resources
+                ),
             )
 
     assert exc.value.status_code == 409

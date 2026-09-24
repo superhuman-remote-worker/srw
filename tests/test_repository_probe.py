@@ -11,6 +11,7 @@ from orchestrator.routers.datasources import (
 )
 from shared.runtime.services import forge
 from shared.runtime.services.forge import ForgeError, ForgeRepo, probe_repository_access
+from orchestrator.services import datasource_config as datasource_config_module
 
 
 def _route_deps(row: dict):
@@ -22,7 +23,9 @@ def _route_deps(row: dict):
     rather than awaited up front, which is what keeps an unexpected resolution
     failure inside the probe's own try/except.
     """
-    from orchestrator.main import _mcp_datasources_enabled, _validate_mcp_datasource
+    from orchestrator.services.deployment_gates import (
+        mcp_datasources_enabled as _mcp_datasources_enabled,
+    )
     from orchestrator.routers.datasources import DatasourcesDependencies
     from orchestrator.services.datasources import DatasourceDependencies
     from orchestrator.services.kb_task_registry import KbDatasourceTaskRegistry
@@ -43,7 +46,7 @@ def _route_deps(row: dict):
                 inject_system_kb_embedding_profile=AsyncMock(return_value=None),
             ),
             mcp_datasources_enabled=_mcp_datasources_enabled,
-            validate_mcp_datasource=_validate_mcp_datasource,
+            validate_mcp_datasource=datasource_config_module.validate_mcp_datasource,
         ),
         require_datasource_owner=AsyncMock(return_value=({}, row)),
     )

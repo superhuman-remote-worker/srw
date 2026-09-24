@@ -12,6 +12,17 @@ from fastapi import HTTPException
 
 import orchestrator.main as main
 from orchestrator.services.container_provisioner import WorkspaceCleanupOutcome
+from orchestrator.security import access as access_module
+from orchestrator.services import agent_provisioner as agent_provisioner_module
+from orchestrator.services import container_provisioner as container_provisioner_module
+from orchestrator.services import officer_conference as officer_conference_module
+from orchestrator.services import (
+    persistent_provisioner as persistent_provisioner_module,
+)
+from orchestrator.services import session_class_policy as session_class_policy_module
+from orchestrator.services import snapshot_service as snapshot_service_module
+from orchestrator.services import thread_retirement as thread_retirement_module
+from orchestrator.services import workspace_suspension as workspace_suspension_module
 
 
 THREAD_ID = "11111111-1111-4111-8111-111111111111"
@@ -313,14 +324,18 @@ async def test_duplicate_soft_end_reuses_settled_proof_without_effects() -> None
 
     with (
         patch.object(
-            main,
+            access_module,
             "require_thread_owner",
             AsyncMock(return_value=({"sub": "user-1"}, thread)),
         ),
-        patch.object(main, "postgres_db", db),
-        patch.object(main, "container_provisioner", provisioner),
-        patch.object(main, "snapshot_service", snapshots),
-        patch.object(main, "_conclude_conference_if_any", AsyncMock()),
+        patch.object(main.app.state.resources, "postgres_db", db),
+        patch.object(
+            container_provisioner_module, "container_provisioner", provisioner
+        ),
+        patch.object(snapshot_service_module, "snapshot_service", snapshots),
+        patch.object(
+            officer_conference_module, "conclude_conference_if_any", AsyncMock()
+        ),
     ):
         result = await control_seams.end_thread(
             THREAD_ID, SimpleNamespace(), permanent=False, force=True
@@ -350,13 +365,13 @@ async def test_permanent_end_retry_accepts_exact_process_zero_authority() -> Non
 
     with (
         patch.object(
-            main,
+            access_module,
             "require_thread_owner",
             AsyncMock(return_value=({"sub": "user-1"}, thread)),
         ),
-        patch.object(main, "postgres_db", db),
+        patch.object(main.app.state.resources, "postgres_db", db),
         patch.object(
-            main.thread_retirement_operations,
+            thread_retirement_module,
             "reconcile_stateless_thread_retirement",
             reconcile,
         ),
@@ -380,7 +395,7 @@ def test_process_zero_without_pending_retirement_stays_fail_closed() -> None:
     thread["metadata"].pop("_stateless_claim_retirement")
 
     with pytest.raises(HTTPException) as exc:
-        main._require_stateless_end_workspace(thread)
+        session_class_policy_module.require_stateless_end_workspace(thread)
 
     assert exc.value.status_code == 409
     assert "workspace_status_unavailable" in str(exc.value.detail)
@@ -452,7 +467,7 @@ async def test_process_zero_retry_retires_exact_live_residents_and_shell(
         acknowledge_stateless_thread_resident_retirement=AsyncMock(return_value=True),
         acknowledge_stateless_thread_shell_retirement=AsyncMock(return_value=True),
     )
-    teardown_identity = main.WorkspaceTeardownIdentity(
+    teardown_identity = container_provisioner_module.WorkspaceTeardownIdentity(
         pod_uid=RUNTIME,
         pvc_uid="44444444-4444-4444-8444-444444444444",
         service_uid="55555555-5555-4555-8555-555555555555",
@@ -503,9 +518,11 @@ async def test_process_zero_retry_retires_exact_live_residents_and_shell(
     monkeypatch.delenv("CLOUD_RCLONE_ALLOW_CONTAINER", raising=False)
 
     with (
-        patch.object(main, "postgres_db", db),
-        patch.object(main, "container_provisioner", provisioner),
-        patch.object(main, "main_cloud_router", cloud_router),
+        patch.object(main.app.state.resources, "postgres_db", db),
+        patch.object(
+            container_provisioner_module, "container_provisioner", provisioner
+        ),
+        patch.object(main.app.state.resources, "main_cloud_router", cloud_router),
         patch.object(
             retirement_service,
             "retire_stateless_workspace_residents",
@@ -571,12 +588,14 @@ async def test_end_holds_before_begin_when_published_runtime_cannot_reach_ready(
     suspension = SimpleNamespace()
 
     with (
-        patch.object(main, "postgres_db", db),
+        patch.object(main.app.state.resources, "postgres_db", db),
+        patch.object(thread_retirement_module, "ensure_session_workspace", ensure),
         patch.object(
-            main.thread_retirement_operations, "ensure_session_workspace", ensure
+            container_provisioner_module, "container_provisioner", provisioner
         ),
-        patch.object(main, "container_provisioner", provisioner),
-        patch.object(main, "workspace_suspension_service", suspension),
+        patch.object(
+            workspace_suspension_module, "workspace_suspension_service", suspension
+        ),
     ):
         with pytest.raises(HTTPException) as exc:
             await control_seams.reconcile_stateless_thread_retirement(
@@ -606,14 +625,20 @@ async def test_end_continues_exact_runtime_to_ready_before_begin() -> None:
     )
 
     with (
-        patch.object(main, "postgres_db", db),
+        patch.object(main.app.state.resources, "postgres_db", db),
         patch.object(
-            main.thread_retirement_operations,
+            thread_retirement_module,
             "ensure_session_workspace",
             AsyncMock(),
         ),
-        patch.object(main, "container_provisioner", SimpleNamespace()),
-        patch.object(main, "workspace_suspension_service", SimpleNamespace()),
+        patch.object(
+            container_provisioner_module, "container_provisioner", SimpleNamespace()
+        ),
+        patch.object(
+            workspace_suspension_module,
+            "workspace_suspension_service",
+            SimpleNamespace(),
+        ),
     ):
         with pytest.raises(HTTPException) as exc:
             await control_seams.reconcile_stateless_thread_retirement(
@@ -646,12 +671,16 @@ async def test_end_holds_when_creation_continuation_leaves_restore_debt() -> Non
     ensure = AsyncMock()
 
     with (
-        patch.object(main, "postgres_db", db),
+        patch.object(main.app.state.resources, "postgres_db", db),
+        patch.object(thread_retirement_module, "ensure_session_workspace", ensure),
         patch.object(
-            main.thread_retirement_operations, "ensure_session_workspace", ensure
+            container_provisioner_module, "container_provisioner", SimpleNamespace()
         ),
-        patch.object(main, "container_provisioner", SimpleNamespace()),
-        patch.object(main, "workspace_suspension_service", SimpleNamespace()),
+        patch.object(
+            workspace_suspension_module,
+            "workspace_suspension_service",
+            SimpleNamespace(),
+        ),
     ):
         with pytest.raises(HTTPException) as exc:
             await control_seams.reconcile_stateless_thread_retirement(
@@ -674,12 +703,16 @@ async def test_end_holds_markerless_ready_workspace_until_restore_clears() -> No
     ensure = AsyncMock()
 
     with (
-        patch.object(main, "postgres_db", db),
+        patch.object(main.app.state.resources, "postgres_db", db),
+        patch.object(thread_retirement_module, "ensure_session_workspace", ensure),
         patch.object(
-            main.thread_retirement_operations, "ensure_session_workspace", ensure
+            container_provisioner_module, "container_provisioner", SimpleNamespace()
         ),
-        patch.object(main, "container_provisioner", SimpleNamespace()),
-        patch.object(main, "workspace_suspension_service", SimpleNamespace()),
+        patch.object(
+            workspace_suspension_module,
+            "workspace_suspension_service",
+            SimpleNamespace(),
+        ),
     ):
         with pytest.raises(HTTPException) as exc:
             await control_seams.reconcile_stateless_thread_retirement(
@@ -706,12 +739,16 @@ async def test_end_begins_only_after_exact_restore_debt_is_cleared() -> None:
     ensure = AsyncMock()
 
     with (
-        patch.object(main, "postgres_db", db),
+        patch.object(main.app.state.resources, "postgres_db", db),
+        patch.object(thread_retirement_module, "ensure_session_workspace", ensure),
         patch.object(
-            main.thread_retirement_operations, "ensure_session_workspace", ensure
+            container_provisioner_module, "container_provisioner", SimpleNamespace()
         ),
-        patch.object(main, "container_provisioner", SimpleNamespace()),
-        patch.object(main, "workspace_suspension_service", SimpleNamespace()),
+        patch.object(
+            workspace_suspension_module,
+            "workspace_suspension_service",
+            SimpleNamespace(),
+        ),
     ):
         with pytest.raises(HTTPException) as exc:
             await control_seams.reconcile_stateless_thread_retirement(
@@ -749,7 +786,7 @@ async def test_delete_acceptance_cannot_finish_until_exact_old_uid_is_404() -> N
         begin_stateless_thread_workspace_retirement=AsyncMock(return_value=closure),
         finish_stateless_thread_workspace_retirement=AsyncMock(return_value=True),
     )
-    teardown_identity = main.WorkspaceTeardownIdentity(
+    teardown_identity = container_provisioner_module.WorkspaceTeardownIdentity(
         pod_uid=RUNTIME,
         pvc_uid="44444444-4444-4444-8444-444444444444",
         service_uid="55555555-5555-4555-8555-555555555555",
@@ -772,8 +809,10 @@ async def test_delete_acceptance_cannot_finish_until_exact_old_uid_is_404() -> N
     )
 
     with (
-        patch.object(main, "postgres_db", db),
-        patch.object(main, "container_provisioner", provisioner),
+        patch.object(main.app.state.resources, "postgres_db", db),
+        patch.object(
+            container_provisioner_module, "container_provisioner", provisioner
+        ),
     ):
         with pytest.raises(HTTPException) as exc:
             await control_seams.reconcile_stateless_thread_retirement(
@@ -860,8 +899,10 @@ async def test_exact_terminal_uid_acknowledges_then_deletes_through_finalizer_pa
     )
 
     with (
-        patch.object(main, "postgres_db", db),
-        patch.object(main, "container_provisioner", provisioner),
+        patch.object(main.app.state.resources, "postgres_db", db),
+        patch.object(
+            container_provisioner_module, "container_provisioner", provisioner
+        ),
     ):
         result = await control_seams.reconcile_stateless_thread_retirement(
             THREAD_ID, force=True, permanent=False
@@ -916,15 +957,23 @@ async def test_soft_end_to_permanent_reclaims_snapshot_before_row_delete(
 
     with (
         patch.object(
-            main,
+            access_module,
             "require_thread_owner",
             AsyncMock(return_value=({"sub": "user-1"}, thread)),
         ),
-        patch.object(main, "postgres_db", db),
-        patch.object(main, "container_provisioner", provisioner),
-        patch.object(main, "snapshot_service", snapshots),
-        patch.object(main, "gitea_client", SimpleNamespace(is_initialized=False)),
-        patch.object(main, "_conclude_conference_if_any", AsyncMock()),
+        patch.object(main.app.state.resources, "postgres_db", db),
+        patch.object(
+            container_provisioner_module, "container_provisioner", provisioner
+        ),
+        patch.object(snapshot_service_module, "snapshot_service", snapshots),
+        patch.object(
+            main.app.state.resources,
+            "gitea_client",
+            SimpleNamespace(is_initialized=False),
+        ),
+        patch.object(
+            officer_conference_module, "conclude_conference_if_any", AsyncMock()
+        ),
     ):
         if historical_clean:
             result = await control_seams.end_thread(
@@ -975,15 +1024,23 @@ async def test_snapshot_delete_failure_keeps_settled_thread_retryable() -> None:
 
     with (
         patch.object(
-            main,
+            access_module,
             "require_thread_owner",
             AsyncMock(return_value=({"sub": "user-1"}, thread)),
         ),
-        patch.object(main, "postgres_db", db),
-        patch.object(main, "container_provisioner", provisioner),
-        patch.object(main, "snapshot_service", snapshots),
-        patch.object(main, "gitea_client", SimpleNamespace(is_initialized=False)),
-        patch.object(main, "_conclude_conference_if_any", AsyncMock()),
+        patch.object(main.app.state.resources, "postgres_db", db),
+        patch.object(
+            container_provisioner_module, "container_provisioner", provisioner
+        ),
+        patch.object(snapshot_service_module, "snapshot_service", snapshots),
+        patch.object(
+            main.app.state.resources,
+            "gitea_client",
+            SimpleNamespace(is_initialized=False),
+        ),
+        patch.object(
+            officer_conference_module, "conclude_conference_if_any", AsyncMock()
+        ),
     ):
         with pytest.raises(HTTPException) as exc_info:
             await control_seams.end_thread(
@@ -1051,8 +1108,10 @@ async def test_missing_runtime_absence_matrix(
     )
 
     with (
-        patch.object(main, "postgres_db", db),
-        patch.object(main, "container_provisioner", provisioner),
+        patch.object(main.app.state.resources, "postgres_db", db),
+        patch.object(
+            container_provisioner_module, "container_provisioner", provisioner
+        ),
     ):
         if succeeds:
             result = await control_seams.reconcile_stateless_thread_retirement(
@@ -1095,8 +1154,10 @@ async def test_missing_runtime_nonabsence_refuses_before_queue_close(authority) 
     )
 
     with (
-        patch.object(main, "postgres_db", db),
-        patch.object(main, "container_provisioner", provisioner),
+        patch.object(main.app.state.resources, "postgres_db", db),
+        patch.object(
+            container_provisioner_module, "container_provisioner", provisioner
+        ),
         pytest.raises(HTTPException) as exc,
     ):
         await control_seams.reconcile_stateless_thread_retirement(
@@ -1142,8 +1203,10 @@ async def test_unsupported_absence_settled_proof_cannot_upgrade_to_permanent() -
     )
 
     with (
-        patch.object(main, "postgres_db", db),
-        patch.object(main, "container_provisioner", provisioner),
+        patch.object(main.app.state.resources, "postgres_db", db),
+        patch.object(
+            container_provisioner_module, "container_provisioner", provisioner
+        ),
     ):
         with pytest.raises(HTTPException) as exc:
             await control_seams.reconcile_stateless_thread_retirement(
@@ -1193,19 +1256,25 @@ async def test_direct_permanent_end_does_not_require_an_uncaptured_snapshot(
 
     with (
         patch.object(
-            main,
+            access_module,
             "require_thread_owner",
             AsyncMock(return_value=({"sub": "user-1"}, thread)),
         ),
-        patch.object(main, "postgres_db", db),
-        patch.object(main, "snapshot_service", snapshots),
-        patch.object(main, "gitea_client", SimpleNamespace(is_initialized=False)),
+        patch.object(main.app.state.resources, "postgres_db", db),
+        patch.object(snapshot_service_module, "snapshot_service", snapshots),
         patch.object(
-            main.thread_retirement_operations,
+            main.app.state.resources,
+            "gitea_client",
+            SimpleNamespace(is_initialized=False),
+        ),
+        patch.object(
+            thread_retirement_module,
             "reconcile_stateless_thread_retirement",
             reconcile,
         ),
-        patch.object(main, "_conclude_conference_if_any", AsyncMock()),
+        patch.object(
+            officer_conference_module, "conclude_conference_if_any", AsyncMock()
+        ),
     ):
         result = await control_seams.end_thread(
             THREAD_ID, SimpleNamespace(), permanent=True, force=True
@@ -1251,22 +1320,24 @@ async def test_emptydir_permanent_requires_snapshot_prefix_cleanup_after_restore
 
     with (
         patch.object(
-            main,
+            access_module,
             "require_thread_owner",
             AsyncMock(return_value=({"sub": "user-1"}, thread)),
         ),
-        patch.object(main, "postgres_db", db),
+        patch.object(main.app.state.resources, "postgres_db", db),
         patch.object(
-            main,
+            snapshot_service_module,
             "snapshot_service",
             SimpleNamespace(is_available=False),
         ),
         patch.object(
-            main.thread_retirement_operations,
+            thread_retirement_module,
             "reconcile_stateless_thread_retirement",
             reconcile,
         ),
-        patch.object(main, "_conclude_conference_if_any", AsyncMock()),
+        patch.object(
+            officer_conference_module, "conclude_conference_if_any", AsyncMock()
+        ),
         pytest.raises(HTTPException) as exc,
     ):
         await control_seams.end_thread(
@@ -1309,17 +1380,27 @@ async def test_permanent_virtual_end_purges_exact_workspace_before_row_delete(
 
     with (
         patch.object(
-            main,
+            access_module,
             "require_thread_owner",
             AsyncMock(return_value=({"sub": "user-1"}, thread)),
         ),
-        patch.object(main, "postgres_db", db),
-        patch.object(main, "snapshot_service", SimpleNamespace(is_available=False)),
+        patch.object(main.app.state.resources, "postgres_db", db),
+        patch.object(
+            snapshot_service_module,
+            "snapshot_service",
+            SimpleNamespace(is_available=False),
+        ),
         patch.object(
             thread_uploads, "purge_attested_stateless_virtual_workspace", purge
         ),
-        patch.object(main, "gitea_client", SimpleNamespace(is_initialized=False)),
-        patch.object(main, "_conclude_conference_if_any", AsyncMock()),
+        patch.object(
+            main.app.state.resources,
+            "gitea_client",
+            SimpleNamespace(is_initialized=False),
+        ),
+        patch.object(
+            officer_conference_module, "conclude_conference_if_any", AsyncMock()
+        ),
     ):
         if purged:
             result = await control_seams.end_thread(
@@ -1363,10 +1444,14 @@ async def test_stateless_legacy_suspend_caller_never_falls_through_to_pod_delete
     )
 
     with (
-        patch.object(main, "postgres_db", db),
-        patch.object(main, "workspace_suspension_service", suspension),
-        patch.object(main, "agent_provisioner", agent),
-        patch.object(main, "persistent_provisioner", persistent),
+        patch.object(main.app.state.resources, "postgres_db", db),
+        patch.object(
+            workspace_suspension_module, "workspace_suspension_service", suspension
+        ),
+        patch.object(agent_provisioner_module, "agent_provisioner", agent),
+        patch.object(
+            persistent_provisioner_module, "persistent_provisioner", persistent
+        ),
     ):
         await control_seams.suspend_thread_resources_inner(THREAD_ID)
 
@@ -1421,8 +1506,10 @@ async def test_release_never_starts_while_resident_proof_is_incomplete() -> None
     )
 
     with (
-        patch.object(main, "postgres_db", db),
-        patch.object(main, "container_provisioner", provisioner),
+        patch.object(main.app.state.resources, "postgres_db", db),
+        patch.object(
+            container_provisioner_module, "container_provisioner", provisioner
+        ),
     ):
         with pytest.raises(HTTPException) as exc_info:
             await control_seams.reconcile_stateless_thread_retirement(

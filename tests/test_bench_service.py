@@ -22,6 +22,11 @@ from orchestrator.services.bench import (
     sweep_run,
     sweep_tick,
 )
+from orchestrator.application import jobs as jobs_composition
+from orchestrator.security import access as access_module
+from orchestrator.services import job_mutation_controls as job_mutation_controls_module
+from orchestrator.services import session_tool_policy as session_tool_policy_module
+import functools
 
 RUN_ID = "11111111-1111-1111-1111-111111111111"
 USER_ID = "22222222-2222-2222-2222-222222222222"
@@ -538,32 +543,57 @@ async def test_application_cancel_adapter_revalidates_member_without_request(
     database.get_job = AsyncMock(return_value=job)
     authorize = AsyncMock(return_value=True)
     cancel = AsyncMock(return_value={"status": "cancelled"})
-    monkeypatch.setattr(main, "postgres_db", database)
-    monkeypatch.setattr(main, "user_can_access_job", authorize)
+    monkeypatch.setattr(main.app.state.resources, "postgres_db", database)
+    monkeypatch.setattr(access_module, "user_can_access_job", authorize)
     monkeypatch.setattr(
-        main.job_mutation_operations.JobControlOperations,
+        job_mutation_controls_module.JobControlOperations,
         "cancel",
         cancel,
     )
 
-    assert await main._cancel_bench_job("job-1", caller) == {"status": "cancelled"}
+    assert await jobs_composition.cancel_bench_job(
+        main.app.state.resources, "job-1", caller
+    ) == {"status": "cancelled"}
 
     authorize.assert_awaited_once_with(caller, database, "job-1")
     cancel.assert_awaited_once_with("job-1", job=job)
 
 
+def _bound_to_application(operation, function, resources) -> bool:
+    """``operation`` is ``function`` partially applied to exactly ``resources``."""
+
+    return (
+        isinstance(operation, functools.partial)
+        and operation.func is function
+        and len(operation.args) == 1
+        and operation.args[0] is resources
+        and not operation.keywords
+    )
+
+
 def test_application_factory_binds_complete_bench_dependencies():
     import orchestrator.main as main
 
-    dependencies = main._bench_dependencies()
+    dependencies = jobs_composition.bench_dependencies(main.app.state.resources)
 
-    assert dependencies.store.db is main.postgres_db
-    assert dependencies.create_job is main._create_bench_job
-    assert dependencies.validate_tool_overrides is main._with_validated_tool_overrides
-    assert dependencies.audit_reader is main.audit_reader
-    assert dependencies.forge is main.gitea_client
+    assert dependencies.store.db is main.app.state.resources.postgres_db
+    assert _bound_to_application(
+        dependencies.create_job,
+        jobs_composition.create_bench_job,
+        main.app.state.resources,
+    )
+    assert (
+        dependencies.validate_tool_overrides
+        is session_tool_policy_module.with_validated_tool_overrides
+    )
+    assert dependencies.audit_reader is main.app.state.resources.audit_reader
+    assert dependencies.forge is main.app.state.resources.gitea_client
     assert dependencies.resolve_job_repo is not None
-    assert dependencies.cancel_job is main._cancel_bench_job
+    assert _bound_to_application(
+        dependencies.cancel_job,
+        jobs_composition.cancel_bench_job,
+        main.app.state.resources,
+    )
 
 
 def test_seeded_queue_is_stable_and_skips_ledger_entries():

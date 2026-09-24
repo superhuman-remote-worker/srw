@@ -20,11 +20,18 @@ import pytest
 
 from tests import _b09_control_seams as control_seams
 
-from orchestrator.main import _resolve_session_config, _strip_acknowledged_grants
+import orchestrator.main
+from orchestrator.services.grant_enforcement import (
+    strip_acknowledged_grants as _strip_acknowledged_grants,
+)
 from orchestrator.services.config_drift import (
     acknowledged_drift_ids,
     acknowledged_grant_keys,
     strip_acknowledged,
+)
+from orchestrator.application import preparation as preparation_composition
+from orchestrator.services import (
+    session_config_resolution as session_config_resolution_module,
 )
 
 
@@ -124,9 +131,18 @@ async def test_resolve_session_config_strips_the_delivered_blob_not_just_the_cap
     metadata = {"config_drift_ack": {"grant:shell_tools": "revoked"}}
 
     with (
-        patch("orchestrator.main.postgres_db.fetchrow", AsyncMock(return_value=None)),
-        patch("orchestrator.main._is_experts_db_enabled", return_value=True),
-        patch("orchestrator.main._user_experts_enabled", AsyncMock(return_value=True)),
+        patch(
+            "orchestrator.main.app.state.resources.postgres_db.fetchrow",
+            AsyncMock(return_value=None),
+        ),
+        patch(
+            "orchestrator.services.deployment_gates.is_experts_db_enabled",
+            return_value=True,
+        ),
+        patch(
+            "orchestrator.services.grant_enforcement.user_experts_enabled",
+            AsyncMock(return_value=True),
+        ),
         # R1.B05 lane P: same-module sibling of the resolve once main
         # delegates to ``services.session_config_resolution`` — patch both so
         # the stub is reached before AND after the extraction.
@@ -135,21 +151,34 @@ async def test_resolve_session_config_strips_the_delivered_blob_not_just_the_cap
             ".resolve_session_account_defaults",
             AsyncMock(return_value={}),
         ),
-        patch("orchestrator.main._gather_in_scope_skills", AsyncMock(return_value={})),
-        patch("orchestrator.main._thread_project_ids", AsyncMock(return_value=[])),
+        # R1.B12: the session config dependencies reach the skill gatherer
+        # through ``catalogue.expert_catalog_service(resources)`` per call, so
+        # the double replaces the service method, not a main wrapper.
         patch(
-            "orchestrator.main._resolve_runner_grants",
+            "orchestrator.services.expert_catalog.ExpertCatalogService"
+            ".gather_in_scope_skills",
+            AsyncMock(return_value={}),
+        ),
+        patch(
+            "orchestrator.services.thread_mount_rows.thread_project_ids",
+            AsyncMock(return_value=[]),
+        ),
+        patch(
+            "orchestrator.services.grant_enforcement.resolve_runner_grants",
             AsyncMock(return_value={"shell_tools": False}),
         ),
         patch(
-            "orchestrator.main._inject_thread_dispatch_credentials",
+            "orchestrator.services.dispatch_credentials.inject_thread_dispatch_credentials",
             AsyncMock(side_effect=lambda co, **_kw: co),
         ),
     ):
-        delivered = await _resolve_session_config(
+        delivered = await session_config_resolution_module.resolve_session_config(
             thread,
             metadata,
             config_override={"tools": {"shell": ["run_command"]}},
+            dependencies=preparation_composition.session_config_dependencies(
+                orchestrator.main.app.state.resources
+            ),
         )
 
     assert delivered is not None
@@ -198,7 +227,7 @@ class TestConnectorStripIsConditionalOnCurrentAvailability:
         db.get_user = AsyncMock(return_value=_owner_row())
         db.get_datasource_policy_rows = AsyncMock(return_value=[_ds_row(DS_OK)])
 
-        with patch("orchestrator.main.postgres_db", db):
+        with patch("orchestrator.main.app.state.resources.postgres_db", db):
             (
                 selected,
                 revisions,
@@ -224,7 +253,7 @@ class TestConnectorStripIsConditionalOnCurrentAvailability:
         db.get_user = AsyncMock(return_value=_owner_row())
         db.get_datasource_policy_rows = AsyncMock(return_value=[])  # still gone
 
-        with patch("orchestrator.main.postgres_db", db):
+        with patch("orchestrator.main.app.state.resources.postgres_db", db):
             (
                 selected,
                 revisions,
@@ -252,7 +281,7 @@ class TestConnectorStripIsConditionalOnCurrentAvailability:
         db.get_user = AsyncMock(return_value=_owner_row())
         db.get_datasource_policy_rows = AsyncMock(return_value=[_ds_row(DS_OK)])
 
-        with patch("orchestrator.main.postgres_db", db):
+        with patch("orchestrator.main.app.state.resources.postgres_db", db):
             with pytest.raises(HTTPException) as exc:
                 await control_seams.revalidate_thread_datasource_selection(
                     thread, [DS_OK, DS_GONE], target_project_ids=[]
@@ -284,7 +313,7 @@ async def test_strip_still_denied_ack_translates_unavailable_to_403():
     db = AsyncMock()
     db.get_user = AsyncMock(return_value=_owner_row())
 
-    with patch("orchestrator.main.postgres_db", db):
+    with patch("orchestrator.main.app.state.resources.postgres_db", db):
         with pytest.raises(HTTPException) as exc:
             await control_seams.revalidate_thread_datasource_selection(
                 thread, ["not-a-uuid"], target_project_ids=[]

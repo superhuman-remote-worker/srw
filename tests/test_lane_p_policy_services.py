@@ -25,7 +25,6 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from fastapi import HTTPException
 
-import orchestrator.main as main
 from orchestrator.schemas.job_create import JobCreate
 from orchestrator.services import (
     agent_toolset_probe as toolset,
@@ -45,6 +44,23 @@ from orchestrator.services import (
     vm_workspace_policy as vmpolicy,
     workspace_tier_policy as tier,
 )
+from orchestrator.services import agent_toolset_probe as agent_toolset_probe_module
+from orchestrator.services import config_overrides as config_overrides_module
+from orchestrator.services import datasource_config as datasource_config_module
+from orchestrator.services import deployment_gates as deployment_gates_module
+from orchestrator.services import grant_enforcement as grant_enforcement_module
+from orchestrator.services import job_create_ingress as job_create_ingress_module
+from orchestrator.services import session_class_policy as session_class_policy_module
+from orchestrator.services import (
+    session_create_overrides as session_create_overrides_module,
+)
+from orchestrator.services import session_tool_policy as session_tool_policy_module
+from orchestrator.services import (
+    session_workspace_policy as session_workspace_policy_module,
+)
+from orchestrator.services import virtual_workspace as virtual_workspace_module
+from orchestrator.services import vm_workspace_policy as vm_workspace_policy_module
+from orchestrator.services import workspace_tier_policy as workspace_tier_policy_module
 
 # ---------------------------------------------------------------------------
 # Feature gates
@@ -55,44 +71,49 @@ from orchestrator.services import (
 _GATES = [
     (
         gates.is_experts_db_enabled,
-        main._is_experts_db_enabled,
+        deployment_gates_module.is_experts_db_enabled,
         "EXPERTS_DB_ENABLED",
         True,
     ),
     (
         gates.is_skills_db_enabled,
-        main._is_skills_db_enabled,
+        deployment_gates_module.is_skills_db_enabled,
         "SKILLS_DB_ENABLED",
         False,
     ),
     (
         gates.mcp_datasources_enabled,
-        main._mcp_datasources_enabled,
+        deployment_gates_module.mcp_datasources_enabled,
         "MCP_DATASOURCES_ENABLED",
         False,
     ),
     (
         gates.datasource_defaults_on_omission,
-        main._datasource_defaults_on_omission,
+        deployment_gates_module.datasource_defaults_on_omission,
         "DATASOURCE_DEFAULTS_ON_OMISSION",
         False,
     ),
     (
         gates.datasource_scope_auto_attach_v1_enabled,
-        main._datasource_scope_auto_attach_v1_enabled,
+        deployment_gates_module.datasource_scope_auto_attach_v1_enabled,
         "DATASOURCE_SCOPE_AUTO_ATTACH_V1_ENABLED",
         False,
     ),
-    (gates.mcp_stdio_enabled, main._mcp_stdio_enabled, "MCP_STDIO_ENABLED", False),
+    (
+        gates.mcp_stdio_enabled,
+        deployment_gates_module.mcp_stdio_enabled,
+        "MCP_STDIO_ENABLED",
+        False,
+    ),
     (
         gates.is_protected_cloud_mode_enabled,
-        main._is_protected_cloud_mode_enabled,
+        deployment_gates_module.is_protected_cloud_mode_enabled,
         "PROTECTED_CLOUD_MODE_ENABLED",
         False,
     ),
     (
         gates.require_pinned_status_identity,
-        main._require_pinned_status_identity,
+        deployment_gates_module.require_pinned_status_identity,
         "REQUIRE_PINNED_STATUS_IDENTITY",
         True,
     ),
@@ -185,7 +206,7 @@ def test_validate_mcp_datasource_matches_main(monkeypatch, url, creds, fragment)
             return (exc.status_code, str(exc.detail))
 
     moved = run(datasource_config.validate_mcp_datasource)
-    original = run(main._validate_mcp_datasource)
+    original = run(datasource_config_module.validate_mcp_datasource)
     assert moved == original
     if fragment is None:
         assert moved is None
@@ -244,9 +265,9 @@ class TestWorkspaceTierPolicy:
     )
     def test_backend_from_override_matches_main(self, override, expected):
         assert tier.backend_from_override(override) == expected
-        assert tier.backend_from_override(override) == main._backend_from_override(
+        assert tier.backend_from_override(
             override
-        )
+        ) == workspace_tier_policy_module.backend_from_override(override)
 
     def test_non_lite_returns_the_caller_object_itself(self):
         co = {"workspace": {"backend": "sandbox"}}
@@ -313,9 +334,9 @@ class TestWorkspaceTierPolicy:
     )
     def test_is_lite_config_override(self, override, expected):
         assert tier.is_lite_config_override(override) is expected
-        assert tier.is_lite_config_override(override) == main._is_lite_config_override(
+        assert tier.is_lite_config_override(
             override
-        )
+        ) == workspace_tier_policy_module.is_lite_config_override(override)
 
     def test_thread_workspace_backend_reads_json_metadata(self):
         thread = {
@@ -342,12 +363,12 @@ class TestObjectStoreStartupChecks:
         env = {"S3_ENDPOINT": "https://s3", "VIRTUAL_WORKSPACE_RCLONE_TYPE": "memory"}
         msg = virtual_workspace.object_store_startup_warning(env)
         assert "NON-DURABLE" in msg
-        assert msg == main._object_store_startup_warning(env)
+        assert msg == virtual_workspace_module.object_store_startup_warning(env)
 
     def test_unset_seams_name_both_failures(self):
         msg = virtual_workspace.object_store_startup_warning({})
         assert "S3_ENDPOINT unset" in msg and "LiteWorkspaceConfigError" in msg
-        assert msg == main._object_store_startup_warning({})
+        assert msg == virtual_workspace_module.object_store_startup_warning({})
 
     def test_warn_only_by_default(self):
         assert virtual_workspace.check_object_store_config({}) is not None
@@ -397,7 +418,7 @@ class TestSessionWorkspacePolicy:
         assert wspolicy.default_session_workspace_backend(settings) == expected
         assert wspolicy.default_session_workspace_backend(
             settings
-        ) == main._default_session_workspace_backend(settings)
+        ) == session_workspace_policy_module.default_session_workspace_backend(settings)
 
     def test_workspace_override_accepts_vm_and_rejects_unknown(self):
         assert wspolicy.validated_session_workspace_override(
@@ -492,7 +513,7 @@ class TestSessionClassPolicy:
         assert classes.protected_cloud_officer_active(config) is expected
         assert classes.protected_cloud_officer_active(
             config
-        ) == main._protected_cloud_officer_active(config)
+        ) == session_class_policy_module.protected_cloud_officer_active(config)
 
     @pytest.mark.parametrize(
         "config", [None, {"agent": 3}, {"officer": 5}, {"officer": {"enabled": 1}}]
@@ -744,13 +765,15 @@ class TestToolPolicyPrediction:
             request_override=override,
         )
         assert toolpolicy.merged_session_tool_groups(**kwargs) == (
-            main._merged_session_tool_groups(**kwargs)
+            session_tool_policy_module.merged_session_tool_groups(**kwargs)
         )
 
     @pytest.mark.parametrize("override", CASES)
     def test_legacy_groups_match_main(self, override):
         assert toolpolicy.legacy_session_tool_groups("session_base", override) == (
-            main._legacy_session_tool_groups("session_base", override)
+            session_tool_policy_module.legacy_session_tool_groups(
+                "session_base", override
+            )
         )
 
     def test_delegation_gate_applies_to_both_predictions(self):
@@ -831,7 +854,7 @@ class TestAgentToolsetProbe:
             toolset.Measurement({"core": []}, "t", {"a": 1}, None),
             toolset.Measurement({"core": []}, None, None, "thin", partial=True),
         ):
-            twin = main._Measurement(
+            twin = agent_toolset_probe_module.Measurement(
                 m.categories, m.observed_at, m.backend, m.reason, m.partial
             )
             assert toolset.origin_fields(m) == session_tool_view.origin_fields(twin)
@@ -977,7 +1000,9 @@ class TestGrantRefusalShapes:
         assert (
             detail == "config exceeds your capability grants: shell_tools; vm_workspace"
         )
-        assert detail == main._grant_violations_detail(["shell_tools", "vm_workspace"])
+        assert detail == grant_enforcement_module.grant_violations_detail(
+            ["shell_tools", "vm_workspace"]
+        )
 
     def test_endpoint_violations_detail_is_the_rendered_string(self):
         detail = sessioncfg.endpoint_violations_detail(["llm: no url"])
@@ -1002,7 +1027,7 @@ class TestStripAcknowledgedGrants:
         out = grants.strip_acknowledged_grants(
             fragment, {"shell_tools": False}, {"shell_tools"}
         )
-        assert out == main._strip_acknowledged_grants(
+        assert out == grant_enforcement_module.strip_acknowledged_grants(
             {"tools": {"shell": True}}, {"shell_tools": False}, {"shell_tools"}
         )
         assert not out.get("tools", {}).get("shell")
@@ -1335,7 +1360,9 @@ class TestVmWorkspacePolicy:
     )
     def test_vm_needs_release_matches_main(self, ctx, expected):
         assert vmpolicy.vm_needs_release(ctx) is expected
-        assert vmpolicy.vm_needs_release(ctx) == main._vm_needs_release(ctx)
+        assert vmpolicy.vm_needs_release(
+            ctx
+        ) == vm_workspace_policy_module.vm_needs_release(ctx)
 
 
 # ---------------------------------------------------------------------------
@@ -1372,7 +1399,7 @@ class TestPublicJobIngress:
     def test_stripping_matches_main(self):
         moved, original = self._job(), self._job()
         ingress.strip_public_job_reserved_markers(moved)
-        main._strip_public_job_reserved_markers(original)
+        job_create_ingress_module.strip_public_job_reserved_markers(original)
         assert moved.context == original.context
         assert moved.config_override == original.config_override
 
@@ -1411,11 +1438,11 @@ class TestPublicJobIngress:
         )
         assert (
             ingress.PUBLIC_JOB_CONTEXT_RESERVED_KEYS
-            == main._PUBLIC_JOB_CONTEXT_RESERVED_KEYS
+            == job_create_ingress_module.PUBLIC_JOB_CONTEXT_RESERVED_KEYS
         )
         assert (
             ingress.PUBLIC_JOB_CONFIG_RESERVED_KEYS
-            == main._PUBLIC_JOB_CONFIG_RESERVED_KEYS
+            == job_create_ingress_module.PUBLIC_JOB_CONFIG_RESERVED_KEYS
         )
 
 
@@ -1545,7 +1572,9 @@ class TestSessionCreateValidators:
         assert overrides.effective_officer_post_owned_refusal(config) == expected
         assert overrides.effective_officer_post_owned_refusal(
             config
-        ) == main._effective_officer_post_owned_refusal(config)
+        ) == session_create_overrides_module.effective_officer_post_owned_refusal(
+            config
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -2121,4 +2150,6 @@ class TestSessionPreflights:
 )
 def test_looks_like_uuid_matches_main(value, expected):
     assert config_overrides.looks_like_uuid(value) is expected
-    assert config_overrides.looks_like_uuid(value) == main._looks_like_uuid(value)
+    assert config_overrides.looks_like_uuid(
+        value
+    ) == config_overrides_module.looks_like_uuid(value)

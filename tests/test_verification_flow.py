@@ -10,6 +10,15 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from orchestrator.services import job_controls as job_controls_module
+from orchestrator.services import (
+    job_datasource_selection as job_datasource_selection_module,
+)
+from orchestrator.services import job_dispatcher as job_dispatcher_module
+from orchestrator.services import notification_service as notification_service_module
+from orchestrator.services import session_wake as session_wake_module
+from orchestrator.services import subjob_completion as subjob_completion_module
+import fastapi as fastapi_module
 
 
 TARGET_ID = "t1"
@@ -186,12 +195,9 @@ class TestRecordVerificationRound:
         """Two invalid submissions: plain 409s, no escalation, empty ledger.
         knowledge-history/done/rejected_verdict_livelocks_critic_and_wedges_parent.md
         """
-        import orchestrator.main as main_module
 
         escalate = AsyncMock()
-        monkeypatch.setattr(
-            main_module.subjob_completion_operations, "escalate_target", escalate
-        )
+        monkeypatch.setattr(subjob_completion_module, "escalate_target", escalate)
 
         for _ in range(2):
             exc = await self._submit_invalid(fake_db, "c1")
@@ -206,12 +212,9 @@ class TestRecordVerificationRound:
         """The cap: rejection 3 escalates the TARGET (via _escalate_target,
         which stays loop-aware) and flags the 409 so the agent-side client
         turns its retry instruction into a stop order."""
-        import orchestrator.main as main_module
 
         escalate = AsyncMock()
-        monkeypatch.setattr(
-            main_module.subjob_completion_operations, "escalate_target", escalate
-        )
+        monkeypatch.setattr(subjob_completion_module, "escalate_target", escalate)
 
         await self._submit_invalid(fake_db, "c1")
         await self._submit_invalid(fake_db, "c1")
@@ -230,12 +233,9 @@ class TestRecordVerificationRound:
     async def test_rejection_counter_is_per_critic(self, fake_db, monkeypatch):
         """A fresh critic (new round) starts at zero — c1 exhausting the cap
         must not poison c2."""
-        import orchestrator.main as main_module
 
         escalate = AsyncMock()
-        monkeypatch.setattr(
-            main_module.subjob_completion_operations, "escalate_target", escalate
-        )
+        monkeypatch.setattr(subjob_completion_module, "escalate_target", escalate)
 
         for _ in range(3):
             await self._submit_invalid(fake_db, "c1")
@@ -823,7 +823,10 @@ class TestLedgerIsNotPubliclySeedable:
     """
 
     def test_verification_rounds_is_stripped_from_a_public_payload(self):
-        from orchestrator.main import JobCreate, _strip_public_job_reserved_markers
+        from orchestrator.schemas.job_create import JobCreate
+        from orchestrator.services.job_create_ingress import (
+            strip_public_job_reserved_markers as _strip_public_job_reserved_markers,
+        )
 
         job = JobCreate(
             description="d",
@@ -842,7 +845,9 @@ class TestLedgerIsNotPubliclySeedable:
     def test_it_joins_the_other_verification_markers(self):
         """``verification_target`` was already stripped; the ledger the target
         side of that pair owns must be too."""
-        from orchestrator.main import _PUBLIC_JOB_CONTEXT_RESERVED_KEYS
+        from orchestrator.services.job_create_ingress import (
+            PUBLIC_JOB_CONTEXT_RESERVED_KEYS as _PUBLIC_JOB_CONTEXT_RESERVED_KEYS,
+        )
 
         assert "verification_target" in _PUBLIC_JOB_CONTEXT_RESERVED_KEYS
         assert "verification_rounds" in _PUBLIC_JOB_CONTEXT_RESERVED_KEYS
@@ -1141,7 +1146,11 @@ class TestEscalateTarget:
         from tests.b08_completion_helpers import escalate_target as _escalate_target
 
         update_mock = AsyncMock()
-        monkeypatch.setattr(main_module.postgres_db, "update_job_status", update_mock)
+        monkeypatch.setattr(
+            main_module.app.state.resources.postgres_db,
+            "update_job_status",
+            update_mock,
+        )
 
         job = {"id": "t1", "context": {}}
         status = await _escalate_target("t1", job, "no progress: still broken")
@@ -1159,7 +1168,11 @@ class TestEscalateTarget:
         from tests.b08_completion_helpers import escalate_target as _escalate_target
 
         update_mock = AsyncMock()
-        monkeypatch.setattr(main_module.postgres_db, "update_job_status", update_mock)
+        monkeypatch.setattr(
+            main_module.app.state.resources.postgres_db,
+            "update_job_status",
+            update_mock,
+        )
 
         job = {"id": "t1", "context": {"loop_id": "loop-1"}}
         status = await _escalate_target("t1", job, "round limit reached")
@@ -1176,11 +1189,13 @@ def _patch_escalation_collaborators(monkeypatch, main_module):
     wake_mock = AsyncMock()
     kick_mock = MagicMock()
     notify_mock = AsyncMock()
-    monkeypatch.setattr(main_module.postgres_db, "update_job_status", update_mock)
-    monkeypatch.setattr(main_module, "maybe_wake_session", wake_mock)
-    monkeypatch.setattr(main_module, "_kick_session_wake_drain", kick_mock)
     monkeypatch.setattr(
-        main_module.notification_service,
+        main_module.app.state.resources.postgres_db, "update_job_status", update_mock
+    )
+    monkeypatch.setattr(session_wake_module, "maybe_wake_session", wake_mock)
+    monkeypatch.setattr(session_wake_module, "kick_drain", kick_mock)
+    monkeypatch.setattr(
+        notification_service_module.notification_service,
         "record_review_returned",
         notify_mock,
     )
@@ -1208,9 +1223,9 @@ class TestEscalateTargetWakesAndNotifies:
         await _escalate_target("t1", job, "no progress")
 
         wake_mock.assert_awaited_once_with(
-            main_module.postgres_db, "t1", "pending_review"
+            main_module.app.state.resources.postgres_db, "t1", "pending_review"
         )
-        kick_mock.assert_called_once_with(main_module.postgres_db)
+        kick_mock.assert_called_once_with(main_module.app.state.resources.postgres_db)
 
     @pytest.mark.asyncio
     async def test_wake_uses_the_loop_terminal_status(self, monkeypatch):
@@ -1222,7 +1237,9 @@ class TestEscalateTargetWakesAndNotifies:
         job = {"id": "t1", "context": {"loop_id": "l1"}, "user_id": "u1"}
         await _escalate_target("t1", job, "round limit reached")
 
-        wake_mock.assert_awaited_once_with(main_module.postgres_db, "t1", "completed")
+        wake_mock.assert_awaited_once_with(
+            main_module.app.state.resources.postgres_db, "t1", "completed"
+        )
 
     @pytest.mark.asyncio
     async def test_notifies_the_owner_with_the_reason(self, monkeypatch):
@@ -1371,7 +1388,11 @@ class TestTriggerVerificationContentTreeWiring:
         )
 
         update_mock = AsyncMock()
-        monkeypatch.setattr(main_module.postgres_db, "update_job_status", update_mock)
+        monkeypatch.setattr(
+            main_module.app.state.resources.postgres_db,
+            "update_job_status",
+            update_mock,
+        )
 
         prior_round = {
             "round": 1,
@@ -1412,23 +1433,29 @@ class TestTriggerVerificationContentTreeWiring:
         )
 
         update_mock = AsyncMock()
-        monkeypatch.setattr(main_module.postgres_db, "update_job_status", update_mock)
         monkeypatch.setattr(
-            main_module.postgres_db,
+            main_module.app.state.resources.postgres_db,
+            "update_job_status",
+            update_mock,
+        )
+        monkeypatch.setattr(
+            main_module.app.state.resources.postgres_db,
             "create_job",
             AsyncMock(return_value={"id": "critic-999"}),
         )
-        monkeypatch.setattr(main_module, "_trigger_dispatch", lambda: None)
+        monkeypatch.setattr(
+            job_dispatcher_module, "trigger_dispatch", lambda *, dependencies: None
+        )
         # No critic in flight — this test is about the gate, not the
         # duplicate-spawn guard (which fails closed on the non-UUID id here).
         monkeypatch.setattr(
-            main_module.postgres_db,
+            main_module.app.state.resources.postgres_db,
             "has_live_verification_critic",
             AsyncMock(return_value=False),
         )
         monkeypatch.setattr(
-            main_module,
-            "_revalidate_job_datasource_selection",
+            job_datasource_selection_module,
+            "revalidate_job_datasource_selection",
             AsyncMock(return_value=([], {})),
         )
 
@@ -1465,7 +1492,11 @@ class TestTriggerVerificationContentTreeWiring:
         )
 
         update_mock = AsyncMock()
-        monkeypatch.setattr(main_module.postgres_db, "update_job_status", update_mock)
+        monkeypatch.setattr(
+            main_module.app.state.resources.postgres_db,
+            "update_job_status",
+            update_mock,
+        )
 
         prior_round = {
             "round": 1,
@@ -1529,8 +1560,14 @@ class TestUndeliveredCompletionSkipsTheCritic:
 
         update_mock = AsyncMock()
         create_mock = AsyncMock(return_value={"id": "critic-999"})
-        monkeypatch.setattr(main_module.postgres_db, "update_job_status", update_mock)
-        monkeypatch.setattr(main_module.postgres_db, "create_job", create_mock)
+        monkeypatch.setattr(
+            main_module.app.state.resources.postgres_db,
+            "update_job_status",
+            update_mock,
+        )
+        monkeypatch.setattr(
+            main_module.app.state.resources.postgres_db, "create_job", create_mock
+        )
 
         # No prior rounds: the gate would otherwise say "spawn", so an escalation
         # here can only come from the delivery check.
@@ -1559,21 +1596,27 @@ class TestUndeliveredCompletionSkipsTheCritic:
         )
 
         update_mock = AsyncMock()
-        monkeypatch.setattr(main_module.postgres_db, "update_job_status", update_mock)
         monkeypatch.setattr(
-            main_module.postgres_db,
+            main_module.app.state.resources.postgres_db,
+            "update_job_status",
+            update_mock,
+        )
+        monkeypatch.setattr(
+            main_module.app.state.resources.postgres_db,
             "create_job",
             AsyncMock(return_value={"id": "critic-999"}),
         )
-        monkeypatch.setattr(main_module, "_trigger_dispatch", lambda: None)
         monkeypatch.setattr(
-            main_module.postgres_db,
+            job_dispatcher_module, "trigger_dispatch", lambda *, dependencies: None
+        )
+        monkeypatch.setattr(
+            main_module.app.state.resources.postgres_db,
             "has_live_verification_critic",
             AsyncMock(return_value=False),
         )
         monkeypatch.setattr(
-            main_module,
-            "_revalidate_job_datasource_selection",
+            job_datasource_selection_module,
+            "revalidate_job_datasource_selection",
             AsyncMock(return_value=([], {})),
         )
 
@@ -1596,9 +1639,13 @@ class TestUndeliveredCompletionSkipsTheCritic:
         )
 
         update_mock = AsyncMock()
-        monkeypatch.setattr(main_module.postgres_db, "update_job_status", update_mock)
         monkeypatch.setattr(
-            main_module.postgres_db,
+            main_module.app.state.resources.postgres_db,
+            "update_job_status",
+            update_mock,
+        )
+        monkeypatch.setattr(
+            main_module.app.state.resources.postgres_db,
             "create_job",
             AsyncMock(return_value={"id": "critic-999"}),
         )
@@ -1634,19 +1681,27 @@ class TestNoDuplicateCriticSpawn:
     @staticmethod
     def _patch(monkeypatch, main_module, *, live_critic: bool):
         create_job_mock = AsyncMock(return_value={"id": "critic-999"})
-        monkeypatch.setattr(main_module.postgres_db, "create_job", create_job_mock)
         monkeypatch.setattr(
-            main_module.postgres_db,
+            main_module.app.state.resources.postgres_db, "create_job", create_job_mock
+        )
+        monkeypatch.setattr(
+            main_module.app.state.resources.postgres_db,
             "has_live_verification_critic",
             AsyncMock(return_value=live_critic),
         )
         monkeypatch.setattr(
-            main_module,
-            "_revalidate_job_datasource_selection",
+            job_datasource_selection_module,
+            "revalidate_job_datasource_selection",
             AsyncMock(return_value=([], {})),
         )
-        monkeypatch.setattr(main_module.postgres_db, "update_job_status", AsyncMock())
-        monkeypatch.setattr(main_module, "_trigger_dispatch", lambda: None)
+        monkeypatch.setattr(
+            main_module.app.state.resources.postgres_db,
+            "update_job_status",
+            AsyncMock(),
+        )
+        monkeypatch.setattr(
+            job_dispatcher_module, "trigger_dispatch", lambda *, dependencies: None
+        )
         return create_job_mock
 
     @pytest.mark.asyncio
@@ -1706,19 +1761,23 @@ class TestNoDuplicateCriticSpawn:
             return {"id": "critic-999"}
 
         monkeypatch.setattr(
-            main_module.postgres_db,
+            main_module.app.state.resources.postgres_db,
             "has_live_verification_critic",
             AsyncMock(side_effect=_guard),
         )
         monkeypatch.setattr(
-            main_module.postgres_db, "create_job", AsyncMock(side_effect=_create)
+            main_module.app.state.resources.postgres_db,
+            "create_job",
+            AsyncMock(side_effect=_create),
         )
         monkeypatch.setattr(
-            main_module,
-            "_revalidate_job_datasource_selection",
+            job_datasource_selection_module,
+            "revalidate_job_datasource_selection",
             AsyncMock(return_value=([], {})),
         )
-        monkeypatch.setattr(main_module, "_trigger_dispatch", lambda: None)
+        monkeypatch.setattr(
+            job_dispatcher_module, "trigger_dispatch", lambda *, dependencies: None
+        )
 
         job = _make_completion_job(freeze_content_tree="aaa", verification_rounds=[])
         await _trigger_verification_on_complete(
@@ -1737,24 +1796,22 @@ class TestCriticDatasourceFailureUnblocksTarget:
         )
 
         monkeypatch.setattr(
-            main_module.postgres_db,
+            main_module.app.state.resources.postgres_db,
             "has_live_verification_critic",
             AsyncMock(return_value=False),
         )
         monkeypatch.setattr(
-            main_module,
-            "_revalidate_job_datasource_selection",
+            job_datasource_selection_module,
+            "revalidate_job_datasource_selection",
             AsyncMock(
-                side_effect=main_module.HTTPException(
+                side_effect=fastapi_module.HTTPException(
                     status_code=403,
                     detail="One or more selected connectors are unavailable",
                 )
             ),
         )
         escalate = AsyncMock(return_value="pending_review")
-        monkeypatch.setattr(
-            main_module.subjob_completion_operations, "escalate_target", escalate
-        )
+        monkeypatch.setattr(subjob_completion_module, "escalate_target", escalate)
 
         job = _make_completion_job(freeze_content_tree="aaa", verification_rounds=[])
         actions: list[str] = []
@@ -1862,18 +1919,22 @@ class TestTriggerVerificationInstructionsWiring:
         )
 
         create_job_mock = AsyncMock(return_value={"id": "critic-999"})
-        monkeypatch.setattr(main_module.postgres_db, "create_job", create_job_mock)
-        monkeypatch.setattr(main_module, "_trigger_dispatch", lambda: None)
+        monkeypatch.setattr(
+            main_module.app.state.resources.postgres_db, "create_job", create_job_mock
+        )
+        monkeypatch.setattr(
+            job_dispatcher_module, "trigger_dispatch", lambda *, dependencies: None
+        )
         # No critic in flight — this test is about the gate, not the
         # duplicate-spawn guard (which fails closed on the non-UUID id here).
         monkeypatch.setattr(
-            main_module.postgres_db,
+            main_module.app.state.resources.postgres_db,
             "has_live_verification_critic",
             AsyncMock(return_value=False),
         )
         monkeypatch.setattr(
-            main_module,
-            "_revalidate_job_datasource_selection",
+            job_datasource_selection_module,
+            "revalidate_job_datasource_selection",
             AsyncMock(return_value=([], {})),
         )
 
@@ -1927,16 +1988,20 @@ class TestTriggerVerificationInstructionsWiring:
         )
 
         create_job_mock = AsyncMock(return_value={"id": "critic-999"})
-        monkeypatch.setattr(main_module.postgres_db, "create_job", create_job_mock)
-        monkeypatch.setattr(main_module, "_trigger_dispatch", lambda: None)
         monkeypatch.setattr(
-            main_module.postgres_db,
+            main_module.app.state.resources.postgres_db, "create_job", create_job_mock
+        )
+        monkeypatch.setattr(
+            job_dispatcher_module, "trigger_dispatch", lambda *, dependencies: None
+        )
+        monkeypatch.setattr(
+            main_module.app.state.resources.postgres_db,
             "has_live_verification_critic",
             AsyncMock(return_value=False),
         )
         monkeypatch.setattr(
-            main_module,
-            "_revalidate_job_datasource_selection",
+            job_datasource_selection_module,
+            "revalidate_job_datasource_selection",
             AsyncMock(return_value=([], {})),
         )
 
@@ -2102,8 +2167,14 @@ class TestHandleCriticVerdictOnCompleteWiring:
 
         get_job_mock = AsyncMock()
         update_mock = AsyncMock()
-        monkeypatch.setattr(main_module.postgres_db, "get_job", get_job_mock)
-        monkeypatch.setattr(main_module.postgres_db, "update_job_status", update_mock)
+        monkeypatch.setattr(
+            main_module.app.state.resources.postgres_db, "get_job", get_job_mock
+        )
+        monkeypatch.setattr(
+            main_module.app.state.resources.postgres_db,
+            "update_job_status",
+            update_mock,
+        )
 
         job = _make_critic_job(
             critic_job_id="child-1",
@@ -2134,8 +2205,14 @@ class TestHandleCriticVerdictOnCompleteWiring:
 
         get_job_mock = AsyncMock()
         update_mock = AsyncMock()
-        monkeypatch.setattr(main_module.postgres_db, "get_job", get_job_mock)
-        monkeypatch.setattr(main_module.postgres_db, "update_job_status", update_mock)
+        monkeypatch.setattr(
+            main_module.app.state.resources.postgres_db, "get_job", get_job_mock
+        )
+        monkeypatch.setattr(
+            main_module.app.state.resources.postgres_db,
+            "update_job_status",
+            update_mock,
+        )
 
         job = _make_critic_job(status="paused")
         job["freeze_data"] = {"freeze_type": "llm_unavailable"}
@@ -2168,11 +2245,13 @@ class TestHandleCriticVerdictOnCompleteWiring:
             ]
         )
         monkeypatch.setattr(
-            main_module.postgres_db, "get_job", AsyncMock(return_value=target)
+            main_module.app.state.resources.postgres_db,
+            "get_job",
+            AsyncMock(return_value=target),
         )
         set_status_mock = AsyncMock(return_value="completed")
         monkeypatch.setattr(
-            main_module.subjob_completion_operations,
+            subjob_completion_module,
             "set_target_to_autonomy_status",
             set_status_mock,
         )
@@ -2208,11 +2287,13 @@ class TestHandleCriticVerdictOnCompleteWiring:
             ]
         )
         monkeypatch.setattr(
-            main_module.postgres_db, "get_job", AsyncMock(return_value=target)
+            main_module.app.state.resources.postgres_db,
+            "get_job",
+            AsyncMock(return_value=target),
         )
         resume_mock = AsyncMock()
         monkeypatch.setattr(
-            main_module.job_control_operations.JobControlOperations,
+            job_controls_module.JobControlOperations,
             "internal_resume_job",
             resume_mock,
         )
@@ -2266,11 +2347,17 @@ class TestHandleCriticVerdictOnCompleteWiring:
             ]
         )
         monkeypatch.setattr(
-            main_module.postgres_db, "get_job", AsyncMock(return_value=target)
+            main_module.app.state.resources.postgres_db,
+            "get_job",
+            AsyncMock(return_value=target),
         )
         queue_mock = AsyncMock(return_value=True)
-        monkeypatch.setattr(main_module.postgres_db, "queue_job_for_resume", queue_mock)
-        monkeypatch.setattr(main_module, "_trigger_dispatch", MagicMock())
+        monkeypatch.setattr(
+            main_module.app.state.resources.postgres_db,
+            "queue_job_for_resume",
+            queue_mock,
+        )
+        monkeypatch.setattr(job_dispatcher_module, "trigger_dispatch", MagicMock())
 
         await _handle_critic_verdict_on_complete(_make_critic_job(), [])
 
@@ -2319,11 +2406,13 @@ class TestHandleCriticVerdictOnCompleteWiring:
             ]
         )
         monkeypatch.setattr(
-            main_module.postgres_db, "get_job", AsyncMock(return_value=target)
+            main_module.app.state.resources.postgres_db,
+            "get_job",
+            AsyncMock(return_value=target),
         )
         resume_mock = AsyncMock()
         monkeypatch.setattr(
-            main_module.job_control_operations.JobControlOperations,
+            job_controls_module.JobControlOperations,
             "internal_resume_job",
             resume_mock,
         )
@@ -2349,10 +2438,16 @@ class TestHandleCriticVerdictOnCompleteWiring:
 
         target = _make_target_job(rounds=[])
         monkeypatch.setattr(
-            main_module.postgres_db, "get_job", AsyncMock(return_value=target)
+            main_module.app.state.resources.postgres_db,
+            "get_job",
+            AsyncMock(return_value=target),
         )
         update_mock = AsyncMock()
-        monkeypatch.setattr(main_module.postgres_db, "update_job_status", update_mock)
+        monkeypatch.setattr(
+            main_module.app.state.resources.postgres_db,
+            "update_job_status",
+            update_mock,
+        )
 
         job = _make_critic_job()
         actions: list[str] = []
@@ -2374,10 +2469,16 @@ class TestHandleCriticVerdictOnCompleteWiring:
 
         target = _make_target_job(rounds=[], is_loop=True)
         monkeypatch.setattr(
-            main_module.postgres_db, "get_job", AsyncMock(return_value=target)
+            main_module.app.state.resources.postgres_db,
+            "get_job",
+            AsyncMock(return_value=target),
         )
         update_mock = AsyncMock()
-        monkeypatch.setattr(main_module.postgres_db, "update_job_status", update_mock)
+        monkeypatch.setattr(
+            main_module.app.state.resources.postgres_db,
+            "update_job_status",
+            update_mock,
+        )
 
         job = _make_critic_job()
         actions: list[str] = []
@@ -2415,13 +2516,19 @@ class TestHandleCriticVerdictOnCompleteWiring:
             ]
         )
         monkeypatch.setattr(
-            main_module.postgres_db, "get_job", AsyncMock(return_value=target)
+            main_module.app.state.resources.postgres_db,
+            "get_job",
+            AsyncMock(return_value=target),
         )
         update_mock = AsyncMock()
-        monkeypatch.setattr(main_module.postgres_db, "update_job_status", update_mock)
+        monkeypatch.setattr(
+            main_module.app.state.resources.postgres_db,
+            "update_job_status",
+            update_mock,
+        )
         set_status_mock = AsyncMock()
         monkeypatch.setattr(
-            main_module.subjob_completion_operations,
+            subjob_completion_module,
             "set_target_to_autonomy_status",
             set_status_mock,
         )

@@ -200,7 +200,7 @@ async def parent(migrated_dsn, monkeypatch):
             runtime_attach_token=binding["runtime_attach_token"],
         )
         assert await agent.session_parent_authority_current(authority) is True
-        monkeypatch.setattr(main, "postgres_db", db)
+        monkeypatch.setattr(main.app.state.resources, "postgres_db", db)
         monkeypatch.setattr(access, "_INTERNAL_KEY", "draft-test-internal-key")
         requests = []
 

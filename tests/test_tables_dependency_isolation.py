@@ -16,6 +16,9 @@ from orchestrator.routers.tables import (
     router,
 )
 from orchestrator.security import auth
+from orchestrator.application import access as access_composition
+from orchestrator.security import access as access_module
+from orchestrator.security import auth as auth_module
 
 
 def make_app(db):
@@ -132,11 +135,11 @@ async def test_main_admin_adapter_preserves_call_time_auth_and_audit_bindings(
     request = Request(
         {"type": "http", "method": "GET", "path": "/api/tables", "headers": []}
     )
-    monkeypatch.setattr(main, "postgres_db", db)
-    monkeypatch.setattr(main, "require_approved_user", resolver)
-    monkeypatch.setattr(main, "log_security_event", audit)
+    monkeypatch.setattr(main.app.state.resources, "postgres_db", db)
+    monkeypatch.setattr(auth_module, "require_approved_user", resolver)
+    monkeypatch.setattr(access_module, "log_security_event", audit)
     with pytest.raises(HTTPException) as caught:
-        await main._require_admin(request)
+        await access_composition.require_admin(main.app.state.resources, request)
     assert caught.value.status_code == 403
     assert caught.value.detail == "Admin access required"
     resolver.assert_awaited_once_with(request, db)

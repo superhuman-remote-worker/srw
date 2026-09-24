@@ -61,6 +61,9 @@ from agent.services.knowledge.bindings import (
     build_knowledge_bindings,
 )
 from tests._fs_backend import FilesystemTestBackend
+from orchestrator.services import datasource_config as datasource_config_module
+from orchestrator.services import deployment_gates as deployment_gates_module
+from orchestrator.services import session_tool_policy as session_tool_policy_module
 
 
 def _index_deps(store) -> KnowledgeIndexDependencies:
@@ -97,7 +100,6 @@ def _projects_deps(store, gitea=None, **gates) -> ProjectsDependencies:
     ``orchestrator.security.access`` implementation the dataclass defaults to —
     which is what an unpatched ``main`` global used to resolve to.
     """
-    from orchestrator import main
 
     forge = gitea if gitea is not None else MagicMock(is_initialized=False)
     gates.setdefault("require_admin", AsyncMock())
@@ -111,7 +113,7 @@ def _projects_deps(store, gitea=None, **gates) -> ProjectsDependencies:
             main_cloud_router=MagicMock(),
             logger=logging.getLogger("test.kb_native"),
             provisioning=_provisioning_deps(store, forge),
-            with_validated_tool_overrides=main._with_validated_tool_overrides,
+            with_validated_tool_overrides=session_tool_policy_module.with_validated_tool_overrides,
         ),
         **gates,
     )
@@ -133,7 +135,6 @@ def _attach_deps(store, gitea) -> ProjectsDependencies:
 
 def _ds_deps(store=None, **gates) -> DatasourcesDependencies:
     """Connector router dependencies, composed the way main's factory does."""
-    from orchestrator import main
 
     db = MagicMock() if store is None else store
     return DatasourcesDependencies(
@@ -142,8 +143,8 @@ def _ds_deps(store=None, **gates) -> DatasourcesDependencies:
             store=db,
             vector_db=MagicMock(),
             knowledge_index=_index_deps(db),
-            mcp_datasources_enabled=main._mcp_datasources_enabled,
-            validate_mcp_datasource=main._validate_mcp_datasource,
+            mcp_datasources_enabled=deployment_gates_module.mcp_datasources_enabled,
+            validate_mcp_datasource=datasource_config_module.validate_mcp_datasource,
         ),
         **gates,
     )

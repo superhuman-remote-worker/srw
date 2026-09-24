@@ -18,6 +18,7 @@ from pathlib import Path
 import pytest
 
 from orchestrator.database.postgres import KNOWN_JOB_ORIGINS
+from orchestrator.application import jobs as jobs_composition
 
 ROOT = Path(__file__).resolve().parents[1]
 ORCHESTRATOR = ROOT / "src" / "orchestrator"
@@ -51,9 +52,7 @@ class TestSubmittedJobOriginResolution:
 
     @pytest.fixture(autouse=True)
     def _resolver(self):
-        from orchestrator.main import _resolve_submitted_job_origin
-
-        self.resolve = _resolve_submitted_job_origin
+        self.resolve = jobs_composition.resolve_submitted_job_origin
 
     def test_a_plain_submission_is_user(self):
         assert self.resolve(context=None, parent_job_id=None, thread_id=None) == "user"

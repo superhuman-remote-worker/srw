@@ -21,12 +21,18 @@ from tests._workspace_recovery_fakes import idle_recovery_store
 import pytest
 
 # R1.B06: these handlers moved to services/thread_config_update with their
-# routes in routers/thread_config. main's dependency factory still reads
-# main's attributes at call time, so the patches below keep steering what
-# they steered before.
+# routes in routers/thread_config. The application's dependency factory
+# (``orchestrator.application.sessions``) reads the provisioner singleton from
+# its owning module and the store from ``app.state.resources`` at call time.
 from orchestrator.services import thread_config_update  # noqa: E402
 
 import orchestrator.main as orch_main
+from orchestrator.application import sessions as sessions_composition
+from orchestrator.security import access as access_module
+from orchestrator.services import vm_provisioner as vm_provisioner_module
+import dataclasses
+
+import fastapi as fastapi_module
 
 
 def _db(thread):
@@ -66,8 +72,19 @@ def legacy_resource_cleanup(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def recovery_store(monkeypatch):
+    """Inject an idle recovery store through the composition factory.
+
+    ``thread_config_update_dependencies`` builds its recovery store per call.
+    """
     store = idle_recovery_store()
-    monkeypatch.setattr(orch_main, "VMWorkspaceRecoveryStore", lambda db: store)
+    dependencies = sessions_composition.thread_config_update_dependencies
+    monkeypatch.setattr(
+        sessions_composition,
+        "thread_config_update_dependencies",
+        lambda resources: dataclasses.replace(
+            dependencies(resources), recovery_store=store
+        ),
+    )
     return store
 
 
@@ -76,15 +93,17 @@ class TestAbortThreadVmUpgrade:
     async def test_404_when_thread_missing(self):
         db = _db(None)
         with (
-            patch.object(orch_main, "require_internal", AsyncMock()),
-            patch.object(orch_main, "postgres_db", db),
-            patch.object(orch_main, "vm_provisioner", _provisioner()),
+            patch.object(access_module, "require_internal", AsyncMock()),
+            patch.object(orch_main.app.state.resources, "postgres_db", db),
+            patch.object(vm_provisioner_module, "vm_provisioner", _provisioner()),
         ):
-            with pytest.raises(orch_main.HTTPException) as exc:
+            with pytest.raises(fastapi_module.HTTPException) as exc:
                 await thread_config_update.agent_abort_thread_vm_upgrade(
                     MagicMock(),
                     "tid",
-                    dependencies=orch_main._thread_config_update_dependencies(),
+                    dependencies=sessions_composition.thread_config_update_dependencies(
+                        orch_main.app.state.resources
+                    ),
                 )
         assert exc.value.status_code == 404
 
@@ -93,14 +112,16 @@ class TestAbortThreadVmUpgrade:
         db = _db({"id": "tid"})
         prov = _provisioner(available=True, delete_result=True)
         with (
-            patch.object(orch_main, "require_internal", AsyncMock()),
-            patch.object(orch_main, "postgres_db", db),
-            patch.object(orch_main, "vm_provisioner", prov),
+            patch.object(access_module, "require_internal", AsyncMock()),
+            patch.object(orch_main.app.state.resources, "postgres_db", db),
+            patch.object(vm_provisioner_module, "vm_provisioner", prov),
         ):
             out = await thread_config_update.agent_abort_thread_vm_upgrade(
                 MagicMock(),
                 "tid",
-                dependencies=orch_main._thread_config_update_dependencies(),
+                dependencies=sessions_composition.thread_config_update_dependencies(
+                    orch_main.app.state.resources
+                ),
             )
 
         prov.release_vm_captured.assert_awaited_once()
@@ -119,15 +140,17 @@ class TestAbortThreadVmUpgrade:
         db = _db({"id": "tid"})
         prov = _provisioner(available=False)
         with (
-            patch.object(orch_main, "require_internal", AsyncMock()),
-            patch.object(orch_main, "postgres_db", db),
-            patch.object(orch_main, "vm_provisioner", prov),
+            patch.object(access_module, "require_internal", AsyncMock()),
+            patch.object(orch_main.app.state.resources, "postgres_db", db),
+            patch.object(vm_provisioner_module, "vm_provisioner", prov),
         ):
-            with pytest.raises(orch_main.HTTPException) as exc:
+            with pytest.raises(fastapi_module.HTTPException) as exc:
                 await thread_config_update.agent_abort_thread_vm_upgrade(
                     MagicMock(),
                     "tid",
-                    dependencies=orch_main._thread_config_update_dependencies(),
+                    dependencies=sessions_composition.thread_config_update_dependencies(
+                        orch_main.app.state.resources
+                    ),
                 )
 
         prov.release_vm_captured.assert_not_called()
@@ -143,15 +166,17 @@ class TestAbortThreadVmUpgrade:
         db = _db({"id": "tid"})
         prov = _provisioner(available=True, delete_exc=RuntimeError("nats down"))
         with (
-            patch.object(orch_main, "require_internal", AsyncMock()),
-            patch.object(orch_main, "postgres_db", db),
-            patch.object(orch_main, "vm_provisioner", prov),
+            patch.object(access_module, "require_internal", AsyncMock()),
+            patch.object(orch_main.app.state.resources, "postgres_db", db),
+            patch.object(vm_provisioner_module, "vm_provisioner", prov),
         ):
-            with pytest.raises(orch_main.HTTPException) as exc:
+            with pytest.raises(fastapi_module.HTTPException) as exc:
                 await thread_config_update.agent_abort_thread_vm_upgrade(
                     MagicMock(),
                     "tid",
-                    dependencies=orch_main._thread_config_update_dependencies(),
+                    dependencies=sessions_composition.thread_config_update_dependencies(
+                        orch_main.app.state.resources
+                    ),
                 )
 
         db.merge_thread_vm_context.assert_not_awaited()

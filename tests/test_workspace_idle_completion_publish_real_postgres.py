@@ -19,6 +19,7 @@ from tests.test_completion_finalizer_real_postgres import _pool_db, _claimed_run
 from orchestrator import main
 from orchestrator.schemas.job_runtime import JobCompleteRequest
 from orchestrator.services.legacy_job_completion import complete_job_legacy
+from orchestrator.application import completion as completion_composition
 
 pg = _pg_fixture
 
@@ -41,14 +42,16 @@ async def through_status(
     monkeypatch, db, runner, report, *, before_status=None, forge=None,
     agent_id=None,
 ):
-    monkeypatch.setattr(main, "postgres_db", db)
+    monkeypatch.setattr(main.app.state.resources, "postgres_db", db)
     monkeypatch.setattr(
-        main,
+        main.app.state.resources,
         "gitea_client",
         forge if forge is not None else SimpleNamespace(is_initialized=False),
     )
-    monkeypatch.setattr(main, "vector_db", None)
-    dependencies = main._legacy_completion_dependencies()
+    monkeypatch.setattr(main.app.state.resources, "vector_db", None)
+    dependencies = completion_composition.legacy_completion_dependencies(
+        main.app.state.resources
+    )
     original = dependencies.effects.run
 
     async def effects(effect_runner, name, group, callback, **kwargs):

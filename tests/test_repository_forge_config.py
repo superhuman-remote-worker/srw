@@ -7,6 +7,8 @@ from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from orchestrator.services.datasource_config import normalize_repository_config
+from orchestrator.security import access as access_module
+from orchestrator.security import auth as auth_module
 
 
 def test_explicit_forge_is_kept():
@@ -74,7 +76,7 @@ def app_client(monkeypatch):
     from orchestrator import main
 
     monkeypatch.setattr(
-        main,
+        auth_module,
         "require_approved_user",
         AsyncMock(return_value={"id": _OWNER_ID, "is_admin": False}),
     )
@@ -105,7 +107,7 @@ class TestCreateDatasourceRepositoryEndpoint:
             }
 
         monkeypatch.setattr(
-            main.postgres_db,
+            main.app.state.resources.postgres_db,
             "create_datasource",
             AsyncMock(side_effect=fake_create_datasource),
         )
@@ -130,7 +132,7 @@ class TestCreateDatasourceRepositoryEndpoint:
         from orchestrator import main
 
         monkeypatch.setattr(
-            main.postgres_db,
+            main.app.state.resources.postgres_db,
             "create_datasource",
             AsyncMock(side_effect=AssertionError("must not persist a rejected config")),
         )
@@ -164,7 +166,7 @@ class TestUpdateDatasourceRepositoryEndpoint:
             "read_only": None,
         }
         monkeypatch.setattr(
-            main,
+            access_module,
             "require_datasource_owner",
             AsyncMock(return_value=({"id": _OWNER_ID, "is_admin": False}, existing_ds)),
         )
@@ -175,17 +177,19 @@ class TestUpdateDatasourceRepositoryEndpoint:
             return True
 
         monkeypatch.setattr(
-            main.postgres_db,
+            main.app.state.resources.postgres_db,
             "update_datasource",
             AsyncMock(side_effect=fake_update_datasource),
         )
         monkeypatch.setattr(
-            main.postgres_db,
+            main.app.state.resources.postgres_db,
             "get_datasource",
             AsyncMock(return_value={**existing_ds, "config": {"forge": "gitlab"}}),
         )
         monkeypatch.setattr(
-            main.postgres_db, "list_datasource_projects", AsyncMock(return_value=[])
+            main.app.state.resources.postgres_db,
+            "list_datasource_projects",
+            AsyncMock(return_value=[]),
         )
         client = TestClient(main.app)
 
@@ -220,7 +224,7 @@ class TestUpdateDatasourceRepositoryEndpoint:
             "read_only": None,
         }
         monkeypatch.setattr(
-            main,
+            access_module,
             "require_datasource_owner",
             AsyncMock(return_value=({"id": _OWNER_ID, "is_admin": False}, existing_ds)),
         )
@@ -231,17 +235,19 @@ class TestUpdateDatasourceRepositoryEndpoint:
             return True
 
         monkeypatch.setattr(
-            main.postgres_db,
+            main.app.state.resources.postgres_db,
             "update_datasource",
             AsyncMock(side_effect=fake_update_datasource),
         )
         monkeypatch.setattr(
-            main.postgres_db,
+            main.app.state.resources.postgres_db,
             "get_datasource",
             AsyncMock(return_value={**existing_ds, "name": "renamed-widget"}),
         )
         monkeypatch.setattr(
-            main.postgres_db, "list_datasource_projects", AsyncMock(return_value=[])
+            main.app.state.resources.postgres_db,
+            "list_datasource_projects",
+            AsyncMock(return_value=[]),
         )
         client = TestClient(main.app)
 

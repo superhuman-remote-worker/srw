@@ -14,7 +14,7 @@ import logging
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import ANY, AsyncMock, Mock
 from uuid import UUID
 
 import httpx
@@ -24,6 +24,28 @@ from fastapi import FastAPI, HTTPException
 from orchestrator import main
 from orchestrator.routers import job_lifecycle as job_lifecycle_routes
 from orchestrator.services.default_experts import ExpertSelection
+from orchestrator import uploads as uploads_module
+from orchestrator.application import access as access_composition
+from orchestrator.application import jobs as jobs_composition
+from orchestrator.routers import project_jobs as project_jobs_module
+from orchestrator.security import access as access_module
+from orchestrator.security import auth as auth_module
+from orchestrator.services import container_provisioner as container_provisioner_module
+from orchestrator.services import default_experts as default_experts_module
+from orchestrator.services import deployment_gates as deployment_gates_module
+from orchestrator.services import grant_enforcement as grant_enforcement_module
+from orchestrator.services import job_dispatcher as job_dispatcher_module
+from orchestrator.services import job_workspace_runtime as job_workspace_runtime_module
+from orchestrator.services import subjob_completion as subjob_completion_module
+from orchestrator.services import (
+    thread_datasource_authorization as thread_datasource_authorization_module,
+)
+from orchestrator.services import thread_mount_rows as thread_mount_rows_module
+from orchestrator.services import (
+    thread_project_authorization as thread_project_authorization_module,
+)
+from orchestrator.services import vm_workspace_policy as vm_workspace_policy_module
+import functools
 
 
 USER = "11111111-1111-4111-8111-111111111111"
@@ -41,7 +63,8 @@ PROJECT_PATH = f"/api/projects/{PROJECT}/jobs"
 @pytest.fixture
 def wire(monkeypatch):
     user = {"id": USER, "is_admin": False, "is_approved": True}
-    enforce_grants = main._enforce_job_create_grants
+    # The real owner operation: the composition binds its dependencies per call.
+    enforce_grants = grant_enforcement_module.enforce_job_create_grants
 
     async def approved(request, _db):
         if not request.headers.get("x-test-user"):
@@ -88,30 +111,42 @@ def wire(monkeypatch):
         )
     )
     provision, dispatch = AsyncMock(), Mock()
-    monkeypatch.setattr(main, "postgres_db", db)
-    monkeypatch.setattr(main, "require_approved_user", approved)
-    monkeypatch.setattr(main, "require_project_member", AsyncMock())
+    monkeypatch.setattr(main.app.state.resources, "postgres_db", db)
+    monkeypatch.setattr(auth_module, "require_approved_user", approved)
+    monkeypatch.setattr(access_module, "require_project_member", AsyncMock())
     monkeypatch.setattr(
-        main,
+        access_module,
         "is_internal_call",
         lambda request: bool(request.headers.get("x-test-internal")),
     )
-    monkeypatch.setattr(main, "_enforce_readiness_gate", AsyncMock())
-    monkeypatch.setattr(main, "_is_experts_db_enabled", lambda: True)
-    monkeypatch.setattr(main, "_user_experts_enabled", AsyncMock(return_value=True))
-    monkeypatch.setattr(main, "resolve_root_expert", expert)
+    monkeypatch.setattr(access_composition, "enforce_readiness_gate", AsyncMock())
+    monkeypatch.setattr(deployment_gates_module, "is_experts_db_enabled", lambda: True)
+    monkeypatch.setattr(
+        grant_enforcement_module, "user_experts_enabled", AsyncMock(return_value=True)
+    )
+    monkeypatch.setattr(default_experts_module, "resolve_root_expert", expert)
     monkeypatch.setattr(catalogue_state(), "experts", [SimpleNamespace(id="developer")])
-    monkeypatch.setattr(main, "_authorize_thread_datasource_selection", authorize)
-    monkeypatch.setattr(main, "_datasource_defaults_on_omission", lambda: False)
-    monkeypatch.setattr(main, "_enforce_job_create_grants", AsyncMock())
-    monkeypatch.setattr(main, "STATELESS_WORKER_DEFAULT_ENABLED", False)
+    monkeypatch.setattr(
+        thread_datasource_authorization_module,
+        "authorize_thread_datasource_selection",
+        authorize,
+    )
+    monkeypatch.setattr(
+        deployment_gates_module, "datasource_defaults_on_omission", lambda: False
+    )
+    monkeypatch.setattr(
+        grant_enforcement_module, "enforce_job_create_grants", AsyncMock()
+    )
+    monkeypatch.setattr(
+        main.app.state.resources.settings, "stateless_worker_default_enabled", False
+    )
     scholar = AsyncMock(return_value=None)
     monkeypatch.setattr(
-        main.subjob_completion_operations,
+        subjob_completion_module,
         "spawn_scholar_subjob",
         scholar,
     )
-    monkeypatch.setattr(main, "_trigger_dispatch", dispatch)
+    monkeypatch.setattr(job_dispatcher_module, "trigger_dispatch", dispatch)
     monkeypatch.setattr(
         "orchestrator.services.datasource_policy.default_datasource_selection", defaults
     )
@@ -119,12 +154,14 @@ def wire(monkeypatch):
         "orchestrator.services.job_provisioning.provision_job_repo", provision
     )
     app = FastAPI()
-    app.state.job_lifecycle_route_dependencies_factory = (
-        main._job_lifecycle_route_dependencies
+    app.state.job_lifecycle_route_dependencies_factory = functools.partial(
+        jobs_composition.job_lifecycle_route_dependencies, main.app.state.resources
     )
     app.add_api_route(PATH, job_lifecycle_routes.create_job, methods=["POST"])
     app.add_api_route(
-        "/api/projects/{project_id}/jobs", main.create_project_job, methods=["POST"]
+        "/api/projects/{project_id}/jobs",
+        project_jobs_module.create_project_job,
+        methods=["POST"],
     )
     return SimpleNamespace(
         app=app,
@@ -155,14 +192,18 @@ def body(**fields):
 @pytest.fixture
 def workspace_wire(wire, monkeypatch):
     """Exercise real workspace/lane and VM policy with controlled capabilities."""
-    monkeypatch.setattr(main, "STATELESS_WORKER_DEFAULT_ENABLED", True)
-    monkeypatch.setattr(main, "STATELESS_WORKER_ENABLED", True)
     monkeypatch.setattr(
-        main,
+        main.app.state.resources.settings, "stateless_worker_default_enabled", True
+    )
+    monkeypatch.setattr(
+        main.app.state.resources.settings, "stateless_worker_enabled", True
+    )
+    monkeypatch.setattr(
+        container_provisioner_module,
         "container_provisioner",
         SimpleNamespace(is_available=True, in_cluster=True),
     )
-    monkeypatch.setattr(main, "vm_workspaces_on_pod_network", lambda: False)
+    monkeypatch.setattr(access_module, "vm_workspaces_on_pod_network", lambda: False)
     wire.db.get_system_setting = AsyncMock(return_value=None)
     wire.db.user_can_use_vm = AsyncMock(return_value=True)
     return wire
@@ -190,35 +231,66 @@ def test_workspace_dependency_factory_binds_without_reads_and_defers_flags(monke
     second_store = SimpleNamespace(get_user=AsyncMock())
     first_provisioner, second_provisioner = UnreadProvisioner(), UnreadProvisioner()
     callbacks = {
-        "needs_vm": ("_job_needs_vm", Mock()),
-        "needs_sandbox": ("_job_needs_sandbox", Mock()),
-        "check_vm_permission": ("_check_vm_permission", AsyncMock()),
-        "resolve_execution_lane": ("_resolve_requested_job_execution_lane", Mock()),
-        "vm_workspaces_on_pod_network": ("vm_workspaces_on_pod_network", Mock()),
-        "enforce_grants": ("_enforce_job_create_grants", AsyncMock()),
+        "needs_vm": ((job_workspace_runtime_module, "job_needs_vm"), Mock()),
+        "needs_sandbox": ((job_workspace_runtime_module, "job_needs_sandbox"), Mock()),
+        "check_vm_permission": (
+            (vm_workspace_policy_module, "check_vm_permission"),
+            AsyncMock(),
+        ),
+        "resolve_execution_lane": (
+            (job_workspace_runtime_module, "resolve_requested_job_execution_lane"),
+            Mock(),
+        ),
+        "vm_workspaces_on_pod_network": (
+            (access_module, "vm_workspaces_on_pod_network"),
+            Mock(),
+        ),
+        "enforce_grants": (
+            (grant_enforcement_module, "enforce_job_create_grants"),
+            AsyncMock(),
+        ),
     }
-    for attribute, callback in callbacks.values():
-        monkeypatch.setattr(main, attribute, callback)
-    monkeypatch.setattr(main, "postgres_db", first_store)
-    monkeypatch.setattr(main, "container_provisioner", first_provisioner)
-    monkeypatch.setattr(main, "STATELESS_WORKER_DEFAULT_ENABLED", False)
-    monkeypatch.setattr(main, "STATELESS_WORKER_ENABLED", False)
-    first = main._job_admission_workspace_dependencies()
-    monkeypatch.setattr(main, "postgres_db", second_store)
-    monkeypatch.setattr(main, "container_provisioner", second_provisioner)
-    second = main._job_admission_workspace_dependencies()
+    for (owner, attribute), callback in callbacks.values():
+        monkeypatch.setattr(owner, attribute, callback)
+    monkeypatch.setattr(main.app.state.resources, "postgres_db", first_store)
+    monkeypatch.setattr(
+        container_provisioner_module, "container_provisioner", first_provisioner
+    )
+    monkeypatch.setattr(
+        main.app.state.resources.settings, "stateless_worker_default_enabled", False
+    )
+    monkeypatch.setattr(
+        main.app.state.resources.settings, "stateless_worker_enabled", False
+    )
+    first = jobs_composition.job_admission_workspace_dependencies(
+        main.app.state.resources
+    )
+    monkeypatch.setattr(main.app.state.resources, "postgres_db", second_store)
+    monkeypatch.setattr(
+        container_provisioner_module, "container_provisioner", second_provisioner
+    )
+    second = jobs_composition.job_admission_workspace_dependencies(
+        main.app.state.resources
+    )
     assert first.store is first_store and second.store is second_store
     assert first.provisioner is first_provisioner
     assert second.provisioner is second_provisioner
     first_store.get_user.assert_not_awaited()
     second_store.get_user.assert_not_awaited()
     for field, (_, callback) in callbacks.items():
-        assert getattr(first, field) is callback
+        # Bound operations (``resources.bound``) wrap the owner and pass its
+        # dependencies per call; the plain ones are the owner itself.
+        bound_operation = getattr(first, field)
+        assert getattr(bound_operation, "__wrapped__", bound_operation) is callback
         callback.assert_not_called()
     assert first.stateless_default_enabled() is False
     assert first.stateless_enabled() is False
-    monkeypatch.setattr(main, "STATELESS_WORKER_DEFAULT_ENABLED", True)
-    monkeypatch.setattr(main, "STATELESS_WORKER_ENABLED", True)
+    monkeypatch.setattr(
+        main.app.state.resources.settings, "stateless_worker_default_enabled", True
+    )
+    monkeypatch.setattr(
+        main.app.state.resources.settings, "stateless_worker_enabled", True
+    )
     assert first.stateless_default_enabled() is True
     assert first.stateless_enabled() is True
 
@@ -248,10 +320,12 @@ async def test_vm_refusal_precedes_lane_grants_and_later_effects(
         wire.db.user_can_use_vm.return_value = False
     else:
         wire.db.get_system_setting.return_value = {"value": {"enabled": False}}
-    sandbox = Mock(wraps=main._job_needs_sandbox)
-    lane = Mock(wraps=main._resolve_requested_job_execution_lane)
-    monkeypatch.setattr(main, "_job_needs_sandbox", sandbox)
-    monkeypatch.setattr(main, "_resolve_requested_job_execution_lane", lane)
+    sandbox = Mock(wraps=job_workspace_runtime_module.job_needs_sandbox)
+    lane = Mock(wraps=job_workspace_runtime_module.resolve_requested_job_execution_lane)
+    monkeypatch.setattr(job_workspace_runtime_module, "job_needs_sandbox", sandbox)
+    monkeypatch.setattr(
+        job_workspace_runtime_module, "resolve_requested_job_execution_lane", lane
+    )
     response = await submit(
         wire,
         body(
@@ -264,7 +338,7 @@ async def test_vm_refusal_precedes_lane_grants_and_later_effects(
     wire.db.get_user.assert_awaited_once_with(USER)
     sandbox.assert_not_called()
     lane.assert_not_called()
-    main._enforce_job_create_grants.assert_not_awaited()
+    grant_enforcement_module.enforce_job_create_grants.assert_not_awaited()
     assert_no_workspace_admission_effects(wire)
 
 
@@ -289,7 +363,11 @@ async def test_create_lane_default_keeps_omission_and_parent_authority(
     logged_default,
 ):
     wire = workspace_wire
-    monkeypatch.setattr(main, "STATELESS_WORKER_DEFAULT_ENABLED", default_enabled)
+    monkeypatch.setattr(
+        main.app.state.resources.settings,
+        "stateless_worker_default_enabled",
+        default_enabled,
+    )
     caplog.set_level(logging.DEBUG)
     fields = {"config_override": {"workspace": {"backend": "sandbox"}}}
     if requested is not None:
@@ -350,11 +428,13 @@ async def test_omitted_root_lane_keeps_fallback_diagnostic_and_insert_value(
 ):
     wire = workspace_wire
     if failure == "disabled":
-        monkeypatch.setattr(main, "STATELESS_WORKER_ENABLED", False)
+        monkeypatch.setattr(
+            main.app.state.resources.settings, "stateless_worker_enabled", False
+        )
     elif failure == "unavailable":
-        main.container_provisioner.is_available = False
+        container_provisioner_module.container_provisioner.is_available = False
     elif failure == "outside_cluster":
-        main.container_provisioner.in_cluster = False
+        container_provisioner_module.container_provisioner.in_cluster = False
     caplog.set_level(logging.DEBUG)
     response = await submit(
         wire, body(config_override={"workspace": {"backend": backend}})
@@ -367,7 +447,7 @@ async def test_omitted_root_lane_keeps_fallback_diagnostic_and_insert_value(
         )
         == 1
     )
-    main._enforce_job_create_grants.assert_awaited_once()
+    grant_enforcement_module.enforce_job_create_grants.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -388,7 +468,9 @@ async def test_fallback_diagnostic_rereads_provisioner_after_lane_resolution(
             return self.cluster_reads > 1
 
     provisioner = RecoveringProvisioner()
-    monkeypatch.setattr(main, "container_provisioner", provisioner)
+    monkeypatch.setattr(
+        container_provisioner_module, "container_provisioner", provisioner
+    )
     caplog.set_level(logging.DEBUG)
     response = await submit(
         wire, body(config_override={"workspace": {"backend": "sandbox"}})
@@ -427,8 +509,10 @@ async def test_explicit_stateless_refusals_keep_exact_http_and_no_later_effects(
     workspace_wire, monkeypatch, enabled, available, backend, status, detail
 ):
     wire = workspace_wire
-    monkeypatch.setattr(main, "STATELESS_WORKER_ENABLED", enabled)
-    main.container_provisioner.is_available = available
+    monkeypatch.setattr(
+        main.app.state.resources.settings, "stateless_worker_enabled", enabled
+    )
+    container_provisioner_module.container_provisioner.is_available = available
     response = await submit(
         wire,
         body(
@@ -438,7 +522,7 @@ async def test_explicit_stateless_refusals_keep_exact_http_and_no_later_effects(
     )
     assert response.status_code == status, response.text
     assert response.json() == {"detail": detail}
-    main._enforce_job_create_grants.assert_not_awaited()
+    grant_enforcement_module.enforce_job_create_grants.assert_not_awaited()
     assert_no_workspace_admission_effects(wire)
 
 
@@ -453,18 +537,23 @@ async def test_external_vm_lane_override_keeps_permission_and_merged_grant_order
     }
     caplog.set_level(logging.DEBUG)
     order = Mock()
-    permission = AsyncMock(wraps=main._check_vm_permission)
-    sandbox = Mock(wraps=main._job_needs_sandbox)
-    lane = Mock(wraps=main._resolve_requested_job_execution_lane)
-    monkeypatch.setattr(main, "_check_vm_permission", permission)
-    monkeypatch.setattr(main, "_job_needs_sandbox", sandbox)
-    monkeypatch.setattr(main, "_resolve_requested_job_execution_lane", lane)
+    permission = AsyncMock(wraps=vm_workspace_policy_module.check_vm_permission)
+    sandbox = Mock(wraps=job_workspace_runtime_module.job_needs_sandbox)
+    lane = Mock(wraps=job_workspace_runtime_module.resolve_requested_job_execution_lane)
+    monkeypatch.setattr(vm_workspace_policy_module, "check_vm_permission", permission)
+    monkeypatch.setattr(job_workspace_runtime_module, "job_needs_sandbox", sandbox)
+    monkeypatch.setattr(
+        job_workspace_runtime_module, "resolve_requested_job_execution_lane", lane
+    )
     for name, collaborator in (
         ("creator", wire.db.get_user),
         ("permission", permission),
         ("sandbox", sandbox),
         ("lane", lane),
-        ("grants", main._enforce_job_create_grants),
+        (
+            "grants",
+            grant_enforcement_module.enforce_job_create_grants,
+        ),
         ("datasources", wire.authorize),
         ("insert", wire.db.create_job),
         ("provision", wire.provision),
@@ -489,13 +578,15 @@ async def test_external_vm_lane_override_keeps_permission_and_merged_grant_order
         "insert",
         "provision",
     ]
+    # Both owners are bound by the composition, which passes ``dependencies=``.
     permission.assert_awaited_once_with(
-        wire.db.get_user.return_value, job_needs_vm=True
+        wire.db.get_user.return_value, job_needs_vm=True, dependencies=ANY
     )
-    main._enforce_job_create_grants.assert_awaited_once_with(
+    grant_enforcement_module.enforce_job_create_grants.assert_awaited_once_with(
         {"workspace": {"backend": "vm"}, "autonomy": "partial"},
         user_id=USER,
         project_ids=[PROJECT],
+        dependencies=ANY,
     )
     assert wire.db.create_job.await_args.kwargs["execution_lane"] == "pinned"
     assert (
@@ -509,7 +600,9 @@ async def test_real_merged_capability_denial_is_refused_before_datasources_or_in
     workspace_wire, monkeypatch
 ):
     wire = workspace_wire
-    monkeypatch.setattr(main, "_enforce_job_create_grants", wire.enforce_grants)
+    monkeypatch.setattr(
+        grant_enforcement_module, "enforce_job_create_grants", wire.enforce_grants
+    )
     wire.db.get_project.return_value["default_config_override"] = {"autonomy": "full"}
     wire.db.list_grants_for_scopes = AsyncMock(
         return_value={"user": [], "project": [], "global": []}
@@ -562,9 +655,15 @@ def officer_wire(wire, monkeypatch):
         yield SimpleNamespace(fetchrow=read_snapshot)
 
     wire.db.acquire = acquire
-    monkeypatch.setattr(main, "_thread_project_ids", AsyncMock(return_value=[PROJECT]))
     monkeypatch.setattr(
-        main, "_revalidate_thread_project_ids", AsyncMock(return_value=[PROJECT])
+        thread_mount_rows_module,
+        "thread_project_ids",
+        AsyncMock(return_value=[PROJECT]),
+    )
+    monkeypatch.setattr(
+        thread_project_authorization_module,
+        "revalidate_thread_project_ids",
+        AsyncMock(return_value=[PROJECT]),
     )
     ticket = AsyncMock(
         return_value={
@@ -608,7 +707,7 @@ def officer_wire(wire, monkeypatch):
 
 def assert_no_admission_effects(wire):
     wire.authorize.assert_not_awaited()
-    main._enforce_job_create_grants.assert_not_awaited()
+    grant_enforcement_module.enforce_job_create_grants.assert_not_awaited()
     wire.db.create_job.assert_not_awaited()
     wire.officer.admit.assert_not_awaited()
     wire.officer.preflight.assert_not_awaited()
@@ -628,12 +727,16 @@ async def test_officer_dependency_factory_captures_stores_without_reading_them(
     monkeypatch.setattr(project_backlog, "fetch_ticket_state", ticket)
     first_store, first_vector = object(), object()
     second_store, second_vector = object(), object()
-    monkeypatch.setattr(main, "postgres_db", first_store)
-    monkeypatch.setattr(main, "vector_db", first_vector)
-    first = main._job_admission_officer_dependencies()
-    monkeypatch.setattr(main, "postgres_db", second_store)
-    monkeypatch.setattr(main, "vector_db", second_vector)
-    second = main._job_admission_officer_dependencies()
+    monkeypatch.setattr(main.app.state.resources, "postgres_db", first_store)
+    monkeypatch.setattr(main.app.state.resources, "vector_db", first_vector)
+    first = jobs_composition.job_admission_officer_dependencies(
+        main.app.state.resources
+    )
+    monkeypatch.setattr(main.app.state.resources, "postgres_db", second_store)
+    monkeypatch.setattr(main.app.state.resources, "vector_db", second_vector)
+    second = jobs_composition.job_admission_officer_dependencies(
+        main.app.state.resources
+    )
     snapshot.assert_not_called()
     ticket.assert_not_called()
     assert first.store is first_store and second.store is second_store
@@ -830,14 +933,17 @@ async def test_officer_slot_ticket_preparation_reaches_final_admission_in_order(
         STAMP.replace(tzinfo=None) if naive else STAMP
     )
     order = Mock()
-    vm_check = Mock(wraps=main._job_needs_vm)
-    monkeypatch.setattr(main, "_job_needs_vm", vm_check)
+    vm_check = Mock(wraps=job_workspace_runtime_module.job_needs_vm)
+    monkeypatch.setattr(job_workspace_runtime_module, "job_needs_vm", vm_check)
     for name, collaborator in (
         ("snapshot", wire.officer.read_snapshot),
         ("ticket", wire.officer.ticket),
         ("vm", vm_check),
         ("datasources", wire.authorize),
-        ("grants", main._enforce_job_create_grants),
+        (
+            "grants",
+            grant_enforcement_module.enforce_job_create_grants,
+        ),
         ("admit", wire.officer.admit),
         ("preflight", wire.officer.preflight),
     ):
@@ -886,7 +992,9 @@ async def test_officer_slot_ticket_preparation_reaches_final_admission_in_order(
         in context["kickoff_message"]
     )
     assert context["kickoff_message"].endswith("Existing brief")
-    wire.officer.ticket.assert_awaited_once_with(main.vector_db, PROJECT, "fixture")
+    wire.officer.ticket.assert_awaited_once_with(
+        main.app.state.resources.vector_db, PROJECT, "fixture"
+    )
     wire.provision.assert_not_awaited()
     wire.dispatch.assert_not_called()
 
@@ -938,7 +1046,9 @@ async def test_datasource_wire_presence_preserves_selection_intent(
     expected,
     origin,
 ):
-    monkeypatch.setattr(main, "_datasource_defaults_on_omission", lambda: gate)
+    monkeypatch.setattr(
+        deployment_gates_module, "datasource_defaults_on_omission", lambda: gate
+    )
     response = await submit(wire, body(**selection))
     assert response.status_code == 200, response.text
     args = wire.db.create_job.await_args.kwargs
@@ -1076,8 +1186,8 @@ async def test_project_wrapper_overrides_body_project_after_editor_check(wire):
     response = await submit(wire, body(project_id=PARENT), PROJECT_PATH)
     assert response.status_code == 200, response.text
     assert wire.db.create_job.await_args.kwargs["project_id"] == PROJECT
-    assert main.require_project_member.await_args_list[0].args[2] == PROJECT
-    assert main.require_project_member.await_args_list[0].kwargs == {
+    assert access_module.require_project_member.await_args_list[0].args[2] == PROJECT
+    assert access_module.require_project_member.await_args_list[0].kwargs == {
         "min_role": "editor",
         "allow_archived": False,
     }
@@ -1085,7 +1195,7 @@ async def test_project_wrapper_overrides_body_project_after_editor_check(wire):
 
 @pytest.mark.asyncio
 async def test_project_denial_precedes_creation(wire):
-    main.require_project_member.side_effect = HTTPException(
+    access_module.require_project_member.side_effect = HTTPException(
         403, "Project editor required"
     )
     response = await submit(wire, body(), PROJECT_PATH)
@@ -1097,9 +1207,11 @@ async def test_project_denial_precedes_creation(wire):
 async def test_readiness_precedes_internal_authority_and_upload_checks(
     wire, monkeypatch
 ):
-    main._enforce_readiness_gate.side_effect = HTTPException(503, "Not ready")
+    access_composition.enforce_readiness_gate.side_effect = HTTPException(
+        503, "Not ready"
+    )
     upload = Mock()
-    monkeypatch.setattr(main, "authorize_upload_reference", upload)
+    monkeypatch.setattr(uploads_module, "authorize_upload_reference", upload)
     response = await submit(
         wire,
         body(parent_job_id=PARENT, upload_id="unread"),
@@ -1120,7 +1232,7 @@ async def test_upload_refusal_precedes_project_expert_insert_and_provision(
     wire, monkeypatch
 ):
     upload = Mock(side_effect=HTTPException(403, "Upload belongs to another user"))
-    monkeypatch.setattr(main, "authorize_upload_reference", upload)
+    monkeypatch.setattr(uploads_module, "authorize_upload_reference", upload)
     response = await submit(
         wire,
         body(parent_job_id=PARENT, upload_id="foreign"),
@@ -1168,7 +1280,7 @@ async def test_catalogue_stays_application_owned_and_only_scans_for_explicit_slu
     patch_service_method(
         monkeypatch, expert_catalog_module.ExpertCatalogService, "scan_experts", scan
     )
-    main._job_admission_config_dependencies()
+    jobs_composition.job_admission_config_dependencies(main.app.state.resources)
     scan.assert_not_called()
     assert (
         await submit(wire, body(config_name="deployment/custom.yaml"))
@@ -1224,7 +1336,7 @@ async def test_bench_adapter_revalidates_creator_and_preserves_provenance(
     monkeypatch.delenv("MCP_INTERNAL_KEY", raising=False)
     monkeypatch.setattr(access, "_INTERNAL_KEY", None)
     monkeypatch.setattr(
-        main,
+        auth_module,
         "require_approved_user",
         AsyncMock(side_effect=AssertionError("benchmark must not fabricate HTTP auth")),
     )
@@ -1232,7 +1344,13 @@ async def test_bench_adapter_revalidates_creator_and_preserves_provenance(
     task = {"id": "scope-test", "description": "bench admission"}
     arm = {"name": "baseline", "model": "fixture-model"}
     result = await bench._create_job_through_admission(
-        run, task, arm, 1, create_job=main._create_bench_job
+        run,
+        task,
+        arm,
+        1,
+        create_job=functools.partial(
+            jobs_composition.create_bench_job, main.app.state.resources
+        ),
     )
     assert str(result["id"]) == JOB
     args = wire.db.create_job.await_args.kwargs
@@ -1251,13 +1369,25 @@ async def test_bench_adapter_revalidates_creator_and_preserves_provenance(
     wire.db.get_user.return_value["is_approved"] = False
     with pytest.raises(HTTPException) as exc:
         await bench._create_job_through_admission(
-            run, task, arm, 2, create_job=main._create_bench_job
+            run,
+            task,
+            arm,
+            2,
+            create_job=functools.partial(
+                jobs_composition.create_bench_job, main.app.state.resources
+            ),
         )
     assert exc.value.status_code == 403
     wire.db.get_user.return_value = None
     with pytest.raises(HTTPException) as exc:
         await bench._create_job_through_admission(
-            run, task, arm, 3, create_job=main._create_bench_job
+            run,
+            task,
+            arm,
+            3,
+            create_job=functools.partial(
+                jobs_composition.create_bench_job, main.app.state.resources
+            ),
         )
     assert exc.value.status_code == 401
     wire.db.create_job.assert_not_awaited()
@@ -1622,8 +1752,8 @@ async def test_bench_readiness_refusal_precedes_fresh_creator_lookup(wire, monke
     from orchestrator.routers import bench
 
     monkeypatch.setattr(
-        main,
-        "_enforce_readiness_gate",
+        access_composition,
+        "enforce_readiness_gate",
         AsyncMock(side_effect=HTTPException(503, "not ready")),
     )
     run = {"id": JOB, "created_by": USER, "spec": {"project_id": PROJECT}}
@@ -1633,7 +1763,9 @@ async def test_bench_readiness_refusal_precedes_fresh_creator_lookup(wire, monke
             {"id": "scope-test", "description": "bench admission"},
             {"name": "baseline", "model": "fixture-model"},
             1,
-            create_job=main._create_bench_job,
+            create_job=functools.partial(
+                jobs_composition.create_bench_job, main.app.state.resources
+            ),
         )
     assert (exc.value.status_code, exc.value.detail) == (503, "not ready")
     wire.db.get_user.assert_not_awaited()

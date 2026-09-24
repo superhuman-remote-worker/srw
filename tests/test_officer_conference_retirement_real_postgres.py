@@ -13,6 +13,8 @@ import pytest
 
 from orchestrator import main
 from tests import test_persistent_recycler_real_postgres as fixtures
+from orchestrator.application import workflows as workflows_composition
+from orchestrator.services import officer_conference as officer_conference_module
 
 db = fixtures.db
 pg_dsn = fixtures.pg_dsn
@@ -28,20 +30,30 @@ async def _conference(db, monkeypatch):
         ids["thread"],
         json.dumps({"enabled": False, "conference": True}),
     )
-    monkeypatch.setattr(main, "postgres_db", db)
+    monkeypatch.setattr(main.app.state.resources, "postgres_db", db)
     return ids
 
 
 @pytest.mark.asyncio
 async def test_open_conference_ignores_an_authorized_retirement(db, monkeypatch):
     ids = await _conference(db, monkeypatch)
-    found = await main._find_open_conference_thread(ids["project"])
+    found = await officer_conference_module.find_open_conference_thread(
+        ids["project"],
+        dependencies=workflows_composition.officer_conference_dependencies(
+            main.app.state.resources
+        ),
+    )
     assert found is not None and str(found["id"]) == ids["thread"]
 
     retirement = await db.begin_pinned_thread_retirement(ids["thread"], permanent=False)
     # A begun-but-unauthorized retirement is still abortable, so the thread
     # may yet return to service: it stays the open conference.
-    found = await main._find_open_conference_thread(ids["project"])
+    found = await officer_conference_module.find_open_conference_thread(
+        ids["project"],
+        dependencies=workflows_composition.officer_conference_dependencies(
+            main.app.state.resources
+        ),
+    )
     assert found is not None and str(found["id"]) == ids["thread"]
 
     assert await db.authorize_pinned_thread_retirement(
@@ -53,4 +65,12 @@ async def test_open_conference_ignores_an_authorized_retirement(db, monkeypatch)
     # Authorized is irrevocable: the row is still `awaiting_user`, but it is
     # leaving service and must not block a fresh conference.
     assert (await db.get_thread(ids["thread"]))["status"] == "awaiting_user"
-    assert await main._find_open_conference_thread(ids["project"]) is None
+    assert (
+        await officer_conference_module.find_open_conference_thread(
+            ids["project"],
+            dependencies=workflows_composition.officer_conference_dependencies(
+                main.app.state.resources
+            ),
+        )
+        is None
+    )

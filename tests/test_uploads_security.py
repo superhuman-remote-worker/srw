@@ -575,12 +575,20 @@ def _create_job_as(fake_db, caller) -> ExitStack:
     uses for the same handler."""
     stack = ExitStack()
     stack.enter_context(patch.object(access_module, "_INTERNAL_KEY", INTERNAL_KEY))
-    stack.enter_context(patch("orchestrator.main.postgres_db", fake_db))
     stack.enter_context(
-        patch("orchestrator.main.require_approved_user", AsyncMock(return_value=caller))
+        patch("orchestrator.main.app.state.resources.postgres_db", fake_db)
     )
     stack.enter_context(
-        patch("orchestrator.main._enforce_readiness_gate", AsyncMock(return_value=None))
+        patch(
+            "orchestrator.security.auth.require_approved_user",
+            AsyncMock(return_value=caller),
+        )
+    )
+    stack.enter_context(
+        patch(
+            "orchestrator.application.access.enforce_readiness_gate",
+            AsyncMock(return_value=None),
+        )
     )
     return stack
 
@@ -590,7 +598,7 @@ class TestCreateJobUploadOwnership:
     async def test_another_users_upload_is_403(
         self, uploads_dir, user_a, user_b, fake_db, fake_request
     ):
-        from orchestrator.main import JobCreate
+        from orchestrator.schemas.job_create import JobCreate
         from tests._b09_control_seams import create_job
 
         upload_id = _mint()
@@ -614,7 +622,7 @@ class TestCreateJobUploadOwnership:
     ):
         """The dispatcher reads the ids from ``jobs.context``; a body that
         sets them there directly must meet the same check."""
-        from orchestrator.main import JobCreate
+        from orchestrator.schemas.job_create import JobCreate
         from tests._b09_control_seams import create_job
 
         upload_id = _mint("config" if key == "config_upload_id" else "documents")
@@ -633,7 +641,7 @@ class TestCreateJobUploadOwnership:
     async def test_malformed_and_missing_upload_ids_are_refused(
         self, uploads_dir, user_a, fake_db, fake_request
     ):
-        from orchestrator.main import JobCreate
+        from orchestrator.schemas.job_create import JobCreate
         from tests._b09_control_seams import create_job
 
         fake_request.headers = {}
@@ -652,7 +660,7 @@ class TestCreateJobUploadOwnership:
         """Sentinel on the step right after the ownership check: reaching it
         proves the owner's own upload was accepted. An HTTPException subclass
         so ``create_job``'s ``except Exception`` → 500 wrapper lets it out."""
-        from orchestrator.main import JobCreate
+        from orchestrator.schemas.job_create import JobCreate
         from tests._b09_control_seams import create_job
 
         class _PastTheUploadCheck(HTTPException):
@@ -668,7 +676,7 @@ class TestCreateJobUploadOwnership:
         with (
             _create_job_as(fake_db, user_a),
             patch(
-                "orchestrator.main._require_job_project_access",
+                "orchestrator.application.jobs.require_job_project_access",
                 AsyncMock(
                     side_effect=_PastTheUploadCheck(status_code=599, detail="past")
                 ),

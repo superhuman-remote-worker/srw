@@ -40,6 +40,7 @@ from orchestrator.services.deliverable_contracts import (  # noqa: E402
     DeliveryContractConflict,
     prepare_delivery_contract,
 )
+from orchestrator.schemas import job_create as job_create_module
 
 # =============================================================================
 # Fixtures
@@ -1141,9 +1142,8 @@ class TestCreatePlumbing:
     def test_jobcreate_accepts_and_normalizes(self):
         """The REST model carries the field; the create path stores the
         normalized manifest into context (both spellings collapse)."""
-        import orchestrator.main as orchestrator_main
 
-        body = orchestrator_main.JobCreate(
+        body = job_create_module.JobCreate(
             description="ship it",
             required_deliverables=["repo/output/a.md", "./output/a.md", "kb:note"],
         )
@@ -1272,9 +1272,7 @@ class TestCreationRefusesClonedRepoManifests:
         assert "pull request" in exc.value.message.lower()
 
     def test_ordinary_and_kb_deliverables_still_pass(self) -> None:
-        import orchestrator.main as orchestrator_main
-
-        body = orchestrator_main.JobCreate(
+        body = job_create_module.JobCreate(
             description="ship it",
             required_deliverables=["output/a.md", "repo/output/b.md", "kb:note"],
         )

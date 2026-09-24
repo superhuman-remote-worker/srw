@@ -8,8 +8,13 @@ it. Each task is identified *behaviourally* — by the coroutine it would run
 task name — never by the module that defines it, so the same expectations hold
 before and after the bodies move to their owners.
 
-Every external collaborator the lifespan touches is replaced on
-``orchestrator.main`` with a fake; ``KUBECONFIG`` points nowhere, so no path
+Each run enters ``orchestrator.application.lifecycle.lifespan`` over a fresh
+application of its own (``_application``: the resources ``create_app()``
+builds, without the process-wide router and auth bindings, which the lifespan
+never reads). Its stores and clients are replaced with fakes on that
+application's resources; every process-wide collaborator the lifespan touches
+is replaced with a fake on its owning module (the singletons
+``tests/conftest.py`` snapshots). ``KUBECONFIG`` points nowhere, so no path
 can reach a real cluster or database.
 """
 
@@ -18,17 +23,39 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import functools
+import importlib
+import inspect
 import os
+import sys
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from fastapi import FastAPI
 
 os.environ.setdefault("VECTOR_DB_URL", "postgresql://test@localhost/test")
 
-import orchestrator.main as main  # noqa: E402
-
+from orchestrator.application import (
+    build_application_resources,
+    lifecycle,
+)
+from orchestrator.application import (
+    controls as controls_composition,
+)
+from orchestrator.application import (
+    jobs as jobs_composition,
+)
+from orchestrator.application.resources import ApplicationResources  # noqa: E402
+from orchestrator.services import (
+    default_experts as default_experts_module,  # noqa: E402
+)
+from orchestrator.services import job_dispatcher as job_dispatcher_module  # noqa: E402
+from orchestrator.services import lifecycle as instance_lifecycle_module
+from orchestrator.services import readiness as readiness_module  # noqa: E402
+from orchestrator.services.cloud import (  # noqa: E402
+    instance_registry as instance_registry_module,
+)
 
 # --------------------------------------------------------------------------- #
 # Recording stubs
@@ -195,8 +222,112 @@ class _FakeStore:
         return method
 
 
+def _application() -> FastAPI:
+    """A fresh application with the resources ``create_app()`` builds.
+
+    Only the lifespan runs here, and it reads nothing but
+    ``app.state.resources``; the routers and the process-wide bindings
+    ``create_app()`` also installs (auth provisioning backends, the VM
+    authority routers) are left alone so no other test sees this application.
+    """
+
+    app = FastAPI(lifespan=lifecycle.lifespan)
+    app.state.resources = build_application_resources()
+    return app
+
+
+# (owner module, attribute) of every process-wide collaborator the lifespan
+# reads, with the fake's recorded async/sync methods and plain attributes.
+_OWNER_FAKES = (
+    (
+        "orchestrator.services.nats_bridge",
+        "nats_bridge",
+        ("connect", "disconnect"),
+        (),
+        {"lifecycle_identity_authenticated": False},
+    ),
+    (
+        "orchestrator.services.snapshot_service",
+        "snapshot_service",
+        ("connect",),
+        (),
+        {"is_available": False},
+    ),
+    (
+        "orchestrator.services.vm_provisioner",
+        "vm_provisioner",
+        ("disconnect",),
+        ("connect",),
+        {"mode": "off", "is_available": False},
+    ),
+    (
+        "orchestrator.services.container_provisioner",
+        "container_provisioner",
+        (),
+        ("connect",),
+        {"is_available": False, "in_cluster": False},
+    ),
+    (
+        "orchestrator.services.docker_provisioner",
+        "docker_provisioner",
+        (),
+        ("connect",),
+        {"is_available": False, "workspace_hosts": []},
+    ),
+    ("orchestrator.services.ide_session", "ide_session_service", (), ("connect",), {}),
+    (
+        "orchestrator.services.persistent_provisioner",
+        "persistent_provisioner",
+        (),
+        ("connect",),
+        {"is_available": False},
+    ),
+    (
+        "orchestrator.services.agent_provisioner",
+        "agent_provisioner",
+        (),
+        ("connect",),
+        {"is_available": False, "_k8s_available": False},
+    ),
+    (
+        "orchestrator.services.workspace_suspension",
+        "workspace_suspension_service",
+        (),
+        ("connect",),
+        {},
+    ),
+    ("orchestrator.services.ide_proxy", "ide_proxy_service", (), ("connect",), {}),
+    (
+        "orchestrator.services.notification_service",
+        "notification_service",
+        (),
+        ("connect",),
+        {},
+    ),
+    (
+        "orchestrator.services.imap_poller",
+        "imap_poller",
+        (),
+        ("connect",),
+        {"is_available": False},
+    ),
+    ("orchestrator.services.sudo_gate", "sudo_gate", (), ("connect",), {}),
+)
+
+
+def _owner(attribute: str) -> Any:
+    """The module that owns the process-wide collaborator ``attribute``."""
+
+    for module_name, name, *_ in _OWNER_FAKES:
+        if name == attribute:
+            return importlib.import_module(module_name)
+    raise KeyError(attribute)
+
+
 @contextlib.contextmanager
-def _lifespan_environment(monkeypatch, recorder: _Recorder, *, env=None):
+def _lifespan_environment(
+    monkeypatch, recorder: _Recorder, *, env=None, app=None, settings=None
+):
     log = recorder.events
     for key in (
         "LLM_BASE_URL",
@@ -212,66 +343,39 @@ def _lifespan_environment(monkeypatch, recorder: _Recorder, *, env=None):
     for key, value in (env or {}).items():
         monkeypatch.setenv(key, value)
 
+    app = app if app is not None else _application()
+    resources: ApplicationResources = app.state.resources
+    for key, value in (settings or {}).items():
+        monkeypatch.setattr(resources.settings, key, value)
+
     store = _FakeStore(log)
     vector = _FakeStore(log, "vector_db")
-    monkeypatch.setattr(main, "postgres_db", store)
-    monkeypatch.setattr(main, "vector_db", vector)
-    monkeypatch.setattr(main, "audit_db", None)
+    monkeypatch.setattr(resources, "postgres_db", store)
+    monkeypatch.setattr(resources, "vector_db", vector)
+    monkeypatch.setattr(resources, "audit_db", None)
     monkeypatch.setattr(
-        main,
+        resources,
         "audit_store",
         _fake("audit_store", log, async_methods=("connect", "disconnect")),
     )
-    monkeypatch.setattr(main, "audit_reader", main.audit_store)
-    for singleton, async_methods, sync_methods, attrs in (
-        (
+    monkeypatch.setattr(resources, "audit_reader", resources.audit_store)
+    monkeypatch.setattr(
+        resources,
+        "gitea_client",
+        _fake(
             "gitea_client",
-            ("ensure_initialized", "ensure_oidc_configured", "close"),
-            (),
-            {},
+            log,
+            async_methods=("ensure_initialized", "ensure_oidc_configured", "close"),
         ),
-        ("keycloak_groups", ("ensure_initialized",), (), {}),
-        (
-            "nats_bridge",
-            ("connect", "disconnect"),
-            (),
-            {"lifecycle_identity_authenticated": False},
-        ),
-        ("snapshot_service", ("connect",), (), {"is_available": False}),
-        (
-            "vm_provisioner",
-            ("disconnect",),
-            ("connect",),
-            {"mode": "off", "is_available": False},
-        ),
-        (
-            "container_provisioner",
-            (),
-            ("connect",),
-            {"is_available": False, "in_cluster": False},
-        ),
-        (
-            "docker_provisioner",
-            (),
-            ("connect",),
-            {"is_available": False, "workspace_hosts": []},
-        ),
-        ("ide_session_service", (), ("connect",), {}),
-        ("persistent_provisioner", (), ("connect",), {"is_available": False}),
-        (
-            "agent_provisioner",
-            (),
-            ("connect",),
-            {"is_available": False, "_k8s_available": False},
-        ),
-        ("workspace_suspension_service", (), ("connect",), {}),
-        ("ide_proxy_service", (), ("connect",), {}),
-        ("notification_service", (), ("connect",), {}),
-        ("imap_poller", (), ("connect",), {"is_available": False}),
-        ("sudo_gate", (), ("connect",), {}),
-    ):
+    )
+    monkeypatch.setattr(
+        resources,
+        "keycloak_groups",
+        _fake("keycloak_groups", log, async_methods=("ensure_initialized",)),
+    )
+    for module_name, singleton, async_methods, sync_methods, attrs in _OWNER_FAKES:
         monkeypatch.setattr(
-            main,
+            importlib.import_module(module_name),
             singleton,
             _fake(
                 singleton,
@@ -281,7 +385,7 @@ def _lifespan_environment(monkeypatch, recorder: _Recorder, *, env=None):
                 **attrs,
             ),
         )
-    main.agent_provisioner.list_pods = AsyncMock(return_value=[])
+    _owner("agent_provisioner").agent_provisioner.list_pods = AsyncMock(return_value=[])
 
     # Startup steps that would otherwise reach real services or schemas.
     import orchestrator.services.manifest_experts as manifest_experts
@@ -292,26 +396,28 @@ def _lifespan_environment(monkeypatch, recorder: _Recorder, *, env=None):
     monkeypatch.setattr(manifest_experts, "installed_srw_image", lambda: None)
     monkeypatch.setattr(manifest_projects, "migrate_projects", AsyncMock())
     monkeypatch.setattr(
-        main,
+        default_experts_module,
         "seed_managed_default_experts",
         AsyncMock(return_value={"worker": None, "session": None}),
     )
-    monkeypatch.setattr(
-        main.readiness_service, "try_auto_pin_required_defaults", AsyncMock()
-    )
-    # The capability probe is bound wherever the startup step that calls it
-    # lives (the lifespan at the base, the metering bootstrap afterwards).
+    monkeypatch.setattr(readiness_module, "try_auto_pin_required_defaults", AsyncMock())
+    # The capability probe is bound where the metering bootstrap that calls it
+    # lives (R1.B11 moved the startup step to its domain).
     import orchestrator.services.infrastructure_metering.bootstrap as metering
 
-    for owner in (main, metering):
-        monkeypatch.setattr(
-            owner,
-            "probe_schema_capabilities",
-            AsyncMock(return_value=_NoCapabilities()),
-            raising=False,
-        )
-    monkeypatch.setattr(main, "initialize_main_cloud_instance_authority", AsyncMock())
-    monkeypatch.setattr(main, "preload_retained_main_cloud_instances", AsyncMock())
+    monkeypatch.setattr(
+        metering,
+        "probe_schema_capabilities",
+        AsyncMock(return_value=_NoCapabilities()),
+    )
+    monkeypatch.setattr(
+        instance_registry_module,
+        "initialize_main_cloud_instance_authority",
+        AsyncMock(),
+    )
+    monkeypatch.setattr(
+        instance_registry_module, "preload_retained_main_cloud_instances", AsyncMock()
+    )
     import orchestrator.seed.llm_config as llm_config
 
     monkeypatch.setattr(
@@ -321,13 +427,13 @@ def _lifespan_environment(monkeypatch, recorder: _Recorder, *, env=None):
         llm_config, "ensure_elevenlabs_tts_endpoint", AsyncMock(return_value=False)
     )
 
-    real_drain = main.kb_datasource_tasks.drain
+    real_drain = resources.kb_datasource_tasks.drain
 
     async def _drain():
         log.append("kb_datasource_tasks.drain")
         await real_drain()
 
-    monkeypatch.setattr(main.kb_datasource_tasks, "drain", _drain)
+    monkeypatch.setattr(resources.kb_datasource_tasks, "drain", _drain)
 
     from shared.runtime.core import model_registry
 
@@ -344,7 +450,9 @@ def _lifespan_environment(monkeypatch, recorder: _Recorder, *, env=None):
     monkeypatch.setattr(model_registry, "register_catalog_lookup", _register)
     monkeypatch.setattr(asyncio, "create_task", recorder.create_task)
     try:
-        yield SimpleNamespace(store=store, vector=vector, log=log)
+        yield SimpleNamespace(
+            app=app, resources=resources, store=store, vector=vector, log=log
+        )
     finally:
         monkeypatch.undo()
 
@@ -484,10 +592,20 @@ def _closure(recorder: _Recorder) -> list[str]:
     return [event for event in recorder.events if event in SHUTDOWN_CLOSURE]
 
 
-def _run_lifespan(monkeypatch, recorder, *, env=None, inside=None):
+def _run_lifespan(
+    monkeypatch, recorder, *, env=None, inside=None, app=None, settings=None
+):
+    """Enter ``lifecycle.lifespan`` once, over ``app`` or a fresh application.
+
+    ``settings`` replaces deployment gates on that application's own
+    ``DeploymentSettings`` for the run.
+    """
+
     async def _go():
-        with _lifespan_environment(monkeypatch, recorder, env=env) as world:
-            async with main.lifespan(main.app):
+        with _lifespan_environment(
+            monkeypatch, recorder, env=env, app=app, settings=settings
+        ) as world:
+            async with lifecycle.lifespan(world.app):
                 if inside is not None:
                     await inside(world)
             return world
@@ -554,8 +672,9 @@ async def test_optional_tasks_follow_their_gates(monkeypatch):
 @pytest.mark.asyncio
 async def test_completion_commands_start_the_sweep_router(monkeypatch):
     recorder = _Recorder()
-    monkeypatch.setattr(main, "COMPLETION_COMMANDS_ENABLED", True)
-    await _run_lifespan(monkeypatch, recorder)
+    await _run_lifespan(
+        monkeypatch, recorder, settings={"completion_commands_enabled": True}
+    )
     created = {e["label"]: e for e in recorder.created}
     assert created["CompletionFinalizer.run_drain"]["name"] == (
         "completion-finalizer-drain"
@@ -572,14 +691,15 @@ async def test_completion_commands_start_the_sweep_router(monkeypatch):
 @pytest.mark.asyncio
 async def test_two_consecutive_lifecycles_are_isolated(monkeypatch):
     first = _Recorder()
-    await _run_lifespan(monkeypatch, first)
-    first_event = main._shutdown_event
+    world = await _run_lifespan(monkeypatch, first)
+    first_event = world.resources.shutdown_event
     second = _Recorder()
-    await _run_lifespan(monkeypatch, second)
+    # The same application, started a second time.
+    await _run_lifespan(monkeypatch, second, app=world.app)
 
     assert _creation(first) == _creation(second) == DEFAULT_CREATION
     assert first.awaited == second.awaited == DEFAULT_SHUTDOWN
-    assert main._shutdown_event is not first_event
+    assert world.resources.shutdown_event is not first_event
     assert first_event.is_set()
 
 
@@ -588,11 +708,16 @@ async def test_preflight_refusal_happens_before_any_resource_is_acquired(
     monkeypatch,
 ):
     recorder = _Recorder()
-    monkeypatch.setattr(main, "COMPLETION_COMMANDS_ENABLED", False)
-    monkeypatch.setattr(main, "COMPLETION_STATUS_REORDER_ENABLED", True)
-    monkeypatch.setattr(main.sys, "exit", MagicMock(side_effect=SystemExit(1)))
+    monkeypatch.setattr(sys, "exit", MagicMock(side_effect=SystemExit(1)))
     with pytest.raises(SystemExit):
-        await _run_lifespan(monkeypatch, recorder)
+        await _run_lifespan(
+            monkeypatch,
+            recorder,
+            settings={
+                "completion_commands_enabled": False,
+                "completion_status_reorder_enabled": True,
+            },
+        )
     assert recorder.created == []
     assert "postgres_db.connect" not in recorder.events
     # Nothing was acquired, so nothing is unwound either.
@@ -636,7 +761,9 @@ async def test_startup_failure_stops_started_tasks_and_releases_pools(monkeypatc
     def _explode(*_a, **_k):
         raise _Boom("lifecycle reconciler construction failed")
 
-    monkeypatch.setattr(main, "InstanceLifecycleReconciler", _explode)
+    monkeypatch.setattr(
+        instance_lifecycle_module, "InstanceLifecycleReconciler", _explode
+    )
     with pytest.raises(_Boom):
         await _run_lifespan(monkeypatch, recorder)
     started = [e["label"] for e in recorder.created]
@@ -652,13 +779,19 @@ async def test_triggered_dispatch_is_stopped_before_the_pools_close(monkeypatch)
     from orchestrator.services import leader_election
 
     recorder = _Recorder()
-    monkeypatch.setattr(main, "AUTO_ASSIGN_ENABLED", True)
     monkeypatch.setattr(leader_election.is_leader, "is_set", lambda: True)
 
-    async def _inside(_world):
-        main._trigger_dispatch()
+    async def _inside(world):
+        job_dispatcher_module.trigger_dispatch(
+            dependencies=jobs_composition.job_dispatch_dependencies(world.resources)
+        )
 
-    await _run_lifespan(monkeypatch, recorder, inside=_inside)
+    await _run_lifespan(
+        monkeypatch,
+        recorder,
+        inside=_inside,
+        settings={"auto_assign_enabled": True},
+    )
     triggered = [
         e["label"] for e in recorder.created if "dispatch_pending_jobs" in e["label"]
     ]
@@ -703,6 +836,13 @@ def test_identify_names_the_gated_loop_not_the_wrapper():
 # --------------------------------------------------------------------------- #
 
 
+def _binding(operation: Any) -> tuple[Any, Any, Any]:
+    """What a ``resources.bound`` callable binds: (operation, factory, resources)."""
+
+    closure = inspect.getclosurevars(operation).nonlocals
+    return closure["operation"], closure["dependencies"], closure["resources"]
+
+
 def _keywords(entry: dict[str, Any]) -> dict[str, Any]:
     target = entry["target"]
     if isinstance(target, functools.partial):
@@ -730,30 +870,65 @@ async def test_moved_loops_receive_the_application_collaborators(monkeypatch):
     )
     during: dict[str, Any] = {}
 
-    async def _snapshot(_world):
+    async def _snapshot(world):
         # The environment restores the real singletons on exit; compare with
-        # the collaborators that were live while the lifespan ran.
-        during.update({name: getattr(main, name) for name in names})
+        # the collaborators that were live while the lifespan ran. The main
+        # cloud router is the application's own; the rest are process-wide
+        # singletons read from their owning modules.
+        during.update(
+            {
+                name: (
+                    world.resources.main_cloud_router
+                    if name == "main_cloud_router"
+                    else getattr(_owner(name), name)
+                )
+                for name in names
+            }
+        )
 
     world = await _run_lifespan(monkeypatch, recorder, inside=_snapshot)
+    resources = world.resources
     live = SimpleNamespace(**during)
     created = {entry["label"]: entry for entry in recorder.created}
 
     dispatch = _keywords(created["auto_assign_dispatcher"])["dependencies"]
     assert dispatch.store is world.store
-    assert dispatch.state is main._job_dispatch_state
+    assert dispatch.state is resources.job_dispatch_state
     assert dispatch.agent_provisioner is live.agent_provisioner
     # The pause-pending set preemption fills is the one delivery discards from.
     assert (
-        main._job_delivery_operations().dependencies.pause_pending_job_ids
-        is main._job_dispatch_state.pause_pending_job_ids
+        controls_composition.job_delivery_operations(
+            resources
+        ).dependencies.pause_pending_job_ids
+        is resources.job_dispatch_state.pause_pending_job_ids
     )
 
     detector = _keywords(created["stale_agent_detector"])["dependencies"]
     assert detector.store is world.store
-    assert detector.trigger_dispatch is main._trigger_dispatch
-    assert detector.pinned_retirement_operations is main._pinned_retirement_operations
-    assert detector.thread_retirement_operations is main._thread_retirement_operations
+    # The detector's dispatch trigger is this application's: the dispatcher's
+    # own ``trigger_dispatch`` bound to the dispatch dependencies it builds
+    # from these resources.
+    assert _binding(detector.trigger_dispatch) == (
+        job_dispatcher_module.trigger_dispatch,
+        jobs_composition.job_dispatch_dependencies,
+        resources,
+    )
+    # The retirement operations are providers recomposed per call from this
+    # application's resources.
+    for provider, composition in (
+        (
+            detector.pinned_retirement_operations,
+            controls_composition.pinned_retirement_operations,
+        ),
+        (
+            detector.thread_retirement_operations,
+            controls_composition.thread_retirement_operations,
+        ),
+    ):
+        assert isinstance(provider, functools.partial)
+        assert provider.func is composition
+        assert len(provider.args) == 1 and provider.args[0] is resources
+        assert not provider.keywords
 
     for label in (
         "pinned_agent_create_intent_reconciler",
@@ -806,7 +981,7 @@ async def test_a_failed_first_connect_unwinds_without_masking_the_error(monkeypa
     with _lifespan_environment(monkeypatch, recorder) as world:
         world.store.connect = _refused
         with pytest.raises(ConnectionRefusedError, match="unreachable"):
-            async with main.lifespan(main.app):
+            async with lifecycle.lifespan(world.app):
                 await _inside(world)
     assert recorder.created == []
     # The ordinary closure ran; each close was a no-op on an unopened client.
@@ -823,7 +998,9 @@ async def test_a_failing_cleanup_does_not_replace_the_startup_error(monkeypatch)
     def _explode(*_a, **_k):
         raise _Boom("lifecycle reconciler construction failed")
 
-    monkeypatch.setattr(main, "InstanceLifecycleReconciler", _explode)
+    monkeypatch.setattr(
+        instance_lifecycle_module, "InstanceLifecycleReconciler", _explode
+    )
     recorder.fail_labels = {"stale_agent_detector"}
     with pytest.raises(_Boom):
         await _run_lifespan(monkeypatch, recorder)

@@ -1,6 +1,6 @@
 """R1.B12 T1: the application's request-spawned task registries at shutdown.
 
-``_stop_application`` stops the lifecycle's background tasks, drains the
+``stop_application`` stops the lifecycle's background tasks, drains the
 dispatch state and the KB reindex registry, then closes clients and stores.
 Every other application-owned registry keeps strong references to tasks that a
 request spawned — cloud engage/stage, stateless workspace reconciles, project
@@ -12,8 +12,9 @@ The unit tests pin each registry's ``drain()``: an in-flight task is cancelled
 and awaited (its own cancellation path has run when ``drain`` returns), the
 caller's own task is never cancelled, a second drain is a no-op, and the
 registry is left empty and usable. The lifecycle tests reuse the R1.B11
-harness: real in-flight tasks sit in every registry while the lifespan shuts
-down, and each must observe its cancellation before the first client closes.
+harness: real in-flight tasks sit in every registry of the application's
+resources while its lifespan shuts down, and each must observe its
+cancellation before the first client closes.
 """
 
 from __future__ import annotations
@@ -25,6 +26,8 @@ from typing import Any
 
 import pytest
 
+from orchestrator.application import sessions as sessions_composition
+from orchestrator.application.resources import ApplicationResources
 from orchestrator.services import (
     application_tasks,
     cloud_task_registry,
@@ -38,7 +41,6 @@ from tests.test_b11_lifespan_characterization import (
     _closure,
     _Recorder,
     _run_lifespan,
-    main,
 )
 
 THREAD = "11111111-1111-4111-8111-111111111111"
@@ -79,7 +81,7 @@ async def _settle() -> None:
 
 
 # --------------------------------------------------------------------------- #
-# The generic helper for the two plain dicts main owns
+# The generic helper for the two plain dicts the application owns
 # --------------------------------------------------------------------------- #
 
 
@@ -375,30 +377,31 @@ class _RegistryTasks:
             self._log.append(f"cancelled:{label}")
             raise
 
-    async def place(self) -> None:
+    async def place(self, resources: ApplicationResources) -> None:
         # The harness replaces ``asyncio.create_task`` with a recorder; these
         # must be real tasks, so they are created on the loop directly.
+        self._resources = resources
         loop = asyncio.get_running_loop()
         for label in self.LABELS:
             self.tasks[label] = loop.create_task(self._body(label))
         keys = self._keys
-        main._attach_abort_successor_tasks[keys["attach_abort_successor"]] = self.tasks[
-            "attach_abort_successor"
-        ]
-        main._stateless_workspace_ensure_registry.register(
+        resources.attach_abort_successor_tasks[keys["attach_abort_successor"]] = (
+            self.tasks["attach_abort_successor"]
+        )
+        resources.stateless_workspace_ensure_registry.register(
             keys["stateless_workspace_ensure"],
             self.tasks["stateless_workspace_ensure"],
         )
-        main._late_cloud_setup_tasks[keys["late_cloud_setup"]] = self.tasks[
+        resources.late_cloud_setup_tasks[keys["late_cloud_setup"]] = self.tasks[
             "late_cloud_setup"
         ]
-        main.cloud_task_registry.protected_engage_register(
+        resources.cloud_task_registry.protected_engage_register(
             keys["protected_engage"], self.tasks["protected_engage"]
         )
-        main.cloud_task_registry.cloud_stage_tasks[keys["cloud_stage"]] = self.tasks[
-            "cloud_stage"
-        ]
-        main._project_repair_state.bg_repair_tasks.add(self.tasks["project_repair"])
+        resources.cloud_task_registry.cloud_stage_tasks[keys["cloud_stage"]] = (
+            self.tasks["cloud_stage"]
+        )
+        resources.project_repair_state.bg_repair_tasks.add(self.tasks["project_repair"])
         await _settle()
 
     async def cleanup(self) -> None:
@@ -407,17 +410,20 @@ class _RegistryTasks:
             task.cancel()
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
+        resources = getattr(self, "_resources", None)
+        if resources is None:
+            return
         keys = self._keys
-        main._attach_abort_successor_tasks.pop(keys["attach_abort_successor"], None)
-        main._stateless_workspace_ensure_registry.discard(
+        resources.attach_abort_successor_tasks.pop(keys["attach_abort_successor"], None)
+        resources.stateless_workspace_ensure_registry.discard(
             keys["stateless_workspace_ensure"]
         )
-        main._late_cloud_setup_tasks.pop(keys["late_cloud_setup"], None)
-        main.cloud_task_registry.protected_engage_tasks.pop(
+        resources.late_cloud_setup_tasks.pop(keys["late_cloud_setup"], None)
+        resources.cloud_task_registry.protected_engage_tasks.pop(
             keys["protected_engage"], None
         )
-        main.cloud_task_registry.cloud_stage_tasks.pop(keys["cloud_stage"], None)
-        main._project_repair_state.bg_repair_tasks.discard(
+        resources.cloud_task_registry.cloud_stage_tasks.pop(keys["cloud_stage"], None)
+        resources.project_repair_state.bg_repair_tasks.discard(
             self.tasks.get("project_repair")
         )
 
@@ -429,23 +435,24 @@ async def test_shutdown_cancels_every_registry_task_before_any_client_closes(
     recorder = _Recorder()
     placed = _RegistryTasks(recorder.events)
 
-    async def _inside(_world):
-        await placed.place()
+    async def _inside(world):
+        await placed.place(world.resources)
 
     try:
-        await _run_lifespan(monkeypatch, recorder, inside=_inside)
+        world = await _run_lifespan(monkeypatch, recorder, inside=_inside)
+        resources = world.resources
         events = recorder.events
         first_close = events.index(_FIRST_CLOSE)
         for label in _RegistryTasks.LABELS:
             assert f"cancelled:{label}" in events, f"{label} was never cancelled"
             assert events.index(f"cancelled:{label}") < first_close, label
         assert all(task.done() for task in placed.tasks.values())
-        assert main._attach_abort_successor_tasks == {}
-        assert main._stateless_workspace_ensure_registry.in_flight() == {}
-        assert main._late_cloud_setup_tasks == {}
-        assert main.cloud_task_registry.protected_engage_tasks == {}
-        assert main.cloud_task_registry.cloud_stage_tasks == {}
-        assert main._project_repair_state.bg_repair_tasks == set()
+        assert resources.attach_abort_successor_tasks == {}
+        assert resources.stateless_workspace_ensure_registry.in_flight() == {}
+        assert resources.late_cloud_setup_tasks == {}
+        assert resources.cloud_task_registry.protected_engage_tasks == {}
+        assert resources.cloud_task_registry.cloud_stage_tasks == {}
+        assert resources.project_repair_state.bg_repair_tasks == set()
         assert _closure(recorder) == SHUTDOWN_CLOSURE
     finally:
         await placed.cleanup()
@@ -461,8 +468,9 @@ async def test_attach_abort_successor_is_stopped_and_its_outcome_survives_shutdo
     reconciling = asyncio.Event()
     stopped: list[str] = []
     scheduled: list[asyncio.Task[None]] = []
+    successor_tasks: list[dict[Any, asyncio.Task[None]]] = []
 
-    async def reconcile_blocks(_candidate) -> bool:
+    async def reconcile_blocks(_candidate, **_kwargs) -> bool:
         reconciling.set()
         try:
             await asyncio.Event().wait()
@@ -474,7 +482,17 @@ async def test_attach_abort_successor_is_stopped_and_its_outcome_survives_shutdo
 
     async def _inside(world):
         world.store.acquire = outcome_store.acquire
-        monkeypatch.setattr(main, "_reconcile_attach_abort_successor", reconcile_blocks)
+        # The composition binds the owner's reconcile when it builds the
+        # recovery dependencies, so the owner is patched.
+        monkeypatch.setattr(
+            session_attach_recovery,
+            "reconcile_attach_abort_successor",
+            reconcile_blocks,
+        )
+        dependencies = sessions_composition.session_attach_recovery_dependencies(
+            world.resources
+        )
+        successor_tasks.append(dependencies.successor_tasks)
         # The real scheduler, with the real ``asyncio.create_task``: the
         # harness's recorder would replace the task with a stub. The harness
         # restores the real function when it exits either way.
@@ -482,11 +500,12 @@ async def test_attach_abort_successor_is_stopped_and_its_outcome_survives_shutdo
         asyncio.create_task = _REAL_CREATE_TASK
         try:
             scheduled.append(
-                main._schedule_attach_abort_successor(
+                session_attach_recovery.schedule_attach_abort_successor(
                     THREAD,
                     retired_runtime_generation=GENERATION,
                     retired_attach_token=ATTACH_TOKEN,
                     retired_agent_id=AGENT,
+                    dependencies=dependencies,
                 )
             )
         finally:
@@ -494,7 +513,11 @@ async def test_attach_abort_successor_is_stopped_and_its_outcome_survives_shutdo
         await asyncio.wait_for(reconciling.wait(), timeout=2)
 
     try:
-        await _run_lifespan(monkeypatch, recorder, inside=_inside)
+        world = await _run_lifespan(monkeypatch, recorder, inside=_inside)
+        # The scheduler registered its task in this application's registry.
+        assert successor_tasks and (
+            successor_tasks[0] is world.resources.attach_abort_successor_tasks
+        )
         events = recorder.events
         assert "cancelled:attach_abort_successor" in events
         assert events.index("cancelled:attach_abort_successor") < events.index(
@@ -511,15 +534,14 @@ async def test_attach_abort_successor_is_stopped_and_its_outcome_survives_shutdo
             if not task.done():
                 task.cancel()
                 await asyncio.gather(task, return_exceptions=True)
-        main._attach_abort_successor_tasks.pop(
-            (THREAD, GENERATION, ATTACH_TOKEN, AGENT), None
-        )
+        for tasks in successor_tasks:
+            tasks.pop((THREAD, GENERATION, ATTACH_TOKEN, AGENT), None)
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "failing",
-    ["kb_datasource_tasks", "cloud_task_registry", "_project_repair_state"],
+    ["kb_datasource_tasks", "cloud_task_registry", "project_repair_state"],
 )
 async def test_a_failing_drain_does_not_abort_the_rest_of_shutdown(
     monkeypatch, failing
@@ -531,11 +553,13 @@ async def test_a_failing_drain_does_not_abort_the_rest_of_shutdown(
         recorder.events.append(f"drain-failed:{failing}")
         raise RuntimeError(f"{failing} drain exploded")
 
-    async def _inside(_world):
-        await placed.place()
+    async def _inside(world):
+        await placed.place(world.resources)
         # Applied inside the lifespan: the harness installs its own
         # ``kb_datasource_tasks.drain`` wrapper when it starts.
-        monkeypatch.setattr(getattr(main, failing), "drain", _explode, raising=False)
+        monkeypatch.setattr(
+            getattr(world.resources, failing), "drain", _explode, raising=False
+        )
 
     failure: BaseException | None = None
     try:
@@ -546,7 +570,7 @@ async def test_a_failing_drain_does_not_abort_the_rest_of_shutdown(
         events = recorder.events
         owned_by_failing = {
             "cloud_task_registry": {"protected_engage", "cloud_stage"},
-            "_project_repair_state": {"project_repair"},
+            "project_repair_state": {"project_repair"},
         }.get(failing, set())
         for label in _RegistryTasks.LABELS:
             if label in owned_by_failing:

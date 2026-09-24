@@ -152,7 +152,8 @@ async def test_public_documentation_annotation_keeps_internal_parsing_and_raw_in
 
 def test_actual_composed_operations_keep_ids_and_publish_public_request_schema():
     from fastapi.openapi.utils import get_openapi
-    from orchestrator.main import app, JobCreate as legacy
+    from orchestrator.main import app
+    from orchestrator.schemas.job_create import JobCreate as legacy
 
     assert legacy is JobCreate
     document = get_openapi(title=app.title, version=app.version, routes=app.routes)

@@ -18,6 +18,10 @@ from agent.core.datasource_setup import (
     process_datasources,
     resolve_repo_clone_names,
 )
+from orchestrator.application import preparation as preparation_composition
+from orchestrator.services import (
+    agent_datasource_payload as agent_datasource_payload_module,
+)
 
 
 def make_workspace_manager(supports_shell=True, with_backend=True):
@@ -58,9 +62,14 @@ def agent_payload(*db_rows):
     contract the orchestrator never produces. Anything asserting on what the
     agent receives must start here.
     """
-    from orchestrator.main import _build_datasources_payload
+    import orchestrator.main
 
-    return _build_datasources_payload(list(db_rows))
+    return agent_datasource_payload_module.build_datasources_payload(
+        list(db_rows),
+        dependencies=preparation_composition.datasource_payload_dependencies(
+            orchestrator.main.app.state.resources
+        ),
+    )
 
 
 class TestCapabilityGate:
@@ -518,9 +527,15 @@ class TestRealAgentPayloadCarriesForgeMetadata:
             clone_repository_datasources(payload, ws)
         assert ws.source_repo_meta["srw"]["forge"] == "github"
 
-        from orchestrator.main import _build_datasource_tool_override
+        import orchestrator.main
 
-        override = _build_datasource_tool_override(payload, None)
+        override = agent_datasource_payload_module.build_datasource_tool_override(
+            payload,
+            None,
+            dependencies=preparation_composition.datasource_payload_dependencies(
+                orchestrator.main.app.state.resources
+            ),
+        )
         config = load_config_from_resolved(
             {
                 "agent": {

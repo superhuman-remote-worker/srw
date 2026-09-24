@@ -17,6 +17,27 @@ from orchestrator.database.postgres import PostgresDB
 from orchestrator.services import manifest_execution_snapshot as snapshots
 from orchestrator.services.manifest_store import ManifestStore
 from shared.manifests import validate_documents
+from orchestrator.application import controls as controls_composition
+from orchestrator.services import config_resolver as config_resolver_module
+from orchestrator.services import deployment_gates as deployment_gates_module
+from orchestrator.services import grant_enforcement as grant_enforcement_module
+from orchestrator.services import (
+    job_datasource_selection as job_datasource_selection_module,
+)
+from orchestrator.services import (
+    job_dispatch_credentials as job_dispatch_credentials_module,
+)
+from orchestrator.services import job_start_bundle as job_start_bundle_module
+from orchestrator.services import (
+    job_workspace_authority as job_workspace_authority_module,
+)
+from orchestrator.services import job_workspace_runtime as job_workspace_runtime_module
+from orchestrator.services import (
+    managed_repository_authority as managed_repository_authority_module,
+)
+from orchestrator.services import runtime_actor as runtime_actor_module
+from orchestrator.services import workspace_tier_policy as workspace_tier_policy_module
+import httpx
 
 
 USER = "11111111-1111-4111-8111-111111111111"
@@ -774,7 +795,7 @@ async def test_session_update_rolls_back_settings_when_revision_capture_fails(
     db.refresh_session_execution = AsyncMock(
         side_effect=HTTPException(409, "capture failed")
     )
-    monkeypatch.setattr(main, "postgres_db", db)
+    monkeypatch.setattr(main.app.state.resources, "postgres_db", db)
     monkeypatch.setattr(
         thread_config_update, "apply_thread_config_update_locked", change_settings
     )
@@ -967,64 +988,76 @@ async def test_job_resume_uses_frozen_config_and_requires_capable_recipient(
         safe_projection=lambda: {"effective_backend": "none"},
     )
     check = AsyncMock()
-    monkeypatch.setattr(main, "postgres_db", db)
-    monkeypatch.setattr(main, "COMPLETION_COMMANDS_ENABLED", False)
+    monkeypatch.setattr(main.app.state.resources, "postgres_db", db)
     monkeypatch.setattr(
-        main,
-        "_prepare_job_workspace_runtime",
+        main.app.state.resources.settings, "completion_commands_enabled", False
+    )
+    monkeypatch.setattr(
+        job_workspace_authority_module,
+        "prepare_job_workspace_runtime",
         AsyncMock(return_value=("proceed", job, None)),
     )
     monkeypatch.setattr(
-        main.job_workspace_authority,
+        job_workspace_authority_module,
         "attest_pinned_k8s_job_workspace",
         AsyncMock(return_value=(job, None)),
     )
     monkeypatch.setattr(
-        main, "_resolve_authorized_job_datasources", AsyncMock(return_value=[])
+        job_datasource_selection_module,
+        "resolve_authorized_job_datasources",
+        AsyncMock(return_value=[]),
     )
-    monkeypatch.setattr(main, "_job_project_repositories", AsyncMock(return_value=[]))
     monkeypatch.setattr(
-        main,
+        job_start_bundle_module, "job_project_repositories", AsyncMock(return_value=[])
+    )
+    monkeypatch.setattr(
+        managed_repository_authority_module,
         "authorize_job_repository_transport",
         AsyncMock(return_value=(None, [], [])),
     )
     monkeypatch.setattr(
-        main.job_workspace_runtime,
+        job_workspace_runtime_module,
         "inject_matching_workspace_config",
         lambda _job, co, **_: (co, decision),
     )
-    monkeypatch.setattr(main, "_inject_lite_workspace_config", lambda co, **_: co)
-    monkeypatch.setattr(main, "_is_experts_db_enabled", lambda: False)
-    monkeypatch.setattr(main, "_user_experts_enabled", AsyncMock(return_value=True))
-    monkeypatch.setattr(main, "_enforce_dispatch_grants", check)
     monkeypatch.setattr(
-        main,
-        "_inject_dispatch_credentials",
+        workspace_tier_policy_module, "inject_lite_workspace_config", lambda co, **_: co
+    )
+    monkeypatch.setattr(deployment_gates_module, "is_experts_db_enabled", lambda: False)
+    monkeypatch.setattr(
+        grant_enforcement_module, "user_experts_enabled", AsyncMock(return_value=True)
+    )
+    monkeypatch.setattr(grant_enforcement_module, "enforce_dispatch_grants", check)
+    monkeypatch.setattr(
+        job_dispatch_credentials_module,
+        "inject_dispatch_credentials",
         AsyncMock(side_effect=lambda _job, co, **_: co),
     )
     monkeypatch.setattr(
-        main, "resolve_config", lambda **_: pytest.fail("resume used live SRW resolver")
+        config_resolver_module,
+        "resolve_config",
+        lambda **_: pytest.fail("resume used live SRW resolver"),
     )
     monkeypatch.setattr(
-        main,
+        runtime_actor_module,
         "mint_worker_runtime_actor",
         AsyncMock(return_value=SimpleNamespace(to_payload=lambda: {})),
     )
     monkeypatch.setattr(
-        main.job_workspace_authority,
+        job_workspace_authority_module,
         "pinned_k8s_job_workspace_authority_is_current",
         AsyncMock(return_value=True),
     )
     monkeypatch.setattr(
-        main,
-        "_prepare_pinned_job_mutation_target",
+        controls_composition,
+        "prepare_pinned_job_mutation_target",
         AsyncMock(
             return_value=SimpleNamespace(
                 agent=agent, recipient=SimpleNamespace(model_dump=lambda **_: {})
             )
         ),
     )
-    monkeypatch.setattr(main.httpx, "AsyncClient", Client)
+    monkeypatch.setattr(httpx, "AsyncClient", Client)
 
     assert (
         await control_seams.resume_job_on_agent(job, agent)
@@ -1077,13 +1110,19 @@ async def test_resume_preflight_checks_frozen_policy_without_live_expert(monkeyp
         "context": {},
     }
     db = SimpleNamespace(fetchrow=AsyncMock(return_value=frozen))
-    check = AsyncMock(side_effect=main.GrantDenied(["revoked model grant"]))
-    monkeypatch.setattr(main, "postgres_db", db)
-    monkeypatch.setattr(main._completion_control_boundary, "guard", AsyncMock())
-    monkeypatch.setattr(main, "_user_experts_enabled", AsyncMock(return_value=True))
-    monkeypatch.setattr(main, "_enforce_dispatch_grants", check)
+    check = AsyncMock(
+        side_effect=grant_enforcement_module.GrantDenied(["revoked model grant"])
+    )
+    monkeypatch.setattr(main.app.state.resources, "postgres_db", db)
     monkeypatch.setattr(
-        main,
+        main.app.state.resources.completion_control_boundary, "guard", AsyncMock()
+    )
+    monkeypatch.setattr(
+        grant_enforcement_module, "user_experts_enabled", AsyncMock(return_value=True)
+    )
+    monkeypatch.setattr(grant_enforcement_module, "enforce_dispatch_grants", check)
+    monkeypatch.setattr(
+        config_resolver_module,
         "resolve_config",
         lambda **_: pytest.fail("resume preflight read live config"),
     )

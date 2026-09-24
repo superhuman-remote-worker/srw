@@ -19,6 +19,14 @@ from orchestrator.services import (
     job_start_bundle,
     job_workspace_authority,
 )
+from orchestrator.application import sessions as sessions_composition
+from orchestrator.schemas import job_runtime as job_runtime_module
+from orchestrator.security import access as access_module
+from orchestrator.services import container_provisioner as container_provisioner_module
+from orchestrator.services import (
+    vm_workspace_recovery_store as vm_workspace_recovery_store_module,
+)
+import functools
 
 UNIT_ID = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
 POD_NAME = "srw-agent-stateless-d9d86bd6f-pll7v"
@@ -154,29 +162,38 @@ def _sandbox_app(monkeypatch, *, repo_credentials=None):
     monkeypatch.setenv("AGENT_LABEL_NAME", "superhuman-remote-worker")
     monkeypatch.setenv("AGENT_LABEL_INSTANCE", "srw")
     db = NoRegistrationFakeDB(run_queue_row=dict(LEASED_ROW), job=_worker_job())
-    store = orch_main.VMWorkspaceRecoveryStore(db)
+    store = vm_workspace_recovery_store_module.VMWorkspaceRecoveryStore(db)
     attest = AsyncMock(return_value=None)
-    original_factory = orch_main._unit_claim_bundle_dependencies
+    original_factory = functools.partial(
+        sessions_composition.unit_claim_bundle_dependencies,
+        orch_main.app.state.resources,
+    )
 
     def _factory():
         deps = original_factory()
         return dataclasses.replace(deps, attest_stateless_claimant=attest)
 
-    monkeypatch.setattr(orch_main, "postgres_db", db)
-    monkeypatch.setattr(orch_main, "require_internal", AsyncMock())
-    monkeypatch.setattr(orch_main, "VMWorkspaceRecoveryStore", lambda _db: store)
-    monkeypatch.setattr(orch_main, "_unit_claim_bundle_dependencies", _factory)
+    monkeypatch.setattr(orch_main.app.state.resources, "postgres_db", db)
+    monkeypatch.setattr(access_module, "require_internal", AsyncMock())
+    monkeypatch.setattr(
+        vm_workspace_recovery_store_module,
+        "VMWorkspaceRecoveryStore",
+        lambda _db: store,
+    )
+    monkeypatch.setattr(
+        sessions_composition, "unit_claim_bundle_dependencies", _factory
+    )
     monkeypatch.setattr(
         job_workspace_authority,
         "resolve_subjob_inherited_workspace",
         AsyncMock(return_value=("proceed", None)),
     )
     if repo_credentials is None:
-        job_start_request = orch_main.JobStartRequest(
+        job_start_request = job_runtime_module.JobStartRequest(
             job_id=UNIT_ID, description="work"
         )
     else:
-        job_start_request = orch_main.JobStartRequest(
+        job_start_request = job_runtime_module.JobStartRequest(
             job_id=UNIT_ID,
             description="secret-bearing",
             managed_repository_credentials=repo_credentials,
@@ -186,7 +203,7 @@ def _sandbox_app(monkeypatch, *, repo_credentials=None):
         "build_job_start_request",
         AsyncMock(return_value=job_start_request),
     )
-    attested = orch_main.WorkspaceRuntimeAttestation(
+    attested = container_provisioner_module.WorkspaceRuntimeAttestation(
         backing_id="k8s-pod:superhuman-remote-worker:" + WORKSPACE_GENERATION,
         workspace_generation=WORKSPACE_GENERATION,
         runtime_incarnation=WORKSPACE_RUNTIME,
@@ -196,7 +213,7 @@ def _sandbox_app(monkeypatch, *, repo_credentials=None):
         port=30022,
     )
     monkeypatch.setattr(
-        orch_main.container_provisioner,
+        container_provisioner_module.container_provisioner,
         "attest_workspace_runtime",
         AsyncMock(return_value=attested),
     )
@@ -398,8 +415,6 @@ async def test_repo_revoked_during_final_claimant_lookup_refused(monkeypatch):
 
     import httpx
 
-    from orchestrator import main as orch_main
-
     app, db, attest = _sandbox_app(monkeypatch)
     credentials = [
         {
@@ -414,7 +429,7 @@ async def test_repo_revoked_during_final_claimant_lookup_refused(monkeypatch):
         job_start_bundle,
         "build_job_start_request",
         AsyncMock(
-            return_value=orch_main.JobStartRequest(
+            return_value=job_runtime_module.JobStartRequest(
                 job_id=UNIT_ID,
                 description="secret-bearing",
                 managed_repository_credentials=credentials,
@@ -576,10 +591,9 @@ async def test_transport_auth_refused_before_attestation(monkeypatch):
     from fastapi import HTTPException as _HTTPException
 
     app, db, attest = _sandbox_app(monkeypatch)
-    from orchestrator import main as orch_main
 
     monkeypatch.setattr(
-        orch_main,
+        access_module,
         "require_internal",
         _AsyncMock(side_effect=_HTTPException(401, "Unauthorized")),
     )

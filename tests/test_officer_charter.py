@@ -45,6 +45,7 @@ from shared.runtime_actor import (
 )
 from agent.tools.knowledge.knowledge_tools import create_kb_tools
 from orchestrator.services import session_create_overrides
+from orchestrator.services import officer_post_policy as officer_post_policy_module
 
 _MIGRATION = (
     Path(__file__).resolve().parents[1]
@@ -609,8 +610,6 @@ class TestConferenceConfig:
             )
 
     def test_private_post_snapshot_materializes_safe_exact_authority(self):
-        import orchestrator.main
-
         cleaned = session_create_overrides.validated_post_owned_officer_create_fragment(
             {
                 "officer": {
@@ -619,7 +618,7 @@ class TestConferenceConfig:
                     "slots": {"line": {"count": 1, "spend_ceiling_daily": 4.5}},
                 }
             },
-            validated_officer_post_patch=orchestrator.main._validated_officer_post_patch,
+            validated_officer_post_patch=officer_post_policy_module.validated_officer_post_patch,
         )
         assert cleaned == {
             "auto_pull": True,

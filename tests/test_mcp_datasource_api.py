@@ -8,12 +8,12 @@ from uuid import UUID
 import pytest
 from fastapi import HTTPException
 
-from orchestrator.main import (
-    _build_datasource_tool_override,
-    _build_datasources_payload,
-    _mcp_datasources_enabled,
-    _mcp_stdio_enabled,
-    _validate_mcp_datasource,
+import orchestrator.main
+from orchestrator.services.deployment_gates import (
+    mcp_datasources_enabled as _mcp_datasources_enabled,
+)
+from orchestrator.services.deployment_gates import (
+    mcp_stdio_enabled as _mcp_stdio_enabled,
 )
 from orchestrator.routers.datasources import (
     create_datasource,
@@ -21,6 +21,11 @@ from orchestrator.routers.datasources import (
     update_datasource,
 )
 from orchestrator.schemas.datasources import DatasourceCreate, DatasourceUpdate
+from orchestrator.application import preparation as preparation_composition
+from orchestrator.services import (
+    agent_datasource_payload as agent_datasource_payload_module,
+)
+from orchestrator.services import datasource_config as datasource_config_module
 
 
 def _route_deps(*, store=None, gates=None):
@@ -52,7 +57,7 @@ def _route_deps(*, store=None, gates=None):
             inject_system_kb_embedding_profile=AsyncMock(return_value=None),
         ),
         mcp_datasources_enabled=_mcp_datasources_enabled,
-        validate_mcp_datasource=_validate_mcp_datasource,
+        validate_mcp_datasource=datasource_config_module.validate_mcp_datasource,
     )
     return DatasourcesDependencies(store=db, operations=operations, **(gates or {}))
 
@@ -89,25 +94,31 @@ class TestMcpShapeValidation:
     def test_remote_requires_http_url(self, monkeypatch):
         monkeypatch.setenv("MCP_STDIO_ENABLED", "true")
         with pytest.raises(HTTPException, match="connection_url"):
-            _validate_mcp_datasource(None, {"transport": "http"})
+            datasource_config_module.validate_mcp_datasource(
+                None, {"transport": "http"}
+            )
         with pytest.raises(HTTPException, match="HTTP"):
-            _validate_mcp_datasource("file:///tmp/socket", {"transport": "http"})
+            datasource_config_module.validate_mcp_datasource(
+                "file:///tmp/socket", {"transport": "http"}
+            )
 
     def test_stdio_gate_and_command(self, monkeypatch):
         monkeypatch.delenv("MCP_STDIO_ENABLED", raising=False)
         with pytest.raises(HTTPException, match="disabled"):
-            _validate_mcp_datasource(
+            datasource_config_module.validate_mcp_datasource(
                 None,
                 {"transport": "stdio", "command": "npx"},
             )
 
         monkeypatch.setenv("MCP_STDIO_ENABLED", "true")
         with pytest.raises(HTTPException, match="command"):
-            _validate_mcp_datasource(None, {"transport": "stdio"})
+            datasource_config_module.validate_mcp_datasource(
+                None, {"transport": "stdio"}
+            )
 
     def test_rejects_unknown_transport(self):
         with pytest.raises(HTTPException, match="transport"):
-            _validate_mcp_datasource(
+            datasource_config_module.validate_mcp_datasource(
                 "https://example.test/mcp",
                 {"transport": "pigeon"},
             )
@@ -115,7 +126,7 @@ class TestMcpShapeValidation:
     def test_validates_auth_without_echoing_secret(self):
         secret = "DO_NOT_ECHO_THIS_TOKEN"
         with pytest.raises(HTTPException) as exc:
-            _validate_mcp_datasource(
+            datasource_config_module.validate_mcp_datasource(
                 "https://example.test/mcp",
                 {
                     "transport": "http",
@@ -269,7 +280,7 @@ def test_payload_forwards_mcp_credentials(monkeypatch):
         "args": [],
         "env": {"K": "v"},
     }
-    payload = _build_datasources_payload(
+    payload = agent_datasource_payload_module.build_datasources_payload(
         [
             {
                 "id": "x",
@@ -279,7 +290,10 @@ def test_payload_forwards_mcp_credentials(monkeypatch):
                 "credentials": credentials,
                 "project_read_only": False,
             }
-        ]
+        ],
+        dependencies=preparation_composition.datasource_payload_dependencies(
+            orchestrator.main.app.state.resources
+        ),
     )
     assert payload[0]["credentials"] == credentials
 
@@ -295,16 +309,55 @@ def test_runtime_gates_strip_existing_mcp_rows(monkeypatch):
     }
 
     monkeypatch.delenv("MCP_DATASOURCES_ENABLED", raising=False)
-    assert _build_datasources_payload([datasource]) is None
-    assert _build_datasource_tool_override([datasource], None)["tools"]["mcp"] == []
+    assert (
+        agent_datasource_payload_module.build_datasources_payload(
+            [datasource],
+            dependencies=preparation_composition.datasource_payload_dependencies(
+                orchestrator.main.app.state.resources
+            ),
+        )
+        is None
+    )
+    assert (
+        agent_datasource_payload_module.build_datasource_tool_override(
+            [datasource],
+            None,
+            dependencies=preparation_composition.datasource_payload_dependencies(
+                orchestrator.main.app.state.resources
+            ),
+        )["tools"]["mcp"]
+        == []
+    )
 
     monkeypatch.setenv("MCP_DATASOURCES_ENABLED", "true")
     monkeypatch.delenv("MCP_STDIO_ENABLED", raising=False)
-    assert _build_datasources_payload([datasource]) is None
+    assert (
+        agent_datasource_payload_module.build_datasources_payload(
+            [datasource],
+            dependencies=preparation_composition.datasource_payload_dependencies(
+                orchestrator.main.app.state.resources
+            ),
+        )
+        is None
+    )
 
     monkeypatch.setenv("MCP_STDIO_ENABLED", "true")
-    assert _build_datasources_payload([datasource]) is not None
-    assert _build_datasource_tool_override([datasource], None)["tools"]["mcp"] == ["*"]
+    assert (
+        agent_datasource_payload_module.build_datasources_payload(
+            [datasource],
+            dependencies=preparation_composition.datasource_payload_dependencies(
+                orchestrator.main.app.state.resources
+            ),
+        )
+        is not None
+    )
+    assert agent_datasource_payload_module.build_datasource_tool_override(
+        [datasource],
+        None,
+        dependencies=preparation_composition.datasource_payload_dependencies(
+            orchestrator.main.app.state.resources
+        ),
+    )["tools"]["mcp"] == ["*"]
 
 
 class TestMcpConnectionTest:

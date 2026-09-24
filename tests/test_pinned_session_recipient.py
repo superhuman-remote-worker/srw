@@ -11,6 +11,21 @@ import pytest
 
 from shared.pinned_session_identity import PinnedSessionBinding
 from orchestrator.services import session_attach_payload
+from orchestrator.application import sessions as sessions_composition
+from orchestrator.services import agent_provisioner as agent_provisioner_module
+from orchestrator.services import (
+    managed_repository_authority as managed_repository_authority_module,
+)
+from orchestrator.services import (
+    pinned_session_mutation_target as pinned_session_mutation_target_module,
+)
+from orchestrator.services import (
+    protected_cloud_engage as protected_cloud_engage_module,
+)
+from orchestrator.services import (
+    session_attach_binding as session_attach_binding_module,
+)
+import httpx
 
 THREAD_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
 AGENT_ID = "11111111-1111-4111-8111-111111111111"
@@ -58,10 +73,17 @@ async def test_orchestrator_attests_receipt_backed_warm_pool_shape(monkeypatch):
     binding = _binding(pod_authority_kind="warm_pool")
     attest = AsyncMock(return_value=True)
     monkeypatch.setattr(
-        main.agent_provisioner, "attest_pinned_session_recipient", attest
+        agent_provisioner_module.agent_provisioner,
+        "attest_pinned_session_recipient",
+        attest,
     )
 
-    assert await main._attest_pinned_session_mutation_pod(binding=binding)
+    assert await pinned_session_mutation_target_module.attest_pinned_session_mutation_pod(
+        binding=binding,
+        dependencies=sessions_composition.pinned_session_mutation_target_dependencies(
+            main.app.state.resources
+        ),
+    )
     attest.assert_awaited_once_with(
         binding.agent_hostname,
         thread_id=THREAD_ID,
@@ -180,8 +202,8 @@ async def test_orchestrator_detach_sends_exact_bound_fingerprint(monkeypatch):
             observed.update({"url": url, "json": json})
             return _Response()
 
-    monkeypatch.setattr(main, "postgres_db", db)
-    monkeypatch.setattr(main.httpx, "AsyncClient", _Client)
+    monkeypatch.setattr(main.app.state.resources, "postgres_db", db)
+    monkeypatch.setattr(httpx, "AsyncClient", _Client)
 
     assert await control_seams.detach_agent_session(THREAD_ID, timeout=1) is True
     assert observed == {
@@ -206,8 +228,8 @@ async def test_orchestrator_detach_never_dials_without_exact_binding(monkeypatch
         get_pinned_session_binding=AsyncMock(return_value=None),
     )
     client = AsyncMock()
-    monkeypatch.setattr(main, "postgres_db", db)
-    monkeypatch.setattr(main.httpx, "AsyncClient", client)
+    monkeypatch.setattr(main.app.state.resources, "postgres_db", db)
+    monkeypatch.setattr(httpx, "AsyncClient", client)
 
     assert await control_seams.detach_agent_session(THREAD_ID, timeout=1) is False
     client.assert_not_called()
@@ -409,15 +431,22 @@ async def test_same_ip_successor_fails_pre_delivery_process_recheck(monkeypatch)
             return _Response()
 
     attest = AsyncMock(return_value=True)
-    monkeypatch.setattr(main, "postgres_db", db)
-    monkeypatch.setattr(main.httpx, "AsyncClient", _Client)
-    monkeypatch.setattr(main, "_attest_pinned_session_mutation_pod", attest)
+    monkeypatch.setattr(main.app.state.resources, "postgres_db", db)
+    monkeypatch.setattr(httpx, "AsyncClient", _Client)
+    monkeypatch.setattr(
+        pinned_session_mutation_target_module,
+        "attest_pinned_session_mutation_pod",
+        attest,
+    )
 
-    target = await main._prepare_pinned_session_mutation_target(
+    target = await pinned_session_mutation_target_module.prepare_pinned_session_mutation_target(
         thread_id=THREAD_ID,
         agent_id=AGENT_ID,
         runtime_generation=GENERATION,
         attach_token=ATTACH_TOKEN,
+        dependencies=sessions_composition.pinned_session_mutation_target_dependencies(
+            main.app.state.resources
+        ),
     )
 
     assert target is None
@@ -442,7 +471,7 @@ async def test_attach_wrapper_sends_server_recipient_and_postchecks(monkeypatch)
         "pod_ip": "10.42.0.17",
         "pod_port": 8001,
     }
-    target = main._PinnedSessionMutationTarget(
+    target = pinned_session_mutation_target_module.PinnedSessionMutationTarget(
         agent=agent,
         binding=_binding(),
         recipient=_recipient(),
@@ -470,15 +499,21 @@ async def test_attach_wrapper_sends_server_recipient_and_postchecks(monkeypatch)
             observed.update({"url": url, "json": json})
             return _Response()
 
-    monkeypatch.setattr(main, "postgres_db", db)
+    monkeypatch.setattr(main.app.state.resources, "postgres_db", db)
     monkeypatch.setattr(
-        main, "_await_protected_cloud_runtime_ready", AsyncMock(return_value=True)
+        protected_cloud_engage_module,
+        "_await_protected_cloud_runtime_ready",
+        AsyncMock(return_value=True),
     )
     monkeypatch.setattr(
-        main, "prepare_thread_repository_authority", AsyncMock(return_value=None)
+        managed_repository_authority_module,
+        "prepare_thread_repository_authority",
+        AsyncMock(return_value=None),
     )
     monkeypatch.setattr(
-        main, "_reserve_session_attach_binding", AsyncMock(return_value=ATTACH_TOKEN)
+        session_attach_binding_module,
+        "reserve_session_attach_binding",
+        AsyncMock(return_value=ATTACH_TOKEN),
     )
     monkeypatch.setattr(
         session_attach_payload,
@@ -486,15 +521,25 @@ async def test_attach_wrapper_sends_server_recipient_and_postchecks(monkeypatch)
         AsyncMock(return_value={"session_runtime_generation": GENERATION}),
     )
     monkeypatch.setattr(
-        main,
-        "_prepare_pinned_session_mutation_target",
+        pinned_session_mutation_target_module,
+        "prepare_pinned_session_mutation_target",
         AsyncMock(return_value=target),
     )
     current = AsyncMock(return_value=True)
-    monkeypatch.setattr(main, "_pinned_session_mutation_target_is_current", current)
-    monkeypatch.setattr(main.httpx, "AsyncClient", _Client)
+    monkeypatch.setattr(
+        pinned_session_mutation_target_module,
+        "pinned_session_mutation_target_is_current",
+        current,
+    )
+    monkeypatch.setattr(httpx, "AsyncClient", _Client)
 
-    accepted = await main._send_session_attach_locked(agent, THREAD_ID)
+    accepted = await session_attach_binding_module.send_session_attach_locked(
+        agent,
+        THREAD_ID,
+        dependencies=sessions_composition.session_attach_binding_dependencies(
+            main.app.state.resources
+        ),
+    )
 
     assert accepted is True
     assert observed == {
@@ -505,4 +550,9 @@ async def test_attach_wrapper_sends_server_recipient_and_postchecks(monkeypatch)
             "_recipient": _recipient(),
         },
     }
-    current.assert_awaited_once_with(target)
+    # The post-check is the owner's, bound by the composition to this
+    # application's store.
+    current.assert_awaited_once()
+    assert current.await_args.args == (target,)
+    assert set(current.await_args.kwargs) == {"dependencies"}
+    assert current.await_args.kwargs["dependencies"].store is db

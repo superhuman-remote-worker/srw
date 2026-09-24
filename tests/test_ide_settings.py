@@ -1568,9 +1568,12 @@ class TestSweeperRegistrationShape:
         import ast
         import inspect
 
-        import orchestrator.main as orchestrator_main
+        # R1.B12: the background tasks are started by the application's
+        # composition, which names the sweeper through its owning module.
+        from orchestrator.application import background_tasks
 
-        tree = ast.parse(inspect.getsource(orchestrator_main._start_background_tasks))
+        source = inspect.getsource(background_tasks.start_background_tasks)
+        tree = ast.parse(source)
         gated = []
         for node in ast.walk(tree):
             if not (
@@ -1584,10 +1587,8 @@ class TestSweeperRegistrationShape:
             ):
                 target = target.args[0]
             gated.append(ast.unparse(target))
-        assert "code_server_settings_sweeper" in gated
-        mentions = inspect.getsource(orchestrator_main._start_background_tasks).count(
-            "code_server_settings_sweeper"
-        )
+        assert "ide_settings.code_server_settings_sweeper" in gated
+        mentions = source.count("code_server_settings_sweeper")
         assert mentions == 1
 
     @pytest.mark.asyncio

@@ -10,6 +10,7 @@ import copy
 
 from orchestrator.security import access
 from orchestrator.services.thread_projection import redact_thread_metadata
+from orchestrator.application import jobs as jobs_composition
 
 
 def _full_config_override() -> dict:
@@ -226,9 +227,7 @@ class TestRedactThreadMetadataShape:
 
 class TestRedactJobWorkspaceAuthority:
     def test_public_job_projection_is_coordinate_and_credential_free(self):
-        import orchestrator.main as main
-
-        out = main._redact_job_config_override(
+        out = jobs_composition.redact_job_config_override(
             {
                 "id": "job-1",
                 "config_override": {

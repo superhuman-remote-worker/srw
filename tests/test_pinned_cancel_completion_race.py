@@ -18,6 +18,10 @@ from tests.test_job_completion_endpoint_wrapper import (
     _patch_normal_route_dependencies,
     _route_job,
 )
+from orchestrator.schemas import job_runtime as job_runtime_module
+from orchestrator.services import job_dispatcher as job_dispatcher_module
+from orchestrator.services import job_workspace_runtime as job_workspace_runtime_module
+from orchestrator.services import vm_provisioner as vm_provisioner_module
 
 
 pg_dsn = postgres_fixtures.pg_dsn
@@ -107,7 +111,9 @@ def _isolate(monkeypatch, db):
     _patch_normal_route_dependencies(
         monkeypatch, database=db, terminal_effects=terminal, workspace_cleanup=cleanup
     )
-    monkeypatch.setattr(main, "COMPLETION_COMMANDS_ENABLED", False)
+    monkeypatch.setattr(
+        main.app.state.resources.settings, "completion_commands_enabled", False
+    )
     return terminal, cleanup
 
 
@@ -123,7 +129,7 @@ async def test_real_postgres_inflight_completion_cannot_overwrite_cancel(
     )
     db = await _database(pg, context=context)
     terminal, cleanup = _isolate(monkeypatch, db)
-    body = main.JobCompleteRequest(
+    body = job_runtime_module.JobCompleteRequest(
         should_stop=True,
         goal_achieved=outcome == "completed",
         error=(
@@ -158,9 +164,13 @@ async def test_real_postgres_recovery_pause_loss_stops_completion_tail(
         race_at="pause_job_shed_freeze" if recovery == "pod" else "pause_job",
     )
     terminal, cleanup = _isolate(monkeypatch, db)
-    monkeypatch.setattr(main, "_job_needs_vm", lambda _: recovery == "vm")
+    monkeypatch.setattr(
+        job_workspace_runtime_module, "job_needs_vm", lambda _: recovery == "vm"
+    )
     vm_capture = AsyncMock()
-    monkeypatch.setattr(main.vm_provisioner, "capture_vm_teardown_identity", vm_capture)
+    monkeypatch.setattr(
+        vm_provisioner_module.vm_provisioner, "capture_vm_teardown_identity", vm_capture
+    )
     error = None
     freeze = None
     if recovery in {"infra", "vm", "pod"}:
@@ -180,7 +190,9 @@ async def test_real_postgres_recovery_pause_loss_stops_completion_tail(
         await b08_helpers.complete_job_legacy(
             None,
             db.job["id"],
-            main.JobCompleteRequest(should_stop=True, error=error, freeze_data=freeze),
+            job_runtime_module.JobCompleteRequest(
+                should_stop=True, error=error, freeze_data=freeze
+            ),
             _authorized=True,
         )
     assert exc.value.status_code == 409
@@ -190,7 +202,7 @@ async def test_real_postgres_recovery_pause_loss_stops_completion_tail(
     terminal.assert_not_awaited()
     cleanup.assert_not_awaited()
     vm_capture.assert_not_awaited()
-    main._trigger_dispatch.assert_not_called()
+    job_dispatcher_module.trigger_dispatch.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -266,7 +278,7 @@ async def test_real_postgres_uncontested_legacy_disposition_still_commits(
 ):
     db = await _database(pg, race_at=None)
     _isolate(monkeypatch, db)
-    body = main.JobCompleteRequest(
+    body = job_runtime_module.JobCompleteRequest(
         should_stop=True,
         goal_achieved=freeze_type is None,
         freeze_data={"freeze_type": freeze_type} if freeze_type else None,
@@ -295,10 +307,10 @@ async def test_real_deliverable_gate_cannot_swallow_cancelled_resume_race(
     real_gate = completion.apply_deliverable_gate
     terminal, cleanup = _isolate(monkeypatch, db)
     monkeypatch.setattr(completion, "apply_deliverable_gate", real_gate)
-    monkeypatch.setattr(main, "gitea_client", make_gitea([]))
+    monkeypatch.setattr(main.app.state.resources, "gitea_client", make_gitea([]))
     evidence = AsyncMock()
     monkeypatch.setattr(job_evidence, "build_evidence_manifest", evidence)
-    body = main.JobCompleteRequest(
+    body = job_runtime_module.JobCompleteRequest(
         should_stop=True,
         goal_achieved=True,
         freeze_data={"freeze_type": "job_complete", "summary": "test completion"},
@@ -315,4 +327,4 @@ async def test_real_deliverable_gate_cannot_swallow_cancelled_resume_race(
     evidence.assert_not_awaited()
     terminal.assert_not_awaited()
     cleanup.assert_not_awaited()
-    main._trigger_dispatch.assert_not_called()
+    job_dispatcher_module.trigger_dispatch.assert_not_called()
