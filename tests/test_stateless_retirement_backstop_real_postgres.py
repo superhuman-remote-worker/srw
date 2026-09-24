@@ -474,3 +474,53 @@ class TestAbsentRuntimeRecoveryRequiresTheExactReceipt:
             terminal_token=int(closure["terminal_token"]) - 1,
             runtime_incarnation=thread["runtime"],
         )
+
+
+class TestResumeTransitionRequiresASettledPredecessor:
+    """The ended->created transaction itself refuses an unsettled End."""
+
+    @pytest.mark.asyncio
+    async def test_resume_refuses_while_the_marker_is_pending(self, db):
+        thread = await _live_stateless_thread(db)
+        await _begin(db, thread, permanent=False)
+
+        assert not await db.resume_thread(thread["thread_id"])
+        row = await db.get_thread(thread["thread_id"])
+        assert row["status"] == "ended"
+
+    @pytest.mark.asyncio
+    async def test_proofs_without_settlement_still_refuse_resume(self, db):
+        """Acknowledged stages are not a released runtime."""
+
+        thread = await _live_stateless_thread(db)
+        closure = await _begin(db, thread, permanent=False)
+        assert await db.record_stateless_thread_workspace_process_zero(
+            thread["thread_id"], runtime_incarnation=thread["runtime"]
+        )
+        assert await db.acknowledge_stateless_thread_runtime_process_zero(
+            thread["thread_id"],
+            terminal_token=int(closure["terminal_token"]),
+            runtime_incarnation=thread["runtime"],
+        )
+
+        assert not await db.resume_thread(thread["thread_id"])
+        row = await db.get_thread(thread["thread_id"])
+        assert row["status"] == "ended"
+
+    @pytest.mark.asyncio
+    async def test_repeated_begin_reuses_the_same_terminal_token(self, db):
+        """End/Delete retries while pending never mint a new owner."""
+
+        thread = await _live_stateless_thread(db)
+        first = await _begin(db, thread, permanent=True)
+        again = await db.begin_stateless_thread_workspace_retirement(
+            thread["thread_id"], force=True, permanent=True
+        )
+
+        assert again["state"] == "closed"
+        assert again["retry"] is True
+        assert again["terminal_token"] == first["terminal_token"]
+        soft = await db.begin_stateless_thread_workspace_retirement(
+            thread["thread_id"], force=True, permanent=False
+        )
+        assert soft["retry"] is True and soft["permanent"] is True
