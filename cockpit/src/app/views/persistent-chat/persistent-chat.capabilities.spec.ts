@@ -43,7 +43,8 @@ function sessionState() {
     'outbox', 'outboxIds', 'draftDatasourceIds']) state[key] = signal([]);
   for (const key of ['compaction', 'rewindPrefill', 'rewindPreview', 'runningTool', 'pendingWorkspaceOffer',
     'currentUsage', 'queueState', 'verifiedProjectFolder', 'cloudSessionUrl', 'ncSessionFolder',
-    'cloudDiffProbe', 'cloudStagedAt', 'attachmentError', 'error', 'endedAt', 'draftDefaultsError']) state[key] = signal(null);
+    'cloudDiffProbe', 'cloudStagedAt', 'attachmentError', 'error', 'endedAt', 'draftDefaultsError',
+    'workspaceLifecycle']) state[key] = signal(null);
   return {...state, isConnected: signal(true), sessionReady: signal(true), threadId: signal('test-thread'),
     threadStatus: signal('active'), sessionTitle: signal('Test session'), connectionState: signal('connected'),
     modelName: signal('Test model'), permissionMode: signal('supervised'), narrationMode: signal('off'),

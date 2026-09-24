@@ -2164,9 +2164,12 @@ describe('persistent-chat host wiring', () => {
     // folder is only renamed when a project action sits beside it.
     expect(src).toContain('sessionFilesLabelKey()');
     // The asleep/ended branch must offer it too — that is where PC-19 was hit.
-    expect(src).toContain(
-      '@else if (chat.cloudSessionUrl() || chat.ncSessionFolder() || chat.verifiedProjectFolder())',
-    );
+    // Its gate also admits a VM lifecycle (a suspended VM's IDE/SSH wake), but
+    // it must still admit the verified project folder and render its action.
+    const asleepBranch =
+      '@else if (chat.workspaceLifecycle() || chat.cloudSessionUrl() || chat.ncSessionFolder() || chat.verifiedProjectFolder())';
+    expect(src).toContain(asleepBranch);
+    expect(blockAfter(src, asleepBranch)).toContain('(click)="openProjectFiles()"');
   });
 
   it('never offers a project folder that was not cross-checked', () => {

@@ -70,8 +70,8 @@ const HELD_ROWS = ['unbound', 'bound_reserved', 'active', 'warm', 'teardown', 't
           <h4>{{ 'admin.capacity.vm.held' | transloco }}</h4>
           <p class="subtle">{{ 'admin.capacity.vm.heldDescription' | transloco }}</p>
           <div class="table-wrap">
-            <table data-testid="vm-held-table">
-              <thead><tr><th scope="col">{{ 'admin.capacity.vm.categoryHeading' | transloco }}</th><th scope="col">CPU (m)</th><th scope="col">{{ 'admin.capacity.vm.memory' | transloco }} (B)</th><th scope="col">{{ 'admin.capacity.vm.storage' | transloco }} (B)</th><th scope="col">KVM</th><th scope="col">TUN</th><th scope="col">vhost-net</th></tr></thead>
+            <table class="app-table" data-testid="vm-held-table">
+              <thead><tr><th scope="col">{{ 'admin.capacity.vm.categoryHeading' | transloco }}</th><th scope="col">CPU <span class="unit">(m)</span></th><th scope="col">{{ 'admin.capacity.vm.memory' | transloco }} <span class="unit">(B)</span></th><th scope="col">{{ 'admin.capacity.vm.storage' | transloco }} <span class="unit">(B)</span></th><th scope="col">KVM</th><th scope="col">TUN</th><th scope="col">vhost-net</th></tr></thead>
               <tbody>
                 @for (row of heldRows; track row) {
                   <tr><th scope="row">{{ ('admin.capacity.vm.category.' + row) | transloco }}</th>
@@ -85,8 +85,8 @@ const HELD_ROWS = ['unbound', 'bound_reserved', 'active', 'warm', 'teardown', 't
           @if (cluster.totals; as totals) {
             <h4>{{ 'admin.capacity.vm.accounting' | transloco }}</h4>
             <div class="table-wrap">
-              <table data-testid="vm-totals-table">
-                <thead><tr><th scope="col">{{ 'admin.capacity.vm.categoryHeading' | transloco }}</th><th scope="col">CPU (m)</th><th scope="col">{{ 'admin.capacity.vm.memory' | transloco }} (B)</th><th scope="col">{{ 'admin.capacity.vm.storage' | transloco }} (B)</th><th scope="col">KVM</th><th scope="col">TUN</th><th scope="col">vhost-net</th></tr></thead>
+              <table class="app-table" data-testid="vm-totals-table">
+                <thead><tr><th scope="col">{{ 'admin.capacity.vm.categoryHeading' | transloco }}</th><th scope="col">CPU <span class="unit">(m)</span></th><th scope="col">{{ 'admin.capacity.vm.memory' | transloco }} <span class="unit">(B)</span></th><th scope="col">{{ 'admin.capacity.vm.storage' | transloco }} <span class="unit">(B)</span></th><th scope="col">KVM</th><th scope="col">TUN</th><th scope="col">vhost-net</th></tr></thead>
                 <tbody>
                   @for (row of resourceRows; track row) {
                     <tr><th scope="row">{{ ('admin.capacity.vm.category.' + row) | transloco }}</th>
@@ -101,8 +101,8 @@ const HELD_ROWS = ['unbound', 'bound_reserved', 'active', 'warm', 'teardown', 't
           }
           <h4>{{ 'admin.capacity.vm.separate' | transloco }}</h4>
           <div class="table-wrap">
-            <table data-testid="vm-separate-table">
-              <thead><tr><th scope="col">{{ 'admin.capacity.vm.categoryHeading' | transloco }}</th><th scope="col">CPU (m)</th><th scope="col">{{ 'admin.capacity.vm.memory' | transloco }} (B)</th><th scope="col">{{ 'admin.capacity.vm.storage' | transloco }} (B)</th><th scope="col">KVM</th><th scope="col">TUN</th><th scope="col">vhost-net</th></tr></thead>
+            <table class="app-table" data-testid="vm-separate-table">
+              <thead><tr><th scope="col">{{ 'admin.capacity.vm.categoryHeading' | transloco }}</th><th scope="col">CPU <span class="unit">(m)</span></th><th scope="col">{{ 'admin.capacity.vm.memory' | transloco }} <span class="unit">(B)</span></th><th scope="col">{{ 'admin.capacity.vm.storage' | transloco }} <span class="unit">(B)</span></th><th scope="col">KVM</th><th scope="col">TUN</th><th scope="col">vhost-net</th></tr></thead>
               <tbody>
                 <tr><th scope="row">{{ 'admin.capacity.vm.orphaned' | transloco }} ({{ known(cluster.orphaned_held?.count) }})</th>
                   <td>{{ known(cluster.orphaned_held?.resources?.cpu_millicores) }}</td><td>{{ known(cluster.orphaned_held?.resources?.memory_bytes) }}</td><td>{{ known(cluster.orphaned_held?.resources?.ephemeral_storage_bytes) }}</td><td>{{ known(cluster.orphaned_held?.resources?.kvm_devices) }}</td><td>{{ known(cluster.orphaned_held?.resources?.tun_devices) }}</td><td>{{ known(cluster.orphaned_held?.resources?.vhost_net_devices) }}</td>
@@ -122,8 +122,8 @@ const HELD_ROWS = ['unbound', 'bound_reserved', 'active', 'warm', 'teardown', 't
                   <h5>{{ node.name }}</h5>
                   @if (node.general_exclusion) { <code>{{ node.general_exclusion }}</code> }
                   <div class="table-wrap">
-                    <table>
-                      <thead><tr><th scope="col">{{ 'admin.capacity.vm.categoryHeading' | transloco }}</th><th scope="col">CPU (m)</th><th scope="col">{{ 'admin.capacity.vm.memory' | transloco }} (B)</th><th scope="col">{{ 'admin.capacity.vm.storage' | transloco }} (B)</th><th scope="col">KVM</th><th scope="col">TUN</th><th scope="col">vhost-net</th></tr></thead>
+                    <table class="app-table">
+                      <thead><tr><th scope="col">{{ 'admin.capacity.vm.categoryHeading' | transloco }}</th><th scope="col">CPU <span class="unit">(m)</span></th><th scope="col">{{ 'admin.capacity.vm.memory' | transloco }} <span class="unit">(B)</span></th><th scope="col">{{ 'admin.capacity.vm.storage' | transloco }} <span class="unit">(B)</span></th><th scope="col">KVM</th><th scope="col">TUN</th><th scope="col">vhost-net</th></tr></thead>
                       <tbody>
                         @for (row of resourceRows; track row) {
                           <tr><th scope="row">{{ ('admin.capacity.vm.category.' + row) | transloco }}</th>
@@ -161,10 +161,16 @@ const HELD_ROWS = ['unbound', 'bound_reserved', 'active', 'warm', 'teardown', 't
     .fact-label { color: var(--text-muted); margin-bottom: 4px; }
     small { overflow-wrap: anywhere; }
     .table-wrap { max-width: 100%; overflow-x: auto; }
-    table { border-collapse: collapse; min-width: 790px; width: 100%; font-size: 12px; font-variant-numeric: tabular-nums; }
-    th, td { text-align: right; padding: 7px 9px; border-bottom: 1px solid var(--border-hairline); white-space: nowrap; }
-    th:first-child { text-align: left; }
-    tbody th { font-weight: 500; }
+    /* Header, row and divider look come from the global .app-table
+       (src/styles/_app-table.scss); only the numeric grid stays local. */
+    .app-table { min-width: 790px; font-variant-numeric: tabular-nums; }
+    .app-table th, .app-table td { white-space: nowrap; }
+    .app-table thead th:not(:first-child), .app-table td { text-align: right; }
+    /* Row labels are <th scope="row">, which the global recipe leaves bare:
+       give them the body-cell metrics so the label column lines up. */
+    .app-table tbody th { text-align: left; font-weight: 500; padding: 10px 12px; border-bottom: 1px solid var(--border-hairline); color: var(--text-primary); }
+    /* The eyebrow header uppercases; a unit must keep its case (m is milli, M is mega). */
+    .unit { text-transform: none; letter-spacing: normal; }
     details { margin-top: 18px; }
     summary { cursor: pointer; font-weight: 600; }
     .node { border-top: 1px solid var(--border-hairline); margin-top: 10px; }
