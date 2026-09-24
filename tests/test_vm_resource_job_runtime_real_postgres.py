@@ -953,7 +953,8 @@ async def test_fresh_controller_inventory_rechecks_selected_node_before_effect(d
 
 
 @pytest.mark.asyncio
-async def test_ready_binding_uses_exact_pod_and_keeps_overreserve_high_water(db):
+@pytest.mark.parametrize("initial_overbudget", [False, True])
+async def test_ready_binding_uses_exact_pod_and_keeps_overreserve_high_water(db, initial_overbudget):
     policy, inventory, original, demand = await environment(db)
     retry = await waiter(db, policy, inventory)
     admitted = await policy.admit(request_id=str(retry["request_id"]))
@@ -1034,15 +1035,18 @@ async def test_ready_binding_uses_exact_pod_and_keeps_overreserve_high_water(db)
         admitted["reservation_id"],
     ) is None
     sample["pods"][0]["reservation_id"] = admitted["reservation_id"]
+    if initial_overbudget:
+        sample["pods"][0]["requests"]["cpu_millicores"] += 1
     await publish_sample(sample)
-    assert await bind()
+    assert await bind() is (not initial_overbudget)
     row = await db.fetchrow(
         "SELECT state,vm_uid,vmi_uid,launcher_uid,observed_cpu_millicores "
         "FROM vm_resource_reservations WHERE id=$1", admitted["reservation_id"],
     )
     assert (row["state"], str(row["vm_uid"]), str(row["vmi_uid"]),
             str(row["launcher_uid"]), row["observed_cpu_millicores"]) == (
-        "active", vm_uid, vmi_uid, launcher_uid, demand.cpu_millicores,
+        "reserved" if initial_overbudget else "active", vm_uid, vmi_uid, launcher_uid,
+        demand.cpu_millicores + int(initial_overbudget),
     )
     sample["pods"][0]["requests"]["cpu_millicores"] = demand.cpu_millicores + 1
     await publish_sample(sample)
@@ -1051,6 +1055,15 @@ async def test_ready_binding_uses_exact_pod_and_keeps_overreserve_high_water(db)
         "SELECT observed_cpu_millicores FROM vm_resource_reservations WHERE id=$1",
         admitted["reservation_id"],
     ) == demand.cpu_millicores + 1
+    from orchestrator.services.vm_resource_capacity import vm_capacity_snapshot
+
+    capacity = await vm_capacity_snapshot(db)
+    cluster = next(c for c in capacity["clusters"] if c["cluster_id"] == inventory.cluster_id)
+    expected = {**demand.to_six_dict(), "cpu_millicores": demand.cpu_millicores + 1}
+    category = "bound_reserved" if initial_overbudget else "active"
+    assert cluster["totals"][category] == cluster["held"][category] == expected
+    assert cluster["totals"]["unbound"] == dict.fromkeys(expected, 0)
+    assert cluster["totals"]["external"] == dict.fromkeys(expected, 0)
     sample["pods"][0]["requests"]["cpu_millicores"] = demand.cpu_millicores
     await publish_sample(sample)
     assert not await bind()

@@ -233,7 +233,7 @@ async def test_orphaned_charge_keeps_observed_high_water_and_blocks_reused_node_
 
 
 @pytest.mark.asyncio
-async def test_external_pending_and_count_backstop_have_distinct_scopes(db):
+async def test_external_pending_and_golden_vms_have_distinct_scopes(db):
     store, inventory, sample, demand = await environment(db)
     newer = successor(sample)
     external = {
@@ -278,8 +278,6 @@ async def test_external_pending_and_count_backstop_have_distinct_scopes(db):
             "deleting": deleting,
         }
         for name, deleting in (
-            ("agent-vm-example", False),
-            ("agent-vm-deleting", True),
             ("agent-vm-golden-image", False),
             ("unrelated-vm", False),
         )
@@ -288,22 +286,26 @@ async def test_external_pending_and_count_backstop_have_distinct_scopes(db):
     value = cluster(await vm_capacity_snapshot(db), inventory)
     assert value["available"] is True
     assert value["totals"]["external"] == value["pending_external"] == external
-    assert value["count_backstop"]["observed"] == 1
+    assert value["count_backstop"]["observed"] == 0
     assert value["count_backstop"]["maximum"] is None
 
 
 @pytest.mark.asyncio
-async def test_known_srw_vm_without_reservation_is_unknown_not_external_capacity(db):
+@pytest.mark.parametrize("owner_kind", ["thread", None])
+@pytest.mark.parametrize("deleting", [False, True])
+async def test_known_srw_vm_without_reservation_is_unknown_not_external_capacity(
+    db, owner_kind, deleting
+):
     store, inventory, sample, demand = await environment(db)
     newer = successor(sample)
     newer["vms"] = [
         {
             "uid": str(uuid4()),
             "name": "agent-vm-legacy",
-            "owner_kind": "thread",
-            "owner_id": str(uuid4()),
+            "owner_kind": owner_kind,
+            "owner_id": str(uuid4()) if owner_kind else None,
             "provision_generation": str(uuid4()),
-            "deleting": False,
+            "deleting": deleting,
         }
     ]
     await publish(inventory, newer)

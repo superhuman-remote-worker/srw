@@ -12,7 +12,11 @@ from orchestrator.services.vm_resource_reservation_store import (
     _charge_vector,
     _node_document,
 )
-from shared.vm_resource_accounting import ReservationCharge, account_inventory
+from shared.vm_resource_accounting import (
+    ReservationCharge,
+    account_inventory,
+    reservation_category,
+)
 from shared.vm_resource_admission import ResourceAdmissionError, ResourceVector
 from shared.vm_resource_inventory import (
     InventoryError,
@@ -23,7 +27,7 @@ from shared.vm_resource_placement import node_exclusion
 from shared.vm_resource_policy import validate_enforcement_resource_policy
 
 
-_CATEGORIES = ("unbound", "active", "warm", "teardown")
+_CATEGORIES = ("unbound", "bound_reserved", "active", "warm", "teardown")
 _NODE_CATEGORIES = (
     "allocatable",
     "headroom",
@@ -49,7 +53,12 @@ def _held(rows):
     totals = {key: _ZERO for key in _CATEGORIES}
     unknown = set()
     for row in rows:
-        key = "unbound" if row["state"] == "reserved" else row["state"]
+        key = reservation_category(
+            row["state"],
+            vm_uid=row["vm_uid"],
+            vmi_uid=row["current_vmi_uid"],
+            launcher_uid=row["current_launcher_uid"],
+        )
         totals[key] += _charge_vector(row)
         if row["resource_version"] != 2:
             unknown.add(key)
