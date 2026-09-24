@@ -3413,22 +3413,67 @@ async def _start_application(tasks: ApplicationTaskSet) -> None:
 
 async def _stop_application(tasks: ApplicationTaskSet) -> None:
     """Stop the lifecycle's tasks, drain the registries, then close clients and
-    stores in order (R1.B11 split of ``lifespan``)."""
+    stores in order (R1.B11 split of ``lifespan``).
+
+    The drains run after every background task has stopped and before any
+    client or store closes, in this fixed order (R1.B12):
+
+    1. dispatch passes and preemptions (``_job_dispatch_state``);
+    2. KB datasource reindexes (``kb_datasource_tasks``);
+    3. attach-abort successor provisioning (``_attach_abort_successor_tasks``);
+    4. stateless workspace reconciles (``_stateless_workspace_ensure_registry``);
+    5. late session-folder provisioning (``_late_cloud_setup_tasks``);
+    6. protected-cloud engages and cloud stages (``cloud_task_registry``);
+    7. background project repairs (``_project_repair_state``).
+
+    Work that provisions or awaits other work is stopped before the leaf work
+    it may be waiting on. A drain that fails is logged and the next one still
+    runs; like a failed background task, the first failure is re-raised only
+    once every store is closed.
+    """
+
+    from orchestrator.services.application_tasks import drain_task_mapping
 
     # Signal shutdown to background tasks and wait for each of them. A task
     # that ended with an error does not stop the rest of shutdown; it is
     # re-raised once every store is closed.
-    task_failure = await tasks.stop(_BACKGROUND_TASK_SHUTDOWN_ORDER)
+    first_failure = await tasks.stop(_BACKGROUND_TASK_SHUTDOWN_ORDER)
 
     # Dispatch passes and preemptions started by triggers belong to the
     # application too: stop them before any store closes. The leader loop has
     # exited above, so no new trigger can start one.
-    await _job_dispatch_state.drain()
-
     # Initial/manual datasource reindexes are request-spawned rather than loop
     # tasks. Cancel them before closing git/vector clients; the source context
     # removes temporary repositories and auth material in its cancellation path.
-    await kb_datasource_tasks.drain()
+    # The remaining registries hold request-spawned tasks that use the same
+    # clients and stores; each is cancelled and awaited here. A drain only
+    # cancels: it never writes or clears durable intent, such as the
+    # attach-abort outcome row the stale-agent detector re-schedules from.
+    drains = (
+        ("dispatch passes", lambda: _job_dispatch_state.drain()),
+        ("KB datasource reindexes", lambda: kb_datasource_tasks.drain()),
+        (
+            "attach-abort successors",
+            lambda: drain_task_mapping(_attach_abort_successor_tasks),
+        ),
+        (
+            "stateless workspace reconciles",
+            lambda: _stateless_workspace_ensure_registry.drain(),
+        ),
+        (
+            "late session-folder provisioning",
+            lambda: drain_task_mapping(_late_cloud_setup_tasks),
+        ),
+        ("cloud engage and stage tasks", lambda: cloud_task_registry.drain()),
+        ("background project repairs", lambda: _project_repair_state.drain()),
+    )
+    for label, drain in drains:
+        try:
+            await drain()
+        except Exception as exc:
+            logger.error("Draining %s failed; shutdown continues", label, exc_info=exc)
+            if first_failure is None:
+                first_failure = exc
 
     # Cleanup clients
     await nats_bridge.disconnect()
@@ -3450,8 +3495,8 @@ async def _stop_application(tasks: ApplicationTaskSet) -> None:
     await postgres_db.disconnect()
     _completion_runtime.reset()
     _session_memory_runtime.reset()
-    if task_failure is not None:
-        raise task_failure
+    if first_failure is not None:
+        raise first_failure
 
 
 @asynccontextmanager

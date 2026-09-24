@@ -10,13 +10,17 @@ Leader gating is the existing contract in
 ``run_when_leader``, which runs it only while this replica holds leadership
 and cancels it when leadership is lost or shutdown begins. Loops with their
 own advisory lock, row lease or claim are started plainly.
+
+Request-spawned tasks are not started here; their registries each own them.
+:func:`drain_task_mapping` is the one cancel-and-await primitive those
+registries share, so shutdown can stop them before the stores close (R1.B12).
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Awaitable, Callable, Coroutine, Sequence
+from collections.abc import Awaitable, Callable, Coroutine, MutableMapping, Sequence
 from typing import Any
 
 from orchestrator.services import leader_election
@@ -104,4 +108,41 @@ class ApplicationTaskSet:
         return first_failure
 
 
-__all__ = ["ApplicationTaskSet"]
+async def drain_task_mapping(
+    *mappings: MutableMapping[Any, asyncio.Task[Any]],
+) -> None:
+    """Cancel and await every task the given registries hold, then forget them.
+
+    R1.B12. For the application's request-spawned task registries, at
+    shutdown: every in-flight task in every mapping is cancelled first, then
+    all are awaited together (their errors and cancellations are absorbed), so
+    a task scheduled but not yet started never begins its body. Each drained
+    slot is then removed if it still holds the same task — the registries'
+    own identity-checked eviction, applied here because a task cancelled
+    before it started never runs the ``finally`` or callback some registries
+    evict from.
+
+    The calling task is never cancelled or awaited, and its slot is left to
+    its own owner. Cancellation of the caller is not absorbed. A task
+    registered after the drain began is not included; draining again is safe
+    and leaves the mappings usable.
+    """
+
+    current = asyncio.current_task()
+    drained = [
+        (mapping, key, task)
+        for mapping in mappings
+        for key, task in list(mapping.items())
+        if task is not current
+    ]
+    pending = [task for _mapping, _key, task in drained if not task.done()]
+    for task in pending:
+        task.cancel()
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+    for mapping, key, task in drained:
+        if mapping.get(key) is task:
+            mapping.pop(key, None)
+
+
+__all__ = ["ApplicationTaskSet", "drain_task_mapping"]

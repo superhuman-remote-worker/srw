@@ -41,15 +41,6 @@ from tests.test_b11_lifespan_characterization import (
     main,
 )
 
-_XFAIL = pytest.mark.xfail(
-    strict=True,
-    raises=AssertionError,
-    reason=(
-        "R1.B12 T1: the application's request-spawned task registries have no "
-        "shutdown drain; their tasks outlive the stores"
-    ),
-)
-
 THREAD = "11111111-1111-4111-8111-111111111111"
 GENERATION = "22222222-2222-4222-8222-222222222222"
 ATTACH_TOKEN = "33333333-3333-4333-8333-333333333333"
@@ -92,7 +83,6 @@ async def _settle() -> None:
 # --------------------------------------------------------------------------- #
 
 
-@_XFAIL
 @pytest.mark.asyncio
 async def test_drain_task_mapping_cancels_and_awaits_every_in_flight_task():
     drain_task_mapping = _drain_of(application_tasks, "drain_task_mapping")
@@ -117,7 +107,6 @@ async def test_drain_task_mapping_cancels_and_awaits_every_in_flight_task():
     assert third.cancelled() and tasks == {}
 
 
-@_XFAIL
 @pytest.mark.asyncio
 async def test_drain_task_mapping_never_cancels_the_calling_task():
     drain_task_mapping = _drain_of(application_tasks, "drain_task_mapping")
@@ -142,7 +131,6 @@ async def test_drain_task_mapping_never_cancels_the_calling_task():
 # --------------------------------------------------------------------------- #
 
 
-@_XFAIL
 @pytest.mark.asyncio
 async def test_cloud_task_registry_drain_cancels_engage_and_stage_tasks():
     registry = cloud_task_registry.CloudTaskRegistry()
@@ -173,7 +161,6 @@ async def test_cloud_task_registry_drain_cancels_engage_and_stage_tasks():
     assert registry.cloud_stage_tasks == {}
 
 
-@_XFAIL
 @pytest.mark.asyncio
 async def test_stateless_workspace_ensure_registry_drain_cancels_the_reconcile():
     registry = stateless_workspace_scheduler.StatelessWorkspaceEnsureRegistry()
@@ -203,7 +190,6 @@ async def test_stateless_workspace_ensure_registry_drain_cancels_the_reconcile()
     await drain()
 
 
-@_XFAIL
 @pytest.mark.asyncio
 async def test_project_repair_state_drain_cancels_background_repairs():
     state = project_provisioning.ProjectRepairState()
@@ -225,7 +211,6 @@ async def test_project_repair_state_drain_cancels_background_repairs():
     await drain()
 
 
-@_XFAIL
 @pytest.mark.asyncio
 async def test_late_cloud_setup_tasks_are_drained_by_the_mapping_helper():
     drain_task_mapping = _drain_of(application_tasks, "drain_task_mapping")
@@ -307,7 +292,6 @@ def _schedule_successor(dependencies):
     )
 
 
-@_XFAIL
 @pytest.mark.asyncio
 async def test_attach_abort_successor_drain_keeps_the_durable_outcome():
     drain_task_mapping = _drain_of(application_tasks, "drain_task_mapping")
@@ -438,7 +422,6 @@ class _RegistryTasks:
         )
 
 
-@_XFAIL
 @pytest.mark.asyncio
 async def test_shutdown_cancels_every_registry_task_before_any_client_closes(
     monkeypatch,
@@ -468,7 +451,6 @@ async def test_shutdown_cancels_every_registry_task_before_any_client_closes(
         await placed.cleanup()
 
 
-@_XFAIL
 @pytest.mark.asyncio
 async def test_attach_abort_successor_is_stopped_and_its_outcome_survives_shutdown(
     monkeypatch,
@@ -534,7 +516,6 @@ async def test_attach_abort_successor_is_stopped_and_its_outcome_survives_shutdo
         )
 
 
-@_XFAIL
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "failing",
