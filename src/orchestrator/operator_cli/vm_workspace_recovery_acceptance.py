@@ -972,15 +972,39 @@ class LiveScenario:
         )
 
     async def _reset_lease(self, job_id: UUID) -> int:
+        from shared.worker_queue import _CAS_JOB_SQL
+
+        worker = f"vm-recovery-gate:{self.run_id}"
         async with self.db.acquire() as conn, conn.transaction():
-            token = await conn.fetchval(
+            queue = await conn.fetchrow(
                 "UPDATE run_queue SET state='leased',lease_token=lease_token+1,"
                 "leased_by=$2,leased_until=clock_timestamp()+interval '5 minutes',"
                 "run_after=clock_timestamp(),park_reason=NULL,parked_at=NULL "
-                "WHERE unit_id=$1 RETURNING lease_token",
+                "WHERE unit_id=$1 AND unit_kind='worker_batch' "
+                "RETURNING lease_token,leased_until",
                 job_id,
-                f"vm-recovery-gate:{self.run_id}",
+                worker,
             )
+            job = await conn.fetchrow(
+                "SELECT status,context FROM jobs WHERE id=$1 FOR UPDATE", job_id
+            )
+            if (
+                queue is None
+                or job is None
+                or job["status"] not in {"created", "processing", "paused"}
+                or _object(job["context"]).get("vm_workspace_recovery_acceptance_gate")
+                != self.run_id
+                or await conn.fetchval(
+                    "SELECT EXISTS(SELECT 1 FROM vm_workspace_recovery_jobs "
+                    "WHERE job_id=$1 AND resolved_at IS NULL)", job_id
+                )
+                or await conn.fetchval(
+                    _CAS_JOB_SQL, job_id, job["status"], worker,
+                    queue["lease_token"], queue["leased_until"],
+                ) != job_id
+            ):
+                raise AcceptanceFailure("fixture lease reset lacks current claim authority")
+            token = queue["lease_token"]
             await conn.execute(
                 "INSERT INTO worker_batch_attempts (job_id,lease_token,claimed_attempt) "
                 "VALUES ($1,$2,1) ON CONFLICT DO NOTHING",
@@ -1008,7 +1032,7 @@ class LiveScenario:
                 operation_id,
             )
             await conn.execute(
-                "UPDATE jobs SET freeze_data=NULL,status='processing' WHERE id=$1",
+                "UPDATE jobs SET freeze_data=NULL,status='paused' WHERE id=$1",
                 job_id,
             )
 
@@ -2205,7 +2229,8 @@ class LiveScenario:
                 await conn.execute(
                     "UPDATE vm_workspace_recoveries r SET phase='cancelled',"
                     "resolved_at=COALESCE(r.resolved_at,clock_timestamp()) "
-                    "WHERE r.id IN (SELECT recovery_id FROM vm_workspace_recovery_jobs "
+                    "WHERE r.resolved_at IS NULL AND r.id IN "
+                    "(SELECT recovery_id FROM vm_workspace_recovery_jobs "
                     "WHERE job_id=$1)",
                     job_id,
                 )
