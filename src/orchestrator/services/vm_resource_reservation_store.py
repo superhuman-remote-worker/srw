@@ -735,7 +735,7 @@ class VMResourceReservationStore:
             ),
             "provision_generation": str(retry["provision_generation"]),
         }
-        if effects_present and not rejected_only:
+        if disposition_complete:
             disposition = _json(retry["cancellation_disposition"])
             if not isinstance(disposition, dict) or not isinstance(
                 disposition.get("disposition_id"), str

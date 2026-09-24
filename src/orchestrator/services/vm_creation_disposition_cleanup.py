@@ -8,11 +8,23 @@ from uuid import UUID, uuid5, NAMESPACE_URL
 
 def root_cleanup(disposition):
     """Derive the existing controller cleanup protocol's full immutable intent."""
+    if not isinstance(disposition, Mapping):
+        raise ValueError("Cancellation does not authorize disk purge")
+    owner_kind = disposition.get("owner_kind", "job")
+    owner_id = (
+        disposition.get("thread_id")
+        if owner_kind == "thread"
+        else disposition.get("job_id") if owner_kind == "job" else None
+    )
     if (
-        not isinstance(disposition, Mapping)
-        or type(disposition.get("version")) is not int
+        type(disposition.get("version")) is not int
         or disposition["version"] != 1
-        or disposition.get("disk_policy") != "purge_new_job_disk"
+        or disposition.get("disk_policy") != (
+            "purge_new_thread_disk" if owner_kind == "thread" else "purge_new_job_disk"
+        )
+        or owner_kind not in {"job", "thread"}
+        or owner_id is None
+        or (owner_kind == "thread" and disposition.get("job_id") != owner_id)
         or disposition.get("workspace_storage") is not None
         or disposition.get("workspace_instance_id") is not None
     ):
@@ -20,14 +32,14 @@ def root_cleanup(disposition):
     root = disposition["objects"]["rootdisk"]
     if (
         root["outcome"] != "observed"
-        or root["name"] != f"agent-vm-{disposition['job_id']}-rootdisk"
+        or root["name"] != f"agent-vm-{owner_id}-rootdisk"
         or root["namespace"] != disposition["namespace"]
     ):
         raise ValueError("Cancellation root identity changed")
     for value in (
         disposition["request_id"],
         disposition["disposition_id"],
-        disposition["job_id"],
+        owner_id,
         disposition["provision_generation"],
         disposition["admission_id"],
         root["uid"],
@@ -37,8 +49,8 @@ def root_cleanup(disposition):
             raise ValueError("Cancellation identity is invalid")
     identity = {
         "source": "controller_creation_rootdisk_delete",
-        "owner_kind": "job",
-        "owner_id": disposition["job_id"],
+        "owner_kind": owner_kind,
+        "owner_id": owner_id,
         "pvc_uid": root["pvc_uid"],
         "dv_uid": root["uid"],
         "provision_generation": disposition["provision_generation"],
@@ -156,7 +168,15 @@ async def validate_disposition_child(
         expected = root_cleanup(disposition)
         return (
             expected_vm_uid is None
-            and disposition["job_id"] == str(row["job_id"])
+            and disposition["job_id"] == str(
+                row["thread_id"] if row["owner_kind"] == "thread" else row["job_id"]
+            )
+            and disposition.get("owner_kind", "job") == row["owner_kind"]
+            and (row["owner_kind"] != "thread" or (
+                disposition.get("thread_id") == str(row["thread_id"])
+                and disposition.get("thread_runtime_generation")
+                == str(row["thread_runtime_generation"])
+            ))
             and disposition["provision_generation"] == str(row["provision_generation"])
             and disposition["carrier_uid"] == str(row["creation_carrier_uid"])
             and disposition["namespace"] == row["creation_carrier_namespace"]
@@ -207,8 +227,10 @@ async def child_disposition_identity(conn, child):
         not exact_root_child(child, disposition)
         or parent["completed_at"] is not None
         or parent["parent_admission_id"] is not None
-        or parent["owner_kind"] != "job"
-        or parent["owner_id"] != row["job_id"]
+        or parent["owner_kind"] != row["owner_kind"]
+        or parent["owner_id"] != (
+            row["thread_id"] if row["owner_kind"] == "thread" else row["job_id"]
+        )
         or parent["pvc_uid"] != row["observed_pvc_uid"]
     ):
         raise ValueError("Creation disposition child changed")

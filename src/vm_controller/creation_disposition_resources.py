@@ -193,7 +193,7 @@ class DispositionResources:
                         metadata.get(key) != expected[key]
                         for key in ("name", "namespace", "uid")
                     )
-                    or labels.get("srw.io/owner-kind") != "job"
+                    or labels.get("srw.io/owner-kind") != disposition.get("owner_kind", "job")
                     or labels.get("srw.io/owner-id") != disposition["job_id"]
                     or annotations.get(EFFECT_NONCE_ANNOTATION)
                     != intent["effect_nonce"]
@@ -217,7 +217,7 @@ class DispositionResources:
                                 "name": expected["name"],
                                 "old_pvc_uid": expected["pvc_uid"],
                                 "old_dv_uid": expected["uid"],
-                                "owner_kind": "job",
+                                "owner_kind": disposition.get("owner_kind", "job"),
                                 "owner_id": disposition["job_id"],
                             },
                         )

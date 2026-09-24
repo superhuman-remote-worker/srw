@@ -26,7 +26,7 @@ def source_disposition_plan(row, disposition, source, target):
         "kind": "source_disposition_planned",
         "disposition_id": disposition["disposition_id"],
         "request_id": str(row["request_id"]),
-        "job_id": str(row["job_id"]),
+        "job_id": str(row["thread_id"] if row.get("owner_kind") == "thread" else row["job_id"]),
         "provision_generation": str(row["provision_generation"]),
         "request_digest": row["request_digest"],
         "controller_configuration_digest": row["controller_configuration_digest"],

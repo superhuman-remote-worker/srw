@@ -36,6 +36,58 @@ class VMCreationDispositionStore:
         self.retries = retries
         self.db = retries.db
 
+    async def _scope(self, conn, request_id):
+        """Use the frozen, authorized End as the thread's terminal authority."""
+        row, owner = await self.retries._effect_scope(
+            conn, request_id, allow_terminal=True,
+        )
+        if row["owner_kind"] != "thread":
+            return row, owner
+        context = _json(owner["runtime_retirement_context"])
+        if not isinstance(context, dict):
+            raise VMCreationRetryConflict("thread_retirement_source_changed")
+        source = context.get("vm_creation_source")
+        captured = source.get("captured_vm") if isinstance(source, dict) else None
+        metadata = _json(owner["metadata"])
+        if not isinstance(metadata, dict):
+            raise VMCreationRetryConflict("thread_retirement_source_changed")
+        if (
+            owner["runtime_retirement_token"] is None
+            or owner["runtime_retirement_authorized_at"] is None
+            or context.get("settle_status") != "ended"
+            or owner["runtime_generation"] != row["thread_runtime_generation"]
+            or source is None
+            or source.get("request_id") != str(row["request_id"])
+            or source.get("provision_generation") != str(row["provision_generation"])
+            or source.get("request_digest") != row["request_digest"]
+            or source.get("controller_configuration_digest")
+            != row["controller_configuration_digest"]
+            or source.get("thread_runtime_generation")
+            != str(row["thread_runtime_generation"])
+            or source.get("thread_agent_id")
+            != (str(row["thread_agent_id"]) if row["thread_agent_id"] else None)
+            or source.get("thread_attach_token")
+            != (str(row["thread_attach_token"]) if row["thread_attach_token"] else None)
+            or not isinstance(captured, dict)
+            or captured.get("creation_request_id") != str(row["request_id"])
+            or captured.get("provision_generation") != str(row["provision_generation"])
+            or captured.get("vm_uid") is not None
+            or (
+                captured.get("rootdisk_pvc_uid") is not None
+                and captured["rootdisk_pvc_uid"] != (
+                    str(row["observed_pvc_uid"])
+                    if row["observed_pvc_uid"] else None
+                )
+            )
+            or (
+                metadata.get("vm") != captured
+                if row["state"] != "settled"
+                else "vm" in metadata
+            )
+        ):
+            raise VMCreationRetryConflict("thread_retirement_source_changed")
+        return row, owner
+
     async def prepare(self, *, request_id: str) -> dict:
         """Identify a cancellation-only carrier under an already held admission.
 
@@ -47,7 +99,7 @@ class VMCreationDispositionStore:
 
         async with self.db.acquire() as conn:
             async with conn.transaction():
-                row, _ = await self.retries._effect_scope(conn, request_id)
+                row, _ = await self._scope(conn, request_id)
                 if row["state"] != "cancel_requested":
                     raise VMCreationRetryConflict("job_not_cancelled")
                 permit = await self.retries._creation_permit_on_conn(conn, row)
@@ -68,6 +120,10 @@ class VMCreationDispositionStore:
                         row["request_id"],
                     )
                 ):
+                    raise VMCreationRetryConflict("creation_carrier_required")
+                if row["owner_kind"] == "thread":
+                    # A typed source requires its original v4 resource grant.
+                    # No cancellation-only v1 carrier may impersonate it.
                     raise VMCreationRetryConflict("creation_carrier_required")
                 binding = row["canonical_request"].get("workspace_storage")
                 return {
@@ -105,7 +161,7 @@ class VMCreationDispositionStore:
         values = self.retries._carrier(carrier)
         async with self.db.acquire() as conn:
             async with conn.transaction():
-                row, _ = await self.retries._effect_scope(conn, request_id)
+                row, owner = await self._scope(conn, request_id)
                 if row["state"] != "cancel_requested":
                     raise VMCreationRetryConflict("job_not_cancelled")
                 await self.retries._check_carrier(conn, row, carrier, values)
@@ -165,14 +221,14 @@ class VMCreationDispositionStore:
                     "version": 1,
                     "disposition_id": str(uuid4()),
                     "request_id": str(row["request_id"]),
-                    "job_id": str(row["job_id"]),
+                    "job_id": str(row["thread_id"] if row["owner_kind"] == "thread" else row["job_id"]),
                     "provision_generation": str(row["provision_generation"]),
                     "admission_id": str(row["creation_admission_id"]),
                     "carrier_uid": carrier["metadata"]["uid"],
                     "namespace": carrier["metadata"]["namespace"],
                     "disk_policy": "retain"
                     if binding or row["expected_pvc_uid"]
-                    else "purge_new_job_disk",
+                    else "purge_new_thread_disk" if row["owner_kind"] == "thread" else "purge_new_job_disk",
                     "workspace_storage": binding,
                     "workspace_instance_id": str(instance["id"]) if instance else None,
                     "objects": objects,
@@ -180,6 +236,15 @@ class VMCreationDispositionStore:
                     "source": source,
                     "source_resolution": source_resolution(row, source),
                 }
+                if row["owner_kind"] == "thread":
+                    disposition.update(
+                        owner_kind="thread", thread_id=str(row["thread_id"]),
+                        thread_runtime_generation=str(row["thread_runtime_generation"]),
+                        thread_agent_id=str(row["thread_agent_id"]) if row["thread_agent_id"] else None,
+                        thread_attach_token=str(row["thread_attach_token"]) if row["thread_attach_token"] else None,
+                        thread_wake_operation_id=str(row["thread_wake_operation_id"]) if row["thread_wake_operation_id"] else None,
+                        retirement_token=str(owner["runtime_retirement_token"]),
+                    )
                 await conn.execute(
                     "UPDATE vm_creation_retries SET cancellation_disposition=$2::jsonb,creation_carrier_uid=$3,creation_carrier_namespace=$4,revision=revision+1,updated_at=clock_timestamp() WHERE request_id=$1",
                     row["request_id"],
@@ -191,7 +256,7 @@ class VMCreationDispositionStore:
 
     async def _locked(self, conn, request_id, carrier):
         values = self.retries._carrier(carrier)
-        row, _ = await self.retries._effect_scope(conn, request_id)
+        row, _ = await self._scope(conn, request_id)
         if row["state"] != "cancel_requested":
             raise VMCreationRetryConflict("job_not_cancelled")
         await self.retries._check_carrier(conn, row, carrier, values)
@@ -232,7 +297,7 @@ class VMCreationDispositionStore:
                 if stage == "rootdisk" and binding
                 else (
                     "agent-vm-"
-                    + str(row["job_id"])
+                    + str(row["thread_id"] if row["owner_kind"] == "thread" else row["job_id"])
                     + ("-rootdisk" if stage == "rootdisk" else "-cloudinit")
                 )
             )
@@ -308,10 +373,11 @@ class VMCreationDispositionStore:
             child_id = child.admission_id
         else:
             child_id = await conn.fetchval(
-                "SELECT id FROM vm_workspace_cleanup_admissions WHERE parent_admission_id=$1 AND request_id=$2 AND owner_kind='job' AND owner_id=$3 AND pvc_uid=$4 AND source=$5 AND intent_digest=$6",
+                "SELECT id FROM vm_workspace_cleanup_admissions WHERE parent_admission_id=$1 AND request_id=$2 AND owner_kind=$3 AND owner_id=$4 AND pvc_uid=$5 AND source=$6 AND intent_digest=$7",
                 parent["id"],
                 UUID(intent["request_id"]),
-                row["job_id"],
+                intent["owner_kind"],
+                UUID(intent["owner_id"]),
                 UUID(intent["pvc_uid"]),
                 intent["source"],
                 intent["intent_digest"],
@@ -408,7 +474,7 @@ class VMCreationDispositionStore:
                     "namespace": disposition["namespace"],
                     "name": storage_name(binding)
                     if binding
-                    else f"agent-vm-{row['job_id']}-rootdisk",
+                    else f"agent-vm-{row['thread_id'] if row['owner_kind'] == 'thread' else row['job_id']}-rootdisk",
                 }
         try:
             plan = source_disposition_plan(row, disposition, source, target)
@@ -651,7 +717,7 @@ class VMCreationDispositionStore:
 
         async with self.db.acquire() as conn:
             async with conn.transaction():
-                row, _ = await self.retries._effect_scope(conn, request_id)
+                row, _ = await self._scope(conn, request_id)
                 values = self.retries._carrier(carrier)
                 await self.retries._check_carrier(conn, row, carrier, values, allow_completed=True)
                 if row["state"] == "settled":
@@ -705,4 +771,18 @@ class VMCreationDispositionStore:
                     "UPDATE vm_creation_retries SET state='settled',reason='creation_disposed',revision=revision+1,claim_token=NULL,claim_expires_at=NULL,resolved_at=clock_timestamp(),updated_at=clock_timestamp() WHERE request_id=$1",
                     row["request_id"],
                 )
+                if row["owner_kind"] == "thread":
+                    cleared = await conn.fetchval(
+                        "UPDATE threads SET metadata=metadata-'vm' "
+                        "WHERE id=$1 AND runtime_generation=$2 "
+                        "AND runtime_retirement_token=$3 "
+                        "AND runtime_retirement_authorized_at IS NOT NULL "
+                        "AND runtime_retirement_context->'vm_creation_source'->>'request_id'=$4 "
+                        "AND metadata->'vm'=runtime_retirement_context->'vm_creation_source'->'captured_vm' "
+                        "AND metadata->'vm'->>'vm_uid' IS NULL RETURNING id",
+                        row["thread_id"], row["thread_runtime_generation"],
+                        UUID(disposition["retirement_token"]), str(row["request_id"]),
+                    )
+                    if cleared is None:
+                        raise VMCreationRetryConflict("thread_retirement_source_changed")
                 return {"settled": True, "disposition": "creation_disposed"}
