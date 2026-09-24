@@ -7,6 +7,7 @@ import httpx
 
 from shared.vm_creation_issuance import canonical_configuration_digest
 from shared.vm_creation_retry import canonical_request_digest
+from shared.vm_disk_size import quantity_bytes, resolved_disk_size
 from shared.vm_lifecycle_auth import (
     AUTH_FIELD,
     sign_payload,
@@ -21,7 +22,12 @@ class CreationConfigurationUnavailable(ValueError):
         super().__init__(reason)
 
 
-def validate_creation_resolution(request: Mapping, result: Mapping) -> dict:
+def validate_creation_resolution(
+    request: Mapping,
+    result: Mapping,
+    *,
+    allow_legacy_floor: bool = False,
+) -> dict:
     """Validate a previously authenticated reply against the frozen preflight."""
     if (
         type(result.get("creation_retry_protocol")) is not int
@@ -36,9 +42,26 @@ def validate_creation_resolution(request: Mapping, result: Mapping) -> dict:
         != result["controller_configuration_digest"]
     ):
         raise ValueError("configuration digest mismatch")
+    configuration = result["controller_configuration"]
+    floor = configuration.get("disk_size_floor")
+    if floor is None:
+        if not allow_legacy_floor:
+            raise ValueError("controller disk floor unproven")
+    else:
+        expected_disk = resolved_disk_size(request.get("disk_size"), floor)
+        if request.get("preparation") is not None:
+            preparation_disk = configuration["preparation"]["disk_size"]
+            prepared_bytes = quantity_bytes(preparation_disk)
+            if prepared_bytes is None:
+                raise ValueError("controller preparation disk unproven")
+            if quantity_bytes(expected_disk) < prepared_bytes:
+                if request.get("disk_size") is not None:
+                    raise ValueError("caller intent changed")
+                expected_disk = preparation_disk
+        if result["request"].get("disk_size") != expected_disk:
+            raise ValueError("caller intent changed")
     for key, value in request.items():
-        # The existing controller raises disk_size to its source-disk floor.
-        # It materializes omitted/empty defaults and normalizes tier whitespace.
+        # The controller materializes omitted/empty defaults and normalizes tier whitespace.
         if key == "disk_size" or value in (None, ""):
             continue
         expected = (

@@ -202,6 +202,92 @@ async def test_resolution_handoff_atomically_freezes_config_and_initial_ledger(d
 
 
 @pytest.mark.asyncio
+async def test_signed_resolution_keeps_requested_disk_and_freezes_controller_floor(
+    db, monkeypatch
+):
+    import httpx
+
+    from orchestrator.services.vm_creation_transport import (
+        resolve_vm_creation_configuration,
+    )
+    from shared.vm_creation_retry import canonical_request_digest
+    from shared.vm_lifecycle_auth import (
+        AUTH_FIELD,
+        sign_payload,
+        unsigned_payload,
+        verify_payload,
+    )
+    from tests.test_vm_creation_configuration import controller
+    from vm_controller import controller as settings
+    from vm_controller.creation_configuration import resolve_creation_configuration
+
+    monkeypatch.setattr(settings, "VM_DISK_SIZE", "30Gi")
+    job = await initial_job(db)
+    request, fresh = candidate(job, disk_size="12Gi")
+    store = VMCreationPreflightStore(db)
+    await store.begin(job_id=str(job), request=request, fresh_context=fresh)
+    claim = (await store.claim_due(limit=1))[0]
+    secret = b"signed-disk-resolution-test-secret-32"
+
+    def signed_controller(http_request):
+        body = json.loads(http_request.content)
+        assert verify_payload(
+            body,
+            direction="request",
+            operation="creation_config_resolve",
+            secret=secret,
+        )
+        reply = resolve_creation_configuration(
+            controller(),
+            unsigned_payload(body)["request"],
+        )
+        return httpx.Response(
+            200,
+            json=sign_payload(
+                reply,
+                direction="response",
+                operation="creation_config_resolve",
+                secret=secret,
+                correlation_id=body[AUTH_FIELD]["request_id"],
+            ),
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(signed_controller),
+        base_url="http://controller",
+    ) as client:
+        resolved = await resolve_vm_creation_configuration(
+            client,
+            claim["request"],
+            secret=secret,
+        )
+    assert claim["request"]["disk_size"] == "12Gi"
+    assert resolved["request"]["disk_size"] == "30Gi"
+    await store.complete_resolution(claim, resolved)
+    async with db.acquire() as conn:
+        context = json.loads(
+            await conn.fetchval("SELECT context FROM jobs WHERE id=$1", job)
+        )
+        retry = await conn.fetchrow(
+            "SELECT canonical_request,request_digest,controller_configuration_digest "
+            "FROM vm_creation_retries WHERE request_id=$1",
+            claim["request_id"],
+        )
+    preflight = context["vm"]["creation_preflight"]
+    snapshot = context["vm"]["creation_request"]
+    assert preflight["request"]["disk_size"] == "12Gi"
+    assert preflight["request_digest"] == canonical_request_digest(preflight["request"])
+    assert snapshot["request"]["disk_size"] == "30Gi"
+    assert snapshot["request"] == json.loads(retry["canonical_request"])
+    assert snapshot["request_digest"] == retry["request_digest"]
+    assert (
+        snapshot["controller_configuration_digest"]
+        == retry["controller_configuration_digest"]
+    )
+    assert claim["request"] == request
+
+
+@pytest.mark.asyncio
 async def test_failed_ledger_admission_rolls_back_full_snapshot_and_preflight_handoff(
     db, monkeypatch
 ):

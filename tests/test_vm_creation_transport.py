@@ -73,6 +73,47 @@ async def test_configuration_resolution_authenticates_materialized_defaults_with
     assert "_auth" not in actual
 
 
+@pytest.mark.parametrize(
+    "requested, expected, changed",
+    [
+        ("malformed", "30Gi", "40Gi"),
+        ("12Gi", "30Gi", "12Gi"),
+        ("45Gi", "45Gi", "46Gi"),
+    ],
+)
+def test_resolution_disk_must_equal_authenticated_controller_floor(
+    monkeypatch,
+    requested,
+    expected,
+    changed,
+):
+    from orchestrator.services.vm_creation_transport import validate_creation_resolution
+    from shared.vm_creation_retry import canonical_request_digest
+    from vm_controller import controller as settings
+
+    monkeypatch.setattr(settings, "VM_DISK_SIZE", "30Gi")
+    monkeypatch.setattr(settings, "VM_GOLDEN_DISK_SIZE", "20Gi")
+    request = build_vm_creation_request(
+        **options(vm_image=None),
+        network_tier="restricted",
+        disk_size=requested,
+    )
+    resolved = resolve_creation_configuration(controller(), request)
+    assert resolved["controller_configuration"]["disk_size_floor"] == "30Gi"
+    assert resolved["controller_configuration"]["golden_disk_size"] == "20Gi"
+    assert (
+        validate_creation_resolution(request, resolved)["request"]["disk_size"]
+        == expected
+    )
+    changed_resolution = deepcopy(resolved)
+    changed_resolution["request"]["disk_size"] = changed
+    changed_resolution["request_digest"] = canonical_request_digest(
+        changed_resolution["request"]
+    )
+    with pytest.raises(ValueError, match="caller intent changed"):
+        validate_creation_resolution(request, changed_resolution)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "failure",
@@ -83,6 +124,8 @@ async def test_configuration_resolution_authenticates_materialized_defaults_with
         "options",
         "digest",
         "configuration",
+        "disk_floor",
+        "missing_disk_floor",
         "unavailable",
         "legacy",
         "boolean_protocol",
@@ -106,6 +149,16 @@ async def test_configuration_resolution_refuses_unproven_or_changed_intent(failu
             result["request_digest"] = "sha256:" + "0" * 64
         elif failure == "configuration":
             result["controller_configuration"]["namespace"] = "foreign"
+        elif failure == "disk_floor":
+            result["request"]["disk_size"] = "40Gi"
+            result["request_digest"] = canonical_request_digest(result["request"])
+        elif failure == "missing_disk_floor":
+            from shared.vm_creation_issuance import canonical_configuration_digest
+
+            result["controller_configuration"].pop("disk_size_floor")
+            result["controller_configuration_digest"] = canonical_configuration_digest(
+                result["controller_configuration"]
+            )
         elif failure == "legacy":
             result.pop("creation_retry_protocol")
         elif failure == "boolean_protocol":

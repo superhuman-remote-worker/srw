@@ -273,11 +273,17 @@ async def test_prepared_source_replacement_before_grant_has_no_job_write(prepare
 
 @pytest.mark.asyncio
 async def test_configuration_floors_omitted_disk_to_prepared_capacity(prepared):
+    from orchestrator.services.vm_creation_transport import validate_creation_resolution
+
     ctrl, _, authority, _, _ = prepared
     request = {**authority.row["request"]}
     request.pop("disk_size")
     resolved = resolve_creation_configuration(ctrl, request)
     assert resolved["request"]["disk_size"] == "30Gi"
+    assert (
+        validate_creation_resolution(request, resolved)["request"]["disk_size"]
+        == "30Gi"
+    )
 
 
 @pytest.mark.asyncio

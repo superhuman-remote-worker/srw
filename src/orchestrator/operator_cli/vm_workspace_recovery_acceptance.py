@@ -506,7 +506,7 @@ class LiveScenario:
                 )
                 retry = await conn.fetchrow(
                     "SELECT request_id,job_id,provision_generation,state,reason,ready_at,"
-                    "canonical_request,request_digest,observed_vm_uid,"
+                    "canonical_request,request_digest,controller_configuration_digest,observed_vm_uid,"
                     "observed_pvc_uid,execution_id,"
                     "execution_revision,execution_generation "
                     "FROM vm_creation_retries "
@@ -723,7 +723,7 @@ class LiveScenario:
         )
         retry = await self._row(
             "SELECT request_id,job_id,provision_generation,state,reason,ready_at,"
-            "canonical_request,request_digest,observed_vm_uid,"
+            "canonical_request,request_digest,controller_configuration_digest,observed_vm_uid,"
             "observed_pvc_uid,execution_id,"
             "execution_revision,execution_generation FROM vm_creation_retries "
             "WHERE request_id=$1",
@@ -764,7 +764,7 @@ class LiveScenario:
     ) -> bool:
         """Match one frozen, authenticated Ready result to this gate Job."""
         from orchestrator.services.vm_creation_preflight import _preflight
-        from shared.vm_creation_retry import canonical_request_digest
+        from orchestrator.operator_cli.vm_fixture_readiness import creation_source_matches
         from shared.vm_network_profile import NETWORK_PROFILE, reusable_profile_evidence
 
         context = _object(job.get("context"))
@@ -805,6 +805,7 @@ class LiveScenario:
             or preflight["request"].get("provision_generation")
             != self.fixture_generation
             or preflight["request"].get("vm_image") != self.fixture_image
+            or preflight["request"].get("disk_size") != vm_config.get("disk_size")
             or vm.get("creation_request_id") != self.fixture_request_id
             or vm.get("identity_authenticated") is not True
             or vm.get("identity_provision_generation") != self.fixture_generation
@@ -818,7 +819,6 @@ class LiveScenario:
             != identity.get("prior_vmi_uid")
         ):
             return False
-        canonical = _object(retry.get("canonical_request"))
         if (
             str(retry.get("request_id")) != self.fixture_request_id
             or retry.get("job_id") != job_id
@@ -828,14 +828,13 @@ class LiveScenario:
             or (retry.get("ready_at") is not None) != require_ready
             or str(retry.get("observed_vm_uid")) != identity["vm_uid"]
             or str(retry.get("observed_pvc_uid")) != identity["root_pvc_uid"]
-            or canonical != preflight["request"]
-            or not canonical
-            or canonical_request_digest(canonical) != retry.get("request_digest")
+            or not creation_source_matches(vm, preflight, retry)
             or str(retry.get("execution_id")) != preflight["execution_id"]
             or retry.get("execution_revision") != preflight["execution_revision"]
             or retry.get("execution_generation") != preflight["execution_generation"]
         ):
             return False
+        canonical = _object(retry.get("canonical_request"))
         if getattr(self, "profiled_fixture", False) and (
             canonical.get("network_profile") != NETWORK_PROFILE
             or not reusable_profile_evidence(

@@ -12,6 +12,7 @@ from uuid import UUID
 from orchestrator.services.vm_creation_preflight import _preflight
 from orchestrator.services.vm_creation_readiness import VMCreationReadinessStore
 from orchestrator.services.vm_creation_retry_store import VMCreationRetryConflict
+from orchestrator.services.vm_creation_transport import validate_creation_resolution
 from shared.vm_creation_retry import canonical_request_digest
 
 
@@ -35,6 +36,52 @@ def _uuid(value: str) -> UUID | None:
         return None
 
 
+def creation_source_matches(vm: dict, preflight: dict, retry: dict) -> bool:
+    """Bind original caller intent and authenticated resolution to one retry."""
+    canonical = _object(retry.get("canonical_request"))
+    if not canonical:
+        return False
+    try:
+        digest = canonical_request_digest(canonical)
+        if digest != retry.get("request_digest"):
+            return False
+        snapshot_value = vm.get("creation_request")
+        if snapshot_value is None:
+            # Older exact fixtures have no captured controller resolution.
+            return (
+                canonical == preflight["request"]
+                and digest == preflight["request_digest"]
+            )
+        snapshot = _object(snapshot_value)
+        if (
+            type(snapshot.get("version")) is not int
+            or snapshot["version"] != 1
+            or snapshot.get("initial_request") is not True
+            or snapshot.get("controller_configuration_authenticated") is not True
+            or snapshot.get("provision_generation")
+            != preflight["request"]["provision_generation"]
+            or snapshot.get("request") != canonical
+            or snapshot.get("request_digest") != digest
+            or snapshot.get("controller_configuration_digest")
+            != retry.get("controller_configuration_digest")
+        ):
+            return False
+        validate_creation_resolution(
+            preflight["request"],
+            {
+                "creation_retry_protocol": 1,
+                "request": canonical,
+                "request_digest": digest,
+                "controller_configuration": snapshot["controller_configuration"],
+                "controller_configuration_digest": snapshot["controller_configuration_digest"],
+            },
+            allow_legacy_floor=True,
+        )
+        return True
+    except (ValueError, TypeError, KeyError, AttributeError):
+        return False
+
+
 async def _matches(
     db, *, job_id: UUID, owner_id: UUID, run_id: str, marker_key: str,
     request_id: UUID, generation: UUID, vm_uid: UUID, pvc_uid: UUID,
@@ -48,6 +95,7 @@ async def _matches(
         retry = await conn.fetchrow(
             "SELECT request_id,job_id,provision_generation,state,reason,"
             "boot_counted,ready_at,canonical_request,request_digest,"
+            "controller_configuration_digest,"
             "observed_vm_uid,observed_pvc_uid,execution_id,execution_revision,"
             "execution_generation,admission_deadline "
             "FROM vm_creation_retries WHERE request_id=$1", request_id,
@@ -66,10 +114,9 @@ async def _matches(
         context = _object(job["context"])
         vm = _object(context.get("vm"))
         preflight = _preflight(vm)
-        canonical = _object(retry["canonical_request"])
-        if not preflight or not canonical:
+        if not preflight:
             return False
-        digest_matches = canonical_request_digest(canonical) == retry["request_digest"]
+        source_matches = creation_source_matches(vm, preflight, retry)
     except (VMCreationRetryConflict, ValueError, KeyError, TypeError):
         return False
     return (
@@ -92,9 +139,7 @@ async def _matches(
         and vm.get("vm_uid") == str(vm_uid)
         and vm.get("rootdisk_pvc_uid") == str(pvc_uid)
         and preflight["request_id"] == str(request_id)
-        and preflight["request"] == canonical
-        and preflight["request_digest"] == retry["request_digest"]
-        and digest_matches
+        and source_matches
         and preflight["execution_id"] == str(retry["execution_id"])
         and preflight["execution_revision"] == retry["execution_revision"]
         and preflight["execution_generation"] == retry["execution_generation"]

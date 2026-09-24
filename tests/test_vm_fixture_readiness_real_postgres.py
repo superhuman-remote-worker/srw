@@ -15,6 +15,19 @@ from tests.test_vm_creation_readiness_real_postgres import (  # noqa: F401
 
 async def fixture_ready(db, monkeypatch, *, marker_key, run, profiled=False):  # noqa: F811
     from shared.worker_queue import enqueue_worker_batch, hold_worker_batch_for_preflight
+    from tests import test_vm_creation_effects_real_postgres as effect_tests
+    from vm_controller import controller as controller_settings
+
+    original_admitted_job = effect_tests.admitted_job
+
+    async def admitted_with_resolved_disk(*args, **kwargs):
+        request_options = dict(kwargs.get("request_options") or {})
+        request_options.setdefault("disk_size", controller_settings.VM_DISK_SIZE)
+        return await original_admitted_job(
+            *args, **{**kwargs, "request_options": request_options}
+        )
+
+    monkeypatch.setattr(effect_tests, "admitted_job", admitted_with_resolved_disk)
 
     if profiled:
         from orchestrator.services.vm_creation_retry_store import VMCreationRetryStore
@@ -180,9 +193,70 @@ async def test_fixture_guard_refuses_changed_source_before_real_release(
     ) is None
 
 
+def test_fixture_source_accepts_legacy_authenticated_floor_and_exact_passthrough(monkeypatch):
+    from orchestrator.operator_cli.vm_fixture_readiness import creation_source_matches
+    from shared.vm_creation_issuance import canonical_configuration_digest
+    from shared.vm_creation_retry import canonical_request_digest
+    from tests.test_vm_creation_configuration import controller, request
+    from vm_controller import controller as settings
+    from vm_controller.creation_configuration import resolve_creation_configuration
+
+    monkeypatch.setattr(settings, "VM_DISK_SIZE", "30Gi")
+    original = {**request(), "disk_size": "12Gi"}
+    resolved = resolve_creation_configuration(controller(), original)
+    legacy_configuration = dict(resolved["controller_configuration"])
+    legacy_configuration.pop("disk_size_floor")
+    legacy_digest = canonical_configuration_digest(legacy_configuration)
+    preflight = {
+        "request": original,
+        "request_digest": canonical_request_digest(original),
+    }
+    snapshot = {
+        "version": 1,
+        "initial_request": True,
+        "controller_configuration_authenticated": True,
+        "provision_generation": original["provision_generation"],
+        "request": resolved["request"],
+        "request_digest": resolved["request_digest"],
+        "controller_configuration": legacy_configuration,
+        "controller_configuration_digest": legacy_digest,
+    }
+    retry = {
+        "canonical_request": resolved["request"],
+        "request_digest": resolved["request_digest"],
+        "controller_configuration_digest": legacy_digest,
+    }
+    assert creation_source_matches({"creation_request": snapshot}, preflight, retry)
+    assert not creation_source_matches({}, preflight, retry)
+    exact_retry = {
+        **retry,
+        "canonical_request": original,
+        "request_digest": preflight["request_digest"],
+    }
+    assert creation_source_matches({}, preflight, exact_retry)
+
+
 @pytest.mark.asyncio
-async def test_b_wait_adapter_uses_real_release_then_existing_authority(db, monkeypatch):  # noqa: F811
+@pytest.mark.parametrize("disk_sizes", [("12Gi", "12Gi"), ("12Gi", "30Gi")])
+async def test_b_wait_adapter_uses_real_release_then_existing_authority(
+    db, monkeypatch, disk_sizes,  # noqa: F811
+):
     from orchestrator.operator_cli.vm_workspace_recovery_acceptance import LiveScenario
+    from shared.vm_creation_retry import canonical_request_digest
+    from vm_controller import controller as controller_settings
+
+    requested_disk, resolved_disk = disk_sizes
+    monkeypatch.setattr(controller_settings, "VM_DISK_SIZE", resolved_disk)
+    if resolved_disk:
+        from tests import test_vm_creation_effects_real_postgres as effect_tests
+
+        original_admitted_job = effect_tests.admitted_job
+
+        async def admitted_with_disk(*args, **kwargs):
+            kwargs["request_options"] = {"disk_size": resolved_disk}
+            return await original_admitted_job(*args, **kwargs)
+
+        monkeypatch.setattr(effect_tests, "admitted_job", admitted_with_disk)
 
     run = "srw-b-fixture-" + uuid4().hex[:8]
     row, owner, _ = await fixture_ready(
@@ -192,6 +266,11 @@ async def test_b_wait_adapter_uses_real_release_then_existing_authority(db, monk
         "SELECT context FROM jobs WHERE id=$1", row["job_id"],
     ))
     vm = context["vm"]
+    if requested_disk != resolved_disk:
+        assert vm["creation_request"]["request"]["disk_size"] == "30Gi"
+        preflight = vm["creation_preflight"]
+        preflight["request"]["disk_size"] = requested_disk
+        preflight["request_digest"] = canonical_request_digest(preflight["request"])
     vmi_uid = str(uuid4())
     vm["provisioning"] = _boot_phase(row["job_id"], vm, vmi_uid)
     context["_workspace_contract"] = {
@@ -199,6 +278,7 @@ async def test_b_wait_adapter_uses_real_release_then_existing_authority(db, monk
         "assignment_source": "fixture",
     }
     request = json.loads(row["canonical_request"])
+    assert request["disk_size"] == resolved_disk
     image = request["vm_image"]
     await db.execute(
         "UPDATE jobs SET context=$2::jsonb,config_override=$3::jsonb WHERE id=$1",
@@ -241,6 +321,32 @@ async def test_b_wait_adapter_uses_real_release_then_existing_authority(db, monk
         "SELECT ready_at FROM vm_creation_retries WHERE request_id=$1",
         row["request_id"],
     ) is not None
+    current = dict(await db.fetchrow(
+        "SELECT id,status,execution_lane,assigned_agent_id,user_id,context,"
+        "config_override,freeze_data,lease_expires_at FROM jobs WHERE id=$1",
+        row["job_id"],
+    ))
+    retry = dict(await db.fetchrow(
+        "SELECT * FROM vm_creation_retries WHERE request_id=$1", row["request_id"],
+    ))
+    assert scenario._fixture_authority_matches(row["job_id"], current, retry, identity)
+    for change in ("resolved_body", "resolved_digest", "cross_generation", "original_body"):
+        changed = dict(current)
+        changed["context"] = json.loads(current["context"])
+        changed_vm = changed["context"]["vm"]
+        if change == "resolved_body":
+            changed_vm["creation_request"]["request"]["disk_size"] = "31Gi"
+        elif change == "resolved_digest":
+            changed_vm["creation_request"]["request_digest"] = "sha256:" + "0" * 64
+        elif change == "cross_generation":
+            changed_vm["creation_request"]["provision_generation"] = str(uuid4())
+        else:
+            original = changed_vm["creation_preflight"]
+            original["request"]["disk_size"] = "11Gi"
+            original["request_digest"] = canonical_request_digest(original["request"])
+        assert not scenario._fixture_authority_matches(
+            row["job_id"], changed, retry, identity,
+        )
     assert await scenario._fixture_ready_identity(row["job_id"]) == identity
     scenario.provisioner.query_status.return_value = {
         **live, "vm_uid": str(uuid4()),

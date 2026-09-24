@@ -12,6 +12,7 @@ from kubernetes.client.exceptions import ApiException
 from vm_controller import controller as settings
 from vm_controller.creation_configuration import resolve_creation_configuration
 from shared.vm_creation_issuance import (
+    canonical_configuration_digest,
     public_effect_observation,
     verify_creation_carrier,
 )
@@ -746,6 +747,45 @@ async def test_current_configuration_drift_cannot_start_effect(setup, monkeypatc
     ctrl, api, authority, payload = setup
     monkeypatch.setattr(settings, "VM_STORAGE_CLASS", "changed")
     result = await ctrl._do_create_serialized(payload)
+    assert result["status"] == "creation_attention"
+    assert api.writes == []
+
+
+@pytest.mark.asyncio
+async def test_legacy_configuration_without_floor_replays_exact_projection(setup):
+    ctrl, api, authority, payload = setup
+    legacy = deepcopy(authority.row["controller_configuration"])
+    legacy.pop("disk_size_floor")
+    digest = canonical_configuration_digest(legacy)
+    authority.row["controller_configuration"] = legacy
+    authority.row["controller_configuration_digest"] = digest
+    payload["creation_retry"]["controller_configuration_digest"] = digest
+
+    result = await ctrl._do_create_serialized(payload)
+
+    assert result["status"] == "created"
+    assert api.writes == ["Lease", "DataVolume", "Secret", "VirtualMachine"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mutation", ["storage_class", "digest"])
+async def test_legacy_projection_refuses_changed_configuration(
+    setup, monkeypatch, mutation
+):
+    ctrl, api, authority, payload = setup
+    legacy = deepcopy(authority.row["controller_configuration"])
+    legacy.pop("disk_size_floor")
+    digest = canonical_configuration_digest(legacy)
+    authority.row["controller_configuration"] = legacy
+    authority.row["controller_configuration_digest"] = digest
+    payload["creation_retry"]["controller_configuration_digest"] = digest
+    if mutation == "storage_class":
+        monkeypatch.setattr(settings, "VM_STORAGE_CLASS", "changed")
+    else:
+        legacy["storage_class"] = "forged"
+
+    result = await ctrl._do_create_serialized(payload)
+
     assert result["status"] == "creation_attention"
     assert api.writes == []
 

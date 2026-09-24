@@ -775,6 +775,7 @@ def canonical_configuration_digest(configuration):
             _CONFIGURATION_FIELDS
             | ({"resource_admission"} if configuration["version"] in (2, 3) else set())
             | ({"network_profile_policy"} if "network_profile_policy" in configuration else set())
+            | ({"disk_size_floor"} if "disk_size_floor" in configuration else set())
         )
     ):
         raise ValueError("Effective controller configuration is incomplete")
@@ -782,6 +783,12 @@ def canonical_configuration_digest(configuration):
         r"[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?", configuration["namespace"]
     ):
         raise ValueError("Controller namespace identity is invalid")
+    if "disk_size_floor" in configuration:
+        from shared.vm_disk_size import quantity_bytes
+
+        floor = configuration["disk_size_floor"]
+        if not isinstance(floor, str) or not (quantity_bytes(floor) or 0) > 0:
+            raise ValueError("Controller disk floor identity is invalid")
     for key, value in configuration.items():
         if key.endswith("_digest") and (
             not isinstance(value, str)

@@ -182,6 +182,7 @@ def resolve_creation_configuration(
         + hashlib.sha256(public_key.encode()).hexdigest(),
         "golden_enabled": settings.VM_GOLDEN_IMAGE_ENABLED,
         "golden_disk_size": settings.VM_GOLDEN_DISK_SIZE,
+        "disk_size_floor": settings.VM_DISK_SIZE,
         "preparation": asdict(preparation_settings),
     }
     if "network_profile" in payload:

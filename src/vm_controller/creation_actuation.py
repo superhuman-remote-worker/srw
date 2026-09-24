@@ -16,6 +16,7 @@ from kubernetes.client.exceptions import ApiException
 
 from shared.vm_creation_retry import canonical_request_digest
 from shared.vm_creation_issuance import (
+    canonical_configuration_digest,
     CREATION_INTENT_ANNOTATION,
     CREATION_SIGNATURE_ANNOTATION,
     EFFECT_NONCE_ANNOTATION,
@@ -26,6 +27,33 @@ from shared.vm_creation_issuance import (
 )
 from shared.vm_workspace_storage import storage_name, storage_labels
 from vm_controller.creation_configuration import resolve_creation_configuration
+
+
+def _resolved_configuration_matches_frozen(resolved, row):
+    frozen = row.get("controller_configuration")
+    if not isinstance(frozen, dict):
+        return False
+    try:
+        if (
+            canonical_configuration_digest(frozen)
+            != row["controller_configuration_digest"]
+        ):
+            return False
+        current = resolved["controller_configuration"]
+        # Only legacy snapshots made before the authenticated floor existed
+        # may compare against this exact one-field projection. Source, template,
+        # policy and every other configuration input remain bound by the digest.
+        if "disk_size_floor" not in frozen:
+            current = {
+                key: value for key, value in current.items() if key != "disk_size_floor"
+            }
+        return (
+            current == frozen
+            and canonical_configuration_digest(current)
+            == row["controller_configuration_digest"]
+        )
+    except (KeyError, TypeError, ValueError):
+        return False
 
 
 class CreationUnproven(ValueError):
@@ -930,11 +958,9 @@ class CreationActuator:
             await self.require_vm_absent(row)
             _mark_creation_stage("configuration")
             resolved = resolve_creation_configuration(self.controller, request)
-            if (
-                resolved["request_digest"] != row["request_digest"]
-                or resolved["controller_configuration_digest"]
-                != row["controller_configuration_digest"]
-            ):
+            if resolved["request_digest"] != row[
+                "request_digest"
+            ] or not _resolved_configuration_matches_frozen(resolved, row):
                 raise CreationUnproven("creation_configuration_changed")
             _mark_creation_stage("capacity")
             if await self.controller._capacity_wait("agent-vm-" + row["job_id"]):
