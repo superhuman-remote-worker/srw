@@ -41,6 +41,7 @@ src/orchestrator/services/container_provisioner.py  ContainerProvisioner._wait_f
 src/orchestrator/services/container_provisioner.py  ContainerProvisioner.release_workspace  remote-effect  self._snapshot_service.capture_vm_snapshot  8fbdf2e3ec4d  #1  fresh-k8s-attestation
 src/orchestrator/services/container_provisioner.py  ContainerProvisioner.wait_for_workspace_code_server  http  client.get  26953bc71144  #1  fresh-k8s-attestation
 src/orchestrator/services/ide_proxy.py  IdeProxyService._attest_k8s_target  remote-effect  IdeProxyTarget  e974ce0ee82c  #1  fresh-k8s-attestation
+src/orchestrator/services/ide_proxy.py  IdeProxyService.resolve_target  remote-effect  IdeProxyTarget  06c25e1b3bbd  #1  fresh-k8s-attestation
 src/orchestrator/services/ide_session.py  IdeSessionService._clone_gitea_to_vm  ssh  self._install_and_sync_managed_repository_over_ssh  c6fb8c5b7144  #1  vm-authority
 src/orchestrator/services/ide_session.py  IdeSessionService._current_ide_restore_runtime  http  session.get  a5f7a072e653  #1  fresh-k8s-attestation
 src/orchestrator/services/ide_session.py  IdeSessionService._extract_snapshot_to_k8s_pod  remote-effect  stream_extract_snapshot  82b5dd0c4392  #1  fresh-k8s-attestation
@@ -58,10 +59,10 @@ src/orchestrator/services/ide_settings.py  _ssh_tar_to_file  remote-effect  crea
 src/orchestrator/services/ide_settings.py  _ssh_tar_to_file  ssh  build_agent_ssh_cmd  f8767f86b8ea  #1  local-only
 src/orchestrator/services/ide_settings.py  _ssh_untar_from_file  ssh  build_agent_ssh_cmd  08a92c9f4009  #1  pinned-host-key
 src/orchestrator/services/ide_settings.py  _ssh_untar_from_file  ssh  pinned_agent_ssh_command  7205bc5e3833  #1  pinned-host-key
-src/orchestrator/services/job_control_delivery.py  dispatch_job_to_agent  http  client.post  d2ec1a50b42e  #1  exact-runtime-recipient
+src/orchestrator/services/job_control_delivery.py  dispatch_job_to_agent  http  client.post  d7e904d804d6  #1  exact-runtime-recipient
 src/orchestrator/services/job_control_delivery.py  initiate_pause  http  client.post  c40208b4763b  #1  exact-runtime-recipient
 src/orchestrator/services/job_control_delivery.py  resume_job_on_agent  http  client.get  8c74982a3556  #1  read-only-probe
-src/orchestrator/services/job_control_delivery.py  resume_job_on_agent  http  client.post  d1bd7131e5e1  #1  exact-runtime-recipient
+src/orchestrator/services/job_control_delivery.py  resume_job_on_agent  http  client.post  d7e904d804d6  #1  exact-runtime-recipient
 src/orchestrator/services/job_controls.py  JobControlOperations._capture_workspace_snapshot_for_freeze  remote-effect  self.dependencies.snapshots.capture_vm_snapshot  53894f22b30a  #1  vm-authority
 src/orchestrator/services/job_controls.py  JobControlOperations._capture_workspace_snapshot_for_freeze  remote-effect  self.dependencies.snapshots.capture_vm_snapshot  cc065a54844d  #1  contained-k8s
 src/orchestrator/services/job_controls.py  JobControlOperations._resume_job_internal  remote-effect  self.dependencies.ide_sessions.restore_snapshot_for_resume  949910f05071  #1  fresh-k8s-attestation
@@ -84,7 +85,9 @@ src/orchestrator/services/snapshot_service.py  SnapshotService.capture_vm_snapsh
 src/orchestrator/services/snapshot_service.py  SnapshotService.capture_vm_snapshot  remote-effect  self.upload_snapshot  8d7e90952645  #1  vm-authority
 src/orchestrator/services/ssh_access.py  parse_ssh_gateway_host_keys  ssh  asyncssh.import_public_key  4fe182bafd50  #1  local-only
 src/orchestrator/services/ssh_gateway_client.py  resolve_target  ssh  SshTarget  2d5328ea1c45  #1  pinned-host-key
+src/orchestrator/services/ssh_gateway_client.py  vm_access  ssh  SshTarget  ebc2e15b9815  #1  pinned-host-key
 src/orchestrator/services/ssh_gateway_server.py  connect_upstream  socket  asyncssh.connect  463ff14e685e  #1  pinned-host-key
+src/orchestrator/services/ssh_gateway_server.py  connect_upstream  socket  asyncssh.connect  700676d97d8c  #1  pinned-host-key
 src/orchestrator/services/ssh_helpers.py  _scan_pinned_host_key  remote-effect  create_owned_subprocess_exec  5aba5e03ae48  #1  pinned-host-key
 src/orchestrator/services/ssh_helpers.py  pinned_agent_ssh_command  ssh  SSHHostKeyVerificationError  e9c8cd6548e1  #1  pinned-host-key
 src/orchestrator/services/ssh_helpers.py  pinned_agent_ssh_command  ssh  build_agent_ssh_cmd  1655b1e96d17  #1  pinned-host-key
@@ -98,12 +101,14 @@ src/orchestrator/services/thread_retirement.py  thread_turn_in_flight  http  cli
 src/orchestrator/services/thread_uploads.py  resolve_thread_upload_destination  ssh  _SshTarget  4b9010b50487  #1  pinned-host-key
 src/orchestrator/services/thread_workspace_delivery.py  agent_get_thread_workspace_locked  remote-effect  remote_canvas_presentation_available  f40229a0ebf2  #1  fresh-k8s-attestation
 src/orchestrator/services/thread_workspace_delivery.py  agent_get_thread_workspace_locked  remote-effect  remote_canvas_presentation_available  f40229a0ebf2  #2  fresh-k8s-attestation
+src/orchestrator/services/vm_ide_transport.py  _target  remote-effect  RemoteWorkspaceTarget  6a6c69471ada  #1  pinned-host-key
+src/orchestrator/services/vm_idle_lifecycle.py  VMIdleLifecycleService._stop_pinned_agent  http  client.post  1f577b8e155a  #1  exact-runtime-recipient
 src/orchestrator/services/vm_initialization.py  read_vm_initialization  ssh  pinned_agent_ssh_command  a92e98f85e87  #1  pinned-host-key
 src/orchestrator/services/vm_provisioner.py  VMProvisioner.release_vm_captured  remote-effect  self._snapshot_service.capture_vm_snapshot  22b821d81a7c  #1  vm-authority
 src/orchestrator/services/vm_readiness.py  VMReadinessService._probe  remote-effect  seed_ide_config_for_user  2ab90cdbc684  #1  vm-authority
 src/orchestrator/services/vm_readiness.py  VMReadinessService._probe  remote-effect  seed_ide_profile  60d991bbb85d  #1  vm-authority
 src/orchestrator/services/vm_readiness.py  VMReadinessService._probe  ssh  wait_for_agent_ssh  4555c1fcc905  #1  vm-authority
-src/orchestrator/services/vm_readiness.py  qualify_recovery_successor  ssh  pinned_agent_ssh_command  3d313169ca78  #1  pinned-host-key
+src/orchestrator/services/vm_readiness.py  qualify_recovery_successor  ssh  pinned_agent_ssh_command  9c169ef8fe0e  #1  pinned-host-key
 src/orchestrator/services/vm_readiness.py  qualify_recovery_successor  ssh  wait_for_agent_ssh  4555c1fcc905  #1  pinned-host-key
 src/orchestrator/services/vm_remote_operation.py  VMRemoteOperationLease.__aexit__  remote-effect  self.db.settle_vm_remote_operation  579f12752d18  #1  vm-authority
 src/orchestrator/services/vm_remote_operation.py  claim_vm_remote_operation  remote-effect  VMRemoteOperationLease  53462e29e728  #1  vm-authority
