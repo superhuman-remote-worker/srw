@@ -844,27 +844,35 @@ describe('SessionsPageComponent', () => {
             expect(threadListReads(mockHttp)).toBe(2);
         });
 
-        // R1 follow-up: a stateless retirement left pending by a fenced
-        // End/Delete makes no progress until the user retries End, Delete or
-        // Resume (each re-reads the list itself), so it never arms the poll.
-        it('does not poll for a stateless pending retirement', async () => {
-            serveThreadLists(mockHttp, [
-                makeThread({
-                    id: 't-stateless',
-                    status: 'active',
-                    execution_lane: 'stateless',
-                    runtime_retirement_pending: true,
-                    retirement_disposition: 'ended',
-                    retirement_permanent: true,
-                }),
-            ]);
+        // R1 follow-up live (busy_force): a forced stateless End was still
+        // running on the server when the list showed its card `ending`; it
+        // settled ~15 s later. The card must follow the server without a
+        // reload — a still-running End/Delete (or another tab) can finish it.
+        it('re-reads a stateless pending card until the server settles it', async () => {
+            const pending = makeThread({
+                id: 't-stateless',
+                status: 'ended',
+                execution_lane: 'stateless',
+                runtime_retirement_pending: true,
+                retirement_disposition: 'ended',
+                retirement_permanent: false,
+            });
+            serveThreadLists(
+                mockHttp,
+                [pending],
+                [pending],
+                [{...pending, runtime_retirement_pending: false, retirement_disposition: null}],
+            );
 
             component.ngOnInit();
             await vi.advanceTimersByTimeAsync(0);
             expect(component.threads()[0].status).toBe('ending');
-            await vi.advanceTimersByTimeAsync(120_000);
+            await vi.advanceTimersByTimeAsync(ENDING_POLL_GAPS_MS[0]);
+            expect(threadListReads(mockHttp)).toBe(2);
+            await vi.advanceTimersByTimeAsync(ENDING_POLL_GAPS_MS[1]);
+            expect(threadListReads(mockHttp)).toBe(3);
 
-            expect(threadListReads(mockHttp)).toBe(1);
+            expect(component.threads()[0].status).toBe('ended');
             expect(vi.getTimerCount()).toBe(0);
         });
 
