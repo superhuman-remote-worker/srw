@@ -141,6 +141,50 @@ async def test_mixed_sources_cannot_double_spend_last_budget(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("same_owner", [False, True])
+async def test_held_thread_reservation_blocks_later_job(db, same_owner):
+    store, inventory, _, demand = await environment(
+        db, installation_count=2 if same_owner else 1, owner_count=1
+    )
+    thread = await thread_waiter(db, store, inventory)
+    admitted = await store.admit(request_id=str(thread["request_id"]))
+    assert admitted["action"] == "admitted"
+    job = await waiter(
+        db,
+        store,
+        inventory,
+        user_id=thread["thread_owner_user_id"] if same_owner else uuid4(),
+    )
+    expected_wait = {
+        "action": "wait",
+        "reason": "owner_budget" if same_owner else "installation_budget",
+    }
+    for _ in range(2):
+        assert await store.admit(request_id=str(job["request_id"])) == expected_wait
+        assert await store.admit(request_id=str(thread["request_id"])) == admitted
+    held = await db.fetch(
+        "SELECT r.request_id,w.owner_kind,w.job_id,w.thread_id "
+        "FROM vm_resource_reservations r JOIN vm_resource_waiters w USING(request_id) "
+        "WHERE r.cluster_id=$1 AND r.state<>'released'",
+        inventory.cluster_id,
+    )
+    assert len(held) == 1
+    assert dict(held[0]) == {
+        "request_id": thread["request_id"],
+        "owner_kind": "thread",
+        "job_id": None,
+        "thread_id": thread["thread_id"],
+    }
+    capacity = await vm_capacity_snapshot(db)
+    cluster = next(
+        c for c in capacity["clusters"] if c["cluster_id"] == inventory.cluster_id
+    )
+    assert cluster["available"] is True
+    assert cluster["held"]["unbound"] == cluster["held"]["total"] == demand.to_six_dict()
+    assert cluster["waiting"]["count"] == 1
+
+
+@pytest.mark.asyncio
 async def test_mixed_owner_charges_share_admin_snapshot_and_survive_stale_inventory(db):
     store, inventory, _, demand = await environment(db, installation_count=2)
     job = await waiter(db, store, inventory, user_id=uuid4())
