@@ -2299,6 +2299,16 @@ async def test_phase_approval_reenqueues_stateless_job(monkeypatch, tmp_path):
     )
     monkeypatch.setattr(main, "gitea_client", SimpleNamespace(is_initialized=False))
     monkeypatch.setattr(main, "workspace_service", SimpleNamespace(base_path=tmp_path))
+    # Model an available idle schema with no open operation for this offline
+    # stateless fixture; approval then follows the ordinary queue path.
+    monkeypatch.setattr(
+        "orchestrator.services.vm_idle_lifecycle.VMIdleLifecycleStore.schema_available",
+        AsyncMock(return_value=True),
+    )
+    monkeypatch.setattr(
+        "orchestrator.services.vm_idle_lifecycle.VMIdleLifecycleStore.get_open_for_owner",
+        AsyncMock(return_value=None),
+    )
     queued = AsyncMock(return_value=True)
     monkeypatch.setattr(main.postgres_db, "queue_stateless_job_for_resume", queued)
 
@@ -2310,6 +2320,7 @@ async def test_phase_approval_reenqueues_stateless_job(monkeypatch, tmp_path):
         priority=7,
         fair_key="33333333-3333-3333-3333-333333333333",
         expected_status="pending_review",
+        idle_phase_source_snapshot=None,
     )
 
 
