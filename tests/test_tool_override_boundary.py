@@ -1530,6 +1530,19 @@ class TestPrepareBoundary:
         monkeypatch.setattr(
             sessions_mod, "_schedule_prepare_task", lambda coro: MagicMock()
         )
+        # A pinned prepare first asks the durable idle ledger whether it must
+        # wake a released VM instead. No idle operation or access continuation
+        # is open here, so the request takes the ordinary provisioning path.
+        from orchestrator.services.vm_idle_lifecycle import VMIdleLifecycleStore
+
+        monkeypatch.setattr(
+            VMIdleLifecycleStore, "get_open_for_thread", AsyncMock(return_value=None)
+        )
+        monkeypatch.setattr(
+            VMIdleLifecycleStore,
+            "get_pending_access_continuation",
+            AsyncMock(return_value=None),
+        )
 
         app = FastAPI()
         # The router reads its collaborators off the application answering the

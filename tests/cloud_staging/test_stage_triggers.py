@@ -246,6 +246,21 @@ def _make_protected_thread(**overrides):
     return thread
 
 
+@pytest.fixture(autouse=True)
+def legacy_resource_cleanup(monkeypatch):
+    """Thread-owned suspension cleanup carries no v3 Job resource charge.
+
+    ``complete_vm_cleanup_permit`` fences a charged Job cleanup through
+    ``prepare_vm_cleanup_resource``; for a thread owner the real scope is
+    always ``None``, so the synthetic recovery store needs no DB pool.
+    """
+    import orchestrator.services.vm_workspace_recovery_store as recovery
+
+    monkeypatch.setattr(
+        recovery, "prepare_vm_cleanup_resource", AsyncMock(return_value=None)
+    )
+
+
 def _make_suspension_service(db):
     svc = WorkspaceSuspensionService()
     snapshot_service = MagicMock()

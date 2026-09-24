@@ -1645,6 +1645,11 @@ class TestEndThreadReroute:
         db.authorize_pinned_thread_retirement = AsyncMock(return_value=True)
         db.settle_pinned_thread_retirement = AsyncMock(return_value=True)
         db.try_thread_advisory_lock = MagicMock(return_value=lock)
+        # End recovers the idle physical-Pod-stop requirement from durable
+        # ``vm_idle_operations`` authority, never from the caller. No open
+        # pinned idle operation exists here, so this is a plain owner End.
+        db.reserve_pinned_thread_idle_terminal_end = AsyncMock(return_value="none")
+        db.fetchrow = AsyncMock(return_value=None)
         monkeypatch.setattr(
             orch_main.PinnedRetirementOperations,
             "pinned_retirement_is_current",

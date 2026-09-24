@@ -288,6 +288,7 @@ class TestSessionPrepareWriteBoundary:
         self, user_a, thread_a
     ):
         from orchestrator.routers import sessions as sessions_router
+        from orchestrator.services.vm_idle_lifecycle import VMIdleLifecycleStore
 
         thread = dict(thread_a)
         thread.update(
@@ -307,8 +308,25 @@ class TestSessionPrepareWriteBoundary:
             store=db
         )
 
-        with patch.object(
-            sessions_router, "require_approved_user", AsyncMock(return_value=user_a)
+        # A pinned prepare first consults the durable idle ledger; no idle
+        # operation or access continuation is open, so this is the ordinary
+        # provisioning path whose body name reaches the provisioner.
+        with (
+            patch.object(
+                sessions_router,
+                "require_approved_user",
+                AsyncMock(return_value=user_a),
+            ),
+            patch.object(
+                VMIdleLifecycleStore,
+                "get_open_for_thread",
+                AsyncMock(return_value=None),
+            ),
+            patch.object(
+                VMIdleLifecycleStore,
+                "get_pending_access_continuation",
+                AsyncMock(return_value=None),
+            ),
         ):
             with patch.object(
                 sessions_router,

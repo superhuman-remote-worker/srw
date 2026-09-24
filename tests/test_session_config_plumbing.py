@@ -2270,6 +2270,10 @@ class TestEndedSessionKeepsItsVolume:
         }
 
         db = SimpleNamespace(
+            # No admitted pinned idle stop: permanent End has nothing to join
+            # and the durable idle-operation probe finds no physical-stop row.
+            reserve_pinned_thread_idle_terminal_end=AsyncMock(return_value="none"),
+            fetchrow=AsyncMock(return_value=None),
             begin_pinned_thread_retirement=AsyncMock(return_value=retirement),
             authorize_pinned_thread_retirement=AsyncMock(return_value=True),
             settle_pinned_thread_retirement=AsyncMock(return_value=True),
