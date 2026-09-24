@@ -298,3 +298,55 @@ async def test_shared_browser_kick_schedules_the_owner_workspace_reconcile(monke
     assert dependencies.kick_workspace_provisioning("thread-1", db) is None
     await asyncio.sleep(0)
     assert calls == [("thread-1", db, provisioner, suspension)]
+
+
+@pytest.mark.asyncio
+async def test_vm_wiring_binds_its_own_application(monkeypatch):
+    """The VM idle, IDE-transport, capacity and SSH-access wiring that develop
+    added to ``main`` while B12 was in flight is composed per application: each
+    factory reaches its own application's store and the owners' singletons."""
+    from orchestrator.application import (
+        administration as administration_composition,
+        workspace as workspace_composition,
+    )
+    from orchestrator.services import agent_provisioner as agent_owner
+    from orchestrator.services import vm_provisioner as vm_owner
+    from orchestrator.services import vm_resource_capacity
+    from orchestrator.services import workspace_suspension as suspension_owner
+
+    provisioner, agents, suspension = object(), object(), object()
+    monkeypatch.setattr(vm_owner, "vm_provisioner", provisioner)
+    monkeypatch.setattr(agent_owner, "agent_provisioner", agents)
+    monkeypatch.setattr(suspension_owner, "workspace_suspension_service", suspension)
+    snapshots = []
+
+    async def vm_capacity_snapshot(db):
+        snapshots.append(db)
+        return {"vm": True}
+
+    monkeypatch.setattr(
+        vm_resource_capacity, "vm_capacity_snapshot", vm_capacity_snapshot
+    )
+    first, second = create_app(), create_app()
+    for app in (first, second):
+        resources = app.state.resources
+        idle = workspace_composition.vm_idle_service(resources)
+        assert idle.db is resources.postgres_db
+        assert idle.recovery_store.db is resources.postgres_db
+        assert idle.provisioner is provisioner
+        assert idle.agent_provisioner is agents
+        assert idle.thread_workspace_suspension is suspension
+        assert idle.claimant.endswith(":vm-idle")
+        ide = workspace_composition.ide_dependencies(resources)
+        files = workspace_composition.thread_files_dependencies(resources)
+        assert ide.vm_ide_transport.provisioner is provisioner
+        assert files.vm_ide_transport.provisioner is provisioner
+        ssh = administration_composition.ssh_access_dependencies(resources)
+        assert ssh.vm_access_store.db is resources.postgres_db
+        assert ssh.vm_provisioner is provisioner
+        capacity = administration_composition.capacity_dependencies(resources)
+        assert await capacity.vm_snapshot() == {"vm": True}
+    assert snapshots == [
+        first.state.resources.postgres_db,
+        second.state.resources.postgres_db,
+    ]
