@@ -1,5 +1,6 @@
 """Only durable claims feed the creation transport, including feature-off drains."""
 
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from uuid import uuid4
@@ -10,11 +11,30 @@ from orchestrator.services.vm_creation_transport import CreationConfigurationUna
 from orchestrator.services.vm_creation_retry_store import VMCreationRetryConflict
 
 
+class EffectRows:
+    """Model the durable issued-effect read before replay, not a feature flag."""
+
+    def __init__(self):
+        self.issued = set()
+        self.inspected = []
+
+    @asynccontextmanager
+    async def acquire(self):
+        yield self
+
+    async def fetchval(self, query, request_id):
+        assert "FROM vm_creation_effects" in query
+        assert "state IN ('issued','observed')" in query
+        self.inspected.append(request_id)
+        return request_id in self.issued
+
+
 def service(monkeypatch):
     from orchestrator.services import vm_creation_retry as module
 
+    db = EffectRows()
     instance = module.VMCreationRetryService(
-        object(),
+        db,
         SimpleNamespace(_http_client=object(), _lifecycle_hmac_secret=b"secret"),
     )
     instance.preflight = SimpleNamespace(
@@ -29,6 +49,7 @@ def service(monkeypatch):
         apply_observation=AsyncMock(),
     )
     monkeypatch.setenv("VM_CREATION_RETRY_ENABLED", "false")
+    monkeypatch.delenv("VM_RESOURCE_ADMISSION_CONFIG", raising=False)
     monkeypatch.setattr(module, "resolve_vm_creation_configuration", AsyncMock())
     monkeypatch.setattr(
         module,
@@ -62,6 +83,7 @@ async def test_service_resolves_frozen_preflight_then_admits_before_replay_even_
     preflight = {"request": {"frozen": "original"}}
     instance.preflight.claim_due.return_value = [preflight]
     row = claim()
+    instance.db.issued.add(row["request_id"])
     sequence = []
     instance.preflight.complete_resolution.side_effect = lambda *args: sequence.append(
         "committed"
@@ -73,6 +95,7 @@ async def test_service_resolves_frozen_preflight_then_admits_before_replay_even_
 
     instance.store.claim_due.side_effect = due
     await instance.reconcile_once()
+    assert instance.db.inspected == [row["request_id"]]
     module.resolve_vm_creation_configuration.assert_awaited_once_with(
         instance.provisioner._http_client, preflight["request"], secret=b"secret"
     )
