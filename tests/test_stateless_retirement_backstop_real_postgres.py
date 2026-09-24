@@ -158,6 +158,82 @@ async def _live_stateless_thread(db: PostgresDB, *, queue_token: int = 4) -> dic
     }
 
 
+async def _terminal_job_intent(db: PostgresDB) -> dict:
+    """A job workspace whose terminal status admitted its own cleanup intent."""
+
+    job_id = uuid4()
+    runtime_uid = str(uuid4())
+    async with db.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO jobs (id, description, status) "
+            "VALUES ($1, 'job workspace', 'paused')",
+            job_id,
+        )
+    reservation = await db.reserve_managed_repository_workspace_creation(
+        str(job_id),
+        owner_kind="job",
+        scope="workspace_container",
+        claimant="job-workspace",
+        desired_manifest_digest="0" * 64,
+    )
+    reservation = await db.mark_managed_repository_workspace_creation_started(
+        str(job_id),
+        owner_kind="job",
+        scope="workspace_container",
+        reservation_generation=int(reservation["reservation_generation"]),
+        claimant="job-workspace",
+        claim_token=int(reservation["claim_token"]),
+    )
+    assert await db.authorize_managed_repository_workspace_creation_runtime(
+        str(job_id),
+        owner_kind="job",
+        scope="workspace_container",
+        reservation_generation=int(reservation["reservation_generation"]),
+        claimant="job-workspace",
+        claim_token=int(reservation["claim_token"]),
+        runtime_incarnation=runtime_uid,
+    )
+    workspace = {
+        "workspace_container": {
+            "provisioner": "k8s",
+            "status": "ready",
+            "_runtime_incarnation": runtime_uid,
+            "_creation_reservation_id": str(reservation["id"]),
+            "_creation_claim_token": str(reservation["claim_token"]),
+            "pod_name": f"ws-job-{str(job_id)[:12]}",
+            "namespace": "srw",
+            "pod_ip": "10.42.0.41",
+            "host": "10.42.0.41",
+            "port": 30022,
+        }
+    }
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE jobs SET context = $2::jsonb WHERE id = $1",
+            job_id,
+            json.dumps(workspace),
+        )
+    assert await db.settle_managed_repository_workspace_creation_reservation(
+        str(job_id),
+        owner_kind="job",
+        scope="workspace_container",
+        reservation_generation=int(reservation["reservation_generation"]),
+        claimant="job-workspace",
+        claim_token=int(reservation["claim_token"]),
+        runtime_incarnation=runtime_uid,
+    )
+    async with db.acquire() as conn:
+        await conn.execute("UPDATE jobs SET status = 'failed' WHERE id = $1", job_id)
+    intent = await db.get_managed_repository_workspace_cleanup_intent(
+        str(job_id),
+        owner_kind="job",
+        scope="workspace_container",
+        runtime_incarnation=runtime_uid,
+    )
+    assert isinstance(intent, dict)
+    return intent
+
+
 def _backstop_ids(rows: list[dict]) -> set[str]:
     return {str(row["id"]) for row in rows}
 
@@ -290,26 +366,7 @@ class TestBackstopDefersToTheStatelessRetirementOwner:
         thread = await _live_stateless_thread(db)
         await _begin(db, thread, permanent=True)
         deferred = await _terminal_intent(db, thread)
-        job_id = uuid4()
-        async with db.acquire() as conn:
-            await conn.execute(
-                "INSERT INTO jobs (id, description, status) "
-                "VALUES ($1, 'job workspace', 'paused')",
-                job_id,
-            )
-        job_runtime = str(uuid4())
-        job_intent = await db.prepare_managed_repository_workspace_cleanup_intent(
-            str(job_id),
-            owner_kind="job",
-            scope="workspace_container",
-            runtime_incarnation=job_runtime,
-            target_disposition="deleted",
-            reclaim_shared_resources=False,
-            allow_orphan=True,
-            admission_source="explicit",
-        )
-        assert isinstance(job_intent, dict)
-
+        job_intent = await _terminal_job_intent(db)
         listed = _backstop_ids(
             await db.list_pending_managed_repository_workspace_cleanup_intents(
                 limit=500
