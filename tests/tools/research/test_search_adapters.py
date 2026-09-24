@@ -289,6 +289,66 @@ def test_searxng_search_returns_normalized_results():
     assert client.get.call_args.args[0] == "https://search.internal/search"
 
 
+def _searxng_search(payload: dict):
+    response = httpx.Response(
+        200,
+        json=payload,
+        request=httpx.Request("GET", "https://search.internal/search"),
+    )
+    manager, _ = _http_client(response)
+    adapter = SearxngAdapter(base_url="https://search.internal")
+    with patch(
+        "agent.tools.research.search.searxng.httpx.Client", return_value=manager
+    ):
+        return adapter.search("query", 5)
+
+
+def test_searxng_empty_answer_from_failed_engines_is_an_outage():
+    # Observed on dev 2026-09-24: every upstream engine CAPTCHA-blocked or
+    # rate-limited, yet SearXNG answers 200 with an empty result list.
+    with pytest.raises(ProviderUnavailableError) as excinfo:
+        _searxng_search(
+            {
+                "results": [],
+                "unresponsive_engines": [
+                    ["brave", "Suspended: too many requests"],
+                    ["duckduckgo", "CAPTCHA"],
+                ],
+            }
+        )
+
+    assert excinfo.value.failover_eligible
+    assert "brave (Suspended: too many requests)" in str(excinfo.value)
+    assert "duckduckgo (CAPTCHA)" in str(excinfo.value)
+
+
+def test_searxng_outage_message_is_bounded():
+    unresponsive = [[f"engine{i}", "CAPTCHA"] for i in range(8)]
+
+    with pytest.raises(ProviderUnavailableError) as excinfo:
+        _searxng_search({"results": [], "unresponsive_engines": unresponsive})
+
+    assert "8 upstream engine(s) failed" in str(excinfo.value)
+    assert "engine5" not in str(excinfo.value)
+    assert "3 more" in str(excinfo.value)
+
+
+def test_searxng_zero_results_without_failed_engines_is_an_answer():
+    assert _searxng_search({"results": [], "unresponsive_engines": []}) == []
+    assert _searxng_search({"results": []}) == []
+
+
+def test_searxng_results_win_over_partially_failed_engines():
+    results = _searxng_search(
+        {
+            "results": [{"title": "Hit", "url": "https://result.example/"}],
+            "unresponsive_engines": [["brave", "too many requests"]],
+        }
+    )
+
+    assert [item.url for item in results] == ["https://result.example/"]
+
+
 def test_brave_search_returns_normalized_results():
     response = httpx.Response(
         200,
