@@ -136,7 +136,18 @@ async def db(pg_dsn):
             )
             """
         )
-        await conn.execute("TRUNCATE threads, agents, jobs")
+        # The resume CAS refuses a pinned Job while an open idle operation
+        # (migration 0270) owns it. Only the fence columns are modelled.
+        await conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS vm_idle_operations (
+                owner_kind text NOT NULL,
+                owner_id uuid NOT NULL,
+                closed_at timestamptz
+            )
+            """
+        )
+        await conn.execute("TRUNCATE threads, agents, jobs, vm_idle_operations")
         await conn.execute(
             """
             INSERT INTO jobs (id, status, assigned_agent_id, context, freeze_data)

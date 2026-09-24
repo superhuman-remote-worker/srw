@@ -134,6 +134,14 @@ class _Connection:
             return {"id": JOB_ID} if allowed else None
         raise AssertionError(f"unexpected SQL: {compact}")
 
+    async def fetchval(self, sql: str, *_args):
+        compact = " ".join(sql.split())
+        self.state.sql.append(compact)
+        if "FROM vm_idle_operations" in compact and "closed_at IS NULL" in compact:
+            # No open pinned idle operation owns this Job's report authority.
+            return False
+        raise AssertionError(f"unexpected SQL: {compact}")
+
     async def execute(self, sql: str, *_args):
         self.state.sql.append(" ".join(sql.split()))
         return "UPDATE 1"

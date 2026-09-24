@@ -221,7 +221,11 @@ async def runtime_db(pg_url):
             owner_kind text, owner_id uuid, status text, quarantine_reason text,
             updated_at timestamptz
         );
-        TRUNCATE jobs, agents, srw_execution_specs, run_queue;
+        -- Pinned resume paths fence on an open idle operation (0270).
+        CREATE TABLE IF NOT EXISTS vm_idle_operations(
+            owner_kind text NOT NULL, owner_id uuid NOT NULL, closed_at timestamptz
+        );
+        TRUNCATE jobs, agents, srw_execution_specs, run_queue, vm_idle_operations;
     """)
     yield db
     await db.disconnect()

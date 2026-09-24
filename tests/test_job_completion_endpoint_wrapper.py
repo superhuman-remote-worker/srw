@@ -73,6 +73,18 @@ def _isolate_workspace_cleanup_authority(monkeypatch: pytest.MonkeyPatch) -> Non
         orchestrator.main, "_legacy_completion_dependencies", legacy_dependencies
     )
 
+    # These synthetic completion owners have no v3 creation/retry resource
+    # charge, so the charged-cleanup fence has nothing to prepare. The
+    # permit-only stores above deliberately carry no database seam.
+    import orchestrator.services.completion_effects as completion_effects
+    import orchestrator.services.vm_workspace_recovery_store as recovery
+
+    no_resource_charge = AsyncMock(return_value=None)
+    monkeypatch.setattr(recovery, "prepare_vm_cleanup_resource", no_resource_charge)
+    monkeypatch.setattr(
+        completion_effects, "prepare_vm_cleanup_resource", no_resource_charge
+    )
+
 
 class _RecordingRunner:
     """Small in-memory model of the durable effect-runner route contract."""
@@ -3206,6 +3218,11 @@ async def test_fresh_stateless_accept_returns_exact_background_handoff(
         status_reorder_enabled=False,
         lease_token=17,
         agent_id=str(AGENT_ID),
+        pinned_delivery_id=None,
+        pinned_projection_digest=None,
+        pinned_delivery_proof=None,
+        pinned_process_generation=None,
+        pinned_pod_uid=None,
         client_report_id=str(REPORT_ID),
         requested_by=f"agent:{AGENT_ID}",
     )
@@ -3302,6 +3319,11 @@ async def test_fresh_pinned_admission_preserves_exact_inline_response_and_calls(
         status_reorder_enabled=False,
         lease_token=17,
         agent_id=str(AGENT_ID),
+        pinned_delivery_id=None,
+        pinned_projection_digest=None,
+        pinned_delivery_proof=None,
+        pinned_process_generation=None,
+        pinned_pod_uid=None,
         client_report_id=str(REPORT_ID),
         requested_by=f"agent:{AGENT_ID}",
     )

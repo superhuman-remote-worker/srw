@@ -234,6 +234,10 @@ class _RecordingConnection:
             return self.existing.get("id")
         if "from run_queue" in normalized:
             return self.queue_lease_token if self.queue_present else None
+        if "from vm_idle_operations" in normalized:
+            # Pinned admission probes for an open idle operation that would
+            # own report authority; these jobs have none.
+            return False
         if "from jobs" in normalized:
             return self.completion_seq_hwm
         if normalized.startswith("update run_queue"):
