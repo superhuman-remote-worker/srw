@@ -224,6 +224,41 @@ excluded_rules = [
 #                These two exact files have also already been applied to the
 #                preserved disposable acceptance database. Preserve their SQL
 #                checksums; all other new migrations retain full lint coverage.
+#        - app/0272-0275, 0277, 0278, 0280: 32 findings from the idle-lifecycle
+#                and thread-owned VM resource rollout, reported by develop run
+#                35974496286 after the files had been replayed on the scratch
+#                and acceptance databases (see the 2026-09-2x VM reports in
+#                knowledge-base/knowledge/superpowers/plans/). The shapes:
+#                * Every constraint-missing-not-valid CHECK constrains columns
+#                  added by the SAME ALTER, whose defaults satisfy it (new
+#                  columns all NULL, owner_kind DEFAULT 'job', resource_version
+#                  DEFAULT 1, release_kind DEFAULT 'stateless'), or replaces a
+#                  check with a strictly wider one (0277 adds 'pinned_thread').
+#                  That is the app/0123 carve-out: the scan can only see rows it
+#                  accepts, and NOT VALID would open a window for a bad row.
+#                * The indexes and FKs in 0272/0273/0275 are on
+#                  vm_idle_operations, which app/0270 creates in this same
+#                  rollout, or point at tables created in the same file
+#                  (pinned_job_deliveries, pinned_job_wait_receipts). Each file
+#                  is transactional-atomic with the triggers that enforce the
+#                  same invariant, so CONCURRENTLY cannot be used (the app/0117
+#                  shape).
+#                * 0274/0278/0280 touch the small VM admission ledgers from
+#                  app/0257 and app/0264 (vm_creation_retries,
+#                  vm_resource_waiters, vm_resource_reservations), whose size
+#                  is bounded by VM count. 0278's new FK columns start all
+#                  NULL, so validation is trivial. The SHARE ROW EXCLUSIVE
+#                  lock that an FK takes on the table it references
+#                  (threads/agents here, job_completion_commands in 0272) is
+#                  waited for at most 2 s, the file's lock_timeout.
+#                * 0278's five ban-drop-not-null findings are that migration's
+#                  purpose: a thread-owned creation retry or resource waiter
+#                  has no job_id/execution_*. The exact-owner CHECKs added in
+#                  the same ALTER keep them NOT NULL for every owner_kind='job'
+#                  row, and only the thread-owned admission path writes
+#                  owner_kind='thread'.
+#                Preserve their SQL checksums. All other new migrations keep
+#                full lint coverage.
 excluded_paths = [
     "src/orchestrator/database/migrations/app/0001_initial.sql",
     "src/orchestrator/database/migrations/vector/0001_initial.sql",
@@ -251,5 +286,12 @@ excluded_paths = [
     "src/orchestrator/database/migrations/app/0256_vm_workspace_cleanup_delegation.sql",
     "src/orchestrator/database/migrations/app/0258_vm_creation_effects.sql",
     "src/orchestrator/database/migrations/app/0261_vm_creation_attachment_effect.sql",
+    "src/orchestrator/database/migrations/app/0272_vm_idle_terminal_review.sql",
+    "src/orchestrator/database/migrations/app/0273_vm_idle_access_wake_lineage.sql",
+    "src/orchestrator/database/migrations/app/0274_vm_resource_whole_launcher.sql",
+    "src/orchestrator/database/migrations/app/0275_vm_idle_pinned_job.sql",
+    "src/orchestrator/database/migrations/app/0277_vm_idle_pinned_session.sql",
+    "src/orchestrator/database/migrations/app/0278_vm_resource_thread_runtime.sql",
+    "src/orchestrator/database/migrations/app/0280_vm_thread_cancel_carrier.sql",
     "src/orchestrator/database/migrations/vector/0008_kb_index_chunking.sql",
 ]
