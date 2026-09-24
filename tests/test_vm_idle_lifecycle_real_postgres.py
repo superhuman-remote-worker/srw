@@ -202,11 +202,12 @@ async def _schema(db):
     if not await db.fetchval("SELECT to_regclass('public.vm_idle_operations') IS NOT NULL"):
         await db.execute(MIGRATION.read_text())
     # The shared PG fixture truncates jobs between tests; idle operations have
-    # deliberately no Job FK and need their own isolation reset. Include the
-    # retained thread continuation receipts that reference an idle operation.
+    # deliberately no Job FK and need their own isolation reset. Typed thread
+    # creation sources also reference wake operations; clear their dependent
+    # receipts in this disposable database rather than leave cross-test state.
     await db.execute(
         "TRUNCATE vm_idle_thread_access_continuations, "
-        "vm_idle_access_leases, vm_idle_operations"
+        "vm_idle_access_leases, vm_idle_operations CASCADE"
     )
 
 
