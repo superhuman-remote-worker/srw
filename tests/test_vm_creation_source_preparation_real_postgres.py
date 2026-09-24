@@ -16,11 +16,34 @@ from tests.test_vm_creation_prepared_real_postgres import (
 )
 from orchestrator.services.vm_creation_retry_store import VMCreationRetryStore
 from shared.vm_creation_disposition import disposition_identity
+from shared.vm_creation_source_completion import validate_source_completion
 from vm_controller.creation_disposition import CreationDisposer
 from vm_controller.creation_sources import pins
 from vm_controller.workspace_preparation import allocation_name, creation_held
 
 setup, prepared, db = _setup_fixture, _prepared_fixture, _db_fixture
+
+
+async def assert_settled_source_disposition(
+    db, current, allocation, *, source_kind, outcome
+):
+    assert (current["state"], current["reason"]) == ("settled", "creation_disposed")
+    disposition = current["cancellation_disposition"]
+    plan = current["cancellation_progress"]["source"]
+    completion = current["cancellation_completion"]["source"]
+    assert plan["kind"] == "source_disposition_planned"
+    assert plan["disposition_id"] == disposition["disposition_id"]
+    assert plan["source"]["kind"] == source_kind
+    assert completion["outcome"] == outcome
+    assert completion["allocation"]["uid"] == allocation.uid
+    assert validate_source_completion(plan, completion) == completion
+    async with db.acquire() as conn:
+        parent = await conn.fetchrow(
+            "SELECT completed_at,outcome FROM vm_workspace_cleanup_admissions WHERE id=$1",
+            UUID(current["creation_admission_id"]),
+        )
+    assert parent["completed_at"] is not None
+    assert parent["outcome"] == "creation_disposed"
 
 
 @pytest.mark.asyncio
@@ -89,16 +112,9 @@ async def test_precarrier_prepared_source_cancel_releases_only_exact_pin_and_all
         == "disposed"
     )
     current = await store.inspect(request_id=row["request_id"])
-    assert current["state"] == "cancel_requested"
-    assert (
-        current["cancellation_progress"]["source"]["kind"]
-        == "source_disposition_planned"
+    await assert_settled_source_disposition(
+        db, current, allocation, source_kind="prepared", outcome="pin_disposed"
     )
-    async with db.acquire() as conn:
-        assert await conn.fetchval(
-            "SELECT completed_at IS NULL FROM vm_workspace_cleanup_admissions WHERE id=$1",
-            UUID(current["creation_admission_id"]),
-        )
 
 
 @pytest.mark.asyncio
@@ -130,9 +146,14 @@ async def test_existing_undelivered_allocation_is_cancelled_without_creating_sou
     assert [kind for kind in api.writes if kind != "Lease"] == [
         kind for kind in writes if kind != "Lease"
     ]
-    assert (await store.inspect(request_id=row["request_id"]))[
-        "state"
-    ] == "cancel_requested"
+    current = await store.inspect(request_id=row["request_id"])
+    await assert_settled_source_disposition(
+        db,
+        current,
+        allocation,
+        source_kind="preparation_never_delivered",
+        outcome="allocation_never_delivered",
+    )
 
 
 @pytest.mark.asyncio
