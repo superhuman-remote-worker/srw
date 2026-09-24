@@ -18,6 +18,8 @@ def boundary_tree(tmp_path):
     for package in (
         "agent",
         "orchestrator",
+        "orchestrator/application",
+        "orchestrator/operator_cli",
         "orchestrator/routers",
         "orchestrator/schemas",
         "orchestrator/services",
@@ -60,6 +62,16 @@ def boundary_tree(tmp_path):
         "orchestrator/services/preference_defaults.py": "from shared.value import VALUE\n",
         "orchestrator/services/session_workspace_policy.py": "from shared.value import VALUE\n",
         "orchestrator/services/manifest_legacy.py": "from shared.runtime.provider import VALUE\n",
+        # R1.B12: the composition package and the one entrypoint allowed to use
+        # it outside ``orchestrator.main`` (the stateless-wake operator harness).
+        "orchestrator/application/__init__.py": "from shared.value import VALUE\n",
+        "orchestrator/application/controls.py": "from shared.value import VALUE\n",
+        "orchestrator/application/transport.py": "from shared.value import VALUE\n",
+        "orchestrator/operator_cli/__init__.py": "",
+        "orchestrator/operator_cli/stateless_wake_acceptance.py": (
+            "import orchestrator.application\n"
+            "from orchestrator.application import controls, transport\n"
+        ),
         "mcp_server/app.py": "from shared.contracts.item import VALUE\n",
         "vm_controller/app.py": "from shared.value import VALUE\n",
     }.items():
@@ -111,8 +123,9 @@ def test_allowed_runtime_and_lightweight_dependencies_pass(boundary_tree):
     # The generic manifest path also excludes the legacy harness adapter.
     # 24 since R1.B09 added its contract over control, delivery and retirement;
     # 25 since R1.B10 added session transport, projections and permissions;
-    # 26 since R1.B11 added scheduling, reconciliation and task ownership.
-    assert "Contracts: 26 kept, 0 broken" in result.stdout
+    # 26 since R1.B11 added scheduling, reconciliation and task ownership;
+    # 28 since R1.B12 closed the entrypoint and the composition boundary.
+    assert "Contracts: 28 kept, 0 broken" in result.stdout
 
 
 @pytest.mark.parametrize(
@@ -245,6 +258,14 @@ def test_allowed_runtime_and_lightweight_dependencies_pass(boundary_tree):
         ("orchestrator/services/lifecycle/reconciler.py", "orchestrator.main"),
         ("orchestrator/services/sudo_gate.py", "orchestrator.main"),
         ("orchestrator/services/ide_settings.py", "orchestrator.main"),
+        # R1.B12: nothing imports the entrypoint, and only the entrypoint (plus
+        # the named operator harness) composes the application.
+        ("orchestrator/application/controls.py", "orchestrator.main"),
+        ("orchestrator/operator_cli/__init__.py", "orchestrator.main"),
+        ("orchestrator/routers/contacts.py", "orchestrator.application"),
+        ("orchestrator/services/job_queries.py", "orchestrator.application.controls"),
+        ("orchestrator/schemas/job_create.py", "orchestrator.application"),
+        ("orchestrator/operator_cli/__init__.py", "orchestrator.application"),
         ("vm_controller/app.py", "headscale_client"),
     ],
 )

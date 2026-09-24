@@ -101,8 +101,6 @@ source_modules = [
   "orchestrator.services.manifest_workspaces",
 ]
 forbidden_modules = ["orchestrator.main"]
-# Existing shared authorization helpers retain indirect composition lookups.
-allow_indirect_imports = true
 
 [[tool.importlinter.contracts]]
 name = "Generic image hosting does not load the reference harness"
@@ -118,17 +116,12 @@ name = "Contacts router does not import application startup"
 type = "forbidden"
 source_modules = ["orchestrator.routers.contacts"]
 forbidden_modules = ["orchestrator.main"]
-# Legacy security helpers still resolve some app services through main. This
-# pilot protects the extracted router's direct boundary while those are migrated.
-allow_indirect_imports = true
 
 [[tool.importlinter.contracts]]
 name = "Tables router does not import application startup"
 type = "forbidden"
 source_modules = ["orchestrator.routers.tables"]
 forbidden_modules = ["orchestrator.main"]
-# Existing auth helpers retain indirect composition lookups, as for contacts.
-allow_indirect_imports = true
 
 [[tool.importlinter.contracts]]
 name = "Preferences domain does not import application startup"
@@ -139,8 +132,6 @@ source_modules = [
     "orchestrator.services.session_workspace_policy",
 ]
 forbidden_modules = ["orchestrator.main"]
-# Existing auth helpers retain indirect composition lookups, as for contacts.
-allow_indirect_imports = true
 
 [[tool.importlinter.contracts]]
 name = "Job creation schemas and ingress policy do not import application startup"
@@ -158,8 +149,6 @@ source_modules = [
     "orchestrator.routers.job_artifacts",
 ]
 forbidden_modules = ["orchestrator.main"]
-# Existing authorization helpers retain indirect composition lookups.
-allow_indirect_imports = true
 
 [[tool.importlinter.contracts]]
 name = "Job read services do not import application startup"
@@ -509,6 +498,62 @@ forbidden_modules = ["orchestrator.main"]
 # No exception: R1.B11 moved the loop bodies, dispatch scheduling, agent
 # reconciliation, the metering bootstrap and the startup backfills out of the
 # application; the application lifespan owns creation, gating and shutdown.
+
+[[tool.importlinter.contracts]]
+name = "Nothing imports the orchestrator entrypoint"
+type = "forbidden"
+source_modules = [
+    "orchestrator.application",
+    "orchestrator.auth",
+    "orchestrator.canvas_gateway",
+    "orchestrator.database",
+    "orchestrator.graph_routes",
+    "orchestrator.init",
+    "orchestrator.logging_config",
+    "orchestrator.operator_cli",
+    "orchestrator.routers",
+    "orchestrator.schemas",
+    "orchestrator.security",
+    "orchestrator.seed",
+    "orchestrator.services",
+    "orchestrator.ssh_gateway",
+    "orchestrator.uploads",
+    "orchestrator.utils",
+]
+forbidden_modules = ["orchestrator.main"]
+# R1.B12 closed the caller ledger: ``orchestrator.main`` only prepares the
+# process and calls ``create_app()``; uvicorn is its one consumer.
+
+[[tool.importlinter.contracts]]
+name = "Only the entrypoint composes the application"
+type = "forbidden"
+source_modules = [
+    "orchestrator.auth",
+    "orchestrator.canvas_gateway",
+    "orchestrator.database",
+    "orchestrator.graph_routes",
+    "orchestrator.init",
+    "orchestrator.logging_config",
+    "orchestrator.operator_cli",
+    "orchestrator.routers",
+    "orchestrator.schemas",
+    "orchestrator.security",
+    "orchestrator.seed",
+    "orchestrator.services",
+    "orchestrator.ssh_gateway",
+    "orchestrator.uploads",
+    "orchestrator.utils",
+]
+forbidden_modules = ["orchestrator.application"]
+# The one exception: the stateless-wake operator harness runs inside the
+# orchestrator container without serving HTTP; it builds one application's
+# resources and reaches the owning operations through their composition
+# functions (R1.B12).
+ignore_imports = [
+    "orchestrator.operator_cli.stateless_wake_acceptance -> orchestrator.application",
+    "orchestrator.operator_cli.stateless_wake_acceptance -> orchestrator.application.controls",
+    "orchestrator.operator_cli.stateless_wake_acceptance -> orchestrator.application.transport",
+]
 
 [[tool.importlinter.contracts]]
 name = "MCP and VM controller do not depend on shared runtime"
