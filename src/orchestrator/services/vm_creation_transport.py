@@ -115,7 +115,10 @@ async def replay_vm_creation(client, row: Mapping, *, secret: bytes) -> dict:
     request = deepcopy(row["canonical_request"])
     identity = VMCreationRetryIdentity(
         request_id=str(row["request_id"]),
-        job_id=str(row["job_id"]),
+        job_id=str(
+            row["thread_id"] if row["owner_kind"] == "thread"
+            else row["job_id"]
+        ),
         provision_generation=str(row["provision_generation"]),
         request_digest=row["request_digest"],
         expected_pvc_uid=str(row["expected_pvc_uid"])

@@ -873,6 +873,21 @@ class VMReadinessService:
                 status.get("vm_uid"),
                 ready_updates,
             )
+        elif entity_type == "thread" and getattr(
+            self._db, "supports_vm_creation_retry", False
+        ) is True:
+            from orchestrator.services.vm_provisioning_phases import (
+                VMProvisioningPhaseStore,
+            )
+
+            promoted = await VMProvisioningPhaseStore(self._db).publish_thread_ready(
+                entity_id, generation, registration_id,
+                status.get("vm_uid"), ready_updates,
+            )
+            if promoted is None:
+                promoted = bool(await self._db.merge_thread_vm_context_if_current(
+                    entity_id, registration_id, ready_updates,
+                ))
         else:
             promote = (
                 self._db.merge_thread_vm_context_if_current

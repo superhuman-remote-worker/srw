@@ -40,6 +40,49 @@ async def _scope(conn, request_id):
     )
     if prior is None:
         raise VMCreationRetryConflict("retry_request_missing")
+    if prior["owner_kind"] == "thread":
+        thread = await conn.fetchrow(
+            "SELECT * FROM threads WHERE id=$1 FOR UPDATE", prior["thread_id"],
+        )
+        retry = _record(await conn.fetchrow(
+            "SELECT * FROM vm_creation_retries WHERE request_id=$1 FOR UPDATE",
+            request_id,
+        ))
+        if retry is None or any(retry[key] != prior[key] for key in (
+            "owner_kind", "thread_id", "thread_runtime_generation",
+            "thread_agent_id", "thread_attach_token", "thread_wake_operation_id",
+            "provision_generation", "expected_pvc_uid", "observed_pvc_uid",
+        )):
+            raise VMCreationRetryConflict("scope_raced")
+        effects = await conn.fetch(
+            "SELECT * FROM vm_creation_effects WHERE request_id=$1 "
+            "ORDER BY effect_number FOR UPDATE", request_id,
+        )
+        metadata = _json(thread["metadata"]) if thread is not None else None
+        vm = metadata.get("vm") if isinstance(metadata, dict) else None
+        blocker = None
+        if (
+            thread is None or thread["execution_lane"] != "pinned"
+            or thread["runtime_generation"] != retry["thread_runtime_generation"]
+            or thread["agent_id"] != retry["thread_agent_id"]
+            or thread["runtime_attach_token"] != retry["thread_attach_token"]
+            or thread["runtime_retirement_token"] is not None
+            or thread["pinned_idle_terminal_intent_at"] is not None
+            or not isinstance(vm, dict)
+            or vm.get("provision_generation") != str(retry["provision_generation"])
+            or vm.get("creation_request_id") != str(retry["request_id"])
+        ):
+            blocker = "thread_changed"
+        elif await conn.fetchval(
+            "SELECT EXISTS(SELECT 1 FROM vm_workspace_recoveries "
+            "WHERE owner_kind='thread' AND owner_id=$1 AND resolved_at IS NULL) "
+            "OR EXISTS(SELECT 1 FROM vm_workspace_cleanup_admissions "
+            "WHERE owner_kind='thread' AND owner_id=$1 AND completed_at IS NULL "
+            "AND id IS DISTINCT FROM $2)",
+            retry["thread_id"], retry["creation_admission_id"],
+        ):
+            blocker = "workspace_recovery_held"
+        return retry, thread, None, effects, blocker
     job_id = prior["job_id"]
     membership = await conn.fetchrow(
         "SELECT parent_job_id FROM jobs WHERE id=$1", job_id
@@ -144,6 +187,29 @@ async def _scope(conn, request_id):
 
 
 def _outcome(retry, job, execution, effects, blocker, policy_digest, waiter, now):
+    if retry["owner_kind"] == "thread":
+        if effects or retry["state"] == "succeeded" or retry["observed_vm_uid"]:
+            return "parked", "creation_effect_present"
+        if blocker == "thread_changed":
+            return "cancelled", blocker
+        if blocker:
+            return "parked", blocker
+        vm = _json(job["metadata"]).get("vm")
+        if (
+            job["status"] not in {"created", "active", "awaiting_user", "suspended"}
+            or not isinstance(vm, dict)
+            or vm.get("status") in {"deleting", "deleted", "suspending", "suspended"}
+        ):
+            return "cancelled", "thread_changed"
+        if waiter["policy_digest"] != policy_digest:
+            return "cancelled", "policy_superseded"
+        if retry["state"] in {"cancel_requested", "settled"}:
+            return "cancelled", "creation_cancelled"
+        if retry["state"] == "attention":
+            return "parked", "retry_attention"
+        return ("waiting", None) if retry["state"] in {"queued", "reconciling"} else (
+            "parked", "runtime_identity_unproven"
+        )
     if blocker == "creation_attachment_lineage_unproven":
         # A narrower, known target scope can only remove eligibility. Full
         # lineage authority must be re-established before every other action.
@@ -251,10 +317,13 @@ class VMResourceWaiterMaintenance:
         )
         if (
             waiter is None
-            or any(
-                waiter[key] != retry[key]
-                for key in ("job_id", "provision_generation", "request_digest")
-            )
+            or (waiter["owner_kind"] if "owner_kind" in waiter else "job")
+            != retry["owner_kind"]
+            or (waiter["thread_id"] if "thread_id" in waiter else None)
+            != retry["thread_id"]
+            or any(waiter[key] != retry[key] for key in (
+                "job_id", "provision_generation", "request_digest",
+            ))
             or waiter["cluster_id"] != policy["cluster_id"]
         ):
             raise ResourceAdmissionError("resource_waiter_changed")

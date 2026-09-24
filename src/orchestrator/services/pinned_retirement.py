@@ -2065,6 +2065,22 @@ class PinnedRetirementOperations:
         # stable remote grant key. The scheduler uses this same cross-replica lock.
         if not await self._pinned_retirement_is_current(retirement):
             raise RuntimeError("pinned retirement authority changed")
+        creation_source = context.get("vm_creation_source")
+        if creation_source is not None:
+            if not isinstance(creation_source, Mapping) or not creation_source.get(
+                "request_id"
+            ):
+                raise RuntimeError("captured thread VM creation source is malformed")
+            from orchestrator.services.vm_creation_retry_store import VMCreationRetryStore
+
+            # An issued or uncertain API effect is not physical absence. The
+            # retry/disposition observer must settle the exact source first;
+            # this leaves End and its shared resource charge pending.
+            source_outcome = await VMCreationRetryStore(
+                self.dependencies.store
+            ).settle_never_issued(request_id=str(creation_source["request_id"]))
+            if source_outcome.get("settled") is not True:
+                raise RuntimeError("thread VM creation disposition is pending")
         if (
             permanent
             and await self.dependencies.store.pinned_retirement_external_cleanup_complete(

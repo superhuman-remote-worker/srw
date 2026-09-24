@@ -236,7 +236,7 @@ def carrier_record(lease, *, secret):
     values = verify_creation_carrier(lease, secret=secret)
     return {
         **values,
-        "owner_kind": "job",
+        "owner_kind": values.get("owner_kind", "job"),
         "owner_id": values["job_id"],
         "name": values["object_name"],
         "carrier_name": lease["metadata"]["name"],
@@ -396,7 +396,7 @@ class CreationActuator:
             if (
                 meta.get("deletionTimestamp")
                 or dv.get("status", {}).get("phase") == "Failed"
-                or labels.get("srw.io/owner-kind") != "job"
+                or labels.get("srw.io/owner-kind") != row.get("owner_kind", "job")
                 or labels.get("srw.io/owner-id") != owner
             ):
                 raise CreationUnproven("retained_disk_changed")
@@ -411,7 +411,7 @@ class CreationActuator:
             labels = meta.get("labels", {})
             if (
                 meta.get("deletionTimestamp")
-                or labels.get("srw.io/owner-kind") != "job"
+                or labels.get("srw.io/owner-kind") != row.get("owner_kind", "job")
                 or labels.get("srw.io/owner-id") != owner
             ):
                 raise CreationUnproven("retained_disk_changed")
@@ -574,6 +574,16 @@ class CreationActuator:
             "intent_digest": reservation["intent_digest"],
             "retry_request_id": row["request_id"],
             "job_id": row["job_id"],
+            **(
+                {
+                    "owner_kind": "thread",
+                    "thread_runtime_generation": row["thread_runtime_generation"],
+                    "thread_agent_id": row["thread_agent_id"],
+                    "thread_attach_token": row["thread_attach_token"],
+                    "thread_wake_operation_id": row["thread_wake_operation_id"],
+                }
+                if row.get("owner_kind") == "thread" else {}
+            ),
             "provision_generation": row["provision_generation"],
             "request_digest": row["request_digest"],
             "controller_configuration_digest": row["controller_configuration_digest"],
@@ -723,7 +733,8 @@ class CreationActuator:
             raise CreationUnproven("creation_object_name_changed")
         metadata["namespace"] = self.namespace
         metadata.setdefault("labels", {}).update(
-            {"srw.io/owner-kind": "job", "srw.io/owner-id": row["job_id"]}
+            {"srw.io/owner-kind": row.get("owner_kind", "job"),
+             "srw.io/owner-id": row["job_id"]}
         )
         metadata.setdefault("annotations", {}).update(
             {

@@ -3263,6 +3263,7 @@ class VMProvisioner:
         disk_size: Optional[str] = None,
         initialization: dict | None = None,
         preparation: dict | None = None,
+        network_profile: dict | None = None,
         expected_runtime_generation: str | None = None,
         expected_agent_id: str | None = None,
         expected_attach_token: str | None = None,
@@ -3378,6 +3379,92 @@ class VMProvisioner:
         begin_impl = getattr(self._db, "begin_pinned_thread_vm_provisioning", None)
         if not callable(begin_impl):
             return False
+        from shared.vm_resource_policy import configured_enforcement_required
+
+        try:
+            resource_enforced = configured_enforcement_required()
+        except ValueError:
+            return False
+        creation_source = None
+        if resource_enforced:
+            # A claimed immutable source is the only route to a v3 effect. A
+            # polling caller reuses its durable request; it never installs a
+            # second source or replays a legacy POST/NATS create.
+            if (
+                self.mode != "same-cluster"
+                or os.getenv("VM_CREATION_RETRY_ENABLED", "false").lower() != "true"
+                or self._http_client is None
+                or self._lifecycle_hmac_secret is None
+            ):
+                return False
+            if poll:
+                request_id = (expected_vm_context or {}).get("creation_request_id")
+                if request_id is None:
+                    return False
+                try:
+                    source = await self._db.fetchrow(
+                        "SELECT owner_kind,thread_id,thread_runtime_generation,"
+                        "thread_agent_id,thread_attach_token,provision_generation "
+                        "FROM vm_creation_retries WHERE request_id=$1", UUID(request_id),
+                    )
+                except (TypeError, ValueError):
+                    return False
+                return bool(
+                    source and source["owner_kind"] == "thread"
+                    and str(source["thread_id"]) == thread_id
+                    and str(source["thread_runtime_generation"])
+                    == expected_runtime_generation
+                    and str(source["provision_generation"]) == generation
+                    and (str(source["thread_agent_id"])
+                         if source["thread_agent_id"] else None) == expected_agent_id
+                    and (str(source["thread_attach_token"])
+                         if source["thread_attach_token"] else None)
+                    == expected_attach_token
+                )
+            from orchestrator.services.vm_creation_request import (
+                build_vm_creation_request,
+            )
+            from orchestrator.services.vm_creation_transport import (
+                CreationConfigurationUnavailable,
+                resolve_vm_creation_configuration,
+            )
+
+            try:
+                network_tier = (
+                    await self._db.get_workspace_network_tier(thread_id, "thread")
+                    or DEFAULT_NETWORK_TIER
+                )
+                request = build_vm_creation_request(
+                    job_id=thread_id, entity_type="thread",
+                    agent_config=agent_config, vm_image=vm_image,
+                    cpu_cores=cpu_cores, memory=memory, description=description,
+                    network_tier=network_tier, provision_generation=generation,
+                    orchestrator_url=os.getenv("ORCHESTRATOR_URL"),
+                    disk_size=disk_size, initialization=initialization,
+                    preparation=preparation, network_profile=network_profile,
+                )
+                resolved = await resolve_vm_creation_configuration(
+                    self._http_client, request,
+                    secret=self._lifecycle_hmac_secret,
+                )
+                if resolved["controller_configuration"].get("version") != 3:
+                    return False
+                from shared.vm_creation_retry import canonical_request_digest
+                from shared.vm_creation_issuance import canonical_configuration_digest
+
+                frozen_request = resolved["request"]
+                frozen_config = resolved["controller_configuration"]
+                creation_source = {
+                    "request_id": fresh_context.get("idle_wake_request_id")
+                    or str(uuid4()),
+                    "request": frozen_request,
+                    "request_digest": canonical_request_digest(frozen_request),
+                    "controller_configuration": frozen_config,
+                    "controller_configuration_digest":
+                    canonical_configuration_digest(frozen_config),
+                }
+            except (CreationConfigurationUnavailable, ValueError, TypeError, KeyError):
+                return False
         try:
             persisted = await begin_impl(
                 thread_id,
@@ -3387,6 +3474,7 @@ class VMProvisioner:
                 expected_vm_context=expected_vm_context,
                 provision_context=fresh_context,
                 wake_operation_id=wake_operation_id,
+                **({"creation_source": creation_source} if creation_source else {}),
                 **({"poll": True} if poll else {}),
                 **(
                     {"expected_preparation_context": preparation_context}
@@ -3402,6 +3490,11 @@ class VMProvisioner:
             return False
         if not persisted:
             return False
+
+        if resource_enforced:
+            # The controller retry service owns every subsequent POST and
+            # observation. A boolean here means durable source admission only.
+            return True
 
         result: bool | dict[str, Any]
         if self._nats_available:
