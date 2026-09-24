@@ -1390,7 +1390,7 @@ async def ensure_crawl4ai_fetch_endpoint(
             display_label="Crawl4AI (self-hosted)",
             capabilities=["fetch"],
             family="crawl4ai",
-            params_json={"provider": "crawl4ai", "ops": ["extract", "crawl"]},
+            params_json={"provider": "crawl4ai", "ops": ["extract", "crawl", "map"]},
             enabled=True,
             seeded_from="helm:crawl4ai",
             on_conflict_do_nothing=True,

@@ -769,7 +769,7 @@ def test_crawl4ai_declared_ops_return_normalized_shapes():
             Page(url="https://result.example/docs", content="Docs body"),
         ]
 
-    assert adapter.ops == frozenset({"extract", "crawl"})
+    assert adapter.ops == frozenset({"extract", "crawl", "map"})
     assert all(
         call.args[0] == "https://crawl4ai.internal/api/crawl"
         for call in client.post.call_args_list
@@ -782,34 +782,32 @@ def test_crawl4ai_declared_ops_return_normalized_shapes():
     )
 
 
-@pytest.mark.parametrize("op", ["search", "map"])
-def test_crawl4ai_undeclared_ops_raise(op):
+def test_crawl4ai_cannot_search():
     adapter = Crawl4AIAdapter(
         base_url="https://crawl4ai.internal",
         api_key="crawl4ai-test",
     )
 
     with pytest.raises(ProviderRequestError):
-        if op == "search":
-            adapter.search("query", 5)
-        else:
-            adapter.map("https://example.com")
+        adapter.search("query", 5)
 
 
-@pytest.mark.parametrize("op", ["extract", "crawl"])
+@pytest.mark.parametrize("op", ["extract", "crawl", "map"])
 def test_crawl4ai_restricted_ops_raise(op):
-    declared_op = "crawl" if op == "extract" else "extract"
+    # A catalog row that does not declare the op (e.g. one seeded before map
+    # existed) must not reach the provider for it.
+    declared_ops = frozenset({"extract", "crawl", "map"} - {op})
     adapter = Crawl4AIAdapter(
         base_url="https://crawl4ai.internal",
         api_key="crawl4ai-test",
-        ops=frozenset({declared_op}),
+        ops=declared_ops,
     )
 
     with pytest.raises(ProviderRequestError):
         if op == "extract":
             adapter.extract(["https://example.com"])
         else:
-            adapter.crawl("https://example.com")
+            getattr(adapter, op)("https://example.com")
 
 
 def test_crawl4ai_empty_results_is_answer_and_target_stays_payload():
@@ -878,4 +876,175 @@ def test_crawl4ai_is_registered_and_constructed_with_supported_ops_only():
     )
 
     assert isinstance(adapter, Crawl4AIAdapter)
-    assert adapter.ops == frozenset({"extract", "crawl"})
+    assert adapter.ops == frozenset({"extract", "crawl", "map"})
+
+
+def _crawl4ai_links_response(page_url: str, *hrefs: str) -> httpx.Response:
+    return httpx.Response(
+        200,
+        json={
+            "success": True,
+            "results": [
+                {
+                    "url": page_url,
+                    "success": True,
+                    "markdown": {"raw_markdown": "body"},
+                    "links": {"internal": [{"href": href} for href in hrefs]},
+                }
+            ],
+        },
+    )
+
+
+def _crawl4ai_map(responses: list[httpx.Response], url: str, **kw):
+    client = MagicMock()
+    client.post.side_effect = responses
+    manager = MagicMock()
+    manager.__enter__.return_value = client
+    manager.__exit__.return_value = False
+    adapter = Crawl4AIAdapter(
+        base_url="https://crawl4ai.internal",
+        api_key="crawl4ai-test",
+    )
+    with patch(
+        "agent.tools.research.search.crawl4ai.httpx.Client", return_value=manager
+    ):
+        return adapter.map(url, **kw), client
+
+
+def test_crawl4ai_map_lists_links_breadth_first_without_repeats():
+    urls, client = _crawl4ai_map(
+        [
+            _crawl4ai_links_response(
+                "https://site.example/",
+                "/docs",
+                "/blog#latest",
+                "https://site.example/docs",
+            ),
+            httpx.Response(
+                200,
+                json={
+                    "success": True,
+                    "results": [
+                        {
+                            "url": "https://site.example/docs",
+                            "success": True,
+                            "links": {
+                                "internal": [
+                                    {"href": "/docs/install"},
+                                    {"href": "/"},
+                                ]
+                            },
+                        },
+                        {
+                            "url": "https://site.example/blog",
+                            "success": True,
+                            "links": {"internal": [{"href": "/blog/post-1"}]},
+                        },
+                    ],
+                },
+            ),
+        ],
+        "https://site.example/",
+        max_depth=2,
+        limit=50,
+    )
+
+    assert urls == [
+        "https://site.example/",
+        "https://site.example/docs",
+        "https://site.example/blog",
+        "https://site.example/docs/install",
+        "https://site.example/blog/post-1",
+    ]
+    # Depth 2 renders the start page, then the depth-1 pages; the depth-2
+    # URLs are listed without being rendered.
+    assert [call.kwargs["json"]["urls"] for call in client.post.call_args_list] == [
+        ["https://site.example/"],
+        ["https://site.example/docs", "https://site.example/blog"],
+    ]
+
+
+def test_crawl4ai_map_depth_one_renders_only_the_start_page():
+    urls, client = _crawl4ai_map(
+        [_crawl4ai_links_response("https://site.example/", "/a", "/b")],
+        "https://site.example/",
+        max_depth=1,
+    )
+
+    assert urls == [
+        "https://site.example/",
+        "https://site.example/a",
+        "https://site.example/b",
+    ]
+    assert client.post.call_count == 1
+
+
+def test_crawl4ai_map_stops_rendering_once_limit_is_reached():
+    hrefs = [f"/page-{i}" for i in range(15)]
+    urls, client = _crawl4ai_map(
+        [_crawl4ai_links_response("https://site.example/", *hrefs)],
+        "https://site.example/",
+        max_depth=3,
+        limit=5,
+    )
+
+    assert urls == ["https://site.example/"] + [
+        f"https://site.example/page-{i}" for i in range(4)
+    ]
+    assert client.post.call_count == 1
+
+
+def test_crawl4ai_map_path_filters_scope_listing_and_traversal():
+    urls, client = _crawl4ai_map(
+        [
+            _crawl4ai_links_response(
+                "https://site.example/",
+                "/docs/guide",
+                "/docs/internal/secret",
+                "/pricing",
+            ),
+            _crawl4ai_links_response(
+                "https://site.example/docs/guide", "/docs/guide/step-2"
+            ),
+        ],
+        "https://site.example/",
+        max_depth=2,
+        select_paths=["^/docs/"],
+        exclude_paths=["/internal/"],
+    )
+
+    # The start page is always rendered, but it is only listed if it matches.
+    assert urls == [
+        "https://site.example/docs/guide",
+        "https://site.example/docs/guide/step-2",
+    ]
+    assert client.post.call_args_list[-1].kwargs["json"] == {
+        "urls": ["https://site.example/docs/guide"]
+    }
+
+
+def test_crawl4ai_map_rejects_an_invalid_path_regex_before_any_request():
+    client = MagicMock()
+    manager = MagicMock()
+    manager.__enter__.return_value = client
+    adapter = Crawl4AIAdapter(
+        base_url="https://crawl4ai.internal",
+        api_key="crawl4ai-test",
+    )
+
+    with (
+        patch(
+            "agent.tools.research.search.crawl4ai.httpx.Client",
+            return_value=manager,
+        ),
+        pytest.raises(ProviderRequestError, match="select_paths"),
+    ):
+        adapter.map("https://site.example/", select_paths=["(unclosed"])
+
+    client.post.assert_not_called()
+
+
+def test_crawl4ai_map_surfaces_provider_errors():
+    with pytest.raises(ProviderUnavailableError):
+        _crawl4ai_map([httpx.Response(500)], "https://site.example/")

@@ -53,7 +53,7 @@ async def test_fresh_install_creates_fetch_row_and_claims_the_empty_slot(monkeyp
     assert model["capabilities"] == ["fetch"]
     assert model["params_json"] == {
         "provider": "crawl4ai",
-        "ops": ["extract", "crawl"],
+        "ops": ["extract", "crawl", "map"],
     }
     assert db.set_default_llm_model.await_args_list == [
         call("fetch", CRAWL4AI_MODEL_ID, source="default")
