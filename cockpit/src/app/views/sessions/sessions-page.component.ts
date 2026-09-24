@@ -41,7 +41,8 @@ interface Project {
  * Delete, about 60–75 s) the list is re-read in the background: first 2 s
  * after the card is seen, doubling, capped at 15 s — so a settled card updates
  * within the server's settlement time plus at most one 15 s interval. The poll
- * stops as soon as no card is ending, and on destroy.
+ * stops as soon as no card is ending, and on destroy. A stateless retirement a
+ * retryable fence left pending never settles by itself, so it does not poll.
  */
 const ENDING_POLL_INITIAL_MS = 2_000;
 const ENDING_POLL_MAX_MS = 15_000;
@@ -232,7 +233,7 @@ const ENDING_POLL_MAX_MS = 15_000;
                 <app-icon-button
                   [ariaLabel]="'sessions.tooltip.resume' | transloco"
                   [tooltip]="'sessions.tooltip.resume' | transloco"
-                  [disabled]="thread.status === 'ending'"
+                  [disabled]="thread.status === 'ending' && !isPendingEndResume(thread)"
                   (clicked)="resumeSession(thread)"
                 >
                   <app-icon size="sm">play_arrow</app-icon>
@@ -678,10 +679,15 @@ export class SessionsPageComponent implements OnInit {
     /**
      * Keep one background re-read scheduled while any card is `ending`, each
      * gap doubling up to the cap; stop and reset the backoff once none is.
+     * A stateless pending retirement moves only on the user's retry (which
+     * re-reads the list itself), so it never arms the poll on its own.
      * House idiom: a cleared setTimeout, not rxjs.
      */
     private syncEndingPoll(): void {
-        if (this.destroyed || !this.threads().some(t => t.status === 'ending')) {
+        const settling = this.threads().some(
+            t => t.status === 'ending' && !this.isStatelessPendingRetirement(t),
+        );
+        if (this.destroyed || !settling) {
             this.cancelEndingPoll();
             this.endingPollDelayMs = ENDING_POLL_INITIAL_MS;
             return;
@@ -721,9 +727,31 @@ export class SessionsPageComponent implements OnInit {
         this.deleteRetries.set(retries);
     }
 
-    /** True while this card's last confirmed permanent Delete was fenced (503). */
+    /**
+     * True while this card's last confirmed permanent Delete was fenced (503)
+     * in this page, or the server reports a stateless permanent Delete still
+     * pending (e.g. after a reload): either way Delete is that retry.
+     */
     isDeleteRetry(thread: Thread): boolean {
-        return this.deleteRetries().has(thread.id);
+        return (
+            this.deleteRetries().has(thread.id) ||
+            (this.isStatelessPendingRetirement(thread) && thread.retirement_permanent === true)
+        );
+    }
+
+    /**
+     * A stateless soft End still pending: Resume is the retry the server
+     * accepts (it finishes the pending End cleanup, then resumes). A pinned
+     * `ending` card stays closed — the server settles it by itself.
+     */
+    isPendingEndResume(thread: Thread): boolean {
+        return this.isStatelessPendingRetirement(thread) && thread.retirement_permanent !== true;
+    }
+
+    /** A stateless End/Delete a retryable fence left pending: nothing on the
+     *  server finishes it until the user retries End, Delete or Resume. */
+    private isStatelessPendingRetirement(thread: Thread): boolean {
+        return thread.execution_lane === 'stateless' && thread.runtime_retirement_pending === true;
     }
 
     async loadProjects(): Promise<void> {
@@ -859,7 +887,8 @@ export class SessionsPageComponent implements OnInit {
     }
 
     async resumeSession(thread: Thread): Promise<void> {
-        if (thread.status === 'ended') {
+        const pendingEnd = this.isPendingEndResume(thread);
+        if (thread.status === 'ended' || pendingEnd) {
             try {
                 await firstValueFrom(
                     this.http.post(`${environment.apiUrl}/persistent/threads/${thread.id}/resume`, {})
@@ -879,6 +908,10 @@ export class SessionsPageComponent implements OnInit {
                 // dead-ends here with the toast.
                 if (classifyResumeError(e).kind !== 'drift') {
                     this.toast.danger(this.errors.translate(e, 'errors.sessions.resumeFailed'));
+                    // A refused retry of a pending stateless End (cleanup
+                    // still incomplete, or a permanent Delete took over):
+                    // re-read so the card offers what the server now accepts.
+                    if (pendingEnd) await this.refreshThreads();
                     return;
                 }
                 // The 428 arrives before the thread's status flips, so the
@@ -909,10 +942,12 @@ export class SessionsPageComponent implements OnInit {
     deleteSession(thread: Thread): void {
         // A card whose confirmed permanent Delete hit the retryable 503 fence
         // re-sends that same request (force kept): the user already confirmed
-        // it, and the server contract for the fence is "retry".
-        const force = this.deleteRetries().get(thread.id);
-        if (force !== undefined) {
-            void this.sendPermanentDelete(thread, force);
+        // it, and the server contract for the fence is "retry". A stateless
+        // permanent Delete the server still reports pending (the page was
+        // reloaded since) is the same confirmed request; its force is not
+        // known here, and a busy refusal still escalates to the force confirm.
+        if (this.isDeleteRetry(thread)) {
+            void this.sendPermanentDelete(thread, this.deleteRetries().get(thread.id) ?? false);
             return;
         }
         // Open the themed confirmation dialog instead of a native confirm().
@@ -943,11 +978,14 @@ export class SessionsPageComponent implements OnInit {
             this.setDeleteRetry(thread.id, null);
         } catch (e: any) {
             // Mid-turn guard (session_silent_failure_audit.md #11): a
-            // cleanup sweep used to tear down live sessions silently.
+            // cleanup sweep used to tear down live sessions silently. A
+            // stateless session answers the same way with
+            // `stateless_end_busy` (a leased turn or pending input/control).
             if (
                 !force &&
                 e?.status === 409 &&
-                e?.error?.detail?.code === 'turn_in_flight'
+                (e?.error?.detail?.code === 'turn_in_flight' ||
+                    e?.error?.detail?.code === 'stateless_end_busy')
             ) {
                 // Live/mid-turn session — escalate to a force-delete confirm.
                 this.pendingDelete.set(thread);
