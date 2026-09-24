@@ -63,6 +63,7 @@ import {
 import {ToolCardView} from '../../core/models/tool-card.model';
 import {toolCardViewFromEvent} from '../../core/tools/tool-card-adapters';
 import {ApiService, IdeSessionStatus} from '../../core/services/api.service';
+import {workspaceLifecycleReasonKey} from '../../core/util/vm-lifecycle';
 import {I18nService} from '../../core/services/i18n.service';
 import {FileHandlingService} from '../../core/services/file-handling.service';
 import {ChatPreferencesService, type ChatTextSize, type ReadingWidth} from '../../core/services/chat-preferences.service';
@@ -682,7 +683,11 @@ export function pickCodeServerUrlToOpen(status: IdeSessionStatus | null): string
  * payloads that were about to advertise a URL) — where SSH is exactly the
  * working fallback.
  */
-export function sshWorkspaceReachable(status: IdeSessionStatus | null): boolean {
+export function sshWorkspaceReachable(
+    status: IdeSessionStatus | null,
+    lifecycle?: {state: string} | null,
+): boolean {
+    if (lifecycle) return lifecycle.state !== 'unsupported';
     if (!status) return false;
     return status.status === 'active' || status.status === 'restoring' || !!status.code;
 }
@@ -1022,10 +1027,12 @@ export function clearDraft(threadId: string | null): void {
               @if (ideStatus()?.gitea_url; as giteaUrl) {
                 <app-menu-item (activated)="openIde(giteaUrl)">{{ 'chat.header.gitButton' | transloco }}</app-menu-item>
               }
-              @if (ideStatus()?.status === 'active' && ideStatus()?.code_server_url) {
+              @if (chat.workspaceLifecycle() && chat.workspaceLifecycle()?.state !== 'unsupported') {
+                <app-menu-item (activated)="openVmCodeServer()">{{ 'chat.header.ideButton' | transloco }}</app-menu-item>
+              } @else if (ideStatus()?.status === 'active' && ideStatus()?.code_server_url) {
                 <app-menu-item (activated)="openCodeServer()">{{ 'chat.header.ideButton' | transloco }}</app-menu-item>
               }
-              @if (ideStatus()?.status === 'restoring') {
+              @if (!chat.workspaceLifecycle() && ideStatus()?.status === 'restoring') {
                 <app-menu-item [disabled]="true">{{ 'chat.header.ideLoadingTooltip' | transloco }}</app-menu-item>
               }
               @if (sshButtonVisible()) {
@@ -1038,18 +1045,32 @@ export function clearDraft(threadId: string | null): void {
                         (clicked)="disconnectAndLeave()">
               {{ 'chat.header.disconnect' | transloco }}
             </app-button>
-          } @else if (chat.cloudSessionUrl() || chat.ncSessionFolder() || chat.verifiedProjectFolder()) {
-            <!-- Asleep/ended session. Every other header action drives the live
-                 agent, so the isConnected() gate above is right for them — but
-                 these just open an external cloud URL that loadThreadMeta has
-                 already resolved, and they are the one deliverable surface a
-                 user comes back to a dead session for. Keep them reachable.
+          } @else if (chat.workspaceLifecycle() || chat.cloudSessionUrl() || chat.ncSessionFolder() || chat.verifiedProjectFolder()) {
+            <!-- A suspended VM can be woken by explicit IDE/SSH access even
+                 while its agent is disconnected. Cloud files are likewise
+                 useful after a session has ended. Keep both reachable.
 
                  PC-19: for a protected session the project folder is the one
                  the staged diff applies to; the legacy session folder is an
                  empty agent-service directory. Both are offered, each named
                  for what it is — and the project action exists only when the
                  mount has been cross-checked against the diff summary. -->
+            @if (chat.workspaceLifecycle()?.state && chat.workspaceLifecycle()?.state !== 'unsupported') {
+              <app-icon-button
+                size="sm"
+                [ariaLabel]="'chat.header.moreActions' | transloco"
+                [appMenuTrigger]="asleepVmMenu"
+                menuPlacement="bottom-end"
+              >
+                <app-icon size="sm">more_vert</app-icon>
+              </app-icon-button>
+              <app-menu #asleepVmMenu>
+                <app-menu-item (activated)="openVmCodeServer()">{{ 'chat.header.ideButton' | transloco }}</app-menu-item>
+                @if (sshButtonVisible()) {
+                  <app-menu-item (activated)="showSshPanel.update(v => !v)">{{ 'chat.header.sshButton' | transloco }}</app-menu-item>
+                }
+              </app-menu>
+            }
             @if (chat.verifiedProjectFolder(); as folder) {
               @if (headerCompact()) {
                 <app-icon-button
@@ -1088,6 +1109,21 @@ export function clearDraft(threadId: string | null): void {
           }
         </div>
       </div>
+
+      @if (chat.workspaceLifecycle(); as lifecycle) {
+        <div class="vm-lifecycle" role="status">
+          {{ ('jobs.lifecycle.state.' + lifecycle.state) | transloco }}
+          @if (lifecycle.idle_expires_at) {
+            · {{ 'jobs.lifecycle.idleAt' | transloco }} {{ lifecycle.idle_expires_at | date:'shortTime' }}
+          }
+          @if (lifecycle.reason_code) {
+            · {{ lifecycleReasonKey(lifecycle.reason_code) | transloco }}
+          }
+          @if (lifecycle.next_retry_at) {
+            · {{ 'jobs.lifecycle.nextRetry' | transloco }} {{ lifecycle.next_retry_at | date:'shortTime' }}
+          }
+        </div>
+      }
 
       <!-- Pending protected-cloud review. Deliberately OUTSIDE the
            isConnected() gate above: the review API serves ended threads on
@@ -2641,7 +2677,8 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     /** SSH button gate: a deployed gateway AND a workspace it can reach —
      *  see {@link sshWorkspaceReachable} for what counts as reachable. */
     readonly sshButtonVisible = computed(
-        () => !!this.capabilities.sshGateway() && sshWorkspaceReachable(this.ideStatus()),
+        () => !!this.capabilities.sshGateway() &&
+            sshWorkspaceReachable(this.ideStatus(), this.chat.workspaceLifecycle()),
     );
 
     /**
@@ -2848,7 +2885,9 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
 
     // IDE status
     readonly ideStatus = signal<IdeSessionStatus | null>(null);
+    readonly lifecycleReasonKey = workspaceLifecycleReasonKey;
     private idePollingTimer: ReturnType<typeof setInterval> | null = null;
+    private vmIdeOpenTimer: ReturnType<typeof setInterval> | null = null;
     private idePollingAttempts = 0;
 
     private autoScroll = true;
@@ -3293,6 +3332,7 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     ngOnDestroy(): void {
         // Don't disconnect — keep session alive across navigation
         this.stopIdePolling();
+        if (this.vmIdeOpenTimer) clearInterval(this.vmIdeOpenTimer);
         if (this.startupTickInterval) {
             clearInterval(this.startupTickInterval);
             this.startupTickInterval = null;
@@ -4032,6 +4072,61 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         });
     }
 
+    openVmCodeServer(): void {
+        const threadId = this.chat.threadId();
+        if (!threadId) return;
+        const tab = window.open('', '_blank');
+        if (!tab) {
+            this.toast.warning(this.transloco.translate('jobs.lifecycle.popupBlocked'));
+            return;
+        }
+        tab.opener = null;
+        tab.document.title = this.transloco.translate('jobs.lifecycle.wakingTab');
+        tab.document.body.textContent = this.transloco.translate('jobs.lifecycle.wakingTab');
+        this.api.startThreadIdeSession(threadId).subscribe(result => {
+            const leaseId = result?.access_lease_id;
+            if (!result || !leaseId || result.status === 'unavailable') {
+                tab.close();
+                this.toast.warning(this.transloco.translate('jobs.lifecycle.ideUnavailable'));
+                return;
+            }
+            if (result.status === 'active' && result.code_server_url) {
+                tab.location.href = result.code_server_url;
+                return;
+            }
+            if (this.vmIdeOpenTimer) clearInterval(this.vmIdeOpenTimer);
+            let attempts = 0;
+            this.vmIdeOpenTimer = setInterval(() => {
+                if (tab.closed || ++attempts > 100) {
+                    if (this.vmIdeOpenTimer) clearInterval(this.vmIdeOpenTimer);
+                    this.vmIdeOpenTimer = null;
+                    if (!tab.closed) {
+                        tab.close();
+                        this.toast.warning(this.transloco.translate('jobs.lifecycle.wakeTimedOut'));
+                    }
+                    this.api.closeThreadIdeLease(threadId, leaseId).subscribe();
+                    return;
+                }
+                this.api.getThreadIdeStatus(threadId, leaseId).subscribe(status => {
+                    if (status?.workspace_lifecycle) {
+                        this.chat.workspaceLifecycle.set(status.workspace_lifecycle);
+                    }
+                    if (status?.status === 'active' && status.code_server_url) {
+                        if (this.vmIdeOpenTimer) clearInterval(this.vmIdeOpenTimer);
+                        this.vmIdeOpenTimer = null;
+                        tab.location.href = status.code_server_url;
+                    } else if (!status || status.status === 'unavailable' || status.status === 'failed') {
+                        if (this.vmIdeOpenTimer) clearInterval(this.vmIdeOpenTimer);
+                        this.vmIdeOpenTimer = null;
+                        tab.close();
+                        this.api.closeThreadIdeLease(threadId, leaseId).subscribe();
+                        this.toast.warning(this.transloco.translate('jobs.lifecycle.ideUnavailable'));
+                    }
+                });
+            }, 3000);
+        });
+    }
+
     /**
      * The session scratch folder is only relabelled when a project-folder
      * action sits beside it. On an ordinary session there is nothing to
@@ -4137,6 +4232,7 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         this.idePollingAttempts++;
         this.api.getThreadIdeStatus(threadId).subscribe(status => {
             this.ideStatus.set(status);
+            if (status?.workspace_lifecycle) this.chat.workspaceLifecycle.set(status.workspace_lifecycle);
             // Stop polling once active or after 30 attempts (5 min)
             if (status?.status === 'active' || this.idePollingAttempts >= 30) {
                 this.stopIdePolling();

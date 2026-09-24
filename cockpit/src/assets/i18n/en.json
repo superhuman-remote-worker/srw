@@ -813,6 +813,30 @@
       "nextCheck": "Next check",
       "cleanupPending": "Workspace cleanup remains pending"
     },
+    "lifecycle": {
+      "state": {
+        "warm": "Workspace warm",
+        "releasing": "Pausing workspace…",
+        "release_held": "Workspace pause needs attention",
+        "suspended": "Workspace asleep",
+        "waking": "Starting workspace…",
+        "wake_held": "Workspace start needs attention",
+        "ready": "Workspace ready",
+        "unsupported": "Workspace access unavailable"
+      },
+      "reason": {
+        "identity": "Workspace identity could not be verified.",
+        "capacity": "Waiting for workspace capacity.",
+        "access": "Close active IDE or SSH access, then try again.",
+        "attention": "The workspace is waiting for a safe retry."
+      },
+      "idleAt": "May pause at",
+      "nextRetry": "Next retry",
+      "wakingTab": "Starting your workspace…",
+      "popupBlocked": "Allow popups for this site, then open the IDE again.",
+      "wakeTimedOut": "The workspace is taking longer to start. Open the IDE again to check its progress.",
+      "ideUnavailable": "The workspace IDE is unavailable. Try opening it again shortly."
+    },
     "delegationChildren": "{{count}} children",
     "promote": {
       "namePlaceholder": "Project name (required)",

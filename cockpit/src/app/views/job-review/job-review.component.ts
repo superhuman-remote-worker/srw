@@ -1,4 +1,4 @@
-import {Component, computed, effect, inject, signal} from '@angular/core';
+import {Component, DestroyRef, computed, effect, inject, signal} from '@angular/core';
 import {Router} from '@angular/router';
 import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
 import {ApiService} from '../../core/services/api.service';
@@ -236,6 +236,9 @@ export function selectDeliveryRepository(
                   [class.warning]="job()!.workspace_contract!.state !== 'ready'"
                   [title]="workspaceContractTitle()"
                 >{{ workspaceContractSummary() }}</span>
+              }
+              @if (job()!.workspace_lifecycle; as lifecycle) {
+                <span class="meta-item" role="status">{{ ('jobs.lifecycle.state.' + lifecycle.state) | transloco }}</span>
               }
             </div>
           </div>
@@ -797,6 +800,7 @@ export class JobReviewComponent {
   private readonly data = inject(DataService);
   private readonly transloco = inject(TranslocoService);
   private readonly router = inject(Router);
+  private readonly destroyRef = inject(DestroyRef);
 
   readonly currentJobId = this.data.currentJobId;
   readonly job = signal<Job | null>(null);
@@ -862,6 +866,9 @@ export class JobReviewComponent {
   feedbackText = '';
 
   constructor() {
+    this.destroyRef.onDestroy(() => {
+      if (this.idePollingInterval) clearInterval(this.idePollingInterval);
+    });
     // React to job selection changes
     effect(() => {
       const jobId = this.currentJobId();
@@ -990,6 +997,7 @@ export class JobReviewComponent {
     if (!currentJob) return false;
     // Hide IDE on subjobs — they share the parent's workspace
     if (currentJob.parent_job_id) return false;
+    if (currentJob.workspace_lifecycle && currentJob.workspace_lifecycle.state !== 'unsupported') return true;
     // Show IDE button if: live VM, snapshot available, or has Gitea repo
     if (currentJob.status === 'processing') return true;
     // context is JSONB and may arrive as a raw JSON string, so it must be
@@ -1006,6 +1014,10 @@ export class JobReviewComponent {
     const currentJob = this.job();
     if (!currentJob) return;
     const jobId = currentJob.id;
+    if (currentJob.workspace_lifecycle && currentJob.workspace_lifecycle.state !== 'unsupported') {
+      this.openVmIde(jobId);
+      return;
+    }
 
     this.ideLoading.set(true);
     this.resultMessage.set(null);
@@ -1058,6 +1070,66 @@ export class JobReviewComponent {
         this.resultIsError.set(true);
       }
       this.ideLoading.set(false);
+    });
+  }
+
+  private openVmIde(jobId: string): void {
+    const tab = window.open('', '_blank');
+    if (!tab) {
+      this.resultMessage.set(this.transloco.translate('jobs.lifecycle.popupBlocked'));
+      this.resultIsError.set(true);
+      return;
+    }
+    tab.opener = null;
+    tab.document.title = this.transloco.translate('jobs.lifecycle.wakingTab');
+    tab.document.body.textContent = this.transloco.translate('jobs.lifecycle.wakingTab');
+    this.ideLoading.set(true);
+    this.api.startIdeSession(jobId).subscribe(start => {
+      const leaseId = start?.access_lease_id;
+      if (!start || !leaseId || start.status === 'unavailable') {
+        tab.close();
+        this.ideLoading.set(false);
+        this.resultMessage.set(this.transloco.translate('jobs.lifecycle.ideUnavailable'));
+        this.resultIsError.set(true);
+        return;
+      }
+      if (start.status === 'active' && start.code_server_url) {
+        tab.location.href = start.code_server_url;
+        this.ideLoading.set(false);
+        return;
+      }
+      if (this.idePollingInterval) clearInterval(this.idePollingInterval);
+      this.idePollAttempts = 0;
+      this.idePollingInterval = setInterval(() => {
+        if (tab.closed || ++this.idePollAttempts > this.maxIdePollAttempts) {
+          if (this.idePollingInterval) clearInterval(this.idePollingInterval);
+          this.idePollingInterval = null;
+          this.ideLoading.set(false);
+          if (!tab.closed) {
+            tab.close();
+            this.resultMessage.set(this.transloco.translate('jobs.lifecycle.wakeTimedOut'));
+            this.resultIsError.set(true);
+          }
+          this.api.closeVmIdeLease(jobId, leaseId).subscribe();
+          return;
+        }
+        this.api.getIdeSession(jobId, leaseId).subscribe(status => {
+          if (status?.status === 'active' && status.code_server_url) {
+            if (this.idePollingInterval) clearInterval(this.idePollingInterval);
+            this.idePollingInterval = null;
+            this.ideLoading.set(false);
+            tab.location.href = status.code_server_url;
+          } else if (!status || status.status === 'unavailable' || status.status === 'failed') {
+            if (this.idePollingInterval) clearInterval(this.idePollingInterval);
+            this.idePollingInterval = null;
+            this.ideLoading.set(false);
+            tab.close();
+            this.api.closeVmIdeLease(jobId, leaseId).subscribe();
+            this.resultMessage.set(this.transloco.translate('jobs.lifecycle.ideUnavailable'));
+            this.resultIsError.set(true);
+          }
+        });
+      }, 3000);
     });
   }
 

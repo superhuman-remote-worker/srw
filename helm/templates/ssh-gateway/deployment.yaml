@@ -81,6 +81,10 @@ spec:
             - configMapRef:
                 name: {{ include "srw.sshGatewayName" . }}
           env:
+            {{- if include "srw.vmSameCluster" . }}
+            - name: SSH_KEY_PATH
+              value: /run/secrets/vm-ssh-key
+            {{- end }}
             # `optional: true` on both of these on purpose: a missing key then
             # surfaces as load_config's own explicit message in the pod log
             # ("ssh-gateway requires SESSION_JWT_SECRET to verify the WSS
@@ -147,6 +151,12 @@ spec:
             - name: ssh-gateway-user-ca
               mountPath: {{ include "srw.sshGatewayCaDir" . }}
               readOnly: true
+            {{- if include "srw.vmSameCluster" . }}
+            - name: vm-ssh-key
+              mountPath: /run/secrets/vm-ssh-key
+              subPath: ssh-privatekey
+              readOnly: true
+            {{- end }}
       volumes:
         - name: tmp
           emptyDir: {}
@@ -181,4 +191,13 @@ spec:
             items:
               - key: user-ca
                 path: user-ca
+        {{- if include "srw.vmSameCluster" . }}
+        - name: vm-ssh-key
+          secret:
+            secretName: {{ include "srw.fullname" . }}-vm-ssh-key
+            defaultMode: 0444
+            items:
+              - key: ssh-privatekey
+                path: ssh-privatekey
+        {{- end }}
 {{- end }}

@@ -12,7 +12,7 @@ import { takeUntilDestroyed } from '@angular/core/rxjs-interop';
 import { HttpClient } from '@angular/common/http';
 import { filter, firstValueFrom, map, Observable, Subscription, tap, timeout } from 'rxjs';
 import { environment } from '../environment';
-import { Project, ThreadCloudDiffSummary, ThreadMount, ThreadStatus } from '../models/api.model';
+import { Project, ThreadCloudDiffSummary, ThreadMount, ThreadStatus, WorkspaceLifecycleView } from '../models/api.model';
 // Type + pure derivation only — importing them from the review component
 // would pull it (and Monaco's loader) back into the eager bundle graph and
 // defeat the @defer that keeps the review surface lazy.
@@ -1177,6 +1177,7 @@ export class PersistentChatService {
   /** Safe public projection of the immutable retirement outcome. The browser
    *  never receives or stores the server's retirement token/context. */
   readonly retirementDisposition = signal<'ended' | 'suspended' | null>(null);
+  readonly workspaceLifecycle = signal<WorkspaceLifecycleView | null>(null);
 
   // --- Session readiness (agent has finished init and is ready for messages) ---
   readonly sessionReady = signal(false);
@@ -2767,6 +2768,7 @@ export class PersistentChatService {
       this.threadStatus.set(effectiveStatus);
       this.endedAt.set(thread.ended_at || thread.last_activity || null);
       this.retirementDisposition.set(retirementDisposition);
+      this.workspaceLifecycle.set(thread.workspace_lifecycle ?? null);
       this.threadMounts.set(Array.isArray(thread.mounts) ? thread.mounts : []);
       this._protectedCloud.set(!!thread.metadata?.protected_cloud);
       if (this._protectedCloud()) {
@@ -4584,6 +4586,7 @@ export class PersistentChatService {
     this.cloudSessionUrl.set(null);
     this.sshHandle.set(null);
     this.threadStatus.set(null);
+    this.workspaceLifecycle.set(null);
     this.endedAt.set(null);
     this.retirementDisposition.set(null);
     this.tasks.set([]);

@@ -12,6 +12,7 @@ import {
 } from '@angular/core';
 import {takeUntilDestroyed} from '@angular/core/rxjs-interop';
 import {forkJoin} from 'rxjs';
+import {DatePipe} from '@angular/common';
 import {ActivatedRoute, ParamMap, Router} from '@angular/router';
 import {ApiService} from '../../core/services/api.service';
 import {DataService} from '../../core/services/data.service';
@@ -39,6 +40,7 @@ import {
   jobStatusTone as sharedJobStatusTone,
 } from '../../core/util/job-status';
 import {JobListParams} from '../../core/models/audit.model';
+import {workspaceLifecycleReasonKey} from '../../core/util/vm-lifecycle';
 import {MultiSelectOption} from '../../ui/multi-select';
 import {JobFilterBarComponent} from './job-filter-bar.component';
 import {JobFilterPanelComponent} from './job-filter-panel.component';
@@ -117,7 +119,7 @@ export function jobCloudAction(job: JobSummary): JobCloudAction {
   selector: 'app-job-list',
   standalone: true,
   imports: [
-    SidebarToggleComponent, TranslocoPipe,
+    SidebarToggleComponent, TranslocoPipe, DatePipe,
     AppButtonComponent,
     AppBadgeComponent,
     AppInputComponent,
@@ -334,6 +336,17 @@ export function jobCloudAction(job: JobSummary): JobCloudAction {
                         [title]="workspaceContractTitle(row.job)"
                       >
                         {{ workspaceContractSummary(row.job) }}
+                      </div>
+                    }
+                    @if (row.job.workspace_lifecycle; as lifecycle) {
+                      <div class="workspace-recovery" [style.padding-left.px]="row.isChild ? 16 : 0" role="status">
+                        {{ ('jobs.lifecycle.state.' + lifecycle.state) | transloco }}
+                        @if (lifecycle.idle_expires_at) {
+                          · {{ lifecycle.idle_expires_at | date:'shortTime' }}
+                        }
+                        @if (lifecycle.reason_code) {
+                          · {{ lifecycleReasonKey(lifecycle.reason_code) | transloco }}
+                        }
                       </div>
                     }
                     @if (row.job.workspace_recovery) {
@@ -1848,10 +1861,16 @@ export class JobListComponent implements OnInit, OnDestroy {
     // Show IDE button only on root jobs (subjobs share the parent's workspace)
     if (job.parent_job_id) return false;
     // Show if: live VM, snapshot available, or has Gitea repo
-    return this.hasLiveVm(job) || job.snapshot_status === 'available' || !!job.repo_name;
+    return (job.workspace_lifecycle != null && job.workspace_lifecycle.state !== 'unsupported') ||
+      this.hasLiveVm(job) || job.snapshot_status === 'available' || !!job.repo_name;
   }
 
   openIde(jobId: string): void {
+    const job = this.jobs().find(item => item.id === jobId);
+    if (job?.workspace_lifecycle && job.workspace_lifecycle.state !== 'unsupported') {
+      this.openVmIde(jobId);
+      return;
+    }
     // Mark as loading
     const next = new Set(this.ideLoadingJobIds());
     next.add(jobId);
@@ -1899,6 +1918,69 @@ export class JobListComponent implements OnInit, OnDestroy {
       if (result.error) this.toast.warning(result.error);
     });
   }
+
+  /** A VM wake can outlast popup activation; reserve its tab in the click. */
+  private openVmIde(jobId: string): void {
+    const tab = window.open('', '_blank');
+    if (!tab) {
+      this.toast.warning(this.transloco.translate('jobs.lifecycle.popupBlocked'));
+      return;
+    }
+    tab.opener = null;
+    tab.document.title = this.transloco.translate('jobs.lifecycle.wakingTab');
+    tab.document.body.textContent = this.transloco.translate('jobs.lifecycle.wakingTab');
+    const next = new Set(this.ideLoadingJobIds());
+    next.add(jobId);
+    this.ideLoadingJobIds.set(next);
+    this.api.startIdeSession(jobId).subscribe(result => {
+      const leaseId = result?.access_lease_id;
+      if (!result || !leaseId || result.status === 'unavailable' || result.status === 'failed') {
+        tab.close();
+        this.removeIdeLoading(jobId);
+        this.toast.warning(this.transloco.translate('jobs.lifecycle.ideUnavailable'));
+        return;
+      }
+      if (result.status === 'active' && result.code_server_url) {
+        tab.location.href = result.code_server_url;
+        this.removeIdeLoading(jobId);
+        return;
+      }
+      let attempts = 0;
+      const prior = this.idePollingIntervals.get(jobId);
+      if (prior) clearInterval(prior);
+      const interval = setInterval(() => {
+        if (tab.closed || ++attempts > 100) {
+          clearInterval(interval);
+          this.idePollingIntervals.delete(jobId);
+          this.removeIdeLoading(jobId);
+          if (!tab.closed) {
+            tab.close();
+            this.toast.warning(this.transloco.translate('jobs.lifecycle.wakeTimedOut'));
+          }
+          this.api.closeVmIdeLease(jobId, leaseId).subscribe();
+          return;
+        }
+        this.api.getIdeSession(jobId, leaseId).subscribe(status => {
+          if (status?.status === 'active' && status.code_server_url) {
+            clearInterval(interval);
+            this.idePollingIntervals.delete(jobId);
+            this.removeIdeLoading(jobId);
+            tab.location.href = status.code_server_url;
+          } else if (!status || status.status === 'unavailable' || status.status === 'failed') {
+            clearInterval(interval);
+            this.idePollingIntervals.delete(jobId);
+            this.removeIdeLoading(jobId);
+            tab.close();
+            this.api.closeVmIdeLease(jobId, leaseId).subscribe();
+            this.toast.warning(this.transloco.translate('jobs.lifecycle.ideUnavailable'));
+          }
+        });
+      }, 3000);
+      this.idePollingIntervals.set(jobId, interval);
+    });
+  }
+
+  readonly lifecycleReasonKey = workspaceLifecycleReasonKey;
 
   private pollIdeSession(jobId: string): void {
     // Clear any existing poll for this job

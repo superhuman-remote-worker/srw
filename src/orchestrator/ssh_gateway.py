@@ -94,6 +94,7 @@ from orchestrator.services.ssh_gateway_client import (
     mark_key_used,
     record_attachment,
     resolve_target,
+    vm_access,
 )
 from orchestrator.services.ssh_gateway_config import load_config, server_options
 from orchestrator.services.ssh_gateway_limits import GatewayLimiter
@@ -725,6 +726,12 @@ def _build_app() -> Starlette:
     # inject at. mark_key_used is bound HERE and not left defaulted to None --
     # left unbound, last_used_at never moves in production and the
     # stolen-key signal the whole column exists for is dead (ruling G1).
+    # The gateway's host private key is the dedicated VM admission signer.
+    # The orchestrator mounts only its public half; no extra fleet-wide HMAC
+    # secret is distributed to agent pods for this capability.
+    import asyncssh
+
+    vm_signer = asyncssh.read_private_key(config.host_key_paths[0])
     application.state.context = GatewayContext(
         config=config,
         ca=load_user_ca(config.user_ca_path),
@@ -733,6 +740,9 @@ def _build_app() -> Starlette:
         record_attach=functools.partial(record_attachment, config),
         close_attach=functools.partial(close_attachment, config),
         mark_key_used=functools.partial(mark_key_used, config),
+        vm_admit=functools.partial(vm_access, config, vm_signer, action="admit"),
+        vm_renew=functools.partial(vm_access, config, vm_signer, action="renew"),
+        vm_close=functools.partial(vm_access, config, vm_signer, action="close"),
     )
     return application
 

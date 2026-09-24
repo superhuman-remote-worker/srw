@@ -29,6 +29,7 @@ import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
+from uuid import UUID
 
 import httpx
 from fastapi import (
@@ -76,6 +77,7 @@ class IdeDependencies:
     store: Any
     ide_sessions: Any
     ide_proxy: Any
+    vm_ide_transport: Any = None
     require_approved_user: Callable[..., Awaitable[Any]] = require_approved_user
     require_job_access: Callable[..., Awaitable[Any]] = require_job_access
     resolve_ws_user: Callable[..., Awaitable[Any]] = resolve_ws_user
@@ -100,6 +102,52 @@ def get_ide_dependencies_ws(websocket: WebSocket) -> IdeDependencies:
     return websocket.app.state.ide_dependencies_factory()
 
 
+def _vm_job(job: Any) -> bool:
+    """Live VM-backed Job access; completed Jobs keep snapshot IDE behavior."""
+    import json
+
+    if not isinstance(job, dict) or job.get("status") in {
+        "completed",
+        "failed",
+        "cancelled",
+    }:
+        return False
+    context = job.get("context") or {}
+    if isinstance(context, str):
+        try:
+            context = json.loads(context)
+        except ValueError:
+            return False
+    vm = context.get("vm") if isinstance(context, dict) else None
+    # A release may move through a status not listed by the IDE itself.  The
+    # presence of a VM owner still routes through the fail-closed access store;
+    # falling through to snapshot restore would create a second workspace.
+    return isinstance(vm, dict) and bool(vm)
+
+
+def _vm_ide_url(job_id: str, lease_id: str) -> str:
+    import os
+
+    base = os.environ.get("IDE_PROXY_BASE_URL", "http://localhost:8085").rstrip("/")
+    return (
+        f"{base}/api/ide/{job_id}/proxy/_vm/{lease_id}/"
+        "?folder=/home/agent-host/workspace"
+    )
+
+
+def _vm_proxy_path(path: str) -> tuple[str | None, str]:
+    parts = path.split("/", 2)
+    if len(parts) < 2 or parts[0] != "_vm":
+        return None, path
+    try:
+        lease = UUID(parts[1])
+    except (TypeError, ValueError):
+        return None, path
+    if str(lease) != parts[1]:
+        return None, path
+    return str(lease), parts[2] if len(parts) == 3 else ""
+
+
 @router.post("/api/jobs/{job_id}/ide")
 async def start_ide_session(
     request: Request,
@@ -119,19 +167,81 @@ async def start_ide_session(
     if body is None:
         body = IdeSessionRequest()
 
+    from orchestrator.services.vm_idle_access import VMIdleAccessStore
+    from orchestrator.services.vm_ide_transport import VMIDEUnavailable, matches_admitted_runtime
     from orchestrator.services.vm_idle_lifecycle import VMIdleLifecycleStore
 
     idle = VMIdleLifecycleStore(dependencies.store)
-    if await idle.schema_available():
-        if await idle.get_open_for_owner(job_id) is not None:
-            wake = await idle.request_wake(
-                job_id, execution_requested=False,
-                access_kind="ide", access_claimant=str(user["id"]),
+    if _vm_job(job):
+        if not await idle.schema_available():
+            raise HTTPException(status_code=503, detail="VM access is unavailable")
+        access = VMIdleAccessStore(dependencies.store)
+        lease = await access.request(
+            owner_kind="job", owner_id=job_id, kind="ide", user_id=str(user["id"])
+        )
+        if lease is None:
+            raise HTTPException(status_code=409, detail="VM access authority changed")
+        lease_id = str(lease["id"])
+        current = await access.inspect_for_user(
+            lease_id,
+            owner_kind="job",
+            owner_id=job_id,
+            kind="ide",
+            user_id=str(user["id"]),
+        )
+        if current is None:
+            return {
+                "status": "restoring",
+                "code_server_url": None,
+                "access_lease_id": lease_id,
+                "estimated_seconds": 120,
+            }
+        if dependencies.vm_ide_transport is None:
+            await access.close_for_user(
+                lease_id,
+                owner_kind="job",
+                owner_id=job_id,
+                kind="ide",
+                user_id=str(user["id"]),
             )
-            if wake is None:
-                raise HTTPException(status_code=409, detail="VM wake authority changed")
-            return {"status": "restoring", "estimated_seconds": 120}
-        await idle.renew_access(job_id, kind="ide", claimant=str(user["id"]))
+            raise HTTPException(
+                status_code=503, detail="VM IDE transport is unavailable"
+            )
+        try:
+            proof = await dependencies.vm_ide_transport.start_and_probe(
+                job_id, owner_kind="job",
+                expected_generation=lease["provision_generation"],
+                expected_vm_uid=lease["vm_uid"],
+            )
+            if not matches_admitted_runtime(
+                proof, lease["provision_generation"], lease["vm_uid"],
+            ):
+                raise VMIDEUnavailable("ide_runtime_changed")
+        except VMIDEUnavailable as exc:
+            await access.close_for_user(
+                lease_id,
+                owner_kind="job",
+                owner_id=job_id,
+                kind="ide",
+                user_id=str(user["id"]),
+            )
+            return {"status": "unavailable", "code_server_url": None, "code": exc.code}
+        if await access.inspect_for_user(
+            lease_id, owner_kind="job", owner_id=job_id, kind="ide",
+            user_id=str(user["id"]),
+        ) is None:
+            await access.close_for_user(
+                lease_id, owner_kind="job", owner_id=job_id, kind="ide",
+                user_id=str(user["id"]),
+            )
+            return {"status": "unavailable", "code_server_url": None,
+                    "code": "ide_runtime_changed"}
+        return {
+            "status": "active",
+            "access_lease_id": lease_id,
+            "code_server_url": _vm_ide_url(job_id, lease_id),
+            "expires_at": lease["expires_at"].isoformat(),
+        }
 
     try:
         result = await dependencies.ide_sessions.start_session(
@@ -149,6 +259,7 @@ async def start_ide_session(
 async def get_ide_session(
     request: Request,
     job_id: str,
+    lease_id: str | None = None,
     *,
     dependencies: IdeDependencies = Depends(get_ide_dependencies),
 ) -> dict[str, Any]:
@@ -157,17 +268,67 @@ async def get_ide_session(
     Used by the cockpit to poll session state and determine
     IDE button visibility/behavior.
     """
-    user, _job = await dependencies.require_job_access(
+    user, job = await dependencies.require_job_access(
         request, dependencies.store, job_id
     )
+    from orchestrator.services.vm_idle_access import VMIdleAccessStore
+    from orchestrator.services.vm_ide_transport import VMIDEUnavailable, matches_admitted_runtime
     from orchestrator.services.vm_idle_lifecycle import VMIdleLifecycleStore
 
     idle = VMIdleLifecycleStore(dependencies.store)
-    if await idle.schema_available():
+    if _vm_job(job):
         active = await idle.get_open_for_owner(job_id)
-        if active is not None and active["wake_ready_at"] is None:
-            return {"status": "restoring", "estimated_seconds": 120}
-        await idle.renew_access(job_id, kind="ide", claimant=str(user["id"]))
+        if active is not None:
+            return {
+                "status": "restoring",
+                "code_server_url": None,
+                "estimated_seconds": 120,
+            }
+        if lease_id is None:
+            return {"status": "ready", "code_server_url": None}
+        lease = await VMIdleAccessStore(dependencies.store).inspect_for_user(
+            lease_id,
+            owner_kind="job",
+            owner_id=job_id,
+            kind="ide",
+            user_id=str(user["id"]),
+        )
+        if lease is None:
+            return {
+                "status": "unavailable",
+                "code_server_url": None,
+                "code": "ide_access_expired",
+            }
+        if dependencies.vm_ide_transport is None:
+            return {
+                "status": "unavailable",
+                "code_server_url": None,
+                "code": "ide_guest_transport_unavailable",
+            }
+        try:
+            proof = await dependencies.vm_ide_transport.probe(
+                job_id, owner_kind="job",
+                expected_generation=lease["provision_generation"],
+                expected_vm_uid=lease["vm_uid"],
+            )
+            if not matches_admitted_runtime(
+                proof, lease["provision_generation"], lease["vm_uid"],
+            ):
+                raise VMIDEUnavailable("ide_runtime_changed")
+        except VMIDEUnavailable as exc:
+            return {"status": "unavailable", "code_server_url": None, "code": exc.code}
+        if await VMIdleAccessStore(dependencies.store).inspect_for_user(
+            lease_id, owner_kind="job", owner_id=job_id, kind="ide",
+            user_id=str(user["id"]),
+        ) is None:
+            return {"status": "unavailable", "code_server_url": None,
+                    "code": "ide_runtime_changed"}
+        return {
+            "status": "active",
+            "access_lease_id": lease_id,
+            "code_server_url": _vm_ide_url(job_id, lease_id),
+            "expires_at": lease["expires_at"].isoformat(),
+        }
     try:
         return await dependencies.ide_sessions.get_session_status(job_id)
     except Exception as e:
@@ -178,6 +339,7 @@ async def get_ide_session(
 async def stop_ide_session(
     request: Request,
     job_id: str,
+    lease_id: str | None = None,
     *,
     dependencies: IdeDependencies = Depends(get_ide_dependencies),
 ) -> dict[str, Any]:
@@ -186,7 +348,23 @@ async def stop_ide_session(
     Deletes the restored VM and marks the session as expired.
     The underlying S3 snapshot is preserved for future restores.
     """
-    await dependencies.require_job_access(request, dependencies.store, job_id)
+    user, job = await dependencies.require_job_access(
+        request, dependencies.store, job_id
+    )
+    if _vm_job(job):
+        from orchestrator.services.vm_idle_access import VMIdleAccessStore
+
+        if lease_id is None or not await VMIdleAccessStore(
+            dependencies.store
+        ).close_for_user(
+            lease_id,
+            owner_kind="job",
+            owner_id=job_id,
+            kind="ide",
+            user_id=str(user["id"]),
+        ):
+            raise HTTPException(status_code=409, detail="VM IDE access changed")
+        return {"status": "stopped"}
     try:
         result = await dependencies.ide_sessions.stop_session(job_id)
         return result
@@ -250,18 +428,32 @@ async def ide_proxy_http(
         )
         raise HTTPException(status_code=403, detail="IDE access denied")
 
-    # An exact target attestation is a point-in-time proof, not a durable
-    # operation lease serialized against End/recycle. Until that lease exists,
-    # never begin a body-bearing or otherwise mutating HTTP operation: a
-    # lifecycle transition could otherwise commit between the last proof and a
-    # later upload chunk. The request body remains unread and no upstream
-    # connection is opened.
-    if str(request.method or "").upper() not in _IDE_PROXY_SAFE_HTTP_METHODS:
+    vm_lease_id, upstream_path = _vm_proxy_path(path)
+    vm_access = None
+    vm_owner_kind = "job"
+    if vm_lease_id is not None:
+        from orchestrator.services.vm_idle_access import VMIdleAccessStore
+
+        if await dependencies.store.get_job(job_id) is None:
+            vm_owner_kind = "thread"
+        vm_access = VMIdleAccessStore(dependencies.store)
+        lease = await vm_access.inspect_for_user(
+            vm_lease_id,
+            owner_kind=vm_owner_kind,
+            owner_id=job_id,
+            kind="ide",
+            user_id=str(user["id"]),
+        )
+        if lease is None:
+            raise HTTPException(status_code=409, detail="VM IDE access expired")
+
+    mutation = str(request.method or "").upper() not in _IDE_PROXY_SAFE_HTTP_METHODS
+    if mutation and vm_lease_id is None:
         raise HTTPException(
             status_code=503,
             detail={
                 "code": "ide_mutation_operation_lease_unavailable",
-                "message": "IDE mutation transport requires a durable operation lease",
+                "message": "IDE mutation transport is unavailable",
             },
         )
 
@@ -298,24 +490,83 @@ async def ide_proxy_http(
         target = await dependencies.ide_proxy.resolve_target(job_id)
         if target is None:
             raise HTTPException(status_code=503, detail="IDE session not active")
-        if not orchestrator_can_reach(target.host):
+        if target.backend == "vm" and vm_lease_id is None:
+            raise HTTPException(status_code=409, detail="VM IDE access is required")
+        if target.backend != "vm" and vm_lease_id is not None:
+            raise HTTPException(status_code=409, detail="IDE runtime changed")
+        if target.backend != "vm" and not orchestrator_can_reach(target.host):
             raise HTTPException(
                 status_code=503,
                 detail="IDE is not yet available for VM-backed workspaces.",
             )
-        upstream_url = f"http://{target.authority}/{path}"
+        upstream_url = f"http://{target.authority}/{upstream_path}"
         safe_query = _ide_proxy_query(request.url.query)
         if safe_query:
             upstream_url += f"?{safe_query}"
         upstream_headers["host"] = target.authority
-        upstream_resp = await _request_exact_ide_http(
-            target=target,
-            method=request.method,
-            url=upstream_url,
-            headers=upstream_headers,
-            content=None,
-            ide_proxy=dependencies.ide_proxy,
-        )
+        if target.backend == "vm":
+            from orchestrator.services.vm_ide_transport import VMIDEUnavailable
+            from orchestrator.services.vm_idle_access import VMIdleAccessLost
+
+            if dependencies.vm_ide_transport is None or vm_access is None:
+                raise HTTPException(
+                    status_code=503, detail="VM IDE transport is unavailable"
+                )
+            if not await vm_access.renew(
+                vm_lease_id,
+                owner_kind=vm_owner_kind,
+                owner_id=job_id,
+                kind="ide",
+                claimant=lease["claimed_by"],
+            ):
+                raise HTTPException(status_code=409, detail="VM IDE access expired")
+            try:
+                if mutation:
+                    # Admission and heartbeat use a distinct durable row. A
+                    # tab DELETE cannot close an in-flight writer; End and
+                    # recycle consult the same table under the owner lock.
+                    async with vm_access.ide_operation(
+                        vm_lease_id,
+                        owner_kind=vm_owner_kind,
+                        owner_id=job_id,
+                        user_id=str(user["id"]),
+                    ):
+                        content = bytearray()
+                        async for chunk in request.stream():
+                            content.extend(chunk)
+                            if len(content) > 16 * 1024 * 1024:
+                                raise HTTPException(
+                                    status_code=413, detail="IDE request is too large"
+                                )
+                        upstream_resp = (
+                            await dependencies.vm_ide_transport.request_http(
+                                target,
+                                method=request.method,
+                                url=upstream_url,
+                                headers=upstream_headers,
+                                content=bytes(content),
+                            )
+                        )
+                else:
+                    upstream_resp = await dependencies.vm_ide_transport.request_http(
+                        target,
+                        method=request.method,
+                        url=upstream_url,
+                        headers=upstream_headers,
+                    )
+            except VMIdleAccessLost as exc:
+                raise HTTPException(status_code=409, detail={"code": str(exc)}) from exc
+            except VMIDEUnavailable as exc:
+                raise HTTPException(status_code=503, detail={"code": exc.code}) from exc
+        else:
+            upstream_resp = await _request_exact_ide_http(
+                target=target,
+                method=request.method,
+                url=upstream_url,
+                headers=upstream_headers,
+                content=None,
+                ide_proxy=dependencies.ide_proxy,
+            )
     except IdeProxyUnavailable as exc:
         raise HTTPException(
             status_code=503,
@@ -410,6 +661,27 @@ async def ide_proxy_ws(
         await ws.close(code=4403, reason="IDE access denied")
         return
 
+    vm_lease_id, upstream_path = _vm_proxy_path(path)
+    vm_access = None
+    vm_owner_kind = "job"
+    lease = None
+    if vm_lease_id is not None:
+        from orchestrator.services.vm_idle_access import VMIdleAccessStore
+
+        if await dependencies.store.get_job(job_id) is None:
+            vm_owner_kind = "thread"
+        vm_access = VMIdleAccessStore(dependencies.store)
+        lease = await vm_access.inspect_for_user(
+            vm_lease_id,
+            owner_kind=vm_owner_kind,
+            owner_id=job_id,
+            kind="ide",
+            user_id=str(user["id"]),
+        )
+        if lease is None:
+            await ws.close(code=4409, reason="VM IDE access expired")
+            return
+
     try:
         await _require_stateless_ide_lifecycle(
             job_id, store=dependencies.store, ide_proxy=dependencies.ide_proxy
@@ -425,6 +697,97 @@ async def ide_proxy_ws(
         return
     if target is None:
         await ws.close(code=4503, reason="IDE session not active")
+        return
+
+    if target.backend == "vm":
+        from orchestrator.services.vm_ide_transport import VMIDEUnavailable
+        from orchestrator.services.vm_idle_access import VMIdleAccessLost
+
+        if vm_lease_id is None or vm_access is None or lease is None:
+            await ws.close(code=4409, reason="VM IDE access required")
+            return
+        if dependencies.vm_ide_transport is None or not await vm_access.renew(
+            vm_lease_id,
+            owner_kind=vm_owner_kind,
+            owner_id=job_id,
+            kind="ide",
+            claimant=lease["claimed_by"],
+        ):
+            await ws.close(code=4409, reason="VM IDE access expired")
+            return
+        safe_query = _ide_proxy_query(ws.url.query)
+        guest_path = "/" + upstream_path
+        if safe_query:
+            guest_path += "?" + safe_query
+        try:
+            async with vm_access.ide_operation(
+                vm_lease_id,
+                owner_kind=vm_owner_kind,
+                owner_id=job_id,
+                user_id=str(user["id"]),
+            ):
+                async with dependencies.vm_ide_transport.open_websocket(
+                    target,
+                    path=guest_path,
+                ) as upstream_ws:
+                    await ws.accept()
+
+                    async def browser_to_guest():
+                        while True:
+                            message = await ws.receive()
+                            if message["type"] == "websocket.disconnect":
+                                return
+                            if message["type"] != "websocket.receive":
+                                continue
+                            if message.get("text") is not None:
+                                await upstream_ws.send(message["text"])
+                            elif message.get("bytes") is not None:
+                                await upstream_ws.send(message["bytes"])
+
+                    async def guest_to_browser():
+                        async for message in upstream_ws:
+                            if isinstance(message, str):
+                                await ws.send_text(message)
+                            else:
+                                await ws.send_bytes(message)
+
+                    async def live_supervisor():
+                        while True:
+                            await asyncio.sleep(_IDE_WS_LIFECYCLE_RECHECK_S)
+                            if not await _ide_ws_runtime_is_current(
+                                job_id,
+                                target,
+                                store=dependencies.store,
+                                ide_proxy=dependencies.ide_proxy,
+                            ):
+                                return
+
+                    tasks = [
+                        asyncio.create_task(browser_to_guest()),
+                        asyncio.create_task(guest_to_browser()),
+                        asyncio.create_task(live_supervisor()),
+                    ]
+                    try:
+                        await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+                    finally:
+                        for task in tasks:
+                            task.cancel()
+                        await asyncio.gather(*tasks, return_exceptions=True)
+        except VMIDEUnavailable as exc:
+            with contextlib.suppress(Exception):
+                await ws.close(code=4503, reason=exc.code)
+        except VMIdleAccessLost:
+            with contextlib.suppress(Exception):
+                await ws.close(code=4409, reason="VM IDE access expired")
+        except WebSocketDisconnect:
+            pass
+        finally:
+            with contextlib.suppress(Exception):
+                await ws.close()
+        return
+
+    if vm_lease_id is not None:
+        await ws.close(code=4409, reason="IDE runtime changed")
         return
 
     credential = getattr(target, "credential", None)

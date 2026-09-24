@@ -4631,16 +4631,34 @@ class PostgresDB:
             return False
 
         async with self.acquire() as conn:
-            result = await conn.execute(
-                """
-                UPDATE jobs
-                SET status = 'cancelled',
-                    assigned_agent_id = NULL,
-                    updated_at = CURRENT_TIMESTAMP
-                WHERE id = $1 AND status NOT IN ('completed', 'cancelled')
-                """,
-                uuid_val,
-            )
+            async with conn.transaction():
+                # Access admission takes queue -> Job before inserting a lease.
+                # Lock both rows first, then read leases in a fresh statement:
+                # an UPDATE blocked on Job would otherwise retain a snapshot
+                # from before the winning admission committed.
+                await conn.fetchrow(
+                    "SELECT unit_id FROM run_queue WHERE unit_id=$1 FOR UPDATE",
+                    uuid_val,
+                )
+                job = await conn.fetchrow(
+                    "SELECT status::text AS status FROM jobs WHERE id=$1 FOR UPDATE",
+                    uuid_val,
+                )
+                if job is None or job["status"] in {"completed", "cancelled"}:
+                    return False
+                if await conn.fetchval(
+                    "SELECT EXISTS(SELECT 1 FROM vm_idle_access_leases "
+                    "WHERE owner_kind='job' AND owner_id=$1 AND closed_at IS NULL "
+                    "AND expires_at>clock_timestamp())",
+                    uuid_val,
+                ):
+                    return False
+                result = await conn.execute(
+                    "UPDATE jobs SET status='cancelled', assigned_agent_id=NULL, "
+                    "updated_at=CURRENT_TIMESTAMP WHERE id=$1 "
+                    "AND status NOT IN ('completed','cancelled')",
+                    uuid_val,
+                )
 
         cancelled = result == "UPDATE 1"
         if cancelled:
@@ -4678,6 +4696,10 @@ class PostgresDB:
         recovery_cancellation = None
         async with self.acquire() as conn:
             async with conn.transaction():
+                await conn.fetchrow(
+                    "SELECT unit_id FROM run_queue WHERE unit_id=$1 FOR UPDATE",
+                    uuid_val,
+                )
                 if expected_execution_deadline is not None:
                     from orchestrator.services.execution_deadline import (
                         lock_expired_execution,
@@ -4687,6 +4709,23 @@ class PostgresDB:
                         conn, uuid_val, expected_execution_deadline
                     ):
                         return False
+                # The separate lease read must follow a Job row lock. A single
+                # UPDATE with NOT EXISTS can evaluate against a snapshot taken
+                # before a concurrent IDE writer commits while it waits here.
+                if (
+                    await conn.fetchrow(
+                        "SELECT id FROM jobs WHERE id=$1 FOR UPDATE", uuid_val
+                    )
+                    is None
+                ):
+                    return False
+                if await conn.fetchval(
+                    "SELECT EXISTS(SELECT 1 FROM vm_idle_access_leases "
+                    "WHERE owner_kind='job' AND owner_id=$1 AND closed_at IS NULL "
+                    "AND expires_at>clock_timestamp())",
+                    uuid_val,
+                ):
+                    return False
                 result = await conn.execute(
                     f"""
                     UPDATE jobs
@@ -4848,6 +4887,21 @@ class PostgresDB:
                         "FOR UPDATE",
                         job_uuid,
                     )
+                    # Access admission also takes queue -> Job. Read leases in
+                    # a new statement after the owner lock so an admission
+                    # which committed while we waited cannot be missed by an
+                    # UPDATE snapshot; abort before closing the queue.
+                    if await conn.fetchrow(
+                        "SELECT id FROM jobs WHERE id=$1 FOR UPDATE", job_uuid,
+                    ) is None:
+                        raise _CancelCASLostError
+                    if await conn.fetchval(
+                        "SELECT EXISTS(SELECT 1 FROM vm_idle_access_leases "
+                        "WHERE owner_kind='job' AND owner_id=$1 AND closed_at IS NULL "
+                        "AND expires_at>clock_timestamp())",
+                        job_uuid,
+                    ):
+                        raise _CancelCASLostError
                     queue_closed = await cancel_queued_worker_batch(
                         conn, job_id=job_uuid
                     )
@@ -11054,7 +11108,8 @@ class PostgresDB:
                     return False
                 job = await conn.fetchrow(
                     "SELECT status::text AS status,assigned_agent_id,"
-                    "context FROM jobs WHERE id=$1 FOR UPDATE", job_uuid,
+                    "context FROM jobs WHERE id=$1 FOR UPDATE",
+                    job_uuid,
                 )
                 if (
                     job is None
@@ -11078,10 +11133,21 @@ class PostgresDB:
                     or context.get("_vm_creation_pending") is not None
                 ):
                     return False
+                if await conn.fetchval(
+                    "SELECT EXISTS(SELECT 1 FROM vm_idle_access_leases "
+                    "WHERE owner_kind='job' AND owner_id=$1 "
+                    "AND provision_generation=$2::uuid AND vm_uid=$3::uuid "
+                    "AND closed_at IS NULL AND expires_at>clock_timestamp())",
+                    job_uuid,
+                    UUID(generation),
+                    UUID(vm),
+                ):
+                    return False
                 updated = await conn.execute(
                     "UPDATE jobs SET context=jsonb_set(context,'{vm}',"
                     "context->'vm'||'{\"retirement_cleanup_pending\":true}'::jsonb),"
-                    "updated_at=clock_timestamp() WHERE id=$1", job_uuid,
+                    "updated_at=clock_timestamp() WHERE id=$1",
+                    job_uuid,
                 )
                 return updated == "UPDATE 1"
 
@@ -37318,6 +37384,14 @@ class PostgresDB:
                         "reason": "retirement_attempt_missing",
                         "generation": generation,
                     }
+
+                if await conn.fetchval(
+                    "SELECT EXISTS(SELECT 1 FROM vm_idle_access_leases "
+                    "WHERE owner_kind='thread' AND owner_id=$1 "
+                    "AND closed_at IS NULL AND expires_at>clock_timestamp())",
+                    parsed_thread_id,
+                ):
+                    return {"state": "conflict", "reason": "active_workspace_access"}
 
                 status = str(thread.get("status") or "")
                 if status == "ended" and not permanent and settle_status == "ended":

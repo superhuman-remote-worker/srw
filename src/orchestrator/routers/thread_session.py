@@ -39,6 +39,7 @@ from orchestrator.services.thread_control_inbox import (
     find_existing_thread_control,
 )
 from orchestrator.services.thread_projection import redact_thread_metadata
+from orchestrator.services.vm_idle_public import read_vm_idle_states
 
 logger = logging.getLogger(__name__)
 
@@ -95,6 +96,10 @@ async def get_thread(
     store = dependencies.store
     user, thread = await dependencies.require_thread_owner(request, store, thread_id)
     result = redact_thread_metadata(dict(thread))
+    states = await read_vm_idle_states(
+        store, owner_kind="thread", owner_ids=[thread_id]
+    )
+    result["workspace_lifecycle"] = states.get(thread_id)
     if not result.get("ssh_handle"):
         try:
             result["ssh_handle"] = await store.ensure_thread_ssh_handle(thread_id)

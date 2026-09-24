@@ -1917,6 +1917,7 @@ export interface Thread {
    *  Raw retirement tokens/context never belong in an owner payload. */
   runtime_retirement_pending?: boolean;
   retirement_disposition?: 'ended' | 'suspended' | null;
+  workspace_lifecycle?: WorkspaceLifecycleView | null;
   total_turns: number;
   total_tokens: number;
   nc_session_folder?: string | null;
@@ -2209,6 +2210,14 @@ export interface VMCreationView {
   resumable: boolean;
 }
 
+/** VM compute state beside the human wait or Job/session status. */
+export interface WorkspaceLifecycleView {
+  state: 'warm' | 'releasing' | 'release_held' | 'suspended' | 'waking' | 'wake_held' | 'ready' | 'unsupported';
+  idle_expires_at?: string | null;
+  reason_code?: string | null;
+  next_retry_at?: string | null;
+}
+
 export interface Job {
   id: string;
   description: string;
@@ -2288,6 +2297,7 @@ export interface Job {
   /** Safe recovery state; controller coordinates and raw diagnostics are never included. */
   workspace_recovery?: WorkspaceRecoveryView | null;
   vm_creation?: VMCreationView | null;
+  workspace_lifecycle?: WorkspaceLifecycleView | null;
 }
 
 /**

@@ -1873,6 +1873,7 @@ class VMIdleLifecycleStore:
                     SELECT id FROM vm_idle_access_leases
                     WHERE owner_kind='job' AND owner_id=$1 AND kind=$2
                       AND claimed_by=$3 AND wake_id=$4 AND closed_at IS NULL
+                      AND expires_at>clock_timestamp()
                       AND max_expires_at>clock_timestamp()
                     ORDER BY acquired_at DESC LIMIT 1 FOR UPDATE
                     """,
@@ -2016,6 +2017,7 @@ class VMIdleLifecycleStore:
                         "SELECT id FROM vm_idle_access_leases WHERE "
                         "owner_kind='thread' AND owner_id=$1 AND kind=$2 "
                         "AND claimed_by=$3 AND wake_id=$4 AND closed_at IS NULL "
+                        "AND expires_at>clock_timestamp() "
                         "AND max_expires_at>clock_timestamp() "
                         "ORDER BY acquired_at DESC LIMIT 1 FOR UPDATE",
                         owner_id, access_kind, access_claimant,
@@ -2095,6 +2097,7 @@ class VMIdleLifecycleStore:
                     "SELECT id FROM vm_idle_access_leases WHERE "
                     "owner_kind='thread' AND owner_id=$1 AND kind=$2 "
                     "AND claimed_by=$3 AND wake_id=$4 AND closed_at IS NULL "
+                    "AND expires_at>clock_timestamp() "
                     "AND max_expires_at>clock_timestamp() "
                     "ORDER BY acquired_at DESC LIMIT 1 FOR UPDATE",
                     owner_id, access_kind, access_claimant, row["wake_id"],

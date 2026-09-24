@@ -27,10 +27,12 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import quote
+from uuid import UUID
 
 import httpx
 
 from orchestrator.services.ssh_handles import is_valid_handle
+from orchestrator.services.ssh_gateway_vm_access_proof import mint_vm_access_proof
 
 # state -> (message shown on stderr, process exit code)
 # 75 EX_TEMPFAIL    -- genuinely retryable without anything else changing:
@@ -95,6 +97,9 @@ class SshTarget:
     pod_port: int
     host_key_fingerprint: str
     state: str
+    backend: str = "container"
+    lease_id: str | None = None
+    binding: str | None = None
 
 
 class TargetDenied(Exception):
@@ -399,4 +404,76 @@ async def resolve_target(config, handle: str, fingerprint: str) -> SshTarget:
         # REFUSAL_MESSAGES`) must all become the same readable refusal as
         # any other bad control-plane response, not an unhandled exception
         # surfacing mid-authentication in the SSH server.
+        raise TargetUnavailable("unreachable") from exc
+
+
+async def vm_access(
+    config,
+    signer,
+    *,
+    action: str,
+    connection_id: str,
+    handle: str,
+    fingerprint: str,
+    target: SshTarget | None = None,
+) -> SshTarget | bool:
+    """A post-key.verify, signed gateway action; never a fingerprint GET."""
+    if signer is None or not is_valid_handle(handle):
+        raise TargetUnavailable("vm_unsupported")
+    proof = mint_vm_access_proof(
+        signer,
+        action=action,
+        connection_id=connection_id,
+        handle=handle,
+        fingerprint=fingerprint,
+        lease_id=target.lease_id if target and action != "admit" else "",
+        binding=target.binding if target and action != "admit" else "",
+    )
+    try:
+        response = await _http_post(
+            f"{config.orchestrator_url}/api/internal/ssh-vm-access/{action}",
+            headers=_audit_headers(config),
+            json={"proof": proof},
+            timeout=config.orchestrator_request_timeout,
+        )
+    except Exception:
+        raise TargetUnavailable("unreachable") from None
+    if response.status_code == 404:
+        raise TargetDenied()
+    if response.status_code != 200:
+        raise TargetUnavailable("unreachable")
+    try:
+        payload = response.json()
+        if action != "admit":
+            return payload["renewed" if action == "renew" else "closed"] is True
+        if payload.get("state") != "live":
+            raise TargetUnavailable(
+                payload["state"]
+                if payload.get("state") in REFUSAL_MESSAGES
+                else "unreachable"
+            )
+        if not (
+            _is_valid_identifier(payload["pod_ip"])
+            and _is_valid_port(payload["pod_port"])
+            and _is_valid_identifier(payload["host_key_fingerprint"])
+            and _is_valid_identifier(payload["thread_id"])
+            and _is_valid_identifier(payload["user_id"])
+            and isinstance(payload["binding"], str)
+            and len(payload["binding"]) == 64
+        ):
+            raise TargetUnavailable("unreachable")
+        UUID(payload["lease_id"])
+        int(payload["binding"], 16)
+        return SshTarget(
+            thread_id=payload["thread_id"],
+            user_id=payload["user_id"],
+            pod_ip=payload["pod_ip"],
+            pod_port=payload["pod_port"],
+            host_key_fingerprint=payload["host_key_fingerprint"],
+            state="live",
+            backend="vm",
+            lease_id=payload["lease_id"],
+            binding=payload["binding"],
+        )
+    except (AttributeError, KeyError, TypeError, ValueError) as exc:
         raise TargetUnavailable("unreachable") from exc

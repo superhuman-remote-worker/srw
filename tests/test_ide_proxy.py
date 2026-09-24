@@ -243,7 +243,7 @@ class TestResolvePodIp:
             await service.resolve_pod_ip("job-1")
 
         assert exc.value.code == "vm_ide_transport_unavailable"
-        service._vm_provisioner.attest_workspace_runtime.assert_not_awaited()
+        service._vm_provisioner.attest_workspace_runtime.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_cache_miss_vm_fallback_ssh_host(self, service):
@@ -730,7 +730,7 @@ class TestKubernetesIdeProxyAuthority:
 
 
 class TestVmIdeProxyAuthority:
-    """VM browser relay is contained until a guest-bound tunnel exists."""
+    """A guest-bound target never downgrades to a launcher HTTP address."""
 
     _JOB_ID = "77777777-7777-4777-8777-777777777777"
     _POD_IP = "10.42.4.17"
@@ -786,7 +786,7 @@ class TestVmIdeProxyAuthority:
             await service.resolve_target(self._JOB_ID)
 
         assert exc.value.code == "vm_ide_transport_unavailable"
-        vm.attest_workspace_runtime.assert_not_awaited()
+        vm.attest_workspace_runtime.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_vm_attestation_outage_fails_closed_without_coordinate_cache(self):
@@ -812,9 +812,38 @@ class TestVmIdeProxyAuthority:
 
         with pytest.raises(IdeProxyUnavailable) as exc:
             await service.resolve_target(self._JOB_ID)
-        assert exc.value.code == "vm_ide_transport_unavailable"
-        vm.attest_workspace_runtime.assert_not_awaited()
+        assert exc.value.code == "vm_ide_runtime_unproven"
+        vm.attest_workspace_runtime.assert_awaited_once()
         assert self._JOB_ID not in service._pod_ip_cache
+
+    @pytest.mark.asyncio
+    async def test_full_attestation_resolves_ssh_endpoint_not_launcher_http(self):
+        from orchestrator.services.ide_proxy import IdeProxyService
+
+        proof = SimpleNamespace(
+            workspace_generation=str(__import__("uuid").uuid4()),
+            vm_uid=str(__import__("uuid").uuid4()),
+            vmi_uid=str(__import__("uuid").uuid4()),
+            launcher_pod_uid=str(__import__("uuid").uuid4()),
+            rootdisk_pvc_uid=str(__import__("uuid").uuid4()),
+            ssh_host_key_fingerprint="SHA256:" + "a" * 43,
+            host=self._POD_IP, port=22,
+        )
+        db = SimpleNamespace(
+            get_job=AsyncMock(return_value=self._job()),
+            get_thread=AsyncMock(return_value=None),
+        )
+        vm = SimpleNamespace(attest_workspace_runtime=AsyncMock(return_value=proof))
+        service = IdeProxyService()
+        service.connect(db, vm_provisioner=vm)
+        target = await service.resolve_target(self._JOB_ID)
+        assert target.backend == "vm"
+        assert target.host == self._POD_IP and target.port == 22
+        assert target.identity[1:5] == (
+            proof.vm_uid, proof.vmi_uid, proof.launcher_pod_uid,
+            proof.rootdisk_pvc_uid,
+        )
+        assert await service.resolve_pod_ip(self._JOB_ID) is None
 
     @pytest.mark.asyncio
     async def test_http_route_returns_typed_vm_transport_refusal(self):
