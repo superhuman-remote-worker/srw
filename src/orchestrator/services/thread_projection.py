@@ -55,6 +55,9 @@ def redact_thread_metadata(thread: dict[str, Any]) -> dict[str, Any]:
         candidate = str(raw_retirement_context.get("settle_status") or "")
         if candidate in {"ended", "suspended"}:
             retirement_disposition = candidate
+    retirement_permanent = bool(
+        retirement_pending and thread.get("runtime_retirement_permanent") is True
+    )
 
     thread = redact_nested_workspace_state(
         thread,
@@ -76,6 +79,21 @@ def redact_thread_metadata(thread: dict[str, Any]) -> dict[str, Any]:
     md.pop("_workspace_binding", None)
     md.pop("_stateless_workspace_process_zero_observation", None)
     thread["metadata"] = md
+    # A stateless End or permanent Delete holds its marker until the exact
+    # retirement settles; a retryable 503 leaves it pending until End,
+    # Delete or Resume is retried.  That is `ending`, not a settled End, and
+    # the retry the server accepts depends on its permanence.
+    if (
+        not retirement_pending
+        and thread.get("execution_lane") == "stateless"
+        and md.get("_stateless_workspace_retirement_pending") is True
+    ):
+        marker = md.get("_stateless_claim_retirement")
+        retirement_pending = True
+        retirement_disposition = "ended"
+        retirement_permanent = bool(
+            isinstance(marker, Mapping) and marker.get("permanent") is True
+        )
     # These are internal capabilities or immutable physical cleanup evidence,
     # not owner API fields.  Never let a broad SELECT * list/detail response
     # leak them.  Cockpit gets only the durable, non-secret lifecycle shape.
@@ -96,6 +114,7 @@ def redact_thread_metadata(thread: dict[str, Any]) -> dict[str, Any]:
         thread.pop(internal_key, None)
     thread["runtime_retirement_pending"] = retirement_pending
     thread["retirement_disposition"] = retirement_disposition
+    thread["retirement_permanent"] = retirement_permanent
     return thread
 
 
