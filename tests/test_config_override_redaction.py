@@ -8,6 +8,8 @@ persistence, while every non-secret field is preserved verbatim.
 
 import copy
 
+import pytest
+
 from orchestrator.security import access
 from orchestrator.services.thread_projection import redact_thread_metadata
 from orchestrator.application import jobs as jobs_composition
@@ -223,6 +225,84 @@ class TestRedactThreadMetadataShape:
         assert out["runtime_retirement_pending"] is False
         assert out["retirement_disposition"] is None
         assert "hidden-token" not in repr(out)
+
+    @staticmethod
+    def _stateless(metadata: dict) -> dict:
+        return {
+            "id": "t",
+            "status": "ended",
+            "execution_lane": "stateless",
+            "metadata": metadata,
+        }
+
+    @pytest.mark.parametrize("permanent", [False, True])
+    def test_pending_stateless_retirement_is_public_ending(self, permanent):
+        """A stateless End or Delete answered 503 is not a settled End.
+
+        Its marker stays pending until End, Delete or Resume is retried; the
+        owner projection must say so (R1.B12 thread ``9bee082e`` read
+        ``ended`` with the marker still set).
+        """
+
+        out = redact_thread_metadata(
+            self._stateless(
+                {
+                    "_stateless_workspace_retirement_pending": True,
+                    "_stateless_claim_retirement": {
+                        "terminal_token": 8,
+                        "permanent": permanent,
+                    },
+                }
+            )
+        )
+
+        assert out["runtime_retirement_pending"] is True
+        assert out["retirement_disposition"] == "ended"
+        assert out["retirement_permanent"] is permanent
+
+    def test_settled_stateless_retirement_is_not_pending(self):
+        out = redact_thread_metadata(
+            self._stateless(
+                {
+                    "_stateless_workspace_retirement_settled": {
+                        "terminal_token": 8,
+                        "permanent": False,
+                    }
+                }
+            )
+        )
+
+        assert out["runtime_retirement_pending"] is False
+        assert out["retirement_disposition"] is None
+        assert out["retirement_permanent"] is False
+
+    def test_stateless_marker_on_another_lane_is_not_public_ending(self):
+        thread = self._stateless({"_stateless_workspace_retirement_pending": True})
+        thread["execution_lane"] = "pinned"
+
+        out = redact_thread_metadata(thread)
+
+        assert out["runtime_retirement_pending"] is False
+        assert out["retirement_permanent"] is False
+
+    @pytest.mark.parametrize("authorized", [True, False])
+    def test_pinned_permanence_is_public_only_while_pending(self, authorized):
+        out = redact_thread_metadata(
+            {
+                "id": "t",
+                "metadata": {},
+                "runtime_retirement_token": "retirement-secret",
+                "runtime_retirement_permanent": True,
+                "runtime_retirement_authorized_at": (
+                    "2026-08-26T00:00:01Z" if authorized else None
+                ),
+                "runtime_retirement_context": {"settle_status": "ended"},
+            }
+        )
+
+        assert out["runtime_retirement_pending"] is authorized
+        assert out["retirement_permanent"] is authorized
+        assert "runtime_retirement_permanent" not in out
 
 
 class TestRedactJobWorkspaceAuthority:
