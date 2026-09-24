@@ -21088,6 +21088,7 @@ class PostgresDB:
         poll: bool = False,
         preparation_only: bool = False,
         expected_preparation_context: Mapping[str, Any] | None = None,
+        creation_source: Mapping[str, Any] | None = None,
     ) -> bool | dict:
         """Install one VM provision generation before any controller effect.
 
@@ -21154,6 +21155,31 @@ class PostgresDB:
         ):
             return False
         proposed["provision_generation"] = provision_generation
+        parsed_request_id = None
+        if creation_source is not None:
+            from shared.vm_creation_issuance import canonical_configuration_digest
+            from shared.vm_creation_retry import canonical_request_digest
+
+            try:
+                parsed_request_id = UUID(str(creation_source["request_id"]))
+                request = creation_source["request"]
+                configuration = creation_source["controller_configuration"]
+                if (
+                    not isinstance(request, dict)
+                    or not isinstance(configuration, dict)
+                    or configuration.get("version") != 3
+                    or request.get("entity_type") != "thread"
+                    or request.get("job_id") != str(parsed_thread)
+                    or request.get("provision_generation") != provision_generation
+                    or canonical_request_digest(request)
+                        != creation_source["request_digest"]
+                    or canonical_configuration_digest(configuration)
+                        != creation_source["controller_configuration_digest"]
+                ):
+                    return False
+            except (KeyError, TypeError, ValueError, AttributeError):
+                return False
+            proposed["creation_request_id"] = str(parsed_request_id)
         if preparation_only:
             from shared.workspace_preparation import validate_request
 
@@ -21175,7 +21201,8 @@ class PostgresDB:
             async with conn.transaction():
                 row = await conn.fetchrow(
                     "SELECT status,execution_lane,runtime_generation,"
-                    "runtime_retirement_token,agent_id,runtime_attach_token,metadata "
+                    "runtime_retirement_token,agent_id,runtime_attach_token,metadata,"
+                    "pinned_idle_terminal_intent_at "
                     "FROM threads WHERE id=$1::uuid FOR UPDATE",
                     parsed_thread,
                 )
@@ -21287,6 +21314,7 @@ class PostgresDB:
                     and row["runtime_retirement_token"] is None
                     and row["agent_id"] == parsed_agent
                     and row["runtime_attach_token"] == parsed_attach
+                    and row["pinned_idle_terminal_intent_at"] is None
                 ):
                     return False
                 inverse_agents = await conn.fetch(
@@ -21381,7 +21409,38 @@ class PostgresDB:
                     json.dumps(metadata),
                     parsed_runtime_generation,
                 )
-                return result == "UPDATE 1"
+                if result != "UPDATE 1":
+                    return False
+                if creation_source is not None:
+                    from orchestrator.services.vm_resource_job_runtime import (
+                        installed_job_resource_store,
+                    )
+
+                    source = await conn.fetchrow(
+                        "INSERT INTO vm_creation_retries "
+                        "(request_id,owner_kind,thread_id,thread_runtime_generation,"
+                        "thread_agent_id,thread_attach_token,thread_wake_operation_id,"
+                        "provision_generation,origin,request_digest,canonical_request,"
+                        "controller_configuration_digest,controller_configuration,"
+                        "expected_pvc_uid) VALUES($1,'thread',$2,$3,$4,$5,$6,$7,'initial',"
+                        "$8,$9::jsonb,$10,$11::jsonb,$12) RETURNING *",
+                        parsed_request_id, parsed_thread, parsed_runtime_generation,
+                        parsed_agent, parsed_attach, parsed_wake,
+                        UUID(provision_generation), creation_source["request_digest"],
+                        json.dumps(request),
+                        creation_source["controller_configuration_digest"],
+                        json.dumps(configuration),
+                        open_idle["pvc_uid"] if open_idle is not None else None,
+                    )
+                    resource = await installed_job_resource_store(
+                        conn, self, configuration,
+                    )
+                    if resource is None:
+                        raise RuntimeError("Thread resource installation unavailable")
+                    await resource._write_thread_waiter_on_conn(
+                        conn, retry=source,
+                    )
+                return True
 
     async def merge_thread_preparation_if_current(
         self, thread_id, runtime_generation, expected, updates
@@ -37234,6 +37293,11 @@ class PostgresDB:
                                 "reason": "authorization_changed",
                                 "generation": generation,
                             }
+                        source = existing_context.get("vm_creation_source")
+                        if source is not None:
+                            await self._cancel_retiring_thread_creation_on_conn(
+                                conn, parsed_thread_id, source,
+                            )
                     return {
                         "state": "pending",
                         "token": str(existing_token),
@@ -37882,17 +37946,88 @@ class PostgresDB:
                         "reason": "workspace_backend_malformed",
                     }
                 retained_soft_workspace: dict[str, Any] | None = None
+                vm_creation_source: dict[str, Any] | None = None
                 try:
                     if vm_evidence:
                         _canonical_uuid_text(
                             vm_context.get("provision_generation"),
                             label="VM provision generation",
                         )
-                        _canonical_uuid_text(vm_context.get("vm_uid"), label="VM UID")
-                        _canonical_uuid_text(
-                            vm_context.get("rootdisk_pvc_uid"),
-                            label="VM rootdisk UID",
-                        )
+                        if vm_context.get("vm_uid") is None:
+                            # A typed, immutable creation source can be
+                            # retired before its VM identity is observed.
+                            # Lock it after the thread row so Begin and every
+                            # effect grant serialize on the same source.
+                            from shared.vm_creation_retry import canonical_request_digest
+                            from shared.vm_creation_issuance import canonical_configuration_digest
+
+                            request_id = _canonical_uuid_text(
+                                vm_context.get("creation_request_id"),
+                                label="thread VM creation request",
+                            )
+                            creation = await conn.fetchrow(
+                                "SELECT * FROM vm_creation_retries WHERE "
+                                "request_id=$1::uuid FOR UPDATE",
+                                UUID(request_id),
+                            )
+                            if creation is None:
+                                raise RuntimeError("thread VM creation source missing")
+                            creation_request = creation["canonical_request"]
+                            configuration = creation["controller_configuration"]
+                            if isinstance(creation_request, str):
+                                creation_request = json.loads(creation_request)
+                            if isinstance(configuration, str):
+                                configuration = json.loads(configuration)
+                            if not (
+                                creation["owner_kind"] == "thread"
+                                and creation["thread_id"] == parsed_thread_id
+                                and creation["job_id"] is None
+                                and str(creation["thread_runtime_generation"]) == generation
+                                and creation["thread_agent_id"] == thread["agent_id"]
+                                and creation["thread_attach_token"] == thread["runtime_attach_token"]
+                                and str(creation["provision_generation"])
+                                == str(vm_context["provision_generation"])
+                                and creation["state"] in {
+                                    "queued", "reconciling", "attention",
+                                    "cancel_requested",
+                                }
+                                and isinstance(creation_request, dict)
+                                and creation_request.get("entity_type") == "thread"
+                                and creation_request.get("job_id") == str(parsed_thread_id)
+                                and creation_request.get("provision_generation")
+                                == str(creation["provision_generation"])
+                                and canonical_request_digest(creation_request)
+                                == creation["request_digest"]
+                                and isinstance(configuration, dict)
+                                and configuration.get("version") == 3
+                                and canonical_configuration_digest(configuration)
+                                == creation["controller_configuration_digest"]
+                                and creation["observed_vm_uid"] is None
+                            ):
+                                raise RuntimeError("thread VM creation source changed")
+                            if vm_context.get("rootdisk_pvc_uid") is not None:
+                                _canonical_uuid_text(
+                                    vm_context["rootdisk_pvc_uid"],
+                                    label="VM rootdisk UID",
+                                )
+                            vm_creation_source = {
+                                "request_id": request_id,
+                                "provision_generation": str(creation["provision_generation"]),
+                                "request_digest": creation["request_digest"],
+                                "controller_configuration_digest": creation["controller_configuration_digest"],
+                                "thread_runtime_generation": generation,
+                                "thread_agent_id": str(creation["thread_agent_id"])
+                                if creation["thread_agent_id"] is not None else None,
+                                "thread_attach_token": str(creation["thread_attach_token"])
+                                if creation["thread_attach_token"] is not None else None,
+                                "captured_vm": vm_context,
+                            }
+                        else:
+                            _canonical_uuid_text(vm_context.get("vm_uid"), label="VM UID")
+                            _canonical_uuid_text(
+                                vm_context.get("rootdisk_pvc_uid"),
+                                label="VM rootdisk UID",
+                            )
                     elif sandbox_evidence and workspace_provision_intent is None:
                         if workspace_context.get("provisioner") == "docker":
                             lease_id = _canonical_uuid_text(
@@ -38097,7 +38232,11 @@ class PostgresDB:
                     "retained_soft_workspace": retained_soft_workspace,
                     "workspace_container": metadata.get("workspace_container"),
                     "workspace_binding": metadata.get("_workspace_binding"),
-                    "vm": metadata.get("vm"),
+                    # Before an effect has an exact VM identity, the retry
+                    # source is the cleanup authority. Do not represent a
+                    # provisioning marker as a captured physical VM.
+                    "vm": None if vm_creation_source else metadata.get("vm"),
+                    "vm_creation_source": vm_creation_source,
                     "workspace_backend": effective_backend,
                     "protected_cloud": protected_marker == "on",
                     "protected_cloud_state": protected_marker,
@@ -38145,6 +38284,13 @@ class PostgresDB:
                 )
                 if admitted is None:
                     return {"state": "conflict", "reason": "authority_changed"}
+                # A hidden owner preflight is still abortable. It fences
+                # grants through the thread token, but cancellation becomes
+                # durable only at the irrevocable authorization edge.
+                if authorize_immediately and vm_creation_source is not None:
+                    await self._cancel_retiring_thread_creation_on_conn(
+                        conn, parsed_thread_id, vm_creation_source,
+                    )
                 return {
                     "state": "pending",
                     "token": str(token),
@@ -38245,20 +38391,63 @@ class PostgresDB:
         async with (
             self.acquire() if _connection is None else nullcontext(_connection)
         ) as conn:
-            row = await conn.fetchval(
-                "UPDATE threads SET runtime_retirement_authorized_at="
-                "COALESCE(runtime_retirement_authorized_at, now()) "
-                "WHERE id=$1::uuid AND execution_lane='pinned' "
-                "AND runtime_generation=$2::uuid "
-                "AND runtime_retirement_token=$3::uuid "
-                "AND runtime_retirement_context->>'settle_status'=$4 "
-                "RETURNING id",
-                parsed_thread,
-                parsed_generation,
-                parsed_token,
-                settle_status,
-            )
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    "UPDATE threads SET runtime_retirement_authorized_at="
+                    "COALESCE(runtime_retirement_authorized_at, now()) "
+                    "WHERE id=$1::uuid AND execution_lane='pinned' "
+                    "AND runtime_generation=$2::uuid "
+                    "AND runtime_retirement_token=$3::uuid "
+                    "AND runtime_retirement_context->>'settle_status'=$4 "
+                    "RETURNING id,runtime_retirement_context",
+                    parsed_thread, parsed_generation, parsed_token, settle_status,
+                )
+                if row is not None:
+                    context = row["runtime_retirement_context"]
+                    if isinstance(context, str):
+                        context = json.loads(context)
+                    source = context.get("vm_creation_source") if isinstance(context, dict) else None
+                    if source is not None:
+                        await self._cancel_retiring_thread_creation_on_conn(
+                            conn, parsed_thread, source,
+                        )
         return row is not None
+
+    async def _cancel_retiring_thread_creation_on_conn(
+        self, conn: Any, thread_id: UUID, source: Mapping[str, Any],
+    ) -> None:
+        """Cancel only the immutable source captured by the current End."""
+        changed = await conn.fetchval(
+            "UPDATE vm_creation_retries SET state='cancel_requested',"
+            "revision=revision+1,claim_token=NULL,claim_expires_at=NULL,"
+            "reason='thread_retirement',next_probe_at=clock_timestamp(),"
+            "updated_at=clock_timestamp() WHERE request_id=$1::uuid "
+            "AND owner_kind='thread' AND thread_id=$2::uuid "
+            "AND thread_runtime_generation=$3::uuid "
+            "AND provision_generation=$4::uuid "
+            "AND request_digest=$5 AND controller_configuration_digest=$6 "
+            "AND state IN ('queued','reconciling','attention') RETURNING request_id",
+            UUID(source["request_id"]), thread_id,
+            UUID(source["thread_runtime_generation"]),
+            UUID(source["provision_generation"]),
+            source["request_digest"],
+            source["controller_configuration_digest"],
+        )
+        if changed is None:
+            existing = await conn.fetchval(
+                "SELECT state FROM vm_creation_retries WHERE request_id=$1::uuid "
+                "AND owner_kind='thread' AND thread_id=$2::uuid "
+                "AND thread_runtime_generation=$3::uuid "
+                "AND provision_generation=$4::uuid "
+                "AND request_digest=$5 AND controller_configuration_digest=$6",
+                UUID(source["request_id"]), thread_id,
+                UUID(source["thread_runtime_generation"]),
+                UUID(source["provision_generation"]),
+                source["request_digest"],
+                source["controller_configuration_digest"],
+            )
+            if existing != "cancel_requested":
+                raise RuntimeError("retiring thread VM creation source changed")
 
     async def acknowledge_pinned_thread_local_quiescence(
         self,

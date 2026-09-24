@@ -274,6 +274,18 @@ def profiled_setup(setup, monkeypatch):
     return ctrl, api, authority, payload
 
 
+def test_authenticated_configuration_resolves_genuine_thread_owner(setup):
+    ctrl, _, authority, _ = setup
+    request = {
+        **authority.row["request"],
+        "job_id": str(uuid4()),
+        "entity_type": "thread",
+    }
+    resolved = resolve_creation_configuration(ctrl, request)
+    assert resolved["request"]["entity_type"] == "thread"
+    assert resolved["request"]["job_id"] == request["job_id"]
+
+
 @pytest.mark.asyncio
 async def test_protocol_authority_denial_performs_no_job_effect(setup):
     ctrl, api, authority, payload = setup

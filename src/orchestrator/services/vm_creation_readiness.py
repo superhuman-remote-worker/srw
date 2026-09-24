@@ -90,7 +90,9 @@ def _ready(vm, row, evidence, now):
 
         initialization = validate_initialization_request(initialization)
         storage = request.get("workspace_storage")
-        owner = _object(storage)["uid"] if storage is not None else str(row["job_id"])
+        owner = _object(storage)["uid"] if storage is not None else str(
+            row["thread_id"] if row["owner_kind"] == "thread" else row["job_id"]
+        )
         receipt = initialization_receipt(
             vm.get("initialization_receipt"),
             owner_id=owner,

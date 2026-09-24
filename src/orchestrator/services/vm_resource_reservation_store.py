@@ -167,7 +167,9 @@ def _expected_waiter_request_fields(retry, *, inventory, policy_document, cost):
 
     fields = {
         "request_id": retry["request_id"],
+        "owner_kind": retry["owner_kind"] if "owner_kind" in retry else "job",
         "job_id": retry["job_id"],
+        "thread_id": retry["thread_id"] if "thread_id" in retry else None,
         "provision_generation": retry["provision_generation"],
         "cluster_id": inventory.cluster_id,
         "policy_digest": inventory.policy_digest,
@@ -198,6 +200,12 @@ def _expected_waiter_request_fields(retry, *, inventory, policy_document, cost):
 
 def _waiter_request_fields_match(actual, expected):
     for key, value in expected.items():
+        if key in {"owner_kind", "thread_id"} and key not in actual:
+            # The pre-0278 Job schema has no typed source columns. Its native
+            # non-null job FK already fixes this row to the Job branch.
+            if expected.get("owner_kind") != "job" or expected.get("thread_id") is not None:
+                return False
+            continue
         if key == "placement":
             try:
                 if _encoded(_json(actual[key])) != _encoded(value):
@@ -494,7 +502,7 @@ class VMResourceReservationStore:
         return grant
 
     async def bind_ready_on_conn(self, conn, *, retry, vm, job_id, generation):
-        """Bind one genuine signed-inventory launcher before Job Ready commits.
+        """Bind one genuine signed-inventory launcher before owner Ready commits.
 
         The caller already owns the Job lock and its Ready identity CAS. A
         refusal can still commit observed high-water, so this returns False
@@ -580,7 +588,9 @@ class VMResourceReservationStore:
         node_uid = str(reservation["node_uid"])
         if (
             actual_vm is None or actual_vmi is None or pod is None
-            or actual_vm["owner_kind"] != "job"
+            or actual_vm["owner_kind"] != (
+                retry["owner_kind"] if "owner_kind" in retry else "job"
+            )
             or actual_vm["owner_id"] != job_id
             or actual_vm["provision_generation"] != generation
             or actual_vm["name"] != "agent-vm-" + job_id
@@ -649,7 +659,22 @@ class VMResourceReservationStore:
             "SELECT EXISTS(SELECT 1 FROM vm_creation_effects WHERE request_id=$1)",
             retry["request_id"],
         )
-        if effects_present:
+        # A recorded API rejection is definitive non-issuance. For a thread
+        # with no golden/preparation source, it can settle through the exact
+        # cancellation source without manufacturing a disposition for objects
+        # that the API never accepted. Keep the Job disposition protocol intact.
+        rejected_only = bool(
+            effects_present
+            and retry["owner_kind"] == "thread"
+            and not await conn.fetchval(
+                "SELECT EXISTS(SELECT 1 FROM vm_creation_effects "
+                "WHERE request_id=$1 AND state<>'rejected')",
+                retry["request_id"],
+            )
+            and retry["canonical_request"].get("preparation") is None
+            and retry["controller_configuration"].get("golden_enabled") is False
+        )
+        if effects_present and not rejected_only:
             if not disposition_complete or not await conn.fetchval(
                 "SELECT public.valid_vm_creation_disposition_evidence(r) "
                 "FROM vm_creation_retries r WHERE request_id=$1",
@@ -702,10 +727,15 @@ class VMResourceReservationStore:
         evidence = {
             "kind": "never_vm_issued",
             "request_id": str(retry["request_id"]),
-            "job_id": str(retry["job_id"]),
+            (
+                "thread_id" if retry["owner_kind"] == "thread" else "job_id"
+            ): str(
+                retry["thread_id"] if retry["owner_kind"] == "thread"
+                else retry["job_id"]
+            ),
             "provision_generation": str(retry["provision_generation"]),
         }
-        if effects_present:
+        if effects_present and not rejected_only:
             disposition = _json(retry["cancellation_disposition"])
             if not isinstance(disposition, dict) or not isinstance(
                 disposition.get("disposition_id"), str
@@ -740,11 +770,15 @@ class VMResourceReservationStore:
             "SELECT * FROM vm_resource_reservations WHERE request_id=$1 "
             "AND state<>'released' FOR UPDATE", retry["request_id"],
         )
+        source_kind = retry["owner_kind"] if "owner_kind" in retry else "job"
         if reservation is None or (
             reservation["resource_version"] != 2
             or reservation["state"] not in {"active", "warm"}
             or retry["state"] != "succeeded"
-            or retry["job_id"] != operation["owner_id"]
+            or (
+                retry["thread_id"] if source_kind == "thread"
+                else retry["job_id"]
+            ) != operation["owner_id"]
             or retry["provision_generation"] != operation["provision_generation"]
             or retry["observed_vm_uid"] != operation["vm_uid"]
             or retry["observed_pvc_uid"] != operation["root_pvc_uid"]
@@ -820,15 +854,21 @@ class VMResourceReservationStore:
             "SELECT * FROM vm_resource_reservations WHERE request_id=$1 "
             "AND state<>'released' FOR UPDATE", retry["request_id"],
         )
+        source_kind = retry["owner_kind"] if "owner_kind" in retry else "job"
+        source_owner = (
+            retry["thread_id"] if source_kind == "thread" else retry["job_id"]
+        )
         if charge is None or (
             charge["resource_version"] != 2
             or retry["state"] != "succeeded"
-            or retry["job_id"] != operation["owner_id"]
+            or source_owner != operation["owner_id"]
             or retry["provision_generation"] != operation["provision_generation"]
             or retry["observed_vm_uid"] != operation["vm_uid"]
             or retry["observed_pvc_uid"] != operation["pvc_uid"]
             or charge["vm_uid"] != operation["vm_uid"]
-            or operation["owner_kind"] != "job"
+            or operation["owner_kind"] != source_kind
+            or (source_kind == "thread"
+                and operation["release_kind"] != "pinned_thread")
         ):
             raise ResourceAdmissionError("resource_idle_identity_unproven")
         successor = await conn.fetchrow(
@@ -895,9 +935,10 @@ class VMResourceReservationStore:
             raise ResourceAdmissionError("resource_physical_release_unproven")
         if not await conn.fetchval(
             "SELECT EXISTS(SELECT 1 FROM managed_repository_process_zero_receipts "
-            "WHERE owner_kind='job' AND owner_id=$1 AND scope='vm' "
+            "WHERE owner_kind=$3 AND owner_id=$1 AND scope='vm' "
             "AND provisioner='vm' AND runtime_incarnation=$2)",
             operation["owner_id"], str(operation["provision_generation"]),
+            operation["owner_kind"],
         ):
             raise ResourceAdmissionError("resource_physical_release_unproven")
         digest = await conn.fetchval(
@@ -907,7 +948,9 @@ class VMResourceReservationStore:
         release = {
             "kind": "exact_compute_absent",
             "operation_id": str(operation["id"]),
-            "job_id": str(operation["owner_id"]),
+            (
+                "thread_id" if operation["owner_kind"] == "thread" else "job_id"
+            ): str(operation["owner_id"]),
             "provision_generation": str(operation["provision_generation"]),
             "vm_uid": str(operation["vm_uid"]),
             "vmi_uid": str(operation["vmi_uid"]),
@@ -1167,6 +1210,52 @@ class VMResourceReservationStore:
         await self._deadline(conn, retry)
         return dict(row)
 
+    async def _write_thread_waiter_on_conn(self, conn, *, retry):
+        """Project one genuine thread source under its locked owner transaction."""
+        if (
+            retry["owner_kind"] != "thread"
+            or retry["job_id"] is not None
+            or retry["thread_id"] is None
+            or retry["state"] != "queued"
+        ):
+            raise ResourceAdmissionError("creation_request_ineligible")
+        if await conn.fetchval(
+            "SELECT EXISTS(SELECT 1 FROM vm_creation_effects WHERE request_id=$1)",
+            retry["request_id"],
+        ):
+            raise ResourceAdmissionError("creation_effect_already_issued")
+        await self._lock_policy(conn)
+        expected = _expected_waiter_request_fields(
+            retry, inventory=self.inventory,
+            policy_document=self.policy_document, cost=self.cost,
+        )
+        owner_key = (
+            "system" if retry["thread_owner_user_id"] is None
+            else "user:" + str(retry["thread_owner_user_id"])
+        )
+        row = await conn.fetchrow(
+            "INSERT INTO vm_resource_waiters "
+            "(request_id,owner_kind,thread_id,provision_generation,cluster_id,"
+            "policy_digest,owner_key,project_id,priority,request_digest,"
+            "guest_vcpus,guest_memory_bytes,cpu_millicores,memory_bytes,"
+            "kvm_devices,placement,ephemeral_storage_bytes,tun_devices,"
+            "vhost_net_devices,resource_version) "
+            "VALUES($1,'thread',$2,$3,$4,$5,$6,$7,0,$8,$9,$10,$11,$12,$13,"
+            "$14::jsonb,$15,$16,$17,2) RETURNING *",
+            expected["request_id"], expected["thread_id"],
+            expected["provision_generation"], expected["cluster_id"],
+            expected["policy_digest"], owner_key,
+            retry["thread_owner_project_id"], expected["request_digest"],
+            expected["guest_vcpus"], expected["guest_memory_bytes"],
+            expected["cpu_millicores"], expected["memory_bytes"],
+            expected["kvm_devices"], json.dumps(expected["placement"]),
+            expected["ephemeral_storage_bytes"], expected["tun_devices"],
+            expected["vhost_net_devices"],
+        )
+        if not _waiter_request_fields_match(row, expected):
+            raise ResourceAdmissionError("resource_waiter_changed")
+        return dict(row)
+
     async def _admit(self, conn, request_id):
         retry, job = await self.creation._effect_scope(conn, request_id)
         await self.creation._current(
@@ -1258,7 +1347,9 @@ class VMResourceReservationStore:
             inventory.policy_digest,
         )
         reservations = await conn.fetch(
-            "SELECT r.*,w.job_id,w.provision_generation,w.owner_key,"
+            "SELECT r.*,COALESCE(to_jsonb(w)->>'owner_kind','job') AS owner_kind,"
+            "w.job_id,(to_jsonb(w)->>'thread_id')::uuid AS thread_id,"
+            "w.provision_generation,w.owner_key,"
             "COALESCE(successor.successor_vmi_uid,r.vmi_uid) AS current_vmi_uid,"
             "COALESCE(successor.successor_launcher_uid,r.launcher_uid) AS current_launcher_uid "
             "FROM vm_resource_reservations r "
@@ -1316,8 +1407,11 @@ class VMResourceReservationStore:
                 reservation_id=str(row["id"]),
                 node_uid=str(row["node_uid"]),
                 node_name=row["node_name"],
-                owner_kind="job",
-                owner_id=str(row["job_id"]),
+                owner_kind=row["owner_kind"],
+                owner_id=str(
+                    row["job_id"] if row["owner_kind"] == "job"
+                    else row["thread_id"]
+                ),
                 provision_generation=str(row["provision_generation"]),
                 vector=_row_vector(row, six=inventory.protocol == 2),
                 state=row["state"],

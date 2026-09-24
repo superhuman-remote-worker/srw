@@ -274,15 +274,32 @@ def _validate_prepared_source(source, *, request, configuration, expected_pvc_ui
 def _values(value):
     version = value.get("version") if isinstance(value, Mapping) else None
     fields = _FIELDS
+    thread_source = isinstance(value, Mapping) and value.get("owner_kind") == "thread"
     if version in (2, 3, 4, 5):
         fields |= {"rootdisk_source"}
     if version in (3, 5):
         fields |= {"workspace_attachment", "current_attachment_uid"}
     if version in (4, 5):
         fields |= {"resource_grant"}
+    if thread_source:
+        fields |= {
+            "owner_kind", "thread_runtime_generation", "thread_agent_id",
+            "thread_attach_token", "thread_wake_operation_id",
+        }
     if not isinstance(value, Mapping) or set(value) != fields:
         raise ValueError("Incomplete creation carrier intent")
     value = dict(value)
+    if thread_source:
+        if version not in (4, 5):
+            raise ValueError("Thread creation requires a resource grant")
+        _uuid(value["thread_runtime_generation"])
+        if (value["thread_agent_id"] is None) != (
+            value["thread_attach_token"] is None
+        ):
+            raise ValueError("Thread creation agent identity is incomplete")
+        for key in ("thread_agent_id", "thread_attach_token", "thread_wake_operation_id"):
+            if value[key] is not None:
+                _uuid(value[key])
     if (
         type(value["version"]) is not int
         or value["version"] not in (1, 2, 3, 4, 5)
@@ -592,7 +609,7 @@ def public_effect_observation(
                 }
             )
         if (
-            labels.get("srw.io/owner-kind") != "job"
+            labels.get("srw.io/owner-kind") != values.get("owner_kind", "job")
             or labels.get("srw.io/owner-id") != owner
         ):
             raise ValueError("Creation object owner changed")

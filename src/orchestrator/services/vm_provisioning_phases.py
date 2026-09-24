@@ -56,6 +56,141 @@ class VMProvisioningPhaseStore:
     def __init__(self, db):
         self.db = db
 
+    async def publish_thread_ready(
+        self, thread_id, generation, registration, vm_uid, updates,
+    ) -> bool | None:
+        """Bind a typed thread charge before publishing the probed Ready VM.
+
+        None means there is no typed source on a deployment with enforcement
+        off, so the historical thread projection may proceed. False is a hold.
+        """
+        from orchestrator.services.vm_creation_readiness import _ready
+        from orchestrator.services.vm_creation_retry_store import _creation_intent
+        from orchestrator.services.vm_resource_job_runtime import (
+            configured_enforcement_policy, installed_job_resource_store,
+        )
+        from orchestrator.services.vm_workspace_recovery_store import cleanup_intent_digest
+        from shared.vm_resource_admission import ResourceAdmissionError
+        from shared.vm_resource_inventory import InventoryError
+        from uuid import NAMESPACE_URL, uuid5
+
+        if not all(_uuid(value) for value in (thread_id, generation, vm_uid, registration)):
+            return False
+        if not isinstance(updates, Mapping) or updates.get("status") != "ready":
+            return False
+        async with self.db.acquire() as conn, conn.transaction():
+            thread = await conn.fetchrow(
+                "SELECT * FROM threads WHERE id=$1 FOR UPDATE", UUID(thread_id),
+            )
+            if thread is None:
+                return False
+            retry = await conn.fetchrow(
+                "SELECT * FROM vm_creation_retries WHERE owner_kind='thread' "
+                "AND thread_id=$1 AND provision_generation=$2 FOR UPDATE",
+                UUID(thread_id), UUID(generation),
+            )
+            if retry is None:
+                return None if configured_enforcement_policy() is None else False
+            metadata = _object(thread["metadata"])
+            vm = _object(metadata.get("vm"))
+            if (
+                thread["execution_lane"] != "pinned"
+                or thread["runtime_retirement_token"] is not None
+                or thread["pinned_idle_terminal_intent_at"] is not None
+                or thread["runtime_generation"] != retry["thread_runtime_generation"]
+                or thread["agent_id"] != retry["thread_agent_id"]
+                or thread["runtime_attach_token"] != retry["thread_attach_token"]
+                or retry["state"] != "succeeded"
+                or retry["reason"] != "creation_adopted"
+                or retry["observed_vm_uid"] != UUID(vm_uid)
+                or vm.get("vm_uid") != vm_uid
+                or vm.get("provision_generation") != generation
+                or vm.get("creation_request_id") != str(retry["request_id"])
+                or vm.get("ssh_registration_id") != registration
+                or updates.get("ssh_registration_id") != registration
+            ):
+                return False
+            if retry["thread_wake_operation_id"] is not None:
+                wake = await conn.fetchrow(
+                    "SELECT id,owner_kind,owner_id,phase,closed_at,wake_generation,"
+                    "wake_request_id,pvc_uid,thread_terminal_intent_at "
+                    "FROM vm_idle_operations WHERE id=$1 FOR SHARE",
+                    retry["thread_wake_operation_id"],
+                )
+                if (
+                    wake is None or wake["owner_kind"] != "thread"
+                    or wake["owner_id"] != thread["id"]
+                    or wake["phase"] not in {"waking", "wake_held"}
+                    or wake["closed_at"] is not None
+                    or wake["thread_terminal_intent_at"] is not None
+                    or wake["wake_generation"] != retry["provision_generation"]
+                    or wake["wake_request_id"] != retry["request_id"]
+                    or wake["pvc_uid"] != retry["expected_pvc_uid"]
+                ):
+                    return False
+            permit = await conn.fetchrow(
+                "SELECT * FROM vm_workspace_cleanup_admissions WHERE id=$1",
+                retry["creation_admission_id"],
+            )
+            if (
+                permit is None or permit["completed_at"] is None
+                or permit["outcome"] != "adopted"
+                or permit["owner_kind"] != "thread"
+                or permit["owner_id"] != thread["id"]
+                or permit["source"] != "controller_vm_create"
+                or permit["pvc_uid"] != retry["observed_pvc_uid"]
+                or permit["request_id"] != uuid5(
+                    NAMESPACE_URL, "vm-create:" + str(retry["request_id"])
+                )
+                or permit["intent_digest"] != cleanup_intent_digest(
+                    _creation_intent(retry)
+                )
+            ):
+                return False
+            effect = await conn.fetchval(
+                "SELECT evidence FROM vm_creation_effects WHERE request_id=$1 "
+                "AND effect_kind='vm' AND state='observed' "
+                "ORDER BY effect_number DESC LIMIT 1", retry["request_id"],
+            )
+            evidence = _object(effect)
+            if evidence.get("uid") != vm_uid or evidence.get("pvc_uid") != str(
+                retry["observed_pvc_uid"]
+            ):
+                return False
+            now = await conn.fetchval(
+                "SELECT extract(epoch FROM clock_timestamp())::double precision"
+            )
+            ready_vm = {**vm, **dict(updates)}
+            if not _ready(ready_vm, retry, evidence, now):
+                return False
+            try:
+                resource = await installed_job_resource_store(
+                    conn, self.db, retry["controller_configuration"], fresh=False,
+                )
+                if resource is None or not await resource.bind_ready_on_conn(
+                    conn, retry=retry, vm=vm,
+                    job_id=thread_id, generation=generation,
+                ):
+                    return False
+            except (ResourceAdmissionError, InventoryError):
+                return False
+            metadata["vm"] = ready_vm
+            changed = await conn.execute(
+                "UPDATE threads SET metadata=$2::jsonb,last_activity=clock_timestamp() "
+                "WHERE id=$1 AND runtime_generation=$3 "
+                "AND runtime_retirement_token IS NULL",
+                thread["id"], json.dumps(metadata),
+                retry["thread_runtime_generation"],
+            )
+            if changed != "UPDATE 1":
+                return False
+            await conn.execute(
+                "UPDATE vm_creation_retries SET ready_at=COALESCE(ready_at,clock_timestamp()),"
+                "revision=revision+1,updated_at=clock_timestamp() WHERE request_id=$1",
+                retry["request_id"],
+            )
+            return True
+
     async def publish_ready(self, job_id, generation, registration, vm_uid, updates):
         """Commit the final prober result and legacy budget reset together.
 

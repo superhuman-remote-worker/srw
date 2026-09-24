@@ -162,7 +162,10 @@ def _contract(template_text, request, configuration, effect_intent, kind):
 
 def _stamp(metadata, request, values=None):
     labels = metadata.setdefault("labels", {})
-    labels.update({"srw.io/owner-kind": "job", "srw.io/owner-id": request["job_id"]})
+    labels.update({
+        "srw.io/owner-kind": request.get("entity_type", "job"),
+        "srw.io/owner-id": request["job_id"],
+    })
     annotations = metadata.setdefault("annotations", {})
     annotations["srw.io/provision-generation"] = request["provision_generation"]
     if values is not None:
