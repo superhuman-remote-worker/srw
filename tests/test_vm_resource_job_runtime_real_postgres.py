@@ -2006,3 +2006,20 @@ async def test_genuine_recovery_release_appends_exact_charged_successor(
         (1, vmi_uid, successor_vmi, launcher_uid, successor_launcher),
         (2, successor_vmi, second_vmi, successor_launcher, second_launcher),
     ]
+    # Admin accounting follows the same append-only successor chain. The
+    # replacement launcher is managed occupancy, never charged again as external.
+    from orchestrator.services.vm_resource_capacity import vm_capacity_snapshot
+
+    successor_sample["vmis"][0]["uid"] = str(second_vmi)
+    successor_sample["pods"][0]["uid"] = str(second_launcher)
+    successor_sample["pods"][0]["vmi_uid"] = str(second_vmi)
+    successor_sample["snapshot_id"] = str(uuid4())
+    successor_sample["sequence"] += 1
+    successor_sample["started_at"] = successor_sample["finished_at"] = datetime.now(timezone.utc).isoformat()
+    await publish(inventory, successor_sample)
+    capacity = await vm_capacity_snapshot(db)
+    cluster = next(c for c in capacity["clusters"] if c["cluster_id"] == inventory.cluster_id)
+    assert cluster["available"] is True
+    assert cluster["totals"]["active"] == demand.to_six_dict()
+    assert cluster["totals"]["unbound"] == demand.to_six_dict()
+    assert cluster["totals"]["external"] == dict.fromkeys(demand.to_six_dict(), 0)

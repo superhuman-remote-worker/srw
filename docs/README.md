@@ -26,6 +26,8 @@ notes are intentionally not prerequisites for using the public repository.
   secrets, external services, HA databases, upgrades, and VM workspaces.
 - [SSH access](../ssh-access.md) — connect a terminal or IDE to a live session
   workspace.
+- [VM capacity diagnostics](vm-capacity.md) — interpret resource inventory,
+  retained reservations and unavailable capacity.
 - [Expert configuration](../config/README.md) — configure agent roles, overlays,
   prompts, models, and tools.
 
