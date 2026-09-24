@@ -95,9 +95,8 @@ spec:
     {{- if $.Values.sshGateway.enabled }}
     # The ssh-gateway's inner hop: one certificate-authenticated SSH
     # connection per user attach, multiplexed into channels. Container
-    # workspaces only (30022) — VM-tier targets are refused upstream by
-    # services/ssh_gateway_targets (vm_unsupported), so unlike the
-    # canvas-gateway block above this one deliberately does not open 22.
+    # workspaces (30022) or exact admitted VM guests (22). The gateway's
+    # VM credential is distinct from the container user CA.
     - from:
         - podSelector:
             matchLabels:
@@ -105,6 +104,10 @@ spec:
       ports:
         - protocol: TCP
           port: 30022
+        {{- if include "srw.vmSameCluster" $ }}
+        - protocol: TCP
+          port: 22
+        {{- end }}
     {{- end }}
     # code-server from orchestrator (IDE session proxying)
     - from:

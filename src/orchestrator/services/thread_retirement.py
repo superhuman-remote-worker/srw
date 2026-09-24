@@ -1329,6 +1329,8 @@ async def end_thread_flow(
                 detail={
                     "code": "pinned_retirement_conflict",
                     "reason": retirement.get("reason") or state,
+                    **({"message": "Close active IDE or SSH access, then retry ending this session"}
+                       if retirement.get("reason") == "active_workspace_access" else {}),
                 },
             )
         # Idle admission installs this row atomically with the same pinned

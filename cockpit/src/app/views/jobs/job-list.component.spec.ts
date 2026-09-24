@@ -123,6 +123,38 @@ describe('JobListComponent — server-resolved tree', () => {
   });
   afterEach(() => TestBed.resetTestingModule());
 
+  it('opens a suspended VM IDE from the click and uses the admitted URL', () => {
+    const startIdeSession = vi.fn().mockReturnValue(of({
+      status: 'active', access_lease_id: 'lease-1',
+      code_server_url: 'https://example.test/api/ide/vm/proxy/_vm/lease-1/',
+    }));
+    const getIdeSession = vi.fn();
+    const {fixture, component} = mountLogic({
+      api: {startIdeSession, getIdeSession} as Partial<ApiService>,
+    });
+    fixture.detectChanges();
+    const vm = job('vm', {
+      status: 'waiting', workspace_lifecycle: {state: 'suspended'},
+    }) as JobSummary;
+    component.jobs.set([vm]);
+    const tab = {
+      opener: null, document: {title: '', body: {textContent: ''}},
+      location: {href: ''}, close: vi.fn(), closed: false,
+    };
+    const opened = vi.spyOn(window, 'open').mockReturnValue(tab as unknown as Window);
+    try {
+      expect(component.canOpenIde(vm)).toBe(true);
+      component.openIde('vm');
+      expect(opened).toHaveBeenCalledWith('', '_blank');
+      expect(startIdeSession).toHaveBeenCalledWith('vm');
+      expect(getIdeSession).not.toHaveBeenCalled();
+      expect(tab.location.href).toContain('/api/ide/vm/proxy/_vm/lease-1/');
+      expect(tab.close).not.toHaveBeenCalled();
+    } finally {
+      opened.mockRestore();
+    }
+  });
+
   it('keeps blocked/undelivered distinct from cancellation and non-actionable', () => {
     const {fixture, component} = mountLogic();
     fixture.detectChanges();

@@ -232,7 +232,11 @@ class JobControlOperations:
         if not permit.allowed:
             raise HTTPException(
                 status_code=409,
-                detail="VM cleanup is held for workspace recovery",
+                detail=(
+                    "Close active workspace access, then retry VM cleanup"
+                    if permit.reason == "active_workspace_access"
+                    else "VM cleanup is held for workspace recovery"
+                ),
             )
         disposition = completed_cleanup_outcome(permit)
         if disposition is None:

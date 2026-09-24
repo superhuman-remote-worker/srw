@@ -138,6 +138,37 @@ async def _drain_background_tasks() -> None:
         await asyncio.gather(*pending, return_exceptions=True)
 
 
+@pytest.mark.asyncio
+async def test_vm_lease_only_after_auth_completed_and_closed_with_connection():
+    calls = []
+    target = _target(backend="vm", lease_id="lease", binding="a" * 64)
+
+    async def resolver(*_):
+        raise TargetUnavailable("vm_unsupported")
+
+    async def admit(**kwargs):
+        calls.append(("admit", kwargs))
+        return target
+
+    async def close(**kwargs):
+        calls.append(("close", kwargs))
+        return True
+
+    server = _authenticated(GatewaySSHServer(_context(
+        limiter=_limiter(), resolve=resolver, vm_admit=admit, vm_close=close,
+    ), CLIENT_IP))
+    with pytest.raises(TargetUnavailable):
+        await server._attached_target()
+    assert calls == []
+    await server.auth_completed()  # callback occurs only after key.verify
+    assert await server._attached_target() == target
+    assert [kind for kind, _ in calls] == ["admit"]
+    server.connection_lost(None)
+    await _drain_background_tasks()
+    assert [kind for kind, _ in calls] == ["admit", "close"]
+    assert calls[-1][1]["target"] == target
+
+
 # --- clamp_direct_tcpip ---------------------------------------------------
 
 

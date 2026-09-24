@@ -10,6 +10,8 @@ indistinguishable, and that only holds while the resolution and the opaque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
+import os
+from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 
@@ -18,6 +20,7 @@ from orchestrator.schemas.ssh_access import (
     SshAttachmentCreate,
     SshKeyCreate,
     SshKeyUsedRequest,
+    VMGatewayAccessRequest,
 )
 from orchestrator.security.access import (
     require_internal,
@@ -27,6 +30,8 @@ from orchestrator.security.access import (
 from orchestrator.security.auth import require_approved_user
 from orchestrator.services import ssh_access
 from orchestrator.services.ssh_handles import is_valid_handle
+from orchestrator.services.ssh_gateway_vm_access_proof import verify_vm_access_proof
+from orchestrator.services.vm_ssh_access_binding import vm_binding_digest
 
 router = APIRouter()
 
@@ -41,6 +46,8 @@ class SshAccessDependencies:
     user_can_access_ide_entity: Callable[..., Awaitable[bool]] = (
         user_can_access_ide_entity
     )
+    vm_access_store: Any = None
+    vm_provisioner: Any = None
 
 
 def get_ssh_access_dependencies(request: Request) -> SshAccessDependencies:
@@ -284,6 +291,154 @@ async def get_ssh_target(
     return await ssh_access.resolve_target(
         thread_id=thread_id, user=user, dependencies=dependencies.operations
     )
+
+
+@router.post("/api/internal/ssh-vm-access/{action}")
+async def internal_vm_ssh_access(
+    action: str,
+    request: Request,
+    body: VMGatewayAccessRequest,
+    *,
+    dependencies: SshAccessDependencies = Depends(get_ssh_access_dependencies),
+) -> dict[str, Any]:
+    """One verified gateway SSH connection, after key.verify, owns one lease.
+
+    InternalKey alone is deliberately insufficient.  The gateway signs the
+    exact connection/action with its host private key, whose public half is
+    mounted in the orchestrator.  The asserted handle/key are re-resolved to
+    an approved owner here on every action.
+    """
+    await dependencies.require_internal(request)
+    opaque = HTTPException(status_code=404, detail="No such workspace")
+    if action not in {"admit", "renew", "close"} or not dependencies.vm_access_store:
+        raise opaque
+    payload = body.proof
+    entries = dependencies.operations.host_keys.load(
+        os.environ.get("SSH_GATEWAY_PUBLIC_HOST_KEYS", "")
+    )
+    if not verify_vm_access_proof(
+        payload,
+        [entry["public_key"] for entry in entries],
+        action=action,
+    ):
+        raise opaque
+    handle = str(payload["handle"])
+    fingerprint = str(payload["fingerprint"])
+    thread_id = await dependencies.store.get_thread_id_by_ssh_handle(handle)
+    user = await dependencies.store.resolve_user_by_ssh_fingerprint(fingerprint)
+    if (
+        not thread_id
+        or not user
+        or not await dependencies.user_can_access_ide_entity(
+            user,
+            dependencies.store,
+            thread_id,
+        )
+    ):
+        raise opaque
+    thread = await dependencies.store.get_thread(thread_id)
+    if not thread:
+        raise opaque
+    from orchestrator.services.ssh_access import thread_metadata_object
+
+    metadata = thread_metadata_object(thread)
+    if (
+        not dependencies.operations.thread_is_vm_tier(
+            metadata,
+            metadata.get("workspace_container") or {},
+            metadata.get("vm") or {},
+        )
+        or thread.get("execution_lane") != "pinned"
+    ):
+        raise opaque
+    access = dependencies.vm_access_store
+    claimant = f"{user['id']}:{payload['connection_id']}"
+    if action == "close":
+        return {
+            "closed": await access.close(
+                payload["lease_id"],
+                owner_kind="thread",
+                owner_id=thread_id,
+                kind="ssh",
+                claimant=claimant,
+            )
+        }
+    if action == "renew":
+        if not dependencies.vm_provisioner:
+            return {"renewed": False}
+        try:
+            proof = await dependencies.vm_provisioner.attest_workspace_runtime(
+                thread_id,
+                entity_type="thread",
+            )
+            if vm_binding_digest(proof) != payload["binding"]:
+                return {"renewed": False}
+        except Exception:
+            return {"renewed": False}
+        return {
+            "renewed": await access.renew(
+                payload["lease_id"],
+                owner_kind="thread",
+                owner_id=thread_id,
+                kind="ssh",
+                claimant=claimant,
+            )
+        }
+    lease = await access.request(
+        owner_kind="thread",
+        owner_id=thread_id,
+        kind="ssh",
+        user_id=str(user["id"]),
+        connection_id=str(payload["connection_id"]),
+    )
+    if lease is None:
+        return {"state": "restoring"}
+    current = await access.inspect(
+        str(lease["id"]),
+        owner_kind="thread",
+        owner_id=thread_id,
+        kind="ssh",
+        claimant=claimant,
+    )
+    if current is None:
+        await access.close(
+            str(lease["id"]),
+            owner_kind="thread",
+            owner_id=thread_id,
+            kind="ssh",
+            claimant=claimant,
+        )
+        return {"state": "restoring"}
+    try:
+        proof = await dependencies.vm_provisioner.attest_workspace_runtime(
+            thread_id,
+            entity_type="thread",
+        )
+        if (
+            UUID(str(proof.vm_uid)) != lease["vm_uid"]
+            or UUID(str(proof.workspace_generation)) != lease["provision_generation"]
+        ):
+            raise ValueError("VM SSH binding changed")
+        binding = vm_binding_digest(proof)
+    except Exception:
+        await access.close(
+            str(lease["id"]),
+            owner_kind="thread",
+            owner_id=thread_id,
+            kind="ssh",
+            claimant=claimant,
+        )
+        return {"state": "stale_binding"}
+    return {
+        "state": "live",
+        "thread_id": thread_id,
+        "user_id": str(user["id"]),
+        "pod_ip": proof.host,
+        "pod_port": proof.port,
+        "host_key_fingerprint": proof.ssh_host_key_fingerprint,
+        "lease_id": str(lease["id"]),
+        "binding": binding,
+    }
 
 
 @router.post("/api/internal/ssh-keys/used")

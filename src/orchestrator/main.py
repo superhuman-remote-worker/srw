@@ -9086,10 +9086,13 @@ def _media_dependencies() -> media_routes.MediaDependencies:
 
 def _ide_dependencies() -> ide_routes.IdeDependencies:
     """Bind the IDE session and proxy services this application owns."""
+    from orchestrator.services.vm_ide_transport import VMIDETransport
+
     return ide_routes.IdeDependencies(
         store=postgres_db,
         ide_sessions=ide_session_service,
         ide_proxy=ide_proxy_service,
+        vm_ide_transport=VMIDETransport(vm_provisioner),
     )
 
 
@@ -9125,12 +9128,15 @@ def _workspace_access_dependencies() -> (
 
 def _thread_files_dependencies() -> thread_files_routes.ThreadFilesDependencies:
     """Bind both workspace provisioners plus B05's backend/lane resolvers."""
+    from orchestrator.services.vm_ide_transport import VMIDETransport
+
     return thread_files_routes.ThreadFilesDependencies(
         store=postgres_db,
         container_provisioner=container_provisioner,
         vm_provisioner=vm_provisioner,
         thread_workspace_backend=_thread_workspace_backend,
         require_stateless_workspace=_require_stateless_workspace,
+        vm_ide_transport=VMIDETransport(vm_provisioner),
     )
 
 
@@ -9549,6 +9555,8 @@ def _ssh_access_dependencies() -> ssh_access_routes.SshAccessDependencies:
     here would hand every request an empty cache and silently delete the
     memoization this unauthenticated endpoint depends on.
     """
+    from orchestrator.services.vm_idle_access import VMIdleAccessStore
+
     return ssh_access_routes.SshAccessDependencies(
         store=postgres_db,
         operations=ssh_access_operations.SshAccessDependencies(
@@ -9563,6 +9571,8 @@ def _ssh_access_dependencies() -> ssh_access_routes.SshAccessDependencies:
         require_internal=require_internal,
         require_personal_scope=require_personal_scope,
         user_can_access_ide_entity=user_can_access_ide_entity,
+        vm_access_store=VMIdleAccessStore(postgres_db),
+        vm_provisioner=vm_provisioner,
     )
 
 

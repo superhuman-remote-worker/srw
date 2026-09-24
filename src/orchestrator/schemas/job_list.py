@@ -38,6 +38,15 @@ class VMCreationView(BaseModel):
     resumable: bool
 
 
+class WorkspaceLifecycleView(BaseModel):
+    """Safe VM compute state, separate from the human wait or Job status."""
+
+    state: str
+    idle_expires_at: datetime | None = None
+    reason_code: str | None = None
+    next_retry_at: datetime | None = None
+
+
 class PublicJobListItem(BaseModel):
     """Current list-row projection; additional public fields remain compatible."""
 
@@ -80,6 +89,9 @@ class PublicJobListItem(BaseModel):
     )
     vm_creation: VMCreationView | None = Field(
         description="Safe VM creation progress and advisory Resume availability."
+    )
+    workspace_lifecycle: WorkspaceLifecycleView | None = Field(
+        description="Safe VM compute state; no runtime identities, coordinates or other users' leases."
     )
     audit_count: int | None = Field(
         description="Null when the optional audit service is unavailable; zero when available with no entries."

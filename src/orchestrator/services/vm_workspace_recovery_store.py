@@ -1593,6 +1593,22 @@ class VMWorkspaceRecoveryStore:
                 ) is not None
             ):
                 return CleanupPermit(allowed=False, reason="pinned_job_idle_owned")
+        if source != "vm_idle_release":
+            # Operation leases are admitted under the owner row lock.  Take
+            # that same lock before issuing a physical cleanup permit; an
+            # edit already in flight wins with a bounded hold, and a cleanup
+            # permit that won first is seen by new IDE operation admission.
+            if owner_kind == "job":
+                await conn.fetchrow("SELECT id FROM jobs WHERE id=$1 FOR UPDATE", owner_id)
+            elif owner_kind == "thread":
+                await conn.fetchrow("SELECT id FROM threads WHERE id=$1 FOR UPDATE", owner_id)
+            if await conn.fetchval(
+                "SELECT EXISTS(SELECT 1 FROM vm_idle_access_leases "
+                "WHERE owner_kind=$1 AND owner_id=$2 AND closed_at IS NULL "
+                "AND expires_at>clock_timestamp())",
+                owner_kind, owner_id,
+            ):
+                return CleanupPermit(allowed=False, reason="active_workspace_access")
         if (
             owner_kind == "job"
             and source in {"completion_workspace_teardown", "kept_disk"}

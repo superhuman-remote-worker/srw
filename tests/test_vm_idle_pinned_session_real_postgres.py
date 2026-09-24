@@ -1167,3 +1167,47 @@ async def test_two_connections_join_one_thread_wake_and_preserve_pause_clock(
             "owner_kind='thread' AND owner_id=$1 AND phase='ready'",
             thread_id,
         ) == 2
+
+
+@pytest.mark.asyncio
+async def test_pinned_thread_ide_explicit_access_and_read_only_poll(db, monkeypatch):
+    from orchestrator.routers.thread_files import (
+        ThreadFilesDependencies, get_thread_ide_status,
+        start_thread_ide_session, stop_thread_ide_session,
+    )
+
+    await db.execute("TRUNCATE vm_idle_access_leases, vm_idle_operations CASCADE")
+    thread_id, _, _ = await ready_pinned_thread(db, monkeypatch)
+    user = {"id": uuid4(), "is_approved": True}
+    thread = await db.get_thread(str(thread_id))
+    transport = SimpleNamespace(start_and_probe=AsyncMock(return_value=True),
+                                probe=AsyncMock(return_value=True))
+    deps = ThreadFilesDependencies(
+        store=db, container_provisioner=object(), vm_provisioner=object(),
+        thread_workspace_backend=lambda *_: "vm",
+        require_stateless_workspace=lambda *_: "vm",
+        require_thread_owner=AsyncMock(return_value=(user, thread)),
+        vm_ide_transport=transport,
+    )
+    response = await start_thread_ide_session(str(thread_id), SimpleNamespace(),
+                                              dependencies=deps)
+    assert response["status"] == "active"
+    lease_id = response["access_lease_id"]
+    before = await db.fetchval(
+        "SELECT expires_at FROM vm_idle_access_leases WHERE id=$1", __import__("uuid").UUID(lease_id),
+    )
+    status = await get_thread_ide_status(str(thread_id), SimpleNamespace(),
+                                         dependencies=deps)
+    assert status["code_server_url"] is None
+    assert await db.fetchval(
+        "SELECT expires_at FROM vm_idle_access_leases WHERE id=$1", __import__("uuid").UUID(lease_id),
+    ) == before
+    active = await get_thread_ide_status(str(thread_id), SimpleNamespace(),
+                                         lease_id=lease_id, dependencies=deps)
+    assert active["status"] == "active" and lease_id in active["code_server_url"]
+    await stop_thread_ide_session(str(thread_id), SimpleNamespace(), lease_id=lease_id,
+                                  dependencies=deps)
+    assert await db.fetchval(
+        "SELECT closed_at IS NOT NULL FROM vm_idle_access_leases WHERE id=$1",
+        __import__("uuid").UUID(lease_id),
+    )

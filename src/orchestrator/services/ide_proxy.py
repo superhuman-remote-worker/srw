@@ -278,14 +278,36 @@ class IdeProxyService:
 
         if backend == "vm":
             self.evict(entity_id)
-            # The VM lifecycle attestation proves the launcher Pod and guest
-            # SSH identity; it does *not* prove that code-server is listening
-            # on the launcher Pod's port 38080. Direct launcher routing is a
-            # category error. Keep VM IDE unavailable until the existing
-            # host-key-pinned SSH direct-tcpip contract is integrated here.
-            raise IdeProxyUnavailable(
-                "vm_ide_transport_unavailable",
-                "VM IDE transport requires an exact guest tunnel",
+            provisioner = self._vm_provisioner
+            if provisioner is None or not callable(
+                getattr(provisioner, "attest_workspace_runtime", None)
+            ):
+                raise IdeProxyUnavailable(
+                    "vm_ide_transport_unavailable", "VM IDE authority is unavailable",
+                )
+            try:
+                proof = await provisioner.attest_workspace_runtime(
+                    entity_id, entity_type=owner_kind,
+                )
+            except Exception as exc:
+                raise IdeProxyUnavailable(
+                    "vm_ide_runtime_unproven", "VM IDE runtime is not ready",
+                ) from exc
+            if not all(getattr(proof, name, None) for name in (
+                "vm_uid", "vmi_uid", "launcher_pod_uid", "rootdisk_pvc_uid",
+                "ssh_host_key_fingerprint", "host", "port",
+            )):
+                raise IdeProxyUnavailable(
+                    "vm_ide_transport_unavailable", "VM IDE runtime is not ready",
+                )
+            return IdeProxyTarget(
+                entity_id=entity_id, owner_kind=owner_kind, backend="vm",
+                scope="vm", host=proof.host, port=proof.port,
+                identity=(
+                    proof.workspace_generation, proof.vm_uid, proof.vmi_uid,
+                    proof.launcher_pod_uid, proof.rootdisk_pvc_uid,
+                    proof.ssh_host_key_fingerprint,
+                ),
             )
 
         if coordinate is None:
@@ -456,7 +478,9 @@ class IdeProxyService:
                 "waiting",
                 "waiting_for_reply",
             }
-        return status in {"created", "active", "idle", "awaiting_user"}
+        return status in {"created", "active", "idle", "awaiting_user"} or (
+            status == "suspended" and row.get("execution_lane") == "pinned"
+        )
 
     @staticmethod
     def _owner_lifecycle_projection(owner_kind: str, row: dict) -> tuple[str, ...]:

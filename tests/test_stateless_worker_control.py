@@ -344,6 +344,8 @@ async def test_leased_cancel_publishes_status_without_pruning_checkpoint():
         normalized = " ".join(sql.split())
         if normalized.startswith("SELECT state FROM run_queue"):
             return {"state": "leased"}
+        if normalized.startswith("SELECT id FROM jobs"):
+            return {"id": UUID(JOB_ID)}
         if normalized.startswith("UPDATE run_queue"):
             return None
         if normalized.startswith("SELECT recovery_id FROM vm_workspace_recovery_jobs"):
@@ -353,6 +355,7 @@ async def test_leased_cancel_publishes_status_without_pruning_checkpoint():
         raise AssertionError(normalized)
 
     conn.fetchrow = AsyncMock(side_effect=fetchrow)
+    conn.fetchval = AsyncMock(return_value=False)
     db = _db_with_conn(conn)
 
     assert await db.cancel_stateless_job(JOB_ID) == (True, False)
@@ -1559,6 +1562,8 @@ async def test_flag_on_completed_pinned_cancel_stays_completed_without_cleanup(
 async def test_pinned_cancel_linearizer_has_terminal_status_parity_guard():
     conn = AsyncMock()
     conn.transaction = MagicMock(return_value=_AsyncCM())
+    conn.fetchrow = AsyncMock(return_value={"id": UUID(JOB_ID)})
+    conn.fetchval = AsyncMock(return_value=False)
     conn.execute.return_value = "UPDATE 0"
     db = _db_with_conn(conn)
 
@@ -1581,6 +1586,10 @@ async def test_cancel_sql_names_control_marker_only_when_completion_flag_on():
         normalized = " ".join(sql.split())
         if normalized.startswith("SELECT state FROM run_queue"):
             return {"state": "queued"}
+        if normalized.startswith("SELECT unit_id FROM run_queue"):
+            return {"unit_id": UUID(JOB_ID)}
+        if normalized.startswith("SELECT id FROM jobs"):
+            return {"id": UUID(JOB_ID)}
         if normalized.startswith("UPDATE run_queue"):
             return {"state": "done"}
         if normalized.startswith("UPDATE jobs"):
@@ -1588,6 +1597,7 @@ async def test_cancel_sql_names_control_marker_only_when_completion_flag_on():
         raise AssertionError(normalized)
 
     conn.fetchrow = AsyncMock(side_effect=fetchrow)
+    conn.fetchval = AsyncMock(return_value=False)
     db = _db_with_conn(conn)
 
     assert not await db.linearize_pinned_cancel(

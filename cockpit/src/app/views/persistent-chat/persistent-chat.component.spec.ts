@@ -602,6 +602,10 @@ describe('pickCodeServerUrlToOpen', () => {
 });
 
 describe('sshWorkspaceReachable', () => {
+    it('offers SSH wake for a suspended VM and hides unsupported VM access', () => {
+        expect(sshWorkspaceReachable({status: 'ready', code_server_url: null}, {state: 'suspended'})).toBe(true);
+        expect(sshWorkspaceReachable({status: 'active', code_server_url: 'https://api/x/proxy/'}, {state: 'unsupported'})).toBe(false);
+    });
     // The SSH button used to render off capabilities.sshGateway() alone, so it
     // appeared on sessions whose workspace SSH cannot reach (a virtual-tier
     // session answers `srw: this session has no workspace yet`). The gate is

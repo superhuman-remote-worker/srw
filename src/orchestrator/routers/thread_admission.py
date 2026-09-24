@@ -21,6 +21,7 @@ from fastapi import APIRouter, Request
 
 from orchestrator.schemas.thread_admission import ThreadCreateRequest
 from orchestrator.services import thread_admission
+from orchestrator.services.vm_idle_public import read_vm_idle_states
 
 # No `tags=` and no prefix: the two declarations this replaces carried neither,
 # and either would change the published OpenAPI operation for a route whose
@@ -87,13 +88,21 @@ async def list_threads(
     """List persistent threads for the authenticated user."""
     dependencies = get_thread_admission_dependencies(request)
     user = await dependencies.require_approved_user(request, dependencies.store)
-    return await thread_admission.list_threads(
+    result = await thread_admission.list_threads(
         request,
         project_id,
         status,
         dependencies=dependencies,
         user=user,
     )
+    states = await read_vm_idle_states(
+        dependencies.store,
+        owner_kind="thread",
+        owner_ids=[str(thread["id"]) for thread in result["threads"]],
+    )
+    for thread in result["threads"]:
+        thread["workspace_lifecycle"] = states.get(str(thread["id"]))
+    return result
 
 
 __all__ = [

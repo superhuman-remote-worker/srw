@@ -813,6 +813,30 @@
       "nextCheck": "Nächste Prüfung",
       "cleanupPending": "Bereinigung des Arbeitsbereichs steht weiterhin aus"
     },
+    "lifecycle": {
+      "state": {
+        "warm": "Arbeitsbereich ist noch aktiv",
+        "releasing": "Arbeitsbereich wird pausiert…",
+        "release_held": "Pausieren des Arbeitsbereichs benötigt Aufmerksamkeit",
+        "suspended": "Arbeitsbereich ruht",
+        "waking": "Arbeitsbereich wird gestartet…",
+        "wake_held": "Start des Arbeitsbereichs benötigt Aufmerksamkeit",
+        "ready": "Arbeitsbereich bereit",
+        "unsupported": "Zugriff auf Arbeitsbereich nicht verfügbar"
+      },
+      "reason": {
+        "identity": "Die Identität des Arbeitsbereichs konnte nicht bestätigt werden.",
+        "capacity": "Warten auf freie Kapazität für den Arbeitsbereich.",
+        "access": "Schließen Sie aktive IDE- oder SSH-Verbindungen und versuchen Sie es erneut.",
+        "attention": "Der Arbeitsbereich wartet auf einen sicheren erneuten Versuch."
+      },
+      "idleAt": "Kann pausieren um",
+      "nextRetry": "Nächster Versuch",
+      "wakingTab": "Ihr Arbeitsbereich wird gestartet…",
+      "popupBlocked": "Erlauben Sie Pop-ups für diese Seite und öffnen Sie die IDE erneut.",
+      "wakeTimedOut": "Der Start des Arbeitsbereichs dauert länger. Öffnen Sie die IDE erneut, um den Fortschritt zu prüfen.",
+      "ideUnavailable": "Die IDE des Arbeitsbereichs ist nicht verfügbar. Versuchen Sie es in Kürze erneut."
+    },
     "delegationChildren": "{{count}} Unteraufträge",
     "promote": {
       "namePlaceholder": "Projektname (erforderlich)",

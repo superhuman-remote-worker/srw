@@ -25,6 +25,7 @@ import {JobSummary} from '../../core/models/audit.model';
 import {AppBadgeComponent, BadgeTone} from '../../ui/badge';
 import {AppSpinnerComponent} from '../../ui/spinner';
 import {isTerminalJobStatus, jobStatusTone} from '../../core/util/job-status';
+import {workspaceLifecycleReasonKey} from '../../core/util/vm-lifecycle';
 
 /** Own spend, or the whole subtree beneath the job. */
 export type UsageScope = 'job' | 'subtree';
@@ -336,6 +337,20 @@ export function heldForReviewReason(
       } @else if (job().vm_creation; as creation) {
         <section class="recovery-detail vm-creation" [class.attention]="creation.state === 'attention'">
           <strong>{{ job().error_message || creation.message }}</strong>
+        </section>
+      }
+      @if (job().workspace_lifecycle; as lifecycle) {
+        <section class="recovery-detail" role="status">
+          <strong>{{ ('jobs.lifecycle.state.' + lifecycle.state) | transloco }}</strong>
+          @if (lifecycle.idle_expires_at) {
+            <span>{{ 'jobs.lifecycle.idleAt' | transloco }}: {{ lifecycle.idle_expires_at | date:'mediumTime' }}</span>
+          }
+          @if (lifecycle.reason_code) {
+            <span>{{ lifecycleReasonKey(lifecycle.reason_code) | transloco }}</span>
+          }
+          @if (lifecycle.next_retry_at) {
+            <span>{{ 'jobs.lifecycle.nextRetry' | transloco }}: {{ lifecycle.next_retry_at | date:'mediumTime' }}</span>
+          }
         </section>
       }
       @if (heldForReviewReason(job()); as held) {
@@ -891,6 +906,7 @@ export function heldForReviewReason(
   ],
 })
 export class JobDetailPanelComponent {
+  readonly lifecycleReasonKey = workspaceLifecycleReasonKey;
   readonly job = input.required<JobSummary>();
   /** Null until the lazy load for this job has been kicked off. */
   readonly data = input<JobDetailState | null>(null);

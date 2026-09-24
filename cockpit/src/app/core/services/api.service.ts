@@ -105,6 +105,7 @@ import type {
   SessionQueueState,
   SessionQueueRetryOutcome,
   RunQueueUnparkResult,
+  WorkspaceLifecycleView,
 } from '../models/api.model';
 import {
   ThreadUploadEvent,
@@ -177,8 +178,10 @@ export interface JobVersionInfo {
  * IDE session status from the orchestrator.
  */
 export interface IdeSessionStatus {
-  status: 'unavailable' | 'available' | 'restoring' | 'active' | 'idle' | 'expired' | 'failed';
+  status: 'unavailable' | 'available' | 'ready' | 'restoring' | 'active' | 'idle' | 'expired' | 'failed';
   code_server_url?: string | null;
+  access_lease_id?: string;
+  workspace_lifecycle?: WorkspaceLifecycleView | null;
     gitea_url?: string | null;
   snapshot_type?: string;
   estimated_seconds?: number;
@@ -1901,9 +1904,11 @@ export class ApiService {
   /**
    * Get IDE session status for a job.
    */
-  getIdeSession(jobId: string): Observable<IdeSessionStatus | null> {
+  getIdeSession(jobId: string, leaseId?: string): Observable<IdeSessionStatus | null> {
     return this.http
-      .get<IdeSessionStatus>(`${this.baseUrl}/jobs/${jobId}/ide`)
+      .get<IdeSessionStatus>(`${this.baseUrl}/jobs/${jobId}/ide`, {
+        params: leaseId ? {lease_id: leaseId} : {},
+      })
       .pipe(
         catchError((error) => {
           console.error(`Failed to get IDE session for ${jobId}:`, error);
@@ -1945,9 +1950,11 @@ export class ApiService {
   /**
    * Stop an active IDE session.
    */
-  stopIdeSession(jobId: string): Observable<{ status: string } | null> {
+  stopIdeSession(jobId: string, leaseId?: string): Observable<{ status: string } | null> {
     return this.http
-      .delete<{ status: string }>(`${this.baseUrl}/jobs/${jobId}/ide`)
+      .delete<{ status: string }>(`${this.baseUrl}/jobs/${jobId}/ide`, {
+        params: leaseId ? {lease_id: leaseId} : {},
+      })
       .pipe(
         tap(() => this.toast.success(this.t('toasts.ide.stopped'))),
         catchError((error) => {
@@ -1956,6 +1963,13 @@ export class ApiService {
           return of(null);
         }),
       );
+  }
+
+  /** Quiet cleanup for a VM access attempt abandoned before the IDE opened. */
+  closeVmIdeLease(jobId: string, leaseId: string): Observable<void> {
+    return this.http.delete<void>(`${this.baseUrl}/jobs/${jobId}/ide`, {
+      params: {lease_id: leaseId},
+    }).pipe(catchError(() => of(void 0)));
   }
 
     /**
@@ -2068,15 +2082,31 @@ export class ApiService {
     /**
      * Get IDE status for a persistent thread's workspace.
      */
-    getThreadIdeStatus(threadId: string): Observable<IdeSessionStatus | null> {
+    getThreadIdeStatus(threadId: string, leaseId?: string): Observable<IdeSessionStatus | null> {
         return this.http
-            .get<IdeSessionStatus>(`${this.baseUrl}/persistent/threads/${threadId}/ide`)
+            .get<IdeSessionStatus>(`${this.baseUrl}/persistent/threads/${threadId}/ide`, {
+                params: leaseId ? {lease_id: leaseId} : {},
+            })
             .pipe(
                 catchError((error) => {
                     console.error(`Failed to get IDE status for thread ${threadId}:`, error);
                     return of(null);
                 }),
             );
+    }
+
+    /** A user gesture admits one pinned VM IDE tab and may wake its workspace. */
+    startThreadIdeSession(threadId: string): Observable<IdeSessionStatus | null> {
+        return this.http.post<IdeSessionStatus>(
+            `${this.baseUrl}/persistent/threads/${threadId}/ide`, {},
+        ).pipe(catchError(() => of(null)));
+    }
+
+    closeThreadIdeLease(threadId: string, leaseId: string): Observable<void> {
+        return this.http.delete<void>(
+            `${this.baseUrl}/persistent/threads/${threadId}/ide`,
+            {params: {lease_id: leaseId}},
+        ).pipe(catchError(() => of(void 0)));
     }
 
   /**
