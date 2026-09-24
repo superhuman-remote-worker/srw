@@ -5,6 +5,39 @@ Administrators can read VM resource accounting in the `vm` block of
 their existing meaning. This endpoint does not reserve resources or enable
 resource admission.
 
+## Configuration and rollout boundary
+
+The chart currently permits resource observation only. It rejects
+`vm.resourceAdmission.shadowEnabled: true` and
+`vm.resourceAdmission.enforcementEnabled: true` while runtime qualification is
+unfinished. Both default to `false`, as does `observerEnabled`. The presence of
+capacity tables or reservation records does not enable enforcement.
+
+Configure observation under `vm.resourceAdmission` in your Helm values:
+
+| Setting | Purpose |
+| --- | --- |
+| `observerEnabled` | Publish authenticated inventory; defaults to `false`. |
+| `stableClusterId` | Stable identity for the cluster's policy and inventory. |
+| `clusterWidePodReadAcknowledged` | Explicitly permit the observer's cluster-wide Pod inventory. |
+| `inventory` | Explicit freshness, timeout, item/byte/history bounds and placement label keys. |
+| `launcherProfile` | Expected installed KubeVirt launcher shape; requires the exact KubeVirt namespace/name and architecture label. |
+| `hostCost`, `nodeHeadroom`, `installationBudget`, `ownerBudget`, `fairness` | Operator-supplied admission policy inputs; left unset by default. They do not bypass the chart's enforcement gate. |
+
+Observation requires `vm.mode: same-cluster`, a configured lifecycle HMAC
+Secret, and all required inventory settings. See the comments in
+[the chart values](../helm/values.yaml) for the complete fields. Set resource
+budgets from the actual launcher requests and node overhead; guest CPU and
+memory alone do not describe host demand.
+
+The separate object-count backstop is `vmController.maxConcurrentVms`, passed
+to the controller as `VM_MAX_CONCURRENT`. Its chart default is `4`; a deployment
+may override it. It is not a resource-based safe-concurrency recommendation.
+The admin endpoint reports its maximum as unknown until it has authoritative
+controller configuration, even when this Helm value is configured.
+
+## Reading capacity
+
 In Cockpit, open **Admin → Capacity → VM capacity**. Each installed cluster has
 its own policy mode, inventory freshness, count backstop, waiting and teardown
 diagnostics, durable holds, and six-dimensional resource tables. Expand **Nodes**
