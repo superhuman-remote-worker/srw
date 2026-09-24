@@ -570,6 +570,7 @@
     "confirmDelete": "Diese Sitzung dauerhaft löschen?",
     "confirmForceDelete": "Der Agent arbeitet in dieser Sitzung noch an einem Zug. Trotzdem löschen? Der laufende Zug geht verloren.",
     "confirmEndMidTurn": "Der Agent arbeitet noch an einem Zug. Sitzung trotzdem beenden? Der laufende Zug und alle eingereihten Eingaben gehen verloren.",
+    "confirmEndStatelessBusy": "Der Agent schließt seinen aktuellen Zug noch ab. Sitzung trotzdem beenden? Der unfertige Zug wird abgebrochen.",
     "turnsOne": "Zug",
     "turnsMany": "Züge",
     "filter": {
@@ -3763,6 +3764,7 @@
       "resumeFailed": "Sitzung konnte nicht fortgesetzt werden.",
       "stillEnding": "Diese Sitzung wird noch beendet. Lass diese Seite geöffnet und versuche Fortsetzen danach erneut.",
       "endFailed": "Sitzung konnte nicht beendet werden.",
+      "endRetryable": "Das Beenden hat begonnen, aber das Workspace-Cleanup ist noch nicht abgeschlossen. Drücke erneut auf „Trennen“, um es noch einmal zu versuchen.",
       "deleteFailed": "Sitzung konnte nicht gelöscht werden.",
       "deleteRetryable": "Diese Sitzung wird noch heruntergefahren und konnte daher noch nicht gelöscht werden. Nutze gleich „Löschen erneut versuchen“ auf ihrer Karte.",
       "createFailed": "Sitzung konnte nicht erstellt werden.",

@@ -570,6 +570,7 @@
     "confirmDelete": "Delete this session permanently?",
     "confirmForceDelete": "The agent is still working on a turn in this session. Delete anyway? The in-flight turn will be lost.",
     "confirmEndMidTurn": "The agent is still working on a turn. End the session anyway? The in-flight turn and any queued input will be lost.",
+    "confirmEndStatelessBusy": "The agent is still finishing its current turn. End the session anyway? The unfinished turn will be stopped.",
     "turnsOne": "turn",
     "turnsMany": "turns",
     "filter": {
@@ -3763,6 +3764,7 @@
       "resumeFailed": "Couldn't resume the session.",
       "stillEnding": "This session is still finishing. Keep this page open, then try Resume again.",
       "endFailed": "Couldn't end the session.",
+      "endRetryable": "Ending has started, but workspace cleanup has not finished yet. Press Disconnect again to retry.",
       "deleteFailed": "Couldn't delete the session.",
       "deleteRetryable": "This session is still shutting down, so it couldn't be deleted yet. Use Retry delete on its card in a moment.",
       "createFailed": "Couldn't create the session.",

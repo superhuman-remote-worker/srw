@@ -28,7 +28,7 @@ import {CitationRefDirective} from '../../core/markdown/citation-ref.directive';
 import {WorkspaceFileLinkDirective} from '../../core/markdown/workspace-file-link.directive';
 import {KatexDirective} from '../../core/markdown/katex.directive';
 import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
-import {ChatAttachment, PermissionRequest, PersistentChatService, RewindPrefill, RunningToolInfo, ToolCallInfo,} from '../../core/services/persistent-chat.service';
+import {ChatAttachment, EndSessionOutcome, PermissionRequest, PersistentChatService, RewindPrefill, RunningToolInfo, ToolCallInfo,} from '../../core/services/persistent-chat.service';
 import {uploadSummary} from '../../core/services/upload-stage';
 import {
     AssistantTurn,
@@ -1106,6 +1106,17 @@ export function clearDraft(threadId: string | null): void {
                 </button>
               }
             }
+          }
+          @if (!chat.isConnected() && chat.endRetryAvailable()) {
+            <!-- A stateless End fenced by a retryable 503 stays pending until
+                 End is pressed again (nothing on the server finishes it), so
+                 the header keeps End while the session shows as ending. -->
+            <app-button variant="ghost" size="sm"
+                        [loading]="isDisconnecting()"
+                        [ariaLabel]="(isDisconnecting() ? 'chat.header.disconnecting' : 'chat.header.disconnect') | transloco"
+                        (clicked)="disconnectAndLeave()">
+              {{ 'chat.header.disconnect' | transloco }}
+            </app-button>
           }
         </div>
       </div>
@@ -4173,17 +4184,27 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     async disconnectAndLeave(): Promise<void> {
         if (this.isDisconnecting()) return;
         this.isDisconnecting.set(true);
+        let outcome: EndSessionOutcome = 'done';
         try {
-            await this.chat.endSession();
+            outcome = await this.chat.endSession();
         } catch (e: any) {
             this.toast.danger(this.errors.translate(e, 'errors.sessions.endFailed'));
-        } finally {
-            // Leaving destroys this component, so clearing the flag is normally
-            // moot — but a guard can refuse the navigation, and then the header
-            // has to come back rather than spin forever.
-            const left = await this.router.navigate(['/sessions']);
-            if (!left) this.isDisconnecting.set(false);
         }
+        if (outcome !== 'done') {
+            // The session is still here: the user declined to stop a busy
+            // stateless turn (`kept`), or cleanup has not finished and End is
+            // the retry (`retryable`). Stay, with End usable again.
+            if (outcome === 'retryable') {
+                this.toast.warning(this.transloco.translate('errors.sessions.endRetryable'));
+            }
+            this.isDisconnecting.set(false);
+            return;
+        }
+        // Leaving destroys this component, so clearing the flag is normally
+        // moot — but a guard can refuse the navigation, and then the header
+        // has to come back rather than spin forever.
+        const left = await this.router.navigate(['/sessions']);
+        if (!left) this.isDisconnecting.set(false);
     }
 
     async onRenameSession(threadId: string, title: string): Promise<void> {
