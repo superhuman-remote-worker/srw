@@ -40,6 +40,7 @@ from orchestrator.services import (
     session_tool_policy as toolpolicy,
     session_tool_view,
     session_workspace_policy as wspolicy,
+    thread_config_update as config_update,
     virtual_workspace,
     vm_workspace_policy as vmpolicy,
     workspace_tier_policy as tier,
@@ -453,7 +454,7 @@ class TestSessionClassPolicy:
         assert classes.session_class_pinned_refusal(config) == expected
         assert classes.session_class_pinned_refusal(
             config
-        ) == main._stateless_session_class_refusal(config)
+        ) == config_update.session_class_pinned_refusal(config)
 
     def test_conference_is_checked_before_enabled(self):
         both = {"officer": {"enabled": True, "conference": True}}
@@ -1476,7 +1477,7 @@ class TestSessionCreateValidators:
         assert overrides.validated_session_officer_override({}) is None
         assert overrides.validated_session_officer_override(None) is None
 
-    def test_officer_override_matches_main(self):
+    def test_officer_override_matches_the_config_commit_core(self):
         for co in (
             {"officer": {"enabled": True, "sleep_min_minutes": 5}},
             {"officer": {"conference": True}},
@@ -1484,7 +1485,7 @@ class TestSessionCreateValidators:
         ):
             assert overrides.validated_session_officer_override(
                 co
-            ) == main._validated_session_officer_override(co)
+            ) == config_update.validated_session_officer_override(co)
 
     def test_post_owned_fragment_materializes_safe_absent_values(self):
         seen: list = []

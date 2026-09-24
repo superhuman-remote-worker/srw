@@ -162,17 +162,30 @@ def _config_deps(**over: Any) -> tcu.ThreadConfigUpdateDependencies:
             in_cluster=True,
             create_pinned_thread_workspace=AsyncMock(return_value=True),
         ),
-        apply_thread_config_update_locked=AsyncMock(
-            return_value=({"llm": {"model": "m"}}, ["d1"])
-        ),
         enforce_workspace_upgrade_grants=AsyncMock(),
         require_internal=AsyncMock(),
         require_thread_owner=AsyncMock(return_value=(USER, _thread())),
+        thread_project_ids=AsyncMock(return_value=[]),
+        authorize_thread_datasource_selection=AsyncMock(return_value=([], {})),
+        build_datasource_tool_override=MagicMock(return_value={}),
+        datasource_selection_provenance=AsyncMock(return_value={}),
+        enforce_session_create_grants=AsyncMock(),
+        inject_model_credentials=AsyncMock(),
+        log_security_event=AsyncMock(),
     )
     fields.update(over)
     return tcu.ThreadConfigUpdateDependencies(
         recovery_store=SimpleNamespace(), **fields
     )
+
+
+@pytest.fixture(autouse=True)
+def locked_commit_core(monkeypatch) -> AsyncMock:
+    """The commit core is characterized in test_b12_thread_config_update_policy;
+    here it is stubbed at its owner so these tests pin only the wire."""
+    core = AsyncMock(return_value=({"llm": {"model": "m"}}, ["d1"]))
+    monkeypatch.setattr(tcu, "apply_thread_config_update_locked", core)
+    return core
 
 
 def _client(admission=None, config=None) -> TestClient:

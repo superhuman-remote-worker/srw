@@ -3630,9 +3630,10 @@ async def test_docker_release_revokes_canvas_before_static_host_reset(
 
 def test_canvas_session_create_override_is_closed() -> None:
     import orchestrator.main
+    from orchestrator.services import session_tool_policy
 
     with pytest.raises(orchestrator.main.HTTPException) as exc:
-        orchestrator.main._validated_tool_overrides(
+        session_tool_policy.validated_tool_overrides(
             {"tools": {"canvas": ["run_command"]}}
         )
     assert exc.value.status_code == 400
@@ -3640,7 +3641,7 @@ def test_canvas_session_create_override_is_closed() -> None:
     # ``shell`` is no longer discarded — every category the request names is
     # honoured now (Defect 2). The canvas group is still closed against a
     # foreign name, which is the part this test exists for.
-    accepted = orchestrator.main._validated_tool_overrides(
+    accepted = session_tool_policy.validated_tool_overrides(
         {"tools": {"canvas": [], "shell": ["shell_execute"]}}
     )
     assert accepted == {"canvas": [], "shell": ["shell_execute"]}

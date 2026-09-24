@@ -424,9 +424,12 @@ class TestTheGateIsNotThePDP:
 class TestOrchestratorWrapper:
     def test_a_rejection_becomes_a_400(self):
         import orchestrator.main as orch_main
+        from orchestrator.services import session_tool_policy
 
         with pytest.raises(orch_main.HTTPException) as exc:
-            orch_main._validated_tool_overrides({"tools": {"canvas": ["run_command"]}})
+            session_tool_policy.validated_tool_overrides(
+                {"tools": {"canvas": ["run_command"]}}
+            )
         assert exc.value.status_code == 400
         assert "run_command" in exc.value.detail
 

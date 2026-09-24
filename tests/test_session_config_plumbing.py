@@ -34,6 +34,7 @@ import orchestrator.main as orch_main
 # R1.B05 lane P: the tier constants keep their owner; main no longer
 # re-exports them.
 from orchestrator.services import session_workspace_policy
+from orchestrator.services import session_tool_policy
 from orchestrator.services import thread_workspace_delivery
 from orchestrator.routers import (
     agent_thread_workspace as agent_thread_workspace_routes,
@@ -534,7 +535,7 @@ class TestSessionWorkspaceBackendDefaultChain:
         assert tools == []
 
     def test_session_tool_group_overrides_pass_through(self):
-        tools = orch_main._validated_tool_overrides(
+        tools = session_tool_policy.validated_tool_overrides(
             {"tools": {"orchestrator": [], "agent_catalog": [], "workflows": []}}
         )
         assert tools == {"orchestrator": [], "agent_catalog": [], "workflows": []}
@@ -558,7 +559,7 @@ class TestSessionWorkspaceBackendDefaultChain:
 
     def test_invalid_agent_catalog_tools_override_rejected(self):
         with pytest.raises(orch_main.HTTPException) as exc:
-            orch_main._validated_tool_overrides(
+            session_tool_policy.validated_tool_overrides(
                 {"tools": {"agent_catalog": "disabled"}}
             )
         assert exc.value.status_code == 400
@@ -566,7 +567,9 @@ class TestSessionWorkspaceBackendDefaultChain:
 
     def test_invalid_workflows_tools_override_rejected(self):
         with pytest.raises(orch_main.HTTPException) as exc:
-            orch_main._validated_tool_overrides({"tools": {"workflows": "disabled"}})
+            session_tool_policy.validated_tool_overrides(
+                {"tools": {"workflows": "disabled"}}
+            )
         assert exc.value.status_code == 400
         assert "workflows" in exc.value.detail
 
@@ -581,13 +584,13 @@ class TestSessionWorkspaceBackendDefaultChain:
     )
     def test_cross_category_session_tool_override_rejected(self, group, injected):
         with pytest.raises(orch_main.HTTPException) as exc:
-            orch_main._validated_tool_overrides({"tools": {group: [injected]}})
+            session_tool_policy.validated_tool_overrides({"tools": {group: [injected]}})
         assert exc.value.status_code == 400
         assert group in exc.value.detail
         assert injected in exc.value.detail
 
     def test_known_session_tool_override_names_are_accepted(self):
-        assert orch_main._validated_tool_overrides(
+        assert session_tool_policy.validated_tool_overrides(
             {
                 "tools": {
                     "orchestrator": ["get_session_context"],

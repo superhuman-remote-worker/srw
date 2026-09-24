@@ -743,6 +743,7 @@ async def test_session_update_rolls_back_settings_when_revision_capture_fails(
     monkeypatch,
 ):
     import orchestrator.main as main
+    from orchestrator.services import thread_config_update
 
     thread = {"id": WORK, "metadata": {}}
 
@@ -774,7 +775,9 @@ async def test_session_update_rolls_back_settings_when_revision_capture_fails(
         side_effect=HTTPException(409, "capture failed")
     )
     monkeypatch.setattr(main, "postgres_db", db)
-    monkeypatch.setattr(main, "_apply_thread_config_update_locked", change_settings)
+    monkeypatch.setattr(
+        thread_config_update, "apply_thread_config_update_locked", change_settings
+    )
     with pytest.raises(HTTPException, match="capture failed"):
         await control_seams.apply_thread_config_update(
             WORK, thread, {}, [WORK], request=None, actor=None

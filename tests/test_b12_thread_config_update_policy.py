@@ -1,19 +1,20 @@
 """R1.B12 lane A — characterization of the live thread-config commit core.
 
-``_apply_thread_config_update_locked`` is the validate → authorize → enrich →
+``apply_thread_config_update_locked`` is the validate → authorize → enrich →
 persist → audit core shared by the internal agent PATCH and the owner-facing
 PATCH. It runs inside ``thread_configuration_transaction`` after the
 ``SELECT … FOR UPDATE`` read and the managed-runtime generation fence.
 
-This suite pins what the core does *today* — status codes and detail
-payloads of every refusal, the exact collaborator calls and their order, what
-is persisted (redacted) versus returned (enriched), and that a refusal
-persists and audits nothing — so the core can move to its service unchanged.
+This suite pinned what the core did while it still lived in
+``orchestrator.main`` — status codes and detail payloads of every refusal,
+the exact collaborator calls and their order, what is persisted (redacted)
+versus returned (enriched), and that a refusal persists and audits nothing —
+and runs unchanged against the moved function in
+``services/thread_config_update``.
 
 Only the ``apply_locked`` fixture knows where the core lives and how its
-collaborators reach it. Every test drives it through that fixture, so the
-suite runs unchanged against the moved function once that one fixture is
-switched. The pure policy helpers the core uses (tool/officer/delegation
+collaborators reach it; it was the one fixture switched by the move. The
+pure policy helpers the core uses (tool/officer/delegation
 validators, the strict protected marker, the stateless workspace gate,
 redaction, the change summary) run for real; everything with an effect is a
 fake that records into one ordered ledger.
@@ -22,6 +23,7 @@ fake that records into one ordered ledger.
 from __future__ import annotations
 
 import contextlib
+import functools
 import json
 import uuid
 from dataclasses import dataclass
@@ -30,7 +32,6 @@ from typing import Any, Awaitable, Callable
 import pytest
 from fastapi import HTTPException
 
-import orchestrator.main as main
 from orchestrator.database.postgres import DatasourcePolicyConflictError
 from orchestrator.services import thread_config_update as tcu
 from shared.credential_connectors import CredentialConnectorAttachedError
@@ -266,51 +267,35 @@ class BoundCore:
 
 
 @pytest.fixture
-def apply_locked(monkeypatch) -> Callable[[Fakes], BoundCore]:
+def apply_locked() -> Callable[[Fakes], BoundCore]:
     """Bind ``fakes`` to the commit core, wherever it lives.
 
-    Base: the core is ``main._apply_thread_config_update_locked`` and reads its
-    collaborators from the application module's namespace at call time, so
-    the fakes are installed there.
+    R1.B12: the core is ``thread_config_update.apply_thread_config_update_locked``
+    and every effectful collaborator arrives through
+    ``ThreadConfigUpdateDependencies``, so the fakes are the dependencies.
     """
 
     def bind(fakes: Fakes) -> BoundCore:
-        monkeypatch.setattr(main, "postgres_db", fakes.store)
-        monkeypatch.setattr(main, "_thread_project_ids", fakes.thread_project_ids)
-        monkeypatch.setattr(
-            main,
-            "_authorize_thread_datasource_selection",
-            fakes.authorize_thread_datasource_selection,
-        )
-        monkeypatch.setattr(
-            main,
-            "_build_datasource_tool_override",
-            fakes.build_datasource_tool_override,
-        )
-        monkeypatch.setattr(
-            main,
-            "_datasource_selection_provenance",
-            fakes.datasource_selection_provenance,
-        )
-        monkeypatch.setattr(
-            main,
-            "_enforce_session_create_grants",
-            fakes.enforce_session_create_grants,
-        )
-        monkeypatch.setattr(
-            main, "_inject_model_credentials", fakes.inject_model_credentials
-        )
-        monkeypatch.setattr(main, "log_security_event", fakes.log_security_event)
-        core = main._apply_thread_config_update_locked
         dependencies = tcu.ThreadConfigUpdateDependencies(
             store=fakes.store,
             vm_provisioner=None,
             container_provisioner=None,
             recovery_store=None,
-            apply_thread_config_update_locked=core,
             enforce_workspace_upgrade_grants=_never,
             require_internal=_never,
             require_thread_owner=_never,
+            thread_project_ids=fakes.thread_project_ids,
+            authorize_thread_datasource_selection=(
+                fakes.authorize_thread_datasource_selection
+            ),
+            build_datasource_tool_override=fakes.build_datasource_tool_override,
+            datasource_selection_provenance=fakes.datasource_selection_provenance,
+            enforce_session_create_grants=fakes.enforce_session_create_grants,
+            inject_model_credentials=fakes.inject_model_credentials,
+            log_security_event=fakes.log_security_event,
+        )
+        core = functools.partial(
+            tcu.apply_thread_config_update_locked, dependencies=dependencies
         )
         return BoundCore(core, dependencies)
 

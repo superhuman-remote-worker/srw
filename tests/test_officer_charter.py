@@ -579,9 +579,7 @@ class TestConferenceConfig:
         assert cfg.conference is False
 
     def test_sanitizer_admits_conference(self):
-        import orchestrator.main
-
-        cleaned = orchestrator.main._validated_session_officer_override(
+        cleaned = session_create_overrides.validated_session_officer_override(
             {"officer": {"conference": True}}
         )
         assert cleaned == {"conference": True}
@@ -593,20 +591,16 @@ class TestConferenceConfig:
     def test_generic_sanitizer_rejects_post_owned_authority(self, field, value):
         from fastapi import HTTPException
 
-        import orchestrator.main
-
         with pytest.raises(HTTPException, match="Unknown officer override"):
-            orchestrator.main._validated_session_officer_override(
+            session_create_overrides.validated_session_officer_override(
                 {"officer": {field: value}}
             )
 
     def test_generic_sanitizer_rejects_slot_spend_authority(self):
         from fastapi import HTTPException
 
-        import orchestrator.main
-
         with pytest.raises(HTTPException, match="owned by the Officer Post"):
-            orchestrator.main._validated_session_officer_override(
+            session_create_overrides.validated_session_officer_override(
                 {
                     "officer": {
                         "slots": {"line": {"count": 1, "spend_ceiling_daily": 4.5}}
@@ -637,10 +631,8 @@ class TestConferenceConfig:
     def test_sanitizer_rejects_non_boolean_auto_pull(self, value):
         from fastapi import HTTPException
 
-        import orchestrator.main
-
         with pytest.raises(HTTPException):
-            orchestrator.main._validated_session_officer_override(
+            session_create_overrides.validated_session_officer_override(
                 {"officer": {"auto_pull": value}}
             )
 
@@ -648,19 +640,15 @@ class TestConferenceConfig:
     def test_sanitizer_rejects_invalid_century_ceiling(self, value):
         from fastapi import HTTPException
 
-        import orchestrator.main
-
         with pytest.raises(HTTPException):
-            orchestrator.main._validated_session_officer_override(
+            session_create_overrides.validated_session_officer_override(
                 {"officer": {"worker_spend_ceiling_daily": value}}
             )
 
     def test_sanitizer_still_rejects_unknown_keys(self):
         from fastapi import HTTPException
 
-        import orchestrator.main
-
         with pytest.raises(HTTPException):
-            orchestrator.main._validated_session_officer_override(
+            session_create_overrides.validated_session_officer_override(
                 {"officer": {"conferance": True}}
             )

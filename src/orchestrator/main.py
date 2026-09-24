@@ -69,7 +69,6 @@ from orchestrator.database import (  # noqa: E402
 from orchestrator.database.postgres import (  # noqa: E402
     KNOWN_JOB_ORIGINS,
     JOB_STATUS_FILTER_VALUES,
-    DatasourcePolicyConflictError,
     _completion_control_active_sql,
     _completion_control_owned_active_sql,
 )
@@ -485,7 +484,6 @@ from orchestrator.services.thread_project_authorization import (  # noqa: E402,F
 )
 from orchestrator.services.thread_config_update import (  # noqa: E402,F401
     config_change_summary as _config_change_summary,
-    protected_cloud_mutation_marker as _protected_cloud_mutation_marker,
     require_unprotected_workspace_upgrade as _require_unprotected_workspace_upgrade,
 )
 from orchestrator.routers import (  # noqa: E402
@@ -684,9 +682,6 @@ from orchestrator.services.session_wake import (  # noqa: E402
 )
 from shared.pinned_session_identity import PinnedSessionBinding  # noqa: E402
 from shared.pinned_session_identity import PinnedJobRecipient  # noqa: E402, F401
-from orchestrator.services.stateless_workspace_gate import (  # noqa: E402
-    thread_metadata_object,
-)
 from orchestrator.services.stale_verification_sweeper import (  # noqa: E402
     stale_verification_sweeper_loop,
 )
@@ -1617,11 +1612,6 @@ from orchestrator.services.workspace_tier_policy import (  # noqa: E402
 
 
 from orchestrator.services.session_class_policy import (  # noqa: E402
-    session_class_pinned_refusal as _stateless_session_class_refusal,
-)
-
-
-from orchestrator.services.session_class_policy import (  # noqa: E402
     require_stateless_workspace as _require_stateless_workspace,
 )
 
@@ -1658,16 +1648,6 @@ def _execution_lane_dependencies() -> session_class_policy.ExecutionLaneDependen
 # owned by the durable Officer Post and must never be accepted from the generic
 # session-create/config surfaces. Explicit commission carries them through the
 # non-model-selectable ``_officer_post_config_snapshot`` seam below.
-
-
-from orchestrator.services.session_create_overrides import (  # noqa: E402
-    validated_session_officer_override as _validated_session_officer_override,
-)
-
-
-from orchestrator.services.session_tool_policy import (  # noqa: E402
-    validated_tool_overrides as _validated_tool_overrides,
-)
 
 
 from orchestrator.services.session_tool_policy import (  # noqa: E402
@@ -4132,7 +4112,6 @@ def _thread_config_update_dependencies() -> (
         vm_provisioner=vm_provisioner,
         container_provisioner=container_provisioner,
         recovery_store=VMWorkspaceRecoveryStore(postgres_db),
-        apply_thread_config_update_locked=_apply_thread_config_update_locked,
         enforce_workspace_upgrade_grants=(
             lambda *args, **kwargs: (
                 grant_enforcement.enforce_workspace_upgrade_grants(
@@ -4142,6 +4121,13 @@ def _thread_config_update_dependencies() -> (
         ),
         require_internal=require_internal,
         require_thread_owner=require_thread_owner,
+        thread_project_ids=_thread_project_ids,
+        authorize_thread_datasource_selection=_authorize_thread_datasource_selection,
+        build_datasource_tool_override=_build_datasource_tool_override,
+        datasource_selection_provenance=_datasource_selection_provenance,
+        enforce_session_create_grants=_enforce_session_create_grants,
+        inject_model_credentials=_inject_model_credentials,
+        log_security_event=log_security_event,
     )
 
 
@@ -7493,389 +7479,6 @@ async def _require_pinned_workspace_credential_owner(
         expected_protected_ro_row=expected_protected_ro_row,
         dependencies=_thread_workspace_delivery_dependencies(),
     )
-
-
-async def _apply_thread_config_update_locked(
-    thread_id: str,
-    thread_row: dict[str, Any] | None,
-    config_override: dict[str, Any],
-    datasource_ids: list[str] | None,
-    *,
-    request: Request,
-    actor: dict[str, Any] | None,
-) -> tuple[dict[str, Any], list[str] | None]:
-    """Validate → authorize → enrich → persist a thread config change.
-
-    Shared core of the internal live-session PATCH
-    (``agent_update_thread_config``) and the owner-facing
-    disconnected-session PATCH (live_session_settings.md Slice C) — the two
-    callers differ only in auth, connection gating, and response redaction.
-    Authorization (datasource selection + capability grants) is keyed to the
-    THREAD OWNER in both cases, so an API caller can never exceed what the
-    live pane allows.
-
-    Returns ``(config_override, selected_datasource_ids)`` where the fragment
-    is enriched with resolved model transport (``base_url``/``api_key`` +
-    explicit ``None`` sentinels) — the internal caller returns it verbatim to
-    the agent; browser-facing callers MUST redact it. Persistence is always
-    redacted. Emits a ``session_config_updated`` security event on success
-    (``actor`` is the resolved caller for owner-facing requests, None for
-    internal ones — the recorded path distinguishes the two).
-    """
-    protected_marker = _protected_cloud_mutation_marker(thread_row)
-    if protected_marker == "on" and {
-        "workspace",
-        "officer",
-    }.intersection(config_override):
-        # A protected session is safe only while its effective runtime remains
-        # the supported Container/non-Officer class.  Generic live config
-        # mutation is not an atomic protected-runtime transition protocol, so
-        # reject both security-relevant blocks before grant resolution, audit,
-        # or persistence.  Even a seemingly harmless partial/no-op block is
-        # refused: defaults and expert inheritance make a fragment alone an
-        # insufficient proof of the resulting class.
-        raise HTTPException(
-            status_code=409,
-            detail={
-                "code": "protected_cloud_runtime_class_fixed",
-                "message": (
-                    "Protected cloud sessions cannot change workspace tier or "
-                    "Officer mode."
-                ),
-            },
-        )
-    if "officer" in config_override and thread_row and thread_row.get("project_id"):
-        post = await postgres_db.get_project_officer(str(thread_row["project_id"]))
-        if post and str(post.get("thread_id") or "") == str(thread_id):
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    "The commissioned officer block is owned by the Officer "
-                    "Post; use the project Officer Post endpoint so durable "
-                    "and runtime configuration change atomically."
-                ),
-            )
-    if thread_row and thread_row.get("execution_lane") == "stateless":
-        # Generic config mutation is not the workspace-upgrade protocol. Refuse
-        # an already-drifted row and allow only same-tier workspace tuning.
-        current_backend = _require_stateless_workspace(thread_row)
-        if "officer" in config_override:
-            # Runtime PATCH historically accepted this block without the
-            # create-time validator. Normalize booleans and reject unknown
-            # fields before evaluating the proposed immutable session class.
-            normalized_officer = _validated_session_officer_override(config_override)
-            config_override["officer"] = normalized_officer or {}
-
-        metadata = thread_metadata_object(thread_row)
-        persisted_override = metadata.get("config_override") or {}
-        if not isinstance(persisted_override, dict):
-            persisted_override = {}
-        proposed_override = _deep_merge_dicts(
-            persisted_override,
-            config_override,
-        )
-        class_refusal = _stateless_session_class_refusal(proposed_override)
-        if class_refusal is not None:
-            # Creation materializes the fully resolved class booleans into the
-            # request layer, so this merge is authoritative even if the expert
-            # or account default changes later. Never persist a fragment that
-            # would move a live queue-served thread onto pinned-only wake
-            # machinery without an atomic lane-transition protocol.
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    "A stateless session cannot enable pinned-only lifecycle "
-                    f"behavior ({class_refusal})"
-                ),
-            )
-        if "workspace" in config_override:
-            workspace_patch = config_override.get("workspace")
-            if not isinstance(workspace_patch, dict) or (
-                "backend" in workspace_patch
-                and workspace_patch.get("backend") != current_backend
-            ):
-                raise HTTPException(
-                    status_code=409,
-                    detail=(
-                        "A stateless session cannot change its workspace tier "
-                        "through generic config mutation"
-                    ),
-                )
-
-    if "tools" in config_override:
-        # Runtime updates use the same registry vocabulary as session creation
-        # and job creation.  A fragment this boundary will not honour is a 400
-        # from here, not a silent discard: the previous closed-group filter
-        # replaced `tools` with the four accepted groups and dropped the rest,
-        # so a live "turn research off" was acknowledged and never applied.
-        # The names are also checked against their own category, because the
-        # loader resolves a name against the global registry rather than the
-        # key it arrived under.
-        accepted_tools = _validated_tool_overrides(config_override)
-        if accepted_tools:
-            config_override["tools"] = accepted_tools
-        else:
-            # `tools: {}` only — it asks for nothing, so there is nothing to
-            # honour and nothing to report as changed.
-            config_override.pop("tools", None)
-
-    if "delegation" in config_override:
-        # The gate half of the Delegation toggle (see create_thread). Same
-        # validator as create, so the two write paths cannot disagree about
-        # what the block means; malformed is a 400, never a silent drop.
-        from orchestrator.services.session_create_overrides import (
-            SessionOverrideError,
-            validate_delegation_override,
-        )
-
-        try:
-            accepted_delegation = validate_delegation_override(
-                config_override["delegation"]
-            )
-        except SessionOverrideError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-        if accepted_delegation:
-            config_override["delegation"] = accepted_delegation
-        else:
-            config_override.pop("delegation", None)
-
-    # Audit summary is computed PRE-enrichment so it names only the keys the
-    # caller actually sent (enrichment adds llm.api_key/base_url internally).
-    change_summary = _config_change_summary(config_override, datasource_ids)
-
-    # Live datasource change (live_session_settings.md Slice B): authorize
-    # the requested full selection exactly like create does — including the
-    # lite-tier/repository rule against the thread's CURRENT workspace
-    # backend (a live add is create-like; only the attach-time
-    # revalidation deliberately passes None) — then fold the resulting
-    # datasource tool-category flip into the grant-checked fragment so a
-    # datasource_tools-denied principal fails HERE at the PATCH, not at
-    # the next attach.
-    selected_ds_ids: list[str] | None = None
-    selected_ds_revisions: dict[str, int] | None = None
-    datasource_selection_provenance: dict[str, Any] | None = None
-    grant_fragment = config_override
-    if datasource_ids is not None:
-        if thread_row is None:
-            raise HTTPException(status_code=404, detail="Thread not found")
-        requested_ids = [str(v) for v in datasource_ids]
-        current_metadata = thread_metadata_object(thread_row)
-        try:
-            canonical_requested = {str(UUID(value)) for value in requested_ids}
-        except (TypeError, ValueError) as exc:
-            raise HTTPException(
-                status_code=403,
-                detail="One or more selected connectors are unavailable",
-            ) from exc
-        removed_ids = (
-            set(current_metadata.get("datasource_ids") or []) - canonical_requested
-        )
-        if removed_ids:
-            removed_rows = await postgres_db.get_datasource_policy_rows(
-                list(removed_ids)
-            )
-            if any(row.get("type") == "credentials" for row in removed_rows):
-                raise HTTPException(
-                    status_code=409,
-                    detail="Credential connectors stay attached for the lifetime of the session",
-                )
-        target_project_ids = await _thread_project_ids(thread_id)
-        if thread_row.get("user_id"):
-            owner = await postgres_db.get_user(str(thread_row["user_id"]))
-            if owner is None:
-                # Same generic denial as create — no enumeration oracle.
-                raise HTTPException(
-                    status_code=403,
-                    detail="One or more selected connectors are unavailable",
-                )
-            (
-                selected_ds_ids,
-                selected_ds_revisions,
-            ) = await _authorize_thread_datasource_selection(
-                owner,
-                requested_ids,
-                workspace_backend=_thread_workspace_backend(thread_row),
-                target_project_ids=target_project_ids,
-                effective_work_owner_id=str(thread_row["user_id"]),
-            )
-        else:
-            # Ownerless/system threads have no ambient authority. A live edit
-            # may narrow or preserve the already-materialized set, but cannot
-            # use the trusted-inheritance seam to add an arbitrary UUID.
-            metadata = thread_row.get("metadata") or {}
-            if isinstance(metadata, str):
-                try:
-                    metadata = json.loads(metadata)
-                except (json.JSONDecodeError, TypeError):
-                    metadata = {}
-            persisted_ids = (
-                metadata.get("datasource_ids") if isinstance(metadata, dict) else []
-            ) or []
-            try:
-                requested_set = {str(UUID(str(value))) for value in requested_ids}
-                persisted_set = {str(UUID(str(value))) for value in persisted_ids}
-            except (TypeError, ValueError) as exc:
-                raise HTTPException(
-                    status_code=403,
-                    detail="One or more selected connectors are unavailable",
-                ) from exc
-            if not requested_set.issubset(persisted_set):
-                raise HTTPException(
-                    status_code=403,
-                    detail="One or more selected connectors are unavailable",
-                )
-            (
-                selected_ds_ids,
-                selected_ds_revisions,
-            ) = await _authorize_thread_datasource_selection(
-                None,
-                requested_ids,
-                workspace_backend=_thread_workspace_backend(thread_row),
-                target_project_ids=target_project_ids,
-                trusted_system_inheritance=True,
-            )
-
-        resolved_ds = await postgres_db.resolve_datasources_for_thread(
-            datasource_ids=selected_ds_ids,
-            project_ids=target_project_ids,
-        )
-        flip = _build_datasource_tool_override(resolved_ds, None)
-        # THE FLIP WINS, and the order is load-bearing. It used to be the other
-        # way round, safe only because the request's tools were filtered down
-        # to four non-connector groups first. Now that every category is
-        # honoured, a request could send `tools.sql: []` and mask a
-        # datasource_tools violation from the PDP below — while attach applies
-        # the flip LAST anyway (_build_datasource_tool_override updates the
-        # request's tools with the datasource categories), so the session would
-        # get connector tools the grant check never saw. Modelling attach
-        # exactly is what keeps this fragment honest.
-        grant_fragment = {
-            **config_override,
-            "tools": {
-                **(config_override.get("tools") or {}),
-                **flip.get("tools", {}),
-            },
-        }
-        datasource_selection_provenance = await _datasource_selection_provenance(
-            datasource_ids=selected_ds_ids,
-            policy_revisions=selected_ds_revisions,
-            origin="explicit",
-            effective_work_owner_id=(
-                str(thread_row["user_id"]) if thread_row.get("user_id") else None
-            ),
-            actor=actor,
-            project_ids=target_project_ids,
-            creation_path=(
-                "live_thread_internal" if actor is None else "live_thread_rest"
-            ),
-        )
-
-    # Layer 2 (fail loud): a runtime config change must also fit the owner's
-    # grants — reject a denied permission_mode/model with 422 instead of
-    # persisting a config the session can't run (an API-direct or stale-UI
-    # escalation past the user's ceiling; the cockpit greys these out
-    # client-side). Ownerless/standalone threads (user_id NULL) aren't
-    # subject to a user's grants — skip. Admin owner bypasses.
-    # knowledge-base/knowledge/issues/session_permission_mode_grant_denied_ready_timeout.md
-    if thread_row and thread_row.get("user_id"):
-        await _enforce_session_create_grants(
-            grant_fragment,
-            user_id=str(thread_row["user_id"]),
-            project_ids=(
-                [str(thread_row["project_id"])] if thread_row.get("project_id") else []
-            ),
-        )
-
-    # Enrich endpoint-backed model swaps with base_url + api_key so the
-    # persisted override is complete. Without this, a hot-swap to a
-    # custom-endpoint model leaves the next session attach pointing at
-    # the default OpenAI base.
-    llm_section = config_override.get("llm")
-    if llm_section and llm_section.get("model"):
-        if thread_row:
-            user_id = str(thread_row["user_id"]) if thread_row.get("user_id") else None
-            project_id = (
-                str(thread_row["project_id"]) if thread_row.get("project_id") else None
-            )
-            resolved_keys = await postgres_db.resolve_api_keys_for_job(
-                user_id=user_id, project_id=project_id
-            )
-            llm_section = dict(llm_section)
-            await _inject_model_credentials(
-                section=llm_section,
-                model_id=llm_section["model"],
-                user_id=user_id,
-                resolved_keys=resolved_keys,
-            )
-            # A model swap must fully determine its transport. Any field
-            # resolution didn't set becomes an explicit None so the
-            # agent-side deep_merge CLEARS the previous model's value
-            # instead of inheriting it (e.g. swapping off an
-            # endpoint-backed model must not keep its base_url).
-            for transport_key in ("provider", "base_url", "api_key"):
-                llm_section.setdefault(transport_key, None)
-            config_override["llm"] = llm_section
-
-    # Persist WITHOUT secrets — the agent rebuilds its LLM from the enriched
-    # dict returned below, and resume re-injects from source. The explicit
-    # None transport sentinels stay in the stored copy so the deep-merge
-    # clears the previous model's transport; resume re-injection treats them
-    # as absent (see _inject_thread_dispatch_credentials).
-    ok = await postgres_db.merge_thread_config_override(
-        thread_id, redact_config_override(config_override)
-    )
-    if not ok:
-        raise HTTPException(status_code=404, detail="Thread not found")
-
-    # Persist the accepted selection only after every check above passed.
-    # The category flip is NOT merged into config_override — the closed
-    # session tools vocabulary would drop it anyway; the agent re-fetches
-    # GET /api/agents/threads/{id}/workspace and applies the categories
-    # directly to its live session config, and every attach path re-derives
-    # them from metadata.datasource_ids.
-    if selected_ds_ids is not None:
-        from shared.credential_connectors import CredentialConnectorAttachedError
-
-        try:
-            updated = await postgres_db.set_thread_datasource_ids(
-                thread_id,
-                selected_ds_ids,
-                datasource_policy_revisions=selected_ds_revisions,
-                datasource_selection_provenance=datasource_selection_provenance,
-            )
-        except CredentialConnectorAttachedError as exc:
-            raise HTTPException(status_code=409, detail=str(exc)) from exc
-        except DatasourcePolicyConflictError as exc:
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    "Connector policy changed while updating the session; "
-                    "retry the request"
-                ),
-            ) from exc
-        if not updated:
-            raise HTTPException(status_code=404, detail="Thread not found")
-
-    # Config-change audit (live_session_settings.md Slice C): key paths only,
-    # fired after every persist step succeeded. log_security_event never
-    # raises, so a broken audit trail can't fail the update it documents.
-    await log_security_event(
-        postgres_db,
-        resource_type="thread",
-        event_type="session_config_updated",
-        user=actor,
-        resource_id=thread_id,
-        detail=change_summary,
-        request=request,
-    )
-    if selected_ds_ids is not None:
-        # The snapshot policy and pinned merge use the same authorized derived
-        # categories. Persisted author overrides still omit this live binding.
-        config_override = {
-            **config_override,
-            "tools": grant_fragment.get("tools", {}),
-        }
-    return config_override, selected_ds_ids
 
 
 # =============================================================================

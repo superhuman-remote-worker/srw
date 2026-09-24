@@ -643,7 +643,7 @@ def test_materialized_ordinary_class_wins_over_later_expert_and_account_changes(
         {"officer": {"conference": True}},  # selected expert edited later
     ):
         effective = orch_main._deep_merge_dicts(mutable_lower_layer, materialized)
-        assert orch_main._stateless_session_class_refusal(effective) is None
+        assert session_class_policy.session_class_pinned_refusal(effective) is None
 
 
 @pytest.mark.asyncio
