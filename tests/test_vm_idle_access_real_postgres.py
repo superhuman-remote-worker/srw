@@ -450,6 +450,142 @@ async def test_ide_operation_expiry_cancels_transport_and_closes_only_its_row(db
 
 
 @pytest.mark.asyncio
+async def test_connected_ide_socket_renews_old_tab_and_close_does_not_kill_writer(db):
+    from orchestrator.services.vm_idle_access import VMIdleAccessStore
+
+    await db.execute("TRUNCATE vm_idle_access_leases, vm_idle_operations CASCADE")
+    owner, _, _ = await seed_wait(db)
+    access = VMIdleAccessStore(db)
+    user = str(uuid4())
+    tab = await access.acquire(
+        owner_kind="job", owner_id=str(owner), kind="ide", claimant=f"{user}:tab"
+    )
+    # The tab has already been connected for longer than its initial two-minute
+    # sliding TTL. A live socket, rather than an HTTP poll, must keep it usable.
+    await db.execute(
+        "UPDATE vm_idle_access_leases SET acquired_at=clock_timestamp()-interval '3 minutes', "
+        "expires_at=clock_timestamp()+interval '5 seconds' WHERE id=$1", tab["id"],
+    )
+    entered = asyncio.Event()
+    async def socket():
+        async with access.ide_operation(
+            str(tab["id"]), owner_kind="job", owner_id=str(owner),
+            user_id=user, heartbeat_seconds=0.02,
+        ):
+            entered.set()
+            await asyncio.sleep(10)
+
+    task = asyncio.create_task(socket())
+    await asyncio.wait_for(entered.wait(), 2)
+    try:
+        await asyncio.sleep(0.15)
+        assert not task.done()
+        assert await db.fetchval(
+            "SELECT expires_at>clock_timestamp()+interval '1 minute' "
+            "FROM vm_idle_access_leases WHERE id=$1", tab["id"],
+        )
+        second_writer = await access.begin_ide_operation(
+            str(tab["id"]), owner_kind="job", owner_id=str(owner), user_id=user,
+        )
+        assert second_writer is not None
+        assert await access.close(
+            str(second_writer["id"]), owner_kind="job", owner_id=str(owner),
+            kind="ide", claimant=second_writer["claimed_by"],
+        )
+        writer_row = await db.fetchrow(
+            "SELECT id,claimed_by FROM vm_idle_access_leases WHERE owner_id=$1 "
+            "AND claimed_by LIKE $2 AND closed_at IS NULL ORDER BY acquired_at LIMIT 1",
+            owner, f"{user}:operation:%",
+        )
+        writer = writer_row["id"]
+        other_tab = await access.acquire(
+            owner_kind="job", owner_id=str(owner), kind="ide",
+            claimant=f"{user}:other-tab",
+        )
+        assert other_tab is not None
+        assert not await access.renew_tab_for_operation(
+            str(other_tab["id"]), operation_id=str(writer),
+            operation_claimant=writer_row["claimed_by"],
+            tab_claimant=other_tab["claimed_by"],
+            owner_kind="job", owner_id=str(owner),
+        )
+        assert await access.close_for_user(
+            str(tab["id"]), owner_kind="job", owner_id=str(owner),
+            kind="ide", user_id=user,
+        )
+        closed_expiry = await db.fetchval(
+            "SELECT expires_at FROM vm_idle_access_leases WHERE id=$1", tab["id"],
+        )
+        await asyncio.sleep(0.08)
+        assert not task.done()
+        assert await db.fetchval(
+            "SELECT closed_at IS NULL FROM vm_idle_access_leases WHERE id=$1", writer,
+        )
+        assert await access.begin_ide_operation(
+            str(tab["id"]), owner_kind="job", owner_id=str(owner), user_id=user,
+        ) is None
+        assert await db.fetchval(
+            "SELECT closed_at IS NOT NULL FROM vm_idle_access_leases WHERE id=$1",
+            tab["id"],
+        )
+        assert await db.fetchval(
+            "SELECT expires_at FROM vm_idle_access_leases WHERE id=$1", tab["id"],
+        ) == closed_expiry
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+    assert await db.fetchval(
+        "SELECT closed_at IS NOT NULL FROM vm_idle_access_leases WHERE id=$1", writer,
+    )
+
+
+@pytest.mark.asyncio
+async def test_job_ide_start_runtime_swap_refuses_active_url_after_transport(db):
+    from orchestrator.routers.ide import IdeDependencies, start_ide_session
+    from orchestrator.services.vm_ide_transport import VMIDETransport
+    from tests.test_vm_ide_transport import _Pool, _proof
+
+    await db.execute("TRUNCATE vm_idle_access_leases, vm_idle_operations CASCADE")
+    owner, _, identity = await seed_wait(db)
+    user = {"id": uuid4(), "is_approved": True}
+    job = await db.get_job(str(owner))
+    entered, resume = asyncio.Event(), asyncio.Event()
+    admitted = replace(
+        _proof(), workspace_generation=identity["generation"], vm_uid=identity["vm_uid"],
+    )
+    successor = replace(admitted, vm_uid=str(uuid4()))
+    async def swap(*args, **kwargs):
+        entered.set()
+        await resume.wait()
+        return successor
+    connection = SimpleNamespace(run=AsyncMock(), open_connection=AsyncMock())
+    transport = VMIDETransport(
+        SimpleNamespace(attest_workspace_runtime=AsyncMock(side_effect=swap)),
+        pool=_Pool(connection), key_path="/private/key",
+    )
+    deps = IdeDependencies(
+        store=db, ide_sessions=object(), ide_proxy=SimpleNamespace(_vm_provisioner=object()),
+        vm_ide_transport=transport,
+        require_job_access=AsyncMock(return_value=(user, job)),
+    )
+    task = asyncio.create_task(start_ide_session(SimpleNamespace(), str(owner), dependencies=deps))
+    await asyncio.wait_for(entered.wait(), 2)
+    await db.execute(
+        "UPDATE jobs SET context=jsonb_set(context,'{vm,vm_uid}',to_jsonb($2::text)) "
+        "WHERE id=$1", owner, str(uuid4()),
+    )
+    resume.set()
+    response = await asyncio.wait_for(task, 2)
+    assert response == {"status": "unavailable", "code_server_url": None,
+                        "code": "ide_runtime_changed"}
+    assert await db.fetchval(
+        "SELECT count(*) FROM vm_idle_access_leases WHERE owner_id=$1 AND closed_at IS NOT NULL",
+        owner,
+    ) == 1
+    connection.run.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_expired_pending_claim_cannot_be_revived_by_repeat_wake(db, monkeypatch):
     from orchestrator.services.vm_idle_lifecycle import VMIdleLifecycleStore
 
@@ -621,8 +757,14 @@ async def test_job_ide_actual_entrypoints_do_not_renew_on_status_poll(db):
     owner, _, _ = await seed_wait(db)
     user = {"id": uuid4(), "is_approved": True}
     job = await db.get_job(str(owner))
+    def admitted_proof(*args, **kwargs):
+        return SimpleNamespace(
+            workspace_generation=str(kwargs["expected_generation"]),
+            vm_uid=str(kwargs["expected_vm_uid"]),
+        )
     transport = SimpleNamespace(
-        start_and_probe=AsyncMock(return_value=True), probe=AsyncMock(return_value=True)
+        start_and_probe=AsyncMock(side_effect=admitted_proof),
+        probe=AsyncMock(side_effect=admitted_proof),
     )
     sessions = SimpleNamespace(
         start_session=AsyncMock(),
@@ -662,6 +804,19 @@ async def test_job_ide_actual_entrypoints_do_not_renew_on_status_poll(db):
     )
     assert status["status"] == "active"
     assert str(lease_id) in status["code_server_url"]
+    assert transport.start_and_probe.await_args.kwargs["expected_vm_uid"]
+    assert transport.start_and_probe.await_args.kwargs["expected_generation"]
+    assert transport.probe.await_args.kwargs["expected_vm_uid"]
+    assert transport.probe.await_args.kwargs["expected_generation"]
+    transport.probe.side_effect = lambda *args, **kwargs: SimpleNamespace(
+        workspace_generation=str(kwargs["expected_generation"]),
+        vm_uid=str(uuid4()),
+    )
+    wrong_proof = await get_ide_session(
+        SimpleNamespace(), str(owner), lease_id=str(lease_id), dependencies=deps,
+    )
+    assert wrong_proof["status"] == "unavailable"
+    assert wrong_proof["code"] == "ide_runtime_changed"
     assert (
         await db.fetchval(
             "SELECT expires_at FROM vm_idle_access_leases WHERE id=$1",
@@ -669,6 +824,18 @@ async def test_job_ide_actual_entrypoints_do_not_renew_on_status_poll(db):
         )
         == before
     )
+    async def switch_during_probe(*args, **kwargs):
+        await db.execute(
+            "UPDATE jobs SET context=jsonb_set(context,'{vm,vm_uid}',to_jsonb($2::text)) "
+            "WHERE id=$1", owner, str(uuid4()),
+        )
+        return admitted_proof(*args, **kwargs)
+    transport.probe.side_effect = switch_during_probe
+    stale = await get_ide_session(
+        SimpleNamespace(), str(owner), lease_id=str(lease_id), dependencies=deps,
+    )
+    assert stale["status"] == "unavailable"
+    assert stale["code"] == "ide_runtime_changed"
     await stop_ide_session(
         SimpleNamespace(), str(owner), lease_id=str(lease_id), dependencies=deps
     )

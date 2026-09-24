@@ -168,7 +168,7 @@ async def start_ide_session(
         body = IdeSessionRequest()
 
     from orchestrator.services.vm_idle_access import VMIdleAccessStore
-    from orchestrator.services.vm_ide_transport import VMIDEUnavailable
+    from orchestrator.services.vm_ide_transport import VMIDEUnavailable, matches_admitted_runtime
     from orchestrator.services.vm_idle_lifecycle import VMIdleLifecycleStore
 
     idle = VMIdleLifecycleStore(dependencies.store)
@@ -208,9 +208,15 @@ async def start_ide_session(
                 status_code=503, detail="VM IDE transport is unavailable"
             )
         try:
-            await dependencies.vm_ide_transport.start_and_probe(
-                job_id, owner_kind="job"
+            proof = await dependencies.vm_ide_transport.start_and_probe(
+                job_id, owner_kind="job",
+                expected_generation=lease["provision_generation"],
+                expected_vm_uid=lease["vm_uid"],
             )
+            if not matches_admitted_runtime(
+                proof, lease["provision_generation"], lease["vm_uid"],
+            ):
+                raise VMIDEUnavailable("ide_runtime_changed")
         except VMIDEUnavailable as exc:
             await access.close_for_user(
                 lease_id,
@@ -220,6 +226,16 @@ async def start_ide_session(
                 user_id=str(user["id"]),
             )
             return {"status": "unavailable", "code_server_url": None, "code": exc.code}
+        if await access.inspect_for_user(
+            lease_id, owner_kind="job", owner_id=job_id, kind="ide",
+            user_id=str(user["id"]),
+        ) is None:
+            await access.close_for_user(
+                lease_id, owner_kind="job", owner_id=job_id, kind="ide",
+                user_id=str(user["id"]),
+            )
+            return {"status": "unavailable", "code_server_url": None,
+                    "code": "ide_runtime_changed"}
         return {
             "status": "active",
             "access_lease_id": lease_id,
@@ -256,7 +272,7 @@ async def get_ide_session(
         request, dependencies.store, job_id
     )
     from orchestrator.services.vm_idle_access import VMIdleAccessStore
-    from orchestrator.services.vm_ide_transport import VMIDEUnavailable
+    from orchestrator.services.vm_ide_transport import VMIDEUnavailable, matches_admitted_runtime
     from orchestrator.services.vm_idle_lifecycle import VMIdleLifecycleStore
 
     idle = VMIdleLifecycleStore(dependencies.store)
@@ -290,9 +306,23 @@ async def get_ide_session(
                 "code": "ide_guest_transport_unavailable",
             }
         try:
-            await dependencies.vm_ide_transport.probe(job_id, owner_kind="job")
+            proof = await dependencies.vm_ide_transport.probe(
+                job_id, owner_kind="job",
+                expected_generation=lease["provision_generation"],
+                expected_vm_uid=lease["vm_uid"],
+            )
+            if not matches_admitted_runtime(
+                proof, lease["provision_generation"], lease["vm_uid"],
+            ):
+                raise VMIDEUnavailable("ide_runtime_changed")
         except VMIDEUnavailable as exc:
             return {"status": "unavailable", "code_server_url": None, "code": exc.code}
+        if await VMIdleAccessStore(dependencies.store).inspect_for_user(
+            lease_id, owner_kind="job", owner_id=job_id, kind="ide",
+            user_id=str(user["id"]),
+        ) is None:
+            return {"status": "unavailable", "code_server_url": None,
+                    "code": "ide_runtime_changed"}
         return {
             "status": "active",
             "access_lease_id": lease_id,

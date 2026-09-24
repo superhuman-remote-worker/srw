@@ -1180,8 +1180,13 @@ async def test_pinned_thread_ide_explicit_access_and_read_only_poll(db, monkeypa
     thread_id, _, _ = await ready_pinned_thread(db, monkeypatch)
     user = {"id": uuid4(), "is_approved": True}
     thread = await db.get_thread(str(thread_id))
-    transport = SimpleNamespace(start_and_probe=AsyncMock(return_value=True),
-                                probe=AsyncMock(return_value=True))
+    def admitted_proof(*args, **kwargs):
+        return SimpleNamespace(
+            workspace_generation=str(kwargs["expected_generation"]),
+            vm_uid=str(kwargs["expected_vm_uid"]),
+        )
+    transport = SimpleNamespace(start_and_probe=AsyncMock(side_effect=admitted_proof),
+                                probe=AsyncMock(side_effect=admitted_proof))
     deps = ThreadFilesDependencies(
         store=db, container_provisioner=object(), vm_provisioner=object(),
         thread_workspace_backend=lambda *_: "vm",
@@ -1205,9 +1210,87 @@ async def test_pinned_thread_ide_explicit_access_and_read_only_poll(db, monkeypa
     active = await get_thread_ide_status(str(thread_id), SimpleNamespace(),
                                          lease_id=lease_id, dependencies=deps)
     assert active["status"] == "active" and lease_id in active["code_server_url"]
+    assert transport.start_and_probe.await_args.kwargs["expected_vm_uid"]
+    assert transport.start_and_probe.await_args.kwargs["expected_generation"]
+    assert transport.probe.await_args.kwargs["expected_vm_uid"]
+    assert transport.probe.await_args.kwargs["expected_generation"]
+    transport.probe.side_effect = lambda *args, **kwargs: SimpleNamespace(
+        workspace_generation=str(kwargs["expected_generation"]),
+        vm_uid=str(uuid4()),
+    )
+    wrong_proof = await get_thread_ide_status(
+        str(thread_id), SimpleNamespace(), lease_id=lease_id, dependencies=deps,
+    )
+    assert wrong_proof["status"] == "unavailable"
+    assert wrong_proof["code"] == "ide_runtime_changed"
+    async def switch_during_probe(*args, **kwargs):
+        await db.execute(
+            "UPDATE threads SET metadata=jsonb_set(metadata,'{vm,vm_uid}',to_jsonb($2::text)) "
+            "WHERE id=$1", thread_id, str(uuid4()),
+        )
+        return admitted_proof(*args, **kwargs)
+    transport.probe.side_effect = switch_during_probe
+    stale = await get_thread_ide_status(
+        str(thread_id), SimpleNamespace(), lease_id=lease_id, dependencies=deps,
+    )
+    assert stale["status"] == "unavailable"
+    assert stale["code"] == "ide_runtime_changed"
     await stop_thread_ide_session(str(thread_id), SimpleNamespace(), lease_id=lease_id,
                                   dependencies=deps)
     assert await db.fetchval(
         "SELECT closed_at IS NOT NULL FROM vm_idle_access_leases WHERE id=$1",
         __import__("uuid").UUID(lease_id),
     )
+
+
+@pytest.mark.asyncio
+async def test_pinned_thread_ide_start_runtime_swap_refuses_active_url(db, monkeypatch):
+    from orchestrator.routers.thread_files import (
+        ThreadFilesDependencies, start_thread_ide_session,
+    )
+    from orchestrator.services.vm_ide_transport import VMIDETransport
+    from tests.test_vm_ide_transport import _Pool, _proof
+    from dataclasses import replace
+
+    await db.execute("TRUNCATE vm_idle_access_leases, vm_idle_operations CASCADE")
+    thread_id, _, identity = await ready_pinned_thread(db, monkeypatch)
+    user = {"id": uuid4(), "is_approved": True}
+    thread = await db.get_thread(str(thread_id))
+    entered, resume = asyncio.Event(), asyncio.Event()
+    admitted = replace(
+        _proof(), workspace_generation=identity["generation"], vm_uid=identity["vm_uid"],
+    )
+    successor = replace(admitted, vm_uid=str(uuid4()))
+    async def swap(*args, **kwargs):
+        entered.set()
+        await resume.wait()
+        return successor
+    connection = SimpleNamespace(run=AsyncMock(), open_connection=AsyncMock())
+    transport = VMIDETransport(
+        SimpleNamespace(attest_workspace_runtime=AsyncMock(side_effect=swap)),
+        pool=_Pool(connection), key_path="/private/key",
+    )
+    deps = ThreadFilesDependencies(
+        store=db, container_provisioner=object(), vm_provisioner=object(),
+        thread_workspace_backend=lambda *_: "vm",
+        require_stateless_workspace=lambda *_: "vm",
+        require_thread_owner=AsyncMock(return_value=(user, thread)),
+        vm_ide_transport=transport,
+    )
+    task = asyncio.create_task(
+        start_thread_ide_session(str(thread_id), SimpleNamespace(), dependencies=deps)
+    )
+    await asyncio.wait_for(entered.wait(), 2)
+    await db.execute(
+        "UPDATE threads SET metadata=jsonb_set(metadata,'{vm,vm_uid}',to_jsonb($2::text)) "
+        "WHERE id=$1", thread_id, str(uuid4()),
+    )
+    resume.set()
+    response = await asyncio.wait_for(task, 2)
+    assert response == {"status": "unavailable", "code_server_url": None,
+                        "code": "ide_runtime_changed"}
+    assert await db.fetchval(
+        "SELECT count(*) FROM vm_idle_access_leases WHERE owner_id=$1 AND closed_at IS NOT NULL",
+        thread_id,
+    ) == 1
+    connection.run.assert_not_awaited()

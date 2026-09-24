@@ -88,7 +88,7 @@ async def start_thread_ide_session(
 ) -> dict[str, Any]:
     """One explicit owner gesture admits a bounded pinned-VM IDE connection."""
     from orchestrator.services.vm_idle_access import VMIdleAccessStore
-    from orchestrator.services.vm_ide_transport import VMIDEUnavailable
+    from orchestrator.services.vm_ide_transport import VMIDEUnavailable, matches_admitted_runtime
 
     user, thread = await dependencies.require_thread_owner(
         request,
@@ -130,9 +130,15 @@ async def start_thread_ide_session(
         )
         raise HTTPException(status_code=503, detail="VM IDE transport is unavailable")
     try:
-        await dependencies.vm_ide_transport.start_and_probe(
-            thread_id, owner_kind="thread"
+        proof = await dependencies.vm_ide_transport.start_and_probe(
+            thread_id, owner_kind="thread",
+            expected_generation=lease["provision_generation"],
+            expected_vm_uid=lease["vm_uid"],
         )
+        if not matches_admitted_runtime(
+            proof, lease["provision_generation"], lease["vm_uid"],
+        ):
+            raise VMIDEUnavailable("ide_runtime_changed")
     except VMIDEUnavailable as exc:
         await access.close_for_user(
             lease_id,
@@ -142,6 +148,16 @@ async def start_thread_ide_session(
             user_id=str(user["id"]),
         )
         return {"status": "unavailable", "code_server_url": None, "code": exc.code}
+    if await access.inspect_for_user(
+        lease_id, owner_kind="thread", owner_id=thread_id, kind="ide",
+        user_id=str(user["id"]),
+    ) is None:
+        await access.close_for_user(
+            lease_id, owner_kind="thread", owner_id=thread_id, kind="ide",
+            user_id=str(user["id"]),
+        )
+        return {"status": "unavailable", "code_server_url": None,
+                "code": "ide_runtime_changed"}
     return {
         "status": "active",
         "access_lease_id": lease_id,
@@ -226,7 +242,7 @@ async def get_thread_ide_status(
         from orchestrator.services.vm_idle_access import VMIdleAccessStore
         from orchestrator.services.vm_idle_lifecycle import VMIdleLifecycleStore
         from orchestrator.services.vm_idle_public import read_vm_idle_states
-        from orchestrator.services.vm_ide_transport import VMIDEUnavailable
+        from orchestrator.services.vm_ide_transport import VMIDEUnavailable, matches_admitted_runtime
 
         states = await read_vm_idle_states(
             dependencies.store,
@@ -283,13 +299,32 @@ async def get_thread_ide_status(
                 "gitea_url": gitea_url,
             }
         try:
-            await dependencies.vm_ide_transport.probe(thread_id, owner_kind="thread")
+            proof = await dependencies.vm_ide_transport.probe(
+                thread_id, owner_kind="thread",
+                expected_generation=lease["provision_generation"],
+                expected_vm_uid=lease["vm_uid"],
+            )
+            if not matches_admitted_runtime(
+                proof, lease["provision_generation"], lease["vm_uid"],
+            ):
+                raise VMIDEUnavailable("ide_runtime_changed")
         except VMIDEUnavailable as exc:
             return {
                 **lifecycle,
                 "status": "unavailable",
                 "code_server_url": None,
                 "code": exc.code,
+                "gitea_url": gitea_url,
+            }
+        if await VMIdleAccessStore(dependencies.store).inspect_for_user(
+            lease_id, owner_kind="thread", owner_id=thread_id, kind="ide",
+            user_id=str(user["id"]),
+        ) is None:
+            return {
+                **lifecycle,
+                "status": "unavailable",
+                "code_server_url": None,
+                "code": "ide_runtime_changed",
                 "gitea_url": gitea_url,
             }
         return {

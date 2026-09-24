@@ -79,7 +79,10 @@ async def test_start_probes_guest_loopback_only_after_pinned_current_runtime():
     provisioner = SimpleNamespace(attest_workspace_runtime=AsyncMock(return_value=proof))
     pool = _Pool(connection)
     transport = VMIDETransport(provisioner, pool=pool, key_path="/private/guest-key")
-    assert await transport.start_and_probe("job-1", owner_kind="job") == proof
+    assert await transport.start_and_probe(
+        "job-1", owner_kind="job",
+        expected_generation=proof.workspace_generation, expected_vm_uid=proof.vm_uid,
+    ) == proof
     connection.run.assert_awaited_once_with(
         "systemctl --user start srw-code-server-user.service", check=False,
     )
@@ -94,7 +97,10 @@ async def test_start_probes_guest_loopback_only_after_pinned_current_runtime():
                 b'{"status":"alive"}'), _Writer(),
     )
     connection.run.reset_mock()
-    assert await transport.probe("job-1", owner_kind="job") == proof
+    assert await transport.probe(
+        "job-1", owner_kind="job",
+        expected_generation=proof.workspace_generation, expected_vm_uid=proof.vm_uid,
+    ) == proof
     connection.run.assert_not_awaited()
 
 
@@ -110,7 +116,10 @@ async def test_changed_attestation_and_missing_older_image_unit_refuse():
     provisioner = SimpleNamespace(attest_workspace_runtime=AsyncMock(return_value=proof))
     transport = VMIDETransport(provisioner, pool=_Pool(connection), key_path="/private/key")
     with pytest.raises(VMIDEUnavailable, match="ide_guest_unit_unavailable"):
-        await transport.start_and_probe("job-1", owner_kind="job")
+        await transport.start_and_probe(
+            "job-1", owner_kind="job",
+            expected_generation=proof.workspace_generation, expected_vm_uid=proof.vm_uid,
+        )
     connection.open_connection.assert_not_awaited()
 
     provisioner.attest_workspace_runtime = AsyncMock(
@@ -118,7 +127,41 @@ async def test_changed_attestation_and_missing_older_image_unit_refuse():
     )
     connection.run.reset_mock()
     with pytest.raises(VMIDEUnavailable, match="ide_runtime_changed"):
-        await transport.start_and_probe("job-1", owner_kind="job")
+        await transport.start_and_probe(
+            "job-1", owner_kind="job",
+            expected_generation=proof.workspace_generation, expected_vm_uid=proof.vm_uid,
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("owner_kind", ["job", "thread"])
+@pytest.mark.parametrize("changed", ["vm_uid", "workspace_generation"])
+async def test_start_never_runs_guest_unit_for_a_successor_of_the_admitted_lease(
+    owner_kind, changed,
+):
+    from orchestrator.services.vm_ide_transport import VMIDETransport, VMIDEUnavailable
+
+    admitted = _proof()
+    successor = replace(admitted, **{changed: str(uuid4())})
+    connection = SimpleNamespace(run=AsyncMock(), open_connection=AsyncMock())
+    provisioner = SimpleNamespace(
+        attest_workspace_runtime=AsyncMock(return_value=successor)
+    )
+    transport = VMIDETransport(provisioner, pool=_Pool(connection), key_path="/private/key")
+    with pytest.raises(VMIDEUnavailable, match="ide_runtime_changed"):
+        await transport.start_and_probe(
+            "owner-1", owner_kind=owner_kind,
+            expected_generation=admitted.workspace_generation,
+            expected_vm_uid=admitted.vm_uid,
+        )
+    connection.run.assert_not_awaited()
+    connection.open_connection.assert_not_awaited()
+    with pytest.raises(VMIDEUnavailable, match="ide_runtime_changed"):
+        await transport.probe(
+            "owner-1", owner_kind=owner_kind,
+            expected_generation=admitted.workspace_generation,
+            expected_vm_uid=admitted.vm_uid,
+        )
     connection.run.assert_not_awaited()
 
 

@@ -40,6 +40,17 @@ class VMIDEUnavailable(RuntimeError):
         self.code = code
 
 
+def matches_admitted_runtime(proof: Any, generation: Any, vm_uid: Any) -> bool:
+    """Compare the guest proof to the exact durable access lease identity."""
+    try:
+        return (
+            UUID(str(proof.workspace_generation)) == UUID(str(generation))
+            and UUID(str(proof.vm_uid)) == UUID(str(vm_uid))
+        )
+    except (TypeError, ValueError, AttributeError):
+        return False
+
+
 @dataclass(frozen=True)
 class VMIDEHTTPResponse:
     status_code: int
@@ -385,11 +396,16 @@ class VMIDETransport:
         except Exception as exc:
             raise VMIDEUnavailable("ide_guest_transport_unavailable") from exc
 
-    async def start_and_probe(self, owner_id: str, *, owner_kind: str) -> Any:
+    async def start_and_probe(
+        self, owner_id: str, *, owner_kind: str,
+        expected_generation: Any, expected_vm_uid: Any,
+    ) -> Any:
         """Start a fixed dormant user unit, then prove its loopback service."""
         if not self.key_path:
             raise VMIDEUnavailable("ide_guest_key_unavailable")
         initial = await self._attest(owner_id, owner_kind)
+        if not matches_admitted_runtime(initial, expected_generation, expected_vm_uid):
+            raise VMIDEUnavailable("ide_runtime_changed")
         try:
             async with self.pool.checkout(
                 target=_target(owner_id, initial),
@@ -412,11 +428,16 @@ class VMIDETransport:
             raise VMIDEUnavailable("ide_guest_transport_unavailable") from exc
         return initial
 
-    async def probe(self, owner_id: str, *, owner_kind: str) -> Any:
+    async def probe(
+        self, owner_id: str, *, owner_kind: str,
+        expected_generation: Any, expected_vm_uid: Any,
+    ) -> Any:
         """Observe an already-started service; status polls never start it."""
         if not self.key_path:
             raise VMIDEUnavailable("ide_guest_key_unavailable")
         initial = await self._attest(owner_id, owner_kind)
+        if not matches_admitted_runtime(initial, expected_generation, expected_vm_uid):
+            raise VMIDEUnavailable("ide_runtime_changed")
         try:
             async with self.pool.checkout(
                 target=_target(owner_id, initial),

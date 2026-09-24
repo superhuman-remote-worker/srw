@@ -114,6 +114,22 @@ class VMIdleAccessStore:
                     if active is not None:
                         active.cancel()
                     return
+                try:
+                    valid = await self.renew_tab_for_operation(
+                        tab_lease_id,
+                        operation_id=str(lease["id"]),
+                        operation_claimant=lease["claimed_by"],
+                        tab_claimant=lease["_tab_claimed_by"],
+                        owner_kind=owner_kind,
+                        owner_id=owner_id,
+                    )
+                except Exception:
+                    valid = False
+                if not valid:
+                    lost.set()
+                    if active is not None:
+                        active.cancel()
+                    return
 
         task = asyncio.create_task(heartbeat())
         try:
@@ -369,6 +385,68 @@ class VMIdleAccessStore:
             )
             return dict(lease)
 
+    async def renew_tab_for_operation(
+        self,
+        tab_lease_id: str,
+        *,
+        operation_id: str,
+        operation_claimant: str,
+        tab_claimant: str,
+        owner_kind: str,
+        owner_id: str,
+    ) -> bool:
+        """Keep this connected tab alive while its exact writer is alive.
+
+        A deliberate tab close wins: the writer may finish draining, but this
+        heartbeat cannot reopen or extend the closed tab. An expired open tab
+        cannot be resurrected. Both rows share the admitted VM generation.
+        """
+        owner = self._arguments(owner_kind, owner_id, "ide", tab_claimant)
+        tab_id, writer_id = _uuid(tab_lease_id), _uuid(operation_id)
+        if owner is None or tab_id is None or writer_id is None:
+            return False
+        if not operation_claimant.startswith(
+            f"{tab_claimant.split(':', 1)[0]}:operation:{tab_id}:"
+        ):
+            return False
+        async with self.db.acquire() as conn, conn.transaction():
+            row = await self._locked_owner(conn, owner_kind, owner)
+            if row is None:
+                return False
+            identity = await self._ready_identity(conn, owner_kind, owner, row)
+            if identity is None:
+                return False
+            writer = await conn.fetchrow(
+                "SELECT id FROM vm_idle_access_leases WHERE id=$1 AND owner_kind=$2 "
+                "AND owner_id=$3 AND kind='ide' AND claimed_by=$4 "
+                "AND provision_generation=$5 AND vm_uid=$6 "
+                "AND wake_id IS NOT DISTINCT FROM $7 AND closed_at IS NULL "
+                "AND expires_at>clock_timestamp() AND max_expires_at>clock_timestamp() "
+                "FOR UPDATE",
+                writer_id, owner_kind, owner, operation_claimant, *identity,
+            )
+            if writer is None:
+                return False
+            tab = await conn.fetchrow(
+                "SELECT closed_at,expires_at,max_expires_at FROM vm_idle_access_leases "
+                "WHERE id=$1 AND owner_kind=$2 AND owner_id=$3 AND kind='ide' "
+                "AND claimed_by=$4 AND provision_generation=$5 AND vm_uid=$6 "
+                "AND wake_id IS NOT DISTINCT FROM $7 FOR UPDATE",
+                tab_id, owner_kind, owner, tab_claimant, *identity,
+            )
+            if tab is None:
+                return False
+            if tab["closed_at"] is not None:
+                return True
+            updated = await conn.fetchrow(
+                "UPDATE vm_idle_access_leases SET "
+                "expires_at=LEAST(max_expires_at,clock_timestamp()+interval '2 minutes') "
+                "WHERE id=$1 AND closed_at IS NULL "
+                "AND expires_at>clock_timestamp() AND max_expires_at>clock_timestamp() "
+                "RETURNING id", tab_id,
+            )
+            return updated is not None
+
     async def begin_ide_operation(
         self,
         tab_lease_id: str,
@@ -410,7 +488,7 @@ class VMIdleAccessStore:
             )
             if tab is None or ":operation:" in tab["claimed_by"]:
                 return None
-            claimant = f"{user_id}:operation:{uuid4()}"
+            claimant = f"{user_id}:operation:{tab_id}:{uuid4()}"
             lease = await conn.fetchrow(
                 "INSERT INTO vm_idle_access_leases "
                 "(owner_kind,owner_id,provision_generation,vm_uid,wake_id,kind,claimed_by,"
@@ -422,7 +500,7 @@ class VMIdleAccessStore:
                 *identity,
                 claimant,
             )
-            return dict(lease)
+            return {**dict(lease), "_tab_claimed_by": tab["claimed_by"]}
 
     async def inspect(
         self, lease_id: str, *, owner_kind: str, owner_id: str, kind: str, claimant: str
