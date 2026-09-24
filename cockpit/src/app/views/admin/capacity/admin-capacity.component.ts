@@ -14,6 +14,7 @@ import {ApiService} from '../../../core/services/api.service';
 import {AppToastService} from '../../../ui/toast';
 import {AdminCapacity, AdminCapacityParkedRow} from '../../../core/models/api.model';
 import {queueParkReasonKey} from '../../../core/models/queue-park-reason';
+import {AdminVMCapacityComponent} from './admin-vm-capacity.component';
 
 /** How often the page re-reads GET /api/admin/capacity while open. */
 export const CAPACITY_REFRESH_MS = 10_000;
@@ -28,7 +29,7 @@ export const CAPACITY_REFRESH_MS = 10_000;
   selector: 'app-admin-capacity',
   standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [SidebarToggleComponent, TranslocoPipe],
+  imports: [SidebarToggleComponent, TranslocoPipe, AdminVMCapacityComponent],
   template: `
     <div class="admin-page">
       <div class="admin-container">
@@ -69,6 +70,10 @@ export const CAPACITY_REFRESH_MS = 10_000;
               <span class="kpi-sub">{{ 'admin.capacity.floor' | transloco }} {{ c.params.min_replicas }} · {{ 'admin.capacity.reserve' | transloco }} {{ c.params.reserve }}</span>
             </div>
           </section>
+
+          @if (c.vm; as vm) {
+            <app-admin-vm-capacity [vm]="vm" />
+          }
 
           <section class="admin-section">
             <div class="section-head">

@@ -935,6 +935,17 @@
       "workspace": "Workspace"
     }
   },
+  "vmWait": {
+    "kind": {
+      "resource": "Waiting for this workspace's resources",
+      "count": "Waiting for the VM controller's count limit",
+      "controller": "Waiting for the VM controller to respond",
+      "unknown": "Waiting; capacity source cannot be verified"
+    },
+    "sizeNonfit": "The requested size currently fits no eligible node.",
+    "requested": "Requested size",
+    "since": "Since"
+  },
   "admin": {
     "helm": {
       "badge": "Helm",
@@ -979,7 +990,48 @@
       "colAttempts": "Attempts",
       "colPending": "Pending input",
       "yes": "yes",
-      "no": "no"
+      "no": "no",
+      "vm": {
+        "title": "VM workspace compute",
+        "description": "Installed cluster accounting and durable holds. Remaining resources do not guarantee that a particular VM can be placed; no queue position or wait time is estimated.",
+        "noPolicy": "No VM resource policy is installed.",
+        "mode": {"off": "Off", "shadow": "Observe only", "enforce": "Enforced", "drain": "Draining"},
+        "accounted": "Inventory accounted",
+        "unavailable": "Accounting unavailable",
+        "reason": "Diagnostic reason",
+        "inventory": "Inventory",
+        "fresh": "Fresh",
+        "unknown": "Missing or stale",
+        "observed": "Observed",
+        "age": "Age",
+        "incomplete": "Incomplete snapshot",
+        "countBackstop": "VM count backstop",
+        "countDescription": "Observed VMs / controller maximum. A dash means unknown.",
+        "waiting": "Resource waiters",
+        "nonfit": "size nonfit",
+        "oldest": "Oldest wait",
+        "bypasses": "Bypasses",
+        "protected": "Protected",
+        "teardown": "Teardown holds",
+        "overdue": "overdue",
+        "unknownAge": "Unknown age",
+        "oldestProgress": "Oldest progress age",
+        "held": "Durable resource holds",
+        "heldDescription": "Known holds remain visible when inventory cannot be accounted. A dash is unknown, not zero.",
+        "accounting": "Cluster accounting",
+        "accountingUnavailable": "Node and cluster accounting is unavailable; durable holds above remain in force.",
+        "orphaned": "Holds on missing nodes",
+        "pendingExternal": "Pending external demand",
+        "separate": "Outside node totals",
+        "nodes": "Node details",
+        "nodeNote": "Node values are diagnostics; request-specific selectors, tolerations and storage topology still determine placement.",
+        "categoryHeading": "Category",
+        "category": {
+          "allocatable": "Allocatable", "headroom": "Headroom", "external": "Scheduled external", "unbound": "Unbound", "bound_reserved": "Bound, awaiting Ready", "active": "Active", "warm": "Warm", "teardown": "Teardown", "available": "Remaining", "shortfall": "Shortfall", "total": "Total held"
+        },
+        "memory": "Memory",
+        "storage": "Ephemeral storage"
+      }
     },
     "config": {
       "messages": {

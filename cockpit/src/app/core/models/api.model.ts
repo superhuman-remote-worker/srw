@@ -1918,6 +1918,8 @@ export interface Thread {
   runtime_retirement_pending?: boolean;
   retirement_disposition?: 'ended' | 'suspended' | null;
   workspace_lifecycle?: WorkspaceLifecycleView | null;
+  /** Bounded progress for this exact pinned VM creation source. */
+  vm_creation?: VMCreationView | null;
   total_turns: number;
   total_tokens: number;
   nc_session_folder?: string | null;
@@ -2207,6 +2209,13 @@ export interface VMCreationView {
   stage: 'configuration' | 'creation' | 'readiness';
   reason_code: string;
   message: string;
+  wait?: {
+    kind: 'resource' | 'count' | 'controller' | 'unknown';
+    since: string | null;
+    size_nonfit: boolean;
+    guest_vcpus: number | null;
+    guest_memory_bytes: number | null;
+  } | null;
   resumable: boolean;
 }
 
@@ -2962,6 +2971,56 @@ export interface AdminCapacityParkedRow {
 }
 
 /** GET /api/admin/capacity — what the KEDA scaler sees, plus the parked worklist. */
+export interface VMResourceVector {
+  cpu_millicores: number | null;
+  memory_bytes: number | null;
+  ephemeral_storage_bytes: number | null;
+  kvm_devices: number | null;
+  tun_devices: number | null;
+  vhost_net_devices: number | null;
+}
+
+export type VMResourceCategory =
+  | 'allocatable' | 'headroom' | 'external' | 'unbound' | 'bound_reserved'
+  | 'active' | 'warm' | 'teardown' | 'available' | 'shortfall';
+
+export interface AdminVMClusterCapacity {
+  cluster_id: string;
+  namespace: string;
+  mode: 'off' | 'shadow' | 'enforce' | 'drain';
+  policy_digest: string;
+  available: boolean;
+  reason: string | null;
+  inventory: {
+    observed_at: string;
+    received_at: string;
+    age_seconds: number | null;
+    complete: boolean;
+    fresh: boolean;
+    stale_after_seconds: number;
+  } | null;
+  held: Record<'unbound' | 'bound_reserved' | 'active' | 'warm' | 'teardown' | 'total', VMResourceVector>;
+  waiting: {count: number; nonfit: number; oldest_age_seconds: number | null; bypasses: number; protected: number};
+  teardown: {count: number; unknown_age: number; overdue: number; oldest_progress_age_seconds: number | null; overdue_after_seconds: number};
+  totals: Record<VMResourceCategory, VMResourceVector> | null;
+  nodes: Array<{
+    name: string;
+    general_exclusion: string | null;
+    request_fit_required: true;
+    resources: Record<VMResourceCategory, VMResourceVector>;
+  }> | null;
+  orphaned_held: {count: number; resources: VMResourceVector} | null;
+  pending_external: VMResourceVector | null;
+  count_backstop: {maximum: number | null; observed: number | null; reason: string | null};
+}
+
+export interface AdminVMCapacity {
+  available: boolean;
+  reason: string | null;
+  observed_at: string;
+  clusters: AdminVMClusterCapacity[];
+}
+
 export interface AdminCapacity {
   observed_at: string;
   executors: { total: number | null; ready: number | null; busy: number };
@@ -2970,6 +3029,7 @@ export interface AdminCapacity {
   desired: number;
   params: { min_replicas: number; reserve: number };
   parked?: AdminCapacityParkedRow[];
+  vm?: AdminVMCapacity;
 }
 
 /** POST /api/admin/run-queue/{unit}/unpark */

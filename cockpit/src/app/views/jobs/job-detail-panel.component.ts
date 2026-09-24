@@ -22,6 +22,7 @@ import {
   WorkspaceContractProjection,
 } from '../../core/models/api.model';
 import {JobSummary} from '../../core/models/audit.model';
+import {VMCreationWaitComponent} from '../../core/components/vm-creation-wait.component';
 import {AppBadgeComponent, BadgeTone} from '../../ui/badge';
 import {AppSpinnerComponent} from '../../ui/spinner';
 import {isTerminalJobStatus, jobStatusTone} from '../../core/util/job-status';
@@ -255,7 +256,7 @@ export function heldForReviewReason(
   selector: 'app-job-detail-panel',
   standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [RouterLink, DatePipe, TranslocoModule, AppBadgeComponent, AppSpinnerComponent],
+  imports: [RouterLink, DatePipe, TranslocoModule, AppBadgeComponent, AppSpinnerComponent, VMCreationWaitComponent],
   template: `
     <div class="detail-panel">
       @if (job().description) {
@@ -336,7 +337,11 @@ export function heldForReviewReason(
         </section>
       } @else if (job().vm_creation; as creation) {
         <section class="recovery-detail vm-creation" [class.attention]="creation.state === 'attention'">
-          <strong>{{ job().error_message || creation.message }}</strong>
+          @if (creation.wait) {
+            <app-vm-creation-wait [creation]="creation" />
+          } @else {
+            <strong>{{ job().error_message || creation.message }}</strong>
+          }
         </section>
       }
       @if (job().workspace_lifecycle; as lifecycle) {

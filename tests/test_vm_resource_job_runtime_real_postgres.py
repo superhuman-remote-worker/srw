@@ -725,7 +725,14 @@ async def test_retry_scan_preserves_waiter_and_never_posts_with_conflicted_inven
         "SELECT state,reason,request_digest,provision_generation "
         "FROM vm_creation_retries WHERE request_id=$1", retry["request_id"],
     )
-    assert (row["state"], row["reason"]) == ("queued", "capacity_wait")
+    assert (row["state"], row["reason"]) == ("queued", "resource_wait")
+    from tests.test_job_projection import redact
+
+    owner_view = redact(await db.get_job(str(retry["job_id"])))
+    assert owner_view["vm_creation"]["wait"]["kind"] == "resource"
+    assert owner_view["vm_creation"]["wait"]["guest_vcpus"] == 8
+    assert "cluster_id" not in json.dumps(owner_view["vm_creation"])
+    assert "installation_budget" not in json.dumps(owner_view["vm_creation"])
     assert row["request_digest"] == retry["request_digest"]
     assert row["provision_generation"] == retry["provision_generation"]
     assert await db.fetchval(

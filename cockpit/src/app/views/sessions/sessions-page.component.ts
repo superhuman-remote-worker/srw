@@ -14,6 +14,7 @@ import {AppToastService} from '../../ui/toast';
 import {ErrorMessageService} from '../../core/services/error-message.service';
 import {UserService} from '../../core/services/user.service';
 import {Thread} from '../../core/models/api.model';
+import {VMCreationWaitComponent} from '../../core/components/vm-creation-wait.component';
 import {SidebarToggleComponent} from '../../shell/sidebar-toggle/sidebar-toggle.component';
 import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
 import {AppButtonComponent} from '../../ui/button';
@@ -54,6 +55,7 @@ interface Project {
         AppIconComponent,
         AppFormFieldComponent,
         AppDialogComponent,
+        VMCreationWaitComponent,
     ],
     template: `
     <div class="sessions-page">
@@ -195,6 +197,9 @@ interface Project {
                 <span class="meta-item">{{ thread.total_turns || 0 }} {{ ((thread.total_turns || 0) === 1 ? 'sessions.turnsOne' : 'sessions.turnsMany') | transloco }}</span>
                 <span class="meta-item">{{ thread.last_activity | translocoDate:{dateStyle:'short', timeStyle:'short'} }}</span>
               </div>
+              @if (thread.vm_creation; as creation) {
+                @if (creation.wait) { <app-vm-creation-wait [creation]="creation" /> }
+              }
               <div class="session-actions">
                 @if (canTalk(thread)) {
                   <app-icon-button

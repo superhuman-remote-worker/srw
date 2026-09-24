@@ -645,13 +645,13 @@ async def test_thread_waiter_uses_same_resource_ledger_with_real_owner(db):
         "INSERT INTO vm_creation_retries "
         "(request_id,owner_kind,thread_id,thread_runtime_generation,"
         "provision_generation,origin,request_digest,canonical_request,"
-        "controller_configuration_digest,controller_configuration) "
-        "VALUES($1,'thread',$2,$3,$4,'initial',$5,$6::jsonb,$7,$8::jsonb)",
+        "controller_configuration_digest,controller_configuration,thread_owner_user_id,reason) "
+        "VALUES($1,'thread',$2,$3,$4,'initial',$5,$6::jsonb,$7,$8::jsonb,$9,'resource_wait')",
         request_id, thread_id, runtime_generation, generation,
         request_digest, json.dumps({
             "job_id": str(thread_id), "entity_type": "thread",
             "provision_generation": str(generation),
-        }), policy_digest, json.dumps({"version": 3}),
+        }), policy_digest, json.dumps({"version": 3}), owner,
     )
     await db.execute(
         "INSERT INTO vm_resource_admission_policy "
@@ -674,6 +674,36 @@ async def test_thread_waiter_uses_same_resource_ledger_with_real_owner(db):
         "SELECT job_id IS NULL AND thread_id=$2 AND owner_kind='thread' "
         "FROM vm_resource_waiters WHERE request_id=$1", request_id, thread_id,
     )
+    from orchestrator.services.vm_creation_owner_view import thread_creation_views
+
+    current = await thread_creation_views(
+        db, [str(thread_id)], viewer_user_id=str(owner),
+    )
+    assert current[str(thread_id)]["wait"]["kind"] == "resource"
+    assert current[str(thread_id)]["wait"]["guest_vcpus"] == 1
+    assert await thread_creation_views(
+        db, [str(thread_id)], viewer_user_id=str(uuid4()),
+    ) == {}
+    # The owner-gated detail route must carry this projection, not just the
+    # helper used to compute it. The gate is supplied explicitly here; the
+    # helper independently rechecks the current thread owner in PostgreSQL.
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+    from orchestrator.routers.thread_session import get_thread
+
+    response = await get_thread(
+        str(thread_id), object(),
+        dependencies=SimpleNamespace(
+            store=db,
+            require_thread_owner=AsyncMock(return_value=(
+                {"id": str(owner), "is_admin": False},
+                await db.get_thread(str(thread_id)),
+            )),
+            resolve_cloud_session_url=lambda *_: None,
+        ),
+    )
+    assert response["vm_creation"]["wait"]["kind"] == "resource"
+    assert "resource_wait" not in response
 
 
 @pytest.mark.asyncio

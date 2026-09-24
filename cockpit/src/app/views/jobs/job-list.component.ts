@@ -19,6 +19,7 @@ import {DataService} from '../../core/services/data.service';
 import {UserService} from '../../core/services/user.service';
 import {environment} from '../../core/environment';
 import {JobSummary} from '../../core/models/audit.model';
+import {VMCreationWaitComponent} from '../../core/components/vm-creation-wait.component';
 import {
   JobDetailPanelComponent,
   type JobDetailState,
@@ -134,6 +135,7 @@ export function jobCloudAction(job: JobSummary): JobCloudAction {
     JobFilterPanelComponent,
     JobListFooterComponent,
     JobDetailPanelComponent,
+    VMCreationWaitComponent,
   ],
   template: `
     <div class="job-list-container">
@@ -357,13 +359,17 @@ export function jobCloudAction(job: JobSummary): JobCloudAction {
                       >
                         {{ row.job.workspace_recovery.message }}
                       </div>
-                    } @else if (row.job.vm_creation) {
+                    } @else if (row.job.vm_creation; as creation) {
                       <div
                         class="workspace-recovery vm-creation"
-                        [class.attention]="row.job.vm_creation.state === 'attention'"
+                        [class.attention]="creation.state === 'attention'"
                         [style.padding-left.px]="row.isChild ? 16 : 0"
                       >
-                        {{ row.job.error_message || row.job.vm_creation.message }}
+                        @if (creation.wait) {
+                          <app-vm-creation-wait [creation]="creation" />
+                        } @else {
+                          {{ row.job.error_message || creation.message }}
+                        }
                       </div>
                     }
                     @if (row.job.status === 'failed' && row.job.error_message && !row.job.vm_creation) {

@@ -1,8 +1,10 @@
 # SSH access to a session workspace
 
-Every persistent session has a workspace container behind it, and you can open a real
-`ssh` connection into that container: run shell commands, `scp` files in and
-out, or point an editor at it. This page covers registering a key, connecting with
+Container-backed persistent sessions have a workspace you can reach over real
+`ssh`: run shell commands, `scp` files in and out, or point an editor at it.
+VM-backed Jobs and pinned sessions have a separate browser IDE path described
+below; the SSH gateway does not yet support their guest workspaces. This page
+covers registering a key, connecting with
 plain `ssh`, VS Code Remote-SSH and JetBrains Gateway, what the gateway deliberately
 refuses, how this interacts with the agent working in the same workspace, and how to
 read the errors you'll actually hit.
@@ -16,6 +18,24 @@ unstated, so read at least these before anything else:
 - **JetBrains Gateway cannot use the config block at all**, and downloads a large IDE
   backend into your workspace the first time you attach. See
   [JetBrains Gateway](#3-jetbrains-gateway).
+
+## VM browser IDE access
+
+For a VM-backed Job or pinned session, use its **Open IDE** action in Cockpit.
+The action requests access to that exact workspace; if the VM is asleep,
+Cockpit waits for its admitted wake before opening the IDE. Access does not
+resume the agent or start a new agent turn. Authenticated IDE activity renews
+a short tab lease; an abandoned tab expires when activity stops. Closing a tab
+does not interrupt an edit that is already in flight. Each access has a
+one-hour maximum lifetime, even while active. Open the IDE again after it
+expires.
+
+The VM image must include the stage-2 `srw-code-server-user.service` user unit
+and agent-host user lingering. The IDE starts only after authenticated access
+and runs on guest loopback. An older image without that unit cannot serve the
+VM IDE; rebuild and promote a supported image before relying on this action.
+The browser IDE is separate from this page's SSH gateway, which still refuses
+VM-tier SSH and SFTP connections.
 
 ## 1. Register a key
 

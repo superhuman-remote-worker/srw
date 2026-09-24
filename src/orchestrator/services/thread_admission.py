@@ -1590,6 +1590,15 @@ async def list_threads(
             t["cloud_session_url"] = dependencies.resolve_cloud_session_url(
                 t, mounts_by_thread.get(str(t["id"]), [])
             )
+        if getattr(dependencies.store, "supports_vm_creation_retry", False):
+            from orchestrator.services.vm_creation_owner_view import thread_creation_views
+
+            progress = await thread_creation_views(
+                dependencies.store, [str(t["id"]) for t in threads],
+                viewer_user_id=str(user["id"]), admin=user.get("is_admin") is True,
+            )
+            for t in threads:
+                t["vm_creation"] = progress.get(str(t["id"]))
         return {"threads": [dependencies.redact_thread_metadata(t) for t in threads]}
     except HTTPException:
         raise
