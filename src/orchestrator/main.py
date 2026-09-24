@@ -8859,10 +8859,12 @@ def _system_settings_dependencies() -> (
 def _capacity_dependencies() -> capacity_routes.CapacityDependencies:
     """Admin capacity read (capacity_ux_and_queue_autoscaling.md §2)."""
     from orchestrator.services.stateless_capacity import capacity_snapshot
+    from orchestrator.services.vm_resource_capacity import vm_capacity_snapshot
 
     return capacity_routes.CapacityDependencies(
         snapshot=lambda: capacity_snapshot(postgres_db),
         require_admin=_require_admin,
+        vm_snapshot=lambda: vm_capacity_snapshot(postgres_db),
     )
 
 

@@ -15,6 +15,13 @@ ZERO = ResourceVector(0, 0, 0)
 _HELD = {"reserved", "active", "warm", "teardown"}
 
 
+def reservation_category(state, *, vm_uid, vmi_uid, launcher_uid):
+    """Separate durable observed placement from a successful Ready transition."""
+    if state == "reserved":
+        return "bound_reserved" if all((vm_uid, vmi_uid, launcher_uid)) else "unbound"
+    return state
+
+
 def _uuid(value, *, nullable=False):
     if value is None and nullable:
         return
@@ -70,6 +77,7 @@ class NodeAccounting:
     headroom: ResourceVector
     external: ResourceVector
     unbound: ResourceVector
+    bound_reserved: ResourceVector
     active: ResourceVector
     warm: ResourceVector
     teardown: ResourceVector
@@ -79,7 +87,9 @@ class NodeAccounting:
 
     @property
     def held(self):
-        return self.unbound + self.active + self.warm + self.teardown
+        return (
+            self.unbound + self.bound_reserved + self.active + self.warm + self.teardown
+        )
 
 
 @dataclass(frozen=True)
@@ -123,7 +133,15 @@ def account_inventory(snapshot, reservations, *, headroom):
     vms = {vm["uid"]: vm for vm in snapshot["vms"]}
     charges = {
         uid: {
-            key: ZERO for key in ("external", "unbound", "active", "warm", "teardown")
+            key: ZERO
+            for key in (
+                "external",
+                "unbound",
+                "bound_reserved",
+                "active",
+                "warm",
+                "teardown",
+            )
         }
         for uid in nodes
     }
@@ -180,7 +198,12 @@ def account_inventory(snapshot, reservations, *, headroom):
         if _exact_launcher(reservation, pod, vmis, vms):
             charge = charge.maximum(ResourceVector(**pod["requests"]))
             excluded.add(pod["uid"])
-        category = "unbound" if reservation.state == "reserved" else reservation.state
+        category = reservation_category(
+            reservation.state,
+            vm_uid=reservation.vm_uid,
+            vmi_uid=reservation.vmi_uid,
+            launcher_uid=reservation.launcher_uid,
+        )
         charges[reservation.node_uid][category] += charge
     if snapshot["protocol"] == 2:
         # A known SRW VM is installation/owner occupancy, even when its Pod
@@ -189,6 +212,13 @@ def account_inventory(snapshot, reservations, *, headroom):
         attributable_by_name = {}
         for vm in snapshot["vms"]:
             if vm["owner_kind"] not in {"job", "thread"}:
+                if vm["name"].startswith("agent-vm-") and not vm["name"].startswith(
+                    "agent-vm-golden-"
+                ):
+                    # Legacy guests may predate owner labels. Neither a
+                    # missing launcher nor a deletion timestamp proves that
+                    # their logical or physical occupancy has ended.
+                    raise ResourceAdmissionError("legacy_occupancy_unclassified")
                 continue
             reservation = held_by_vm.get(vm["uid"])
             if (
@@ -211,14 +241,11 @@ def account_inventory(snapshot, reservations, *, headroom):
             reservation = attributable.get(vmi["vm_uid"])
             if reservation is None:
                 continue
-            if (
-                reservation.vmi_uid != vmi["uid"]
-                or (
-                    vmi["node_uid"] is not None
-                    and (
-                        reservation.node_uid != vmi["node_uid"]
-                        or reservation.node_name != vmi["node_name"]
-                    )
+            if reservation.vmi_uid != vmi["uid"] or (
+                vmi["node_uid"] is not None
+                and (
+                    reservation.node_uid != vmi["node_uid"]
+                    or reservation.node_name != vmi["node_name"]
                 )
             ):
                 raise ResourceAdmissionError("legacy_occupancy_unclassified")

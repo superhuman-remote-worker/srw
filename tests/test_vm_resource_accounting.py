@@ -80,6 +80,23 @@ def test_exact_bound_launcher_charged_once_at_component_max():
     assert node.available == ResourceVector(2800, 7 * 1024**3, 9)
 
 
+@pytest.mark.parametrize("deleting", [False, True])
+@pytest.mark.parametrize("launcher_present", [False, True])
+def test_unlabelled_srw_vm_never_becomes_external_only_capacity(deleting, launcher_present):
+    value, reservation = setup()
+    value["protocol"] = 2
+    value["vms"][0].update(name="agent-vm-" + str(uuid4()), owner_kind=None,
+                           owner_id=None, provision_generation=None, deleting=deleting)
+    value["pods"][0].update(reservation_id=None, provision_generation=None,
+                            requests=ResourceVector(1200, 512 * 1024**2, 1, 50000000, 1, 1).to_six_dict())
+    if not launcher_present:
+        value["pods"] = []
+    value["nodes"][0]["allocatable"].update(ephemeral_storage_bytes=1000000000,
+                                           tun_devices=8, vhost_net_devices=8)
+    with pytest.raises(ResourceAdmissionError, match="legacy_occupancy_unclassified"):
+        result(value, [])
+
+
 def test_protocol_two_external_launcher_keeps_node_charge_without_srw_budget_identity():
     value, reservation = setup()
     value["protocol"] = 2
@@ -173,6 +190,17 @@ def test_unbound_reservation_and_untrusted_launcher_both_remain_charged():
     node = result(value, [reservation]).nodes[reservation.node_uid]
     assert node.unbound == reservation.vector
     assert node.external == ResourceVector(**value["pods"][0]["requests"])
+
+
+def test_reserved_with_observed_launcher_is_bound_even_before_ready():
+    value, reservation = setup()
+    reservation = replace(reservation, state="reserved")
+    node = result(value, [reservation]).nodes[reservation.node_uid]
+    assert node.unbound == ZERO
+    assert node.bound_reserved == ResourceVector(1200, 1024**3, 1)
+    assert node.external == ZERO
+    assert node.held == node.bound_reserved
+    assert node.available == ResourceVector(2800, 7 * 1024**3, 9)
 
 
 def test_deleting_external_pod_counts_until_terminal_and_unscheduled_has_no_node_charge():

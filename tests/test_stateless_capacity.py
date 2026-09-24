@@ -487,17 +487,24 @@ async def test_capacity_route_requires_admin():
         raise HTTPException(status_code=403, detail="Admin access required")
 
     snapshot = AsyncMock(return_value={"desired": 2})
-    deps = routes.CapacityDependencies(snapshot=snapshot, require_admin=_deny)
+    vm_snapshot = AsyncMock(return_value={"available": False, "clusters": []})
+    deps = routes.CapacityDependencies(snapshot=snapshot, require_admin=_deny, vm_snapshot=vm_snapshot)
     with pytest.raises(HTTPException) as exc:
         await routes.get_capacity(MagicMock(), dependencies=deps)
     assert exc.value.status_code == 403
     snapshot.assert_not_awaited()
+    vm_snapshot.assert_not_awaited()
 
     async def _allow(_request):
         return {"id": "admin", "real_is_admin": True}
 
     deps = routes.CapacityDependencies(snapshot=snapshot, require_admin=_allow)
     assert await routes.get_capacity(MagicMock(), dependencies=deps) == {"desired": 2}
+    deps = routes.CapacityDependencies(snapshot=snapshot, require_admin=_allow, vm_snapshot=vm_snapshot)
+    assert await routes.get_capacity(MagicMock(), dependencies=deps) == {
+        "desired": 2, "vm": {"available": False, "clusters": []},
+    }
+    vm_snapshot.assert_awaited_once()
 
 
 def test_capacity_route_is_mounted():
