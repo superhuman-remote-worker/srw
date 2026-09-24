@@ -1,8 +1,19 @@
-import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest';
-import {Injector, runInInjectionContext, signal} from '@angular/core';
+import {afterEach, beforeAll, beforeEach, describe, expect, it, vi} from 'vitest';
+import {
+    CUSTOM_ELEMENTS_SCHEMA,
+    DestroyableInjector,
+    Injector,
+    Pipe,
+    PipeTransform,
+    runInInjectionContext,
+    signal,
+    ɵresolveComponentResources,
+} from '@angular/core';
+import {TestBed} from '@angular/core/testing';
+import {TitleCasePipe} from '@angular/common';
 import {HttpClient, HttpErrorResponse} from '@angular/common/http';
 import {Router} from '@angular/router';
-import {of, throwError} from 'rxjs';
+import {Observable, of, Subject, throwError} from 'rxjs';
 import {SessionsPageComponent} from './sessions-page.component';
 import {SessionListService} from '../../core/services/session-list.service';
 import {TranslocoService} from '@jsverse/transloco';
@@ -14,9 +25,10 @@ import {ErrorMessageService} from '../../core/services/error-message.service';
 import {UserService} from '../../core/services/user.service';
 
 /**
- * Create a SessionsPageComponent in a minimal injection context.
+ * The page's collaborators as mocks, plus the providers that wire them. Shared
+ * by the direct-construction harness and the rendered (TestBed) one.
  */
-function createComponent() {
+function createMocks() {
     const mockHttp: any = {
         get: vi.fn().mockReturnValue(of({threads: []})),
         post: vi.fn().mockReturnValue(of({thread_id: 'new-thread-123'})),
@@ -71,28 +83,37 @@ function createComponent() {
         load: vi.fn(),
     };
 
-    const injector = Injector.create({
-        providers: [
-            {provide: HttpClient, useValue: mockHttp},
-            {provide: Router, useValue: mockRouter},
-            {provide: PersistentChatService, useValue: mockChat},
-            {provide: AppToastService, useValue: mockToast},
-            {provide: ErrorMessageService, useValue: {translate: (_e: unknown, fallback: string) => fallback}},
-            {provide: UserService, useValue: mockUserService},
-            {provide: SettingsService, useValue: mockSettings},
-            {provide: ModelService, useValue: mockModelService},
-            {provide: TranslocoService, useValue: {translate: (key: string) => key, getActiveLang: () => 'en'}},
-            // Real service, not a hand-rolled mock: it has no logic of its own
-            // worth stubbing, and wiring it for real here means it resolves
-            // against the same mockHttp above — every existing assertion on
-            // mockHttp.get keeps working unchanged.
-            SessionListService,
-        ],
-    });
+    const providers = [
+        {provide: HttpClient, useValue: mockHttp},
+        {provide: Router, useValue: mockRouter},
+        {provide: PersistentChatService, useValue: mockChat},
+        {provide: AppToastService, useValue: mockToast},
+        {provide: ErrorMessageService, useValue: {translate: (_e: unknown, fallback: string) => fallback}},
+        {provide: UserService, useValue: mockUserService},
+        {provide: SettingsService, useValue: mockSettings},
+        {provide: ModelService, useValue: mockModelService},
+        {provide: TranslocoService, useValue: {translate: (key: string) => key, getActiveLang: () => 'en'}},
+        // Real service, not a hand-rolled mock: it has no logic of its own
+        // worth stubbing, and wiring it for real here means it resolves
+        // against the same mockHttp above — every existing assertion on
+        // mockHttp.get keeps working unchanged.
+        SessionListService,
+    ];
+    return {mockHttp, mockRouter, mockChat, mockToast, providers};
+}
+
+/**
+ * Create a SessionsPageComponent in a minimal injection context. The injector
+ * is returned so a test can destroy it: outside a rendered view the page's
+ * DestroyRef resolves to this injector, so destroying it is the page's destroy.
+ */
+function createComponent() {
+    const {mockHttp, mockRouter, mockChat, mockToast, providers} = createMocks();
+    const injector = Injector.create({providers});
 
     const component = runInInjectionContext(injector, () => new SessionsPageComponent());
     const sessionList = injector.get(SessionListService);
-    return {component, mockHttp, mockRouter, mockChat, mockToast, sessionList};
+    return {component, injector, mockHttp, mockRouter, mockChat, mockToast, sessionList};
 }
 
 function makeThread(overrides: Partial<any> = {}) {
@@ -111,26 +132,69 @@ function makeThread(overrides: Partial<any> = {}) {
     };
 }
 
+/**
+ * The gaps between background re-reads while any card is `ending` (a pinned
+ * retirement settles in about 60–75 s): the first re-read 2 s after the card
+ * is seen, doubling, capped at 15 s — so a settled card updates within the
+ * server's settlement time plus at most one 15 s interval.
+ */
+const ENDING_POLL_GAPS_MS = [2_000, 4_000, 8_000, 15_000, 15_000, 15_000];
+
+/**
+ * Route GETs by URL. Each `/persistent/threads` read answers with the next
+ * entry of `lists` (the last one repeats); an array is served as the thread
+ * list, an Observable is returned as-is so a test can hold a read in flight.
+ * Anything else (the projects read) answers empty.
+ */
+function serveThreadLists(mockHttp: any, ...lists: Array<any[] | Observable<unknown>>): void {
+    let next = 0;
+    mockHttp.get.mockImplementation((url: string) => {
+        if (!String(url).includes('/persistent/threads')) return of([]);
+        const list = lists[Math.min(next++, lists.length - 1)];
+        return Array.isArray(list) ? of({threads: list}) : list;
+    });
+}
+
+/** How many times the page has read the thread list. */
+function threadListReads(mockHttp: any): number {
+    return mockHttp.get.mock.calls.filter((call: any[]) =>
+        String(call[0]).includes('/persistent/threads'),
+    ).length;
+}
+
 
 describe('SessionsPageComponent', () => {
     let component: SessionsPageComponent;
+    let injector: DestroyableInjector;
     let mockHttp: any;
     let mockRouter: any;
     let mockChat: any;
     let mockToast: any;
     let sessionList: SessionListService;
+    let pageDestroyed: boolean;
+
+    /** The page's destroy; idempotent (an injector throws if destroyed twice). */
+    const destroyPage = () => {
+        if (pageDestroyed) return;
+        pageDestroyed = true;
+        injector.destroy();
+    };
 
     beforeEach(() => {
         const created = createComponent();
         component = created.component;
+        injector = created.injector;
         mockHttp = created.mockHttp;
         mockRouter = created.mockRouter;
         mockChat = created.mockChat;
         mockToast = created.mockToast;
         sessionList = created.sessionList;
+        pageDestroyed = false;
     });
 
     afterEach(() => {
+        // Destroy the page so nothing it scheduled outlives its test.
+        destroyPage();
         vi.clearAllMocks();
     });
 
@@ -512,6 +576,182 @@ describe('SessionsPageComponent', () => {
                 ),
             ).toBe(false);
         });
+
+        // R1.B12 guard: the retry path for a fenced (503) delete must not
+        // change the mid-turn escalation — a 409 turn_in_flight still opens
+        // the force confirm, raises no toast, and force goes out only after
+        // that second confirmation.
+        it('keeps the 409 turn_in_flight escalation to a confirmed force delete', async () => {
+            component.deleteSession(makeThread({id: 't-live'}));
+            mockHttp.delete.mockReturnValueOnce(throwError(() => new HttpErrorResponse({
+                status: 409,
+                error: {detail: {code: 'turn_in_flight'}},
+            })));
+
+            await component.confirmDelete();
+
+            expect(component.confirmForceOpen()).toBe(true);
+            expect(mockToast.danger).not.toHaveBeenCalled();
+            expect(mockToast.warning).not.toHaveBeenCalled();
+            expect(mockHttp.delete).toHaveBeenCalledTimes(1);
+            expect(mockHttp.delete.mock.calls[0][0]).not.toContain('force=true');
+
+            await component.confirmForceDelete();
+
+            expect(component.confirmForceOpen()).toBe(false);
+            expect(mockHttp.delete).toHaveBeenCalledTimes(2);
+            expect(mockHttp.delete.mock.calls[1][0]).toContain(
+                '/persistent/threads/t-live?permanent=true&force=true',
+            );
+        });
+    });
+
+    // =========================================================================
+    // R1.B12: an `ending` card refreshes itself instead of waiting for a
+    // manual reload (knowledge-base/knowledge/issues/
+    // cockpit_ending_session_card_never_refreshes.md).
+    // =========================================================================
+
+    describe('ending cards refresh in the background', () => {
+        beforeEach(() => {
+            vi.useFakeTimers();
+        });
+
+        afterEach(() => {
+            // Destroy while the fake clock is still installed, so the page
+            // clears its own timer rather than one the real clock never had.
+            destroyPage();
+            vi.useRealTimers();
+        });
+
+        it.fails('re-reads the list while a card is ending and shows it ended, with no loading placeholder', async () => {
+            const inFlight = new Subject<unknown>();
+            serveThreadLists(mockHttp, [makeThread({id: 't-end', status: 'ending'})], inFlight);
+
+            component.ngOnInit();
+            await vi.advanceTimersByTimeAsync(0);
+            expect(component.threads()[0].status).toBe('ending');
+            expect(threadListReads(mockHttp)).toBe(1);
+
+            await vi.advanceTimersByTimeAsync(ENDING_POLL_GAPS_MS[0]);
+
+            // The background re-read is in flight and the list stays on
+            // screen: the page's placeholder is exactly `@if (loading())`.
+            expect(threadListReads(mockHttp)).toBe(2);
+            expect(component.loading()).toBe(false);
+            expect(component.threads().map(thread => thread.id)).toEqual(['t-end']);
+
+            inFlight.next({threads: [makeThread({id: 't-end', status: 'ended'})]});
+            inFlight.complete();
+            await vi.advanceTimersByTimeAsync(0);
+
+            expect(component.threads()[0].status).toBe('ended');
+            expect(component.loading()).toBe(false);
+        });
+
+        it.fails('re-reads a retirement-pending card and drops it once the server no longer lists it', async () => {
+            const kept = makeThread({id: 't-keep', status: 'active'});
+            serveThreadLists(
+                mockHttp,
+                [kept, makeThread({id: 't-gone', status: 'active', runtime_retirement_pending: true})],
+                [kept],
+            );
+
+            component.ngOnInit();
+            await vi.advanceTimersByTimeAsync(0);
+            expect(component.threads().find(thread => thread.id === 't-gone')?.status).toBe('ending');
+            const loadingWrites = vi.spyOn(component.loading, 'set');
+
+            await vi.advanceTimersByTimeAsync(ENDING_POLL_GAPS_MS[0]);
+
+            expect(threadListReads(mockHttp)).toBe(2);
+            expect(component.threads().map(thread => thread.id)).toEqual(['t-keep']);
+            expect(loadingWrites).not.toHaveBeenCalledWith(true);
+            expect(component.loading()).toBe(false);
+        });
+
+        // Guard (holds before and after the fix): the poll exists only for
+        // `ending` cards; an ordinary list is read once.
+        it('does not poll when no card is ending', async () => {
+            serveThreadLists(mockHttp, [
+                makeThread({id: 't-active', status: 'active'}),
+                makeThread({id: 't-ended', status: 'ended'}),
+            ]);
+
+            component.ngOnInit();
+            await vi.advanceTimersByTimeAsync(120_000);
+
+            expect(threadListReads(mockHttp)).toBe(1);
+            expect(vi.getTimerCount()).toBe(0);
+        });
+
+        it.fails('stops polling once no card is ending', async () => {
+            serveThreadLists(
+                mockHttp,
+                [makeThread({id: 't-end', status: 'ending'})],
+                [makeThread({id: 't-end', status: 'ending'})],
+                [makeThread({id: 't-end', status: 'ended'})],
+            );
+
+            component.ngOnInit();
+            await vi.advanceTimersByTimeAsync(0);
+            await vi.advanceTimersByTimeAsync(ENDING_POLL_GAPS_MS[0]);
+            expect(threadListReads(mockHttp)).toBe(2);
+            await vi.advanceTimersByTimeAsync(ENDING_POLL_GAPS_MS[1]);
+            expect(threadListReads(mockHttp)).toBe(3);
+            expect(component.threads()[0].status).toBe('ended');
+
+            expect(vi.getTimerCount()).toBe(0);
+            await vi.advanceTimersByTimeAsync(120_000);
+            expect(threadListReads(mockHttp)).toBe(3);
+        });
+
+        it.fails('stops polling when the page is destroyed', async () => {
+            serveThreadLists(mockHttp, [makeThread({id: 't-end', status: 'ending'})]);
+
+            component.ngOnInit();
+            await vi.advanceTimersByTimeAsync(0);
+            expect(vi.getTimerCount()).toBe(1);
+
+            destroyPage();
+
+            expect(vi.getTimerCount()).toBe(0);
+            await vi.advanceTimersByTimeAsync(120_000);
+            expect(threadListReads(mockHttp)).toBe(1);
+        });
+
+        it.fails('does not re-arm from a re-read that lands after the page is destroyed', async () => {
+            const inFlight = new Subject<unknown>();
+            serveThreadLists(mockHttp, [makeThread({id: 't-end', status: 'ending'})], inFlight);
+
+            component.ngOnInit();
+            await vi.advanceTimersByTimeAsync(0);
+            await vi.advanceTimersByTimeAsync(ENDING_POLL_GAPS_MS[0]);
+            expect(threadListReads(mockHttp)).toBe(2);
+
+            destroyPage();
+            inFlight.next({threads: [makeThread({id: 't-end', status: 'ending'})]});
+            inFlight.complete();
+            await vi.advanceTimersByTimeAsync(120_000);
+
+            expect(vi.getTimerCount()).toBe(0);
+            expect(threadListReads(mockHttp)).toBe(2);
+        });
+
+        it.fails('backs off 2 s → 4 s → 8 s → 15 s and holds the 15 s cap', async () => {
+            serveThreadLists(mockHttp, [makeThread({id: 't-end', status: 'ending'})]);
+
+            component.ngOnInit();
+            await vi.advanceTimersByTimeAsync(0);
+
+            let reads = 1;
+            for (const gap of ENDING_POLL_GAPS_MS) {
+                await vi.advanceTimersByTimeAsync(gap - 1);
+                expect(threadListReads(mockHttp)).toBe(reads);
+                await vi.advanceTimersByTimeAsync(1);
+                expect(threadListReads(mockHttp)).toBe(++reads);
+            }
+        });
     });
 
     describe('openSession()', () => {
@@ -601,5 +841,215 @@ describe('SessionsPageComponent', () => {
 
             expect(mockRouter.navigate).not.toHaveBeenCalled();
         });
+    });
+});
+
+/** Keys straight through: the card is asserted on its bindings, not its copy. */
+@Pipe({name: 'transloco', standalone: true})
+class TranslocoStubPipe implements PipeTransform {
+    transform(key: string): string {
+        return key;
+    }
+}
+
+@Pipe({name: 'translocoDate', standalone: true})
+class TranslocoDateStubPipe implements PipeTransform {
+    transform(value: unknown): string {
+        return String(value ?? '');
+    }
+}
+
+// =============================================================================
+// R1.B12: a permanent Delete fenced by a retryable 503 keeps a retry path on
+// the card. Rendered, because the defect is the Delete control's `disabled`
+// binding on an `ending` card. The design-system children are stubbed as
+// custom elements, so a binding is read back as an element property and an
+// `(clicked)` output is driven with a `clicked` DOM event.
+// =============================================================================
+
+describe('SessionsPageComponent (rendered): a fenced permanent delete', () => {
+    type IconButton = HTMLElement & {disabled: boolean; tooltip: string; ariaLabel: string};
+    let mocks: ReturnType<typeof createMocks>;
+
+    beforeAll(async () => {
+        // The real children carry styleUrl resources JIT cannot fetch; they
+        // are stubbed below, but TestBed still resolves them on import.
+        await ɵresolveComponentResources(() => Promise.resolve(''));
+    });
+
+    beforeEach(() => {
+        mocks = createMocks();
+        TestBed.configureTestingModule({
+            imports: [SessionsPageComponent],
+            providers: mocks.providers,
+        });
+        TestBed.overrideComponent(SessionsPageComponent, {
+            set: {
+                imports: [TranslocoStubPipe, TranslocoDateStubPipe, TitleCasePipe],
+                schemas: [CUSTOM_ELEMENTS_SCHEMA],
+            },
+        });
+    });
+
+    afterEach(() => {
+        TestBed.resetTestingModule();
+        vi.clearAllMocks();
+    });
+
+    /** Let the page's HTTP promise chains settle, then re-render. */
+    async function settle(fixture: {detectChanges(): void}): Promise<void> {
+        await new Promise(resolve => setTimeout(resolve, 0));
+        fixture.detectChanges();
+    }
+
+    function card(host: HTMLElement, id: string): HTMLElement {
+        return host.querySelector(`[data-thread-id="${id}"]`) as HTMLElement;
+    }
+
+    function deleteButton(host: HTMLElement, id: string): IconButton {
+        return card(host, id).querySelector('app-icon-button[variant="danger"]') as IconButton;
+    }
+
+    it.fails('keeps Delete enabled as a retry on the ending card, re-sends it on click, and drops the retry on a 200', async () => {
+        const live = makeThread({id: 't-del', status: 'active'});
+        // What the list reports once the fenced delete has begun retirement.
+        const retiring = makeThread({id: 't-del', status: 'active', runtime_retirement_pending: true});
+        serveThreadLists(mocks.mockHttp, [live], [retiring]);
+        mocks.mockHttp.delete
+            .mockReturnValueOnce(throwError(() => new HttpErrorResponse({
+                status: 503,
+                error: {detail: 'Terminal workspace authority advanced; retry retirement'},
+            })))
+            .mockReturnValueOnce(of({status: 'ending'}));
+
+        const fixture = TestBed.createComponent(SessionsPageComponent);
+        const component = fixture.componentInstance;
+        const host = fixture.nativeElement as HTMLElement;
+        fixture.detectChanges();
+        await settle(fixture);
+        expect(deleteButton(host, 't-del').disabled).toBe(false);
+
+        deleteButton(host, 't-del').dispatchEvent(new CustomEvent('clicked'));
+        expect(component.confirmDeleteOpen()).toBe(true);
+        await component.confirmDelete();
+        // The user's reload: the card now shows the pending retirement.
+        await component.loadThreads();
+        await settle(fixture);
+
+        expect(card(host, 't-del').classList.contains('ending')).toBe(true);
+        expect(deleteButton(host, 't-del').disabled).toBe(false);
+        expect(deleteButton(host, 't-del').tooltip).toBe('sessions.tooltip.retryDelete');
+        expect(deleteButton(host, 't-del').ariaLabel).toBe('sessions.tooltip.retryDelete');
+        expect(mocks.mockToast.warning).toHaveBeenCalledWith('errors.sessions.deleteRetryable');
+        expect(mocks.mockToast.danger).not.toHaveBeenCalled();
+
+        // The retry re-sends the permanent delete the user already confirmed.
+        deleteButton(host, 't-del').dispatchEvent(new CustomEvent('clicked'));
+        await settle(fixture);
+
+        expect(component.confirmDeleteOpen()).toBe(false);
+        expect(mocks.mockHttp.delete).toHaveBeenCalledTimes(2);
+        expect(mocks.mockHttp.delete.mock.calls[1][0]).toContain(
+            '/persistent/threads/t-del?permanent=true',
+        );
+        expect(mocks.mockHttp.delete.mock.calls[1][0]).not.toContain('force=true');
+        // A 200 hands the delete to the server; the card is a plain ending
+        // card again until the poll sees it gone.
+        expect(card(host, 't-del').classList.contains('ending')).toBe(true);
+        expect(deleteButton(host, 't-del').disabled).toBe(true);
+        expect(deleteButton(host, 't-del').tooltip).toBe('sessions.tooltip.delete');
+    });
+
+    it.fails('retries a fenced force delete as a force delete, and drops the retry once the card leaves ending', async () => {
+        const live = makeThread({id: 't-live', status: 'active'});
+        const retiring = makeThread({id: 't-live', status: 'active', runtime_retirement_pending: true});
+        serveThreadLists(mocks.mockHttp, [live], [retiring]);
+        const fenced = () => throwError(() => new HttpErrorResponse({
+            status: 503,
+            error: {detail: 'Terminal workspace successor authority is not yet safe'},
+        }));
+        mocks.mockHttp.delete
+            .mockReturnValueOnce(throwError(() => new HttpErrorResponse({
+                status: 409,
+                error: {detail: {code: 'turn_in_flight'}},
+            })))
+            .mockReturnValueOnce(fenced())
+            .mockReturnValueOnce(fenced());
+
+        const fixture = TestBed.createComponent(SessionsPageComponent);
+        const component = fixture.componentInstance;
+        const host = fixture.nativeElement as HTMLElement;
+        fixture.detectChanges();
+        await settle(fixture);
+
+        deleteButton(host, 't-live').dispatchEvent(new CustomEvent('clicked'));
+        await component.confirmDelete();
+        expect(component.confirmForceOpen()).toBe(true);
+        await component.confirmForceDelete();
+        await component.loadThreads();
+        await settle(fixture);
+
+        expect(card(host, 't-live').classList.contains('ending')).toBe(true);
+        expect(deleteButton(host, 't-live').disabled).toBe(false);
+
+        // A retry that meets the fence again keeps the retry, and keeps force.
+        deleteButton(host, 't-live').dispatchEvent(new CustomEvent('clicked'));
+        await settle(fixture);
+
+        expect(component.confirmForceOpen()).toBe(false);
+        expect(mocks.mockHttp.delete).toHaveBeenCalledTimes(3);
+        expect(mocks.mockHttp.delete.mock.calls[2][0]).toContain(
+            '/persistent/threads/t-live?permanent=true&force=true',
+        );
+        expect(deleteButton(host, 't-live').disabled).toBe(false);
+        expect(deleteButton(host, 't-live').tooltip).toBe('sessions.tooltip.retryDelete');
+
+        // The retirement settles: the card leaves `ending`, the retry goes,
+        // and Delete is the ordinary confirmed action again.
+        serveThreadLists(mocks.mockHttp, [makeThread({id: 't-live', status: 'ended'})]);
+        await component.loadThreads();
+        await settle(fixture);
+
+        expect(deleteButton(host, 't-live').disabled).toBe(false);
+        expect(deleteButton(host, 't-live').tooltip).toBe('sessions.tooltip.delete');
+        deleteButton(host, 't-live').dispatchEvent(new CustomEvent('clicked'));
+        expect(component.confirmDeleteOpen()).toBe(true);
+        expect(mocks.mockHttp.delete).toHaveBeenCalledTimes(3);
+    });
+
+    it.fails('drops the retry when a retried delete fails for a reason that is not the fence', async () => {
+        const live = makeThread({id: 't-del', status: 'active'});
+        const retiring = makeThread({id: 't-del', status: 'active', runtime_retirement_pending: true});
+        serveThreadLists(mocks.mockHttp, [live], [retiring]);
+        mocks.mockHttp.delete
+            .mockReturnValueOnce(throwError(() => new HttpErrorResponse({
+                status: 503,
+                error: {detail: 'Terminal workspace authority advanced; retry retirement'},
+            })))
+            .mockReturnValueOnce(throwError(() => new HttpErrorResponse({
+                status: 409,
+                error: {detail: {code: 'pinned_retirement_conflict'}},
+            })));
+
+        const fixture = TestBed.createComponent(SessionsPageComponent);
+        const component = fixture.componentInstance;
+        const host = fixture.nativeElement as HTMLElement;
+        fixture.detectChanges();
+        await settle(fixture);
+
+        deleteButton(host, 't-del').dispatchEvent(new CustomEvent('clicked'));
+        await component.confirmDelete();
+        await component.loadThreads();
+        await settle(fixture);
+        expect(deleteButton(host, 't-del').disabled).toBe(false);
+
+        deleteButton(host, 't-del').dispatchEvent(new CustomEvent('clicked'));
+        await settle(fixture);
+
+        expect(mocks.mockHttp.delete).toHaveBeenCalledTimes(2);
+        expect(mocks.mockToast.danger).toHaveBeenCalledOnce();
+        expect(component.confirmForceOpen()).toBe(false);
+        expect(deleteButton(host, 't-del').disabled).toBe(true);
+        expect(deleteButton(host, 't-del').tooltip).toBe('sessions.tooltip.delete');
     });
 });
