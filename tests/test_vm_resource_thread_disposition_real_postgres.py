@@ -1,8 +1,11 @@
 """Typed partial creation End keeps a genuine thread charge until exact cleanup."""
 
+import json
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from copy import deepcopy
-from uuid import UUID
+from types import SimpleNamespace
+from uuid import UUID, uuid4
 
 import asyncpg
 import pytest
@@ -15,6 +18,17 @@ from orchestrator.services.vm_creation_retry_store import (
     VMCreationRetryStore,
 )
 from orchestrator.services.vm_provisioning_phases import VMProvisioningPhaseStore
+from orchestrator.services.vm_creation_request import build_vm_creation_request
+from orchestrator.services.vm_idle_lifecycle import VMIdleLifecycleStore
+from orchestrator.services.vm_provisioner import VMProvisioner
+from orchestrator.services.agent_thread_status import update_thread_status
+from shared.vm_creation_issuance import canonical_configuration_digest, seal_creation_carrier
+from shared.vm_creation_retry import canonical_request_digest
+from shared.vm_launcher_profile import predict_launcher
+from tests.test_vm_idle_pinned_session_real_postgres import ready_pinned_thread
+from tests.test_vm_resource_configuration import whole_launcher_configuration
+from tests.test_vm_resource_whole_store_real_postgres import environment
+from tests.test_vm_resource_inventory_real_postgres import publish, successor
 from shared.vm_creation_disposition import disposition_identity
 from tests.test_vm_creation_actuation import setup as _setup_fixture
 from tests.test_vm_resource_thread_source_real_postgres import (
@@ -28,6 +42,452 @@ from tests.test_vm_resource_thread_source_real_postgres import (
 from vm_controller.creation_disposition import CreationDisposer
 
 setup = _setup_fixture
+
+
+async def retained_wake_partial(
+    db, monkeypatch, *, secret=False, effect=True, authorize_end=True,
+):
+    """Build a real suspended pinned wake, typed grant, and observed retained DV."""
+    from tests.test_vm_creation_actuation import SECRET
+
+    monkeypatch.setenv("VM_LIFECYCLE_HMAC_SECRET", SECRET.decode())
+    thread_id, body, old = await ready_pinned_thread(db, monkeypatch)
+    await update_thread_status(
+        str(thread_id), body,
+        dependencies=SimpleNamespace(db=db, thread_accepts_runtime=lambda _: True),
+    )
+    episode = json.loads(await db.fetchval(
+        "SELECT workspace_idle_episode FROM threads WHERE id=$1", thread_id,
+    ))
+    episode["episode_id"] = str(uuid4())
+    episode["entered_at"] = (datetime.now(timezone.utc) - timedelta(minutes=16)).isoformat()
+    await db.execute(
+        "UPDATE threads SET workspace_idle_revision=2,workspace_idle_episode=$2::jsonb WHERE id=$1",
+        thread_id, json.dumps(episode),
+    )
+    idle = VMIdleLifecycleStore(db)
+    operation = await idle.admit_thread_release(
+        str(thread_id), episode_id=episode["episode_id"], revision=2,
+        identity=old, turn_quiescent=True,
+    )
+    assert operation is not None
+    context = json.loads(await db.fetchval(
+        "SELECT runtime_retirement_context FROM threads WHERE id=$1", thread_id,
+    ))
+    assert await db.acknowledge_pinned_thread_local_quiescence(
+        str(thread_id),
+        expected_runtime_generation=str(operation["thread_runtime_generation"]),
+        expected_retirement_token=str(operation["thread_retirement_token"]),
+        expected_agent_id=context["agent_id"],
+        expected_attach_token=context["runtime_attach_token"],
+        expected_settle_status="suspended",
+        expected_quiescence_protocol="workspace_actuator_zero_v1",
+        expected_workspace_generation=old["generation"],
+        expected_workspace_runtime_incarnation=old["vm_uid"],
+    ) is not None
+    assert await db.settle_pinned_thread_retirement(
+        str(thread_id), token=str(operation["thread_retirement_token"]),
+        generation=str(operation["thread_runtime_generation"]),
+        final_status="suspended",
+    )
+    await db.execute(
+        "UPDATE threads SET metadata=jsonb_set(metadata,'{vm}',metadata->'vm' || $2::jsonb) WHERE id=$1",
+        thread_id, json.dumps({
+            "status": "suspending", "_suspend_remote_io_closed": str(operation["id"]),
+        }),
+    )
+    await db.execute(
+        "INSERT INTO managed_repository_process_zero_receipts "
+        "(owner_kind,owner_id,scope,provisioner,runtime_incarnation) "
+        "VALUES('thread',$1,'vm','vm',$2)", thread_id, old["generation"],
+    )
+    pod = json.loads(operation["thread_agent_pod_identity"])
+    assert await idle.record_thread_agent_stop(
+        str(operation["id"]), evidence={
+            "version": 1, "pod": pod, "disposition": "exact_absent",
+            "retirement_token": str(operation["thread_retirement_token"]),
+            "controller_authenticated": True,
+        },
+    )
+    assert await idle.complete_release(str(operation["id"]), evidence={
+        "version": 1, "kind": "vm_idle_physical_stop",
+        "operation_id": str(operation["id"]), "generation": old["generation"],
+        "vm_uid": old["vm_uid"], "vmi_uid": old["vmi_uid"],
+        "launcher_uid": old["launcher_uid"], "pvc_uid": old["pvc_uid"],
+        "vm_absent": True, "vmi_absent": True, "launcher_absent": True,
+        "retained_pvc": True, "controller_authenticated": True,
+        "same_generation_replacement": False,
+    })
+    waking = await idle.request_thread_wake(str(thread_id), execution_requested=True)
+    assert waking is not None
+    owner = await db.get_thread(str(thread_id))
+    predecessor = json.loads(owner["metadata"])["vm"]
+    runtime = owner["runtime_generation"]
+    generation, request_id = waking["wake_generation"], waking["wake_request_id"]
+    proposed = VMProvisioner._fresh_provision_ctx()
+    proposed.update(
+        status="provisioning", provision_generation=str(generation),
+        idle_wake_operation_id=str(waking["id"]),
+        idle_wake_request_id=str(request_id),
+        idle_predecessor_pvc_uid=old["pvc_uid"],
+    )
+    policy, inventory, sample, _ = await environment(db)
+    sample = successor(sample)
+    pv_uid = str(uuid4())
+    sample["pvcs"] = [{
+        "uid": old["pvc_uid"], "name": f"agent-vm-{thread_id}-rootdisk",
+        "pv_uid": pv_uid, "pv_name": "thread-retained",
+        "storage_class_uid": sample["storage_classes"][0]["uid"],
+        "phase": "Bound",
+    }]
+    sample["pvs"] = [{
+        "uid": pv_uid, "name": "thread-retained",
+        "claim_uid": old["pvc_uid"],
+        "required_affinity": {"nodeSelectorTerms": [{"matchExpressions": [{
+            "key": "kubernetes.io/hostname", "operator": "In",
+            "values": ["node-a"],
+        }]}]},
+    }]
+    await publish(inventory, sample)
+    config = whole_launcher_configuration()
+    config.update(namespace="workers", storage_class="local")
+    resource = config["resource_admission"]
+    resource["cluster_id"] = inventory.cluster_id
+    resource["policy_digest"] = inventory.policy_digest
+    resource["template_profile"].update(
+        storage_class="local", guest_vcpus=8, guest_memory_bytes=16 * 1024**3,
+    )
+    resource["launcher_prediction"]["vector"] = predict_launcher(
+        policy.launcher_profile, guest_vcpus=8, guest_memory_bytes=16 * 1024**3,
+    ).to_six_dict()
+    resource["host_mapping"]["vector"] = policy.cost.cost(8, "16Gi").to_six_dict()
+    request = build_vm_creation_request(
+        job_id=str(thread_id), entity_type="thread", agent_config="worker_base",
+        vm_image="pinned:image", cpu_cores=8, memory="16Gi", description="thread wake",
+        network_tier="restricted", provision_generation=str(generation),
+    )
+    assert await db.begin_pinned_thread_vm_provisioning(
+        str(thread_id), expected_runtime_generation=str(runtime),
+        expected_agent_id=None, expected_attach_token=None,
+        expected_vm_context=predecessor, provision_context=proposed,
+        wake_operation_id=str(waking["id"]), creation_source={
+            "request_id": str(request_id), "request": request,
+            "request_digest": canonical_request_digest(request),
+            "controller_configuration": config,
+            "controller_configuration_digest": canonical_configuration_digest(config),
+        },
+    )
+    admitted = await policy.admit(request_id=str(request_id))
+    assert admitted["action"] == "admitted", admitted
+    store = VMCreationRetryStore(db)
+    claim = (await store.claim_due(limit=1))[0]
+    grant = await store.authorize_controller(
+        request_id=str(request_id), claim_token=str(claim["claim_token"]),
+        observed={
+            "job_id": str(thread_id), "provision_generation": str(generation),
+            "request_digest": canonical_request_digest(request),
+            "controller_configuration_digest": canonical_configuration_digest(config),
+            "expected_pvc_uid": old["pvc_uid"],
+        },
+    )
+    assert grant["allowed"] is True
+    dv_uid = str(uuid4())
+    values = {
+        "version": 4, "resource_grant": grant["resource_grant"],
+        "rootdisk_source": {"kind": "retained", "pvc_uid": old["pvc_uid"]},
+        "source": "controller_vm_create", "admission_id": str(grant["admission_id"]),
+        "reservation_request_id": grant["request_id"],
+        "intent_digest": grant["intent_digest"], "retry_request_id": str(request_id),
+        "job_id": str(thread_id), "owner_kind": "thread",
+        "thread_runtime_generation": str(runtime), "thread_agent_id": None,
+        "thread_attach_token": None, "thread_wake_operation_id": str(waking["id"]),
+        "provision_generation": str(generation),
+        "request_digest": canonical_request_digest(request),
+        "controller_configuration_digest": canonical_configuration_digest(config),
+        "expected_pvc_uid": old["pvc_uid"], "retained_dv_uid": dv_uid,
+        "current_dv_uid": dv_uid, "current_pvc_uid": old["pvc_uid"],
+        "current_secret_uid": None, "effect_kind": "rootdisk",
+        "effect_nonce": str(uuid4()),
+        "object_name": f"agent-vm-{thread_id}-rootdisk",
+    }
+    carrier = seal_creation_carrier(
+        values, namespace="workers", uid=str(uuid4()), resource_version="3",
+        secret=SECRET,
+    )
+    if effect:
+        assert (await store.begin_effect(
+            request_id=str(request_id), claim_token=str(claim["claim_token"]),
+            carrier=carrier,
+        ))["actuation_allowed"] is True
+    else:
+        carrier = None
+    labels = {"srw.io/owner-kind": "thread", "srw.io/owner-id": str(thread_id)}
+    dv = {
+        "apiVersion": "cdi.kubevirt.io/v1beta1", "kind": "DataVolume",
+        "metadata": {"uid": dv_uid, "name": values["object_name"],
+                     "namespace": "workers", "labels": labels},
+        "status": {"phase": "Succeeded"},
+    }
+    pvc = {
+        "apiVersion": "v1", "kind": "PersistentVolumeClaim",
+        "metadata": {"uid": old["pvc_uid"], "name": values["object_name"],
+                     "namespace": "workers", "labels": labels,
+                     "ownerReferences": [{"kind": "DataVolume", "uid": dv_uid,
+                                           "controller": True}]},
+        "spec": {"volumeMode": "Filesystem"}, "status": {"phase": "Bound"},
+    }
+    if effect:
+        assert (await store.observe_effect(
+            request_id=str(request_id), carrier=carrier,
+            observation={"outcome": "observed", "object": dv, "pvc": pvc},
+        ))["recorded"] is True
+    secret_obj = None
+    if secret and effect:
+        from shared.vm_creation_issuance import EFFECT_NONCE_ANNOTATION, REQUEST_ANNOTATION
+
+        values = {
+            **values, "effect_kind": "cloud_init", "effect_nonce": str(uuid4()),
+            "object_name": f"agent-vm-{thread_id}-cloudinit",
+        }
+        carrier = seal_creation_carrier(
+            values, namespace="workers", uid=carrier["metadata"]["uid"],
+            resource_version="4", secret=SECRET,
+        )
+        assert (await store.begin_effect(
+            request_id=str(request_id), claim_token=str(claim["claim_token"]),
+            carrier=carrier,
+        ))["actuation_allowed"] is True
+        secret_obj = {
+            "apiVersion": "v1", "kind": "Secret", "metadata": {
+                "uid": str(uuid4()), "name": values["object_name"],
+                "namespace": "workers", "labels": labels, "annotations": {
+                    EFFECT_NONCE_ANNOTATION: values["effect_nonce"],
+                    REQUEST_ANNOTATION: str(request_id),
+                    "srw.io/provision-generation": str(generation),
+                    "srw.io/ssh-host-key-fingerprint": "SHA256:" + "A" * 43,
+                },
+            },
+        }
+        assert (await store.observe_effect(
+            request_id=str(request_id), carrier=carrier,
+            observation={"outcome": "observed", "object": secret_obj},
+        ))["recorded"] is True
+    retirement = await db.begin_pinned_thread_retirement(
+        str(thread_id), permanent=True,
+        expected_runtime_generation=str(runtime),
+        expected_agent_id=None, expected_attach_token=None,
+    )
+    assert retirement["state"] == "pending", retirement
+    if authorize_end:
+        assert await db.authorize_pinned_thread_retirement(
+            str(thread_id), token=retirement["token"],
+            generation=retirement["generation"], settle_status="ended",
+        )
+    return store, thread_id, request_id, admitted, dv, pvc, carrier, waking, secret_obj
+
+
+@pytest.mark.asyncio
+async def test_retained_thread_wake_rootdisk_end_holds_then_freezes(db, monkeypatch):
+    store, _, request_id, admitted, _, _, carrier, _, _ = await retained_wake_partial(
+        db, monkeypatch,
+    )
+    assert await db.fetchval(
+        "SELECT state FROM vm_resource_reservations WHERE id=$1",
+        admitted["reservation_id"],
+    ) == "reserved"
+    frozen = await store.freeze_disposition(request_id=str(request_id), carrier=carrier)
+    assert frozen["frozen"] is True
+    assert frozen["disposition"]["disk_policy"] == "retain"
+
+
+@pytest.mark.asyncio
+async def test_retained_wake_without_original_carrier_settles_never_issued(
+    db, monkeypatch,
+):
+    store, thread_id, request_id, admitted, _, _, carrier, waking, _ = await retained_wake_partial(
+        db, monkeypatch, effect=False,
+    )
+    assert carrier is None
+    assert await db.fetchval(
+        "SELECT count(*) FROM vm_creation_effects WHERE request_id=$1", request_id,
+    ) == 0
+    with pytest.raises(VMCreationRetryConflict, match="creation_carrier_required"):
+        await store.prepare_disposition(request_id=str(request_id))
+    never_issued = await store.settle_never_issued(request_id=str(request_id))
+    assert never_issued == {"settled": True, "disposition": "never_issued"}
+    assert await db.fetchval(
+        "SELECT state FROM vm_resource_reservations WHERE id=$1",
+        admitted["reservation_id"],
+    ) == "released"
+    current = await store.inspect(request_id=str(request_id))
+    assert current["creation_carrier_uid"] is None
+    assert await db.fetchval(
+        "SELECT pvc_uid FROM vm_idle_operations WHERE id=$1", waking["id"],
+    ) == waking["pvc_uid"]
+    assert await db.fetchval(
+        "SELECT public.thread_vm_creation_never_issued_source($1,$2)",
+        thread_id, current["provision_generation"],
+    )
+
+
+async def retained_controller_runtime(db, setup, monkeypatch, *, secret=False):
+    """Wire the real typed wake to the fault-injected K8s controller API."""
+    from vm_controller import controller as settings
+
+    monkeypatch.setattr(settings, "VM_NAMESPACE", "workers")
+    ctrl, api, _, _ = setup
+    store, thread_id, request_id, admitted, dv, pvc, carrier, waking, secret_obj = (
+        await retained_wake_partial(db, monkeypatch, secret=secret)
+    )
+    observations = {"rootdisk": {"object": dv, "pvc": pvc}}
+    if secret:
+        observations["cloud_init"] = {"object": secret_obj}
+    for value in (
+        carrier, dv, pvc,
+        *([observations["cloud_init"]["object"]] if secret else []),
+    ):
+        api.objects[value["kind"], value["metadata"]["name"]] = deepcopy(value)
+    api.deletes = []
+    api.lost_deletes = set()
+
+    def listed(kind):
+        return {
+            "metadata": {"resourceVersion": "1"},
+            "items": [deepcopy(value) for (resource, _), value in api.objects.items()
+                      if resource == kind],
+        }
+
+    def delete(kind, name, body):
+        current = api.read(kind, name)
+        uid = body["preconditions"]["uid"]
+        if uid != current["metadata"]["uid"]:
+            raise ApiException(status=409)
+        api.deletes.append((kind, name, uid))
+        del api.objects[kind, name]
+        if kind in api.lost_deletes:
+            api.lost_deletes.remove(kind)
+            raise TimeoutError("lost delete reply")
+
+    ctrl.k8s_client.list_namespaced_custom_object = lambda **kw: listed({
+        "virtualmachines": "VirtualMachine",
+        "virtualmachineinstances": "VirtualMachineInstance",
+    }[kw["plural"]])
+    ctrl.core_api.list_namespaced_pod = lambda **kw: listed("Pod")
+    ctrl.k8s_client.delete_namespaced_custom_object = lambda **kw: delete(
+        "DataVolume", kw["name"], kw["body"],
+    )
+    ctrl.core_api.delete_namespaced_persistent_volume_claim = lambda **kw: delete(
+        "PersistentVolumeClaim", kw["name"], kw["body"],
+    )
+    ctrl.core_api.delete_namespaced_secret = lambda **kw: delete(
+        "Secret", kw["name"], kw["body"],
+    )
+    ctrl.coordination_api.delete_namespaced_lease = lambda **kw: delete(
+        "Lease", kw["name"], kw["body"],
+    )
+
+    async def authority(path, body, *, operation):
+        method = path.rsplit("/", 1)[-1].replace("-", "_")
+        assert operation == "creation_retry_" + method
+        return await getattr(store, method)(**body)
+
+    ctrl._workspace_cleanup_authority_request = authority
+    row = await store.inspect(request_id=str(request_id))
+    return ctrl, api, store, row, admitted, observations, carrier, waking
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("secret", [False, True])
+async def test_retained_thread_controller_keeps_pvc_and_releases_only_after_end(
+    db, setup, monkeypatch, secret,
+):
+    ctrl, api, store, row, admitted, observations, carrier, waking = (
+        await retained_controller_runtime(db, setup, monkeypatch, secret=secret)
+    )
+    assert (await store.freeze_disposition(
+        request_id=row["request_id"], carrier=carrier,
+    ))["frozen"] is True
+    with pytest.raises(VMCreationRetryConflict, match="creation_disposition_incomplete"):
+        await store.settle_disposition(request_id=row["request_id"], carrier=carrier)
+    assert await db.fetchval(
+        "SELECT state FROM vm_resource_reservations WHERE id=$1",
+        admitted["reservation_id"],
+    ) == "reserved"
+    if secret:
+        api.lost_deletes.add("Secret")
+    result = await CreationDisposer(ctrl).run(disposition_identity(row))
+    assert result["status"] == "creation_disposed", result
+    assert api.read("PersistentVolumeClaim", observations["rootdisk"]["pvc"]["metadata"]["name"])
+    assert api.read("DataVolume", observations["rootdisk"]["object"]["metadata"]["name"])
+    assert not any(kind in {"PersistentVolumeClaim", "DataVolume"} for kind, _, _ in api.deletes)
+    assert await db.fetchval(
+        "SELECT state FROM vm_resource_reservations WHERE id=$1",
+        admitted["reservation_id"],
+    ) == "released"
+    completed = await store.inspect(request_id=row["request_id"])
+    assert completed["state"] == "settled"
+    assert completed["cancellation_completion"]["rootdisk"]["kind"] == "rootdisk_retained"
+    assert completed["cancellation_completion"]["source"]["outcome"] == "not_required"
+    assert completed["cancellation_completion"]["workspace_attachment"]["outcome"] == "not_applicable"
+    assert (await store.settle_disposition(
+        request_id=row["request_id"], carrier=carrier,
+    ))["settled"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("changed", ["pvc_uid", "dv_uid", "pvc_owner", "carrier_uid"])
+async def test_retained_thread_replaced_identity_preserves_old_charge(
+    db, setup, monkeypatch, changed,
+):
+    ctrl, api, store, row, admitted, observations, carrier, _ = (
+        await retained_controller_runtime(db, setup, monkeypatch)
+    )
+    assert (await store.freeze_disposition(
+        request_id=row["request_id"], carrier=carrier,
+    ))["frozen"] is True
+    root_name = observations["rootdisk"]["object"]["metadata"]["name"]
+    if changed == "carrier_uid":
+        name = carrier["metadata"]["name"]
+        api.objects["Lease", name]["metadata"]["uid"] = str(uuid4())
+    elif changed == "dv_uid":
+        api.objects["DataVolume", root_name]["metadata"]["uid"] = str(uuid4())
+    elif changed == "pvc_uid":
+        api.objects["PersistentVolumeClaim", root_name]["metadata"]["uid"] = str(uuid4())
+    else:
+        api.objects["PersistentVolumeClaim", root_name]["metadata"]["labels"][
+            "srw.io/owner-id"
+        ] = str(uuid4())
+    result = await CreationDisposer(ctrl).run(disposition_identity(row))
+    assert result["status"] == "creation_attention", result
+    assert not api.deletes
+    assert await db.fetchval(
+        "SELECT state FROM vm_resource_reservations WHERE id=$1",
+        admitted["reservation_id"],
+    ) == "reserved"
+
+
+@pytest.mark.asyncio
+async def test_retained_thread_stale_end_token_refuses_disposition(db, monkeypatch):
+    store, thread_id, request_id, admitted, _, _, carrier, _, _ = (
+        await retained_wake_partial(db, monkeypatch, authorize_end=False)
+    )
+    owner = await db.fetchrow(
+        "SELECT runtime_generation,runtime_retirement_token FROM threads WHERE id=$1",
+        thread_id,
+    )
+    assert not await db.authorize_pinned_thread_retirement(
+        str(thread_id), token=str(uuid4()),
+        generation=str(owner["runtime_generation"]), settle_status="ended",
+    )
+    with pytest.raises(VMCreationRetryConflict):
+        await store.freeze_disposition(request_id=str(request_id), carrier=carrier)
+    assert await db.fetchval(
+        "SELECT state FROM vm_creation_retries WHERE request_id=$1", request_id,
+    ) == "reconciling"
+    assert await db.fetchval(
+        "SELECT state FROM vm_resource_reservations WHERE id=$1",
+        admitted["reservation_id"],
+    ) == "reserved"
 
 
 @pytest_asyncio.fixture(scope="module")
@@ -53,6 +513,11 @@ async def disposition_schema(pg_dsn, thread_schema):  # noqa: F811
             "AND column_name='disposition_carrier_uid')"
         ):
             await conn.execute(migration.read_text())
+        migration = (
+            Path(__file__).resolve().parents[1]
+            / "src/orchestrator/database/migrations/app/0281_vm_thread_retained_creation_disposition.sql"
+        )
+        await conn.execute(migration.read_text())
     finally:
         await conn.close()
 
