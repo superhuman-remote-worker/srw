@@ -15833,7 +15833,39 @@ CREATE FUNCTION public.valid_vm_creation_thread_disposition_identity(retry publi
              AND retry.cancellation_disposition->>'carrier_kind'='thread_creation_cancel'
              AND retry.cancellation_disposition->>'carrier_uid'=retry.disposition_carrier_uid::text
              AND retry.cancellation_disposition->>'namespace'=retry.disposition_carrier_namespace))
-       AND retry.cancellation_disposition->>'disk_policy'='purge_new_thread_disk'
+       AND ((retry.cancellation_disposition->>'disk_policy'='purge_new_thread_disk'
+             AND retry.expected_pvc_uid IS NULL)
+            OR (retry.cancellation_disposition->>'disk_policy'='retain'
+             AND retry.creation_carrier_uid IS NOT NULL
+             AND retry.disposition_carrier_uid IS NULL
+             AND retry.expected_pvc_uid IS NOT NULL
+             AND retry.observed_pvc_uid=retry.expected_pvc_uid
+             AND retry.thread_wake_operation_id IS NOT NULL
+             AND retry.cancellation_disposition->'objects'->'rootdisk'->>'pvc_uid'=retry.expected_pvc_uid::text
+             AND retry.cancellation_disposition->'source'=jsonb_build_object(
+                 'kind','retained','pvc_uid',retry.expected_pvc_uid::text)
+             AND EXISTS (SELECT 1 FROM public.vm_creation_effects root
+                 WHERE root.request_id=retry.request_id
+                   AND root.effect_kind='rootdisk' AND root.state='observed'
+                   AND root.evidence->>'pvc_uid'=retry.expected_pvc_uid::text
+                   AND root.evidence->>'uid'=retry.cancellation_disposition->'objects'->'rootdisk'->>'uid'
+                   AND root.carrier_intent->>'thread_wake_operation_id'=retry.thread_wake_operation_id::text
+                   AND root.carrier_intent->'rootdisk_source'=retry.cancellation_disposition->'source')
+             AND NOT EXISTS (SELECT 1 FROM public.vm_creation_effects e
+                 WHERE e.request_id=retry.request_id AND e.effect_kind='workspace_attach'
+                   AND e.state<>'rejected')
+             AND EXISTS (SELECT 1 FROM public.vm_idle_operations idle
+                 WHERE idle.id=retry.thread_wake_operation_id
+                   AND idle.owner_kind='thread' AND idle.owner_id=retry.thread_id
+                   AND idle.release_kind='pinned_thread'
+                   AND idle.wake_request_id=retry.request_id
+                   AND idle.wake_generation=retry.provision_generation
+                   AND idle.pvc_uid=retry.expected_pvc_uid
+                   AND idle.stop_verified_at IS NOT NULL
+                   AND idle.stop_evidence->>'retained_pvc'='true'
+                   AND idle.stop_evidence->>'pvc_uid'=retry.expected_pvc_uid::text
+                   AND idle.phase IN ('waking','wake_held')
+                   AND idle.closed_at IS NULL)))
        AND retry.cancellation_disposition->'workspace_storage'='null'::jsonb
        AND retry.cancellation_disposition->'workspace_instance_id'='null'::jsonb
        AND EXISTS (SELECT 1 FROM public.threads t
