@@ -543,6 +543,54 @@ describe('SessionsPageComponent', () => {
             expect(mockToast.info).not.toHaveBeenCalled();
             expect(mockRouter.navigate).not.toHaveBeenCalled();
         });
+
+        // R1 follow-up: Resume on a stateless thread whose soft End is still
+        // pending is the server-supported retry — the server finishes the
+        // pending End cleanup, then resumes.
+        it('POSTs resume for a stateless soft-pending (ending) card', async () => {
+            mockHttp.post.mockReturnValue(of({status: 'created'}));
+            const thread = makeThread({
+                id: 't-soft',
+                status: 'ending',
+                execution_lane: 'stateless',
+                runtime_retirement_pending: true,
+                retirement_disposition: 'ended',
+                retirement_permanent: false,
+            });
+
+            await component.resumeSession(thread);
+
+            expect(mockHttp.post).toHaveBeenCalledTimes(1);
+            expect(mockHttp.post.mock.calls[0][0]).toContain('/persistent/threads/t-soft/resume');
+            expect(mockRouter.navigate).toHaveBeenCalledWith(['/sessions', 't-soft']);
+            expect(mockToast.danger).not.toHaveBeenCalled();
+        });
+
+        it('stays and re-reads the list when resuming a soft-pending card is refused', async () => {
+            const soft = makeThread({
+                id: 't-soft',
+                status: 'active',
+                execution_lane: 'stateless',
+                runtime_retirement_pending: true,
+                retirement_disposition: 'ended',
+                retirement_permanent: false,
+            });
+            serveThreadLists(mockHttp, [soft]);
+            await component.loadThreads();
+            const readsBefore = threadListReads(mockHttp);
+            mockHttp.post.mockReturnValue(throwError(() => new HttpErrorResponse({
+                status: 503,
+                error: {detail: 'Stateless workspace lifecycle lock unavailable'},
+            })));
+
+            await component.resumeSession(component.threads()[0]);
+
+            expect(mockHttp.post).toHaveBeenCalledTimes(1);
+            expect(mockToast.danger).toHaveBeenCalledOnce();
+            expect(mockRouter.navigate).not.toHaveBeenCalled();
+            expect(threadListReads(mockHttp)).toBe(readsBefore + 1);
+            expect(component.threads()[0].status).toBe('ending');
+        });
     });
 
     describe('confirmDelete()', () => {
@@ -603,6 +651,64 @@ describe('SessionsPageComponent', () => {
             expect(mockHttp.delete.mock.calls[1][0]).toContain(
                 '/persistent/threads/t-live?permanent=true&force=true',
             );
+        });
+
+        // R1 follow-up: a stateless permanent Delete meets the same busy
+        // refusal as a stateless End (`409 stateless_end_busy`; `force=true`
+        // stops the unfinished turn). It escalates exactly like turn_in_flight.
+        it('escalates a busy stateless delete (409 stateless_end_busy) to the force confirm', async () => {
+            component.deleteSession(makeThread({id: 't-busy', execution_lane: 'stateless'}));
+            mockHttp.delete.mockReturnValueOnce(throwError(() => new HttpErrorResponse({
+                status: 409,
+                error: {detail: {code: 'stateless_end_busy', queue_state: 'leased', pending_input: true}},
+            })));
+
+            await component.confirmDelete();
+
+            expect(component.confirmForceOpen()).toBe(true);
+            expect(mockToast.danger).not.toHaveBeenCalled();
+            expect(mockHttp.delete).toHaveBeenCalledTimes(1);
+
+            await component.confirmForceDelete();
+
+            expect(mockHttp.delete).toHaveBeenCalledTimes(2);
+            expect(mockHttp.delete.mock.calls[1][0]).toContain(
+                '/persistent/threads/t-busy?permanent=true&force=true',
+            );
+        });
+
+        // Guard (holds before and after): a Delete refused because the
+        // session changed underneath it (e.g. a just-Resumed workspace) shows
+        // the server's own reason, arms no retry and is never replayed.
+        it('shows the server reason for a lifecycle-changed 409 and never replays it', async () => {
+            const mocks = createMocks();
+            const providers = mocks.providers.map((provider: any) =>
+                provider?.provide === ErrorMessageService
+                    ? {provide: ErrorMessageService, useFactory: () => new ErrorMessageService(), deps: []}
+                    : provider,
+            );
+            const pageInjector = Injector.create({providers});
+            try {
+                const page = runInInjectionContext(pageInjector, () => new SessionsPageComponent());
+                const thread = makeThread({id: 't-changed', execution_lane: 'stateless'});
+                mocks.mockHttp.delete.mockReturnValue(throwError(() => new HttpErrorResponse({
+                    status: 409,
+                    error: {detail: 'Thread lifecycle generation changed while waiting for cleanup ownership'},
+                })));
+
+                page.deleteSession(thread);
+                await page.confirmDelete();
+
+                expect(mocks.mockToast.danger).toHaveBeenCalledWith(
+                    'Thread lifecycle generation changed while waiting for cleanup ownership',
+                );
+                expect(mocks.mockToast.warning).not.toHaveBeenCalled();
+                expect(page.confirmForceOpen()).toBe(false);
+                expect(page.isDeleteRetry(thread)).toBe(false);
+                expect(mocks.mockHttp.delete).toHaveBeenCalledTimes(1);
+            } finally {
+                pageInjector.destroy();
+            }
         });
     });
 
@@ -736,6 +842,58 @@ describe('SessionsPageComponent', () => {
 
             expect(vi.getTimerCount()).toBe(0);
             expect(threadListReads(mockHttp)).toBe(2);
+        });
+
+        // R1 follow-up: a stateless retirement left pending by a fenced
+        // End/Delete makes no progress until the user retries End, Delete or
+        // Resume (each re-reads the list itself), so it never arms the poll.
+        it('does not poll for a stateless pending retirement', async () => {
+            serveThreadLists(mockHttp, [
+                makeThread({
+                    id: 't-stateless',
+                    status: 'active',
+                    execution_lane: 'stateless',
+                    runtime_retirement_pending: true,
+                    retirement_disposition: 'ended',
+                    retirement_permanent: true,
+                }),
+            ]);
+
+            component.ngOnInit();
+            await vi.advanceTimersByTimeAsync(0);
+            expect(component.threads()[0].status).toBe('ending');
+            await vi.advanceTimersByTimeAsync(120_000);
+
+            expect(threadListReads(mockHttp)).toBe(1);
+            expect(vi.getTimerCount()).toBe(0);
+        });
+
+        // Guard (holds before and after): a pinned ending card beside it
+        // still polls exactly as before.
+        it('keeps polling for a pinned ending card beside a stateless pending one', async () => {
+            serveThreadLists(mockHttp, [
+                makeThread({
+                    id: 't-stateless',
+                    status: 'active',
+                    execution_lane: 'stateless',
+                    runtime_retirement_pending: true,
+                    retirement_permanent: false,
+                }),
+                makeThread({
+                    id: 't-pinned',
+                    status: 'active',
+                    execution_lane: 'pinned',
+                    runtime_retirement_pending: true,
+                    retirement_permanent: false,
+                }),
+            ]);
+
+            component.ngOnInit();
+            await vi.advanceTimersByTimeAsync(0);
+            await vi.advanceTimersByTimeAsync(ENDING_POLL_GAPS_MS[0]);
+
+            expect(threadListReads(mockHttp)).toBe(2);
+            expect(vi.getTimerCount()).toBe(1);
         });
 
         it('backs off 2 s → 4 s → 8 s → 15 s and holds the 15 s cap', async () => {
@@ -1051,5 +1209,113 @@ describe('SessionsPageComponent (rendered): a fenced permanent delete', () => {
         expect(component.confirmForceOpen()).toBe(false);
         expect(deleteButton(host, 't-del').disabled).toBe(true);
         expect(deleteButton(host, 't-del').tooltip).toBe('sessions.tooltip.delete');
+    });
+
+    // =========================================================================
+    // R1 follow-up: a stateless retirement left pending by a fenced End or
+    // Delete is finished only by the user's retry. The owner projection says
+    // which retry the server accepts: `retirement_permanent` → Delete (the
+    // same already-confirmed permanent request), otherwise → Resume. A pinned
+    // retirement finishes on the server, so its card is unchanged.
+    // =========================================================================
+
+    function resumeButton(host: HTMLElement, id: string): IconButton {
+        return [...card(host, id).querySelectorAll('app-icon-button')].find(
+            button => (button as IconButton).ariaLabel === 'sessions.tooltip.resume',
+        ) as IconButton;
+    }
+
+    const statelessPending = (id: string, permanent: boolean) => makeThread({
+        id,
+        status: 'active',
+        execution_lane: 'stateless',
+        runtime_retirement_pending: true,
+        retirement_disposition: 'ended',
+        retirement_permanent: permanent,
+    });
+
+    it('offers Delete as the retry on a reloaded stateless permanent-pending card, without a second confirmation', async () => {
+        // A fresh page: no in-memory retry was armed in this browser session.
+        serveThreadLists(mocks.mockHttp, [statelessPending('t-perm', true)]);
+        mocks.mockHttp.delete.mockReturnValueOnce(of({status: 'deleted'}));
+
+        const fixture = TestBed.createComponent(SessionsPageComponent);
+        const component = fixture.componentInstance;
+        const host = fixture.nativeElement as HTMLElement;
+        fixture.detectChanges();
+        await settle(fixture);
+
+        expect(card(host, 't-perm').classList.contains('ending')).toBe(true);
+        expect(deleteButton(host, 't-perm').disabled).toBe(false);
+        expect(deleteButton(host, 't-perm').tooltip).toBe('sessions.tooltip.retryDelete');
+        expect(resumeButton(host, 't-perm').disabled).toBe(true);
+
+        deleteButton(host, 't-perm').dispatchEvent(new CustomEvent('clicked'));
+        await settle(fixture);
+
+        expect(component.confirmDeleteOpen()).toBe(false);
+        expect(mocks.mockHttp.delete).toHaveBeenCalledTimes(1);
+        expect(mocks.mockHttp.delete.mock.calls[0][0]).toContain(
+            '/persistent/threads/t-perm?permanent=true',
+        );
+        expect(mocks.mockHttp.delete.mock.calls[0][0]).not.toContain('force=true');
+    });
+
+    it('keeps Resume enabled as the retry on a stateless soft-pending card, with Delete still closed', async () => {
+        serveThreadLists(mocks.mockHttp, [statelessPending('t-soft', false)]);
+        mocks.mockHttp.post.mockReturnValueOnce(of({status: 'created'}));
+
+        const fixture = TestBed.createComponent(SessionsPageComponent);
+        const host = fixture.nativeElement as HTMLElement;
+        fixture.detectChanges();
+        await settle(fixture);
+
+        expect(card(host, 't-soft').classList.contains('ending')).toBe(true);
+        expect(resumeButton(host, 't-soft').disabled).toBe(false);
+        expect(deleteButton(host, 't-soft').disabled).toBe(true);
+
+        resumeButton(host, 't-soft').dispatchEvent(new CustomEvent('clicked'));
+        await settle(fixture);
+
+        expect(mocks.mockHttp.post).toHaveBeenCalledTimes(1);
+        expect(mocks.mockHttp.post.mock.calls[0][0]).toContain('/persistent/threads/t-soft/resume');
+        expect(mocks.mockRouter.navigate).toHaveBeenCalledWith(['/sessions', 't-soft']);
+    });
+
+    // Guard (holds before and after): the server finishes a pinned
+    // retirement by itself, so neither Resume nor Delete opens on its card —
+    // whatever its permanence.
+    it('leaves a pinned ending card with Resume and Delete disabled', async () => {
+        serveThreadLists(mocks.mockHttp, [
+            makeThread({
+                id: 't-pin-soft',
+                status: 'active',
+                execution_lane: 'pinned',
+                runtime_retirement_pending: true,
+                retirement_disposition: 'ended',
+                retirement_permanent: false,
+            }),
+            makeThread({
+                id: 't-pin-perm',
+                status: 'active',
+                execution_lane: 'pinned',
+                runtime_retirement_pending: true,
+                retirement_disposition: 'ended',
+                retirement_permanent: true,
+            }),
+        ]);
+
+        const fixture = TestBed.createComponent(SessionsPageComponent);
+        const host = fixture.nativeElement as HTMLElement;
+        fixture.detectChanges();
+        await settle(fixture);
+
+        for (const id of ['t-pin-soft', 't-pin-perm']) {
+            expect(card(host, id).classList.contains('ending')).toBe(true);
+            expect(resumeButton(host, id).disabled).toBe(true);
+            expect(deleteButton(host, id).disabled).toBe(true);
+            expect(deleteButton(host, id).tooltip).toBe('sessions.tooltip.delete');
+        }
+        fixture.destroy();
     });
 });

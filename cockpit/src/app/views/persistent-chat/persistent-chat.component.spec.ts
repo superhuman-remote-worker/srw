@@ -1,4 +1,5 @@
 import {beforeEach, describe, expect, it, vi} from 'vitest';
+import {signal} from '@angular/core';
 
 import {
     canComposeDuringSession,
@@ -571,6 +572,73 @@ describe('onRenameSession', () => {
 
         expect(renameLocal).not.toHaveBeenCalled();
         expect(danger).toHaveBeenCalledWith('errors.sessions.renameFailed');
+    });
+});
+
+/**
+ * R1 follow-up: the header End (disconnectAndLeave) leaves for /sessions only
+ * when the End request is finished with. A declined stateless force prompt
+ * (`kept`: the session is still running) and a retryable fence (`retryable`:
+ * cleanup has not finished; End is the retry) keep the user on the session.
+ * Same .call() convention as onRenameSession above.
+ */
+describe('disconnectAndLeave', () => {
+    function makeHost(endSession: () => Promise<unknown>) {
+        const isDisconnecting = signal(false);
+        const navigate = vi.fn().mockResolvedValue(true);
+        const danger = vi.fn();
+        const warning = vi.fn();
+        const host = {
+            isDisconnecting,
+            chat: {endSession: vi.fn(endSession)},
+            router: {navigate},
+            toast: {danger, warning},
+            errors: {translate: (_e: unknown, fallback?: string) => fallback},
+            transloco: {translate: (key: string) => key},
+        } as unknown as PersistentChatComponent;
+        return {host, isDisconnecting, navigate, danger, warning};
+    }
+
+    it('stays on a stateless session whose End the user declined, with no toast', async () => {
+        const {host, isDisconnecting, navigate, danger, warning} = makeHost(() =>
+            Promise.resolve('kept'),
+        );
+
+        await PersistentChatComponent.prototype.disconnectAndLeave.call(host);
+
+        expect(navigate).not.toHaveBeenCalled();
+        expect(danger).not.toHaveBeenCalled();
+        expect(warning).not.toHaveBeenCalled();
+        expect(isDisconnecting()).toBe(false);
+    });
+
+    it('stays and warns when End met a retryable fence, keeping End usable', async () => {
+        const {host, isDisconnecting, navigate, danger, warning} = makeHost(() =>
+            Promise.resolve('retryable'),
+        );
+
+        await PersistentChatComponent.prototype.disconnectAndLeave.call(host);
+
+        expect(warning).toHaveBeenCalledWith('errors.sessions.endRetryable');
+        expect(danger).not.toHaveBeenCalled();
+        expect(navigate).not.toHaveBeenCalled();
+        expect(isDisconnecting()).toBe(false);
+    });
+
+    // Guard (holds before and after): a finished End and any other failure
+    // keep today's behaviour — leave for /sessions, toasting the failure.
+    it('leaves after a finished End, and after any other failure with the danger toast', async () => {
+        const done = makeHost(() => Promise.resolve('done'));
+        await PersistentChatComponent.prototype.disconnectAndLeave.call(done.host);
+        expect(done.navigate).toHaveBeenCalledWith(['/sessions']);
+        expect(done.danger).not.toHaveBeenCalled();
+        expect(done.warning).not.toHaveBeenCalled();
+
+        const failed = makeHost(() => Promise.reject({status: 500}));
+        await PersistentChatComponent.prototype.disconnectAndLeave.call(failed.host);
+        expect(failed.danger).toHaveBeenCalledWith('errors.sessions.endFailed');
+        expect(failed.warning).not.toHaveBeenCalled();
+        expect(failed.navigate).toHaveBeenCalledWith(['/sessions']);
     });
 });
 
