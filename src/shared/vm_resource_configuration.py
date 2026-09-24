@@ -24,7 +24,6 @@ from shared.vm_resource_policy import (
     validate_resource_policy_snapshot,
 )
 from shared.vm_launcher_profile import (
-    LAUNCHER_ALGORITHM,
     predict_launcher,
     validate_launcher_profile,
 )
@@ -125,7 +124,7 @@ def validate_resource_configuration(value, configuration):
             prediction = _object(
                 value["launcher_prediction"], {"algorithm", "vector"}
             )
-            if prediction["algorithm"] != LAUNCHER_ALGORITHM:
+            if prediction["algorithm"] != launcher["costAlgorithm"]:
                 raise ValueError
             predicted = predict_launcher(
                 launcher,
@@ -182,7 +181,7 @@ def build_resource_configuration(snapshot, *, template, request, configuration):
     if snapshot.inventory.protocol == 2:
         result["launcher_profile"] = deepcopy(snapshot.launcher_profile)
         result["launcher_prediction"] = {
-            "algorithm": LAUNCHER_ALGORITHM,
+            "algorithm": snapshot.launcher_profile["costAlgorithm"],
             "vector": predict_launcher(
                 snapshot.launcher_profile,
                 guest_vcpus=profile["guest_vcpus"],

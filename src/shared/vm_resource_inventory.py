@@ -159,12 +159,13 @@ def _installed_profile(value):
     _integer(value["observedGeneration"], positive=True)
     if (
         value["generation"] != value["observedGeneration"]
-        or value["targetVersion"] != "v1.6.6"
         or value["observedVersion"] != value["targetVersion"]
         or value["observedDeploymentID"] != value["targetDeploymentID"]
     ):
         raise InventoryError("invalid_inventory")
-    validate_launcher_profile(value["profile"])
+    profile = validate_launcher_profile(value["profile"])
+    if value["targetVersion"] != profile["kubevirtVersion"]:
+        raise InventoryError("invalid_inventory")
 
 
 def _affinity(value, label_keys):

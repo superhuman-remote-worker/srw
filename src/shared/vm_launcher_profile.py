@@ -1,4 +1,4 @@
-"""Closed KubeVirt v1.6.6/amd64 ordinary PVC launcher cost profile.
+"""Closed KubeVirt v1.6.6 and v1.8.4 amd64 ordinary PVC launcher profiles.
 
 This is a prediction from the pinned renderer, not installation evidence or a
 reservation. The controller separately attests the installed KubeVirt CR and
@@ -23,6 +23,10 @@ from shared.vm_resource_admission import (
 
 
 LAUNCHER_ALGORITHM = "kubevirt-v1.6.6-amd64-ordinary-pvc-v1"
+_LAUNCHER_ALGORITHMS = {
+    "v1.6.6": LAUNCHER_ALGORITHM,
+    "v1.8.4": "kubevirt-v1.8.4-amd64-ordinary-pvc-v1",
+}
 _SUPPORT_TYPES = (
     "guest-console-log", "container-disk", "sidecar", "virtiofs",
     "hotplug-disk", "vmexport",
@@ -48,7 +52,9 @@ _FEATURES = {
 }
 
 
-def default_launcher_profile():
+def default_launcher_profile(kubevirt_version="v1.6.6"):
+    if type(kubevirt_version) is not str or kubevirt_version not in _LAUNCHER_ALGORITHMS:
+        raise ResourceAdmissionError("unsupported_launcher_profile")
     support = {kind: None for kind in _SUPPORT_TYPES}
     support["guest-console-log"] = {
         "requests": {"cpuMillicores": 5, "memoryBytes": 35000000},
@@ -56,9 +62,9 @@ def default_launcher_profile():
     }
     return {
         "version": 1,
-        "kubevirtVersion": "v1.6.6",
+        "kubevirtVersion": kubevirt_version,
         "architecture": "amd64",
-        "costAlgorithm": LAUNCHER_ALGORITHM,
+        "costAlgorithm": _LAUNCHER_ALGORITHMS[kubevirt_version],
         "network": "pod/masquerade",
         "cpuAllocationRatio": 10,
         "cpuRequestMillicores": 100,
@@ -75,8 +81,10 @@ def default_launcher_profile():
 
 def validate_launcher_profile(profile):
     """Return an owned closed profile; allow measured ratio and console inputs."""
-    default = default_launcher_profile()
     try:
+        if not isinstance(profile, dict):
+            raise ValueError
+        default = default_launcher_profile(profile.get("kubevirtVersion"))
         if not isinstance(profile, dict) or set(profile) != set(default):
             raise ValueError
         for name in (
@@ -125,13 +133,15 @@ def validate_launcher_profile(profile):
 
 
 def predict_launcher(profile, *, guest_vcpus, guest_memory_bytes):
-    """Recreate the supported v1.6.6 renderer then use Pod request aggregation."""
+    """Recreate an explicitly supported renderer, then aggregate Pod requests."""
     profile = validate_launcher_profile(profile)
     _integer(guest_vcpus, positive=True)
     _integer(guest_memory_bytes, positive=True)
     # The static SRW VMI has guest memory but no pre-render resource request.
     # GetMemoryOverhead therefore has no page-table request component. Its
     # supported amd64 branch adds 220Mi fixed, 8Mi/vCPU, 8Mi IO and 32Mi video.
+    # In v1.8.4 this branch moved to pkg/hypervisor/kvm/hypervisorbackend.go;
+    # the ordinary PVC/KVM branch retains the same resource calculation.
     memory_overhead = (220 + 8 * guest_vcpus + 8 + 32) * 1024**2
     memory_request = (
         guest_memory_bytes * 100 // profile["memoryOvercommit"]
@@ -203,8 +213,7 @@ def normalize_installed_profile(raw, *, namespace="kubevirt", name="kubevirt"):
             or status["phase"] != "Deployed"
             or type(status["observedGeneration"]) is not int
             or status["observedGeneration"] != meta["generation"]
-            or status["targetKubeVirtVersion"] != "v1.6.6"
-            or status["observedKubeVirtVersion"] != "v1.6.6"
+            or status["targetKubeVirtVersion"] != status["observedKubeVirtVersion"]
             or not isinstance(status["targetDeploymentID"], str)
             or not status["targetDeploymentID"]
             or status["targetDeploymentID"] != status["observedDeploymentID"]
@@ -220,9 +229,10 @@ def normalize_installed_profile(raw, *, namespace="kubevirt", name="kubevirt"):
             or config.get("defaultRuntimeClass") is not None
             or config.get("autoCPULimitNamespaceLabelSelector") is not None
             or config.get("network") is not None
+            or config.get("hypervisors", []) != []
         ):
             raise ValueError
-        profile = default_launcher_profile()
+        profile = default_launcher_profile(status["observedKubeVirtVersion"])
         profile["cpuAllocationRatio"] = developer.get("cpuAllocationRatio", 10)
         profile["memoryOvercommit"] = developer.get("memoryOvercommit", 100)
         profile["useEmulation"] = developer.get("useEmulation", False)

@@ -101,7 +101,8 @@ async def test_collects_complete_scope_without_serializing_private_fields():
 
 
 @pytest.mark.asyncio
-async def test_protocol_two_gets_exact_installed_cr_and_limitranges_without_raw_dump():
+@pytest.mark.parametrize("kubevirt_version", ["v1.6.6", "v1.8.4"])
+async def test_protocol_two_gets_exact_installed_cr_and_limitranges_without_raw_dump(kubevirt_version):
     from tests.test_vm_launcher_profile import installed_cr
 
     collector, pages, calls = fixture()
@@ -117,6 +118,7 @@ async def test_protocol_two_gets_exact_installed_cr_and_limitranges_without_raw_
     collector.kubevirt_name = "kubevirt"
     collector.label_keys.append("kubernetes.io/arch")
     raw_cr = installed_cr()
+    raw_cr["status"].update(targetKubeVirtVersion=kubevirt_version, observedKubeVirtVersion=kubevirt_version)
     raw_cr["metadata"]["resourceVersion"] = "11"
     raw_cr["spec"]["private"] = "DO_NOT_EMIT"
     observed = []
@@ -130,7 +132,7 @@ async def test_protocol_two_gets_exact_installed_cr_and_limitranges_without_raw_
     result = await collector.collect(1)
     assert result["complete"] is True
     assert result["protocol"] == 2
-    assert result["installed_profile"]["profile"]["kubevirtVersion"] == "v1.6.6"
+    assert result["installed_profile"]["profile"]["kubevirtVersion"] == kubevirt_version
     assert result["nodes"][0]["allocatable"]["ephemeral_storage_bytes"] == 100000000000
     assert result["resource_versions"]["kubevirt"] == "11"
     assert observed[0]["namespace"] == "kubevirt" and observed[0]["name"] == "kubevirt"

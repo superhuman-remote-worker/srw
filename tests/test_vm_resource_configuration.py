@@ -259,14 +259,19 @@ def test_resolver_opt_in_is_private_typed_and_no_policy_keeps_v1(resolver_inputs
     vm.custom_api.assert_not_called()
 
 
+@pytest.mark.parametrize("kubevirt_version", ["v1.6.6", "v1.8.4"])
 def test_operator_enforcement_selects_v3_on_actual_configuration_resolver(
-    resolver_inputs, monkeypatch,
+    resolver_inputs, monkeypatch, kubevirt_version,
 ):
     from tests.test_vm_resource_policy import whole_launcher_policy
     from vm_controller.creation_configuration import resolve_creation_configuration
 
     policy = whole_launcher_policy()
     policy["policy"].update(shadowEnabled=True, enforcementEnabled=True)
+    policy["policy"]["launcherProfile"].update(
+        kubevirtVersion=kubevirt_version,
+        costAlgorithm=f"kubevirt-{kubevirt_version}-amd64-ordinary-pvc-v1",
+    )
     monkeypatch.setenv("VM_RESOURCE_ADMISSION_CONFIG", json.dumps(policy))
     vm, request = resolver_inputs
 
@@ -275,6 +280,13 @@ def test_operator_enforcement_selects_v3_on_actual_configuration_resolver(
     assert result["controller_configuration"]["version"] == 3
     assert result["controller_configuration"]["resource_admission"]["version"] == 2
     assert result["controller_configuration"]["resource_admission"]["cluster_id"] == "test-cluster"
+    resource = result["controller_configuration"]["resource_admission"]
+    assert resource["launcher_prediction"]["algorithm"] == policy["policy"]["launcherProfile"]["costAlgorithm"]
+    changed = deepcopy(result["controller_configuration"])
+    changed["resource_admission"]["launcher_prediction"]["algorithm"] = "unknown"
+    with pytest.raises(ValueError):
+        canonical_configuration_digest(changed)
+
 
 
 @pytest.mark.parametrize("invalid", [{}, "sha256:" + "a" * 64, False])

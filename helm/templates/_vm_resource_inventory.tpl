@@ -18,8 +18,8 @@
 {{- if or
   (ne (index $policy.launcherProfile "version") (float64 1))
   (ne (index $policy.launcherProfile "architecture") "amd64")
-  (ne (index $policy.launcherProfile "kubevirtVersion") "v1.6.6")
-  (ne (index $policy.launcherProfile "costAlgorithm") "kubevirt-v1.6.6-amd64-ordinary-pvc-v1")
+  (not (has (index $policy.launcherProfile "kubevirtVersion") (list "v1.6.6" "v1.8.4")))
+  (ne (index $policy.launcherProfile "costAlgorithm") (printf "kubevirt-%s-amd64-ordinary-pvc-v1" (index $policy.launcherProfile "kubevirtVersion")))
 -}}
 {{- fail "vm.resourceAdmission enforcement requires the supported whole-launcher profile" -}}
 {{- end -}}

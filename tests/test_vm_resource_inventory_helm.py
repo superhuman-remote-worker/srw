@@ -74,11 +74,15 @@ def render_full_policy(tmp_path, *, mutate=None):
     )
 
 
-def test_explicit_whole_resource_policy_renders_one_valid_shared_document(tmp_path):
+@pytest.mark.parametrize("kubevirt_version", ["v1.6.6", "v1.8.4"])
+def test_explicit_whole_resource_policy_renders_one_valid_shared_document(tmp_path, kubevirt_version):
     from shared.vm_resource_policy import validate_enforcement_resource_policy
     from tests.test_helm_vm_workspace_recovery import _env, _orchestrator
 
-    rendered = render_full_policy(tmp_path)
+    rendered = render_full_policy(tmp_path, mutate=lambda values: values["vm"]["resourceAdmission"]["launcherProfile"].update(
+        kubevirtVersion=kubevirt_version,
+        costAlgorithm=f"kubevirt-{kubevirt_version}-amd64-ordinary-pvc-v1",
+    ))
     assert rendered.returncode == 0, rendered.stderr
     docs = [doc for doc in yaml.safe_load_all(rendered.stdout) if doc]
     controller = next(
@@ -102,7 +106,7 @@ def test_explicit_whole_resource_policy_renders_one_valid_shared_document(tmp_pa
     [
         "shadow_only", "enforcement_only", "retry_disabled", "ack_missing",
         "budget_missing", "host_cost_zero", "profile_missing",
-        "profile_unsupported", "arch_label_missing", "installation_missing",
+        "profile_unsupported", "profile_version_unknown", "profile_algorithm_mismatch", "arch_label_missing", "installation_missing",
     ],
 )
 def test_incomplete_whole_resource_policy_is_rejected(tmp_path, case):
@@ -124,6 +128,11 @@ def test_incomplete_whole_resource_policy_is_rejected(tmp_path, case):
             policy["launcherProfile"] = None
         elif case == "profile_unsupported":
             policy["launcherProfile"]["architecture"] = "arm64"
+        elif case == "profile_version_unknown":
+            policy["launcherProfile"]["kubevirtVersion"] = "v1.8.5"
+            policy["launcherProfile"]["costAlgorithm"] = "kubevirt-v1.8.5-amd64-ordinary-pvc-v1"
+        elif case == "profile_algorithm_mismatch":
+            policy["launcherProfile"]["kubevirtVersion"] = "v1.8.4"
         elif case == "arch_label_missing":
             policy["inventory"]["nodeLabelKeys"].remove("kubernetes.io/arch")
         elif case == "installation_missing":

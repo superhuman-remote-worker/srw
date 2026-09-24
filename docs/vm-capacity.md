@@ -35,6 +35,22 @@ Secret, and all required inventory settings. See the comments in
 budgets from the actual launcher requests and node overhead; guest CPU and
 memory alone do not describe host demand.
 
+The ordinary PVC launcher profile supports exactly KubeVirt `v1.6.6` and
+`v1.8.4` on `amd64` with KVM. Set `launcherProfile.kubevirtVersion` to the
+installed version and `costAlgorithm` to
+`kubevirt-<version>-amd64-ordinary-pvc-v1`. The observed and target KubeVirt
+versions must match that profile. Unknown versions, custom hypervisor
+configuration and unsupported launcher features hold admission.
+
+The installation CPU budget applies to the operator's reserved host cost.
+`launcherProfile.cpuAllocationRatio` describes KubeVirt's actual requests;
+`hostCost.cpuMillicoresPerVcpuNumerator` and `Denominator` independently choose
+a conservative reservation. For example, numerator `1000` and denominator `1`
+reserve one CPU per guest vCPU even if KubeVirt requests less. CPU and memory
+budgets also include the configured launcher overhead, so their full values
+are not available for guest allocations. The count backstop can remain enabled
+alongside these budgets.
+
 Choose the installation and owner budgets from eligible-node capacity and
 other workload reservations. The chart does not derive them. Review the exact
 JSON rendered as `VM_RESOURCE_ADMISSION_CONFIG` in both Deployments; it must
