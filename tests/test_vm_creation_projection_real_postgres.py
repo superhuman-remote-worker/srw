@@ -41,30 +41,37 @@ async def test_real_list_and_detail_show_same_attention_without_private_history(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "outcome,reason,expected",
+    "outcome,reason,source,expected",
     [
-        ("capacity_wait", "capacity_wait", "controller_count_wait"),
-        ("capacity_wait", "installation_budget", "resource_wait"),
-        ("dependency_wait", "preparation_wait", "preparation_wait"),
-        ("dependency_wait", "SECRET raw body", "creation_dependency_pending"),
-        ("transport_unknown", "SECRET raw body", "controller_unavailable"),
+        ("capacity_wait", "capacity_wait", None, "controller_count_wait"),
+        ("capacity_wait", "installation_budget", None, "capacity_wait"),
+        ("capacity_wait", "resource_wait", "resource_admission", "resource_wait"),
+        ("capacity_wait", "resource_unavailable", "resource_admission", "resource_unavailable"),
+        ("dependency_wait", "preparation_wait", None, "preparation_wait"),
+        ("dependency_wait", "SECRET raw body", None, "creation_dependency_pending"),
+        ("transport_unknown", "SECRET raw body", None, "controller_unavailable"),
     ],
 )
 async def test_observer_persists_only_bounded_diagnostic_category(
-    db, outcome, reason, expected
+    db, outcome, reason, source, expected
 ):
     job, preflight, claim, resolved = await resolving(db)
     await preflight.complete_resolution(claim, resolved)
     store = VMCreationRetryStore(db)
     row = (await store.claim_due(limit=1))[0]
+    observation = {"outcome": outcome, "reason": reason}
+    if source is not None:
+        observation["source"] = source
     assert await store.apply_observation(
         request_id=str(row["request_id"]),
         claim_token=str(row["claim_token"]),
         expected_revision=row["revision"],
-        observation={"outcome": outcome, "reason": reason},
+        observation=observation,
     )
     result = redact(await db.get_job(str(job)))
     assert result["vm_creation"]["reason_code"] == expected
+    if reason == "installation_budget":
+        assert result["vm_creation"]["wait"]["kind"] == "unknown"
     assert result["vm_creation"]["resumable"] is False
     async with db.acquire() as conn:
         assert (
