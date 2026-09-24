@@ -1521,3 +1521,200 @@ async def test_release_never_starts_while_resident_proof_is_incomplete() -> None
     assert exc_info.value.status_code == 503
     provisioner.release_workspace.assert_not_awaited()
     provisioner.release_absent_workspace.assert_not_awaited()
+
+
+def _unacknowledged_retiring_thread(*, permanent: bool) -> dict:
+    thread = _retiring_process_zero_thread()
+    marker = thread["metadata"]["_stateless_claim_retirement"]
+    marker.update(
+        {
+            "residents_retired": False,
+            "residents_retired_by": None,
+            "remote_retired": False,
+            "remote_retired_by": None,
+            "permanent": permanent,
+        }
+    )
+    thread["metadata"].pop("_stateless_resident_retirement_ack", None)
+    thread["metadata"].pop("_stateless_shell_retirement_ack", None)
+    return thread
+
+
+def _receipt_acknowledged_thread(*, permanent: bool) -> dict:
+    thread = _retiring_process_zero_thread()
+    ack = {
+        "kind": "workspace_runtime_terminal",
+        "terminal_token": 8,
+        "runtime_incarnation": RUNTIME,
+        "evidence": "process_zero_receipt",
+    }
+    thread["metadata"]["_stateless_claim_retirement"].update(
+        {
+            "residents_retired_by": "workspace_runtime_terminal",
+            "remote_retired_by": "workspace_runtime_terminal",
+            "permanent": permanent,
+        }
+    )
+    thread["metadata"]["_stateless_resident_retirement_ack"] = dict(ack)
+    thread["metadata"]["_stateless_shell_retirement_ack"] = dict(ack)
+    return thread
+
+
+def _awaiting_residents(*, permanent: bool) -> dict:
+    return {
+        "state": "closed",
+        "terminal_token": 8,
+        "claimant_quiesced": True,
+        "claim_losses": [],
+        "resident_cleanup_required": True,
+        "resident_acknowledged": False,
+        "shell_retirement_required": True,
+        "remote_acknowledged": False,
+        "permanent": permanent,
+        "workspace_absence_proven": False,
+        "retry": True,
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("permanent", (False, True))
+async def test_backstop_deleted_runtime_settles_through_its_exact_process_zero_receipt(
+    permanent,
+) -> None:
+    """R1.B12 ``bff692dc``: the Pod went before End's proofs, with a receipt.
+
+    The finalizer release durably recorded the exact UID's observed container
+    termination before the Pod object disappeared. That receipt, bound to the
+    marker's runtime inside the acknowledging UPDATE, is the same evidence as
+    an observed ``exact_terminal`` Pod; a bare 404 is not.
+    """
+
+    awaiting = _awaiting_residents(permanent=permanent)
+    acknowledged = {
+        **awaiting,
+        "resident_acknowledged": True,
+        "remote_acknowledged": True,
+    }
+    db = SimpleNamespace(
+        get_thread=AsyncMock(
+            side_effect=[
+                _unacknowledged_retiring_thread(permanent=permanent),
+                _receipt_acknowledged_thread(permanent=permanent),
+                _receipt_acknowledged_thread(permanent=permanent),
+            ]
+        ),
+        begin_stateless_thread_workspace_retirement=AsyncMock(
+            side_effect=[awaiting, acknowledged, acknowledged]
+        ),
+        acknowledge_stateless_thread_runtime_process_zero=AsyncMock(return_value=True),
+        acknowledge_stateless_thread_shell_absent=AsyncMock(),
+        finish_stateless_thread_workspace_retirement=AsyncMock(return_value=True),
+    )
+    provisioner = _settled_cleanup_provisioner(
+        workspace_pod_authority=AsyncMock(return_value="exact_absent"),
+        release_absent_workspace=AsyncMock(return_value=True),
+        release_workspace=AsyncMock(),
+    )
+
+    with (
+        patch.object(main.app.state.resources, "postgres_db", db),
+        patch.object(
+            container_provisioner_module, "container_provisioner", provisioner
+        ),
+    ):
+        result = await control_seams.reconcile_stateless_thread_retirement(
+            THREAD_ID, force=True, permanent=permanent
+        )
+
+    assert result["state"] == "settled"
+    db.acknowledge_stateless_thread_runtime_process_zero.assert_awaited_once_with(
+        THREAD_ID,
+        terminal_token=8,
+        runtime_incarnation=RUNTIME,
+    )
+    db.acknowledge_stateless_thread_shell_absent.assert_not_awaited()
+    provisioner.release_workspace.assert_not_awaited()
+    if permanent:
+        provisioner.reconcile_workspace_cleanup_intent.assert_awaited_once()
+    else:
+        provisioner.release_absent_workspace.assert_awaited_once()
+        db.finish_stateless_thread_workspace_retirement.assert_awaited_once_with(
+            THREAD_ID
+        )
+
+
+@pytest.mark.asyncio
+async def test_absent_runtime_without_its_exact_receipt_stays_fail_closed() -> None:
+    """Kubernetes absence alone still never manufactures process zero."""
+
+    db = SimpleNamespace(
+        get_thread=AsyncMock(
+            return_value=_unacknowledged_retiring_thread(permanent=True)
+        ),
+        begin_stateless_thread_workspace_retirement=AsyncMock(
+            return_value=_awaiting_residents(permanent=True)
+        ),
+        acknowledge_stateless_thread_runtime_process_zero=AsyncMock(return_value=False),
+        acknowledge_stateless_thread_shell_absent=AsyncMock(),
+    )
+    provisioner = SimpleNamespace(
+        workspace_pod_authority=AsyncMock(return_value="exact_absent"),
+        release_workspace=AsyncMock(),
+        release_absent_workspace=AsyncMock(),
+        prepare_workspace_cleanup_intent=AsyncMock(),
+    )
+
+    with (
+        patch.object(main.app.state.resources, "postgres_db", db),
+        patch.object(
+            container_provisioner_module, "container_provisioner", provisioner
+        ),
+    ):
+        with pytest.raises(HTTPException) as exc_info:
+            await control_seams.reconcile_stateless_thread_retirement(
+                THREAD_ID, force=True, permanent=True
+            )
+
+    assert exc_info.value.status_code == 503
+    assert exc_info.value.detail == (
+        "Workspace resident runtime authority changed or is ambiguous"
+    )
+    db.acknowledge_stateless_thread_shell_absent.assert_not_awaited()
+    provisioner.release_workspace.assert_not_awaited()
+    provisioner.release_absent_workspace.assert_not_awaited()
+    provisioner.prepare_workspace_cleanup_intent.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("authority", ("replacement", "unknown"))
+async def test_a_replacement_or_unknown_runtime_never_consults_the_receipt(
+    authority,
+) -> None:
+    db = SimpleNamespace(
+        get_thread=AsyncMock(
+            return_value=_unacknowledged_retiring_thread(permanent=True)
+        ),
+        begin_stateless_thread_workspace_retirement=AsyncMock(
+            return_value=_awaiting_residents(permanent=True)
+        ),
+        acknowledge_stateless_thread_runtime_process_zero=AsyncMock(return_value=True),
+    )
+    provisioner = SimpleNamespace(
+        workspace_pod_authority=AsyncMock(return_value=authority),
+        release_workspace=AsyncMock(),
+    )
+
+    with (
+        patch.object(main.app.state.resources, "postgres_db", db),
+        patch.object(
+            container_provisioner_module, "container_provisioner", provisioner
+        ),
+    ):
+        with pytest.raises(HTTPException) as exc_info:
+            await control_seams.reconcile_stateless_thread_retirement(
+                THREAD_ID, force=True, permanent=True
+            )
+
+    assert exc_info.value.status_code == 503
+    db.acknowledge_stateless_thread_runtime_process_zero.assert_not_awaited()
+    provisioner.release_workspace.assert_not_awaited()
