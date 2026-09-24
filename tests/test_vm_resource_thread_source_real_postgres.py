@@ -284,11 +284,25 @@ async def test_thread_source_and_cleanup_permit_do_not_deadlock_on_observed_pvc(
     results = await asyncio.wait_for(
         asyncio.gather(authorization(), ordinary_cleanup(), return_exceptions=True), 8,
     )
-    assert not any(isinstance(result, asyncpg.DeadlockDetectedError) for result in results), results
+    unexpected = [
+        result for result in results
+        if isinstance(result, BaseException)
+        and not (
+            cleanup_first
+            and isinstance(result, VMCreationRetryConflict)
+            and str(result) == "workspace_cleanup_already_admitted"
+        )
+    ]
+    assert not unexpected, results
+    if cleanup_first:
+        assert isinstance(results[0], VMCreationRetryConflict), results
 
 
-async def _adopted_charged_thread(db, monkeypatch):
-    """Real typed CAS, shared admit, signed effects and exact adoption."""
+async def _adopted_charged_thread(
+    db, monkeypatch, *, stop_after="vm", adopt=True, observe_last=True,
+    stop_before_effect=False, golden_enabled=False,
+):
+    """Real typed CAS, shared admit, signed effects and optional adoption."""
     from tests.test_vm_creation_actuation import SECRET
 
     monkeypatch.setenv("VM_LIFECYCLE_HMAC_SECRET", SECRET.decode())
@@ -300,6 +314,8 @@ async def _adopted_charged_thread(db, monkeypatch):
     generation, request_id = uuid4(), uuid4()
     config = whole_launcher_configuration()
     config.update(namespace="workers", storage_class="local")
+    if golden_enabled:
+        config["golden_enabled"] = True
     resource = config["resource_admission"]
     resource["cluster_id"] = inventory.cluster_id
     resource["policy_digest"] = inventory.policy_digest
@@ -343,6 +359,11 @@ async def _adopted_charged_thread(db, monkeypatch):
         },
     )
     assert grant["allowed"] is True
+    if stop_before_effect:
+        return (
+            policy, inventory, sample, demand, thread_id, runtime, generation,
+            request_id, admitted, {}, None,
+        )
     values = {
         "version": 4, "resource_grant": grant["resource_grant"],
         "rootdisk_source": {"kind": "registry", "image": request["vm_image"]},
@@ -384,6 +405,8 @@ async def _adopted_charged_thread(db, monkeypatch):
             request_id=str(request_id), claim_token=str(claim["claim_token"]),
             carrier=carrier,
         ))["actuation_allowed"] is True
+        if kind == stop_after and not observe_last:
+            break
         object_metadata = {
             "uid": str(uuid4()), "name": values["object_name"],
             "namespace": "workers",
@@ -439,16 +462,23 @@ async def _adopted_charged_thread(db, monkeypatch):
             observation=observation,
         ))["recorded"] is True
         observations[kind] = observation
-    assert await retry.settle_adopted(
-        request_id=str(request_id), carrier=carrier, observations=observations,
-    ) == {"settled": True, "disposition": "adopted"}
-    return policy, inventory, sample, demand, thread_id, runtime, generation, request_id, admitted, observations
+        if kind == stop_after:
+            break
+    if adopt:
+        assert stop_after == "vm"
+        assert await retry.settle_adopted(
+            request_id=str(request_id), carrier=carrier, observations=observations,
+        ) == {"settled": True, "disposition": "adopted"}
+    return (
+        policy, inventory, sample, demand, thread_id, runtime, generation,
+        request_id, admitted, observations, carrier,
+    )
 
 
 async def _ready_charged_thread(db, monkeypatch):
     (
         _, inventory, sample, demand, thread_id, runtime, generation,
-        request_id, admitted, observations,
+        request_id, admitted, observations, _,
     ) = await _adopted_charged_thread(db, monkeypatch)
     vm_uid = observations["vm"]["object"]["metadata"]["uid"]
     vmi_uid, launcher_uid, registration = (str(uuid4()) for _ in range(3))

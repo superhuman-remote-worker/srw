@@ -7677,6 +7677,7 @@ BEGIN
     IF NEW.cancellation_disposition IS NOT NULL AND OLD.cancellation_disposition IS NULL THEN
         IF OLD.state<>'cancel_requested' OR NEW.state<>'cancel_requested' OR
            NEW.creation_admission_id IS NULL OR NEW.creation_carrier_uid IS NULL OR
+           (NEW.owner_kind='thread' AND NOT public.valid_vm_creation_thread_disposition_identity(NEW,true)) OR
            EXISTS(SELECT 1 FROM public.vm_creation_effects WHERE request_id=NEW.request_id
                   AND (state='issued' OR (effect_kind='vm' AND state<>'rejected'))) THEN
             RAISE EXCEPTION 'Creation disposition requires no possible VM issuance' USING ERRCODE='23514';
@@ -7807,6 +7808,13 @@ BEGIN
             RAISE EXCEPTION 'Creation disposition terminal instance is incomplete' USING ERRCODE='23514';
         END IF;
     END IF;
+    IF retry.owner_kind='thread' AND NOT EXISTS (
+        SELECT 1 FROM public.threads t WHERE t.id=retry.thread_id
+          AND NOT t.metadata ? 'vm'
+          AND public.valid_vm_creation_thread_disposition_identity(retry,false)
+          AND NOT EXISTS (SELECT 1 FROM public.vm_resource_reservations v
+              WHERE v.request_id=retry.request_id AND v.state<>'released')
+    ) THEN RAISE EXCEPTION 'Thread creation disposition remains held' USING ERRCODE='23514'; END IF;
     RETURN NULL;
 END;
 $$;
@@ -8822,11 +8830,27 @@ BEGIN
                OR proof->>'request_id' IS DISTINCT FROM NEW.request_id::text
                OR proof->>'thread_id' IS DISTINCT FROM source.thread_id::text
                OR proof->>'provision_generation' IS DISTINCT FROM source.provision_generation::text
-               OR source.controller_configuration->>'golden_enabled' IS DISTINCT FROM 'false'
-               OR source.canonical_request->'preparation' IS NOT NULL
-               OR EXISTS(SELECT 1 FROM public.vm_creation_effects e
-                          WHERE e.request_id=NEW.request_id
-                            AND e.state<>'rejected') THEN
+               OR NOT (
+                   (source.controller_configuration->>'golden_enabled' IS NOT DISTINCT FROM 'false'
+                    AND source.canonical_request->'preparation' IS NULL
+                    AND NOT EXISTS(SELECT 1 FROM public.vm_creation_effects e
+                        WHERE e.request_id=NEW.request_id AND e.state<>'rejected'))
+                   OR (proof->>'disposition_id' IS NOT NULL
+                       AND proof->>'disposition_id' IS NOT DISTINCT FROM
+                           source.cancellation_disposition->>'disposition_id'
+                       AND proof->>'creation_admission_id' IS NOT DISTINCT FROM
+                           source.creation_admission_id::text
+                       AND EXISTS(SELECT 1 FROM public.vm_creation_retries r
+                           WHERE r.request_id=NEW.request_id
+                             AND public.valid_vm_creation_disposition_evidence(r))
+                       AND EXISTS(SELECT 1 FROM public.vm_workspace_cleanup_admissions a
+                           WHERE a.id=source.creation_admission_id
+                             AND a.owner_kind='thread' AND a.owner_id=source.thread_id
+                             AND a.completed_at IS NOT NULL AND a.outcome='creation_disposed')
+                       AND NOT EXISTS(SELECT 1 FROM public.vm_creation_effects e
+                           WHERE e.request_id=NEW.request_id
+                             AND e.effect_kind='vm' AND e.state<>'rejected'))
+               ) THEN
                 RAISE EXCEPTION 'VM thread never-issued release unproven' USING ERRCODE='23514';
             END IF;
             RETURN NEW;
@@ -15206,16 +15230,21 @@ CREATE FUNCTION public.thread_vm_creation_never_issued_source(requested_thread u
               ->'vm_creation_source'->>'request_digest'
           AND r.controller_configuration_digest = t.runtime_retirement_context
               ->'vm_creation_source'->>'controller_configuration_digest'
-          AND r.state = 'settled' AND r.reason = 'creation_never_issued'
-          AND r.observed_vm_uid IS NULL AND r.observed_pvc_uid IS NULL
-          AND (a.id IS NULL OR (a.completed_at IS NOT NULL
-                                AND a.outcome = 'never_issued'
-                                AND a.owner_kind = 'thread'
-                                AND a.owner_id = t.id))
-          AND NOT EXISTS (
-              SELECT 1 FROM public.vm_creation_effects e
-               WHERE e.request_id = r.request_id
-                 AND e.state IN ('issued','observed')
+          AND r.state = 'settled' AND (
+              (r.reason = 'creation_never_issued'
+               AND r.observed_vm_uid IS NULL AND r.observed_pvc_uid IS NULL
+               AND (a.id IS NULL OR (a.completed_at IS NOT NULL
+                     AND a.outcome = 'never_issued' AND a.owner_kind = 'thread'
+                     AND a.owner_id = t.id))
+               AND NOT EXISTS (SELECT 1 FROM public.vm_creation_effects e
+                   WHERE e.request_id = r.request_id
+                     AND e.state IN ('issued','observed')))
+              OR (r.reason = 'creation_disposed'
+                  AND r.observed_vm_uid IS NULL
+                  AND a.completed_at IS NOT NULL
+                  AND a.outcome = 'creation_disposed'
+                  AND a.owner_kind = 'thread' AND a.owner_id = t.id
+                  AND public.valid_vm_creation_disposition_evidence(r))
           )
           AND NOT EXISTS (
               SELECT 1 FROM public.vm_resource_reservations v
@@ -15387,7 +15416,7 @@ BEGIN
         AND plan-ARRAY['version','kind','disposition_id','request_id','job_id','provision_generation','binding','name','namespace','outcome','prior']='{}'::jsonb
         AND plan->'version'='1'::jsonb AND plan->>'kind'='attachment_disposition_planned'
         AND plan->'disposition_id'=retry.cancellation_disposition->'disposition_id'
-        AND plan->>'request_id'=retry.request_id::text AND plan->>'job_id'=retry.job_id::text
+        AND plan->>'request_id'=retry.request_id::text AND plan->>'job_id'=COALESCE(retry.job_id,retry.thread_id)::text
         AND plan->>'provision_generation'=retry.provision_generation::text
         AND plan->'namespace'=retry.cancellation_disposition->'namespace'
         AND plan->'binding'=binding
@@ -15406,7 +15435,7 @@ BEGIN
         (plan->>'outcome'='detached' AND retry.cancellation_completion->'rootdisk'->>'kind'='rootdisk_retained')
     )) IS TRUE THEN RETURN false; END IF;
     labels := jsonb_build_object('srw.io/workspace-instance',binding->'uid',
-        'srw.io/workspace-generation',binding->>'generation','srw.io/workspace-execution',retry.job_id::text);
+        'srw.io/workspace-generation',binding->>'generation','srw.io/workspace-execution',COALESCE(retry.job_id,retry.thread_id)::text);
     prior := plan->'prior'; lease := evidence->'lease';
     observed := retry.cancellation_disposition->'objects'->'workspace_attach';
     IF prior='null'::jsonb THEN
@@ -15451,9 +15480,11 @@ BEGIN
         AND retry.state IN ('cancel_requested','settled')
         AND retry.cancellation_disposition->>'request_id'=retry.request_id::text
         AND retry.cancellation_disposition->>'admission_id'=retry.creation_admission_id::text
-        AND retry.cancellation_disposition->>'job_id'=retry.job_id::text
+        AND retry.cancellation_disposition->>'job_id'=COALESCE(retry.job_id,retry.thread_id)::text
         AND retry.cancellation_disposition->>'provision_generation'=retry.provision_generation::text
         AND retry.observed_vm_uid IS NULL
+        AND (retry.owner_kind='job' OR (retry.owner_kind='thread'
+             AND public.valid_vm_creation_thread_disposition_identity(retry,false)))
         AND retry.boot_counted=false
         AND jsonb_typeof(retry.cancellation_completion)='object'
         AND retry.cancellation_completion ?& ARRAY['source','cloud_init','rootdisk','workspace_attachment']
@@ -15506,7 +15537,7 @@ CREATE FUNCTION public.valid_vm_creation_disposition_parent_identity(retry publi
     LANGUAGE sql STABLE
     AS $$
     SELECT (parent.id=retry.creation_admission_id
-        AND parent.owner_kind='job' AND parent.owner_id=retry.job_id
+        AND parent.owner_kind=retry.owner_kind AND parent.owner_id=COALESCE(retry.job_id,retry.thread_id)
         AND parent.source='controller_vm_create' AND parent.parent_admission_id IS NULL
         AND parent.pvc_uid IS NOT DISTINCT FROM COALESCE(retry.expected_pvc_uid,retry.observed_pvc_uid)
         AND parent.request_id=uuid_generate_v5(uuid_ns_url(),'vm-create:' || retry.request_id::text)
@@ -15531,7 +15562,7 @@ BEGIN
     IF resource IS NULL THEN
         expected_name := CASE WHEN stage='rootdisk' AND retry.canonical_request->'workspace_storage'<>'null'::jsonb
             THEN 'srw-ws-' || replace(retry.canonical_request->'workspace_storage'->>'uid','-','')
-            ELSE 'agent-vm-' || retry.job_id::text || CASE WHEN stage='rootdisk' THEN '-rootdisk' ELSE '-cloudinit' END END;
+            ELSE 'agent-vm-' || COALESCE(retry.job_id,retry.thread_id)::text || CASE WHEN stage='rootdisk' THEN '-rootdisk' ELSE '-cloudinit' END END;
         keys := ARRAY['version','kind','disposition_id','name','namespace'];
         RETURN (evidence ?& keys AND evidence-keys='{}'::jsonb
             AND evidence->>'kind'=CASE WHEN stage='rootdisk' THEN 'rootdisk_never_issued' ELSE 'secret_never_issued' END
@@ -15556,11 +15587,11 @@ BEGIN
     keys := ARRAY['version','kind','disposition_id','name','namespace','uid','pvc_uid','admission_id','request_id','intent_digest'];
     RETURN (evidence ?& keys AND evidence-keys='{}'::jsonb
         AND evidence->>'kind'='rootdisk_purged' AND evidence->'pvc_uid'=resource->'pvc_uid'
-        AND retry.cancellation_disposition->>'disk_policy'='purge_new_job_disk'
+        AND retry.cancellation_disposition->>'disk_policy'=CASE WHEN retry.owner_kind='thread' THEN 'purge_new_thread_disk' ELSE 'purge_new_job_disk' END
         AND EXISTS(SELECT 1 FROM public.vm_workspace_cleanup_admissions a
             WHERE a.id::text=evidence->>'admission_id' AND a.parent_admission_id=retry.creation_admission_id
               AND a.request_id::text=evidence->>'request_id' AND a.intent_digest=evidence->>'intent_digest'
-              AND a.owner_kind='job' AND a.owner_id=retry.job_id AND a.pvc_uid::text=evidence->>'pvc_uid'
+              AND a.owner_kind=retry.owner_kind AND a.owner_id=COALESCE(retry.job_id,retry.thread_id) AND a.pvc_uid::text=evidence->>'pvc_uid'
               AND a.source='controller_creation_rootdisk_delete' AND a.completed_at IS NOT NULL AND a.outcome='deleted')) IS TRUE;
 END;
 $$;
@@ -15588,7 +15619,7 @@ BEGIN
     IF NOT (public.valid_vm_creation_source_completion(plan,completion)
         AND resolution IN ('required','unknown','not_required')
         AND plan->>'request_id'=retry.request_id::text
-        AND plan->>'job_id'=retry.job_id::text
+        AND plan->>'job_id'=COALESCE(retry.job_id,retry.thread_id)::text
         AND plan->>'provision_generation'=retry.provision_generation::text
         AND plan->>'request_digest'=retry.request_digest
         AND plan->>'controller_configuration_digest'=retry.controller_configuration_digest
@@ -15623,7 +15654,7 @@ BEGIN
     IF root IS NULL THEN
         expected_name := CASE WHEN retry.canonical_request->'workspace_storage'<>'null'::jsonb
             THEN 'srw-ws-' || replace(retry.canonical_request->'workspace_storage'->>'uid','-','')
-            ELSE 'agent-vm-' || retry.job_id::text || '-rootdisk' END;
+            ELSE 'agent-vm-' || COALESCE(retry.job_id,retry.thread_id)::text || '-rootdisk' END;
         RETURN (target=jsonb_build_object('kind','rootdisk_never_issued',
                 'name',expected_name,'namespace',disposition->>'namespace')
             AND retry.expected_pvc_uid IS NULL AND retry.observed_pvc_uid IS NULL
@@ -15750,6 +15781,55 @@ BEGIN
     END) IS TRUE;
 END;
 $_$;
+
+
+--
+-- Name: valid_vm_creation_thread_disposition_identity(public.vm_creation_retries, boolean); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.valid_vm_creation_thread_disposition_identity(retry public.vm_creation_retries, require_captured boolean) RETURNS boolean
+    LANGUAGE sql STABLE
+    AS $$
+    SELECT (retry.owner_kind='thread' AND retry.job_id IS NULL
+       AND retry.thread_id IS NOT NULL
+       AND retry.canonical_request->>'entity_type'='thread'
+       AND retry.canonical_request->>'job_id'=retry.thread_id::text
+       AND retry.canonical_request->>'provision_generation'=retry.provision_generation::text
+       AND COALESCE(retry.canonical_request->'workspace_storage','null'::jsonb)='null'::jsonb
+       AND retry.cancellation_disposition->>'owner_kind'='thread'
+       AND retry.cancellation_disposition->>'thread_id'=retry.thread_id::text
+       AND retry.cancellation_disposition->>'job_id'=retry.thread_id::text
+       AND retry.cancellation_disposition->>'thread_runtime_generation'=retry.thread_runtime_generation::text
+       AND retry.cancellation_disposition->>'thread_agent_id' IS NOT DISTINCT FROM retry.thread_agent_id::text
+       AND retry.cancellation_disposition->>'thread_attach_token' IS NOT DISTINCT FROM retry.thread_attach_token::text
+       AND retry.cancellation_disposition->>'thread_wake_operation_id' IS NOT DISTINCT FROM retry.thread_wake_operation_id::text
+       AND retry.cancellation_disposition->>'disk_policy'='purge_new_thread_disk'
+       AND retry.cancellation_disposition->'workspace_storage'='null'::jsonb
+       AND retry.cancellation_disposition->'workspace_instance_id'='null'::jsonb
+       AND EXISTS (SELECT 1 FROM public.threads t
+           WHERE t.id=retry.thread_id AND t.execution_lane='pinned'
+             AND t.runtime_generation=retry.thread_runtime_generation
+             AND t.runtime_retirement_token IS NOT NULL
+             AND t.runtime_retirement_authorized_at IS NOT NULL
+             AND t.runtime_retirement_context->>'settle_status'='ended'
+             AND retry.cancellation_disposition->>'retirement_token'=t.runtime_retirement_token::text
+             AND t.runtime_retirement_context->'vm_creation_source'->>'request_id'=retry.request_id::text
+             AND t.runtime_retirement_context->'vm_creation_source'->>'provision_generation'=retry.provision_generation::text
+             AND t.runtime_retirement_context->'vm_creation_source'->>'thread_runtime_generation'=retry.thread_runtime_generation::text
+             AND t.runtime_retirement_context->'vm_creation_source'->>'request_digest'=retry.request_digest
+             AND t.runtime_retirement_context->'vm_creation_source'->>'controller_configuration_digest'=retry.controller_configuration_digest
+             AND t.runtime_retirement_context->'vm_creation_source'->>'thread_agent_id' IS NOT DISTINCT FROM retry.thread_agent_id::text
+             AND t.runtime_retirement_context->'vm_creation_source'->>'thread_attach_token' IS NOT DISTINCT FROM retry.thread_attach_token::text
+             AND t.runtime_retirement_context->'vm_creation_source'->'captured_vm'->>'creation_request_id'=retry.request_id::text
+             AND t.runtime_retirement_context->'vm_creation_source'->'captured_vm'->>'provision_generation'=retry.provision_generation::text
+             AND COALESCE(t.runtime_retirement_context->'vm_creation_source'->'captured_vm'->'vm_uid','null'::jsonb)='null'::jsonb
+             AND (COALESCE(t.runtime_retirement_context->'vm_creation_source'->'captured_vm'->'rootdisk_pvc_uid','null'::jsonb)='null'::jsonb
+                  OR t.runtime_retirement_context->'vm_creation_source'->'captured_vm'->>'rootdisk_pvc_uid'=retry.observed_pvc_uid::text)
+             AND (CASE WHEN require_captured THEN
+                 t.metadata->'vm'=t.runtime_retirement_context->'vm_creation_source'->'captured_vm'
+                 ELSE t.metadata->'vm'=t.runtime_retirement_context->'vm_creation_source'->'captured_vm'
+                      OR NOT t.metadata ? 'vm' END))) IS TRUE;
+$$;
 
 
 --

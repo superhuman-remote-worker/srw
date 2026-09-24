@@ -59,7 +59,7 @@ def attachment_plan(row, disposition, completion, obj):
         "kind": "attachment_disposition_planned",
         "disposition_id": disposition["disposition_id"],
         "request_id": str(row["request_id"]),
-        "job_id": str(row["job_id"]),
+        "job_id": str(row["thread_id"] if row.get("owner_kind") == "thread" else row["job_id"]),
         "provision_generation": str(row["provision_generation"]),
         "binding": deepcopy(binding),
         "name": storage_name(binding) if binding else None,
