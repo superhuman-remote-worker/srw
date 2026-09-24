@@ -3733,6 +3733,16 @@ class PostgresDB:
                        (SELECT jsonb_build_object(
                             'request_id', c.request_id, 'stage', 'creation',
                             'state', c.state, 'reason', c.reason,
+                            'resource_wait', (SELECT jsonb_build_object(
+                                'state', w.state, 'reason', w.reason,
+                                'enqueued_at', w.enqueued_at,
+                                'guest_vcpus', w.guest_vcpus,
+                                'guest_memory_bytes', w.guest_memory_bytes
+                            ) FROM vm_resource_waiters w
+                            WHERE w.request_id=c.request_id AND w.owner_kind='job'
+                              AND w.job_id=j.id
+                              AND w.provision_generation=c.provision_generation
+                              AND w.state IN ('waiting','nonfit')),
                             'admission_deadline', c.admission_deadline,
                             'ready_at', c.ready_at,
                             'pending', COALESCE(j.context->>'_vm_creation_pending'=c.request_id::text, false),
@@ -3740,7 +3750,7 @@ class PostgresDB:
                                 '_completion_control_claim','_stateless_delete_pending','_stateless_cancel_cleanup_pending'], false)
                                 OR COALESCE(j.context->'vm'->>'retirement_cleanup_pending'='true', false)
                                 OR COALESCE(j.context->'vm'->>'status' IN ('retiring_process_zero','deleting','deleted','delete_failed'), false)
-                        ) FROM vm_creation_retries c WHERE c.job_id=j.id
+                        ) FROM vm_creation_retries c WHERE c.owner_kind='job' AND c.job_id=j.id
                             AND c.provision_generation::text=j.context->'vm'->>'provision_generation'
                        ) AS _vm_creation
                 FROM page
@@ -3899,6 +3909,16 @@ class PostgresDB:
                        (SELECT jsonb_build_object(
                             'request_id', c.request_id, 'stage', 'creation',
                             'state', c.state, 'reason', c.reason,
+                            'resource_wait', (SELECT jsonb_build_object(
+                                'state', w.state, 'reason', w.reason,
+                                'enqueued_at', w.enqueued_at,
+                                'guest_vcpus', w.guest_vcpus,
+                                'guest_memory_bytes', w.guest_memory_bytes
+                            ) FROM vm_resource_waiters w
+                            WHERE w.request_id=c.request_id AND w.owner_kind='job'
+                              AND w.job_id=j.id
+                              AND w.provision_generation=c.provision_generation
+                              AND w.state IN ('waiting','nonfit')),
                             'admission_deadline', c.admission_deadline,
                             'ready_at', c.ready_at,
                             'pending', COALESCE(j.context->>'_vm_creation_pending'=c.request_id::text, false),
@@ -3906,7 +3926,7 @@ class PostgresDB:
                                 '_completion_control_claim','_stateless_delete_pending','_stateless_cancel_cleanup_pending'], false)
                                 OR COALESCE(j.context->'vm'->>'retirement_cleanup_pending'='true', false)
                                 OR COALESCE(j.context->'vm'->>'status' IN ('retiring_process_zero','deleting','deleted','delete_failed'), false)
-                        ) FROM vm_creation_retries c WHERE c.job_id=j.id
+                        ) FROM vm_creation_retries c WHERE c.owner_kind='job' AND c.job_id=j.id
                             AND c.provision_generation::text=j.context->'vm'->>'provision_generation'
                        ) AS _vm_creation
                 FROM jobs j

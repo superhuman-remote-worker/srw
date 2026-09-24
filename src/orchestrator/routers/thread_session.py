@@ -100,6 +100,13 @@ async def get_thread(
         store, owner_kind="thread", owner_ids=[thread_id]
     )
     result["workspace_lifecycle"] = states.get(thread_id)
+    if getattr(store, "supports_vm_creation_retry", False):
+        from orchestrator.services.vm_creation_owner_view import thread_creation_views
+
+        result["vm_creation"] = (await thread_creation_views(
+            store, [thread_id], viewer_user_id=str(user["id"]),
+            admin=user.get("is_admin") is True,
+        )).get(thread_id)
     if not result.get("ssh_handle"):
         try:
             result["ssh_handle"] = await store.ensure_thread_ssh_handle(thread_id)

@@ -43,7 +43,8 @@ async def test_real_list_and_detail_show_same_attention_without_private_history(
 @pytest.mark.parametrize(
     "outcome,reason,expected",
     [
-        ("capacity_wait", "capacity_wait", "capacity_wait"),
+        ("capacity_wait", "capacity_wait", "controller_count_wait"),
+        ("capacity_wait", "installation_budget", "resource_wait"),
         ("dependency_wait", "preparation_wait", "preparation_wait"),
         ("dependency_wait", "SECRET raw body", "creation_dependency_pending"),
         ("transport_unknown", "SECRET raw body", "controller_unavailable"),

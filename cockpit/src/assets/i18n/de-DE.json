@@ -935,6 +935,17 @@
       "workspace": "Workspace"
     }
   },
+  "vmWait": {
+    "kind": {
+      "resource": "Wartet auf Ressourcen für diesen Workspace",
+      "count": "Wartet auf die VM-Anzahlgrenze des Controllers",
+      "controller": "Wartet auf Antwort des VM-Controllers",
+      "unknown": "Wartet; Kapazitätsquelle nicht verifizierbar"
+    },
+    "sizeNonfit": "Die angeforderte Größe passt derzeit auf keinen geeigneten Knoten.",
+    "requested": "Angeforderte Größe",
+    "since": "Seit"
+  },
   "admin": {
     "helm": {
       "badge": "Helm",
@@ -979,7 +990,48 @@
       "colAttempts": "Versuche",
       "colPending": "Offene Eingabe",
       "yes": "ja",
-      "no": "nein"
+      "no": "nein",
+      "vm": {
+        "title": "VM-Workspace-Rechenkapazität",
+        "description": "Ressourcenbilanz installierter Cluster und dauerhafte Belegungen. Verbleibende Ressourcen garantieren keinen Platz für eine bestimmte VM; Warteschlangenposition und Wartezeit werden nicht geschätzt.",
+        "noPolicy": "Keine VM-Ressourcenrichtlinie installiert.",
+        "mode": {"off": "Aus", "shadow": "Nur beobachten", "enforce": "Erzwungen", "drain": "Wird geleert"},
+        "accounted": "Inventar bilanziert",
+        "unavailable": "Bilanzierung nicht verfügbar",
+        "reason": "Diagnosegrund",
+        "inventory": "Inventar",
+        "fresh": "Aktuell",
+        "unknown": "Fehlt oder veraltet",
+        "observed": "Beobachtet",
+        "age": "Alter",
+        "incomplete": "Unvollständige Momentaufnahme",
+        "countBackstop": "VM-Anzahlgrenze",
+        "countDescription": "Beobachtete VMs / Controller-Maximum. Ein Strich bedeutet unbekannt.",
+        "waiting": "Ressourcenwartende",
+        "nonfit": "Größe passt nicht",
+        "oldest": "Längste Wartezeit",
+        "bypasses": "Übersprungen",
+        "protected": "Geschützt",
+        "teardown": "Abbau-Belegungen",
+        "overdue": "überfällig",
+        "unknownAge": "Alter unbekannt",
+        "oldestProgress": "Ältester Fortschritt",
+        "held": "Dauerhafte Ressourcenbelegungen",
+        "heldDescription": "Bekannte Belegungen bleiben sichtbar, auch wenn das Inventar nicht bilanziert werden kann. Ein Strich bedeutet unbekannt, nicht null.",
+        "accounting": "Clusterbilanz",
+        "accountingUnavailable": "Knoten- und Clusterbilanz nicht verfügbar; die oben gezeigten dauerhaften Belegungen gelten weiter.",
+        "orphaned": "Belegungen auf fehlenden Knoten",
+        "pendingExternal": "Ausstehender externer Bedarf",
+        "separate": "Außerhalb der Knotensummen",
+        "nodes": "Knotendetails",
+        "nodeNote": "Knotenwerte dienen der Diagnose; anfragespezifische Selektoren, Toleranzen und Speichertopologie entscheiden weiterhin über die Platzierung.",
+        "categoryHeading": "Kategorie",
+        "category": {
+          "allocatable": "Zuteilbar", "headroom": "Reserve", "external": "Geplante externe Last", "unbound": "Ungebunden", "bound_reserved": "Gebunden, wartet auf Bereit", "active": "Aktiv", "warm": "Bereitgehalten", "teardown": "Abbau", "available": "Verbleibend", "shortfall": "Fehlbetrag", "total": "Gesamt belegt"
+        },
+        "memory": "Arbeitsspeicher",
+        "storage": "Temporärer Speicher"
+      }
     },
     "config": {
       "messages": {

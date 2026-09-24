@@ -11,6 +11,8 @@ _MESSAGES = {
     "creation_configuration_pending": "Waiting to resolve VM configuration.",
     "creation_configuration_unproven": "VM creation paused because its configuration could not be verified.",
     "capacity_wait": "Waiting for VM capacity.",
+    "controller_count_wait": "Waiting for the VM controller count limit.",
+    "resource_wait": "Waiting for VM workspace resources.",
     "golden_wait": "Waiting for the VM base disk.",
     "preparation_wait": "Waiting for workspace preparation.",
     "headscale_wait": "Waiting for VM network registration.",
@@ -96,6 +98,32 @@ def _deadline_valid(value):
         return False
 
 
+def _owner_wait(raw, reason):
+    """One request's bounded wait; no cluster budget, fleet count or queue rank."""
+    if reason == "controller_unavailable":
+        return {"kind": "controller", "since": None, "size_nonfit": False,
+                "guest_vcpus": None, "guest_memory_bytes": None}
+    if reason == "controller_count_wait":
+        return {"kind": "count", "since": None, "size_nonfit": False,
+                "guest_vcpus": None, "guest_memory_bytes": None}
+    if reason not in {"resource_wait", "capacity_wait", "vm_creation_retry_pending"}:
+        return None
+    resource = raw.get("resource_wait")
+    if isinstance(resource, Mapping) and resource.get("state") in {"waiting", "nonfit"}:
+        vcpus, memory = resource.get("guest_vcpus"), resource.get("guest_memory_bytes")
+        since = resource.get("enqueued_at")
+        return {
+            "kind": "resource",
+            "since": since if isinstance(since, str) else None,
+            "size_nonfit": resource["state"] == "nonfit"
+            and resource.get("reason") == "resource_size_nonfit",
+            "guest_vcpus": vcpus if type(vcpus) is int and vcpus > 0 else None,
+            "guest_memory_bytes": memory if type(memory) is int and memory > 0 else None,
+        }
+    return {"kind": "unknown", "since": None, "size_nonfit": False,
+            "guest_vcpus": None, "guest_memory_bytes": None}
+
+
 def vm_creation_projection(job):
     raw = _object(job.get("_vm_creation")) or preflight_creation_progress(
         job.get("context")
@@ -130,6 +158,7 @@ def vm_creation_projection(job):
         reason = "job_cancelled"
     if not isinstance(reason, str) or reason not in _MESSAGES:
         reason = "creation_evidence_unproven"
+    wait = _owner_wait(raw, reason) if state in {"queued", "reconciling"} else None
     resumable = (
         state == "attention"
         and reason in _RETRYABLE
@@ -147,5 +176,6 @@ def vm_creation_projection(job):
         "stage": stage,
         "reason_code": reason,
         "message": _MESSAGES[reason],
+        "wait": wait,
         "resumable": resumable,
     }
