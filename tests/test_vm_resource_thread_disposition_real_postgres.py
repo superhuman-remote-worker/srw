@@ -467,6 +467,44 @@ async def test_retained_thread_replaced_identity_preserves_old_charge(
 
 
 @pytest.mark.asyncio
+async def test_retained_wake_observed_rootdisk_without_original_carrier_holds_end(
+    db, setup, monkeypatch,
+):
+    ctrl, api, store, row, admitted, observations, carrier, waking = (
+        await retained_controller_runtime(db, setup, monkeypatch)
+    )
+    name = carrier["metadata"]["name"]
+    del api.objects["Lease", name]
+
+    assert await store.settle_never_issued(request_id=row["request_id"]) == {
+        "settled": False, "reason": "creation_effect_unresolved",
+    }
+    result = await CreationDisposer(ctrl).run(disposition_identity(row))
+    assert result["status"] == "creation_attention", result
+    assert not api.deletes
+    assert api.read("DataVolume", observations["rootdisk"]["object"]["metadata"]["name"])
+    assert api.read("PersistentVolumeClaim", observations["rootdisk"]["pvc"]["metadata"]["name"])
+    assert await db.fetchval(
+        "SELECT pvc_uid FROM vm_idle_operations WHERE id=$1", waking["id"],
+    ) == waking["pvc_uid"]
+    assert await db.fetchval(
+        "SELECT state FROM vm_resource_reservations WHERE id=$1",
+        admitted["reservation_id"],
+    ) == "reserved"
+    assert await db.fetchval(
+        "SELECT state FROM vm_creation_retries WHERE request_id=$1",
+        row["request_id"],
+    ) == "cancel_requested"
+    assert await db.fetchval(
+        "SELECT EXISTS(SELECT 1 FROM threads t JOIN vm_creation_retries r "
+        "ON r.thread_id=t.id WHERE r.request_id=$1 "
+        "AND t.runtime_retirement_token IS NOT NULL "
+        "AND t.runtime_retirement_authorized_at IS NOT NULL)",
+        row["request_id"],
+    )
+
+
+@pytest.mark.asyncio
 async def test_retained_thread_stale_end_token_refuses_disposition(db, monkeypatch):
     store, thread_id, request_id, admitted, _, _, carrier, _, _ = (
         await retained_wake_partial(db, monkeypatch, authorize_end=False)
