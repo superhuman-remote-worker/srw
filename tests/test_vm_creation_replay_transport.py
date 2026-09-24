@@ -29,6 +29,10 @@ def replay_fixture(*, status="creation_pending", reason="capacity_wait", failure
         "claim_token": uuid4(),
         "state": "reconciling",
         "canonical_request": resolved["request"],
+        # Store claims are always normalized by the retry store's ``_record``
+        # to carry the typed 0278 source columns; a Job claim has no thread.
+        "owner_kind": "job",
+        "thread_id": None,
         "job_id": resolved["request"]["job_id"],
         "provision_generation": resolved["request"]["provision_generation"],
         "expected_pvc_uid": None,

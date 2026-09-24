@@ -24,6 +24,16 @@ import pytest
 import orchestrator.main as orch_main
 
 
+@pytest.fixture(autouse=True)
+def legacy_resource_cleanup(monkeypatch):
+    """These synthetic teardown owners have no v3 creation/retry charge."""
+    import orchestrator.services.vm_workspace_recovery_store as recovery
+
+    monkeypatch.setattr(
+        recovery, "prepare_vm_cleanup_resource", AsyncMock(return_value=None)
+    )
+
+
 def _allow_cleanup_store():
     return SimpleNamespace(
         acquire_cleanup_permit=AsyncMock(

@@ -1036,10 +1036,15 @@ async def test_lite_backend_retirement_recovers_through_agent_runtime_zero(
 @pytest.mark.parametrize("backend", ["vm", "remote"])
 async def test_non_sandbox_recovery_uses_the_captured_vm_actuator(monkeypatch, backend):
     """Leader recovery must break the VM receipt/End retry dependency cycle."""
+    import orchestrator.services.vm_workspace_recovery_store as recovery
     from orchestrator.services.vm_provisioner import VMTeardownResult
 
     monkeypatch.setattr(
         main, "VMWorkspaceRecoveryStore", lambda db: idle_recovery_store()
+    )
+    # This pinned-thread owner has no v3 Job creation/retry resource charge.
+    monkeypatch.setattr(
+        recovery, "prepare_vm_cleanup_resource", AsyncMock(return_value=None)
     )
     retirement, current = _vm_retirement(backend=backend)
     db, provisioner = _lite_recovery_mocks(current)

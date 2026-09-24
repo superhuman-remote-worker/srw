@@ -16,6 +16,16 @@ from orchestrator.services.vm_workspace_recovery_store import CleanupPermit
 GENERATION = "00000000-0000-4000-8000-000000000001"
 
 
+@pytest.fixture(autouse=True)
+def legacy_resource_cleanup(monkeypatch):
+    """These handoff fixtures do not install a v3 resource charge."""
+    import orchestrator.services.vm_workspace_recovery_store as recovery
+
+    monkeypatch.setattr(
+        recovery, "prepare_vm_cleanup_resource", AsyncMock(return_value=None)
+    )
+
+
 def decision(vm, now):
     return vm_provisioning_decision(
         vm, provision_attempts=3, max_provision_attempts=3, now=now, timeout_s=600

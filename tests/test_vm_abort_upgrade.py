@@ -55,6 +55,16 @@ def _provisioner(*, available=True, delete_result=True, delete_exc=None):
 
 
 @pytest.fixture(autouse=True)
+def legacy_resource_cleanup(monkeypatch):
+    """Thread abort fixtures have no v3 Job creation/retry resource charge."""
+    import orchestrator.services.vm_workspace_recovery_store as recovery
+
+    monkeypatch.setattr(
+        recovery, "prepare_vm_cleanup_resource", AsyncMock(return_value=None)
+    )
+
+
+@pytest.fixture(autouse=True)
 def recovery_store(monkeypatch):
     store = idle_recovery_store()
     monkeypatch.setattr(orch_main, "VMWorkspaceRecoveryStore", lambda db: store)
