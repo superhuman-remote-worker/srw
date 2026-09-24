@@ -2873,6 +2873,14 @@ searxng:
   image: ghcr.io/searxng/searxng:2026.8.20-8d3dd0cd4
   service:
     port: 8080
+  # -- Per-engine overrides merged by name into the upstream engine list
+  # (settings.yml `engines:`; an unknown name adds a new engine). Upstream
+  # defaults stay untouched when empty. Useful when the default web engines
+  # are CAPTCHA-blocked from the cluster's egress IP, e.g.:
+  #   engines:
+  #     - name: bing
+  #       disabled: false
+  engines: []
   resources:
     requests:
       memory: "512Mi"
