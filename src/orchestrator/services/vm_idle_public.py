@@ -87,7 +87,7 @@ def project_vm_idle_state(row: dict[str, Any]) -> dict[str, Any] | None:
     # would hide the IDE's restoring indicator behind a false idle warning.
     if (
         vm.get("status") in {"pending", "provisioning"}
-        and not document
+        and row.get("workspace_idle_episode") is None
         and row.get("workspace_idle_revision") == 0
         and phase is None
     ):

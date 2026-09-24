@@ -125,6 +125,22 @@ def test_nonready_vm_with_prior_idle_history_stays_held():
     }
 
 
+@pytest.mark.parametrize("raw_episode", [{}, "{malformed json"])
+def test_nonready_vm_with_nonnull_idle_episode_stays_held(raw_episode):
+    row = _owner()
+    row["status"] = "created"
+    row["context"]["vm"] = {"status": "provisioning"}
+    row["workspace_idle_episode"] = raw_episode
+    row["workspace_idle_revision"] = 0
+    row["idle_phase"] = None
+    row["idle_episode_id"] = None
+
+    assert project_vm_idle_state(row) == {
+        "state": "release_held",
+        "reason_code": "identity_unverified",
+    }
+
+
 @pytest.mark.asyncio
 async def test_real_postgres_public_read_tracks_releasing_without_leaking_identity(
     db, monkeypatch
