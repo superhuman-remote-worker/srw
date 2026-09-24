@@ -57,6 +57,21 @@ transition requires it through `--expected-receipt-file`; a changed policy or
 stale receipt is refused. The command never selects budgets, changes Helm
 flags, or starts admission in the background.
 
+If a transition may have committed but its output was lost, read the installed
+receipt with the same reviewed policy file, cluster ID, and digest:
+
+```text
+python -m orchestrator.operator_cli.vm_resource_policy current-receipt \
+  --policy-file resource-policy.json --cluster-id CLUSTER_ID \
+  --policy-digest sha256:POLICY_DIGEST
+```
+
+This read-only command refuses a missing row or any document/identity mismatch.
+Compare the returned mode and revision with the intended transition before
+choosing the next action. It does not retry or reverse a transition. Keep the
+full receipt as the expected input for the next transition; an old receipt is
+never silently accepted.
+
 ```text
 python -m orchestrator.operator_cli.vm_resource_policy activate-enforce \
   --policy-file resource-policy.json --cluster-id CLUSTER_ID \
@@ -90,6 +105,9 @@ while the durable row still says `enforce` does not revoke already frozen v3
 requests; changing the policy document during drain also removes the fresh
 inventory needed to finish it. Do not roll back to an image that cannot
 reconcile the existing reservation ledger.
+The current lifecycle treats `off` as terminal for that installed cluster
+policy; `ensure-shadow` does not re-enable an off row. A later rollout needs a
+separately reviewed policy-epoch transition, not a replay of this command.
 
 The separate object-count backstop is `vmController.maxConcurrentVms`, passed
 to the controller as `VM_MAX_CONCURRENT`. Its chart default is `4`; a deployment

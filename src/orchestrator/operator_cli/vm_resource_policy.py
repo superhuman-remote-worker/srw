@@ -24,7 +24,8 @@ from shared.vm_resource_policy import validate_enforcement_resource_policy
 
 
 _ACTIONS = (
-    "ensure-shadow", "activate-enforce", "begin-drain", "finalize-off",
+    "current-receipt", "ensure-shadow", "activate-enforce", "begin-drain",
+    "finalize-off",
 )
 _RECEIPT_FIELDS = {
     "cluster_id", "namespace", "policy_digest", "revision", "mode",
@@ -54,7 +55,7 @@ def load_request(args: argparse.Namespace):
         or args.policy_digest != snapshot.policy_digest
     ):
         raise ResourceAdmissionError("resource_policy_changed")
-    if args.action == "ensure-shadow":
+    if args.action in {"current-receipt", "ensure-shadow"}:
         if args.expected_receipt_file is not None:
             raise ResourceAdmissionError("resource_policy_changed")
         return snapshot, None
@@ -83,6 +84,8 @@ def load_request(args: argparse.Namespace):
 
 async def apply_transition(db, snapshot, *, action: str, expected):
     lifecycle = VMResourcePolicyLifecycleStore(db, snapshot=snapshot)
+    if action == "current-receipt" and expected is None:
+        return await lifecycle.current_receipt()
     if action == "ensure-shadow" and expected is None:
         return await lifecycle.ensure_shadow()
     if not isinstance(expected, ResourcePolicyReceipt):

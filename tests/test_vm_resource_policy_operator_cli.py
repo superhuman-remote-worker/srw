@@ -165,6 +165,75 @@ async def test_operator_command_uses_application_connection_and_returns_only_rec
     ) == "shadow"
 
 
+@pytest.mark.asyncio
+async def test_operator_recovers_lost_transition_receipt_only_for_exact_policy(
+    db, pg_dsn, tmp_path,  # noqa: F811
+):
+    from orchestrator.database.postgres import PostgresDB
+    from orchestrator.operator_cli.vm_resource_policy import run
+    from orchestrator.services.vm_resource_policy_lifecycle_store import (
+        ResourcePolicyReceipt,
+    )
+    from shared.vm_resource_policy import validate_enforcement_resource_policy
+
+    def connection():
+        return PostgresDB(
+            connection_string=pg_dsn, min_connections=1, max_connections=2,
+        )
+
+    policy = snapshot()
+    current_args = _arguments(tmp_path, policy, "current-receipt")
+    with pytest.raises(ResourceAdmissionError, match="resource_policy_changed"):
+        await run(current_args, db_factory=connection)
+
+    shadow = await run(
+        _arguments(tmp_path, policy, "ensure-shadow"), db_factory=connection,
+    )
+    await run(
+        _arguments(
+            tmp_path, policy, "begin-drain", ResourcePolicyReceipt(**shadow),
+        ),
+        db_factory=connection,
+    )  # The response is lost after the durable transition commits.
+
+    recovered = await run(current_args, db_factory=connection)
+    assert recovered == {
+        "cluster_id": policy.inventory.cluster_id,
+        "namespace": "workers",
+        "policy_digest": policy.policy_digest,
+        "revision": 2,
+        "mode": "drain",
+    }
+    row = await db.fetchrow(
+        "SELECT mode,revision FROM vm_resource_admission_policy WHERE cluster_id=$1",
+        policy.inventory.cluster_id,
+    )
+    assert (row["mode"], row["revision"]) == ("drain", 2)
+    with pytest.raises(ResourceAdmissionError, match="resource_policy_changed"):
+        await run(
+            _arguments(
+                tmp_path, policy, "finalize-off", ResourcePolicyReceipt(**shadow),
+            ),
+            db_factory=connection,
+        )
+    with pytest.raises(ResourceAdmissionError, match="inventory_unavailable"):
+        await run(
+            _arguments(
+                tmp_path, policy, "finalize-off", ResourcePolicyReceipt(**recovered),
+            ),
+            db_factory=connection,
+        )
+
+    changed_document = json.loads(policy.canonical_document)
+    changed_document["policy"]["fairness"]["maxBypasses"] = 3
+    changed = validate_enforcement_resource_policy(changed_document)
+    with pytest.raises(ResourceAdmissionError, match="resource_policy_changed"):
+        await run(
+            _arguments(tmp_path, changed, "current-receipt"),
+            db_factory=connection,
+        )
+
+
 def test_operator_command_redacts_database_failure(monkeypatch, capsys, tmp_path):
     from orchestrator.operator_cli import vm_resource_policy as command
 
