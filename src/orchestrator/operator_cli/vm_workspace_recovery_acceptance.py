@@ -981,6 +981,9 @@ class LiveScenario:
                 "leased_by=$2,leased_until=clock_timestamp()+interval '5 minutes',"
                 "run_after=clock_timestamp(),park_reason=NULL,parked_at=NULL "
                 "WHERE unit_id=$1 AND unit_kind='worker_batch' "
+                "AND state IN ('queued','parked') "
+                "AND leased_by IS NULL AND leased_until IS NULL "
+                "AND (park_reason IS NULL OR park_reason='workspace_recovery') "
                 "RETURNING lease_token,leased_until",
                 job_id,
                 worker,

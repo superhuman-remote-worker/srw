@@ -52,7 +52,7 @@ async def test_resolve_then_reset_uses_fresh_workspace_claim_authority(app_pg):
         )
         await conn.execute(
             "UPDATE run_queue SET state='parked',lease_token=28,leased_by=NULL,"
-            "leased_until=NULL,park_reason='vm_workspace_recovery' WHERE unit_id=$1",
+            "leased_until=NULL,park_reason='workspace_recovery' WHERE unit_id=$1",
             job_id,
         )
         await conn.execute(
@@ -99,7 +99,15 @@ async def test_resolve_then_reset_uses_fresh_workspace_claim_authority(app_pg):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "refusal", ["foreign_run", "open_recovery", "operator_pause", "terminal"]
+    "refusal",
+    [
+        "foreign_run",
+        "open_recovery",
+        "operator_pause",
+        "terminal",
+        "live_worker",
+        "foreign_park",
+    ],
 )
 async def test_fixture_claim_refusal_rolls_back_queue_reset(app_pg, refusal):
     doc = await seeded(app_pg)
@@ -125,6 +133,17 @@ async def test_fixture_claim_refusal_rolls_back_queue_reset(app_pg, refusal):
             )
         elif refusal == "terminal":
             await conn.execute("UPDATE jobs SET status='cancelled' WHERE id=$1", job_id)
+        elif refusal == "live_worker":
+            await conn.execute(
+                "UPDATE run_queue SET state='leased',leased_by='another-worker',"
+                "leased_until=clock_timestamp()+interval '5 minutes' WHERE unit_id=$1",
+                job_id,
+            )
+        elif refusal == "foreign_park":
+            await conn.execute(
+                "UPDATE run_queue SET park_reason='operator_pause' WHERE unit_id=$1",
+                job_id,
+            )
         before = dict(
             await conn.fetchrow("SELECT * FROM run_queue WHERE unit_id=$1", job_id)
         )
