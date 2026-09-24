@@ -32,6 +32,9 @@ async def escalate(db, seed, route, **overrides):
     return await db.transition_message_route(route["route_id"], **args)
 
 
+# A pinned Job's human wait enters the idle clock only through an accepted
+# exact delivery receipt, so every test seeds one: the handoff/SLA condition
+# under test, not a missing receipt, decides whether an episode is recorded.
 @pytest.fixture(autouse=True)
 def tracking(monkeypatch):
     monkeypatch.setenv("WORKSPACE_IDLE_RELEASE_ENABLED", "true")
@@ -40,8 +43,10 @@ def tracking(monkeypatch):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("initial", ["pending_officer", "pending_both"])
-async def test_human_handoff_enters_once_and_delivery_does_not_reset(db, initial):
-    seed, _ = await seeded(db)
+async def test_human_handoff_enters_once_and_delivery_does_not_reset(
+    db, monkeypatch, initial
+):
+    seed, _ = await seeded(db, delivered=True, monkeypatch=monkeypatch)
     _, route = await publish(db, seed, state=initial)
     before = await episode(db, seed["job_id"])
     assert before[0] == (1 if initial == "pending_both" else 0)
@@ -59,8 +64,8 @@ async def test_human_handoff_enters_once_and_delivery_does_not_reset(db, initial
 @pytest.mark.parametrize(
     "source", ["wrong_thread", "wrong_incarnation", "recommissioned"]
 )
-async def test_stale_officer_cannot_publish_handoff(db, source):
-    seed, _ = await seeded(db)
+async def test_stale_officer_cannot_publish_handoff(db, monkeypatch, source):
+    seed, _ = await seeded(db, delivered=True, monkeypatch=monkeypatch)
     _, route = await publish(db, seed, state="pending_officer")
     overrides = {}
     if source == "wrong_thread":
@@ -79,8 +84,8 @@ async def test_stale_officer_cannot_publish_handoff(db, source):
 
 
 @pytest.mark.asyncio
-async def test_sla_two_replicas_publish_one_episode(db):
-    seed, _ = await seeded(db)
+async def test_sla_two_replicas_publish_one_episode(db, monkeypatch):
+    seed, _ = await seeded(db, delivered=True, monkeypatch=monkeypatch)
     _, route = await publish(db, seed, state="pending_officer")
     results = await asyncio.gather(
         db.claim_officer_sla_escalations(), db.claim_officer_sla_escalations()
@@ -91,10 +96,12 @@ async def test_sla_two_replicas_publish_one_episode(db):
 
 
 @pytest.mark.asyncio
-async def test_sla_skips_locked_job_prefix_before_consuming_batch_limit(db):
+async def test_sla_skips_locked_job_prefix_before_consuming_batch_limit(
+    db, monkeypatch
+):
     seeded_routes = []
     for index in range(3):
-        seed, _ = await seeded(db)
+        seed, _ = await seeded(db, delivered=True, monkeypatch=monkeypatch)
         _, route = await publish(db, seed, state="pending_officer")
         await db.execute(
             "UPDATE job_message_routes SET officer_deadline=clock_timestamp()"
@@ -125,8 +132,10 @@ async def test_sla_skips_locked_job_prefix_before_consuming_batch_limit(db):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("changed", ["question", "nonblocking", "terminal"])
-async def test_historical_route_settles_without_entering_current_idle(db, changed):
-    seed, _ = await seeded(db)
+async def test_historical_route_settles_without_entering_current_idle(
+    db, monkeypatch, changed
+):
+    seed, _ = await seeded(db, delivered=True, monkeypatch=monkeypatch)
     _, route = await publish(db, seed, state="pending_officer")
     if changed == "question":
         await db.execute(
@@ -151,7 +160,7 @@ async def test_historical_route_settles_without_entering_current_idle(db, change
 async def test_episode_failure_rolls_back_route_cas(db, monkeypatch):
     from orchestrator.services import workspace_idle_events
 
-    seed, _ = await seeded(db)
+    seed, _ = await seeded(db, delivered=True, monkeypatch=monkeypatch)
     _, route = await publish(db, seed, state="pending_officer")
     original = workspace_idle_events.apply_idle_transition_on_conn
 
@@ -169,8 +178,8 @@ async def test_episode_failure_rolls_back_route_cas(db, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_escalation_rechecks_question_after_waiting_for_job_lock(db):
-    seed, _ = await seeded(db)
+async def test_escalation_rechecks_question_after_waiting_for_job_lock(db, monkeypatch):
+    seed, _ = await seeded(db, delivered=True, monkeypatch=monkeypatch)
     _, route = await publish(db, seed, state="pending_officer")
     async with db.acquire() as blocker:
         async with blocker.transaction():
@@ -206,7 +215,7 @@ async def test_escalation_rechecks_question_after_waiting_for_job_lock(db):
 @pytest.mark.parametrize("enabled", [True, False])
 async def test_system_handoff_and_disabled_compatibility(db, monkeypatch, enabled):
     monkeypatch.setenv("WORKSPACE_IDLE_RELEASE_ENABLED", str(enabled).lower())
-    seed, _ = await seeded(db)
+    seed, _ = await seeded(db, delivered=True, monkeypatch=monkeypatch)
     _, route = await publish(db, seed, state="pending_officer")
     assert await escalate(
         db,
@@ -221,10 +230,12 @@ async def test_system_handoff_and_disabled_compatibility(db, monkeypatch, enable
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("legacy_context", [None, [], "legacy"])
-async def test_unproven_legacy_context_does_not_block_human_handoff(db, legacy_context):
+async def test_unproven_legacy_context_does_not_block_human_handoff(
+    db, monkeypatch, legacy_context
+):
     from tests._previous_release_seed import seed_previous_release_row
 
-    seed, _ = await seeded(db)
+    seed, _ = await seeded(db, delivered=True, monkeypatch=monkeypatch)
     _, route = await publish(db, seed, state="pending_officer")
     async with db.acquire() as conn:
         await seed_previous_release_row(

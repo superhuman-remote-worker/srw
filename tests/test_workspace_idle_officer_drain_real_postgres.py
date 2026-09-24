@@ -37,7 +37,8 @@ async def test_officer_drain_records_human_wait_for_job_outside_officer_lineage(
 ):
     monkeypatch.setenv("WORKSPACE_IDLE_RELEASE_ENABLED", "true")
     monkeypatch.setenv("VM_MODE", "same-cluster")
-    seed, _ = await seeded(db)
+    # Pinned idle entry needs an accepted exact delivery receipt.
+    seed, _ = await seeded(db, delivered=True, monkeypatch=monkeypatch)
     _, route = await publish(db, seed, state="pending_officer")
     # The route Job is deliberately not created_by_thread_id. The drain must
     # lock all affected route Jobs, not just the officer's admitted lineage.
@@ -64,7 +65,8 @@ async def test_episode_failure_rolls_back_officer_lifecycle_and_route(
 
     monkeypatch.setenv("WORKSPACE_IDLE_RELEASE_ENABLED", "true")
     monkeypatch.setenv("VM_MODE", "same-cluster")
-    seed, _ = await seeded(db)
+    # Pinned idle entry needs an accepted exact delivery receipt.
+    seed, _ = await seeded(db, delivered=True, monkeypatch=monkeypatch)
     _, route = await publish(db, seed, state="pending_officer")
     before_post = await db.fetchrow(
         "SELECT * FROM project_officers WHERE project_id=$1", UUID(seed["project_id"])

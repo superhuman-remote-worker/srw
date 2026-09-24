@@ -21,7 +21,8 @@ db = _db_fixture
 async def test_stale_stateless_reply_preserves_new_question_and_queue(db, monkeypatch):
     monkeypatch.setenv("WORKSPACE_IDLE_RELEASE_ENABLED", "true")
     monkeypatch.setenv("VM_MODE", "same-cluster")
-    seed, _ = await seeded(db)
+    # Pinned idle entry needs an accepted exact delivery receipt.
+    seed, _ = await seeded(db, delivered=True, monkeypatch=monkeypatch)
     _, current_route = await publish(db, seed)
     job_id = UUID(seed["job_id"])
     await db.execute(
