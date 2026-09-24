@@ -69,7 +69,10 @@ LEDGER_MARKER = "# notification-ledger:"
 
 
 def _roots() -> list[Path]:
+    # main.py is only the entrypoint once the application composition package
+    # (orchestrator/application/) owns what used to live in it; scan both.
     roots = [ORCHESTRATOR / "main.py"]
+    roots.extend(sorted((ORCHESTRATOR / "application").rglob("*.py")))
     for sub in ("services", "database", "security"):
         roots.extend(sorted((ORCHESTRATOR / sub).glob("*.py")))
     return roots
