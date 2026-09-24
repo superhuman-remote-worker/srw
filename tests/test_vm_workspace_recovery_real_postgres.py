@@ -139,6 +139,7 @@ async def insert_recovery(
     phase: str = "recovering",
     first_observed_offset: timedelta = timedelta(0),
     deadline_offset: timedelta = timedelta(minutes=15),
+    original_cause: dict | None = None,
 ) -> UUID:
     async with app_pg.acquire() as conn:
         first = await conn.fetchval("SELECT clock_timestamp()")
@@ -149,10 +150,12 @@ async def insert_recovery(
                 owner_kind, owner_id, workspace_contract_digest,
                 provision_generation, cluster_name, namespace, vm_uid,
                 prior_vmi_uid, prior_launcher_uid, root_pvc_uid, phase,
-                first_observed_at, deadline_at, next_check_at, reason_code
+                first_observed_at, deadline_at, next_check_at, reason_code,
+                original_cause
             ) VALUES (
                 'job', $1, 'sha256:contract', $2, 'test-cluster', 'workers', $3,
-                $4, $5, $6, $7, $8, $9, $8, 'workspace_runtime_not_ready'
+                $4, $5, $6, $7, $8, $9, $8, 'workspace_runtime_not_ready',
+                $10::jsonb
             ) RETURNING id
             """,
             owner_id,
@@ -164,6 +167,7 @@ async def insert_recovery(
             phase,
             first,
             first + deadline_offset,
+            json.dumps(original_cause if original_cause is not None else {}),
         )
 
 
