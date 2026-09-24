@@ -18718,11 +18718,34 @@ class PostgresDB:
         ):
             return []
         async with self.acquire() as conn:
+            # Stateless End's Begin admits the terminal intent for the exact
+            # live runtime in the same transaction as its retirement marker.
+            # Until End has durably drained the residents and retired the
+            # shell for that runtime, the explicit owner (End, Delete or
+            # Resume retrying the marker) holds it: deleting the Pod first
+            # would destroy the only object that can produce those proofs.
             rows = await conn.fetch(
                 "SELECT * FROM managed_repository_workspace_cleanup_intents "
-                "WHERE settled_at IS NULL AND intent_generation > $1 "
-                "AND next_attempt_at <= now() "
-                "ORDER BY intent_generation LIMIT $2",
+                "AS intent WHERE intent.settled_at IS NULL "
+                "AND intent.intent_generation > $1 "
+                "AND intent.next_attempt_at <= now() "
+                "AND NOT EXISTS (SELECT 1 FROM threads AS owner "
+                "WHERE intent.owner_kind = 'thread' "
+                "AND intent.scope = 'workspace_container' "
+                "AND owner.id = intent.owner_id "
+                "AND owner.execution_lane = 'stateless' "
+                "AND owner.metadata #> '{_stateless_workspace_retirement_pending}'"
+                " = 'true'::jsonb "
+                "AND owner.metadata #>> "
+                "'{_stateless_claim_retirement,runtime_incarnation}' "
+                "= intent.runtime_incarnation::text "
+                "AND NOT (COALESCE(owner.metadata #> "
+                "'{_stateless_claim_retirement,residents_retired}' "
+                "= 'true'::jsonb, FALSE) "
+                "AND COALESCE(owner.metadata #> "
+                "'{_stateless_claim_retirement,remote_retired}' "
+                "= 'true'::jsonb, FALSE))) "
+                "ORDER BY intent.intent_generation LIMIT $2",
                 after_generation,
                 limit,
             )
