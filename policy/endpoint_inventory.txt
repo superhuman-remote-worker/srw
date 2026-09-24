@@ -227,6 +227,7 @@ POST   /api/internal/ssh-attachments                                            
 POST   /api/internal/ssh-attachments/{attachment_id}/close                              pat=refused         gated:user_can_access_ide_entity
 POST   /api/internal/ssh-keys/used                                                      pat=refused         internal:require_internal
 GET    /api/internal/ssh-targets/{handle}                                               pat=refused         gated:user_can_access_ide_entity
+POST   /api/internal/ssh-vm-access/{action}                                             pat=refused         gated:user_can_access_ide_entity
 POST   /api/internal/vm-creation-retries/authorize                                      pat=refused         internal:require_vm_cleanup_authority
 POST   /api/internal/vm-creation-retries/authorize-disposition                          pat=refused         internal:require_vm_cleanup_authority
 POST   /api/internal/vm-creation-retries/begin-effect                                   pat=refused         internal:require_vm_cleanup_authority
@@ -372,7 +373,9 @@ POST   /api/persistent/threads/{thread_id}/canvases/main/view-attachments/{attac
 GET    /api/persistent/threads/{thread_id}/citations                                    pat=chat:read       gated:require_thread_owner
 PATCH  /api/persistent/threads/{thread_id}/config                                       pat=chat:write      gated:require_thread_owner
 POST   /api/persistent/threads/{thread_id}/controls                                     pat=chat:write      gated:require_thread_owner
+DELETE /api/persistent/threads/{thread_id}/ide                                          pat=chat:write      gated:require_thread_owner
 GET    /api/persistent/threads/{thread_id}/ide                                          pat=chat:read       gated:require_thread_owner
+POST   /api/persistent/threads/{thread_id}/ide                                          pat=chat:write      gated:require_thread_owner
 POST   /api/persistent/threads/{thread_id}/input                                        pat=chat:write      gated:require_approved_user
 POST   /api/persistent/threads/{thread_id}/interrupt                                    pat=chat:write      gated:require_thread_owner
 GET    /api/persistent/threads/{thread_id}/logs                                         pat=chat:read       gated:require_thread_owner
