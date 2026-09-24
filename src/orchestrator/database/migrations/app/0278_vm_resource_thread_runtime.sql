@@ -64,26 +64,27 @@ BEGIN
     IF NEW.owner_kind='job' THEN
         RETURN NEW;
     END IF;
-    IF NEW.canonical_request->>'entity_type'<>'thread'
-       OR NEW.canonical_request->>'job_id'<>NEW.thread_id::text
-       OR NEW.canonical_request->>'provision_generation'<>NEW.provision_generation::text
-       OR NEW.controller_configuration->'version'<>'3'::jsonb
-       OR NEW.request_id IS DISTINCT FROM COALESCE(
-           (SELECT wake_request_id FROM public.vm_idle_operations
-             WHERE id=NEW.thread_wake_operation_id),NEW.request_id) THEN
+    IF jsonb_typeof(NEW.canonical_request) IS DISTINCT FROM 'object'
+       OR NEW.canonical_request->>'entity_type' IS DISTINCT FROM 'thread'
+       OR NEW.canonical_request->>'job_id' IS DISTINCT FROM NEW.thread_id::text
+       OR NEW.canonical_request->>'provision_generation' IS DISTINCT FROM NEW.provision_generation::text
+       OR jsonb_typeof(NEW.controller_configuration) IS DISTINCT FROM 'object'
+       OR NEW.controller_configuration->'version' IS DISTINCT FROM '3'::jsonb THEN
         RAISE EXCEPTION 'VM thread creation request identity mismatch' USING ERRCODE='23514';
     END IF;
     SELECT * INTO current_thread FROM public.threads
       WHERE id=NEW.thread_id FOR SHARE;
     current_vm := current_thread.metadata->'vm';
-    IF NOT FOUND OR current_thread.execution_lane<>'pinned'
-       OR current_thread.runtime_generation<>NEW.thread_runtime_generation
+    IF NOT FOUND OR current_thread.execution_lane IS DISTINCT FROM 'pinned'
+       OR current_thread.runtime_generation IS DISTINCT FROM NEW.thread_runtime_generation
        OR current_thread.runtime_retirement_token IS NOT NULL
        OR current_thread.pinned_idle_terminal_intent_at IS NOT NULL
        OR current_thread.agent_id IS DISTINCT FROM NEW.thread_agent_id
        OR current_thread.runtime_attach_token IS DISTINCT FROM NEW.thread_attach_token
-       OR current_vm->>'provision_generation'<>NEW.provision_generation::text
-       OR current_vm->>'status'<>'provisioning' THEN
+       OR jsonb_typeof(current_vm) IS DISTINCT FROM 'object'
+       OR current_vm->>'provision_generation' IS DISTINCT FROM NEW.provision_generation::text
+       OR current_vm->>'creation_request_id' IS DISTINCT FROM NEW.request_id::text
+       OR current_vm->>'status' IS DISTINCT FROM 'provisioning' THEN
         RAISE EXCEPTION 'VM thread creation owner changed' USING ERRCODE='23514';
     END IF;
     IF NEW.thread_agent_id IS NULL THEN
@@ -97,15 +98,16 @@ BEGIN
     IF NEW.thread_wake_operation_id IS NOT NULL THEN
         SELECT * INTO current_wake FROM public.vm_idle_operations
           WHERE id=NEW.thread_wake_operation_id FOR SHARE;
-        IF NOT FOUND OR current_wake.owner_kind<>'thread'
-           OR current_wake.owner_id<>NEW.thread_id
-           OR current_wake.release_kind<>'pinned_thread'
+        IF NOT FOUND OR current_wake.owner_kind IS DISTINCT FROM 'thread'
+           OR current_wake.owner_id IS DISTINCT FROM NEW.thread_id
+           OR current_wake.release_kind IS DISTINCT FROM 'pinned_thread'
+           OR current_wake.phase IS NULL
            OR current_wake.phase NOT IN ('waking','wake_held')
            OR current_wake.closed_at IS NOT NULL
            OR current_wake.stop_verified_at IS NULL
            OR current_wake.thread_terminal_intent_at IS NOT NULL
-           OR current_wake.wake_request_id<>NEW.request_id
-           OR current_wake.wake_generation<>NEW.provision_generation
+           OR current_wake.wake_request_id IS DISTINCT FROM NEW.request_id
+           OR current_wake.wake_generation IS DISTINCT FROM NEW.provision_generation
            OR current_wake.pvc_uid IS DISTINCT FROM NEW.expected_pvc_uid THEN
             RAISE EXCEPTION 'VM thread wake source changed' USING ERRCODE='23514';
         END IF;

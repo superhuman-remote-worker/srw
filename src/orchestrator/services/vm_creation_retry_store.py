@@ -88,9 +88,16 @@ class VMCreationRetryStore:
         self.cleanup = VMWorkspaceRecoveryStore(db)
         self._resource_waiter_writer = _resource_waiter_writer
 
-    async def _thread_scope(self, conn, source, *, allow_terminal=False):
-        """Lock one genuine pinned thread before its retry or resource rows."""
-        pvc_uid = source["expected_pvc_uid"] or source["observed_pvc_uid"]
+    async def _thread_scope(
+        self, conn, source, *, pvc_uid=None, allow_terminal=False,
+    ):
+        """Lock owner, disk, then pinned thread before retry/resource rows."""
+        await conn.execute(
+            "SELECT pg_advisory_xact_lock(hashtextextended($1,0))",
+            f"workspace-recovery:thread:{source['thread_id']}",
+        )
+        if pvc_uid is None:
+            pvc_uid = source["expected_pvc_uid"] or source["observed_pvc_uid"]
         if pvc_uid is not None:
             await conn.execute(
                 "SELECT pg_advisory_xact_lock(hashtextextended($1,0))",
@@ -966,7 +973,9 @@ class VMCreationRetryStore:
             raise VMCreationRetryConflict("retry_request_missing")
         scope_pvc = row["expected_pvc_uid"] or row["observed_pvc_uid"] or observed_pvc
         job = (
-            await self._thread_scope(conn, row, allow_terminal=allow_terminal)
+            await self._thread_scope(
+                conn, row, pvc_uid=scope_pvc, allow_terminal=allow_terminal,
+            )
             if row["owner_kind"] == "thread"
             else await self._scope(
                 conn,
