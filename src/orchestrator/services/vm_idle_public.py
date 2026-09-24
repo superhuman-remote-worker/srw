@@ -83,6 +83,16 @@ def project_vm_idle_state(row: dict[str, Any]) -> dict[str, Any] | None:
                 result["next_retry_at"] = retry.isoformat()
         return result
 
+    # Initial VM creation has no idle lifecycle yet. Reporting a hold here
+    # would hide the IDE's restoring indicator behind a false idle warning.
+    if (
+        vm.get("status") in {"pending", "provisioning"}
+        and not document
+        and row.get("workspace_idle_revision") == 0
+        and phase is None
+    ):
+        return None
+
     if vm.get("status") != "ready":
         return {"state": "release_held", "reason_code": "identity_unverified"}
     if (

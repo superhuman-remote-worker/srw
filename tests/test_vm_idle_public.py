@@ -87,6 +87,44 @@ def test_owner_projection_covers_warm_release_wake_and_safe_holds():
     }
 
 
+@pytest.mark.parametrize("status", ["pending", "provisioning"])
+def test_initial_vm_provisioning_has_no_idle_lifecycle(status):
+    row = _owner()
+    row["status"] = "created"
+    row["context"]["vm"]["status"] = status
+    row["workspace_idle_episode"] = None
+    row["workspace_idle_revision"] = 0
+    row["idle_phase"] = None
+    row["idle_episode_id"] = None
+
+    assert project_vm_idle_state(row) is None
+
+
+def test_nonready_vm_with_existing_idle_operation_keeps_its_lifecycle():
+    row = _owner()
+    row["context"]["vm"]["status"] = "provisioning"
+    row["idle_phase"] = "wake_held"
+    row["idle_reason"] = "resource_reservation_held"
+
+    assert project_vm_idle_state(row) == {
+        "state": "wake_held",
+        "reason_code": "resource_reservation_held",
+    }
+
+
+def test_nonready_vm_with_prior_idle_history_stays_held():
+    row = _owner()
+    row["context"]["vm"] = {"status": "provisioning"}
+    row["workspace_idle_episode"] = None
+    row["workspace_idle_revision"] = 2
+    row["idle_phase"] = None
+
+    assert project_vm_idle_state(row) == {
+        "state": "release_held",
+        "reason_code": "identity_unverified",
+    }
+
+
 @pytest.mark.asyncio
 async def test_real_postgres_public_read_tracks_releasing_without_leaking_identity(
     db, monkeypatch

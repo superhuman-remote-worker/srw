@@ -9,6 +9,7 @@ import json
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
+from uuid import UUID
 
 import httpx
 import pytest
@@ -108,7 +109,7 @@ def wire(monkeypatch):
     app = FastAPI()
     app.state.thread_files_dependencies_factory = factory
     app.include_router(router)
-    return SimpleNamespace(app=app, state=state, holder=holder, events=events)
+    return SimpleNamespace(app=app, state=state, holder=holder, sql=sql, events=events)
 
 
 _DEFAULT = object()
@@ -265,6 +266,58 @@ class TestThreadIdeStatus:
         assert response.json() == {
             "workspace_lifecycle": None,
             "status": status,
+            "code_server_url": None,
+            "gitea_url": None,
+        }
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status", ["pending", "provisioning"])
+    async def test_a_pinned_vm_being_provisioned_reports_restoring_without_url(
+        self, wire, status
+    ):
+        vm = {"status": status, "ssh_host": "10.0.0.3"}
+        wire.state.thread = dict(
+            wire.state.thread,
+            metadata={"vm": vm},
+        )
+        wire.sql.fetch.return_value = [
+            {
+                "id": UUID(THREAD),
+                "status": "created",
+                "execution_lane": "pinned",
+                "metadata": {"vm": vm},
+                "workspace_idle_episode": None,
+                "workspace_idle_revision": 0,
+                "idle_phase": None,
+                "idle_episode_id": None,
+                "idle_reason": None,
+                "idle_retry_after": None,
+            }
+        ]
+
+        response = await call(wire, "GET", self.PATH)
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "workspace_lifecycle": None,
+            "status": "restoring",
+            "code_server_url": None,
+            "gitea_url": None,
+        }
+
+    @pytest.mark.asyncio
+    async def test_an_open_idle_operation_keeps_restoring_precedence(self, wire):
+        wire.state.thread = dict(
+            wire.state.thread,
+            metadata={"vm": {"status": "failed"}},
+        )
+        wire.sql.fetchrow.return_value = {"id": UUID(THREAD)}
+
+        response = await call(wire, "GET", self.PATH)
+
+        assert response.json() == {
+            "workspace_lifecycle": None,
+            "status": "restoring",
             "code_server_url": None,
             "gitea_url": None,
         }

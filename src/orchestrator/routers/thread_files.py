@@ -261,6 +261,13 @@ async def get_thread_ide_status(
                 "gitea_url": gitea_url,
             }
         vm = metadata.get("vm") or {}
+        if vm.get("status") in ("pending", "provisioning"):
+            return {
+                **lifecycle,
+                "status": "restoring",
+                "code_server_url": None,
+                "gitea_url": gitea_url,
+            }
         if vm.get("status") != "ready":
             return {
                 **lifecycle,
