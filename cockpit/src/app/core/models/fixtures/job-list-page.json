@@ -35,7 +35,8 @@
       "vm_creation": null,
       "audit_count": null,
       "cloud_review_mode": "open_folder",
-      "exported_folder_url": null
+      "exported_folder_url": null,
+      "workspace_lifecycle": null
     },
     {
       "id": "33333333-3333-4333-8333-333333333334",
@@ -72,7 +73,8 @@
       "vm_creation": null,
       "audit_count": null,
       "cloud_review_mode": "open_folder",
-      "exported_folder_url": null
+      "exported_folder_url": null,
+      "workspace_lifecycle": null
     }
   ],
   "total": 10000,

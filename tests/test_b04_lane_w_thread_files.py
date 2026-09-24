@@ -66,11 +66,24 @@ def wire(monkeypatch):
             raise state.lock_error
         yield state.lock_owner
 
+    # A pinned VM thread's IDE status reads its VM idle state and any open
+    # idle operation through PostgresDB.acquire(). No idle operation exists
+    # here, so every raw read answers empty.
+    sql = SimpleNamespace(
+        fetch=AsyncMock(return_value=[]),
+        fetchrow=AsyncMock(return_value=None),
+    )
+
+    @asynccontextmanager
+    async def acquire():
+        yield sql
+
     store = SimpleNamespace(
         get_thread=AsyncMock(
             side_effect=lambda _id: (None if state.fresh is None else dict(state.fresh))
         ),
         stateless_session_workspace_ensure_lock=ensure_lock,
+        acquire=acquire,
     )
     holder = SimpleNamespace(
         store=store,
@@ -193,6 +206,10 @@ class TestThreadIdeStatus:
 
     @pytest.mark.asyncio
     async def test_a_vm_workspace_wins_over_a_container(self, wire, monkeypatch):
+        """A pinned VM thread is answered by the lease-gated VM branch: a
+        status read without ``lease_id`` offers no code-server URL (the owner
+        must POST for a bounded access lease first) and never falls back to
+        the container's live URL."""
         monkeypatch.setenv("IDE_PROXY_BASE_URL", "https://srw.test")
         wire.state.thread = dict(
             wire.state.thread,
@@ -204,12 +221,13 @@ class TestThreadIdeStatus:
 
         response = await call(wire, "GET", self.PATH)
 
-        body = response.json()
-        assert body["source"] == "live_vm"
-        assert body["code_server_url"] == (
-            f"https://srw.test/api/ide/{THREAD}/proxy/"
-            "?folder=/home/agent-host/workspace"
-        )
+        assert response.status_code == 200
+        assert response.json() == {
+            "workspace_lifecycle": None,
+            "status": "ready",
+            "code_server_url": None,
+            "gitea_url": None,
+        }
 
     @pytest.mark.asyncio
     async def test_a_ready_container_reports_live_workspace(self, wire, monkeypatch):
@@ -226,14 +244,30 @@ class TestThreadIdeStatus:
         assert response.json()["source"] == "live_workspace"
 
     @pytest.mark.asyncio
-    async def test_a_vm_without_an_address_falls_through(self, wire):
-        wire.state.thread = dict(
-            wire.state.thread, metadata={"vm": {"status": "ready"}}
-        )
+    @pytest.mark.parametrize(
+        "vm,status",
+        [
+            ({"status": "ready"}, "ready"),
+            ({"status": "failed", "ssh_host": "10.0.0.3"}, "unavailable"),
+        ],
+    )
+    async def test_a_vm_status_read_never_uses_the_metadata_address(
+        self, wire, vm, status
+    ):
+        """The guest endpoint is attested fresh when a lease starts the IDE,
+        so a recorded address neither makes a VM usable nor its absence
+        unusable: only the VM's own readiness decides, and no lease-less read
+        carries a URL."""
+        wire.state.thread = dict(wire.state.thread, metadata={"vm": vm})
 
         response = await call(wire, "GET", self.PATH)
 
-        assert response.json()["status"] == "unavailable"
+        assert response.json() == {
+            "workspace_lifecycle": None,
+            "status": status,
+            "code_server_url": None,
+            "gitea_url": None,
+        }
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("status", ["provisioning", "pending"])

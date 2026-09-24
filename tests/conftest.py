@@ -3,6 +3,8 @@
 import os
 import sys
 import tempfile
+from contextlib import asynccontextmanager
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 from uuid import UUID
 
@@ -447,6 +449,25 @@ def fake_db(
         side_effect=list_datasource_projects_bulk
     )
     db.list_datasources = AsyncMock(side_effect=list_datasources)
+
+    # PostgresDB.acquire() is an @asynccontextmanager, not a coroutine: the
+    # owner reads (read_vm_idle_states on job/thread detail and list, and
+    # VMIdleLifecycleStore on pinned Resume) open it with ``async with``. This
+    # graph holds no VM contexts and no vm_idle_operations rows, so every raw
+    # read answers empty, as the real query would. Only reads are modelled; a
+    # raw write through this double still fails loudly. Tests needing SQL
+    # rows keep overriding ``fake_db.acquire`` themselves.
+    empty_reads = SimpleNamespace(
+        fetch=AsyncMock(return_value=[]),
+        fetchrow=AsyncMock(return_value=None),
+        fetchval=AsyncMock(return_value=None),
+    )
+
+    @asynccontextmanager
+    async def acquire():
+        yield empty_reads
+
+    db.acquire = MagicMock(side_effect=acquire)
     return db
 
 

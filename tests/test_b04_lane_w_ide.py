@@ -286,10 +286,13 @@ class TestIdeProxyHttpAdmission:
 
         response = await call(wire, method, PROXY_PATH)
 
+        # PROXY_PATH carries no ``_vm/<lease>`` prefix: only a VM access lease
+        # admits a mutation (through a durable IDE operation row), so the
+        # unleased path still refuses before any lifecycle or upstream work.
         assert response.status_code == 503
         assert response.json()["detail"] == {
             "code": "ide_mutation_operation_lease_unavailable",
-            "message": "IDE mutation transport requires a durable operation lease",
+            "message": "IDE mutation transport is unavailable",
         }
         lifecycle.assert_not_awaited()
         wire.holder.ide_proxy.resolve_target.assert_not_awaited()
