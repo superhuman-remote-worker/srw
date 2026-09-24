@@ -95,11 +95,12 @@ def _payload() -> dict[str, object]:
     }
 
 
-async def _agent(conn) -> UUID:
+async def _agent(conn, *, status: str = "working") -> UUID:
     return await conn.fetchval(
         "INSERT INTO agents (config_name, hostname, status) "
-        "VALUES ('developer', $1, 'working') RETURNING id",
+        "VALUES ('developer', $1, $2) RETURNING id",
         f"control-{uuid4().hex[:10]}",
+        status,
     )
 
 
@@ -389,7 +390,7 @@ async def test_vm_lifecycle_retains_real_claim_for_ambiguous_teardown(pg):
     identity = VMTeardownIdentity(
         provision_generation="00000000-0000-4000-8000-000000000001",
         vm_uid="vm-uid-original",
-        rootdisk_pvc_uid="rootdisk-uid-original",
+        rootdisk_pvc_uid="00000000-0000-4000-8000-000000000003",
     )
     manager, provisioner = _real_pg_vm_manager(
         pg, identity=identity, outcome=VMTeardownResult("identity_unknown", False)
@@ -507,8 +508,8 @@ async def test_accept_first_makes_control_exact_409_without_second_mutation(pg):
 @pytest.mark.asyncio
 async def test_active_marker_blocks_both_dispatch_scan_and_final_claim(pg):
     async with pg.acquire() as conn:
-        agent_id = await _agent(conn)
-        job_id = await _pinned_job(conn, status="paused", agent_id=agent_id)
+        agent_id = await _agent(conn, status="ready")
+        job_id = await _pinned_job(conn, status="paused", agent_id=None)
 
     control = CompletionControl(_PoolDB(pg), AsyncMock())
     await control.claim_job(
@@ -536,7 +537,7 @@ async def test_active_marker_blocks_both_dispatch_scan_and_final_claim(pg):
 @pytest.mark.asyncio
 async def test_unfinished_command_blocks_dispatch_scan_and_atomic_claim(pg):
     async with pg.acquire() as conn:
-        agent_id = await _agent(conn)
+        agent_id = await _agent(conn, status="ready")
         job_id = await _pinned_job(conn, status="paused", agent_id=None)
         await conn.execute("UPDATE jobs SET freeze_data=NULL WHERE id=$1", job_id)
         await _unfinished_command(conn, job_id)
@@ -693,7 +694,7 @@ async def test_cancel_first_prevents_later_control_claim(pg, lane):
 @pytest.mark.asyncio
 async def test_expired_marker_releases_dispatch_but_malformed_stays_closed(pg):
     async with pg.acquire() as conn:
-        agent_id = await _agent(conn)
+        agent_id = await _agent(conn, status="ready")
         expired_id = await _pinned_job(conn, status="paused", agent_id=None)
         malformed_id = await _pinned_job(conn, status="paused", agent_id=None)
         await conn.execute(
