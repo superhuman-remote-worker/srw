@@ -2223,6 +2223,9 @@ class LiveScenario:
         for row in rows:
             job_id = row["id"]
             async with self.db.acquire() as conn, conn.transaction():
+                await self._fixture_controller_pin_rows(
+                    conn, job_id, released_required=False, lock=True
+                )
                 await conn.execute(
                     "UPDATE vm_workspace_recovery_jobs SET participation='cancelled',"
                     "resolved_at=COALESCE(resolved_at,clock_timestamp()) "
@@ -2244,7 +2247,114 @@ class LiveScenario:
                     "FROM vm_workspace_recovery_jobs WHERE job_id=$1)",
                     job_id,
                 )
+            await self._release_fixture_controller_pins(job_id)
             await self._purge_fixture(job_id)
+
+    async def _fixture_controller_pin_rows(
+        self, conn: Any, job_id: UUID, *, released_required: bool, lock: bool = False
+    ) -> list[Any]:
+        rows = await conn.fetch(
+            "SELECT r.id AS recovery_id,pin.recovery_id AS pin_recovery_id,"
+            "pin.pvc_uid,pin.provision_generation,"
+            "pin.released_at,pin.controller_pinned_at,pin.controller_pin_uid,"
+            "pin.controller_pin_resource_version,pin.controller_released_at,"
+            "r.owner_kind,r.owner_id,r.namespace,r.root_pvc_uid,"
+            "r.provision_generation AS recovery_generation,"
+            "r.original_cause,j.context "
+            "FROM vm_workspace_recovery_jobs part "
+            "JOIN vm_workspace_recoveries r ON r.id=part.recovery_id "
+            "LEFT JOIN vm_workspace_recovery_retention_pins pin "
+            "ON pin.recovery_id=r.id "
+            "JOIN jobs j ON j.id=part.job_id "
+            "WHERE part.job_id=$1 ORDER BY r.id"
+            + (" FOR UPDATE OF j,part,r" if lock else ""),
+            job_id,
+        )
+        for row in rows:
+            context = _object(row["context"])
+            vm = _object(context.get("vm"))
+            if (
+                context.get("vm_workspace_recovery_acceptance_gate") != self.run_id
+                or _object(row["original_cause"]) != {"gate": self.run_id}
+                or row["owner_kind"] != "job"
+                or row["owner_id"] != job_id
+                or row["namespace"] != self.namespace
+                or str(row["root_pvc_uid"]) != vm.get("rootdisk_pvc_uid")
+                or str(row["recovery_generation"]) != vm.get("provision_generation")
+                or row["pin_recovery_id"] != row["recovery_id"]
+                or row["pvc_uid"] != row["root_pvc_uid"]
+                or row["provision_generation"] != row["recovery_generation"]
+                or (released_required and row["released_at"] is None)
+                or row["controller_pinned_at"] is None
+                or not row["controller_pin_uid"]
+                or not row["controller_pin_resource_version"]
+            ):
+                raise AcceptanceFailure("fixture controller retention pin changed")
+        return rows
+
+    async def _release_fixture_controller_pins(self, job_id: UUID) -> None:
+        """Acknowledge only this gate fixture's durable pins before disk purge."""
+
+        from orchestrator.services.vm_workspace_recovery import (
+            VMWorkspaceRecoveryService,
+        )
+        from orchestrator.services.vm_workspace_recovery_store import (
+            RetentionPinCommand,
+            VMWorkspaceRecoveryStore,
+        )
+
+        async with self.db.acquire() as conn:
+            rows = await self._fixture_controller_pin_rows(
+                conn, job_id, released_required=True
+            )
+        commands: list[RetentionPinCommand] = []
+        for row in rows:
+            if row["controller_released_at"] is None:
+                commands.append(
+                    RetentionPinCommand(
+                        recovery_id=row["recovery_id"],
+                        pvc_uid=row["pvc_uid"],
+                        provision_generation=row["provision_generation"],
+                        desired_state="released",
+                        owner_kind="job",
+                        owner_id=job_id,
+                        namespace=self.namespace,
+                        controller_pin_uid=row["controller_pin_uid"],
+                        controller_pin_resource_version=row[
+                            "controller_pin_resource_version"
+                        ],
+                    )
+                )
+        if not commands:
+            return
+        service = VMWorkspaceRecoveryService(
+            VMWorkspaceRecoveryStore(
+                self.db, worker_id=f"gate-pin-release:{self.run_id}"
+            ),
+            self.provisioner,
+            probe_timeout_seconds=self.settings.external_call_timeout_seconds,
+        )
+        for command in commands:
+            if not await service._sync_retention_pin(command):
+                raise AcceptanceFailure(
+                    "fixture controller retention pin was not acknowledged"
+                )
+            async with self.db.acquire() as conn:
+                acknowledged = await conn.fetchval(
+                    "SELECT controller_released_at IS NOT NULL "
+                    "FROM vm_workspace_recovery_retention_pins "
+                    "WHERE recovery_id=$1 AND pvc_uid=$2 "
+                    "AND provision_generation=$3 AND released_at IS NOT NULL "
+                    "AND controller_pin_uid=$4",
+                    command.recovery_id,
+                    command.pvc_uid,
+                    command.provision_generation,
+                    command.controller_pin_uid,
+                )
+            if acknowledged is not True:
+                raise AcceptanceFailure(
+                    "fixture controller retention pin was not acknowledged"
+                )
 
     async def _purge_fixture(self, job_id):
         from orchestrator.operator_cli.vm_recovery_gate_stop_control import (

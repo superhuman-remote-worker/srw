@@ -34,7 +34,7 @@ def cleanup_digest(job_id, generation, dv_uid, pvc_uid):
     )
 
 
-async def seeded(pool, *, offset=timedelta(0)):
+async def seeded(pool, *, offset=timedelta(0), source_run=False):
     doc, _ = objects()
     async with pool.acquire() as conn:
         await conn.execute(
@@ -50,7 +50,10 @@ async def seeded(pool, *, offset=timedelta(0)):
             json.dumps({"vm_workspace_recovery_acceptance_gate": doc["run_id"]}),
         )
     rid = await insert_recovery(
-        pool, owner_id=UUID(doc["job_id"]), first_observed_offset=offset
+        pool,
+        owner_id=UUID(doc["job_id"]),
+        first_observed_offset=offset,
+        original_cause={"gate": doc["run_id"]} if source_run else None,
     )
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
@@ -222,6 +225,15 @@ async def test_cleanup_selection_requires_exact_run_context_not_description_pref
     doc = await seeded(app_pg)
     other = uuid4()
     async with app_pg.acquire() as conn:
+        # This selection test represents a gate Job before recovery admission.
+        await conn.execute(
+            "DELETE FROM vm_workspace_recovery_jobs WHERE recovery_id=$1",
+            UUID(doc["operation_id"]),
+        )
+        await conn.execute(
+            "DELETE FROM vm_workspace_recoveries WHERE id=$1",
+            UUID(doc["operation_id"]),
+        )
         await conn.execute(
             "INSERT INTO jobs(id,user_id,description,status,execution_lane,context) VALUES($1,$2,$3,'processing','stateless',$4::jsonb)",
             other,
