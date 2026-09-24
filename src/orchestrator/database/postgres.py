@@ -41125,6 +41125,123 @@ class PostgresDB:
             )
         return row is not None
 
+    async def acknowledge_stateless_thread_runtime_process_zero(
+        self,
+        thread_id: str,
+        *,
+        terminal_token: int,
+        runtime_incarnation: str,
+    ) -> bool:
+        """Record an absent runtime's durable process-zero receipt as proof.
+
+        The finalizer release writes the ``stateless_workspace`` receipt only
+        after observing every container of the exact Pod UID terminated, and
+        before it lets the object go.  When that Pod is already absent, the
+        receipt is the same evidence ``exact_terminal`` would have shown, so
+        it may acknowledge both stages exactly as
+        :meth:`acknowledge_stateless_thread_shell_absent` does.  The receipt
+        is required inside this UPDATE for the marker's own runtime; a bare
+        404, a predecessor's receipt, or the resident SSH proof's generic
+        ``workspace_container`` receipt authorizes nothing.
+        """
+        try:
+            expected_runtime = _canonical_uuid_text(
+                runtime_incarnation,
+                label="stateless workspace runtime incarnation",
+            )
+        except RuntimeError:
+            return False
+        acknowledgement = json.dumps(
+            {
+                "kind": "workspace_runtime_terminal",
+                "terminal_token": int(terminal_token),
+                "runtime_incarnation": expected_runtime,
+                "evidence": "process_zero_receipt",
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        async with self.acquire() as conn:
+            row = await conn.fetchval(
+                """
+                UPDATE threads
+                SET metadata = jsonb_set(
+                    jsonb_set(
+                        jsonb_set(
+                            jsonb_set(
+                                jsonb_set(
+                                    jsonb_set(
+                                        COALESCE(metadata, '{}'::jsonb),
+                                        '{_stateless_resident_retirement_ack}',
+                                        $4::jsonb,
+                                        true
+                                    ),
+                                    '{_stateless_shell_retirement_ack}',
+                                    $4::jsonb,
+                                    true
+                                ),
+                                '{_stateless_claim_retirement,residents_retired}',
+                                'true'::jsonb,
+                                false
+                            ),
+                            '{_stateless_claim_retirement,residents_retired_by}',
+                            '"workspace_runtime_terminal"'::jsonb,
+                            true
+                        ),
+                        '{_stateless_claim_retirement,remote_retired}',
+                        'true'::jsonb,
+                        false
+                    ),
+                    '{_stateless_claim_retirement,remote_retired_by}',
+                    '"workspace_runtime_terminal"'::jsonb,
+                    true
+                )
+                WHERE id = $1::uuid
+                  AND execution_lane = 'stateless'
+                  AND status = 'ended'
+                  AND metadata #> '{_stateless_workspace_retirement_pending}'
+                      = 'true'::jsonb
+                  AND metadata #>
+                       '{_stateless_claim_retirement,terminal_token}'
+                      = to_jsonb($2::bigint)
+                  AND metadata #>
+                       '{_stateless_claim_retirement,claimant_quiesced}'
+                      = 'true'::jsonb
+                  AND NOT (COALESCE(metadata, '{}'::jsonb)
+                           ? '_stateless_claim_losses')
+                  AND metadata #>
+                       '{_stateless_claim_retirement,shell_retirement_required}'
+                      = 'true'::jsonb
+                  AND metadata #>
+                       '{_stateless_claim_retirement,resident_cleanup_required}'
+                      = 'true'::jsonb
+                  AND metadata #>>
+                       '{_stateless_claim_retirement,runtime_incarnation}'
+                      = $3::text
+                  AND EXISTS (
+                      SELECT 1 FROM run_queue
+                      WHERE unit_id = $1::uuid
+                        AND unit_kind = 'session_turn'
+                        AND state = 'done'
+                        AND lease_token = $2::bigint
+                  )
+                  AND EXISTS (
+                      SELECT 1 FROM managed_repository_process_zero_receipts
+                      WHERE owner_kind = 'thread'
+                        AND owner_id = $1::uuid
+                        AND scope = 'stateless_workspace'
+                        AND provisioner = 'k8s'
+                        AND runtime_incarnation = $3::text
+                  )
+                RETURNING id
+                """,
+                thread_id,
+                int(terminal_token),
+                expected_runtime,
+                acknowledgement,
+            )
+        return row is not None
+
     async def mark_stateless_thread_snapshot_restore_required(
         self, thread_id: str, *, terminal_token: int
     ) -> bool:

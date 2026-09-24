@@ -631,6 +631,18 @@ async def reconcile_stateless_thread_retirement(
                     status_code=503,
                     detail="Workspace resident retirement acknowledgement was ambiguous",
                 )
+        elif runtime_authority == "exact_absent" and (
+            await postgres_db.acknowledge_stateless_thread_runtime_process_zero(
+                thread_id,
+                terminal_token=terminal_token,
+                runtime_incarnation=str(runtime_incarnation),
+            )
+        ):
+            # The Pod left before these proofs, but only after its finalizer
+            # release durably recorded the exact UID's container termination.
+            # That receipt, required inside the acknowledging UPDATE, is the
+            # evidence exact_terminal shows; bare absence still refuses below.
+            pass
         else:
             raise HTTPException(
                 status_code=503,
@@ -719,6 +731,15 @@ async def reconcile_stateless_thread_retirement(
                 thread_id,
                 terminal_token=terminal_token,
                 runtime_incarnation=str(runtime_incarnation),
+            )
+        elif runtime_authority == "exact_absent":
+            # Same exact-receipt rule as the resident stage above.
+            acknowledged = (
+                await postgres_db.acknowledge_stateless_thread_runtime_process_zero(
+                    thread_id,
+                    terminal_token=terminal_token,
+                    runtime_incarnation=str(runtime_incarnation),
+                )
             )
         else:
             acknowledged = False
