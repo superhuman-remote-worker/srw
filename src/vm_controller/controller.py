@@ -64,18 +64,23 @@ from vm_controller.lifecycle_auth import (
     verify_payload,
 )
 from shared.vm_disk_size import quantity_bytes as _quantity_bytes, resolved_disk_size
+from shared.logging_format import RedactingTextLogFormatter
 
 _log_level = os.environ.get("LOG_LEVEL", "INFO").upper()
+_log_handler = logging.StreamHandler()
+_log_handler.setFormatter(
+    RedactingTextLogFormatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+)
 if _log_level == "DEBUG" and not os.environ.get("DEBUG_ALL"):
     logging.basicConfig(
         level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        handlers=[_log_handler],
     )
     logging.getLogger("vm-controller").setLevel(logging.DEBUG)
 else:
     logging.basicConfig(
         level=_log_level,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        handlers=[_log_handler],
     )
 log = logging.getLogger("vm-controller")
 

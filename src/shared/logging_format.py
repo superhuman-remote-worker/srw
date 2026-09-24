@@ -15,6 +15,12 @@ from typing import Any
 
 REDACTED = "***REDACTED***"
 
+# The VM controller's signed HTTP URL includes this one secret query value.
+# Stop at the next query parameter so generation and request diagnostics remain.
+_LIFECYCLE_AUTH = re.compile(
+    r"(?i)\blifecycle_auth(\s{0,16}=\s{0,16})[^&\s\"',}{)#;]{1,4096}"
+)
+
 # key: <value> / key=<value> for secret-ish key names.
 _KV_SECRET = re.compile(
     r"(?i)\b(authorization|api[_-]?key|secret|client[_-]?secret|password|passwd|"
@@ -47,10 +53,18 @@ def redact(text: str) -> str:
     """Mask secret-shaped substrings without introducing quotes or newlines."""
     if not text:
         return text
+    text = _LIFECYCLE_AUTH.sub(lambda m: f"lifecycle_auth{m.group(1)}{REDACTED}", text)
     text = _KV_SECRET.sub(lambda m: f"{m.group(1)}{m.group(2)}{REDACTED}", text)
     for pattern in _STANDALONE:
         text = pattern.sub(REDACTED, text)
     return text
+
+
+class RedactingTextLogFormatter(logging.Formatter):
+    """Format a text record, then mask secrets in its message and traceback."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        return redact(super().format(record))
 
 
 # Promoted to stable top-level keys, in this order, when present.

@@ -1,6 +1,7 @@
 """Shared logging behaviour and application adapter policy remain compatible."""
 
 import asyncio
+import io
 import json
 import logging
 import subprocess
@@ -10,6 +11,7 @@ import warnings
 from pathlib import Path
 
 import pytest
+import httpx
 
 from orchestrator import logging_config as orch_log
 from agent.core import logging_config as agent_log
@@ -281,6 +283,68 @@ for prefix in ["shared.runtime", "langchain", "langchain_core", "langgraph", *sy
 
 
 class TestRedaction:
+    @pytest.mark.parametrize("log_format", ["text", "json"])
+    @pytest.mark.asyncio
+    async def test_httpx_lifecycle_signature_is_masked_without_losing_diagnostics(
+        self, monkeypatch, log_format
+    ):
+        monkeypatch.setenv("LOG_FORMAT", log_format)
+        output = io.StringIO()
+        handler = logging.StreamHandler(output)
+        handler.setFormatter(orch_log.build_formatter())
+        logger = logging.getLogger("httpx")
+        old_level, old_propagate = logger.level, logger.propagate
+        logger.addHandler(handler)
+        logger.setLevel(logging.INFO)
+        logger.propagate = False
+        try:
+            async with httpx.AsyncClient(
+                transport=httpx.MockTransport(lambda _: httpx.Response(200))
+            ) as client:
+                response = await client.get(
+                    "http://controller.test/vms/job-1",
+                    params={
+                        "provision_generation": "generation-2",
+                        "lifecycle_auth": "synthetic-signature-123",
+                        "lifecycle_auth_issued_at": "123",
+                        "lifecycle_auth_request_id": "request-1",
+                    },
+                )
+        finally:
+            logger.removeHandler(handler)
+            logger.setLevel(old_level)
+            logger.propagate = old_propagate
+        assert response.status_code == 200
+        assert response.request.url.params["lifecycle_auth"] == (
+            "synthetic-signature-123"
+        )
+        line = output.getvalue()
+        if log_format == "json":
+            line = json.loads(line)["message"]
+        assert "synthetic-signature-123" not in line
+        assert "GET" in line
+        assert "/vms/job-1?provision_generation=generation-2" in line
+        assert "lifecycle_auth=***REDACTED***" in line
+        assert "lifecycle_auth_issued_at=123" in line
+        assert "lifecycle_auth_request_id=request-1" in line
+        assert "200" in line
+
+    def test_lifecycle_signature_redacts_parameterized_message_and_exception(self, mod):
+        url = (
+            "/vms/job-1?lifecycle_auth=synthetic-signature-123"
+            "&provision_generation=generation-2"
+        )
+        try:
+            raise ValueError(f"request failed: {url}")
+        except ValueError:
+            exc_info = sys.exc_info()
+        record = _record("request %s", url, exc_info=exc_info)
+        for formatter in (mod.JsonLogFormatter(), mod.TextLogFormatter()):
+            line = formatter.format(record)
+            assert "synthetic-signature-123" not in line
+            assert "lifecycle_auth=***REDACTED***" in line
+            assert "provision_generation=generation-2" in line
+
     @pytest.mark.parametrize(
         "secret",
         [
