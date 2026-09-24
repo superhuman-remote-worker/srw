@@ -912,10 +912,12 @@ timeout cleanup. Phase observations never bypass SSH or initialization checks.
 (`VM_CREATION_RETRY_ENABLED`). It admits new Job VM creates through durable
 configuration resolution, fenced creation effects, and a separate SSH/init Ready
 release. Existing operations keep reconciling when admission is disabled.
-Migration `0260_vm_creation_ready_release.sql` and compatible controllers are
-required. Keep this switch off until the source, attachment, cancellation and
-live acceptance gates in the failed-creation retry plan have passed; the current
-controller deliberately does not advertise the complete protocol capability.
+Migration `0260_vm_creation_ready_release.sql` and a deployed controller with
+the complete creation and cleanup contract are required. Current controller
+source advertises `creation_retry_protocol: 1`; verify the deployed image and
+its compatibility before activation. Keep this switch off until the source,
+attachment, cancellation and live acceptance gates in the failed-creation retry
+plan have passed.
 
 Retained-disk restarts can opt into the closed single-NIC NoCloud DHCP profile
 with `vmController.networkProfile.enabled: true` and an explicit
