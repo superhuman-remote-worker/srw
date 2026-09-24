@@ -2,11 +2,10 @@
 
 R1.B05 lane C. Three things are proven here, in this order:
 
-1. **Characterization** — each extracted node produces, for the same input and
-   the same patched collaborators, byte-identical output through
-   ``orchestrator.main`` and through
-   ``orchestrator.services.dispatch_credentials``. That is what makes the move
-   provably behaviour-preserving rather than plausibly so.
+1. **Characterization** — B05 proved each extracted node byte-identical through
+   its ``orchestrator.main`` bridge and the service. R1.B12 removed the last
+   bridges, so those comparisons (which had nothing left to compare) are gone;
+   the call-site guard below drives the application's own binding.
 2. **Privacy** — a resolved credential lands only in the section it was
    resolved for, survives no logging statement, and is removed in full by
    ``redact_config_override`` (the persistence + response boundary). Asserted
@@ -206,24 +205,6 @@ def _deps() -> dc.DispatchCredentialDependencies:
     )
 
 
-def _main(name: str):
-    """The ``orchestrator.main`` twin of an extracted node, or skip.
-
-    Characterization compares main against the service. While main keeps a
-    bridge the comparison still holds (bridge -> service, which is worth
-    asserting). Once the root integrator deletes a symbol that has no main
-    caller left there is nothing to compare, and the property itself is covered
-    by the dedicated privacy/precedence cases below — so skip rather than fail.
-    Symbols main genuinely still needs are exercised hard by the pre-existing
-    suites (``test_thread_config_persistence``, ``test_live_datasource_update``,
-    ``test_claim_bundle``), which call them by their main names.
-    """
-    fn = getattr(orchestrator.main, name, None)
-    if fn is None:
-        pytest.skip(f"orchestrator.main.{name} removed after B05 integration")
-    return fn
-
-
 def _no_secret_in_logs(caplog) -> None:
     for record in caplog.records:
         rendered = record.getMessage() + " " + repr(record.args)
@@ -252,236 +233,16 @@ def _collect_strings(value, out=None):
 # ==========================================================================
 
 
-class TestPureHelpersMatchMain:
-    """The three pure nodes move as plain imports (§P4) — prove they are equal."""
-
-    @pytest.mark.parametrize(
-        "model",
-        [
-            "",
-            "openrouter/minimax-m2",
-            "groq/llama-3",
-            "codex/gpt-5.3",
-            "openai/gpt-5",
-            "claude-opus-4-6",
-            "gemini-2.5-pro",
-            "gemma-3-27b",
-            "gpt-5.5",
-            "o1-preview",
-            "o3-mini",
-            "o4-mini",
-            "text-embedding-3-large",
-            "Qwen/Qwen3-32B",
-            "CLAUDE-SONNET-4",
-        ],
-    )
-    def test_provider_of_model_matches_main(self, model):
-        assert dc.provider_of_model(model) == _main("_provider_of_model")(model)
+class TestPureHelpers:
+    """The pure nodes' own contracts (§P4)."""
 
     def test_provider_of_model_is_a_miss_not_a_guess(self):
         """A miss returns None so the caller falls through to its own heuristic."""
         assert dc.provider_of_model("Qwen/Qwen3-32B") is None
         assert dc.provider_of_model("") is None
 
-    def test_nested_model_slots_matches_main(self):
-        override = {
-            "llm": {
-                "model": "top",
-                "strategic": {"model": "s"},
-                "tactical": {"model": "t"},
-                "summarization": {"model": "sum"},
-                "not_a_slot": "scalar",
-            },
-            "subagents": {
-                "llm": {"model": "roster-wide"},
-                "roster": {
-                    "critic": {"llm": {"model": "c", "summarization": {"model": "cs"}}},
-                    "broken": "not-a-dict",
-                    "no_llm": {"expert": "x"},
-                },
-            },
-        }
-        mine = dc.nested_model_slots(override)
-        theirs = _main("_nested_model_slots")(override)
-        assert mine == theirs
-        labels = [label for label, _, _ in mine]
-        assert labels == [
-            "llm.strategic",
-            "llm.tactical",
-            "llm.summarization",
-            "subagents.llm",
-            "subagents.roster.critic.llm",
-            "subagents.roster.critic.llm.summarization",
-        ]
-        # Only mappings survive; every entry is the caller's live dict so the
-        # injectors write through it.
-        assert all(isinstance(sect, dict) for _, sect, _ in mine)
-        assert mine[0][1] is override["llm"]["strategic"]
 
-    @pytest.mark.parametrize(
-        "override,config_name",
-        [
-            ({"llm": {"provider": "OpenRouter", "model": "claude-opus-4-6"}}, "worker"),
-            ({"llm": {"model": "claude-opus-4-6"}}, "worker"),
-            ({"llm": {"model": "Qwen/Qwen3-32B"}}, "anthropic_worker"),
-            ({"llm": {"model": "Qwen/Qwen3-32B"}}, "worker"),
-            ({}, "anthropic_worker"),
-            ({}, "worker"),
-            (None, "worker"),
-        ],
-    )
-    def test_dispatch_fallback_matches_main(self, override, config_name):
-        job = _job(config_name)
-        assert dc.dispatch_llm_provider_fallback(job, copy.deepcopy(override)) == _main(
-            "_dispatch_llm_provider_fallback"
-        )(job, copy.deepcopy(override))
-
-
-class TestInjectorsMatchMain:
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize(
-        "seed",
-        [
-            {},
-            {"api_key": "sk-caller-pinned"},
-            {"base_url": "https://caller/v1"},
-            {"api_key": "sk-caller-pinned", "base_url": "https://caller/v1"},
-            {"provider": "caller-provider", "extra_headers": {"X-Caller": "1"}},
-            {"model_max_context_tokens": 42, "max_output_tokens": 7},
-        ],
-        ids=["bare", "key", "url", "complete", "provider-headers", "limits"],
-    )
-    @pytest.mark.parametrize(
-        "model", ["endpoint-chat", "builtin-chat", "router-chat", "unknown-model"]
-    )
-    async def test_inject_model_credentials_matches_main(
-        self, patched_main, model, seed
-    ):
-        """Every (model kind x pre-populated section) pair, not just bare ones.
-
-        The pre-populated seeds are what exercise the ``setdefault`` guards and
-        the ``transport_complete`` short-circuit; a matrix of empty dicts would
-        agree with an injector that had lost them.
-        """
-        for capability in ("chat", "auxiliary"):
-            mine = copy.deepcopy(seed)
-            theirs = copy.deepcopy(seed)
-            await dc.inject_model_credentials(
-                section=mine,
-                model_id=model,
-                user_id="u",
-                resolved_keys=dict(USER_KEYS),
-                capability=capability,
-                dependencies=_deps(),
-            )
-            await _main("_inject_model_credentials")(
-                section=theirs,
-                model_id=model,
-                user_id="u",
-                resolved_keys=dict(USER_KEYS),
-                capability=capability,
-            )
-            assert mine == theirs, (model, capability, seed)
-        assert patched_main.resolver.await_count == 4
-
-    @pytest.mark.asyncio
-    async def test_inject_env_key_credentials_matches_main(self, patched_main):
-        seeds = (
-            {},
-            {"VISION_MODEL": "pinned-model"},
-            {"VISION_API_KEY": "sk-caller-pinned"},
-            {"VISION_BASE_URL": "https://caller/v1"},
-        )
-        for model in ("endpoint-chat", "builtin-chat", "unknown-model"):
-            for seed in seeds:
-                mine = copy.deepcopy(seed)
-                theirs = copy.deepcopy(seed)
-                await dc.inject_env_key_credentials(
-                    env_keys=mine,
-                    prefix="VISION",
-                    model_id=model,
-                    user_id="u",
-                    resolved_keys=dict(USER_KEYS),
-                    capability="vision",
-                    dependencies=_deps(),
-                )
-                await _main("_inject_env_key_credentials")(
-                    env_keys=theirs,
-                    prefix="VISION",
-                    model_id=model,
-                    user_id="u",
-                    resolved_keys=dict(USER_KEYS),
-                    capability="vision",
-                )
-                assert mine == theirs, (model, seed)
-        assert patched_main.resolver.await_count == 24
-
-    @pytest.mark.asyncio
-    async def test_seed_registry_model_overrides_matches_main(self, patched_main):
-        for override in (
-            None,
-            {},
-            {"llm": {}},
-            {"llm": {"model": "endpoint-chat"}},
-            {"llm": {"model": "router-chat"}},
-            {"llm": {"model": "unknown-model"}},
-            {"llm": {"model": "endpoint-chat", "model_max_context_tokens": 999}},
-        ):
-            mine = await dc.seed_registry_model_overrides(
-                copy.deepcopy(override), user_id="u", dependencies=_deps()
-            )
-            theirs = await _main("_seed_registry_model_overrides")(
-                copy.deepcopy(override), user_id="u"
-            )
-            assert mine == theirs, override
-        assert patched_main.resolver.await_count > 0
-
-    @pytest.mark.asyncio
-    async def test_inject_thread_dispatch_credentials_matches_main(self, patched_main):
-        base = {
-            "llm": {
-                "model": "endpoint-chat",
-                "summarization": {"model": "router-chat"},
-            },
-            "auxiliary": {"model": "builtin-chat"},
-            "subagents": {
-                "llm": {"model": "builtin-chat"},
-                "roster": {"critic": {"llm": {"model": "router-chat"}}},
-            },
-            "env_keys": {"EMBEDDING_MODEL": "sys-embed"},
-        }
-        with patch(
-            "orchestrator.services.capability_credentials.resolve_capability_credentials",
-            AsyncMock(return_value=None),
-        ) as resolver:
-            mine = await dc.inject_thread_dispatch_credentials(
-                copy.deepcopy(base),
-                user_id="u",
-                project_id="p",
-                user_settings={},
-                dependencies=_deps(),
-            )
-            theirs = await _main("_inject_thread_dispatch_credentials")(
-                copy.deepcopy(base), user_id="u", project_id="p", user_settings={}
-            )
-        assert resolver.await_count > 0  # the shared resolver really was reached
-        assert mine == theirs
-        # And the move actually did something worth comparing.
-        assert mine["llm"]["api_key"] == ENDPOINT_KEY
-
-    @pytest.mark.asyncio
-    async def test_inject_system_kb_embedding_profile_matches_main(self, patched_main):
-        patched_main.defaults.side_effect = _capability_default
-        mine: dict = {}
-        theirs: dict = {}
-        assert (
-            await dc.inject_system_kb_embedding_profile(mine, dependencies=_deps())
-            == "sys-embed"
-        )
-        assert await _main("_inject_system_kb_embedding_profile")(theirs) == "sys-embed"
-        assert mine == theirs
-        assert mine["KB_EMBEDDING_API_KEY"] == SYSTEM_OPENAI_KEY
-
+class TestInjectors:
     @pytest.mark.asyncio
     async def test_search_fallback_needs_a_DIFFERENT_catalog_row(self, patched_main):
         """A fallback resolving to the primary's own row is not a fallback.
@@ -556,26 +317,6 @@ class TestInjectorsMatchMain:
                 dependencies=_deps(),
             )
         assert out["research"]["search_fallback"]["provider"] == "brave"
-
-    @pytest.mark.asyncio
-    async def test_inject_search_credentials_matches_main(self, patched_main):
-        with patch(
-            "orchestrator.services.capability_credentials.resolve_capability_credentials",
-            AsyncMock(side_effect=_search_resolver),
-        ) as resolver:
-            mine = await dc.inject_search_credentials(
-                {},
-                user_settings={},
-                user_id="u",
-                resolved_keys=dict(USER_KEYS),
-                dependencies=_deps(),
-            )
-            theirs = await _main("_inject_search_credentials")(
-                {}, user_settings={}, user_id="u", resolved_keys=dict(USER_KEYS)
-            )
-        assert resolver.await_count == 6
-        assert mine == theirs
-        assert mine["research"]["search"]["api_key"] == SEARCH_KEY
 
 
 async def _capability_default(capability):
@@ -1200,7 +941,8 @@ class TestProviderFallbackIsNotADefault:
     async def test_job_dispatch_does_not_fall_back_when_the_registry_resolved(
         self, patched_main, monkeypatch
     ):
-        """Characterization of the *call site* (``_inject_dispatch_credentials``).
+        """Characterization of the *call site* (``inject_dispatch_credentials`` as the
+        job-start bundle binds it).
 
         The fallback lives behind ``meta.api_key_ref`` there. Pinned here so the
         guard cannot be dropped while the helper keeps passing its own tests.
@@ -1209,7 +951,6 @@ class TestProviderFallbackIsNotADefault:
         def tripwire(job, config_override):  # pragma: no cover - must never run
             raise AssertionError("provider fallback fired on a resolved model")
 
-        _main("_dispatch_llm_provider_fallback")  # skip once it is gone from main
         monkeypatch.setattr(
             dispatch_credentials_module, "dispatch_llm_provider_fallback", tripwire
         )
@@ -1217,9 +958,10 @@ class TestProviderFallbackIsNotADefault:
             "orchestrator.services.capability_credentials.resolve_capability_credentials",
             AsyncMock(return_value=None),
         ):
-            out = await _main("_inject_dispatch_credentials")(
-                _job(), {"llm": {"model": "router-chat"}}
-            )
+            inject = preparation_composition.job_start_bundle_dependencies(
+                orchestrator.main.app.state.resources
+            ).inject_dispatch_credentials
+            out = await inject(_job(), {"llm": {"model": "router-chat"}})
         assert out["llm"]["api_key"] == USER_OPENROUTER_KEY
 
 
