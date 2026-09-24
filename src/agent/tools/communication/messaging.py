@@ -238,15 +238,28 @@ def create_communication_tools(context: ToolContext) -> List[Any]:
                     "routing_generation": routing_generation,
                 }
                 if not context._stateless_worker:
-                    client = context.orchestrator_client
-                    if getattr(client, "pinned_delivery_job_id", None) == job_id:
-                        payload.update({
-                            "pinned_delivery_id": getattr(client, "pinned_delivery_id", None),
-                            "pinned_projection_digest": getattr(client, "pinned_projection_digest", None),
-                            "pinned_delivery_proof": getattr(client, "pinned_delivery_proof", None),
-                            "pinned_process_generation": getattr(client, "dispatch_process_generation", None),
-                            "pinned_pod_uid": os.environ.get("POD_UID"),
-                        })
+                    # Read the pinned delivery proof off the orchestrator
+                    # client without rebinding ``client``: the POST below must
+                    # still go through the httpx client carrying the headers.
+                    pinned = context.orchestrator_client
+                    if getattr(pinned, "pinned_delivery_job_id", None) == job_id:
+                        payload.update(
+                            {
+                                "pinned_delivery_id": getattr(
+                                    pinned, "pinned_delivery_id", None
+                                ),
+                                "pinned_projection_digest": getattr(
+                                    pinned, "pinned_projection_digest", None
+                                ),
+                                "pinned_delivery_proof": getattr(
+                                    pinned, "pinned_delivery_proof", None
+                                ),
+                                "pinned_process_generation": getattr(
+                                    pinned, "dispatch_process_generation", None
+                                ),
+                                "pinned_pod_uid": os.environ.get("POD_UID"),
+                            }
+                        )
                 # One bounded transport retry covers response loss while the
                 # same durable generation suppresses a second quota charge,
                 # route, or provider delivery. A fresh model-authored send is

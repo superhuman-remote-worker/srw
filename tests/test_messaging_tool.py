@@ -11,6 +11,7 @@ the dual-callable paths that branch on ``user`` vs. internal.
 """
 
 from __future__ import annotations
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -170,3 +171,51 @@ async def test_transport_retry_reuses_the_same_hidden_routing_generation(monkeyp
         payload["routing_generation"] for payload in _RetryClient.post_payloads
     }
     assert len(generations) == 1
+
+
+@pytest.mark.asyncio
+async def test_pinned_delivery_proof_rides_the_httpx_post(monkeypatch):
+    """A pinned worker's delivery proof is read off the orchestrator client,
+    but the send itself must still go through the header-carrying httpx
+    client: the orchestrator client has no ``post``, so rebinding to it
+    turned every pinned send_message into an AttributeError."""
+    monkeypatch.setenv("MCP_INTERNAL_KEY", "test-internal-key")
+    monkeypatch.setenv("POD_UID", "pod-uid-1")
+    _CapturingAsyncClient.last_init_headers = None
+    _CapturingAsyncClient.last_post_json = None
+    monkeypatch.setattr(
+        "agent.tools.communication.messaging.httpx.AsyncClient",
+        _CapturingAsyncClient,
+    )
+    pinned = SimpleNamespace(
+        agent_id="agent-1",
+        pinned_delivery_job_id="job-1",
+        pinned_delivery_id="delivery-1",
+        pinned_projection_digest="digest-1",
+        pinned_delivery_proof="proof-1",
+        dispatch_process_generation="generation-1",
+    )
+    send = _tool_by_name(
+        create_communication_tools(
+            ToolContext(_job_id="job-1", orchestrator_client=pinned)
+        ),
+        "send_message",
+    )
+
+    result = await send.ainvoke(
+        {"to": "user", "subject": "hi", "message": "hello", "mode": "async"}
+    )
+
+    assert "Message sent" in result
+    assert _CapturingAsyncClient.last_init_headers == {
+        "X-Internal-Key": "test-internal-key"
+    }
+    payload = _CapturingAsyncClient.last_post_json
+    assert payload["agent_id"] == "agent-1"
+    assert {key: payload[key] for key in payload if key.startswith("pinned_")} == {
+        "pinned_delivery_id": "delivery-1",
+        "pinned_projection_digest": "digest-1",
+        "pinned_delivery_proof": "proof-1",
+        "pinned_process_generation": "generation-1",
+        "pinned_pod_uid": "pod-uid-1",
+    }
