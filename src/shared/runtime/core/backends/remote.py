@@ -925,6 +925,36 @@ while pid >= 1 and pid not in ancestors:
     except (OSError, ValueError, IndexError):
         break
 
+UNSETTLED = object()
+
+def environment(name):
+    # Every thread of a group shares one mm and so one environment. A
+    # leader without an mm (a zombie, an exiting task, or a dead main
+    # thread whose siblings still run) opens with ESRCH on Linux 6.16+ and
+    # reads empty before it, so ESRCH alone never proves the group stopped:
+    # read through the tasks, where any task holding the mm is exact.
+    try:
+        values = open(f"/proc/{{name}}/environ", "rb").read()
+    except ProcessLookupError:
+        values = b""
+    if values:
+        return values.split(b"\\0")
+    for _ in range(5):
+        listed = os.listdir(f"/proc/{{name}}/task")
+        for tid in listed:
+            try:
+                values = open(f"/proc/{{name}}/task/{{tid}}/environ", "rb").read()
+            except (FileNotFoundError, ProcessLookupError):
+                continue
+            if values:
+                return values.split(b"\\0")
+        # No listed task holds an mm with an environment. A thread created
+        # meanwhile appears in a second listing; without one, no task of
+        # the group carries a tag it can still act on.
+        if set(os.listdir(f"/proc/{{name}}/task")) <= set(listed):
+            return None
+    return UNSETTLED
+
 def matching():
     found = []
     ambiguous = False
@@ -935,7 +965,7 @@ def matching():
         if candidate in ancestors:
             continue
         try:
-            values = open(f"/proc/{{name}}/environ", "rb").read().split(b"\\0")
+            values = environment(name)
         except FileNotFoundError:
             continue
         except PermissionError:
@@ -952,7 +982,9 @@ def matching():
             continue
         except OSError:
             raise SystemExit(86)
-        if tag in values:
+        if values is UNSETTLED:
+            ambiguous = True
+        elif values is not None and tag in values:
             found.append(candidate)
     return found, ambiguous
 
