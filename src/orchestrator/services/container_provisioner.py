@@ -24,7 +24,7 @@ import os
 import re
 from collections.abc import Mapping
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Awaitable, Callable, Literal, Optional
 from uuid import UUID, uuid4
 from shared.workspace_recovery import WorkspaceRecoveryCode
@@ -41,6 +41,14 @@ from orchestrator.services.ide_credentials import IDE_CREDENTIAL_ENV, ide_creden
 from orchestrator.services.workspace_lifecycle import WorkspaceOwner
 from orchestrator.services.managed_repository_process_retirement import (
     retire_managed_repository_processes,
+)
+from orchestrator.services.sandbox_workspace_settings import (
+    SandboxImagePolicy,
+    SandboxPodProfile,
+    SandboxSettings,
+    image_repository,
+    resolve_sandbox_settings,
+    sandbox_pod_profile,
 )
 
 logger = logging.getLogger(__name__)
@@ -491,6 +499,10 @@ class ContainerProvisioner:
         self._fuse_privileged: bool = self._fuse_enabled and _env_flag(
             "WORKSPACE_FUSE_PRIVILEGED", True
         )
+        # Slice A1: which images keep the privileged FUSE profile and how long a
+        # custom image may take to pull. See sandbox_workspace_settings.
+        self._custom_image_policy = SandboxImagePolicy.from_env()
+        self._image_pull_timeout: int = self._custom_image_policy.pull_timeout_seconds
 
     @property
     def is_available(self) -> bool:
@@ -502,11 +514,18 @@ class ContainerProvisioner:
         """True if connected via in-cluster config (running inside K8s)."""
         return self._in_cluster
 
-    # =========================================================================
-    # Lifecycle
-    # =========================================================================
+    def _image_policy(self) -> SandboxImagePolicy:
+        """The installation policy bound to this provisioner's live settings."""
+        return replace(
+            self._custom_image_policy,
+            default_image=self._workspace_image,
+            trusted_repositories=self._custom_image_policy.trusted_repositories
+            | {image_repository(self._workspace_image)},
+            fuse_enabled=self._fuse_enabled,
+            fuse_privileged=self._fuse_privileged,
+        )
 
-    async def _workspace_creation_plan(
+    async def _sandbox_profile(
         self,
         owner: WorkspaceOwner,
         *,
@@ -515,6 +534,34 @@ class ContainerProvisioner:
         cpu_limit: str,
         memory_limit: str,
         image: str | None,
+    ) -> SandboxPodProfile:
+        """Resolve the owner's frozen template settings into pod inputs.
+
+        The snapshot is immutable, so every create, restore, give-up and
+        stateless generation of this owner computes the same profile.
+        """
+        settings = SandboxSettings()
+        if self._db is not None and callable(getattr(type(self._db), "fetchrow", None)):
+            settings = await resolve_sandbox_settings(self._db, owner.kind, owner.id)
+        return sandbox_pod_profile(
+            settings,
+            self._image_policy(),
+            cpu=cpu,
+            memory=memory,
+            cpu_limit=cpu_limit,
+            memory_limit=memory_limit,
+            image=image,
+        )
+
+    # =========================================================================
+    # Lifecycle
+    # =========================================================================
+
+    async def _workspace_creation_plan(
+        self,
+        owner: WorkspaceOwner,
+        *,
+        profile: SandboxPodProfile,
         stateless_creation_generation: str | None,
     ) -> dict[str, Any]:
         """Resolve every physical input before reserving a generation."""
@@ -531,17 +578,19 @@ class ContainerProvisioner:
             "version": 1,
             "scope": "workspace_container",
             "owner_kind": owner.kind,
-            "image": image or self._workspace_image,
-            "cpu": cpu,
-            "memory": memory,
-            "cpu_limit": cpu_limit,
-            "memory_limit": memory_limit,
+            "image": profile.image,
+            "cpu": profile.cpu,
+            "memory": profile.memory,
+            "cpu_limit": profile.cpu_limit,
+            "memory_limit": profile.memory_limit,
             "network_tier": await self._resolve_network_tier(
                 owner.id, kind=owner.network_tier_kind
             ),
             "pvc": {
                 "enabled": self._pvc_enabled,
-                "size": self._pvc_size if self._pvc_enabled else None,
+                "size": (profile.storage or self._pvc_size)
+                if self._pvc_enabled
+                else None,
                 "storage_class": self._storage_class if self._pvc_enabled else None,
             },
             "seed_files": seed_files,
@@ -550,10 +599,13 @@ class ContainerProvisioner:
             "stateless_generation": stateless_creation_generation,
             "runtime_policy": {
                 "ssh_secret_name": self._ssh_secret_name,
-                "fuse_enabled": self._fuse_enabled,
-                "fuse_privileged": self._fuse_privileged,
+                "fuse_enabled": profile.fuse_enabled,
+                "fuse_privileged": profile.fuse_privileged,
             },
         }
+        extension = profile.plan_extension()
+        if extension is not None:
+            plan["sandbox"] = extension
         plan["digest"] = _canonical_manifest_digest(plan)
         return plan
 
@@ -912,13 +964,25 @@ class ContainerProvisioner:
             if operation_id is not None
             else f"container-{operation_kind}:{uuid4()}"
         )
+        try:
+            profile = await self._sandbox_profile(
+                owner,
+                cpu=cpu,
+                memory=memory,
+                cpu_limit=cpu_limit,
+                memory_limit=memory_limit,
+                image=image,
+            )
+        except Exception:
+            logger.exception(
+                "Could not read the frozen workspace settings for %s %s",
+                owner.kind,
+                owner.id,
+            )
+            return False
         creation_plan = await self._workspace_creation_plan(
             owner,
-            cpu=cpu,
-            memory=memory,
-            cpu_limit=cpu_limit,
-            memory_limit=memory_limit,
-            image=image,
+            profile=profile,
             stateless_creation_generation=stateless_creation_generation,
         )
         reservation = await reserve(
@@ -955,6 +1019,7 @@ class ContainerProvisioner:
                 allow_stateless_create=allow_stateless_create,
                 _creation_reservation=reservation,
                 _creation_plan=creation_plan,
+                _creation_profile=profile,
             )
         if not created:
             if reservation.get("external_mutation_started_at") is None:
@@ -1842,6 +1907,7 @@ class ContainerProvisioner:
         allow_stateless_create: bool = False,
         _creation_reservation: dict[str, Any] | None = None,
         _creation_plan: dict[str, Any] | None = None,
+        _creation_profile: SandboxPodProfile | None = None,
     ) -> bool:
         """Create a workspace container for a job or persistent thread.
 
@@ -2764,7 +2830,25 @@ class ContainerProvisioner:
                 return False
 
         pod_name = owner.pod_name
-        workspace_image = image or self._workspace_image
+        try:
+            profile = await self._sandbox_profile(
+                owner,
+                cpu=cpu,
+                memory=memory,
+                cpu_limit=cpu_limit,
+                memory_limit=memory_limit,
+                image=image,
+            )
+        except Exception:
+            logger.exception(
+                "Could not read the frozen workspace settings for %s %s",
+                owner.kind,
+                owner.id,
+            )
+            return False
+        workspace_image = profile.image
+        cpu, memory = profile.cpu, profile.memory
+        cpu_limit, memory_limit = profile.cpu_limit, profile.memory_limit
         network_tier = await self._resolve_network_tier(
             owner.id, kind=owner.network_tier_kind
         )
@@ -2800,6 +2884,7 @@ class ContainerProvisioner:
             seed_files=seed_files,
             seed_extensions=seed_exts,
             seed_needs_state=seed_needs_state,
+            profile=profile,
         )
         pinned_intent: dict[str, Any] | None = None
         pinned_attempt_id: str | None = None
@@ -2969,7 +3054,7 @@ class ContainerProvisioner:
                     )
                 pvc_status = await self._create_pvc(
                     pvc_name,
-                    size=self._pvc_size,
+                    size=profile.storage or self._pvc_size,
                     # Owner label lets the backstop reaper resolve PVC → owner.
                     labels=pvc_labels,
                     expected_owner=owner,
@@ -11765,6 +11850,7 @@ class ContainerProvisioner:
         seed_files: Mapping[str, Any],
         seed_extensions: Mapping[str, Any],
         seed_needs_state: bool,
+        profile: SandboxPodProfile | None = None,
     ) -> str:
         """Digest the complete deterministic pinned create rendering contract.
 
@@ -11795,11 +11881,19 @@ class ContainerProvisioner:
             "memory": memory,
             "cpu_limit": cpu_limit,
             "memory_limit": memory_limit,
-            "pvc_size": self._pvc_size if pvc_name is not None else None,
+            "pvc_size": (
+                ((profile.storage if profile else None) or self._pvc_size)
+                if pvc_name is not None
+                else None
+            ),
             "storage_class": self._storage_class if pvc_name is not None else None,
-            "fuse_enabled": self._fuse_enabled,
-            "fuse_privileged": self._fuse_privileged,
-            "workspace_capabilities": self._workspace_capabilities(),
+            "fuse_enabled": profile.fuse_enabled if profile else self._fuse_enabled,
+            "fuse_privileged": (
+                profile.fuse_privileged if profile else self._fuse_privileged
+            ),
+            "workspace_capabilities": self._workspace_capabilities(
+                profile.fuse_enabled if profile else None
+            ),
             "ssh_secret_name": self._ssh_secret_name,
             "seed_files": seed_files,
             "seed_extensions": seed_extensions,
@@ -11811,6 +11905,9 @@ class ContainerProvisioner:
             "pod_manifest_contract": 1,
             "service_manifest_contract": 1,
         }
+        extension = profile.plan_extension() if profile else None
+        if extension is not None:
+            contract["sandbox"] = extension
         return hashlib.sha256(
             json.dumps(
                 contract,
@@ -13112,7 +13209,7 @@ class ContainerProvisioner:
             )
         return manifest
 
-    def _workspace_capabilities(self) -> list[str]:
+    def _workspace_capabilities(self, fuse_enabled: bool | None = None) -> list[str]:
         capabilities = [
             "CHOWN",
             "DAC_OVERRIDE",
@@ -13124,7 +13221,7 @@ class ContainerProvisioner:
             "KILL",
             "AUDIT_WRITE",
         ]
-        if self._fuse_enabled:
+        if self._fuse_enabled if fuse_enabled is None else fuse_enabled:
             capabilities.append("SYS_ADMIN")
         return capabilities
 
