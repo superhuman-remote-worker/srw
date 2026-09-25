@@ -331,3 +331,51 @@ class TestSuccessorTerminalCleanupAfterResume:
             successor_state,
             "9",
         ]
+
+
+class TestRetiredResourceVerificationHonoursTheProcessZeroScan:
+    """The post-shell re-proof must fail when its own zero scan refuses.
+
+    ``verify_terminal_claim_resources_retired`` runs the retired-record fence,
+    whose last step is the read-only tagged process-zero scan, and then the
+    caller's resident-zero command. The scan's refusal must end the script;
+    otherwise the resident command's own success is reported instead.
+    """
+
+    def test_a_live_tagged_process_fails_the_post_shell_verification(self, tmp_path):
+        workspace = _Workspace(tmp_path)
+        generation, runtime = str(uuid4()), str(uuid4())
+        backend = _runtime_backend(
+            token=9, workspace_generation=generation, runtime_incarnation=runtime
+        )
+        _run(workspace, backend, runtime, backend.shell_cleanup)
+        tombstone = workspace.tombstone(backend)
+        assert tombstone[2:6] == [generation, runtime, "retired", "9"]
+        # Verify mode reads /proc and never signals, so a real host process
+        # is a safe residual: it carries this runtime's exact workspace tag.
+        survivor = subprocess.Popen(
+            ["sleep", "60"],
+            env={
+                **os.environ,
+                "SRW_WORKSPACE_PROCESS_TAG": backend._workspace_process_tag(),
+            },
+            start_new_session=True,
+        )
+        try:
+            with (
+                patch.object(
+                    backend,
+                    "_exec_with_status",
+                    side_effect=workspace.runner(runtime),
+                ),
+                patch.object(backend, "_ensure_connected"),
+                pytest.raises(WorkspaceUnavailableError, match=r"exit code 85$"),
+            ):
+                backend.verify_terminal_claim_resources_retired(
+                    "printf __SRW_TERMINAL_RESIDENTS_ZERO__", 30
+                )
+            assert survivor.poll() is None
+        finally:
+            survivor.kill()
+            survivor.wait(timeout=5)
+        assert workspace.tombstone(backend) == tombstone

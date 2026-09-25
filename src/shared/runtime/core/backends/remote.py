@@ -903,8 +903,11 @@ class RemoteBackend(WorkspaceBackend):
         # could match the very tag being scanned. It also handles /proc stat
         # names with spaces and excludes the complete verifier ancestor chain
         # (entrypoint/sshd/flock/sh), while still finding disowned siblings.
+        # A refusal ends the enclosing script: a caller may append its own
+        # proof after this scan, and that command's success must never be
+        # reported in place of the scan's 85/86.
         return f"""
-python3 - {shlex.quote(env_name)} {tag_argument} {mode} <<'__SRW_PROCESS_ZERO_PY__'
+python3 - {shlex.quote(env_name)} {tag_argument} {mode} <<'__SRW_PROCESS_ZERO_PY__' || exit $?
 import os
 import signal
 import sys
@@ -925,6 +928,36 @@ while pid >= 1 and pid not in ancestors:
     except (OSError, ValueError, IndexError):
         break
 
+UNSETTLED = object()
+
+def environment(name):
+    # Every thread of a group shares one mm and so one environment. A
+    # leader without an mm (a zombie, an exiting task, or a dead main
+    # thread whose siblings still run) opens with ESRCH on Linux 6.16+ and
+    # reads empty before it, so ESRCH alone never proves the group stopped:
+    # read through the tasks, where any task holding the mm is exact.
+    try:
+        values = open(f"/proc/{{name}}/environ", "rb").read()
+    except ProcessLookupError:
+        values = b""
+    if values:
+        return values.split(b"\\0")
+    for _ in range(5):
+        listed = os.listdir(f"/proc/{{name}}/task")
+        for tid in listed:
+            try:
+                values = open(f"/proc/{{name}}/task/{{tid}}/environ", "rb").read()
+            except (FileNotFoundError, ProcessLookupError):
+                continue
+            if values:
+                return values.split(b"\\0")
+        # No listed task holds an mm with an environment. A thread created
+        # meanwhile appears in a second listing; without one, no task of
+        # the group carries a tag it can still act on.
+        if set(os.listdir(f"/proc/{{name}}/task")) <= set(listed):
+            return None
+    return UNSETTLED
+
 def matching():
     found = []
     ambiguous = False
@@ -935,7 +968,7 @@ def matching():
         if candidate in ancestors:
             continue
         try:
-            values = open(f"/proc/{{name}}/environ", "rb").read().split(b"\\0")
+            values = environment(name)
         except FileNotFoundError:
             continue
         except PermissionError:
@@ -952,7 +985,9 @@ def matching():
             continue
         except OSError:
             raise SystemExit(86)
-        if tag in values:
+        if values is UNSETTLED:
+            ambiguous = True
+        elif values is not None and tag in values:
             found.append(candidate)
     return found, ambiguous
 
@@ -1036,7 +1071,10 @@ def process_identity(name):
             uid_line = next(line for line in status if line.startswith("Uid:"))
             real_uid = int(uid_line.split()[1])
             state_line = next(line for line in status if line.startswith("State:"))
-            return real_uid, state_line.split()[1]
+            threads_line = next(
+                line for line in status if line.startswith("Threads:")
+            )
+            return real_uid, state_line.split()[1], int(threads_line.split()[1])
         except FileNotFoundError:
             return None
         except (PermissionError, OSError, StopIteration, ValueError, IndexError):
@@ -1062,12 +1100,15 @@ def same_uid_processes():
         identity = process_identity(name)
         if identity is None:
             continue
-        real_uid, state = identity
-        # A zombie has already lost every userspace execution capability and
-        # cannot mutate the workspace.  Its parent/reaper may need the exact
-        # cleanup SSH ancestry to stay alive long enough to collect it, so a
-        # zombie must not make the process-zero proof self-deadlock.
-        if real_uid == workspace_uid and state != "Z":
+        real_uid, state, threads = identity
+        # A zombie whose thread group has otherwise exited has lost every
+        # userspace execution capability and cannot mutate the workspace.
+        # Its parent/reaper may need the exact cleanup SSH ancestry to stay
+        # alive long enough to collect it, so it must not make the
+        # process-zero proof self-deadlock.  ``Threads`` counts every thread
+        # until it is released, so a ``Z`` leader with more than one is a
+        # dead main thread whose siblings still execute as this UID.
+        if real_uid == workspace_uid and not (state == "Z" and threads == 1):
             found.append(candidate)
     return found
 
@@ -1297,6 +1338,7 @@ __SRW_WORKSPACE_UID_ZERO_PY__
                 )
             inner = self._stateless_retired_resource_fence_shell() + command
             with self._shell_io_lock:
+                self._close_sftp_before_process_zero_proof()
                 output, exit_code = self._exec_with_status(
                     self._tmux_lock_command(inner, shell="bash"),
                     timeout=timeout,
@@ -2667,6 +2709,33 @@ __SRW_WORKSPACE_UID_ZERO_PY__
             + self._stateless_terminal_process_zero_shell(terminate=False)
         )
 
+    def _close_sftp_before_process_zero_proof(self) -> None:
+        """Close this backend's own SFTP channel before a process-zero proof.
+
+        The stateless process-zero scan intentionally refuses unreadable
+        same-UID processes. ``connect()`` opens an SFTP subsystem whose server
+        is a sibling of the exec channel, not an ancestor the scan can
+        exclude, and OpenSSH's ``sftp-server`` makes itself non-dumpable, so
+        the workspace user cannot inspect it. Close this terminal backend's
+        own writer channel before opening the proof exec; the still-active
+        SSH transport is sufficient for that exec and ``_ensure_connected()``
+        will not recreate SFTP. ``$HOME`` is resolved through this channel,
+        so cache it first: later terminal scripts on this backend still build
+        their paths from it.
+        """
+        self._ensure_connected()
+        with self._sftp_lock:
+            sftp = self._sftp
+            self._sftp = None
+            if sftp is not None:
+                if self._home_dir is None:
+                    try:
+                        self._home_dir = sftp.normalize(".")
+                    except (OSError, paramiko.SSHException):
+                        # Uncached, a later home-relative path fails closed.
+                        pass
+                sftp.close()
+
     def _tmux_exec_checked(
         self,
         command: str,
@@ -2693,19 +2762,7 @@ __SRW_WORKSPACE_UID_ZERO_PY__
                     "Remote shell owner has been retired from this backend"
                 )
             if close_sftp:
-                # The final stateless process-zero scan intentionally refuses
-                # unreadable same-UID processes. ``connect()`` opens an SFTP
-                # subsystem whose server is a sibling of the exec channel,
-                # not an ancestor the scan can exclude. Close this terminal
-                # backend's own writer channel before opening the proof exec;
-                # the still-active SSH transport is sufficient for that exec
-                # and `_ensure_connected()` will not recreate SFTP.
-                self._ensure_connected()
-                with self._sftp_lock:
-                    sftp = self._sftp
-                    self._sftp = None
-                    if sftp is not None:
-                        sftp.close()
+                self._close_sftp_before_process_zero_proof()
             # tmux completion sentinels and the attested prompt live at the end
             # of capture-pane output. Keep a bounded tail so scrollback over the
             # generic 5 MiB SSH cap cannot make a finished command look busy.
