@@ -93,3 +93,84 @@ async def test_ordinary_vm_approval_atomically_selects_terminal_cleanup(
     assert [item["id"] for item in await db.list_terminal_vm_cleanup_jobs(limit=4)] == [
         str(owner),
     ]
+
+
+@pytest.mark.asyncio
+async def test_completed_exact_parent_keeps_deleting_marker_nominated(db):
+    owner, other, generation, pvc_uid, admission_id, other_admission = (
+        uuid4() for _ in range(6)
+    )
+    vm = {"status": "deleting", "provision_generation": str(generation),
+          "rootdisk_pvc_uid": str(pvc_uid)}
+    for job_id, marker_admission in ((owner, admission_id),
+                                     (other, other_admission)):
+        await db.execute(
+            "INSERT INTO jobs(id,description,status,execution_lane,context) "
+            "VALUES($1,'completed cleanup','completed','pinned',$2::jsonb)",
+            job_id, json.dumps({"vm": vm, "_job_terminal_vm_cleanup": {
+                "version": 1, "source": "approve",
+                "provision_generation": str(generation),
+                "admission_id": str(marker_admission),
+            }}),
+        )
+    await db.execute(
+        "INSERT INTO vm_workspace_cleanup_admissions "
+        "(id,owner_kind,owner_id,pvc_uid,source,request_id,intent_digest,"
+        "completed_at,outcome) VALUES "
+        "($1,'job',$2,$3,'job_terminal_vm_release',$4,'exact-intent',"
+        "clock_timestamp(),'completed'),"
+        "($5,'job',$6,$3,'job_terminal_vm_release',$7,'exact-intent',"
+        "clock_timestamp(),'completed')",
+        admission_id, owner, pvc_uid, uuid4(), uuid4(), other, uuid4(),
+    )
+
+    nominated = await db.list_terminal_vm_cleanup_jobs(limit=4)
+    assert [row["id"] for row in nominated] == [str(owner)]
+    # A completed receipt by another identity cannot close this generation.
+    assert not await db.complete_terminal_vm_cleanup_marker(
+        str(other), expected_generation=str(generation),
+    )
+
+
+@pytest.mark.asyncio
+async def test_terminal_marker_binds_only_its_exact_admitted_parent(db):
+    owner, generation, pvc_uid, admission_id, wrong_admission = (
+        uuid4() for _ in range(5)
+    )
+    await db.execute(
+        "INSERT INTO jobs(id,description,status,execution_lane,context) "
+        "VALUES($1,'selected cleanup','completed','pinned',$2::jsonb)",
+        owner, json.dumps({"vm": {
+            "status": "ready", "provision_generation": str(generation),
+            "rootdisk_pvc_uid": str(pvc_uid),
+        }, "_job_terminal_vm_cleanup": {
+            "version": 1, "source": "approve",
+            "provision_generation": str(generation),
+        }}),
+    )
+    await db.execute(
+        "INSERT INTO vm_workspace_cleanup_admissions "
+        "(id,owner_kind,owner_id,pvc_uid,source,request_id,intent_digest) "
+        "VALUES($1,'job',$2,$3,'job_terminal_vm_release',$4,'exact-intent')",
+        admission_id, owner, pvc_uid, uuid4(),
+    )
+    assert not await db.bind_terminal_vm_cleanup_admission(
+        str(owner), expected_generation=str(generation),
+        admission_id=str(wrong_admission), pvc_uid=str(pvc_uid),
+    )
+    assert not await db.bind_terminal_vm_cleanup_admission(
+        str(owner), expected_generation=str(generation),
+        admission_id=str(admission_id), pvc_uid=str(uuid4()),
+    )
+    assert await db.bind_terminal_vm_cleanup_admission(
+        str(owner), expected_generation=str(generation),
+        admission_id=str(admission_id), pvc_uid=str(pvc_uid),
+    )
+    context = json.loads((await db.fetchrow(
+        "SELECT context FROM jobs WHERE id=$1", owner,
+    ))["context"])
+    assert context["_job_terminal_vm_cleanup"]["admission_id"] == str(admission_id)
+    assert not await db.bind_terminal_vm_cleanup_admission(
+        str(owner), expected_generation=str(generation),
+        admission_id=str(wrong_admission), pvc_uid=str(pvc_uid),
+    )

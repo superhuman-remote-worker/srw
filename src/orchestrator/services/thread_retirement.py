@@ -2287,6 +2287,17 @@ async def archive_and_cleanup_workspace(
                 )
                 if not cleanup.allowed:
                     raise RuntimeError("job VM cleanup held for workspace recovery")
+                marker = (
+                    raw_context.get("_job_terminal_vm_cleanup")
+                    if isinstance(raw_context, dict) else None
+                )
+                if marker is not None and not await postgres_db.bind_terminal_vm_cleanup_admission(
+                    entity_id,
+                    expected_generation=teardown_identity.provision_generation,
+                    admission_id=cleanup.admission_id,
+                    pvc_uid=teardown_identity.rootdisk_pvc_uid,
+                ):
+                    raise RuntimeError("terminal Job VM cleanup admission changed")
                 disposition = completed_cleanup_outcome(cleanup)
                 if disposition is None:
                     outcome = await vm_provisioner.release_vm_captured(

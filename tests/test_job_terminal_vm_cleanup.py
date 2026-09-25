@@ -127,14 +127,15 @@ async def test_reconcile_ordinary_terminal_vm_uses_single_owner_and_strict_archi
         list_terminal_vm_cleanup_jobs=AsyncMock(return_value=[job]),
         get_job=AsyncMock(return_value=job),
         stateless_cancel_cleanup_lock=lock,
-        complete_terminal_vm_cleanup_marker=AsyncMock(return_value=True),
+        complete_terminal_vm_cleanup_marker=AsyncMock(side_effect=[False, True]),
     )
     archive = AsyncMock()
     operation = controls(store=store, archive=archive)
 
     assert await operation.reconcile_terminal_vm_cleanups(limit=4) == 1
     archive.assert_awaited_once_with(JOB_ID)
-    store.complete_terminal_vm_cleanup_marker.assert_awaited_once_with(
+    assert store.complete_terminal_vm_cleanup_marker.await_count == 2
+    store.complete_terminal_vm_cleanup_marker.assert_awaited_with(
         JOB_ID, expected_generation=VM["provision_generation"],
     )
 
@@ -160,6 +161,90 @@ async def test_reconcile_rejects_marker_for_another_vm_generation():
 
     assert await operation.reconcile_terminal_vm_cleanups(limit=4) == 0
     archive.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_completed_exact_parent_clears_marker_without_restarting_teardown():
+    marker = {"version": 1, "source": "approve",
+              "provision_generation": VM["provision_generation"],
+              "admission_id": "77777777-8888-4999-8aaa-bbbbbbbbbbbb"}
+    job = {"id": JOB_ID, "status": "completed", "execution_lane": "pinned",
+           "context": {"vm": {**VM, "status": "deleting"},
+                       "_job_terminal_vm_cleanup": marker}}
+
+    @asynccontextmanager
+    async def lock(_job_id):
+        yield True
+
+    store = SimpleNamespace(
+        list_terminal_vm_cleanup_jobs=AsyncMock(return_value=[job]),
+        get_job=AsyncMock(return_value=job),
+        stateless_cancel_cleanup_lock=lock,
+        complete_terminal_vm_cleanup_marker=AsyncMock(return_value=True),
+    )
+    archive = AsyncMock(side_effect=AssertionError("completed parent restarted"))
+    operation = controls(store=store, archive=archive)
+
+    assert await operation.reconcile_terminal_vm_cleanups() == 1
+    archive.assert_not_awaited()
+    store.complete_terminal_vm_cleanup_marker.assert_awaited_once_with(
+        JOB_ID, expected_generation=VM["provision_generation"],
+    )
+
+
+@pytest.mark.asyncio
+async def test_hung_descendant_is_bounded_and_does_not_hide_next_candidate(monkeypatch):
+    from orchestrator.services import job_mutation_controls as module
+
+    monkeypatch.setattr(module, "TERMINAL_VM_CLEANUP_TIMEOUT_SECONDS", .02,
+                        raising=False)
+    second_id = "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff"
+    marker = {"version": 1, "source": "cancel",
+              "provision_generation": VM["provision_generation"]}
+    rows = {
+        job_id: {"id": job_id, "status": "cancelled", "execution_lane": "pinned",
+                 "context": {"vm": VM, "_job_terminal_vm_cleanup": marker}}
+        for job_id in (JOB_ID, second_id)
+    }
+    cancelled = asyncio.Event()
+
+    @asynccontextmanager
+    async def lock(_job_id):
+        yield True
+
+    completion_calls = {}
+
+    async def complete(job_id, *, expected_generation):
+        assert expected_generation == VM["provision_generation"]
+        completion_calls[job_id] = completion_calls.get(job_id, 0) + 1
+        return completion_calls[job_id] > 1
+
+    store = SimpleNamespace(
+        list_terminal_vm_cleanup_jobs=AsyncMock(return_value=list(rows.values())),
+        get_job=AsyncMock(side_effect=lambda job_id: rows[job_id]),
+        stateless_cancel_cleanup_lock=lock,
+        delete_checkpoint_thread=AsyncMock(),
+        complete_terminal_vm_cleanup_marker=complete,
+    )
+    operation = controls(store=store)
+
+    async def cascade(job_id):
+        if job_id == JOB_ID:
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+        return True
+
+    operation.cascade_cancel_to_children = cascade
+    assert await asyncio.wait_for(
+        operation.reconcile_terminal_vm_cleanups(limit=2), .3,
+    ) == 1
+    assert cancelled.is_set()
+    assert rows[JOB_ID]["context"]["_job_terminal_vm_cleanup"] == marker
+    operation.dependencies.archive_and_cleanup_workspace.assert_awaited_once_with(
+        second_id,
+    )
 
 
 @pytest.mark.asyncio
@@ -191,7 +276,7 @@ async def test_slow_snapshot_does_not_block_another_terminal_vm_candidate():
         list_terminal_vm_cleanup_jobs=AsyncMock(return_value=list(rows.values())),
         get_job=AsyncMock(side_effect=lambda job_id: rows[job_id]),
         stateless_cancel_cleanup_lock=lock,
-        complete_terminal_vm_cleanup_marker=AsyncMock(return_value=True),
+        complete_terminal_vm_cleanup_marker=AsyncMock(side_effect=[False, False, True, True]),
     )
     operation = controls(store=store, archive=archive)
     task = asyncio.create_task(operation.reconcile_terminal_vm_cleanups(limit=2))

@@ -5237,7 +5237,8 @@ class PostgresDB:
         Terminal review storage belongs to the VM idle operation and is kept
         until its own reconciler proves compute absent. Ordinary terminal Jobs
         use the normal snapshot and purge policy. A pending parent admission
-        stays nominated even after context.vm changes to ``deleting``.
+        stays nominated even after context.vm changes to ``deleting``. A
+        completed exact parent also remains nominated until its marker clears.
         """
         cursor = UUID(after_id) if after_id is not None else None
         async with self.acquire() as conn:
@@ -5272,6 +5273,21 @@ class PostgresDB:
                           AND a.source='job_terminal_vm_release'
                           AND a.completed_at IS NULL
                     )
+                    OR (
+                        j.context->'_job_terminal_vm_cleanup'->>'version'='1'
+                        AND j.context->'_job_terminal_vm_cleanup'->>'provision_generation'=
+                            j.context->'vm'->>'provision_generation'
+                        AND EXISTS (
+                            SELECT 1 FROM vm_workspace_cleanup_admissions a
+                            WHERE a.id::text=j.context->'_job_terminal_vm_cleanup'->>'admission_id'
+                              AND a.owner_kind='job' AND a.owner_id=j.id
+                              AND a.source='job_terminal_vm_release'
+                              AND a.parent_admission_id IS NULL
+                              AND a.pvc_uid::text IS NOT DISTINCT FROM
+                                  j.context->'vm'->>'rootdisk_pvc_uid'
+                              AND a.completed_at IS NOT NULL AND a.outcome='completed'
+                        )
+                    )
                   )
                   AND NOT EXISTS (
                     SELECT 1 FROM vm_idle_operations idle
@@ -5287,6 +5303,43 @@ class PostgresDB:
                 max(1, min(int(limit), 25)), cursor,
             )
         return [dict(row) for row in rows]
+
+    async def bind_terminal_vm_cleanup_admission(
+        self, job_id: str, *, expected_generation: str,
+        admission_id: str, pvc_uid: str | None,
+    ) -> bool:
+        """Pin the selected terminal marker to its admitted exact parent."""
+        try:
+            owner_id = UUID(job_id)
+            generation = UUID(expected_generation)
+            parent_id = UUID(str(admission_id))
+            pvc_id = UUID(str(pvc_uid)) if pvc_uid is not None else None
+        except (TypeError, ValueError):
+            return False
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                UPDATE jobs j SET context=jsonb_set(
+                    j.context, '{_job_terminal_vm_cleanup,admission_id}',
+                    to_jsonb($3::text), true)
+                WHERE j.id=$1 AND j.status IN ('completed','failed','cancelled')
+                  AND j.context->'_job_terminal_vm_cleanup'->>'version'='1'
+                  AND j.context->'_job_terminal_vm_cleanup'->>'provision_generation'=$2
+                  AND j.context->'vm'->>'provision_generation'=$2
+                  AND (j.context->'_job_terminal_vm_cleanup'->>'admission_id' IS NULL
+                       OR j.context->'_job_terminal_vm_cleanup'->>'admission_id'=$3)
+                  AND EXISTS (
+                    SELECT 1 FROM vm_workspace_cleanup_admissions a
+                    WHERE a.id=$3::uuid AND a.owner_kind='job' AND a.owner_id=j.id
+                      AND a.source='job_terminal_vm_release'
+                      AND a.parent_admission_id IS NULL
+                      AND a.pvc_uid IS NOT DISTINCT FROM $4::uuid
+                  )
+                RETURNING j.id
+                """,
+                owner_id, str(generation), str(parent_id), pvc_id,
+            )
+        return row is not None
 
     async def complete_terminal_vm_cleanup_marker(
         self, job_id: str, *, expected_generation: str,
@@ -5316,8 +5369,10 @@ class PostgresDB:
                   )
                   AND EXISTS (
                     SELECT 1 FROM vm_workspace_cleanup_admissions a
-                    WHERE a.owner_kind='job' AND a.owner_id=j.id
+                    WHERE a.id::text=j.context->'_job_terminal_vm_cleanup'->>'admission_id'
+                      AND a.owner_kind='job' AND a.owner_id=j.id
                       AND a.source='job_terminal_vm_release'
+                      AND a.parent_admission_id IS NULL
                       AND a.pvc_uid::text IS NOT DISTINCT FROM
                           j.context->'vm'->>'rootdisk_pvc_uid'
                       AND a.completed_at IS NOT NULL AND a.outcome='completed'

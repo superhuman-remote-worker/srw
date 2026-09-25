@@ -23,6 +23,8 @@ from orchestrator.services.manifest_runtime_ownership import (
 )
 from orchestrator.services.vm_workspace_policy import vm_needs_release
 
+TERMINAL_VM_CLEANUP_TIMEOUT_SECONDS = 900
+
 
 def _terminal_vm_needs_release(job: dict[str, Any]) -> bool:
     context = job.get("context") or {}
@@ -135,9 +137,24 @@ class JobControlOperations:
         # Distinct rows have distinct per-Job locks. A slow snapshot must not
         # delay another candidate in this bounded batch.
         return sum(await asyncio.gather(*(
-            self._reconcile_terminal_vm_cleanup(candidate)
+            self._reconcile_terminal_vm_cleanup_bounded(candidate)
             for candidate in candidates
         )))
+
+    async def _reconcile_terminal_vm_cleanup_bounded(
+        self, candidate: dict[str, Any],
+    ) -> int:
+        try:
+            return await asyncio.wait_for(
+                self._reconcile_terminal_vm_cleanup(candidate),
+                timeout=TERMINAL_VM_CLEANUP_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            self.dependencies.logger.warning(
+                "Terminal Job VM cleanup timed out for %s; durable intent remains",
+                candidate["id"],
+            )
+            return 0
 
     async def _reconcile_terminal_vm_cleanup(self, candidate: dict[str, Any]) -> int:
         d = self.dependencies
@@ -175,10 +192,8 @@ class JobControlOperations:
             ):
                 if not await self.cascade_cancel_to_children(job_id):
                     return 0
-                if await asyncio.wait_for(
-                    self.wait_for_stateless_cancel_settle(
-                        job_id, timeout_seconds=0,
-                    ), timeout=900,
+                if await self.wait_for_stateless_cancel_settle(
+                    job_id, timeout_seconds=0,
                 ):
                     return 1
                 return 0
@@ -199,6 +214,12 @@ class JobControlOperations:
                     "_job_terminal_vm_cleanup"
                 ) != marker:
                     return 0
+                if marker is not None and await d.store.complete_terminal_vm_cleanup_marker(
+                    job_id, expected_generation=marker["provision_generation"],
+                ):
+                    # A completed exact parent may have survived a crash just
+                    # before marker finalization. Never restart its teardown.
+                    return 1
                 if fresh["status"] == "cancelled":
                     if not await self.cascade_cancel_to_children(job_id):
                         return 0
@@ -206,9 +227,7 @@ class JobControlOperations:
                         # A terminal fence already detached the old agent.
                         # Checkpoint pruning precedes workspace retirement.
                         await d.store.delete_checkpoint_thread(job_id)
-                await asyncio.wait_for(
-                    d.archive_and_cleanup_workspace(job_id), timeout=900,
-                )
+                await d.archive_and_cleanup_workspace(job_id)
                 if marker is not None and not await d.store.complete_terminal_vm_cleanup_marker(
                     job_id, expected_generation=marker["provision_generation"],
                 ):
