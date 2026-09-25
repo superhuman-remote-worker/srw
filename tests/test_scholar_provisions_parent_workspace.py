@@ -313,11 +313,8 @@ class TestProvisionParentWorkspaceForScholar:
             "get_job",
             AsyncMock(side_effect=[parent_creating, parent_ready]),
         )
-        monkeypatch.setattr(
-            workspace_lifecycle_module,
-            "ensure_workspace",
-            AsyncMock(return_value=_ensure(EnsureOutcome.READY, "ready")),
-        )
+        ensure = AsyncMock(return_value=_ensure(EnsureOutcome.READY, "ready"))
+        monkeypatch.setattr(workspace_lifecycle_module, "ensure_workspace", ensure)
 
         result = await job_workspace_authority_module.provision_parent_workspace_for_scholar(
             scholar_job,
@@ -329,6 +326,13 @@ class TestProvisionParentWorkspaceForScholar:
 
         assert result == "promoted"
         wire["fail"].assert_not_awaited()
+        # The parent's stored config_override carries legacy
+        # workspace.container sizing (config_override above), but it never
+        # reaches ensure_workspace: the provisioner resolves sizing itself
+        # from the frozen execution snapshot, not from a caller/stored dict.
+        ensure.assert_awaited_once()
+        assert "ws_config" not in ensure.await_args.kwargs
+        assert not {"cpu", "memory", "image"} & set(ensure.await_args.kwargs)
         # Persist only the inherit discriminator. Dispatch re-reads and overlays
         # the parent's ready runtime in memory; copying it here would claim
         # parent-owned Kubernetes authority on the child row.
