@@ -569,15 +569,24 @@ async def test_two_connection_heartbeat_cannot_undo_pinned_nomination(db, monkey
     store = VMIdleLifecycleStore(db)
     async with db.acquire() as blocker, blocker.transaction():
         await blocker.fetchrow("SELECT id FROM agents WHERE id=$1 FOR UPDATE", agent_id)
+        blocker_pid = await blocker.fetchval("SELECT pg_backend_pid()")
         nominee = asyncio.create_task(store.admit_release(
             str(owner), episode_id=episode["episode_id"],
             revision=revision, identity=identity,
         ))
-        await asyncio.sleep(0.05)
+        nominee_pid = await _wait_for_agent_row_waiter(
+            db,
+            "SELECT * FROM agents WHERE id=$1 FOR UPDATE%",
+            {blocker_pid},
+        )
         heartbeat = asyncio.create_task(db.heartbeat(
             str(agent_id), "working", current_job_id=str(owner),
         ))
-        await asyncio.sleep(0.05)
+        await _wait_for_agent_row_waiter(
+            db,
+            "UPDATE agents SET%",
+            {blocker_pid, nominee_pid},
+        )
         assert not nominee.done() and not heartbeat.done()
     admitted, beat = await asyncio.wait_for(
         asyncio.gather(nominee, heartbeat), timeout=5,
@@ -809,6 +818,26 @@ async def _second_pinned_job(db):
     return other
 
 
+async def _wait_for_agent_row_waiter(db, query_pattern, blocking_pids):
+    """Prove a contender reached PostgreSQL's lock queue before the next starts."""
+    async with asyncio.timeout(10):
+        while True:
+            # Each probe needs a fresh statement snapshot; do not keep the
+            # observer inside a transaction while waiting for pg_stat_activity.
+            async with db.acquire() as observer:
+                pid = await observer.fetchval(
+                    "SELECT pid FROM pg_stat_activity "
+                    "WHERE datname=current_database() AND wait_event_type='Lock' "
+                    "AND query LIKE $1 AND pg_blocking_pids(pid) && $2::int[] "
+                    "LIMIT 1",
+                    query_pattern,
+                    list(blocking_pids),
+                )
+            if pid is not None:
+                return pid
+            await asyncio.sleep(0.01)
+
+
 @pytest.mark.asyncio
 async def test_open_pinned_idle_operation_fences_new_agent_claim(db, monkeypatch):
     from orchestrator.services.vm_idle_lifecycle import VMIdleLifecycleStore
@@ -849,7 +878,12 @@ async def test_admitted_pinned_fence_survives_feature_flag_off(db, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_stale_cross_job_claim_waits_for_agent_first_nomination(db, monkeypatch):
+@pytest.mark.parametrize("nominee_start_delay", [0, 0.15])
+async def test_stale_cross_job_claim_waits_for_agent_first_nomination(
+    db,
+    monkeypatch,
+    nominee_start_delay,
+):
     from orchestrator.services.vm_idle_lifecycle import VMIdleLifecycleStore
 
     owner, agent_id, _, revision, episode, identity = await _due_pinned_route(
@@ -860,15 +894,32 @@ async def test_stale_cross_job_claim_waits_for_agent_first_nomination(db, monkey
     async with db.acquire() as blocker:
         async with blocker.transaction():
             await blocker.fetchrow("SELECT id FROM agents WHERE id=$1 FOR UPDATE", agent_id)
-            nominee = asyncio.create_task(store.admit_release(
-                str(owner), episode_id=episode["episode_id"],
-                revision=revision, identity=identity,
-            ))
-            await asyncio.sleep(0.05)
+            blocker_pid = await blocker.fetchval("SELECT pg_backend_pid()")
+
+            async def nominate():
+                # A delayed task start reproduces the old sleep-based race.
+                await asyncio.sleep(nominee_start_delay)
+                return await store.admit_release(
+                    str(owner),
+                    episode_id=episode["episode_id"],
+                    revision=revision,
+                    identity=identity,
+                )
+
+            nominee = asyncio.create_task(nominate())
+            nominee_pid = await _wait_for_agent_row_waiter(
+                db,
+                "SELECT * FROM agents WHERE id=$1 FOR UPDATE%",
+                {blocker_pid},
+            )
             stale_claim = asyncio.create_task(
                 db.claim_job_for_agent(str(other), str(agent_id))
             )
-            await asyncio.sleep(0.05)
+            await _wait_for_agent_row_waiter(
+                db,
+                "SELECT status,current_job_id FROM agents WHERE id=$1 FOR UPDATE%",
+                {blocker_pid, nominee_pid},
+            )
             assert not nominee.done() and not stale_claim.done()
         admitted, claimed = await asyncio.wait_for(
             asyncio.gather(nominee, stale_claim), timeout=5,
