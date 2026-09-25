@@ -377,6 +377,105 @@ def profiled_setup(setup, monkeypatch):
     return ctrl, api, authority, payload
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "final_state", ["valid", "changed_uid", "incomplete", "late_limit_range"]
+)
+async def test_resource_final_proof_after_grant_before_post(
+    profiled_setup, monkeypatch, final_state
+):
+    """Only a successful selected proof lets the issued effect reach POST."""
+    import json
+    from tests.test_vm_resource_policy import whole_launcher_policy
+    from tests.test_vm_resource_effect_targeted import proof_case
+
+    policy = whole_launcher_policy()
+    policy["policy"].update(shadowEnabled=True, enforcementEnabled=True)
+    monkeypatch.setenv("VM_RESOURCE_ADMISSION_CONFIG", json.dumps(policy))
+    ctrl, api, authority, payload = profiled_setup
+    monkeypatch.setattr(settings, "VM_NAMESPACE", "workers")
+    resolved = resolve_creation_configuration(ctrl, authority.row["request"])
+    authority.row.update(resolved)
+    payload.update(resolved["request"])
+    payload["creation_retry"].update(
+        {
+            "request_digest": resolved["request_digest"],
+            "controller_configuration_digest": resolved[
+                "controller_configuration_digest"
+            ],
+        }
+    )
+    case = proof_case()
+    resource = resolved["controller_configuration"]["resource_admission"]
+    grant = {
+        **case.grant,
+        "version": 1,
+        "id": str(uuid4()),
+        "revision": 1,
+        "cluster_id": resource["cluster_id"],
+        "policy_digest": resource["policy_digest"],
+        "vector": resource["host_mapping"]["vector"],
+        "snapshot_id": str(uuid4()),
+        "snapshot_digest": "sha256:" + "a" * 64,
+    }
+    case.grant.update(grant)
+    case.controller.resource_inventory_collector.cluster_id = grant["cluster_id"]
+    case.controller.resource_inventory_collector.policy_digest = grant["policy_digest"]
+    case.objects["storage_class"]["metadata"]["name"] = resource["template_profile"][
+        "storage_class"
+    ]
+    snapshot = await case.controller.resource_inventory_collector.collect_effect_proof(
+        node_name=grant["node_name"],
+        storage_class_name=resource["template_profile"]["storage_class"],
+    )
+    final_snapshot = deepcopy(snapshot)
+    if final_state == "changed_uid":
+        final_snapshot["nodes"][0]["uid"] = str(uuid4())
+    if final_state == "late_limit_range":
+        case.objects["limitranges"].append(
+            {
+                "metadata": {
+                    "uid": str(uuid4()),
+                    "name": "new-limit",
+                    "namespace": "workers",
+                },
+            }
+        )
+    final_collect = (
+        case.controller.resource_inventory_collector.collect_effect_proof
+        if final_state == "late_limit_range"
+        else AsyncMock(
+            side_effect=TimeoutError("selected read timed out")
+            if final_state == "incomplete"
+            else None,
+            return_value=final_snapshot,
+        )
+    )
+    collector = SimpleNamespace(
+        collect=AsyncMock(return_value=snapshot),
+        collect_effect_proof=final_collect,
+    )
+    ctrl.resource_inventory_collector = collector
+    authority.reservation["resource_grant"] = grant
+
+    result = await ctrl._do_create_serialized(payload)
+
+    assert result["status"] == (
+        "creation_pending" if final_state == "valid" else "creation_attention"
+    ), (result, api.writes, authority.row["effects"])
+    assert [effect["state"] for effect in authority.row["effects"]] == [
+        "observed" if final_state == "valid" else "issued"
+    ]
+    assert api.writes == (
+        ["Lease", "DataVolume"] if final_state == "valid" else ["Lease"]
+    )
+    collector.collect.assert_awaited_once()
+    if final_state == "late_limit_range":
+        assert [kind for kind, _ in case.calls].count("limitranges") == 2
+    else:
+        collector.collect_effect_proof.assert_awaited_once()
+
+
 def test_authenticated_configuration_resolves_genuine_thread_owner(setup):
     ctrl, _, authority, _ = setup
     request = {

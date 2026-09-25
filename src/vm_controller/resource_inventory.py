@@ -6,6 +6,7 @@ import time
 from uuid import uuid4
 
 from kubernetes.client import ApiClient
+from kubernetes.client.exceptions import ApiException
 
 from shared.vm_resource_admission import effective_pod_request, scheduled_pod_charge
 from shared.vm_launcher_profile import normalize_installed_profile
@@ -13,6 +14,7 @@ from shared.vm_resource_inventory import (
     INVENTORY_KINDS,
     INCOMPLETE_REASONS,
     InventoryError,
+    SelectedResourceChanged,
     canonical_snapshot,
 )
 from shared.vm_resource_placement import node_allocatable
@@ -377,6 +379,122 @@ class ResourceInventoryCollector:
             return _document(method(**kwargs))
 
         return await self._run_worker(call_and_document)
+
+    async def _get(self, method, *, deadline, **kwargs):
+        budget = deadline - time.monotonic()
+        if budget <= 0:
+            raise InventoryError("collection_stale")
+        try:
+            result = await self._call(
+                method,
+                **kwargs,
+                _request_timeout=min(self.request_timeout_seconds, budget),
+            )
+        except ApiException as exc:
+            if exc.status == 404:
+                raise SelectedResourceChanged("selected_resource_missing") from None
+            raise
+        if time.monotonic() > deadline:
+            raise InventoryError("collection_stale")
+        meta = _meta(result)
+        if meta.get("name") != kwargs["name"] or (
+            "namespace" in kwargs and meta.get("namespace") != kwargs["namespace"]
+        ):
+            raise SelectedResourceChanged("selected_resource_identity_changed")
+        return result
+
+    async def collect_effect_proof(
+        self, *, node_name, storage_class_name, pvc_name=None
+    ):
+        """Re-read selected objects and namespace LimitRanges, ending with the Node.
+
+        The returned shape is private to the final effect validator. ``complete``
+        means these exact GETs and their normalization finished, not that a
+        cluster-wide admission inventory was collected.
+        """
+        if self.protocol != 2 or not node_name or not storage_class_name:
+            raise InventoryError("invalid_inventory_configuration")
+        deadline = time.monotonic() + self.collection_timeout_seconds
+        kubevirt = await self._get(
+            self.custom.get_namespaced_custom_object,
+            deadline=deadline,
+            group="kubevirt.io",
+            version="v1",
+            plural="kubevirts",
+            namespace=self.kubevirt_namespace,
+            name=self.kubevirt_name,
+        )
+        storage_class = await self._get(
+            self.storage.read_storage_class,
+            deadline=deadline,
+            name=storage_class_name,
+        )
+        pvc, pv = None, None
+        if pvc_name is not None:
+            pvc = await self._get(
+                self.core.read_namespaced_persistent_volume_claim,
+                deadline=deadline,
+                namespace=self.namespace,
+                name=pvc_name,
+            )
+            pv_name = _map(pvc.get("spec", {})).get("volumeName")
+            if not isinstance(pv_name, str) or not pv_name:
+                raise SelectedResourceChanged("selected_pv_missing")
+            pv = await self._get(
+                self.core.read_persistent_volume,
+                deadline=deadline,
+                name=pv_name,
+            )
+        limits, _ = await self._list(
+            self.core.list_namespaced_limit_range,
+            deadline=deadline,
+            remaining=self.max_items,
+            namespace=self.namespace,
+        )
+        if limits:
+            raise SelectedResourceChanged("selected_limit_range_changed")
+        # Keep the live selected Node read as the final API request before POST.
+        node = await self._get(self.core.read_node, deadline=deadline, name=node_name)
+
+        def normalize():
+            raw = {
+                kind: []
+                for kind in (
+                    "nodes",
+                    "vms",
+                    "vmis",
+                    "pods",
+                    "pvcs",
+                    "pvs",
+                    "storage_classes",
+                    "dvs",
+                )
+            }
+            raw["nodes"], raw["storage_classes"] = [node], [storage_class]
+            if pvc is not None:
+                raw["pvcs"], raw["pvs"] = [pvc], [pv]
+            return {
+                "protocol": 2,
+                "complete": True,
+                "cluster_id": self.cluster_id,
+                "policy_digest": self.policy_digest,
+                "installed_profile": normalize_installed_profile(
+                    kubevirt,
+                    namespace=self.kubevirt_namespace,
+                    name=self.kubevirt_name,
+                ),
+                **normalize_inventory(
+                    raw,
+                    namespace=self.namespace,
+                    label_keys=self.label_keys,
+                    protocol=2,
+                ),
+            }
+
+        proof = await self._run_worker(normalize)
+        if time.monotonic() > deadline:
+            raise InventoryError("collection_stale")
+        return proof
 
     async def _list(self, method, *, deadline, remaining, **kwargs):
         items, tokens, version, token = [], set(), None, None

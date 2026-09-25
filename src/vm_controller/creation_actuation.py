@@ -1118,19 +1118,6 @@ class CreationActuator:
             )
             if grant.get("actuation_allowed") is not True:
                 return pending
-            if "resource_grant" in values:
-                from shared.vm_resource_admission import ResourceAdmissionError
-                from shared.vm_resource_effect_node import fresh_resource_effect_node
-
-                try:
-                    _mark_creation_stage("resource_node")
-                    await fresh_resource_effect_node(
-                        self.controller,
-                        row,
-                        values["resource_grant"],
-                    )
-                except ResourceAdmissionError as exc:
-                    raise CreationUnproven(str(exc)) from None
             # The returned CAS grants only this one API call. Any subsequent
             # refusal/transport loss remains conservatively issued-unknown.
             _effect_stage(kind, "grant_carrier_read")
@@ -1144,7 +1131,9 @@ class CreationActuator:
             _effect_stage(kind, "grant_previous")
             await self.exact_previous(row, current)
             _effect_stage(kind, "grant_disk")
-            await self.disk(row, require_attachment=kind != "workspace_attach")
+            disk_name, _, _ = await self.disk(
+                row, require_attachment=kind != "workspace_attach"
+            )
             _effect_stage(kind, "grant_absence")
             await self.require_vm_absent(row)
             if kind == "workspace_attach":
@@ -1155,6 +1144,20 @@ class CreationActuator:
             ):
                 _effect_stage(kind, "grant_source_validate")
                 await sources.validate(row, rootdisk_source)
+            if "resource_grant" in values:
+                from shared.vm_resource_admission import ResourceAdmissionError
+                from shared.vm_resource_effect_node import targeted_resource_effect_node
+
+                try:
+                    _mark_creation_stage("resource_node")
+                    await targeted_resource_effect_node(
+                        self.controller,
+                        row,
+                        values["resource_grant"],
+                        pvc_name=disk_name if row["expected_pvc_uid"] else None,
+                    )
+                except ResourceAdmissionError as exc:
+                    raise CreationUnproven(str(exc)) from None
             if body is not None:
                 try:
                     _effect_stage(kind, "api_create")
