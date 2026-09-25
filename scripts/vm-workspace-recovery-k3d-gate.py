@@ -32,6 +32,8 @@ It is responsible for collecting those values from the live Kubernetes API,
 the application API and PostgreSQL, and for recording application/controller/
 guest revisions. This wrapper independently verifies the substrate and cluster
 UID, then rejects incomplete or contradictory evidence.
+The replacement proof also requires a changed, controller-observed VMI UID and
+MAC tied to the stop, resume, and stored network receipts.
 """
 
 from __future__ import annotations
@@ -49,6 +51,7 @@ import tarfile
 import tempfile
 import time
 from typing import Any, Callable, Mapping, NamedTuple, Sequence
+from uuid import UUID
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -79,6 +82,21 @@ class CapabilityReport(NamedTuple):
 def require(condition: bool, message: str) -> None:
     if not condition:
         raise GateFailure(message)
+
+
+def _canonical_uuid(value: object) -> bool:
+    if not isinstance(value, str):
+        return False
+    try:
+        return str(UUID(value)) == value
+    except ValueError:
+        return False
+
+
+def _observed_mac(value: object) -> bool:
+    return isinstance(value, str) and re.fullmatch(
+        r"(?:[0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}", value
+    ) is not None
 
 
 def require_disposable_cluster_name(name: str) -> None:
@@ -442,6 +460,67 @@ def validate_acceptance_evidence(evidence: dict[str, Any]) -> None:
         and isinstance(resume_receipt.get("successor"), dict),
         "full resume receipt evidence is absent",
     )
+    vmi_before = replacement.get("vmi_uid_before")
+    vmi_after = replacement.get("vmi_uid_after")
+    mac_before = replacement.get("interface_mac_before")
+    mac_after = replacement.get("interface_mac_after")
+    require(
+        _canonical_uuid(vmi_before) and _canonical_uuid(vmi_after)
+        and vmi_before != vmi_after,
+        "replacement did not prove changed VMI UID",
+    )
+    require(
+        _observed_mac(mac_before) and _observed_mac(mac_after)
+        and mac_before.lower() != mac_after.lower(),
+        "replacement did not prove changed VMI MAC",
+    )
+    successor = resume_receipt["successor"]
+    require(
+        receipt["vmi_uid"] == vmi_before
+        and receipt["root_pvc_uid"] == replacement["pvc_uid_before"]
+        and resume_receipt.get("stop_receipt_digest")
+        == receipt["evidence_digest"]
+        and successor.get("vmi_uid") == vmi_after
+        and _canonical_uuid(successor.get("launcher_uid"))
+        and _observed_mac(successor.get("interface_mac"))
+        and successor["interface_mac"].lower() == mac_after.lower(),
+        "replacement VMI/MAC observations disagree with stop or resume receipt",
+    )
+    before_receipt = replacement.get("network_profile_receipt_before")
+    after_receipt = replacement.get("network_profile_receipt_after")
+    require(
+        type(replacement.get("profiled_fixture")) is bool,
+        "profiled fixture mode is absent",
+    )
+    require(
+        (before_receipt is None) == (after_receipt is None),
+        "network profile receipt lineage is incomplete",
+    )
+    require(
+        replacement["profiled_fixture"] is False or before_receipt is not None,
+        "profiled replacement has no stored network receipt",
+    )
+    if before_receipt is not None:
+        require(
+            isinstance(before_receipt, dict) and isinstance(after_receipt, dict),
+            "network profile receipt identity is malformed",
+        )
+        for observed, vmi_uid, launcher_uid, mac in (
+            (before_receipt, vmi_before, receipt["launcher_uid"], mac_before),
+            (after_receipt, vmi_after, successor["launcher_uid"], mac_after),
+        ):
+            require(
+                observed.get("vm_uid") == receipt["vm_uid"]
+                and observed.get("pvc_uid") == receipt["root_pvc_uid"]
+                and observed.get("vmi_uid") == vmi_uid
+                and observed.get("launcher_uid") == launcher_uid
+                and (
+                    observed.get("interface_mac") is None
+                    or _observed_mac(observed["interface_mac"])
+                    and observed["interface_mac"].lower() == mac.lower()
+                ),
+                "network profile receipt does not match observed replacement",
+            )
     retention_pin = replacement.get("retention_pin")
     require(
         isinstance(retention_pin, dict)

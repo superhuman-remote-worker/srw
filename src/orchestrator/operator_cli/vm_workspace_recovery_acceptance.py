@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 from collections.abc import Mapping, Sequence
+from copy import deepcopy
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 import hashlib
@@ -658,7 +659,22 @@ class LiveScenario:
         stored_provisioning = _object(context.get("provisioning"))
         stored_identity = _object(stored_provisioning.get("identity"))
         live_vmi_uid = live_provisioning.get("vmi_uid")
-        if not live_vmi_uid or stored_identity.get("vmi_uid") != live_vmi_uid:
+        live_mac = status.get("interface_mac")
+        if (
+            not live_vmi_uid
+            or stored_identity.get("vmi_uid") != live_vmi_uid
+            or status.get("vmi_uid") != live_vmi_uid
+            or not isinstance(live_mac, str)
+            or re.fullmatch(r"(?:[0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}", live_mac)
+            is None
+            or any(
+                status.get(key) != context.get(key)
+                for key in (
+                    "provision_generation", "vm_uid", "rootdisk_pvc_uid",
+                    "active_pod_uid",
+                )
+            )
+        ):
             return None
         identity = {
             "owner_kind": "job",
@@ -676,6 +692,9 @@ class LiveScenario:
             or status.get("ssh_registration_id"),
             "ssh_host_key_fingerprint": context.get("ssh_host_key_fingerprint")
             or status.get("ssh_host_key_fingerprint"),
+            # VMI status is the observed MAC source; the Job receipt currently
+            # binds the same VMI/launcher but does not itself carry a MAC.
+            "interface_mac": live_mac,
         }
         required = (
             "provision_generation",
@@ -699,6 +718,31 @@ class LiveScenario:
             "root_pvc_uid",
         ):
             _require_uuid(identity[key], key)
+        receipt = context.get("network_profile_evidence")
+        if receipt is not None or getattr(self, "profiled_fixture", False):
+            from shared.vm_network_profile import (
+                NETWORK_PROFILE,
+                reusable_profile_evidence,
+            )
+
+            if not reusable_profile_evidence(
+                receipt, NETWORK_PROFILE,
+                provision_generation=identity["provision_generation"],
+                vm_uid=identity["vm_uid"],
+                pvc_uid=identity["root_pvc_uid"],
+                vmi_uid=identity["prior_vmi_uid"],
+                launcher_uid=identity["prior_launcher_uid"],
+            ):
+                return None
+            receipt_mac = receipt.get("interface_mac")
+            if receipt_mac is not None and (
+                not isinstance(receipt_mac, str)
+                or receipt_mac.lower() != live_mac.lower()
+            ):
+                return None
+        identity["network_profile_receipt"] = (
+            dict(receipt) if isinstance(receipt, Mapping) else None
+        )
         return identity
 
     async def _fixture_ready_identity(self, job_id: UUID) -> dict[str, Any] | None:
@@ -1959,6 +2003,9 @@ class LiveScenario:
             lambda: self._ready_identity(job_id),
             timeout=600,
         )
+        # Later negative scenarios observe another VMI. Keep the actual first
+        # replacement paired with this stop/resume receipt and guest check.
+        first_replacement_identity = deepcopy(replacement_identity)
         executor_occupancy_samples.append(await self._executor_occupied(job_id))
         marker_after = await self._ssh_file(replacement_identity, marker_path, None)
         checkpoint_after = await self._ssh_file(
@@ -2144,6 +2191,8 @@ class LiveScenario:
         longhorn = await self._longhorn_volume_evidence(
             job_id, str(replacement_identity["root_pvc_uid"])
         )
+        # This general authority sample is the final, post-deletion runtime.
+        # The replacement case below uses the first recovery's frozen sample.
         authority_evidence = {
             "application_api": application_api_evidence,
             "kubernetes_api": {
@@ -2183,8 +2232,17 @@ class LiveScenario:
             },
             "replacement": {
                 "state": recovered["phase"],
+                "profiled_fixture": bool(getattr(self, "profiled_fixture", False)),
                 "pvc_uid_before": identity["root_pvc_uid"],
-                "pvc_uid_after": replacement_identity["root_pvc_uid"],
+                "pvc_uid_after": first_replacement_identity["root_pvc_uid"],
+                "vmi_uid_before": identity["prior_vmi_uid"],
+                "vmi_uid_after": first_replacement_identity["prior_vmi_uid"],
+                "interface_mac_before": identity["interface_mac"],
+                "interface_mac_after": first_replacement_identity["interface_mac"],
+                "network_profile_receipt_before": identity["network_profile_receipt"],
+                "network_profile_receipt_after": first_replacement_identity[
+                    "network_profile_receipt"
+                ],
                 "marker_before": marker,
                 "marker_after": marker_after,
                 "checkpoint_before": checkpoint,

@@ -464,6 +464,8 @@ async def test_ready_identity_uses_matching_authenticated_nested_vmi(stored_as_j
         vm_uid=vm,
         rootdisk_pvc_uid=pvc,
         active_pod_uid=launcher,
+        vmi_uid=vmi,
+        interface_mac="02:00:00:00:00:41",
         provisioning={"vmi_uid": vmi},
     )
     scenario = object.__new__(LiveScenario)
@@ -475,8 +477,86 @@ async def test_ready_identity_uses_matching_authenticated_nested_vmi(stored_as_j
     )
     result = await scenario._ready_identity(acceptance.UUID(job))
     assert result["prior_vmi_uid"] == vmi
+    assert result["interface_mac"] == "02:00:00:00:00:41"
     context["provisioning"]["identity"]["vmi_uid"] = str(uuid4())
     scenario._row.return_value = {"context": {"vm": context}}
+    assert await scenario._ready_identity(acceptance.UUID(job)) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "change",
+    [
+        "missing_mac", "malformed_mac", "stale_live_vmi",
+        "stale_vmi_receipt", "stale_launcher_receipt",
+        "stale_receipt_mac", "missing_receipt",
+    ],
+)
+async def test_ready_identity_binds_controller_mac_and_stored_profile_receipt(change):
+    from shared.vm_network_profile import NETWORK_PROFILE
+    from uuid import uuid4
+    from unittest.mock import AsyncMock
+
+    job, generation, vm_uid, pvc_uid, vmi_uid, launcher_uid = (
+        str(uuid4()) for _ in range(6)
+    )
+    mac = "02:00:00:00:00:41"
+    receipt = {
+        "profile": NETWORK_PROFILE,
+        "provision_generation": generation,
+        "vm_uid": vm_uid, "pvc_uid": pvc_uid,
+        "vmi_uid": vmi_uid, "launcher_uid": launcher_uid,
+        "guest_boot_id": str(uuid4()),
+        "cloud_init_instance_id": "first-boot",
+        "cloud_init_cached_instance_id": "first-boot",
+        "network_file_sha256": "a" * 64,
+        "name_only_dhcp": True,
+    }
+    vm = {
+        "provision_generation": generation,
+        "vm_uid": vm_uid, "rootdisk_pvc_uid": pvc_uid,
+        "active_pod_uid": launcher_uid,
+        "pod_ip": "10.42.0.2",
+        "ssh_registration_id": str(uuid4()),
+        "ssh_host_key_fingerprint": "SHA256:" + "A" * 43,
+        "provisioning": {"identity": {"vmi_uid": vmi_uid}},
+        "network_profile_evidence": receipt,
+    }
+    status = {
+        "ready": True,
+        "provision_generation": generation,
+        "vm_uid": vm_uid, "rootdisk_pvc_uid": pvc_uid,
+        "active_pod_uid": launcher_uid,
+        "vmi_uid": vmi_uid,
+        "interface_mac": mac,
+        "provisioning": {"vmi_uid": vmi_uid},
+    }
+    scenario = object.__new__(LiveScenario)
+    scenario.namespace = "agent-vms"
+    scenario.profiled_fixture = True
+    scenario.provisioner = SimpleNamespace(
+        query_status=AsyncMock(return_value=status)
+    )
+    scenario._row = AsyncMock(return_value={"context": {"vm": vm}})
+    accepted = await scenario._ready_identity(acceptance.UUID(job))
+    assert accepted is not None
+    assert accepted["interface_mac"] == mac
+    assert accepted["network_profile_receipt"] == receipt
+
+    if change == "missing_mac":
+        status.pop("interface_mac")
+    elif change == "malformed_mac":
+        status["interface_mac"] = "not-a-mac"
+    elif change == "stale_live_vmi":
+        status["vmi_uid"] = str(uuid4())
+    elif change == "stale_vmi_receipt":
+        receipt["vmi_uid"] = str(uuid4())
+    elif change == "stale_launcher_receipt":
+        receipt["launcher_uid"] = str(uuid4())
+    elif change == "stale_receipt_mac":
+        receipt["interface_mac"] = "02:00:00:00:00:43"
+    else:
+        vm.pop("network_profile_evidence")
     assert await scenario._ready_identity(acceptance.UUID(job)) is None
 
 
@@ -766,6 +846,8 @@ async def _profiled_ready_lease_fixture(
                 "provision_generation": generation,
                 "rootdisk_pvc_uid": pvc_uid,
                 "active_pod_uid": launcher_uid,
+                "vmi_uid": vmi_uid,
+                "interface_mac": "02:00:00:00:00:41",
                 "provisioning": {"vmi_uid": vmi_uid},
             }
         )
