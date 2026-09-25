@@ -560,3 +560,25 @@ name = "MCP and VM controller do not depend on shared runtime"
 type = "forbidden"
 source_modules = ["mcp_server", "vm_controller"]
 forbidden_modules = ["shared.runtime"]
+
+[[tool.importlinter.contracts]]
+name = "Session client transport does not import the persistent runtime or application factories"
+type = "forbidden"
+source_modules = [
+  "agent.api.session_contract",
+  "agent.api.session_http",
+  "agent.api.session_websocket",
+  "agent.api.session_canvas_control",
+  "agent.api._session_auth",
+  "agent.api.session_transport",
+]
+forbidden_modules = [
+  "agent.api.persistent_app",
+  "agent.api.dual_app",
+  "agent.api.app",
+  "agent.api.turn_executor",
+  "agent.persistent_graph",
+  "agent.graph",
+  "agent.agent",
+  "langgraph",
+]
