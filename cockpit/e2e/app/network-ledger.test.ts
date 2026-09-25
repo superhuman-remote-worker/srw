@@ -47,6 +47,14 @@ function emitRequestFailed(
   } as Request);
 }
 
+function requestForFailure(method: string, url: string, failure: string): Request {
+  return {
+    method: () => method,
+    url: () => url,
+    failure: () => ({ errorText: failure }),
+  } as Request;
+}
+
 function emitResponse(
   handlers: Map<PageEvent, PageHandler>,
   method: string,
@@ -201,6 +209,62 @@ describe('network ledger safety and warm-up classification', () => {
       'GET',
       'http://srw-e2e.test/api/persistent/threads/owned-thread/stream',
     );
+
+    expect(ledger.problems()).toHaveLength(1);
+  });
+
+  it('accepts an owned connection poll aborted by reload only when it began before navigation', () => {
+    const { ledger, handlers } = ledgerHarness();
+    ledger.registerThread('owned-thread');
+    ledger.setPhase('turn');
+    const request = requestForFailure(
+      'GET', 'http://srw-e2e.test/api/sessions/owned-thread/connection', 'net::ERR_ABORTED',
+    );
+    handlers.get('request')?.(request);
+
+    ledger.setPhase('reload');
+    handlers.get('requestfailed')?.(request);
+
+    expect(ledger.problems()).toEqual([]);
+    expect(ledger.entries()).toContainEqual(
+      expect.objectContaining({
+        kind: 'requestfailed',
+        pathname: '/api/sessions/owned-thread/connection',
+        phase: 'reload',
+        classification: 'expected-navigation-cancellation',
+      }),
+    );
+  });
+
+  it('still rejects an owned connection poll that starts and aborts during reload', () => {
+    const { ledger, handlers } = ledgerHarness();
+    ledger.registerThread('owned-thread');
+    ledger.setPhase('reload');
+    const request = requestForFailure(
+      'GET', 'http://srw-e2e.test/api/sessions/owned-thread/connection', 'net::ERR_ABORTED',
+    );
+    handlers.get('request')?.(request);
+    handlers.get('requestfailed')?.(request);
+
+    expect(ledger.problems()).toEqual([
+      'unexpected network failure during reload: GET /api/sessions/owned-thread/connection (net::ERR_ABORTED)',
+    ]);
+  });
+
+  it.each([
+    ['GET', 'http://srw-e2e.test/api/sessions/foreign/connection', 'net::ERR_ABORTED'],
+    ['POST', 'http://srw-e2e.test/api/sessions/owned-thread/connection', 'net::ERR_ABORTED'],
+    ['GET', 'http://srw-e2e.test/api/sessions/owned-thread/connection', 'net::ERR_CONNECTION_RESET'],
+    ['GET', 'http://srw-e2e.test/api/sessions/owned-thread/connection', 'NS_BINDING_ABORTED'],
+    ['GET', 'http://srw-e2e.test/api/persistent/threads/owned-thread/input', 'net::ERR_ABORTED'],
+  ])('rejects non-navigation reload failure %s %s %s', (method, url, failure) => {
+    const { ledger, handlers } = ledgerHarness();
+    ledger.registerThread('owned-thread');
+    ledger.setPhase('turn');
+    const request = requestForFailure(method, url, failure);
+    handlers.get('request')?.(request);
+    ledger.setPhase('reload');
+    handlers.get('requestfailed')?.(request);
 
     expect(ledger.problems()).toHaveLength(1);
   });

@@ -178,7 +178,9 @@ export class NetworkLedger {
     const pathname = safePathname(request.url());
     if (!pathname) return;
     const reason = sanitizedDiagnostic(request.failure()?.errorText ?? 'unknown network failure');
-    const classification = this.cancellationClassification(request.method(), pathname, reason);
+    const classification = this.cancellationClassification(
+      request.method(), pathname, reason, this.started.get(request)?.phase,
+    );
     this.records.push({
       kind: 'requestfailed',
       method: request.method(),
@@ -193,6 +195,7 @@ export class NetworkLedger {
     method: string,
     pathname: string,
     reason: string,
+    startedPhase?: JourneyPhase,
   ): FailureEntry['classification'] {
     if (method !== 'GET' || !ABORT_REASON.test(reason)) return 'unexpected';
 
@@ -209,6 +212,18 @@ export class NetworkLedger {
       return 'expected-warmup-reconnect';
     }
     if (this.phase === 'list-navigation' && ownedThreadStream) {
+      return 'expected-navigation-cancellation';
+    }
+    const connectionMatch = pathname.match(CONNECTION);
+    // A Chrome reload cancels a poll from the old document. Keep failures of
+    // polls started by the new document visible to the network guard.
+    if (
+      this.phase === 'reload' &&
+      startedPhase === 'turn' &&
+      reason === 'net::ERR_ABORTED' &&
+      connectionMatch !== null &&
+      this.ownedThreadIds.has(decodeURIComponent(connectionMatch[1]))
+    ) {
       return 'expected-navigation-cancellation';
     }
     if (this.phase === 'reload' || this.phase === 'closing') {
