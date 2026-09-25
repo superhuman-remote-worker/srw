@@ -372,4 +372,13 @@ describe('JobReviewComponent delivery section', () => {
     expect(text).not.toContain('ssh_host');
     expect(text).not.toContain('private.svc');
   });
+
+  it('uses the terminal unavailable title for a cancelled VM without public cleanup evidence', async () => {
+    await render(undefined, OPEN_STATUS, {
+      requested_backend: 'vm', assigned_backend: 'vm', effective_backend: null,
+      state: 'waiting', failure: 'vm_runtime_not_ready',
+    }, {status: 'cancelled'});
+
+    expect(fixture.componentInstance.workspaceContractTitle()).toBe('VM workspace unavailable');
+  });
 });
