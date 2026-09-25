@@ -15,6 +15,7 @@ from typing import Any, Awaitable, Callable, Protocol
 from uuid import UUID
 
 from fastapi import HTTPException
+from typing_extensions import NotRequired, TypedDict
 
 from shared.operator_pause_hold import operator_pause_hold_present
 from orchestrator.services.manifest_runtime_ownership import (
@@ -24,6 +25,11 @@ from orchestrator.services.manifest_runtime_ownership import (
 from orchestrator.services.vm_workspace_policy import vm_needs_release
 
 TERMINAL_VM_CLEANUP_TIMEOUT_SECONDS = 900
+
+
+class JobCancelResponse(TypedDict):
+    status: str
+    cleanup_pending: NotRequired[bool]
 
 
 def _terminal_vm_needs_release(job: dict[str, Any]) -> bool:
@@ -653,7 +659,7 @@ class JobControlOperations:
 
     async def cancel(
         self, job_id: str, *, job: dict[str, Any], expected_execution_deadline=None
-    ) -> dict[str, str]:
+    ) -> JobCancelResponse:
         """Cancel already-authorized work through runtime and cleanup fences."""
         d = self.dependencies
         deadline_guard = (

@@ -9956,7 +9956,9 @@ async def _create_bench_job(creator_id: str, command: JobCreate) -> dict[str, An
     )
 
 
-async def _cancel_bench_job(job_id: str, caller: dict[str, Any]) -> dict[str, str]:
+async def _cancel_bench_job(
+    job_id: str, caller: dict[str, Any]
+) -> job_mutation_operations.JobCancelResponse:
     """Revalidate one run member, then invoke the application control operation."""
 
     job = await postgres_db.get_job(job_id)
