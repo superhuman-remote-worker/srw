@@ -178,14 +178,14 @@ async def _observer_resources(settings, *, base_url, secret):
 @asynccontextmanager
 async def inventory_observer_context(settings, *, base_url, secret, stop):
     if settings is None:
-        yield
+        yield None
         return
     async with _observer_resources(
         settings, base_url=base_url, secret=secret
     ) as observer:
         task = asyncio.create_task(observer.run(stop), name="vm-resource-inventory")
         try:
-            yield
+            yield observer
         finally:
             task.cancel()
             try:

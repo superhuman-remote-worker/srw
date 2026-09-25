@@ -144,8 +144,44 @@ async def test_disabled_context_initializes_no_clients_or_tasks(monkeypatch):
     )
     async with runtime.inventory_observer_context(
         None, base_url="", secret=None, stop=asyncio.Event()
-    ):
-        pass
+    ) as observer:
+        assert observer is None
+
+
+@pytest.mark.asyncio
+async def test_enabled_context_yields_active_observer_until_resources_close(monkeypatch):
+    entered, joined = asyncio.Event(), asyncio.Event()
+    collector = object()
+
+    class Observer:
+        def __init__(self):
+            self.collector = collector
+
+        async def run(self, stop):
+            entered.set()
+            try:
+                await stop.wait()
+            finally:
+                joined.set()
+
+    observer = Observer()
+
+    @asynccontextmanager
+    async def resources(*a, **kw):
+        try:
+            yield observer
+        finally:
+            assert joined.is_set()
+
+    monkeypatch.setattr(runtime, "_observer_resources", resources)
+    async with runtime.inventory_observer_context(
+        load(), base_url="http://orchestrator", secret=SECRET, stop=asyncio.Event()
+    ) as active:
+        await entered.wait()
+        assert active is observer
+        assert active.collector is collector
+        assert not joined.is_set()
+    assert joined.is_set()
 
 
 @pytest.mark.asyncio
@@ -236,3 +272,51 @@ async def test_controller_transport_failure_still_closes_observer_context(monkey
     with pytest.raises(RuntimeError, match="transport failed"):
         await service.run()
     assert entered == closed == [True]
+
+
+@pytest.mark.asyncio
+async def test_controller_binds_live_collector_for_transport_lifetime(monkeypatch):
+    from vm_controller import controller
+    from shared.vm_resource_inventory_settings import InventorySettings
+    from unittest.mock import AsyncMock
+
+    collector = object()
+    entered, joined = asyncio.Event(), asyncio.Event()
+
+    class Observer:
+        def __init__(self):
+            self.collector = collector
+
+        async def run(self, stop):
+            entered.set()
+            try:
+                await stop.wait()
+            finally:
+                joined.set()
+
+    @asynccontextmanager
+    async def resources(*a, **kw):
+        try:
+            yield Observer()
+        finally:
+            assert joined.is_set()
+
+    monkeypatch.setattr(runtime, "_observer_resources", resources)
+    monkeypatch.setattr(controller, "TRANSPORT", "http")
+    settings = load()
+    monkeypatch.setattr(InventorySettings, "from_environment", lambda: settings)
+    service = controller.VMController.__new__(controller.VMController)
+    service.load_template = lambda: None
+    service.init_k8s = lambda: None
+    service.headscale = SimpleNamespace(init=AsyncMock())
+    service._shutdown = asyncio.Event()
+
+    async def transports():
+        await entered.wait()
+        assert service.resource_inventory_collector is collector
+        assert not joined.is_set()
+
+    service._run_transports = transports
+    await service.run()
+    assert service.resource_inventory_collector is None
+    assert joined.is_set()
