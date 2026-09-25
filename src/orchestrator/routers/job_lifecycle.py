@@ -11,7 +11,10 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from orchestrator.schemas.job_create import PublicJobCreateBody
 from orchestrator.services.config_overrides import refuse_caller_transport_keys
 from orchestrator.services.job_admission import JobAdmissionActor
-from orchestrator.services.job_mutation_controls import JobControlOperations
+from orchestrator.services.job_mutation_controls import (
+    JobCancelResponse,
+    JobControlOperations,
+)
 
 router = APIRouter()
 
@@ -190,7 +193,7 @@ async def cancel_job(
     dependencies: JobControlRouteDependencies = Depends(
         get_job_control_route_dependencies
     ),
-) -> dict[str, str]:
+) -> JobCancelResponse:
     """Cancel a running job. **Dual-callable** (P4b): cockpit user with job
     access (``require_job_access``) OR agent with valid ``X-Internal-Key``
     (agent's `cancel_job` tool path).

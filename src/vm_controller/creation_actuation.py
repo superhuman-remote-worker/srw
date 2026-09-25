@@ -793,7 +793,7 @@ class CreationActuator:
         if await self.read("vm", "agent-vm-" + row["job_id"]) is not None:
             raise CreationUnproven("creation_existing_vm_unproven")
 
-    async def run(self, payload):
+    async def run(self, payload, *, observe_only=False):
         base = {
             "job_id": payload.get("job_id"),
             "provision_generation": payload.get("provision_generation"),
@@ -803,6 +803,8 @@ class CreationActuator:
 
         diagnostic_token = _CREATION_DIAGNOSTIC_STAGE.set("protocol")
         try:
+            if observe_only:
+                return await self._run(payload, observe_only=True)
             return await self._run(payload)
         except PreparedWaiting:
             return {**base, "status": "creation_pending", "reason": "preparation_wait"}
@@ -842,7 +844,7 @@ class CreationActuator:
         finally:
             _CREATION_DIAGNOSTIC_STAGE.reset(diagnostic_token)
 
-    async def _run(self, payload):
+    async def _run(self, payload, *, observe_only=False):
         request = dict(payload)
         envelope = request.pop("creation_retry")
         if (
@@ -874,6 +876,7 @@ class CreationActuator:
             "status": "creation_pending",
             "reason": "creation_observation_pending",
         }
+        issued_this_poll = False
         for _ in range(9):
             _mark_creation_stage("inspect")
             row = await self.authority("inspect", request_id=envelope["request_id"])
@@ -892,6 +895,10 @@ class CreationActuator:
                 or row["request"] != request
             ):
                 raise CreationUnproven("creation_request_changed")
+            if observe_only:
+                if row["state"] != "reconciling":
+                    raise CreationUnproven("creation_source_not_active")
+                return pending
             effects = row["effects"]
             latest = effects[-1] if effects else None
             lease = None
@@ -963,6 +970,8 @@ class CreationActuator:
                 "attention",
             }:
                 raise CreationUnproven("creation_source_not_active")
+            if issued_this_poll:
+                return pending
             # Already-issued VM observation/adoption returned above. All paths
             # below would grant a fresh effect and require authoritative absence.
             _mark_creation_stage("prepublish_absence")
@@ -1175,6 +1184,7 @@ class CreationActuator:
                 except Exception:
                     return pending
             # Inspect again, then record exact read-back of this issued nonce.
+            issued_this_poll = True
         return pending
 
 

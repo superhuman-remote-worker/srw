@@ -115,9 +115,11 @@ async def test_prepared_real_authority_lost_vm_reply_and_completed_clone(
     assert initial["reason"] == "preparation_wait"
     service.store.finish(next(iter(service.store.pods)))
     api.lost.add("VirtualMachine")
-    for _ in range(4):
+    for _ in range(5):
         pending = await ctrl._do_create_serialized(payload)
-        if pending.get("reason") != "preparation_wait":
+        if (forged and pending.get("reason") != "preparation_wait") or (
+            not forged and "VirtualMachine" in api.writes
+        ):
             break
     assert pending["status"] == "creation_pending"
     if forged:

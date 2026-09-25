@@ -324,6 +324,12 @@ async def test_actual_cancel_revokes_claim_and_new_controller_authorization(db, 
         )
     assert cancelled["state"] == "cancel_requested"
     assert cancelled["claim_token"] is None
+    assert not await store.apply_observation(
+        request_id=str(claimed["request_id"]),
+        claim_token=str(claimed["claim_token"]),
+        expected_revision=claimed["revision"],
+        observation={"outcome": "transport_unknown"},
+    )
     denied = await store.authorize_controller(
         request_id=str(claimed["request_id"]),
         claim_token=str(claimed["claim_token"]),
@@ -485,8 +491,14 @@ async def test_store_backoff_uses_db_time_and_capacity_clears_transport_outage(d
     )
     assert await store.claim_due(limit=1) == []
     async with db.acquire() as conn:
+        held = await conn.fetchrow(
+            "SELECT state,claim_token,claim_expires_at FROM vm_creation_retries WHERE job_id=$1", job,
+        )
+        assert held["state"] == "reconciling"
+        assert held["claim_token"] == claim["claim_token"]
+        assert held["claim_expires_at"] == claim["claim_expires_at"]
         await conn.execute(
-            "UPDATE vm_creation_retries SET next_probe_at=clock_timestamp(),transport_outage_started_at=clock_timestamp()-interval '20 minutes' WHERE job_id=$1",
+            "UPDATE vm_creation_retries SET next_probe_at=clock_timestamp(),claim_expires_at=clock_timestamp()-interval '1 second',transport_outage_started_at=clock_timestamp()-interval '20 minutes' WHERE job_id=$1",
             job,
         )
     claim = (await store.claim_due(limit=1))[0]
@@ -504,6 +516,73 @@ async def test_store_backoff_uses_db_time_and_capacity_clears_transport_outage(d
     assert row["state"] == "queued"
     assert row["transport_outage_started_at"] is None
     assert row["boot_counted"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lane", ["pinned", "stateless"])
+async def test_transport_loss_keeps_original_claim_for_authorize_until_expiry(db, lane):
+    job, generation, proposal = await admitted_job(db, lane=lane)
+    retry = await admit(db, job, generation, proposal)
+    store = VMCreationRetryStore(db)
+    claim = (await store.claim_due(limit=1))[0]
+    async with db.acquire() as conn:
+        # Emulate the caller timing out at second 30 without a wall-clock wait.
+        await conn.execute(
+            "UPDATE vm_creation_retries SET claim_expires_at=clock_timestamp()+interval '30 seconds' WHERE request_id=$1",
+            retry["request_id"],
+        )
+    assert await store.apply_observation(
+        request_id=str(retry["request_id"]),
+        claim_token=str(claim["claim_token"]),
+        expected_revision=claim["revision"],
+        observation={"outcome": "transport_unknown"},
+    )
+    assert await store.claim_due(limit=1) == []
+    permitted = await store.authorize_controller(
+        request_id=str(retry["request_id"]),
+        claim_token=str(claim["claim_token"]),
+        observed=observed(job, generation, proposal),
+    )
+    assert permitted["allowed"] is True
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE vm_creation_retries SET claim_expires_at=clock_timestamp()-interval '1 second',next_probe_at=clock_timestamp() WHERE request_id=$1",
+            retry["request_id"],
+        )
+    replacement = (await store.claim_due(limit=1))[0]
+    assert replacement["claim_token"] != claim["claim_token"]
+    assert not (await store.authorize_controller(
+        request_id=str(retry["request_id"]),
+        claim_token=str(claim["claim_token"]),
+        observed=observed(job, generation, proposal),
+    ))["allowed"]
+
+
+@pytest.mark.asyncio
+async def test_transport_outage_attention_revokes_original_claim(db):
+    job, generation, proposal = await admitted_job(db)
+    retry = await admit(db, job, generation, proposal)
+    store = VMCreationRetryStore(db)
+    claim = (await store.claim_due(limit=1))[0]
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE vm_creation_retries SET transport_outage_started_at=clock_timestamp()-interval '901 seconds' WHERE request_id=$1",
+            retry["request_id"],
+        )
+    assert await store.apply_observation(
+        request_id=str(retry["request_id"]),
+        claim_token=str(claim["claim_token"]),
+        expected_revision=claim["revision"],
+        observation={"outcome": "transport_unknown"},
+    )
+    async with db.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT state,claim_token,claim_expires_at FROM vm_creation_retries WHERE request_id=$1",
+            retry["request_id"],
+        )
+    assert row["state"] == "attention"
+    assert row["claim_token"] is None
+    assert row["claim_expires_at"] is None
 
 
 @pytest.mark.asyncio

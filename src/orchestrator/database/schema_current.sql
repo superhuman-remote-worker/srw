@@ -7674,17 +7674,19 @@ BEGIN
     IF OLD.disposition_carrier_uid IS NOT NULL AND (
        NEW.disposition_carrier_uid IS DISTINCT FROM OLD.disposition_carrier_uid OR
        NEW.disposition_carrier_namespace IS DISTINCT FROM OLD.disposition_carrier_namespace) THEN
-        RAISE EXCEPTION 'Thread cancellation carrier is immutable' USING ERRCODE='23514';
+        RAISE EXCEPTION 'Cancellation carrier is immutable' USING ERRCODE='23514';
     END IF;
-    IF NEW.disposition_carrier_uid IS NOT NULL AND (
-       NEW.owner_kind<>'thread' OR NEW.creation_carrier_uid IS NOT NULL OR
-       NEW.cancellation_disposition IS NULL OR
-       NEW.cancellation_disposition->>'carrier_kind'<>'thread_creation_cancel' OR
-       NEW.cancellation_disposition->>'carrier_uid' IS DISTINCT FROM NEW.disposition_carrier_uid::text OR
-       NEW.cancellation_disposition->>'namespace' IS DISTINCT FROM NEW.disposition_carrier_namespace OR
-       EXISTS(SELECT 1 FROM public.vm_creation_effects WHERE request_id=NEW.request_id)
-    ) THEN
-        RAISE EXCEPTION 'Thread cancellation carrier cannot create' USING ERRCODE='23514';
+    IF NEW.disposition_carrier_uid IS NOT NULL AND NOT ((
+       NEW.creation_carrier_uid IS NULL AND
+       NEW.cancellation_disposition IS NOT NULL AND
+       NEW.cancellation_disposition->>'carrier_uid' IS NOT DISTINCT FROM NEW.disposition_carrier_uid::text AND
+       NEW.cancellation_disposition->>'namespace' IS NOT DISTINCT FROM NEW.disposition_carrier_namespace AND
+       ((NEW.owner_kind='thread' AND
+         NEW.cancellation_disposition->>'carrier_kind'='thread_creation_cancel' AND
+         NOT EXISTS(SELECT 1 FROM public.vm_creation_effects WHERE request_id=NEW.request_id))
+        OR (NEW.owner_kind='job' AND public.valid_vm_creation_job_cancel_identity(NEW)))
+    ) IS TRUE) THEN
+        RAISE EXCEPTION 'Cancellation carrier cannot create' USING ERRCODE='23514';
     END IF;
     IF OLD.cancellation_disposition IS NOT NULL AND
        NEW.cancellation_disposition IS DISTINCT FROM OLD.cancellation_disposition THEN
@@ -15398,6 +15400,7 @@ CREATE TABLE public.vm_creation_retries (
     thread_owner_project_id uuid,
     disposition_carrier_uid uuid,
     disposition_carrier_namespace text,
+    CONSTRAINT vm_cancel_carrier_exclusive CHECK (((disposition_carrier_uid IS NULL) OR ((owner_kind = ANY (ARRAY['thread'::text, 'job'::text])) AND (creation_carrier_uid IS NULL)))),
     CONSTRAINT vm_creation_carrier_pair CHECK ((((creation_carrier_uid IS NULL) = (creation_carrier_namespace IS NULL)) AND ((creation_carrier_namespace IS NULL) OR (creation_carrier_namespace <> ''::text)))),
     CONSTRAINT vm_creation_retries_backoff_attempt_check CHECK ((backoff_attempt >= 0)),
     CONSTRAINT vm_creation_retries_canonical_request_check CHECK ((jsonb_typeof(canonical_request) = 'object'::text)),
@@ -15416,7 +15419,6 @@ CREATE TABLE public.vm_creation_retries (
     CONSTRAINT vm_creation_retries_revision_check CHECK ((revision >= 0)),
     CONSTRAINT vm_creation_retries_state_check CHECK ((state = ANY (ARRAY['queued'::text, 'reconciling'::text, 'succeeded'::text, 'attention'::text, 'cancel_requested'::text, 'settled'::text]))),
     CONSTRAINT vm_creation_retry_exact_owner CHECK ((((owner_kind = 'job'::text) AND (job_id IS NOT NULL) AND (thread_id IS NULL) AND (thread_runtime_generation IS NULL) AND (thread_agent_id IS NULL) AND (thread_attach_token IS NULL) AND (thread_wake_operation_id IS NULL) AND (thread_owner_user_id IS NULL) AND (thread_owner_project_id IS NULL) AND (execution_id IS NOT NULL) AND (execution_revision IS NOT NULL) AND (execution_generation IS NOT NULL)) OR ((owner_kind = 'thread'::text) AND (job_id IS NULL) AND (thread_id IS NOT NULL) AND (thread_runtime_generation IS NOT NULL) AND ((thread_agent_id IS NULL) = (thread_attach_token IS NULL)) AND (execution_id IS NULL) AND (execution_revision IS NULL) AND (execution_generation IS NULL) AND (admission_deadline IS NULL) AND (predecessor_cleanup_admission_id IS NULL) AND (controller_configuration IS NOT NULL)))),
-    CONSTRAINT vm_thread_cancel_carrier_exclusive CHECK (((disposition_carrier_uid IS NULL) OR ((owner_kind = 'thread'::text) AND (creation_carrier_uid IS NULL)))),
     CONSTRAINT vm_thread_cancel_carrier_pair CHECK ((((disposition_carrier_uid IS NULL) = (disposition_carrier_namespace IS NULL)) AND ((disposition_carrier_namespace IS NULL) OR (disposition_carrier_namespace <> ''::text))))
 );
 
@@ -15562,6 +15564,70 @@ CREATE FUNCTION public.valid_vm_creation_disposition_parent_identity(retry publi
         AND parent.source='controller_vm_create' AND parent.parent_admission_id IS NULL
         AND parent.pvc_uid IS NOT DISTINCT FROM COALESCE(retry.expected_pvc_uid,retry.observed_pvc_uid)
         AND parent.request_id=uuid_generate_v5(uuid_ns_url(),'vm-create:' || retry.request_id::text)
+    ) IS TRUE;
+$$;
+
+
+--
+-- Name: valid_vm_creation_job_cancel_identity(public.vm_creation_retries); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.valid_vm_creation_job_cancel_identity(retry public.vm_creation_retries) RETURNS boolean
+    LANGUAGE sql STABLE
+    AS $$
+    SELECT (retry.owner_kind='job' AND retry.job_id IS NOT NULL
+       AND retry.thread_id IS NULL
+       AND retry.creation_carrier_uid IS NULL
+       AND retry.expected_pvc_uid IS NULL
+       AND retry.observed_pvc_uid IS NULL
+       AND retry.observed_vm_uid IS NULL
+       AND retry.controller_configuration->>'version'='3'
+       AND jsonb_typeof(retry.controller_configuration->'resource_admission')='object'
+       AND retry.canonical_request->>'entity_type'='job'
+       AND retry.canonical_request->>'job_id'=retry.job_id::text
+       AND retry.canonical_request->>'provision_generation'=retry.provision_generation::text
+       AND retry.cancellation_disposition->>'carrier_kind'='job_creation_cancel'
+       AND retry.cancellation_disposition->>'request_id'=retry.request_id::text
+       AND retry.cancellation_disposition->>'admission_id'=retry.creation_admission_id::text
+       AND retry.cancellation_disposition->>'job_id'=retry.job_id::text
+       AND retry.cancellation_disposition->>'provision_generation'=retry.provision_generation::text
+       AND retry.cancellation_disposition->>'carrier_uid'=retry.disposition_carrier_uid::text
+       AND retry.cancellation_disposition->>'namespace'=retry.disposition_carrier_namespace
+       AND retry.disposition_carrier_namespace=retry.controller_configuration->>'namespace'
+       AND retry.cancellation_disposition->'effects'='[]'::jsonb
+       AND retry.cancellation_disposition->'objects'='{}'::jsonb
+       AND retry.cancellation_disposition->'source'='null'::jsonb
+       AND retry.cancellation_disposition->>'source_resolution'=(CASE
+           WHEN COALESCE(retry.canonical_request->'preparation','null'::jsonb)<>'null'::jsonb
+             OR retry.controller_configuration->'golden_enabled' IS DISTINCT FROM 'false'::jsonb
+           THEN 'unknown' ELSE 'not_required' END)
+       AND NOT EXISTS (SELECT 1 FROM public.vm_creation_effects e
+           WHERE e.request_id=retry.request_id)
+       AND EXISTS (SELECT 1 FROM public.jobs j
+           WHERE j.id=retry.job_id AND j.status::text='cancelled'
+             AND j.context->'vm'->>'provision_generation'=retry.provision_generation::text)
+       AND EXISTS (SELECT 1 FROM public.vm_workspace_cleanup_admissions a
+           WHERE a.id=retry.creation_admission_id
+             AND a.source='controller_vm_create'
+             AND a.owner_kind='job' AND a.owner_id=retry.job_id
+             AND a.request_id=uuid_generate_v5(uuid_ns_url(),
+                 'vm-create:' || retry.request_id::text)
+             AND a.pvc_uid IS NULL)
+       AND EXISTS (SELECT 1 FROM public.vm_resource_reservations r
+           JOIN public.vm_resource_waiters w ON w.request_id=r.request_id
+           WHERE r.request_id=retry.request_id
+             AND r.resource_version=2 AND r.vm_uid IS NULL
+             AND w.owner_kind='job' AND w.job_id=retry.job_id
+             AND w.provision_generation=retry.provision_generation
+             AND r.cluster_id=w.cluster_id
+             AND r.policy_digest=w.policy_digest
+             AND r.cluster_id=retry.controller_configuration->'resource_admission'->>'cluster_id'
+             AND r.policy_digest=retry.controller_configuration->'resource_admission'->>'policy_digest'
+             AND ((retry.state='cancel_requested'
+                   AND r.state='reserved' AND w.state='admitted')
+                  OR (retry.state='settled'
+                   AND r.state='released' AND w.state='released'
+                   AND r.release_evidence->>'disposition_id'=retry.cancellation_disposition->>'disposition_id')))
     ) IS TRUE;
 $$;
 

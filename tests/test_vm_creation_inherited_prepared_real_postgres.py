@@ -6,6 +6,8 @@ from uuid import UUID, uuid4
 
 import pytest
 
+from tests.test_vm_creation_actuation import poll_until_terminal
+
 from tests.test_vm_creation_prepared_attachment_real_postgres import (
     db as _db_fixture,
     postgres_db_fixture,  # noqa: F401
@@ -147,7 +149,7 @@ async def test_prepared_inheritance_keeps_exact_completed_target_and_original_re
     )
     disk = deepcopy(api.read("DataVolume", storage_name(request["workspace_storage"])))
     _, row, payload = await admit_replacement(db, ctrl, store, request, fresh)
-    result = await ctrl._do_create_serialized(payload)
+    result = await poll_until_terminal(ctrl._do_create_serialized, payload, limit=5)
     assert result["status"] == "created", result
     current = await store.inspect(request_id=str(row["request_id"]))
     assert current["prepared_origin"]["request_id"] == str(original["request_id"])
@@ -231,11 +233,11 @@ async def test_prepared_inheriting_job_can_replace_using_own_retirement(db, work
     ctrl, api, _, _, _ = workspace
     store, _, request, fresh, _ = await inheritance(db, workspace, allocation_lost=True)
     _, first, payload = await admit_replacement(db, ctrl, store, request, fresh)
-    assert (await ctrl._do_create_serialized(payload))["status"] == "created"
+    assert (await poll_until_terminal(ctrl._do_create_serialized, payload, limit=5))["status"] == "created"
     request, fresh, _, _, _ = await retire(db, workspace[:4], payload)
     _, second, payload = await admit_replacement(db, ctrl, store, request, fresh)
     assert second["admission_deadline"] == first["admission_deadline"]
-    assert (await ctrl._do_create_serialized(payload))["status"] == "created"
+    assert (await poll_until_terminal(ctrl._do_create_serialized, payload, limit=5))["status"] == "created"
     assert "DataVolume" not in api.writes
 
 
@@ -320,7 +322,7 @@ async def test_signed_inherited_origin_cannot_replace_full_durable_clone_identit
         return await authority(path, body, operation=operation)
 
     ctrl._workspace_cleanup_authority_request = forge
-    assert (await ctrl._do_create_serialized(payload))["status"] != "created"
+    assert (await poll_until_terminal(ctrl._do_create_serialized, payload, limit=5))["status"] != "created"
     assert attempted
     assert len((await store.inspect(request_id=str(row["request_id"])))["effects"]) == 1
     assert (
@@ -341,7 +343,11 @@ async def test_inherited_prepared_lost_vm_reply_retains_exact_original_receipt(
     )
     _, row, payload = await admit_replacement(db, ctrl, store, request, fresh)
     api.lost.add("VirtualMachine")
-    assert (await ctrl._do_create_serialized(payload))["status"] == "creation_pending"
+    for _ in range(4):
+        assert (await ctrl._do_create_serialized(payload))["status"] == "creation_pending"
+        if "VirtualMachine" in api.writes:
+            break
+    assert api.writes.count("VirtualMachine") == 1
     if cancelled:
         async with db.acquire() as conn:
             await conn.execute(
@@ -392,7 +398,11 @@ async def test_inherited_prepared_completion_is_rechecked_after_vm_grant(db, wor
         return result
 
     ctrl._workspace_cleanup_authority_request = drift_after_grant
-    assert (await ctrl._do_create_serialized(payload))["status"] != "created"
+    for _ in range(4):
+        result = await ctrl._do_create_serialized(payload)
+        if changed:
+            break
+    assert result["status"] != "created"
     assert changed and "VirtualMachine" not in api.writes
     current = await store.inspect(request_id=str(row["request_id"]))
     assert current["effects"][-1]["state"] == "issued"
@@ -410,14 +420,14 @@ async def test_three_job_prepared_chain_preserves_first_clone_and_exact_previous
         db, workspace, allocation_lost=True
     )
     _, second, payload = await admit_replacement(db, ctrl, store, request, fresh)
-    assert (await ctrl._do_create_serialized(payload))["status"] == "created"
+    assert (await poll_until_terminal(ctrl._do_create_serialized, payload, limit=5))["status"] == "created"
     request, fresh = await next_job(db, workspace, second, payload)
     proof, third, payload = await admit_replacement(db, ctrl, store, request, fresh)
     assert proof["predecessor_evidence"]["previous_job_id"] == str(second["job_id"])
     assert proof["predecessor_evidence"]["prepared_origin"]["request_id"] == str(
         original["request_id"]
     )
-    result = await ctrl._do_create_serialized(payload)
+    result = await poll_until_terminal(ctrl._do_create_serialized, payload, limit=5)
     assert result["status"] == "created", result
     assert result["preparation"]["buildUid"] == source["artifact"]["uid"]
     assert "DataVolume" not in api.writes

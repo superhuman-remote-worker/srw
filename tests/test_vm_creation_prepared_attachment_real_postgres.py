@@ -37,6 +37,10 @@ async def test_prepared_workspace_adopts_lost_vm_reply_and_releases_completed_cl
     store, row = await bridge(db, workspace[:4])
     api.lost.add("VirtualMachine")
     assert (await finish_prepared(workspace))["status"] == "creation_pending"
+    for _ in range(5):
+        if "VirtualMachine" in api.writes:
+            break
+        assert (await ctrl._do_create_serialized(payload))["status"] == "creation_pending"
     assert api.writes.count("VirtualMachine") == 1
     if cancelled:
         async with db.acquire() as conn:
@@ -84,7 +88,7 @@ async def test_signed_prepared_source_cannot_substitute_another_workspace_target
         verify_creation_carrier,
     )
 
-    ctrl, api, _, payload, _ = workspace
+    ctrl, api, _, payload, service = workspace
     store, row = await bridge(db, workspace[:4])
     original = ctrl._workspace_cleanup_authority_request
     attempted = False
@@ -111,7 +115,16 @@ async def test_signed_prepared_source_cannot_substitute_another_workspace_target
         return await original(path, body, operation=operation)
 
     ctrl._workspace_cleanup_authority_request = authority
-    result = await finish_prepared(workspace)
+    for _ in range(3):
+        result = await ctrl._do_create_serialized(payload)
+        if result.get("reason") == "preparation_wait":
+            break
+    assert result.get("reason") == "preparation_wait"
+    service.store.finish(next(iter(service.store.pods)))
+    for _ in range(5):
+        result = await ctrl._do_create_serialized(payload)
+        if attempted:
+            break
     assert attempted and result["status"] != "created"
     observed = await store.inspect(request_id=str(row["request_id"]))
     assert len(observed["effects"]) == 1

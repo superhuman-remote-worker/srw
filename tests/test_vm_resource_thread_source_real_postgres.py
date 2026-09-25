@@ -764,6 +764,17 @@ async def test_actual_pinned_provision_cas_captures_thread_source_and_waiter(
     assert claims[0]["request_id"] == request_id
     assert claims[0]["thread_id"] == thread_id
     assert claims[0]["claim_token"] is not None
+    await db.execute(
+        "UPDATE vm_creation_retries SET claim_expires_at=clock_timestamp()+interval '30 seconds' WHERE request_id=$1",
+        request_id,
+    )
+    retries = VMCreationRetryStore(db)
+    assert await retries.apply_observation(
+        request_id=str(request_id), claim_token=str(claims[0]["claim_token"]),
+        expected_revision=claims[0]["revision"],
+        observation={"outcome": "transport_unknown"},
+    )
+    assert await retries.claim_due(limit=1) == []
     authorized = await VMCreationRetryStore(db).authorize_controller(
         request_id=str(request_id), claim_token=str(claims[0]["claim_token"]),
         observed={

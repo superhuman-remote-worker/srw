@@ -402,7 +402,9 @@ async def test_inherited_controller_keeps_original_disk_and_advances_exact_previ
     name = storage_name(payload["workspace_storage"])
     original_disk = api.read("DataVolume", name)
     original_lease = api.read("Lease", name)
-    result = await ctrl._do_create_serialized(payload)
+    from tests.test_vm_creation_actuation import poll_until_terminal
+
+    result = await poll_until_terminal(ctrl._do_create_serialized, payload, limit=5)
     assert result["status"] == "created", result
     assert api.read("DataVolume", name) == original_disk
     assert (
@@ -439,6 +441,11 @@ async def test_inherited_lost_reply_preserves_disk_and_exact_late_adoption(
         api.lost.add("VirtualMachine")
     assert (await ctrl._do_create_serialized(payload))["status"] == "creation_pending"
     if lost == "vm":
+        for _ in range(3):
+            assert (await ctrl._do_create_serialized(payload))["status"] == "creation_pending"
+            if "VirtualMachine" in api.writes:
+                break
+        assert api.writes.count("VirtualMachine") == 1
         async with db.acquire() as conn:
             await conn.execute(
                 "UPDATE jobs SET status='cancelled' WHERE id=$1", jobs[-1]
@@ -447,7 +454,9 @@ async def test_inherited_lost_reply_preserves_disk_and_exact_late_adoption(
                 "UPDATE srw_workspace_instances SET status='Deleting' WHERE id=$1",
                 UUID(payload["workspace_storage"]["uid"]),
             )
-    assert (await ctrl._do_create_serialized(payload))["status"] == "created"
+    from tests.test_vm_creation_actuation import poll_until_terminal
+
+    assert (await poll_until_terminal(ctrl._do_create_serialized, payload, limit=5))["status"] == "created"
     assert "DataVolume" not in api.writes
     assert api.writes.count("VirtualMachine") == 1
     result = await store.inspect(request_id=str(row["request_id"]))

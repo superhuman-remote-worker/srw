@@ -113,6 +113,45 @@ async def test_two_replicas_receive_only_one_effect_grant(db, monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("cancel", [False, True])
+async def test_transport_timeout_keeps_only_original_effect_authority(db, monkeypatch, cancel):
+    store, row, claim, carrier = await reserved(db, monkeypatch)
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE vm_creation_retries SET claim_expires_at=clock_timestamp()+interval '30 seconds' WHERE request_id=$1",
+            row["request_id"],
+        )
+    assert await store.apply_observation(
+        request_id=str(row["request_id"]),
+        claim_token=str(claim["claim_token"]),
+        expected_revision=claim["revision"],
+        observation={"outcome": "transport_unknown"},
+    )
+    assert await store.claim_due(limit=1) == []
+    if cancel:
+        await db.linearize_pinned_cancel(str(row["job_id"]), expected_status="paused")
+        with pytest.raises(VMCreationRetryConflict):
+            await store.begin_effect(
+                request_id=str(row["request_id"]),
+                claim_token=str(claim["claim_token"]), carrier=carrier,
+            )
+        assert await db.fetchval(
+            "SELECT count(*) FROM vm_creation_effects WHERE request_id=$1", row["request_id"],
+        ) == 0
+    else:
+        grant = await store.begin_effect(
+            request_id=str(row["request_id"]),
+            claim_token=str(claim["claim_token"]), carrier=carrier,
+        )
+        assert grant["actuation_allowed"] is True
+        replay = await store.begin_effect(
+            request_id=str(row["request_id"]),
+            claim_token=str(claim["claim_token"]), carrier=carrier,
+        )
+        assert replay["actuation_allowed"] is False
+
+
+@pytest.mark.asyncio
 async def test_unknown_issuance_survives_claim_expiry_and_cancellation(db, monkeypatch):
     store, row, claim, carrier = await reserved(db, monkeypatch)
     await store.begin_effect(

@@ -501,6 +501,52 @@ class VMResourceReservationStore:
         )
         return grant
 
+    async def check_cancel_grant_on_conn(self, conn, *, retry, job, grant):
+        """Match a published no-effect carrier to its frozen held reservation.
+
+        End must work after inventory freshness expires or policy enters drain/off.
+        This comparison grants no creation and performs no new node admission.
+        """
+        await self._lock_policy(conn, allow_off=True)
+        expected = _expected_waiter_request_fields(
+            retry, inventory=self.inventory,
+            policy_document=self.policy_document, cost=self.cost,
+        )
+        waiter = await conn.fetchrow(
+            "SELECT * FROM vm_resource_waiters WHERE request_id=$1 FOR UPDATE",
+            retry["request_id"],
+        )
+        held = await conn.fetchrow(
+            "SELECT * FROM vm_resource_reservations WHERE request_id=$1 FOR UPDATE",
+            retry["request_id"],
+        )
+        owner_key = "system" if job["user_id"] is None else "user:" + str(job["user_id"])
+        if (
+            waiter is None or not _waiter_request_fields_match(waiter, expected)
+            or waiter["owner_key"] != owner_key
+            or waiter["state"] != "admitted"
+            or held is None or held["state"] != "reserved"
+            or held["resource_version"] != 2 or held["vm_uid"] is not None
+            or held["vmi_uid"] is not None or held["launcher_uid"] is not None
+            or held["cluster_id"] != self.inventory.cluster_id
+            or held["policy_digest"] != self.inventory.policy_digest
+            or _row_vector(held, six=True) != _row_vector(expected, six=True)
+            or grant != {
+                "version": 1,
+                "id": str(held["id"]),
+                "revision": held["revision"],
+                "cluster_id": held["cluster_id"],
+                "policy_digest": held["policy_digest"],
+                "node_uid": str(held["node_uid"]),
+                "node_name": held["node_name"],
+                "vector": _row_vector(held, six=True).to_six_dict(),
+                "headroom": self.headroom.to_six_dict(),
+                "snapshot_id": str(held["snapshot_id"]),
+                "snapshot_digest": held["snapshot_digest"],
+            }
+        ):
+            raise ResourceAdmissionError("resource_reservation_changed")
+
     async def bind_ready_on_conn(self, conn, *, retry, vm, job_id, generation):
         """Bind one genuine signed-inventory launcher before owner Ready commits.
 

@@ -1,11 +1,13 @@
 import asyncio
 from copy import deepcopy
 import json
+import threading
 from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
 
+from vm_controller import resource_inventory
 from vm_controller.resource_inventory import ResourceInventoryCollector
 from tests.test_vm_resource_placement import node
 from tests.test_infrastructure_metering_pod_normalization import _pod
@@ -75,6 +77,113 @@ def fixture(*, max_items=100, max_bytes=100000):
         collection_timeout_seconds=10,
     )
     return collector, pages, calls
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "stage", ("_document", "normalize_inventory", "canonical_snapshot")
+)
+async def test_cpu_conversion_keeps_controller_event_loop_responsive(
+    monkeypatch, stage,
+):
+    collector, _, _ = fixture()
+    loop = asyncio.get_running_loop()
+    loop_progress = threading.Event()
+    original = getattr(resource_inventory, stage)
+
+    def guarded(*args, **kwargs):
+        if stage == "canonical_snapshot" and not args[0]["complete"]:
+            return original(*args, **kwargs)
+        loop.call_soon_threadsafe(loop_progress.set)
+        if not loop_progress.wait(timeout=2):
+            raise RuntimeError("controller event loop blocked during conversion")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(resource_inventory, stage, guarded)
+    snapshot = await collector.collect(1)
+
+    assert loop_progress.is_set()
+    assert snapshot["complete"] is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ("_document", "normalize_inventory"))
+async def test_cancellation_drains_cpu_conversion_worker(monkeypatch, stage):
+    collector, _, _ = fixture()
+    entered, release, exited = (
+        threading.Event(), threading.Event(), threading.Event()
+    )
+    original = getattr(resource_inventory, stage)
+
+    def blocked(*args, **kwargs):
+        entered.set()
+        try:
+            if not release.wait(timeout=2):
+                raise RuntimeError("conversion worker was not released")
+            return original(*args, **kwargs)
+        finally:
+            exited.set()
+
+    monkeypatch.setattr(resource_inventory, stage, blocked)
+    task = asyncio.create_task(collector.collect(1))
+    try:
+        assert await asyncio.to_thread(entered.wait, 2)
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
+    finally:
+        release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert exited.is_set()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ("_document", "normalize_inventory"))
+@pytest.mark.parametrize("worker_fails", (False, True))
+async def test_repeated_cancellation_drains_conversion_worker(
+    monkeypatch, stage, worker_fails,
+):
+    collector, _, _ = fixture()
+    entered, release, exited = (
+        threading.Event(), threading.Event(), threading.Event()
+    )
+    original = getattr(resource_inventory, stage)
+
+    def blocked(*args, **kwargs):
+        entered.set()
+        try:
+            if not release.wait(timeout=2):
+                raise RuntimeError("conversion worker was not released")
+            if worker_fails:
+                raise RuntimeError("private worker error")
+            return original(*args, **kwargs)
+        finally:
+            exited.set()
+
+    monkeypatch.setattr(resource_inventory, stage, blocked)
+    task = asyncio.create_task(collector.collect(1))
+    loop = asyncio.get_running_loop()
+    try:
+        assert await asyncio.to_thread(entered.wait, 2)
+        task.cancel()
+        # The worker has already entered. This callback is queued after the
+        # cancelled collector wakes, so the first drain await has begun.
+        drain_started = asyncio.Event()
+        loop.call_soon(drain_started.set)
+        await drain_started.wait()
+        assert not task.done()
+
+        task.cancel()
+        second_cancel_delivered = asyncio.Event()
+        loop.call_soon(second_cancel_delivered.set)
+        await second_cancel_delivered.wait()
+        assert not task.done()
+    finally:
+        release.set()
+        assert await asyncio.to_thread(exited.wait, 2)
+    with pytest.raises(asyncio.CancelledError):
+        await task
 
 
 @pytest.mark.asyncio

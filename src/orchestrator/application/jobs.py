@@ -90,6 +90,7 @@ from orchestrator.services.job_admission_scope import (
 from orchestrator.services.job_admission_workspace import (
     JobAdmissionWorkspaceDependencies,
 )
+from orchestrator.services.job_mutation_controls import JobCancelResponse
 
 logger = logging.getLogger(__name__)
 
@@ -640,7 +641,7 @@ async def create_bench_job(
 
 async def cancel_bench_job(
     resources: ApplicationResources, job_id: str, caller: dict[str, Any]
-) -> dict[str, str]:
+) -> JobCancelResponse:
     """Revalidate one run member, then invoke the application control operation."""
 
     job = await resources.postgres_db.get_job(job_id)

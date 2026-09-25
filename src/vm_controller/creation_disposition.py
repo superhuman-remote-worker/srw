@@ -99,6 +99,90 @@ class CreationDisposer:
             raise ValueError("Thread cancellation Lease changed")
         return result
 
+    async def _publish_job_cancel(
+        self, values, *, legacy_intent, expected_uid=None,
+    ):
+        """Convert only the exact signed v1 dummy, preserving its Lease UID."""
+        from shared.vm_creation_job_cancel_carrier import (
+            INTENT_ANNOTATION, SIGNATURE_ANNOTATION, LABEL,
+            carrier_name, seal_cancel_carrier, validate_intent,
+            verify_cancel_carrier,
+        )
+
+        values = validate_intent(values)
+        name = carrier_name(values["admission_id"])
+        lease = await self.actuator.read("lease", name)
+        if lease is None:
+            if expected_uid is not None:
+                raise ValueError("Job cancellation Lease is missing")
+            body = {
+                "apiVersion": "coordination.k8s.io/v1", "kind": "Lease",
+                "metadata": {
+                    "name": name, "namespace": self.actuator.namespace,
+                    "labels": {LABEL: "true"},
+                    "annotations": {INTENT_ANNOTATION: json.dumps(
+                        values, sort_keys=True, separators=(",", ":"),
+                    )},
+                },
+                "spec": {"holderIdentity": values["admission_id"]},
+            }
+            try:
+                lease = document(await asyncio.to_thread(
+                    self.controller.coordination_api.create_namespaced_lease,
+                    namespace=self.actuator.namespace, body=body,
+                ))
+            except Exception:
+                lease = await self.actuator.read("lease", name)
+                if lease is None:
+                    raise
+        metadata = lease["metadata"]
+        if expected_uid is not None and metadata["uid"] != expected_uid:
+            raise ValueError("Job cancellation Lease UID changed")
+        if (
+            metadata.get("deletionTimestamp") is not None
+            or metadata["namespace"] != self.actuator.namespace
+        ):
+            raise ValueError("Job cancellation Lease changed")
+        annotations = metadata.get("annotations") or {}
+        if SIGNATURE_ANNOTATION in annotations:
+            if verify_cancel_carrier(lease, secret=self.actuator.secret) != values:
+                raise ValueError("Job cancellation Lease changed")
+            return lease
+        if CREATION_SIGNATURE_ANNOTATION in annotations:
+            if (
+                expected_uid is not None
+                or verify_creation_carrier(lease, secret=self.actuator.secret)
+                != legacy_intent
+            ):
+                raise ValueError("Legacy Job cancellation Lease changed")
+        elif (
+            annotations.get(INTENT_ANNOTATION) != json.dumps(
+                values, sort_keys=True, separators=(",", ":"),
+            )
+            or metadata.get("labels", {}).get(LABEL) != "true"
+            or lease.get("spec", {}).get("holderIdentity") != values["admission_id"]
+        ):
+            raise ValueError("Job cancellation Lease changed")
+        body = seal_cancel_carrier(
+            values, namespace=self.actuator.namespace, uid=metadata["uid"],
+            resource_version=metadata["resourceVersion"], secret=self.actuator.secret,
+        )
+        try:
+            result = document(await asyncio.to_thread(
+                self.controller.coordination_api.replace_namespaced_lease,
+                name=name, namespace=self.actuator.namespace, body=body,
+            ))
+        except Exception:
+            result = await self.actuator.read("lease", name)
+            if result is None:
+                raise
+        if (
+            result["metadata"]["uid"] != metadata["uid"]
+            or verify_cancel_carrier(result, secret=self.actuator.secret) != values
+        ):
+            raise ValueError("Job cancellation Lease changed")
+        return result
+
     async def run(self, payload):
         identity = validate_disposition_request(payload)
         pending = {
@@ -151,9 +235,47 @@ class CreationDisposer:
                 lease is None or lease["metadata"]["uid"] != row["creation_carrier_uid"]
             ):
                 raise ValueError("Cancellation carrier changed")
-            if row.get("disposition_carrier_uid") and lease is not None:
+            if (
+                row.get("owner_kind") == "thread"
+                and row.get("disposition_carrier_uid") and lease is not None
+            ):
                 raise ValueError("Competing original creation Lease appeared")
             cancel_carrier = False
+            from shared.vm_creation_job_cancel_carrier import (
+                INTENT_ANNOTATION as JOB_INTENT_ANNOTATION,
+                verify_cancel_carrier as verify_job_cancel_carrier,
+            )
+
+            annotations = lease["metadata"].get("annotations", {}) if lease else {}
+            job_v3 = (
+                row.get("owner_kind") != "thread"
+                and row["controller_configuration"].get("version") == 3
+                and row["creation_carrier_uid"] is None
+                and not row["effects"]
+            )
+            legacy_dummy = False
+            if job_v3 and CREATION_SIGNATURE_ANNOTATION in annotations:
+                legacy_dummy = verify_creation_carrier(
+                    lease, secret=self.actuator.secret,
+                )["version"] == 1
+            if job_v3 and (
+                lease is None or JOB_INTENT_ANNOTATION in annotations or legacy_dummy
+            ):
+                prepared = await self.actuator.authority(
+                    "prepare-disposition", request_id=row["request_id"]
+                )
+                if (
+                    prepared.get("actuation_allowed") is not False
+                    or prepared["namespace"] != self.actuator.namespace
+                    or prepared["carrier_intent"].get("kind") != "job_creation_cancel"
+                ):
+                    raise ValueError("Job cancellation authority is unproven")
+                lease = await self._publish_job_cancel(
+                    prepared["carrier_intent"],
+                    legacy_intent=prepared["legacy_intent"],
+                    expected_uid=row.get("disposition_carrier_uid"),
+                )
+                cancel_carrier = "job"
             if lease is None and row.get("owner_kind") == "thread":
                 prepared = await self.actuator.authority(
                     "prepare-disposition", request_id=row["request_id"]
@@ -168,12 +290,17 @@ class CreationDisposer:
                     prepared["carrier_intent"],
                     expected_uid=row.get("disposition_carrier_uid"),
                 )
-                cancel_carrier = True
-            elif lease is None or not lease["metadata"].get("annotations", {}).get(
-                CREATION_SIGNATURE_ANNOTATION
+                cancel_carrier = "thread"
+            elif not cancel_carrier and (
+                lease is None
+                or not lease["metadata"].get("annotations", {}).get(
+                    CREATION_SIGNATURE_ANNOTATION
+                )
             ):
                 if row.get("owner_kind") == "thread":
                     raise ValueError("Original thread creation Lease is unproven")
+                if job_v3:
+                    raise ValueError("Resource-enforced Job Lease is unproven")
                 prepared = await self.actuator.authority(
                     "prepare-disposition", request_id=row["request_id"]
                 )
@@ -185,10 +312,12 @@ class CreationDisposer:
                 lease = await self.actuator.publish(prepared["carrier_intent"])
             if lease["metadata"].get("deletionTimestamp") is not None:
                 raise ValueError("Cancellation carrier is deleting")
-            if cancel_carrier:
+            if cancel_carrier == "thread":
                 from shared.vm_creation_cancel_carrier import verify_cancel_carrier
 
                 values = verify_cancel_carrier(lease, secret=self.actuator.secret)
+            elif cancel_carrier == "job":
+                values = verify_job_cancel_carrier(lease, secret=self.actuator.secret)
             else:
                 values = verify_creation_carrier(lease, secret=self.actuator.secret)
             if (

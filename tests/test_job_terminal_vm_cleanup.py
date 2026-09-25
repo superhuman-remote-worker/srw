@@ -7,7 +7,10 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 
+from orchestrator.routers import job_lifecycle
 from orchestrator.services.job_mutation_controls import (
     JobControlOperations,
     _terminal_vm_needs_release,
@@ -46,6 +49,43 @@ def test_inherited_child_cannot_select_parent_vm_for_terminal_cleanup():
         "context": {"vm": VM, "inherits_parent_workspace": True},
     }
     assert _terminal_vm_needs_release(child) is False
+
+
+def test_http_vm_cancel_serializes_boolean_cleanup_pending():
+    job = {
+        "id": JOB_ID,
+        "status": "processing",
+        "execution_lane": "stateless",
+        "assigned_agent_id": None,
+        "context": {"vm": VM},
+    }
+    store = SimpleNamespace(cancel_stateless_job=AsyncMock(return_value=(True, True)))
+    operation = controls(store=store)
+    access = AsyncMock(return_value=({"id": "caller"}, job))
+    dependencies = job_lifecycle.JobControlRouteDependencies(
+        operations=operation,
+        store=store,
+        require_job_access=access,
+        require_internal_or_job_access=access,
+        require_internal=AsyncMock(),
+    )
+    app = FastAPI()
+    app.include_router(job_lifecycle.router)
+    app.dependency_overrides[job_lifecycle.get_job_control_route_dependencies] = (
+        lambda: dependencies
+    )
+
+    with TestClient(app) as client:
+        response = client.put(f"/api/jobs/{JOB_ID}/cancel")
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "cancelled", "cleanup_pending": True}
+    assert type(response.json()["cleanup_pending"]) is bool
+    schema = app.openapi()["components"]["schemas"]["JobCancelResponse"]
+    assert schema["properties"]["cleanup_pending"]["type"] == "boolean"
+    assert schema["required"] == ["status"]
+    access.assert_awaited_once()
+    store.cancel_stateless_job.assert_awaited_once()
 
 
 @pytest.mark.asyncio

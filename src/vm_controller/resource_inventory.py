@@ -353,18 +353,30 @@ class ResourceInventoryCollector:
         self.kubevirt_namespace = kubevirt_namespace
         self.kubevirt_name = kubevirt_name
 
-    async def _call(self, method, **kwargs):
-        task = asyncio.create_task(asyncio.to_thread(method, **kwargs))
+    async def _run_worker(self, method):
+        task = asyncio.create_task(asyncio.to_thread(method))
         try:
-            return _document(await asyncio.shield(task))
+            return await asyncio.shield(task)
         except asyncio.CancelledError:
-            # The caller must use an observer-owned client with retries=0. Its
-            # bounded HTTP timeout terminates the thread; cancellation alone cannot.
-            try:
-                await task
-            except Exception:
-                pass
+            # Cancellation does not stop an in-flight thread. Drain it before
+            # the observer closes its client or starts another collection.
+            # Shutdown can cancel the observer again while it is draining.
+            while not task.done():
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    pass
+            if not task.cancelled():
+                task.exception()  # Retrieve any worker error; preserve cancellation.
             raise
+
+    async def _call(self, method, **kwargs):
+        def call_and_document():
+            return _document(method(**kwargs))
+
+        return await self._run_worker(call_and_document)
 
     async def _list(self, method, *, deadline, remaining, **kwargs):
         items, tokens, version, token = [], set(), None, None
@@ -493,26 +505,30 @@ class ResourceInventoryCollector:
                 if not isinstance(rv, str) or not rv:
                     raise InventoryError("collection_incomplete")
                 versions["kubevirt"] = rv
-                snapshot["installed_profile"] = normalize_installed_profile(
-                    kubevirt,
-                    namespace=self.kubevirt_namespace,
-                    name=self.kubevirt_name,
+            def finish_snapshot():
+                if self.protocol == 2:
+                    snapshot["installed_profile"] = normalize_installed_profile(
+                        kubevirt,
+                        namespace=self.kubevirt_namespace,
+                        name=self.kubevirt_name,
+                    )
+                snapshot.update(
+                    normalize_inventory(
+                        raw, namespace=self.namespace, label_keys=self.label_keys,
+                        protocol=self.protocol,
+                    )
                 )
-            snapshot.update(
-                normalize_inventory(
-                    raw, namespace=self.namespace, label_keys=self.label_keys,
-                    protocol=self.protocol,
+                snapshot.update(
+                    complete=True,
+                    reason=None,
+                    resource_versions=versions,
+                    finished_at=datetime.now(timezone.utc).isoformat(),
                 )
-            )
-            snapshot.update(
-                complete=True,
-                reason=None,
-                resource_versions=versions,
-                finished_at=datetime.now(timezone.utc).isoformat(),
-            )
-            return canonical_snapshot(
-                snapshot, max_items=self.max_items, max_bytes=self.max_bytes
-            )
+                return canonical_snapshot(
+                    snapshot, max_items=self.max_items, max_bytes=self.max_bytes
+                )
+
+            return await self._run_worker(finish_snapshot)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
