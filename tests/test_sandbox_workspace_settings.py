@@ -129,6 +129,60 @@ def test_policy_from_env_rejects_a_non_list(monkeypatch):
         SandboxImagePolicy.from_env()
 
 
+def test_fuse_enabled_uses_the_provisioners_deny_list(monkeypatch):
+    # WORKSPACE_FUSE_ENABLED must parse exactly like
+    # container_provisioner._env_flag: unset defaults on, a recognized falsy
+    # value turns it off, and anything else (even a typo) stays on.
+    monkeypatch.delenv("WORKSPACE_FUSE_ENABLED", raising=False)
+    assert SandboxImagePolicy.from_env().fuse_enabled is True
+
+    monkeypatch.setenv("WORKSPACE_FUSE_ENABLED", "false")
+    loaded = SandboxImagePolicy.from_env()
+    assert loaded.fuse_enabled is False and loaded.fuse_privileged is False
+
+    monkeypatch.setenv("WORKSPACE_FUSE_ENABLED", "enabled")
+    assert SandboxImagePolicy.from_env().fuse_enabled is True
+
+
+def test_fuse_privileged_off_disables_privilege_but_not_fuse(monkeypatch):
+    monkeypatch.setenv("WORKSPACE_FUSE_ENABLED", "true")
+    monkeypatch.setenv("WORKSPACE_FUSE_PRIVILEGED", "off")
+    loaded = SandboxImagePolicy.from_env()
+    assert loaded.fuse_enabled is True
+    assert loaded.fuse_privileged is False
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [("yes", True), ("enabled", False), (None, False)],
+)
+def test_custom_images_privileged_is_fail_closed(monkeypatch, value, expected):
+    # Unlike the FUSE flags, a garbage WORKSPACE_CUSTOM_IMAGES_PRIVILEGED must
+    # never grant privilege: only a recognized truthy value opts in.
+    if value is None:
+        monkeypatch.delenv("WORKSPACE_CUSTOM_IMAGES_PRIVILEGED", raising=False)
+    else:
+        monkeypatch.setenv("WORKSPACE_CUSTOM_IMAGES_PRIVILEGED", value)
+    assert SandboxImagePolicy.from_env().custom_images_privileged is expected
+
+
+@pytest.mark.parametrize(
+    "fuse_enabled,fuse_privileged",
+    [("true", "true"), ("false", "true"), ("true", "off"), ("enabled", "true")],
+)
+def test_from_env_fuse_matches_the_container_provisioner(
+    monkeypatch, fuse_enabled, fuse_privileged
+):
+    from orchestrator.services.container_provisioner import ContainerProvisioner
+
+    monkeypatch.setenv("WORKSPACE_FUSE_ENABLED", fuse_enabled)
+    monkeypatch.setenv("WORKSPACE_FUSE_PRIVILEGED", fuse_privileged)
+    loaded = SandboxImagePolicy.from_env()
+    provisioner = ContainerProvisioner()
+    assert loaded.fuse_enabled == provisioner._fuse_enabled
+    assert loaded.fuse_privileged == provisioner._fuse_privileged
+
+
 @pytest.mark.asyncio
 async def test_non_uuid_owner_has_no_snapshot():
     assert await resolve_sandbox_settings(object(), "job", "not-a-uuid") == (

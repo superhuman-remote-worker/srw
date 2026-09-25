@@ -27,6 +27,19 @@ DEFAULT_PULL_TIMEOUT_SECONDS = 600
 
 
 def _env_flag(name: str, default: bool) -> bool:
+    # Must stay identical to container_provisioner._env_flag (~:388): a
+    # deny-list, so WORKSPACE_FUSE_ENABLED/WORKSPACE_FUSE_PRIVILEGED parse the
+    # same way here as in the provisioner that actually builds the pod.
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _env_opt_in(name: str, default: bool) -> bool:
+    # Fail-closed: unlike _env_flag, only a recognized truthy value enables
+    # this. A garbage WORKSPACE_CUSTOM_IMAGES_PRIVILEGED must never grant
+    # privilege by accident.
     value = os.environ.get(name)
     if value is None:
         return default
@@ -117,7 +130,7 @@ class SandboxImagePolicy:
             trusted_repositories=frozenset(
                 [image_repository(default_image), *configured]
             ),
-            custom_images_privileged=_env_flag(
+            custom_images_privileged=_env_opt_in(
                 "WORKSPACE_CUSTOM_IMAGES_PRIVILEGED", False
             ),
             fuse_enabled=fuse_enabled,
