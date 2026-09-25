@@ -2124,6 +2124,29 @@ class TestRemoteBackendTmuxFences:
 
         assert seen_at_exec == [(None, True)]
 
+    def test_home_paths_still_resolve_after_the_verification_closed_sftp(self):
+        """The post-shell re-proof runs once per resident kind on one backend.
+
+        Between those calls the cloud mount and overlay managers build their
+        zero scripts from ``resolve_home_path``, whose ``$HOME`` comes from
+        SFTP. Closing the proof's own channel must not take that away.
+        """
+        backend = self._incarnation_backend(token=48)
+        sftp = MagicMock()
+        sftp.normalize.return_value = "/home/agent-host"
+        backend._sftp = sftp
+
+        with (
+            patch.object(backend, "_ensure_connected"),
+            patch.object(backend, "_exec_with_status", return_value=("zero-ok", 0)),
+        ):
+            backend.verify_terminal_claim_resources_retired(":", 30)
+            resolved = backend.resolve_home_path(".cache/srw/rclone/thread")
+            backend.verify_terminal_claim_resources_retired(":", 30)
+
+        assert resolved == "/home/agent-host/.cache/srw/rclone/thread"
+        assert backend._sftp is None
+
     def test_tmux_lock_command_defaults_to_sh_and_rejects_other_shells(self):
         backend = self._incarnation_backend()
 
