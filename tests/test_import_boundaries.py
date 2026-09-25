@@ -124,8 +124,9 @@ def test_allowed_runtime_and_lightweight_dependencies_pass(boundary_tree):
     # 24 since R1.B09 added its contract over control, delivery and retirement;
     # 25 since R1.B10 added session transport, projections and permissions;
     # 26 since R1.B11 added scheduling, reconciliation and task ownership;
-    # 28 since R1.B12 closed the entrypoint and the composition boundary.
-    assert "Contracts: 28 kept, 0 broken" in result.stdout
+    # 28 since R1.B12 closed the entrypoint and the composition boundary;
+    # 29 since R3.2 fenced the session client transport off the runtime.
+    assert "Contracts: 29 kept, 0 broken" in result.stdout
 
 
 @pytest.mark.parametrize(
