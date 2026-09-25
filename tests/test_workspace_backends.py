@@ -2093,6 +2093,34 @@ class TestRemoteBackendTmuxFences:
         assert "exit 81" in command
         assert execute.call_args.kwargs == {"timeout": 29, "retain_tail": True}
 
+    def test_retired_resource_verification_closes_its_own_sftp_before_the_proof(
+        self,
+    ):
+        """The proof's own SFTP server is a non-dumpable same-UID sibling.
+
+        OpenSSH's ``sftp-server`` disables tracing on itself, so the workspace
+        user cannot read its environment and the read-only zero scan correctly
+        refuses (86) beside it. Like the terminate proof in ``shell_cleanup``,
+        the verification closes this backend's SFTP channel first and runs over
+        the still-active transport.
+        """
+        backend = self._incarnation_backend(token=48)
+        sftp = MagicMock()
+        backend._sftp = sftp
+        seen_at_exec = []
+
+        def execute(command, **kwargs):
+            seen_at_exec.append((backend._sftp, sftp.close.called))
+            return "zero-ok", 0
+
+        with (
+            patch.object(backend, "_ensure_connected"),
+            patch.object(backend, "_exec_with_status", side_effect=execute),
+        ):
+            backend.verify_terminal_claim_resources_retired(":", 30)
+
+        assert seen_at_exec == [(None, True)]
+
     def test_tmux_lock_command_defaults_to_sh_and_rejects_other_shells(self):
         backend = self._incarnation_backend()
 
