@@ -2164,6 +2164,7 @@ class ContainerProvisioner:
             seed_configmap=seed_cm,
             stateless_creation_generation=stateless_creation_generation,
             creation_reservation_id=str(_creation_reservation["id"]),
+            profile=_creation_profile,
         )
 
         # Once the durable false->true attempt CAS is submitted, its outcome is
@@ -3184,6 +3185,7 @@ class ContainerProvisioner:
                 pinned_runtime_generation if strict_pinned else None
             ),
             pinned_provision_attempt=(pinned_attempt_id if strict_pinned else None),
+            profile=profile,
         )
 
         # Once the durable false->true attempt CAS is submitted, its outcome is
@@ -11116,6 +11118,25 @@ class ContainerProvisioner:
                             pvc_name=pvc_name,
                             expected_storage_class=resolved_storage_class,
                         )
+                        requests = (
+                            getattr(
+                                getattr(
+                                    getattr(existing, "spec", None), "resources", None
+                                ),
+                                "requests",
+                                None,
+                            )
+                            or {}
+                        )
+                        existing_size = requests.get("storage")
+                        if existing_size is not None and existing_size != size:
+                            logger.warning(
+                                "Reusing PVC %s at %s although %s was requested; "
+                                "existing workspace volumes are never resized.",
+                                pvc_name,
+                                existing_size,
+                                size,
+                            )
                         if (
                             mutation_authority is not None
                             and not await mutation_authority()
@@ -11813,7 +11834,10 @@ class ContainerProvisioner:
         return f"{owner.pod_name}.{self._namespace}.svc.cluster.local"
 
     def _build_workspace_labels(
-        self, owner: WorkspaceOwner, network_tier: str = DEFAULT_NETWORK_TIER
+        self,
+        owner: WorkspaceOwner,
+        network_tier: str = DEFAULT_NETWORK_TIER,
+        image: str | None = None,
     ) -> dict[str, str]:
         labels = {
             "app": "srw-workspace",
@@ -11828,8 +11852,9 @@ class ContainerProvisioner:
         }
         # Phase 2a: build SHA label parity with agent pods. Lets the
         # lifecycle reconciler enumerate stale workspaces by selector
-        # without joining to the jobs table.
-        if ":sha-" in self._workspace_image:
+        # without joining to the jobs table. Only the installation image
+        # carries it: a template's own image is not replaced on rollouts.
+        if ":sha-" in self._workspace_image and image in (None, self._workspace_image):
             labels["srw/build-sha"] = self._workspace_image.rsplit(":sha-", 1)[-1]
         return labels
 
@@ -12936,6 +12961,7 @@ class ContainerProvisioner:
         creation_reservation_id: str | None = None,
         pinned_runtime_generation: str | None = None,
         pinned_provision_attempt: str | None = None,
+        profile: SandboxPodProfile | None = None,
     ) -> dict:
         """Build the Kubernetes Pod manifest for a workspace container.
 
@@ -12950,13 +12976,19 @@ class ContainerProvisioner:
             owner_id=owner.id,
             pod_name=pod_name,
         )
+        fuse_enabled = self._fuse_enabled if profile is None else profile.fuse_enabled
+        fuse_privileged = (
+            self._fuse_privileged if profile is None else profile.fuse_privileged
+        )
         manifest = {
             "apiVersion": "v1",
             "kind": "Pod",
             "metadata": {
                 "name": pod_name,
                 "namespace": self._namespace,
-                "labels": self._build_workspace_labels(owner, network_tier),
+                "labels": self._build_workspace_labels(
+                    owner, network_tier, image=image
+                ),
                 # GC backstop hook: marks the pod as owned by the lifecycle
                 # reconciler so a future K8s TTL/GC controller (or an age
                 # sweep) can reclaim a tail the reconciler missed. Bare pods
@@ -13008,9 +13040,7 @@ class ContainerProvisioner:
                 # management (su to agent-host), but restrict everything else.
                 "securityContext": {
                     "seccompProfile": {
-                        "type": "Unconfined"
-                        if self._fuse_privileged
-                        else "RuntimeDefault"
+                        "type": "Unconfined" if fuse_privileged else "RuntimeDefault"
                     },
                 },
                 "containers": [
@@ -13078,7 +13108,7 @@ class ContainerProvisioner:
                         "securityContext": {
                             "capabilities": {
                                 "drop": ["ALL"],
-                                "add": self._workspace_capabilities(),
+                                "add": self._workspace_capabilities(fuse_enabled),
                             },
                             "allowPrivilegeEscalation": True,
                         },
@@ -13176,8 +13206,8 @@ class ContainerProvisioner:
                     WORKSPACE_PROVISION_GENERATION_LABEL: pinned_runtime_generation,
                 }
             )
-        if self._fuse_enabled:
-            if self._fuse_privileged:
+        if fuse_enabled:
+            if fuse_privileged:
                 manifest["spec"]["containers"][0]["securityContext"]["privileged"] = (
                     True
                 )
@@ -13206,6 +13236,14 @@ class ContainerProvisioner:
                     "name": "code-server-config",
                     "configMap": {"name": seed_configmap, "defaultMode": 0o644},
                 }
+            )
+        workspace_container = manifest["spec"]["containers"][0]
+        if profile is not None and profile.pull_policy:
+            workspace_container["imagePullPolicy"] = profile.pull_policy
+        if profile is not None and profile.storage and not pvc_name:
+            manifest["spec"]["volumes"][0]["emptyDir"]["sizeLimit"] = profile.storage
+            workspace_container["resources"]["requests"]["ephemeral-storage"] = (
+                profile.storage
             )
         return manifest
 
