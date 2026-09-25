@@ -237,7 +237,9 @@ async def container_denies_fuse(store: Any, thread: dict) -> bool:
     )
 
 
-_FAIL_AT_ONCE = frozenset({"InvalidImageName"})
+# ErrImageNeverPull: pullPolicy Never and the node lacks the image; only a
+# node-side action can fix it, so the pull budget would be wasted waiting.
+_FAIL_AT_ONCE = frozenset({"InvalidImageName", "ErrImageNeverPull"})
 _FAIL_AFTER_BUDGET = frozenset(
     {"ErrImagePull", "ImagePullBackOff", "CreateContainerConfigError"}
 )

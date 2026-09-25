@@ -66,6 +66,16 @@ def test_invalid_image_name_fails_at_once():
     assert result.message == PULL_FAILURE
 
 
+def test_a_never_pull_image_missing_from_the_node_fails_at_once():
+    # pullPolicy: Never with the image absent can't resolve without someone
+    # loading the image onto the node, so waiting out the budget is pointless.
+    result = verdict(pod("ErrImageNeverPull", message="not present"))
+    assert result.state == "failed"
+    assert result.message == (
+        f"Workspace image {IMAGE} could not be pulled: ErrImageNeverPull (not present)"
+    )
+
+
 def test_backoff_is_pulling_until_the_budget_then_fails():
     assert verdict(pod("ImagePullBackOff", age_seconds=30)).state == "pulling"
     assert verdict(pod("ImagePullBackOff", age_seconds=601)).state == "failed"
@@ -206,6 +216,23 @@ async def test_strict_stateless_creation_publishes_no_projection():
         {"id": "r"},
         WorkspaceImagePullError("x"),
         strict_stateless=True,
+    )
+    provisioner._set_context.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_session_creation_never_gets_an_error_projection():
+    # Sessions only log in A1 (spec refinement 1), even on a non-strict path.
+    provisioner = ContainerProvisioner()
+    provisioner._workspace_creation_reservation_is_current = AsyncMock(
+        return_value=True
+    )
+    provisioner._set_context = AsyncMock(return_value=True)
+    await provisioner._record_creation_diagnostic(
+        WorkspaceOwner.session("66666666-7777-4888-8999-aaaaaaaaaaaa"),
+        {"id": "r"},
+        WorkspaceImagePullError("x"),
+        strict_stateless=False,
     )
     provisioner._set_context.assert_not_awaited()
 

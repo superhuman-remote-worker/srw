@@ -14029,16 +14029,18 @@ class ContainerProvisioner:
         """Give a Job its pull or admission error; never a lifecycle projection.
 
         Only ``error`` is written, and only while this reservation is current.
-        Strict stateless creations keep their ambiguity rules: they log only.
-        Best effort: it runs inside the creation's failure handler, so it never
-        raises there.
+        Sessions log only (A1 refinement 1), and strict stateless creations
+        keep their ambiguity rules. Best effort: it runs inside the creation's
+        failure handler, so it never raises there.
         """
+        if owner.kind != "job" or strict_stateless:
+            return
         message = (
             str(exc)
             if isinstance(exc, WorkspaceImagePullError)
             else pod_admission_rejection(exc)
         )
-        if message is None or strict_stateless:
+        if message is None:
             return
         try:
             current = await self._workspace_creation_reservation_is_current(
