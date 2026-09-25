@@ -2073,9 +2073,12 @@ class TestRemoteBackendTmuxFences:
 
     def test_retired_resource_verification_uses_bash_for_zero_script(self):
         backend = self._incarnation_backend(token=48)
-        with patch.object(
-            backend, "_exec_with_status", return_value=("zero-ok", 0)
-        ) as execute:
+        with (
+            patch.object(backend, "_ensure_connected"),
+            patch.object(
+                backend, "_exec_with_status", return_value=("zero-ok", 0)
+            ) as execute,
+        ):
             assert (
                 backend.verify_terminal_claim_resources_retired(
                     "set -euo pipefail\nprintf '__SRW_RESOURCE_ZERO__\\n'",

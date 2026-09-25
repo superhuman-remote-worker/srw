@@ -1338,6 +1338,7 @@ __SRW_WORKSPACE_UID_ZERO_PY__
                 )
             inner = self._stateless_retired_resource_fence_shell() + command
             with self._shell_io_lock:
+                self._close_sftp_before_process_zero_proof()
                 output, exit_code = self._exec_with_status(
                     self._tmux_lock_command(inner, shell="bash"),
                     timeout=timeout,
@@ -2708,6 +2709,25 @@ __SRW_WORKSPACE_UID_ZERO_PY__
             + self._stateless_terminal_process_zero_shell(terminate=False)
         )
 
+    def _close_sftp_before_process_zero_proof(self) -> None:
+        """Close this backend's own SFTP channel before a process-zero proof.
+
+        The stateless process-zero scan intentionally refuses unreadable
+        same-UID processes. ``connect()`` opens an SFTP subsystem whose server
+        is a sibling of the exec channel, not an ancestor the scan can
+        exclude, and OpenSSH's ``sftp-server`` makes itself non-dumpable, so
+        the workspace user cannot inspect it. Close this terminal backend's
+        own writer channel before opening the proof exec; the still-active
+        SSH transport is sufficient for that exec and ``_ensure_connected()``
+        will not recreate SFTP.
+        """
+        self._ensure_connected()
+        with self._sftp_lock:
+            sftp = self._sftp
+            self._sftp = None
+            if sftp is not None:
+                sftp.close()
+
     def _tmux_exec_checked(
         self,
         command: str,
@@ -2734,19 +2754,7 @@ __SRW_WORKSPACE_UID_ZERO_PY__
                     "Remote shell owner has been retired from this backend"
                 )
             if close_sftp:
-                # The final stateless process-zero scan intentionally refuses
-                # unreadable same-UID processes. ``connect()`` opens an SFTP
-                # subsystem whose server is a sibling of the exec channel,
-                # not an ancestor the scan can exclude. Close this terminal
-                # backend's own writer channel before opening the proof exec;
-                # the still-active SSH transport is sufficient for that exec
-                # and `_ensure_connected()` will not recreate SFTP.
-                self._ensure_connected()
-                with self._sftp_lock:
-                    sftp = self._sftp
-                    self._sftp = None
-                    if sftp is not None:
-                        sftp.close()
+                self._close_sftp_before_process_zero_proof()
             # tmux completion sentinels and the attested prompt live at the end
             # of capture-pane output. Keep a bounded tail so scrollback over the
             # generic 5 MiB SSH cap cannot make a finished command look busy.
