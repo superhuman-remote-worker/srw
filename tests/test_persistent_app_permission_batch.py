@@ -1017,7 +1017,7 @@ async def _terminate(reason: str = "rest_detach", **kwargs):
         patch.object(pa, "_stop_watchdogs", MagicMock()),
         patch.object(pa, "_stop_thread_control_watcher", AsyncMock()),
         patch.object(pa, "_stop_thread_interrupt_watcher", AsyncMock()),
-        patch.object(pa, "_clear_all_canvas_awareness", MagicMock()),
+        patch.object(pa._canvas_control, "clear_all", MagicMock()),
         patch.object(pa, "_loop_task", None),
         patch.object(pa, "_event_writer", None),
         patch.object(pa, "_max_sessions_per_process", 0),

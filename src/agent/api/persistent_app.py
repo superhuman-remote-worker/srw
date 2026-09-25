@@ -9,14 +9,12 @@ Connect with: websocat ws://localhost:8001/ws/chat
 
 import asyncio
 import hashlib
-import hmac
 import inspect
 import json
 import logging
 import contextlib
 import os
 import socket
-import re
 import time
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
@@ -36,11 +34,35 @@ from typing import (
 from uuid import UUID, uuid4
 
 import httpx
-from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, WebSocket
 from fastapi.responses import JSONResponse
 
 from agent.api import session_transport as _session_transport
-from agent.api._session_auth import validate_session_token as _validate_session_token
+from agent.api._session_auth import SessionAuthBindings
+from agent.api.session_canvas_control import CanvasControlChannel
+from agent.api.session_contract import (
+    AcceptedInput,
+    DurableInputUnavailable,
+    ProtectedCloudUnavailable,
+    SessionIdentityMismatch,
+    SessionOperations,
+    SessionRuntimeView,
+    TerminationAdmissionClosed,
+    WorkspaceNotReady,
+    canonical_session_identity_fingerprint,
+)
+from agent.api.session_http import (
+    SessionHttpPorts,
+    register_session_http_routes,
+    stateless_rejection,
+)
+from agent.api.session_websocket import (
+    SessionConnectionPorts,
+    SessionSocketCommands,
+    SessionSocketPorts,
+    SessionWelcomePorts,
+    register_session_websocket_routes,
+)
 from agent.api.models import PinnedSessionRecipient, pinned_session_recipient_matches
 from agent.api.orchestrator_client import (
     DuplicateThreadBinding,
@@ -564,8 +586,9 @@ _vm_upgrade_poll_timeout: int = int(os.environ.get("VM_UPGRADE_POLL_TIMEOUT", "9
 # be sent directly to a single WebSocket scoped to ws_chat. Under headless
 # semantics the loop must outlive any single WS attach, so the loop instead
 # broadcasts via _broadcast() and each WebSocket connection registers its own
-# queue via _subscribe(). A _run_subscriber_pump task drains each queue into
-# its WS. Closing a WS just calls _unsubscribe() — the loop keeps running.
+# queue via _subscribe(). The session WebSocket transport runs one pump per
+# connection that drains its queue into its WS. Closing a WS just calls
+# _unsubscribe() — the loop keeps running.
 #
 # Keyed by client_id (generated server-side per WS connection). Bounded queue
 # protects the loop from a slow consumer: on overflow the oldest frame is
@@ -573,30 +596,16 @@ _vm_upgrade_poll_timeout: int = int(os.environ.get("VM_UPGRADE_POLL_TIMEOUT", "9
 _SUBSCRIBER_QUEUE_MAXSIZE: int = 1000
 _subscribers: Dict[str, asyncio.Queue] = {}
 
-_CANVAS_AWARENESS_TTL_S: float = max(
-    15.0, min(60.0, float(os.environ.get("CANVAS_AWARENESS_TTL_S", "15")))
+# Canvas control/awareness state for connected clients. One channel per
+# process, like the subscriber registry; attach/terminate clear it across the
+# session boundary and each disconnect releases only its own lease.
+_canvas_control = CanvasControlChannel(
+    load_state=lambda: _current_canvas_for_control(),
+    invalidate_recent_read=lambda path: _invalidate_session_recent_read(path),
+    identity_fingerprint=lambda: _current_pinned_session_identity_fingerprint(),
+    broadcast=lambda method, params: _broadcast(method, params),
+    fan_out_live=lambda frame: _fan_out_live_frame(frame),
 )
-_CANVAS_CONTROL_VALIDATION_MIN_INTERVAL_S = 0.5
-_CANVAS_AWARENESS_RENEW_MIN_INTERVAL_S = 1.0
-
-
-@dataclass(frozen=True)
-class _CanvasAwarenessLease:
-    task: asyncio.Task
-    params: Dict[str, Any]
-    renewed_at: float
-    validated_at: float
-
-
-_canvas_awareness: Dict[str, _CanvasAwarenessLease] = {}
-_canvas_control_validation_at: Dict[tuple[str, str], float] = {}
-_canvas_source_updates: Dict[str, tuple[str, int, str]] = {}
-_canvas_presentation_updates: Dict[str, int] = {}
-
-# Idle keepalive on the control WS (see _run_subscriber_pump). Must be
-# shorter than the cockpit's CONTROL_WS_WATCHDOG_TIMEOUT_MS and any
-# edge/tunnel idle timeout on the WS path.
-_WS_PING_INTERVAL_S: float = 20.0
 
 # Loop-facing input primitives. Used to be closure-scoped inside ws_chat;
 # hoisted to module level so they survive WS reconnect. All three are reset
@@ -936,20 +945,6 @@ _NOTIFICATION_METHODS = frozenset(
     }
 )
 
-# Roles POST /api/input may request. 'human' is the normal path; 'event' is a
-# system-injected notice (currently: a worker job this session created reached a
-# terminal state — knowledge-base/knowledge/features/session_wake_on_job_completion.md).
-#
-# An allow-list rather than a passthrough because ordinary /api/input is an
-# internal orchestrator effect endpoint rather than a browser-token endpoint.
-# Durable events must name the exact runtime fingerprint and also require the
-# existing internal transport key below. Human requests that carry the new
-# fingerprint are fenced identically; the missing-field compatibility branch
-# remains only until the orchestrator forwarding cutover is atomic. An
-# arbitrary role would let anything that can reach the pod forge 'ai' or
-# 'system' rows.
-_ACCEPTED_INPUT_ROLES = frozenset({"human", "event"})
-
 
 def _stateless_mode() -> bool:
     """True when this process runs as the M3 stateless turn executor.
@@ -1010,38 +1005,6 @@ async def _safe_mark_stateless_natural_pause(*, require_untethered: bool) -> boo
             exc,
         )
         return False
-
-
-def _stateless_reject() -> JSONResponse:
-    """409 for direct-session verbs on a stateless executor pod."""
-    return JSONResponse(
-        {
-            "error": (
-                "stateless executor: this pod serves queued turns from the "
-                "run_queue (threads.execution_lane='stateless'); direct "
-                "session attach/input is not accepted here"
-            )
-        },
-        status_code=409,
-    )
-
-
-class WorkspaceNotReady(RuntimeError):
-    """The session's workspace container never became ready in time.
-
-    Subclasses RuntimeError so existing ``except RuntimeError`` handlers (e.g.
-    the pool-mode /session/attach path) keep catching it, while the lifespan
-    startup can catch it specifically to exit cleanly instead of crash-looping.
-    """
-
-
-class ProtectedCloudUnavailable(WorkspaceNotReady):
-    """A protected attach cannot prove its lower+overlay delivery contract.
-
-    This is terminal for the current attach.  Retrying a partially described
-    protected payload as an ordinary workspace would expose credentials and
-    tools before the review boundary exists, so callers must fail closed.
-    """
 
 
 _PROTECTED_CLOUD_SAFE_ERROR_CODES = frozenset(
@@ -1653,20 +1616,6 @@ async def _wait_for_termination_quiescence(timeout_seconds: float) -> bool:
     return True
 
 
-def _termination_rejection() -> JSONResponse:
-    """Stable, base64/secret-free retry contract for direct injectors."""
-
-    return JSONResponse(
-        {
-            "error": "runtime_terminating",
-            "retryable": True,
-            "message": "Persistent runtime is terminating; retry on its replacement.",
-        },
-        status_code=503,
-        headers={"Retry-After": "5"},
-    )
-
-
 def _protected_cloud_runtime_ready() -> bool:
     """Fail-closed runtime check shared by input, provider and tool gates."""
 
@@ -1688,18 +1637,6 @@ def _runtime_input_admission_open() -> bool:
     return not _runtime_admission_closed() and _protected_cloud_runtime_ready()
 
 
-def _protected_cloud_unavailable_rejection() -> JSONResponse:
-    return JSONResponse(
-        {
-            "error": "protected_cloud_unavailable",
-            "retryable": True,
-            "message": "Protected cloud is temporarily unavailable; retry when it recovers.",
-        },
-        status_code=503,
-        headers={"Retry-After": "5"},
-    )
-
-
 def _current_pinned_session_identity_fingerprint() -> str | None:
     """Return the exact local identity used by readiness and effect gates."""
 
@@ -1712,18 +1649,6 @@ def _current_pinned_session_identity_fingerprint() -> str | None:
     )
 
 
-def _canonical_pinned_session_identity_fingerprint(value: Any) -> str | None:
-    """Return one exact v1 fingerprint, never a normalised lookalike."""
-
-    if not isinstance(value, str) or not (
-        value.startswith("sha256:")
-        and len(value) == 71
-        and all(char in "0123456789abcdef" for char in value[7:])
-    ):
-        return None
-    return value
-
-
 def _session_ready() -> bool:
     """True when the persistent session is fully attached and the loop
     primitives are ready to accept a WS subscriber.
@@ -1733,7 +1658,7 @@ def _session_ready() -> bool:
     later in ``_attach_session`` (after repo clone, cloud sync pull, message
     restore, and the ``thread_status='active'`` DB update). Anything that
     gates session readiness — the readiness probes (``/ready``,
-    ``/session/status``) and ``handle_persistent_websocket`` — must call
+    ``/session/status``) and the session WebSocket transport — must call
     this so the WS isn't accepted in the mid-attach window where the loop's
     get-user-input callback would crash on a ``None`` queue.
     """
@@ -3831,7 +3756,7 @@ async def _cleanup_failed_event_journal_attach(
     _clear_attached_runtime_identity()
     _clear_attached_runtime_actor()
     _queued_input_claims.clear()
-    _clear_all_canvas_awareness()
+    _canvas_control.clear_all()
     _subscribers.clear()
     from agent.tools.registry import register_mcp_tools
 
@@ -4108,7 +4033,7 @@ async def _attach_session_inner(
             )
         ),
     )
-    _clear_all_canvas_awareness()
+    _canvas_control.clear_all()
 
     if _session is not None:
         raise RuntimeError(
@@ -5869,7 +5794,7 @@ async def _terminate_session_inner(
     )
     _queued_input_claims.clear()
     _draft_title_value = None
-    _clear_all_canvas_awareness()
+    _canvas_control.clear_all()
     _subscribers.clear()
 
     # Phase 2 event-log cursor reset. The next session attach reads the
@@ -6131,6 +6056,113 @@ async def _admit_pool_session_attach(request: Dict[str, Any]) -> JSONResponse:
     return JSONResponse({"status": "attaching", "thread_id": thread_id})
 
 
+@dataclass(frozen=True, slots=True)
+class SessionTransportBindings:
+    """The session client transport's ports over this process's runtime."""
+
+    auth: SessionAuthBindings
+    http: SessionHttpPorts
+    socket: SessionSocketPorts
+
+
+def _attached_session_thread_id() -> str:
+    """The attached session's own thread, for pool pods without an env binding."""
+
+    session = _session
+    if session is None:
+        return ""
+    return str(getattr(session, "thread_id", "") or "")
+
+
+def _welcome_running_tool(session: Any) -> Optional[Dict[str, Any]]:
+    """The tool call this session's loop is blocked in right now, if any."""
+
+    running_tool = inflight_tool_call(session.messages) if _tool_inflight else None
+    if running_tool is None:
+        return None
+    return {
+        "id": running_tool["id"],
+        "tool": running_tool["tool"],
+        "args": _safe_serialize(running_tool["args"]),
+    }
+
+
+def session_transport_bindings() -> SessionTransportBindings:
+    """Bind the session client transport to this process's runtime.
+
+    Persistent and dual applications register the transport routes from these
+    ports. Every provider and operation resolves this module's state or owner
+    function when it is called, never when it is bound: the attached session,
+    its identity and the stateless lease change across attach, replacement and
+    retirement, and a binding that captured them would authorize a stale
+    client against a successor. Operations pass their arguments through
+    unchanged. Admission, the loop, interrupts, permissions, commands and the
+    subscriber registry remain owned here (R3.3); only the binding lives in
+    this factory until R3.4 composes the runtime explicitly.
+    """
+
+    runtime = SessionRuntimeView(
+        stateless_mode=lambda: _stateless_mode(),
+        session=lambda: _session,
+        thread_id=lambda: _thread_id,
+        identity_fingerprint=lambda: _current_pinned_session_identity_fingerprint(),
+        runtime_admission_closed=lambda: _runtime_admission_closed(),
+        retirement_admission_closed=lambda: _retirement_admission_closed(),
+        protected_cloud_ready=lambda: _protected_cloud_runtime_ready(),
+        session_ready=lambda: _session_ready(),
+        input_queue=lambda: _loop_user_queue,
+        turn_open=lambda: _turn_event_open,
+        tool_inflight=lambda: _tool_inflight,
+    )
+    operations = SessionOperations(
+        ensure_loop_started=lambda *args, **kwargs: _ensure_persistent_loop_started(
+            *args, **kwargs
+        ),
+        accept_input=lambda *args, **kwargs: _accept_user_input(*args, **kwargs),
+        signal_interrupt=lambda *args, **kwargs: _signal_interrupt_for_turn(
+            *args, **kwargs
+        ),
+        resolve_permission=lambda *args, **kwargs: _resolve_pending_permission(
+            *args, **kwargs
+        ),
+    )
+    return SessionTransportBindings(
+        auth=SessionAuthBindings(
+            attached_thread_id=lambda: _attached_session_thread_id(),
+            identity_fingerprint=lambda: _current_pinned_session_identity_fingerprint(),
+        ),
+        http=SessionHttpPorts(runtime=runtime, operations=operations),
+        socket=SessionSocketPorts(
+            runtime=runtime,
+            operations=operations,
+            connection=SessionConnectionPorts(
+                subscribe=lambda client_id: _subscribe(client_id),
+                unsubscribe=lambda client_id: _unsubscribe(client_id),
+                note_connection_arrived=lambda: _signal_ws_connected(),
+                track_side_task=lambda task: _track_session_side_task(task),
+            ),
+            welcome=SessionWelcomePorts(
+                durable_control_modes=lambda: _durable_session_control_modes(),
+                pending_permissions=lambda: _pending_permission_requests(),
+                running_tool=lambda session: _welcome_running_tool(session),
+            ),
+            commands=SessionSocketCommands(
+                config_update=lambda *args, **kwargs: _handle_config_update(
+                    *args, **kwargs
+                ),
+                compact=lambda *args, **kwargs: _handle_compact(*args, **kwargs),
+                archive=lambda ws: _handle_archive(ws),
+                vm_upgrade=lambda ws: _handle_vm_upgrade(ws),
+                workspace_upgrade=lambda ws, target_tier: _handle_workspace_upgrade(
+                    ws, target_tier
+                ),
+                rewind=lambda ws, data: _handle_rewind(ws, data),
+            ),
+            canvas=_canvas_control,
+        ),
+    )
+
+
 def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> FastAPI:
     """Create the persistent-mode FastAPI application.
 
@@ -6282,7 +6314,7 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
     async def recipient_bound_session_status(request: dict = {}):
         """Report turn state only for this exact pinned runtime identity."""
 
-        expected = _canonical_pinned_session_identity_fingerprint(
+        expected = canonical_session_identity_fingerprint(
             request.get("session_identity_fingerprint")
             if isinstance(request, dict)
             else None
@@ -6336,7 +6368,7 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
         if _stateless_mode():
             # The executor owns attach/detach on this pod — an out-of-band
             # attach would corrupt its session cache and run outside a lease.
-            return _stateless_reject()
+            return stateless_rejection()
         return await _admit_pool_session_attach(request)
 
     @app.post("/session/detach")
@@ -6349,8 +6381,8 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
         if _stateless_mode():
             # A detach mid-lease would kill a claimed turn out-of-band; the
             # executor detaches its own cached session between claims.
-            return _stateless_reject()
-        expected = _canonical_pinned_session_identity_fingerprint(
+            return stateless_rejection()
+        expected = canonical_session_identity_fingerprint(
             request.get("session_identity_fingerprint")
             if isinstance(request, dict)
             else None
@@ -6471,100 +6503,15 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
                 status_code=500,
             )
 
-    # --- Headless REST input endpoints (phase 2) ---
+    # --- Session client transport: REST input verbs and the session socket ---
     #
-    # Counterparts to the WS-receive-loop methods, exposed so the orchestrator's
-    # SSE-based clients (cockpit chunk 3, MCP, curl) can drive the session
-    # without a WebSocket. The orchestrator forwards from
-    # POST /api/threads/{id}/{input,interrupt,approve/{approval_id}}.
-
-    @app.post("/api/input")
-    async def api_input(request: Request):
-        return await handle_api_input(request)
-
-    @app.post("/api/interrupt")
-    async def api_interrupt(request: Request):
-        return await handle_api_interrupt(request)
-
-    @app.post("/api/approve")
-    async def api_approve(request: Request):
-        return await handle_api_approve(request)
-
-    # --- WebSocket endpoint ---
-
-    @app.websocket("/ws/chat")
-    async def ws_chat(ws: WebSocket):
-        # Validate the session JWT carried as ?t={token}.
-        if not await _validate_session_token(ws):
-            return
-        await handle_persistent_websocket(ws)
-
-    # External path the per-session Ingress routes to (the cockpit dials
-    # wss://api.<domain>/p/<thread_id>/ws?t=<jwt>). The {thread_id} path param
-    # is unused — the bound thread is enforced by _validate_session_token
-    # against SESSION_BOUND_THREAD_ID + the JWT's tid claim.
-    @app.websocket("/p/{thread_id}/ws")
-    async def ws_session(ws: WebSocket, thread_id: str):
-        if not await _validate_session_token(ws):
-            return
-        await handle_persistent_websocket(ws)
+    # The transport owners parse, authenticate and map refusals; this runtime
+    # keeps admission, interrupts, permissions and the loop behind the ports.
+    transport = session_transport_bindings()
+    register_session_http_routes(app, transport.http)
+    register_session_websocket_routes(app, auth=transport.auth, ports=transport.socket)
 
     return app
-
-
-# --- REST handlers (module-level so dual_app can call them too) ---
-#
-# Reached from both:
-#   - persistent_app.create_persistent_app()'s /api/{input,interrupt,approve}
-#     routes (pure persistent mode, agent.py --mode persistent).
-#   - dual_app.create_dual_app() routes (dual mode — adds pod-state pre-check
-#     then delegates here).
-#
-# Mirror of the /ws/chat consolidation; same rationale, see
-# knowledge-base/knowledge/issues/persistent_session_dual_mode_phase1_gap.md.
-
-
-class TerminationAdmissionClosed(RuntimeError):
-    """Input reached the runtime after its termination fence closed."""
-
-
-class DurableInputUnavailable(RuntimeError):
-    """A retry-stable event could not establish its durable inbox row."""
-
-
-class SessionIdentityMismatch(RuntimeError):
-    """Input was addressed to a different pinned runtime incarnation."""
-
-
-@dataclass(frozen=True, slots=True)
-class AcceptedInput:
-    message_id: str
-    delivery_id: str
-    delivery_state: str
-    claim_generation: int
-    enqueued: bool
-    duplicate: bool = False
-    deferred: bool = False
-
-
-def _accepted_input_payload(admission: AcceptedInput) -> dict[str, Any]:
-    """Serialize one durable input acknowledgement across REST and WS.
-
-    Once the transcript+delivery transaction commits, the input belongs to
-    the durable inbox.  In particular, ``deferred`` means the successor will
-    reclaim it; telling an uncorrelated WebSocket client to retry would mint a
-    second delivery identity and could buy a second turn.
-    """
-
-    return {
-        "accepted": True,
-        "message_id": admission.message_id,
-        "duplicate": admission.duplicate,
-        "deferred": admission.deferred,
-        "retryable": False,
-        "delivery_id": admission.delivery_id,
-        "delivery_state": admission.delivery_state,
-    }
 
 
 def _pinned_input_runtime_identity() -> tuple[str, str, str, str]:
@@ -7133,131 +7080,6 @@ async def _accept_user_input(
     )
 
 
-async def handle_api_input(request: Request) -> JSONResponse:
-    """Push user input onto the loop's queue. Body: {content, role?, turn_id?}.
-
-    ``role`` defaults to 'human'. The orchestrator sends ``role='event'`` when
-    injecting a system notice (a worker job the session created finished) so the
-    persisted row does not render as a user bubble.
-
-    Before persistence, a 503 tells either caller to retry. After the durable
-    transaction commits, both human and event inputs receive an accepted 202
-    with their exact delivery state. The orchestrator interprets that as
-    persisted-not-executed and retains its stable-identity outbox claim; an
-    uncorrelated human client must not submit a second input.
-    """
-    if _stateless_mode():
-        return _stateless_reject()
-    if _runtime_admission_closed():
-        return _termination_rejection()
-    if _session is not None and not _protected_cloud_runtime_ready():
-        return _protected_cloud_unavailable_rejection()
-    if _session is None or _loop_user_queue is None:
-        return JSONResponse({"error": "Session not active"}, status_code=503)
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse({"error": "invalid JSON"}, status_code=400)
-    content = body.get("content", "")
-    if not isinstance(content, str) or not content:
-        return JSONResponse(
-            {"error": "content must be a non-empty string"},
-            status_code=400,
-        )
-    role = body.get("role") or "human"
-    if role not in _ACCEPTED_INPUT_ROLES:
-        return JSONResponse(
-            {"error": f"role must be one of {sorted(_ACCEPTED_INPUT_ROLES)}"},
-            status_code=400,
-        )
-    delivery_id = body.get("delivery_id")
-    expected_session_identity_fingerprint = body.get("session_identity_fingerprint")
-    if role == "event":
-        import uuid as _uuid
-
-        if delivery_id is None:
-            return JSONResponse(
-                {"error": "durable event input requires a delivery_id"},
-                status_code=400,
-            )
-        expected_key = os.environ.get("MCP_INTERNAL_KEY", "")
-        presented_key = request.headers.get("X-Internal-Key", "")
-        if not expected_key or not hmac.compare_digest(expected_key, presented_key):
-            # The identity links an outbox row to its one paid turn. It is
-            # server-owned authority, not an unauthenticated dedup hint.
-            return JSONResponse(
-                {"error": "durable event delivery requires internal authority"},
-                status_code=403,
-            )
-        try:
-            delivery_id = str(_uuid.UUID(str(delivery_id)))
-        except (ValueError, TypeError, AttributeError):
-            return JSONResponse(
-                {"error": "delivery_id must be a UUID"}, status_code=400
-            )
-    elif delivery_id is not None:
-        return JSONResponse(
-            {"error": "delivery_id is reserved for durable event input"},
-            status_code=400,
-        )
-    expected_session_identity_fingerprint = (
-        _canonical_pinned_session_identity_fingerprint(
-            expected_session_identity_fingerprint
-        )
-    )
-    if (
-        expected_session_identity_fingerprint is None
-        or _current_pinned_session_identity_fingerprint()
-        != expected_session_identity_fingerprint
-    ):
-        return JSONResponse(
-            {"error": "session_identity_mismatch", "retryable": True},
-            status_code=409,
-        )
-    if not _ensure_persistent_loop_started("rest_input"):
-        if _runtime_admission_closed():
-            return _termination_rejection()
-        return JSONResponse({"error": "Session not ready"}, status_code=503)
-    try:
-        admission = await _accept_user_input(
-            content,
-            role=role,
-            delivery_id=delivery_id,
-            expected_session_identity_fingerprint=expected_session_identity_fingerprint,
-        )
-    except TerminationAdmissionClosed:
-        return _termination_rejection()
-    except ProtectedCloudUnavailable:
-        return _protected_cloud_unavailable_rejection()
-    except DurableInputUnavailable:
-        return JSONResponse(
-            {
-                "error": "durable_input_unavailable",
-                "retryable": True,
-                "message": "Durable input admission is temporarily unavailable.",
-            },
-            status_code=503,
-            headers={"Retry-After": "5"},
-        )
-    except SessionIdentityMismatch:
-        return JSONResponse(
-            {"error": "session_identity_mismatch", "retryable": True},
-            status_code=409,
-        )
-    return JSONResponse(
-        {
-            **_accepted_input_payload(admission),
-            "turn_id": _session.turn_count,
-            "queue_depth": _loop_user_queue.qsize(),
-        },
-        status_code=(
-            200
-            if admission.delivery_state in {"admitted", "settled", "cancelled"}
-            else 202
-        ),
-    )
-
-
 def _clear_loop_interrupt(*, target_turn_id: int | None = None) -> bool:
     """Clear one pending interrupt without crossing a turn boundary.
 
@@ -7314,692 +7136,6 @@ def _signal_interrupt_for_turn(
     return mode
 
 
-async def handle_api_interrupt(request: Optional[Request] = None) -> JSONResponse:
-    """Signal the pinned loop, optionally fenced to a correlated turn.
-
-    Every HTTP call must carry the exact pinned-session fingerprint.  After
-    removing that identity field, an otherwise-empty body retains the legacy
-    active-turn behavior. New orchestrator forwarding may additionally supply
-    ``client_request_id`` and ``target_turn_id``; those calls are rejected
-    before any RAM mutation unless the exact transcript turn is active.
-    Stateless pods consume the durable inbox instead of this direct route.
-    """
-
-    if _stateless_mode():
-        return _stateless_reject()
-    if _session is None:
-        return JSONResponse({"error": "Session not active"}, status_code=503)
-
-    parsed_body: Dict[str, Any] = {}
-    if request is not None:
-        raw = await request.body()
-        if raw:
-            try:
-                parsed = json.loads(raw)
-            except (TypeError, ValueError):
-                return JSONResponse(
-                    {"error": "invalid JSON", "error_code": "invalid_request"},
-                    status_code=400,
-                )
-            if not isinstance(parsed, dict):
-                return JSONResponse(
-                    {
-                        "error": "body must be a JSON object",
-                        "error_code": "invalid_request",
-                    },
-                    status_code=400,
-                )
-            parsed_body = parsed
-
-    expected_session_identity_fingerprint = (
-        _canonical_pinned_session_identity_fingerprint(
-            parsed_body.get("session_identity_fingerprint")
-        )
-    )
-    if (
-        expected_session_identity_fingerprint is None
-        or _current_pinned_session_identity_fingerprint()
-        != expected_session_identity_fingerprint
-    ):
-        return JSONResponse(
-            {"error": "session_identity_mismatch", "retryable": True},
-            status_code=409,
-        )
-
-    body = dict(parsed_body)
-    body.pop("session_identity_fingerprint", None)
-    if not body:
-        # Legacy clients omitted a turn identity. Scope the exact-runtime
-        # request to the concrete active turn observed now; an idle request
-        # must never arm the next input.
-        target_turn_id = int(_session.turn_count)
-        mode = _signal_interrupt_for_turn(target_turn_id)
-        if mode is None:
-            return JSONResponse(
-                {
-                    "ack": False,
-                    "applied": False,
-                    "target_turn_id": target_turn_id,
-                    "error": "target turn is no longer active",
-                    "error_code": "target_turn_not_active",
-                },
-                status_code=409,
-            )
-        logger.info(
-            "Interrupt received via legacy REST "
-            "(target_turn=%d mode=%s tool_inflight=%s)",
-            target_turn_id,
-            mode,
-            _tool_inflight,
-        )
-        return JSONResponse(
-            {
-                "ack": True,
-                "applied": True,
-                "target_turn_id": target_turn_id,
-                "mode": mode,
-            }
-        )
-
-    client_request_id = body.get("client_request_id")
-    target_turn_id = body.get("target_turn_id")
-    if not isinstance(client_request_id, str) or not client_request_id:
-        return JSONResponse(
-            {
-                "error": "client_request_id must be a non-empty string",
-                "error_code": "invalid_request",
-            },
-            status_code=400,
-        )
-    if (
-        isinstance(target_turn_id, bool)
-        or not isinstance(target_turn_id, int)
-        or target_turn_id < 1
-    ):
-        return JSONResponse(
-            {
-                "error": "target_turn_id must be a positive integer",
-                "error_code": "invalid_request",
-            },
-            status_code=400,
-        )
-
-    response: Dict[str, Any] = {
-        "client_request_id": client_request_id,
-        "target_turn_id": target_turn_id,
-    }
-    request_id = body.get("request_id")
-    if request_id is not None:
-        if not isinstance(request_id, str) or not request_id:
-            return JSONResponse(
-                {
-                    "error": "request_id must be a non-empty string",
-                    "error_code": "invalid_request",
-                },
-                status_code=400,
-            )
-        response["request_id"] = request_id
-
-    mode = _signal_interrupt_for_turn(target_turn_id)
-    if mode is None:
-        return JSONResponse(
-            {
-                **response,
-                "applied": False,
-                "error": "target turn is no longer active",
-                "error_code": "target_turn_not_active",
-            },
-            status_code=409,
-        )
-    logger.info(
-        "Correlated interrupt received via REST "
-        "(target_turn=%d mode=%s tool_inflight=%s)",
-        target_turn_id,
-        mode,
-        _tool_inflight,
-    )
-    return JSONResponse({**response, "ack": True, "applied": True, "mode": mode})
-
-
-async def handle_api_approve(request: Request) -> JSONResponse:
-    """Resolve a pending permission gate by UPDATEing the
-    thread_permission_requests row. Body: {decision: approve|deny,
-    approval_id?}. If approval_id is omitted, the most-recent-pending
-    row for this thread is resolved (legacy single-pending-at-a-time
-    contract). The DB trigger emits NOTIFY → agent's permission_check
-    wakes up."""
-    if _stateless_mode():
-        return _stateless_reject()
-    if _session is None:
-        return JSONResponse({"error": "Session not active"}, status_code=503)
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse({"error": "invalid JSON"}, status_code=400)
-    decision_raw = body.get("decision")
-    if decision_raw == "approve":
-        decision = "approved"
-    elif decision_raw == "deny":
-        decision = "denied"
-    else:
-        return JSONResponse(
-            {"error": "decision must be 'approve' or 'deny'"},
-            status_code=400,
-        )
-    approval_id = body.get("approval_id")
-    resolved = await _resolve_pending_permission(
-        decision,
-        approval_id=approval_id,
-        decided_by="rest_client",
-    )
-    if resolved is None:
-        return JSONResponse(
-            {
-                "error": "No matching pending request",
-                "approval_id": approval_id,
-            },
-            status_code=404,
-        )
-    return JSONResponse(
-        {
-            "accepted": True,
-            "decision": decision_raw,
-            "approval_id": str(resolved["id"]),
-            "tool_call_id": resolved["tool_call_id"],
-        }
-    )
-
-
-# --- WebSocket handler (module-level so dual_app can call it too) ---
-
-
-async def handle_persistent_websocket(ws: WebSocket) -> None:
-    """WebSocket consumer for an already-running persistent session.
-
-    Headless lifecycle (chunk 1):
-      - First WS attach spawns the persistent loop with module-level
-        callbacks. Subsequent attaches just register a subscriber and
-        tap into the existing loop's broadcast stream.
-      - WS close calls _unsubscribe() and cancels this connection's pump
-        task. The loop keeps running. It only stops via
-        _loop_completion_handler (idle timeout, /done, crash) or via
-        out-of-band _terminate_session (drain, watchdog, REST detach).
-      - The pod no longer exits when the WS closes — that was the
-        WS-bound era. _schedule_exit is now driven only by drain intent
-        and shutdown paths.
-
-    Reached from both:
-      - persistent_app.create_persistent_app()'s /ws/chat route (pure
-        persistent mode, agent.py --mode persistent).
-      - dual_app.ws_chat (dual mode — adds pod-state pre-checks then
-        delegates here). Sharing this body is what closes the Phase-1
-        gap described in
-        knowledge-base/knowledge/issues/persistent_session_dual_mode_phase1_gap.md.
-    """
-    import uuid
-
-    validated_identity = getattr(ws.state, "session_identity_fingerprint", None)
-    validated_session = _session
-    await ws.accept()
-    if (
-        not isinstance(validated_identity, str)
-        or validated_session is None
-        or _session is not validated_session
-        or _current_pinned_session_identity_fingerprint() != validated_identity
-    ):
-        await ws.close(code=4403, reason="session identity changed")
-        return
-
-    # Stateless executor (M3): sessions on this pod are driven exclusively by
-    # run_queue claims — there is no live WS surface. Mirror the REST 409.
-    if _stateless_mode():
-        try:
-            await ws.send_json(
-                {
-                    "method": "error",
-                    "params": {
-                        "message": (
-                            "stateless executor: this pod serves queued turns; "
-                            "no direct session WebSocket is available"
-                        )
-                    },
-                }
-            )
-        except Exception:
-            pass
-        await ws.close(code=4409, reason="stateless executor")
-        return
-
-    if _runtime_admission_closed():
-        try:
-            await ws.send_json(
-                {
-                    "method": "input.rejected",
-                    "params": {
-                        "error": "runtime_terminating",
-                        "retryable": True,
-                        "message": "Retry input on the replacement runtime.",
-                    },
-                }
-            )
-        finally:
-            await ws.close(code=4512, reason="runtime terminating")
-        return
-
-    # Signal the boot-WS watchdog that a connection arrived. Done before
-    # the readiness check so even a failed-to-be-ready connection counts:
-    # the user clearly came back, and a different error path applies.
-    _signal_ws_connected()
-
-    # Readiness gates on the loop primitives, not just the session — see
-    # _session_ready() for the why. Single source of truth shared with
-    # /ready and /session/status so the probe and the WS gate can't drift.
-    if not _session_ready():
-        await _ws_send(ws, "error", {"message": "Agent not ready"})
-        await ws.close(code=4503, reason="Agent not ready")
-        return
-
-    # Register this WS as a subscriber on the broadcast hub.
-    client_id = uuid.uuid4().hex
-    queue = _subscribe(client_id)
-    pump_task = asyncio.create_task(
-        _run_subscriber_pump(ws, client_id, queue),
-        name=f"subscriber-pump-{client_id[:8]}",
-    )
-
-    logger.info(f"WebSocket connected: thread={_thread_id} client={client_id[:8]}")
-
-    def _identity_current() -> bool:
-        return bool(
-            _session is validated_session
-            and _current_pinned_session_identity_fingerprint() == validated_identity
-        )
-
-    async def _reject_preloop_identity_change() -> None:
-        _unsubscribe(client_id)
-        _clear_canvas_awareness(client_id)
-        if not pump_task.done():
-            pump_task.cancel()
-            try:
-                await pump_task
-            except asyncio.CancelledError:
-                pass
-        await ws.close(code=4403, reason="session identity changed")
-
-    def _spawn_ws_effect(coro: Any, *, name: str) -> asyncio.Task[Any]:
-        return _track_session_side_task(asyncio.create_task(coro, name=name))
-
-    # Send current session state so this client can sync. Direct send —
-    # this is the welcome frame, only the connecting client cares.
-    #
-    # running_tool: if the loop is blocked in a tool call right now, tell this
-    # (re)attaching client which command is running so it can render a "running
-    # command" card instead of a blank "Connecting…". Incremental history may
-    # already carry the AIMessage + tool_call, but it cannot say that the call
-    # is still running — this welcome frame is the authoritative snapshot.
-    #
-    # pending_permissions: same idea for supervised gates that are still
-    # waiting on an answer. The durable row survives, but REST history does
-    # not carry it, so without this a reload (or a dropped live stream) leaves
-    # the approval card unrenderable and the gate unanswerable — the failure
-    # in knowledge-history/done/supervised_parallel_gates_timeout_fabricates_denial.md.
-    running_tool = (
-        inflight_tool_call(validated_session.messages) if _tool_inflight else None
-    )
-    if running_tool is not None:
-        running_tool = {
-            "id": running_tool["id"],
-            "tool": running_tool["tool"],
-            "args": _safe_serialize(running_tool["args"]),
-        }
-    (
-        durable_permission_mode,
-        durable_narration_mode,
-    ) = await _durable_session_control_modes()
-    if not _identity_current():
-        await _reject_preloop_identity_change()
-        return
-    pending_permissions = await _pending_permission_requests()
-    if not _identity_current():
-        await _reject_preloop_identity_change()
-        return
-    task_manager = validated_session.session_task_manager
-    session_tasks = task_manager.to_dict_list() if task_manager is not None else []
-    await _ws_send(
-        ws,
-        "session.state",
-        {
-            "thread_id": _thread_id,
-            "permission_mode": durable_permission_mode,
-            "narration_mode": durable_narration_mode,
-            "turn_count": validated_session.turn_count,
-            # Authoritative join signal for a cold Cockpit reattach. REST can
-            # already contain an incrementally persisted prefix of this turn;
-            # the client uses (turn_in_flight, turn_count) to keep that prefix
-            # and cursor-replayed suffix in one streaming bubble.
-            "turn_in_flight": _turn_event_open,
-            "message_count": len(validated_session.messages),
-            "model": validated_session.config.llm.model,
-            "temperature": validated_session.config.llm.temperature,
-            "running_tool": running_tool,
-            "pending_permissions": pending_permissions,
-            "tasks": session_tasks,
-        },
-    )
-    if not _identity_current():
-        await _reject_preloop_identity_change()
-        return
-
-    # Spawn the persistent loop if it isn't already running. Reconnecting
-    # to a session whose loop is mid-turn just joins the broadcast — no
-    # restart, no replay (replay arrives in chunk 2 via the event log).
-    _ensure_persistent_loop_started("websocket", client_id=client_id)
-
-    # --- WebSocket receive loop ---
-    try:
-        # The exact current queue lock is also the admission serialization
-        # point. Any old-token admission that started before this claim must
-        # commit before this snapshot; one that starts after it observes the
-        # new token and cannot create old-generation work. Fetch the complete
-        # (unbounded) generation once so one steal produces at most one epoch
-        # rotation and one terminal boundary per abandoned target.
-        while True:
-            raw = await ws.receive_text()
-            if not _identity_current():
-                await ws.close(code=4403, reason="session identity changed")
-                break
-            try:
-                data = json.loads(raw)
-            except json.JSONDecodeError:
-                # Plain text → treat as message
-                data = {"method": "message", "content": raw}
-
-            method = data.get("method", "message")
-            if _retirement_admission_closed():
-                # This socket may predate the exact ``ending`` transition.
-                # Retire every moment-scoped control surface together: a late
-                # approval/config/upgrade must not leak through simply because
-                # it is not a user-message verb. The SSE/journal plane lives in
-                # Cockpit and is intentionally independent of this socket.
-                await _ws_send(
-                    ws,
-                    "input.rejected",
-                    {
-                        "error": "runtime_terminating",
-                        "retryable": True,
-                        "message": "Retry input on the replacement runtime.",
-                    },
-                )
-                await ws.close(code=4512, reason="runtime terminating")
-                break
-
-            if method == "message":
-                content = data.get("content", "")
-                if content and _loop_user_queue is not None:
-                    try:
-                        admission = await _accept_user_input(
-                            content,
-                            expected_session_identity_fingerprint=validated_identity,
-                        )
-                        rejection_error = "runtime_terminating"
-                        rejection_message = "Retry input on the replacement runtime."
-                    except TerminationAdmissionClosed:
-                        admission = None
-                        rejection_error = "runtime_terminating"
-                        rejection_message = "Retry input on the replacement runtime."
-                    except ProtectedCloudUnavailable:
-                        admission = None
-                        rejection_error = "protected_cloud_unavailable"
-                        rejection_message = (
-                            "Retry input when the protected cloud mount recovers."
-                        )
-                    except DurableInputUnavailable:
-                        admission = None
-                        rejection_error = "durable_input_unavailable"
-                        rejection_message = "Retry input when durable storage recovers."
-                    except SessionIdentityMismatch:
-                        await ws.close(code=4403, reason="session identity changed")
-                        break
-                    if admission is None:
-                        await _ws_send(
-                            ws,
-                            "input.rejected",
-                            {
-                                "error": rejection_error,
-                                "retryable": True,
-                                "message": rejection_message,
-                            },
-                        )
-                    elif admission.deferred:
-                        await _ws_send(
-                            ws,
-                            "input.accepted",
-                            _accepted_input_payload(admission),
-                        )
-
-            elif method in {
-                "canvas.presentation_updated",
-                "canvas.source_updated",
-                "canvas.user_editing",
-                "canvas.user_idle",
-            }:
-                await _handle_canvas_control(
-                    ws,
-                    data,
-                    client_id,
-                    expected_session_identity_fingerprint=validated_identity,
-                )
-
-            elif method == "approve":
-                # Phase 3: resolve the most-recent-pending permission
-                # request in the DB. Cockpit can pass an explicit
-                # approval_id to disambiguate when multiple are
-                # pending (rare — agent's loop serializes most flows).
-                approval_id = data.get("approval_id")
-                _spawn_ws_effect(
-                    _resolve_pending_permission(
-                        "approved",
-                        approval_id=approval_id,
-                        decided_by="ws_client",
-                    ),
-                    name="resolve-approve",
-                )
-
-            elif method == "deny":
-                approval_id = data.get("approval_id")
-                _spawn_ws_effect(
-                    _resolve_pending_permission(
-                        "denied",
-                        approval_id=approval_id,
-                        decided_by="ws_client",
-                    ),
-                    name="resolve-deny",
-                )
-
-            elif method == "interrupt":
-                # Legacy WebSocket clients carry no target. Bind the request to
-                # the concrete active turn observed now; never leave a bare flag
-                # that can interrupt a later input.
-                target_turn_id = int(_session.turn_count) if _session else 0
-                mode = (
-                    _signal_interrupt_for_turn(target_turn_id)
-                    if target_turn_id > 0
-                    else None
-                )
-                if mode is None:
-                    await _ws_send(
-                        ws,
-                        "interrupt.ack",
-                        {
-                            "applied": False,
-                            "target_turn_id": target_turn_id or None,
-                            "error_code": "target_turn_not_active",
-                        },
-                    )
-                    logger.info("Idle legacy WebSocket interrupt rejected")
-                else:
-                    await _ws_send(
-                        ws,
-                        "interrupt.ack",
-                        {
-                            "applied": True,
-                            "target_turn_id": target_turn_id,
-                            "mode": mode,
-                        },
-                    )
-                    logger.info(
-                        "Interrupt acknowledged (target_turn=%d mode=%s)",
-                        target_turn_id,
-                        mode,
-                    )
-
-            elif method in {"mode.set", "narration.set"}:
-                # These verbs are lane-agnostic orchestrator REST controls.
-                # Keeping a second live-only mutation path here would let an
-                # old client change RAM without the desired scalar, inbox
-                # order, durable result receipt, or owner fence.
-                await _ws_send(
-                    ws,
-                    "error",
-                    {
-                        "code": "control_transport_retired",
-                        "message": "Use the session control REST endpoint",
-                    },
-                )
-
-            elif method == "config.update":
-                config_override = data.get("config", {})
-                # Slice B: a datasource change rides the same frame as a
-                # sibling key — the full desired selection (None = unchanged).
-                datasource_ids = data.get("datasource_ids")
-                if config_override or datasource_ids is not None:
-                    _spawn_ws_effect(
-                        _handle_config_update(
-                            ws,
-                            config_override,
-                            datasource_ids=datasource_ids,
-                            request_id=data.get("request_id"),
-                        ),
-                        name="handle-config-update",
-                    )
-
-            elif method == "compact":
-                # Manual compaction (/compact command, or the rewind action
-                # sheet's "Summarize up to here" with boundary_message_id).
-                focus = data.get("focus", "")
-                _spawn_ws_effect(
-                    _handle_compact(
-                        ws, focus, boundary_message_id=data.get("boundary_message_id")
-                    ),
-                    name="handle-compact",
-                )
-
-            elif method == "archive":
-                # End session (/done command)
-                _spawn_ws_effect(_handle_archive(ws), name="handle-archive")
-
-            elif method == "upgrade-to-vm":
-                # Upgrade workspace from container to VM
-                _spawn_ws_effect(_handle_vm_upgrade(ws), name="handle-vm-upgrade")
-
-            elif method == "upgrade-to-workspace":
-                # Upgrade a lite (virtual) session to a real sandbox container
-                target_tier = data.get("target_tier", "sandbox")
-                _spawn_ws_effect(
-                    _handle_workspace_upgrade(ws, target_tier),
-                    name="handle-workspace-upgrade",
-                )
-
-            elif method == "undo":
-                if _session is None:
-                    await _ws_send(
-                        ws,
-                        "error",
-                        {"message": "Session no longer active"},
-                    )
-                    continue
-                if _session.shell_owner_token is not None:
-                    await _ws_send(
-                        ws,
-                        "error",
-                        {
-                            "code": "control_transport_required",
-                            "message": "Use the session control REST endpoint",
-                        },
-                    )
-                    continue
-                turn_id = data.get("turn_id")
-                try:
-                    restored = await _session.undo_turn(turn_id)
-                except WorkspaceUndoUnavailable as exc:
-                    await _ws_send(
-                        ws,
-                        "error",
-                        {
-                            "code": exc.code,
-                            "message": str(exc),
-                        },
-                    )
-                except WorkspaceUndoRetryable as exc:
-                    await _ws_send(
-                        ws,
-                        "error",
-                        {
-                            "code": "workspace_undo_retryable",
-                            "message": str(exc),
-                        },
-                    )
-                else:
-                    await _ws_send(
-                        ws,
-                        "files.restored",
-                        {**restored, "turn_id": turn_id},
-                    )
-
-            elif method == "rewind":
-                if _session is None:
-                    await _ws_send(
-                        ws,
-                        "error",
-                        {
-                            "message": "Session no longer active",
-                            "request_id": data.get("request_id"),
-                        },
-                    )
-                    continue
-                _spawn_ws_effect(
-                    _handle_rewind(ws, data),
-                    name="handle-rewind",
-                )
-
-            else:
-                await _ws_send(ws, "error", {"message": f"Unknown method: {method}"})
-
-    except WebSocketDisconnect:
-        logger.info(
-            f"WebSocket disconnected: thread={_thread_id} "
-            f"client={client_id[:8]} (loop continues)"
-        )
-    except Exception as e:
-        logger.exception(f"WebSocket error: {e}")
-    finally:
-        # Headless keystone: WS close only unsubscribes. The loop keeps
-        # running until _loop_completion_handler routes its natural exit,
-        # or out-of-band _terminate_session intervenes. We do NOT cancel
-        # _loop_task here, and we do NOT schedule pod exit.
-        _unsubscribe(client_id)
-        _clear_canvas_awareness(client_id)
-        if not pump_task.done():
-            pump_task.cancel()
-            try:
-                await pump_task
-            except asyncio.CancelledError:
-                pass
-        logger.info(
-            f"WebSocket pump released: thread={_thread_id} client={client_id[:8]}"
-        )
-
-
 # --- Helpers ---
 
 
@@ -8013,7 +7149,7 @@ def _subscribe(client_id: str) -> asyncio.Queue:
 
     Each WebSocket connection (and later, each SSE consumer) gets its own
     bounded queue. _broadcast() enqueues onto every registered queue;
-    _run_subscriber_pump drains one queue into one WS.
+    the session WebSocket transport's pump drains one queue into one WS.
 
     Phase 5: if this is the first subscriber after an untethered pause,
     schedule a status revert to 'active' so the attention-sleep watchdog
@@ -10784,6 +9920,13 @@ def _emit_canvas_event(method: str, params: Dict[str, Any]) -> None:
         logger.warning("Canvas invalidation broadcast failed: %s", exc)
 
 
+def _invalidate_session_recent_read(path: str) -> None:
+    """Forget a cached workspace read after a committed Canvas source save."""
+
+    if _session is not None and _session.tool_context is not None:
+        _session.tool_context.invalidate_recent_read(path)
+
+
 async def _current_canvas_for_control() -> dict[str, Any] | None:
     """Load authoritative Canvas state with the attached delegated owner."""
 
@@ -10799,386 +9942,6 @@ async def _current_canvas_for_control() -> dict[str, Any] | None:
         return await client.get_thread_canvas(_thread_id)
     finally:
         await client.close()
-
-
-def _validated_canvas_control_state(
-    data: Dict[str, Any], state: dict[str, Any] | None
-) -> dict[str, Any] | None:
-    """Match an untrusted control frame to exact authoritative Canvas state."""
-
-    if state is None or data.get("canvas_id") != "main":
-        return None
-    revision = data.get("presentation_revision")
-    if (
-        isinstance(revision, bool)
-        or not isinstance(revision, int)
-        or revision != state.get("presentation_revision")
-    ):
-        return None
-    if data.get("method") == "canvas.presentation_updated":
-        return state
-
-    source = state.get("source")
-    if (
-        not isinstance(source, dict)
-        or source.get("type") != "workspace_file"
-        or not isinstance(data.get("path"), str)
-        or data["path"] != source.get("path")
-        or not isinstance(data.get("source_version"), str)
-        or data["source_version"] != state.get("source_version")
-    ):
-        return None
-    return state
-
-
-def _cancel_canvas_awareness(client_id: str) -> _CanvasAwarenessLease | None:
-    lease = _canvas_awareness.pop(client_id, None)
-    if lease is not None and lease.task is not asyncio.current_task():
-        lease.task.cancel()
-    return lease
-
-
-def _fan_out_canvas_idle(client_id: str, params: Dict[str, Any]) -> None:
-    _fan_out_live_frame(
-        {
-            "method": "canvas.user_idle",
-            "params": {**params, "sender_id": client_id},
-        }
-    )
-
-
-async def _expire_canvas_awareness(
-    client_id: str, editing_session_id: str, params: Dict[str, Any]
-) -> None:
-    try:
-        await asyncio.sleep(_CANVAS_AWARENESS_TTL_S)
-    except asyncio.CancelledError:
-        return
-    lease = _canvas_awareness.get(client_id)
-    if (
-        lease is None
-        or lease.task is not asyncio.current_task()
-        or lease.params.get("editing_session_id") != editing_session_id
-    ):
-        return
-    _canvas_awareness.pop(client_id, None)
-    _fan_out_canvas_idle(client_id, params)
-
-
-def _clear_canvas_awareness(client_id: str) -> None:
-    """Expire every courtesy lease owned by one disconnected connection."""
-
-    lease = _cancel_canvas_awareness(client_id)
-    if lease is not None:
-        _fan_out_canvas_idle(client_id, lease.params)
-    for key in [key for key in _canvas_control_validation_at if key[0] == client_id]:
-        _canvas_control_validation_at.pop(key, None)
-    _canvas_source_updates.pop(client_id, None)
-    _canvas_presentation_updates.pop(client_id, None)
-
-
-def _clear_all_canvas_awareness() -> None:
-    """Cancel leases without emitting across a detach/reattach boundary."""
-
-    leases = list(_canvas_awareness.values())
-    _canvas_awareness.clear()
-    _canvas_control_validation_at.clear()
-    _canvas_source_updates.clear()
-    _canvas_presentation_updates.clear()
-    for lease in leases:
-        lease.task.cancel()
-
-
-def _start_canvas_awareness(
-    client_id: str,
-    params: Dict[str, Any],
-    *,
-    renewed_at: float,
-    validated_at: float,
-) -> None:
-    editing_session_id = str(params["editing_session_id"])
-    task = asyncio.create_task(
-        _expire_canvas_awareness(client_id, editing_session_id, params),
-        name=f"canvas-awareness-{client_id[:8]}",
-    )
-    _canvas_awareness[client_id] = _CanvasAwarenessLease(
-        task=task,
-        params=params,
-        renewed_at=renewed_at,
-        validated_at=validated_at,
-    )
-    _fan_out_live_frame(
-        {
-            "method": "canvas.user_editing",
-            "params": {
-                **params,
-                "sender_id": client_id,
-                "ttl_ms": int(_CANVAS_AWARENESS_TTL_S * 1000),
-            },
-        }
-    )
-
-
-async def _handle_canvas_control(
-    ws: WebSocket,
-    data: Dict[str, Any],
-    client_id: str,
-    *,
-    expected_session_identity_fingerprint: str | None = None,
-) -> bool:
-    """Handle validated edit invalidation and live-only awareness frames."""
-
-    method = data.get("method")
-    allowed = {
-        "canvas.presentation_updated",
-        "canvas.source_updated",
-        "canvas.user_editing",
-        "canvas.user_idle",
-    }
-    if method not in allowed:
-        return False
-    if method == "canvas.presentation_updated":
-        expected_fields = {"method", "canvas_id", "presentation_revision"}
-    else:
-        expected_fields = {
-            "method",
-            "canvas_id",
-            "path",
-            "presentation_revision",
-            "source_version",
-        }
-        if method in {"canvas.user_editing", "canvas.user_idle"}:
-            expected_fields.add("editing_session_id")
-    if set(data) != expected_fields:
-        await _ws_send(
-            ws,
-            "error",
-            {
-                "code": "invalid_canvas_control",
-                "message": "Canvas control message is invalid",
-            },
-        )
-        return True
-    editing_session_id = data.get("editing_session_id")
-    if method in {"canvas.user_editing", "canvas.user_idle"} and (
-        not isinstance(editing_session_id, str)
-        or not re.fullmatch(r"[A-Za-z0-9_-]{8,128}", editing_session_id)
-    ):
-        await _ws_send(
-            ws,
-            "error",
-            {
-                "code": "invalid_canvas_control",
-                "message": "Canvas editing session is invalid",
-            },
-        )
-        return True
-    path = data.get("path")
-    revision = data.get("presentation_revision")
-    source_version = data.get("source_version")
-    invalid_identity = (
-        data.get("canvas_id") != "main"
-        or isinstance(revision, bool)
-        or not isinstance(revision, int)
-        or revision < 1
-    )
-    invalid_file_identity = method != "canvas.presentation_updated" and (
-        not isinstance(path, str)
-        or not 0 < len(path) <= 4096
-        or not isinstance(source_version, str)
-        or not re.fullmatch(r"sha256:[0-9a-f]{64}", source_version)
-    )
-    if invalid_identity or invalid_file_identity:
-        await _ws_send(
-            ws,
-            "error",
-            {
-                "code": "invalid_canvas_control",
-                "message": "Canvas control message is invalid",
-            },
-        )
-        return True
-
-    now = asyncio.get_running_loop().time()
-    if method in {"canvas.user_editing", "canvas.user_idle"}:
-        lease = _canvas_awareness.get(client_id)
-        if lease is not None and all(
-            data.get(field) == lease.params.get(field)
-            for field in (
-                "canvas_id",
-                "path",
-                "presentation_revision",
-                "source_version",
-                "editing_session_id",
-            )
-        ):
-            if method == "canvas.user_idle":
-                _cancel_canvas_awareness(client_id)
-                _fan_out_canvas_idle(client_id, lease.params)
-                return True
-            if now - lease.validated_at < _CANVAS_AWARENESS_TTL_S:
-                if now - lease.renewed_at < _CANVAS_AWARENESS_RENEW_MIN_INTERVAL_S:
-                    # Exact duplicate/over-eager renewal: the current server TTL
-                    # is still live, so avoid task churn and redundant fan-out.
-                    return True
-                _cancel_canvas_awareness(client_id)
-                _start_canvas_awareness(
-                    client_id,
-                    lease.params,
-                    renewed_at=now,
-                    validated_at=lease.validated_at,
-                )
-                return True
-
-    source_identity: tuple[str, int, str] | None = None
-    if method == "canvas.source_updated":
-        assert isinstance(path, str) and isinstance(revision, int)
-        assert isinstance(source_version, str)
-        source_identity = (path, revision, source_version)
-        if _canvas_source_updates.get(client_id) == source_identity:
-            # The successful save response may be retried. A real subsequent
-            # save advances the revision, so only the exact last accepted
-            # identity is safe to deduplicate locally.
-            return True
-
-        # Do not drop a distinct committed revision. Pace authoritative checks
-        # instead, bounding invalid/mismatched spam without losing a real save.
-        validation_key = (client_id, "source")
-        last_validation = _canvas_control_validation_at.get(validation_key)
-        if last_validation is not None:
-            remaining = _CANVAS_CONTROL_VALIDATION_MIN_INTERVAL_S - (
-                now - last_validation
-            )
-            if remaining > 0:
-                await asyncio.sleep(remaining)
-                now = asyncio.get_running_loop().time()
-        _canvas_control_validation_at[validation_key] = now
-    elif method == "canvas.presentation_updated":
-        assert isinstance(revision, int)
-        if _canvas_presentation_updates.get(client_id) == revision:
-            return True
-        validation_key = (client_id, "presentation")
-        last_validation = _canvas_control_validation_at.get(validation_key)
-        if last_validation is not None:
-            remaining = _CANVAS_CONTROL_VALIDATION_MIN_INTERVAL_S - (
-                now - last_validation
-            )
-            if remaining > 0:
-                await asyncio.sleep(remaining)
-                now = asyncio.get_running_loop().time()
-        _canvas_control_validation_at[validation_key] = now
-    else:
-        validation_key = (client_id, "awareness")
-        last_validation = _canvas_control_validation_at.get(validation_key)
-        if (
-            last_validation is not None
-            and now - last_validation < _CANVAS_CONTROL_VALIDATION_MIN_INTERVAL_S
-        ):
-            await _ws_send(
-                ws,
-                "error",
-                {
-                    "code": "canvas_control_rate_limited",
-                    "message": "Canvas control messages are arriving too quickly",
-                },
-            )
-            return True
-        _canvas_control_validation_at[validation_key] = now
-
-    try:
-        state = await _current_canvas_for_control()
-    except Exception as exc:
-        logger.warning("Canvas control state validation failed: %s", exc)
-        await _ws_send(
-            ws,
-            "error",
-            {
-                "code": "canvas_control_unavailable",
-                "message": "Canvas state could not be validated",
-            },
-        )
-        return True
-    if (
-        expected_session_identity_fingerprint is not None
-        and _current_pinned_session_identity_fingerprint()
-        != expected_session_identity_fingerprint
-    ):
-        return True
-    state = _validated_canvas_control_state(data, state)
-    if state is None:
-        await _ws_send(
-            ws,
-            "error",
-            {
-                "code": "canvas_control_stale",
-                "message": "Canvas state changed; reload before continuing",
-            },
-        )
-        return True
-
-    if method == "canvas.presentation_updated":
-        source = state.get("source")
-        source_type = source.get("type") if isinstance(source, dict) else None
-        _broadcast(
-            "canvas.updated",
-            {
-                "canvas_id": "main",
-                "presentation_revision": state["presentation_revision"],
-                "source_type": source_type,
-                "updated_at": state.get("updated_at"),
-            },
-        )
-        assert isinstance(revision, int)
-        _canvas_presentation_updates[client_id] = revision
-        return True
-
-    if method == "canvas.source_updated":
-        if _session is not None and _session.tool_context is not None:
-            _session.tool_context.invalidate_recent_read(path)
-        _broadcast(
-            "canvas.source_updated",
-            {
-                "canvas_id": "main",
-                "presentation_revision": state["presentation_revision"],
-                "source_type": "workspace_file",
-                "updated_at": state.get("updated_at"),
-            },
-        )
-        assert source_identity is not None
-        _canvas_source_updates[client_id] = source_identity
-        return True
-
-    awareness_params = {
-        "canvas_id": "main",
-        "path": path,
-        "presentation_revision": state["presentation_revision"],
-        "source_version": state["source_version"],
-        "editing_session_id": editing_session_id,
-    }
-    assert isinstance(editing_session_id, str)
-    previous = _cancel_canvas_awareness(client_id)
-    if previous is not None:
-        _fan_out_canvas_idle(client_id, previous.params)
-    if method == "canvas.user_idle":
-        _fan_out_canvas_idle(client_id, awareness_params)
-        return True
-
-    _start_canvas_awareness(
-        client_id,
-        awareness_params,
-        renewed_at=now,
-        validated_at=now,
-    )
-    return True
-
-
-async def _run_subscriber_pump(
-    ws: WebSocket, client_id: str, queue: asyncio.Queue
-) -> None:
-    """Drain one socket's queue; the handler owns cancellation and unsubscribe."""
-    await _session_transport.run_subscriber_pump(
-        ws, queue, ping_interval=_WS_PING_INTERVAL_S
-    )
 
 
 # ---------------------------------------------------------------------------

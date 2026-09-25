@@ -432,7 +432,7 @@ async def test_teardown_skips_raw_sync_only_for_stateless(stateless: bool):
         patch.object(papp, "_stop_watchdogs"),
         patch.object(papp, "_stop_thread_control_watcher", AsyncMock()),
         patch.object(papp, "_await_pending_cloud_push", AsyncMock()),
-        patch.object(papp, "_clear_all_canvas_awareness"),
+        patch.object(papp._canvas_control, "clear_all"),
         patch.object(papp, "_subscribers", {}),
         patch.object(papp, "_sessions_served", 0),
         patch.object(papp, "_max_sessions_per_process", 0),

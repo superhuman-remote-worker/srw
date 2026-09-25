@@ -13,7 +13,13 @@ from fastapi import WebSocketDisconnect
 from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 
 from orchestrator.services import session_lifecycle, session_wake, sitrep
-from agent.api import persistent_app, persistent_termination
+from agent.api import (
+    persistent_app,
+    persistent_termination,
+    session_http,
+    session_transport,
+    session_websocket,
+)
 from agent.api.persistent_session import PersistentSession
 from agent.persistent_graph import (
     PersistentLoopCallbacks,
@@ -199,6 +205,14 @@ def _wire_input_runtime(monkeypatch, tmp_path, db, *, turn_count: int = 5):
     return queue
 
 
+async def _handle_api_input(request):
+    """POST /api/input through the HTTP transport bound to this runtime."""
+
+    return await session_http.handle_input(
+        request, persistent_app.session_transport_bindings().http
+    )
+
+
 def _current_session_identity_fingerprint() -> str:
     value = persistent_app._current_pinned_session_identity_fingerprint()
     assert value is not None
@@ -256,9 +270,11 @@ async def _run_websocket_input(monkeypatch, content: str, *, before_receive=None
         persistent_app, "_subscribe", lambda _client_id: subscriber_queue
     )
     monkeypatch.setattr(persistent_app, "_unsubscribe", MagicMock())
-    monkeypatch.setattr(persistent_app, "_clear_canvas_awareness", MagicMock())
-    monkeypatch.setattr(persistent_app, "_run_subscriber_pump", _park_pump)
-    await persistent_app.handle_persistent_websocket(ws)
+    monkeypatch.setattr(persistent_app._canvas_control, "release", MagicMock())
+    monkeypatch.setattr(session_transport, "run_subscriber_pump", _park_pump)
+    await session_websocket.serve_session_websocket(
+        ws, persistent_app.session_transport_bindings().socket
+    )
     return ws
 
 
@@ -483,7 +499,7 @@ async def test_supplied_event_delivery_identity_requires_internal_authority(
     )
     delivery_id = str(uuid4())
 
-    denied = await persistent_app.handle_api_input(
+    denied = await _handle_api_input(
         SimpleNamespace(
             headers={},
             json=AsyncMock(
@@ -501,7 +517,7 @@ async def test_supplied_event_delivery_identity_requires_internal_authority(
     assert denied.status_code == 403
     assert db.rows == []
 
-    accepted = await persistent_app.handle_api_input(
+    accepted = await _handle_api_input(
         SimpleNamespace(
             headers={"X-Internal-Key": "synthetic-internal-key"},
             json=AsyncMock(
@@ -530,7 +546,7 @@ async def test_wrong_runtime_event_is_refused_before_loop_or_persist(
     start_loop = MagicMock(return_value=True)
     monkeypatch.setattr(persistent_app, "_ensure_persistent_loop_started", start_loop)
 
-    response = await persistent_app.handle_api_input(
+    response = await _handle_api_input(
         SimpleNamespace(
             headers={"X-Internal-Key": "synthetic-internal-key"},
             json=AsyncMock(
@@ -560,7 +576,7 @@ async def test_wrong_runtime_human_input_is_refused_before_loop_or_persist(
     start_loop = MagicMock(return_value=True)
     monkeypatch.setattr(persistent_app, "_ensure_persistent_loop_started", start_loop)
 
-    wrong = await persistent_app.handle_api_input(
+    wrong = await _handle_api_input(
         SimpleNamespace(
             headers={},
             json=AsyncMock(
@@ -588,7 +604,7 @@ async def test_human_input_without_runtime_identity_is_refused_before_effects(
     start_loop = MagicMock(return_value=True)
     monkeypatch.setattr(persistent_app, "_ensure_persistent_loop_started", start_loop)
 
-    response = await persistent_app.handle_api_input(
+    response = await _handle_api_input(
         SimpleNamespace(
             headers={},
             json=AsyncMock(return_value={"content": "missing identity"}),
@@ -615,7 +631,7 @@ async def test_human_rest_input_carries_exact_runtime_through_durable_admission(
         persistent_app, "_ensure_persistent_loop_started", MagicMock(return_value=True)
     )
 
-    response = await persistent_app.handle_api_input(
+    response = await _handle_api_input(
         SimpleNamespace(
             headers={},
             json=AsyncMock(
@@ -645,7 +661,7 @@ async def test_event_role_without_stable_internal_identity_is_rejected(
         persistent_app, "_ensure_persistent_loop_started", MagicMock(return_value=True)
     )
 
-    response = await persistent_app.handle_api_input(
+    response = await _handle_api_input(
         SimpleNamespace(
             headers={"X-Internal-Key": "synthetic-internal-key"},
             json=AsyncMock(return_value={"content": "forged wake", "role": "event"}),
@@ -1149,7 +1165,7 @@ async def test_rest_post_persist_event_defer_is_accepted_for_outbox_retry(
     )
     delivery_id = str(uuid4())
 
-    response = await persistent_app.handle_api_input(
+    response = await _handle_api_input(
         SimpleNamespace(
             headers={"X-Internal-Key": "synthetic-internal-key"},
             json=AsyncMock(

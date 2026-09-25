@@ -50,6 +50,26 @@ from agent.api.persistent_app import (
 )
 
 
+async def _handle_api_interrupt(request):
+    """POST /api/interrupt through the HTTP transport bound to this runtime."""
+    import agent.api.persistent_app as pa
+    from agent.api import session_http
+
+    return await session_http.handle_interrupt(
+        request, pa.session_transport_bindings().http
+    )
+
+
+async def _serve_session_websocket(ws):
+    """One session socket through the WS transport bound to this runtime."""
+    import agent.api.persistent_app as pa
+    from agent.api import session_websocket
+
+    await session_websocket.serve_session_websocket(
+        ws, pa.session_transport_bindings().socket
+    )
+
+
 def _retirement_session_mock(**kwargs):
     """Build a session double with the async child-quiescence contract."""
 
@@ -6099,7 +6119,7 @@ class TestHandlePersistentWebsocketReadiness:
             patch("agent.api.persistent_app._loop_task", None),
             patch("agent.api.persistent_app._ws_connected_event", None),
         ):
-            await pa.handle_persistent_websocket(ws)
+            await _serve_session_websocket(ws)
             assert pa._loop_task is None
 
         ws.accept.assert_awaited_once()
@@ -6124,7 +6144,7 @@ class TestHandlePersistentWebsocketReadiness:
                 return_value=self.fingerprint,
             ),
         ):
-            await pa.handle_persistent_websocket(ws)
+            await _serve_session_websocket(ws)
             assert pa._loop_task is None
 
         ws.close.assert_awaited_once_with(code=4503, reason="Agent not ready")
@@ -6152,7 +6172,7 @@ class TestHandlePersistentWebsocketReadiness:
                 return_value=self.fingerprint,
             ),
         ):
-            await pa.handle_persistent_websocket(ws)
+            await _serve_session_websocket(ws)
             # The whole point of the fix: the loop must NOT have been
             # spawned despite llm_with_tools being set.
             assert pa._loop_task is None
@@ -6162,7 +6182,6 @@ class TestHandlePersistentWebsocketReadiness:
     @pytest.mark.asyncio
     async def test_sends_error_frame_before_close(self):
         """Error frame must precede the close so clients see the reason."""
-        from agent.api import persistent_app as pa
 
         ws = self._validated_websocket()
         session = MagicMock()
@@ -6177,7 +6196,7 @@ class TestHandlePersistentWebsocketReadiness:
                 return_value=self.fingerprint,
             ),
         ):
-            await pa.handle_persistent_websocket(ws)
+            await _serve_session_websocket(ws)
 
         ws.send_json.assert_awaited_once_with(
             {"method": "error", "params": {"message": "Agent not ready"}}
@@ -6191,8 +6210,6 @@ class TestHandlePersistentWebsocketReadiness:
         race could be missed and the pod could time out mid-recovery.
         """
         import asyncio
-
-        from agent.api import persistent_app as pa
 
         ws = self._validated_websocket()
         session = MagicMock()
@@ -6208,7 +6225,7 @@ class TestHandlePersistentWebsocketReadiness:
                 return_value=self.fingerprint,
             ),
         ):
-            await pa.handle_persistent_websocket(ws)
+            await _serve_session_websocket(ws)
 
         assert connected.is_set()
         ws.close.assert_awaited_once_with(code=4503, reason="Agent not ready")
@@ -6219,8 +6236,6 @@ class TestHandlePersistentWebsocketReadiness:
         incrementally persisted history prefix with the cursor-replayed suffix.
         """
         from fastapi import WebSocketDisconnect
-
-        from agent.api import persistent_app as pa
 
         ws = self._validated_websocket()
         ws.receive_text.side_effect = WebSocketDisconnect()
@@ -6263,7 +6278,7 @@ class TestHandlePersistentWebsocketReadiness:
                 return_value=self.fingerprint,
             ),
         ):
-            await pa.handle_persistent_websocket(ws)
+            await _serve_session_websocket(ws)
 
         welcome = next(
             call.args[0]
@@ -6330,7 +6345,7 @@ class TestHandlePersistentWebsocketReadiness:
                 return_value=self.fingerprint,
             ),
         ):
-            await pa.handle_persistent_websocket(ws)
+            await _serve_session_websocket(ws)
 
             ack = next(
                 call.args[0]
@@ -6721,7 +6736,7 @@ class TestHandleApiInterruptHardEvent:
             "_current_pinned_session_identity_fingerprint",
             return_value=self.fingerprint,
         ):
-            await mod.handle_api_interrupt(self._request())
+            await _handle_api_interrupt(self._request())
 
         assert mod._loop_interrupt_flag == "hard"
         assert mod._loop_interrupt_target_turn_id == 7
@@ -6743,7 +6758,7 @@ class TestHandleApiInterruptHardEvent:
             "_current_pinned_session_identity_fingerprint",
             return_value=self.fingerprint,
         ):
-            await mod.handle_api_interrupt(self._request())
+            await _handle_api_interrupt(self._request())
 
         assert mod._loop_interrupt_flag == "graceful"
         assert mod._loop_interrupt_target_turn_id == 7
@@ -6767,7 +6782,7 @@ class TestHandleApiInterruptHardEvent:
             "_current_pinned_session_identity_fingerprint",
             return_value=self.fingerprint,
         ):
-            response = await mod.handle_api_interrupt(request)
+            response = await _handle_api_interrupt(request)
 
         assert response.status_code == 200
         assert json.loads(response.body) == {
@@ -6799,7 +6814,7 @@ class TestHandleApiInterruptHardEvent:
             "_current_pinned_session_identity_fingerprint",
             return_value=self.fingerprint,
         ):
-            response = await mod.handle_api_interrupt(request)
+            response = await _handle_api_interrupt(request)
 
         assert response.status_code == 409
         payload = json.loads(response.body)
@@ -6828,7 +6843,7 @@ class TestHandleApiInterruptHardEvent:
             "_current_pinned_session_identity_fingerprint",
             return_value=self.fingerprint,
         ):
-            response = await mod.handle_api_interrupt(self._request())
+            response = await _handle_api_interrupt(self._request())
 
         assert response.status_code == 409
         assert json.loads(response.body)["error_code"] == "target_turn_not_active"
@@ -6850,7 +6865,7 @@ class TestHandleApiInterruptHardEvent:
             "_current_pinned_session_identity_fingerprint",
             return_value=self.fingerprint,
         ):
-            response = await mod.handle_api_interrupt(request)
+            response = await _handle_api_interrupt(request)
 
         assert response.status_code == 400
         assert json.loads(response.body)["error_code"] == "invalid_request"
@@ -6868,7 +6883,7 @@ class TestHandleApiInterruptHardEvent:
             "_current_pinned_session_identity_fingerprint",
             return_value="sha256:" + ("b" * 64),
         ):
-            response = await mod.handle_api_interrupt(self._request())
+            response = await _handle_api_interrupt(self._request())
 
         assert response.status_code == 409
         assert json.loads(response.body) == {
@@ -7027,7 +7042,17 @@ class TestCreatePersistentApp:
         }
 
 
-class TestCanvasControlMessages:
+class TestRuntimeCanvasControlBinding:
+    """The runtime's one Canvas channel resolves its owners at call time.
+
+    Validation, pacing and awareness live in
+    ``agent.api.session_canvas_control`` (tests/test_session_canvas_control.py);
+    this checks the runtime wiring: authoritative state loader, the attached
+    session's read cache, the ordered journal and live fan-out.
+    """
+
+    fingerprint = "sha256:" + ("e" * 64)
+
     @staticmethod
     def _state():
         return {
@@ -7039,251 +7064,88 @@ class TestCanvasControlMessages:
         }
 
     @staticmethod
-    def _frame(
-        method: str,
-        *,
-        editing_session_id: str | None = None,
-        revision: int = 4,
-        version_char: str = "a",
-    ):
-        frame = {
+    def _frame(method, **extra):
+        return {
             "method": method,
             "canvas_id": "main",
             "path": "output/report.md",
-            "presentation_revision": revision,
-            "source_version": "sha256:" + version_char * 64,
-        }
-        if editing_session_id is not None:
-            frame["editing_session_id"] = editing_session_id
-        return frame
-
-    @pytest.mark.asyncio
-    async def test_source_updated_invalidates_read_and_uses_distinct_event(
-        self, monkeypatch
-    ):
-        import agent.api.persistent_app as mod
-
-        mod._clear_all_canvas_awareness()
-        tool_context = MagicMock()
-        monkeypatch.setattr(mod, "_session", SimpleNamespace(tool_context=tool_context))
-        next_state = {
-            **self._state(),
-            "presentation_revision": 5,
-            "source_version": "sha256:" + "b" * 64,
-            "updated_at": "2026-07-13T12:00:01Z",
-        }
-        state_loader = AsyncMock(side_effect=[self._state(), next_state])
-        monkeypatch.setattr(mod, "_current_canvas_for_control", state_loader)
-        monkeypatch.setattr(mod, "_CANVAS_CONTROL_VALIDATION_MIN_INTERVAL_S", 0)
-        broadcast = MagicMock()
-        monkeypatch.setattr(mod, "_broadcast", broadcast)
-
-        try:
-            handled = await mod._handle_canvas_control(
-                MagicMock(), self._frame("canvas.source_updated"), "client-a"
-            )
-            # An exact retry is deduplicated, while a real subsequent save has
-            # a new revision and must invalidate again.
-            assert await mod._handle_canvas_control(
-                MagicMock(), self._frame("canvas.source_updated"), "client-a"
-            )
-            assert await mod._handle_canvas_control(
-                MagicMock(),
-                self._frame("canvas.source_updated", revision=5, version_char="b"),
-                "client-a",
-            )
-        finally:
-            mod._clear_all_canvas_awareness()
-
-        assert handled is True
-        assert state_loader.await_count == 2
-        assert tool_context.invalidate_recent_read.call_args_list == [
-            mock_call("output/report.md"),
-            mock_call("output/report.md"),
-        ]
-        assert broadcast.call_args_list == [
-            mock_call(
-                "canvas.source_updated",
-                {
-                    "canvas_id": "main",
-                    "presentation_revision": 4,
-                    "source_type": "workspace_file",
-                    "updated_at": "2026-07-13T12:00:00Z",
-                },
-            ),
-            mock_call(
-                "canvas.source_updated",
-                {
-                    "canvas_id": "main",
-                    "presentation_revision": 5,
-                    "source_type": "workspace_file",
-                    "updated_at": "2026-07-13T12:00:01Z",
-                },
-            ),
-        ]
-
-    @pytest.mark.asyncio
-    async def test_presentation_updated_reloads_authority_and_broadcasts_state(
-        self, monkeypatch
-    ):
-        import agent.api.persistent_app as mod
-
-        mod._clear_all_canvas_awareness()
-        tool_context = MagicMock()
-        monkeypatch.setattr(mod, "_session", SimpleNamespace(tool_context=tool_context))
-        state = {
-            **self._state(),
-            "source": {"type": "workspace_app", "entry_path": "/demo"},
-            "source_version": None,
-        }
-        state_loader = AsyncMock(return_value=state)
-        monkeypatch.setattr(mod, "_current_canvas_for_control", state_loader)
-        monkeypatch.setattr(mod, "_CANVAS_CONTROL_VALIDATION_MIN_INTERVAL_S", 0)
-        broadcast = MagicMock()
-        monkeypatch.setattr(mod, "_broadcast", broadcast)
-        control = {
-            "method": "canvas.presentation_updated",
-            "canvas_id": "main",
             "presentation_revision": 4,
+            "source_version": "sha256:" + "a" * 64,
+            **extra,
         }
 
-        try:
-            assert await mod._handle_canvas_control(MagicMock(), control, "client-p")
-            assert await mod._handle_canvas_control(MagicMock(), control, "client-p")
-        finally:
-            mod._clear_all_canvas_awareness()
+    @pytest.mark.asyncio
+    async def test_channel_reads_current_session_journal_and_fan_out(self, monkeypatch):
+        import agent.api.persistent_app as mod
 
-        state_loader.assert_awaited_once()
-        tool_context.invalidate_recent_read.assert_not_called()
+        mod._canvas_control.clear_all()
+        tool_context = MagicMock()
+        monkeypatch.setattr(mod, "_session", SimpleNamespace(tool_context=tool_context))
+        state_loader = AsyncMock(return_value=self._state())
+        monkeypatch.setattr(mod, "_current_canvas_for_control", state_loader)
+        broadcast = MagicMock()
+        monkeypatch.setattr(mod, "_broadcast", broadcast)
+        frames = []
+        monkeypatch.setattr(mod, "_fan_out_live_frame", frames.append)
+        monkeypatch.setattr(
+            mod,
+            "_current_pinned_session_identity_fingerprint",
+            lambda: self.fingerprint,
+        )
+        monkeypatch.setattr(mod._canvas_control, "validation_min_interval_s", 0)
+
+        try:
+            assert await mod._canvas_control.handle(
+                MagicMock(),
+                self._frame("canvas.source_updated"),
+                "client-a",
+                expected_session_identity_fingerprint=self.fingerprint,
+            )
+            assert await mod._canvas_control.handle(
+                MagicMock(),
+                self._frame(
+                    "canvas.user_editing", editing_session_id="editor_session_a"
+                ),
+                "client-a",
+                expected_session_identity_fingerprint=self.fingerprint,
+            )
+        finally:
+            mod._canvas_control.clear_all()
+
+        assert state_loader.await_count == 2
+        tool_context.invalidate_recent_read.assert_called_once_with("output/report.md")
         broadcast.assert_called_once_with(
-            "canvas.updated",
+            "canvas.source_updated",
             {
                 "canvas_id": "main",
                 "presentation_revision": 4,
-                "source_type": "workspace_app",
+                "source_type": "workspace_file",
                 "updated_at": "2026-07-13T12:00:00Z",
             },
         )
+        assert [frame["method"] for frame in frames] == ["canvas.user_editing"]
+        assert frames[0]["params"]["sender_id"] == "client-a"
 
     @pytest.mark.asyncio
-    async def test_presentation_updated_rejects_extra_file_identity(self, monkeypatch):
+    async def test_detached_session_skips_read_invalidation(self, monkeypatch):
         import agent.api.persistent_app as mod
 
-        state_loader = AsyncMock()
-        send = AsyncMock()
-        monkeypatch.setattr(mod, "_current_canvas_for_control", state_loader)
-        monkeypatch.setattr(mod, "_ws_send", send)
-        malformed = self._frame("canvas.presentation_updated")
-        ws = MagicMock()
-
-        assert await mod._handle_canvas_control(ws, malformed, "client-p")
-
-        state_loader.assert_not_awaited()
-        send.assert_awaited_once_with(
-            ws,
-            "error",
-            {
-                "code": "invalid_canvas_control",
-                "message": "Canvas control message is invalid",
-            },
+        mod._canvas_control.clear_all()
+        monkeypatch.setattr(mod, "_session", None)
+        monkeypatch.setattr(
+            mod, "_current_canvas_for_control", AsyncMock(return_value=self._state())
         )
-
-    @pytest.mark.asyncio
-    async def test_malformed_source_update_is_rejected_before_validation(
-        self, monkeypatch
-    ):
-        import agent.api.persistent_app as mod
-
-        state_loader = AsyncMock()
-        send = AsyncMock()
-        monkeypatch.setattr(mod, "_current_canvas_for_control", state_loader)
-        monkeypatch.setattr(mod, "_ws_send", send)
-        malformed = self._frame("canvas.source_updated")
-        malformed["presentation_revision"] = True
-        ws = MagicMock()
-
-        assert await mod._handle_canvas_control(ws, malformed, "client-b")
-
-        state_loader.assert_not_awaited()
-        send.assert_awaited_once_with(
-            ws,
-            "error",
-            {
-                "code": "invalid_canvas_control",
-                "message": "Canvas control message is invalid",
-            },
-        )
-
-    @pytest.mark.asyncio
-    async def test_awareness_is_one_live_only_lease_and_local_renew_idle(
-        self, monkeypatch
-    ):
-        import agent.api.persistent_app as mod
-
-        mod._clear_all_canvas_awareness()
-        state_loader = AsyncMock(return_value=self._state())
-        frames = []
-        send = AsyncMock()
-        monkeypatch.setattr(mod, "_current_canvas_for_control", state_loader)
-        monkeypatch.setattr(mod, "_fan_out_live_frame", frames.append)
-        monkeypatch.setattr(mod, "_ws_send", send)
-        monkeypatch.setattr(mod, "_CANVAS_CONTROL_VALIDATION_MIN_INTERVAL_S", 0)
+        broadcast = MagicMock()
+        monkeypatch.setattr(mod, "_broadcast", broadcast)
+        monkeypatch.setattr(mod._canvas_control, "validation_min_interval_s", 0)
         try:
-            first = self._frame(
-                "canvas.user_editing", editing_session_id="editor_session_a"
+            assert await mod._canvas_control.handle(
+                MagicMock(), self._frame("canvas.source_updated"), "client-z"
             )
-            assert await mod._handle_canvas_control(MagicMock(), first, "client-a")
-            assert state_loader.await_count == 1
-            assert list(mod._canvas_awareness) == ["client-a"]
-            assert frames[-1]["method"] == "canvas.user_editing"
-            assert frames[-1]["params"]["editing_session_id"] == "editor_session_a"
-            assert frames[-1]["params"]["ttl_ms"] >= 15_000
-
-            # Exact rapid renewal is deduplicated locally, without another
-            # delegated orchestrator request or another task/lease.
-            assert await mod._handle_canvas_control(MagicMock(), first, "client-a")
-            assert state_loader.await_count == 1
-            assert len(mod._canvas_awareness) == 1
-
-            # Local renewals periodically revalidate ownership/current state;
-            # they cannot keep a revoked lease alive forever.
-            from dataclasses import replace
-
-            lease = mod._canvas_awareness["client-a"]
-            mod._canvas_awareness["client-a"] = replace(
-                lease,
-                validated_at=(
-                    asyncio.get_running_loop().time() - mod._CANVAS_AWARENESS_TTL_S - 1
-                ),
-            )
-            assert await mod._handle_canvas_control(MagicMock(), first, "client-a")
-            assert state_loader.await_count == 2
-            assert len(mod._canvas_awareness) == 1
-
-            replacement = self._frame(
-                "canvas.user_editing", editing_session_id="editor_session_b"
-            )
-            assert await mod._handle_canvas_control(
-                MagicMock(), replacement, "client-a"
-            )
-            assert state_loader.await_count == 3
-            assert len(mod._canvas_awareness) == 1
-            assert frames[-2]["method"] == "canvas.user_idle"
-            assert frames[-2]["params"]["editing_session_id"] == "editor_session_a"
-            assert "ttl_ms" not in frames[-2]["params"]
-            assert frames[-1]["params"]["editing_session_id"] == "editor_session_b"
-
-            idle = self._frame(
-                "canvas.user_idle", editing_session_id="editor_session_b"
-            )
-            assert await mod._handle_canvas_control(MagicMock(), idle, "client-a")
-            assert state_loader.await_count == 3
-            assert mod._canvas_awareness == {}
-            assert frames[-1]["method"] == "canvas.user_idle"
-            assert "ttl_ms" not in frames[-1]["params"]
-            send.assert_not_awaited()
         finally:
-            mod._clear_all_canvas_awareness()
+            mod._canvas_control.clear_all()
+
+        broadcast.assert_called_once()
 
 
 # ---------------------------------------------------------------------------

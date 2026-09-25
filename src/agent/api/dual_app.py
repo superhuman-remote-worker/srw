@@ -23,7 +23,7 @@ from enum import Enum
 from typing import Any, Dict, List, Optional
 from uuid import UUID, uuid4
 
-from fastapi import FastAPI, HTTPException, Request, WebSocket
+from fastapi import FastAPI, HTTPException, WebSocket
 from fastapi.responses import JSONResponse
 
 from agent.api.models import (
@@ -40,12 +40,14 @@ from agent.api.models import (
     pinned_job_recipient_matches,
     pinned_session_recipient_matches,
 )
-from agent.api._session_auth import validate_session_token as _validate_session_token
 from agent.api.job_stream import close_job_stream as _close_stream
 from agent.api.orchestrator_client import (
     OrchestratorClient,
     create_orchestrator_client_from_env,
 )
+from agent.api.session_contract import canonical_session_identity_fingerprint
+from agent.api.session_http import register_session_http_routes
+from agent.api.session_websocket import register_session_websocket_routes
 from agent.agent import UniversalAgent
 from shared.runtime.core.loader import resolve_config_path
 from agent.core.phase import push_evidence_snapshot
@@ -1252,7 +1254,7 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
 
         # When in SESSION state, the readiness gate is the three-way check
         # in persistent_app._session_ready() — shared with /session/status
-        # and handle_persistent_websocket so probe and WS gate stay aligned.
+        # and the session WebSocket transport so probe and WS gate stay aligned.
         if _pod_state == PodState.SESSION:
             import agent.api.persistent_app as pa
 
@@ -2037,7 +2039,7 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
         """Check if session is fully set up and ready for WebSocket.
 
         Delegates to ``persistent_app._session_ready()`` so /ready (SESSION
-        branch), this endpoint, and ``handle_persistent_websocket`` share one
+        branch), this endpoint, and the session WebSocket transport share one
         definition of "ready for a WS" and can't drift.
         """
         import agent.api.persistent_app as pa
@@ -2060,7 +2062,7 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
 
         import agent.api.persistent_app as pa
 
-        expected = pa._canonical_pinned_session_identity_fingerprint(
+        expected = canonical_session_identity_fingerprint(
             request.get("session_identity_fingerprint")
             if isinstance(request, dict)
             else None
@@ -2109,7 +2111,7 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
 
         import agent.api.persistent_app as pa
 
-        expected = pa._canonical_pinned_session_identity_fingerprint(
+        expected = canonical_session_identity_fingerprint(
             request.get("session_identity_fingerprint")
             if isinstance(request, dict)
             else None
@@ -2152,59 +2154,38 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
                 status_code=500,
             )
 
-    # --- Persistent-session REST endpoints (orchestrator-driven turns) ---
+    # --- Session client transport (orchestrator-driven turns, session socket) ---
     #
-    # Mirror of /api/{input,interrupt,approve} in persistent_app.py. The
-    # orchestrator forwards from POST /api/persistent/threads/{id}/{input,
-    # interrupt,approve} to whichever agent is attached to the thread, which
-    # in cluster usage is a dual-mode pod. Without these routes the agent
-    # returns 404 and the cockpit's turn never lands. See task #136 /
-    # knowledge-base/knowledge/issues/persistent_session_dual_mode_phase1_gap.md for the parallel
-    # WS-handler gap this duplication caused.
+    # Dual pods host adopted sessions on the persistent runtime's state
+    # (/session/attach seeds it and calls its attach), so the same transport
+    # owners serve both modes. The orchestrator forwards POST
+    # /api/persistent/threads/{id}/{input,interrupt,approve} to whichever agent
+    # is attached to the thread, which in cluster usage can be a dual-mode pod.
+    # Dual mode adds its own pod-state prechecks; see
+    # knowledge-base/knowledge/issues/persistent_session_dual_mode_phase1_gap.md.
+    import agent.api.persistent_app as pa
 
-    @app.post("/api/input", tags=["Session"])
-    async def api_input(request: Request):
+    transport = pa.session_transport_bindings()
+
+    def _session_mode_precheck() -> Optional[JSONResponse]:
         if _pod_state != PodState.SESSION:
             return JSONResponse(
                 {"error": "Pod is not in session mode"}, status_code=404
             )
-        import agent.api.persistent_app as pa
+        return None
 
-        return await pa.handle_api_input(request)
+    register_session_http_routes(
+        app, transport.http, precheck=_session_mode_precheck, tags=["Session"]
+    )
 
-    @app.post("/api/interrupt", tags=["Session"])
-    async def api_interrupt(request: Request):
-        if _pod_state != PodState.SESSION:
-            return JSONResponse(
-                {"error": "Pod is not in session mode"}, status_code=404
-            )
-        import agent.api.persistent_app as pa
+    async def _session_socket_precheck(ws: WebSocket) -> bool:
+        """Dual-mode gate between session authentication and the socket.
 
-        return await pa.handle_api_interrupt(request)
-
-    @app.post("/api/approve", tags=["Session"])
-    async def api_approve(request: Request):
-        if _pod_state != PodState.SESSION:
-            return JSONResponse(
-                {"error": "Pod is not in session mode"}, status_code=404
-            )
-        import agent.api.persistent_app as pa
-
-        return await pa.handle_api_approve(request)
-
-    async def _do_ws_chat(ws: WebSocket) -> None:
-        """Shared WS handler for both /ws/chat and /p/{thread_id}/ws.
-
-        The two routes exist so the agent answers both the legacy direct path
-        (/ws/chat, used by local dev with websocat and any cluster-internal
-        callers) and the external path that the per-session Ingress forwards
-        through Traefik (/p/<thread_id>/ws — cockpit's new direct-WS path).
+        Covers both /ws/chat (local dev with websocat, cluster-internal
+        callers) and the external /p/<thread_id>/ws path the per-session
+        Ingress forwards through Traefik.
         """
         global _pending_exit_task
-
-        # Validate the session JWT carried as ?t={token}.
-        if not await _validate_session_token(ws):
-            return
 
         # Cancel any pending exit from a previous WS disconnect (e.g. page
         # refresh). Vestigial under the Phase-1 keystone — the WS-disconnect
@@ -2224,11 +2205,10 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
                 }
             )
             await ws.close(code=4403, reason="Not in session mode")
-            return
+            return False
 
-        import agent.api.persistent_app as pa
-
-        if not pa._session or not pa._session.llm_with_tools:
+        session = transport.socket.runtime.session()
+        if not session or not session.llm_with_tools:
             await ws.accept()
             await ws.send_json(
                 {
@@ -2237,24 +2217,17 @@ def create_dual_app(config_path: Optional[str] = None) -> FastAPI:
                 }
             )
             await ws.close(code=4503, reason="Session not ready")
-            return
+            return False
 
-        # Delegate to the shared module-level handler. Same implementation
-        # the pure-persistent route uses — Phase-1 keystone, subscriber
-        # model, Phase-5 status flips all included. See
-        # knowledge-base/knowledge/issues/persistent_session_dual_mode_phase1_gap.md for why
-        # this delegation matters.
-        await pa.handle_persistent_websocket(ws)
+        # The shared transport serves the connection from here: the Phase-1
+        # keystone, subscriber model and Phase-5 status flips included.
+        return True
 
-    @app.websocket("/ws/chat")
-    async def ws_chat(ws: WebSocket):
-        await _do_ws_chat(ws)
-
-    @app.websocket("/p/{thread_id}/ws")
-    async def ws_session(ws: WebSocket, thread_id: str):
-        # thread_id is enforced by _validate_session_token against
-        # SESSION_BOUND_THREAD_ID + the JWT's tid claim — the path param is
-        # only here so the Ingress's /p/<tid>/ws path matches a FastAPI route.
-        await _do_ws_chat(ws)
+    register_session_websocket_routes(
+        app,
+        auth=transport.auth,
+        ports=transport.socket,
+        precheck=_session_socket_precheck,
+    )
 
     return app

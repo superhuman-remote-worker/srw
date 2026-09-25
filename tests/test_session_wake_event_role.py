@@ -20,10 +20,10 @@ import pytest
 from langchain_core.messages import HumanMessage
 
 from agent.api.persistent_app import (
-    _ACCEPTED_INPUT_ROLES,
     _db_rows_to_lc_messages,
     _serialize_message_row,
 )
+from agent.api.session_contract import ACCEPTED_INPUT_ROLES
 from shared.runtime.core.loader import scheduled_work_system_floor
 from agent.persistent_graph import PERSIST_ROLE_KEY
 
@@ -121,12 +121,12 @@ def test_only_human_and_event_are_accepted_over_api_input():
     """Ordinary input has no session token, so role remains allow-listed.
 
     The narrower retry-stable event identity is independently internal-key
-    protected by ``handle_api_input``; an arbitrary role must still never
+    protected by the HTTP input transport; an arbitrary role must still never
     reach transcript persistence.
     """
-    assert _ACCEPTED_INPUT_ROLES == frozenset({"human", "event"})
+    assert ACCEPTED_INPUT_ROLES == frozenset({"human", "event"})
     for forged in ("ai", "system", "tool", "summary", "error"):
-        assert forged not in _ACCEPTED_INPUT_ROLES
+        assert forged not in ACCEPTED_INPUT_ROLES
 
 
 # --------------------------------------------------------------------------

@@ -634,7 +634,7 @@ class TestTeardownExtraction:
             patch.object(pa, "_stop_thread_control_watcher", AsyncMock()),
             patch.object(pa, "_retire_announced_permission_rows", AsyncMock()),
             patch.object(pa, "_quiesce_session_side_tasks", AsyncMock()),
-            patch.object(pa, "_clear_all_canvas_awareness"),
+            patch.object(pa._canvas_control, "clear_all"),
             patch.object(pa, "_subscribers", {}),
             patch.object(pa, "_max_sessions_per_process", 0),
             patch.object(pa, "_terminating", False),

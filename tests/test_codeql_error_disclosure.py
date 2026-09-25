@@ -382,6 +382,10 @@ def test_an_unroutable_cloud_backend_names_the_backend_but_not_the_exception():
 # =============================================================================
 
 
+# A canonical v1 session identity; detach validates it exactly.
+_SESSION_FP = "sha256:" + ("f" * 64)
+
+
 def _persistent_client(monkeypatch, *, session, terminate=None):
     from agent.api import persistent_app as module
 
@@ -391,10 +395,7 @@ def _persistent_client(monkeypatch, *, session, terminate=None):
     monkeypatch.setattr(module, "_thread_id", "thread-1")
     monkeypatch.setattr(module, "_sessions_served", 1)
     monkeypatch.setattr(
-        module, "_canonical_pinned_session_identity_fingerprint", lambda _v: "fp"
-    )
-    monkeypatch.setattr(
-        module, "_current_pinned_session_identity_fingerprint", lambda: "fp"
+        module, "_current_pinned_session_identity_fingerprint", lambda: _SESSION_FP
     )
     monkeypatch.setattr(module, "_registered_pinned_agent_id", lambda: AGENT_ID)
     monkeypatch.setattr(module, "_session_runtime_generation", "gen-1")
@@ -441,7 +442,7 @@ def test_persistent_detach_failure_is_a_500_without_the_exception_text(monkeypat
     )
 
     response = client.post(
-        "/session/detach", json={"session_identity_fingerprint": "fp"}
+        "/session/detach", json={"session_identity_fingerprint": _SESSION_FP}
     )
 
     assert response.status_code == 500
@@ -540,10 +541,7 @@ def test_dual_app_detach_failure_is_a_500_without_the_exception_text(monkeypatch
     monkeypatch.setattr(module, "_pod_state", module.PodState.SESSION)
     monkeypatch.setattr(pa, "_thread_id", "thread-1")
     monkeypatch.setattr(
-        pa, "_canonical_pinned_session_identity_fingerprint", lambda _v: "fp"
-    )
-    monkeypatch.setattr(
-        pa, "_current_pinned_session_identity_fingerprint", lambda: "fp"
+        pa, "_current_pinned_session_identity_fingerprint", lambda: _SESSION_FP
     )
     monkeypatch.setattr(
         pa, "_terminate_session", AsyncMock(side_effect=RuntimeError(BOOM))
@@ -551,7 +549,7 @@ def test_dual_app_detach_failure_is_a_500_without_the_exception_text(monkeypatch
     client = TestClient(app, raise_server_exceptions=False)
 
     response = client.post(
-        "/session/detach", json={"session_identity_fingerprint": "fp"}
+        "/session/detach", json={"session_identity_fingerprint": _SESSION_FP}
     )
 
     assert response.status_code == 500

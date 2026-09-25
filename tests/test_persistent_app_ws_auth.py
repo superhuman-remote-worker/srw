@@ -117,22 +117,24 @@ def test_ws_chat_rejects_when_pod_misconfigured(app, monkeypatch):
 def test_ws_chat_accepts_valid_token(app, monkeypatch):
     """Token with matching exact identity passes the validator gate.
 
-    The session itself isn't started so ``handle_persistent_websocket`` will
+    The session itself isn't started so the session socket transport will
     drop the connection shortly after — but the close code must come from
     the downstream handler, not from the validator. The validator's codes
     are 4401 (auth), 4403 (mismatch), and 4500 (misconfig). Anything else
     means the validator allowed the request through.
     """
-    import agent.api.persistent_app as pa
+    from agent.api import session_websocket
 
-    async def _accepted_downstream(ws):
+    async def _accepted_downstream(ws, _ports):
         await ws.accept()
         await ws.close(code=4000, reason="validator passed")
 
     # The real downstream handler also uses 4403 when no live session object
     # exists. Stub it so this test identifies the validator boundary rather
     # than conflating two independent exact-identity checks.
-    monkeypatch.setattr(pa, "handle_persistent_websocket", _accepted_downstream)
+    monkeypatch.setattr(
+        session_websocket, "serve_session_websocket", _accepted_downstream
+    )
 
     token, _ = SessionTokenService("test-pod-secret-do-not-use").mint(
         "u1",

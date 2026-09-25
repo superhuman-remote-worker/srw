@@ -1211,7 +1211,11 @@ class TestAgentRestInputEndpointsNoSession:
                 ),
                 patch.dict("os.environ", {"POD_UID": "rest-input-pod"}),
             ):
-                response = await mod.handle_api_input(request)
+                from agent.api import session_http
+
+                response = await session_http.handle_input(
+                    request, mod.session_transport_bindings().http
+                )
                 # Persistence/queue ownership is not execution admission.
                 assert response.status_code == 202
                 await asyncio.wait_for(mod._loop_task, timeout=1)
