@@ -1863,6 +1863,61 @@ class TestAutomationBoundary:
         assert exc.value.status_code == 400
         db.update_automation.assert_not_awaited()
 
+    @pytest.mark.parametrize("key", ["container", "sandbox"])
+    @pytest.mark.asyncio
+    async def test_workspace_container_or_sandbox_is_refused_at_create(
+        self, automations_env, key
+    ):
+        """Container image/resources come only from the selected
+        WorkspaceTemplate. A caller-authored ``workspace.container`` (the old
+        side door) or ``workspace.sandbox`` (the template's rendered form) is
+        refused here too — same write boundary as the tools fence above."""
+        from fastapi import HTTPException
+
+        mod, db = automations_env
+
+        with pytest.raises(HTTPException) as exc:
+            await mod.create_automation(
+                MagicMock(),
+                self._create_body(
+                    mod, {"workspace": {key: {"image": "registry.example/x:1"}}}
+                ),
+                dependencies=self._deps(mod, db),
+            )
+        assert exc.value.status_code == 422
+        assert (
+            "are no longer supported. Put the image and resources in a "
+            "WorkspaceTemplate" in exc.value.detail
+        )
+        db.create_automation.assert_not_awaited()
+
+    @pytest.mark.parametrize("key", ["container", "sandbox"])
+    @pytest.mark.asyncio
+    async def test_workspace_container_or_sandbox_is_refused_at_patch(
+        self, automations_env, key
+    ):
+        """Every fire replays the stored override, so an update is the same
+        boundary as a create."""
+        from fastapi import HTTPException
+
+        mod, db = automations_env
+
+        with pytest.raises(HTTPException) as exc:
+            await mod.update_automation(
+                MagicMock(),
+                "a1",
+                mod.AutomationUpdate(
+                    config_override={"workspace": {key: {"cpu": "2"}}}
+                ),
+                dependencies=self._deps(mod, db),
+            )
+        assert exc.value.status_code == 422
+        assert (
+            "are no longer supported. Put the image and resources in a "
+            "WorkspaceTemplate" in exc.value.detail
+        )
+        db.update_automation.assert_not_awaited()
+
 
 class TestProjectDefaultOverrideBoundary:
     """`projects.default_config_override` is merged UNDER every job created in
@@ -1933,6 +1988,67 @@ class TestProjectDefaultOverrideBoundary:
                 ),
             )
         assert exc.value.status_code == 400
+        db.update_project.assert_not_awaited()
+
+    @pytest.mark.parametrize("key", ["container", "sandbox"])
+    @pytest.mark.asyncio
+    async def test_create_rejects_workspace_container_or_sandbox(
+        self, project_env, key
+    ):
+        """Container image/resources come only from the selected
+        WorkspaceTemplate; ``default_config_override`` is merged under every
+        job in the project, so the same refusal that guards job/session/
+        automation create runs here too."""
+        from orchestrator.routers.projects import create_project
+        from orchestrator.schemas.projects import ProjectCreate
+
+        main, db = project_env
+
+        with pytest.raises(fastapi_module.HTTPException) as exc:
+            await create_project(
+                ProjectCreate(
+                    name="p",
+                    user_id=SESSION_USER_ID,
+                    default_config_override={
+                        "workspace": {key: {"image": "registry.example/x:1"}}
+                    },
+                ),
+                MagicMock(),
+                dependencies=projects_composition.projects_dependencies(
+                    main.app.state.resources
+                ),
+            )
+        assert exc.value.status_code == 422
+        assert (
+            "are no longer supported. Put the image and resources in a "
+            "WorkspaceTemplate" in exc.value.detail
+        )
+        db.create_project.assert_not_awaited()
+
+    @pytest.mark.parametrize("key", ["container", "sandbox"])
+    @pytest.mark.asyncio
+    async def test_patch_rejects_workspace_container_or_sandbox(self, project_env, key):
+        from orchestrator.routers.projects import update_project
+        from orchestrator.schemas.projects import ProjectUpdate
+
+        main, db = project_env
+
+        with pytest.raises(fastapi_module.HTTPException) as exc:
+            await update_project(
+                "p1",
+                ProjectUpdate(
+                    default_config_override={"workspace": {key: {"cpu": "2"}}}
+                ),
+                MagicMock(),
+                dependencies=projects_composition.projects_dependencies(
+                    main.app.state.resources
+                ),
+            )
+        assert exc.value.status_code == 422
+        assert (
+            "are no longer supported. Put the image and resources in a "
+            "WorkspaceTemplate" in exc.value.detail
+        )
         db.update_project.assert_not_awaited()
 
     @pytest.mark.asyncio

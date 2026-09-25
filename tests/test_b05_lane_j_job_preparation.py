@@ -1914,7 +1914,7 @@ class TestScholarParentProvisioning:
         parent = {
             "id": "parent-1",
             "context": {"workspace_container": READY_CONTAINER},
-            "config_override": {},
+            "config_override": {"workspace": {"container": {"cpu": "2"}}},
         }
         store = MagicMock()
         store.get_job = AsyncMock(return_value=parent)

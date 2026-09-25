@@ -76,7 +76,10 @@ def validated_session_workspace_override(
     word-limit tweaks only) passes through untouched, and the VM sizing sub-dict
     (``vm.{cpu_cores,memory}``) rides along via the caller's merge.
 
-    Raises ``HTTPException(400)`` on a disallowed/invalid backend.
+    Raises ``HTTPException(422)`` if the caller's ``workspace`` fragment sets
+    ``container`` or ``sandbox`` directly — those are execution-owned, filled
+    only from the selected WorkspaceTemplate. Raises ``HTTPException(400)`` on
+    a disallowed/invalid backend.
     """
     refuse_execution_owned_workspace_keys(config_override)
     ws = config_override.get("workspace") if isinstance(config_override, dict) else None

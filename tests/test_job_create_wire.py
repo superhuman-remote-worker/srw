@@ -1816,6 +1816,39 @@ async def test_transport_fence_also_covers_the_internal_rest_path(wire):
     wire.db.create_job.assert_not_awaited()
 
 
+@pytest.mark.parametrize("key", ["container", "sandbox"])
+@pytest.mark.asyncio
+async def test_execution_owned_workspace_keys_are_refused_at_admission(wire, key):
+    """Container image/resources come only from the selected WorkspaceTemplate.
+    ``workspace.container`` was the old unvalidated side door and
+    ``workspace.sandbox`` is the template's own rendered form — a
+    caller-authored override may not set either directly."""
+    response = await submit(
+        wire,
+        body(config_override={"workspace": {key: {"image": "registry.example/x:1"}}}),
+    )
+    assert response.status_code == 422, response.text
+    assert (
+        "are no longer supported. Put the image and resources in a "
+        "WorkspaceTemplate" in response.json()["detail"]
+    )
+    wire.db.create_job.assert_not_awaited()
+    wire.provision.assert_not_awaited()
+    wire.dispatch.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_workspace_container_fence_also_covers_the_internal_rest_path(wire):
+    """Same fence, internal (X-Internal-Key) create route."""
+    response = await submit(
+        wire,
+        body(config_override={"workspace": {"container": {"cpu": "2"}}}),
+        **{"x-test-internal": "1"},
+    )
+    assert response.status_code == 422, response.text
+    wire.db.create_job.assert_not_awaited()
+
+
 @pytest.mark.asyncio
 async def test_model_only_override_is_still_admitted(wire):
     """The fence rejects transport, never the routing selector itself."""

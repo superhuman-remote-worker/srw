@@ -184,6 +184,33 @@ def test_freeze_spec_refuses_transport_keys(layer):
     assert exc.value.status_code == 422
 
 
+@pytest.mark.parametrize("layer", ["tasks", "arms"])
+@pytest.mark.parametrize("key", ["container", "sandbox"])
+def test_freeze_spec_refuses_execution_owned_workspace_keys(layer, key):
+    # Same run-creation write boundary as the transport fence above: a
+    # caller-authored workspace.container/sandbox may not size or image a
+    # container directly — only the selected WorkspaceTemplate may.
+    entry = (
+        {"id": "t", "description": "d"}
+        if layer == "tasks"
+        else {
+            "name": "a",
+            "model": "m",
+        }
+    )
+    entry["config_override"] = {"workspace": {key: {"image": "registry.example/x:1"}}}
+    source = {"tasks": [], "arms": [], layer: [entry]}
+    if layer == "arms":
+        source["tasks"] = [{"id": "t", "description": "d"}]
+    with pytest.raises(HTTPException) as exc:
+        freeze_spec(source)
+    assert exc.value.status_code == 422
+    assert (
+        "are no longer supported. Put the image and resources in a "
+        "WorkspaceTemplate" in exc.value.detail
+    )
+
+
 def test_freeze_spec_is_complete_normalized_and_detached():
     source = {
         "tasks": [

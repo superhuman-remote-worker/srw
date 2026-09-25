@@ -209,6 +209,28 @@ class TestConfigOverrideRebuild:
         )
         assert override["workspace"]["backend"] == "virtual"
 
+    @pytest.mark.parametrize("key", ["container", "sandbox"])
+    def test_workspace_container_or_sandbox_is_refused_at_create(self, key):
+        """Container image/resources come only from the selected
+        WorkspaceTemplate; a caller-authored ``workspace.container`` (the old
+        side door) or ``workspace.sandbox`` (the template's rendered form) is
+        refused here, at the New Session create boundary."""
+        with pytest.raises(HTTPException) as exc:
+            ta.build_session_config_override(
+                ThreadCreateRequest(
+                    config_override={
+                        "workspace": {key: {"image": "registry.example/x:1"}}
+                    }
+                ),
+                user_id=USER["id"],
+                dependencies=_deps(),
+            )
+        assert exc.value.status_code == 422
+        assert (
+            "are no longer supported. Put the image and resources in a "
+            "WorkspaceTemplate" in exc.value.detail
+        )
+
     def test_an_unknown_nested_key_is_reported_rather_than_dropped_silently(self):
         override, ignored = ta.build_session_config_override(
             ThreadCreateRequest(config_override={"memory": {"enabled": False}}),
