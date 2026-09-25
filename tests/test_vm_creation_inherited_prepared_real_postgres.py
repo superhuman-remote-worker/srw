@@ -382,6 +382,12 @@ async def test_inherited_prepared_completion_is_rechecked_after_vm_grant(db, wor
     _, row, payload = await admit_replacement(db, ctrl, store, request, fresh)
     authority = ctrl._workspace_cleanup_authority_request
     changed = False
+    surrenders = []
+    retained_name = storage_name(request["workspace_storage"])
+    retained_uid = api.read("DataVolume", retained_name)["metadata"]["uid"]
+    retained_pvc_uid = api.read("PersistentVolumeClaim", retained_name)["metadata"][
+        "uid"
+    ]
 
     async def drift_after_grant(path, body, *, operation):
         nonlocal changed
@@ -395,6 +401,8 @@ async def test_inherited_prepared_completion_is_rechecked_after_vm_grant(db, wor
                 api.objects["DataVolume", storage_name(request["workspace_storage"])][
                     "status"
                 ]["phase"] = "CloneInProgress"
+        elif operation == "creation_retry_record_not_attempted":
+            surrenders.append((body["effect_nonce"], body["reason"]))
         return result
 
     ctrl._workspace_cleanup_authority_request = drift_after_grant
@@ -405,7 +413,23 @@ async def test_inherited_prepared_completion_is_rechecked_after_vm_grant(db, wor
     assert result["status"] != "created"
     assert changed and "VirtualMachine" not in api.writes
     current = await store.inspect(request_id=str(row["request_id"]))
-    assert current["effects"][-1]["state"] == "issued"
+    effect = current["effects"][-1]
+    assert effect["carrier_intent"]["effect_kind"] == "vm"
+    assert effect["state"] == "rejected"
+    assert effect["evidence"] == {
+        "outcome": "not_attempted",
+        "reason": "creation_rootdisk_source_unproven",
+    }
+    assert surrenders == [
+        (effect["carrier_intent"]["effect_nonce"], "creation_rootdisk_source_unproven")
+    ]
+    assert current["state"] == "attention"
+    assert current["reason"] == "vm_creation_retry_blocked"
+    assert "issuer_receipt" not in str(current)
+    assert api.read("DataVolume", retained_name)["metadata"]["uid"] == retained_uid
+    assert api.read("PersistentVolumeClaim", retained_name)["metadata"][
+        "uid"
+    ] == retained_pvc_uid
     assert (
         api.read("Secret", "agent-vm-" + request["job_id"] + "-cloudinit") is not None
     )
