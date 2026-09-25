@@ -2239,19 +2239,51 @@ async def archive_and_cleanup_workspace(
         ws_ctx = _get_container_context(job)
         vm_ctx = _get_vm_context(job)
 
+        # A controller may have stopped the VM and marked its context deleting
+        # before the parent admission/compute charge committed. Replay that
+        # same exact terminal admission until authenticated absence settles it.
+        pending_terminal_vm_cleanup = False
+        if vm_ctx and not _vm_needs_release(vm_ctx):
+            async with postgres_db.acquire() as conn:
+                pending_terminal_vm_cleanup = bool(await conn.fetchval(
+                    "SELECT EXISTS(SELECT 1 FROM vm_workspace_cleanup_admissions "
+                    "WHERE owner_kind='job' AND owner_id=$1::uuid "
+                    "AND source='job_terminal_vm_release' "
+                    "AND pvc_uid::text IS NOT DISTINCT FROM $2::text "
+                    "AND completed_at IS NULL)",
+                    entity_id, vm_ctx.get("rootdisk_pvc_uid"),
+                ))
+
         # VM cleanup (snapshot + delete)
-        if _vm_needs_release(vm_ctx):
+        if _vm_needs_release(vm_ctx) or pending_terminal_vm_cleanup:
             if vm_provisioner.lifecycle_available:
                 teardown_identity = await vm_provisioner.capture_vm_teardown_identity(
                     entity_id
                 )
+                purge_disk = True
+                if vm_ctx.get("workspace_storage") is not None:
+                    # The context is a hint; only the durable reservation can
+                    # authorize keeping this rootdisk after terminal compute.
+                    if await vm_provisioner._storage_context(entity_id) is None:
+                        raise RuntimeError("VM retained storage authority is unavailable")
+                    purge_disk = False
+                from orchestrator.services.vm_idle_lifecycle import (
+                    retained_terminal_rootdisk,
+                )
+
+                if await retained_terminal_rootdisk(
+                    postgres_db, job_id=entity_id,
+                    generation=teardown_identity.provision_generation,
+                    pvc_uid=teardown_identity.rootdisk_pvc_uid,
+                ):
+                    raise RuntimeError("terminal VM rootdisk belongs to idle review release")
                 cleanup = await acquire_vm_cleanup_permit(
                     recovery_store,
                     owner_kind="job",
                     owner_id=entity_id,
                     identity=teardown_identity,
                     source="job_terminal_vm_release",
-                    purge_disk=True,
+                    purge_disk=purge_disk,
                 )
                 if not cleanup.allowed:
                     raise RuntimeError("job VM cleanup held for workspace recovery")
@@ -2262,7 +2294,7 @@ async def archive_and_cleanup_workspace(
                         teardown_identity,
                         ssh_host=vm_ctx.get("ssh_host"),
                         ssh_port=vm_ctx.get("ssh_port"),
-                        purge_disk=True,
+                        purge_disk=purge_disk,
                         **vm_cleanup_kwargs(cleanup),
                     )
                     disposition = outcome.disposition
@@ -2271,6 +2303,7 @@ async def archive_and_cleanup_workspace(
                             recovery_store,
                             cleanup,
                             outcome=disposition,
+                            provisioner=vm_provisioner,
                         )
                 if disposition != "completed":
                     raise RuntimeError("VM exact teardown remains " + str(disposition))

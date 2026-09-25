@@ -2044,35 +2044,62 @@ async def workspace_idle_sweeper(shutdown_event: asyncio.Event) -> None:
                 _job_control_operations().publish_terminal_review(operation)
             ),
         )
-    while not shutdown_event.is_set():
-        # Session workspace reconcile (safety-net): recreate failed/missing
-        # workspaces for active sessions. Runs regardless of whether idle
-        # suspension is enabled — recovering a wedged workspace is independent
-        # of idle policy. This is the session-side equivalent of the job
-        # dispatcher's per-cycle workspace reconcile.
-        # (reconcile_session_workspaces never raises; the try/except is a
-        # belt-and-suspenders guard so a future change can't kill this loop.)
-        try:
-            await reconcile_session_workspaces(
-                db=postgres_db,
-                provisioner=container_provisioner,
-                suspension=workspace_suspension_service,
-            )
-        except Exception as e:
-            logger.error("Error in session workspace reconcile: %s", e)
-
-        if vm_idle_service is not None:
+    terminal_vm_controls = _job_mutation_operations()
+    terminal_vm_task: asyncio.Task[int] | None = None
+    try:
+        while not shutdown_event.is_set():
+            # Session workspace reconcile (safety-net): recreate failed/missing
+            # workspaces for active sessions. Runs regardless of whether idle
+            # suspension is enabled — recovering a wedged workspace is independent
+            # of idle policy. This is the session-side equivalent of the job
+            # dispatcher's per-cycle workspace reconcile.
+            # (reconcile_session_workspaces never raises; the try/except is a
+            # belt-and-suspenders guard so a future change can't kill this loop.)
             try:
-                await vm_idle_service.reconcile_once(limit=16)
+                await reconcile_session_workspaces(
+                    db=postgres_db,
+                    provisioner=container_provisioner,
+                    suspension=workspace_suspension_service,
+                )
+            except Exception as e:
+                logger.error("Error in session workspace reconcile: %s", e)
+
+            if vm_idle_service is not None:
+                try:
+                    await vm_idle_service.reconcile_once(limit=16)
+                except Exception:
+                    logger.exception("VM idle reconcile held")
+
+            # Terminal Job rows outlive HTTP callers. Replay their ordinary exact
+            # VM cleanup through the same admission after a timeout or restart;
+            # retained terminal reviews remain owned by vm_idle_service above.
+            if terminal_vm_task is None or terminal_vm_task.done():
+                if terminal_vm_task is not None:
+                    try:
+                        terminal_vm_task.result()
+                    except asyncio.CancelledError:
+                        pass
+                    except Exception:
+                        logger.exception("Terminal Job VM cleanup reconcile held")
+                terminal_vm_task = asyncio.create_task(
+                    terminal_vm_controls.reconcile_terminal_vm_cleanups(limit=4)
+                )
+
+            try:
+                await asyncio.wait_for(shutdown_event.wait(), timeout=60.0)
+                break
+            except asyncio.TimeoutError:
+                pass
+
+    finally:
+        if terminal_vm_task is not None:
+            terminal_vm_task.cancel()
+            try:
+                await terminal_vm_task
+            except asyncio.CancelledError:
+                pass
             except Exception:
-                logger.exception("VM idle reconcile held")
-
-        try:
-            await asyncio.wait_for(shutdown_event.wait(), timeout=60.0)
-            break
-        except asyncio.TimeoutError:
-            pass
-
+                logger.exception("Terminal Job VM cleanup reconcile held on shutdown")
     logger.info("Workspace idle sweeper stopped")
 
 

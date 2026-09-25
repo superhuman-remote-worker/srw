@@ -14,6 +14,7 @@ See knowledge-base/knowledge/issues/vm_reliability_assessment.md P1-7.
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from tests import _b09_control_seams as control_seams
 
 from types import SimpleNamespace
@@ -171,7 +172,16 @@ async def _cleanup_job(status):
         if status is not None
         else {}
     )
-    identity = object()
+    identity = SimpleNamespace(
+        provision_generation="8d6f28f4-cc40-4adc-9ad3-343831f7874d",
+        rootdisk_pvc_uid="8d6f28f4-cc40-4adc-9ad3-343831f7874e",
+    )
+    conn = SimpleNamespace(fetchval=AsyncMock(return_value=False))
+
+    @asynccontextmanager
+    async def acquire():
+        yield conn
+
     vm_provisioner = SimpleNamespace(
         is_available=True,
         lifecycle_available=True,
@@ -185,7 +195,8 @@ async def _cleanup_job(status):
             orch_main,
             "postgres_db",
             SimpleNamespace(
-                get_job=AsyncMock(return_value={"id": "j1", "context": context})
+                get_job=AsyncMock(return_value={"id": "j1", "context": context}),
+                acquire=acquire,
             ),
         ),
         patch.object(orch_main, "vm_provisioner", vm_provisioner),

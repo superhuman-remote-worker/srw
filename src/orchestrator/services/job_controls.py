@@ -52,6 +52,23 @@ from shared.runtime.core.tool_policy import ToolPolicyError
 from shared.workspace_contract import resolve_workspace_contract
 
 
+# Approval selects ordinary terminal VM cleanup in the same transaction as
+# completed status. Historical terminal rows without this intent remain owned
+# by their original retention decisions and are not swept retroactively.
+_TERMINAL_VM_APPROVAL_CONTEXT_SQL = """
+CASE WHEN jsonb_typeof(context->'vm')='object'
+          AND context->'vm' <> '{}'::jsonb
+          AND NOT (parent_job_id IS NOT NULL AND
+                   context->>'inherits_parent_workspace'='true')
+          AND COALESCE(context->'vm'->>'status','') NOT IN ('deleted','deleting')
+     THEN jsonb_set(COALESCE(context,'{}'::jsonb),
+          '{_job_terminal_vm_cleanup}',
+          jsonb_build_object('version',1,'source','approve',
+            'provision_generation',context->'vm'->>'provision_generation'), true)
+     ELSE context END
+"""
+
+
 def resume_reject_should_requeue(status_code: int) -> bool:
     """Return whether a stale-ready agent rejection should re-enter dispatch."""
 
@@ -2088,6 +2105,7 @@ class JobControlOperations:
                     "deliverables": completion_data.get("deliverables", []),
                     "approved_at": completion_data["approved_at"],
                     "publication_pending": publication_pending,
+                    "cleanup_pending": operation.get("closed_at") is None,
                     "_terminal_notification_owned": True,
                 }
 
@@ -2106,6 +2124,7 @@ class JobControlOperations:
                         )
                         updated = await conn.fetchrow(
                             "UPDATE jobs SET status = 'completed', freeze_data = NULL, "
+                            f"context={_TERMINAL_VM_APPROVAL_CONTEXT_SQL}, "
                             "completed_at = CURRENT_TIMESTAMP, "
                             "updated_at = CURRENT_TIMESTAMP "
                             "WHERE id = $1::uuid AND execution_lane = 'stateless' "
@@ -2161,6 +2180,7 @@ class JobControlOperations:
                     ):
                         updated = await conn.fetchrow(
                             "UPDATE jobs SET status = 'completed', "
+                            f"context={_TERMINAL_VM_APPROVAL_CONTEXT_SQL}, "
                             "freeze_data = NULL, assigned_agent_id = NULL, "
                             "completed_at = COALESCE(completed_at, CURRENT_TIMESTAMP), "
                             "updated_at = CURRENT_TIMESTAMP "
@@ -2181,6 +2201,7 @@ class JobControlOperations:
                 async with self.dependencies.store.acquire() as conn:
                     await conn.execute(
                         "UPDATE jobs SET status = 'completed', freeze_data = NULL, "
+                        f"context={_TERMINAL_VM_APPROVAL_CONTEXT_SQL}, "
                         "completed_at = CURRENT_TIMESTAMP, "
                         "updated_at = CURRENT_TIMESTAMP WHERE id = $1::uuid",
                         job_id,
@@ -2243,6 +2264,26 @@ class JobControlOperations:
                 "deliverables": completion_data.get("deliverables", []),
                 "approved_at": completion_data["approved_at"],
             }
+            approval_context = job.get("context") or {}
+            if isinstance(approval_context, str):
+                approval_context = json.loads(approval_context)
+            vm = (
+                approval_context.get("vm")
+                if isinstance(approval_context, Mapping)
+                else None
+            )
+            inherited_workspace = (
+                isinstance(approval_context, Mapping)
+                and job.get("parent_job_id")
+                and approval_context.get("inherits_parent_workspace") is True
+            )
+            if (
+                isinstance(vm, Mapping)
+                and vm
+                and not inherited_workspace
+                and vm.get("status") not in {"deleted", "deleting"}
+            ):
+                result["cleanup_pending"] = True
             if merge_result:
                 result["merge"] = merge_result
             return result

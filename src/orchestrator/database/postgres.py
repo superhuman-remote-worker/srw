@@ -4751,6 +4751,20 @@ class PostgresDB:
                     UPDATE jobs
                     SET status = 'cancelled',
                         assigned_agent_id = NULL,
+                        context = CASE
+                          WHEN jsonb_typeof(context->'vm')='object'
+                            AND context->'vm' <> '{{}}'::jsonb
+                            AND NOT (parent_job_id IS NOT NULL AND
+                                     context->>'inherits_parent_workspace'='true')
+                            AND COALESCE(context->'vm'->>'status','')
+                                NOT IN ('deleted','deleting')
+                          THEN jsonb_set(COALESCE(context,'{{}}'::jsonb),
+                            '{{_job_terminal_vm_cleanup}}',
+                            jsonb_build_object(
+                              'version',1,'source','cancel',
+                              'provision_generation',
+                                context->'vm'->>'provision_generation'), true)
+                          ELSE context END,
                         updated_at = CURRENT_TIMESTAMP
                     WHERE id = $1
                       AND execution_lane = 'pinned'
@@ -5214,6 +5228,105 @@ class PostgresDB:
         if row["execution_lane"] != "stateless" or row["status"] != "cancelled":
             return None
         return bool(row["cleanup_pending"])
+
+    async def list_terminal_vm_cleanup_jobs(
+        self, *, limit: int = 4, after_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Nominate durable terminal VM owners, including unsettled receipts.
+
+        Terminal review storage belongs to the VM idle operation and is kept
+        until its own reconciler proves compute absent. Ordinary terminal Jobs
+        use the normal snapshot and purge policy. A pending parent admission
+        stays nominated even after context.vm changes to ``deleting``.
+        """
+        cursor = UUID(after_id) if after_id is not None else None
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT j.id::text AS id, j.status::text AS status,
+                       j.execution_lane, j.context
+                FROM jobs j
+                WHERE j.status IN ('completed','failed','cancelled')
+                  AND ($2::uuid IS NULL OR j.id > $2::uuid)
+                  AND jsonb_typeof(j.context->'vm')='object'
+                  AND j.context->'vm' <> '{}'::jsonb
+                  AND NOT (j.parent_job_id IS NOT NULL AND
+                           j.context->>'inherits_parent_workspace'='true')
+                  AND (
+                    j.context ? '_job_terminal_vm_cleanup'
+                    OR j.context ? '_stateless_cancel_cleanup_pending'
+                    OR EXISTS (
+                        SELECT 1 FROM vm_workspace_cleanup_admissions a
+                        WHERE a.owner_kind='job' AND a.owner_id=j.id
+                          AND a.source='job_terminal_vm_release'
+                          AND a.completed_at IS NULL
+                    )
+                  )
+                  AND (
+                    COALESCE(j.context->'vm'->>'status','')
+                        NOT IN ('deleted','deleting')
+                    OR j.context ? '_stateless_cancel_cleanup_pending'
+                    OR EXISTS (
+                        SELECT 1 FROM vm_workspace_cleanup_admissions a
+                        WHERE a.owner_kind='job' AND a.owner_id=j.id
+                          AND a.source='job_terminal_vm_release'
+                          AND a.completed_at IS NULL
+                    )
+                  )
+                  AND NOT EXISTS (
+                    SELECT 1 FROM vm_idle_operations idle
+                    WHERE idle.owner_kind='job' AND idle.owner_id=j.id
+                      AND idle.storage_disposition='retention_unknown'
+                      AND idle.provision_generation::text=
+                          j.context->'vm'->>'provision_generation'
+                      AND idle.pvc_uid::text=
+                          j.context->'vm'->>'rootdisk_pvc_uid'
+                  )
+                ORDER BY j.id LIMIT $1
+                """,
+                max(1, min(int(limit), 25)), cursor,
+            )
+        return [dict(row) for row in rows]
+
+    async def complete_terminal_vm_cleanup_marker(
+        self, job_id: str, *, expected_generation: str,
+    ) -> bool:
+        """Close only the selected generation after its parent permit settled."""
+        try:
+            owner_id, generation = UUID(job_id), UUID(expected_generation)
+        except (TypeError, ValueError):
+            return False
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                """
+                UPDATE jobs j
+                SET context=jsonb_set(
+                    context - '_job_terminal_vm_cleanup',
+                    '{vm,status}', '"deleted"'::jsonb, true),
+                    updated_at=clock_timestamp()
+                WHERE j.id=$1 AND j.status IN ('completed','failed','cancelled')
+                  AND j.context->'_job_terminal_vm_cleanup'->>'version'='1'
+                  AND j.context->'_job_terminal_vm_cleanup'->>'provision_generation'=$2
+                  AND j.context->'vm'->>'provision_generation'=$2
+                  AND NOT EXISTS (
+                    SELECT 1 FROM vm_workspace_cleanup_admissions a
+                    WHERE a.owner_kind='job' AND a.owner_id=j.id
+                      AND a.source='job_terminal_vm_release'
+                      AND a.completed_at IS NULL
+                  )
+                  AND EXISTS (
+                    SELECT 1 FROM vm_workspace_cleanup_admissions a
+                    WHERE a.owner_kind='job' AND a.owner_id=j.id
+                      AND a.source='job_terminal_vm_release'
+                      AND a.pvc_uid::text IS NOT DISTINCT FROM
+                          j.context->'vm'->>'rootdisk_pvc_uid'
+                      AND a.completed_at IS NOT NULL AND a.outcome='completed'
+                  )
+                RETURNING j.id
+                """,
+                owner_id, str(generation),
+            )
+        return row is not None
 
     async def finalize_cancelled_stateless_job(self, job_id: str) -> bool:
         """Finish cleanup only after a cancelled worker lease has quiesced.
