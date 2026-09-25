@@ -256,10 +256,16 @@ async def test_retained_attachment_cas_keeps_disk_and_recovers_lost_put(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("change", ["rv", "uid", "detached"])
-async def test_attachment_change_after_grant_cannot_reach_put(attached, change):
+@pytest.mark.parametrize(
+    "change,advance",
+    [("rv", False), ("uid", False), ("detached", False), ("rv", True)],
+)
+async def test_attachment_change_after_grant_cannot_reach_put(
+    attached, change, advance,
+):
     ctrl, api, authority, payload = attached
-    name = retained_attachment(attached)
+    name = retained_attachment(attached, advance=advance)
+    prior = api.read("Lease", name)
     original = authority.call
     original_replace = api.replace
     attachment_replaces = []
@@ -297,6 +303,14 @@ async def test_attachment_change_after_grant_cannot_reach_put(attached, change):
     ]["effect_nonce"]
     assert authority.surrenders[0]["reason"] == "workspace_attachment_unproven"
     assert attachment_replaces == []
+    if advance:
+        assert authority.row["effects"][0]["carrier_intent"]["workspace_attachment"][
+            "action"
+        ] == "replace"
+        assert api.read("Lease", name)["metadata"]["uid"] == prior["metadata"]["uid"]
+        assert api.read("Lease", name)["metadata"]["annotations"] == prior[
+            "metadata"
+        ]["annotations"]
     assert (await ctrl._do_create_serialized(payload))["status"] != "created"
     assert api.writes == ["Lease"]
     assert attachment_replaces == []
