@@ -7,7 +7,11 @@ from uuid import uuid4
 import pytest
 
 from tests.test_vm_idle_lifecycle_real_postgres import (
-    db as _db_fixture, pg_dsn, postgres_db_fixture, _schema_applied, seed_wait,
+    db as _db_fixture,
+    pg_dsn,  # noqa: F401 - imported pytest fixture dependency
+    postgres_db_fixture,  # noqa: F401 - imported pytest fixture dependency
+    _schema_applied,  # noqa: F401 - imported pytest fixture dependency
+    seed_wait,
 )
 from tests.test_vm_idle_terminal_review_real_postgres import controls_for
 
