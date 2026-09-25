@@ -79,3 +79,22 @@ async def test_session_snapshot_keeps_container_settings_and_refuses_changes(
     assert denied.value.status_code == 422
     assert "container image or resources" in denied.value.detail
     assert await read_execution(database, "Session", thread_id) == current
+
+
+@pytest.mark.asyncio
+async def test_resolver_reads_the_captured_session_settings(database, actor):
+    from orchestrator.services.sandbox_workspace_settings import (
+        SandboxSettings,
+        resolve_sandbox_settings,
+    )
+
+    thread_id = await sandbox_session(database, actor)
+    assert await resolve_sandbox_settings(database, "session", thread_id) == (
+        SandboxSettings(
+            image=IMAGE,
+            pull_policy="IfNotPresent",
+            cpu=1,
+            memory="3Gi",
+            storage="15Gi",
+        )
+    )
