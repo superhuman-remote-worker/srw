@@ -113,6 +113,12 @@ def test_malformed_container_image_is_refused():
 
 @pytest.mark.parametrize("role", ["worker", "session"])
 def test_expert_private_config_never_sizes_or_images_a_container(role):
+    # blob["agent"]["workspace"] never carries a "sandbox" key at all (see
+    # test_selected_sandbox_settings_survive_binding), so asserting against it
+    # here would be vacuous -- it would pass even if the attacker's payload
+    # below leaked all the way into the frozen policy. The real captured
+    # source -- what admission freezes into policy.workspace.sandbox -- is
+    # capture["merged_fragment"]["workspace"]; assert against that instead.
     row = {
         "config": {
             "workspace": {
@@ -121,13 +127,15 @@ def test_expert_private_config_never_sizes_or_images_a_container(role):
             }
         }
     }
-    blob = resolve_config(
+    capture: dict = {}
+    resolve_config(
         base_config_name=f"{role}_base",
         expert_type=role,
         expert_row=row,
         request_override={"workspace": {"backend": "sandbox"}},
+        capture=capture,
     )
-    assert "sandbox" not in blob["agent"]["workspace"]
+    assert capture["merged_fragment"]["workspace"].get("sandbox") is None
 
 
 @pytest.mark.parametrize("role", ["worker", "session"])
