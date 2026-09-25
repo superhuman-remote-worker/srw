@@ -1996,6 +1996,14 @@ class VMIdleLifecycleStore:
                     }
                 ):
                     return None
+                from orchestrator.services.vm_thread_network import (
+                    successor_profile_on_conn,
+                )
+
+                if not await successor_profile_on_conn(
+                    conn, thread_id=owner_id, operation=prior, vm=vm,
+                ):
+                    return None
                 if execution_requested:
                     changed = await conn.execute(
                         "UPDATE threads SET status='created' WHERE id=$1 "
@@ -2262,6 +2270,14 @@ class VMIdleLifecycleStore:
                 or operation["launcher_uid"] == UUID(launcher_uid)
             ):
                 return False
+            from orchestrator.services.vm_thread_network import (
+                successor_profile_on_conn,
+            )
+
+            if not await successor_profile_on_conn(
+                conn, thread_id=operation["owner_id"], operation=operation, vm=vm,
+            ):
+                return False
             episode = read_episode(
                 _episode_document(thread["workspace_idle_episode"]),
                 revision=thread["workspace_idle_revision"],
@@ -2388,6 +2404,14 @@ class VMIdleLifecycleStore:
                     "launcher_uid": vm.get("active_pod_uid"),
                     "pvc_uid": str(operation["pvc_uid"]),
                 }
+            ):
+                return False
+            from orchestrator.services.vm_thread_network import (
+                successor_profile_on_conn,
+            )
+
+            if not await successor_profile_on_conn(
+                conn, thread_id=operation["owner_id"], operation=operation, vm=vm,
             ):
                 return False
             if operation["wake_execution_requested"]:

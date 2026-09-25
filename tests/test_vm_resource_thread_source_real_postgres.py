@@ -26,6 +26,7 @@ from shared.vm_creation_issuance import (
 )
 from shared.vm_creation_retry import canonical_request_digest
 from shared.vm_launcher_profile import predict_launcher
+from shared.vm_network_profile import NETWORK_PROFILE
 from tests.test_b10_session_queries_real_postgres import (
     _schema_applied,  # noqa: F401
     _thread,
@@ -736,6 +737,52 @@ async def test_actual_pinned_provision_cas_captures_thread_source_and_waiter(
     )
     proposed = VMProvisioner._fresh_provision_ctx()
     proposed.update(status="provisioning", provision_generation=str(generation))
+    unqualified_image = "registry.example/unqualified@sha256:" + "a" * 64
+    monkeypatch.setenv("VM_NETWORK_PROFILE_ENABLED", "true")
+    monkeypatch.setenv(
+        "VM_NETWORK_PROFILE_IMAGE_ALLOWLIST",
+        "registry.example/other@sha256:" + "b" * 64,
+    )
+    injected = {
+        **request, "vm_image": unqualified_image,
+        "network_profile": NETWORK_PROFILE,
+    }
+    config["network_profile_policy"] = {
+        "version": 1, "image": unqualified_image, "profile": NETWORK_PROFILE,
+    }
+    assert not await db.begin_pinned_thread_vm_provisioning(
+        str(thread_id), expected_runtime_generation=str(runtime_generation),
+        expected_agent_id=None, expected_attach_token=None,
+        expected_vm_context=None, provision_context=proposed,
+        creation_source={
+            "request_id": str(request_id), "request": injected,
+            "request_digest": canonical_request_digest(injected),
+            "controller_configuration": config,
+            "controller_configuration_digest": canonical_configuration_digest(config),
+        },
+    )
+    assert await db.fetchval(
+        "SELECT count(*) FROM vm_creation_retries WHERE thread_id=$1", thread_id,
+    ) == 0
+    assert await db.fetchval(
+        "SELECT count(*) FROM vm_creation_effects e JOIN vm_creation_retries r "
+        "ON r.request_id=e.request_id WHERE r.thread_id=$1", thread_id,
+    ) == 0
+    monkeypatch.setenv("VM_NETWORK_PROFILE_IMAGE_ALLOWLIST", unqualified_image)
+    prepared_profile = {**injected, "preparation": {"kind": "test-artifact"}}
+    assert not await db.begin_pinned_thread_vm_provisioning(
+        str(thread_id), expected_runtime_generation=str(runtime_generation),
+        expected_agent_id=None, expected_attach_token=None,
+        expected_vm_context=None, provision_context=proposed,
+        creation_source={
+            "request_id": str(request_id), "request": prepared_profile,
+            "request_digest": canonical_request_digest(prepared_profile),
+            "controller_configuration": config,
+            "controller_configuration_digest": canonical_configuration_digest(config),
+        },
+    )
+    config.pop("network_profile_policy")
+    monkeypatch.delenv("VM_NETWORK_PROFILE_ENABLED")
     assert await db.begin_pinned_thread_vm_provisioning(
         str(thread_id), expected_runtime_generation=str(runtime_generation),
         expected_agent_id=None, expected_attach_token=None,
@@ -887,8 +934,12 @@ async def test_actual_pinned_provision_cas_captures_thread_source_and_waiter(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("profile_enabled", "immutable_image", "expected_profile"),
+    [(True, True, True), (False, True, False), (True, False, False)],
+)
 async def test_real_thread_provisioner_uses_immutable_source_not_legacy_create(
-    db, monkeypatch,
+    db, monkeypatch, profile_enabled, immutable_image, expected_profile,
 ):
     store, inventory, _, _ = await environment(db)
     _, thread_id = await _thread(db, lane="pinned", status="created")
@@ -910,9 +961,20 @@ async def test_real_thread_provisioner_uses_immutable_source_not_legacy_create(
     monkeypatch.setenv("VM_MODE", "same-cluster")
     monkeypatch.setenv("VM_CREATION_RETRY_ENABLED", "true")
     monkeypatch.setenv("VM_RESOURCE_ADMISSION_CONFIG", json.dumps(store.policy_document))
+    qualified_image = "registry.example/session@sha256:" + "a" * 64
+    image = qualified_image if immutable_image else "registry.example/session:latest"
+    monkeypatch.setenv(
+        "VM_NETWORK_PROFILE_ENABLED", "true" if profile_enabled else "false",
+    )
+    monkeypatch.setenv("VM_NETWORK_PROFILE_IMAGE_ALLOWLIST", qualified_image)
 
     async def resolve(_client, request, *, secret):
         assert secret == b"thread-resource-test-secret"
+        if request.get("network_profile") is not None:
+            config["network_profile_policy"] = {
+                "version": 1, "image": image,
+                "profile": request["network_profile"],
+            }
         return {"request": request, "controller_configuration": config}
 
     async def legacy(*_args, **_kwargs):
@@ -928,8 +990,21 @@ async def test_real_thread_provisioner_uses_immutable_source_not_legacy_create(
     provisioner._controller_url = "http://controller.test"
     provisioner._http_client = object()
     provisioner._lifecycle_hmac_secret = b"thread-resource-test-secret"
+    conflicting_profile = (
+        {**NETWORK_PROFILE, "version": 2} if expected_profile else NETWORK_PROFILE
+    )
     assert await provisioner.create_thread_vm(
-        str(thread_id), vm_image="pinned:image", cpu_cores=8, memory="16Gi",
+        str(thread_id), vm_image=image, cpu_cores=8, memory="16Gi",
+        network_profile=conflicting_profile,
+        expected_runtime_generation=str(runtime_generation),
+        expected_agent_id=None, expected_attach_token=None,
+        expected_vm_context=None,
+    ) is False
+    assert await db.fetchval(
+        "SELECT count(*) FROM vm_creation_retries WHERE thread_id=$1", thread_id,
+    ) == 0
+    assert await provisioner.create_thread_vm(
+        str(thread_id), vm_image=image, cpu_cores=8, memory="16Gi",
         expected_runtime_generation=str(runtime_generation),
         expected_agent_id=None, expected_attach_token=None,
         expected_vm_context=None,
@@ -940,6 +1015,10 @@ async def test_real_thread_provisioner_uses_immutable_source_not_legacy_create(
     )
     assert row["thread_id"] == thread_id and row["job_id"] is None
     assert json.loads(row["canonical_request"])["entity_type"] == "thread"
+    frozen = json.loads(row["canonical_request"])
+    assert frozen.get("network_profile") == (
+        NETWORK_PROFILE if expected_profile else None
+    )
     assert await db.fetchval(
         "SELECT count(*) FROM vm_resource_waiters WHERE request_id=$1", row["request_id"],
     ) == 1

@@ -103,8 +103,20 @@ def resolve_creation_configuration(
         )
 
         validate_network_profile(payload["network_profile"])
+        # This endpoint only calculates a canonical configuration. A profiled
+        # retained Session must re-resolve its frozen image after the operator
+        # allowlist changes. The thread source transaction separately proves
+        # fresh selection or the exact predecessor source and guest receipt;
+        # the typed retry controller still requires that durable effect grant.
+        frozen_thread_candidate = (
+            payload["entity_type"] == "thread"
+            and isinstance(_resource_policy_snapshot, EnforcementResourcePolicySnapshot)
+            and compatible_image(
+                payload["vm_image"], allowlist=payload["vm_image"]
+            )
+        )
         if (
-            not compatible_image(payload["vm_image"])
+            not (compatible_image(payload["vm_image"]) or frozen_thread_candidate)
             or payload.get("preparation") is not None
         ):
             raise ValueError("VM network profile source is not admitted")
