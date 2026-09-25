@@ -107,30 +107,22 @@ def _items(value):
     return value["items"]
 
 
-async def require_no_consumers(actuator, disposition):
-    """Complete namespace scans include deleting VM/VMI/Pods and Secret users."""
-    ctrl = actuator.controller
-    job_name = "agent-vm-" + disposition["job_id"]
-    root = disposition["objects"].get("rootdisk", {}).get("name")
-    secret = disposition["objects"].get("cloud_init", {}).get("name")
-    if await actuator.read("vm", job_name) is not None:
-        raise CreationUnproven("creation_vm_requires_observation")
+def _scan_consumers(ctrl, namespace, job_name, root, secret):
+    """Read and interpret each complete namespace LIST in one owned worker."""
     documents = []
     for plural in ("virtualmachines", "virtualmachineinstances"):
-        result = await asyncio.to_thread(
-            ctrl.k8s_client.list_namespaced_custom_object,
+        result = ctrl.k8s_client.list_namespaced_custom_object(
             group="kubevirt.io",
             version="v1",
-            namespace=actuator.namespace,
+            namespace=namespace,
             plural=plural,
+            _request_timeout=5,
         )
         documents.extend((plural, item) for item in _items(result))
-    result = await asyncio.to_thread(
-        ctrl.core_api.list_namespaced_pod, namespace=actuator.namespace
-    )
+    result = ctrl.core_api.list_namespaced_pod(namespace=namespace, _request_timeout=5)
     documents.extend(("pods", item) for item in _items(result))
     for kind, item in documents:
-        metadata = _consumer_spec(item, kind, actuator.namespace)
+        metadata = _consumer_spec(item, kind, namespace)
         if (
             metadata.get("name") == job_name
             or (metadata.get("labels") or {}).get("vm.kubevirt.io/name") == job_name
@@ -146,6 +138,40 @@ async def require_no_consumers(actuator, disposition):
             and _secret_reference(item, secret)
         ):
             raise CreationUnproven("creation_resource_in_use")
+
+
+async def require_no_consumers(actuator, disposition):
+    """Complete namespace scans include deleting VM/VMI/Pods and Secret users."""
+    job_name = "agent-vm-" + disposition["job_id"]
+    root = disposition["objects"].get("rootdisk", {}).get("name")
+    secret = disposition["objects"].get("cloud_init", {}).get("name")
+    if await actuator.read("vm", job_name) is not None:
+        raise CreationUnproven("creation_vm_requires_observation")
+    worker = asyncio.create_task(
+        asyncio.to_thread(
+            _scan_consumers,
+            actuator.controller,
+            actuator.namespace,
+            job_name,
+            root,
+            secret,
+        )
+    )
+    try:
+        await asyncio.shield(worker)
+    except asyncio.CancelledError:
+        # A cancelled coroutine does not stop a thread. Keep ownership until
+        # conversion and every SDK call finish, even if shutdown cancels again.
+        while not worker.done():
+            try:
+                await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                pass
+        if not worker.cancelled():
+            worker.exception()  # Retrieve a worker error; cancellation wins.
+        raise
 
 
 class DispositionResources:
@@ -193,7 +219,8 @@ class DispositionResources:
                         metadata.get(key) != expected[key]
                         for key in ("name", "namespace", "uid")
                     )
-                    or labels.get("srw.io/owner-kind") != disposition.get("owner_kind", "job")
+                    or labels.get("srw.io/owner-kind")
+                    != disposition.get("owner_kind", "job")
                     or labels.get("srw.io/owner-id") != disposition["job_id"]
                     or annotations.get(EFFECT_NONCE_ANNOTATION)
                     != intent["effect_nonce"]
