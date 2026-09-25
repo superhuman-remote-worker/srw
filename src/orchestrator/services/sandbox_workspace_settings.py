@@ -9,10 +9,11 @@ call site can drop them. See the Slice A1 spec in the knowledge base
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 import json
 import math
 import os
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID
 
 from orchestrator.services.manifest_execution_snapshot import (
@@ -234,3 +235,58 @@ async def container_denies_fuse(store: Any, thread: dict) -> bool:
     return (
         policy.fuse_enabled and not sandbox_pod_profile(settings, policy).fuse_enabled
     )
+
+
+_FAIL_AT_ONCE = frozenset({"InvalidImageName"})
+_FAIL_AFTER_BUDGET = frozenset(
+    {"ErrImagePull", "ImagePullBackOff", "CreateContainerConfigError"}
+)
+_STILL_PULLING = (
+    frozenset({"ContainerCreating", "PodInitializing"}) | _FAIL_AFTER_BUDGET
+)
+
+
+@dataclass(frozen=True)
+class PullVerdict:
+    state: Literal["ok", "pulling", "failed"]
+    message: str | None = None
+
+
+def classify_image_pull(
+    pod: Any, *, image: str, now: datetime, pull_timeout_seconds: float
+) -> PullVerdict:
+    """Classify the workspace container's waiting state for a custom image."""
+    statuses = getattr(getattr(pod, "status", None), "container_statuses", None) or []
+    workspace = next((s for s in statuses if s.name == "workspace"), None)
+    state = getattr(workspace, "state", None)
+    waiting = getattr(state, "waiting", None)
+    if waiting is None:
+        return PullVerdict("ok")
+    reason = waiting.reason or ""
+    message = f"Workspace image {image} could not be pulled: {reason}"
+    if waiting.message:
+        message += f" ({waiting.message})"
+    if reason in _FAIL_AT_ONCE:
+        return PullVerdict("failed", message)
+    if reason not in _STILL_PULLING:
+        return PullVerdict("ok")
+    created = getattr(pod.metadata, "creation_timestamp", None)
+    if (
+        reason in _FAIL_AFTER_BUDGET
+        and created is not None
+        and (now - created).total_seconds() >= pull_timeout_seconds
+    ):
+        return PullVerdict("failed", message)
+    return PullVerdict("pulling")
+
+
+def pod_admission_rejection(exc: BaseException) -> str | None:
+    """Describe a 403 from pod admission (ResourceQuota, LimitRange, policy)."""
+    if getattr(exc, "status", None) != 403:
+        return None
+    body = getattr(exc, "body", "") or ""
+    try:
+        detail = json.loads(body).get("message") or str(exc)
+    except (TypeError, ValueError, AttributeError):
+        detail = str(exc)
+    return f"Workspace pod was rejected by the cluster: {detail}"

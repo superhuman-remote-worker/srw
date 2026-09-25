@@ -25,6 +25,7 @@ import re
 from collections.abc import Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Literal, Optional
 from uuid import UUID, uuid4
 from shared.workspace_recovery import WorkspaceRecoveryCode
@@ -46,7 +47,9 @@ from orchestrator.services.sandbox_workspace_settings import (
     SandboxImagePolicy,
     SandboxPodProfile,
     SandboxSettings,
+    classify_image_pull,
     image_repository,
+    pod_admission_rejection,
     resolve_sandbox_settings,
     sandbox_pod_profile,
 )
@@ -132,6 +135,10 @@ class WorkspaceSSHAuthenticationError(RuntimeError):
 
 class WorkspaceRuntimeAuthorityError(RuntimeError):
     """A deterministic Pod name no longer identifies the authorized runtime."""
+
+
+class WorkspaceImagePullError(RuntimeError):
+    """A custom workspace image could not be pulled within its budget."""
 
 
 class WorkspaceRuntimeRecoveryRequired(WorkspaceRuntimeAuthorityError):
@@ -2453,6 +2460,12 @@ class ContainerProvisioner:
                 expected_network_tier=network_tier,
                 expected_pvc_name=pvc_name,
                 expected_seed_configmap=seed_cm,
+                pull_image=(
+                    _creation_profile.image
+                    if _creation_profile is not None
+                    and _creation_profile.image != self._workspace_image
+                    else None
+                ),
             )
             if pod_ip:
                 if seed_cm is not None:
@@ -2698,6 +2711,12 @@ class ContainerProvisioner:
                 owner.kind,
                 owner.id,
                 e,
+            )
+            await self._record_creation_diagnostic(
+                owner,
+                _creation_reservation,
+                e,
+                strict_stateless=strict_stateless,
             )
             # Once the durable reservation crosses its external-effect edge,
             # every response is potentially ambiguous.  Do not perform
@@ -3478,6 +3497,9 @@ class ContainerProvisioner:
                 expected_network_tier=network_tier,
                 expected_pvc_name=pvc_name,
                 expected_seed_configmap=seed_cm,
+                pull_image=(
+                    profile.image if profile.image != self._workspace_image else None
+                ),
             )
             if pod_ip:
                 if seed_cm is not None:
@@ -13462,6 +13484,7 @@ class ContainerProvisioner:
         expected_seed_configmap: str | None | object = (_UNSPECIFIED_RESOURCE_BINDING),
         expected_pod_name: str | None = None,
         expected_component: str | None = None,
+        pull_image: str | None = None,
     ) -> Optional[str]:
         """Poll until the pod is ready and accepts the configured SSH key.
 
@@ -13472,10 +13495,19 @@ class ContainerProvisioner:
             WorkspaceSSHAuthenticationError: the pod is Kubernetes-ready but
                 the configured private key is unusable or authentication does
                 not succeed within its bounded readiness window.
+            WorkspaceImagePullError: ``pull_image`` (a custom image) cannot be
+                pulled: at once for an invalid reference, otherwise once the
+                pull budget is spent. While it is still pulling, the wait
+                extends up to that budget.
         """
-        deadline = asyncio.get_event_loop().time() + timeout
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + timeout
+        pull_deadline = (
+            loop.time() + self._image_pull_timeout if pull_image is not None else None
+        )
+        pull_observation: Any = None
 
-        while asyncio.get_event_loop().time() < deadline:
+        while loop.time() < deadline:
             try:
                 pod = await self._bounded_kubernetes_call(
                     self._core_api.read_namespaced_pod,
@@ -13498,6 +13530,20 @@ class ContainerProvisioner:
                         expected_pod_name=expected_pod_name,
                         expected_component=expected_component,
                     )
+                if pull_image is not None:
+                    # Classified only after the identity fence above, so a pod
+                    # that is not this runtime stays an authority error.
+                    pull_observation = pod
+                    verdict = classify_image_pull(
+                        pod,
+                        image=pull_image,
+                        now=datetime.now(timezone.utc),
+                        pull_timeout_seconds=self._image_pull_timeout,
+                    )
+                    if verdict.state == "failed":
+                        raise WorkspaceImagePullError(verdict.message)
+                    if verdict.state == "pulling" and pull_deadline is not None:
+                        deadline = max(deadline, pull_deadline)
                 if pod.status.phase == "Running" and pod.status.pod_ip:
                     # Check container readiness
                     if pod.status.container_statuses and all(
@@ -13557,11 +13603,31 @@ class ContainerProvisioner:
                 raise
             except WorkspaceRuntimeAuthorityError:
                 raise
+            except WorkspaceImagePullError:
+                raise
             except Exception:
                 pass
 
             await asyncio.sleep(2)
 
+        if (
+            pull_image is not None
+            and pull_deadline is not None
+            and pull_observation is not None
+            and loop.time() >= pull_deadline
+        ):
+            # The pull budget is spent, yet the pod's age (stamped by the API
+            # server just before this wait began) can read a poll short of it.
+            # Judge the last observation as out of budget so a pod stuck in
+            # ImagePullBackOff fails instead of being reported "not ready yet".
+            verdict = classify_image_pull(
+                pull_observation,
+                image=pull_image,
+                now=datetime.now(timezone.utc),
+                pull_timeout_seconds=0,
+            )
+            if verdict.state == "failed":
+                raise WorkspaceImagePullError(verdict.message)
         return None
 
     async def _trusted_pod_ssh_identity(
@@ -13951,6 +14017,42 @@ class ContainerProvisioner:
             fingerprint,
             runtime_incarnation,
         )
+
+    async def _record_creation_diagnostic(
+        self,
+        owner: WorkspaceOwner,
+        reservation: dict[str, Any],
+        exc: BaseException,
+        *,
+        strict_stateless: bool,
+    ) -> None:
+        """Give a Job its pull or admission error; never a lifecycle projection.
+
+        Only ``error`` is written, and only while this reservation is current.
+        Strict stateless creations keep their ambiguity rules: they log only.
+        Best effort: it runs inside the creation's failure handler, so it never
+        raises there.
+        """
+        message = (
+            str(exc)
+            if isinstance(exc, WorkspaceImagePullError)
+            else pod_admission_rejection(exc)
+        )
+        if message is None or strict_stateless:
+            return
+        try:
+            current = await self._workspace_creation_reservation_is_current(
+                owner, reservation, scope="workspace_container"
+            )
+        except Exception:
+            logger.exception(
+                "Could not record the workspace creation error for %s %s",
+                owner.kind,
+                owner.id,
+            )
+            return
+        if current:
+            await self._set_context(owner, {"error": message})
 
     async def _set_context(self, owner: WorkspaceOwner, updates: dict) -> bool:
         """Atomically merge updates into the workspace context for a job or session."""
