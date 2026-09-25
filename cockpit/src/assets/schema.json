@@ -251,36 +251,6 @@
           "default": "sandbox",
           "description": "Workspace backend type. 'sandbox' (SSH/SFTP to an isolated workspace container) and 'vm' (SSH/SFTP to a KubeVirt VM with sudo gate) get the full shell/git/browser toolset. The lite tiers run with no workspace pod (no_workspace_agent_mode.md): 'virtual' exposes object-store-backed file tools (no shell/git/browser); 'none' exposes no file tools at all. Shell/browser/git are gated off automatically for the lite tiers by backend capability, not by config. The agent never operates on its own filesystem."
         },
-        "container": {
-          "type": "object",
-          "description": "Workspace container settings (only used when backend: container). The orchestrator provisions the container and injects SSH connection details automatically.",
-          "properties": {
-            "image": {
-              "type": "string",
-              "description": "Workspace container image override (defaults to WORKSPACE_IMAGE env var)"
-            },
-            "cpu": {
-              "type": "string",
-              "default": "500m",
-              "description": "CPU request for workspace container"
-            },
-            "memory": {
-              "type": "string",
-              "default": "1Gi",
-              "description": "Memory request for workspace container"
-            },
-            "cpu_limit": {
-              "type": "string",
-              "default": "2000m",
-              "description": "CPU limit for workspace container"
-            },
-            "memory_limit": {
-              "type": "string",
-              "default": "4Gi",
-              "description": "Memory limit for workspace container"
-            }
-          }
-        },
         "remote": {
           "type": "object",
           "description": "Remote backend settings (only used when backend: remote)",

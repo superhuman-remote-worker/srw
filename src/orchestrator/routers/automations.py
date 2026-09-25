@@ -36,7 +36,10 @@ from orchestrator.services.cron_dispatcher import (
     validate_cron_expr,
     validate_timezone,
 )
-from orchestrator.services.config_overrides import refuse_caller_transport_keys
+from orchestrator.services.config_overrides import (
+    refuse_caller_transport_keys,
+    refuse_execution_owned_workspace_keys,
+)
 from orchestrator.services.default_experts import ExpertSelectionError
 from orchestrator.services.session_tool_policy import with_validated_tool_overrides
 from shared.runtime.core.loader import canonical_config_name
@@ -197,6 +200,7 @@ async def create_automation(
     # a standing order that re-plants a caller base_url on every fire would
     # otherwise pair it with the deployment's stored key at each dispatch.
     refuse_caller_transport_keys(body.config_override)
+    refuse_execution_owned_workspace_keys(body.config_override)
     validated_override = with_validated_tool_overrides(body.config_override)
 
     if body.project_id:
@@ -318,6 +322,7 @@ async def update_automation(
     # every fire, bypassing the POST /api/jobs validator entirely.
     if "config_override" in fields:
         refuse_caller_transport_keys(fields["config_override"])
+        refuse_execution_owned_workspace_keys(fields["config_override"])
         fields["config_override"] = with_validated_tool_overrides(
             fields["config_override"]
         )

@@ -301,7 +301,7 @@ class TestProvisionParentWorkspaceForScholar:
         parent_creating = {
             "id": "parent-uuid",
             "context": {"workspace_container": {"status": "creating"}},
-            "config_override": {"workspace": {"container": {"cpu": "500m"}}},
+            "config_override": {},
         }
         parent_ready = {
             "id": "parent-uuid",

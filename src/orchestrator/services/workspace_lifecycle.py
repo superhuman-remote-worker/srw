@@ -77,7 +77,6 @@ class EnsureResult:
 async def _create(
     owner: "WorkspaceOwner",
     provisioner,
-    ws_config,
     *,
     stateless_creation_generation: str | None = None,
     allow_stateless_create: bool = False,
@@ -94,14 +93,13 @@ async def _create(
         if not callable(pinned_create):
             ok = False
         else:
-            pinned_kwargs = dict(ws_config or {})
+            pinned_kwargs: dict[str, Any] = {}
             if pinned_runtime_lock_held:
                 pinned_kwargs["runtime_lock_held"] = True
             ok = await pinned_create(owner.id, **pinned_kwargs)
     else:
         ok = await provisioner.create_workspace(
             owner,
-            **(ws_config or {}),
             **strict_kwargs,
         )
     return EnsureResult(
@@ -115,7 +113,6 @@ async def _ensure_existing_runtime(
     *,
     provisioner,
     current_status: Optional[str],
-    ws_config: Optional[dict],
     expected_runtime_incarnation: str,
     stateless_creation_generation: str | None,
 ) -> "EnsureResult":
@@ -154,7 +151,6 @@ async def _ensure_existing_runtime(
                 owner,
                 generation=stateless_creation_generation,
                 expected_runtime_incarnation=expected_runtime_incarnation,
-                **(ws_config or {}),
             )
         except Exception:
             return EnsureResult(EnsureOutcome.PENDING, status=current_status)
@@ -180,7 +176,6 @@ async def _ensure_existing_runtime(
         return await _create(
             owner,
             provisioner,
-            ws_config,
             stateless_creation_generation=generation,
             allow_stateless_create=True,
         )
@@ -202,7 +197,6 @@ async def _ensure_existing_runtime(
                 return await _create(
                     owner,
                     provisioner,
-                    ws_config,
                     stateless_creation_generation=stateless_creation_generation,
                     allow_stateless_create=True,
                 )
@@ -329,7 +323,6 @@ async def ensure_workspace(
     provisioner,
     suspension,
     current_status: Optional[str],
-    ws_config: Optional[dict] = None,
     expected_runtime_incarnation: Optional[str] = None,
     require_runtime_incarnation: bool = False,
     snapshot_restore_required: Any = False,
@@ -401,7 +394,6 @@ async def ensure_workspace(
             owner,
             provisioner=provisioner,
             current_status=s,
-            ws_config=ws_config,
             expected_runtime_incarnation=expected_runtime_incarnation,
             stateless_creation_generation=stateless_creation_generation,
         )
@@ -412,7 +404,6 @@ async def ensure_workspace(
         return await _create(
             owner,
             provisioner,
-            ws_config,
             stateless_creation_generation=stateless_creation_generation,
             allow_stateless_create=allow_stateless_create,
             pinned_runtime_lock_held=pinned_runtime_lock_held,
@@ -429,7 +420,6 @@ async def ensure_workspace(
             return await _create(
                 owner,
                 provisioner,
-                ws_config,
                 stateless_creation_generation=stateless_creation_generation,
                 allow_stateless_create=allow_stateless_create,
                 pinned_runtime_lock_held=pinned_runtime_lock_held,
@@ -450,7 +440,6 @@ async def ensure_workspace(
         return await _create(
             owner,
             provisioner,
-            ws_config,
             stateless_creation_generation=stateless_creation_generation,
             allow_stateless_create=allow_stateless_create,
             pinned_runtime_lock_held=pinned_runtime_lock_held,
@@ -463,7 +452,6 @@ async def ensure_workspace(
         return await _create(
             owner,
             provisioner,
-            ws_config,
             pinned_runtime_lock_held=pinned_runtime_lock_held,
         )
     # "Already progressing" set — keep in sync with the NOT IN clause in
@@ -489,7 +477,6 @@ async def ensure_workspace(
                 return await _create(
                     owner,
                     provisioner,
-                    ws_config,
                     stateless_creation_generation=stateless_creation_generation,
                     allow_stateless_create=allow_stateless_create,
                     pinned_runtime_lock_held=pinned_runtime_lock_held,

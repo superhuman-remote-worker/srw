@@ -9,7 +9,10 @@ from typing import Any, Awaitable, Callable
 from fastapi import APIRouter, Depends, HTTPException, Request
 
 from orchestrator.schemas.job_create import PublicJobCreateBody
-from orchestrator.services.config_overrides import refuse_caller_transport_keys
+from orchestrator.services.config_overrides import (
+    refuse_caller_transport_keys,
+    refuse_execution_owned_workspace_keys,
+)
 from orchestrator.services.job_admission import JobAdmissionActor
 from orchestrator.services.job_mutation_controls import (
     JobCancelResponse,
@@ -115,6 +118,7 @@ async def admit_job_request(
     # vocabulary as the MCP create tool. Runs after auth so an anonymous
     # request still gets 401 first.
     refuse_caller_transport_keys(job.config_override)
+    refuse_execution_owned_workspace_keys(job.config_override)
     return await dependencies.admit_job(
         command=job,
         actor=JobAdmissionActor(

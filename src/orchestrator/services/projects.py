@@ -58,6 +58,7 @@ from orchestrator.services.cloud.identity import (
     peek_home_browser_url,
 )
 from orchestrator.services.config_overrides import (
+    refuse_execution_owned_workspace_keys,
     validated_config_name as _validated_config_name,
 )
 from orchestrator.services.managed_repository_authority import (
@@ -165,6 +166,7 @@ async def create_project(
     # shell tool for jobs whose owner has no shell_tools grant. Validated on
     # WRITE only — no existing row is touched, and the field only reaches this
     # check when a caller explicitly sends it.
+    refuse_execution_owned_workspace_keys(body.default_config_override)
     validated_project_override = dependencies.with_validated_tool_overrides(
         body.default_config_override
     )
@@ -588,6 +590,7 @@ async def update_project(
     # quietly binding foreign tools on every job.
     report: dict[str, Any] = {}
     if "default_config_override" in kwargs:
+        refuse_execution_owned_workspace_keys(kwargs["default_config_override"])
         # Reads serve the redacted view (public_project) and the cockpit writes
         # that view back whole, so without this, flipping one key would delete
         # every stored secret in the override.

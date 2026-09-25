@@ -5,12 +5,16 @@ may supply infrastructure; a private Expert backend is never a provisioning inpu
 Generic harness configuration does not pass through this adapter.
 """
 
+import logging
 from copy import deepcopy
 from typing import Any
 
 from shared.workspace_contract import normalize_workspace_backend
 
+logger = logging.getLogger(__name__)
+
 INFRASTRUCTURE_KEYS = frozenset({"backend", "vm", "sandbox"})
+LEGACY_WORKSPACE_KEYS = frozenset({"container"})
 
 
 def execution_workspace_config(*layers: dict | None, role: str = "worker") -> dict:
@@ -32,7 +36,12 @@ def bind_execution_workspace(data: dict, workspace: dict) -> dict:
     result = deepcopy(data)
     private = result.get("workspace")
     private = deepcopy(private) if isinstance(private, dict) else {}
-    for key in INFRASTRUCTURE_KEYS:
+    if any(key in private for key in LEGACY_WORKSPACE_KEYS):
+        logger.warning(
+            "Dropped legacy workspace.container settings; container image and "
+            "resources come from the selected WorkspaceTemplate."
+        )
+    for key in INFRASTRUCTURE_KEYS | LEGACY_WORKSPACE_KEYS:
         private.pop(key, None)
     private.update(deepcopy(workspace))
     result["workspace"] = private

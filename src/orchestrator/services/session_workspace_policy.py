@@ -38,6 +38,10 @@ from typing import Any, Optional  # noqa: E402
 
 from fastapi import HTTPException  # noqa: E402
 
+from orchestrator.services.config_overrides import (  # noqa: E402
+    refuse_execution_owned_workspace_keys,
+)
+
 
 def default_session_workspace_backend(user_settings: dict[str, Any] | None) -> str:
     """The owner's saved default session tier, else the platform default.
@@ -74,6 +78,7 @@ def validated_session_workspace_override(
 
     Raises ``HTTPException(400)`` on a disallowed/invalid backend.
     """
+    refuse_execution_owned_workspace_keys(config_override)
     ws = config_override.get("workspace") if isinstance(config_override, dict) else None
     if not isinstance(ws, dict) or not ws:
         return None

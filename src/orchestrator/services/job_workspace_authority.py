@@ -707,24 +707,11 @@ async def provision_parent_workspace_for_scholar(
             parent_ctx = {}
     parent_container = parent_ctx.get("workspace_container") or {}
 
-    parent_co = parent.get("config_override") or {}
-    if isinstance(parent_co, str):
-        try:
-            parent_co = json.loads(parent_co)
-        except (json.JSONDecodeError, ValueError):
-            parent_co = {}
-    ws_cfg = (parent_co.get("workspace") or {}).get("container") or {}
-
     res = await dependencies.ensure_workspace(
         WorkspaceOwner.job(parent_id),
         provisioner=dependencies.workspace_provisioner,
         suspension=dependencies.workspace_suspension,
         current_status=parent_container.get("status"),
-        ws_config={
-            k: ws_cfg[k]
-            for k in ("cpu", "memory", "cpu_limit", "memory_limit", "image")
-            if k in ws_cfg
-        },
     )
     if res.outcome is EnsureOutcome.FAILED:
         # create_workspace records the concrete failure in the parent's

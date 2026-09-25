@@ -766,26 +766,11 @@ async def dispatch_pending_jobs(*, dependencies: JobDispatchDependencies) -> Non
                         continue  # Skip — wait for container to become ready
                     # K8s create (when status absent) + all lifecycle states route
                     # through the shared, owner-agnostic state machine.
-                    config_override = job.get("config_override") or {}
-                    if isinstance(config_override, str):
-                        config_override = json.loads(config_override)
-                    ws_cfg = config_override.get("workspace", {}).get("container", {})
                     res = await ensure_workspace(
                         WorkspaceOwner.job(job_id),
                         provisioner=dependencies.container_provisioner,
                         suspension=dependencies.workspace_suspension,
                         current_status=container_status,
-                        ws_config={
-                            k: ws_cfg[k]
-                            for k in (
-                                "cpu",
-                                "memory",
-                                "cpu_limit",
-                                "memory_limit",
-                                "image",
-                            )
-                            if k in ws_cfg
-                        },
                     )
                     if res.outcome is EnsureOutcome.FAILED:
                         failed_ctx = container_ctx

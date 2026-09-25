@@ -1914,7 +1914,7 @@ class TestScholarParentProvisioning:
         parent = {
             "id": "parent-1",
             "context": {"workspace_container": READY_CONTAINER},
-            "config_override": {"workspace": {"container": {"cpu": "2", "junk": "x"}}},
+            "config_override": {},
         }
         store = MagicMock()
         store.get_job = AsyncMock(return_value=parent)
@@ -1943,8 +1943,9 @@ class TestScholarParentProvisioning:
         store.merge_job_context.assert_awaited_once_with(
             "scholar-1", {"inherits_parent_workspace": True}
         )
-        # Only the whitelisted workspace sizing keys reach the provisioner.
-        assert ensure.await_args.kwargs["ws_config"] == {"cpu": "2"}
+        # Container sizing comes from the parent's frozen template, resolved by
+        # the provisioner; the scholar path passes none.
+        assert "ws_config" not in ensure.await_args.kwargs
         conn.execute.assert_awaited_once()
 
 

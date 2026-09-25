@@ -52,6 +52,34 @@ def refuse_caller_transport_keys(config_override: Any) -> None:
         )
 
 
+EXECUTION_OWNED_WORKSPACE_KEYS = ("container", "sandbox")
+
+
+def refuse_execution_owned_workspace_keys(config_override: Any) -> None:
+    """422 if a caller-authored override sizes or images a container directly.
+
+    Container image and resources come only from the selected WorkspaceTemplate,
+    which admission validates and freezes. ``workspace.container`` was the old
+    unvalidated side door; ``workspace.sandbox`` is the template's rendered form.
+    """
+    workspace = (
+        config_override.get("workspace") if isinstance(config_override, dict) else None
+    )
+    if not isinstance(workspace, dict):
+        return
+    offending = [key for key in EXECUTION_OWNED_WORKSPACE_KEYS if key in workspace]
+    if offending:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                ", ".join(f"config_override.workspace.{key}" for key in offending)
+                + " are no longer supported. Put the image and resources in a "
+                "WorkspaceTemplate (environment.image, resources) and select it "
+                "with `workspace`."
+            ),
+        )
+
+
 def deep_merge_dicts(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
     """Deep merge two dicts. Override wins for scalars/lists; dicts merge recursively."""
     result = base.copy()
