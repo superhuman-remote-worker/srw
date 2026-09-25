@@ -25,6 +25,7 @@ interface FailureEntry {
   method: string;
   pathname: string;
   phase: JourneyPhase;
+  started_phase: JourneyPhase | null;
   failure: string;
   classification: 'expected-navigation-cancellation' | 'expected-warmup-reconnect' | 'unexpected';
 }
@@ -178,14 +179,16 @@ export class NetworkLedger {
     const pathname = safePathname(request.url());
     if (!pathname) return;
     const reason = sanitizedDiagnostic(request.failure()?.errorText ?? 'unknown network failure');
+    const startedPhase = this.started.get(request)?.phase ?? null;
     const classification = this.cancellationClassification(
-      request.method(), pathname, reason, this.started.get(request)?.phase,
+      request.method(), pathname, reason, startedPhase,
     );
     this.records.push({
       kind: 'requestfailed',
       method: request.method(),
       pathname,
       phase: this.phase,
+      started_phase: startedPhase,
       failure: reason,
       classification,
     });
@@ -195,7 +198,7 @@ export class NetworkLedger {
     method: string,
     pathname: string,
     reason: string,
-    startedPhase?: JourneyPhase,
+    startedPhase: JourneyPhase | null,
   ): FailureEntry['classification'] {
     if (method !== 'GET' || !ABORT_REASON.test(reason)) return 'unexpected';
 

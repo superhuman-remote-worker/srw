@@ -231,6 +231,7 @@ describe('network ledger safety and warm-up classification', () => {
         kind: 'requestfailed',
         pathname: '/api/sessions/owned-thread/connection',
         phase: 'reload',
+        started_phase: 'turn',
         classification: 'expected-navigation-cancellation',
       }),
     );
@@ -249,6 +250,26 @@ describe('network ledger safety and warm-up classification', () => {
     expect(ledger.problems()).toEqual([
       'unexpected network failure during reload: GET /api/sessions/owned-thread/connection (net::ERR_ABORTED)',
     ]);
+  });
+
+  it('records a missing request start without treating it as navigation cancellation', () => {
+    const { ledger, handlers } = ledgerHarness();
+    ledger.registerThread('owned-thread');
+    ledger.setPhase('reload');
+    emitRequestFailed(
+      handlers,
+      'GET',
+      'http://srw-e2e.test/api/sessions/owned-thread/connection',
+    );
+
+    expect(ledger.entries()).toContainEqual(expect.objectContaining({
+      kind: 'requestfailed',
+      pathname: '/api/sessions/owned-thread/connection',
+      phase: 'reload',
+      started_phase: null,
+      classification: 'unexpected',
+    }));
+    expect(ledger.problems()).toHaveLength(1);
   });
 
   it.each([
