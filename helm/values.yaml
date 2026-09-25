@@ -2701,6 +2701,23 @@ workspace:
     # is required by k3d/containerd and many managed cluster runtimes even when
     # /dev/fuse and SYS_ADMIN are present.
     privileged: true
+  images:
+    # -- Image repositories (host/path, any tag or digest) whose workspaces keep
+    # the privileged FUSE profile. The repository of image.workspace is always
+    # trusted. Every other image is a custom image; see customImages.
+    trustedRepositories: []
+  customImages:
+    # -- Give custom workspace images the same privileged FUSE profile as
+    # trusted ones. Off by default: a custom image decides what runs as root in
+    # its container, and privileged is one step from root on the node. Enable
+    # only when you trust everyone who can author workspace templates.
+    privileged: false
+  # -- How long a custom workspace image may take to pull before a Job fails
+  # with the pull error. The installation image is prewarmed and unaffected.
+  # Job containers are dispatched one at a time, so while a custom image is
+  # still pulling — or failing with back-off — this bounds how long a slow or
+  # unpullable image can hold up dispatch of other Jobs.
+  imagePullTimeoutSeconds: 600
   # -- Access mode for the shared workspace PVC. Production uses
   # ReadWriteMany (Longhorn). Single-node clusters with RWO-only storage
   # (k3s local-path) can override to "ReadWriteOnce".

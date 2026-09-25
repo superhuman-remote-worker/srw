@@ -823,6 +823,9 @@ data:
   WORKSPACE_NAMESPACE: {{ .Release.Namespace | quote }}
   WORKSPACE_FUSE_ENABLED: {{ ternary "true" "false" .Values.workspace.fuse.enabled | quote }}
   WORKSPACE_FUSE_PRIVILEGED: {{ ternary "true" "false" .Values.workspace.fuse.privileged | quote }}
+  WORKSPACE_TRUSTED_IMAGE_REPOSITORIES: {{ (.Values.workspace.images.trustedRepositories | default (list)) | toJson | quote }}
+  WORKSPACE_CUSTOM_IMAGES_PRIVILEGED: {{ ternary "true" "false" .Values.workspace.customImages.privileged | quote }}
+  WORKSPACE_IMAGE_PULL_TIMEOUT_SECONDS: {{ .Values.workspace.imagePullTimeoutSeconds | int | quote }}
 
   # PR 3 — one-time seed knob for the homelab operator. Empty in SaaS deployments.
   # When set, orchestrator init flips this user's default project from

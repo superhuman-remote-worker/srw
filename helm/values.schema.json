@@ -2447,7 +2447,23 @@
               "minimum": 1
             }
           }
-        }
+        },
+        "images": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "trustedRepositories": {
+              "type": "array",
+              "items": {"type": "string", "minLength": 1}
+            }
+          }
+        },
+        "customImages": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {"privileged": {"type": "boolean"}}
+        },
+        "imagePullTimeoutSeconds": {"type": "integer", "minimum": 60, "maximum": 3600}
       }
     }
   },

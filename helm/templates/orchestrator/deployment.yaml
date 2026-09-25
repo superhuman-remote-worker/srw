@@ -1416,6 +1416,24 @@ spec:
                   name: {{ include "srw.configMapName" . }}
                   key: WORKSPACE_FUSE_PRIVILEGED
                   optional: true
+            - name: WORKSPACE_TRUSTED_IMAGE_REPOSITORIES
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: WORKSPACE_TRUSTED_IMAGE_REPOSITORIES
+                  optional: true
+            - name: WORKSPACE_CUSTOM_IMAGES_PRIVILEGED
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: WORKSPACE_CUSTOM_IMAGES_PRIVILEGED
+                  optional: true
+            - name: WORKSPACE_IMAGE_PULL_TIMEOUT_SECONDS
+              valueFrom:
+                configMapKeyRef:
+                  name: {{ include "srw.configMapName" . }}
+                  key: WORKSPACE_IMAGE_PULL_TIMEOUT_SECONDS
+                  optional: true
             - name: OPERATOR_HOME_ALLOWED_EMAIL
               valueFrom:
                 configMapKeyRef:
