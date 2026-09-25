@@ -42,6 +42,7 @@ FORGE_SANDBOX_VALUES_FILE: Final = ASSET_ROOT / "values-forge-sandbox.yaml"
 CLOUD_SANDBOX_VALUES_FILE: Final = ASSET_ROOT / "values-cloud-sandbox.yaml"
 OFFICER_WATCHDOG_VALUES_FILE: Final = ASSET_ROOT / "values-officer-watchdog.yaml"
 SESSION_ATTENTION_VALUES_FILE: Final = ASSET_ROOT / "values-session-attention.yaml"
+DUAL_POOL_VALUES_FILE: Final = ASSET_ROOT / "values-dual-pool.yaml"
 PROVIDER_MANIFEST: Final = ASSET_ROOT / "deterministic_provider/kubernetes.yaml"
 PROVIDER_DOCKERFILE: Final = ASSET_ROOT / "deterministic_provider/Dockerfile"
 PLAYWRIGHT_RUNNER_DOCKERFILE: Final = ASSET_ROOT / "Dockerfile.playwright"
@@ -249,6 +250,30 @@ APPLICATION_E2E_PROFILES: Final = {
             STATELESS_SANDBOX_VALUES_FILE,
             FORGE_SANDBOX_VALUES_FILE,
             SESSION_ATTENTION_VALUES_FILE,
+        ),
+        workspace_backend="sandbox",
+        execution_lane="stateless",
+        include_workspace_image=True,
+        additional_deployments=("srw-e2e-agent-stateless", "srw-e2e-greenmail"),
+        additional_statefulsets=(
+            "srw-e2e-gitea",
+            "srw-e2e-garage",
+            "srw-e2e-auditdb",
+        ),
+        stateless_agents=True,
+        forge_enabled=True,
+    ),
+    # R3.2's live gate: the session-attention stack plus one warm dual-mode
+    # pool agent, so the session transport runs in dual mode (first session)
+    # and persistent mode (the next, dedicated pod) on one cluster.
+    "session-transport": ApplicationE2EProfile(
+        name="session-transport",
+        values_files=(
+            VALUES_FILE,
+            STATELESS_SANDBOX_VALUES_FILE,
+            FORGE_SANDBOX_VALUES_FILE,
+            SESSION_ATTENTION_VALUES_FILE,
+            DUAL_POOL_VALUES_FILE,
         ),
         workspace_backend="sandbox",
         execution_lane="stateless",

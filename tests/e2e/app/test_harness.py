@@ -1482,6 +1482,7 @@ def test_stateless_sandbox_profile_renders_current_executor_and_workspace_images
         "cloud-sandbox",
         "officer-watchdog",
         "session-attention",
+        "session-transport",
     ],
 )
 def test_session_profiles_do_not_render_an_extra_catalog_provider(
@@ -1518,6 +1519,57 @@ def test_session_profiles_do_not_render_an_extra_catalog_provider(
     # catalogue check, even if its service were omitted from the chart.
     environment = research_seed["spec"]["template"]["spec"]["containers"][0]["env"]
     assert "SEARXNG_BASE_URL" not in {item["name"] for item in environment}
+
+
+@pytest.mark.skipif(shutil.which("helm") is None, reason="Helm is not installed")
+def test_session_transport_profile_adds_only_one_warm_dual_pool_agent() -> None:
+    """R3.2's live gate composes session-attention and changes only the pool.
+
+    One warm pool agent (dual mode) serves the first session; with no idle
+    buffer the next session gets a dedicated persistent pod.
+    """
+    attention = harness.resolve_profile("session-attention")
+    profile = harness.resolve_profile("session-transport")
+    assert profile.values_files[:-1] == attention.values_files
+    assert profile.values_files[-1] == harness.DUAL_POOL_VALUES_FILE
+    assert profile.additional_deployments == attention.additional_deployments
+    assert profile.additional_statefulsets == attention.additional_statefulsets
+
+    def _config(values_files):
+        command = [
+            "helm",
+            "template",
+            "srw-e2e",
+            str(harness.REPO_ROOT / "helm"),
+            "-n",
+            harness.NAMESPACE,
+        ]
+        for values_file in values_files:
+            command.extend(("-f", str(values_file)))
+        rendered = subprocess.run(
+            command, check=True, capture_output=True, text=True, timeout=120
+        ).stdout
+        return next(
+            document
+            for document in yaml.safe_load_all(rendered)
+            if document
+            and document.get("kind") == "ConfigMap"
+            and document.get("metadata", {}).get("name") == "srw-e2e-config"
+        )["data"]
+
+    base = _config(attention.values_files)
+    transport = _config(profile.values_files)
+    assert transport["MIN_AGENTS"] == "1"
+    assert transport["AGENT_BUFFER"] == "0"
+    assert transport["MAX_AGENTS"] == "4"
+    changed = {
+        key
+        for key in base.keys() | transport.keys()
+        if base.get(key) != transport.get(key)
+    }
+    # The base e2e profile already pins AGENT_BUFFER to "0"; the overlay
+    # restates it so the one-warm-agent intent does not depend on that.
+    assert changed == {"MIN_AGENTS", "MAX_AGENTS"}
 
 
 @pytest.mark.skipif(shutil.which("helm") is None, reason="Helm is not installed")
