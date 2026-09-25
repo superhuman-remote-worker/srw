@@ -903,8 +903,11 @@ class RemoteBackend(WorkspaceBackend):
         # could match the very tag being scanned. It also handles /proc stat
         # names with spaces and excludes the complete verifier ancestor chain
         # (entrypoint/sshd/flock/sh), while still finding disowned siblings.
+        # A refusal ends the enclosing script: a caller may append its own
+        # proof after this scan, and that command's success must never be
+        # reported in place of the scan's 85/86.
         return f"""
-python3 - {shlex.quote(env_name)} {tag_argument} {mode} <<'__SRW_PROCESS_ZERO_PY__'
+python3 - {shlex.quote(env_name)} {tag_argument} {mode} <<'__SRW_PROCESS_ZERO_PY__' || exit $?
 import os
 import signal
 import sys
