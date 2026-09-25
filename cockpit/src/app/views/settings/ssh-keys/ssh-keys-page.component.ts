@@ -6,7 +6,6 @@ import {SidebarToggleComponent} from '../../../shell/sidebar-toggle/sidebar-togg
 import {AppButtonComponent} from '../../../ui/button';
 import {AppInputComponent} from '../../../ui/input';
 import {AppTextareaComponent} from '../../../ui/textarea';
-import {AppIconComponent} from '../../../ui/icon';
 import {environment} from '../../../core/environment';
 
 /** The signature namespace every registration challenge is minted under.
@@ -70,7 +69,6 @@ function emptyForm(): SshKeyForm {
     AppButtonComponent,
     AppInputComponent,
     AppTextareaComponent,
-    AppIconComponent,
   ],
   template: `
     @if (externalClientsEnabled) {
@@ -78,13 +76,6 @@ function emptyForm(): SshKeyForm {
       <div class="ssh-keys-container">
         <div class="page-header">
           <app-sidebar-toggle />
-          <button
-            class="back-button"
-            (click)="goBack()"
-            [attr.aria-label]="'settings.sshKeys.back' | transloco"
-          >
-            <app-icon size="inherit">arrow_back</app-icon>
-          </button>
           <h1 class="page-title">{{ 'settings.sshKeys.title' | transloco }}</h1>
         </div>
 
@@ -247,7 +238,7 @@ export class SshKeysPageComponent implements OnInit {
 
   ngOnInit(): void {
     if (!this.externalClientsEnabled) {
-      void this.router.navigateByUrl('/settings');
+      void this.router.navigateByUrl('/settings/general');
       return;
     }
     void this.refreshKeys();
@@ -270,10 +261,6 @@ export class SshKeysPageComponent implements OnInit {
     } finally {
       this.keysLoading.set(false);
     }
-  }
-
-  goBack(): void {
-    this.router.navigateByUrl('/settings');
   }
 
   /** Step 1: mint a possession challenge and render the sign command. */

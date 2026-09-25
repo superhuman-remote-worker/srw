@@ -375,9 +375,6 @@
   "nav": {
     "cockpit": "Cockpit",
     "builder": "Builder",
-    "modeChat": "Chat",
-    "modeJobs": "Jobs",
-    "modeProjects": "Projects",
     "newChat": "New chat",
     "searchSessions": "Search sessions",
     "clearFilter": "Clear filter",
@@ -397,10 +394,9 @@
     "workbench": "Workbench",
     "settings": "Settings",
     "logout": "Logout",
-    "admin": "Admin",
-    "more": "More",
-    "apiKeys": "API keys",
-    "sshKeys": "SSH keys",
+    "customize": "Customize",
+    "backToApp": "Back to app",
+    "jobsAwaitingReview": "{{count}} jobs awaiting your review",
     "collapseSidebar": "Collapse sidebar",
     "openSidebar": "Open sidebar",
     "resizeSidebar": "Resize sidebar",
@@ -1161,13 +1157,27 @@
     }
   },
   "emptyCatalog": {
-    "bannerUser": "No LLMs configured yet — add an API key in Settings → API Keys, or register a custom LLM, to use the app.",
-    "bannerAdmin": "No LLMs configured yet — configure a provider in Admin → Models → Providers to use the app.",
+    "bannerUser": "No LLMs configured yet — add an API key in Settings → Provider keys, or register a custom LLM, to use the app.",
+    "bannerAdmin": "No LLMs configured yet — configure a provider in Settings → Models → Providers to use the app.",
     "pickerCta": "Configure a provider to enable this picker.",
     "dismiss": "Dismiss"
   },
   "settings": {
     "title": "Settings",
+    "nav": {
+      "groupSettings": "Settings",
+      "groupAccess": "Access",
+      "groupAdmin": "Administration",
+      "general": "General",
+      "defaults": "Defaults",
+      "providerKeys": "Provider keys",
+      "notifications": "Notifications",
+      "apiKeys": "API keys",
+      "mcp": "MCP tokens",
+      "sshKeys": "SSH keys",
+      "subscriptions": "Subscriptions",
+      "cloud": "Cloud storage"
+    },
     "appearance": {
       "title": "Appearance",
       "desc": "Choose between light and dark mode, or follow your system setting, and pick the accent colour. Both choices are saved on this device.",
@@ -1247,9 +1257,6 @@
       "saveButton": "Save Key"
     },
     "apiKeys": {
-      "linkTitle": "Personal Access Tokens",
-      "linkDesc": "Bearer tokens for n8n, scripts, and other automation tools that need to call the orchestrator API.",
-      "linkManage": "Manage API Keys",
       "title": "Personal Access Tokens",
       "desc": "Bearer tokens for automation tools that talk to the orchestrator API directly. Each token has its own action scopes and expiry. Lost tokens cannot be recovered — generate a new one.",
       "existingTitle": "Your tokens",
@@ -1287,10 +1294,6 @@
       "usageDesc": "Pass the token in an Authorization header. n8n's Header Auth credential type works out of the box."
     },
     "sshKeys": {
-      "linkTitle": "SSH Keys",
-      "linkDesc": "Public keys that let you connect to your session workspaces over SSH.",
-      "linkManage": "Manage SSH Keys",
-      "back": "Back",
       "title": "SSH Keys",
       "desc": "Public keys that authenticate your SSH connections into session workspaces. A key only proves who you are once you've shown you hold the matching private key.",
       "existingTitle": "Your keys",
@@ -1431,7 +1434,7 @@
     },
     "subscriptions": {
       "title": "AI Subscriptions",
-      "desc": "Connect subscription accounts through the shared proxy. Models are registered separately in Admin → Models.",
+      "desc": "Connect subscription accounts through the shared proxy. Models are registered separately under Administration → Models.",
       "checking": "Checking proxy…",
       "connected": "Connected",
       "notConnected": "No account connected",

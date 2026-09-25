@@ -13,7 +13,18 @@ import {adminGuard} from './core/guards/admin.guard';
  * is an access-control hole that no build error and no visual check would
  * catch. This file is that check.
  */
-const ADMIN_CHILD_PATHS = ['models', 'users', 'config', 'grants', 'usage', 'capacity'];
+const ADMIN_CHILD_PATHS = [
+  'models',
+  'users',
+  'config',
+  'grants',
+  'usage',
+  'capacity',
+  // Settings sections only admins can use (navigation_fixed_rail.md §5) —
+  // moved under /admin so they inherit the parent's adminGuard.
+  'subscriptions',
+  'cloud',
+];
 
 describe('app.routes — admin section shell', () => {
   const admin = routes.find((r) => r.path === 'admin');
@@ -33,8 +44,18 @@ describe('app.routes — admin section shell', () => {
     expect(admin?.canActivate?.includes(adminGuard) ?? false).toBe(true);
   });
 
-  it('has exactly six page children plus the empty-path redirect', () => {
-    expect(admin?.children).toHaveLength(7);
+  it('has exactly eight page children plus the empty-path redirect', () => {
+    expect(admin?.children).toHaveLength(9);
+  });
+
+  // The rail owns the admin sub-navigation now; a component here would bring
+  // back a second nav column beside it.
+  it('renders no shell component of its own', () => {
+    expect(admin?.component).toBeUndefined();
+  });
+
+  it.each(['subscriptions', 'cloud'])('renders the %s settings section', (path) => {
+    expect(admin?.children?.find((r) => r.path === path)?.data?.['section']).toBe(path);
   });
 
   it("redirects the empty child path ('') to models", () => {
@@ -74,5 +95,25 @@ describe('app.routes — admin section shell', () => {
   it('still redirects admin/llm to admin/models', () => {
     const r = routes.find((route) => route.path === 'admin/llm');
     expect(r?.redirectTo).toBe('admin/models');
+  });
+});
+
+describe('app.routes — settings sections', () => {
+  const SECTIONS = ['general', 'defaults', 'provider-keys', 'notifications', 'mcp'];
+
+  it('sends /settings to the General section', () => {
+    const r = routes.find((route) => route.path === 'settings');
+    expect(r?.redirectTo).toBe('settings/general');
+    expect(r?.pathMatch).toBe('full');
+  });
+
+  it.each(SECTIONS)('routes settings/%s to its section behind authGuard', (section) => {
+    const r = routes.find((route) => route.path === `settings/${section}`);
+    expect(r?.data?.['section']).toBe(section);
+    expect(r?.canActivate?.includes(authGuard) ?? false).toBe(true);
+  });
+
+  it.each(['settings/api-keys', 'settings/ssh-keys'])('keeps the %s page', (path) => {
+    expect(routes.find((route) => route.path === path)).toBeDefined();
   });
 });

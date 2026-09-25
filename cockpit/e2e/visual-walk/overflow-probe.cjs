@@ -33,8 +33,10 @@ const DEFAULT_ROUTES = [
   '/jobs', '/jobs/new', '/jobs/review', '/inbox',
   '/projects', ...(PROJECT ? [`/projects/${PROJECT}`] : []),
   '/datasources', '/contacts', '/experts', '/experts/new', '/skills', '/skills/new',
-  '/automations', '/settings', '/settings/api-keys', '/settings/ssh-keys',
-  '/admin/models', '/admin/users', '/admin/config', '/admin/grants', '/admin/usage', '/admin/capacity',
+  '/automations', '/settings/general', '/settings/defaults', '/settings/provider-keys',
+  '/settings/notifications', '/settings/mcp', '/settings/api-keys', '/settings/ssh-keys',
+  '/admin/models', '/admin/subscriptions', '/admin/users', '/admin/config', '/admin/grants',
+  '/admin/cloud', '/admin/usage', '/admin/capacity',
   '/workbench',
 ];
 const ROUTES = process.env.PROBE_ROUTES ? process.env.PROBE_ROUTES.split(',') : DEFAULT_ROUTES;
@@ -151,7 +153,7 @@ async function capture(page, name, vp, report) {
           await page.keyboard.press('Escape');
         }
       }
-      for (const [name, sel] of [['home-more-menu', 'app-rail-more-menu button'], ['home-account-menu', 'app-rail-account-menu button']]) {
+      for (const [name, sel] of [['home-account-menu', 'app-rail-account-menu button']]) {
         const trigger = page.locator(sel).first();
         if (await trigger.count()) {
           await trigger.click();

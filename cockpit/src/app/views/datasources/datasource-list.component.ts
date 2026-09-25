@@ -1,4 +1,3 @@
-import {SidebarToggleComponent} from '../../shell/sidebar-toggle/sidebar-toggle.component';
 import {Component, computed, DestroyRef, inject, OnInit, signal} from '@angular/core';
 import {takeUntilDestroyed} from '@angular/core/rxjs-interop';
 import {forkJoin, timer} from 'rxjs';
@@ -47,7 +46,7 @@ type KeyValueRow = {key: string; value: string};
   selector: 'app-datasource-list',
   standalone: true,
   imports: [
-    SidebarToggleComponent, TranslocoPipe,
+    TranslocoPipe,
     AppButtonComponent,
     AppIconButtonComponent,
     AppBadgeComponent,
@@ -68,7 +67,6 @@ type KeyValueRow = {key: string; value: string};
     <div class="ds-container" [class.form-open]="showForm()">
       <!-- Header -->
       <div class="header-bar">
-        <app-sidebar-toggle />
         <span class="title">{{ 'datasources.title' | transloco }}</span>
         <div class="filter-chips">
           @for (filter of typeFilters; track filter.value) {

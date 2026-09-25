@@ -375,9 +375,6 @@
   "nav": {
     "cockpit": "Cockpit",
     "builder": "Builder",
-    "modeChat": "Chat",
-    "modeJobs": "Jobs",
-    "modeProjects": "Projekte",
     "newChat": "Neuer Chat",
     "searchSessions": "Sitzungen durchsuchen",
     "clearFilter": "Filter löschen",
@@ -397,10 +394,9 @@
     "workbench": "Workbench",
     "settings": "Einstellungen",
     "logout": "Abmelden",
-    "admin": "Admin",
-    "more": "Mehr",
-    "apiKeys": "API-Schlüssel",
-    "sshKeys": "SSH-Schlüssel",
+    "customize": "Anpassen",
+    "backToApp": "Zurück zur App",
+    "jobsAwaitingReview": "{{count}} Aufträge warten auf deine Prüfung",
     "collapseSidebar": "Seitenleiste einklappen",
     "openSidebar": "Seitenleiste öffnen",
     "resizeSidebar": "Seitenleiste anpassen",
@@ -1161,13 +1157,27 @@
     }
   },
   "emptyCatalog": {
-    "bannerUser": "Noch keine LLMs konfiguriert — füge in Einstellungen → API-Keys einen Key hinzu oder registriere ein eigenes LLM.",
-    "bannerAdmin": "Noch keine LLMs konfiguriert — konfiguriere unter Admin → Modelle → Anbieter einen Anbieter, um die App zu nutzen.",
+    "bannerUser": "Noch keine LLMs konfiguriert — füge in Einstellungen → Anbieter-Schlüssel einen Key hinzu oder registriere ein eigenes LLM.",
+    "bannerAdmin": "Noch keine LLMs konfiguriert — konfiguriere unter Einstellungen → Modelle → Anbieter einen Anbieter, um die App zu nutzen.",
     "pickerCta": "Konfiguriere einen Anbieter, um diese Auswahl zu aktivieren.",
     "dismiss": "Schließen"
   },
   "settings": {
     "title": "Einstellungen",
+    "nav": {
+      "groupSettings": "Einstellungen",
+      "groupAccess": "Zugang",
+      "groupAdmin": "Administration",
+      "general": "Allgemein",
+      "defaults": "Standardwerte",
+      "providerKeys": "Anbieter-Schlüssel",
+      "notifications": "Benachrichtigungen",
+      "apiKeys": "API-Schlüssel",
+      "mcp": "MCP-Tokens",
+      "sshKeys": "SSH-Schlüssel",
+      "subscriptions": "KI-Abos",
+      "cloud": "Cloud-Speicher"
+    },
     "appearance": {
       "title": "Erscheinungsbild",
       "desc": "Wählen Sie zwischen hellem und dunklem Modus oder folgen Sie der Systemeinstellung, und legen Sie die Akzentfarbe fest. Beide Einstellungen werden auf diesem Gerät gespeichert.",
@@ -1247,9 +1257,6 @@
       "saveButton": "Key speichern"
     },
     "apiKeys": {
-      "linkTitle": "Personal Access Tokens",
-      "linkDesc": "Bearer-Tokens für n8n, Skripte und andere Automatisierungs-Tools, die die Orchestrator-API aufrufen müssen.",
-      "linkManage": "API-Keys verwalten",
       "title": "Personal Access Tokens",
       "desc": "Bearer-Tokens für Automatisierungs-Tools, die direkt mit der Orchestrator-API kommunizieren. Jedes Token hat eigene Action-Scopes und ein eigenes Ablaufdatum. Verlorene Tokens können nicht wiederhergestellt werden — erstelle einfach ein neues.",
       "existingTitle": "Deine Tokens",
@@ -1287,10 +1294,6 @@
       "usageDesc": "Übergib das Token in einem Authorization-Header. n8n's Header-Auth-Credential funktioniert direkt damit."
     },
     "sshKeys": {
-      "linkTitle": "SSH-Schlüssel",
-      "linkDesc": "Öffentliche Schlüssel, mit denen du dich per SSH mit deinen Sitzungs-Workspaces verbindest.",
-      "linkManage": "SSH-Schlüssel verwalten",
-      "back": "Zurück",
       "title": "SSH-Schlüssel",
       "desc": "Öffentliche Schlüssel, die deine SSH-Verbindungen zu Sitzungs-Workspaces authentifizieren. Ein Schlüssel bestätigt deine Identität erst, wenn du nachgewiesen hast, dass du den passenden privaten Schlüssel besitzt.",
       "existingTitle": "Deine Schlüssel",
@@ -1431,7 +1434,7 @@
     },
     "subscriptions": {
       "title": "KI-Abos",
-      "desc": "Verbinden Sie Abo-Konten über den gemeinsamen Proxy. Modelle werden separat unter Admin → Models registriert.",
+      "desc": "Verbinden Sie Abo-Konten über den gemeinsamen Proxy. Modelle werden separat unter Administration → Modelle registriert.",
       "checking": "Proxy wird geprüft…",
       "connected": "Verbunden",
       "notConnected": "Kein Konto verbunden",

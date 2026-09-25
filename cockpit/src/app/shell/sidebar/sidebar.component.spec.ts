@@ -1,14 +1,17 @@
 import {describe, expect, it, vi} from 'vitest';
 import {Injector, computed, runInInjectionContext, signal} from '@angular/core';
+import {Location} from '@angular/common';
 import {NavigationEnd, Router} from '@angular/router';
 import {Subject} from 'rxjs';
-import {SidebarComponent} from './sidebar.component';
+import {SidebarComponent, railViewFor} from './sidebar.component';
 import {UserService} from '../../core/services/user.service';
 import {SidebarService} from '../../core/services/sidebar.service';
 import {ViewportService} from '../../core/services/viewport.service';
 import {LayoutService} from '../../workbench/services/layout.service';
 import {PersistentChatService} from '../../core/services/persistent-chat.service';
 import {SessionListService} from '../../core/services/session-list.service';
+import {ActionCenterService} from '../../core/services/action-center.service';
+import {environment} from '../../core/environment';
 import type {Thread} from '../../core/models/api.model';
 
 /**
@@ -23,15 +26,21 @@ function create(opts: {
    *  true (steady state) — tests exercising the cold-boot distinction set it
    *  explicitly. */
   navigated?: boolean;
+  /** What the browser's address bar holds (Location.path()). Defaults to
+   *  `url`; a cold boot is where the two differ — router.url is still '/'. */
+  locationPath?: string;
   /** SidebarService.collapsed's initial value. Defaults to false (expanded) —
    *  the ⌘K collapse-then-focus test sets it explicitly. */
   collapsed?: boolean;
+  /** Server counts per notification category, as the action center holds them. */
+  byCategory?: Record<string, {pending: number; unseen: number}>;
 }) {
   const threads = signal((opts.threads ?? []) as Thread[]);
   const router = {
     url: opts.url,
     navigated: opts.navigated ?? true,
     navigate: vi.fn(),
+    navigateByUrl: vi.fn(),
     events: new Subject(),
   };
   const sessions = {
@@ -47,9 +56,11 @@ function create(opts: {
     expand: vi.fn(),
     collapsed: signal(opts.collapsed ?? false),
   };
+  const counts = signal({notifications: 0, unseen: 0, total: 0, byCategory: opts.byCategory ?? {}});
   const injector = Injector.create({
     providers: [
       {provide: Router, useValue: router},
+      {provide: Location, useValue: {path: () => opts.locationPath ?? opts.url}},
       {provide: SessionListService, useValue: sessions},
       {provide: UserService, useValue: {
         currentUser: signal({is_admin: opts.isAdmin ?? false}),
@@ -59,117 +70,210 @@ function create(opts: {
       {provide: ViewportService, useValue: {isMobile: signal(false)}},
       {provide: LayoutService, useValue: {}},
       {provide: PersistentChatService, useValue: {threadId: signal(null)}},
+      {provide: ActionCenterService, useValue: {counts}},
     ],
   });
   const component = runInInjectionContext(injector, () => new SidebarComponent());
-  return {component, router, sessions, sidebarService};
+  return {component, router, sessions, sidebarService, counts};
 }
 
-describe('SidebarComponent mode switcher', () => {
-  it('selecting Chat navigates to the draft landing, never to a thread', () => {
-    const {component, router} = create({url: '/sessions/abc-123'});
-    component.selectMode('chat');
-    // Regression guard: sessionsLink was hardcoded in April 2026 because this
-    // used to resume whatever session was active. A fresh draft is not a
-    // resumed session.
-    expect(router.navigate).toHaveBeenCalledWith(['/']);
-    expect(router.navigate).not.toHaveBeenCalledWith(['/sessions', 'abc-123']);
+function navigate(router: ReturnType<typeof create>['router'], url: string): void {
+  router.events.next(new NavigationEnd(1, url, url));
+}
+
+describe('SidebarComponent rail view', () => {
+  // navigation_fixed_rail.md F1: every app route shows the same rail — the
+  // retired mode switcher left it empty on two of its three modes.
+  it.each(['/', '/?foo=bar', '/sessions/abc-123', '/jobs', '/jobs/review', '/projects/p-1', '/automations', '/experts', '/inbox'])(
+    'shows the main rail on %s',
+    (url) => {
+      expect(create({url}).component.railView()).toBe('main');
+    },
+  );
+
+  // F4: Settings and Admin are one Settings, and it takes the rail over.
+  it.each(['/settings/general', '/settings/api-keys', '/settings/ssh-keys', '/admin/models', '/admin/models?tab=catalog', '/admin/subscriptions'])(
+    'hands the rail to Settings on %s',
+    (url) => {
+      expect(create({url}).component.railView()).toBe('settings');
+    },
+  );
+
+  it('hands the rail to the Workbench on /workbench', () => {
+    expect(create({url: '/workbench'}).component.railView()).toBe('workbench');
   });
 
-  it('selecting Jobs navigates to /jobs', () => {
+  it('matches whole path segments, not bare prefixes', () => {
+    expect(railViewFor('/settingsfoo')).toBe('main');
+    expect(railViewFor('/administrator')).toBe('main');
+  });
+
+  // The load flash this fixes: router.url is '/' until the first navigation
+  // ends, so seeding from it drew the landing page's rail on the first frame
+  // of a hard load of /settings/general (or lit Chat on /projects, before
+  // the mode switcher went).
+  it('draws the right rail on the first frame of a hard load, before the router has a url', () => {
+    const {component} = create({url: '/', navigated: false, locationPath: '/settings/general'});
+    expect(component.railView()).toBe('settings');
+  });
+
+  it('follows navigation once it ends', () => {
     const {component, router} = create({url: '/'});
-    component.selectMode('jobs');
-    expect(router.navigate).toHaveBeenCalledWith(['/jobs']);
+    navigate(router, '/admin/users');
+    expect(component.railView()).toBe('settings');
+    navigate(router, '/jobs');
+    expect(component.railView()).toBe('main');
+  });
+});
+
+describe('SidebarComponent primary rows', () => {
+  it.each(['/experts', '/experts/new', '/skills', '/skills/s-1/edit', '/datasources', '/contacts'])(
+    'lights Customize on %s',
+    (url) => {
+      expect(create({url}).component.customizeActive()).toBe(true);
+    },
+  );
+
+  it.each(['/', '/jobs', '/automations', '/expertsish'])('leaves Customize dark on %s', (url) => {
+    expect(create({url}).component.customizeActive()).toBe(false);
   });
 
-  it('derives the active mode from the current url', () => {
-    expect(create({url: '/jobs'}).component.mode()).toBe('jobs');
-    expect(create({url: '/projects/p-1'}).component.mode()).toBe('projects');
-    expect(create({url: '/sessions/abc'}).component.mode()).toBe('chat');
-    expect(create({url: '/'}).component.mode()).toBe('chat');
+  it('badges Jobs with the pending review count', () => {
+    const {component} = create({url: '/', byCategory: {review_queue: {pending: 3, unseen: 1}}});
+    expect(component.jobsAwaitingReview()).toBe(3);
   });
 
-  // Allowlist, not a fallback: fix round 1. mode() used to default to 'chat'
-  // for anything unmatched, which lit the Chat tab on /experts, /admin/*,
-  // /settings, etc. — routes that have no mode of their own and are reached
-  // via the More/avatar menus (Task 8). Those routes must light no tab.
-  it('lights no tab for routes outside the three modes', () => {
-    expect(create({url: '/experts'}).component.mode()).toBeNull();
-    expect(create({url: '/admin/models'}).component.mode()).toBeNull();
-    expect(create({url: '/settings'}).component.mode()).toBeNull();
+  it('shows no Jobs badge when nothing awaits review', () => {
+    const {component} = create({url: '/', byCategory: {sudo_request: {pending: 2, unseen: 2}}});
+    expect(component.jobsAwaitingReview()).toBe(0);
   });
 
-  it('treats the landing page as chat even with a query string', () => {
-    // router.url carries the query string and fragment; a naive `=== '/'`
-    // check breaks on '/?foo=bar' and would wrongly null out the tab on the
-    // landing page itself.
-    expect(create({url: '/?foo=bar'}).component.mode()).toBe('chat');
+  it('follows the live count', () => {
+    const {component, counts} = create({url: '/'});
+    counts.update((c) => ({...c, byCategory: {review_queue: {pending: 1, unseen: 1}}}));
+    expect(component.jobsAwaitingReview()).toBe(1);
+  });
+});
+
+describe('SidebarComponent settings rail', () => {
+  const paths = (component: SidebarComponent) =>
+    component.settingsGroups().flatMap((g) => g.items.map((i) => i.path));
+
+  it('gives every user the Settings and Access groups', () => {
+    const {component} = create({url: '/settings/general'});
+    expect(component.settingsGroups().map((g) => g.labelKey)).toEqual([
+      'settings.nav.groupSettings',
+      'settings.nav.groupAccess',
+    ]);
   });
 
-  it('treats a session thread url as chat, using the id from the hijack test', () => {
-    expect(create({url: '/sessions/abc-123'}).component.mode()).toBe('chat');
+  it('shows a non-admin no Administration entry', () => {
+    const {component} = create({url: '/settings/general', isAdmin: false});
+    expect(paths(component).some((p) => p.startsWith('/admin'))).toBe(false);
+  });
+
+  it('adds the Administration group, last, for an admin', () => {
+    const {component} = create({url: '/settings/general', isAdmin: true});
+    const groups = component.settingsGroups();
+    expect(groups.at(-1)?.labelKey).toBe('settings.nav.groupAdmin');
+    expect(groups.at(-1)?.items.map((i) => i.path)).toEqual([
+      '/admin/models',
+      '/admin/subscriptions',
+      '/admin/users',
+      '/admin/config',
+      '/admin/grants',
+      '/admin/cloud',
+      '/admin/usage',
+      '/admin/capacity',
+    ]);
+  });
+
+  it.each([false, true])('lists MCP and SSH keys only with external clients enabled (%s)', (enabled) => {
+    const previous = environment.externalClientsEnabled;
+    environment.externalClientsEnabled = enabled;
+    try {
+      const listed = paths(create({url: '/settings/general'}).component);
+      expect(listed).toContain('/settings/api-keys');
+      expect(listed.includes('/settings/mcp')).toBe(enabled);
+      expect(listed.includes('/settings/ssh-keys')).toBe(enabled);
+    } finally {
+      environment.externalClientsEnabled = previous;
+    }
+  });
+});
+
+describe('SidebarComponent back to app', () => {
+  it('returns to the last app page visited before Settings', () => {
+    const {component, router} = create({url: '/'});
+    navigate(router, '/sessions/abc-123');
+    navigate(router, '/settings/general');
+    navigate(router, '/admin/models');
+    component.backToApp();
+    expect(router.navigateByUrl).toHaveBeenCalledWith('/sessions/abc-123');
+  });
+
+  it('keeps the query string of the page it returns to', () => {
+    const {component, router} = create({url: '/'});
+    navigate(router, '/jobs?status=failed');
+    navigate(router, '/settings/defaults');
+    component.backToApp();
+    expect(router.navigateByUrl).toHaveBeenCalledWith('/jobs?status=failed');
+  });
+
+  it('falls back to the draft landing after a hard load straight into Settings', () => {
+    const {component, router} = create({url: '/', navigated: false, locationPath: '/settings/general'});
+    navigate(router, '/settings/general');
+    component.backToApp();
+    expect(router.navigateByUrl).toHaveBeenCalledWith('/');
+  });
+
+  it('remembers the page it was constructed on once the router has navigated', () => {
+    const {component, router} = create({url: '/projects/p-1'});
+    navigate(router, '/workbench');
+    component.backToApp();
+    expect(router.navigateByUrl).toHaveBeenCalledWith('/projects/p-1');
   });
 });
 
 describe('SidebarComponent session list', () => {
-  it('lists sessions grouped by recency when the mode is chat', () => {
+  it('lists sessions grouped by recency', () => {
     const {component} = create({url: '/', threads: [
       {id: 'a', title: 'Comparing take-home pay', last_activity: new Date().toISOString()},
     ]});
     expect(component.sessionGroups().map((g) => g.label)).toEqual(['today']);
   });
 
-  it('renders no session groups outside chat mode', () => {
+  // Recents is on every main-rail page now, not only in Chat.
+  it('lists sessions on a non-chat page too', () => {
     const {component} = create({url: '/jobs', threads: [
       {id: 'a', title: 'Comparing take-home pay', last_activity: new Date().toISOString()},
     ]});
-    expect(component.sessionGroups()).toEqual([]);
-  });
-
-  // mode() is an allowlist that returns null for routes outside the three
-  // modes (/admin/*, /experts, /settings, ...). A `!== 'jobs'` rewrite of the
-  // sessionGroups gate would also pass the two tests above yet show sessions
-  // on an admin page — guard that case explicitly.
-  it('renders no session groups when the mode is null', () => {
-    const {component} = create({url: '/admin/users', threads: [
-      {id: 'a', title: 'Comparing take-home pay', last_activity: new Date().toISOString()},
-    ]});
-    expect(component.sessionGroups()).toEqual([]);
+    expect(component.sessionGroups()).toHaveLength(1);
   });
 
   // The rail must have sessions ready the instant the user is looking at
-  // Chat, even when the app boots somewhere else — so this doesn't gate on
+  // them, even when the app boots somewhere else — so this doesn't gate on
   // the starting *route*. (It does gate on Router.navigated — see the
   // cold-boot pair of tests below; this test relies on create()'s default
   // of navigated: true.)
   it('refreshes the session list once on construction, regardless of the starting route', () => {
-    const {sessions} = create({url: '/jobs'});
+    const {sessions} = create({url: '/settings/general'});
     expect(sessions.refresh).toHaveBeenCalledTimes(1);
   });
 
-  it('refreshes the session list again on navigating into chat mode', () => {
-    const {router, sessions} = create({url: '/jobs'});
+  it.each(['/', '/jobs', '/projects', '/experts'])('refreshes on navigating to %s, where Recents shows', (url) => {
+    const {router, sessions} = create({url: '/'});
     expect(sessions.refresh).toHaveBeenCalledTimes(1); // the construction-time call
-    router.events.next(new NavigationEnd(1, '/', '/'));
+    navigate(router, url);
     expect(sessions.refresh).toHaveBeenCalledTimes(2);
   });
 
-  // Refreshing on every navigation regardless of mode would fetch threads
-  // while the user is in Jobs or Admin, for nothing.
-  it('does not refresh the session list on navigating to a non-chat route', () => {
+  // Settings and the Workbench take the rail over — Recents is not on
+  // screen there, and the navigation back out refreshes it anyway.
+  it.each(['/settings/general', '/admin/users', '/workbench'])('does not refresh on navigating to %s', (url) => {
     const {router, sessions} = create({url: '/'});
     expect(sessions.refresh).toHaveBeenCalledTimes(1); // the construction-time call
-    router.events.next(new NavigationEnd(1, '/jobs', '/jobs'));
-    expect(sessions.refresh).toHaveBeenCalledTimes(1);
-  });
-
-  // Same allowlist trap as sessionGroups: a `!== 'jobs'` gate on the
-  // navigation subscription would also pass the two tests above yet refetch
-  // threads while navigating around in the admin section.
-  it('does not refresh the session list on navigating to a route with no mode', () => {
-    const {router, sessions} = create({url: '/'});
-    expect(sessions.refresh).toHaveBeenCalledTimes(1); // the construction-time call
-    router.events.next(new NavigationEnd(1, '/admin/users', '/admin/users'));
+    navigate(router, url);
     expect(sessions.refresh).toHaveBeenCalledTimes(1);
   });
 
@@ -181,7 +285,7 @@ describe('SidebarComponent session list', () => {
   it('does not refresh on construction when the router has not navigated yet, but the subsequent NavigationEnd does', () => {
     const {router, sessions} = create({url: '/', navigated: false});
     expect(sessions.refresh).toHaveBeenCalledTimes(0);
-    router.events.next(new NavigationEnd(1, '/', '/'));
+    navigate(router, '/');
     expect(sessions.refresh).toHaveBeenCalledTimes(1);
   });
 
@@ -219,18 +323,6 @@ describe('SidebarComponent session filter', () => {
     ]});
     component.filterText.set('nothing matches this');
     expect(component.sessionGroups()).toEqual([]);
-  });
-
-  // Fix round 1: the filter box itself must not render outside chat mode —
-  // it offers to search a list that isn't on screen there. Same allowlist
-  // trap as sessionGroups() and the NavigationEnd refresh gate: a `!==
-  // 'jobs'` rewrite would also show the box on /admin/users.
-  it('shows the rail filter only in chat mode', () => {
-    expect(create({url: '/'}).component.showFilter()).toBe(true);
-    expect(create({url: '/sessions/abc'}).component.showFilter()).toBe(true);
-    expect(create({url: '/jobs'}).component.showFilter()).toBe(false);
-    expect(create({url: '/projects'}).component.showFilter()).toBe(false);
-    expect(create({url: '/admin/users'}).component.showFilter()).toBe(false);
   });
 });
 
@@ -284,10 +376,11 @@ describe('SidebarComponent ⌘K shortcut', () => {
     expect(focus).toHaveBeenCalledTimes(1);
   });
 
-  // Unchanged pre-existing behavior: outside chat mode filterInput is never
-  // set (the @if in the template), so the browser's own Ctrl+K must survive.
+  // Settings and the Workbench replace the main rail, so filterInput is
+  // never set there (the @switch in the template), and the browser's own
+  // Ctrl+K must survive.
   it('leaves the browser shortcut alone when the filter is not on screen', () => {
-    const {component, sidebarService} = create({url: '/jobs', collapsed: true});
+    const {component, sidebarService} = create({url: '/settings/general', collapsed: true});
     const event = cmdK();
     const preventDefault = vi.spyOn(event, 'preventDefault');
 
@@ -298,14 +391,11 @@ describe('SidebarComponent ⌘K shortcut', () => {
   });
 });
 
-// F4/F5: the "See all sessions" row and the empty-state copy are template-
-// only additions (a static routerLink and two @if branches on mode()/
-// sessionGroups().length, both already covered by the mode() and
-// sessionGroups() tests above) — this component's spec never renders the
-// template (see the dynamic-query note on filterInput), so there is no
-// rendered-DOM assertion to add for those beyond what mode()'s existing
-// allowlist tests already prove about the gate they share. hasSessions()
-// and clearFilter() are new component-level logic, so those get real cases.
+// The "See all sessions" row and the empty-state copy are template-only (a
+// static routerLink and an @if on sessionGroups().length) — this component's
+// spec never renders the template (see the dynamic-query note on
+// filterInput). hasSessions() and clearFilter() are component-level logic,
+// so those get real cases.
 describe('SidebarComponent rail empty state', () => {
   it('hasSessions reflects the UNFILTERED list, not the filtered one — this is what tells "no sessions yet" apart from "no matches"', () => {
     const {component} = create({url: '/', threads: [

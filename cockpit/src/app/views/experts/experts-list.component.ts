@@ -1,4 +1,3 @@
-import {SidebarToggleComponent} from '../../shell/sidebar-toggle/sidebar-toggle.component';
 import {Component, computed, inject, OnInit, signal} from '@angular/core';
 import {Router} from '@angular/router';
 import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
@@ -69,7 +68,7 @@ export function duplicateResultTranslationArgs(
   selector: 'app-experts-list',
   standalone: true,
   imports: [
-    SidebarToggleComponent, TranslocoPipe,
+    TranslocoPipe,
     AppButtonComponent,
     AppIconButtonComponent,
     AppBadgeComponent,
@@ -85,7 +84,6 @@ export function duplicateResultTranslationArgs(
     <div class="experts">
       <header class="head">
         <div class="head-left">
-          <app-sidebar-toggle />
           <h1>{{ 'experts.title' | transloco }}</h1>
         </div>
         <div class="head-actions">
