@@ -216,3 +216,21 @@ def sandbox_pod_profile(
         fuse_privileged=policy.fuse_privileged and full_profile,
         templated=not settings.is_empty(),
     )
+
+
+async def container_denies_fuse(store: Any, thread: dict) -> bool:
+    """Whether a Session's container is a custom image denied /dev/fuse.
+
+    Mirrors the profile ContainerProvisioner renders from the same snapshot and
+    installation policy. Threads without an execution snapshot, and trusted
+    images, keep today's behaviour.
+    """
+    if thread.get("execution_harness_adapter") is None:
+        return False
+    settings = await resolve_sandbox_settings(store, "session", str(thread["id"]))
+    if settings.image is None:
+        return False
+    policy = SandboxImagePolicy.from_env()
+    return (
+        policy.fuse_enabled and not sandbox_pod_profile(settings, policy).fuse_enabled
+    )

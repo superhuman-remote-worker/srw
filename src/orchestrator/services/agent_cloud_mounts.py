@@ -37,6 +37,7 @@ from orchestrator.services.cloud import (
     SessionFolderHandle,
     SupportsRcloneMount,
 )
+from orchestrator.services.sandbox_workspace_settings import container_denies_fuse
 from orchestrator.services.session_runtime_admission import (
     protected_cloud_marker_state,
     thread_runtime_authority,
@@ -275,14 +276,18 @@ def _build_agent_cloud_sync(
     }
 
 
+def _vm_runtime_ready(metadata: dict[str, Any]) -> bool:
+    vm_ctx = metadata.get("vm") or {}
+    return vm_ctx.get("status") == "ready" and bool(vm_ctx.get("ssh_host"))
+
+
 def _runtime_supports_rclone_mount(
     metadata: dict[str, Any], *, dependencies: AgentCloudMountDependencies
 ) -> bool:
     """Whether this thread's current workspace runtime may receive cloud_mount."""
     if dependencies.cloud_workspace_driver() != "rclone_mount":
         return False
-    vm_ctx = metadata.get("vm") or {}
-    if vm_ctx.get("status") == "ready" and vm_ctx.get("ssh_host"):
+    if _vm_runtime_ready(metadata):
         return True
     allow_container = os.getenv("CLOUD_RCLONE_ALLOW_CONTAINER", "true").lower()
     if allow_container in {"0", "false", "no", "off"}:
@@ -574,6 +579,10 @@ async def _build_agent_cloud_mount(
         runtime_supported = _runtime_supports_rclone_mount(
             metadata, dependencies=dependencies
         )
+        if runtime_supported and not _vm_runtime_ready(metadata):
+            runtime_supported = not await container_denies_fuse(
+                dependencies.store, thread
+            )
     else:
         runtime_supported = _runtime_supports_terminal_rclone_retirement(
             thread,
