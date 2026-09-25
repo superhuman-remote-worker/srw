@@ -1,7 +1,9 @@
 """Controller effects use real provenance validators and fault-injected API stores."""
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
+from threading import Barrier, BrokenBarrierError, Lock
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from uuid import uuid4
@@ -34,6 +36,7 @@ class API:
         self.objects = {}
         self.writes = []
         self.lost = set()
+        self._mutation_lock = Lock()
 
     def read(self, kind, name):
         if (kind, name) not in self.objects:
@@ -43,43 +46,134 @@ class API:
     def create(self, body):
         body = deepcopy(body)
         kind, name = body["kind"], body["metadata"]["name"]
-        self.writes.append(kind)
-        if (kind, name) in self.objects:
-            raise ApiException(status=409)
-        body["metadata"].update(uid=str(uuid4()), resourceVersion="1")
-        self.objects[kind, name] = body
-        if kind == "DataVolume":
-            self.objects["PersistentVolumeClaim", name] = {
-                "apiVersion": "v1",
-                "kind": "PersistentVolumeClaim",
-                "metadata": {
-                    **deepcopy(body["metadata"]),
-                    "uid": str(uuid4()),
-                    "ownerReferences": [
-                        {
-                            "kind": "DataVolume",
-                            "uid": body["metadata"]["uid"],
-                            "controller": True,
-                        }
-                    ],
-                },
-                "status": {"phase": "Pending"},
-            }
+        with self._mutation_lock:
+            self.writes.append(kind)
+            if (kind, name) in self.objects:
+                raise ApiException(status=409)
+            body["metadata"].update(uid=str(uuid4()), resourceVersion="1")
+            self.objects[kind, name] = body
+            if kind == "DataVolume":
+                self.objects["PersistentVolumeClaim", name] = {
+                    "apiVersion": "v1",
+                    "kind": "PersistentVolumeClaim",
+                    "metadata": {
+                        **deepcopy(body["metadata"]),
+                        "uid": str(uuid4()),
+                        "ownerReferences": [
+                            {
+                                "kind": "DataVolume",
+                                "uid": body["metadata"]["uid"],
+                                "controller": True,
+                            }
+                        ],
+                    },
+                    "status": {"phase": "Pending"},
+                }
         if kind in self.lost:
             self.lost.remove(kind)
             raise TimeoutError("reply lost after acceptance")
         return deepcopy(body)
 
     def replace(self, body):
-        old = self.read("Lease", body["metadata"]["name"])
-        if old["metadata"]["resourceVersion"] != body["metadata"]["resourceVersion"]:
-            raise ApiException(status=409)
-        body = deepcopy(body)
-        body["metadata"]["resourceVersion"] = str(
-            int(old["metadata"]["resourceVersion"]) + 1
-        )
-        self.objects["Lease", body["metadata"]["name"]] = body
+        with self._mutation_lock:
+            old = self.read("Lease", body["metadata"]["name"])
+            if old["metadata"]["resourceVersion"] != body["metadata"]["resourceVersion"]:
+                raise ApiException(status=409)
+            body = deepcopy(body)
+            body["metadata"]["resourceVersion"] = str(
+                int(old["metadata"]["resourceVersion"]) + 1
+            )
+            self.objects["Lease", body["metadata"]["name"]] = body
         return deepcopy(body)
+
+
+def test_fake_kubernetes_create_rejects_a_simultaneous_same_name_lease(monkeypatch):
+    """Only one handler can publish the UID later used to seal its carrier."""
+    api = API()
+    original_uuid4 = uuid4
+    both_checked_absence = Barrier(2)
+    start = Barrier(3)
+
+    def gated_uuid4():
+        try:
+            both_checked_absence.wait(timeout=2)
+        except BrokenBarrierError:
+            # Once create is atomic the second worker cannot reach this point.
+            pass
+        return original_uuid4()
+
+    monkeypatch.setattr("tests.test_vm_creation_actuation.uuid4", gated_uuid4)
+    lease = {
+        "apiVersion": "coordination.k8s.io/v1",
+        "kind": "Lease",
+        "metadata": {"name": "same-carrier", "namespace": "test"},
+        "spec": {"holderIdentity": "owner"},
+    }
+
+    def create():
+        start.wait(timeout=3)
+        try:
+            return api.create(lease)
+        except ApiException as exc:
+            return exc.status
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first, second = pool.submit(create), pool.submit(create)
+        start.wait(timeout=3)
+        outcomes = [first.result(timeout=5), second.result(timeout=5)]
+
+    accepted = [value for value in outcomes if isinstance(value, dict)]
+    assert len(accepted) == 1
+    assert [value for value in outcomes if value == 409] == [409]
+    assert api.read("Lease", "same-carrier")["metadata"]["uid"] == accepted[0][
+        "metadata"
+    ]["uid"]
+
+
+def test_fake_kubernetes_replace_enforces_one_resource_version_winner(monkeypatch):
+    """Two sealers reading one version cannot both report a successful CAS."""
+    api = API()
+    lease = api.create(
+        {
+            "apiVersion": "coordination.k8s.io/v1",
+            "kind": "Lease",
+            "metadata": {"name": "same-carrier", "namespace": "test"},
+            "spec": {"holderIdentity": "owner"},
+        }
+    )
+    original_read = api.read
+    both_read_old_version = Barrier(2)
+    start = Barrier(3)
+
+    def gated_read(kind, name):
+        value = original_read(kind, name)
+        try:
+            both_read_old_version.wait(timeout=2)
+        except BrokenBarrierError:
+            # Atomic replace holds the second worker until the first commits.
+            pass
+        return value
+
+    monkeypatch.setattr(api, "read", gated_read)
+
+    def replace():
+        start.wait(timeout=3)
+        try:
+            return api.replace(lease)
+        except ApiException as exc:
+            return exc.status
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first, second = pool.submit(replace), pool.submit(replace)
+        start.wait(timeout=3)
+        outcomes = [first.result(timeout=5), second.result(timeout=5)]
+
+    accepted = [value for value in outcomes if isinstance(value, dict)]
+    assert len(accepted) == 1
+    assert [value for value in outcomes if value == 409] == [409]
+    assert original_read("Lease", "same-carrier")["metadata"][
+        "resourceVersion"
+    ] == "2"
 
 
 class Authority:
