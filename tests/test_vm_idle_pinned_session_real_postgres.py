@@ -130,6 +130,55 @@ async def ready_pinned_thread(db, monkeypatch):
     }
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("permanent", [False, True])
+async def test_pinned_vm_begin_captures_repo_metadata_without_legacy_alias(
+    db, monkeypatch, permanent,
+):
+    thread_id, _, identity = await ready_pinned_thread(db, monkeypatch)
+    repo_metadata = {
+        "repo_name": "srw",
+        "git_remote_url": "https://example.invalid/srw.git",
+    }
+    async with db.acquire() as conn:
+        # A historical bound VM can carry the legacy managed-repo projection.
+        # Re-enable its attachment trigger before exercising Begin.
+        await conn.execute(
+            "ALTER TABLE threads DISABLE TRIGGER "
+            "trg_managed_thread_repository_url_authority"
+        )
+        try:
+            await conn.execute(
+                "UPDATE threads SET metadata=jsonb_set(metadata, "
+                "'{workspace_container}', $2::jsonb) WHERE id=$1",
+                thread_id, json.dumps(repo_metadata),
+            )
+        finally:
+            await conn.execute(
+                "ALTER TABLE threads ENABLE TRIGGER "
+                "trg_managed_thread_repository_url_authority"
+            )
+
+    first = await db.begin_pinned_thread_retirement(
+        str(thread_id), permanent=permanent,
+    )
+    assert first["state"] == "pending"
+    assert first["reused"] is False
+    context = first["context"]
+    assert context["workspace_backend"] == "vm"
+    assert context["workspace_container"] == repo_metadata
+    assert context["workspace_binding"] is None
+    assert context["vm"]["vm_uid"] == identity["vm_uid"]
+    assert "_runtime_incarnation" not in context["vm"]
+
+    duplicate = await db.begin_pinned_thread_retirement(
+        str(thread_id), permanent=permanent,
+    )
+    assert duplicate["state"] == "pending"
+    assert duplicate["reused"] is True
+    assert duplicate["token"] == first["token"]
+
+
 async def bind_fresh_agent(db, thread_id):
     runtime_generation = await db.fetchval(
         "SELECT runtime_generation FROM threads WHERE id=$1", thread_id,

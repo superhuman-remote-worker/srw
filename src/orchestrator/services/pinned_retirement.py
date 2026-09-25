@@ -35,6 +35,7 @@ from orchestrator.services.vm_workspace_recovery_store import (
     completed_cleanup_outcome,
     complete_vm_cleanup_permit,
 )
+from shared.pinned_workspace_evidence import has_pinned_physical_workspace_evidence
 
 
 @dataclass(frozen=True, slots=True)
@@ -1587,7 +1588,8 @@ class PinnedRetirementOperations:
         provision_intent = context.get("workspace_provision_intent")
         if (
             not isinstance(vm, Mapping)
-            or workspace not in (None, {})
+            or not isinstance(workspace, (Mapping, type(None)))
+            or has_pinned_physical_workspace_evidence(workspace or {})
             or binding not in (None, {})
             or provision_intent not in (None, {})
         ):
@@ -1595,7 +1597,7 @@ class PinnedRetirementOperations:
         generation = str(vm.get("provision_generation") or "")
         identity_generation = str(vm.get("identity_provision_generation") or "")
         vm_uid = str(vm.get("vm_uid") or "")
-        runtime_incarnation = str(vm.get("_runtime_incarnation") or "")
+        runtime_incarnation = vm.get("_runtime_incarnation")
         rootdisk_uid = str(vm.get("rootdisk_pvc_uid") or "")
         try:
             UUID(generation)
@@ -1605,7 +1607,8 @@ class PinnedRetirementOperations:
             identity_generation != generation
             or vm.get("identity_authenticated") is not True
             or not vm_uid
-            or runtime_incarnation != vm_uid
+            or runtime_incarnation is not None
+            and str(runtime_incarnation) != vm_uid
             or (permanent and not rootdisk_uid)
         ):
             return None
@@ -2178,23 +2181,8 @@ class PinnedRetirementOperations:
             raise RuntimeError("captured retained workspace authority is malformed")
         virtual_binding_present = bool(binding and binding.get("kind") == "virtual")
         sandbox_identity_present = bool(
-            self._retirement_json_field_is_nonnull(
-                ws, WORKSPACE_RUNTIME_INCARNATION_KEY
-            )
+            has_pinned_physical_workspace_evidence(ws)
             or (binding and not virtual_binding_present)
-            or not self._retirement_json_status_is_absent(ws)
-            or any(
-                self._retirement_json_field_is_nonnull(ws, field)
-                for field in (
-                    "pod_ip",
-                    "pod_name",
-                    "host",
-                    "port",
-                    "ide_host",
-                    "ide_port",
-                    "_canvas_workspace_generation",
-                )
-            )
         )
         if backend not in {"sandbox", "virtual", "none", "vm", "remote"}:
             raise RuntimeError("captured workspace backend is unsupported")
@@ -2235,27 +2223,14 @@ class PinnedRetirementOperations:
         if workspace_provision_intent_zero:
             completed_external_cleanup_protocol = "workspace_provision_fence_v1"
         elif backend in {"vm", "remote"} and vm_identity_present:
-            from orchestrator.services.vm_provisioner import VMTeardownIdentity
-
-            provision_generation = str(vm.get("provision_generation") or "")
-            vm_uid = str(vm.get("vm_uid") or "")
-            rootdisk_uid = str(vm.get("rootdisk_pvc_uid") or "")
+            vm_identity = self._captured_vm_recovery_identity(
+                context, permanent=permanent
+            )
             if (
                 not self.dependencies.vm_provisioner.lifecycle_available
-                or not provision_generation
-                or not vm_uid
-                or (permanent and not rootdisk_uid)
+                or vm_identity is None
             ):
                 raise RuntimeError("exact VM cleanup authority is incomplete")
-            vm_identity = VMTeardownIdentity(
-                provision_generation=provision_generation,
-                vm_uid=vm_uid,
-                rootdisk_pvc_uid=rootdisk_uid or None,
-                ssh_host=vm.get("ssh_host"),
-                ssh_port=vm.get("ssh_port"),
-                ssh_host_key_fingerprint=vm.get("ssh_host_key_fingerprint"),
-                credential_runtime_started=vm.get("credential_runtime_started"),
-            )
             cleanup = await self._admit_vm_cleanup(
                 thread_id,
                 vm_identity,

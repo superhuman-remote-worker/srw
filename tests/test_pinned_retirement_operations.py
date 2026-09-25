@@ -241,6 +241,7 @@ def _vm_retirement() -> dict[str, object]:
         "permanent": True,
         "context": {
             "thread_id": THREAD_ID,
+            "generation": RUNTIME_GENERATION,
             "entry_status": "active",
             "settle_status": "ended",
             "runtime_authority_exposed": True,
@@ -254,7 +255,10 @@ def _vm_retirement() -> dict[str, object]:
                 "namespace": "agents-a",
                 "protection_protocol": "finalizer_v1",
             },
-            "workspace_container": {},
+            "workspace_container": {
+                "repo_name": "srw",
+                "git_remote_url": "https://example.invalid/srw.git",
+            },
             "workspace_binding": {},
             "workspace_provision_intent": {},
             "vm": {
@@ -262,7 +266,6 @@ def _vm_retirement() -> dict[str, object]:
                 "identity_provision_generation": VM_GENERATION,
                 "identity_authenticated": True,
                 "vm_uid": "vm-uid-a",
-                "_runtime_incarnation": "vm-uid-a",
                 "rootdisk_pvc_uid": "rootdisk-uid-a",
                 "ssh_host": "vm.internal",
                 "ssh_port": 22,
@@ -380,6 +383,31 @@ async def test_vm_recovery_stops_exact_pod_before_releasing_captured_vm() -> Non
         quiescence_actor="orchestrator",
     )
 
+    # A duplicate recovery sees the exact durable receipt and the already
+    # absent Pod, so it must not issue another VM release.
+    completed = {
+        **_current_vm_thread(),
+        "runtime_retirement_local_quiescence": {
+            "version": 1,
+            "runtime_generation": RUNTIME_GENERATION,
+            "retirement_token": RETIREMENT_TOKEN,
+            "agent_id": AGENT_ID,
+            "runtime_attach_token": ATTACH_TOKEN,
+            "settle_status": "ended",
+            "quiescence_protocol": "workspace_actuator_zero_v1",
+            "quiescence_actor": "orchestrator",
+            "workspace_generation": VM_GENERATION,
+            "workspace_runtime_incarnation": "vm-uid-a",
+        },
+    }
+    store.get_thread.side_effect = [completed, completed]
+    agent_provisioner.agent_pod_authority.side_effect = [
+        "exact_absent", "exact_absent",
+    ]
+    assert await operations.recover_captured_process_zero(_vm_retirement())
+    vm_provisioner.release_vm_captured.assert_awaited_once()
+    store.acknowledge_pinned_thread_local_quiescence.assert_awaited_once()
+
 
 @pytest.mark.asyncio
 async def test_idle_soft_retirement_stops_captured_pod_before_vm_effect() -> None:
@@ -445,6 +473,34 @@ async def test_idle_soft_retirement_stops_captured_pod_before_vm_effect() -> Non
         expected_pod_uid="55555555-5555-4555-8555-555555555555",
         namespace="agents-a",
     )
+
+
+@pytest.mark.asyncio
+async def test_direct_vm_end_refuses_conflicting_alias_before_vm_effect() -> None:
+    retirement = _vm_retirement()
+    retirement["context"]["vm"]["_runtime_incarnation"] = "different-vm-uid"
+    store = MagicMock()
+    store.get_thread = AsyncMock(return_value=_current_vm_thread())
+    store.pinned_retirement_external_cleanup_complete = AsyncMock(
+        return_value=False
+    )
+    vm = MagicMock()
+    vm.lifecycle_available = True
+    vm.release_vm_captured = AsyncMock(
+        side_effect=AssertionError("conflicting VM authority reached actuator")
+    )
+    operations = _operations(store=store, vm_provisioner=vm)
+
+    with patch.object(
+        PinnedRetirementOperations,
+        "_reconcile_workspace_provision_intent_for_retirement",
+        AsyncMock(return_value=False),
+    ):
+        with pytest.raises(RuntimeError, match="exact VM cleanup authority is incomplete"):
+            await operations.cleanup_pinned_thread_retirement(
+                retirement, cleanup_agent_pod=False,
+            )
+    vm.release_vm_captured.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -524,3 +580,63 @@ async def test_vm_recovery_refuses_incomplete_or_contradictory_authority(
     agent_provisioner.delete_agent_pod_exact.assert_not_awaited()
     vm_provisioner.release_vm_captured.assert_not_awaited()
     store.acknowledge_pinned_thread_local_quiescence.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("context_field", "value"),
+    [
+        ("vm", {"_runtime_incarnation": "different-vm-uid"}),
+        ("workspace_container", {"status": "ready"}),
+        ("workspace_container", {"pod_name": "competing-workspace"}),
+        ("workspace_binding", {"kind": "remote", "generation": VM_GENERATION}),
+    ],
+)
+async def test_vm_recovery_refuses_explicit_competing_physical_authority_before_pod_stop(
+    context_field: str,
+    value: dict[str, object],
+) -> None:
+    retirement = _vm_retirement()
+    retirement["context"][context_field].update(value)
+    store = MagicMock()
+    store.get_thread = AsyncMock(return_value=_current_vm_thread())
+    pod = MagicMock()
+    pod.is_available = True
+    pod.delete_agent_pod_exact = AsyncMock()
+    vm = MagicMock()
+    vm.lifecycle_available = True
+    vm.release_vm_captured = AsyncMock()
+    operations = _operations(store=store, agent_provisioner=pod, vm_provisioner=vm)
+
+    assert not await operations.recover_captured_process_zero(retirement)
+    pod.delete_agent_pod_exact.assert_not_awaited()
+    vm.release_vm_captured.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_vm_recovery_accepts_explicit_null_redundant_alias() -> None:
+    retirement = _vm_retirement()
+    retirement["context"]["vm"]["_runtime_incarnation"] = None
+    operations = _operations()
+
+    identity = operations._captured_vm_recovery_identity(
+        retirement["context"], permanent=True
+    )
+    assert identity is not None
+    assert identity.vm_uid == "vm-uid-a"
+
+
+@pytest.mark.asyncio
+async def test_vm_recovery_requires_rootdisk_uid_only_for_permanent_end() -> None:
+    retirement = _vm_retirement()
+    retirement["context"]["vm"]["rootdisk_pvc_uid"] = None
+    operations = _operations()
+
+    assert operations._captured_vm_recovery_identity(
+        retirement["context"], permanent=True
+    ) is None
+    soft_identity = operations._captured_vm_recovery_identity(
+        retirement["context"], permanent=False
+    )
+    assert soft_identity is not None
+    assert soft_identity.rootdisk_pvc_uid is None

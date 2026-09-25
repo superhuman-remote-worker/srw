@@ -72,6 +72,7 @@ from shared.db_url import build_postgres_url, postgres_database_name
 from shared.job_freeze_types import AUTO_REDISPATCH_FREEZE_TYPES
 from shared.job_steering import context_delivery_key, queued_reply_key
 from shared.pinned_session_identity import PinnedJobRecipient, PinnedSessionBinding
+from shared.pinned_workspace_evidence import has_pinned_physical_workspace_evidence
 from shared.session_retirement import stateless_settled_retirement_authority
 from shared.subagent_parent_authority import (
     ParentExecutionAuthority,
@@ -38134,23 +38135,9 @@ class PostgresDB:
                     workspace_provision_intent
                     and workspace_provision_intent.get("status") == "planned"
                 )
-                workspace_evidence = bool(
-                    not workspace_intent_pending
-                    and not _json_runtime_status_is_absent(workspace_context)
-                    or _has_external_fields(
-                        workspace_context,
-                        (
-                            "_runtime_incarnation",
-                            "pod_ip",
-                            "pod_name",
-                            "host",
-                            "port",
-                            "ide_host",
-                            "ide_port",
-                            "_canvas_workspace_generation",
-                            "_docker_workspace_lease_id",
-                        ),
-                    )
+                workspace_evidence = has_pinned_physical_workspace_evidence(
+                    workspace_context,
+                    provision_intent_pending=workspace_intent_pending,
                 )
                 virtual_binding = bool(
                     workspace_binding_context
