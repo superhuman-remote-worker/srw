@@ -936,11 +936,21 @@ digest when the profile is enabled.
 A selected profile is frozen in creation intent and inherited by retries, idle
 wakes and retained workspace handoffs even if new admission is later disabled.
 Reuse also requires authenticated first-boot evidence of the effective
-name-only DHCP rule and current guest network identity. Existing disks without
+name-only DHCP rule and current guest network identity. Existing Job disks without
 that immutable profile and proof remain warm at idle release and enter a visible
 recoverable hold on retained successor admission, regardless of the fresh
-admission switch;
-the setting does not migrate or edit their guest configuration.
+admission switch. The setting does not migrate or edit their guest configuration.
+
+Pinned Sessions using durable same-cluster creation and resource enforcement
+select the profile for fresh, unprepared allowlisted images. Readiness and wake
+check the frozen creation source and exact disk, VM, VMI, launcher and network
+receipt; Session receipt reuse also checks the interface MAC. A qualified Session
+disk keeps its original image/profile when the admission flag or allowlist
+changes. Missing or mismatched evidence holds its wake. Unprofiled historical
+Session disks are held when the profile is enabled; with it disabled, their
+existing legacy behavior is preserved. Before enabling this profile for retained
+Session workspaces, verify the exact guest image and a same-PVC restart with a
+changed VMI UID and MAC. Prepared images need separate qualification.
 
 Durable recovery is installed reader-first. Its database records, job projection,
 Retry/Cancel controls, disk retention pins and cleanup guards remain active even
