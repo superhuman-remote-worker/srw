@@ -20,6 +20,15 @@ from shared.vm_creation_issuance import (
 SECRET = b"creation-actuation-test-secret-at-least-32-bytes"
 
 
+async def poll_until_terminal(create, payload, *, limit=4):
+    """Drive the controller's separate effect polls for legacy assertions."""
+    for _ in range(limit):
+        result = await create(payload)
+        if result["status"] != "creation_pending":
+            return result
+    return result
+
+
 class API:
     def __init__(self):
         self.objects = {}
@@ -298,11 +307,53 @@ async def test_protocol_authority_denial_performs_no_job_effect(setup):
 @pytest.mark.asyncio
 async def test_new_disk_secret_vm_each_have_one_durable_effect(setup):
     ctrl, api, authority, payload = setup
+    first = await ctrl._do_create_serialized(payload)
+    assert first["status"] == "creation_pending"
+    assert api.writes == ["Lease", "DataVolume"]
+    assert [effect["state"] for effect in authority.row["effects"]] == ["observed"]
+    second = await ctrl._do_create_serialized(payload)
+    assert second["status"] == "creation_pending"
+    assert api.writes == ["Lease", "DataVolume", "Secret"]
+    assert [effect["state"] for effect in authority.row["effects"]] == ["observed", "observed"]
     result = await ctrl._do_create_serialized(payload)
     assert result["status"] == "created"
     assert api.writes == ["Lease", "DataVolume", "Secret", "VirtualMachine"]
     assert authority.settled
     assert [x["state"] for x in authority.row["effects"]] == ["observed"] * 3
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lock_kind", ["owner", "capacity"])
+async def test_busy_create_lock_returns_authenticated_pending_without_grant(
+    setup, monkeypatch, lock_kind,
+):
+    ctrl, api, authority, payload = setup
+    monkeypatch.setattr(settings, "CREATION_LOCK_WAIT_SECONDS", 0.01, raising=False)
+    lock = (
+        ctrl._lifecycle_lock_for(payload["job_id"])
+        if lock_kind == "owner"
+        else asyncio.Lock()
+    )
+    if lock_kind == "capacity":
+        ctrl._capacity_lock = lock
+    await lock.acquire()
+    try:
+        result = await asyncio.wait_for(ctrl._do_create(payload), timeout=1)
+        assert result == {
+            "job_id": payload["job_id"],
+            "provision_generation": payload["provision_generation"],
+            "status": "creation_pending",
+            "reason": "creation_observation_pending",
+        }
+        assert api.writes == []
+        assert authority.row["effects"] == []
+        changed = deepcopy(payload)
+        changed["creation_retry"]["request_digest"] = "sha256:" + "b" * 64
+        refused = await asyncio.wait_for(ctrl._do_create(changed), timeout=1)
+        assert refused["status"] == "creation_attention"
+        assert api.writes == []
+    finally:
+        lock.release()
 
 
 @pytest.mark.asyncio
@@ -316,7 +367,7 @@ async def test_profile_only_v1_reaches_first_vm_effect_with_ordinary_resolver(
     assert resolved["controller_configuration"]["version"] == 1
     assert "resource_admission" not in resolved["controller_configuration"]
 
-    result = await ctrl._do_create_serialized(payload)
+    result = await poll_until_terminal(ctrl._do_create_serialized, payload)
 
     assert result["status"] == "created", (
         api.writes,
@@ -356,7 +407,7 @@ async def test_profile_only_refuses_bad_network_data_before_vm_post(
         return manifest
 
     ctrl.render_template = changed_render
-    result = await ctrl._do_create_serialized(payload)
+    result = await poll_until_terminal(ctrl._do_create_serialized, payload)
     assert result["status"] == "creation_attention"
     assert api.writes == ["Lease", "DataVolume", "Secret"]
     assert [
@@ -399,7 +450,7 @@ async def test_profile_only_refuses_identity_drift_before_vm_post(
             return body
 
         monkeypatch.setattr(CreationActuator, "body", changed_body)
-    result = await ctrl._do_create_serialized(payload)
+    result = await poll_until_terminal(ctrl._do_create_serialized, payload)
     assert result["status"] == "creation_attention"
     assert "VirtualMachine" not in api.writes
     assert not any(
@@ -585,7 +636,7 @@ async def test_vm_creation_run_logs_closed_stage_and_family_without_secret_or_gr
             reject_manifest,
         )
 
-    result = await actuator.run(payload)
+    result = await poll_until_terminal(actuator.run, payload)
 
     assert result["status"] == "creation_attention"
     assert result["reason"] == "creation_evidence_unproven"
@@ -659,7 +710,7 @@ async def test_creation_run_stages_are_isolated_across_concurrent_invocations(
         return await original_body(self, row, values)
 
     monkeypatch.setattr(CreationActuator, "body", seed_previous_effects)
-    assert (await actuator.run(payload))["status"] == "creation_attention"
+    assert (await poll_until_terminal(actuator.run, payload))["status"] == "creation_attention"
     assert len(authority.row["effects"]) == 2
     caplog.clear()
     entered_body = asyncio.Event()
@@ -720,8 +771,7 @@ async def test_creation_run_stages_are_isolated_across_concurrent_invocations(
 async def test_lost_api_reply_replays_only_observation(setup, kind):
     ctrl, api, authority, payload = setup
     api.lost.add(kind)
-    await ctrl._do_create_serialized(payload)
-    result = await ctrl._do_create_serialized(payload)
+    result = await poll_until_terminal(ctrl._do_create_serialized, payload, limit=5)
     assert result["status"] == "created"
     assert api.writes.count(kind) == 1
     assert authority.settled
@@ -746,7 +796,7 @@ async def test_lost_grant_never_creates_from_absence(setup):
 @pytest.mark.asyncio
 async def test_completed_source_missing_vm_never_recreates(setup):
     ctrl, api, authority, payload = setup
-    await ctrl._do_create_serialized(payload)
+    assert (await poll_until_terminal(ctrl._do_create_serialized, payload))["status"] == "created"
     del api.objects["VirtualMachine", "agent-vm-" + payload["job_id"]]
     writes = list(api.writes)
     result = await ctrl._do_create_serialized(payload)
@@ -773,7 +823,7 @@ async def test_legacy_configuration_without_floor_replays_exact_projection(setup
     authority.row["controller_configuration_digest"] = digest
     payload["creation_retry"]["controller_configuration_digest"] = digest
 
-    result = await ctrl._do_create_serialized(payload)
+    result = await poll_until_terminal(ctrl._do_create_serialized, payload)
 
     assert result["status"] == "created"
     assert api.writes == ["Lease", "DataVolume", "Secret", "VirtualMachine"]
@@ -811,7 +861,7 @@ async def test_two_controller_handlers_share_one_stage_nonce(setup):
         ctrl._do_create_serialized(payload), ctrl._do_create_serialized(payload)
     )
     # An observer may stop while its winning peer is still in flight.
-    await ctrl._do_create_serialized(payload)
+    await poll_until_terminal(ctrl._do_create_serialized, payload)
     assert api.writes.count("DataVolume") == 1
     assert api.writes.count("Secret") == 1
     assert api.writes.count("VirtualMachine") == 1
@@ -823,7 +873,8 @@ async def test_exact_late_vm_adoption_survives_cancel_and_configuration_drift(
 ):
     ctrl, api, authority, payload = setup
     api.lost.add("VirtualMachine")
-    await ctrl._do_create_serialized(payload)
+    for _ in range(3):
+        await ctrl._do_create_serialized(payload)
     authority.row["state"] = "cancel_requested"
     authority.deny = True
     monkeypatch.setattr(settings, "VM_STORAGE_CLASS", "changed")
@@ -851,7 +902,7 @@ async def test_disk_replacement_after_grant_refuses_vm_api_write(setup):
         return result
 
     ctrl._workspace_cleanup_authority_request = replace_after_grant
-    result = await ctrl._do_create_serialized(payload)
+    result = await poll_until_terminal(ctrl._do_create_serialized, payload)
     assert result["status"] == "creation_attention"
     assert "VirtualMachine" not in api.writes
     assert authority.row["effects"][-1]["state"] == "issued"
@@ -876,7 +927,7 @@ async def test_protocol_objects_retain_a2_disk_observation_associations(setup):
     from vm_controller.provisioning_observation import build_provisioning_observation
 
     ctrl, api, authority, payload = setup
-    await ctrl._do_create_serialized(payload)
+    assert (await poll_until_terminal(ctrl._do_create_serialized, payload))["status"] == "created"
     name = "agent-vm-" + payload["job_id"]
     observed = build_provisioning_observation(
         vm=api.read("VirtualMachine", name),
@@ -985,7 +1036,7 @@ async def test_retained_exact_disk_reuses_same_permit_without_dv_write(
         },
     }
     authority.row["expected_pvc_uid"] = pvc_uid
-    result = await ctrl._do_create_serialized(payload)
+    result = await poll_until_terminal(ctrl._do_create_serialized, payload)
     assert result["status"] == "created"
     assert "DataVolume" not in api.writes
     assert result["rootdisk_pvc_uid"] == pvc_uid
@@ -1001,7 +1052,8 @@ async def test_periodic_carrier_observer_adopts_after_lost_vm_reply_without_post
 
     ctrl, api, authority, payload = setup
     api.lost.add("VirtualMachine")
-    await ctrl._do_create_serialized(payload)
+    for _ in range(3):
+        await ctrl._do_create_serialized(payload)
     lease = api.read(
         "Lease",
         "srw-cleanup-" + authority.row["creation_admission_id"].replace("-", ""),
@@ -1070,6 +1122,41 @@ async def test_protocol_specific_endpoint_cannot_fall_back_to_legacy(setup):
         secret=SECRET,
         expected_correlation_id=request[AUTH_FIELD]["request_id"],
     )
+
+
+@pytest.mark.asyncio
+async def test_busy_protocol_endpoint_signs_pending_after_owner_check(setup, monkeypatch):
+    import json
+    from shared.vm_lifecycle_auth import sign_payload, verify_payload, AUTH_FIELD
+
+    ctrl, api, authority, payload = setup
+    monkeypatch.setattr(settings, "CREATION_LOCK_WAIT_SECONDS", 0.01)
+    ctrl._verify_lifecycle_request = AsyncMock(return_value=True)
+    signed = sign_payload(
+        payload, direction="request", operation="creation_retry_create", secret=SECRET
+    )
+    lock = ctrl._lifecycle_lock_for(payload["job_id"])
+    await lock.acquire()
+    try:
+        response = await asyncio.wait_for(
+            ctrl.http_creation_retry(SimpleNamespace(json=AsyncMock(return_value=signed))),
+            timeout=1,
+        )
+    finally:
+        lock.release()
+    assert response.status == 200
+    body = json.loads(response.text)
+    assert verify_payload(
+        body, direction="response", operation="creation_retry_create", secret=SECRET,
+        expected_correlation_id=signed[AUTH_FIELD]["request_id"],
+    )
+    assert body["status"] == "creation_pending"
+    assert body["reason"] == "creation_observation_pending"
+    ctrl._verify_lifecycle_request.assert_awaited_once_with(
+        signed, "creation_retry_create", mutating=True
+    )
+    assert api.writes == []
+    assert authority.row["effects"] == []
 
 
 @pytest.mark.asyncio
@@ -1200,7 +1287,14 @@ async def test_unexpected_vm_after_grant_prevents_fresh_effect(setup, stage, for
         return result
 
     ctrl._workspace_cleanup_authority_request = appear_after_grant
-    result = await ctrl._do_create_serialized(payload)
+    result = await poll_until_terminal(ctrl._do_create_serialized, payload)
     assert result["status"] == "creation_attention"
     assert forbidden not in api.writes
     assert authority.row["effects"][-1]["state"] == "issued"
+    issued_nonce = authority.row["effects"][-1]["carrier_intent"]["effect_nonce"]
+    writes = list(api.writes)
+    del api.objects["VirtualMachine", "agent-vm-" + payload["job_id"]]
+    replay = await ctrl._do_create_serialized(payload)
+    assert replay["status"] == "creation_pending"
+    assert api.writes == writes
+    assert authority.row["effects"][-1]["carrier_intent"]["effect_nonce"] == issued_nonce

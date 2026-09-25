@@ -84,6 +84,23 @@ else:
     )
 log = logging.getLogger("vm-controller")
 
+# Lock contention must not consume the controller's short creation claim.
+CREATION_LOCK_WAIT_SECONDS = 1.0
+
+
+class _CreationLockBusy(Exception):
+    pass
+
+
+async def _acquire_creation_lock(lock: asyncio.Lock, wait_timeout: float | None):
+    if wait_timeout is None:
+        await lock.acquire()
+        return
+    try:
+        await asyncio.wait_for(lock.acquire(), timeout=wait_timeout)
+    except TimeoutError as exc:
+        raise _CreationLockBusy from exc
+
 # Configuration from environment
 NATS_URL = os.environ.get("NATS_URL", "nats://nats-leaf.nats.svc.cluster.local:4222")
 # Per-orchestrator scope for vm.lifecycle.* subjects. Required when the
@@ -814,7 +831,9 @@ class VMController:
         return locks[int.from_bytes(digest[:8], "big") % len(locks)]
 
     @asynccontextmanager
-    async def _workspace_lifecycle(self, owner_id: str):
+    async def _workspace_lifecycle(
+        self, owner_id: str, *, wait_timeout: float | None = None
+    ):
         """Serialize one workspace boundary, allowing same-task nesting."""
 
         lock = self._lifecycle_lock_for(str(owner_id))
@@ -829,7 +848,7 @@ class VMController:
         if owners.get(key) is task:
             yield
             return
-        await lock.acquire()
+        await _acquire_creation_lock(lock, wait_timeout)
         owners[key] = task
         try:
             yield
@@ -2261,24 +2280,38 @@ class VMController:
 
             binding = storage_binding(binding)
             lifecycle_owner = binding["owner_id"]
-        async with self._workspace_lifecycle(lifecycle_owner):
-            capacity_lock = getattr(self, "_capacity_lock", None)
-            if capacity_lock is None:
-                # A few unit-test fixtures intentionally construct via __new__.
-                capacity_lock = asyncio.Lock()
-                self._capacity_lock = capacity_lock
-            async with capacity_lock:
-                if binding is not None:
-                    if (
-                        not VM_PERSISTENT_ROOTDISK
-                        or LIFECYCLE_HMAC_SECRET is None
-                        or not getattr(self, "cloud_init_text", "")
-                    ):
-                        raise ValueError(
-                            "Retained VM workspaces require persistent disks and authenticated lifecycle hosting."
-                        )
+        wait_timeout = (
+            CREATION_LOCK_WAIT_SECONDS if "creation_retry" in job_config else None
+        )
+        try:
+            async with self._workspace_lifecycle(
+                lifecycle_owner, wait_timeout=wait_timeout
+            ):
+                capacity_lock = getattr(self, "_capacity_lock", None)
+                if capacity_lock is None:
+                    # A few unit-test fixtures intentionally construct via __new__.
+                    capacity_lock = asyncio.Lock()
+                    self._capacity_lock = capacity_lock
+                await _acquire_creation_lock(capacity_lock, wait_timeout)
+                try:
+                    if binding is not None:
+                        if (
+                            not VM_PERSISTENT_ROOTDISK
+                            or LIFECYCLE_HMAC_SECRET is None
+                            or not getattr(self, "cloud_init_text", "")
+                        ):
+                            raise ValueError(
+                                "Retained VM workspaces require persistent disks and authenticated lifecycle hosting."
+                            )
                     return await self._do_create_serialized(job_config)
-                return await self._do_create_serialized(job_config)
+                finally:
+                    capacity_lock.release()
+        except _CreationLockBusy:
+            from vm_controller.creation_actuation import CreationActuator
+
+            # Recheck the signed request against the durable owner before a
+            # busy reply. No admission or new effect is granted here.
+            return await CreationActuator(self).run(job_config, observe_only=True)
 
     async def _do_create_serialized(self, job_config: dict) -> dict:
         """Create while holding the reusable entity-name lifecycle lock."""

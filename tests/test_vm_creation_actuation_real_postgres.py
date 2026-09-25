@@ -5,7 +5,10 @@ from uuid import UUID, uuid4
 
 import pytest
 
-from tests.test_vm_creation_actuation import setup as _actuation_fixture
+from tests.test_vm_creation_actuation import (
+    poll_until_terminal,
+    setup as _actuation_fixture,
+)
 from tests.test_vm_creation_actuation import profiled_setup as _profiled_fixture
 from tests.test_vm_creation_retry_real_postgres import (
     db as _db_fixture,
@@ -83,7 +86,7 @@ async def test_profiled_first_create_uses_stored_configuration_with_real_authori
         )(**body)
 
     ctrl._workspace_cleanup_authority_request = authority
-    result = await ctrl._do_create_serialized(payload)
+    result = await poll_until_terminal(ctrl._do_create_serialized, payload)
 
     assert result["status"] == "created", (api.writes, result)
     assert api.writes == ["Lease", "DataVolume", "Secret", "VirtualMachine"]
@@ -179,6 +182,10 @@ async def test_real_authority_lost_vm_reply_adoption_retains_attempts_and_hold(
 
     ctrl._workspace_cleanup_authority_request = authority
     api.lost.add("VirtualMachine")
+    assert (await ctrl._do_create_serialized(payload))["status"] == "creation_pending"
+    assert api.writes == ["Lease", "DataVolume"]
+    assert (await ctrl._do_create_serialized(payload))["status"] == "creation_pending"
+    assert api.writes == ["Lease", "DataVolume", "Secret"]
     pending = await ctrl._do_create_serialized(payload)
     assert pending["status"] == "creation_pending"
     assert api.writes.count("VirtualMachine") == 1

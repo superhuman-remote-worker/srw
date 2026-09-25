@@ -926,6 +926,8 @@ class VMCreationRetryStore:
                     if row["state"] == "cancel_requested"
                     else "attention"
                     if attention
+                    else "reconciling"
+                    if outcome == "transport_unknown"
                     else "queued"
                 )
                 reason = {
@@ -956,13 +958,14 @@ class VMCreationRetryStore:
                 ):
                     reason = observation["reason"]
                 await conn.execute(
-                    "UPDATE vm_creation_retries SET state=$2,revision=revision+1,claim_token=NULL,claim_expires_at=NULL,backoff_attempt=$3,transport_outage_started_at=$4,reason=$5,next_probe_at=clock_timestamp()+$6*interval '1 second',updated_at=clock_timestamp() WHERE request_id=$1",
+                    "UPDATE vm_creation_retries SET state=$2,revision=revision+1,claim_token=CASE WHEN $7 THEN claim_token ELSE NULL END,claim_expires_at=CASE WHEN $7 THEN claim_expires_at ELSE NULL END,backoff_attempt=$3,transport_outage_started_at=$4,reason=$5,next_probe_at=clock_timestamp()+$6*interval '1 second',updated_at=clock_timestamp() WHERE request_id=$1",
                     row["request_id"],
                     state,
                     attempt,
                     outage,
                     reason,
                     retry_delay_seconds(attempt, random.uniform(0, 0.2)),
+                    state == "reconciling",
                 )
                 return True
 

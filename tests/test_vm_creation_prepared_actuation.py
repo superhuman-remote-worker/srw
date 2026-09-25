@@ -7,7 +7,10 @@ import pytest
 from kubernetes import client
 from kubernetes.client.exceptions import ApiException
 
-from tests.test_vm_creation_actuation import setup as _actuation_fixture
+from tests.test_vm_creation_actuation import (
+    poll_until_terminal,
+    setup as _actuation_fixture,
+)
 from tests.test_vm_preparation_lifecycle import engine
 from shared.workspace_preparation import preparation_request
 from vm_controller.preparation_store import DISK_LABEL, SCOPE_LABEL, scope_key
@@ -133,18 +136,23 @@ def prepared(setup):
 
 async def finish_prepared(prepared):
     ctrl, api, authority, payload, service = prepared
-    initial = await ctrl._do_create_serialized(payload)
+    for _ in range(3):
+        initial = await ctrl._do_create_serialized(payload)
+        if initial.get("reason") == "preparation_wait":
+            break
     assert (
         initial["status"] == "creation_pending"
         and initial["reason"] == "preparation_wait"
     )
     service.store.finish(next(iter(service.store.pods)))
-    for _ in range(4):
+    for _ in range(8):
         result = await ctrl._do_create_serialized(payload)
-        if (
-            result["status"] != "creation_pending"
-            or result["reason"] != "preparation_wait"
-        ):
+        if result["status"] != "creation_pending":
+            return result
+        # A lost VM reply must remain visible to the caller before adoption.
+        if "VirtualMachine" in api.writes:
+            return result
+        if authority.row["effects"] and authority.row["effects"][-1]["state"] == "issued":
             return result
     raise AssertionError("Prepared source did not finish")
 
@@ -227,7 +235,7 @@ async def test_lost_root_reply_and_cancel_preserve_prepared_source(prepared):
     result = await finish_prepared(prepared)
     # The next poll observes the exact root; no source resolution or second POST.
     if result["status"] == "creation_pending":
-        result = await ctrl._do_create_serialized(payload)
+        result = await poll_until_terminal(ctrl._do_create_serialized, payload)
     assert result["status"] == "created"
     cancelled = await service.cancel_with_receipt(payload["preparation"])
     assert cancelled["cancelled"] is False
@@ -421,7 +429,7 @@ async def test_lost_prepared_capture_or_completion_reply_replays_exact_state(
             break
     assert lost and result["status"] == "creation_pending"
     before = api.writes.count("DataVolume")
-    result = await ctrl._do_create_serialized(payload)
+    result = await poll_until_terminal(ctrl._do_create_serialized, payload)
     assert result["status"] == "created"
     assert api.writes.count("DataVolume") == 1
     assert before == (1 if completion else 0)

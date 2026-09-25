@@ -6,7 +6,10 @@ from uuid import uuid4
 
 import pytest
 
-from tests.test_vm_creation_actuation import setup as _setup_fixture
+from tests.test_vm_creation_actuation import (
+    poll_until_terminal,
+    setup as _setup_fixture,
+)
 from tests.test_vm_creation_golden import golden as _golden_fixture
 from vm_controller.creation_configuration import resolve_creation_configuration
 from shared.vm_workspace_storage import storage_name
@@ -59,7 +62,7 @@ def bind_attachment(setup):
 @pytest.mark.asyncio
 async def test_new_retained_workspace_observes_attachment_before_root(attached):
     ctrl, api, authority, payload = attached
-    result = await ctrl._do_create_serialized(payload)
+    result = await poll_until_terminal(ctrl._do_create_serialized, payload, limit=5)
     assert result["status"] == "created"
     assert [
         effect["carrier_intent"]["effect_kind"] for effect in authority.row["effects"]
@@ -104,7 +107,7 @@ async def test_lost_attachment_post_reply_is_observation_only(attached, cancelle
     if cancelled:
         authority.row["state"] = "cancel_requested"
         authority.deny = True
-    result = await ctrl._do_create_serialized(payload)
+    result = await poll_until_terminal(ctrl._do_create_serialized, payload, limit=5)
     assert result["status"] == ("creation_attention" if cancelled else "created")
     assert api.writes.count("Lease") == 2
     assert api.writes.count("DataVolume") == (0 if cancelled else 1)
@@ -116,7 +119,7 @@ async def test_golden_attachment_clone_pin_uses_exact_workspace_target(golden):
 
     ctrl, api, authority, payload, source_name = golden
     bind_attachment((ctrl, api, authority, payload))
-    result = await ctrl._do_create_serialized(payload)
+    result = await poll_until_terminal(ctrl._do_create_serialized, payload, limit=5)
     assert result["status"] == "created"
     name = storage_name(payload["workspace_storage"])
     pin = pins(api.read("DataVolume", source_name))[authority.row["request_id"]]
@@ -150,7 +153,8 @@ async def test_golden_attachment_clone_pin_uses_exact_workspace_target(golden):
 async def test_vm_attachment_label_drift_cannot_be_adopted(attached, location):
     ctrl, api, authority, payload = attached
     api.lost.add("VirtualMachine")
-    assert (await ctrl._do_create_serialized(payload))["status"] == "creation_pending"
+    for _ in range(4):
+        assert (await ctrl._do_create_serialized(payload))["status"] == "creation_pending"
     vm = api.objects["VirtualMachine", "agent-vm-" + payload["job_id"]]
     metadata = (
         vm["metadata"] if location == "metadata" else vm["spec"]["template"]["metadata"]
@@ -238,7 +242,7 @@ async def test_retained_attachment_cas_keeps_disk_and_recovers_lost_put(
     api.replace = replace
     assert (await ctrl._do_create_serialized(payload))["status"] == "creation_pending"
     assert api.writes == ["Lease"]
-    assert (await ctrl._do_create_serialized(payload))["status"] == "created"
+    assert (await poll_until_terminal(ctrl._do_create_serialized, payload, limit=5))["status"] == "created"
     assert len(puts) == 1
     assert puts[0]["metadata"]["uid"] == before["metadata"]["uid"]
     assert (

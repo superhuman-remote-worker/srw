@@ -5,6 +5,8 @@ from uuid import UUID, uuid4
 
 import pytest
 
+from tests.test_vm_creation_actuation import poll_until_terminal
+
 from tests.test_vm_creation_attachment_actuation import (
     setup as _setup_fixture,
     attached as _attached_fixture,
@@ -94,7 +96,10 @@ async def test_attachment_real_authority_adopts_lost_vm_reply(db, attached, canc
     ctrl, api, _, payload = attached
     store, row = await bridge(db, attached)
     api.lost.add("VirtualMachine")
-    assert (await ctrl._do_create_serialized(payload))["status"] == "creation_pending"
+    for _ in range(4):
+        assert (await ctrl._do_create_serialized(payload))["status"] == "creation_pending"
+        if "VirtualMachine" in api.writes:
+            break
     assert api.writes == ["Lease", "Lease", "DataVolume", "Secret", "VirtualMachine"]
     if cancelled:
         async with db.acquire() as conn:
@@ -105,7 +110,7 @@ async def test_attachment_real_authority_adopts_lost_vm_reply(db, attached, canc
                 "UPDATE srw_workspace_instances SET status='Deleting' WHERE id=$1",
                 UUID(payload["workspace_storage"]["uid"]),
             )
-    result = await ctrl._do_create_serialized(payload)
+    result = await poll_until_terminal(ctrl._do_create_serialized, payload)
     assert result["status"] == "created"
     assert api.writes.count("VirtualMachine") == 1
     observed = await store.inspect(request_id=str(row["request_id"]))

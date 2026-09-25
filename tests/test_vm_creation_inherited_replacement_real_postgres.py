@@ -14,6 +14,7 @@ import pytest
 from fastapi import FastAPI
 from kubernetes.client.exceptions import ApiException
 
+from tests.test_vm_creation_actuation import poll_until_terminal
 from tests.test_vm_creation_inherited_attachment_real_postgres import (
     db as _db_fixture,
     postgres_db_fixture,  # noqa: F401
@@ -116,7 +117,11 @@ async def test_quota_rejected_retained_vm_effect_survives_ordinary_resume(
         return create(body)
 
     api.create = quota_create
-    result = await ctrl._do_create_serialized(payload)
+    for _ in range(5):
+        result = await ctrl._do_create_serialized(payload)
+        current = await store.inspect(request_id=str(row["request_id"]))
+        if current["effects"] and current["effects"][-1]["carrier_intent"]["effect_kind"] == "vm":
+            break
     assert result["status"] == "creation_pending"
     observed = await store.inspect(request_id=str(row["request_id"]))
     assert observed["effects"][-1]["carrier_intent"]["effect_kind"] == "vm"
@@ -156,7 +161,7 @@ async def test_quota_rejected_retained_vm_effect_survives_ordinary_resume(
     assert quota_active
 
     quota_active = False
-    created = await ctrl._do_create_serialized(payload)
+    created = await poll_until_terminal(ctrl._do_create_serialized, payload, limit=5)
     assert created["status"] == "created"
     after = await store.inspect(request_id=str(row["request_id"]))
     assert [
@@ -230,7 +235,7 @@ async def test_a1_open_cleanup_refuses_actual_owner_resume(
     ctrl, _, _, _ = attached
     jobs, _, _, _, payload = await controller_bridge(db, attached)
     job_id = jobs[-1]
-    assert (await ctrl._do_create_serialized(payload))["status"] == "created"
+    assert (await poll_until_terminal(ctrl._do_create_serialized, payload, limit=5))["status"] == "created"
     async with db.acquire() as conn:
         context = json.loads(await conn.fetchval("SELECT context FROM jobs WHERE id=$1", job_id))
         context["vm"]["retirement_cleanup_pending"] = True
@@ -265,7 +270,7 @@ async def test_a1_admitted_cleanup_blocks_http_resume_then_settles(
     ctrl, _, _, _ = attached
     jobs, _, _, _, payload = await controller_bridge(db, attached)
     job_id = jobs[-1]
-    assert (await ctrl._do_create_serialized(payload))["status"] == "created"
+    assert (await poll_until_terminal(ctrl._do_create_serialized, payload, limit=5))["status"] == "created"
     async with db.acquire() as conn:
         context = json.loads(await conn.fetchval("SELECT context FROM jobs WHERE id=$1", job_id))
         context["vm"]["status"] = "ready"
@@ -339,7 +344,7 @@ async def test_a1_ready_recycler_loses_to_prior_queued_resume(
     ctrl, _, _, _ = attached
     jobs, _, _, _, payload = await controller_bridge(db, attached)
     job_id = jobs[-1]
-    assert (await ctrl._do_create_serialized(payload))["status"] == "created"
+    assert (await poll_until_terminal(ctrl._do_create_serialized, payload, limit=5))["status"] == "created"
     async with db.acquire() as conn:
         context = json.loads(await conn.fetchval("SELECT context FROM jobs WHERE id=$1", job_id))
         context["vm"]["status"] = "ready"
@@ -428,7 +433,7 @@ async def retire(db, attached, payload):
 async def replacing(db, attached):
     ctrl, _, _, _ = attached
     jobs, _, store, first, payload = await controller_bridge(db, attached)
-    assert (await ctrl._do_create_serialized(payload))["status"] == "created"
+    assert (await poll_until_terminal(ctrl._do_create_serialized, payload, limit=5))["status"] == "created"
     return store, first, await retire(db, attached, payload)
 
 
@@ -476,7 +481,7 @@ async def test_inherited_replacement_claims_same_lease_with_own_cleanup_proof(
     assert proof["retirement"]["receipt_id"] == str(receipt)
     assert row["predecessor_cleanup_admission_id"] == cleanup
     assert row["admission_deadline"] == first["admission_deadline"]
-    result = await ctrl._do_create_serialized(payload)
+    result = await poll_until_terminal(ctrl._do_create_serialized, payload, limit=5)
     assert result["status"] == "created", result
     assert result["vm_uid"] != old["vm_uid"]
     current = await store.inspect(request_id=str(row["request_id"]))
@@ -600,6 +605,12 @@ async def test_replacement_lost_reply_never_duplicates_effect(db, attached, lost
     else:
         api.lost.add("VirtualMachine")
     assert (await ctrl._do_create_serialized(payload))["status"] == "creation_pending"
+    if lost in {"vm", "cancelled_vm"}:
+        for _ in range(3):
+            assert (await ctrl._do_create_serialized(payload))["status"] == "creation_pending"
+            if "VirtualMachine" in api.writes:
+                break
+        assert api.writes.count("VirtualMachine") == 1
     if lost == "cancelled_vm":
         async with db.acquire() as conn:
             await conn.execute(
@@ -609,7 +620,11 @@ async def test_replacement_lost_reply_never_duplicates_effect(db, attached, lost
                 "UPDATE srw_workspace_instances SET status='Deleting' WHERE id=$1",
                 UUID(request["workspace_storage"]["uid"]),
             )
-    result = await ctrl._do_create_serialized(payload)
+    result = (
+        await ctrl._do_create_serialized(payload)
+        if lost == "grant"
+        else await poll_until_terminal(ctrl._do_create_serialized, payload, limit=5)
+    )
     observed = await store.inspect(request_id=str(row["request_id"]))
     if lost == "grant":
         # The committed grant is ambiguous. No controller may repeat it merely
@@ -685,7 +700,7 @@ async def test_second_replacement_preserves_flat_handoff_and_uses_latest_own_ret
     ctrl, _, _, _ = attached
     store, first, (request, fresh, _, _, _) = await replacing(db, attached)
     _, second, payload = await admit_replacement(db, ctrl, store, request, fresh)
-    assert (await ctrl._do_create_serialized(payload))["status"] == "created"
+    assert (await poll_until_terminal(ctrl._do_create_serialized, payload, limit=5))["status"] == "created"
     request, fresh, _, receipt, cleanup = await retire(db, attached, payload)
     proof, third, payload = await admit_replacement(db, ctrl, store, request, fresh)
     assert proof["predecessor_evidence"]["handoff"] == first["predecessor_evidence"]
@@ -694,7 +709,7 @@ async def test_second_replacement_preserves_flat_handoff_and_uses_latest_own_ret
     )
     assert proof["predecessor_evidence"]["retirement"]["receipt_id"] == str(receipt)
     assert third["predecessor_cleanup_admission_id"] == cleanup
-    assert (await ctrl._do_create_serialized(payload))["status"] == "created"
+    assert (await poll_until_terminal(ctrl._do_create_serialized, payload, limit=5))["status"] == "created"
 
 
 @pytest.mark.asyncio
@@ -774,7 +789,7 @@ async def test_replacement_uses_unchanged_ledger_without_context_copy(db, attach
         )
     _, row, payload = await admit_replacement(db, ctrl, store, request, fresh)
     assert row["admission_deadline"] == first["admission_deadline"]
-    assert (await ctrl._do_create_serialized(payload))["status"] == "created"
+    assert (await poll_until_terminal(ctrl._do_create_serialized, payload, limit=5))["status"] == "created"
 
 
 @pytest.mark.asyncio
@@ -791,7 +806,7 @@ async def test_a1_stale_workspace_resume_cannot_shed_new_ready_retirement(
     ctrl, _, _, _ = attached
     jobs, _, _, _, payload = await controller_bridge(db, attached)
     job_id = jobs[-1]
-    assert (await ctrl._do_create_serialized(payload))["status"] == "created"
+    assert (await poll_until_terminal(ctrl._do_create_serialized, payload, limit=5))["status"] == "created"
     async with db.acquire() as conn:
         context = json.loads(await conn.fetchval("SELECT context FROM jobs WHERE id=$1", job_id))
         context["vm"]["status"] = "provisioning"

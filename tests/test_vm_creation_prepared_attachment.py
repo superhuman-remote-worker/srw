@@ -20,6 +20,14 @@ setup = _setup_fixture
 prepared = _prepared_fixture
 
 
+async def poll_until_preparation_wait(ctrl, payload):
+    for _ in range(3):
+        result = await ctrl._do_create_serialized(payload)
+        if result.get("reason") == "preparation_wait":
+            return result
+    raise AssertionError("Prepared workspace did not reach preparation wait")
+
+
 @pytest.fixture
 def workspace(prepared):
     ctrl, api, authority, payload, service = prepared
@@ -78,7 +86,7 @@ async def test_engine_prepared_workspace_has_frozen_target_and_exact_completion(
 )
 async def test_prepared_target_drift_is_refused_before_delivery(workspace, change):
     ctrl, api, authority, payload, service = workspace
-    first = await ctrl._do_create_serialized(payload)
+    first = await poll_until_preparation_wait(ctrl, payload)
     assert first["reason"] == "preparation_wait"
     allocation = await service.store.get(allocation_name(payload["preparation"]))
     target = allocation.state["creation_binding"]["target"]
@@ -307,7 +315,7 @@ async def test_ordinary_completed_source_preserves_legacy_binding_compatibility(
 @pytest.mark.asyncio
 async def test_never_issued_workspace_preparation_has_no_clone_hold(workspace):
     ctrl, _, _, payload, service = workspace
-    assert (await ctrl._do_create_serialized(payload))["reason"] == "preparation_wait"
+    assert (await poll_until_preparation_wait(ctrl, payload))["reason"] == "preparation_wait"
     allocation = await service.store.get(allocation_name(payload["preparation"]))
     assert allocation.state["workspace_source_issued"] is False
     assert "creation_source" not in allocation.state
