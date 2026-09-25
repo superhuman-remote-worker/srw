@@ -50,6 +50,11 @@ class Proc:
     tasks: dict[int, bytes | BaseException] | None = None
     # Successive answers to listdir(/proc/P/task); the last one repeats.
     listings: list[list[int]] | None = None
+    # A listing taken just before a thread is created: returned by the first
+    # listdir after each read of the leader's environment, so every scan
+    # pass starts from a stale view of the group.
+    first_listing: list[int] | None = None
+    reading: bool = False
     status: str | BaseException | None = None
     # What SIGTERM / SIGKILL do: "exit" (gone), "zombie" (Z, Threads 1),
     # or "ignore".
@@ -97,6 +102,7 @@ class Procfs:
                 )
             return io.StringIO(text)
         if leaf == ["environ"]:
+            proc.reading = True
             return self._read(proc.environ)
         if len(leaf) == 3 and leaf[0] == "task" and leaf[2] == "environ":
             tasks = (
@@ -120,6 +126,9 @@ class Procfs:
         assert parts[3:] == ["task"], path
         pid = int(parts[2])
         proc = self._proc(pid)
+        if proc.first_listing is not None and proc.reading:
+            proc.reading = False
+            return [str(tid) for tid in proc.first_listing]
         if proc.listings:
             listing = proc.listings[0]
             if len(proc.listings) > 1:
@@ -284,14 +293,19 @@ class TestTaggedScanDeadLeaders:
         assert procfs.kills == [(201, signal.SIGTERM)]
 
     def test_esrch_alone_does_not_dismiss_a_group_that_gains_a_thread(self):
-        """Every listed task lost its mm, but a thread appeared meanwhile."""
+        """Every listed task lost its mm, but a thread appeared meanwhile.
+
+        Thread 201 created 202 and exited between the listing and the reads,
+        on every pass. Only a second listing within the pass sees 202.
+        """
 
         half = Proc(
             state="Z",
             threads=2,
             environ=_ESRCH,
             tasks={200: _ESRCH, 201: _ESRCH, 202: _TAGGED},
-            listings=[[200, 201], [200, 202], [200, 202]],
+            first_listing=[200, 201],
+            listings=[[200, 202]],
         )
 
         code, _ = _tagged_scan({200: half}, terminate=False)
