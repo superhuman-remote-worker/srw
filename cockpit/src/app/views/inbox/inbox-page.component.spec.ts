@@ -1,5 +1,5 @@
 import {afterEach, describe, expect, it, vi} from 'vitest';
-import {DestroyRef, Injector, NgZone, runInInjectionContext, signal} from '@angular/core';
+import {DestroyRef, Injector, NgZone, TemplateRef, runInInjectionContext, signal} from '@angular/core';
 import {ActivatedRoute} from '@angular/router';
 import {of} from 'rxjs';
 import {TranslocoService} from '@jsverse/transloco';
@@ -8,6 +8,8 @@ import {InboxPageComponent} from './inbox-page.component';
 import {ActionCenterService} from '../../core/services/action-center.service';
 import {NotificationService} from '../../core/services/notification.service';
 import {ViewportService} from '../../core/services/viewport.service';
+import {SidebarService} from '../../core/services/sidebar.service';
+import {RailTakeoverService} from '../../core/services/rail-takeover.service';
 import {
   EMPTY_NOTIFICATION_COUNTS,
   Notification,
@@ -56,6 +58,7 @@ function createComponent(
   feed: Notification[] = [],
   queryParams: Record<string, string> = {},
   counts: NotificationCounts = EMPTY_NOTIFICATION_COUNTS,
+  layout: {mobile?: boolean; collapsed?: boolean} = {},
 ) {
   const feedSignal = signal<Notification[]>(feed);
   const notificationsMock = {
@@ -90,6 +93,10 @@ function createComponent(
   });
   const actionCenter = runInInjectionContext(baseInjector, () => new ActionCenterService());
 
+  const isMobile = signal(layout.mobile ?? false);
+  const collapsed = signal(layout.collapsed ?? false);
+  const takeover = new RailTakeoverService();
+
   const zoneMock = {
     run: (fn: () => unknown) => fn(),
     runOutsideAngular: (fn: () => unknown) => fn(),
@@ -102,12 +109,14 @@ function createComponent(
       {provide: ActivatedRoute, useValue: {queryParams: of(queryParams)}},
       {provide: NgZone, useValue: zoneMock},
       {provide: TranslocoService, useValue: {translate: (key: string) => key, getActiveLang: () => 'en'}},
-      {provide: ViewportService, useValue: {isMobile: signal(false)}},
+      {provide: ViewportService, useValue: {isMobile}},
+      {provide: SidebarService, useValue: {collapsed}},
+      {provide: RailTakeoverService, useValue: takeover},
     ],
   });
 
   const component = runInInjectionContext(injector, () => new InboxPageComponent());
-  return {component, actionCenter, notificationsMock};
+  return {component, actionCenter, notificationsMock, isMobile, collapsed, takeover};
 }
 
 describe('InboxPageComponent — unified feed', () => {
@@ -306,5 +315,50 @@ describe('InboxPageComponent — unified feed', () => {
     expect(component.selectedItem()?.id).toBe('ntf:a');
     key('Escape');
     expect(component.selectedItem()).toBeNull();
+  });
+});
+
+// navigation_fixed_rail.md F9: on desktop the feed replaces the rail's rows
+// instead of standing beside them as a second list column.
+describe('InboxPageComponent — feed in the rail', () => {
+  const railFeed = {} as TemplateRef<unknown>;
+
+  function lent(layout: {mobile?: boolean; collapsed?: boolean} = {}) {
+    const created = createComponent([], {}, EMPTY_NOTIFICATION_COUNTS, layout);
+    // The spec never renders the template; stand in for the static query.
+    (created.component as unknown as {railFeed: TemplateRef<unknown>}).railFeed = railFeed;
+    created.component.ngOnInit();
+    return created;
+  }
+
+  it('lends the feed to the rail on desktop while the rail is open', () => {
+    const {component, takeover} = lent();
+    expect(component.listInRail()).toBe(true);
+    expect(takeover.template()).toBe(railFeed);
+    component.ngOnDestroy();
+  });
+
+  it('keeps the feed in the page on a phone, where the rail is a drawer', () => {
+    const {component, takeover} = lent({mobile: true});
+    expect(component.listInRail()).toBe(false);
+    expect(takeover.template()).toBeNull();
+    component.ngOnDestroy();
+  });
+
+  // A collapsed rail would otherwise hide the feed altogether.
+  it('takes the feed back into the page while the rail is collapsed', () => {
+    const {component, takeover, collapsed} = lent();
+    collapsed.set(true);
+    expect(component.listInRail()).toBe(false);
+    expect(takeover.template()).toBeNull();
+    collapsed.set(false);
+    expect(takeover.template()).toBe(railFeed);
+    component.ngOnDestroy();
+  });
+
+  it('hands the rail back when the page goes away', () => {
+    const {component, takeover} = lent();
+    component.ngOnDestroy();
+    expect(takeover.template()).toBeNull();
   });
 });

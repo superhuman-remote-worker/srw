@@ -1,5 +1,5 @@
 import {Component, computed, ElementRef, HostListener, inject, signal, ViewChild} from '@angular/core';
-import {Location} from '@angular/common';
+import {Location, NgTemplateOutlet} from '@angular/common';
 import {IsActiveMatchOptions, NavigationEnd, Router, RouterLink, RouterLinkActive} from '@angular/router';
 import {takeUntilDestroyed, toSignal} from '@angular/core/rxjs-interop';
 import {filter, map} from 'rxjs';
@@ -8,8 +8,7 @@ import {ViewportService} from '../../core/services/viewport.service';
 import {SessionListService} from '../../core/services/session-list.service';
 import {UserService} from '../../core/services/user.service';
 import {ActionCenterService} from '../../core/services/action-center.service';
-import {LayoutService} from '../../workbench/services/layout.service';
-import {LayoutPickerComponent} from '../../workbench/components/layout-picker/layout-picker.component';
+import {RailTakeoverService} from '../../core/services/rail-takeover.service';
 import {NotificationBellComponent} from '../notification-bell/notification-bell.component';
 import {PersistentChatService} from '../../core/services/persistent-chat.service';
 import {environment} from '../../core/environment';
@@ -19,10 +18,12 @@ import {LegionMarkComponent} from '../../ui/legion-mark';
 import {RailAccountMenuComponent} from '../rail-account-menu/rail-account-menu.component';
 
 /**
- * What the rail body shows. `main` everywhere except the two areas that take
- * the rail over, each with a way back (navigation_fixed_rail.md F1, F4, F6).
+ * What the rail body shows. `main` everywhere except where the rail is taken
+ * over, always with a way back (navigation_fixed_rail.md F1, F4, F9):
+ * `settings` is the shell's own section list, `page` is content a page lends
+ * the rail through RailTakeoverService.
  */
-export type RailView = 'main' | 'settings' | 'workbench';
+export type RailView = 'main' | 'settings' | 'page';
 
 export interface RailLink {
   path: string;
@@ -37,15 +38,24 @@ export interface RailLinkGroup {
 /** The four pages the Customize row stands for — they share a tab bar. */
 const CUSTOMIZE_ROUTES = ['/experts', '/skills', '/datasources', '/contacts'];
 
+/**
+ * Pages that lend the rail their own list on desktop. Known here by route,
+ * not only by their claim, so a hard load reserves the rail on its first
+ * frame instead of drawing the main rows and then swapping them out. On a
+ * phone the rail is a drawer the user has to open, so these pages keep
+ * their list in the page there.
+ */
+const PAGE_TAKEOVER_ROUTES = ['/inbox'];
+
 /** `path` itself or anything below it — never a sibling that merely shares
  *  the prefix. */
 function isUnder(path: string, prefix: string): boolean {
   return path === prefix || path.startsWith(prefix + '/');
 }
 
-export function railViewFor(path: string): RailView {
+export function railViewFor(path: string, mobile = false): RailView {
   if (isUnder(path, '/settings') || isUnder(path, '/admin')) return 'settings';
-  if (isUnder(path, '/workbench')) return 'workbench';
+  if (!mobile && PAGE_TAKEOVER_ROUTES.some((prefix) => isUnder(path, prefix))) return 'page';
   return 'main';
 }
 
@@ -58,7 +68,7 @@ function pathOf(url: string): string {
 @Component({
   selector: 'app-sidebar',
   standalone: true,
-  imports: [RouterLink, RouterLinkActive, LayoutPickerComponent, NotificationBellComponent, TranslocoPipe, AppIconComponent, LegionMarkComponent, RailAccountMenuComponent],
+  imports: [RouterLink, RouterLinkActive, NgTemplateOutlet, NotificationBellComponent, TranslocoPipe, AppIconComponent, LegionMarkComponent, RailAccountMenuComponent],
   template: `
     <nav class="sidebar" id="sidebar-rail" (click)="onSidebarClick($event)">
       <div class="sidebar-header">
@@ -93,60 +103,14 @@ function pathOf(url: string): string {
               }
             }
           }
-          @case ('workbench') {
+          <!-- A page's own list (the Action Center's feed) in place of the
+               rail's rows, so the page doesn't need a second list column
+               beside the rail (navigation_fixed_rail.md F9). -->
+          @case ('page') {
             <button type="button" class="rail-back" (click)="backToApp()">
               <app-icon size="md">arrow_back</app-icon> {{ 'nav.backToApp' | transloco }}
             </button>
-            @if (adminToolsEnabled) {
-            <div class="section">
-              <div class="section-title">Databases</div>
-              <a class="section-link" [href]="neo4jUrl" target="_blank" rel="noopener">
-                <span class="link-icon">&#x1F535;</span>Neo4j Browser
-              </a>
-              <a class="section-link" [href]="pgadminUrl" target="_blank" rel="noopener">
-                <span class="link-icon">&#x1F418;</span>PostgreSQL
-              </a>
-            </div>
-
-            }
-            <div class="section">
-              <div class="section-title">Tools</div>
-              <a class="section-link" [href]="giteaUrl" target="_blank" rel="noopener">
-                <span class="link-icon">&#x1F375;</span>Gitea
-              </a>
-              @if (adminToolsEnabled) {
-              <a class="section-link" [href]="dozzleUrl" target="_blank" rel="noopener">
-                <span class="link-icon">&#x1F4CB;</span>Dozzle
-              </a>
-              }
-              @if (adminToolsEnabled && minioConsoleUrl) {
-                <a class="section-link" [href]="minioConsoleUrl" target="_blank" rel="noopener">
-                  <span class="link-icon">&#x1F4E6;</span>MinIO
-                </a>
-              }
-              @if (cloudUrl) {
-                <a class="section-link" [href]="cloudUrl" target="_blank" rel="noopener">
-                  <span class="link-icon">&#x2601;</span>Cloud
-                </a>
-              }
-            </div>
-
-            <div class="section">
-              <div class="section-title">Layouts</div>
-              <button class="section-link" #layoutBtn (click)="toggleLayoutPicker(layoutBtn)">
-                <span class="link-icon">&#x1F4D0;</span>Choose Layout
-              </button>
-              <button class="section-link" (click)="resetLayout()">
-                <span class="link-icon">&#x1F504;</span>Reset Layout
-              </button>
-              @if (isLayoutPickerOpen()) {
-                <app-layout-picker
-                  [top]="pickerTop()"
-                  [left]="pickerLeft()"
-                  (closed)="closeLayoutPicker()"
-                />
-              }
-            </div>
+            <ng-container [ngTemplateOutlet]="takeover.template()" />
           }
           <!-- Every other route: the same rows and Recents, whatever the page
                (navigation_fixed_rail.md F1). -->
@@ -431,7 +395,7 @@ function pathOf(url: string): string {
         text-align: center;
       }
 
-      /* The way out of a takeover (Settings, Workbench): an action row, not
+      /* The way out of a takeover (Settings, a page's list): an action row, not
          a destination, so it is a button and never lights up. */
       .rail-back {
         display: flex;
@@ -649,55 +613,6 @@ function pathOf(url: string): string {
         }
       }
 
-      /* Workbench sections */
-
-      .section {
-        padding: 8px;
-        border-top: 1px solid var(--border-hairline);
-      }
-
-      .section-title {
-        font-size: 11px;
-        font-weight: 600;
-        text-transform: uppercase;
-        letter-spacing: 0.06em;
-        color: var(--text-muted);
-        padding: 4px 8px 6px;
-        margin: 0;
-      }
-
-      .section-link {
-        display: flex;
-        align-items: center;
-        gap: 8px;
-        padding: 6px 12px;
-        border-radius: var(--radius-control);
-        color: var(--text-secondary);
-        text-decoration: none;
-        font-size: 12px;
-        cursor: pointer;
-        border: none;
-        background: transparent;
-        width: 100%;
-        text-align: left;
-        font-family: inherit;
-        transition:
-          background 0.15s ease,
-          color 0.15s ease;
-      }
-
-      .section-link:hover {
-        background: var(--surface-0);
-        color: var(--text-primary);
-      }
-
-      .link-icon {
-        font-size: 14px;
-        width: 18px;
-        text-align: center;
-        flex-shrink: 0;
-      }
-
       /* Footer */
 
       .sidebar-footer {
@@ -720,7 +635,7 @@ function pathOf(url: string): string {
 })
 export class SidebarComponent {
   readonly sidebar = inject(SidebarService);
-  readonly layoutService = inject(LayoutService);
+  protected readonly takeover = inject(RailTakeoverService);
   private readonly router = inject(Router);
   private readonly location = inject(Location);
   private readonly chatService = inject(PersistentChatService);
@@ -745,7 +660,7 @@ export class SidebarComponent {
 
   private readonly currentPath = computed(() => pathOf(this.currentUrl()));
 
-  readonly railView = computed(() => railViewFor(this.currentPath()));
+  readonly railView = computed(() => railViewFor(this.currentPath(), this.viewport.isMobile()));
 
   /** The Customize row stands for four pages and has no route of its own to
    *  match with routerLinkActive. */
@@ -836,7 +751,7 @@ export class SidebarComponent {
   readonly hasSessions = computed(() => this.sessions.grouped().length > 0);
 
   // Not `{static: true}`: the filter only exists in the DOM while the main
-  // rail is showing (Settings and the Workbench replace it), so this must be
+  // rail is showing (Settings and a page's list replace it), so this must be
   // a dynamic query that re-resolves as railView() changes — a static query
   // resolves once, before the first change detection, and would stay
   // undefined forever if the component happened to construct on a takeover
@@ -883,14 +798,18 @@ export class SidebarComponent {
     // sidebar is instead constructed after navigation already finished
     // (enabledBlocking, SSR, or a remount), no event is coming and we must fetch here.
     if (this.router.navigated) {
-      this.sessions.refresh();
-      if (railViewFor(pathOf(this.router.url)) === 'main') this.lastAppUrl.set(this.router.url);
+      this.refreshSessions();
+      if (this.isMainRail(this.router.url)) this.lastAppUrl.set(this.router.url);
     }
 
     // Auto-collapse sidebar on mobile after navigation, and keep Recents
     // current — reusing this subscription rather than adding a second one.
-    // Gated on the main rail: Recents is not on screen in Settings or the
-    // Workbench, and the navigation back out of them refreshes it anyway.
+    // Gated on the main rail: Recents is not on screen in Settings or a
+    // page's list, and the navigation back out of them refreshes it anyway.
+    // The first load is not gated: the rail can turn back into the main one
+    // without any navigation (a desktop /inbox narrowed to phone width), and
+    // Recents must not be empty then just because the app booted on a
+    // takeover route.
     this.router.events.pipe(
       filter((e): e is NavigationEnd => e instanceof NavigationEnd),
       takeUntilDestroyed(),
@@ -898,10 +817,9 @@ export class SidebarComponent {
       if (this.viewport.isMobile()) {
         this.sidebar.collapse();
       }
-      if (railViewFor(pathOf(e.urlAfterRedirects)) === 'main') {
-        this.lastAppUrl.set(e.urlAfterRedirects);
-        this.sessions.refresh();
-      }
+      const main = this.isMainRail(e.urlAfterRedirects);
+      if (main) this.lastAppUrl.set(e.urlAfterRedirects);
+      if (main || !this.sessionsLoaded) this.refreshSessions();
     });
   }
 
@@ -919,33 +837,16 @@ export class SidebarComponent {
     }
   }
 
+  private sessionsLoaded = false;
+
+  private refreshSessions(): void {
+    this.sessionsLoaded = true;
+    this.sessions.refresh();
+  }
+
+  private isMainRail(url: string): boolean {
+    return railViewFor(pathOf(url), this.viewport.isMobile()) === 'main';
+  }
+
   readonly externalClientsEnabled = environment.externalClientsEnabled;
-  readonly adminToolsEnabled = environment.adminToolsEnabled;
-  readonly giteaUrl = environment.giteaUrl;
-  readonly dozzleUrl = environment.dozzleUrl;
-  readonly neo4jUrl = environment.neo4jUrl;
-  readonly pgadminUrl = environment.pgadminUrl;
-  readonly minioConsoleUrl = environment.minioConsoleUrl;
-  readonly cloudUrl = environment.cloudUrl;
-
-  readonly isLayoutPickerOpen = signal(false);
-  readonly pickerTop = signal(0);
-  readonly pickerLeft = signal(0);
-
-  toggleLayoutPicker(buttonEl: HTMLButtonElement): void {
-    if (!this.isLayoutPickerOpen()) {
-      const rect = buttonEl.getBoundingClientRect();
-      this.pickerTop.set(rect.top);
-      this.pickerLeft.set(rect.right + 8);
-    }
-    this.isLayoutPickerOpen.update((v) => !v);
-  }
-
-  closeLayoutPicker(): void {
-    this.isLayoutPickerOpen.set(false);
-  }
-
-  resetLayout(): void {
-    this.layoutService.resetLayout();
-  }
 }

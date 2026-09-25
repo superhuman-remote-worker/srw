@@ -1,5 +1,5 @@
 import {describe, expect, it, vi} from 'vitest';
-import {Injector, computed, runInInjectionContext, signal} from '@angular/core';
+import {Injector, TemplateRef, computed, runInInjectionContext, signal} from '@angular/core';
 import {Location} from '@angular/common';
 import {NavigationEnd, Router} from '@angular/router';
 import {Subject} from 'rxjs';
@@ -7,10 +7,10 @@ import {SidebarComponent, railViewFor} from './sidebar.component';
 import {UserService} from '../../core/services/user.service';
 import {SidebarService} from '../../core/services/sidebar.service';
 import {ViewportService} from '../../core/services/viewport.service';
-import {LayoutService} from '../../workbench/services/layout.service';
 import {PersistentChatService} from '../../core/services/persistent-chat.service';
 import {SessionListService} from '../../core/services/session-list.service';
 import {ActionCenterService} from '../../core/services/action-center.service';
+import {RailTakeoverService} from '../../core/services/rail-takeover.service';
 import {environment} from '../../core/environment';
 import type {Thread} from '../../core/models/api.model';
 
@@ -34,6 +34,8 @@ function create(opts: {
   collapsed?: boolean;
   /** Server counts per notification category, as the action center holds them. */
   byCategory?: Record<string, {pending: number; unseen: number}>;
+  /** ViewportService.isMobile's initial value. Defaults to false (desktop). */
+  mobile?: boolean;
 }) {
   const threads = signal((opts.threads ?? []) as Thread[]);
   const router = {
@@ -57,6 +59,7 @@ function create(opts: {
     collapsed: signal(opts.collapsed ?? false),
   };
   const counts = signal({notifications: 0, unseen: 0, total: 0, byCategory: opts.byCategory ?? {}});
+  const takeover = new RailTakeoverService();
   const injector = Injector.create({
     providers: [
       {provide: Router, useValue: router},
@@ -67,14 +70,14 @@ function create(opts: {
         logout: vi.fn(),
       }},
       {provide: SidebarService, useValue: sidebarService},
-      {provide: ViewportService, useValue: {isMobile: signal(false)}},
-      {provide: LayoutService, useValue: {}},
+      {provide: ViewportService, useValue: {isMobile: signal(opts.mobile ?? false)}},
+      {provide: RailTakeoverService, useValue: takeover},
       {provide: PersistentChatService, useValue: {threadId: signal(null)}},
       {provide: ActionCenterService, useValue: {counts}},
     ],
   });
   const component = runInInjectionContext(injector, () => new SidebarComponent());
-  return {component, router, sessions, sidebarService, counts};
+  return {component, router, sessions, sidebarService, counts, takeover};
 }
 
 function navigate(router: ReturnType<typeof create>['router'], url: string): void {
@@ -84,7 +87,7 @@ function navigate(router: ReturnType<typeof create>['router'], url: string): voi
 describe('SidebarComponent rail view', () => {
   // navigation_fixed_rail.md F1: every app route shows the same rail — the
   // retired mode switcher left it empty on two of its three modes.
-  it.each(['/', '/?foo=bar', '/sessions/abc-123', '/jobs', '/jobs/review', '/projects/p-1', '/automations', '/experts', '/inbox'])(
+  it.each(['/', '/?foo=bar', '/sessions/abc-123', '/jobs', '/jobs/review', '/projects/p-1', '/automations', '/experts', '/workbench'])(
     'shows the main rail on %s',
     (url) => {
       expect(create({url}).component.railView()).toBe('main');
@@ -99,8 +102,22 @@ describe('SidebarComponent rail view', () => {
     },
   );
 
-  it('hands the rail to the Workbench on /workbench', () => {
-    expect(create({url: '/workbench'}).component.railView()).toBe('workbench');
+  // F9: the Action Center lends the rail its feed instead of opening a
+  // second list column beside it.
+  it('hands the rail to the Action Center on /inbox', () => {
+    expect(create({url: '/inbox'}).component.railView()).toBe('page');
+    expect(create({url: '/inbox?n=abc'}).component.railView()).toBe('page');
+  });
+
+  // On a phone the rail is a drawer the user has to open, so the feed stays
+  // in the page there and the drawer keeps the main rows.
+  it('keeps the main rail on /inbox on a phone', () => {
+    expect(create({url: '/inbox', mobile: true}).component.railView()).toBe('main');
+    expect(railViewFor('/inbox', true)).toBe('main');
+  });
+
+  it('keeps Settings a takeover on a phone', () => {
+    expect(railViewFor('/settings/general', true)).toBe('settings');
   });
 
   it('matches whole path segments, not bare prefixes', () => {
@@ -229,9 +246,27 @@ describe('SidebarComponent back to app', () => {
 
   it('remembers the page it was constructed on once the router has navigated', () => {
     const {component, router} = create({url: '/projects/p-1'});
-    navigate(router, '/workbench');
+    navigate(router, '/settings/general');
     component.backToApp();
     expect(router.navigateByUrl).toHaveBeenCalledWith('/projects/p-1');
+  });
+});
+
+describe('SidebarComponent page takeover', () => {
+  it('renders what the page lends it', () => {
+    const {component, takeover} = create({url: '/inbox'});
+    const feed = {} as TemplateRef<unknown>;
+    takeover.claim(feed);
+    expect(component.railView()).toBe('page');
+    expect((component as unknown as {takeover: RailTakeoverService}).takeover.template()).toBe(feed);
+  });
+
+  it('returns from the Action Center to the last app page', () => {
+    const {component, router} = create({url: '/'});
+    navigate(router, '/jobs');
+    navigate(router, '/inbox');
+    component.backToApp();
+    expect(router.navigateByUrl).toHaveBeenCalledWith('/jobs');
   });
 });
 
@@ -261,16 +296,16 @@ describe('SidebarComponent session list', () => {
     expect(sessions.refresh).toHaveBeenCalledTimes(1);
   });
 
-  it.each(['/', '/jobs', '/projects', '/experts'])('refreshes on navigating to %s, where Recents shows', (url) => {
+  it.each(['/', '/jobs', '/projects', '/experts', '/workbench'])('refreshes on navigating to %s, where Recents shows', (url) => {
     const {router, sessions} = create({url: '/'});
     expect(sessions.refresh).toHaveBeenCalledTimes(1); // the construction-time call
     navigate(router, url);
     expect(sessions.refresh).toHaveBeenCalledTimes(2);
   });
 
-  // Settings and the Workbench take the rail over — Recents is not on
+  // Settings and the Action Center take the rail over — Recents is not on
   // screen there, and the navigation back out refreshes it anyway.
-  it.each(['/settings/general', '/admin/users', '/workbench'])('does not refresh on navigating to %s', (url) => {
+  it.each(['/settings/general', '/admin/users', '/inbox'])('does not refresh on navigating to %s', (url) => {
     const {router, sessions} = create({url: '/'});
     expect(sessions.refresh).toHaveBeenCalledTimes(1); // the construction-time call
     navigate(router, url);
@@ -286,6 +321,16 @@ describe('SidebarComponent session list', () => {
     const {router, sessions} = create({url: '/', navigated: false});
     expect(sessions.refresh).toHaveBeenCalledTimes(0);
     navigate(router, '/');
+    expect(sessions.refresh).toHaveBeenCalledTimes(1);
+  });
+
+  // A desktop /inbox or /settings can turn back into the main rail without
+  // any navigation (narrowed to phone width); Recents must have loaded once.
+  it.each(['/inbox', '/settings/general'])('loads the session list on a cold boot straight into %s', (url) => {
+    const {router, sessions} = create({url: '/', navigated: false, locationPath: url});
+    navigate(router, url);
+    expect(sessions.refresh).toHaveBeenCalledTimes(1);
+    navigate(router, '/admin/users');
     expect(sessions.refresh).toHaveBeenCalledTimes(1);
   });
 
@@ -376,7 +421,7 @@ describe('SidebarComponent ⌘K shortcut', () => {
     expect(focus).toHaveBeenCalledTimes(1);
   });
 
-  // Settings and the Workbench replace the main rail, so filterInput is
+  // Settings and a page's list replace the main rail, so filterInput is
   // never set there (the @switch in the template), and the browser's own
   // Ctrl+K must survive.
   it('leaves the browser shortcut alone when the filter is not on screen', () => {
