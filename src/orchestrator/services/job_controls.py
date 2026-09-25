@@ -58,8 +58,8 @@ from shared.workspace_contract import resolve_workspace_contract
 _TERMINAL_VM_APPROVAL_CONTEXT_SQL = """
 CASE WHEN jsonb_typeof(context->'vm')='object'
           AND context->'vm' <> '{}'::jsonb
-          AND NOT (parent_job_id IS NOT NULL AND
-                   context->>'inherits_parent_workspace'='true')
+          AND (parent_job_id IS NULL OR
+               context->>'inherits_parent_workspace' IS DISTINCT FROM 'true')
           AND COALESCE(context->'vm'->>'status','') NOT IN ('deleted','deleting')
      THEN jsonb_set(COALESCE(context,'{}'::jsonb),
           '{_job_terminal_vm_cleanup}',

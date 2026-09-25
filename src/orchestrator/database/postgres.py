@@ -4755,8 +4755,8 @@ class PostgresDB:
                         context = CASE
                           WHEN jsonb_typeof(context->'vm')='object'
                             AND context->'vm' <> '{{}}'::jsonb
-                            AND NOT (parent_job_id IS NOT NULL AND
-                                     context->>'inherits_parent_workspace'='true')
+                            AND (parent_job_id IS NULL OR
+                                 context->>'inherits_parent_workspace' IS DISTINCT FROM 'true')
                             AND COALESCE(context->'vm'->>'status','')
                                 NOT IN ('deleted','deleting')
                           THEN jsonb_set(COALESCE(context,'{{}}'::jsonb),
@@ -5252,8 +5252,8 @@ class PostgresDB:
                   AND ($2::uuid IS NULL OR j.id > $2::uuid)
                   AND jsonb_typeof(j.context->'vm')='object'
                   AND j.context->'vm' <> '{}'::jsonb
-                  AND NOT (j.parent_job_id IS NOT NULL AND
-                           j.context->>'inherits_parent_workspace'='true')
+                  AND (j.parent_job_id IS NULL OR
+                       j.context->>'inherits_parent_workspace' IS DISTINCT FROM 'true')
                   AND (
                     j.context ? '_job_terminal_vm_cleanup'
                     OR j.context ? '_stateless_cancel_cleanup_pending'

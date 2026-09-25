@@ -54,6 +54,12 @@ def _terminal_vm_cleanup_marked(job: dict[str, Any]) -> bool:
             return False
     return bool(
         isinstance(context, dict)
+        and isinstance(context.get("vm"), dict)
+        and context["vm"]
+        and not (
+            job.get("parent_job_id")
+            and context.get("inherits_parent_workspace") is True
+        )
         and (
             context.get("_stateless_cancel_cleanup_pending") is True
             or isinstance(context.get("_job_terminal_vm_cleanup"), dict)
