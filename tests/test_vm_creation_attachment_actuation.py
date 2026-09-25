@@ -261,6 +261,15 @@ async def test_attachment_change_after_grant_cannot_reach_put(attached, change):
     ctrl, api, authority, payload = attached
     name = retained_attachment(attached)
     original = authority.call
+    original_replace = api.replace
+    attachment_replaces = []
+
+    def replace(body):
+        if body["metadata"]["name"] == name:
+            attachment_replaces.append(deepcopy(body))
+        return original_replace(body)
+
+    api.replace = replace
 
     async def call(path, body, *, operation):
         result = await original(path, body, operation=operation)
@@ -275,11 +284,68 @@ async def test_attachment_change_after_grant_cannot_reach_put(attached, change):
         return result
 
     ctrl._workspace_cleanup_authority_request = call
-    assert (await ctrl._do_create_serialized(payload))["status"] == "creation_attention"
+    assert (await ctrl._do_create_serialized(payload))["status"] == "creation_pending"
     assert api.writes == ["Lease"]
-    assert authority.row["effects"][0]["state"] == "issued"
+    assert authority.row["effects"][0]["state"] == "rejected"
+    assert authority.row["effects"][0]["evidence"] == {
+        "outcome": "not_attempted",
+        "reason": "workspace_attachment_unproven",
+    }
+    assert len(authority.surrenders) == 1
+    assert authority.surrenders[0]["effect_nonce"] == authority.row["effects"][0][
+        "carrier_intent"
+    ]["effect_nonce"]
+    assert authority.surrenders[0]["reason"] == "workspace_attachment_unproven"
+    assert attachment_replaces == []
     assert (await ctrl._do_create_serialized(payload))["status"] != "created"
     assert api.writes == ["Lease"]
+    assert attachment_replaces == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", ["create", "replace"])
+async def test_attachment_create_method_entry_keeps_unknown_effect(
+    attached, monkeypatch, action
+):
+    from vm_controller.creation_attachment import CreationAttachment
+
+    ctrl, api, authority, payload = attached
+    if action == "replace":
+        retained_attachment(attached, advance=True)
+    entered = []
+
+    async def fail_after_entry(self, body, intent):
+        entered.append(intent["action"])
+        raise TimeoutError("attachment reply lost after method entry")
+
+    monkeypatch.setattr(CreationAttachment, "create", fail_after_entry)
+    assert (await ctrl._do_create_serialized(payload))["status"] == "creation_pending"
+    assert entered == [action]
+    assert api.writes == ["Lease"]
+    assert authority.surrenders == []
+    assert authority.row["effects"][0]["state"] == "issued"
+
+
+@pytest.mark.asyncio
+async def test_unsupported_attachment_validation_code_keeps_issued_hold(
+    attached, monkeypatch
+):
+    from vm_controller.creation_actuation import CreationUnproven
+    from vm_controller.creation_attachment import CreationAttachment
+
+    ctrl, api, authority, payload = attached
+    original = CreationAttachment.validate
+
+    async def validate(self, row, intent):
+        if authority.row["effects"]:
+            raise CreationUnproven("unsupported_creation_code")
+        return await original(self, row, intent)
+
+    monkeypatch.setattr(CreationAttachment, "validate", validate)
+    assert (await ctrl._do_create_serialized(payload))["status"] == "creation_attention"
+    assert api.writes == ["Lease"]
+    assert authority.surrenders == []
+    assert authority.row["effects"][0]["state"] == "issued"
 
 
 @pytest.mark.asyncio

@@ -20,6 +20,7 @@ from shared.vm_creation_issuance import (
 )
 
 SECRET = b"creation-actuation-test-secret-at-least-32-bytes"
+ISSUER_RECEIPT = "7" * 64
 
 
 async def poll_until_terminal(create, payload, *, limit=4):
@@ -198,6 +199,9 @@ class Authority:
         self.deny = False
         self.lost_grant = False
         self.settled = False
+        self.surrenders = []
+        self.surrender_error = None
+        self.surrender_reply_lost = False
 
     async def call(self, path, payload, *, operation):
         assert operation == "creation_retry_" + path.rsplit("/", 1)[1].replace("-", "_")
@@ -221,7 +225,28 @@ class Authority:
             if self.lost_grant:
                 self.lost_grant = False
                 raise TimeoutError("grant reply lost")
-            return {"actuation_allowed": True}
+            return {"actuation_allowed": True, "issuer_receipt": ISSUER_RECEIPT}
+        if method == "record-not-attempted":
+            self.surrenders.append(deepcopy(payload))
+            if self.surrender_error is not None:
+                raise self.surrender_error
+            assert payload["issuer_receipt"] == ISSUER_RECEIPT
+            assert payload["effect_nonce"] == values["effect_nonce"]
+            effect = next(
+                x for x in self.row["effects"] if x["carrier_intent"] == values
+            )
+            effect["state"] = "rejected"
+            effect["evidence"] = {
+                "outcome": "not_attempted",
+                "reason": payload["reason"],
+            }
+            self.row["state"] = (
+                "queued" if payload["reason"] == "resource_inventory_unavailable"
+                else "attention"
+            )
+            if self.surrender_reply_lost:
+                raise TimeoutError("surrender reply lost after acceptance")
+            return {"recorded": True, "effect_state": "rejected"}
         if method == "observe-effect":
             effect = next(
                 x for x in self.row["effects"] if x["carrier_intent"] == values
@@ -379,6 +404,228 @@ def profiled_setup(setup, monkeypatch):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    ("guard", "reason"),
+    [
+        ("carrier", "creation_carrier_changed"),
+        ("previous", "creation_observed_object_missing"),
+        ("previous", "creation_observed_object_changed"),
+        ("disk", "retained_disk_changed"),
+        ("disk", "workspace_recovery_held"),
+        ("disk", "workspace_attachment_unproven"),
+        ("absence", "creation_existing_vm_unproven"),
+        ("source", "creation_rootdisk_source_unproven"),
+    ],
+)
+async def test_winning_unused_grant_surrenders_exact_guard_refusal(
+    setup, monkeypatch, caplog, guard, reason
+):
+    """A recognized refusal sends its private winning receipt before any POST."""
+    from vm_controller import creation_actuation
+    from vm_controller.creation_actuation import CreationActuator, CreationUnproven
+    from vm_controller.creation_sources import GoldenSources
+
+    ctrl, api, authority, payload = setup
+    actuator = CreationActuator(ctrl)
+
+    def refusal():
+        if guard in {"carrier", "source"}:
+            raise ValueError("token=private-auth-value")
+        raise CreationUnproven(reason)
+
+    if guard == "carrier":
+        original = creation_actuation.verify_creation_carrier
+
+        def verify(*args, **kwargs):
+            if authority.row["effects"]:
+                refusal()
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(creation_actuation, "verify_creation_carrier", verify)
+    else:
+        owner, method = {
+            "previous": (CreationActuator, "exact_previous"),
+            "disk": (CreationActuator, "disk"),
+            "absence": (CreationActuator, "require_vm_absent"),
+            "source": (GoldenSources, "validate"),
+        }[guard]
+        original = getattr(owner, method)
+
+        async def check(self, *args, **kwargs):
+            if authority.row["effects"]:
+                refusal()
+            return await original(self, *args, **kwargs)
+
+        monkeypatch.setattr(owner, method, check)
+
+    result = await actuator.run(payload)
+
+    assert result["status"] == "creation_pending"
+    assert api.writes == ["Lease"]
+    effect = authority.row["effects"][0]
+    assert effect["state"] == "rejected"
+    assert effect["evidence"] == {"outcome": "not_attempted", "reason": reason}
+    assert authority.surrenders == [
+        {
+            "request_id": authority.row["request_id"],
+            "effect_nonce": effect["carrier_intent"]["effect_nonce"],
+            "carrier": api.read(
+                "Lease",
+                "srw-cleanup-" + authority.row["creation_admission_id"].replace("-", ""),
+            ),
+            "issuer_receipt": ISSUER_RECEIPT,
+            "reason": reason,
+        }
+    ]
+    assert ISSUER_RECEIPT not in caplog.text
+    assert "private-auth-value" not in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["refused", "timeout", "lost_reply", "missing_receipt"])
+async def test_guard_refusal_is_terminal_even_without_surrender_ack(
+    setup, monkeypatch, failure
+):
+    from vm_controller.creation_actuation import CreationActuator, CreationUnproven
+
+    ctrl, api, authority, payload = setup
+    original = CreationActuator.exact_previous
+
+    async def refuse(self, row, carrier):
+        if authority.row["effects"]:
+            raise CreationUnproven("creation_observed_object_changed")
+        return await original(self, row, carrier)
+
+    monkeypatch.setattr(CreationActuator, "exact_previous", refuse)
+    if failure == "missing_receipt":
+        original_call = authority.call
+
+        async def old_server(path, body, *, operation):
+            result = await original_call(path, body, operation=operation)
+            if path.endswith("begin-effect") and result.get("actuation_allowed"):
+                result.pop("issuer_receipt")
+            return result
+
+        ctrl._workspace_cleanup_authority_request = old_server
+    elif failure == "refused":
+        authority.surrender_error = ValueError("receipt refused")
+    elif failure == "timeout":
+        authority.surrender_error = TimeoutError("surrender timed out")
+    else:
+        authority.surrender_reply_lost = True
+
+    result = await ctrl._do_create_serialized(payload)
+
+    assert result["status"] == "creation_pending"
+    assert api.writes == ["Lease"]
+    assert len(authority.surrenders) == (0 if failure == "missing_receipt" else 1)
+    assert authority.row["effects"][0]["state"] == (
+        "rejected" if failure == "lost_reply" else "issued"
+    )
+
+
+@pytest.mark.asyncio
+async def test_immediate_post_entry_failure_never_surrenders(setup, monkeypatch):
+    from vm_controller.creation_actuation import CreationActuator
+
+    ctrl, api, authority, payload = setup
+    calls = []
+
+    async def failed_after_entry(self, kind, body):
+        calls.append(kind)
+        raise TimeoutError("reply lost after create-method entry")
+
+    monkeypatch.setattr(CreationActuator, "create_object", failed_after_entry)
+    result = await ctrl._do_create_serialized(payload)
+    assert result["status"] == "creation_pending"
+    assert calls == ["rootdisk"]
+    assert api.writes == ["Lease"]
+    assert authority.surrenders == []
+    assert authority.row["effects"][0]["state"] == "issued"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error",
+    [ValueError("unexpected validation error"), "unsupported_creation_code"],
+)
+async def test_unsupported_post_grant_failure_keeps_issued_hold(
+    setup, monkeypatch, error
+):
+    from vm_controller.creation_actuation import CreationActuator, CreationUnproven
+
+    ctrl, api, authority, payload = setup
+    original = CreationActuator.exact_previous
+
+    async def fail(self, row, carrier):
+        if authority.row["effects"]:
+            if isinstance(error, ValueError):
+                raise error
+            raise CreationUnproven(error)
+        return await original(self, row, carrier)
+
+    monkeypatch.setattr(CreationActuator, "exact_previous", fail)
+    assert (await ctrl._do_create_serialized(payload))["status"] == "creation_attention"
+    assert api.writes == ["Lease"]
+    assert authority.surrenders == []
+    assert authority.row["effects"][0]["state"] == "issued"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("site", ["carrier", "source"])
+async def test_unsupported_verifier_code_keeps_issued_hold(
+    setup, monkeypatch, site
+):
+    from vm_controller import creation_actuation
+    from vm_controller.creation_actuation import CreationUnproven
+    from vm_controller.creation_sources import GoldenSources
+
+    ctrl, api, authority, payload = setup
+    if site == "carrier":
+        original = creation_actuation.verify_creation_carrier
+
+        def verify(*args, **kwargs):
+            if authority.row["effects"]:
+                raise CreationUnproven("unsupported_creation_code")
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(creation_actuation, "verify_creation_carrier", verify)
+    else:
+        original = GoldenSources.validate
+
+        async def validate(self, row, source):
+            if authority.row["effects"]:
+                raise CreationUnproven("unsupported_creation_code")
+            return await original(self, row, source)
+
+        monkeypatch.setattr(GoldenSources, "validate", validate)
+    assert (await ctrl._do_create_serialized(payload))["status"] == "creation_attention"
+    assert api.writes == ["Lease"]
+    assert authority.surrenders == []
+    assert authority.row["effects"][0]["state"] == "issued"
+
+
+@pytest.mark.asyncio
+async def test_cancelled_post_grant_guard_keeps_issued_hold(setup, monkeypatch):
+    from vm_controller.creation_actuation import CreationActuator
+
+    ctrl, api, authority, payload = setup
+    original = CreationActuator.exact_previous
+
+    async def cancel(self, row, carrier):
+        if authority.row["effects"]:
+            raise asyncio.CancelledError
+        return await original(self, row, carrier)
+
+    monkeypatch.setattr(CreationActuator, "exact_previous", cancel)
+    with pytest.raises(asyncio.CancelledError):
+        await ctrl._do_create_serialized(payload)
+    assert api.writes == ["Lease"]
+    assert authority.surrenders == []
+    assert authority.row["effects"][0]["state"] == "issued"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
     "final_state", ["valid", "changed_uid", "incomplete", "late_limit_range"]
 )
 async def test_resource_final_proof_after_grant_before_post(
@@ -460,11 +707,11 @@ async def test_resource_final_proof_after_grant_before_post(
 
     result = await ctrl._do_create_serialized(payload)
 
-    assert result["status"] == (
-        "creation_pending" if final_state == "valid" else "creation_attention"
-    ), (result, api.writes, authority.row["effects"])
+    assert result["status"] == "creation_pending", (
+        result, api.writes, authority.row["effects"]
+    )
     assert [effect["state"] for effect in authority.row["effects"]] == [
-        "observed" if final_state == "valid" else "issued"
+        "observed" if final_state == "valid" else "rejected"
     ]
     assert api.writes == (
         ["Lease", "DataVolume"] if final_state == "valid" else ["Lease"]
@@ -474,6 +721,18 @@ async def test_resource_final_proof_after_grant_before_post(
         assert [kind for kind, _ in case.calls].count("limitranges") == 2
     else:
         collector.collect_effect_proof.assert_awaited_once()
+    if final_state != "valid":
+        reason = (
+            "resource_inventory_unavailable"
+            if final_state == "incomplete"
+            else "resource_node_changed"
+        )
+        assert authority.row["effects"][0]["evidence"] == {
+            "outcome": "not_attempted",
+            "reason": reason,
+        }
+        assert len(authority.surrenders) == 1
+        assert authority.surrenders[0]["reason"] == reason
 
 
 def test_authenticated_configuration_resolves_genuine_thread_owner(setup):
@@ -984,6 +1243,7 @@ async def test_lost_grant_never_creates_from_absence(setup):
     result = await ctrl._do_create_serialized(payload)
     assert result["status"] == "creation_pending"
     assert api.writes == ["Lease"]
+    assert authority.surrenders == []
 
 
 @pytest.mark.asyncio
@@ -1098,7 +1358,11 @@ async def test_disk_replacement_after_grant_refuses_vm_api_write(setup):
     result = await poll_until_terminal(ctrl._do_create_serialized, payload)
     assert result["status"] == "creation_attention"
     assert "VirtualMachine" not in api.writes
-    assert authority.row["effects"][-1]["state"] == "issued"
+    assert authority.row["effects"][-1]["state"] == "rejected"
+    assert authority.row["effects"][-1]["evidence"] == {
+        "outcome": "not_attempted",
+        "reason": "retained_disk_changed",
+    }
 
 
 @pytest.mark.asyncio
@@ -1287,6 +1551,7 @@ async def test_only_matching_definitive_api_status_resolves_effect(setup, status
     assert authority.row["effects"][-1]["state"] == (
         "rejected" if status == 422 else "issued"
     )
+    assert authority.surrenders == []
 
 
 @pytest.mark.asyncio
@@ -1483,11 +1748,15 @@ async def test_unexpected_vm_after_grant_prevents_fresh_effect(setup, stage, for
     result = await poll_until_terminal(ctrl._do_create_serialized, payload)
     assert result["status"] == "creation_attention"
     assert forbidden not in api.writes
-    assert authority.row["effects"][-1]["state"] == "issued"
+    assert authority.row["effects"][-1]["state"] == "rejected"
+    assert authority.row["effects"][-1]["evidence"] == {
+        "outcome": "not_attempted",
+        "reason": "creation_existing_vm_unproven",
+    }
     issued_nonce = authority.row["effects"][-1]["carrier_intent"]["effect_nonce"]
     writes = list(api.writes)
     del api.objects["VirtualMachine", "agent-vm-" + payload["job_id"]]
     replay = await ctrl._do_create_serialized(payload)
-    assert replay["status"] == "creation_pending"
+    assert replay["status"] == "creation_attention"
     assert api.writes == writes
     assert authority.row["effects"][-1]["carrier_intent"]["effect_nonce"] == issued_nonce
