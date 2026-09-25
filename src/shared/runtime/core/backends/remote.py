@@ -1036,7 +1036,10 @@ def process_identity(name):
             uid_line = next(line for line in status if line.startswith("Uid:"))
             real_uid = int(uid_line.split()[1])
             state_line = next(line for line in status if line.startswith("State:"))
-            return real_uid, state_line.split()[1]
+            threads_line = next(
+                line for line in status if line.startswith("Threads:")
+            )
+            return real_uid, state_line.split()[1], int(threads_line.split()[1])
         except FileNotFoundError:
             return None
         except (PermissionError, OSError, StopIteration, ValueError, IndexError):
@@ -1062,12 +1065,15 @@ def same_uid_processes():
         identity = process_identity(name)
         if identity is None:
             continue
-        real_uid, state = identity
-        # A zombie has already lost every userspace execution capability and
-        # cannot mutate the workspace.  Its parent/reaper may need the exact
-        # cleanup SSH ancestry to stay alive long enough to collect it, so a
-        # zombie must not make the process-zero proof self-deadlock.
-        if real_uid == workspace_uid and state != "Z":
+        real_uid, state, threads = identity
+        # A zombie whose thread group has otherwise exited has lost every
+        # userspace execution capability and cannot mutate the workspace.
+        # Its parent/reaper may need the exact cleanup SSH ancestry to stay
+        # alive long enough to collect it, so it must not make the
+        # process-zero proof self-deadlock.  ``Threads`` counts every thread
+        # until it is released, so a ``Z`` leader with more than one is a
+        # dead main thread whose siblings still execute as this UID.
+        if real_uid == workspace_uid and not (state == "Z" and threads == 1):
             found.append(candidate)
     return found
 
