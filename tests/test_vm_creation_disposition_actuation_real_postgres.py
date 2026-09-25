@@ -434,19 +434,24 @@ async def test_late_cancelled_vm_still_adopts_without_partial_cleanup(
 
     ctrl, api, _, _ = setup
     create = ctrl._do_create_serialized
-    count = 0
 
     async def create_then_dispose(body):
-        nonlocal count
-        count += 1
-        if count == 1:
+        # Creation now issues only one new effect per poll. Wait until the
+        # imported driver has written the VM and lost its reply, then let its
+        # cancellation race with the exact issued VM observation.
+        if "VirtualMachine" not in api.writes:
             return await create(body)
+        assert api.writes == ["Lease", "DataVolume", "Secret", "VirtualMachine"]
+        assert "VirtualMachine" not in api.lost
         authority = ctrl._workspace_cleanup_authority_request
         current = await authority(
             "/api/internal/vm-creation-retries/inspect",
             {"request_id": body["creation_retry"]["request_id"]},
             operation="creation_retry_inspect",
         )
+        assert current["state"] == "cancel_requested"
+        assert current["effects"][-1]["state"] == "issued"
+        assert current["effects"][-1]["carrier_intent"]["effect_kind"] == "vm"
         prior_writes = list(api.writes)
 
         async def observation_only(path, values, *, operation):

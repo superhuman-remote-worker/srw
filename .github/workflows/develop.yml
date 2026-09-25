@@ -1002,13 +1002,11 @@ jobs:
     needs: [changes]
     if: needs.changes.outputs.python-changed == 'true' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
-    # 25, not 15: the suite is ~22.6k tests and takes ~14 min of test time on
-    # ubuntu-latest plus ~2 min of job setup. At 15 the 2026-09-02 develop run
-    # was killed at 91% while still progressing at full speed (46 progress
-    # marks in its final two minutes, largest single gap 62 s: no hang), and
-    # a timed-out job reports as 'cancelled', which the build jobs treat as a
-    # failure: nothing built and no chart published for that push.
-    timeout-minutes: 25
+    # The VM follow-up selection now includes ~19.7k tests with real PostgreSQL
+    # fixtures. Run 36157300077 reached 76% at the former 25-minute limit while
+    # still progressing. Allow setup, collection and the remaining DB cases;
+    # fail fast below so an assertion is reported before a later timeout.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
         with:
@@ -1041,7 +1039,7 @@ jobs:
       # covers a dispatch, where selection is skipped on purpose, and any path
       # where the output is unset. loadfile keeps each selected file on one worker.
       - name: Run tests
-        run: ./scripts/pytest-fast.sh ${{ needs.changes.outputs.pytest-target || 'tests/' }} -q --tb=short
+        run: ./scripts/pytest-fast.sh ${{ needs.changes.outputs.pytest-target || 'tests/' }} -x -q --tb=short
 
   # ---------------------------------------------------------------------------
   # Cockpit unit + production-browser conformance tests (change-based)
