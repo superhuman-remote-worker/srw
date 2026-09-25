@@ -1353,11 +1353,20 @@ class VMCreationRetryStore:
                     and row["admission_deadline"] <= database_now
                 ):
                     raise VMCreationRetryConflict("job_admission_expired")
+                # A new stage advances creation; a replacement nonce after a
+                # definitive API rejection is another attempt at the same
+                # stage and must retain its accumulated retry backoff.
+                advances_stage = latest is None or latest["state"] == "observed"
                 await conn.execute(
-                    "UPDATE vm_creation_retries SET creation_carrier_uid=$2,creation_carrier_namespace=$3,updated_at=clock_timestamp() WHERE request_id=$1",
+                    "UPDATE vm_creation_retries SET creation_carrier_uid=$2,creation_carrier_namespace=$3,"
+                    "backoff_attempt=CASE WHEN $4 THEN 0 ELSE backoff_attempt END,"
+                    "next_probe_at=CASE WHEN $4 THEN LEAST(next_probe_at,clock_timestamp()+$5*interval '1 second') ELSE next_probe_at END,"
+                    "updated_at=clock_timestamp() WHERE request_id=$1",
                     row["request_id"],
                     UUID(carrier["metadata"]["uid"]),
                     carrier["metadata"]["namespace"],
+                    advances_stage,
+                    retry_delay_seconds(1),
                 )
                 await conn.execute(
                     "INSERT INTO vm_creation_effects(effect_nonce,request_id,effect_number,effect_kind,carrier_uid,carrier_namespace,carrier_intent) VALUES($1,$2,$3,$4,$5,$6,$7::jsonb)",
@@ -1613,6 +1622,18 @@ class VMCreationRetryStore:
                     state,
                     json.dumps(evidence),
                 )
+                if state == "observed":
+                    # Only a new, exactly recorded effect advances creation.
+                    # Duplicate observation and definitive API rejection keep
+                    # their existing backoff; an unexpired claim still gates
+                    # claim_due even when the next probe is brought forward.
+                    await conn.execute(
+                        "UPDATE vm_creation_retries SET backoff_attempt=0,"
+                        "next_probe_at=LEAST(next_probe_at,clock_timestamp()+$2*interval '1 second'),"
+                        "updated_at=clock_timestamp() WHERE request_id=$1",
+                        row["request_id"],
+                        retry_delay_seconds(1),
+                    )
                 return {"recorded": True, "effect_state": state}
 
     async def inspect(self, *, request_id: str) -> dict:
