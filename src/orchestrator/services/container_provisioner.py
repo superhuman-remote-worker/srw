@@ -11118,25 +11118,6 @@ class ContainerProvisioner:
                             pvc_name=pvc_name,
                             expected_storage_class=resolved_storage_class,
                         )
-                        requests = (
-                            getattr(
-                                getattr(
-                                    getattr(existing, "spec", None), "resources", None
-                                ),
-                                "requests",
-                                None,
-                            )
-                            or {}
-                        )
-                        existing_size = requests.get("storage")
-                        if existing_size is not None and existing_size != size:
-                            logger.warning(
-                                "Reusing PVC %s at %s although %s was requested; "
-                                "existing workspace volumes are never resized.",
-                                pvc_name,
-                                existing_size,
-                                size,
-                            )
                         if (
                             mutation_authority is not None
                             and not await mutation_authority()
@@ -11152,6 +11133,26 @@ class ContainerProvisioner:
                             authority_error,
                         )
                         return None
+                    # Advisory only: computed after the authority try/except so a
+                    # problem here can never turn a legitimate reuse into a
+                    # "Refusing stateless PVC reuse" abort.
+                    requests = (
+                        getattr(
+                            getattr(getattr(existing, "spec", None), "resources", None),
+                            "requests",
+                            None,
+                        )
+                        or {}
+                    )
+                    existing_size = requests.get("storage")
+                    if existing_size is not None and existing_size != size:
+                        logger.warning(
+                            "Reusing PVC %s at %s although %s was requested; "
+                            "existing workspace volumes are never resized.",
+                            pvc_name,
+                            existing_size,
+                            size,
+                        )
                 logger.debug("PVC already exists: %s", pvc_name)
                 return "reused"
             # A 403 here is the workspace capacity guard (Phase 3a): the
@@ -11900,7 +11901,11 @@ class ContainerProvisioner:
             "network_tier": network_tier,
             "workspace_image": workspace_image,
             # _build_workspace_labels derives srw/build-sha from the configured
-            # default image even when a caller supplies an image override.
+            # default image, and only emits it when the pod's actual image
+            # matches that default — a template's own custom image never
+            # carries the label. Track the default image here regardless, so
+            # a same-namespace image rollout still invalidates a stale
+            # pinned digest.
             "workspace_label_image": self._workspace_image,
             "cpu": cpu,
             "memory": memory,

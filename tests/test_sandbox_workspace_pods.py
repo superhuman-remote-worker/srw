@@ -74,6 +74,13 @@ def test_custom_image_pod_is_unprivileged_and_sized():
     assert volume(manifest, "workspace-data")["emptyDir"] == {"sizeLimit": "15Gi"}
     assert "privileged" not in workspace["securityContext"]
     assert "SYS_ADMIN" not in workspace["securityContext"]["capabilities"]["add"]
+    # Spec §3, "Custom, switch off (default)": sshd's capability set and
+    # allowPrivilegeEscalation stay — only the FUSE-specific SYS_ADMIN grant
+    # and privileged mode are withheld from an unprivileged custom image.
+    assert set(workspace["securityContext"]["capabilities"]["add"]) == set(
+        provisioner._workspace_capabilities(False)
+    )
+    assert workspace["securityContext"]["allowPrivilegeEscalation"] is True
     assert manifest["spec"]["securityContext"]["seccompProfile"] == {
         "type": "RuntimeDefault"
     }
@@ -103,17 +110,37 @@ def test_resolved_default_pull_policy_reaches_the_pod():
 
 def test_switch_gives_a_custom_image_the_fuse_profile():
     provisioner = ContainerProvisioner()
+    # Pin the installation to FUSE on + privileged so this actually exercises
+    # the switch: reading `provisioner._fuse_*` back from the environment
+    # would let the assertions pass even if the switch were ignored, whenever
+    # the test environment happens to run with WORKSPACE_FUSE_ENABLED=false.
+    provisioner._fuse_enabled = True
+    provisioner._fuse_privileged = True
     policy = provisioner._image_policy()
-    profile = sandbox_pod_profile(
+
+    trusted_profile = sandbox_pod_profile(SandboxSettings(), policy)
+    trusted_manifest = build(provisioner, trusted_profile)
+
+    switched_profile = sandbox_pod_profile(
         SandboxSettings(image=CUSTOM), replace(policy, custom_images_privileged=True)
     )
-    manifest = build(provisioner, profile)
-    assert container(manifest)["securityContext"].get("privileged") is (
-        True if provisioner._fuse_privileged else None
+    switched_manifest = build(provisioner, switched_profile)
+    switched_workspace = container(switched_manifest)
+
+    # Spec §3, "Custom, workspace.customImages.privileged: true": same
+    # profile as trusted — assert the full profile, not just one field, and
+    # compare the pod-level seccomp to a default-image pod built under the
+    # same (pinned) provisioner rather than hardcoding "Unconfined".
+    assert switched_workspace["securityContext"]["privileged"] is True
+    assert "SYS_ADMIN" in switched_workspace["securityContext"]["capabilities"]["add"]
+    assert any(v["name"] == "dev-fuse" for v in switched_manifest["spec"]["volumes"])
+    assert (
+        switched_manifest["spec"]["securityContext"]["seccompProfile"]
+        == (trusted_manifest["spec"]["securityContext"]["seccompProfile"])
     )
-    assert any(v["name"] == "dev-fuse" for v in manifest["spec"]["volumes"]) is (
-        provisioner._fuse_enabled
-    )
+    assert switched_manifest["spec"]["securityContext"]["seccompProfile"] == {
+        "type": "Unconfined"
+    }
 
 
 def test_build_sha_label_only_for_the_installation_image():
@@ -145,11 +172,12 @@ async def test_reusing_a_smaller_pvc_is_logged_not_resized(caplog):
         spec=SimpleNamespace(resources=SimpleNamespace(requests={"storage": "10Gi"}))
     )
     # `_create_pvc` makes its create call through `_bounded_kubernetes_mutation`,
-    # which (by design, see its docstring) always dispatches through the class's
-    # real `_bounded_kubernetes_call`, not `self`'s — so an instance override of
-    # `_bounded_kubernetes_call` alone never sees the create call. Point both
-    # names at the same mock so the shared side_effect list lines up with the
-    # actual call order: create (raises the 409 conflict), then the reuse read.
+    # a `@staticmethod` whose body calls `ContainerProvisioner._bounded_kubernetes_call`
+    # (the class attribute) directly, not `self._bounded_kubernetes_call` — so an
+    # instance override of `_bounded_kubernetes_call` alone never sees the create
+    # call. Point both names at the same mock so the shared side_effect list lines
+    # up with the actual call order: create (raises the 409 conflict), then the
+    # reuse read.
     bounded_call = AsyncMock(side_effect=[conflict, existing])
     provisioner._bounded_kubernetes_call = bounded_call
     provisioner._bounded_kubernetes_mutation = bounded_call
