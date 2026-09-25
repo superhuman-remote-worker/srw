@@ -1,0 +1,15 @@
+apiVersion: srw/v1alpha1
+kind: WorkspaceTemplate
+metadata:
+  name: srw-container-workspace
+spec:
+  backend: sandbox
+  resources:
+    cpu: 2
+    memory: 4Gi
+    storage: 30Gi
+  environment:
+    # Build your own image FROM an SRW base and pin it by digest for a stable
+    # environment. See container-workspace-templates.md.
+    image: ghcr.io/superhuman-remote-worker/srw-workspace:latest
+    pullPolicy: IfNotPresent

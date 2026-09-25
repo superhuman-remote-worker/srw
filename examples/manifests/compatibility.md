@@ -48,7 +48,7 @@ they do not mutate a Job snapshot or silently adopt newer template defaults.
 | Harness image | Omit the image to follow the installed SRW harness. An explicit image must match the installation at admission. | An ordinary image, with its image defaults or explicit launch settings; no mandatory SRW hooks. Requires enabled, verified hosting. |
 | No workspace | Supported through explicit `workspace: null`. | Supported. |
 | Virtual workspace | Backend selection supported. | Not implemented. |
-| Sandbox workspace | Backend selection supported; custom image/resources/initialization in this template are rejected. | Compatible SSH workspace image, resources, initialization and retained instances supported. Harness and workspace have separate lifecycles. |
+| Sandbox workspace | Image, pull policy, CPU, memory and storage supported ([reference](container-workspace-templates.md)); custom images run unprivileged unless the operator allows the full profile. prepare, cache: Rebuild, initialize and Retain are rejected. | Compatible SSH workspace image, resources, initialization and retained instances supported. Harness and workspace have separate lifecycles. |
 | VM workspace | Compatible bootable VM image, whole-core CPU, RAM, storage and initialization supported. | Not implemented. |
 | Prepared VM cache | Same-cluster KubeVirt/CDI, persistent rootdisks, authenticated lifecycle and enabled preparation required. | Not implemented. |
 | Cross-Job retained workspace | Same-cluster VM instances. | Sandbox instances. |
