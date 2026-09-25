@@ -28,6 +28,9 @@ from shared.runtime.core.workspace_backend import (  # noqa: E402
     WorkspaceUnavailableError,
 )
 from shared.runtime.core.backends.remote import WorkspaceHostIdentityMismatch  # noqa: E402
+from tests._process_zero_namespace import (  # noqa: E402
+    run_scenario as run_process_zero_scenario,
+)
 
 
 # =============================================================================
@@ -2461,6 +2464,13 @@ if os.path.exists(sentinel):
         assert "_srw_retire_incarnation=absent" not in command
 
     def test_shared_child_process_zero_leaves_parent_tagged_process_alive(self):
+        """Run in a private PID namespace, where a zero proof is exact.
+
+        On a shared host the whole-``/proc`` scan legitimately refuses (86)
+        beside same-UID processes it cannot inspect, so a host run could only
+        ever show the refusal. See ``tests/_process_zero_namespace.py``.
+        """
+
         child_id = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
         parent_id = "dddddddd-dddd-4ddd-8ddd-dddddddddddd"
         backend = RemoteBackend(
@@ -2475,73 +2485,72 @@ if os.path.exists(sentinel):
         generation = "c" * 32
         shell_tag = backend._shell_process_tag(generation)
         workspace_tag = backend._workspace_process_tag()
-        child = subprocess.Popen(
-            ["sh", "-c", "trap 'exit 0' TERM; while :; do sleep 1; done"],
-            env={
-                **os.environ,
-                "SRW_WORKSPACE_PROCESS_TAG": workspace_tag,
-                "SRW_SHELL_PROCESS_TAG": shell_tag,
-            },
-            start_new_session=True,
-        )
-        parent = subprocess.Popen(
-            ["sh", "-c", "trap 'exit 0' TERM; while :; do sleep 1; done"],
-            env={**os.environ, "SRW_WORKSPACE_PROCESS_TAG": workspace_tag},
-            start_new_session=True,
+        command = (
+            f"_srw_generation={generation}\n"
+            + backend._stateless_terminal_process_zero_shell(terminate=True)
         )
         try:
-            command = (
-                f"_srw_generation={generation}\n"
-                + backend._stateless_terminal_process_zero_shell(terminate=True)
+            result = run_process_zero_scenario(
+                command=command,
+                tag_env="SRW_SHELL_PROCESS_TAG",
+                fixtures=[
+                    {
+                        "name": "child",
+                        "kind": "term_logger",
+                        "env": {
+                            "SRW_WORKSPACE_PROCESS_TAG": workspace_tag,
+                            "SRW_SHELL_PROCESS_TAG": shell_tag,
+                        },
+                    },
+                    {
+                        "name": "parent",
+                        "kind": "term_logger",
+                        "env": {"SRW_WORKSPACE_PROCESS_TAG": workspace_tag},
+                    },
+                ],
             )
-            completed = subprocess.run(
-                ["bash", "-c", command],
-                text=True,
-                capture_output=True,
-                timeout=15,
-                check=False,
-            )
-            assert completed.returncode in {0, 86}, completed.stderr
-            child.wait(timeout=3)
-            assert parent.poll() is None
-        finally:
-            for process in (child, parent):
-                if process.poll() is None:
-                    process.kill()
-                    process.wait(timeout=3)
+        except LookupError as exc:
+            pytest.skip(str(exc))
+
+        scan = result["scans"][0]
+        assert scan["returncode"] == 0, scan
+        child, parent = result["after"]["child"], result["after"]["parent"]
+        assert not child["executing"] and child["log"] == ["TERM"]
+        assert parent["executing"] and parent["log"] == []
 
     def test_terminal_process_zero_kills_disowned_tagged_child_and_excludes_ancestors(
         self,
     ):
+        """The scan carries the tag itself, as it does inside the workspace.
+
+        A zero proof (exit 0) is only possible if the scan excluded its own
+        tagged ancestry and still retired the disowned, session-leading child.
+        """
+
         backend = self._incarnation_backend()
         tag = backend._workspace_process_tag()
         command = backend._stateless_workspace_process_zero_shell(terminate=True)
         assert "\x00" not in command
-
-        child = subprocess.Popen(
-            ["sh", "-c", "trap 'exit 0' TERM; while :; do sleep 1; done"],
-            env={**os.environ, "SRW_WORKSPACE_PROCESS_TAG": tag},
-            start_new_session=True,
-        )
         try:
-            completed = subprocess.run(
-                ["bash", "-c", command],
-                env={**os.environ, "SRW_WORKSPACE_PROCESS_TAG": tag},
-                text=True,
-                capture_output=True,
-                timeout=15,
-                check=False,
+            result = run_process_zero_scenario(
+                command=command,
+                scan_env={"SRW_WORKSPACE_PROCESS_TAG": tag},
+                fixtures=[
+                    {
+                        "name": "child",
+                        "kind": "term_logger",
+                        "env": {"SRW_WORKSPACE_PROCESS_TAG": tag},
+                    }
+                ],
             )
-            # The shared test host can contain same-UID, non-dumpable sibling
-            # processes. Production correctly treats those as ambiguous (86)
-            # rather than a zero proof, but must still retire every readable
-            # exact-tag child before refusing.
-            assert completed.returncode in {0, 86}, completed.stderr
-            child.wait(timeout=3)
-        finally:
-            if child.poll() is None:
-                child.kill()
-                child.wait(timeout=3)
+        except LookupError as exc:
+            pytest.skip(str(exc))
+
+        scan = result["scans"][0]
+        assert scan["returncode"] == 0, scan
+        assert result["before"]["child"]["executing"]
+        child = result["after"]["child"]
+        assert not child["executing"] and child["log"] == ["TERM"]
 
     def test_replacement_runtime_supersedes_stale_marker_only_without_live_tmux(self):
         backend = self._incarnation_backend(token=22)
