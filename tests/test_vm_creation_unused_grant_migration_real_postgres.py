@@ -31,7 +31,7 @@ def _function_ddl(filename, signature):
 
 
 @pytest_asyncio.fixture
-async def upgraded_conn(db, pg_dsn):  # noqa: F811
+async def upgraded_conn(db, pg_dsn, request):  # noqa: F811
     job, generation, proposal = await admitted_job(db)
     retry = await admit(db, job, generation, proposal)
     conn = await asyncpg.connect(pg_dsn)
@@ -56,6 +56,15 @@ async def upgraded_conn(db, pg_dsn):  # noqa: F811
             "DROP CONSTRAINT IF EXISTS vm_creation_issuer_receipt_sha256_length, "
             "DROP COLUMN IF EXISTS issuer_receipt_sha256"
         )
+        historical_nonce = None
+        if getattr(request, "param", False):
+            historical_nonce = uuid4()
+            await conn.execute(
+                "INSERT INTO vm_creation_effects(effect_nonce,request_id,effect_number,"
+                "effect_kind,carrier_uid,carrier_namespace,carrier_intent) "
+                "VALUES($1,$2,1,'rootdisk',$3,'workers','{}'::jsonb)",
+                historical_nonce, retry["request_id"], uuid4(),
+            )
         for filename in (
             "0284_vm_creation_unused_grant_receipt.sql",
             "0285_validate_vm_creation_unused_grant_receipt.sql",
@@ -69,7 +78,7 @@ async def upgraded_conn(db, pg_dsn):  # noqa: F811
             "SELECT convalidated FROM pg_constraint WHERE conname=$1",
             "vm_creation_issuer_receipt_sha256_length",
         ) is True
-        yield conn, retry["request_id"]
+        yield conn, retry["request_id"], historical_nonce
     finally:
         await tx.rollback()
         await conn.close()
@@ -100,8 +109,25 @@ async def _rejects_check(conn, sql, *args):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("upgraded_conn", [True], indirect=True)
+async def test_upgrade_preserves_issued_predecessor_without_issuer_receipt(upgraded_conn):
+    conn, request_id, historical_nonce = upgraded_conn
+    effect = await conn.fetchrow(
+        "SELECT request_id,state,issuer_receipt_sha256 FROM vm_creation_effects "
+        "WHERE effect_nonce=$1", historical_nonce,
+    )
+    assert effect["request_id"] == request_id
+    assert effect["state"] == "issued"
+    assert effect["issuer_receipt_sha256"] is None
+    await _rejects_check(
+        conn, "UPDATE vm_creation_effects SET issuer_receipt_sha256=$2 "
+        "WHERE effect_nonce=$1", historical_nonce, RECEIPT,
+    )
+
+
+@pytest.mark.asyncio
 async def test_receipt_length_and_issued_or_resolved_identity(upgraded_conn):
-    conn, request_id = upgraded_conn
+    conn, request_id, _ = upgraded_conn
     old = await _insert_effect(conn, request_id, 1, receipt=None)
     assert await conn.fetchval(
         "SELECT issuer_receipt_sha256 FROM vm_creation_effects WHERE effect_nonce=$1", old,
@@ -145,7 +171,7 @@ async def test_receipt_length_and_issued_or_resolved_identity(upgraded_conn):
 async def test_no_attempt_evidence_requires_receipt_exact_shape_and_allowlisted_reason(
     upgraded_conn,
 ):
-    conn, request_id = upgraded_conn
+    conn, request_id, _ = upgraded_conn
     historical = await _insert_effect(conn, request_id, 1, receipt=None)
     await _rejects_check(
         conn, "UPDATE vm_creation_effects SET state='rejected',"
@@ -180,7 +206,7 @@ async def test_no_attempt_evidence_requires_receipt_exact_shape_and_allowlisted_
 async def test_attention_requires_latest_receipted_terminal_nonretryable_proof(
     upgraded_conn,
 ):
-    conn, request_id = upgraded_conn
+    conn, request_id, _ = upgraded_conn
     attention = (
         "UPDATE vm_creation_retries SET state='attention',"
         "reason='vm_creation_retry_blocked',revision=revision+1,"

@@ -18,8 +18,15 @@ from tests.test_vm_creation_effects_real_postgres import (
     reserved,
     SECRET,
 )
+from tests.test_vm_creation_prepared_real_postgres import (
+    prepared as _prepared_fixture,
+    setup as _prepared_setup_fixture,
+    test_prepared_real_authority_lost_vm_reply_and_completed_clone as prepare_without_root,
+)
 
 db = _db_fixture
+prepared = _prepared_fixture
+setup = _prepared_setup_fixture
 
 
 async def freeze(store, row, carrier):
@@ -45,6 +52,75 @@ async def cancelled_disk(db, monkeypatch):
     )
     await db.linearize_pinned_cancel(str(row["job_id"]), expected_status="paused")
     return store, row, carrier, observation
+
+
+async def cancelled_unused_vm(db, monkeypatch):
+    from shared.vm_creation_issuance import verify_creation_carrier, seal_creation_carrier
+
+    store, row, carrier, observations = await observed_creation(
+        db, monkeypatch, stop_after="cloud_init"
+    )
+    values = verify_creation_carrier(carrier, secret=SECRET)
+    values.update(
+        effect_kind="vm", effect_nonce=str(uuid4()),
+        object_name=f"agent-vm-{row['job_id']}",
+        current_secret_uid=observations["cloud_init"]["object"]["metadata"]["uid"],
+    )
+    carrier = seal_creation_carrier(
+        values, namespace="agent-vms", uid=carrier["metadata"]["uid"],
+        resource_version="4", secret=SECRET,
+    )
+    async with db.acquire() as conn:
+        claim = await conn.fetchval(
+            "SELECT claim_token FROM vm_creation_retries WHERE request_id=$1",
+            row["request_id"],
+        )
+    grant = await store.begin_effect(
+        request_id=str(row["request_id"]), claim_token=str(claim), carrier=carrier,
+    )
+    assert grant["actuation_allowed"] is True
+    await db.linearize_pinned_cancel(str(row["job_id"]), expected_status="paused")
+    return store, row, carrier, observations, grant
+
+
+@pytest.mark.asyncio
+async def test_cancelled_unused_vm_grant_freezes_only_after_exact_issuer_receipt(
+    db, monkeypatch,
+):
+    store, row, carrier, observations, grant = await cancelled_unused_vm(db, monkeypatch)
+    assert await store.freeze_disposition(
+        request_id=str(row["request_id"]), carrier=carrier,
+    ) == {"frozen": False, "reason": "creation_effect_unresolved"}
+    with pytest.raises(VMCreationRetryConflict):
+        await store.record_not_attempted(
+            request_id=str(row["request_id"]), effect_nonce=grant["effect_nonce"],
+            carrier=carrier, issuer_receipt="f" * 64,
+            reason="resource_node_changed",
+        )
+    assert await db.fetchval(
+        "SELECT completed_at IS NULL FROM vm_workspace_cleanup_admissions "
+        "WHERE id=$1", UUID(carrier["spec"]["holderIdentity"]),
+    ) is True
+    assert await store.record_not_attempted(
+        request_id=str(row["request_id"]), effect_nonce=grant["effect_nonce"],
+        carrier=carrier, issuer_receipt=grant["issuer_receipt"],
+        reason="resource_node_changed",
+    ) == {"recorded": True, "effect_state": "rejected"}
+    frozen = await store.freeze_disposition(
+        request_id=str(row["request_id"]), carrier=carrier,
+    )
+    assert frozen["frozen"] is True
+    assert set(frozen["disposition"]["objects"]) == {"rootdisk", "cloud_init"}
+    assert frozen["disposition"]["objects"]["cloud_init"]["uid"] == (
+        observations["cloud_init"]["object"]["metadata"]["uid"]
+    )
+    state = await store.inspect(request_id=str(row["request_id"]))
+    assert "issuer_receipt" not in str(state)
+    assert state["state"] == "cancel_requested"
+    assert await db.fetchval(
+        "SELECT completed_at IS NULL FROM vm_workspace_cleanup_admissions "
+        "WHERE id=$1", UUID(carrier["spec"]["holderIdentity"]),
+    ) is True
 
 
 @pytest.mark.asyncio
@@ -457,6 +533,94 @@ async def test_attachment_disposition_requires_exact_observed_lease(
         assert intent["objects"]["workspace_attach"]["uid"] == uid
         assert intent["objects"]["workspace_attach"]["resource_version"] == "19"
         assert "vm" not in intent["objects"]
+
+
+@pytest.mark.asyncio
+async def test_unused_attachment_grant_keeps_retained_binding_without_new_lease(
+    db, monkeypatch,
+):
+    from tests.test_vm_creation_attachment_authority_real_postgres import admitted
+
+    store, row, claim, carrier, request = await admitted(db, monkeypatch)
+    grant = await store.begin_effect(
+        request_id=str(row["request_id"]),
+        claim_token=str(claim["claim_token"]), carrier=carrier,
+    )
+    assert grant["actuation_allowed"] is True
+    await db.linearize_pinned_cancel(str(row["job_id"]), expected_status="paused")
+    assert (await store.freeze_disposition(
+        request_id=str(row["request_id"]), carrier=carrier,
+    ))["reason"] == "creation_effect_unresolved"
+    await store.record_not_attempted(
+        request_id=str(row["request_id"]), effect_nonce=grant["effect_nonce"],
+        carrier=carrier, issuer_receipt=grant["issuer_receipt"],
+        reason="workspace_attachment_unproven",
+    )
+    result = await store.freeze_disposition(
+        request_id=str(row["request_id"]), carrier=carrier,
+    )
+    assert result["frozen"] is True
+    intent = result["disposition"]
+    assert intent["disk_policy"] == "retain"
+    assert intent["workspace_storage"] == request["workspace_storage"]
+    assert "workspace_attach" not in intent["objects"]
+    assert (await store.inspect(request_id=str(row["request_id"])))[
+        "cancellation_completion"
+    ] == {}
+    assert await db.fetchval(
+        "SELECT completed_at IS NULL FROM vm_workspace_cleanup_admissions "
+        "WHERE id=$1", UUID(intent["admission_id"]),
+    ) is True
+
+
+@pytest.mark.asyncio
+async def test_unused_prepared_root_grant_keeps_exact_source_until_disposition(
+    db, prepared,
+):
+    from orchestrator.services.vm_creation_retry_store import VMCreationRetryStore
+    from vm_controller.workspace_preparation import allocation_name, creation_held
+
+    # The genuine builder delivered its source and pin; the malformed proposal
+    # was rejected before SQL issuance, leaving a signed, correct carrier.
+    await prepare_without_root(db, prepared, False, "scope")
+    _, api, _, payload, service = prepared
+    store = VMCreationRetryStore(db)
+    row = await store.inspect(request_id=payload["creation_retry"]["request_id"])
+    allocation = await service.store.get(allocation_name(payload["preparation"]))
+    source = allocation.state["creation_source"]
+    assert source["kind"] == "prepared" and creation_held(allocation)
+    lease_name = "srw-cleanup-" + UUID(row["creation_admission_id"]).hex
+    carrier = api.read("Lease", lease_name)
+    grant = await store.begin_effect(
+        request_id=row["request_id"],
+        claim_token=payload["creation_retry"]["claim_token"],
+        carrier=carrier,
+    )
+    assert grant["actuation_allowed"] is True
+    assert await db.cancel_job(row["job_id"])
+    assert (await store.freeze_disposition(
+        request_id=row["request_id"], carrier=carrier,
+    ))["reason"] == "creation_effect_unresolved"
+    await store.record_not_attempted(
+        request_id=row["request_id"], effect_nonce=grant["effect_nonce"],
+        carrier=carrier, issuer_receipt=grant["issuer_receipt"],
+        reason="creation_rootdisk_source_unproven",
+    )
+    frozen = await store.freeze_disposition(
+        request_id=row["request_id"], carrier=carrier,
+    )
+    assert frozen["frozen"] is True
+    assert frozen["disposition"]["source"] == source
+    assert frozen["disposition"]["source_resolution"] == "required"
+    assert frozen["disposition"]["objects"] == {}
+    assert (await store.inspect(request_id=row["request_id"]))[
+        "cancellation_completion"
+    ] == {}
+    assert creation_held(await service.store.get(allocation.name))
+    assert await db.fetchval(
+        "SELECT completed_at IS NULL FROM vm_workspace_cleanup_admissions "
+        "WHERE id=$1", UUID(row["creation_admission_id"]),
+    ) is True
 
 
 @pytest.mark.asyncio

@@ -919,6 +919,26 @@ its compatibility before activation. Keep this switch off until the source,
 attachment, cancellation and live acceptance gates in the failed-creation retry
 plan have passed.
 
+For an existing compatible durable-creation deployment, roll out unused-grant
+acknowledgement in this order: apply migrations `0284` and `0285` and upgrade
+all orchestrators that accept the new authority operation while pinning
+`vmController.image.tag` to the currently deployed compatible controller image;
+then upgrade the controller image. The chart renders the controller image
+independently in `helm/templates/vm-controller/deployment.yaml`; this protocol
+needs no new chart flag. An older controller ignores the extra receipt in a
+successful grant. A newer controller talking to an older orchestrator cannot
+surrender a grant and must retain its uncertain effect. This sequence applies
+to the unused-grant extension; the phase-aware-controller prerequisite above
+still applies when introducing that earlier recovery contract.
+
+Only the handler that received a winning grant can acknowledge that it refused
+before entering a create method. Its exact private receipt settles that effect
+as `not_attempted`. An absent Kubernetes object, an old grant without a receipt,
+a lost winning response, and any create method already entered remain uncertain
+and held. An acknowledged grant does not itself release capacity: cancellation
+still follows the normal exact source, disk, attachment and physical-absence
+disposition before releasing the reservation.
+
 Retained-disk restarts can opt into the closed single-NIC NoCloud DHCP profile
 with `vmController.networkProfile.enabled: true` and an explicit
 `vmController.networkProfile.imageAllowlist` of full `repository@sha256:<digest>`

@@ -4,7 +4,7 @@ import asyncio
 from datetime import datetime, timezone
 import json
 from pathlib import Path
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import asyncpg
 import pytest
@@ -708,8 +708,9 @@ async def test_thread_waiter_uses_same_resource_ledger_with_real_owner(db):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("late_proof", ["api_rejection", "unused_grant"])
 async def test_actual_pinned_provision_cas_captures_thread_source_and_waiter(
-    db, monkeypatch,
+    db, monkeypatch, late_proof,
 ):
     store, inventory, _, _ = await environment(db)
     owner, thread_id = await _thread(db, lane="pinned", status="created")
@@ -915,16 +916,65 @@ async def test_actual_pinned_provision_cas_captures_thread_source_and_waiter(
     assert await db.fetchval(
         "SELECT state FROM vm_resource_reservations WHERE request_id=$1", request_id,
     ) == "reserved"
-    assert await retries.observe_effect(
-        request_id=str(request_id), carrier=carrier,
-        observation={
-            "outcome": "rejected",
-            "api_status": {
-                "apiVersion": "v1", "kind": "Status", "status": "Failure",
-                "code": 403, "reason": "Forbidden",
+    if late_proof == "unused_grant":
+        original = {
+            "request_id": str(request_id),
+            "effect_nonce": granted["effect_nonce"],
+            "carrier": carrier,
+            "issuer_receipt": granted["issuer_receipt"],
+            "reason": "resource_node_changed",
+        }
+        owner_before = await db.fetchrow(
+            "SELECT status,runtime_generation,metadata,runtime_retirement_context "
+            "FROM threads WHERE id=$1", thread_id,
+        )
+        assert json.loads(owner_before["runtime_retirement_context"])["settle_status"] == "ended"
+        assert await retries.record_not_attempted(**original) == {
+            "recorded": True, "effect_state": "rejected",
+        }
+        effect = await db.fetchrow(
+            "SELECT state,evidence,issuer_receipt_sha256 FROM vm_creation_effects "
+            "WHERE effect_nonce=$1", UUID(granted["effect_nonce"]),
+        )
+        assert effect["state"] == "rejected"
+        assert json.loads(effect["evidence"]) == {
+            "outcome": "not_attempted", "reason": "resource_node_changed",
+        }
+        assert effect["issuer_receipt_sha256"] is not None
+        assert await db.fetchrow(
+            "SELECT status,runtime_generation,metadata,runtime_retirement_context "
+            "FROM threads WHERE id=$1", thread_id,
+        ) == owner_before
+        state_before_replay = await db.fetchrow(
+            "SELECT state,revision,claim_token,backoff_attempt,next_probe_at,updated_at "
+            "FROM vm_creation_retries WHERE request_id=$1", request_id,
+        )
+        assert await retries.record_not_attempted(**original) == {
+            "recorded": True, "effect_state": "rejected",
+        }
+        assert await db.fetchrow(
+            "SELECT state,revision,claim_token,backoff_attempt,next_probe_at,updated_at "
+            "FROM vm_creation_retries WHERE request_id=$1", request_id,
+        ) == state_before_replay
+        assert await db.fetchrow(
+            "SELECT status,runtime_generation,metadata,runtime_retirement_context "
+            "FROM threads WHERE id=$1", thread_id,
+        ) == owner_before
+        assert "issuer_receipt" not in str(await retries.inspect(request_id=str(request_id)))
+        assert await db.fetchval(
+            "SELECT state FROM vm_resource_reservations WHERE request_id=$1", request_id,
+        ) == "reserved"
+    else:
+        assert await retries.observe_effect(
+            request_id=str(request_id), carrier=carrier,
+            observation={
+                "outcome": "rejected",
+                "api_status": {
+                    "apiVersion": "v1", "kind": "Status", "status": "Failure",
+                    "code": 403, "reason": "Forbidden",
+                },
             },
-        },
-    ) == {"recorded": True, "effect_state": "rejected"}
+        ) == {"recorded": True, "effect_state": "rejected"}
     assert await retries.settle_never_issued(request_id=str(request_id)) == {
         "settled": True, "disposition": "never_issued",
     }
