@@ -139,6 +139,54 @@ async def test_cancellation_drains_cpu_conversion_worker(monkeypatch, stage):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("stage", ("_document", "normalize_inventory"))
+@pytest.mark.parametrize("worker_fails", (False, True))
+async def test_repeated_cancellation_drains_conversion_worker(
+    monkeypatch, stage, worker_fails,
+):
+    collector, _, _ = fixture()
+    entered, release, exited = (
+        threading.Event(), threading.Event(), threading.Event()
+    )
+    original = getattr(resource_inventory, stage)
+
+    def blocked(*args, **kwargs):
+        entered.set()
+        try:
+            if not release.wait(timeout=2):
+                raise RuntimeError("conversion worker was not released")
+            if worker_fails:
+                raise RuntimeError("private worker error")
+            return original(*args, **kwargs)
+        finally:
+            exited.set()
+
+    monkeypatch.setattr(resource_inventory, stage, blocked)
+    task = asyncio.create_task(collector.collect(1))
+    loop = asyncio.get_running_loop()
+    try:
+        assert await asyncio.to_thread(entered.wait, 2)
+        task.cancel()
+        # The worker has already entered. This callback is queued after the
+        # cancelled collector wakes, so the first drain await has begun.
+        drain_started = asyncio.Event()
+        loop.call_soon(drain_started.set)
+        await drain_started.wait()
+        assert not task.done()
+
+        task.cancel()
+        second_cancel_delivered = asyncio.Event()
+        loop.call_soon(second_cancel_delivered.set)
+        await second_cancel_delivered.wait()
+        assert not task.done()
+    finally:
+        release.set()
+        assert await asyncio.to_thread(exited.wait, 2)
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+@pytest.mark.asyncio
 async def test_collects_complete_scope_without_serializing_private_fields():
     collector, pages, calls = fixture()
     raw = pages["pods"][0]["items"][0]

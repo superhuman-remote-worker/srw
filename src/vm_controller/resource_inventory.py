@@ -360,10 +360,16 @@ class ResourceInventoryCollector:
         except asyncio.CancelledError:
             # Cancellation does not stop an in-flight thread. Drain it before
             # the observer closes its client or starts another collection.
-            try:
-                await task
-            except Exception:
-                pass
+            # Shutdown can cancel the observer again while it is draining.
+            while not task.done():
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    pass
+            if not task.cancelled():
+                task.exception()  # Retrieve any worker error; preserve cancellation.
             raise
 
     async def _call(self, method, **kwargs):
