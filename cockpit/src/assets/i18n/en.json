@@ -691,6 +691,8 @@
     "workspace": {
       "summary": "Workspace: requested {{requested}} · assigned {{assigned}} · effective {{effective}}",
       "state": "Workspace state: {{state}} · detail: {{failure}}",
+      "terminalUnavailable": "VM workspace unavailable",
+      "terminalUnavailableWithPending": "VM workspace unavailable · {{message}}",
       "default": "default",
       "unavailable": "unavailable",
       "none": "none"

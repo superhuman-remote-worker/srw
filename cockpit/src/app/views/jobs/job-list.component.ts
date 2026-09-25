@@ -19,6 +19,7 @@ import {DataService} from '../../core/services/data.service';
 import {UserService} from '../../core/services/user.service';
 import {environment} from '../../core/environment';
 import {JobSummary} from '../../core/models/audit.model';
+import {workspaceContractTitle as formatWorkspaceContractTitle} from '../../core/util/workspace-contract-presentation';
 import {VMCreationWaitComponent} from '../../core/components/vm-creation-wait.component';
 import {
   JobDetailPanelComponent,
@@ -1700,12 +1701,7 @@ export class JobListComponent implements OnInit, OnDestroy {
   }
 
   workspaceContractTitle(job: JobSummary): string {
-    const workspace = job.workspace_contract;
-    if (!workspace) return '';
-    return this.transloco.translate('jobs.workspace.state', {
-      state: workspace.state,
-      failure: workspace.failure ?? this.transloco.translate('jobs.workspace.none'),
-    });
+    return formatWorkspaceContractTitle(job, this.transloco);
   }
 
   selectJob(jobId: string): void {

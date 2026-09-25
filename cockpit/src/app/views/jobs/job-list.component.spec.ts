@@ -795,6 +795,92 @@ describe('JobListComponent — server-resolved tree', () => {
     );
     expect(component.workspaceContractSummary(workspaceJob)).not.toContain('ssh');
   });
+
+  it('describes a terminal VM without a runtime without claiming cleanup finished', () => {
+    const {fixture, component} = mountLogic();
+    fixture.detectChanges();
+    const missingRuntime = {
+      requested_backend: 'vm' as const,
+      assigned_backend: 'vm' as const,
+      effective_backend: null,
+      state: 'waiting',
+      failure: 'vm_runtime_not_ready',
+    };
+    const disposed = job('disposed', {
+      status: 'cancelled', workspace_contract: missingRuntime,
+    }) as JobSummary;
+    const cleanupHeld = job('held', {
+      status: 'cancelled', workspace_contract: missingRuntime,
+      vm_creation: {
+        request_id: 'd4c87f23-fa0b-4d5a-93dc-2a37b2e4a6a9',
+        stage: 'creation', state: 'cancel_requested', reason_code: 'job_cancelled',
+        message: 'Waiting for VM creation cancellation to be reconciled.',
+        resumable: false,
+      },
+    }) as JobSummary;
+
+    expect(component.workspaceContractTitle(disposed)).toBe('VM workspace unavailable');
+    for (const status of ['completed', 'failed']) {
+      expect(component.workspaceContractTitle(job(status, {
+        status, workspace_contract: missingRuntime,
+      }) as JobSummary)).toBe('VM workspace unavailable');
+    }
+    expect(component.workspaceContractTitle(job('blocked', {
+      status: 'cancelled', completion_outcome_kind: 'blocked_undelivered',
+      workspace_contract: missingRuntime,
+    }) as JobSummary)).toBe('VM workspace unavailable');
+    expect(component.workspaceContractTitle(cleanupHeld)).toBe(
+      'VM workspace unavailable · Waiting for VM creation cancellation to be reconciled.',
+    );
+    expect(component.workspaceContractSummary(disposed)).toBe(
+      'Workspace: requested vm · assigned vm · effective unavailable',
+    );
+  });
+
+  it('keeps active waits and terminal retained runtimes in their existing workspace states', () => {
+    const {fixture, component} = mountLogic();
+    fixture.detectChanges();
+    const waiting = {
+      requested_backend: 'vm' as const,
+      assigned_backend: 'vm' as const,
+      effective_backend: null,
+      state: 'waiting',
+      failure: 'vm_runtime_not_ready',
+    };
+
+    for (const status of ['processing', 'paused', 'pending_review']) {
+      expect(component.workspaceContractTitle(job(status, {
+        status, workspace_contract: waiting,
+      }) as JobSummary)).toBe('Workspace state: waiting · detail: vm_runtime_not_ready');
+    }
+    expect(component.workspaceContractTitle(job('capacity', {
+      status: 'paused', workspace_contract: waiting,
+      vm_creation: {
+        request_id: 'd4c87f23-fa0b-4d5a-93dc-2a37b2e4a6a9',
+        stage: 'creation', state: 'reconciling', reason_code: 'capacity_wait',
+        message: 'Waiting for VM capacity.', resumable: false,
+      },
+    }) as JobSummary)).toBe('Workspace state: waiting · detail: vm_runtime_not_ready');
+    expect(component.workspaceContractTitle(job('retained', {
+      status: 'completed',
+      workspace_contract: {...waiting, state: 'ready', failure: null, effective_backend: 'vm'},
+    }) as JobSummary)).toBe('Workspace state: ready · detail: none');
+    expect(component.workspaceContractTitle(job('recovering', {
+      status: 'cancelled', workspace_contract: waiting,
+      workspace_recovery: {
+        operation_id: '22222222-bbbb-4222-8222-222222222222',
+        state: 'recovering', reason_code: 'prior_runtime_unfenced',
+        message: 'Workspace recovery is running.',
+        started_at: '2026-09-16T08:00:00Z',
+        deadline_at: '2026-09-16T08:15:00Z',
+        next_check_at: null, retryable: false, cleanup_pending: true,
+      },
+    }) as JobSummary)).toBe('Workspace state: waiting · detail: vm_runtime_not_ready');
+    expect(component.workspaceContractTitle(job('sandbox', {
+      status: 'cancelled',
+      workspace_contract: {...waiting, assigned_backend: 'sandbox', failure: 'sandbox_runtime_not_ready'},
+    }) as JobSummary)).toBe('Workspace state: waiting · detail: sandbox_runtime_not_ready');
+  });
 });
 
 describe('JobListComponent — filters drive the URL', () => {

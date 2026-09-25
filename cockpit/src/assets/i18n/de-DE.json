@@ -691,6 +691,8 @@
     "workspace": {
       "summary": "Arbeitsbereich: angefordert {{requested}} · zugewiesen {{assigned}} · wirksam {{effective}}",
       "state": "Arbeitsbereichsstatus: {{state}} · Detail: {{failure}}",
+      "terminalUnavailable": "VM-Arbeitsbereich nicht verfügbar",
+      "terminalUnavailableWithPending": "VM-Arbeitsbereich nicht verfügbar · {{message}}",
       "default": "Standard",
       "unavailable": "nicht verfügbar",
       "none": "keines"

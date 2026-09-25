@@ -17,6 +17,7 @@ import {
   jobStatusLabelKey,
   jobStatusTone as sharedJobStatusTone,
 } from '../../core/util/job-status';
+import {workspaceContractTitle as formatWorkspaceContractTitle} from '../../core/util/workspace-contract-presentation';
 
 interface FrozenJobData {
   freeze_type?: string;    // "phase_boundary" | "job_complete" | "vm_upgrade_required"
@@ -840,12 +841,7 @@ export class JobReviewComponent {
   }
 
   workspaceContractTitle(): string {
-    const workspace = this.job()?.workspace_contract;
-    if (!workspace) return '';
-    return this.transloco.translate('jobs.workspace.state', {
-      state: workspace.state,
-      failure: workspace.failure ?? this.transloco.translate('jobs.workspace.none'),
-    });
+    return formatWorkspaceContractTitle(this.job(), this.transloco);
   }
   readonly frozenData = signal<FrozenJobData | null>(null);
   readonly isLoading = signal(false);
