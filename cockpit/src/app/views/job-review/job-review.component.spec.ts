@@ -366,19 +366,21 @@ describe('JobReviewComponent delivery section', () => {
     const text = (root.textContent ?? '').replace(/\s+/g, ' ').trim();
 
     expect(text).toContain('Workspace: requested vm · assigned vm · effective vm');
-    expect(fixture.componentInstance.workspaceContractTitle()).toContain(
+    expect(root.querySelector('.workspace-contract')?.getAttribute('title')).toBe(
       'Workspace state: ready · detail: none',
     );
     expect(text).not.toContain('ssh_host');
     expect(text).not.toContain('private.svc');
   });
 
-  it('uses the terminal unavailable title for a cancelled VM without public cleanup evidence', async () => {
-    await render(undefined, OPEN_STATUS, {
+  it('keeps a cancelled VM on the non-review screen without a workspace tooltip', async () => {
+    const root = await render(undefined, OPEN_STATUS, {
       requested_backend: 'vm', assigned_backend: 'vm', effective_backend: null,
       state: 'waiting', failure: 'vm_runtime_not_ready',
     }, {status: 'cancelled'});
 
-    expect(fixture.componentInstance.workspaceContractTitle()).toBe('VM workspace unavailable');
+    expect(root.querySelector('.not-review-state')).not.toBeNull();
+    expect(root.querySelector('.review-content')).toBeNull();
+    expect(root.querySelector('.workspace-contract')).toBeNull();
   });
 });
