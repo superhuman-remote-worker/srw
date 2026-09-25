@@ -15,6 +15,11 @@ from agent.core.datasource_setup import (
     DATASOURCE_TOOL_MAP,
     datasource_tool_categories,
 )
+from orchestrator.application import preparation as preparation_composition
+from orchestrator.application.resources import bound
+from orchestrator.services import (
+    agent_datasource_payload as agent_datasource_payload_module,
+)
 
 
 def _ds(ds_type: str, read_only: bool = False, name: str = "ds") -> dict:
@@ -149,10 +154,16 @@ class TestRepoCategorySurvivesTheRealFunnel:
     """
 
     def _config_for(self, datasources):
-        from orchestrator.main import _build_datasource_tool_override
+        import orchestrator.main
         from shared.runtime.core.loader import load_config_from_resolved
 
-        override = _build_datasource_tool_override(datasources, None)
+        override = agent_datasource_payload_module.build_datasource_tool_override(
+            datasources,
+            None,
+            dependencies=preparation_composition.datasource_payload_dependencies(
+                orchestrator.main.app.state.resources
+            ),
+        )
         resolved = {
             "agent": {
                 "agent_id": "a",
@@ -280,9 +291,13 @@ class TestOrchestratorDelegation:
 
     @pytest.fixture(scope="class")
     def build_override(self):
-        from orchestrator.main import _build_datasource_tool_override
+        import orchestrator.main
 
-        return _build_datasource_tool_override
+        return bound(
+            agent_datasource_payload_module.build_datasource_tool_override,
+            preparation_composition.datasource_payload_dependencies,
+            orchestrator.main.app.state.resources,
+        )
 
     def test_wrapper_matches_shared_function(self, build_override):
         datasources = [

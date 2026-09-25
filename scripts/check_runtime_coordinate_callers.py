@@ -78,8 +78,10 @@ _REMOTE_EFFECT_HINTS = (
 
 
 def _roots() -> list[Path]:
+    # main.py is only the entrypoint once the application composition package
+    # (orchestrator/application/) owns what used to live in it; scan both.
     roots = [ORCHESTRATOR / "main.py"]
-    for subdir in ("routers", "security", "services"):
+    for subdir in ("application", "routers", "security", "services"):
         roots.extend(sorted((ORCHESTRATOR / subdir).rglob("*.py")))
     return roots
 

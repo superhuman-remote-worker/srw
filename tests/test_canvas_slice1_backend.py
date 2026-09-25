@@ -35,6 +35,9 @@ from orchestrator.services.canvas_files import (
     canonical_workspace_path,
     validate_canvas_bytes,
 )
+from orchestrator.application import jobs as jobs_composition
+from orchestrator.services import session_tool_policy as session_tool_policy_module
+import fastapi as fastapi_module
 
 THREAD_ID = "a3333333-3333-3333-3333-333333333333"
 USER_ID = "b4444444-4444-4444-8444-444444444444"
@@ -2635,8 +2638,6 @@ def test_private_workspace_binding_is_removed_from_public_thread_shapes() -> Non
 
 
 def test_private_workspace_lease_is_removed_from_public_job_shapes() -> None:
-    import orchestrator.main
-
     context = json.dumps(
         {
             # Top-level repo identity is the public half of the job context and
@@ -2654,7 +2655,7 @@ def test_private_workspace_lease_is_removed_from_public_job_shapes() -> None:
             },
         }
     )
-    redacted = orchestrator.main._redact_job_config_override(
+    redacted = jobs_composition.redact_job_config_override(
         {"id": "job", "context": context, "config_override": None}
     )
     assert isinstance(redacted["context"], str)
@@ -3629,10 +3630,10 @@ async def test_docker_release_revokes_canvas_before_static_host_reset(
 
 
 def test_canvas_session_create_override_is_closed() -> None:
-    import orchestrator.main
+    from orchestrator.services import session_tool_policy
 
-    with pytest.raises(orchestrator.main.HTTPException) as exc:
-        orchestrator.main._validated_tool_overrides(
+    with pytest.raises(fastapi_module.HTTPException) as exc:
+        session_tool_policy.validated_tool_overrides(
             {"tools": {"canvas": ["run_command"]}}
         )
     assert exc.value.status_code == 400
@@ -3640,11 +3641,11 @@ def test_canvas_session_create_override_is_closed() -> None:
     # ``shell`` is no longer discarded — every category the request names is
     # honoured now (Defect 2). The canvas group is still closed against a
     # foreign name, which is the part this test exists for.
-    accepted = orchestrator.main._validated_tool_overrides(
+    accepted = session_tool_policy.validated_tool_overrides(
         {"tools": {"canvas": [], "shell": ["shell_execute"]}}
     )
     assert accepted == {"canvas": [], "shell": ["shell_execute"]}
-    assert orchestrator.main._session_tool_group_disabled_markers(
+    assert session_tool_policy_module.session_tool_group_disabled_markers(
         {"tools": {"canvas": []}}
     ) == {"_canvas_disabled": True}
 

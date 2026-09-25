@@ -1,5 +1,6 @@
 """Pinned job mutations are bound to one registered runtime process."""
 
+from orchestrator.services.workspace_lifecycle import WorkspaceOwner
 from tests import _b09_control_seams as control_seams
 
 from unittest.mock import AsyncMock, patch
@@ -8,6 +9,17 @@ import pytest
 
 from orchestrator import main
 from agent.api.models import PinnedJobRecipient, pinned_job_recipient_matches
+from orchestrator.application import controls as controls_composition
+from orchestrator.schemas import job_runtime as job_runtime_module
+from orchestrator.services import agent_provisioner as agent_provisioner_module
+from orchestrator.services import container_provisioner as container_provisioner_module
+from orchestrator.services import job_mutation_target as job_mutation_target_module
+from orchestrator.services import job_start_bundle as job_start_bundle_module
+from orchestrator.services import (
+    job_workspace_authority as job_workspace_authority_module,
+)
+import asyncio
+import httpx
 
 
 AGENT_ID = "11111111-1111-4111-8111-111111111111"
@@ -124,15 +136,20 @@ def test_runtime_identity_requires_all_four_exact_fields():
 async def test_local_recipient_requires_new_runtime_capability():
     _ReadyClient.urls = []
     with (
-        patch.object(main.postgres_db, "get_agent", AsyncMock(return_value=_agent())),
-        patch.object(main.httpx, "AsyncClient", _ReadyClient),
         patch.object(
-            main.agent_provisioner,
+            main.app.state.resources.postgres_db,
+            "get_agent",
+            AsyncMock(return_value=_agent()),
+        ),
+        patch.object(httpx, "AsyncClient", _ReadyClient),
+        patch.object(
+            agent_provisioner_module.agent_provisioner,
             "attest_pinned_job_recipient",
             AsyncMock(),
         ) as attest,
     ):
-        target = await main._prepare_pinned_job_mutation_target(
+        target = await controls_composition.prepare_pinned_job_mutation_target(
+            main.app.state.resources,
             agent_id=AGENT_ID,
             job_id=JOB_ID,
             require_idle=True,
@@ -153,32 +170,39 @@ async def test_k8s_replacement_is_refused_after_capability_probe():
     attest = AsyncMock(return_value=False)
     with (
         patch.object(
-            main.postgres_db,
+            main.app.state.resources.postgres_db,
             "get_agent",
             AsyncMock(return_value=_agent(pod_uid=POD_UID)),
         ),
-        patch.object(main.httpx, "AsyncClient", _ReadyClient),
+        patch.object(httpx, "AsyncClient", _ReadyClient),
         patch.object(
-            main.agent_provisioner,
+            agent_provisioner_module.agent_provisioner,
             "attest_pinned_job_recipient",
             attest,
         ),
-        patch.object(main.asyncio, "sleep", AsyncMock()) as sleep,
+        patch.object(asyncio, "sleep", AsyncMock()) as sleep,
     ):
-        target = await main._prepare_pinned_job_mutation_target(
+        target = await controls_composition.prepare_pinned_job_mutation_target(
+            main.app.state.resources,
             agent_id=AGENT_ID,
             job_id=JOB_ID,
             require_idle=True,
         )
 
     assert target is None
-    assert attest.await_count == main._FRESH_PINNED_RECIPIENT_ATTESTATION_ATTEMPTS
+    assert (
+        attest.await_count
+        == job_mutation_target_module.FRESH_PINNED_RECIPIENT_ATTESTATION_ATTEMPTS
+    )
     attest.assert_awaited_with(
         "pod-a",
         expected_pod_uid=POD_UID,
         expected_pod_ip="10.0.0.9",
     )
-    assert sleep.await_count == main._FRESH_PINNED_RECIPIENT_ATTESTATION_ATTEMPTS - 1
+    assert (
+        sleep.await_count
+        == job_mutation_target_module.FRESH_PINNED_RECIPIENT_ATTESTATION_ATTEMPTS - 1
+    )
 
 
 @pytest.mark.asyncio
@@ -187,19 +211,20 @@ async def test_fresh_k8s_recipient_tolerates_readiness_publication_race():
     attest = AsyncMock(side_effect=[False, False, True])
     with (
         patch.object(
-            main.postgres_db,
+            main.app.state.resources.postgres_db,
             "get_agent",
             AsyncMock(return_value=_agent(pod_uid=POD_UID)),
         ),
-        patch.object(main.httpx, "AsyncClient", _ReadyClient),
+        patch.object(httpx, "AsyncClient", _ReadyClient),
         patch.object(
-            main.agent_provisioner,
+            agent_provisioner_module.agent_provisioner,
             "attest_pinned_job_recipient",
             attest,
         ),
-        patch.object(main.asyncio, "sleep", AsyncMock()) as sleep,
+        patch.object(asyncio, "sleep", AsyncMock()) as sleep,
     ):
-        target = await main._prepare_pinned_job_mutation_target(
+        target = await controls_composition.prepare_pinned_job_mutation_target(
+            main.app.state.resources,
             agent_id=AGENT_ID,
             job_id=JOB_ID,
             require_idle=True,
@@ -215,7 +240,7 @@ async def test_working_k8s_recipient_attestation_remains_fail_fast():
     attest = AsyncMock(return_value=False)
     with (
         patch.object(
-            main.postgres_db,
+            main.app.state.resources.postgres_db,
             "get_agent",
             AsyncMock(
                 return_value=_agent(
@@ -225,15 +250,16 @@ async def test_working_k8s_recipient_attestation_remains_fail_fast():
                 )
             ),
         ),
-        patch.object(main.httpx, "AsyncClient", _ReadyClient),
+        patch.object(httpx, "AsyncClient", _ReadyClient),
         patch.object(
-            main.agent_provisioner,
+            agent_provisioner_module.agent_provisioner,
             "attest_pinned_job_recipient",
             attest,
         ),
-        patch.object(main.asyncio, "sleep", AsyncMock()) as sleep,
+        patch.object(asyncio, "sleep", AsyncMock()) as sleep,
     ):
-        target = await main._prepare_pinned_job_mutation_target(
+        target = await controls_composition.prepare_pinned_job_mutation_target(
+            main.app.state.resources,
             agent_id=AGENT_ID,
             job_id=JOB_ID,
             require_idle=False,
@@ -251,14 +277,15 @@ async def test_old_runtime_and_wrong_current_job_fail_before_mutation():
         _ReadyClient.payload = {"ready": True, "capabilities": {}}
         with (
             patch.object(
-                main.postgres_db,
+                main.app.state.resources.postgres_db,
                 "get_agent",
                 AsyncMock(return_value=_agent()),
             ),
-            patch.object(main.httpx, "AsyncClient", _ReadyClient),
+            patch.object(httpx, "AsyncClient", _ReadyClient),
         ):
             assert (
-                await main._prepare_pinned_job_mutation_target(
+                await controls_composition.prepare_pinned_job_mutation_target(
+                    main.app.state.resources,
                     agent_id=AGENT_ID,
                     job_id=JOB_ID,
                     require_idle=True,
@@ -269,7 +296,7 @@ async def test_old_runtime_and_wrong_current_job_fail_before_mutation():
         network = AsyncMock()
         with (
             patch.object(
-                main.postgres_db,
+                main.app.state.resources.postgres_db,
                 "get_agent",
                 AsyncMock(
                     return_value=_agent(
@@ -277,10 +304,11 @@ async def test_old_runtime_and_wrong_current_job_fail_before_mutation():
                     )
                 ),
             ),
-            patch.object(main.httpx, "AsyncClient", network),
+            patch.object(httpx, "AsyncClient", network),
         ):
             assert (
-                await main._prepare_pinned_job_mutation_target(
+                await controls_composition.prepare_pinned_job_mutation_target(
+                    main.app.state.resources,
                     agent_id=AGENT_ID,
                     job_id=JOB_ID,
                     require_idle=False,
@@ -296,13 +324,14 @@ async def test_old_runtime_and_wrong_current_job_fail_before_mutation():
 async def test_exact_working_job_is_a_safe_lost_response_retry():
     with (
         patch.object(
-            main.postgres_db,
+            main.app.state.resources.postgres_db,
             "get_agent",
             AsyncMock(return_value=_agent(status="working", current_job_id=JOB_ID)),
         ),
-        patch.object(main.httpx, "AsyncClient", _ReadyClient),
+        patch.object(httpx, "AsyncClient", _ReadyClient),
     ):
-        target = await main._prepare_pinned_job_mutation_target(
+        target = await controls_composition.prepare_pinned_job_mutation_target(
+            main.app.state.resources,
             agent_id=AGENT_ID,
             job_id=JOB_ID,
             require_idle=True,
@@ -328,44 +357,54 @@ async def test_fresh_start_delivers_hidden_recipient_before_existing_db_cas():
         expected_process_generation=PROCESS_GENERATION,
         expected_job_id=JOB_ID,
     )
-    start_request = main.JobStartRequest(job_id=JOB_ID, description="bound start")
+    start_request = job_runtime_module.JobStartRequest(
+        job_id=JOB_ID, description="bound start"
+    )
     update_status = AsyncMock()
     heartbeat = AsyncMock()
     with (
         patch.object(
-            main,
-            "_prepare_job_workspace_runtime",
+            job_workspace_authority_module,
+            "prepare_job_workspace_runtime",
             AsyncMock(return_value=("proceed", job, None)),
         ),
         patch.object(
-            main.job_workspace_authority,
+            job_workspace_authority_module,
             "attest_pinned_k8s_job_workspace",
             AsyncMock(return_value=(job, None)),
         ),
         patch.object(
-            main.job_start_bundle,
+            job_start_bundle_module,
             "build_job_start_request",
             AsyncMock(return_value=start_request),
         ),
         patch.object(
-            main,
-            "_workspace_runtime_unchanged_before_delivery",
+            job_workspace_authority_module,
+            "workspace_runtime_unchanged_before_delivery",
             AsyncMock(return_value=True),
         ),
         patch.object(
-            main.postgres_db,
+            main.app.state.resources.postgres_db,
             "managed_repository_authorities_are_current",
             AsyncMock(return_value=True),
         ),
         patch.object(
-            main,
-            "_prepare_pinned_job_mutation_target",
-            AsyncMock(return_value=main._PinnedJobMutationTarget(selected, recipient)),
+            controls_composition,
+            "prepare_pinned_job_mutation_target",
+            AsyncMock(
+                return_value=job_mutation_target_module.PinnedJobMutationTarget(
+                    selected, recipient
+                )
+            ),
         ),
-        patch.object(main.httpx, "AsyncClient", _MutationClient),
-        patch.object(main.postgres_db, "update_job_status", update_status),
-        patch.object(main.postgres_db, "heartbeat", heartbeat),
-        patch.object(main, "COMPLETION_COMMANDS_ENABLED", False),
+        patch.object(httpx, "AsyncClient", _MutationClient),
+        patch.object(
+            main.app.state.resources.postgres_db, "update_job_status", update_status
+        ),
+        patch.object(main.app.state.resources.postgres_db, "heartbeat", heartbeat),
+        patch.object(
+            main.app.state.resources.settings, "completion_commands_enabled", False
+        ),
     ):
         assert await control_seams.dispatch_job_to_agent(job, selected)
 
@@ -409,7 +448,7 @@ async def test_fresh_start_delivers_exact_k8s_authority_and_refuses_final_drift(
         expected_process_generation=PROCESS_GENERATION,
         expected_job_id=JOB_ID,
     )
-    attestation = main.WorkspaceRuntimeAttestation(
+    attestation = container_provisioner_module.WorkspaceRuntimeAttestation(
         backing_id="k8s-pvc:default:55555555-5555-4555-8555-555555555555",
         workspace_generation="55555555-5555-4555-8555-555555555555",
         runtime_incarnation=POD_UID,
@@ -418,48 +457,52 @@ async def test_fresh_start_delivers_exact_k8s_authority_and_refuses_final_drift(
         pod_ip="10.42.0.9",
         port=30022,
     )
-    authority = main._PinnedK8sJobWorkspaceAuthority(
-        main.WorkspaceOwner.job(JOB_ID),
+    authority = job_workspace_authority_module.PinnedK8sJobWorkspaceAuthority(
+        WorkspaceOwner.job(JOB_ID),
         attestation,
     )
-    start_request = main.JobStartRequest(
+    start_request = job_runtime_module.JobStartRequest(
         job_id=JOB_ID,
         description="attested start",
     )
     current = AsyncMock(side_effect=[True, False])
-    target = AsyncMock(return_value=main._PinnedJobMutationTarget(selected, recipient))
+    target = AsyncMock(
+        return_value=job_mutation_target_module.PinnedJobMutationTarget(
+            selected, recipient
+        )
+    )
     with (
         patch.object(
-            main,
-            "_prepare_job_workspace_runtime",
+            job_workspace_authority_module,
+            "prepare_job_workspace_runtime",
             AsyncMock(return_value=("proceed", job, None)),
         ),
         patch.object(
-            main.job_workspace_authority,
+            job_workspace_authority_module,
             "attest_pinned_k8s_job_workspace",
             AsyncMock(return_value=(job, authority)),
         ),
         patch.object(
-            main.job_start_bundle,
+            job_start_bundle_module,
             "build_job_start_request",
             AsyncMock(return_value=start_request),
         ),
         patch.object(
-            main.job_workspace_authority,
+            job_workspace_authority_module,
             "pinned_k8s_job_workspace_authority_is_current",
             current,
         ),
         patch.object(
-            main.postgres_db,
+            main.app.state.resources.postgres_db,
             "managed_repository_authorities_are_current",
             AsyncMock(return_value=True),
         ),
         patch.object(
-            main,
-            "_prepare_pinned_job_mutation_target",
+            controls_composition,
+            "prepare_pinned_job_mutation_target",
             target,
         ),
-        patch.object(main.httpx, "AsyncClient", _MutationClient),
+        patch.object(httpx, "AsyncClient", _MutationClient),
     ):
         assert await control_seams.dispatch_job_to_agent(job, selected) is False
 
@@ -478,7 +521,7 @@ async def test_final_recheck_attests_inherited_parent_without_child_runtime_snap
         "parent_job_id": parent_id,
         "context": {"inherits_parent_workspace": True},
     }
-    attestation = main.WorkspaceRuntimeAttestation(
+    attestation = container_provisioner_module.WorkspaceRuntimeAttestation(
         backing_id="k8s-pvc:default:66666666-6666-4666-8666-666666666666",
         workspace_generation="66666666-6666-4666-8666-666666666666",
         runtime_incarnation=POD_UID,
@@ -487,20 +530,24 @@ async def test_final_recheck_attests_inherited_parent_without_child_runtime_snap
         pod_ip="10.42.0.9",
         port=30022,
     )
-    authority = main._PinnedK8sJobWorkspaceAuthority(
-        main.WorkspaceOwner.job(parent_id),
+    authority = job_workspace_authority_module.PinnedK8sJobWorkspaceAuthority(
+        WorkspaceOwner.job(parent_id),
         attestation,
     )
 
     with (
         patch.object(
-            main,
-            "_workspace_runtime_unchanged_before_delivery",
+            job_workspace_authority_module,
+            "workspace_runtime_unchanged_before_delivery",
             AsyncMock(return_value=True),
         ),
-        patch.object(main.postgres_db, "get_job", AsyncMock(return_value=child)),
         patch.object(
-            main.container_provisioner,
+            main.app.state.resources.postgres_db,
+            "get_job",
+            AsyncMock(return_value=child),
+        ),
+        patch.object(
+            container_provisioner_module.container_provisioner,
             "attest_workspace_runtime",
             AsyncMock(return_value=attestation),
         ) as attest,
@@ -509,4 +556,4 @@ async def test_final_recheck_attests_inherited_parent_without_child_runtime_snap
             child, authority
         )
 
-    attest.assert_awaited_once_with(main.WorkspaceOwner.job(parent_id))
+    attest.assert_awaited_once_with(WorkspaceOwner.job(parent_id))

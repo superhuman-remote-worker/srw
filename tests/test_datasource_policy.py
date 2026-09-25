@@ -17,6 +17,14 @@ from orchestrator.services.datasource_policy import (
     default_datasource_ids,
     default_datasource_selection,
 )
+from orchestrator.application import preparation as preparation_composition
+from orchestrator.services import (
+    job_datasource_selection as job_datasource_selection_module,
+)
+from orchestrator.services import (
+    thread_datasource_authorization as thread_datasource_authorization_module,
+)
+from orchestrator.services import thread_mount_rows as thread_mount_rows_module
 
 
 OWNER = "11111111-1111-4111-8111-111111111111"
@@ -270,14 +278,12 @@ async def test_named_owner_membership_loss_fails_closed():
 
 
 def test_delivery_snapshot_rejects_missing_or_revision_changed_rows():
-    import orchestrator.main as main
-
     for resolved in (
         [],
         [{"id": DS_OWNED, "policy_revision": 8}],
     ):
         with pytest.raises(HTTPException) as exc:
-            main._require_exact_datasource_resolution(
+            job_datasource_selection_module.require_exact_datasource_resolution(
                 [DS_OWNED], {DS_OWNED: 9}, resolved
             )
         assert exc.value.status_code == 403
@@ -285,11 +291,9 @@ def test_delivery_snapshot_rejects_missing_or_revision_changed_rows():
 
 
 def test_delivery_snapshot_rejects_duplicate_resolver_rows():
-    import orchestrator.main as main
-
     row = {"id": DS_OWNED, "policy_revision": 9}
     with pytest.raises(HTTPException):
-        main._require_exact_datasource_resolution(
+        job_datasource_selection_module.require_exact_datasource_resolution(
             [DS_OWNED], {DS_OWNED: 9}, [row, dict(row)]
         )
 
@@ -302,16 +306,19 @@ async def test_job_delivery_authorizes_and_resolves_as_one_exact_snapshot(
 
     db = AsyncMock()
     db.resolve_datasources_for_job = AsyncMock(return_value=[])
-    monkeypatch.setattr(main, "postgres_db", db)
+    monkeypatch.setattr(main.app.state.resources, "postgres_db", db)
     monkeypatch.setattr(
-        main,
-        "_revalidate_job_datasource_selection",
+        job_datasource_selection_module,
+        "revalidate_job_datasource_selection",
         AsyncMock(return_value=([DS_OWNED], {DS_OWNED: 3})),
     )
 
     with pytest.raises(HTTPException):
-        await main._resolve_authorized_job_datasources(
-            {"id": LEGACY_JOB, "project_id": PROJECT_A}
+        await job_datasource_selection_module.resolve_authorized_job_datasources(
+            {"id": LEGACY_JOB, "project_id": PROJECT_A},
+            dependencies=preparation_composition.job_datasource_selection_dependencies(
+                main.app.state.resources
+            ),
         )
 
     db.resolve_datasources_for_job.assert_awaited_once_with(
@@ -327,18 +334,21 @@ async def test_cold_thread_resolution_rejects_silent_deleted_connector(
 
     db = AsyncMock()
     db.resolve_datasources_for_thread = AsyncMock(return_value=[])
-    monkeypatch.setattr(main, "postgres_db", db)
+    monkeypatch.setattr(main.app.state.resources, "postgres_db", db)
     monkeypatch.setattr(
-        main.thread_datasource_authorization_service,
+        thread_datasource_authorization_module,
         "revalidate_thread_datasource_selection",
         AsyncMock(return_value=([DS_OWNED], {DS_OWNED: 3})),
     )
 
     with pytest.raises(HTTPException):
-        await main._resolve_thread_datasources(
+        await thread_mount_rows_module.resolve_thread_datasources(
             {"id": "99999999-9999-4999-8999-999999999999"},
             {"datasource_ids": [DS_OWNED]},
             project_ids=[PROJECT_A],
+            dependencies=preparation_composition.thread_mount_dependencies(
+                main.app.state.resources
+            ),
         )
 
 
@@ -364,11 +374,15 @@ async def test_parent_inheritance_rejects_deleted_materialized_connector(
     # FK CASCADE after connector deletion removed the junction row.  The
     # immutable context still proves that [] is a reduction, not an opt-out.
     db.list_job_datasource_ids = AsyncMock(return_value=[])
-    monkeypatch.setattr(main, "postgres_db", db)
+    monkeypatch.setattr(main.app.state.resources, "postgres_db", db)
 
     with pytest.raises(HTTPException) as exc:
-        await main._inherit_parent_datasource_ids(
-            thread_id=None, parent_job_id=LEGACY_JOB
+        await job_datasource_selection_module.inherit_parent_datasource_ids(
+            thread_id=None,
+            parent_job_id=LEGACY_JOB,
+            dependencies=preparation_composition.job_datasource_selection_dependencies(
+                main.app.state.resources
+            ),
         )
 
     assert exc.value.status_code == 403
@@ -380,12 +394,15 @@ async def test_parent_inheritance_propagates_database_failures(monkeypatch):
 
     db = AsyncMock()
     db.get_thread = AsyncMock(side_effect=RuntimeError("database unavailable"))
-    monkeypatch.setattr(main, "postgres_db", db)
+    monkeypatch.setattr(main.app.state.resources, "postgres_db", db)
 
     with pytest.raises(RuntimeError, match="database unavailable"):
-        await main._inherit_parent_datasource_ids(
+        await job_datasource_selection_module.inherit_parent_datasource_ids(
             thread_id="99999999-9999-4999-8999-999999999999",
             parent_job_id=LEGACY_JOB,
+            dependencies=preparation_composition.job_datasource_selection_dependencies(
+                main.app.state.resources
+            ),
         )
 
 

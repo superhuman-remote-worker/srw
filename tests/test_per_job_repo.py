@@ -9,13 +9,22 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi import HTTPException
+from orchestrator.services import subjob_output as subjob_output_module
 
 # main.py requires VECTOR_DB_URL at module level
 os.environ.setdefault("VECTOR_DB_URL", "postgresql://test@localhost/test")
 
-import orchestrator.main as orch_main  # noqa: E402
+import orchestrator.main as main  # noqa: E402
 
-MODULE = "orchestrator.main"
+ACCESS = "orchestrator.security.access"
+TRIGGER_DISPATCH = "orchestrator.services.job_dispatcher.trigger_dispatch"
+SNAPSHOT_SERVICE = "orchestrator.services.snapshot_service.snapshot_service"
+
+
+def _patch_resource(name: str, *args, **kwargs):
+    """Patch one of the application's resources (the former main globals)."""
+    return patch.object(main.app.state.resources, name, *args, **kwargs)
+
 
 DELETE_RESULT = {
     "status": "deleted",
@@ -41,7 +50,7 @@ def _bypass_job_access_gate(job: dict):
     standing up the full auth stack."""
     admin = {"id": "00000000-0000-0000-0000-000000000099", "is_admin": True}
     return patch(
-        f"{MODULE}.require_job_access",
+        f"{ACCESS}.require_job_access",
         AsyncMock(return_value=(admin, job)),
     )
 
@@ -49,7 +58,7 @@ def _bypass_job_access_gate(job: dict):
 def _bypass_require_internal():
     """Patch `require_internal` to pass through. P4b agent-internal
     endpoints (subjob_merge etc.) gate on this."""
-    return patch(f"{MODULE}.require_internal", AsyncMock(return_value=None))
+    return patch(f"{ACCESS}.require_internal", AsyncMock(return_value=None))
 
 
 # ===========================================================================
@@ -62,7 +71,7 @@ class TestResolveJobRepo:
 
     @pytest.mark.asyncio
     async def test_job_not_found_raises_404(self):
-        with patch(f"{MODULE}.postgres_db") as mock_db:
+        with _patch_resource("postgres_db") as mock_db:
             mock_db.get_job = AsyncMock(return_value=None)
 
             with pytest.raises(HTTPException) as exc_info:
@@ -73,7 +82,7 @@ class TestResolveJobRepo:
     async def test_root_job_with_repo_name(self):
         """Root job has repo_name stored — should return it directly."""
         job = {"repo_name": "job-abcd1234", "branch_name": None}
-        with patch(f"{MODULE}.postgres_db") as mock_db:
+        with _patch_resource("postgres_db") as mock_db:
             mock_db.get_job = AsyncMock(return_value=job)
 
             repo, branch = await b08_helpers.resolve_job_repo("abcd1234-xxxx")
@@ -88,7 +97,7 @@ class TestResolveJobRepo:
             "branch_name": "subjob/abcd1234/creator",
             "parent_job_id": "parent-uuid",
         }
-        with patch(f"{MODULE}.postgres_db") as mock_db:
+        with _patch_resource("postgres_db") as mock_db:
             mock_db.get_job = AsyncMock(return_value=job)
 
             repo, branch = await b08_helpers.resolve_job_repo("abcd1234-xxxx")
@@ -105,7 +114,7 @@ class TestResolveJobRepo:
         }
         parent = {"repo_name": "job-parent12", "branch_name": None}
 
-        with patch(f"{MODULE}.postgres_db") as mock_db:
+        with _patch_resource("postgres_db") as mock_db:
             mock_db.get_job = AsyncMock(
                 side_effect=lambda jid: {
                     "sub12345-xxxx": subjob,
@@ -127,7 +136,7 @@ class TestResolveJobRepo:
             "project_id": "proj-uuid",
         }
 
-        with patch(f"{MODULE}.postgres_db") as mock_db:
+        with _patch_resource("postgres_db") as mock_db:
             mock_db.get_job = AsyncMock(return_value=job)
             mock_db.get_project_repositories = AsyncMock(
                 return_value=[{"name": "my-project-jobs"}]
@@ -150,7 +159,7 @@ class TestResolveJobRepo:
             "project_id": None,
         }
 
-        with patch(f"{MODULE}.postgres_db") as mock_db:
+        with _patch_resource("postgres_db") as mock_db:
             mock_db.get_job = AsyncMock(return_value=job)
 
             repo, branch = await b08_helpers.resolve_job_repo("full-uuid-here")
@@ -169,7 +178,7 @@ class TestDeleteJobGiteaCleanup:
     @pytest.fixture(autouse=True)
     def vector_retirement(self):
         """Repository tests still complete the required vector retirement."""
-        with patch(f"{MODULE}.vector_db") as vector_db:
+        with _patch_resource("vector_db") as vector_db:
             connection = AsyncMock()
             vector_db.acquire.return_value.__aenter__.return_value = connection
             yield connection
@@ -185,8 +194,8 @@ class TestDeleteJobGiteaCleanup:
         }
 
         with (
-            patch(f"{MODULE}.postgres_db") as mock_db,
-            patch(f"{MODULE}.gitea_client") as mock_gitea,
+            _patch_resource("postgres_db") as mock_db,
+            _patch_resource("gitea_client") as mock_gitea,
             _bypass_job_access_gate(job),
         ):
             mock_db.get_job = AsyncMock(return_value=job)
@@ -225,8 +234,8 @@ class TestDeleteJobGiteaCleanup:
         }
 
         with (
-            patch(f"{MODULE}.postgres_db") as mock_db,
-            patch(f"{MODULE}.gitea_client") as mock_gitea,
+            _patch_resource("postgres_db") as mock_db,
+            _patch_resource("gitea_client") as mock_gitea,
             _bypass_job_access_gate(job),
         ):
             mock_db.get_job = AsyncMock(return_value=job)
@@ -258,8 +267,8 @@ class TestDeleteJobGiteaCleanup:
         }
 
         with (
-            patch(f"{MODULE}.postgres_db") as mock_db,
-            patch(f"{MODULE}.gitea_client") as mock_gitea,
+            _patch_resource("postgres_db") as mock_db,
+            _patch_resource("gitea_client") as mock_gitea,
             _bypass_job_access_gate(job),
         ):
             mock_db.get_job = AsyncMock(return_value=job)
@@ -298,8 +307,8 @@ class TestDeleteJobGiteaCleanup:
         }
 
         with (
-            patch(f"{MODULE}.postgres_db") as mock_db,
-            patch(f"{MODULE}.gitea_client") as mock_gitea,
+            _patch_resource("postgres_db") as mock_db,
+            _patch_resource("gitea_client") as mock_gitea,
             _bypass_job_access_gate(job),
         ):
             mock_db.get_job = AsyncMock(return_value=job)
@@ -324,8 +333,8 @@ class TestDeleteJobGiteaCleanup:
         job = {"repo_name": "job-abc", "branch_name": None, "parent_job_id": None}
 
         with (
-            patch(f"{MODULE}.postgres_db") as mock_db,
-            patch(f"{MODULE}.gitea_client") as mock_gitea,
+            _patch_resource("postgres_db") as mock_db,
+            _patch_resource("gitea_client") as mock_gitea,
             _bypass_job_access_gate(job),
         ):
             mock_db.get_job = AsyncMock(return_value=job)
@@ -364,11 +373,11 @@ class TestDeleteJobGiteaCleanup:
         }
 
         with (
-            patch(f"{MODULE}.postgres_db") as mock_db,
-            patch(f"{MODULE}.gitea_client") as mock_gitea,
-            patch(f"{MODULE}.snapshot_service") as mock_snapshots,
+            _patch_resource("postgres_db") as mock_db,
+            _patch_resource("gitea_client") as mock_gitea,
+            patch(SNAPSHOT_SERVICE) as mock_snapshots,
             patch(
-                "orchestrator.main.thread_retirement_operations.ThreadRetirementOperations.archive_and_cleanup_workspace"
+                "orchestrator.services.thread_retirement.ThreadRetirementOperations.archive_and_cleanup_workspace"
             ) as cleanup_workspace,
             _bypass_job_access_gate(job),
         ):
@@ -426,9 +435,9 @@ class TestDeleteJobGiteaCleanup:
         }
 
         with (
-            patch(f"{MODULE}.postgres_db") as mock_db,
+            _patch_resource("postgres_db") as mock_db,
             patch(
-                "orchestrator.main.thread_retirement_operations.ThreadRetirementOperations.archive_and_cleanup_workspace"
+                "orchestrator.services.thread_retirement.ThreadRetirementOperations.archive_and_cleanup_workspace"
             ) as cleanup_workspace,
             _bypass_job_access_gate(job),
         ):
@@ -453,9 +462,9 @@ class TestDeleteJobGiteaCleanup:
         }
 
         with (
-            patch(f"{MODULE}.postgres_db") as mock_db,
+            _patch_resource("postgres_db") as mock_db,
             patch(
-                "orchestrator.main.thread_retirement_operations.ThreadRetirementOperations.archive_and_cleanup_workspace"
+                "orchestrator.services.thread_retirement.ThreadRetirementOperations.archive_and_cleanup_workspace"
             ) as cleanup_workspace,
             _bypass_job_access_gate(job),
         ):
@@ -478,7 +487,7 @@ class TestDeleteJobGiteaCleanup:
         # The gate (`require_job_access`) is what raises 404 for missing
         # jobs now — let the real helper run with a patched db that returns None.
         with (
-            patch(f"{MODULE}.postgres_db") as mock_db,
+            _patch_resource("postgres_db") as mock_db,
             patch(
                 "orchestrator.security.access.require_approved_user",
                 AsyncMock(
@@ -510,7 +519,7 @@ class TestSubjobMergeEndpoint:
         job = {"parent_job_id": None}
 
         with (
-            patch(f"{MODULE}.postgres_db") as mock_db,
+            _patch_resource("postgres_db") as mock_db,
             _bypass_require_internal(),
         ):
             mock_db.get_job = AsyncMock(return_value=job)
@@ -522,7 +531,7 @@ class TestSubjobMergeEndpoint:
     @pytest.mark.asyncio
     async def test_returns_404_for_missing_job(self):
         with (
-            patch(f"{MODULE}.postgres_db") as mock_db,
+            _patch_resource("postgres_db") as mock_db,
             _bypass_require_internal(),
         ):
             mock_db.get_job = AsyncMock(return_value=None)
@@ -542,8 +551,8 @@ class TestSubjobMergeEndpoint:
         }
 
         with (
-            patch(f"{MODULE}.postgres_db") as mock_db,
-            patch(f"{MODULE}.gitea_client") as mock_gitea,
+            _patch_resource("postgres_db") as mock_db,
+            _patch_resource("gitea_client") as mock_gitea,
             _bypass_require_internal(),
         ):
             mock_db.get_job = AsyncMock(return_value=job)
@@ -562,9 +571,9 @@ class TestSubjobMergeEndpoint:
         }
 
         with (
-            patch(f"{MODULE}.postgres_db") as mock_db,
+            _patch_resource("postgres_db") as mock_db,
             patch.object(
-                orch_main.subjob_output_operations,
+                subjob_output_module,
                 "graft_subjob_output",
                 new_callable=AsyncMock,
             ) as mock_graft,
@@ -605,19 +614,19 @@ class TestNextOutputOrdinal:
     @pytest.mark.asyncio
     async def test_first_ordinal_is_001(self):
         fake = _OutputsFake([])
-        with patch(f"{MODULE}.gitea_client", fake):
+        with _patch_resource("gitea_client", fake):
             assert await b08_helpers.next_output_ordinal("job-x", "main") == "001"
 
     @pytest.mark.asyncio
     async def test_increments_past_highest(self):
         fake = _OutputsFake(["001-scholar-aa", "002-critic-bb", "010-developer-cc"])
-        with patch(f"{MODULE}.gitea_client", fake):
+        with _patch_resource("gitea_client", fake):
             assert await b08_helpers.next_output_ordinal("job-x", "main") == "011"
 
     @pytest.mark.asyncio
     async def test_ignores_non_numbered_entries(self):
         fake = _OutputsFake(["notes", "003-scholar-dd"])
-        with patch(f"{MODULE}.gitea_client", fake):
+        with _patch_resource("gitea_client", fake):
             assert await b08_helpers.next_output_ordinal("job-x", "main") == "004"
 
 
@@ -711,8 +720,8 @@ class TestGraftSubjobOutput:
             }
         )
         with (
-            patch(f"{MODULE}.postgres_db") as db,
-            patch(f"{MODULE}.gitea_client", fake),
+            _patch_resource("postgres_db") as db,
+            _patch_resource("gitea_client", fake),
         ):
             db.get_job = AsyncMock(
                 side_effect=lambda j: {
@@ -757,8 +766,8 @@ class TestGraftSubjobOutput:
             context={"verification_target": "parent-uuid"},
         )
         with (
-            patch(f"{MODULE}.postgres_db") as db,
-            patch(f"{MODULE}.gitea_client", fake),
+            _patch_resource("postgres_db") as db,
+            _patch_resource("gitea_client", fake),
         ):
             db.get_job = AsyncMock(
                 side_effect=lambda j: {
@@ -780,8 +789,8 @@ class TestGraftSubjobOutput:
             {"main": {}, "subjob/1234abcd/scholar": {"workspace.md": b"scratch"}}
         )
         with (
-            patch(f"{MODULE}.postgres_db") as db,
-            patch(f"{MODULE}.gitea_client", fake),
+            _patch_resource("postgres_db") as db,
+            _patch_resource("gitea_client", fake),
         ):
             db.get_job = AsyncMock(
                 side_effect=lambda j: {
@@ -805,8 +814,8 @@ class TestGraftSubjobOutput:
             }
         )
         with (
-            patch(f"{MODULE}.postgres_db") as db,
-            patch(f"{MODULE}.gitea_client", fake),
+            _patch_resource("postgres_db") as db,
+            _patch_resource("gitea_client", fake),
         ):
             db.get_job = AsyncMock(
                 side_effect=lambda j: {
@@ -834,8 +843,8 @@ class TestGraftSubjobOutput:
         )
         already = _subjob(context={"graft_output_path": "outputs/001-scholar-sub-uuid"})
         with (
-            patch(f"{MODULE}.postgres_db") as db,
-            patch(f"{MODULE}.gitea_client", fake),
+            _patch_resource("postgres_db") as db,
+            _patch_resource("gitea_client", fake),
         ):
             db.get_job = AsyncMock(
                 side_effect=lambda j: {
@@ -864,8 +873,8 @@ class TestGraftSubjobOutput:
             }
         )
         with (
-            patch(f"{MODULE}.postgres_db") as db,
-            patch(f"{MODULE}.gitea_client", fake),
+            _patch_resource("postgres_db") as db,
+            _patch_resource("gitea_client", fake),
         ):
             db.get_job = AsyncMock(
                 side_effect=lambda job_id: {
@@ -905,8 +914,8 @@ class TestGraftSubjobOutput:
             }
         ]
         with (
-            patch(f"{MODULE}.postgres_db") as db,
-            patch(f"{MODULE}.gitea_client", fake),
+            _patch_resource("postgres_db") as db,
+            _patch_resource("gitea_client", fake),
         ):
             db.get_job = AsyncMock(
                 side_effect=lambda job_id: {
@@ -951,8 +960,8 @@ class TestGraftSubjobOutput:
         )
         fake.commit_probe_available = False
         with (
-            patch(f"{MODULE}.postgres_db") as db,
-            patch(f"{MODULE}.gitea_client", fake),
+            _patch_resource("postgres_db") as db,
+            _patch_resource("gitea_client", fake),
         ):
             db.get_job = AsyncMock(
                 side_effect=lambda job_id: {
@@ -983,8 +992,8 @@ class TestGraftSubjobOutput:
         )
         fake.change_files = AsyncMock(return_value=False)
         with (
-            patch(f"{MODULE}.postgres_db") as db,
-            patch(f"{MODULE}.gitea_client", fake),
+            _patch_resource("postgres_db") as db,
+            _patch_resource("gitea_client", fake),
         ):
             db.get_job = AsyncMock(
                 side_effect=lambda job_id: {
@@ -1030,7 +1039,7 @@ class TestCompletionGraftWiring:
             "config_name": "developer",
         }
         with patch.object(
-            orch_main.subjob_output_operations,
+            subjob_output_module,
             "graft_subjob_output",
             side_effect=fake_graft,
         ):
@@ -1041,7 +1050,7 @@ class TestCompletionGraftWiring:
     @pytest.mark.asyncio
     async def test_no_graft_for_root_job(self):
         with patch.object(
-            orch_main.subjob_output_operations,
+            subjob_output_module,
             "graft_subjob_output",
             new_callable=AsyncMock,
         ) as g:
@@ -1079,13 +1088,13 @@ class TestScholarOutputPointer:
         async def upd_ctx(jid, ctx):
             captured[jid] = ctx
 
-        with patch(f"{MODULE}.postgres_db") as db:
+        with _patch_resource("postgres_db") as db:
             db.get_job = AsyncMock(
                 side_effect=lambda j: {"sch-1": scholar_fresh, "par-1": parent}.get(j)
             )
             db.merge_job_context = AsyncMock(side_effect=upd_ctx)
             db.update_job_status = AsyncMock()
-            with patch(f"{MODULE}._trigger_dispatch"):
+            with patch(TRIGGER_DISPATCH):
                 await b08_helpers.handle_scholar_completion(scholar_in_memory, [])
 
         assert captured["par-1"]["scholar_output_dir"] == "outputs/003-scholar-sch1"
@@ -1106,11 +1115,11 @@ class TestScholarOutputPointer:
             "context": {"scholar_target": "par-1"},
         }
         parent = {"id": "par-1", "status": "waiting", "context": {}}
-        with patch(f"{MODULE}.postgres_db") as db:
+        with _patch_resource("postgres_db") as db:
             db.get_job = AsyncMock(return_value=parent)
             db.merge_job_context = AsyncMock()
             db.update_job_status = AsyncMock()
-            with patch(f"{MODULE}._trigger_dispatch") as trig:
+            with patch(TRIGGER_DISPATCH) as trig:
                 await b08_helpers.handle_scholar_completion(scholar, [])
         db.merge_job_context.assert_not_awaited()
         db.update_job_status.assert_not_awaited()
@@ -1152,14 +1161,14 @@ class TestDelegationOutputPathPopulation:
         async def upd_ctx(jid, ctx):
             captured[jid] = ctx
 
-        with patch(f"{MODULE}.postgres_db") as db:
+        with _patch_resource("postgres_db") as db:
             db.all_delegation_children_terminal = AsyncMock(return_value=True)
             db.get_job = AsyncMock(side_effect=lambda j: {"par-1": parent}.get(j))
             db.get_delegation_children = AsyncMock(return_value=children)
             db.merge_job_context = AsyncMock(side_effect=upd_ctx)
             db.update_job_status = AsyncMock()
             db.claim_delegation_resume = AsyncMock(return_value=True)
-            with patch(f"{MODULE}._trigger_dispatch"):
+            with patch(TRIGGER_DISPATCH):
                 await b08_helpers.handle_delegation_child_completion(job, [])
 
         results = captured["par-1"]["delegation_results"]
@@ -1197,14 +1206,14 @@ class TestDelegationUnblockDispatcherContract:
     @pytest.mark.asyncio
     async def test_unblock_requeues_via_cas_claim(self):
         job, parent, children = self._fixtures()
-        with patch(f"{MODULE}.postgres_db") as db:
+        with _patch_resource("postgres_db") as db:
             db.all_delegation_children_terminal = AsyncMock(return_value=True)
             db.get_job = AsyncMock(return_value=parent)
             db.get_delegation_children = AsyncMock(return_value=children)
             db.merge_job_context = AsyncMock()
             db.update_job_status = AsyncMock()
             db.claim_delegation_resume = AsyncMock(return_value=True)
-            with patch(f"{MODULE}._trigger_dispatch") as trig:
+            with patch(TRIGGER_DISPATCH) as trig:
                 await b08_helpers.handle_delegation_child_completion(job, [])
         db.claim_delegation_resume.assert_awaited_once_with("par-1")
         # update_job_status can't clear freeze_data → must not be the writer
@@ -1216,14 +1225,14 @@ class TestDelegationUnblockDispatcherContract:
         # A concurrent sibling (or the timeout sweeper) already re-queued the
         # parent — the loser must not double-trigger or log a second resume.
         job, parent, children = self._fixtures()
-        with patch(f"{MODULE}.postgres_db") as db:
+        with _patch_resource("postgres_db") as db:
             db.all_delegation_children_terminal = AsyncMock(return_value=True)
             db.get_job = AsyncMock(return_value=parent)
             db.get_delegation_children = AsyncMock(return_value=children)
             db.merge_job_context = AsyncMock()
             db.update_job_status = AsyncMock()
             db.claim_delegation_resume = AsyncMock(return_value=False)
-            with patch(f"{MODULE}._trigger_dispatch") as trig:
+            with patch(TRIGGER_DISPATCH) as trig:
                 await b08_helpers.handle_delegation_child_completion(job, [])
         trig.assert_not_called()
 
@@ -1237,14 +1246,14 @@ class TestDelegationUnblockDispatcherContract:
                 "user_id": "33333333-3333-3333-3333-333333333333",
             }
         )
-        with patch(f"{MODULE}.postgres_db") as db:
+        with _patch_resource("postgres_db") as db:
             db.all_delegation_children_terminal = AsyncMock(return_value=True)
             db.get_job = AsyncMock(return_value=parent)
             db.get_delegation_children = AsyncMock(return_value=children)
             db.queue_stateless_job_for_resume = AsyncMock(return_value=True)
             db.merge_job_context = AsyncMock()
             db.claim_delegation_resume = AsyncMock()
-            with patch(f"{MODULE}._trigger_dispatch") as trig:
+            with patch(TRIGGER_DISPATCH) as trig:
                 await b08_helpers.handle_delegation_child_completion(job, [])
 
         queued = db.queue_stateless_job_for_resume.await_args

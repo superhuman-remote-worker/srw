@@ -35,6 +35,14 @@ import pytest
 # they steered before.
 from orchestrator.services import thread_config_update  # noqa: E402
 from fastapi import HTTPException
+from orchestrator.application import sessions as sessions_composition
+from orchestrator.schemas import thread_config as thread_config_module
+from orchestrator.security import access as access_module
+from orchestrator.services import dispatch_credentials as dispatch_credentials_module
+from orchestrator.services import grant_enforcement as grant_enforcement_module
+from orchestrator.services import thread_config_update as thread_config_update_module
+from orchestrator.services import thread_mount_rows as thread_mount_rows_module
+import fastapi as fastapi_module
 
 THREAD_ID = "11111111-2222-3333-4444-555555555555"
 USER_ID = "aaaaaaaa-1111-4111-8111-111111111111"
@@ -295,16 +303,20 @@ def patched_main(monkeypatch):
             "delivery_override": config_override
         }
     )
-    monkeypatch.setattr(main, "postgres_db", db)
-    monkeypatch.setattr(main, "require_internal", AsyncMock())
-    monkeypatch.setattr(main, "_thread_project_ids", AsyncMock(return_value=[]))
+    monkeypatch.setattr(main.app.state.resources, "postgres_db", db)
+    monkeypatch.setattr(access_module, "require_internal", AsyncMock())
+    monkeypatch.setattr(
+        thread_mount_rows_module, "thread_project_ids", AsyncMock(return_value=[])
+    )
     grants = AsyncMock()
-    monkeypatch.setattr(main, "_enforce_session_create_grants", grants)
+    monkeypatch.setattr(
+        grant_enforcement_module, "enforce_session_create_grants", grants
+    )
     return main, db, grants
 
 
 def _body(main, config_override=None, datasource_ids=None):
-    return main.AgentThreadConfigUpdateRequest(
+    return thread_config_module.AgentThreadConfigUpdateRequest(
         config_override=config_override or {}, datasource_ids=datasource_ids
     )
 
@@ -317,12 +329,14 @@ class TestAgentPatchDatasourceIds:
         db.get_thread.return_value = _thread_row(
             metadata_extra={"datasource_ids": [DATASOURCE_A_ID]}
         )
-        with pytest.raises(main.HTTPException) as caught:
+        with pytest.raises(fastapi_module.HTTPException) as caught:
             await thread_config_update.agent_update_thread_config(
                 MagicMock(),
                 THREAD_ID,
                 _body(main, datasource_ids=[]),
-                dependencies=main._thread_config_update_dependencies(),
+                dependencies=sessions_composition.thread_config_update_dependencies(
+                    main.app.state.resources
+                ),
             )
         assert caught.value.status_code == 409
         assert "stay attached" in caught.value.detail
@@ -342,12 +356,14 @@ class TestAgentPatchDatasourceIds:
             "is_global": True,
         }
 
-        with pytest.raises(main.HTTPException) as exc:
+        with pytest.raises(fastapi_module.HTTPException) as exc:
             await thread_config_update.agent_update_thread_config(
                 MagicMock(),
                 THREAD_ID,
                 _body(main, datasource_ids=[REPOSITORY_ID]),
-                dependencies=main._thread_config_update_dependencies(),
+                dependencies=sessions_composition.thread_config_update_dependencies(
+                    main.app.state.resources
+                ),
             )
         assert exc.value.status_code == 400
         assert "repository" in exc.value.detail.lower()
@@ -364,7 +380,9 @@ class TestAgentPatchDatasourceIds:
             MagicMock(),
             THREAD_ID,
             _body(main, datasource_ids=[DATASOURCE_A_ID]),
-            dependencies=main._thread_config_update_dependencies(),
+            dependencies=sessions_composition.thread_config_update_dependencies(
+                main.app.state.resources
+            ),
         )
 
         fragment = grants.await_args.args[0]
@@ -381,14 +399,18 @@ class TestAgentPatchDatasourceIds:
     @pytest.mark.asyncio
     async def test_grant_denial_prevents_persist(self, patched_main):
         main, db, grants = patched_main
-        grants.side_effect = main.HTTPException(status_code=422, detail="denied")
+        grants.side_effect = fastapi_module.HTTPException(
+            status_code=422, detail="denied"
+        )
 
-        with pytest.raises(main.HTTPException) as exc:
+        with pytest.raises(fastapi_module.HTTPException) as exc:
             await thread_config_update.agent_update_thread_config(
                 MagicMock(),
                 THREAD_ID,
                 _body(main, datasource_ids=[DATASOURCE_A_ID]),
-                dependencies=main._thread_config_update_dependencies(),
+                dependencies=sessions_composition.thread_config_update_dependencies(
+                    main.app.state.resources
+                ),
             )
         assert exc.value.status_code == 422
         db.set_thread_datasource_ids.assert_not_awaited()
@@ -409,7 +431,9 @@ class TestAgentPatchDatasourceIds:
                 MagicMock(),
                 THREAD_ID,
                 _body(main, datasource_ids=[DATASOURCE_A_ID]),
-                dependencies=main._thread_config_update_dependencies(),
+                dependencies=sessions_composition.thread_config_update_dependencies(
+                    main.app.state.resources
+                ),
             )
 
         assert exc.value.status_code == 409
@@ -426,7 +450,9 @@ class TestAgentPatchDatasourceIds:
             MagicMock(),
             THREAD_ID,
             _body(main, datasource_ids=[DATASOURCE_A_ID]),
-            dependencies=main._thread_config_update_dependencies(),
+            dependencies=sessions_composition.thread_config_update_dependencies(
+                main.app.state.resources
+            ),
         )
 
         merged = db.merge_thread_config_override.await_args.args[1]
@@ -446,7 +472,9 @@ class TestAgentPatchDatasourceIds:
                 MagicMock(),
                 THREAD_ID,
                 _body(main, datasource_ids=[DATASOURCE_A_ID]),
-                dependencies=main._thread_config_update_dependencies(),
+                dependencies=sessions_composition.thread_config_update_dependencies(
+                    main.app.state.resources
+                ),
             )
 
         assert exc.value.status_code == 403
@@ -467,7 +495,9 @@ class TestAgentPatchDatasourceIds:
             MagicMock(),
             THREAD_ID,
             _body(main, datasource_ids=[DATASOURCE_A_ID]),
-            dependencies=main._thread_config_update_dependencies(),
+            dependencies=sessions_composition.thread_config_update_dependencies(
+                main.app.state.resources
+            ),
         )
 
         grants.assert_not_awaited()
@@ -484,7 +514,9 @@ class TestAgentPatchDatasourceIds:
             MagicMock(),
             THREAD_ID,
             _body(main, config_override={"llm": {"temperature": 0.5}}),
-            dependencies=main._thread_config_update_dependencies(),
+            dependencies=sessions_composition.thread_config_update_dependencies(
+                main.app.state.resources
+            ),
         )
 
         db.set_thread_datasource_ids.assert_not_awaited()
@@ -498,7 +530,9 @@ class TestAgentPatchDatasourceIds:
             MagicMock(),
             THREAD_ID,
             _body(main, datasource_ids=[]),
-            dependencies=main._thread_config_update_dependencies(),
+            dependencies=sessions_composition.thread_config_update_dependencies(
+                main.app.state.resources
+            ),
         )
 
         persisted = db.set_thread_datasource_ids.await_args
@@ -520,19 +554,22 @@ def patched_owner(patched_main, monkeypatch):
     require_owner = AsyncMock(
         side_effect=lambda request, _db, tid: (owner_user, db.get_thread.return_value)
     )
-    monkeypatch.setattr(main, "require_thread_owner", require_owner)
+    monkeypatch.setattr(access_module, "require_thread_owner", require_owner)
 
-    async def fake_inject(*, section, model_id, user_id, resolved_keys):
+    async def fake_inject(*, section, model_id, user_id, resolved_keys, dependencies):
         # Enrichment resolves transport; the api_key is the secret that must
-        # never reach the browser-facing response.
+        # never reach the browser-facing response. R1.B12: the composition
+        # binds this owner, so the call also carries its ``dependencies``.
         section["api_key"] = "sk-secret"
 
-    monkeypatch.setattr(main, "_inject_model_credentials", fake_inject)
+    monkeypatch.setattr(
+        dispatch_credentials_module, "inject_model_credentials", fake_inject
+    )
     return main, db, require_owner
 
 
 def _patch_body(main, config_override=None, datasource_ids=None):
-    return main.ThreadConfigPatchRequest(
+    return thread_config_module.ThreadConfigPatchRequest(
         config_override=config_override or {}, datasource_ids=datasource_ids
     )
 
@@ -545,12 +582,14 @@ class TestOwnerConfigPatch:
         row.update(agent_id="agent-1", status="active")
         db.get_thread.return_value = row
 
-        with pytest.raises(main.HTTPException) as exc:
+        with pytest.raises(fastapi_module.HTTPException) as exc:
             await thread_config_update.update_thread_config(
                 THREAD_ID,
                 _patch_body(main, {"llm": {"temperature": 0.2}}),
                 MagicMock(),
-                dependencies=main._thread_config_update_dependencies(),
+                dependencies=sessions_composition.thread_config_update_dependencies(
+                    main.app.state.resources
+                ),
             )
         assert exc.value.status_code == 409
         db.merge_thread_config_override.assert_not_awaited()
@@ -569,7 +608,9 @@ class TestOwnerConfigPatch:
             THREAD_ID,
             _patch_body(main, {"llm": {"temperature": 0.2}}),
             MagicMock(),
-            dependencies=main._thread_config_update_dependencies(),
+            dependencies=sessions_composition.thread_config_update_dependencies(
+                main.app.state.resources
+            ),
         )
         assert result["status"] == "updated"
         assert result["effective"] == "next_attach"
@@ -592,7 +633,9 @@ class TestOwnerConfigPatch:
             THREAD_ID,
             _patch_body(main, {"llm": {"reasoning_level": "max"}}),
             MagicMock(),
-            dependencies=main._thread_config_update_dependencies(),
+            dependencies=sessions_composition.thread_config_update_dependencies(
+                main.app.state.resources
+            ),
         )
         assert result["status"] == "updated"
         assert result["effective"] == "next_turn"
@@ -621,19 +664,23 @@ class TestOwnerConfigPatch:
                 },
             ),
             MagicMock(),
-            dependencies=main._thread_config_update_dependencies(),
+            dependencies=sessions_composition.thread_config_update_dependencies(
+                main.app.state.resources
+            ),
         )
         assert result["config_override"]["delegation"] == {"enabled": True}
         merged = db.merge_thread_config_override.await_args.args[1]
         assert merged["delegation"] == {"enabled": True}
         assert merged["tools"]["delegation"] == ["delegate_agent"]
 
-        with pytest.raises(main.HTTPException) as exc:
+        with pytest.raises(fastapi_module.HTTPException) as exc:
             await thread_config_update.update_thread_config(
                 THREAD_ID,
                 _patch_body(main, {"delegation": {"enabled": "yes"}}),
                 MagicMock(),
-                dependencies=main._thread_config_update_dependencies(),
+                dependencies=sessions_composition.thread_config_update_dependencies(
+                    main.app.state.resources
+                ),
             )
         assert exc.value.status_code == 400
 
@@ -651,7 +698,9 @@ class TestOwnerConfigPatch:
             THREAD_ID,
             _patch_body(main, {"llm": {"model": "minimax-m3"}}),
             MagicMock(),
-            dependencies=main._thread_config_update_dependencies(),
+            dependencies=sessions_composition.thread_config_update_dependencies(
+                main.app.state.resources
+            ),
         )
 
         assert "api_key" not in result["config_override"]["llm"]
@@ -674,12 +723,14 @@ class TestOwnerConfigPatch:
             "is_global": True,
         }
 
-        with pytest.raises(main.HTTPException) as exc:
+        with pytest.raises(fastapi_module.HTTPException) as exc:
             await thread_config_update.update_thread_config(
                 THREAD_ID,
                 _patch_body(main, datasource_ids=[REPOSITORY_ID]),
                 MagicMock(),
-                dependencies=main._thread_config_update_dependencies(),
+                dependencies=sessions_composition.thread_config_update_dependencies(
+                    main.app.state.resources
+                ),
             )
         assert exc.value.status_code == 400
         db.set_thread_datasource_ids.assert_not_awaited()
@@ -692,7 +743,9 @@ class TestOwnerConfigPatch:
             THREAD_ID,
             _patch_body(main, datasource_ids=[DATASOURCE_A_ID]),
             MagicMock(),
-            dependencies=main._thread_config_update_dependencies(),
+            dependencies=sessions_composition.thread_config_update_dependencies(
+                main.app.state.resources
+            ),
         )
         persisted = db.set_thread_datasource_ids.await_args
         assert persisted.args == (THREAD_ID, [DATASOURCE_A_ID])
@@ -702,12 +755,14 @@ class TestOwnerConfigPatch:
     @pytest.mark.asyncio
     async def test_empty_body_rejected(self, patched_owner):
         main, db, _ = patched_owner
-        with pytest.raises(main.HTTPException) as exc:
+        with pytest.raises(fastapi_module.HTTPException) as exc:
             await thread_config_update.update_thread_config(
                 THREAD_ID,
                 _patch_body(main),
                 MagicMock(),
-                dependencies=main._thread_config_update_dependencies(),
+                dependencies=sessions_composition.thread_config_update_dependencies(
+                    main.app.state.resources
+                ),
             )
         assert exc.value.status_code == 400
         db.merge_thread_config_override.assert_not_awaited()
@@ -715,16 +770,18 @@ class TestOwnerConfigPatch:
     @pytest.mark.asyncio
     async def test_owner_denial_propagates_before_any_write(self, patched_owner):
         main, db, require_owner = patched_owner
-        require_owner.side_effect = main.HTTPException(
+        require_owner.side_effect = fastapi_module.HTTPException(
             status_code=403, detail="Not your thread"
         )
 
-        with pytest.raises(main.HTTPException) as exc:
+        with pytest.raises(fastapi_module.HTTPException) as exc:
             await thread_config_update.update_thread_config(
                 THREAD_ID,
                 _patch_body(main, {"llm": {"temperature": 0.1}}),
                 MagicMock(),
-                dependencies=main._thread_config_update_dependencies(),
+                dependencies=sessions_composition.thread_config_update_dependencies(
+                    main.app.state.resources
+                ),
             )
         assert exc.value.status_code == 403
         db.merge_thread_config_override.assert_not_awaited()
@@ -743,7 +800,9 @@ class TestConfigChangeAudit:
                 datasource_ids=[DATASOURCE_A_ID],
             ),
             MagicMock(),
-            dependencies=main._thread_config_update_dependencies(),
+            dependencies=sessions_composition.thread_config_update_dependencies(
+                main.app.state.resources
+            ),
         )
 
         kwargs = db.record_security_event.await_args.kwargs
@@ -765,7 +824,9 @@ class TestConfigChangeAudit:
             MagicMock(),
             THREAD_ID,
             _body(main, config_override={"llm": {"temperature": 0.4}}),
-            dependencies=main._thread_config_update_dependencies(),
+            dependencies=sessions_composition.thread_config_update_dependencies(
+                main.app.state.resources
+            ),
         )
 
         kwargs = db.record_security_event.await_args.kwargs
@@ -776,32 +837,32 @@ class TestConfigChangeAudit:
     @pytest.mark.asyncio
     async def test_denied_update_records_no_config_audit(self, patched_main):
         main, db, grants = patched_main
-        grants.side_effect = main.HTTPException(status_code=422, detail="denied")
+        grants.side_effect = fastapi_module.HTTPException(
+            status_code=422, detail="denied"
+        )
 
-        with pytest.raises(main.HTTPException):
+        with pytest.raises(fastapi_module.HTTPException):
             await thread_config_update.agent_update_thread_config(
                 MagicMock(),
                 THREAD_ID,
                 _body(main, datasource_ids=[DATASOURCE_A_ID]),
-                dependencies=main._thread_config_update_dependencies(),
+                dependencies=sessions_composition.thread_config_update_dependencies(
+                    main.app.state.resources
+                ),
             )
         db.record_security_event.assert_not_awaited()
 
 
 class TestConfigChangeSummary:
     def test_flattens_one_level_and_counts_datasources(self):
-        import orchestrator.main as main
-
-        detail = main._config_change_summary(
+        detail = thread_config_update_module.config_change_summary(
             {"llm": {"model": "x", "temperature": 0.1}, "narration": "full"},
             ["a", "b"],
         )
         assert detail == "keys=llm.model,llm.temperature,narration datasource_ids=2"
 
     def test_empty_change(self):
-        import orchestrator.main as main
-
-        assert main._config_change_summary({}, None) == "empty"
+        assert thread_config_update_module.config_change_summary({}, None) == "empty"
 
 
 # ---------------------------------------------------------------------------

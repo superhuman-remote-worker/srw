@@ -375,9 +375,6 @@
   "nav": {
     "cockpit": "Cockpit",
     "builder": "Builder",
-    "modeChat": "Chat",
-    "modeJobs": "Jobs",
-    "modeProjects": "Projekte",
     "newChat": "Neuer Chat",
     "searchSessions": "Sitzungen durchsuchen",
     "clearFilter": "Filter löschen",
@@ -397,10 +394,9 @@
     "workbench": "Workbench",
     "settings": "Einstellungen",
     "logout": "Abmelden",
-    "admin": "Admin",
-    "more": "Mehr",
-    "apiKeys": "API-Schlüssel",
-    "sshKeys": "SSH-Schlüssel",
+    "customize": "Anpassen",
+    "backToApp": "Zurück zur App",
+    "jobsAwaitingReview": "{{count}} Aufträge warten auf deine Prüfung",
     "collapseSidebar": "Seitenleiste einklappen",
     "openSidebar": "Seitenleiste öffnen",
     "resizeSidebar": "Seitenleiste anpassen",
@@ -570,6 +566,7 @@
     "confirmDelete": "Diese Sitzung dauerhaft löschen?",
     "confirmForceDelete": "Der Agent arbeitet in dieser Sitzung noch an einem Zug. Trotzdem löschen? Der laufende Zug geht verloren.",
     "confirmEndMidTurn": "Der Agent arbeitet noch an einem Zug. Sitzung trotzdem beenden? Der laufende Zug und alle eingereihten Eingaben gehen verloren.",
+    "confirmEndStatelessBusy": "Der Agent schließt seinen aktuellen Zug noch ab. Sitzung trotzdem beenden? Der unfertige Zug wird abgebrochen.",
     "turnsOne": "Zug",
     "turnsMany": "Züge",
     "filter": {
@@ -581,6 +578,7 @@
       "sessionFiles": "Sitzungsdateien",
       "resume": "Fortsetzen",
       "delete": "Löschen",
+      "retryDelete": "Löschen erneut versuchen",
       "talk": "Mit dem Offizier sprechen"
     },
     "create": {
@@ -1159,13 +1157,27 @@
     }
   },
   "emptyCatalog": {
-    "bannerUser": "Noch keine LLMs konfiguriert — füge in Einstellungen → API-Keys einen Key hinzu oder registriere ein eigenes LLM.",
-    "bannerAdmin": "Noch keine LLMs konfiguriert — konfiguriere unter Admin → Modelle → Anbieter einen Anbieter, um die App zu nutzen.",
+    "bannerUser": "Noch keine LLMs konfiguriert — füge in Einstellungen → Anbieter-Schlüssel einen Key hinzu oder registriere ein eigenes LLM.",
+    "bannerAdmin": "Noch keine LLMs konfiguriert — konfiguriere unter Einstellungen → Modelle → Anbieter einen Anbieter, um die App zu nutzen.",
     "pickerCta": "Konfiguriere einen Anbieter, um diese Auswahl zu aktivieren.",
     "dismiss": "Schließen"
   },
   "settings": {
     "title": "Einstellungen",
+    "nav": {
+      "groupSettings": "Einstellungen",
+      "groupAccess": "Zugang",
+      "groupAdmin": "Administration",
+      "general": "Allgemein",
+      "defaults": "Standardwerte",
+      "providerKeys": "Anbieter-Schlüssel",
+      "notifications": "Benachrichtigungen",
+      "apiKeys": "API-Schlüssel",
+      "mcp": "MCP-Tokens",
+      "sshKeys": "SSH-Schlüssel",
+      "subscriptions": "KI-Abos",
+      "cloud": "Cloud-Speicher"
+    },
     "appearance": {
       "title": "Erscheinungsbild",
       "desc": "Wählen Sie zwischen hellem und dunklem Modus oder folgen Sie der Systemeinstellung, und legen Sie die Akzentfarbe fest. Beide Einstellungen werden auf diesem Gerät gespeichert.",
@@ -1245,9 +1257,6 @@
       "saveButton": "Key speichern"
     },
     "apiKeys": {
-      "linkTitle": "Personal Access Tokens",
-      "linkDesc": "Bearer-Tokens für n8n, Skripte und andere Automatisierungs-Tools, die die Orchestrator-API aufrufen müssen.",
-      "linkManage": "API-Keys verwalten",
       "title": "Personal Access Tokens",
       "desc": "Bearer-Tokens für Automatisierungs-Tools, die direkt mit der Orchestrator-API kommunizieren. Jedes Token hat eigene Action-Scopes und ein eigenes Ablaufdatum. Verlorene Tokens können nicht wiederhergestellt werden — erstelle einfach ein neues.",
       "existingTitle": "Deine Tokens",
@@ -1285,10 +1294,6 @@
       "usageDesc": "Übergib das Token in einem Authorization-Header. n8n's Header-Auth-Credential funktioniert direkt damit."
     },
     "sshKeys": {
-      "linkTitle": "SSH-Schlüssel",
-      "linkDesc": "Öffentliche Schlüssel, mit denen du dich per SSH mit deinen Sitzungs-Workspaces verbindest.",
-      "linkManage": "SSH-Schlüssel verwalten",
-      "back": "Zurück",
       "title": "SSH-Schlüssel",
       "desc": "Öffentliche Schlüssel, die deine SSH-Verbindungen zu Sitzungs-Workspaces authentifizieren. Ein Schlüssel bestätigt deine Identität erst, wenn du nachgewiesen hast, dass du den passenden privaten Schlüssel besitzt.",
       "existingTitle": "Deine Schlüssel",
@@ -1429,7 +1434,7 @@
     },
     "subscriptions": {
       "title": "KI-Abos",
-      "desc": "Verbinden Sie Abo-Konten über den gemeinsamen Proxy. Modelle werden separat unter Admin → Models registriert.",
+      "desc": "Verbinden Sie Abo-Konten über den gemeinsamen Proxy. Modelle werden separat unter Administration → Modelle registriert.",
       "checking": "Proxy wird geprüft…",
       "connected": "Verbunden",
       "notConnected": "Kein Konto verbunden",
@@ -3762,7 +3767,9 @@
       "resumeFailed": "Sitzung konnte nicht fortgesetzt werden.",
       "stillEnding": "Diese Sitzung wird noch beendet. Lass diese Seite geöffnet und versuche Fortsetzen danach erneut.",
       "endFailed": "Sitzung konnte nicht beendet werden.",
+      "endRetryable": "Das Beenden hat begonnen, aber das Workspace-Cleanup ist noch nicht abgeschlossen. Drücke erneut auf „Trennen“, um es noch einmal zu versuchen.",
       "deleteFailed": "Sitzung konnte nicht gelöscht werden.",
+      "deleteRetryable": "Diese Sitzung wird noch heruntergefahren und konnte daher noch nicht gelöscht werden. Nutze gleich „Löschen erneut versuchen“ auf ihrer Karte.",
       "createFailed": "Sitzung konnte nicht erstellt werden.",
       "renameFailed": "Sitzung konnte nicht umbenannt werden.",
       "bindingInvalid": "Diese Sitzungsverbindung ist nicht mehr autoritativ. Warte auf die Wiederherstellung der Sitzung oder wende dich an einen Administrator."

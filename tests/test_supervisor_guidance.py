@@ -42,6 +42,12 @@ from agent.core.guidance_injection import format_supervisor_guidance  # noqa: E4
 from agent.core.workspace import WorkspaceManager  # noqa: E402
 from agent.managers import TodoManager  # noqa: E402
 from tests._fs_backend import FilesystemTestBackend  # noqa: E402
+from orchestrator.application import sessions as sessions_composition
+from orchestrator.application import workflows as workflows_composition
+from orchestrator.schemas import agent_runtime as agent_runtime_module
+from orchestrator.schemas import messaging as messaging_module
+from orchestrator.security import access as access_module
+from orchestrator.services import job_controls as job_controls_module
 
 
 # =============================================================================
@@ -116,14 +122,23 @@ def _route_inbound_reply(om, *args, **kwargs):
     steering the code under test.
     """
     return inbound_reply.route_inbound_reply(
-        *args, **kwargs, dependencies=om._inbound_reply_dependencies()
+        *args,
+        **kwargs,
+        dependencies=workflows_composition.inbound_reply_dependencies(
+            om.app.state.resources
+        ),
     )
 
 
 def _ack_job_guidance(om, request, job_id, body):
     """Same, for the guidance ack behind ``POST /api/jobs/{id}/guidance/ack``."""
     return job_guidance.ack_job_guidance(
-        request, job_id, body, dependencies=om._job_guidance_dependencies()
+        request,
+        job_id,
+        body,
+        dependencies=workflows_composition.job_guidance_dependencies(
+            om.app.state.resources
+        ),
     )
 
 
@@ -142,8 +157,10 @@ class TestUrgentReplyRoutesToGuidance:
             side_effect=HTTPException(status_code=409, detail="completion finalizing")
         )
         with (
-            patch.object(om, "postgres_db", db),
-            patch.object(om._completion_control_boundary, "guard", guard),
+            patch.object(om.app.state.resources, "postgres_db", db),
+            patch.object(
+                om.app.state.resources.completion_control_boundary, "guard", guard
+            ),
             pytest.raises(HTTPException) as exc,
         ):
             await _route_inbound_reply(
@@ -166,10 +183,12 @@ class TestUrgentReplyRoutesToGuidance:
         resume = AsyncMock(return_value=False)
         guard = AsyncMock()
         with (
-            patch.object(om, "postgres_db", db),
-            patch.object(om._completion_control_boundary, "guard", guard),
+            patch.object(om.app.state.resources, "postgres_db", db),
             patch.object(
-                om.job_control_operations.JobControlOperations,
+                om.app.state.resources.completion_control_boundary, "guard", guard
+            ),
+            patch.object(
+                job_controls_module.JobControlOperations,
                 "internal_resume_job",
                 resume,
             ),
@@ -192,9 +211,13 @@ class TestUrgentReplyRoutesToGuidance:
         db.append_queued_reply.return_value = False
         guard = AsyncMock()
         with (
-            patch.object(om, "COMPLETION_COMMANDS_ENABLED", True),
-            patch.object(om, "postgres_db", db),
-            patch.object(om._completion_control_boundary, "guard", guard),
+            patch.object(
+                om.app.state.resources.settings, "completion_commands_enabled", True
+            ),
+            patch.object(om.app.state.resources, "postgres_db", db),
+            patch.object(
+                om.app.state.resources.completion_control_boundary, "guard", guard
+            ),
             pytest.raises(HTTPException) as exc,
         ):
             await _route_inbound_reply(
@@ -217,9 +240,9 @@ class TestUrgentReplyRoutesToGuidance:
         db = _routing_db(_job(status="processing"))
         resume = AsyncMock()
         with (
-            patch.object(om, "postgres_db", db),
+            patch.object(om.app.state.resources, "postgres_db", db),
             patch.object(
-                om.job_control_operations.JobControlOperations,
+                job_controls_module.JobControlOperations,
                 "internal_resume_job",
                 resume,
             ),
@@ -248,9 +271,9 @@ class TestUrgentReplyRoutesToGuidance:
         db = _routing_db(_job(status="paused"))
         resume = AsyncMock()
         with (
-            patch.object(om, "postgres_db", db),
+            patch.object(om.app.state.resources, "postgres_db", db),
             patch.object(
-                om.job_control_operations.JobControlOperations,
+                job_controls_module.JobControlOperations,
                 "internal_resume_job",
                 resume,
             ),
@@ -276,9 +299,9 @@ class TestUrgentReplyRoutesToGuidance:
         db = _routing_db(held)
         resume = AsyncMock(return_value=True)
         with (
-            patch.object(om, "postgres_db", db),
+            patch.object(om.app.state.resources, "postgres_db", db),
             patch.object(
-                om.job_control_operations.JobControlOperations,
+                job_controls_module.JobControlOperations,
                 "internal_resume_job",
                 resume,
             ),
@@ -301,9 +324,9 @@ class TestUrgentReplyRoutesToGuidance:
         )
         resume = AsyncMock()
         with (
-            patch.object(om, "postgres_db", db),
+            patch.object(om.app.state.resources, "postgres_db", db),
             patch.object(
-                om.job_control_operations.JobControlOperations,
+                job_controls_module.JobControlOperations,
                 "internal_resume_job",
                 resume,
             ),
@@ -328,9 +351,9 @@ class TestUrgentReplyRoutesToGuidance:
         }
         resume = AsyncMock()
         with (
-            patch.object(om, "postgres_db", db),
+            patch.object(om.app.state.resources, "postgres_db", db),
             patch.object(
-                om.job_control_operations.JobControlOperations,
+                job_controls_module.JobControlOperations,
                 "internal_resume_job",
                 resume,
             ),
@@ -351,9 +374,9 @@ class TestUrgentReplyRoutesToGuidance:
         db = _routing_db(_job(status="processing"))
         resume = AsyncMock()
         with (
-            patch.object(om, "postgres_db", db),
+            patch.object(om.app.state.resources, "postgres_db", db),
             patch.object(
-                om.job_control_operations.JobControlOperations,
+                job_controls_module.JobControlOperations,
                 "internal_resume_job",
                 resume,
             ),
@@ -378,7 +401,7 @@ class TestCheckpointCoupledAckEndpoint:
 
         db = AsyncMock()
         db.consume_job_guidance.return_value = 4
-        body = om.GuidanceAckRequest(
+        body = messaging_module.GuidanceAckRequest(
             guidance_ids=["g1"],
             reply_keys=["id:r1"],
             feedback_keys=["feedback:id:f1"],
@@ -386,7 +409,7 @@ class TestCheckpointCoupledAckEndpoint:
             checkpoint_id="cp-9",
         )
         with (
-            patch.object(om, "postgres_db", db),
+            patch.object(om.app.state.resources, "postgres_db", db),
         ):
             result = await _ack_job_guidance(om, MagicMock(), JOB_ID, body)
 
@@ -408,14 +431,14 @@ class TestCheckpointCoupledAckEndpoint:
         db = AsyncMock()
         db.consume_job_guidance.side_effect = ValueError("checkpoint missing")
         with (
-            patch.object(om, "postgres_db", db),
+            patch.object(om.app.state.resources, "postgres_db", db),
             pytest.raises(HTTPException) as exc,
         ):
             await _ack_job_guidance(
                 om,
                 MagicMock(),
                 JOB_ID,
-                om.GuidanceAckRequest(guidance_ids=["g1"]),
+                messaging_module.GuidanceAckRequest(guidance_ids=["g1"]),
             )
 
         assert exc.value.status_code == 409
@@ -428,7 +451,9 @@ class TestCheckpointCoupledAckEndpoint:
 
 class TestHeartbeatCarriesGuidance:
     def _heartbeat_body(self, om):
-        return om.AgentHeartbeat(status="working", current_job_id=JOB_ID)
+        return agent_runtime_module.AgentHeartbeat(
+            status="working", current_job_id=JOB_ID
+        )
 
     def _db(self, context):
         db = AsyncMock()
@@ -451,14 +476,16 @@ class TestHeartbeatCarriesGuidance:
         entries = [{"id": "g1", "text": "steer", "source": "officer"}]
         db = self._db({"pending_guidance": entries})
         with (
-            patch.object(om, "postgres_db", db),
-            patch.object(om, "require_internal", AsyncMock()),
+            patch.object(om.app.state.resources, "postgres_db", db),
+            patch.object(access_module, "require_internal", AsyncMock()),
         ):
             out = await agent_registration.agent_heartbeat(
                 MagicMock(),
                 "agent-1",
                 self._heartbeat_body(om),
-                dependencies=om._agent_registration_dependencies(),
+                dependencies=sessions_composition.agent_registration_dependencies(
+                    om.app.state.resources
+                ),
             )
 
         assert out["job_status"] == "processing"
@@ -470,14 +497,16 @@ class TestHeartbeatCarriesGuidance:
 
         db = self._db({})
         with (
-            patch.object(om, "postgres_db", db),
-            patch.object(om, "require_internal", AsyncMock()),
+            patch.object(om.app.state.resources, "postgres_db", db),
+            patch.object(access_module, "require_internal", AsyncMock()),
         ):
             out = await agent_registration.agent_heartbeat(
                 MagicMock(),
                 "agent-1",
                 self._heartbeat_body(om),
-                dependencies=om._agent_registration_dependencies(),
+                dependencies=sessions_composition.agent_registration_dependencies(
+                    om.app.state.resources
+                ),
             )
 
         assert out["pending_guidance"] == []
@@ -489,14 +518,16 @@ class TestHeartbeatCarriesGuidance:
         db = self._db({})
         db.get_job.side_effect = RuntimeError("db blip")
         with (
-            patch.object(om, "postgres_db", db),
-            patch.object(om, "require_internal", AsyncMock()),
+            patch.object(om.app.state.resources, "postgres_db", db),
+            patch.object(access_module, "require_internal", AsyncMock()),
         ):
             out = await agent_registration.agent_heartbeat(
                 MagicMock(),
                 "agent-1",
                 self._heartbeat_body(om),
-                dependencies=om._agent_registration_dependencies(),
+                dependencies=sessions_composition.agent_registration_dependencies(
+                    om.app.state.resources
+                ),
             )
 
         assert out["pending_guidance"] is None

@@ -31,6 +31,7 @@ from shared.runtime.core.tool_report import (
     STATE_UNAVAILABLE,
     report_categories,
 )
+from orchestrator.application import transport as transport_composition
 
 _AGENT_ROW = {"id": "agent-1", "pod_ip": "10.0.0.9", "pod_port": 8001}
 
@@ -127,7 +128,9 @@ def _app_dependencies():
     """
     import orchestrator.main as orch_main
 
-    return orch_main._thread_session_dependencies()
+    return transport_composition.thread_session_dependencies(
+        orch_main.app.state.resources
+    )
 
 
 async def _get_tool_groups(thread_id, request):
@@ -165,7 +168,7 @@ async def _call(user, db, thread_row, fake_request, *, routes=None, grants=None)
     http_patch, calls = _agent_http(routes or {})
     with ExitStack() as stack:
         stack.enter_context(
-            patch("orchestrator.main.require_approved_user", _approved(user))
+            patch("orchestrator.security.auth.require_approved_user", _approved(user))
         )
         stack.enter_context(
             patch(
@@ -173,18 +176,21 @@ async def _call(user, db, thread_row, fake_request, *, routes=None, grants=None)
                 AsyncMock(return_value=user),
             )
         )
-        stack.enter_context(patch("orchestrator.main.postgres_db", db))
+        stack.enter_context(
+            patch("orchestrator.main.app.state.resources.postgres_db", db)
+        )
         stack.enter_context(
             patch(f"{_TOOL_VIEW}.is_experts_db_enabled", MagicMock(return_value=True))
         )
         stack.enter_context(
             patch(
-                "orchestrator.main._user_experts_enabled", AsyncMock(return_value=True)
+                "orchestrator.services.grant_enforcement.user_experts_enabled",
+                AsyncMock(return_value=True),
             )
         )
         stack.enter_context(
             patch(
-                "orchestrator.main._resolve_runner_grants",
+                "orchestrator.services.grant_enforcement.resolve_runner_grants",
                 AsyncMock(return_value=grants),
             )
         )
@@ -412,18 +418,22 @@ class TestPredictionIsLabelled:
         fake_db.get_agent = AsyncMock(return_value={**_AGENT_ROW, "status": "offline"})
         http_patch, calls = _agent_http({})
         with (
-            patch("orchestrator.main.require_approved_user", _approved(user_a)),
+            patch(
+                "orchestrator.security.auth.require_approved_user", _approved(user_a)
+            ),
             patch(
                 "orchestrator.security.access.require_approved_user",
                 AsyncMock(return_value=user_a),
             ),
-            patch("orchestrator.main.postgres_db", fake_db),
+            patch("orchestrator.main.app.state.resources.postgres_db", fake_db),
             patch(f"{_TOOL_VIEW}.is_experts_db_enabled", MagicMock(return_value=True)),
             patch(
-                "orchestrator.main._user_experts_enabled", AsyncMock(return_value=True)
+                "orchestrator.services.grant_enforcement.user_experts_enabled",
+                AsyncMock(return_value=True),
             ),
             patch(
-                "orchestrator.main._resolve_runner_grants", AsyncMock(return_value=None)
+                "orchestrator.services.grant_enforcement.resolve_runner_grants",
+                AsyncMock(return_value=None),
             ),
             http_patch,
         ):
@@ -453,18 +463,22 @@ class TestPredictionIsLabelled:
             }
         )
         with (
-            patch("orchestrator.main.require_approved_user", _approved(user_a)),
+            patch(
+                "orchestrator.security.auth.require_approved_user", _approved(user_a)
+            ),
             patch(
                 "orchestrator.security.access.require_approved_user",
                 AsyncMock(return_value=user_a),
             ),
-            patch("orchestrator.main.postgres_db", fake_db),
+            patch("orchestrator.main.app.state.resources.postgres_db", fake_db),
             patch(f"{_TOOL_VIEW}.is_experts_db_enabled", MagicMock(return_value=True)),
             patch(
-                "orchestrator.main._user_experts_enabled", AsyncMock(return_value=True)
+                "orchestrator.services.grant_enforcement.user_experts_enabled",
+                AsyncMock(return_value=True),
             ),
             patch(
-                "orchestrator.main._resolve_runner_grants", AsyncMock(return_value=None)
+                "orchestrator.services.grant_enforcement.resolve_runner_grants",
+                AsyncMock(return_value=None),
             ),
             http_patch,
         ):
@@ -625,18 +639,21 @@ class TestUnavailableCarriesAReason:
         D1 violation, so a lookup failure must read as no restriction."""
         fake_db.get_thread = AsyncMock(return_value=_thread())
         with (
-            patch("orchestrator.main.require_approved_user", _approved(user_a)),
+            patch(
+                "orchestrator.security.auth.require_approved_user", _approved(user_a)
+            ),
             patch(
                 "orchestrator.security.access.require_approved_user",
                 AsyncMock(return_value=user_a),
             ),
-            patch("orchestrator.main.postgres_db", fake_db),
+            patch("orchestrator.main.app.state.resources.postgres_db", fake_db),
             patch(f"{_TOOL_VIEW}.is_experts_db_enabled", MagicMock(return_value=True)),
             patch(
-                "orchestrator.main._user_experts_enabled", AsyncMock(return_value=True)
+                "orchestrator.services.grant_enforcement.user_experts_enabled",
+                AsyncMock(return_value=True),
             ),
             patch(
-                "orchestrator.main._resolve_runner_grants",
+                "orchestrator.services.grant_enforcement.resolve_runner_grants",
                 AsyncMock(side_effect=RuntimeError("db down")),
             ),
         ):
@@ -668,18 +685,22 @@ class TestResolveFailureWithAMeasurement:
             }
         )
         with (
-            patch("orchestrator.main.require_approved_user", _approved(user_a)),
+            patch(
+                "orchestrator.security.auth.require_approved_user", _approved(user_a)
+            ),
             patch(
                 "orchestrator.security.access.require_approved_user",
                 AsyncMock(return_value=user_a),
             ),
-            patch("orchestrator.main.postgres_db", fake_db),
+            patch("orchestrator.main.app.state.resources.postgres_db", fake_db),
             patch(f"{_TOOL_VIEW}.is_experts_db_enabled", MagicMock(return_value=True)),
             patch(
-                "orchestrator.main._user_experts_enabled", AsyncMock(return_value=True)
+                "orchestrator.services.grant_enforcement.user_experts_enabled",
+                AsyncMock(return_value=True),
             ),
             patch(
-                "orchestrator.main._resolve_runner_grants", AsyncMock(return_value=None)
+                "orchestrator.services.grant_enforcement.resolve_runner_grants",
+                AsyncMock(return_value=None),
             ),
             patch(
                 f"{_TOOL_VIEW}.merged_session_tool_policy",
@@ -701,10 +722,13 @@ class TestPreviewEndpoint:
     @pytest.mark.asyncio
     async def test_always_a_prediction(self, user_a, fake_db, fake_request):
         with (
-            patch("orchestrator.main.require_approved_user", _approved(user_a)),
-            patch("orchestrator.main.postgres_db", fake_db),
             patch(
-                "orchestrator.main._resolve_runner_grants", AsyncMock(return_value=None)
+                "orchestrator.security.auth.require_approved_user", _approved(user_a)
+            ),
+            patch("orchestrator.main.app.state.resources.postgres_db", fake_db),
+            patch(
+                "orchestrator.services.grant_enforcement.resolve_runner_grants",
+                AsyncMock(return_value=None),
             ),
         ):
             result = await _preview_tool_groups(
@@ -719,10 +743,13 @@ class TestPreviewEndpoint:
     @pytest.mark.asyncio
     async def test_reflects_the_requested_override(self, user_a, fake_db, fake_request):
         with (
-            patch("orchestrator.main.require_approved_user", _approved(user_a)),
-            patch("orchestrator.main.postgres_db", fake_db),
             patch(
-                "orchestrator.main._resolve_runner_grants", AsyncMock(return_value=None)
+                "orchestrator.security.auth.require_approved_user", _approved(user_a)
+            ),
+            patch("orchestrator.main.app.state.resources.postgres_db", fake_db),
+            patch(
+                "orchestrator.services.grant_enforcement.resolve_runner_grants",
+                AsyncMock(return_value=None),
             ),
         ):
             on = await _preview_tool_groups(
@@ -762,10 +789,13 @@ class TestPreviewEndpoint:
         defaulting a worker request to ``session_base``.
         """
         with (
-            patch("orchestrator.main.require_approved_user", _approved(user_a)),
-            patch("orchestrator.main.postgres_db", fake_db),
             patch(
-                "orchestrator.main._resolve_runner_grants", AsyncMock(return_value=None)
+                "orchestrator.security.auth.require_approved_user", _approved(user_a)
+            ),
+            patch("orchestrator.main.app.state.resources.postgres_db", fake_db),
+            patch(
+                "orchestrator.services.grant_enforcement.resolve_runner_grants",
+                AsyncMock(return_value=None),
             ),
         ):
             session = await _preview_tool_groups(
@@ -804,10 +834,13 @@ class TestPreviewEndpoint:
             return {}, {}
 
         with (
-            patch("orchestrator.main.require_approved_user", _approved(user_a)),
-            patch("orchestrator.main.postgres_db", fake_db),
             patch(
-                "orchestrator.main._resolve_runner_grants", AsyncMock(return_value=None)
+                "orchestrator.security.auth.require_approved_user", _approved(user_a)
+            ),
+            patch("orchestrator.main.app.state.resources.postgres_db", fake_db),
+            patch(
+                "orchestrator.services.grant_enforcement.resolve_runner_grants",
+                AsyncMock(return_value=None),
             ),
             patch(
                 f"{_TOOL_VIEW}.merged_session_tool_policy",
@@ -877,8 +910,10 @@ class TestPreviewEndpoint:
         from fastapi import HTTPException
 
         with (
-            patch("orchestrator.main.require_approved_user", _approved(user_a)),
-            patch("orchestrator.main.postgres_db", fake_db),
+            patch(
+                "orchestrator.security.auth.require_approved_user", _approved(user_a)
+            ),
+            patch("orchestrator.main.app.state.resources.postgres_db", fake_db),
             patch(
                 f"{_TOOL_VIEW}.merged_session_tool_policy",
                 MagicMock(side_effect=RuntimeError("boom")),
@@ -896,10 +931,10 @@ class TestPreviewEndpoint:
 
         with (
             patch(
-                "orchestrator.main.require_approved_user",
+                "orchestrator.security.auth.require_approved_user",
                 AsyncMock(side_effect=HTTPException(status_code=403)),
             ),
-            patch("orchestrator.main.postgres_db", fake_db),
+            patch("orchestrator.main.app.state.resources.postgres_db", fake_db),
         ):
             with pytest.raises(HTTPException) as exc:
                 await _preview_tool_groups(ToolGroupPreviewRequest(), fake_request)
@@ -925,10 +960,13 @@ class TestEnumerateOnlyRidesBothReads:
     @pytest.mark.asyncio
     async def test_the_preview_read_serves_it(self, user_a, fake_db, fake_request):
         with (
-            patch("orchestrator.main.require_approved_user", _approved(user_a)),
-            patch("orchestrator.main.postgres_db", fake_db),
             patch(
-                "orchestrator.main._resolve_runner_grants", AsyncMock(return_value=None)
+                "orchestrator.security.auth.require_approved_user", _approved(user_a)
+            ),
+            patch("orchestrator.main.app.state.resources.postgres_db", fake_db),
+            patch(
+                "orchestrator.services.grant_enforcement.resolve_runner_grants",
+                AsyncMock(return_value=None),
             ),
         ):
             result = await _preview_tool_groups(
@@ -972,18 +1010,19 @@ class TestPreviewModelsTheLegacyPathToo:
 
     async def _preview(self, user, db, req, *, experts, override=None):
         with (
-            patch("orchestrator.main.require_approved_user", _approved(user)),
-            patch("orchestrator.main.postgres_db", db),
+            patch("orchestrator.security.auth.require_approved_user", _approved(user)),
+            patch("orchestrator.main.app.state.resources.postgres_db", db),
             patch(
                 f"{_TOOL_VIEW}.is_experts_db_enabled",
                 MagicMock(return_value=experts),
             ),
             patch(
-                "orchestrator.main._user_experts_enabled",
+                "orchestrator.services.grant_enforcement.user_experts_enabled",
                 AsyncMock(return_value=experts),
             ),
             patch(
-                "orchestrator.main._resolve_runner_grants", AsyncMock(return_value=None)
+                "orchestrator.services.grant_enforcement.resolve_runner_grants",
+                AsyncMock(return_value=None),
             ),
         ):
             return await _preview_tool_groups(
@@ -1061,18 +1100,22 @@ class TestOneDeadlineForTheWholeProbe:
         fake_db.get_agent = AsyncMock(return_value=_AGENT_ROW)
         started = asyncio.get_event_loop().time()
         with (
-            patch("orchestrator.main.require_approved_user", _approved(user_a)),
+            patch(
+                "orchestrator.security.auth.require_approved_user", _approved(user_a)
+            ),
             patch(
                 "orchestrator.security.access.require_approved_user",
                 AsyncMock(return_value=user_a),
             ),
-            patch("orchestrator.main.postgres_db", fake_db),
+            patch("orchestrator.main.app.state.resources.postgres_db", fake_db),
             patch(f"{_TOOL_VIEW}.is_experts_db_enabled", MagicMock(return_value=True)),
             patch(
-                "orchestrator.main._user_experts_enabled", AsyncMock(return_value=True)
+                "orchestrator.services.grant_enforcement.user_experts_enabled",
+                AsyncMock(return_value=True),
             ),
             patch(
-                "orchestrator.main._resolve_runner_grants", AsyncMock(return_value=None)
+                "orchestrator.services.grant_enforcement.resolve_runner_grants",
+                AsyncMock(return_value=None),
             ),
             # R1.B05 moved the probe to `services/agent_toolset_probe`, which
             # reads its own module constant. Patching the budget on `main`
@@ -1097,18 +1140,22 @@ class TestOneDeadlineForTheWholeProbe:
         fake_db.get_agent = AsyncMock(return_value={**_AGENT_ROW, "status": "booting"})
         http_patch, calls = _agent_http({})
         with (
-            patch("orchestrator.main.require_approved_user", _approved(user_a)),
+            patch(
+                "orchestrator.security.auth.require_approved_user", _approved(user_a)
+            ),
             patch(
                 "orchestrator.security.access.require_approved_user",
                 AsyncMock(return_value=user_a),
             ),
-            patch("orchestrator.main.postgres_db", fake_db),
+            patch("orchestrator.main.app.state.resources.postgres_db", fake_db),
             patch(f"{_TOOL_VIEW}.is_experts_db_enabled", MagicMock(return_value=True)),
             patch(
-                "orchestrator.main._user_experts_enabled", AsyncMock(return_value=True)
+                "orchestrator.services.grant_enforcement.user_experts_enabled",
+                AsyncMock(return_value=True),
             ),
             patch(
-                "orchestrator.main._resolve_runner_grants", AsyncMock(return_value=None)
+                "orchestrator.services.grant_enforcement.resolve_runner_grants",
+                AsyncMock(return_value=None),
             ),
             http_patch,
         ):
@@ -1273,16 +1320,18 @@ class TestPreviewRoster:
         )
         with (
             patch(
-                "orchestrator.main.require_approved_user",
+                "orchestrator.security.auth.require_approved_user",
                 AsyncMock(return_value=user_a),
             ),
-            patch("orchestrator.main.postgres_db", fake_db),
+            patch("orchestrator.main.app.state.resources.postgres_db", fake_db),
             patch(f"{_TOOL_VIEW}.is_experts_db_enabled", MagicMock(return_value=True)),
             patch(
-                "orchestrator.main._user_experts_enabled", AsyncMock(return_value=True)
+                "orchestrator.services.grant_enforcement.user_experts_enabled",
+                AsyncMock(return_value=True),
             ),
             patch(
-                "orchestrator.main._resolve_runner_grants", AsyncMock(return_value=None)
+                "orchestrator.services.grant_enforcement.resolve_runner_grants",
+                AsyncMock(return_value=None),
             ),
         ):
             with_roster = await _preview_tool_groups(
@@ -1311,9 +1360,12 @@ async def test_explicit_workspace_preview_overrides_expert_recommendation(
         None if backend == "none" else {"template": {"inline": {"backend": backend}}}
     )
     with (
-        patch("orchestrator.main.require_approved_user", _approved(user_a)),
-        patch("orchestrator.main.postgres_db", fake_db),
-        patch("orchestrator.main._resolve_runner_grants", AsyncMock(return_value=None)),
+        patch("orchestrator.security.auth.require_approved_user", _approved(user_a)),
+        patch("orchestrator.main.app.state.resources.postgres_db", fake_db),
+        patch(
+            "orchestrator.services.grant_enforcement.resolve_runner_grants",
+            AsyncMock(return_value=None),
+        ),
     ):
         result = await _preview_tool_groups(
             ToolGroupPreviewRequest(

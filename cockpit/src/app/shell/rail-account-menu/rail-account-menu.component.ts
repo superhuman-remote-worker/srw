@@ -3,16 +3,16 @@ import {Router} from '@angular/router';
 import {TranslocoPipe} from '@jsverse/transloco';
 import {AppMenuComponent, AppMenuItemComponent, AppMenuTriggerDirective} from '../../ui/menu';
 import {UserService} from '../../core/services/user.service';
-import {environment} from '../../core/environment';
+import {ViewportService} from '../../core/services/viewport.service';
 
 /**
- * The rail's avatar flyout — the split rule's instance-facing half (see
- * RailMoreMenuComponent for the "what the agent uses" half).
+ * The rail's avatar flyout: Settings, the Workbench (desktop only), Log out.
  *
- * Holds what is about the signed-in user and this instance: Settings, API
- * keys, SSH keys, then — gated on is_admin — Admin, then Log out. The
- * /admin/* routes carry their own adminGuard; hiding the entry here for a
- * non-admin is UX, not the access-control boundary.
+ * Settings is the one door to everything about you and this instance — API
+ * and SSH keys, and for admins the Administration group — because Settings
+ * takes over the rail and lists them itself (navigation_fixed_rail.md F4).
+ * The Workbench moved here from the retired More menu (F6): it is an
+ * operator surface, kept out of the primary rows a first-time user reads.
  */
 @Component({
   selector: 'app-rail-account-menu',
@@ -26,12 +26,8 @@ import {environment} from '../../core/environment';
       </button>
       <app-menu #accountMenu>
         <app-menu-item (activated)="go('/settings')">{{ 'nav.settings' | transloco }}</app-menu-item>
-        <app-menu-item (activated)="go('/settings/api-keys')">{{ 'nav.apiKeys' | transloco }}</app-menu-item>
-        @if (externalClientsEnabled) {
-          <app-menu-item (activated)="go('/settings/ssh-keys')">{{ 'nav.sshKeys' | transloco }}</app-menu-item>
-        }
-        @if (showAdmin()) {
-          <app-menu-item class="menu-divider" (activated)="go('/admin/models')">{{ 'nav.admin' | transloco }}</app-menu-item>
+        @if (showWorkbench()) {
+          <app-menu-item (activated)="go('/workbench')">{{ 'nav.workbench' | transloco }}</app-menu-item>
         }
         <app-menu-item class="menu-divider" (activated)="logout()">{{ 'nav.logout' | transloco }}</app-menu-item>
       </app-menu>
@@ -98,11 +94,13 @@ import {environment} from '../../core/environment';
   `],
 })
 export class RailAccountMenuComponent {
-  readonly externalClientsEnabled = environment.externalClientsEnabled;
   protected readonly userService = inject(UserService);
+  private readonly viewport = inject(ViewportService);
   private readonly router = inject(Router);
 
-  readonly showAdmin = computed(() => this.userService.currentUser()?.is_admin === true);
+  /** The Workbench is a multi-panel desktop surface; gated exactly as the
+   *  More menu's entry was. */
+  readonly showWorkbench = computed(() => !this.viewport.isMobile());
 
   go(path: string): void {
     this.router.navigate([path]);

@@ -1088,7 +1088,7 @@ class TestReadAloudSettingsValidation:
     sub-object (level enum + prompt length) — 422 before it reaches the DB."""
 
     def test_valid_read_aloud_accepted_and_normalized(self):
-        from orchestrator.main import UserSettingsUpdate
+        from orchestrator.routers.preferences import UserSettingsUpdate
 
         m = UserSettingsUpdate(
             read_aloud={"reasoning_level": "HIGH", "custom_prompt": "skip tables"}
@@ -1096,19 +1096,19 @@ class TestReadAloudSettingsValidation:
         assert m.read_aloud["reasoning_level"] == "high"  # lowercased
 
     def test_bad_level_rejected(self):
-        from orchestrator.main import UserSettingsUpdate
+        from orchestrator.routers.preferences import UserSettingsUpdate
 
         with pytest.raises(Exception):
             UserSettingsUpdate(read_aloud={"reasoning_level": "ultra"})
 
     def test_overlong_prompt_rejected(self):
-        from orchestrator.main import UserSettingsUpdate
+        from orchestrator.routers.preferences import UserSettingsUpdate
 
         with pytest.raises(Exception):
             UserSettingsUpdate(read_aloud={"custom_prompt": "z" * 1001})
 
     def test_prompt_at_cap_accepted(self):
-        from orchestrator.main import UserSettingsUpdate
+        from orchestrator.routers.preferences import UserSettingsUpdate
 
         UserSettingsUpdate(read_aloud={"custom_prompt": "z" * 1000})
 

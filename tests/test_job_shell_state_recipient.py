@@ -7,10 +7,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from fastapi import HTTPException
 
-from orchestrator import main
 from orchestrator.routers import job_diagnostics as job_diagnostics_routes
 from orchestrator.services import job_diagnostics as job_diagnostics_operations
 from agent.api.models import PinnedJobRecipient
+from orchestrator.services import job_mutation_target as job_mutation_target_module
 
 
 AGENT_ID = "11111111-1111-4111-8111-111111111111"
@@ -167,7 +167,7 @@ def _owner_route_dependencies(prepare):
 @pytest.mark.asyncio
 async def test_owner_route_uses_fresh_recipient_and_exact_agent_endpoint():
     recipient = _recipient()
-    target = main._PinnedJobMutationTarget(
+    target = job_mutation_target_module.PinnedJobMutationTarget(
         agent={"pod_ip": "10.0.0.9", "pod_port": 8001},
         recipient=recipient,
     )

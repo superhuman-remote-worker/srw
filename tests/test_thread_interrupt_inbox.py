@@ -594,9 +594,9 @@ async def test_stateless_route_returns_admission_only(monkeypatch):
 
 
 def test_event_pruner_preserves_pending_interrupt_receipts():
-    import orchestrator.main as orch_main
+    from orchestrator.services import retention_sweepers
 
-    source = inspect.getsource(orch_main.thread_events_prune_sweeper)
+    source = inspect.getsource(retention_sweepers.thread_events_prune_sweeper)
     assert source.count("request.id = thread_events.interrupt_request_id") == 2
     assert source.count("FROM thread_interrupt_requests request") == 2
     assert source.count("request.outcome = 'applied'") == 2

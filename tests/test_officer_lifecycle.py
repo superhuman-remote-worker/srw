@@ -62,6 +62,20 @@ from orchestrator.services.officer_post_views import (
 )
 from orchestrator.services.persistent_recycler import PersistentRecycleResult
 from tests._route_inventory import mounted_routes
+from orchestrator.application import controls as controls_composition
+from orchestrator.application import sessions as sessions_composition
+from orchestrator.application.resources import bound
+from orchestrator.services import officer_conference as officer_conference_module
+from orchestrator.services import (
+    officer_post_lifecycle as officer_post_lifecycle_module,
+)
+from orchestrator.services import (
+    persistent_provisioner as persistent_provisioner_module,
+)
+from orchestrator.services import pinned_retirement as pinned_retirement_module
+from orchestrator.services import session_wake as session_wake_module
+from orchestrator.services import thread_admission as thread_admission_module
+from orchestrator.services import thread_retirement as thread_retirement_module
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCHEMA_FILE = REPO_ROOT / "src" / "orchestrator" / "database" / "schema_current.sql"
@@ -495,7 +509,7 @@ def db(monkeypatch):
     db.user_can_run_unattended_operations = AsyncMock(return_value=True)
     # ``_end_thread_flow`` is still main's, and TestEndThreadReroute drives it
     # through this global.
-    monkeypatch.setattr(orch_main, "postgres_db", db)
+    monkeypatch.setattr(orch_main.app.state.resources, "postgres_db", db)
     return db
 
 
@@ -509,17 +523,23 @@ def deps(db) -> OfficerPostLifecycleDependencies:
     reaches the operation."""
     return OfficerPostLifecycleDependencies(
         store=db,
-        persistent_provisioner=orch_main.persistent_provisioner,
-        persistent_thread_recycler=orch_main._persistent_thread_recycler,
+        persistent_provisioner=persistent_provisioner_module.persistent_provisioner,
+        persistent_thread_recycler=orch_main.app.state.resources.persistent_thread_recycler,
         policy=OfficerPostPolicyDependencies(
             auto_pull_release_enabled=(
-                lambda: orch_main.OFFICER_AUTO_PULL_RELEASE_ENABLED
+                lambda: orch_main.app.state.resources.settings.officer_auto_pull_release_enabled
             )
         ),
-        kick_officer_event_drain=orch_main._kick_officer_event_drain,
-        deliver_officer_note=orch_main._deliver_officer_note,
-        create_thread=orch_main.create_thread,
-        end_thread_flow=orch_main._end_thread_flow,
+        kick_officer_event_drain=session_wake_module.kick_event_drain,
+        deliver_officer_note=session_wake_module.deliver_officer_note,
+        create_thread=bound(
+            thread_admission_module.create_thread,
+            sessions_composition.thread_admission_dependencies,
+            orch_main.app.state.resources,
+        ),
+        end_thread_flow=controls_composition.thread_retirement_operations(
+            orch_main.app.state.resources
+        ).end_thread_flow,
     )
 
 
@@ -1651,12 +1671,12 @@ class TestEndThreadReroute:
         db.reserve_pinned_thread_idle_terminal_end = AsyncMock(return_value="none")
         db.fetchrow = AsyncMock(return_value=None)
         monkeypatch.setattr(
-            orch_main.PinnedRetirementOperations,
+            pinned_retirement_module.PinnedRetirementOperations,
             "pinned_retirement_is_current",
             AsyncMock(return_value=True),
         )
         monkeypatch.setattr(
-            orch_main.PinnedRetirementOperations,
+            pinned_retirement_module.PinnedRetirementOperations,
             "cleanup_pinned_thread_retirement",
             AsyncMock(),
         )
@@ -1668,16 +1688,18 @@ class TestEndThreadReroute:
         """The officer branch of ``end_thread``'s stand-down IS decommission
         step 2-3-5 (officer_post.md §5) — reason 'retired' by default."""
         monkeypatch.setattr(
-            orch_main.thread_retirement_operations,
+            thread_retirement_module,
             "thread_turn_in_flight",
             AsyncMock(return_value=False),
         )
         monkeypatch.setattr(
-            orch_main.thread_retirement_operations,
+            thread_retirement_module,
             "release_thread_resources",
             AsyncMock(),
         )
-        monkeypatch.setattr(orch_main, "_conclude_conference_if_any", AsyncMock())
+        monkeypatch.setattr(
+            officer_conference_module, "conclude_conference_if_any", AsyncMock()
+        )
         db.get_project_officer = AsyncMock(return_value=_post_row(thread_id=THREAD_ID))
         db.decommission_project_officer = AsyncMock(
             return_value={
@@ -1697,9 +1719,9 @@ class TestEndThreadReroute:
         thread["metadata"]["officer_state"] = {"pages": {"count": 1}}
         db.get_thread = AsyncMock(return_value=thread)
 
-        out = await orch_main._end_thread_flow(
-            THREAD_ID, thread, permanent=False, force=False
-        )
+        out = await controls_composition.thread_retirement_operations(
+            orch_main.app.state.resources
+        ).end_thread_flow(THREAD_ID, thread, permanent=False, force=False)
 
         assert out == {"status": "ended"}
         # The post handoff and server-owned runtime disable are one database
@@ -1731,18 +1753,20 @@ class TestEndThreadReroute:
     @pytest.mark.asyncio
     async def test_authoritative_handoff_failure_blocks_the_end(self, db, monkeypatch):
         monkeypatch.setattr(
-            orch_main.thread_retirement_operations,
+            thread_retirement_module,
             "thread_turn_in_flight",
             AsyncMock(return_value=False),
         )
         monkeypatch.setattr(
-            orch_main.thread_retirement_operations,
+            thread_retirement_module,
             "release_thread_resources",
             AsyncMock(),
         )
-        monkeypatch.setattr(orch_main, "_conclude_conference_if_any", AsyncMock())
         monkeypatch.setattr(
-            orch_main.officer_post_lifecycle_service,
+            officer_conference_module, "conclude_conference_if_any", AsyncMock()
+        )
+        monkeypatch.setattr(
+            officer_post_lifecycle_module,
             "decommission_officer_post",
             AsyncMock(side_effect=RuntimeError("post table on fire")),
         )
@@ -1750,9 +1774,9 @@ class TestEndThreadReroute:
         thread = _officer_thread(execution_lane="pinned")
         db.get_thread = AsyncMock(return_value=thread)
         with pytest.raises(RuntimeError, match="post table on fire"):
-            await orch_main._end_thread_flow(
-                THREAD_ID, thread, permanent=False, force=False
-            )
+            await controls_composition.thread_retirement_operations(
+                orch_main.app.state.resources
+            ).end_thread_flow(THREAD_ID, thread, permanent=False, force=False)
         db.end_thread.assert_not_awaited()
         db.settle_pinned_thread_retirement.assert_not_awaited()
 
@@ -1778,21 +1802,25 @@ class TestEndThreadReroute:
             }
         )
         monkeypatch.setattr(
-            orch_main.thread_retirement_operations,
+            thread_retirement_module,
             "thread_turn_in_flight",
             AsyncMock(return_value=False),
         )
         release = AsyncMock()
         conclude = AsyncMock()
         monkeypatch.setattr(
-            orch_main.thread_retirement_operations, "release_thread_resources", release
+            thread_retirement_module, "release_thread_resources", release
         )
-        monkeypatch.setattr(orch_main, "_conclude_conference_if_any", conclude)
+        monkeypatch.setattr(
+            officer_conference_module, "conclude_conference_if_any", conclude
+        )
         db.end_thread = AsyncMock()
         thread = _officer_thread(execution_lane="pinned")
         db.get_thread = AsyncMock(return_value=thread)
 
-        out = await orch_main._end_thread_flow(
+        out = await controls_composition.thread_retirement_operations(
+            orch_main.app.state.resources
+        ).end_thread_flow(
             THREAD_ID,
             thread,
             permanent=False,
@@ -1827,21 +1855,25 @@ class TestEndThreadReroute:
             }
         )
         monkeypatch.setattr(
-            orch_main.thread_retirement_operations,
+            thread_retirement_module,
             "thread_turn_in_flight",
             AsyncMock(return_value=False),
         )
         monkeypatch.setattr(
-            orch_main.thread_retirement_operations,
+            thread_retirement_module,
             "release_thread_resources",
             AsyncMock(),
         )
-        monkeypatch.setattr(orch_main, "_conclude_conference_if_any", AsyncMock())
+        monkeypatch.setattr(
+            officer_conference_module, "conclude_conference_if_any", AsyncMock()
+        )
         db.end_thread = AsyncMock()
         thread = _officer_thread(execution_lane="pinned")
         db.get_thread = AsyncMock(return_value=thread)
 
-        out = await orch_main._end_thread_flow(
+        out = await controls_composition.thread_retirement_operations(
+            orch_main.app.state.resources
+        ).end_thread_flow(
             THREAD_ID,
             thread,
             permanent=False,
@@ -1859,16 +1891,18 @@ class TestEndThreadReroute:
     ):
         """Both public controls reach the same post/thread transaction."""
         monkeypatch.setattr(
-            orch_main.thread_retirement_operations,
+            thread_retirement_module,
             "thread_turn_in_flight",
             AsyncMock(return_value=False),
         )
         monkeypatch.setattr(
-            orch_main.thread_retirement_operations,
+            thread_retirement_module,
             "release_thread_resources",
             AsyncMock(),
         )
-        monkeypatch.setattr(orch_main, "_conclude_conference_if_any", AsyncMock())
+        monkeypatch.setattr(
+            officer_conference_module, "conclude_conference_if_any", AsyncMock()
+        )
         db.get_or_create_project_officer = AsyncMock(
             return_value=_post_row(thread_id=THREAD_ID)
         )
@@ -1890,7 +1924,9 @@ class TestEndThreadReroute:
             }
         )
 
-        await orch_main._end_thread_flow(
+        await controls_composition.thread_retirement_operations(
+            orch_main.app.state.resources
+        ).end_thread_flow(
             THREAD_ID,
             thread,
             permanent=False,
@@ -2007,19 +2043,21 @@ class TestEndThreadReroute:
     @pytest.mark.asyncio
     async def test_plain_session_end_skips_officer_hygiene(self, db, monkeypatch):
         monkeypatch.setattr(
-            orch_main.thread_retirement_operations,
+            thread_retirement_module,
             "thread_turn_in_flight",
             AsyncMock(return_value=False),
         )
         monkeypatch.setattr(
-            orch_main.thread_retirement_operations,
+            thread_retirement_module,
             "release_thread_resources",
             AsyncMock(),
         )
-        monkeypatch.setattr(orch_main, "_conclude_conference_if_any", AsyncMock())
+        monkeypatch.setattr(
+            officer_conference_module, "conclude_conference_if_any", AsyncMock()
+        )
         hygiene = AsyncMock()
         monkeypatch.setattr(
-            orch_main.officer_post_lifecycle_service,
+            officer_post_lifecycle_module,
             "decommission_officer_post",
             hygiene,
         )
@@ -2034,7 +2072,9 @@ class TestEndThreadReroute:
             "metadata": {},
         }
         db.get_thread = AsyncMock(return_value=plain)
-        await orch_main._end_thread_flow(THREAD_ID, plain, permanent=False, force=False)
+        await controls_composition.thread_retirement_operations(
+            orch_main.app.state.resources
+        ).end_thread_flow(THREAD_ID, plain, permanent=False, force=False)
         hygiene.assert_not_awaited()
         db.merge_thread_config_override.assert_not_awaited()
 

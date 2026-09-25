@@ -33,6 +33,7 @@ from orchestrator.security.access import (
     require_job_access,
     require_thread_owner,
 )
+from orchestrator.application import administration as administration_composition
 
 
 def _patch_auth(user: dict):
@@ -231,16 +232,19 @@ def _patch_main(user: dict, db):
 
     stack = ExitStack()
     stack.enter_context(
-        patch("orchestrator.main.require_approved_user", AsyncMock(return_value=user))
+        patch(
+            "orchestrator.security.auth.require_approved_user",
+            AsyncMock(return_value=user),
+        )
     )
-    stack.enter_context(patch("orchestrator.main.postgres_db", db))
+    stack.enter_context(patch("orchestrator.main.app.state.resources.postgres_db", db))
     return stack
 
 
 class TestAdminEndpoint:
     @pytest.mark.asyncio
     async def test_admin_lists_events(self, user_admin, fake_db, fake_request):
-        from orchestrator.main import _user_administration_dependencies
+        import orchestrator.main
         from orchestrator.routers.user_administration import (
             admin_list_security_events,
         )
@@ -252,7 +256,9 @@ class TestAdminEndpoint:
             out = await admin_list_security_events(
                 fake_request,
                 limit=10,
-                dependencies=_user_administration_dependencies(),
+                dependencies=administration_composition.user_administration_dependencies(
+                    orchestrator.main.app.state.resources
+                ),
             )
         assert out["count"] == 1
         fake_db.list_security_events.assert_awaited_once_with(
@@ -262,7 +268,7 @@ class TestAdminEndpoint:
     @pytest.mark.asyncio
     async def test_non_admin_denied_and_audited(self, user_a, fake_db, fake_request):
         """The gate guarding the audit log itself writes an admin_denied event."""
-        from orchestrator.main import _user_administration_dependencies
+        import orchestrator.main
         from orchestrator.routers.user_administration import (
             admin_list_security_events,
         )
@@ -271,7 +277,9 @@ class TestAdminEndpoint:
             with pytest.raises(HTTPException) as exc:
                 await admin_list_security_events(
                     fake_request,
-                    dependencies=_user_administration_dependencies(),
+                    dependencies=administration_composition.user_administration_dependencies(
+                        orchestrator.main.app.state.resources
+                    ),
                 )
         assert exc.value.status_code == 403
         kwargs = _event_kwargs(fake_db)
@@ -280,7 +288,7 @@ class TestAdminEndpoint:
 
     @pytest.mark.asyncio
     async def test_bad_since_is_400(self, user_admin, fake_db, fake_request):
-        from orchestrator.main import _user_administration_dependencies
+        import orchestrator.main
         from orchestrator.routers.user_administration import (
             admin_list_security_events,
         )
@@ -290,6 +298,8 @@ class TestAdminEndpoint:
                 await admin_list_security_events(
                     fake_request,
                     since="not-a-date",
-                    dependencies=_user_administration_dependencies(),
+                    dependencies=administration_composition.user_administration_dependencies(
+                        orchestrator.main.app.state.resources
+                    ),
                 )
         assert exc.value.status_code == 400

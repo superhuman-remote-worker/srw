@@ -65,6 +65,25 @@ class ProjectRepairState:
     bg_repair_last: dict[str, float] = field(default_factory=dict)
     bg_repair_cooldown_s: float = BG_REPAIR_COOLDOWN_S
 
+    async def drain(self) -> None:
+        """Cancel and await every in-flight background repair (R1.B12).
+
+        The application calls this at shutdown, before its stores close. A
+        repair is re-derived from drift on a later project read, so a cancelled
+        one leaves nothing to hand over. The task set is left empty and usable;
+        the heal locks and the per-key throttle are bookkeeping, not tasks, and
+        are left as they are. The calling task is never cancelled.
+        """
+        current = asyncio.current_task()
+        drained = [task for task in self.bg_repair_tasks if task is not current]
+        pending = [task for task in drained if not task.done()]
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        for task in drained:
+            self.bg_repair_tasks.discard(task)
+
 
 @dataclass(frozen=True)
 class ProjectProvisioningDependencies:

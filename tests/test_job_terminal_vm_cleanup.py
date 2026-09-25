@@ -490,15 +490,11 @@ async def test_slow_snapshot_does_not_block_another_terminal_vm_candidate():
 
 @pytest.mark.asyncio
 async def test_idle_sweep_does_not_wait_for_slow_terminal_cleanup(monkeypatch):
-    import orchestrator.main as orch_main
+    from orchestrator.services import session_provisioner
 
     shutdown = asyncio.Event()
     started = asyncio.Event()
     cancelled = asyncio.Event()
-
-    @asynccontextmanager
-    async def acquire():
-        yield SimpleNamespace(fetchval=AsyncMock(return_value=False))
 
     async def reconcile_session_workspaces(**_kwargs):
         async def finish_cycle():
@@ -515,19 +511,24 @@ async def test_idle_sweep_does_not_wait_for_slow_terminal_cleanup(monkeypatch):
         finally:
             cancelled.set()
 
-    monkeypatch.setattr(orch_main, "postgres_db", SimpleNamespace(acquire=acquire))
     monkeypatch.setattr(
-        orch_main, "reconcile_session_workspaces", reconcile_session_workspaces
-    )
-    monkeypatch.setattr(
-        orch_main,
-        "_job_mutation_operations",
-        lambda: SimpleNamespace(
-            reconcile_terminal_vm_cleanups=slow_reconcile,
-        ),
+        session_provisioner,
+        "reconcile_session_workspaces",
+        reconcile_session_workspaces,
     )
 
-    await asyncio.wait_for(orch_main.workspace_idle_sweeper(shutdown), 1)
+    await asyncio.wait_for(
+        session_provisioner.workspace_idle_sweeper(
+            shutdown,
+            store=SimpleNamespace(),
+            provisioner=SimpleNamespace(),
+            suspension=SimpleNamespace(),
+            terminal_vm_controls_factory=lambda: SimpleNamespace(
+                reconcile_terminal_vm_cleanups=slow_reconcile,
+            ),
+        ),
+        1,
+    )
     assert started.is_set() and cancelled.is_set()
 
 

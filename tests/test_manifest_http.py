@@ -9,6 +9,7 @@ import pytest
 
 from orchestrator.routers.manifests import ManifestDependencies, router
 from orchestrator.services.manifests import ManifestService
+from orchestrator.security import auth as auth_module
 
 
 def manifest():
@@ -274,7 +275,7 @@ async def test_main_mount_uses_the_real_approved_user_dependency(monkeypatch):
     from orchestrator import main
 
     guard = AsyncMock(return_value={"id": "approved-user"})
-    monkeypatch.setattr(main, "require_approved_user", guard)
+    monkeypatch.setattr(auth_module, "require_approved_user", guard)
     async with AsyncClient(
         transport=ASGITransport(app=main.app), base_url="http://test"
     ) as client:
@@ -285,7 +286,7 @@ async def test_main_mount_uses_the_real_approved_user_dependency(monkeypatch):
     assert response.status_code == 200
     assert response.json()["valid"] is True
     guard.assert_awaited_once()
-    assert guard.await_args.args[1] is main.postgres_db
+    assert guard.await_args.args[1] is main.app.state.resources.postgres_db
 
 
 def _secret_project_rows(project_id, owner_id):

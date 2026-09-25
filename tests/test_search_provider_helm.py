@@ -122,6 +122,36 @@ def test_default_enables_searxng_and_disables_crawl4ai() -> None:
     }
 
 
+def test_searxng_settings_keep_upstream_engines_by_default() -> None:
+    settings = yaml.safe_load(
+        _one(_render(), "searxng", "ConfigMap")["data"]["settings.yml"]
+    )
+
+    assert settings["use_default_settings"] is True
+    assert "engines" not in settings
+
+
+def test_searxng_engine_overrides_render_into_settings() -> None:
+    objects = _render(
+        "searxng.engines[0].name=bing",
+        "searxng.engines[0].disabled=false",
+        "searxng.engines[1].name=duckduckgo",
+        "searxng.engines[1].disabled=true",
+    )
+    settings = yaml.safe_load(
+        _one(objects, "searxng", "ConfigMap")["data"]["settings.yml"]
+    )
+
+    # SearXNG merges these by name into its upstream list, so the rendered
+    # list carries only the overrides, never a copy of the defaults.
+    assert settings["use_default_settings"] is True
+    assert settings["engines"] == [
+        {"name": "bing", "disabled": False},
+        {"name": "duckduckgo", "disabled": True},
+    ]
+    assert settings["server"]["limiter"] is False
+
+
 def test_flags_disable_searxng_and_enable_confined_crawl4ai() -> None:
     objects = _render("searxng.enabled=false", "crawl4ai.enabled=true")
 

@@ -33,6 +33,12 @@ from orchestrator.services import cloud_stage_authority
 from orchestrator.services.container_provisioner import WorkspaceRuntimeAttestation
 from orchestrator.services.vm_provisioner import VMTeardownIdentity, VMTeardownResult
 from orchestrator.services.workspace_suspension import WorkspaceSuspensionService
+from orchestrator.application import workspace as workspace_composition
+from orchestrator.services import snapshot_service as snapshot_service_module
+from orchestrator.services import (
+    thread_workspace_delivery as thread_workspace_delivery_module,
+)
+from orchestrator.services import vm_provisioner as vm_provisioner_module
 
 
 # =============================================================================
@@ -54,7 +60,7 @@ async def _owned_lock(*_args, **_kwargs):
 
 def _stage_tasks() -> dict:
     """The application's live stage-task registry slot map."""
-    return orchestrator.main.cloud_task_registry.cloud_stage_tasks
+    return orchestrator.main.app.state.resources.cloud_task_registry.cloud_stage_tasks
 
 
 def _stage_deps(**overrides):
@@ -65,7 +71,10 @@ def _stage_deps(**overrides):
     patched on a module the router never reads.
     """
     return dataclasses.replace(
-        orchestrator.main._agent_cloud_stage_dependencies(), **overrides
+        workspace_composition.agent_cloud_stage_dependencies(
+            orchestrator.main.app.state.resources
+        ),
+        **overrides,
     )
 
 
@@ -88,7 +97,8 @@ class TestCloudStageEndpoint:
         with (
             patch.object(access_module, "_INTERNAL_KEY", "secret"),
             patch(
-                "orchestrator.main._is_protected_cloud_mode_enabled", return_value=False
+                "orchestrator.services.deployment_gates.is_protected_cloud_mode_enabled",
+                return_value=False,
             ),
         ):
             result = await agent_cloud_stage_routes.agent_trigger_cloud_stage(
@@ -108,30 +118,31 @@ class TestCloudStageEndpoint:
         with (
             patch.object(access_module, "_INTERNAL_KEY", "secret"),
             patch(
-                "orchestrator.main._is_protected_cloud_mode_enabled", return_value=True
+                "orchestrator.services.deployment_gates.is_protected_cloud_mode_enabled",
+                return_value=True,
             ),
             patch(
                 "orchestrator.services.cloud_staging.stage.stage_thread_cloud_diff",
                 stage_mock,
             ),
             patch.object(
-                orchestrator.main.postgres_db,
+                orchestrator.main.app.state.resources.postgres_db,
                 "get_thread",
                 AsyncMock(return_value={"id": "thread-1"}),
             ),
             patch.object(
-                orchestrator.main.postgres_db,
+                orchestrator.main.app.state.resources.postgres_db,
                 "get_ro_mount_by_thread",
                 AsyncMock(return_value={"id": "mount-1"}),
             ),
             patch.object(
-                orchestrator.main.postgres_db,
+                orchestrator.main.app.state.resources.postgres_db,
                 "thread_advisory_lock",
                 side_effect=_owned_lock,
             ),
             patch.object(
-                orchestrator.main,
-                "_require_pinned_workspace_credential_owner",
+                thread_workspace_delivery_module,
+                "require_pinned_workspace_credential_owner",
                 AsyncMock(),
             ),
         ):
@@ -156,10 +167,10 @@ class TestCloudStageEndpoint:
 
         stage_mock.assert_awaited_once_with(
             thread_id="thread-1",
-            postgres_db=orchestrator.main.postgres_db,
-            snapshot_service=orchestrator.main.snapshot_service,
+            postgres_db=orchestrator.main.app.state.resources.postgres_db,
+            snapshot_service=snapshot_service_module.snapshot_service,
             authority=_STAGE_AUTHORITY,
-            vm_provisioner=orchestrator.main.vm_provisioner,
+            vm_provisioner=vm_provisioner_module.vm_provisioner,
         )
         # Self-evicts once the task completes.
         assert task_key not in _stage_tasks()
@@ -178,21 +189,22 @@ class TestCloudStageEndpoint:
         with (
             patch.object(access_module, "_INTERNAL_KEY", "secret"),
             patch(
-                "orchestrator.main._is_protected_cloud_mode_enabled", return_value=True
+                "orchestrator.services.deployment_gates.is_protected_cloud_mode_enabled",
+                return_value=True,
             ),
             patch.object(
-                orchestrator.main.postgres_db,
+                orchestrator.main.app.state.resources.postgres_db,
                 "get_thread",
                 AsyncMock(return_value={"id": "thread-1"}),
             ),
             patch.object(
-                orchestrator.main.postgres_db,
+                orchestrator.main.app.state.resources.postgres_db,
                 "get_ro_mount_by_thread",
                 AsyncMock(return_value={"id": "mount-1"}),
             ),
             patch.object(
-                orchestrator.main,
-                "_require_pinned_workspace_credential_owner",
+                thread_workspace_delivery_module,
+                "require_pinned_workspace_credential_owner",
                 AsyncMock(),
             ),
         ):

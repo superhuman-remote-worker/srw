@@ -52,6 +52,10 @@ from fastapi import HTTPException
 
 import orchestrator.main as m
 from orchestrator.services import grant_enforcement
+from orchestrator.application import preparation as preparation_composition
+from orchestrator.security import access as access_module
+from orchestrator.security import auth as auth_module
+from orchestrator.services import grant_enforcement as grant_enforcement_module
 
 _UID = "11111111-1111-1111-1111-111111111111"
 
@@ -62,12 +66,12 @@ def _patch_grants_db(monkeypatch, *, user_rows=None, is_admin=False):
     fake.list_grants_for_scopes = AsyncMock(
         return_value={"user": user_rows or [], "project": [], "global": []}
     )
-    monkeypatch.setattr(m, "postgres_db", fake)
+    monkeypatch.setattr(m.app.state.resources, "postgres_db", fake)
     return fake
 
 
 def test_violations_detail_lists_keys():
-    assert "shell_tools" in m._grant_violations_detail(
+    assert "shell_tools" in grant_enforcement_module.grant_violations_detail(
         ["shell_tools: tools.shell requires the shell_tools grant"]
     )
 
@@ -78,7 +82,9 @@ async def test_enforce_save_grants_admin_bypasses():
     await grant_enforcement.enforce_save_grants(
         {"tools": {"shell": ["ls"]}},
         user={"id": _UID, "is_admin": True},
-        dependencies=m._grant_enforcement_dependencies(),
+        dependencies=preparation_composition.grant_enforcement_dependencies(
+            m.app.state.resources
+        ),
     )
 
 
@@ -89,14 +95,16 @@ async def test_enforce_save_grants_raises_422_for_ungranted(monkeypatch):
         return_value={"user": [], "project": [], "global": []}
     )
     fake.get_projects_for_user = AsyncMock(return_value=[])
-    monkeypatch.setattr(m, "postgres_db", fake)
+    monkeypatch.setattr(m.app.state.resources, "postgres_db", fake)
     with pytest.raises(HTTPException) as ei:
         await grant_enforcement.enforce_save_grants(
             {"tools": {"shell": ["ls"]}},
             user={"id": _UID, "is_admin": False},
             # Built after the store is swapped, the way the composition root
             # builds it per call.
-            dependencies=m._grant_enforcement_dependencies(),
+            dependencies=preparation_composition.grant_enforcement_dependencies(
+                m.app.state.resources
+            ),
         )
     assert ei.value.status_code == 422 and "shell_tools" in str(ei.value.detail)
 
@@ -104,9 +112,14 @@ async def test_enforce_save_grants_raises_422_for_ungranted(monkeypatch):
 @pytest.mark.asyncio
 async def test_enforce_dispatch_grants_raises_grantdenied(monkeypatch):
     _patch_grants_db(monkeypatch)
-    with pytest.raises(m.GrantDenied) as ei:
-        await m._enforce_dispatch_grants(
-            {"tools": {"shell": ["ls"]}}, runner_user_id=_UID, project_ids=[]
+    with pytest.raises(grant_enforcement_module.GrantDenied) as ei:
+        await grant_enforcement_module.enforce_dispatch_grants(
+            {"tools": {"shell": ["ls"]}},
+            runner_user_id=_UID,
+            project_ids=[],
+            dependencies=preparation_composition.grant_enforcement_dependencies(
+                m.app.state.resources
+            ),
         )
     assert "shell_tools" in str(ei.value)
 
@@ -115,8 +128,13 @@ async def test_enforce_dispatch_grants_raises_grantdenied(monkeypatch):
 async def test_enforce_dispatch_grants_admin_bypass(monkeypatch):
     _patch_grants_db(monkeypatch, is_admin=True)
     # No violation despite ungranted shell — admin runner bypasses.
-    await m._enforce_dispatch_grants(
-        {"tools": {"shell": ["ls"]}}, runner_user_id=_UID, project_ids=[]
+    await grant_enforcement_module.enforce_dispatch_grants(
+        {"tools": {"shell": ["ls"]}},
+        runner_user_id=_UID,
+        project_ids=[],
+        dependencies=preparation_composition.grant_enforcement_dependencies(
+            m.app.state.resources
+        ),
     )
 
 
@@ -130,33 +148,42 @@ async def test_enforce_dispatch_grants_allows_when_granted(monkeypatch):
         ],
     )
     # Granted shell + delegation -> the worker-base-shaped fragment passes.
-    await m._enforce_dispatch_grants(
+    await grant_enforcement_module.enforce_dispatch_grants(
         {"tools": {"shell": ["ls"], "delegation": ["delegate_agent"]}},
         runner_user_id=_UID,
         project_ids=[],
+        dependencies=preparation_composition.grant_enforcement_dependencies(
+            m.app.state.resources
+        ),
     )
 
 
 @pytest.mark.asyncio
 async def test_lifecycle_runner_allows_full_autonomy(monkeypatch):
     _patch_grants_db(monkeypatch)
-    await m._enforce_dispatch_grants(
+    await grant_enforcement_module.enforce_dispatch_grants(
         {"autonomy": "full"},
         runner_user_id=_UID,
         project_ids=[],
         runner_kind="lifecycle",
+        dependencies=preparation_composition.grant_enforcement_dependencies(
+            m.app.state.resources
+        ),
     )
 
 
 @pytest.mark.asyncio
 async def test_user_runner_still_denies_full_autonomy(monkeypatch):
     _patch_grants_db(monkeypatch)
-    with pytest.raises(m.GrantDenied) as ei:
-        await m._enforce_dispatch_grants(
+    with pytest.raises(grant_enforcement_module.GrantDenied) as ei:
+        await grant_enforcement_module.enforce_dispatch_grants(
             {"autonomy": "full"},
             runner_user_id=_UID,
             project_ids=[],
             runner_kind="user",
+            dependencies=preparation_composition.grant_enforcement_dependencies(
+                m.app.state.resources
+            ),
         )
     assert "autonomy_ceiling" in str(ei.value)
 
@@ -164,12 +191,15 @@ async def test_user_runner_still_denies_full_autonomy(monkeypatch):
 @pytest.mark.asyncio
 async def test_lifecycle_runner_keeps_owner_capability_limits(monkeypatch):
     _patch_grants_db(monkeypatch)
-    with pytest.raises(m.GrantDenied) as ei:
-        await m._enforce_dispatch_grants(
+    with pytest.raises(grant_enforcement_module.GrantDenied) as ei:
+        await grant_enforcement_module.enforce_dispatch_grants(
             {"autonomy": "full", "workspace": {"backend": "vm"}},
             runner_user_id=_UID,
             project_ids=[],
             runner_kind="lifecycle",
+            dependencies=preparation_composition.grant_enforcement_dependencies(
+                m.app.state.resources
+            ),
         )
     assert "vm_workspace" in str(ei.value)
     assert "autonomy_ceiling" not in str(ei.value)
@@ -186,12 +216,15 @@ async def test_enforce_session_create_grants_raises_422_for_denied_mode(monkeypa
     fake.list_grants_for_scopes = AsyncMock(
         return_value={"user": [], "project": [], "global": []}
     )
-    monkeypatch.setattr(m, "postgres_db", fake)
+    monkeypatch.setattr(m.app.state.resources, "postgres_db", fake)
     with pytest.raises(HTTPException) as ei:
-        await m._enforce_session_create_grants(
+        await grant_enforcement_module.enforce_session_create_grants(
             {"interactive": {"permission_mode": "autonomous"}},
             user_id=_UID,
             project_ids=[],
+            dependencies=preparation_composition.grant_enforcement_dependencies(
+                m.app.state.resources
+            ),
         )
     assert ei.value.status_code == 422
     assert "permission_mode" in str(ei.value.detail)
@@ -202,12 +235,15 @@ async def test_enforce_session_create_grants_raises_422_for_denied_mode(monkeypa
 async def test_enforce_session_create_grants_admin_bypass(monkeypatch):
     fake = AsyncMock()
     fake.get_user = AsyncMock(return_value={"id": _UID, "is_admin": True})
-    monkeypatch.setattr(m, "postgres_db", fake)
+    monkeypatch.setattr(m.app.state.resources, "postgres_db", fake)
     # Admin owner bypasses — autonomous is fine.
-    await m._enforce_session_create_grants(
+    await grant_enforcement_module.enforce_session_create_grants(
         {"interactive": {"permission_mode": "autonomous"}},
         user_id=_UID,
         project_ids=[],
+        dependencies=preparation_composition.grant_enforcement_dependencies(
+            m.app.state.resources
+        ),
     )
 
 
@@ -218,12 +254,15 @@ async def test_enforce_session_create_grants_allows_within_ceiling(monkeypatch):
     fake.list_grants_for_scopes = AsyncMock(
         return_value={"user": [], "project": [], "global": []}
     )
-    monkeypatch.setattr(m, "postgres_db", fake)
+    monkeypatch.setattr(m.app.state.resources, "postgres_db", fake)
     # 'supervised' is the default ceiling → within grants → no raise.
-    await m._enforce_session_create_grants(
+    await grant_enforcement_module.enforce_session_create_grants(
         {"interactive": {"permission_mode": "supervised"}},
         user_id=_UID,
         project_ids=[],
+        dependencies=preparation_composition.grant_enforcement_dependencies(
+            m.app.state.resources
+        ),
     )
 
 
@@ -231,16 +270,30 @@ async def test_enforce_session_create_grants_allows_within_ceiling(monkeypatch):
 async def test_user_experts_kill_switch_default_enabled(monkeypatch):
     fake = AsyncMock()
     fake.get_system_setting = AsyncMock(return_value=None)  # absent row
-    monkeypatch.setattr(m, "postgres_db", fake)
-    assert await m._user_experts_enabled() is True
+    monkeypatch.setattr(m.app.state.resources, "postgres_db", fake)
+    assert (
+        await grant_enforcement_module.user_experts_enabled(
+            dependencies=preparation_composition.grant_enforcement_dependencies(
+                m.app.state.resources
+            )
+        )
+        is True
+    )
 
 
 @pytest.mark.asyncio
 async def test_user_experts_kill_switch_disabled(monkeypatch):
     fake = AsyncMock()
     fake.get_system_setting = AsyncMock(return_value={"value": {"enabled": False}})
-    monkeypatch.setattr(m, "postgres_db", fake)
-    assert await m._user_experts_enabled() is False
+    monkeypatch.setattr(m.app.state.resources, "postgres_db", fake)
+    assert (
+        await grant_enforcement_module.user_experts_enabled(
+            dependencies=preparation_composition.grant_enforcement_dependencies(
+                m.app.state.resources
+            )
+        )
+        is False
+    )
 
 
 @pytest.mark.asyncio
@@ -253,10 +306,15 @@ async def test_enforce_job_create_grants_raises_422_for_ungranted(monkeypatch):
     fake.list_grants_for_scopes = AsyncMock(
         return_value={"user": [], "project": [], "global": []}
     )
-    monkeypatch.setattr(m, "postgres_db", fake)
+    monkeypatch.setattr(m.app.state.resources, "postgres_db", fake)
     with pytest.raises(HTTPException) as ei:
-        await m._enforce_job_create_grants(
-            {"workspace": {"backend": "vm"}}, user_id=_UID, project_ids=[]
+        await grant_enforcement_module.enforce_job_create_grants(
+            {"workspace": {"backend": "vm"}},
+            user_id=_UID,
+            project_ids=[],
+            dependencies=preparation_composition.grant_enforcement_dependencies(
+                m.app.state.resources
+            ),
         )
     assert ei.value.status_code == 422
     assert "vm_workspace" in str(ei.value.detail)
@@ -268,8 +326,13 @@ async def test_enforce_job_create_grants_allows_granted_override(monkeypatch):
         monkeypatch,
         user_rows=[{"key": "vm_workspace", "value_json": True}],
     )
-    await m._enforce_job_create_grants(
-        {"workspace": {"backend": "vm"}}, user_id=_UID, project_ids=[]
+    await grant_enforcement_module.enforce_job_create_grants(
+        {"workspace": {"backend": "vm"}},
+        user_id=_UID,
+        project_ids=[],
+        dependencies=preparation_composition.grant_enforcement_dependencies(
+            m.app.state.resources
+        ),
     )
 
 
@@ -277,9 +340,14 @@ async def test_enforce_job_create_grants_allows_granted_override(monkeypatch):
 async def test_enforce_job_create_grants_admin_bypass(monkeypatch):
     fake = AsyncMock()
     fake.get_user = AsyncMock(return_value={"id": _UID, "is_admin": True})
-    monkeypatch.setattr(m, "postgres_db", fake)
-    await m._enforce_job_create_grants(
-        {"autonomy": "full"}, user_id=_UID, project_ids=[]
+    monkeypatch.setattr(m.app.state.resources, "postgres_db", fake)
+    await grant_enforcement_module.enforce_job_create_grants(
+        {"autonomy": "full"},
+        user_id=_UID,
+        project_ids=[],
+        dependencies=preparation_composition.grant_enforcement_dependencies(
+            m.app.state.resources
+        ),
     )
 
 
@@ -289,12 +357,31 @@ async def test_enforce_job_create_grants_skips_userless_and_empty(monkeypatch):
     an empty override has nothing to check — neither may touch the DB."""
     fake = AsyncMock()
     fake.get_user = AsyncMock(side_effect=AssertionError("must not hit the DB"))
-    monkeypatch.setattr(m, "postgres_db", fake)
-    await m._enforce_job_create_grants(
-        {"workspace": {"backend": "vm"}}, user_id=None, project_ids=[]
+    monkeypatch.setattr(m.app.state.resources, "postgres_db", fake)
+    await grant_enforcement_module.enforce_job_create_grants(
+        {"workspace": {"backend": "vm"}},
+        user_id=None,
+        project_ids=[],
+        dependencies=preparation_composition.grant_enforcement_dependencies(
+            m.app.state.resources
+        ),
     )
-    await m._enforce_job_create_grants(None, user_id=_UID, project_ids=[])
-    await m._enforce_job_create_grants({}, user_id=_UID, project_ids=[])
+    await grant_enforcement_module.enforce_job_create_grants(
+        None,
+        user_id=_UID,
+        project_ids=[],
+        dependencies=preparation_composition.grant_enforcement_dependencies(
+            m.app.state.resources
+        ),
+    )
+    await grant_enforcement_module.enforce_job_create_grants(
+        {},
+        user_id=_UID,
+        project_ids=[],
+        dependencies=preparation_composition.grant_enforcement_dependencies(
+            m.app.state.resources
+        ),
+    )
 
 
 @pytest.mark.asyncio
@@ -331,15 +418,19 @@ async def test_duplicate_expert_strips_an_ungranted_tool_and_reports_it(monkeypa
         return_value={"user": [], "project": [], "global": []}
     )
     fake.create_expert = AsyncMock(return_value={"id": "forked-id"})
-    monkeypatch.setattr(m, "postgres_db", fake)
+    monkeypatch.setattr(m.app.state.resources, "postgres_db", fake)
 
     non_admin_user = {"id": _UID, "is_admin": False}
     monkeypatch.setattr(
-        m, "require_approved_user", AsyncMock(return_value=non_admin_user)
+        auth_module, "require_approved_user", AsyncMock(return_value=non_admin_user)
     )
-    monkeypatch.setattr(m, "user_visible_project_ids", AsyncMock(return_value=[]))
+    monkeypatch.setattr(
+        access_module, "user_visible_project_ids", AsyncMock(return_value=[])
+    )
     # Kill switch ON: this test isolates the grants half, not the switch.
-    monkeypatch.setattr(m, "_user_experts_enabled", AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        grant_enforcement_module, "user_experts_enabled", AsyncMock(return_value=True)
+    )
 
     result = await catalogue_route(expert_routes.duplicate_expert)(
         MagicMock(), str(uuid4())
@@ -390,14 +481,18 @@ async def test_duplicate_expert_still_forks_when_the_gate_allows(monkeypatch):
         return_value={"user": [], "project": [], "global": []}
     )
     fake.create_expert = AsyncMock(return_value=forked_row)
-    monkeypatch.setattr(m, "postgres_db", fake)
+    monkeypatch.setattr(m.app.state.resources, "postgres_db", fake)
     monkeypatch.setattr(
-        m,
+        auth_module,
         "require_approved_user",
         AsyncMock(return_value={"id": _UID, "is_admin": False}),
     )
-    monkeypatch.setattr(m, "user_visible_project_ids", AsyncMock(return_value=[]))
-    monkeypatch.setattr(m, "_user_experts_enabled", AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        access_module, "user_visible_project_ids", AsyncMock(return_value=[])
+    )
+    monkeypatch.setattr(
+        grant_enforcement_module, "user_experts_enabled", AsyncMock(return_value=True)
+    )
 
     result = await catalogue_route(expert_routes.duplicate_expert)(
         MagicMock(), str(uuid4())
@@ -421,14 +516,18 @@ def _duplicate_env(monkeypatch, *, source_row, grant_rows=(), is_admin=False):
         return_value={"user": list(grant_rows), "project": [], "global": []}
     )
     fake.create_expert = AsyncMock(side_effect=lambda **kw: {"id": "forked-id", **kw})
-    monkeypatch.setattr(m, "postgres_db", fake)
+    monkeypatch.setattr(m.app.state.resources, "postgres_db", fake)
     monkeypatch.setattr(
-        m,
+        auth_module,
         "require_approved_user",
         AsyncMock(return_value={"id": _UID, "is_admin": is_admin}),
     )
-    monkeypatch.setattr(m, "user_visible_project_ids", AsyncMock(return_value=[]))
-    monkeypatch.setattr(m, "_user_experts_enabled", AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        access_module, "user_visible_project_ids", AsyncMock(return_value=[])
+    )
+    monkeypatch.setattr(
+        grant_enforcement_module, "user_experts_enabled", AsyncMock(return_value=True)
+    )
     return fake
 
 
@@ -553,20 +652,24 @@ async def test_duplicate_expert_scholar_end_to_end_for_a_default_grants_user(
         return_value={"user": [], "project": [], "global": []}
     )
     fake.create_expert = AsyncMock(side_effect=lambda **kw: {"id": "forked-id", **kw})
-    monkeypatch.setattr(m, "postgres_db", fake)
+    monkeypatch.setattr(m.app.state.resources, "postgres_db", fake)
     monkeypatch.setattr(
-        m,
+        auth_module,
         "require_approved_user",
         AsyncMock(return_value={"id": _UID, "is_admin": False}),
     )
-    monkeypatch.setattr(m, "_user_experts_enabled", AsyncMock(return_value=True))
+    monkeypatch.setattr(
+        grant_enforcement_module, "user_experts_enabled", AsyncMock(return_value=True)
+    )
     # A bundled (disk) expert_id skips the visibility lookup entirely (it's
     # only for DB rows) — this is the copier's OWN project scope, resolved
     # while computing THEIR grants (_grant_project_ids), and is exercised
     # regardless of the source expert's origin. Explicit here (rather than
     # relying on AsyncMock's default empty-iterable return) so the "no
     # project-level grant" premise is visible, not incidental.
-    monkeypatch.setattr(m, "user_visible_project_ids", AsyncMock(return_value=[]))
+    monkeypatch.setattr(
+        access_module, "user_visible_project_ids", AsyncMock(return_value=[])
+    )
 
     result = await catalogue_route(expert_routes.duplicate_expert)(
         MagicMock(), "scholar"
@@ -619,14 +722,18 @@ async def test_previously_refused_shipped_experts_now_fork_for_default_grants(
         return_value={"user": [], "project": [], "global": []}
     )
     fake.create_expert = AsyncMock(side_effect=lambda **kw: {"id": "forked-id", **kw})
-    monkeypatch.setattr(m, "postgres_db", fake)
+    monkeypatch.setattr(m.app.state.resources, "postgres_db", fake)
     monkeypatch.setattr(
-        m,
+        auth_module,
         "require_approved_user",
         AsyncMock(return_value={"id": _UID, "is_admin": False}),
     )
-    monkeypatch.setattr(m, "_user_experts_enabled", AsyncMock(return_value=True))
-    monkeypatch.setattr(m, "user_visible_project_ids", AsyncMock(return_value=[]))
+    monkeypatch.setattr(
+        grant_enforcement_module, "user_experts_enabled", AsyncMock(return_value=True)
+    )
+    monkeypatch.setattr(
+        access_module, "user_visible_project_ids", AsyncMock(return_value=[])
+    )
 
     result = await catalogue_route(expert_routes.duplicate_expert)(
         MagicMock(), expert_id
@@ -697,15 +804,19 @@ def _fork_env(
     fake.fork_and_set_user_expert_default = AsyncMock(
         side_effect=lambda **kw: _fake_fork_row(**kw)
     )
-    monkeypatch.setattr(m, "postgres_db", fake)
+    monkeypatch.setattr(m.app.state.resources, "postgres_db", fake)
     monkeypatch.setattr(
-        m,
+        auth_module,
         "require_approved_user",
         AsyncMock(return_value={"id": _UID, "is_admin": is_admin}),
     )
-    monkeypatch.setattr(m, "user_visible_project_ids", AsyncMock(return_value=[]))
     monkeypatch.setattr(
-        m, "_user_experts_enabled", AsyncMock(return_value=kill_switch_on)
+        access_module, "user_visible_project_ids", AsyncMock(return_value=[])
+    )
+    monkeypatch.setattr(
+        grant_enforcement_module,
+        "user_experts_enabled",
+        AsyncMock(return_value=kill_switch_on),
     )
     if personal_defaults_ok is not None:
         monkeypatch.setattr(

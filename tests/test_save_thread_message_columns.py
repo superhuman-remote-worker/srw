@@ -47,7 +47,7 @@ def test_request_model_accepts_component_fields():
     os.environ.setdefault("VECTOR_DB_URL", "postgresql://x:x@localhost/x")
     sys.modules.setdefault("aiosmtplib", MagicMock())
 
-    from orchestrator.main import AgentThreadMessageRequest  # noqa: PLC0415
+    from orchestrator.schemas.agent_child_threads import AgentThreadMessageRequest  # noqa: PLC0415
 
     m = AgentThreadMessageRequest(
         role="ai",

@@ -66,6 +66,7 @@ from orchestrator.services import (
 )
 
 from ._mounted_router import mount_router
+from orchestrator.application import workflows as workflows_composition
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 
@@ -342,7 +343,11 @@ def test_cron_provisioning_adapter_forwards_the_applications_clients() -> None:
     try:
         job_row = {"id": "j1"}
         store = object()
-        asyncio.run(main._provision_cron_job_repo(job_row, store))
+        asyncio.run(
+            workflows_composition.provision_cron_job_repo(
+                main.app.state.resources, job_row, store
+            )
+        )
     finally:
         job_provisioning.provision_job_repo = original
 
@@ -350,8 +355,8 @@ def test_cron_provisioning_adapter_forwards_the_applications_clients() -> None:
     # The dispatcher's own handle, not the application's — the fired job is
     # written through the transaction the loop already holds.
     assert seen["postgres_db"] is store
-    assert seen["gitea_client"] is main.gitea_client
-    assert seen["main_cloud_router"] is main.main_cloud_router
+    assert seen["gitea_client"] is main.app.state.resources.gitea_client
+    assert seen["main_cloud_router"] is main.app.state.resources.main_cloud_router
 
 
 def test_officer_watchdog_re_reads_its_recycler_through_a_callable() -> None:

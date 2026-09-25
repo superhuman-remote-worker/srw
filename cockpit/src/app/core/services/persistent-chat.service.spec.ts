@@ -3,7 +3,7 @@ import { Injector, NgZone, PLATFORM_ID, runInInjectionContext, signal } from '@a
 import Dexie from 'dexie';
 import { TestBed } from '@angular/core/testing';
 import { HttpClient } from '@angular/common/http';
-import { NEVER, from, of, Subject, throwError } from 'rxjs';
+import { NEVER, from, map, of, Subject, throwError } from 'rxjs';
 import { TranslocoService } from '@jsverse/transloco';
 import {
   PersistentChatService,
@@ -7919,6 +7919,235 @@ describe('PersistentChatService — endSession()', () => {
     await ctx.service.endSession();
     expect(ctx.mockHttp.delete).not.toHaveBeenCalled();
     expect(ctx.service.connectionState()).toBe('disconnected');
+  });
+});
+
+/**
+ * R1 follow-up: a stateless (queue-served) End has two refusals a pinned End
+ * does not. `409 stateless_end_busy` means the turn/unit is still leased or
+ * input/control is pending; `?force=true` stops it. A string-detail `503` is
+ * a retryable retirement fence: End may already have begun durably (the
+ * thread then projects `runtime_retirement_pending`), and End is the retry.
+ * The thread row carries `execution_lane` and, while a retirement is
+ * pending, `retirement_permanent`.
+ */
+describe('PersistentChatService — stateless End (busy, retryable, pending retry)', () => {
+  let originalEs: any;
+  let originalWs: any;
+
+  beforeEach(() => {
+    originalEs = (globalThis as any).EventSource;
+    originalWs = (globalThis as any).WebSocket;
+  });
+
+  afterEach(() => {
+    (globalThis as any).EventSource = originalEs;
+    (globalThis as any).WebSocket = originalWs;
+    vi.clearAllMocks();
+  });
+
+  const THREAD_META_URL = /\/persistent\/threads\/[^/?]+$/;
+
+  /** activeSessionGet, with `meta()` merged into the thread-row GET only. */
+  function sessionGetWithMeta(meta: () => Record<string, unknown>) {
+    return (url: string) =>
+      THREAD_META_URL.test(url)
+        ? activeSessionGet(url).pipe(map((body) => ({ ...body, ...meta() })))
+        : activeSessionGet(url);
+  }
+
+  function threadMetaReads(mockHttp: any): number {
+    return mockHttp.get.mock.calls.filter((call: any[]) => THREAD_META_URL.test(String(call[0])))
+      .length;
+  }
+
+  const statelessBusy = () =>
+    throwError(() => ({
+      status: 409,
+      error: {
+        detail: {
+          code: 'stateless_end_busy',
+          queue_state: 'leased',
+          lease_token: 7,
+          pending_input: true,
+          pending_control: false,
+          pending_interrupt: false,
+          pending_permission: false,
+        },
+      },
+    }));
+
+  const retryableFence = () =>
+    throwError(() => ({
+      status: 503,
+      error: { detail: 'Workspace resident retirement is not yet acknowledged' },
+    }));
+
+  it('asks before stopping a busy stateless turn and ends with force only on confirm', async () => {
+    const confirmSpy = vi.spyOn(globalThis, 'confirm').mockReturnValue(true);
+    try {
+      const ctx = createService();
+      ctx.mockHttp.get.mockImplementation(
+        sessionGetWithMeta(() => ({ execution_lane: 'stateless' })),
+      );
+      await ctx.service.connect('thread-stateless-busy');
+      fireSseOpen(ctx.sseInstances[0]);
+      ctx.mockHttp.delete
+        .mockReturnValueOnce(statelessBusy())
+        .mockReturnValueOnce(of({ status: 'ended' }));
+
+      await expect(ctx.service.endSession()).resolves.toBe('done');
+
+      expect(confirmSpy).toHaveBeenCalledTimes(1);
+      expect(confirmSpy).toHaveBeenCalledWith('sessions.confirmEndStatelessBusy');
+      expect(ctx.mockHttp.delete).toHaveBeenCalledTimes(2);
+      expect(ctx.mockHttp.delete.mock.calls[0][0]).not.toContain('force=true');
+      expect(ctx.mockHttp.delete.mock.calls[1][0]).toContain(
+        '/persistent/threads/thread-stateless-busy?force=true',
+      );
+      expect(ctx.service.threadStatus()).toBe('ended');
+    } finally {
+      confirmSpy.mockRestore();
+    }
+  });
+
+  it('leaves a busy stateless session running, never retrying, when the user declines', async () => {
+    const confirmSpy = vi.spyOn(globalThis, 'confirm').mockReturnValue(false);
+    try {
+      const ctx = createService();
+      ctx.mockHttp.get.mockImplementation(
+        sessionGetWithMeta(() => ({ execution_lane: 'stateless' })),
+      );
+      await ctx.service.connect('thread-stateless-keep');
+      fireSseOpen(ctx.sseInstances[0]);
+      ctx.mockHttp.delete.mockReturnValue(statelessBusy());
+
+      await expect(ctx.service.endSession()).resolves.toBe('kept');
+
+      expect(confirmSpy).toHaveBeenCalledTimes(1);
+      expect(ctx.mockHttp.delete).toHaveBeenCalledTimes(1);
+      expect(ctx.service.threadStatus()).toBe('active');
+      expect(ctx.service.connectionState()).toBe('connected');
+      expect(ctx.wsInstances[0].close).not.toHaveBeenCalled();
+      expect(ctx.sseInstances[0].close).not.toHaveBeenCalled();
+    } finally {
+      confirmSpy.mockRestore();
+    }
+  });
+
+  it('reports a retryable 503 once, re-reads the thread, and offers End again while it is ending', async () => {
+    const ctx = createService();
+    let pending = false;
+    ctx.mockHttp.get.mockImplementation(
+      sessionGetWithMeta(() =>
+        pending
+          ? {
+              execution_lane: 'stateless',
+              runtime_retirement_pending: true,
+              retirement_disposition: 'ended',
+              retirement_permanent: false,
+            }
+          : { execution_lane: 'stateless' },
+      ),
+    );
+    await ctx.service.connect('thread-stateless-fenced');
+    fireSseOpen(ctx.sseInstances[0]);
+    // The End began durably before the server fenced it.
+    ctx.mockHttp.delete.mockImplementation(() => {
+      pending = true;
+      return retryableFence();
+    });
+    const readsBefore = threadMetaReads(ctx.mockHttp);
+
+    await expect(ctx.service.endSession()).resolves.toBe('retryable');
+
+    expect(ctx.mockHttp.delete).toHaveBeenCalledTimes(1);
+    expect(threadMetaReads(ctx.mockHttp)).toBe(readsBefore + 1);
+    expect(ctx.service.threadStatus()).toBe('ending');
+    expect(ctx.service.retirementDisposition()).toBe('ended');
+    expect(ctx.service.endRetryAvailable()).toBe(true);
+    expect(ctx.sseInstances[0].close).not.toHaveBeenCalled();
+  });
+
+  it('keeps a stateless session live when the fenced End had not started', async () => {
+    const ctx = createService();
+    ctx.mockHttp.get.mockImplementation(
+      sessionGetWithMeta(() => ({ execution_lane: 'stateless' })),
+    );
+    await ctx.service.connect('thread-stateless-not-started');
+    fireSseOpen(ctx.sseInstances[0]);
+    ctx.mockHttp.delete.mockReturnValue(retryableFence());
+
+    await expect(ctx.service.endSession()).resolves.toBe('retryable');
+
+    expect(ctx.mockHttp.delete).toHaveBeenCalledTimes(1);
+    expect(ctx.service.threadStatus()).toBe('active');
+    expect(ctx.service.connectionState()).toBe('connected');
+    expect(ctx.wsInstances[0].close).not.toHaveBeenCalled();
+    // A live session keeps its ordinary End control; the retry affordance is
+    // only for a pending retirement.
+    expect(ctx.service.endRetryAvailable()).toBe(false);
+  });
+
+  it('offers End as the retry on a reloaded stateless soft retirement only', async () => {
+    const cases: Array<[Record<string, unknown>, boolean]> = [
+      [{ execution_lane: 'stateless', retirement_permanent: false }, true],
+      // A permanent Delete is retried from the session list, not by End.
+      [{ execution_lane: 'stateless', retirement_permanent: true }, false],
+      // A pinned retirement settles on the server by itself.
+      [{ execution_lane: 'pinned', retirement_permanent: false }, false],
+    ];
+    for (const [meta, offered] of cases) {
+      const ctx = createService();
+      ctx.mockHttp.get.mockImplementation(
+        sessionGetWithMeta(() => ({
+          runtime_retirement_pending: true,
+          retirement_disposition: 'ended',
+          ...meta,
+        })),
+      );
+
+      await ctx.service.connect('thread-reload-pending');
+
+      expect(ctx.service.threadStatus()).toBe('ending');
+      expect(ctx.service.endRetryAvailable()).toBe(offered);
+    }
+  });
+
+  // Guard (holds before and after): the pinned lane keeps its End contract —
+  // a 503 still fails the End, and a declined mid-turn prompt still hands
+  // control back as a finished request (the caller leaves as before).
+  it('keeps pinned End failures and the turn_in_flight decline unchanged', async () => {
+    const confirmSpy = vi.spyOn(globalThis, 'confirm').mockReturnValue(false);
+    try {
+      const fenced = createService();
+      fenced.mockHttp.get.mockImplementation(
+        sessionGetWithMeta(() => ({ execution_lane: 'pinned' })),
+      );
+      await fenced.service.connect('thread-pinned-fenced');
+      fenced.mockHttp.delete.mockReturnValue(retryableFence());
+
+      await expect(fenced.service.endSession()).rejects.toMatchObject({ status: 503 });
+      expect(fenced.mockHttp.delete).toHaveBeenCalledTimes(1);
+      expect(fenced.service.threadStatus()).toBe('active');
+
+      const midTurn = createService();
+      midTurn.mockHttp.get.mockImplementation(
+        sessionGetWithMeta(() => ({ execution_lane: 'pinned' })),
+      );
+      await midTurn.service.connect('thread-pinned-mid-turn');
+      midTurn.mockHttp.delete.mockReturnValue(
+        throwError(() => ({ status: 409, error: { detail: { code: 'turn_in_flight' } } })),
+      );
+
+      const outcome = await midTurn.service.endSession();
+      expect(outcome === 'kept' || outcome === 'retryable').toBe(false);
+      expect(confirmSpy).toHaveBeenCalledWith('sessions.confirmEndMidTurn');
+      expect(midTurn.mockHttp.delete).toHaveBeenCalledTimes(1);
+      expect(midTurn.service.threadStatus()).toBe('active');
+    } finally {
+      confirmSpy.mockRestore();
+    }
   });
 });
 

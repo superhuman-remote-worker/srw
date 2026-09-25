@@ -29,6 +29,9 @@ import pytest
 
 import orchestrator.main as m  # noqa: E402
 from orchestrator.routers import job_inspection as job_inspection_routes
+from orchestrator.application import jobs as jobs_composition
+from orchestrator.security import access as access_module
+import fastapi as fastapi_module
 
 UTC = timezone.utc
 NOW = datetime(2026, 8, 23, 12, 0, 0, tzinfo=UTC)
@@ -67,12 +70,16 @@ def route_env(monkeypatch):
     job = {"id": job_id, "status": "waiting", "created_at": NOW - timedelta(hours=2)}
     db = SimpleNamespace(get_job_subjob_roster=AsyncMock(return_value=[]))
     guard = AsyncMock(return_value=({"id": "u"}, job))
-    monkeypatch.setattr(m, "postgres_db", db)
-    monkeypatch.setattr(m, "require_job_access", guard)
+    monkeypatch.setattr(m.app.state.resources, "postgres_db", db)
+    monkeypatch.setattr(access_module, "require_job_access", guard)
 
     async def call():
         return await job_inspection_routes.get_job_subjobs(
-            SimpleNamespace(), job_id, dependencies=m._job_inspection_dependencies()
+            SimpleNamespace(),
+            job_id,
+            dependencies=jobs_composition.job_inspection_dependencies(
+                m.app.state.resources
+            ),
         )
 
     return SimpleNamespace(job_id=job_id, job=job, db=db, guard=guard, call=call)
@@ -117,9 +124,11 @@ class TestAuthorization:
 
     @pytest.mark.asyncio
     async def test_a_denied_caller_never_reaches_the_walk(self, route_env, monkeypatch):
-        boom = AsyncMock(side_effect=m.HTTPException(status_code=403, detail="no"))
-        monkeypatch.setattr(m, "require_job_access", boom)
-        with pytest.raises(m.HTTPException) as excinfo:
+        boom = AsyncMock(
+            side_effect=fastapi_module.HTTPException(status_code=403, detail="no")
+        )
+        monkeypatch.setattr(access_module, "require_job_access", boom)
+        with pytest.raises(fastapi_module.HTTPException) as excinfo:
             await route_env.call()
         assert excinfo.value.status_code == 403
         route_env.db.get_job_subjob_roster.assert_not_awaited()
@@ -226,6 +235,6 @@ class TestFailure:
         reintroduced through the error path.
         """
         route_env.db.get_job_subjob_roster.side_effect = RuntimeError("connection lost")
-        with pytest.raises(m.HTTPException) as excinfo:
+        with pytest.raises(fastapi_module.HTTPException) as excinfo:
             await route_env.call()
         assert excinfo.value.status_code == 500

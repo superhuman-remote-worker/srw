@@ -9,7 +9,7 @@ Tests cover:
 
 from tests import b08_completion_helpers as b08_helpers
 
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, patch
 
 import asyncpg
 import pytest
@@ -18,6 +18,13 @@ from orchestrator.services.completion import (  # noqa: E402
     determine_job_status,
     is_job_completion_freeze,
     is_verification_enabled,
+)
+from orchestrator.services import (
+    job_datasource_selection as job_datasource_selection_module,
+)
+from orchestrator.services import job_dispatcher as job_dispatcher_module
+from orchestrator.services import (
+    managed_repository_authority as managed_repository_authority_module,
 )
 
 
@@ -340,7 +347,9 @@ class TestVerificationTriggerGuards:
         from orchestrator import main
 
         create_job_mock = AsyncMock()
-        monkeypatch.setattr(main.postgres_db, "create_job", create_job_mock)
+        monkeypatch.setattr(
+            main.app.state.resources.postgres_db, "create_job", create_job_mock
+        )
 
         job = self._passing_job()
         result = self._passing_result(error={"message": "failed"})
@@ -357,7 +366,9 @@ class TestVerificationTriggerGuards:
         from orchestrator import main
 
         create_job_mock = AsyncMock()
-        monkeypatch.setattr(main.postgres_db, "create_job", create_job_mock)
+        monkeypatch.setattr(
+            main.app.state.resources.postgres_db, "create_job", create_job_mock
+        )
 
         job = self._passing_job()
         result = self._passing_result(should_stop=False)
@@ -374,7 +385,9 @@ class TestVerificationTriggerGuards:
         from orchestrator import main
 
         create_job_mock = AsyncMock()
-        monkeypatch.setattr(main.postgres_db, "create_job", create_job_mock)
+        monkeypatch.setattr(
+            main.app.state.resources.postgres_db, "create_job", create_job_mock
+        )
 
         job = self._passing_job(parent_job_id="parent-123")
         result = self._passing_result()
@@ -392,7 +405,9 @@ class TestVerificationTriggerGuards:
         from orchestrator import main
 
         create_job_mock = AsyncMock()
-        monkeypatch.setattr(main.postgres_db, "create_job", create_job_mock)
+        monkeypatch.setattr(
+            main.app.state.resources.postgres_db, "create_job", create_job_mock
+        )
 
         job = self._passing_job(config_override={"workspace": {"backend": "virtual"}})
         result = self._passing_result()
@@ -409,7 +424,9 @@ class TestVerificationTriggerGuards:
         from orchestrator import main
 
         create_job_mock = AsyncMock()
-        monkeypatch.setattr(main.postgres_db, "create_job", create_job_mock)
+        monkeypatch.setattr(
+            main.app.state.resources.postgres_db, "create_job", create_job_mock
+        )
 
         job = self._passing_job(verification_enabled=False)
         result = self._passing_result()
@@ -427,7 +444,9 @@ class TestVerificationTriggerGuards:
         from orchestrator import main
 
         create_job_mock = AsyncMock()
-        monkeypatch.setattr(main.postgres_db, "create_job", create_job_mock)
+        monkeypatch.setattr(
+            main.app.state.resources.postgres_db, "create_job", create_job_mock
+        )
 
         job = self._passing_job(
             status="processing",
@@ -448,17 +467,21 @@ class TestVerificationTriggerGuards:
         from orchestrator import main
 
         create_job_mock = AsyncMock(return_value={"id": "critic-999"})
-        monkeypatch.setattr(main.postgres_db, "create_job", create_job_mock)
         monkeypatch.setattr(
-            main,
-            "_revalidate_job_datasource_selection",
+            main.app.state.resources.postgres_db, "create_job", create_job_mock
+        )
+        monkeypatch.setattr(
+            job_datasource_selection_module,
+            "revalidate_job_datasource_selection",
             AsyncMock(return_value=([], {})),
         )
-        monkeypatch.setattr(main, "_trigger_dispatch", lambda: None)
+        monkeypatch.setattr(
+            job_dispatcher_module, "trigger_dispatch", lambda *, dependencies: None
+        )
         # No critic already in flight. Stubbed rather than left real because
         # the baseline job id is not a UUID and the guard fails CLOSED on one.
         monkeypatch.setattr(
-            main.postgres_db,
+            main.app.state.resources.postgres_db,
             "has_live_verification_critic",
             AsyncMock(return_value=False),
         )
@@ -478,15 +501,19 @@ class TestVerificationTriggerGuards:
         from orchestrator import main
 
         create_job_mock = AsyncMock(return_value={"id": "critic-999"})
-        monkeypatch.setattr(main.postgres_db, "create_job", create_job_mock)
         monkeypatch.setattr(
-            main,
-            "_revalidate_job_datasource_selection",
+            main.app.state.resources.postgres_db, "create_job", create_job_mock
+        )
+        monkeypatch.setattr(
+            job_datasource_selection_module,
+            "revalidate_job_datasource_selection",
             AsyncMock(return_value=([], {})),
         )
-        monkeypatch.setattr(main, "_trigger_dispatch", lambda: None)
         monkeypatch.setattr(
-            main.postgres_db,
+            job_dispatcher_module, "trigger_dispatch", lambda *, dependencies: None
+        )
+        monkeypatch.setattr(
+            main.app.state.resources.postgres_db,
             "has_live_verification_critic",
             AsyncMock(return_value=False),
         )
@@ -520,14 +547,16 @@ class TestVerificationTriggerGuards:
 
         create_job_mock = AsyncMock(return_value={"id": "critic-999"})
         round_lookup_mock = AsyncMock()
-        monkeypatch.setattr(main.postgres_db, "create_job", create_job_mock)
         monkeypatch.setattr(
-            main.postgres_db,
+            main.app.state.resources.postgres_db, "create_job", create_job_mock
+        )
+        monkeypatch.setattr(
+            main.app.state.resources.postgres_db,
             "get_verification_critic_for_round",
             round_lookup_mock,
         )
         monkeypatch.setattr(
-            main.postgres_db,
+            main.app.state.resources.postgres_db,
             "has_live_verification_critic",
             AsyncMock(return_value=True),
         )
@@ -558,19 +587,25 @@ class TestVerificationTriggerGuards:
                 "context": {"inherits_parent_workspace": True},
             }
         )
-        monkeypatch.setattr(main.postgres_db, "create_job", create_job_mock)
         monkeypatch.setattr(
-            main.postgres_db,
+            main.app.state.resources.postgres_db, "create_job", create_job_mock
+        )
+        monkeypatch.setattr(
+            main.app.state.resources.postgres_db,
             "has_live_verification_critic",
             AsyncMock(return_value=True),
         )
         monkeypatch.setattr(
-            main.postgres_db,
+            main.app.state.resources.postgres_db,
             "get_verification_critic_for_round",
             round_lookup_mock,
         )
         bind_repo = AsyncMock(return_value=True)
-        monkeypatch.setattr(main.postgres_db, "bind_job_managed_repository", bind_repo)
+        monkeypatch.setattr(
+            main.app.state.resources.postgres_db,
+            "bind_job_managed_repository",
+            bind_repo,
+        )
         # The handoff branches from the parent's PROVEN authority, not from a
         # repo name guessed off the job id, so the resolver is the collaborator
         # under stub here.
@@ -580,7 +615,11 @@ class TestVerificationTriggerGuards:
                 "clean_repo_url": "http://gitea/job-aaaaaaaa.git",
             }
         )
-        monkeypatch.setattr(main, "prepare_job_primary_repository_authority", authority)
+        monkeypatch.setattr(
+            managed_repository_authority_module,
+            "prepare_job_primary_repository_authority",
+            authority,
+        )
 
         conn = AsyncMock()
         conn.execute.return_value = "UPDATE 1"
@@ -588,15 +627,17 @@ class TestVerificationTriggerGuards:
         acquired.__aenter__ = AsyncMock(return_value=conn)
         acquired.__aexit__ = AsyncMock(return_value=False)
         monkeypatch.setattr(
-            main.postgres_db, "acquire", MagicMock(return_value=acquired)
+            main.app.state.resources.postgres_db,
+            "acquire",
+            MagicMock(return_value=acquired),
         )
 
         gitea = MagicMock()
         gitea.is_initialized = True
         gitea.create_branch = AsyncMock(return_value=True)
-        monkeypatch.setattr(main, "gitea_client", gitea)
+        monkeypatch.setattr(main.app.state.resources, "gitea_client", gitea)
         trigger_dispatch = MagicMock()
-        monkeypatch.setattr(main, "_trigger_dispatch", trigger_dispatch)
+        monkeypatch.setattr(job_dispatcher_module, "trigger_dispatch", trigger_dispatch)
 
         job = self._passing_job(
             context={
@@ -631,7 +672,7 @@ class TestVerificationTriggerGuards:
             "/home/agent-host/workspace/worktrees/11111111-critic",
             critic_id,
         )
-        trigger_dispatch.assert_called_once_with()
+        trigger_dispatch.assert_called_once_with(dependencies=ANY)
         assert actions == [f"critic job {critic_id} reconciled"]
 
     @pytest.mark.asyncio
@@ -649,14 +690,16 @@ class TestVerificationTriggerGuards:
         from orchestrator import main
 
         critic_id = "11111111-2222-3333-4444-555555555555"
-        monkeypatch.setattr(main.postgres_db, "create_job", AsyncMock())
         monkeypatch.setattr(
-            main.postgres_db,
+            main.app.state.resources.postgres_db, "create_job", AsyncMock()
+        )
+        monkeypatch.setattr(
+            main.app.state.resources.postgres_db,
             "has_live_verification_critic",
             AsyncMock(return_value=True),
         )
         monkeypatch.setattr(
-            main.postgres_db,
+            main.app.state.resources.postgres_db,
             "get_verification_critic_for_round",
             AsyncMock(
                 return_value={
@@ -667,12 +710,12 @@ class TestVerificationTriggerGuards:
             ),
         )
         monkeypatch.setattr(
-            main.postgres_db,
+            main.app.state.resources.postgres_db,
             "bind_job_managed_repository",
             AsyncMock(return_value=True),
         )
         monkeypatch.setattr(
-            main,
+            managed_repository_authority_module,
             "prepare_job_primary_repository_authority",
             AsyncMock(
                 return_value={
@@ -688,14 +731,16 @@ class TestVerificationTriggerGuards:
         acquired.__aenter__ = AsyncMock(return_value=conn)
         acquired.__aexit__ = AsyncMock(return_value=False)
         monkeypatch.setattr(
-            main.postgres_db, "acquire", MagicMock(return_value=acquired)
+            main.app.state.resources.postgres_db,
+            "acquire",
+            MagicMock(return_value=acquired),
         )
 
         gitea = MagicMock()
         gitea.is_initialized = True
         gitea.create_branch = AsyncMock(return_value=True)
-        monkeypatch.setattr(main, "gitea_client", gitea)
-        monkeypatch.setattr(main, "_trigger_dispatch", MagicMock())
+        monkeypatch.setattr(main.app.state.resources, "gitea_client", gitea)
+        monkeypatch.setattr(job_dispatcher_module, "trigger_dispatch", MagicMock())
 
         job = self._passing_job(
             context={
@@ -728,19 +773,21 @@ class TestVerificationTriggerGuards:
         violation = asyncpg.UniqueViolationError("duplicate critic round")
         violation.constraint_name = "jobs_verification_uniq"
         create_job_mock = AsyncMock(side_effect=violation)
-        monkeypatch.setattr(main.postgres_db, "create_job", create_job_mock)
         monkeypatch.setattr(
-            main,
-            "_revalidate_job_datasource_selection",
+            main.app.state.resources.postgres_db, "create_job", create_job_mock
+        )
+        monkeypatch.setattr(
+            job_datasource_selection_module,
+            "revalidate_job_datasource_selection",
             AsyncMock(return_value=([], {})),
         )
         monkeypatch.setattr(
-            main.postgres_db,
+            main.app.state.resources.postgres_db,
             "has_live_verification_critic",
             AsyncMock(return_value=False),
         )
         trigger_dispatch = MagicMock()
-        monkeypatch.setattr(main, "_trigger_dispatch", trigger_dispatch)
+        monkeypatch.setattr(job_dispatcher_module, "trigger_dispatch", trigger_dispatch)
 
         job = self._passing_job()
         actions: list[str] = []
@@ -762,17 +809,17 @@ class TestVerificationTriggerGuards:
         violation = asyncpg.UniqueViolationError("other duplicate")
         violation.constraint_name = "some_other_unique_index"
         monkeypatch.setattr(
-            main.postgres_db,
+            main.app.state.resources.postgres_db,
             "create_job",
             AsyncMock(side_effect=violation),
         )
         monkeypatch.setattr(
-            main,
-            "_revalidate_job_datasource_selection",
+            job_datasource_selection_module,
+            "revalidate_job_datasource_selection",
             AsyncMock(return_value=([], {})),
         )
         monkeypatch.setattr(
-            main.postgres_db,
+            main.app.state.resources.postgres_db,
             "has_live_verification_critic",
             AsyncMock(return_value=False),
         )

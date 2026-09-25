@@ -29,6 +29,12 @@ from orchestrator.services import officer_message_actions as officer_actions
 from orchestrator.services import officer_post_lifecycle as officer_lifecycle
 from orchestrator.services.notification_service import RecordResult
 from shared.runtime_actor import RuntimeActorContext
+from orchestrator.application import workflows as workflows_composition
+from orchestrator.schemas import messaging as messaging_module
+from orchestrator.services import job_controls as job_controls_module
+from orchestrator.services import notification_service as notification_service_module
+from orchestrator.services import runtime_actor as runtime_actor_module
+from orchestrator.services import session_wake as session_wake_module
 
 
 OFFICER_TID = str(uuid4())
@@ -347,7 +353,7 @@ def _body(**overrides):
         "mode": "blocking",
     }
     values.update(overrides)
-    return main.MessageSendRequest(**values)
+    return messaging_module.MessageSendRequest(**values)
 
 
 @contextmanager
@@ -360,10 +366,12 @@ def _send_patches(db, notifier, *, flag=True):
     stubbed here where nothing would call it.
     """
     with (
-        patch.object(main, "COMPLETION_COMMANDS_ENABLED", flag),
-        patch.object(main, "postgres_db", db),
-        patch.object(main, "notification_service", notifier),
-        patch.object(main, "_kick_officer_event_drain", MagicMock()),
+        patch.object(
+            main.app.state.resources.settings, "completion_commands_enabled", flag
+        ),
+        patch.object(main.app.state.resources, "postgres_db", db),
+        patch.object(notification_service_module, "notification_service", notifier),
+        patch.object(session_wake_module, "kick_event_drain", MagicMock()),
     ):
         yield
 
@@ -376,7 +384,12 @@ async def _send(job_id, body):
     which is what keeps those patches steering the code under test.
     """
     return await agent_messaging.send_agent_message(
-        MagicMock(), job_id, body, dependencies=main._agent_messaging_dependencies()
+        MagicMock(),
+        job_id,
+        body,
+        dependencies=workflows_composition.agent_messaging_dependencies(
+            main.app.state.resources
+        ),
     )
 
 
@@ -775,7 +788,7 @@ class TestDrains:
         # (``orchestrator.routers.officers``), not inside the operation, so it
         # is no longer part of what this test drives.
         with (
-            patch.object(main, "postgres_db", db),
+            patch.object(main.app.state.resources, "postgres_db", db),
             patch(
                 "orchestrator.services.officer_notices.inject_officer_notice",
                 AsyncMock(return_value=True),
@@ -789,7 +802,9 @@ class TestDrains:
                 MagicMock(),
                 PROJECT_ID,
                 None,
-                dependencies=main._officer_post_lifecycle_dependencies(),
+                dependencies=workflows_composition.officer_post_lifecycle_dependencies(
+                    main.app.state.resources
+                ),
             )
         assert result["status"] == "held"
         assert result["drained_blocking_routes"] == 3
@@ -828,7 +843,7 @@ def _runtime_officer(
 
 def _authorized_officer():
     return patch.object(
-        main,
+        runtime_actor_module,
         "authorize_runtime_actor_request",
         AsyncMock(return_value=_runtime_officer()),
     )
@@ -843,7 +858,12 @@ def _officer_action_deps(**overrides):
     lane and the route-resolution recorder are ports on this object now, not
     names on ``main``.
     """
-    return dataclasses.replace(main._officer_message_action_dependencies(), **overrides)
+    return dataclasses.replace(
+        workflows_composition.officer_message_action_dependencies(
+            main.app.state.resources
+        ),
+        **overrides,
+    )
 
 
 def _action_db(job, *, officer=True, route=None):
@@ -881,14 +901,14 @@ class TestOfficerActionGuards:
         job = _job(project_id=None)
         db = _action_db(job)
         with (
-            patch.object(main, "postgres_db", db),
+            patch.object(main.app.state.resources, "postgres_db", db),
         ):
             with pytest.raises(HTTPException) as exc:
                 await officer_actions.officer_reply_to_worker_message(
                     _guard_request(),
                     job["id"],
                     "abc123",
-                    main.OfficerMessageReplyRequest(message="hi"),
+                    messaging_module.OfficerMessageReplyRequest(message="hi"),
                     dependencies=_officer_action_deps(),
                 )
         assert exc.value.status_code == 403
@@ -900,7 +920,7 @@ class TestOfficerActionGuards:
         job = _job()
         db = _action_db(job)
         with (
-            patch.object(main, "postgres_db", db),
+            patch.object(main.app.state.resources, "postgres_db", db),
         ):
             with pytest.raises(HTTPException) as exc:
                 request = _guard_request(scope=f"project:{PROJECT_ID}")
@@ -909,7 +929,7 @@ class TestOfficerActionGuards:
                         request,
                         job["id"],
                         "abc123",
-                        main.OfficerMessageReplyRequest(
+                        messaging_module.OfficerMessageReplyRequest(
                             message="hi", officer_thread_id=OFFICER_TID
                         ),
                         dependencies=_officer_action_deps(),
@@ -919,7 +939,7 @@ class TestOfficerActionGuards:
                         request,
                         job["id"],
                         "abc123",
-                        main.OfficerMessageEscalateRequest(
+                        messaging_module.OfficerMessageEscalateRequest(
                             context="help", officer_thread_id=OFFICER_TID
                         ),
                         dependencies=_officer_action_deps(),
@@ -929,7 +949,7 @@ class TestOfficerActionGuards:
                         request,
                         job["id"],
                         "abc123",
-                        main.OfficerMessageAckRequest(
+                        messaging_module.OfficerMessageAckRequest(
                             note="seen", officer_thread_id=OFFICER_TID
                         ),
                         dependencies=_officer_action_deps(),
@@ -939,18 +959,25 @@ class TestOfficerActionGuards:
         db.record_security_event.assert_awaited_once()
 
     def test_public_action_schema_contains_no_actor_identity(self):
-        assert "officer_thread_id" not in main.OfficerMessageReplyRequest.model_fields
         assert (
-            "officer_thread_id" not in main.OfficerMessageEscalateRequest.model_fields
+            "officer_thread_id"
+            not in messaging_module.OfficerMessageReplyRequest.model_fields
         )
-        assert "officer_thread_id" not in main.OfficerMessageAckRequest.model_fields
+        assert (
+            "officer_thread_id"
+            not in messaging_module.OfficerMessageEscalateRequest.model_fields
+        )
+        assert (
+            "officer_thread_id"
+            not in messaging_module.OfficerMessageAckRequest.model_fields
+        )
 
     @pytest.mark.asyncio
     async def test_no_open_route_is_409(self):
         job = _job()
         db = _action_db(job, route=None)
         with (
-            patch.object(main, "postgres_db", db),
+            patch.object(main.app.state.resources, "postgres_db", db),
             _authorized_officer(),
         ):
             with pytest.raises(HTTPException) as exc:
@@ -958,7 +985,7 @@ class TestOfficerActionGuards:
                     _guard_request(),
                     job["id"],
                     "abc123",
-                    main.OfficerMessageReplyRequest(message="hi"),
+                    messaging_module.OfficerMessageReplyRequest(message="hi"),
                     dependencies=_officer_action_deps(),
                 )
         assert exc.value.status_code == 409
@@ -970,7 +997,7 @@ class TestOfficerActionGuards:
         old_route = _route(officer_thread_id=str(uuid4()))
         db = _action_db(job, route=old_route)
         with (
-            patch.object(main, "postgres_db", db),
+            patch.object(main.app.state.resources, "postgres_db", db),
             _authorized_officer(),
         ):
             with pytest.raises(HTTPException) as exc:
@@ -978,7 +1005,7 @@ class TestOfficerActionGuards:
                     _guard_request(),
                     job["id"],
                     "abc123",
-                    main.OfficerMessageReplyRequest(message="hi"),
+                    messaging_module.OfficerMessageReplyRequest(message="hi"),
                     dependencies=_officer_action_deps(),
                 )
         assert exc.value.status_code == 409
@@ -989,7 +1016,7 @@ class TestOfficerActionGuards:
         job = _job()
         db = _action_db(job, route=_route(blocking=True))
         with (
-            patch.object(main, "postgres_db", db),
+            patch.object(main.app.state.resources, "postgres_db", db),
             _authorized_officer(),
         ):
             with pytest.raises(HTTPException) as exc:
@@ -997,7 +1024,7 @@ class TestOfficerActionGuards:
                     _guard_request(),
                     job["id"],
                     "abc123",
-                    main.OfficerMessageAckRequest(),
+                    messaging_module.OfficerMessageAckRequest(),
                     dependencies=_officer_action_deps(),
                 )
         assert exc.value.status_code == 400
@@ -1013,14 +1040,14 @@ class TestOfficerActionFlows:
         deliver = AsyncMock(return_value=("immediate_resume", 2))
         record = AsyncMock()
         with (
-            patch.object(main, "postgres_db", db),
+            patch.object(main.app.state.resources, "postgres_db", db),
             _authorized_officer(),
         ):
             result = await officer_actions.officer_reply_to_worker_message(
                 _guard_request(scope=f"project:{PROJECT_ID}"),
                 job["id"],
                 "abc123",
-                main.OfficerMessageReplyRequest(message="Use option B."),
+                messaging_module.OfficerMessageReplyRequest(message="Use option B."),
                 dependencies=_officer_action_deps(
                     route_inbound_reply=deliver,
                     record_route_reply_resolution=record,
@@ -1042,7 +1069,7 @@ class TestOfficerActionFlows:
         db = _action_db(job, route=route)
         escalate = AsyncMock(return_value={"escalated": True, "delivered": True})
         with (
-            patch.object(main, "postgres_db", db),
+            patch.object(main.app.state.resources, "postgres_db", db),
             patch("orchestrator.services.message_routing.escalate_route", escalate),
             _authorized_officer(),
         ):
@@ -1050,7 +1077,7 @@ class TestOfficerActionFlows:
                 _guard_request(),
                 job["id"],
                 "abc123",
-                main.OfficerMessageEscalateRequest(
+                messaging_module.OfficerMessageEscalateRequest(
                     context="I recommend option B, but it costs money.",
                 ),
                 dependencies=_officer_action_deps(),
@@ -1076,7 +1103,7 @@ class TestOfficerActionFlows:
             return_value={**route, "state": "escalated_to_user", "user_delivery_at": 1}
         )
         with (
-            patch.object(main, "postgres_db", db),
+            patch.object(main.app.state.resources, "postgres_db", db),
             patch(
                 "orchestrator.services.message_routing.escalate_route",
                 AsyncMock(return_value={"escalated": False, "delivered": False}),
@@ -1087,7 +1114,7 @@ class TestOfficerActionFlows:
                 _guard_request(),
                 job["id"],
                 "abc123",
-                main.OfficerMessageEscalateRequest(),
+                messaging_module.OfficerMessageEscalateRequest(),
                 dependencies=_officer_action_deps(),
             )
         assert result["status"] == "escalated"
@@ -1101,14 +1128,14 @@ class TestOfficerActionFlows:
         db = _action_db(job, route=route)
         db.transition_message_route = AsyncMock(return_value=resolved)
         with (
-            patch.object(main, "postgres_db", db),
+            patch.object(main.app.state.resources, "postgres_db", db),
             _authorized_officer(),
         ):
             result = await officer_actions.officer_acknowledge_worker_message(
                 _guard_request(),
                 job["id"],
                 "abc123",
-                main.OfficerMessageAckRequest(note="seen"),
+                messaging_module.OfficerMessageAckRequest(note="seen"),
                 dependencies=_officer_action_deps(),
             )
         assert result["status"] == "acknowledged"
@@ -1144,7 +1171,11 @@ async def _reply(*args, **kwargs):
     steering the code under test.
     """
     return await inbound_reply_svc.route_inbound_reply(
-        *args, **kwargs, dependencies=main._inbound_reply_dependencies()
+        *args,
+        **kwargs,
+        dependencies=workflows_composition.inbound_reply_dependencies(
+            main.app.state.resources
+        ),
     )
 
 
@@ -1158,10 +1189,12 @@ class TestInboundReplyRouteIntegration:
         db = _reply_db(job)
         record = AsyncMock()
         with (
-            patch.object(main, "COMPLETION_COMMANDS_ENABLED", False),
-            patch.object(main, "postgres_db", db),
             patch.object(
-                main.job_control_operations.JobControlOperations,
+                main.app.state.resources.settings, "completion_commands_enabled", False
+            ),
+            patch.object(main.app.state.resources, "postgres_db", db),
+            patch.object(
+                job_controls_module.JobControlOperations,
                 "internal_resume_job",
                 AsyncMock(return_value=True),
             ),
@@ -1181,10 +1214,12 @@ class TestInboundReplyRouteIntegration:
         db = _reply_db(job)
         record = AsyncMock()
         with (
-            patch.object(main, "COMPLETION_COMMANDS_ENABLED", False),
-            patch.object(main, "postgres_db", db),
             patch.object(
-                main.job_control_operations.JobControlOperations,
+                main.app.state.resources.settings, "completion_commands_enabled", False
+            ),
+            patch.object(main.app.state.resources, "postgres_db", db),
+            patch.object(
+                job_controls_module.JobControlOperations,
                 "internal_resume_job",
                 AsyncMock(return_value=True),
             ),
@@ -1209,8 +1244,10 @@ class TestInboundReplyRouteIntegration:
         db = _reply_db(job, route=route)
         guidance = AsyncMock(return_value="guidance_next_turn")
         with (
-            patch.object(main, "COMPLETION_COMMANDS_ENABLED", False),
-            patch.object(main, "postgres_db", db),
+            patch.object(
+                main.app.state.resources.settings, "completion_commands_enabled", False
+            ),
+            patch.object(main.app.state.resources, "postgres_db", db),
             patch.object(inbound_reply_svc, "queue_supervisor_guidance", guidance),
         ):
             strategy, _seq = await _reply(job["id"], "abc123", "Actually do C.")
@@ -1228,10 +1265,12 @@ class TestInboundReplyRouteIntegration:
         db = _reply_db(job, route=route)
         wake = AsyncMock(return_value=True)
         with (
-            patch.object(main, "COMPLETION_COMMANDS_ENABLED", False),
-            patch.object(main, "postgres_db", db),
+            patch.object(
+                main.app.state.resources.settings, "completion_commands_enabled", False
+            ),
+            patch.object(main.app.state.resources, "postgres_db", db),
             patch("orchestrator.services.session_wake.notify_officer", wake),
-            patch.object(main, "_kick_officer_event_drain", MagicMock()),
+            patch.object(session_wake_module, "kick_event_drain", MagicMock()),
         ):
             strategy, _seq = await _reply(job["id"], "abc123", "thanks anyway")
         assert strategy == "recorded_after_disposition"
@@ -1245,8 +1284,10 @@ class TestInboundReplyRouteIntegration:
         job = _job(status="processing")
         db = _reply_db(job, route=None)
         with (
-            patch.object(main, "COMPLETION_COMMANDS_ENABLED", False),
-            patch.object(main, "postgres_db", db),
+            patch.object(
+                main.app.state.resources.settings, "completion_commands_enabled", False
+            ),
+            patch.object(main.app.state.resources, "postgres_db", db),
         ):
             strategy, _seq = await _reply(job["id"], "abc123", "noted")
         assert strategy == "next_strategic_phase"
@@ -1299,7 +1340,10 @@ class TestRouteWiring:
         notifier = _notifier()
         with _send_patches(db, notifier):
             dependencies = dataclasses.replace(
-                main._agent_messaging_dependencies(), require_internal=AsyncMock()
+                workflows_composition.agent_messaging_dependencies(
+                    main.app.state.resources
+                ),
+                require_internal=AsyncMock(),
             )
             response = _messaging_client(
                 agent_messaging_dependencies_factory=lambda: dependencies

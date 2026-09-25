@@ -513,6 +513,18 @@ const LEGACY_SOCKET_VERBS = new Set([
  *  second; a swap that compacts first can take longer, hence the slack. */
 const CONFIG_UPDATE_ACK_TIMEOUT_MS = 30_000;
 
+/**
+ * How an `endSession` request finished, for the caller that owns navigation.
+ * - `done`: the End was accepted (or there was no thread), or the pinned
+ *   mid-turn prompt ran its course — the caller carries on as it always has.
+ * - `kept`: a stateless session was still busy and the user declined to stop
+ *   its unfinished turn; nothing was ended.
+ * - `retryable`: a stateless End met a retryable retirement fence (503). It
+ *   may already have begun; the thread row was re-read, and End is the retry.
+ * Any other failure still rejects.
+ */
+export type EndSessionOutcome = 'done' | 'kept' | 'retryable';
+
 /** Outcome of one `updateConfig` request — resolved, never rejected, so a
  *  caller can always settle its own optimistic state. */
 export type ConfigUpdateOutcome =
@@ -1177,6 +1189,22 @@ export class PersistentChatService {
   /** Safe public projection of the immutable retirement outcome. The browser
    *  never receives or stores the server's retirement token/context. */
   readonly retirementDisposition = signal<'ended' | 'suspended' | null>(null);
+  /** True only while a pending retirement is a permanent Delete. */
+  readonly retirementPermanent = signal(false);
+  /** The row's execution lane; null until the thread row has been read. */
+  readonly executionLane = signal<'pinned' | 'stateless' | null>(null);
+  /**
+   * A stateless soft End left pending by a retryable fence: nothing on the
+   * server finishes it by itself, and End is the retry the server accepts.
+   * (A pinned retirement settles on the server; a permanent one is retried
+   * by Delete from the session list.)
+   */
+  readonly endRetryAvailable = computed(
+    () =>
+      this.threadStatus() === 'ending' &&
+      this.executionLane() === 'stateless' &&
+      !this.retirementPermanent(),
+  );
   readonly workspaceLifecycle = signal<WorkspaceLifecycleView | null>(null);
 
   // --- Session readiness (agent has finished init and is ready for messages) ---
@@ -1872,6 +1900,23 @@ export class PersistentChatService {
     return failure?.status === 409 && failure.error?.detail?.code === 'turn_in_flight';
   }
 
+  /** Stateless End refused because the turn/unit is still leased or input,
+   *  control, interrupt or permission is pending; `?force=true` stops it. */
+  private _isStatelessEndBusyError(err: unknown): boolean {
+    const failure = err as {
+      status?: unknown;
+      error?: { detail?: { code?: unknown } };
+    };
+    return failure?.status === 409 && failure.error?.detail?.code === 'stateless_end_busy';
+  }
+
+  /** The API's own retryable retirement fence: a 503 whose JSON `detail` is
+   *  a string. A gateway 503 carries no such body and stays a failure. */
+  private _isRetryableEndFence(err: unknown): boolean {
+    const failure = err as { status?: unknown; error?: { detail?: unknown } };
+    return failure?.status === 503 && typeof failure.error?.detail === 'string';
+  }
+
   private _controlPlaneAllowed(threadId: string, openingGeneration?: number): boolean {
     return (
       !this.intentionalClose &&
@@ -2127,6 +2172,7 @@ export class PersistentChatService {
       this.sessionRuntimeGeneration = null;
     }
     this.retirementDisposition.set(null);
+    this.retirementPermanent.set(false);
   }
 
   /**
@@ -2768,6 +2814,12 @@ export class PersistentChatService {
       this.threadStatus.set(effectiveStatus);
       this.endedAt.set(thread.ended_at || thread.last_activity || null);
       this.retirementDisposition.set(retirementDisposition);
+      this.retirementPermanent.set(retirementPending && thread.retirement_permanent === true);
+      this.executionLane.set(
+        thread.execution_lane === 'pinned' || thread.execution_lane === 'stateless'
+          ? thread.execution_lane
+          : null,
+      );
       this.workspaceLifecycle.set(thread.workspace_lifecycle ?? null);
       this.threadMounts.set(Array.isArray(thread.mounts) ? thread.mounts : []);
       this._protectedCloud.set(!!thread.metadata?.protected_cloud);
@@ -4589,6 +4641,8 @@ export class PersistentChatService {
     this.workspaceLifecycle.set(null);
     this.endedAt.set(null);
     this.retirementDisposition.set(null);
+    this.retirementPermanent.set(false);
+    this.executionLane.set(null);
     this.tasks.set([]);
     this.undoAvailable.set(false);
     this.rewindInFlight.set(false);
@@ -4736,12 +4790,17 @@ export class PersistentChatService {
    * An untyped DELETE failure is ambiguous: the request may not have reached
    * the server, or End may have committed while its response was lost. Keep
    * all planes intact until SSE/REST authoritatively observes terminal state.
+   *
+   * A stateless End has two typed refusals of its own (see
+   * `EndSessionOutcome`): `409 stateless_end_busy` asks before forcing, like
+   * `turn_in_flight`, and a string-detail 503 is reported as retryable after
+   * the thread row is re-read. Neither is ever retried automatically.
    */
-  async endSession(force = false): Promise<void> {
+  async endSession(force = false): Promise<EndSessionOutcome> {
     const threadId = this.threadId();
     if (!threadId) {
       this.disconnect();
-      return;
+      return 'done';
     }
     let outcome: unknown;
     try {
@@ -4758,13 +4817,25 @@ export class PersistentChatService {
         // mid-turn unless forced. Declining keeps the session alive.
         const proceed = confirm(this.transloco.translate('sessions.confirmEndMidTurn'));
         if (proceed) {
-          await this.endSession(true);
+          return this.endSession(true);
         }
-        return;
+        return 'done';
+      }
+      if (this._isStatelessEndBusyError(err) && !force) {
+        // The stateless turn/unit is still leased or has pending input or
+        // control. `force` stops the unfinished turn; declining ends nothing.
+        const proceed = confirm(this.transloco.translate('sessions.confirmEndStatelessBusy'));
+        return proceed ? this.endSession(true) : 'kept';
+      }
+      if (this.executionLane() === 'stateless' && this._isRetryableEndFence(err)) {
+        // The End may have begun durably (the row then projects a pending
+        // retirement → `ending`) or not at all; the row says which.
+        await this.loadThreadMeta(threadId);
+        return 'retryable';
       }
       throw err;
     }
-    if (this.threadId() !== threadId) return;
+    if (this.threadId() !== threadId) return 'done';
     this.intentionalClose = false;
     const body = outcome as { status?: unknown; retirement_disposition?: unknown } | null;
     // The owner endpoint is asynchronous for a live pinned runtime: `ending`
@@ -4783,6 +4854,7 @@ export class PersistentChatService {
     // A DELETE can win before the initial EventSource was installed. Keep an
     // SSE-only ending/ended view so late archive/staging events remain discoverable.
     if (!this.sse) void this._openSse(threadId);
+    return 'done';
   }
 
   /**

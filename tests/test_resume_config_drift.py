@@ -51,7 +51,10 @@ def _discard_background_task(coroutine):
 def _patch_caller_and_db(user: dict, db):
     stack = ExitStack()
     stack.enter_context(
-        patch("orchestrator.main.require_approved_user", AsyncMock(return_value=user))
+        patch(
+            "orchestrator.security.auth.require_approved_user",
+            AsyncMock(return_value=user),
+        )
     )
     stack.enter_context(
         patch(
@@ -59,7 +62,7 @@ def _patch_caller_and_db(user: dict, db):
             AsyncMock(return_value=user),
         )
     )
-    stack.enter_context(patch("orchestrator.main.postgres_db", db))
+    stack.enter_context(patch("orchestrator.main.app.state.resources.postgres_db", db))
     # Past the drift gate, resume_thread reprovisions an agent and
     # provisions/reuses the session's cloud folder — machinery this file has
     # no interest in exercising. Keep it inert and deterministic rather than
@@ -67,21 +70,25 @@ def _patch_caller_and_db(user: dict, db):
     # the box the tests happen to run on.
     stack.enter_context(
         patch(
-            "orchestrator.main.agent_provisioner", SimpleNamespace(is_available=False)
-        )
-    )
-    stack.enter_context(
-        patch(
-            "orchestrator.main.persistent_provisioner",
+            "orchestrator.services.agent_provisioner.agent_provisioner",
             SimpleNamespace(is_available=False),
         )
     )
     stack.enter_context(
-        patch("orchestrator.main.ensure_session_workspace", AsyncMock())
+        patch(
+            "orchestrator.services.persistent_provisioner.persistent_provisioner",
+            SimpleNamespace(is_available=False),
+        )
     )
     stack.enter_context(
         patch(
-            "orchestrator.main.asyncio.create_task",
+            "orchestrator.services.session_provisioner.ensure_session_workspace",
+            AsyncMock(),
+        )
+    )
+    stack.enter_context(
+        patch(
+            "asyncio.create_task",
             side_effect=_discard_background_task,
         )
     )
@@ -140,7 +147,7 @@ class TestResumeConfigDrift:
 
         with _patch_caller_and_db(user_a, fake_db):
             with patch(
-                "orchestrator.main.thread_resume_operations.thread_config_drift",
+                "orchestrator.services.thread_resume.thread_config_drift",
                 _fake_drift(drift),
             ):
                 with pytest.raises(HTTPException) as exc:
@@ -179,7 +186,7 @@ class TestResumeConfigDrift:
 
         with _patch_caller_and_db(user_a, fake_db):
             with patch(
-                "orchestrator.main.thread_resume_operations.thread_config_drift",
+                "orchestrator.services.thread_resume.thread_config_drift",
                 _fake_drift(drift),
             ):
                 result = await resume_thread(
@@ -209,7 +216,7 @@ class TestResumeConfigDrift:
 
         with _patch_caller_and_db(user_a, fake_db):
             with patch(
-                "orchestrator.main.thread_resume_operations.thread_config_drift",
+                "orchestrator.services.thread_resume.thread_config_drift",
                 _fake_drift(drift),
             ):
                 with pytest.raises(HTTPException) as exc:
@@ -254,7 +261,7 @@ class TestResumeConfigDrift:
 
         with _patch_caller_and_db(user_a, fake_db):
             with patch(
-                "orchestrator.main.thread_resume_operations.thread_config_drift",
+                "orchestrator.services.thread_resume.thread_config_drift",
                 _fake_drift(drift),
             ):
                 result = await resume_thread(
@@ -296,7 +303,7 @@ class TestResumeConfigDrift:
 
         with _patch_caller_and_db(user_a, fake_db):
             with patch(
-                "orchestrator.main.thread_resume_operations.thread_config_drift",
+                "orchestrator.services.thread_resume.thread_config_drift",
                 _fake_drift(drift),
             ):
                 result = await resume_thread(thread_id, fake_request)
@@ -324,7 +331,7 @@ class TestResumeConfigDrift:
 
         with _patch_caller_and_db(user_a, fake_db):
             with patch(
-                "orchestrator.main.thread_resume_operations.thread_config_drift",
+                "orchestrator.services.thread_resume.thread_config_drift",
                 _fake_drift(drift),
             ):
                 with pytest.raises(HTTPException) as exc:
@@ -353,7 +360,7 @@ class TestResumeConfigDrift:
 
         with _patch_caller_and_db(user_a, fake_db):
             with patch(
-                "orchestrator.main.thread_resume_operations.thread_config_drift",
+                "orchestrator.services.thread_resume.thread_config_drift",
                 _fake_drift([]),
             ):
                 result = await resume_thread(thread_id, fake_request)
@@ -376,7 +383,7 @@ class TestResumeConfigDrift:
 
         with _patch_caller_and_db(user_a, fake_db):
             with patch(
-                "orchestrator.main.thread_resume_operations.thread_config_drift",
+                "orchestrator.services.thread_resume.thread_config_drift",
                 drift_probe,
             ):
                 with pytest.raises(HTTPException) as exc:
@@ -412,7 +419,7 @@ class TestResumeConfigDrift:
 
         with _patch_caller_and_db(user_a, fake_db):
             with patch(
-                "orchestrator.main._resolve_session_config",
+                "orchestrator.services.session_config_resolution.resolve_session_config",
                 AsyncMock(side_effect=RuntimeError("boom")),
             ):
                 with pytest.raises(HTTPException) as exc:
@@ -462,11 +469,11 @@ class TestResumeConfigDrift:
         with _patch_caller_and_db(user_admin, fake_db):
             with (
                 patch(
-                    "orchestrator.main._thread_project_ids",
+                    "orchestrator.services.thread_mount_rows.thread_project_ids",
                     AsyncMock(return_value=[project_id]),
                 ),
                 patch(
-                    "orchestrator.main._resolve_session_config",
+                    "orchestrator.services.session_config_resolution.resolve_session_config",
                     AsyncMock(return_value=None),
                 ),
             ):
@@ -521,7 +528,7 @@ class TestResumeConfigDrift:
 
         with _patch_caller_and_db(user_a, fake_db):
             with patch(
-                "orchestrator.main._resolve_session_config",
+                "orchestrator.services.session_config_resolution.resolve_session_config",
                 AsyncMock(return_value=None),
             ):
                 with pytest.raises(HTTPException) as exc:

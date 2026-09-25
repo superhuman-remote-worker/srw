@@ -98,6 +98,7 @@ def source_paths():
         "src/orchestrator/schemas/thread_admission.py",
     }
     for pattern in (
+        "src/orchestrator/application/*.py",
         "src/shared/manifests/*.py",
         "src/shared/manifests/*.json",
         "src/orchestrator/routers/manifests.py",

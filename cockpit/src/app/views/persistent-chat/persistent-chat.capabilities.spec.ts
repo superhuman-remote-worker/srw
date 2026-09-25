@@ -38,7 +38,7 @@ function sessionState() {
     'hasOlderTurns', 'cloudDiffPanelOpen', 'cloudSyncDegraded', 'protectedCloud',
     'workspaceUpgradeInProgress', 'continueAfterUpgrade', 'rewindInFlight', 'rewindOutcomeUnknown',
     'rewindPreviewLoading', 'rewindModeAvailable', 'summarizeAvailable', 'outboxStalled',
-    'draftDefaultsLoading', 'reconnectGaveUp']) state[key] = signal(false);
+    'draftDefaultsLoading', 'reconnectGaveUp', 'endRetryAvailable']) state[key] = signal(false);
   for (const key of ['turns', 'visibleTurns', 'pendingAttachments', 'pendingPermissions', 'tasks',
     'outbox', 'outboxIds', 'draftDatasourceIds']) state[key] = signal([]);
   for (const key of ['compaction', 'rewindPrefill', 'rewindPreview', 'runningTool', 'pendingWorkspaceOffer',
@@ -235,6 +235,54 @@ describe('parked unit composer', () => {
       fixture.detectChanges();
       expect(composer().disabled).toBe(false);
       expect(composer().placeholder).toBe('chat.input.default');
+    } finally {
+      fixture.destroy();
+      TestBed.resetTestingModule();
+    }
+  });
+});
+
+// R1 follow-up: a stateless End fenced by a retryable 503 stays `ending` until
+// End is pressed again — nothing on the server finishes it — so the header
+// keeps End (`chat.header.disconnect`) there. A pinned `ending` session, which
+// the server settles by itself, shows no End.
+describe('header End on a pending stateless retirement', () => {
+  beforeAll(async () => {
+    HTMLElement.prototype.scrollTo = vi.fn();
+    await ɵresolveComponentResources(() => Promise.resolve(''));
+  });
+
+  const api = {
+    getThreadIdeStatus: () => of(null),
+    getMyCapabilities: () => of(null),
+    getSshHostKeys: () => of({hostname: 'ssh.example.test', host_keys: []}),
+  };
+
+  function endButtons(host: HTMLElement): HTMLElement[] {
+    return [...host.querySelectorAll<HTMLElement>('.header-right app-button')]
+      .filter(button => button.textContent?.trim() === 'chat.header.disconnect');
+  }
+
+  it.each([
+    ['offers End as the retry', true],
+    ['shows no End on an ending session End cannot retry', false],
+  ])('%s', async (_name, retry) => {
+    const chat = sessionState() as any;
+    chat.threadStatus.set('ending');
+    chat.isConnected.set(false);
+    chat.connectionState.set('disconnected');
+    chat.endRetryAvailable.set(retry);
+    // `kept`: the page stays put, so no router/toast is reached.
+    chat.endSession = vi.fn(async () => 'kept');
+    const fixture = await mountChat(chat, api, false);
+    try {
+      const buttons = endButtons(fixture.nativeElement as HTMLElement);
+      expect(buttons).toHaveLength(retry ? 1 : 0);
+      if (retry) {
+        buttons[0].dispatchEvent(new CustomEvent('clicked'));
+        await fixture.whenStable();
+        expect(chat.endSession).toHaveBeenCalledTimes(1);
+      }
     } finally {
       fixture.destroy();
       TestBed.resetTestingModule();

@@ -32,6 +32,7 @@ from orchestrator.routers import thread_history, thread_permissions
 from orchestrator.services import session_wake
 
 from ._mounted_router import mount_router
+from orchestrator.application import lifecycle as lifecycle_composition
 
 THREAD_ID = "11111111-2222-4333-8444-555555555555"
 APPROVAL_ID = "99999999-8888-4777-8666-555555555555"
@@ -582,8 +583,8 @@ def _forget_metering_bindings():
 def _composed_store(monkeypatch):
     """A drain store bound to its ledger by the application's own composition."""
     store = _drain_store()
-    monkeypatch.setattr(main, "postgres_db", store)
-    main._bind_officer_wake_metering()
+    monkeypatch.setattr(main.app.state.resources, "postgres_db", store)
+    lifecycle_composition.bind_officer_wake_metering(main.app.state.resources)
     return store
 
 
@@ -603,7 +604,7 @@ async def test_over_budget_officer_wake_defers_to_utc_midnight_through_app_ledge
 ):
     _stub_sitrep(monkeypatch)
     ledger = _ledger(1_000)
-    monkeypatch.setattr(main, "usage_ledger", ledger)
+    monkeypatch.setattr(main.app.state.resources, "usage_ledger", ledger)
     store = _composed_store(monkeypatch)
 
     delivered = await session_wake.drain_pending_event_wakes(store)
@@ -634,7 +635,7 @@ async def test_over_budget_officer_wake_defers_to_utc_midnight_through_app_ledge
 )
 async def test_officer_wake_fails_open_or_delivers_under_budget(monkeypatch, ledger):
     _stub_sitrep(monkeypatch)
-    monkeypatch.setattr(main, "usage_ledger", ledger)
+    monkeypatch.setattr(main.app.state.resources, "usage_ledger", ledger)
     store = _composed_store(monkeypatch)
 
     delivered = await session_wake.drain_pending_event_wakes(store)

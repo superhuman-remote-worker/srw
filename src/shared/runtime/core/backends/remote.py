@@ -1242,9 +1242,12 @@ __SRW_WORKSPACE_UID_ZERO_PY__
         It never creates a missing tmux session.  A missing marker is accepted
         only when the exact tmux name is also absent; an active marker with a
         missing tmux is promoted in place so resident daemons can still be
-        drained.  The record remains ``active`` at ``T`` on success (and on a
-        command failure), allowing :meth:`shell_cleanup` to be the sole writer
-        of the terminal ``retired`` acknowledgement afterward.
+        drained.  A marker naming another runtime is the retired predecessor's
+        record on a Resume-reused volume: like :meth:`shell_cleanup`'s stale
+        branch it is replaced only at or below ``T`` and only while the exact
+        tmux name is absent.  The record remains ``active`` at ``T`` on success
+        (and on a command failure), allowing :meth:`shell_cleanup` to be the
+        sole writer of the terminal ``retired`` acknowledgement afterward.
         """
 
         if self._shell_owner_token is None or not self.workspace_incarnation_fenced:
@@ -2582,15 +2585,24 @@ __SRW_WORKSPACE_UID_ZERO_PY__
         return (
             self._tmux_state_shell()
             + "if _srw_load_state; then\n"
-            + "  _srw_marker=present\n"
             + '  [ "$_srw_process_tagged" = true ] || exit 81\n'
-            + f'  [ "$_srw_workspace_generation" = {expected_workspace} ] '
-            + "|| exit 80\n"
-            + f'  [ "$_srw_runtime_incarnation" = {expected_runtime} ] '
-            + "|| exit 80\n"
-            + '  [ "$_srw_status" = active ] || '
+            + f'  if [ "$_srw_workspace_generation" = {expected_workspace} ] && '
+            + f'[ "$_srw_runtime_incarnation" = {expected_runtime} ]; then\n'
+            + "    _srw_marker=present\n"
+            + '    [ "$_srw_status" = active ] || '
             + '[ "$_srw_status" = creating ] || exit 75\n'
-            + f'  [ "$_srw_token" -le {token} ] || exit 75\n'
+            + f'    [ "$_srw_token" -le {token} ] || exit 75\n'
+            + "  else\n"
+            # The PVC-resident record of a retired predecessor runtime: a
+            # Resume reuses the volume, and only a new turn rewrites it.
+            # Mirror shell_cleanup's stale branch: never behind End's token,
+            # never beside a same-name tmux it cannot explain, otherwise
+            # re-stamped below under this exact runtime.
+            + f'    [ "$_srw_token" -le {token} ] || exit 75\n'
+            + f"    ! tmux has-session -t {target} 2>/dev/null || exit 80\n"
+            + "    _srw_marker=absent\n"
+            + f"    _srw_generation={fallback_generation}\n"
+            + "  fi\n"
             + "else\n"
             + '  _srw_rc=$?; [ "$_srw_rc" -eq 1 ] || exit "$_srw_rc"\n'
             + "  _srw_marker=absent\n"

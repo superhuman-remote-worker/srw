@@ -1,34 +1,74 @@
 import {Component, computed, ElementRef, HostListener, inject, signal, ViewChild} from '@angular/core';
-import {NavigationEnd, Router, RouterLink, RouterLinkActive} from '@angular/router';
+import {Location, NgTemplateOutlet} from '@angular/common';
+import {IsActiveMatchOptions, NavigationEnd, Router, RouterLink, RouterLinkActive} from '@angular/router';
 import {takeUntilDestroyed, toSignal} from '@angular/core/rxjs-interop';
 import {filter, map} from 'rxjs';
 import {SidebarService} from '../../core/services/sidebar.service';
 import {ViewportService} from '../../core/services/viewport.service';
 import {SessionListService} from '../../core/services/session-list.service';
-import {LayoutService} from '../../workbench/services/layout.service';
-import {LayoutPickerComponent} from '../../workbench/components/layout-picker/layout-picker.component';
+import {UserService} from '../../core/services/user.service';
+import {ActionCenterService} from '../../core/services/action-center.service';
+import {RailTakeoverService} from '../../core/services/rail-takeover.service';
 import {NotificationBellComponent} from '../notification-bell/notification-bell.component';
 import {PersistentChatService} from '../../core/services/persistent-chat.service';
 import {environment} from '../../core/environment';
 import {TranslocoPipe} from '@jsverse/transloco';
 import {AppIconComponent} from '../../ui/icon';
 import {LegionMarkComponent} from '../../ui/legion-mark';
-import {AppTabNavComponent, AppTabNavItemComponent} from '../../ui/tab-nav';
-import {RailMoreMenuComponent} from '../rail-more-menu/rail-more-menu.component';
 import {RailAccountMenuComponent} from '../rail-account-menu/rail-account-menu.component';
 
-export type RailMode = 'chat' | 'jobs' | 'projects';
+/**
+ * What the rail body shows. `main` everywhere except where the rail is taken
+ * over, always with a way back (navigation_fixed_rail.md F1, F4, F9):
+ * `settings` is the shell's own section list, `page` is content a page lends
+ * the rail through RailTakeoverService.
+ */
+export type RailView = 'main' | 'settings' | 'page';
 
-const MODE_ROUTES: Record<RailMode, string> = {
-  chat: '/',
-  jobs: '/jobs',
-  projects: '/projects',
-};
+export interface RailLink {
+  path: string;
+  labelKey: string;
+}
+
+export interface RailLinkGroup {
+  labelKey: string;
+  items: RailLink[];
+}
+
+/** The four pages the Customize row stands for — they share a tab bar. */
+const CUSTOMIZE_ROUTES = ['/experts', '/skills', '/datasources', '/contacts'];
+
+/**
+ * Pages that lend the rail their own list on desktop. Known here by route,
+ * not only by their claim, so a hard load reserves the rail on its first
+ * frame instead of drawing the main rows and then swapping them out. On a
+ * phone the rail is a drawer the user has to open, so these pages keep
+ * their list in the page there.
+ */
+const PAGE_TAKEOVER_ROUTES = ['/inbox'];
+
+/** `path` itself or anything below it — never a sibling that merely shares
+ *  the prefix. */
+function isUnder(path: string, prefix: string): boolean {
+  return path === prefix || path.startsWith(prefix + '/');
+}
+
+export function railViewFor(path: string, mobile = false): RailView {
+  if (isUnder(path, '/settings') || isUnder(path, '/admin')) return 'settings';
+  if (!mobile && PAGE_TAKEOVER_ROUTES.some((prefix) => isUnder(path, prefix))) return 'page';
+  return 'main';
+}
+
+/** router.url carries the query string and fragment (e.g. '/?foo=bar') —
+ *  every route test works on the bare path. */
+function pathOf(url: string): string {
+  return url.split(/[?#]/)[0] || '/';
+}
 
 @Component({
   selector: 'app-sidebar',
   standalone: true,
-  imports: [RouterLink, RouterLinkActive, LayoutPickerComponent, NotificationBellComponent, TranslocoPipe, AppIconComponent, LegionMarkComponent, AppTabNavComponent, AppTabNavItemComponent, RailMoreMenuComponent, RailAccountMenuComponent],
+  imports: [RouterLink, RouterLinkActive, NgTemplateOutlet, NotificationBellComponent, TranslocoPipe, AppIconComponent, LegionMarkComponent, RailAccountMenuComponent],
   template: `
     <nav class="sidebar" id="sidebar-rail" (click)="onSidebarClick($event)">
       <div class="sidebar-header">
@@ -46,122 +86,113 @@ const MODE_ROUTES: Record<RailMode, string> = {
       </div>
 
       <div class="sidebar-body">
-        <app-tab-nav class="mode-switcher" [value]="mode()" (valueChange)="selectMode($event)">
-          <app-tab-nav-item value="chat">{{ 'nav.modeChat' | transloco }}</app-tab-nav-item>
-          <app-tab-nav-item value="jobs">{{ 'nav.modeJobs' | transloco }}</app-tab-nav-item>
-          <app-tab-nav-item value="projects">{{ 'nav.modeProjects' | transloco }}</app-tab-nav-item>
-        </app-tab-nav>
-
-        <a class="rail-new" routerLink="/">
-          <app-icon size="md">edit_square</app-icon> {{ 'nav.newChat' | transloco }}
-        </a>
-
-        @if (showFilter()) {
-          <label class="rail-search">
-            <app-icon size="md">search</app-icon>
-            <input #filterInput type="search" [value]="filterText()"
-                   (input)="filterText.set($any($event.target).value)"
-                   [placeholder]="'nav.searchSessions' | transloco"
-                   [attr.aria-label]="'nav.searchSessions' | transloco">
-            <!-- The native ::-webkit-search-cancel-button is suppressed
-                 below (it doesn't double up with this), so an empty vs.
-                 filled filter needs its own way to clear — otherwise
-                 clearing means select-all plus backspace. -->
-            @if (filterText()) {
-              <button type="button" class="rail-search-clear" (click)="clearFilter()"
-                      [attr.aria-label]="'nav.clearFilter' | transloco">
-                <app-icon size="sm">close</app-icon>
-              </button>
-            } @else {
-              <kbd aria-hidden="true">⌘K</kbd>
-            }
-          </label>
-        }
-
-        <!-- Gated on mode(), not on sessionGroups().length — same allowlist
-             reason as showFilter()/sessionGroups() above. A fresh account
-             with zero sessions is exactly the user "See all sessions" must
-             stay reachable for, and the empty-state copy below only makes
-             sense while the session list is the thing on screen. -->
-        @if (mode() === 'chat') {
-          @for (group of sessionGroups(); track group.label) {
-            <div class="rail-group">{{ ('nav.recency.' + group.label) | transloco }}</div>
-            @for (t of group.threads; track t.id) {
-              <a class="rail-item" [routerLink]="['/sessions', t.id]" routerLinkActive="active">
-                {{ t.title }}
-              </a>
-            }
-          }
-
-          <!-- sessionGroups() is [] both when the account has no sessions
-               and when the filter matched none — tell those apart, or a
-               forgotten filter reads as "my sessions disappeared". -->
-          @if (sessionGroups().length === 0) {
-            <div class="rail-empty">{{ (hasSessions() ? 'nav.noMatches' : 'nav.noSessionsYet') | transloco }}</div>
-          }
-
-          <a class="rail-see-all" routerLink="/sessions">
-            <app-icon size="sm">arrow_forward</app-icon> {{ 'nav.seeAllSessions' | transloco }}
-          </a>
-        }
-
-        @if (isWorkbenchRoute()) {
-          @if (adminToolsEnabled) {
-          <div class="section">
-            <div class="section-title">Databases</div>
-            <a class="section-link" [href]="neo4jUrl" target="_blank" rel="noopener">
-              <span class="link-icon">&#x1F535;</span>Neo4j Browser
-            </a>
-            <a class="section-link" [href]="pgadminUrl" target="_blank" rel="noopener">
-              <span class="link-icon">&#x1F418;</span>PostgreSQL
-            </a>
-          </div>
-
-          }
-          <div class="section">
-            <div class="section-title">Tools</div>
-            <a class="section-link" [href]="giteaUrl" target="_blank" rel="noopener">
-              <span class="link-icon">&#x1F375;</span>Gitea
-            </a>
-            @if (adminToolsEnabled) {
-            <a class="section-link" [href]="dozzleUrl" target="_blank" rel="noopener">
-              <span class="link-icon">&#x1F4CB;</span>Dozzle
-            </a>
-            }
-            @if (adminToolsEnabled && minioConsoleUrl) {
-              <a class="section-link" [href]="minioConsoleUrl" target="_blank" rel="noopener">
-                <span class="link-icon">&#x1F4E6;</span>MinIO
-              </a>
-            }
-            @if (cloudUrl) {
-              <a class="section-link" [href]="cloudUrl" target="_blank" rel="noopener">
-                <span class="link-icon">&#x2601;</span>Cloud
-              </a>
-            }
-          </div>
-
-          <div class="section">
-            <div class="section-title">Layouts</div>
-            <button class="section-link" #layoutBtn (click)="toggleLayoutPicker(layoutBtn)">
-              <span class="link-icon">&#x1F4D0;</span>Choose Layout
+        @switch (railView()) {
+          <!-- Settings and Admin are one Settings (navigation_fixed_rail.md
+               F4): the rail becomes its section list, with admins getting
+               the Administration group at the bottom. -->
+          @case ('settings') {
+            <button type="button" class="rail-back" (click)="backToApp()">
+              <app-icon size="md">arrow_back</app-icon> {{ 'nav.backToApp' | transloco }}
             </button>
-            <button class="section-link" (click)="resetLayout()">
-              <span class="link-icon">&#x1F504;</span>Reset Layout
-            </button>
-            @if (isLayoutPickerOpen()) {
-              <app-layout-picker
-                [top]="pickerTop()"
-                [left]="pickerLeft()"
-                (closed)="closeLayoutPicker()"
-              />
+            @for (group of settingsGroups(); track group.labelKey) {
+              <div class="rail-group">{{ group.labelKey | transloco }}</div>
+              @for (item of group.items; track item.path) {
+                <a class="rail-item" [routerLink]="item.path" routerLinkActive="active">
+                  {{ item.labelKey | transloco }}
+                </a>
+              }
             }
-          </div>
+          }
+          <!-- A page's own list (the Action Center's feed) in place of the
+               rail's rows, so the page doesn't need a second list column
+               beside the rail (navigation_fixed_rail.md F9). -->
+          @case ('page') {
+            <button type="button" class="rail-back" (click)="backToApp()">
+              <app-icon size="md">arrow_back</app-icon> {{ 'nav.backToApp' | transloco }}
+            </button>
+            <ng-container [ngTemplateOutlet]="takeover.template()" />
+          }
+          <!-- Every other route: the same rows and Recents, whatever the page
+               (navigation_fixed_rail.md F1). -->
+          @default {
+            <div class="rail-primary">
+              <!-- Always the draft landing, never a thread — see the April
+                   2026 hijack regression in coding_agent_ui_assessment.md §3. -->
+              <a class="rail-nav" routerLink="/" routerLinkActive="active"
+                 [routerLinkActiveOptions]="exactPath">
+                <app-icon size="md">edit_square</app-icon>
+                <span class="rail-nav-label">{{ 'nav.newChat' | transloco }}</span>
+              </a>
+              <a class="rail-nav" routerLink="/jobs" routerLinkActive="active">
+                <app-icon size="md">work</app-icon>
+                <span class="rail-nav-label">{{ 'nav.jobs' | transloco }}</span>
+                @if (jobsAwaitingReview(); as count) {
+                  <span class="rail-badge" [attr.aria-label]="'nav.jobsAwaitingReview' | transloco: {count: count}">
+                    {{ count }}
+                  </span>
+                }
+              </a>
+              <a class="rail-nav" routerLink="/projects" routerLinkActive="active">
+                <app-icon size="md">folder</app-icon>
+                <span class="rail-nav-label">{{ 'nav.projects' | transloco }}</span>
+              </a>
+              <a class="rail-nav" routerLink="/automations" routerLinkActive="active">
+                <app-icon size="md">schedule</app-icon>
+                <span class="rail-nav-label">{{ 'nav.automations' | transloco }}</span>
+              </a>
+              <a class="rail-nav" routerLink="/experts" [class.active]="customizeActive()">
+                <app-icon size="md">extension</app-icon>
+                <span class="rail-nav-label">{{ 'nav.customize' | transloco }}</span>
+              </a>
+            </div>
+
+            <label class="rail-search">
+              <app-icon size="md">search</app-icon>
+              <input #filterInput type="search" [value]="filterText()"
+                     (input)="filterText.set($any($event.target).value)"
+                     [placeholder]="'nav.searchSessions' | transloco"
+                     [attr.aria-label]="'nav.searchSessions' | transloco">
+              <!-- The native ::-webkit-search-cancel-button is suppressed
+                   below (it doesn't double up with this), so an empty vs.
+                   filled filter needs its own way to clear — otherwise
+                   clearing means select-all plus backspace. -->
+              @if (filterText()) {
+                <button type="button" class="rail-search-clear" (click)="clearFilter()"
+                        [attr.aria-label]="'nav.clearFilter' | transloco">
+                  <app-icon size="sm">close</app-icon>
+                </button>
+              } @else {
+                <kbd aria-hidden="true">⌘K</kbd>
+              }
+            </label>
+
+            @for (group of sessionGroups(); track group.label) {
+              <div class="rail-group">{{ ('nav.recency.' + group.label) | transloco }}</div>
+              @for (t of group.threads; track t.id) {
+                <a class="rail-item" [routerLink]="['/sessions', t.id]" routerLinkActive="active">
+                  {{ t.title }}
+                </a>
+              }
+            }
+
+            <!-- sessionGroups() is [] both when the account has no sessions
+                 and when the filter matched none — tell those apart, or a
+                 forgotten filter reads as "my sessions disappeared". -->
+            @if (sessionGroups().length === 0) {
+              <div class="rail-empty">{{ (hasSessions() ? 'nav.noMatches' : 'nav.noSessionsYet') | transloco }}</div>
+            }
+
+            <!-- Rendered whatever the list length: a fresh account with zero
+                 sessions is exactly the user this door must stay reachable
+                 for. -->
+            <a class="rail-see-all" routerLink="/sessions">
+              <app-icon size="sm">arrow_forward</app-icon> {{ 'nav.seeAllSessions' | transloco }}
+            </a>
+          }
         }
       </div>
 
       <div class="sidebar-footer">
-        <app-rail-more-menu />
-        <div class="rail-divider"></div>
         <app-rail-account-menu />
       </div>
     </nav>
@@ -306,31 +337,16 @@ const MODE_ROUTES: Record<RailMode, string> = {
         scrollbar-color: var(--border-color) transparent;
       }
 
-      .mode-switcher {
-        margin: 8px;
+      /* Primary rows: the same five on every main-rail route
+         (navigation_fixed_rail.md F1). */
+      .rail-primary {
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+        padding: 8px 0 4px;
       }
 
-      /* Three modes share one row in the rail, 200px wide at its narrowest.
-         The tab primitive's 20px side padding plus wrap-on-overflow pushed
-         "Projects" onto a second line; distribute the slack across the items
-         instead. */
-      .mode-switcher[data-orientation='horizontal'] {
-        flex-wrap: nowrap;
-      }
-
-      .mode-switcher ::ng-deep app-tab-nav-item {
-        flex: 1 1 auto;
-        min-width: 0;
-        justify-content: center;
-        padding-inline: 6px;
-        white-space: nowrap;
-      }
-
-      /* Rail session list: the Chat mode's "New chat" action and the
-         recency-grouped thread list that fills the space below the
-         switcher. */
-
-      .rail-new {
+      .rail-nav {
         display: flex;
         align-items: center;
         gap: 10px;
@@ -345,7 +361,63 @@ const MODE_ROUTES: Record<RailMode, string> = {
           color 0.15s ease;
       }
 
-      .rail-new:hover {
+      .rail-nav:hover {
+        background: var(--surface-0);
+        color: var(--text-primary);
+      }
+
+      .rail-nav.active {
+        background: var(--surface-0);
+        color: var(--accent-color);
+        font-weight: 600;
+      }
+
+      .rail-nav-label {
+        flex: 1;
+        min-width: 0;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+
+      /* Jobs waiting for review. Same tone as the bell's badge: it is the
+         same kind of "someone needs you" signal, placed where the work is. */
+      .rail-badge {
+        flex: none;
+        min-width: 18px;
+        padding: 1px 6px;
+        border-radius: var(--radius-pill);
+        background: var(--accent-color);
+        color: var(--on-accent);
+        font-size: 11px;
+        font-weight: 600;
+        line-height: 16px;
+        text-align: center;
+      }
+
+      /* The way out of a takeover (Settings, a page's list): an action row, not
+         a destination, so it is a button and never lights up. */
+      .rail-back {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        width: calc(100% - 16px);
+        margin: 8px 8px 4px;
+        padding: 8px 12px;
+        border: none;
+        border-radius: var(--radius-control);
+        background: transparent;
+        color: var(--text-secondary);
+        font-family: inherit;
+        font-size: 13px;
+        text-align: left;
+        cursor: pointer;
+        transition:
+          background 0.15s ease,
+          color 0.15s ease;
+      }
+
+      .rail-back:hover {
         background: var(--surface-0);
         color: var(--text-primary);
       }
@@ -478,7 +550,7 @@ const MODE_ROUTES: Record<RailMode, string> = {
 
       /* Bulk-management escape hatch: routes to /sessions, the only
          discoverable path there (see the finding this fixes). Styled as an
-         action row like .rail-new, not a session row like .rail-item. */
+         action row like .rail-nav, not a session row like .rail-item. */
       .rail-see-all {
         display: flex;
         align-items: center;
@@ -521,24 +593,17 @@ const MODE_ROUTES: Record<RailMode, string> = {
           font-size: 12px;
         }
 
-        /* Tap-target restoration (Task 8 step 5): Task 6 deleted the old flat
-           nav's .nav-link rule — min-height: 44px; padding: 10px 14px;
-           gap: 12px — along with the links it sized. Every control the rail
-           has grown since (Tasks 6, 7, this one, 12, and the "See all
-           sessions" row) needs that minimum back. .rail-new, .rail-item,
-           .rail-search (Task 12's filter label — the whole label focuses the
-           input on tap, an implicit label/input association, so sizing the
-           label covers the target) and .rail-see-all are rendered directly
-           in this template, so one rule reaches all four. The More and
-           avatar triggers (.rail-nav, .rail-account) are owned by their own
-           components now and restore this same rule in their own
-           stylesheets — Emulated encapsulation means a rule here can't reach
-           into their templates. The mode switcher's tabs are
-           app-tab-nav-item, a shared ui/ component with the same
-           encapsulation boundary; ::ng-deep reaches its host element,
-           scoped under .mode-switcher so the other app-tab-nav consumers
-           (admin-models, agent-settings) are unaffected. */
-        .rail-new,
+        /* Tap-target restoration (Task 8 step 5): every row this template
+           renders — the primary rows, the takeover's back button, session
+           and settings rows, the filter (the whole label focuses the input
+           on tap, an implicit label/input association, so sizing the label
+           covers the target) and "See all sessions" — gets the 44px
+           minimum back. The avatar trigger (.rail-account) is owned by its
+           own component and restores the same rule in its own stylesheet —
+           Emulated encapsulation means a rule here can't reach into its
+           template. */
+        .rail-nav,
+        .rail-back,
         .rail-item,
         .rail-search,
         .rail-see-all {
@@ -546,61 +611,6 @@ const MODE_ROUTES: Record<RailMode, string> = {
           padding: 10px 14px;
           gap: 12px;
         }
-
-        .mode-switcher ::ng-deep app-tab-nav-item {
-          min-height: 44px;
-          padding: 10px 14px;
-          gap: 12px;
-        }
-      }
-
-      /* Workbench sections */
-
-      .section {
-        padding: 8px;
-        border-top: 1px solid var(--border-hairline);
-      }
-
-      .section-title {
-        font-size: 11px;
-        font-weight: 600;
-        text-transform: uppercase;
-        letter-spacing: 0.06em;
-        color: var(--text-muted);
-        padding: 4px 8px 6px;
-        margin: 0;
-      }
-
-      .section-link {
-        display: flex;
-        align-items: center;
-        gap: 8px;
-        padding: 6px 12px;
-        border-radius: var(--radius-control);
-        color: var(--text-secondary);
-        text-decoration: none;
-        font-size: 12px;
-        cursor: pointer;
-        border: none;
-        background: transparent;
-        width: 100%;
-        text-align: left;
-        font-family: inherit;
-        transition:
-          background 0.15s ease,
-          color 0.15s ease;
-      }
-
-      .section-link:hover {
-        background: var(--surface-0);
-        color: var(--text-primary);
-      }
-
-      .link-icon {
-        font-size: 14px;
-        width: 18px;
-        text-align: center;
-        flex-shrink: 0;
       }
 
       /* Footer */
@@ -612,10 +622,6 @@ const MODE_ROUTES: Record<RailMode, string> = {
         flex-direction: column;
         gap: 8px;
         flex-shrink: 0;
-      }
-
-      .rail-divider {
-        border-top: 1px solid var(--border-hairline);
       }
     `,
   ],
@@ -629,47 +635,108 @@ const MODE_ROUTES: Record<RailMode, string> = {
 })
 export class SidebarComponent {
   readonly sidebar = inject(SidebarService);
-  readonly layoutService = inject(LayoutService);
+  protected readonly takeover = inject(RailTakeoverService);
   private readonly router = inject(Router);
+  private readonly location = inject(Location);
   private readonly chatService = inject(PersistentChatService);
   readonly viewport = inject(ViewportService);
   private readonly sessions = inject(SessionListService);
+  private readonly userService = inject(UserService);
+  private readonly actionCenter = inject(ActionCenterService);
 
-  readonly mode = computed<RailMode | null>(() => {
-    // Allowlist, deliberately not a fallback: a route that is none of the three
-    // modes must light no tab, rather than defaulting to Chat and telling the
-    // user they are somewhere they are not. Routes outside these three
-    // (/experts, /settings, /admin/*, ...) are reached from the More and avatar
-    // menus and have no mode of their own.
-    // router.url carries the query string and fragment (e.g. '/?foo=bar') —
-    // strip both before matching, or the landing page itself falls through.
-    const path = this.currentUrl().split(/[?#]/)[0];
-    if (path === '/' || path.startsWith('/sessions')) return 'chat';
-    if (path.startsWith('/jobs')) return 'jobs';
-    if (path.startsWith('/projects')) return 'projects';
-    return null;
+  /**
+   * The URL as of the last completed navigation. Before the first one ends,
+   * router.url is still '/', so seeding from it drew the landing page's rail
+   * on the first frame of a hard load of /projects or /settings/general —
+   * read the browser's own path until the router has one.
+   */
+  private readonly currentUrl = toSignal(
+    this.router.events.pipe(
+      filter((e): e is NavigationEnd => e instanceof NavigationEnd),
+      map((e) => e.urlAfterRedirects),
+    ),
+    {initialValue: this.router.navigated ? this.router.url : this.location.path() || '/'},
+  );
+
+  private readonly currentPath = computed(() => pathOf(this.currentUrl()));
+
+  readonly railView = computed(() => railViewFor(this.currentPath(), this.viewport.isMobile()));
+
+  /** The Customize row stands for four pages and has no route of its own to
+   *  match with routerLinkActive. */
+  readonly customizeActive = computed(() =>
+    CUSTOMIZE_ROUTES.some((prefix) => isUnder(this.currentPath(), prefix)),
+  );
+
+  /** New chat lights only on the draft landing itself, not on every route. */
+  readonly exactPath: IsActiveMatchOptions = {
+    paths: 'exact',
+    queryParams: 'ignored',
+    fragment: 'ignored',
+    matrixParams: 'ignored',
+  };
+
+  /** Jobs waiting for the user's review: the server's own count, live over
+   *  the notification stream. 0 hides the badge. */
+  readonly jobsAwaitingReview = computed(
+    () => this.actionCenter.counts().byCategory['review_queue']?.pending ?? 0,
+  );
+
+  /**
+   * The settings rail: every user's sections, then — for admins — the
+   * Administration group (navigation_fixed_rail.md §4). Hiding the group is
+   * UX; /admin/* keeps its own adminGuard.
+   */
+  readonly settingsGroups = computed<RailLinkGroup[]>(() => {
+    const access: RailLink[] = [{path: '/settings/api-keys', labelKey: 'settings.nav.apiKeys'}];
+    if (this.externalClientsEnabled) {
+      access.push(
+        {path: '/settings/mcp', labelKey: 'settings.nav.mcp'},
+        {path: '/settings/ssh-keys', labelKey: 'settings.nav.sshKeys'},
+      );
+    }
+    const groups: RailLinkGroup[] = [
+      {
+        labelKey: 'settings.nav.groupSettings',
+        items: [
+          {path: '/settings/general', labelKey: 'settings.nav.general'},
+          {path: '/settings/defaults', labelKey: 'settings.nav.defaults'},
+          {path: '/settings/provider-keys', labelKey: 'settings.nav.providerKeys'},
+          {path: '/settings/notifications', labelKey: 'settings.nav.notifications'},
+        ],
+      },
+      {labelKey: 'settings.nav.groupAccess', items: access},
+    ];
+    if (this.userService.currentUser()?.is_admin) {
+      groups.push({
+        labelKey: 'settings.nav.groupAdmin',
+        items: [
+          {path: '/admin/models', labelKey: 'admin.nav.models'},
+          {path: '/admin/subscriptions', labelKey: 'settings.nav.subscriptions'},
+          {path: '/admin/users', labelKey: 'admin.nav.users'},
+          {path: '/admin/config', labelKey: 'admin.nav.config'},
+          {path: '/admin/grants', labelKey: 'admin.nav.grants'},
+          {path: '/admin/cloud', labelKey: 'settings.nav.cloud'},
+          {path: '/admin/usage', labelKey: 'admin.nav.usage'},
+          {path: '/admin/capacity', labelKey: 'admin.nav.capacity'},
+        ],
+      });
+    }
+    return groups;
   });
+
+  /** Where "Back to app" returns: the last URL the main rail was showing.
+   *  A hard load straight into Settings has none, so it falls back to the
+   *  draft landing. */
+  private readonly lastAppUrl = signal('/');
+
+  backToApp(): void {
+    void this.router.navigateByUrl(this.lastAppUrl());
+  }
 
   readonly filterText = signal('');
 
-  // Fix round 1: the filter box is a control over the session list, not a
-  // create action like "New chat" — a control over a list that isn't on
-  // screen is noise, so it renders in chat mode only. Deliberately
-  // `=== 'chat'`, not `!== 'jobs'`, for the same allowlist reason as
-  // sessionGroups() below: mode() returns null outside the three modes
-  // (/admin/*, /experts, /settings, ...), and a negated rewrite would show
-  // the box there too. Kept separate from sessionGroups() rather than
-  // derived from `sessionGroups().length > 0` — a search with zero matches
-  // must still show the (now empty) box so the user can see and clear it.
-  readonly showFilter = computed(() => this.mode() === 'chat');
-
-  // Null, same as 'jobs'/'projects': outside chat mode the rail shows no
-  // session groups at all (see the mode() allowlist above). Deliberately
-  // `=== 'chat'`, not `!== 'jobs'` — mode() is an allowlist that returns
-  // null for routes outside the three modes (/admin/*, /experts,
-  // /settings, ...), and a negated rewrite would show sessions there too.
   readonly sessionGroups = computed(() => {
-    if (this.mode() !== 'chat') return [];
     const q = this.filterText().trim().toLowerCase();
     if (!q) return this.sessions.grouped();
     return this.sessions.grouped()
@@ -683,12 +750,12 @@ export class SidebarComponent {
   // when sessionGroups() is empty for either reason.
   readonly hasSessions = computed(() => this.sessions.grouped().length > 0);
 
-  // Not `{static: true}`: the filter now only exists in the DOM in chat mode
-  // (the @if in the template using showFilter() above), so this must be a
-  // dynamic query that re-resolves as mode() changes — a static query
+  // Not `{static: true}`: the filter only exists in the DOM while the main
+  // rail is showing (Settings and a page's list replace it), so this must be
+  // a dynamic query that re-resolves as railView() changes — a static query
   // resolves once, before the first change detection, and would stay
-  // undefined forever if the component happened to construct outside chat
-  // mode. A decorator query is still used rather than the signal-based
+  // undefined forever if the component happened to construct on a takeover
+  // route. A decorator query is still used rather than the signal-based
   // viewChild() function: this repo's vitest JIT pipeline never resolves
   // those (see multi-select.component.ts), while decorator queries resolve
   // under both JIT and AOT — moot for this component's own spec (it never
@@ -703,9 +770,9 @@ export class SidebarComponent {
   @HostListener('window:keydown', ['$event'])
   onKeydown(event: KeyboardEvent): void {
     if (!(event.metaKey || event.ctrlKey) || event.key.toLowerCase() !== 'k') return;
-    // Outside chat mode filterInput is undefined (see the dynamic-query note
-    // above) — leave the browser's own Ctrl+K alone rather than pre-empting
-    // it for a control that isn't on screen to focus.
+    // On a takeover route filterInput is undefined (see the dynamic-query
+    // note above) — leave the browser's own Ctrl+K alone rather than
+    // pre-empting it for a control that isn't on screen to focus.
     if (!this.filterInput) return;
     event.preventDefault();
     // The rail can be collapsed (:host(.collapsed){width:0} + overflow:
@@ -725,36 +792,34 @@ export class SidebarComponent {
     this.filterInput?.nativeElement.focus();
   }
 
-  selectMode(mode: RailMode | null): void {
-    // Always the mode's own route. Never a thread id — see the April 2026
-    // hijack regression recorded in coding_agent_ui_assessment.md §3.
-    if (mode === null) return;
-    this.router.navigate([MODE_ROUTES[mode]]);
-  }
-
   constructor() {
     // enabledNonBlocking (Angular's default) constructs this component before the
     // first navigation, so the subscription below covers the initial load. If the
     // sidebar is instead constructed after navigation already finished
     // (enabledBlocking, SSR, or a remount), no event is coming and we must fetch here.
     if (this.router.navigated) {
-      this.sessions.refresh();
+      this.refreshSessions();
+      if (this.isMainRail(this.router.url)) this.lastAppUrl.set(this.router.url);
     }
 
-    // Auto-collapse sidebar on mobile after navigation, and keep the rail's
-    // session list current — reusing this subscription rather than adding a
-    // second one. Gated on chat mode so navigating within Jobs/Admin doesn't
-    // refetch threads for a list that isn't even shown.
+    // Auto-collapse sidebar on mobile after navigation, and keep Recents
+    // current — reusing this subscription rather than adding a second one.
+    // Gated on the main rail: Recents is not on screen in Settings or a
+    // page's list, and the navigation back out of them refreshes it anyway.
+    // The first load is not gated: the rail can turn back into the main one
+    // without any navigation (a desktop /inbox narrowed to phone width), and
+    // Recents must not be empty then just because the app booted on a
+    // takeover route.
     this.router.events.pipe(
-      filter(e => e instanceof NavigationEnd),
+      filter((e): e is NavigationEnd => e instanceof NavigationEnd),
       takeUntilDestroyed(),
-    ).subscribe(() => {
+    ).subscribe((e) => {
       if (this.viewport.isMobile()) {
         this.sidebar.collapse();
       }
-      if (this.mode() === 'chat') {
-        this.sessions.refresh();
-      }
+      const main = this.isMainRail(e.urlAfterRedirects);
+      if (main) this.lastAppUrl.set(e.urlAfterRedirects);
+      if (main || !this.sessionsLoaded) this.refreshSessions();
     });
   }
 
@@ -772,44 +837,16 @@ export class SidebarComponent {
     }
   }
 
-  private readonly currentUrl = toSignal(
-    this.router.events.pipe(
-      filter((e): e is NavigationEnd => e instanceof NavigationEnd),
-      map((e) => e.urlAfterRedirects),
-    ),
-    { initialValue: this.router.url },
-  );
+  private sessionsLoaded = false;
 
-  readonly isWorkbenchRoute = computed(
-    () => this.currentUrl()?.startsWith('/workbench') ?? false,
-  );
-
-  readonly adminToolsEnabled = environment.adminToolsEnabled;
-  readonly giteaUrl = environment.giteaUrl;
-  readonly dozzleUrl = environment.dozzleUrl;
-  readonly neo4jUrl = environment.neo4jUrl;
-  readonly pgadminUrl = environment.pgadminUrl;
-  readonly minioConsoleUrl = environment.minioConsoleUrl;
-  readonly cloudUrl = environment.cloudUrl;
-
-  readonly isLayoutPickerOpen = signal(false);
-  readonly pickerTop = signal(0);
-  readonly pickerLeft = signal(0);
-
-  toggleLayoutPicker(buttonEl: HTMLButtonElement): void {
-    if (!this.isLayoutPickerOpen()) {
-      const rect = buttonEl.getBoundingClientRect();
-      this.pickerTop.set(rect.top);
-      this.pickerLeft.set(rect.right + 8);
-    }
-    this.isLayoutPickerOpen.update((v) => !v);
+  private refreshSessions(): void {
+    this.sessionsLoaded = true;
+    this.sessions.refresh();
   }
 
-  closeLayoutPicker(): void {
-    this.isLayoutPickerOpen.set(false);
+  private isMainRail(url: string): boolean {
+    return railViewFor(pathOf(url), this.viewport.isMobile()) === 'main';
   }
 
-  resetLayout(): void {
-    this.layoutService.resetLayout();
-  }
+  readonly externalClientsEnabled = environment.externalClientsEnabled;
 }

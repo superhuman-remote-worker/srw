@@ -17,6 +17,7 @@ from orchestrator.services.job_controls import (
     JobControlDependencies,
     JobControlOperations,
 )
+from orchestrator.schemas import job_controls as job_controls_module
 
 
 JOB_ID = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
@@ -383,7 +384,9 @@ async def test_legacy_resume_of_a_held_job_requeues_through_the_guarded_write(
         JOB_ID,
         user={"id": "user-a"},
         job=_operator_paused_job(),
-        request=main.JobResumeRequest(agent_id="agent-a", feedback="focus"),
+        request=job_controls_module.JobResumeRequest(
+            agent_id="agent-a", feedback="focus"
+        ),
     )
 
     assert result["status"] == "queued"
@@ -440,7 +443,7 @@ async def test_concurrent_resume_of_the_same_hold_is_idempotent(
         return_value={**_operator_paused_job(), "context": refreshed_context}
     )
     operations = _operations(tmp_path, store=store, completion_commands_enabled=True)
-    request = main.JobResumeRequest(feedback=feedback)
+    request = job_controls_module.JobResumeRequest(feedback=feedback)
 
     if joins:
         result = await operations.resume_job_internal(

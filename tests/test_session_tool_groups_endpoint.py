@@ -22,6 +22,9 @@ from fastapi import HTTPException
 from shared.runtime.core.session_tool_overrides import SESSION_TOOL_OVERRIDE_NAMES
 from orchestrator.routers import thread_session
 from orchestrator.services import session_config_resolution
+from orchestrator.application import preparation as preparation_composition
+from orchestrator.application import transport as transport_composition
+from orchestrator.services import session_tool_policy as session_tool_policy_module
 
 #: The tool view's own module-level collaborators (deployment gate, policy
 #: merge) are looked up here at call time, so they are patched here.
@@ -31,7 +34,10 @@ _TOOL_VIEW = "orchestrator.services.session_tool_view"
 def _patch_caller_and_db(user: dict, db):
     stack = ExitStack()
     stack.enter_context(
-        patch("orchestrator.main.require_approved_user", AsyncMock(return_value=user))
+        patch(
+            "orchestrator.security.auth.require_approved_user",
+            AsyncMock(return_value=user),
+        )
     )
     stack.enter_context(
         patch(
@@ -39,7 +45,7 @@ def _patch_caller_and_db(user: dict, db):
             AsyncMock(return_value=user),
         )
     )
-    stack.enter_context(patch("orchestrator.main.postgres_db", db))
+    stack.enter_context(patch("orchestrator.main.app.state.resources.postgres_db", db))
     return stack
 
 
@@ -68,7 +74,11 @@ async def _get_tool_groups(thread_id, request):
     import orchestrator.main as orch_main
 
     return await thread_session.get_thread_tool_groups(
-        thread_id, request, dependencies=orch_main._thread_session_dependencies()
+        thread_id,
+        request,
+        dependencies=transport_composition.thread_session_dependencies(
+            orch_main.app.state.resources
+        ),
     )
 
 
@@ -78,7 +88,8 @@ async def _call(user, db, thread_row, fake_request, *, experts=True):
         _patch_caller_and_db(user, db),
         patch(f"{_TOOL_VIEW}.is_experts_db_enabled", MagicMock(return_value=experts)),
         patch(
-            "orchestrator.main._user_experts_enabled", AsyncMock(return_value=experts)
+            "orchestrator.services.grant_enforcement.user_experts_enabled",
+            AsyncMock(return_value=experts),
         ),
     ):
         return await _get_tool_groups(str(thread_row["id"]), fake_request)
@@ -241,7 +252,6 @@ class TestLeanResolveFidelity:
         If account defaults or the settings matrix ever learn to emit
         ``tools``, this fails instead of silently drifting the checkbox.
         """
-        import orchestrator.main as orch_main
         from orchestrator.services.config_resolver import resolve_config
 
         capture: dict = {}
@@ -258,10 +268,10 @@ class TestLeanResolveFidelity:
             expert_type="session",
             capture=capture,
         )
-        markers = orch_main._session_tool_group_disabled_markers(
+        markers = session_tool_policy_module.session_tool_group_disabled_markers(
             capture["merged_fragment"]
         )
-        marker_names = orch_main._SESSION_TOOL_DISABLED_MARKERS
+        marker_names = session_tool_policy_module.SESSION_TOOL_DISABLED_MARKERS
         # Keyed on the MARKER set, not on SESSION_TOOL_OVERRIDE_NAMES. A marker
         # exists to tell the legacy agent not to re-add a canonical list, so only
         # groups that agent knows about have one; a presentation group added later
@@ -272,7 +282,7 @@ class TestLeanResolveFidelity:
             group: marker_names[group] not in markers for group in marker_names
         }
 
-        lean = orch_main._merged_session_tool_groups(
+        lean = session_tool_policy_module.merged_session_tool_groups(
             base_config_name="session_base",
             expert_row=expert_row,
             project_overrides=project_overrides,
@@ -300,9 +310,12 @@ class TestLeanResolveFidelity:
                 }
             }
         )
-        with patch("orchestrator.main.postgres_db", fake_db):
+        with patch("orchestrator.main.app.state.resources.postgres_db", fake_db):
             defaults = await session_config_resolution.resolve_session_account_defaults(
-                str(_UID_A), dependencies=orch_main._session_config_dependencies()
+                str(_UID_A),
+                dependencies=preparation_composition.session_config_dependencies(
+                    orch_main.app.state.resources
+                ),
             )
 
         assert "tools" not in (defaults or {})
@@ -385,7 +398,8 @@ class TestLegacyPath:
             _patch_caller_and_db(user_a, fake_db),
             patch(f"{_TOOL_VIEW}.is_experts_db_enabled", MagicMock(return_value=True)),
             patch(
-                "orchestrator.main._user_experts_enabled", AsyncMock(return_value=False)
+                "orchestrator.services.grant_enforcement.user_experts_enabled",
+                AsyncMock(return_value=False),
             ),
         ):
             result = await _get_tool_groups(str(_thread()["id"]), fake_request)
@@ -414,7 +428,8 @@ class TestFailureModes:
             _patch_caller_and_db(user_a, fake_db),
             patch(f"{_TOOL_VIEW}.is_experts_db_enabled", MagicMock(return_value=True)),
             patch(
-                "orchestrator.main._user_experts_enabled", AsyncMock(return_value=True)
+                "orchestrator.services.grant_enforcement.user_experts_enabled",
+                AsyncMock(return_value=True),
             ),
             patch(
                 f"{_TOOL_VIEW}.merged_session_tool_policy",
@@ -490,7 +505,7 @@ class TestAcknowledgedGrantDriftReportedNotJustEnforced:
         )
 
         with patch(
-            "orchestrator.main._resolve_runner_grants",
+            "orchestrator.services.grant_enforcement.resolve_runner_grants",
             AsyncMock(return_value={"catalog_authoring": False}),
         ):
             result = await _call(user_a, fake_db, thread, fake_request)
@@ -516,7 +531,7 @@ class TestAcknowledgedGrantDriftReportedNotJustEnforced:
         )
 
         with patch(
-            "orchestrator.main._resolve_runner_grants",
+            "orchestrator.services.grant_enforcement.resolve_runner_grants",
             AsyncMock(return_value={"catalog_authoring": True}),
         ):
             result = await _call(user_a, fake_db, thread, fake_request)
@@ -540,7 +555,9 @@ class TestAdminViewUsesTheOwnersGrants:
             metadata={"config_drift_ack": {"grant:catalog_authoring": "revoked"}}
         )
         resolve = AsyncMock(return_value={"catalog_authoring": False})
-        with patch("orchestrator.main._resolve_runner_grants", resolve):
+        with patch(
+            "orchestrator.services.grant_enforcement.resolve_runner_grants", resolve
+        ):
             await _call(user_admin, fake_db, thread, fake_request)
 
         # One lookup explains ``unavailable``, one builds the drift strip.

@@ -23,6 +23,15 @@ from orchestrator.services.generic_harness_runtime import GenericPodObservation
 from orchestrator.services.manifest_execution import ManifestExecutionService
 from orchestrator.services.manifest_execution_snapshot import read_execution
 from orchestrator.services.manifest_resources import ManifestResourceService
+from orchestrator.application import preparation as preparation_composition
+from orchestrator.services import config_resolver as config_resolver_module
+from orchestrator.services import container_provisioner as container_provisioner_module
+from orchestrator.services import (
+    job_dispatch_credentials as job_dispatch_credentials_module,
+)
+from orchestrator.services import job_start_bundle as job_start_bundle_module
+from orchestrator.services import runtime_actor as runtime_actor_module
+from orchestrator.services import vm_provisioner as vm_provisioner_module
 
 
 @pytest.fixture(scope="module")
@@ -188,7 +197,7 @@ async def test_session_partial_patch_freezes_delta_and_rejects_stale_runtime_and
     monkeypatch.setattr(
         database, "manifest_skills_provider", changed_source, raising=False
     )
-    monkeypatch.setattr(main, "postgres_db", database)
+    monkeypatch.setattr(main.app.state.resources, "postgres_db", database)
     thread = await database.get_thread(thread_id)
     delivery, _ = await control_seams.apply_thread_config_update(
         thread_id,
@@ -529,26 +538,35 @@ async def test_native_srw_admission_delivers_frozen_configuration_from_database(
         visit(value)
         return value
 
-    monkeypatch.setattr(main, "postgres_db", database)
-    monkeypatch.setattr(main, "vm_provisioner", SimpleNamespace(mode="kubevirt"))
+    monkeypatch.setattr(main.app.state.resources, "postgres_db", database)
     monkeypatch.setattr(
-        main,
+        vm_provisioner_module, "vm_provisioner", SimpleNamespace(mode="kubevirt")
+    )
+    monkeypatch.setattr(
+        container_provisioner_module,
         "container_provisioner",
         SimpleNamespace(is_available=False, in_cluster=False),
     )
-    monkeypatch.setattr(main, "_inject_dispatch_credentials", provider_transport)
     monkeypatch.setattr(
-        main,
+        job_dispatch_credentials_module,
+        "inject_dispatch_credentials",
+        provider_transport,
+    )
+    monkeypatch.setattr(
+        runtime_actor_module,
         "mint_worker_runtime_actor",
         AsyncMock(return_value=SimpleNamespace(to_payload=lambda: {})),
     )
     monkeypatch.setattr(
-        main,
+        config_resolver_module,
         "resolve_config",
         lambda **_: pytest.fail("Live SRW resolver used after admission"),
     )
-    delivered = await main.job_start_bundle.build_job_start_request(
-        job, dependencies=main._job_start_bundle_dependencies()
+    delivered = await job_start_bundle_module.build_job_start_request(
+        job,
+        dependencies=preparation_composition.job_start_bundle_dependencies(
+            main.app.state.resources
+        ),
     )
     assert delivered is not None
     assert delivered.config_override is None

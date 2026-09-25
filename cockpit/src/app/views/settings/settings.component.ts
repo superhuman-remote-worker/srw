@@ -8,7 +8,7 @@ import {
   OnInit,
   signal,
 } from '@angular/core';
-import { Router } from '@angular/router';
+import { ActivatedRoute, Router } from '@angular/router';
 import { environment } from '../../core/environment';
 import { McpTokenService } from '../../core/services/mcp-token.service';
 import { UserService } from '../../core/services/user.service';
@@ -67,6 +67,29 @@ const PROVIDERS: { value: ApiKeyProvider; label: string }[] = [
   { value: 'vision', label: 'Vision' },
 ];
 
+/** One page per section, chosen by the route's `section` data
+ * (navigation_fixed_rail.md §5). `subscriptions` and `cloud` are routed under
+ * /admin so they inherit its adminGuard. */
+export type SettingsSection =
+  | 'general'
+  | 'defaults'
+  | 'provider-keys'
+  | 'notifications'
+  | 'mcp'
+  | 'subscriptions'
+  | 'cloud';
+
+/** Page title per section — the same keys the settings rail labels its entries with. */
+const SECTION_TITLE_KEYS: Record<SettingsSection, string> = {
+  general: 'settings.nav.general',
+  defaults: 'settings.nav.defaults',
+  'provider-keys': 'settings.nav.providerKeys',
+  notifications: 'settings.nav.notifications',
+  mcp: 'settings.nav.mcp',
+  subscriptions: 'settings.nav.subscriptions',
+  cloud: 'settings.nav.cloud',
+};
+
 const EXPIRY_OPTIONS = [
   { value: '', label: '' },
   { value: '30', label: '' },
@@ -98,1706 +121,1696 @@ const EXPIRY_OPTIONS = [
       <div class="settings-container">
         <div class="page-header">
           <app-sidebar-toggle />
-          <h1 class="page-title">{{ 'settings.title' | transloco }}</h1>
+          <h1 class="page-title">{{ titleKey | transloco }}</h1>
         </div>
 
-        <!-- Appearance Section -->
-        <section class="settings-section">
-          <h2 class="section-title">{{ 'settings.appearance.title' | transloco }}</h2>
-          <p class="section-desc">{{ 'settings.appearance.desc' | transloco }}</p>
-          <div class="form-block">
-            <app-form-field [label]="'settings.appearance.themeLabel' | transloco">
-              <app-theme-toggle
-                [showLabels]="true"
-                [ariaLabel]="'settings.appearance.themeLabel' | transloco"
-              />
-            </app-form-field>
-            <app-form-field [label]="'settings.appearance.accentLabel' | transloco">
-              <app-accent-toggle [ariaLabel]="'settings.appearance.accentLabel' | transloco" />
-            </app-form-field>
-          </div>
-        </section>
-
-        <!-- Language Section -->
-        <section class="settings-section">
-          <h2 class="section-title">{{ 'settings.language.title' | transloco }}</h2>
-          <p class="section-desc">{{ 'settings.language.desc' | transloco }}</p>
-          <div class="form-block">
-            <app-form-field [label]="'settings.language.label' | transloco">
-              <app-select [value]="i18n.activeLang()" (changed)="onLanguageChange($any($event))">
-                <option value="en">English</option>
-                <option value="de-DE">Deutsch</option>
-              </app-select>
-            </app-form-field>
-          </div>
-        </section>
-
-        <!-- Read-aloud voice -->
-        @if (ttsConfigured()) {
-          <section class="settings-section">
-            <h2 class="section-title">{{ 'settings.voice.title' | transloco }}</h2>
-            <p class="section-desc">{{ 'settings.voice.desc' | transloco }}</p>
-            <div class="form-block">
-              <app-form-field
-                [label]="'settings.voice.provider' | transloco"
-                [hint]="'settings.voice.providerHint' | transloco"
-              >
-                <app-select [value]="ttsModel()" (changed)="setTtsModel($any($event))">
-                  @for (m of modelService.ttsModels(); track m.id) {
-                    <option [value]="m.id">
-                      {{ m.label
-                      }}{{
-                        !ttsModelOverridden() && m.id === resolved().default_tts_model
-                          ? ' (' + ('common.default' | transloco) + ')'
-                          : ''
-                      }}
-                    </option>
-                  }
-                </app-select>
-              </app-form-field>
-              <app-form-field [label]="'settings.voice.label' | transloco">
-                @if (ttsBackend() === 'elevenlabs') {
-                  @if (elevenVoicesLoading()) {
-                    <p class="voice-lang-note">{{ 'settings.voice.loadingVoices' | transloco }}</p>
-                  } @else if (elevenVoices().length > 0) {
-                    <app-select [value]="ttsVoice()" (changed)="setTtsVoice($any($event))">
-                      <option value="">{{ 'settings.voice.auto' | transloco }}</option>
-                      @for (v of elevenVoices(); track v.id) {
-                        <option [value]="v.id">{{ elevenVoiceLabel(v) }}</option>
-                      }
-                    </app-select>
-                  } @else {
-                    <app-input
-                      [value]="ttsVoice()"
-                      [placeholder]="'settings.voice.customPlaceholder' | transloco"
-                      (changed)="setTtsVoice($event)"
-                    />
-                  }
-                } @else if (ttsVoices().length > 0) {
-                  <app-select [value]="ttsVoice()" (changed)="setTtsVoice($any($event))">
-                    <option value="">{{ 'settings.voice.auto' | transloco }}</option>
-                    @for (v of ttsVoices(); track v) {
-                      <option [value]="v">{{ voiceOptionLabel(v) }}</option>
-                    }
-                  </app-select>
-                } @else {
-                  <app-input
-                    [value]="ttsVoice()"
-                    [placeholder]="'settings.voice.customPlaceholder' | transloco"
-                    (changed)="setTtsVoice($event)"
+        @switch (section) {
+          @case ('general') {
+            <!-- Appearance Section -->
+            <section class="settings-section">
+              <h2 class="section-title">{{ 'settings.appearance.title' | transloco }}</h2>
+              <p class="section-desc">{{ 'settings.appearance.desc' | transloco }}</p>
+              <div class="form-block">
+                <app-form-field [label]="'settings.appearance.themeLabel' | transloco">
+                  <app-theme-toggle
+                    [showLabels]="true"
+                    [ariaLabel]="'settings.appearance.themeLabel' | transloco"
                   />
-                }
-              </app-form-field>
-              @if (ttsVoices().length > 0) {
-                <p class="voice-lang-note">
-                  {{ 'settings.voice.langNote' | transloco }}
-                  @if (ttsBackend() === 'kokoro') {
-                    {{ 'settings.voice.kokoroNoGerman' | transloco }}
-                  }
-                </p>
-              }
-              <app-form-field [label]="'settings.voice.sampleLabel' | transloco">
-                <app-textarea
-                  [value]="previewText()"
-                  (valueChange)="onPreviewTextChange($event)"
-                  [rows]="2"
-                  size="sm"
-                  [placeholder]="'settings.voice.samplePlaceholder' | transloco"
-                />
-                <p class="voice-sample-hint">
-                  {{ 'settings.voice.sampleHint' | transloco: { left: previewCharsLeft() } }}
-                </p>
-              </app-form-field>
-              <div class="voice-preview-row">
-                <app-button
-                  variant="secondary"
-                  size="sm"
-                  [loading]="previewingVoice()"
-                  [disabled]="previewingVoice()"
-                  (clicked)="previewVoice()"
-                >
-                  <app-icon size="sm">play_arrow</app-icon>
-                  {{ 'settings.voice.preview' | transloco }}
-                </app-button>
-                @if (ttsBackend() === 'elevenlabs' && selectedElevenVoice()?.preview_url) {
-                  <app-button variant="ghost" size="sm" (clicked)="playHostedPreview()">
-                    <app-icon size="sm">graphic_eq</app-icon>
-                    {{ 'settings.voice.hostedPreview' | transloco }}
-                  </app-button>
-                }
-                @if (previewErrorKey()) {
-                  <span class="voice-preview-error">{{ previewErrorKey()! | transloco }}</span>
-                }
+                </app-form-field>
+                <app-form-field [label]="'settings.appearance.accentLabel' | transloco">
+                  <app-accent-toggle [ariaLabel]="'settings.appearance.accentLabel' | transloco" />
+                </app-form-field>
               </div>
-              @if (ttsBackend() === 'elevenlabs' && selectedElevenVoice()?.preview_url) {
-                <p class="voice-lang-note">{{ 'settings.voice.previewCaveat' | transloco }}</p>
-              }
+            </section>
 
-              <!-- How the message is rewritten for speech (all backends). The
-                   auxiliary LLM cleans markdown + shapes the text; these two
-                   knobs steer it — reasoning (off by default; on = smarter but
-                   slower first audio) and a free-text instruction the user
-                   controls (skip tables, TLDR long messages, omit file names…). -->
-              <div class="voice-rewrite">
-                <h3 class="voice-subhead">{{ 'settings.voice.rewriteTitle' | transloco }}</h3>
-                <app-form-field
-                  [label]="'settings.voice.rewriteReasoningLabel' | transloco"
-                  [hint]="'settings.voice.rewriteReasoningHint' | transloco"
-                >
-                  <app-select
-                    [value]="readAloudReasoning()"
-                    (changed)="readAloudReasoning.set($any($event))"
-                  >
-                    <option value="off">{{ 'settings.voice.reasoningOff' | transloco }}</option>
-                    <option value="low">{{ 'settings.voice.reasoningLow' | transloco }}</option>
-                    <option value="medium">
-                      {{ 'settings.voice.reasoningMedium' | transloco }}
-                    </option>
-                    <option value="high">{{ 'settings.voice.reasoningHigh' | transloco }}</option>
+            <!-- Language Section -->
+            <section class="settings-section">
+              <h2 class="section-title">{{ 'settings.language.title' | transloco }}</h2>
+              <p class="section-desc">{{ 'settings.language.desc' | transloco }}</p>
+              <div class="form-block">
+                <app-form-field [label]="'settings.language.label' | transloco">
+                  <app-select [value]="i18n.activeLang()" (changed)="onLanguageChange($any($event))">
+                    <option value="en">English</option>
+                    <option value="de-DE">Deutsch</option>
                   </app-select>
                 </app-form-field>
-                <app-form-field
-                  [label]="'settings.voice.rewritePromptLabel' | transloco"
-                  [hint]="'settings.voice.rewritePromptHint' | transloco"
-                >
-                  <app-textarea
-                    [value]="readAloudPromptDraft()"
-                    (valueChange)="onReadAloudPromptChange($event)"
-                    [rows]="3"
-                    size="sm"
-                    [placeholder]="'settings.voice.rewritePromptPlaceholder' | transloco"
-                  />
-                  <p class="voice-sample-hint">
-                    {{
-                      'settings.voice.rewritePromptCounter'
-                        | transloco: { left: readAloudPromptCharsLeft() }
-                    }}
-                  </p>
-                </app-form-field>
-                <div class="actions-row">
-                  <app-button
-                    variant="primary"
-                    size="sm"
-                    [loading]="savingReadAloud()"
-                    [disabled]="savingReadAloud()"
-                    (clicked)="saveReadAloud()"
+              </div>
+            </section>
+
+            <!-- Read-aloud voice -->
+            @if (ttsConfigured()) {
+              <section class="settings-section">
+                <h2 class="section-title">{{ 'settings.voice.title' | transloco }}</h2>
+                <p class="section-desc">{{ 'settings.voice.desc' | transloco }}</p>
+                <div class="form-block">
+                  <app-form-field
+                    [label]="'settings.voice.provider' | transloco"
+                    [hint]="'settings.voice.providerHint' | transloco"
                   >
-                    {{
-                      savingReadAloud()
-                        ? ('common.saving' | transloco)
-                        : ('settings.voice.rewriteSave' | transloco)
-                    }}
-                  </app-button>
-                  @if (readAloudSaved()) {
-                    <app-badge tone="success" size="sm">{{ 'common.saved' | transloco }}</app-badge>
-                  }
-                </div>
-              </div>
-
-              <!-- ElevenLabs Voice Library browser (Phase 6): search the 10k+
-                   community library, audition via hosted previews, and (when the
-                   admin add-gate is on) copy a voice into the deployment account. -->
-              @if (ttsBackend() === 'elevenlabs') {
-                <div class="voice-library">
-                  <div class="voice-library-head">
-                    <app-button variant="ghost" size="sm" (clicked)="toggleLibrary()">
-                      <app-icon size="sm">{{
-                        libraryOpen() ? 'expand_less' : 'travel_explore'
-                      }}</app-icon>
-                      {{ 'settings.voice.libraryToggle' | transloco }}
-                    </app-button>
-                    @if (userService.currentUser()?.is_admin) {
-                      <label class="voice-library-flag">
-                        <app-switch
-                          size="sm"
-                          [checked]="ttsLibraryFlag()"
-                          [disabled]="ttsLibraryFlagSaving()"
-                          (changed)="setTtsLibraryFlag($event)"
-                        />
-                        <span>{{ 'settings.voice.libraryAdminFlag' | transloco }}</span>
-                      </label>
-                    }
-                  </div>
-
-                  @if (libraryOpen()) {
-                    <div class="voice-library-search">
-                      <app-input
-                        [value]="librarySearch()"
-                        [placeholder]="'settings.voice.librarySearchPlaceholder' | transloco"
-                        (changed)="librarySearch.set($event)"
-                      />
-                      <app-select
-                        [value]="libraryGender()"
-                        (changed)="libraryGender.set($any($event))"
-                      >
-                        <option value="">
-                          {{ 'settings.voice.libraryAnyGender' | transloco }}
-                        </option>
-                        <option value="female">{{ 'settings.voice.female' | transloco }}</option>
-                        <option value="male">{{ 'settings.voice.male' | transloco }}</option>
-                      </app-select>
-                      <app-button
-                        variant="secondary"
-                        size="sm"
-                        [loading]="libraryLoading()"
-                        [disabled]="libraryLoading()"
-                        (clicked)="searchLibrary()"
-                      >
-                        <app-icon size="sm">search</app-icon>
-                        {{ 'settings.voice.librarySearch' | transloco }}
-                      </app-button>
-                    </div>
-
-                    @if (libraryError()) {
-                      <p class="voice-preview-error">{{ libraryError() }}</p>
-                    }
-                    @if (libraryVoices().length > 0) {
-                      <p class="voice-lang-note">
-                        {{ 'settings.voice.libraryPreviewCaveat' | transloco }}
-                      </p>
-                    }
-
-                    <div class="voice-library-results">
-                      @for (v of libraryVoices(); track v.id) {
-                        <div class="voice-library-card" [class.is-added]="libraryAdded() === v.id">
-                          <div class="voice-library-card__info">
-                            <span class="voice-library-card__name">{{ v.name }}</span>
-                            @if (libraryVoiceLabel(v)) {
-                              <span class="voice-library-card__tags">{{
-                                libraryVoiceLabel(v)
-                              }}</span>
-                            }
-                          </div>
-                          <div class="voice-library-card__actions">
-                            @if (v.preview_url) {
-                              <app-button
-                                variant="ghost"
-                                size="sm"
-                                [ariaLabel]="'settings.voice.hostedPreview' | transloco"
-                                (clicked)="playLibrarySample(v)"
-                              >
-                                <app-icon size="sm">graphic_eq</app-icon>
-                              </app-button>
-                            }
-                            @if (libraryAddEnabled()) {
-                              @if (libraryAdded() === v.id) {
-                                <span class="voice-library-card__done">
-                                  <app-icon size="sm">check</app-icon>
-                                  {{ 'settings.voice.libraryAdded' | transloco }}
-                                </span>
-                              } @else {
-                                <app-button
-                                  variant="secondary"
-                                  size="sm"
-                                  [loading]="libraryAddingId() === v.id"
-                                  [disabled]="libraryAddingId() !== null"
-                                  (clicked)="addLibraryVoice(v)"
-                                >
-                                  {{ 'settings.voice.libraryAdd' | transloco }}
-                                </app-button>
-                              }
-                            }
-                          </div>
-                        </div>
-                      }
-                      @if (!libraryLoading() && libraryVoices().length === 0 && !libraryError()) {
-                        <p class="voice-lang-note">
-                          {{ 'settings.voice.libraryEmpty' | transloco }}
-                        </p>
-                      }
-                    </div>
-                  }
-                </div>
-              }
-            </div>
-          </section>
-        }
-
-        <!-- Data Visibility Section (Admin Only) -->
-        @if (userService.currentUser()?.is_admin) {
-          <section class="settings-section">
-            <h2 class="section-title">{{ 'settings.dataVisibility.title' | transloco }}</h2>
-            <p class="section-desc">{{ 'settings.dataVisibility.desc' | transloco }}</p>
-            <div class="form-block">
-              <app-form-field [label]="'settings.dataVisibility.label' | transloco">
-                <app-select
-                  [value]="viewMode.viewMode()"
-                  (changed)="viewMode.setMode($any($event))"
-                >
-                  <option value="all">{{ 'settings.dataVisibility.optionAll' | transloco }}</option>
-                  <option value="me">{{ 'settings.dataVisibility.optionMe' | transloco }}</option>
-                </app-select>
-              </app-form-field>
-            </div>
-          </section>
-        }
-
-        <!-- LLM provider keys: the user's own, used ahead of the system keys.
-             Not the PAT page (settings.apiKeys.*, linked further down). -->
-        <section class="settings-section">
-          <h2 class="section-title">{{ 'settings.providerKeys.title' | transloco }}</h2>
-          <p class="section-desc">{{ 'settings.providerKeys.desc' | transloco }}</p>
-
-          <!-- Key List -->
-          @if (settingsService.apiKeys().length > 0) {
-            <div class="key-table">
-              <div class="key-header">
-                <span class="col-provider">{{ 'settings.providerKeys.colProvider' | transloco }}</span>
-                <span class="col-prefix">{{ 'settings.providerKeys.colKey' | transloco }}</span>
-                <span class="col-label">{{ 'settings.providerKeys.colLabel' | transloco }}</span>
-                <span class="col-updated">{{ 'settings.providerKeys.colUpdated' | transloco }}</span>
-                <span class="col-action"></span>
-              </div>
-              @for (key of settingsService.apiKeys(); track key.id) {
-                <div class="key-row">
-                  <span class="col-provider">{{ providerLabel(key.provider) }}</span>
-                  <span class="col-prefix mono">{{ key.key_prefix }}...</span>
-                  <span class="col-label">{{ key.label || '-' }}</span>
-                  <span class="col-updated">{{ formatDate(key.updated_at) }}</span>
-                  <span class="col-action">
-                    <app-button variant="danger" size="sm" (clicked)="deleteApiKey(key.provider)">
-                      {{ 'common.delete' | transloco }}
-                    </app-button>
-                  </span>
-                </div>
-              }
-            </div>
-          } @else {
-            <p class="empty-state">{{ 'settings.providerKeys.empty' | transloco }}</p>
-          }
-
-          <!-- Set Key Form -->
-          <div class="create-form">
-            <h3 class="form-title">{{ 'settings.providerKeys.addTitle' | transloco }}</h3>
-            <div class="form-row two-col">
-              <app-select
-                [value]="keyProvider()"
-                [disabled]="settingKey()"
-                (changed)="onKeyProviderChange($event)"
-              >
-                @for (p of providers; track p.value) {
-                  <option [value]="p.value">{{ p.label }}</option>
-                }
-              </app-select>
-              <app-input
-                [value]="keyLabel()"
-                [placeholder]="'settings.providerKeys.labelPlaceholder' | transloco"
-                [disabled]="settingKey()"
-                (changed)="keyLabel.set($event)"
-              />
-            </div>
-            <div class="form-row">
-              <app-input
-                type="password"
-                [value]="keyValue()"
-                [placeholder]="'settings.providerKeys.keyPlaceholder' | transloco"
-                [disabled]="settingKey()"
-                (changed)="keyValue.set($event)"
-              />
-            </div>
-            <app-button
-              variant="primary"
-              size="md"
-              [loading]="settingKey()"
-              [disabled]="settingKey() || !keyValue().trim()"
-              (clicked)="saveApiKey()"
-            >
-              {{
-                settingKey()
-                  ? ('common.saving' | transloco)
-                  : ('settings.providerKeys.saveButton' | transloco)
-              }}
-            </app-button>
-          </div>
-        </section>
-
-        <!-- Preferences Section -->
-        <section class="settings-section section-spacer">
-          <h2 class="section-title">{{ 'settings.preferences.title' | transloco }}</h2>
-          <p class="section-desc">{{ 'settings.preferences.desc' | transloco }}</p>
-
-          <div class="form-block">
-            <div class="form-row two-col">
-              <app-form-field [label]="'settings.preferences.defaultModel' | transloco">
-                <app-select
-                  [value]="prefModel() ?? resolved().default_model ?? ''"
-                  (changed)="onPrefChange(prefModel, resolved().default_model, $event)"
-                >
-                  @for (group of modelService.models(); track group.group) {
-                    <optgroup
-                      [label]="
-                        group.configured
-                          ? group.group
-                          : group.group + ' ' + ('settings.preferences.noApiKey' | transloco)
-                      "
-                    >
-                      @for (model of group.models; track model) {
-                        <option [value]="model">
-                          {{ model
+                    <app-select [value]="ttsModel()" (changed)="setTtsModel($any($event))">
+                      @for (m of modelService.ttsModels(); track m.id) {
+                        <option [value]="m.id">
+                          {{ m.label
                           }}{{
-                            !prefModel() && model === resolved().default_model
+                            !ttsModelOverridden() && m.id === resolved().default_tts_model
                               ? ' (' + ('common.default' | transloco) + ')'
                               : ''
                           }}
                         </option>
                       }
-                    </optgroup>
-                  }
-                </app-select>
-              </app-form-field>
-              <app-form-field [label]="'settings.preferences.auxModel' | transloco">
-                <app-select
-                  [value]="prefAuxModel() ?? resolved().default_auxiliary_model ?? ''"
-                  (changed)="onPrefChange(prefAuxModel, resolved().default_auxiliary_model, $event)"
-                >
-                  @for (m of modelService.auxiliaryModels(); track m.id) {
-                    <option [value]="m.id">
-                      {{ m.label
-                      }}{{
-                        !prefAuxModel() && m.id === resolved().default_auxiliary_model
-                          ? ' (' + ('common.default' | transloco) + ')'
-                          : ''
-                      }}{{ m.configured ? '' : ' ' + ('common.noKey' | transloco) }}
-                    </option>
-                  }
-                </app-select>
-              </app-form-field>
-            </div>
-            <div class="form-row two-col">
-              <app-form-field [label]="'settings.preferences.autonomy' | transloco">
-                <app-select
-                  [value]="prefAutonomy() ?? resolved().default_autonomy ?? ''"
-                  (changed)="onPrefChange(prefAutonomy, resolved().default_autonomy, $event)"
-                >
-                  <option value="full">
-                    {{ 'settings.preferences.autonomyFull' | transloco
-                    }}{{
-                      !prefAutonomy() && resolved().default_autonomy === 'full'
-                        ? ' (' + ('common.default' | transloco) + ')'
-                        : ''
-                    }}
-                  </option>
-                  <option value="review">
-                    {{ 'settings.preferences.autonomyReview' | transloco
-                    }}{{
-                      !prefAutonomy() && resolved().default_autonomy === 'review'
-                        ? ' (' + ('common.default' | transloco) + ')'
-                        : ''
-                    }}
-                  </option>
-                  <option value="partial">
-                    {{ 'settings.preferences.autonomyPartial' | transloco
-                    }}{{
-                      !prefAutonomy() && resolved().default_autonomy === 'partial'
-                        ? ' (' + ('common.default' | transloco) + ')'
-                        : ''
-                    }}
-                  </option>
-                  <option value="guided">
-                    {{ 'settings.preferences.autonomyGuided' | transloco
-                    }}{{
-                      !prefAutonomy() && resolved().default_autonomy === 'guided'
-                        ? ' (' + ('common.default' | transloco) + ')'
-                        : ''
-                    }}
-                  </option>
-                  <option value="dependent">
-                    {{ 'settings.preferences.autonomyDependent' | transloco
-                    }}{{
-                      !prefAutonomy() && resolved().default_autonomy === 'dependent'
-                        ? ' (' + ('common.default' | transloco) + ')'
-                        : ''
-                    }}
-                  </option>
-                </app-select>
-              </app-form-field>
-              <app-form-field [label]="'settings.preferences.reasoning' | transloco">
-                <app-select
-                  [value]="prefReasoning() ?? resolved().default_reasoning_level ?? ''"
-                  (changed)="
-                    onPrefChange(prefReasoning, resolved().default_reasoning_level, $event)
-                  "
-                >
-                  <option value="low">
-                    {{ 'settings.preferences.reasoningLow' | transloco
-                    }}{{
-                      !prefReasoning() && resolved().default_reasoning_level === 'low'
-                        ? ' (' + ('common.default' | transloco) + ')'
-                        : ''
-                    }}
-                  </option>
-                  <option value="medium">
-                    {{ 'settings.preferences.reasoningMedium' | transloco
-                    }}{{
-                      !prefReasoning() && resolved().default_reasoning_level === 'medium'
-                        ? ' (' + ('common.default' | transloco) + ')'
-                        : ''
-                    }}
-                  </option>
-                  <option value="high">
-                    {{ 'settings.preferences.reasoningHigh' | transloco
-                    }}{{
-                      !prefReasoning() && resolved().default_reasoning_level === 'high'
-                        ? ' (' + ('common.default' | transloco) + ')'
-                        : ''
-                    }}
-                  </option>
-                </app-select>
-              </app-form-field>
-            </div>
-
-            <h3 class="subsection-title">{{ 'settings.preferences.helperModels' | transloco }}</h3>
-            <div class="form-row two-col">
-              <app-form-field
-                [label]="'settings.preferences.visionModel' | transloco"
-                [hint]="'settings.preferences.visionHint' | transloco"
-              >
-                <app-select
-                  [value]="prefVisionModel() ?? resolved().default_vision_model ?? ''"
-                  (changed)="onPrefChange(prefVisionModel, resolved().default_vision_model, $event)"
-                >
-                  @for (m of modelService.visionModels(); track m.id) {
-                    <option [value]="m.id">
-                      {{ m.label
-                      }}{{
-                        !prefVisionModel() && m.id === resolved().default_vision_model
-                          ? ' (' + ('common.default' | transloco) + ')'
-                          : ''
-                      }}{{ m.configured ? '' : ' ' + ('common.noKey' | transloco) }}
-                    </option>
-                  }
-                </app-select>
-              </app-form-field>
-              <app-form-field
-                [label]="'settings.preferences.whisperModel' | transloco"
-                [hint]="'settings.preferences.whisperHint' | transloco"
-              >
-                <app-select
-                  [value]="prefWhisperModel() ?? resolved().default_whisper_model ?? ''"
-                  (changed)="
-                    onPrefChange(prefWhisperModel, resolved().default_whisper_model, $event)
-                  "
-                >
-                  @for (m of modelService.whisperModels(); track m.id) {
-                    <option [value]="m.id">
-                      {{ m.label
-                      }}{{
-                        !prefWhisperModel() && m.id === resolved().default_whisper_model
-                          ? ' (' + ('common.default' | transloco) + ')'
-                          : ''
-                      }}{{ m.configured ? '' : ' ' + ('common.noKey' | transloco) }}
-                    </option>
-                  }
-                </app-select>
-              </app-form-field>
-            </div>
-            <div class="form-row two-col">
-              <app-form-field
-                [label]="'settings.preferences.embeddingModel' | transloco"
-                [hint]="'settings.preferences.embeddingHint' | transloco"
-              >
-                <app-select
-                  [value]="prefEmbeddingModel() ?? resolved().default_embedding_model ?? ''"
-                  (changed)="
-                    onPrefChange(prefEmbeddingModel, resolved().default_embedding_model, $event)
-                  "
-                >
-                  @for (m of modelService.embeddingModels(); track m.id) {
-                    <option [value]="m.id">
-                      {{ m.label }}{{ m.dimensions ? ' (' + m.dimensions + 'd)' : ''
-                      }}{{
-                        !prefEmbeddingModel() && m.id === resolved().default_embedding_model
-                          ? ' (' + ('common.default' | transloco) + ')'
-                          : ''
-                      }}{{ m.configured ? '' : ' ' + ('common.noKey' | transloco) }}
-                    </option>
-                  }
-                </app-select>
-              </app-form-field>
-              <app-form-field
-                [label]="'settings.preferences.embeddingProvider' | transloco"
-                [hint]="'settings.preferences.embeddingProviderHint' | transloco"
-              >
-                <app-select
-                  [value]="prefEmbeddingProvider() ?? resolved().embedding_provider ?? ''"
-                  (changed)="
-                    onPrefChange(prefEmbeddingProvider, resolved().embedding_provider, $event)
-                  "
-                >
-                  <option value="local">
-                    {{ 'settings.preferences.providerLocal' | transloco
-                    }}{{
-                      !prefEmbeddingProvider() && resolved().embedding_provider === 'local'
-                        ? ' (' + ('common.default' | transloco) + ')'
-                        : ''
-                    }}
-                  </option>
-                  <option value="openrouter">
-                    {{ 'settings.preferences.providerOpenrouter' | transloco
-                    }}{{
-                      !prefEmbeddingProvider() && resolved().embedding_provider === 'openrouter'
-                        ? ' (' + ('common.default' | transloco) + ')'
-                        : ''
-                    }}
-                  </option>
-                </app-select>
-              </app-form-field>
-            </div>
-
-            <div class="actions-row">
-              <app-button
-                variant="primary"
-                size="md"
-                [loading]="savingPrefs()"
-                [disabled]="savingPrefs()"
-                (clicked)="savePreferences()"
-              >
-                {{
-                  savingPrefs()
-                    ? ('common.saving' | transloco)
-                    : ('settings.preferences.save' | transloco)
-                }}
-              </app-button>
-              @if (prefsSaved()) {
-                <app-badge tone="success" size="sm">{{ 'common.saved' | transloco }}</app-badge>
-              }
-            </div>
-          </div>
-        </section>
-
-        <!-- DB-backed defaults: these choose the expert; the settings below
-             remain fallback values for fields that expert does not specify. -->
-        <section class="settings-section section-spacer">
-          <h2 class="section-title">{{ 'settings.expertDefaults.title' | transloco }}</h2>
-          <p class="section-desc">{{ 'settings.expertDefaults.desc' | transloco }}</p>
-          @if (expertDefaults(); as defaults) {
-            @if (!defaults.personal_defaults_allowed) {
-              <p class="section-hint">{{ 'settings.expertDefaults.restricted' | transloco }}</p>
-            }
-            <div class="form-block">
-              @for (type of expertDefaultTypes; track type) {
-                <div class="form-row two-col">
-                  <app-form-field
-                    [label]="'settings.expertDefaults.' + type | transloco"
-                    [hint]="defaultExpertHint(type)"
-                  >
-                    <app-select
-                      [value]="defaults.defaults[type].personal?.id ?? ''"
-                      [disabled]="!defaults.personal_defaults_allowed || !!defaultExpertBusy()"
-                      (changed)="setDefaultExpert(type, $event ?? '')"
-                    >
-                      <option value="">
-                        {{ 'settings.expertDefaults.useApplication' | transloco }}
-                      </option>
-                      @for (expert of ownedExperts(type); track expert.id) {
-                        <option [value]="expert.id">{{ expert.display_name }}</option>
-                      }
                     </app-select>
                   </app-form-field>
-                  <div class="actions-row default-expert-actions">
+                  <app-form-field [label]="'settings.voice.label' | transloco">
+                    @if (ttsBackend() === 'elevenlabs') {
+                      @if (elevenVoicesLoading()) {
+                        <p class="voice-lang-note">{{ 'settings.voice.loadingVoices' | transloco }}</p>
+                      } @else if (elevenVoices().length > 0) {
+                        <app-select [value]="ttsVoice()" (changed)="setTtsVoice($any($event))">
+                          <option value="">{{ 'settings.voice.auto' | transloco }}</option>
+                          @for (v of elevenVoices(); track v.id) {
+                            <option [value]="v.id">{{ elevenVoiceLabel(v) }}</option>
+                          }
+                        </app-select>
+                      } @else {
+                        <app-input
+                          [value]="ttsVoice()"
+                          [placeholder]="'settings.voice.customPlaceholder' | transloco"
+                          (changed)="setTtsVoice($event)"
+                        />
+                      }
+                    } @else if (ttsVoices().length > 0) {
+                      <app-select [value]="ttsVoice()" (changed)="setTtsVoice($any($event))">
+                        <option value="">{{ 'settings.voice.auto' | transloco }}</option>
+                        @for (v of ttsVoices(); track v) {
+                          <option [value]="v">{{ voiceOptionLabel(v) }}</option>
+                        }
+                      </app-select>
+                    } @else {
+                      <app-input
+                        [value]="ttsVoice()"
+                        [placeholder]="'settings.voice.customPlaceholder' | transloco"
+                        (changed)="setTtsVoice($event)"
+                      />
+                    }
+                  </app-form-field>
+                  @if (ttsVoices().length > 0) {
+                    <p class="voice-lang-note">
+                      {{ 'settings.voice.langNote' | transloco }}
+                      @if (ttsBackend() === 'kokoro') {
+                        {{ 'settings.voice.kokoroNoGerman' | transloco }}
+                      }
+                    </p>
+                  }
+                  <app-form-field [label]="'settings.voice.sampleLabel' | transloco">
+                    <app-textarea
+                      [value]="previewText()"
+                      (valueChange)="onPreviewTextChange($event)"
+                      [rows]="2"
+                      size="sm"
+                      [placeholder]="'settings.voice.samplePlaceholder' | transloco"
+                    />
+                    <p class="voice-sample-hint">
+                      {{ 'settings.voice.sampleHint' | transloco: { left: previewCharsLeft() } }}
+                    </p>
+                  </app-form-field>
+                  <div class="voice-preview-row">
                     <app-button
                       variant="secondary"
                       size="sm"
-                      [disabled]="!defaults.personal_defaults_allowed || !!defaultExpertBusy()"
-                      [loading]="defaultExpertBusy() === type"
-                      (clicked)="customizeDefaultExpert(type)"
+                      [loading]="previewingVoice()"
+                      [disabled]="previewingVoice()"
+                      (clicked)="previewVoice()"
                     >
-                      {{ 'settings.expertDefaults.customize' | transloco }}
+                      <app-icon size="sm">play_arrow</app-icon>
+                      {{ 'settings.voice.preview' | transloco }}
                     </app-button>
-                    @if (defaults.defaults[type].personal && !defaults.personal_defaults_allowed) {
-                      <app-button
-                        variant="ghost"
-                        size="sm"
-                        [disabled]="!!defaultExpertBusy()"
-                        (clicked)="setDefaultExpert(type, '')"
-                      >
-                        {{ 'settings.expertDefaults.clear' | transloco }}
+                    @if (ttsBackend() === 'elevenlabs' && selectedElevenVoice()?.preview_url) {
+                      <app-button variant="ghost" size="sm" (clicked)="playHostedPreview()">
+                        <app-icon size="sm">graphic_eq</app-icon>
+                        {{ 'settings.voice.hostedPreview' | transloco }}
                       </app-button>
                     }
-                  </div>
-                </div>
-              }
-              <div class="actions-row">
-                <app-button variant="ghost" size="sm" (clicked)="openExperts()">
-                  {{ 'settings.expertDefaults.manage' | transloco }}
-                </app-button>
-              </div>
-            </div>
-          }
-        </section>
-
-        <!-- Persistent Agent Section -->
-        <section class="settings-section section-spacer">
-          <h2 class="section-title">{{ 'settings.persistent.title' | transloco }}</h2>
-          <p class="section-desc">{{ 'settings.persistent.desc' | transloco }}</p>
-
-          <div class="form-block">
-            <app-form-field
-              [label]="'settings.persistent.model' | transloco"
-              [hint]="
-                paModel()
-                  ? ''
-                  : resolved().persistent_agent?.model
-                    ? ('settings.persistent.defaultPrefix' | transloco) +
-                      ' ' +
-                      (resolved().persistent_agent?.model || '')
-                    : ''
-              "
-            >
-              <app-input
-                [value]="paModel() ?? ''"
-                [placeholder]="
-                  resolved().persistent_agent?.model ??
-                  ('settings.persistent.modelPlaceholder' | transloco)
-                "
-                (changed)="onPaModelChange($event)"
-              />
-            </app-form-field>
-            <app-form-field
-              [label]="'settings.persistent.permissionMode' | transloco"
-              [hint]="
-                capabilities.permissionRestricted()
-                  ? ('grants.locked.permission_mode' | transloco)
-                  : ''
-              "
-            >
-              <app-select
-                [value]="paPermissionMode() ?? resolved().persistent_agent?.permission_mode ?? ''"
-                (changed)="
-                  onPrefChange(
-                    paPermissionMode,
-                    resolved().persistent_agent?.permission_mode,
-                    $event
-                  )
-                "
-              >
-                <option value="supervised">
-                  {{ 'settings.persistent.permissionSupervised' | transloco
-                  }}{{
-                    !paPermissionMode() &&
-                    resolved().persistent_agent?.permission_mode === 'supervised'
-                      ? ' (' + ('common.default' | transloco) + ')'
-                      : ''
-                  }}
-                </option>
-                <option
-                  value="auto_accept"
-                  [disabled]="!capabilities.allowsPermissionMode('auto_accept')"
-                >
-                  {{ 'settings.persistent.permissionAutoAccept' | transloco
-                  }}{{
-                    !paPermissionMode() &&
-                    resolved().persistent_agent?.permission_mode === 'auto_accept'
-                      ? ' (' + ('common.default' | transloco) + ')'
-                      : ''
-                  }}
-                </option>
-                <option
-                  value="autonomous"
-                  [disabled]="!capabilities.allowsPermissionMode('autonomous')"
-                >
-                  {{ 'settings.persistent.permissionAutonomous' | transloco
-                  }}{{
-                    !paPermissionMode() &&
-                    resolved().persistent_agent?.permission_mode === 'autonomous'
-                      ? ' (' + ('common.default' | transloco) + ')'
-                      : ''
-                  }}
-                </option>
-              </app-select>
-            </app-form-field>
-            <app-form-field
-              [label]="'settings.persistent.workspaceBackend' | transloco"
-              [hint]="'settings.persistent.workspaceBackendHint' | transloco"
-            >
-              <app-select
-                [value]="
-                  paWorkspaceBackend() ?? resolved().persistent_agent?.workspace_backend ?? ''
-                "
-                (changed)="
-                  onPrefChange(
-                    paWorkspaceBackend,
-                    resolved().persistent_agent?.workspace_backend,
-                    $event
-                  )
-                "
-              >
-                <option value="virtual">
-                  {{ 'settings.persistent.workspaceVirtual' | transloco
-                  }}{{
-                    !paWorkspaceBackend() &&
-                    resolved().persistent_agent?.workspace_backend === 'virtual'
-                      ? ' (' + ('common.default' | transloco) + ')'
-                      : ''
-                  }}
-                </option>
-                <option value="sandbox">
-                  {{ 'settings.persistent.workspaceSandbox' | transloco
-                  }}{{
-                    !paWorkspaceBackend() &&
-                    resolved().persistent_agent?.workspace_backend === 'sandbox'
-                      ? ' (' + ('common.default' | transloco) + ')'
-                      : ''
-                  }}
-                </option>
-                <option value="none">
-                  {{ 'settings.persistent.workspaceNone' | transloco
-                  }}{{
-                    !paWorkspaceBackend() &&
-                    resolved().persistent_agent?.workspace_backend === 'none'
-                      ? ' (' + ('common.default' | transloco) + ')'
-                      : ''
-                  }}
-                </option>
-              </app-select>
-            </app-form-field>
-            <div class="form-row two-col">
-              <app-form-field [label]="'settings.persistent.idleTimeout' | transloco">
-                <app-input
-                  type="number"
-                  [value]="paIdleTimeoutText()"
-                  [placeholder]="(resolved().persistent_agent?.idle_timeout_minutes ?? 30) + ''"
-                  (changed)="onPaIdleTimeoutChange($event)"
-                />
-              </app-form-field>
-              <app-form-field [label]="'settings.persistent.headlessMode' | transloco">
-                <app-select
-                  [value]="paHeadlessMode() ?? ''"
-                  (changed)="paHeadlessMode.set($any($event || null))"
-                >
-                  <option value="">
-                    {{ 'settings.persistent.headlessModeDefault' | transloco }}
-                  </option>
-                  <option value="eager">
-                    {{ 'settings.persistent.headlessModeEager' | transloco }}
-                  </option>
-                  <option value="polite">
-                    {{ 'settings.persistent.headlessModePolite' | transloco }}
-                  </option>
-                </app-select>
-              </app-form-field>
-            </div>
-            <app-form-field
-              [label]="'settings.persistent.attentionSleep' | transloco"
-              [hint]="'settings.persistent.attentionSleepHint' | transloco"
-            >
-              <app-input
-                type="number"
-                [value]="paAttentionSleepText()"
-                placeholder="60"
-                (changed)="onPaAttentionSleepChange($event)"
-              />
-            </app-form-field>
-            <div class="actions-row">
-              <app-button
-                variant="primary"
-                size="md"
-                [loading]="savingPA()"
-                [disabled]="savingPA()"
-                (clicked)="savePersistentAgent()"
-              >
-                {{
-                  savingPA()
-                    ? ('common.saving' | transloco)
-                    : ('settings.persistent.save' | transloco)
-                }}
-              </app-button>
-              @if (paSaved()) {
-                <app-badge tone="success" size="sm">{{ 'common.saved' | transloco }}</app-badge>
-              }
-            </div>
-          </div>
-        </section>
-
-        <!-- Communication Preferences Section -->
-        <section class="settings-section section-spacer">
-          <h2 class="section-title">{{ 'settings.communication.title' | transloco }}</h2>
-          <p class="section-desc">{{ 'settings.communication.desc' | transloco }}</p>
-
-          <div class="form-block">
-            <app-form-field [label]="'settings.communication.replyDelivery' | transloco">
-              <app-select
-                [value]="commDelivery()"
-                (changed)="commDelivery.set($event ?? 'next_strategic_phase')"
-              >
-                <option value="next_strategic_phase">
-                  {{ 'settings.communication.deliveryNextStrategic' | transloco }}
-                </option>
-                <option value="immediate_interrupt">
-                  {{ 'settings.communication.deliveryImmediate' | transloco }}
-                </option>
-                <option value="llm_triage">
-                  {{ 'settings.communication.deliveryLlmTriage' | transloco }}
-                </option>
-              </app-select>
-            </app-form-field>
-
-            <app-form-field [label]="'settings.communication.channels' | transloco">
-              <div class="channel-list">
-                <app-checkbox
-                  size="sm"
-                  [checked]="commChannelEmail()"
-                  (changed)="commChannelEmail.set($event)"
-                  >Email</app-checkbox
-                >
-                <app-checkbox
-                  size="sm"
-                  [checked]="commChannelNtfy()"
-                  (changed)="commChannelNtfy.set($event)"
-                  >Ntfy</app-checkbox
-                >
-                <app-checkbox
-                  size="sm"
-                  [checked]="commChannelSlack()"
-                  (changed)="commChannelSlack.set($event)"
-                  >Slack</app-checkbox
-                >
-                <app-checkbox
-                  size="sm"
-                  [checked]="commChannelDiscord()"
-                  (changed)="commChannelDiscord.set($event)"
-                  >Discord</app-checkbox
-                >
-              </div>
-            </app-form-field>
-
-            <app-checkbox [checked]="commQuietEnabled()" (changed)="commQuietEnabled.set($event)">
-              {{ 'settings.communication.quietHours' | transloco }}
-            </app-checkbox>
-
-            @if (commQuietEnabled()) {
-              <div class="form-row two-col quiet-hours-row">
-                <app-form-field [label]="'settings.communication.start' | transloco">
-                  <input
-                    type="time"
-                    class="time-input"
-                    [value]="commQuietStart()"
-                    (input)="commQuietStart.set(asInputValue($event))"
-                  />
-                </app-form-field>
-                <app-form-field [label]="'settings.communication.end' | transloco">
-                  <input
-                    type="time"
-                    class="time-input"
-                    [value]="commQuietEnd()"
-                    (input)="commQuietEnd.set(asInputValue($event))"
-                  />
-                </app-form-field>
-              </div>
-              <app-form-field [label]="'settings.communication.timezone' | transloco">
-                <app-input
-                  [value]="commQuietTimezone()"
-                  [placeholder]="'settings.communication.timezonePlaceholder' | transloco"
-                  (changed)="commQuietTimezone.set($event)"
-                />
-              </app-form-field>
-            }
-
-            <div class="actions-row">
-              <app-button
-                variant="primary"
-                size="md"
-                [loading]="savingComm()"
-                [disabled]="savingComm()"
-                (clicked)="saveCommunication()"
-              >
-                {{
-                  savingComm()
-                    ? ('common.saving' | transloco)
-                    : ('settings.communication.save' | transloco)
-                }}
-              </app-button>
-              @if (commSaved()) {
-                <app-badge tone="success" size="sm">{{ 'common.saved' | transloco }}</app-badge>
-              }
-            </div>
-          </div>
-        </section>
-
-        <!-- MCP Tokens Section -->
-        @if (externalClientsEnabled) {
-        <section class="settings-section section-spacer">
-          <h2 class="section-title">{{ 'settings.mcp.title' | transloco }}</h2>
-          <p class="section-desc">{{ 'settings.mcp.desc' | transloco }}</p>
-
-          <!-- Token List -->
-          @if (tokenService.tokens().length > 0) {
-            <div class="token-table">
-              <div class="token-header">
-                <span class="col-name">{{ 'settings.mcp.colName' | transloco }}</span>
-                <span class="col-prefix">{{ 'settings.mcp.colToken' | transloco }}</span>
-                <span class="col-scope">{{ 'settings.mcp.colScope' | transloco }}</span>
-                <span class="col-origin">{{ 'settings.mcp.colOrigin' | transloco }}</span>
-                <span class="col-used">{{ 'settings.mcp.colLastUsed' | transloco }}</span>
-                <span class="col-expires">{{ 'settings.mcp.colExpires' | transloco }}</span>
-                <span class="col-action"></span>
-              </div>
-              @for (token of activeTokens(); track token.id) {
-                <div class="token-row">
-                  <span class="col-name">{{ token.name }}</span>
-                  <span class="col-prefix mono">{{ token.token_prefix }}...</span>
-                  <span class="col-scope">{{ formatScope(token.scope) }}</span>
-                  <span class="col-origin">{{ formatOrigin(token.origin) }}</span>
-                  <span class="col-used">{{
-                    token.last_used_at
-                      ? formatDate(token.last_used_at)
-                      : ('common.never' | transloco)
-                  }}</span>
-                  <span class="col-expires">{{
-                    token.expires_at ? formatDate(token.expires_at) : ('common.never' | transloco)
-                  }}</span>
-                  <span class="col-action">
-                    <app-button variant="danger" size="sm" (clicked)="revokeToken(token.id)">
-                      {{ 'settings.mcp.revoke' | transloco }}
-                    </app-button>
-                  </span>
-                </div>
-              }
-            </div>
-          } @else {
-            <p class="empty-state">{{ 'settings.mcp.empty' | transloco }}</p>
-          }
-
-          <!-- Newly Created Token -->
-          @if (newToken(); as nt) {
-            <div class="new-token-banner">
-              <p class="new-token-warning">{{ 'settings.mcp.copyWarning' | transloco }}</p>
-              <div class="new-token-row">
-                <input
-                  type="text"
-                  class="new-token-input"
-                  [value]="nt.token"
-                  readonly
-                  #tokenInput
-                />
-                <app-button variant="primary" size="md" (clicked)="copyToken(tokenInput)">
-                  {{ copied() ? ('common.copied' | transloco) : ('common.copy' | transloco) }}
-                </app-button>
-              </div>
-            </div>
-          }
-
-          <!-- Create Token Form -->
-          <div class="create-form">
-            <h3 class="form-title">{{ 'settings.mcp.createTitle' | transloco }}</h3>
-            <div class="form-row">
-              <app-input
-                [value]="newName()"
-                [placeholder]="'settings.mcp.namePlaceholder' | transloco"
-                [disabled]="creating()"
-                (changed)="newName.set($event)"
-              />
-            </div>
-            <div class="form-row two-col">
-              <app-select
-                [value]="newScope()"
-                [disabled]="creating()"
-                (changed)="newScope.set($event ?? 'user')"
-              >
-                <option value="user">{{ 'settings.mcp.scopeUser' | transloco }}</option>
-                @for (p of projects(); track p.id) {
-                  <option [value]="'project:' + p.id">
-                    {{ 'settings.mcp.scopeProjectPrefix' | transloco }} {{ p.name }}
-                  </option>
-                }
-                @if (userService.currentUser()?.is_admin) {
-                  <option value="all">{{ 'settings.mcp.scopeAll' | transloco }}</option>
-                }
-              </app-select>
-              <app-select
-                [value]="newExpiryText()"
-                [disabled]="creating()"
-                (changed)="onNewExpiryChange($event)"
-              >
-                <option value="">{{ 'settings.mcp.expiryNever' | transloco }}</option>
-                <option value="30">{{ 'settings.mcp.expiry30' | transloco }}</option>
-                <option value="90">{{ 'settings.mcp.expiry90' | transloco }}</option>
-                <option value="365">{{ 'settings.mcp.expiry365' | transloco }}</option>
-              </app-select>
-            </div>
-            @if (createError(); as err) {
-              <p class="form-error" role="alert">{{ err }}</p>
-            }
-            <app-button
-              variant="primary"
-              size="md"
-              [loading]="creating()"
-              [disabled]="creating() || !newName().trim()"
-              (clicked)="createToken()"
-            >
-              {{
-                creating()
-                  ? ('settings.mcp.creating' | transloco)
-                  : ('settings.mcp.create' | transloco)
-              }}
-            </app-button>
-          </div>
-
-          <!-- Connection Instructions (shown after token creation) -->
-          @if (newToken()) {
-            <div class="instructions">
-              <h3 class="form-title">{{ 'settings.mcp.claudeCodeTitle' | transloco }}</h3>
-              <p class="section-desc" [innerHTML]="'settings.mcp.claudeCodeDesc' | transloco"></p>
-              <div class="code-block-wrapper">
-                <pre class="code-block">{{ mcpJsonSnippet() }}</pre>
-                <app-button
-                  class="code-copy-btn"
-                  variant="primary"
-                  size="sm"
-                  (clicked)="copyText(mcpJsonSnippet())"
-                >
-                  {{
-                    snippetCopied() ? ('common.copied' | transloco) : ('common.copy' | transloco)
-                  }}
-                </app-button>
-              </div>
-            </div>
-          }
-
-          <!-- Web UI Connector Instructions -->
-          <div class="instructions">
-            <h3 class="form-title">{{ 'settings.mcp.webConnectorTitle' | transloco }}</h3>
-            <p class="section-desc">{{ 'settings.mcp.webConnectorDesc' | transloco }}</p>
-            <div class="connector-url-row">
-              <input
-                type="text"
-                class="readonly-input mono"
-                [value]="mcpServerUrl()"
-                readonly
-                #mcpUrlInput
-              />
-              <app-button
-                variant="primary"
-                size="md"
-                (clicked)="copyText(mcpUrlInput.value, 'connector')"
-              >
-                {{
-                  connectorCopied() ? ('common.copied' | transloco) : ('common.copy' | transloco)
-                }}
-              </app-button>
-            </div>
-            <p class="section-hint">{{ 'settings.mcp.webConnectorHint' | transloco }}</p>
-          </div>
-        </section>
-
-        }
-
-        <!-- API Keys (PATs) link card — separate page per design doc §3.4 -->
-        <section class="settings-section section-spacer">
-          <h2 class="section-title">{{ 'settings.apiKeys.linkTitle' | transloco }}</h2>
-          <p class="section-desc">{{ 'settings.apiKeys.linkDesc' | transloco }}</p>
-          <app-button variant="primary" size="md" (clicked)="goToApiKeys()">
-            {{ 'settings.apiKeys.linkManage' | transloco }}
-          </app-button>
-        </section>
-
-        <!-- SSH Keys link card — separate page, same pattern as the PAT card above -->
-        @if (externalClientsEnabled) {
-        <section class="settings-section section-spacer">
-          <h2 class="section-title">{{ 'settings.sshKeys.linkTitle' | transloco }}</h2>
-          <p class="section-desc">{{ 'settings.sshKeys.linkDesc' | transloco }}</p>
-          <app-button variant="primary" size="md" (clicked)="goToSshKeys()">
-            {{ 'settings.sshKeys.linkManage' | transloco }}
-          </app-button>
-        </section>
-
-        }
-
-        <!-- AI Subscriptions Section (Admin Only) -->
-        @if (userService.currentUser()?.is_admin) {
-          <section class="settings-section section-spacer">
-            <h2 class="section-title">{{ 'settings.subscriptions.title' | transloco }}</h2>
-            <p class="section-desc">{{ 'settings.subscriptions.desc' | transloco }}</p>
-
-            <!-- Proxy reachability is reported separately from account state:
-                 an unreachable proxy is "not enabled", not "signed out". -->
-            <div class="subs-status-card">
-              @if (subsLoading()) {
-                <span class="subs-status-text">{{
-                  'settings.subscriptions.checking' | transloco
-                }}</span>
-              } @else {
-                <span class="subs-status-dot" [class.connected]="subsStatus().connected"></span>
-                <span class="subs-status-text">
-                  @if (!subsStatus().reachable) {
-                    {{ 'settings.subscriptions.notEnabled' | transloco }}
-                  } @else {
-                    {{
-                      (subsStatus().connected
-                        ? 'settings.subscriptions.connected'
-                        : 'settings.subscriptions.notConnected'
-                      ) | transloco
-                    }}
-                    @if (subsStatus().model_count > 0) {
-                      &mdash;
-                      {{
-                        'settings.subscriptions.modelsAvailable'
-                          | transloco: {count: subsStatus().model_count}
-                      }}
+                    @if (previewErrorKey()) {
+                      <span class="voice-preview-error">{{ previewErrorKey()! | transloco }}</span>
                     }
+                  </div>
+                  @if (ttsBackend() === 'elevenlabs' && selectedElevenVoice()?.preview_url) {
+                    <p class="voice-lang-note">{{ 'settings.voice.previewCaveat' | transloco }}</p>
                   }
-                </span>
-                <app-button
-                  variant="ghost"
-                  size="sm"
-                  [ariaLabel]="'settings.subscriptions.refreshStatus' | transloco"
-                  (clicked)="loadSubscriptions()"
-                >
-                  <app-icon size="sm">refresh</app-icon>
-                </app-button>
-              }
-            </div>
 
-            <!-- Connected accounts -->
-            @if (subsStatus().accounts.length > 0) {
-              <div class="subs-accounts">
-                @for (acct of subsStatus().accounts; track acct.account_id) {
-                  <div class="subs-account-row">
-                    <span class="subs-account-provider">{{ subscriptionProviderLabel(acct.provider) }}</span>
-                    <span class="mono">{{ acct.email || acct.label || acct.account_id }}</span>
-                    <span
-                      class="subs-account-state"
-                      [class.connected]="acct.state === 'connected'"
-                      [class.warn]="acct.state === 'cooldown' || acct.state === 'disabled'"
-                      [class.bad]="acct.state === 'error'"
-                      [title]="acct.state_detail || ''"
+                  <!-- How the message is rewritten for speech (all backends). The
+                       auxiliary LLM cleans markdown + shapes the text; these two
+                       knobs steer it — reasoning (off by default; on = smarter but
+                       slower first audio) and a free-text instruction the user
+                       controls (skip tables, TLDR long messages, omit file names…). -->
+                  <div class="voice-rewrite">
+                    <h3 class="voice-subhead">{{ 'settings.voice.rewriteTitle' | transloco }}</h3>
+                    <app-form-field
+                      [label]="'settings.voice.rewriteReasoningLabel' | transloco"
+                      [hint]="'settings.voice.rewriteReasoningHint' | transloco"
                     >
-                      {{ 'settings.subscriptions.states.' + acct.state | transloco }}
-                    </span>
-                    <span class="subs-account-scope">{{
-                      'settings.subscriptions.scope.' + acct.scope | transloco
-                    }}</span>
-                    @if (usageFor(acct.account_id); as usage) {
-                      @if (usage.available) {
-                        <app-button
-                          variant="ghost"
-                          size="sm"
-                          (clicked)="toggleUsage(acct.account_id)"
-                        >
-                          {{ 'settings.subscriptions.usage.toggle' | transloco }}
-                        </app-button>
-                      } @else {
-                        <span class="subs-usage-na">{{
-                          'settings.subscriptions.usage.unavailable' | transloco
-                        }}</span>
-                      }
-                    } @else {
-                      <app-button
-                        variant="ghost"
-                        size="sm"
-                        (clicked)="loadUsage(acct.account_id)"
+                      <app-select
+                        [value]="readAloudReasoning()"
+                        (changed)="readAloudReasoning.set($any($event))"
                       >
-                        {{ 'settings.subscriptions.usage.check' | transloco }}
-                      </app-button>
-                    }
-                    <app-button
-                      variant="ghost"
-                      size="sm"
-                      (clicked)="disconnectAccount(acct.account_id)"
+                        <option value="off">{{ 'settings.voice.reasoningOff' | transloco }}</option>
+                        <option value="low">{{ 'settings.voice.reasoningLow' | transloco }}</option>
+                        <option value="medium">
+                          {{ 'settings.voice.reasoningMedium' | transloco }}
+                        </option>
+                        <option value="high">{{ 'settings.voice.reasoningHigh' | transloco }}</option>
+                      </app-select>
+                    </app-form-field>
+                    <app-form-field
+                      [label]="'settings.voice.rewritePromptLabel' | transloco"
+                      [hint]="'settings.voice.rewritePromptHint' | transloco"
                     >
-                      {{ 'settings.subscriptions.disconnect' | transloco }}
-                    </app-button>
+                      <app-textarea
+                        [value]="readAloudPromptDraft()"
+                        (valueChange)="onReadAloudPromptChange($event)"
+                        [rows]="3"
+                        size="sm"
+                        [placeholder]="'settings.voice.rewritePromptPlaceholder' | transloco"
+                      />
+                      <p class="voice-sample-hint">
+                        {{
+                          'settings.voice.rewritePromptCounter'
+                            | transloco: { left: readAloudPromptCharsLeft() }
+                        }}
+                      </p>
+                    </app-form-field>
+                    <div class="actions-row">
+                      <app-button
+                        variant="primary"
+                        size="sm"
+                        [loading]="savingReadAloud()"
+                        [disabled]="savingReadAloud()"
+                        (clicked)="saveReadAloud()"
+                      >
+                        {{
+                          savingReadAloud()
+                            ? ('common.saving' | transloco)
+                            : ('settings.voice.rewriteSave' | transloco)
+                        }}
+                      </app-button>
+                      @if (readAloudSaved()) {
+                        <app-badge tone="success" size="sm">{{ 'common.saved' | transloco }}</app-badge>
+                      }
+                    </div>
                   </div>
 
-                  <!-- Usage bars: only for providers with a verified reader. -->
-                  @if (expandedUsage() === acct.account_id && usageFor(acct.account_id); as usage) {
-                    @if (usage.available) {
-                      <div class="subs-usage">
-                        <div class="subs-usage-title">
-                          {{ 'settings.subscriptions.usage.title' | transloco }}
-                          @if (usage.plan_type) {
-                            <span class="subs-usage-plan">{{ usage.plan_type }}</span>
+                  <!-- ElevenLabs Voice Library browser (Phase 6): search the 10k+
+                       community library, audition via hosted previews, and (when the
+                       admin add-gate is on) copy a voice into the deployment account. -->
+                  @if (ttsBackend() === 'elevenlabs') {
+                    <div class="voice-library">
+                      <div class="voice-library-head">
+                        <app-button variant="ghost" size="sm" (clicked)="toggleLibrary()">
+                          <app-icon size="sm">{{
+                            libraryOpen() ? 'expand_less' : 'travel_explore'
+                          }}</app-icon>
+                          {{ 'settings.voice.libraryToggle' | transloco }}
+                        </app-button>
+                        @if (userService.currentUser()?.is_admin) {
+                          <label class="voice-library-flag">
+                            <app-switch
+                              size="sm"
+                              [checked]="ttsLibraryFlag()"
+                              [disabled]="ttsLibraryFlagSaving()"
+                              (changed)="setTtsLibraryFlag($event)"
+                            />
+                            <span>{{ 'settings.voice.libraryAdminFlag' | transloco }}</span>
+                          </label>
+                        }
+                      </div>
+
+                      @if (libraryOpen()) {
+                        <div class="voice-library-search">
+                          <app-input
+                            [value]="librarySearch()"
+                            [placeholder]="'settings.voice.librarySearchPlaceholder' | transloco"
+                            (changed)="librarySearch.set($event)"
+                          />
+                          <app-select
+                            [value]="libraryGender()"
+                            (changed)="libraryGender.set($any($event))"
+                          >
+                            <option value="">
+                              {{ 'settings.voice.libraryAnyGender' | transloco }}
+                            </option>
+                            <option value="female">{{ 'settings.voice.female' | transloco }}</option>
+                            <option value="male">{{ 'settings.voice.male' | transloco }}</option>
+                          </app-select>
+                          <app-button
+                            variant="secondary"
+                            size="sm"
+                            [loading]="libraryLoading()"
+                            [disabled]="libraryLoading()"
+                            (clicked)="searchLibrary()"
+                          >
+                            <app-icon size="sm">search</app-icon>
+                            {{ 'settings.voice.librarySearch' | transloco }}
+                          </app-button>
+                        </div>
+
+                        @if (libraryError()) {
+                          <p class="voice-preview-error">{{ libraryError() }}</p>
+                        }
+                        @if (libraryVoices().length > 0) {
+                          <p class="voice-lang-note">
+                            {{ 'settings.voice.libraryPreviewCaveat' | transloco }}
+                          </p>
+                        }
+
+                        <div class="voice-library-results">
+                          @for (v of libraryVoices(); track v.id) {
+                            <div class="voice-library-card" [class.is-added]="libraryAdded() === v.id">
+                              <div class="voice-library-card__info">
+                                <span class="voice-library-card__name">{{ v.name }}</span>
+                                @if (libraryVoiceLabel(v)) {
+                                  <span class="voice-library-card__tags">{{
+                                    libraryVoiceLabel(v)
+                                  }}</span>
+                                }
+                              </div>
+                              <div class="voice-library-card__actions">
+                                @if (v.preview_url) {
+                                  <app-button
+                                    variant="ghost"
+                                    size="sm"
+                                    [ariaLabel]="'settings.voice.hostedPreview' | transloco"
+                                    (clicked)="playLibrarySample(v)"
+                                  >
+                                    <app-icon size="sm">graphic_eq</app-icon>
+                                  </app-button>
+                                }
+                                @if (libraryAddEnabled()) {
+                                  @if (libraryAdded() === v.id) {
+                                    <span class="voice-library-card__done">
+                                      <app-icon size="sm">check</app-icon>
+                                      {{ 'settings.voice.libraryAdded' | transloco }}
+                                    </span>
+                                  } @else {
+                                    <app-button
+                                      variant="secondary"
+                                      size="sm"
+                                      [loading]="libraryAddingId() === v.id"
+                                      [disabled]="libraryAddingId() !== null"
+                                      (clicked)="addLibraryVoice(v)"
+                                    >
+                                      {{ 'settings.voice.libraryAdd' | transloco }}
+                                    </app-button>
+                                  }
+                                }
+                              </div>
+                            </div>
                           }
-                          @if (usage.limit_reached) {
-                            <span class="subs-usage-limit">{{
-                              'settings.subscriptions.usage.limitReached' | transloco
-                            }}</span>
+                          @if (!libraryLoading() && libraryVoices().length === 0 && !libraryError()) {
+                            <p class="voice-lang-note">
+                              {{ 'settings.voice.libraryEmpty' | transloco }}
+                            </p>
                           }
                         </div>
-                        @if (usage.primary; as w) {
-                          <div class="subs-usage-row">
-                            <div class="subs-usage-meta">
-                              <span class="subs-usage-name">{{
-                                'settings.subscriptions.usage.session' | transloco
-                              }}</span>
-                              @if (w.reset_after_seconds) {
-                                <span class="subs-usage-reset">{{
-                                  'settings.subscriptions.usage.resetsIn'
-                                    | transloco: {time: formatResetIn(w.reset_after_seconds)}
-                                }}</span>
-                              }
-                            </div>
-                            <div class="subs-usage-track">
-                              <div
-                                class="subs-usage-fill"
-                                [class]="usageTone(w.used_percent)"
-                                [style.width.%]="w.used_percent ?? 0"
-                              ></div>
-                            </div>
-                            <span class="subs-usage-pct">{{ w.used_percent ?? 0 }}%</span>
-                          </div>
-                        }
-                        @if (usage.secondary; as w) {
-                          <div class="subs-usage-row">
-                            <div class="subs-usage-meta">
-                              <span class="subs-usage-name">{{
-                                'settings.subscriptions.usage.weekly' | transloco
-                              }}</span>
-                              @if (w.reset_after_seconds) {
-                                <span class="subs-usage-reset">{{
-                                  'settings.subscriptions.usage.resetsIn'
-                                    | transloco: {time: formatResetIn(w.reset_after_seconds)}
-                                }}</span>
-                              }
-                            </div>
-                            <div class="subs-usage-track">
-                              <div
-                                class="subs-usage-fill"
-                                [class]="usageTone(w.used_percent)"
-                                [style.width.%]="w.used_percent ?? 0"
-                              ></div>
-                            </div>
-                            <span class="subs-usage-pct">{{ w.used_percent ?? 0 }}%</span>
-                          </div>
-                        }
-                        <p class="subs-usage-note">
-                          {{ 'settings.subscriptions.usage.disclaimer' | transloco }}
-                        </p>
-                      </div>
-                    }
-                  }
-                }
-              </div>
-            }
-
-            @if (subsStatus().reachable) {
-              <!-- Provider chooser -->
-              <div class="subs-connect">
-                <h3 class="form-title">{{ 'settings.subscriptions.addTitle' | transloco }}</h3>
-                <div class="subs-provider-grid">
-                  @for (p of subsStatus().providers; track p.key) {
-                    <div class="subs-provider-card" [class.busy]="activeLogin()?.provider === p.key">
-                      <div class="subs-provider-head">
-                        <span class="subs-provider-label">{{ subscriptionProviderLabel(p.key) }}</span>
-                        @if (p.connected_accounts > 0) {
-                          <app-badge tone="success" size="xs">{{
-                            'settings.subscriptions.connectedCount'
-                              | transloco: {count: p.connected_accounts}
-                          }}</app-badge>
-                        }
-                        @if (!p.inference_verified) {
-                          <app-badge tone="warning" size="xs">{{
-                            'settings.subscriptions.unverified' | transloco
-                          }}</app-badge>
-                        }
-                      </div>
-                      <p class="subs-provider-flow">
-                        {{ 'settings.subscriptions.flows.' + p.login_flow | transloco }}
-                      </p>
-                      @for (note of p.notes; track note) {
-                        <p class="subs-provider-note">{{ note }}</p>
                       }
-                      <app-button
-                        variant="secondary"
-                        size="sm"
-                        [loading]="activeLogin()?.provider === p.key && loginBusy()"
-                        [disabled]="!!activeLogin() && activeLogin()?.provider !== p.key"
-                        (clicked)="connectProvider(p.key)"
-                      >
-                        {{ 'settings.subscriptions.connect' | transloco }}
-                      </app-button>
                     </div>
                   }
                 </div>
-              </div>
+              </section>
+            }
 
-              <!-- In-flight authorization -->
-              @if (activeLogin(); as login) {
-                <div class="subs-login">
-                  <p class="subs-login-title">
-                    {{
-                      'settings.subscriptions.login.' + login.status
-                        | transloco: {provider: subscriptionProviderLabel(login.provider)}
-                    }}
-                  </p>
-
-                  @if (login.status === 'pending' || login.status === 'verifying') {
-                    @if (login.flow === 'device') {
-                      <ol class="subs-login-steps">
-                        <li>
-                          {{ 'settings.subscriptions.device.step1' | transloco }}
-                          <a [href]="login.auth_url" target="_blank" rel="noopener">{{
-                            login.auth_url
-                          }}</a>
-                        </li>
-                        @if (login.user_code) {
-                          <li>
-                            {{ 'settings.subscriptions.device.step2' | transloco }}
-                            <code class="subs-user-code">{{ login.user_code }}</code>
-                          </li>
-                        }
-                        <li>{{ 'settings.subscriptions.device.step3' | transloco }}</li>
-                      </ol>
-                      <p class="subs-login-hint">
-                        {{
-                          'settings.subscriptions.device.expires'
-                            | transloco: {time: formatExpiry(login.expires_at)}
-                        }}
-                      </p>
-                    } @else {
-                      <ol class="subs-login-steps">
-                        <li>
-                          {{ 'settings.subscriptions.browser.step1' | transloco }}
-                          <a [href]="login.auth_url" target="_blank" rel="noopener">{{
-                            'settings.subscriptions.browser.openLink' | transloco
-                          }}</a>
-                        </li>
-                        <li>{{ 'settings.subscriptions.browser.step2' | transloco }}</li>
-                        <li>{{ 'settings.subscriptions.browser.step3' | transloco }}</li>
-                      </ol>
-                      <div class="subs-callback-row">
-                        <app-input
-                          [value]="callbackUrl()"
-                          [placeholder]="
-                            'settings.subscriptions.browser.callbackPlaceholder' | transloco
-                          "
-                          (changed)="callbackUrl.set($event)"
-                        />
-                        <app-button
-                          variant="primary"
-                          size="sm"
-                          [loading]="callbackSubmitting()"
-                          [disabled]="callbackSubmitting()"
-                          (clicked)="submitCallback()"
+            <!-- Data Visibility Section (Admin Only) -->
+            @if (userService.currentUser()?.is_admin) {
+              <section class="settings-section">
+                <h2 class="section-title">{{ 'settings.dataVisibility.title' | transloco }}</h2>
+                <p class="section-desc">{{ 'settings.dataVisibility.desc' | transloco }}</p>
+                <div class="form-block">
+                  <app-form-field [label]="'settings.dataVisibility.label' | transloco">
+                    <app-select
+                      [value]="viewMode.viewMode()"
+                      (changed)="viewMode.setMode($any($event))"
+                    >
+                      <option value="all">{{ 'settings.dataVisibility.optionAll' | transloco }}</option>
+                      <option value="me">{{ 'settings.dataVisibility.optionMe' | transloco }}</option>
+                    </app-select>
+                  </app-form-field>
+                </div>
+              </section>
+            }
+          }
+          @case ('defaults') {
+            <!-- DB-backed defaults: these choose the expert; the settings below
+                 remain fallback values for fields that expert does not specify. -->
+            <section class="settings-section section-spacer">
+              <h2 class="section-title">{{ 'settings.expertDefaults.title' | transloco }}</h2>
+              <p class="section-desc">{{ 'settings.expertDefaults.desc' | transloco }}</p>
+              @if (expertDefaults(); as defaults) {
+                @if (!defaults.personal_defaults_allowed) {
+                  <p class="section-hint">{{ 'settings.expertDefaults.restricted' | transloco }}</p>
+                }
+                <div class="form-block">
+                  @for (type of expertDefaultTypes; track type) {
+                    <div class="form-row two-col">
+                      <app-form-field
+                        [label]="'settings.expertDefaults.' + type | transloco"
+                        [hint]="defaultExpertHint(type)"
+                      >
+                        <app-select
+                          [value]="defaults.defaults[type].personal?.id ?? ''"
+                          [disabled]="!defaults.personal_defaults_allowed || !!defaultExpertBusy()"
+                          (changed)="setDefaultExpert(type, $event ?? '')"
                         >
-                          {{ 'settings.subscriptions.browser.complete' | transloco }}
+                          <option value="">
+                            {{ 'settings.expertDefaults.useApplication' | transloco }}
+                          </option>
+                          @for (expert of ownedExperts(type); track expert.id) {
+                            <option [value]="expert.id">{{ expert.display_name }}</option>
+                          }
+                        </app-select>
+                      </app-form-field>
+                      <div class="actions-row default-expert-actions">
+                        <app-button
+                          variant="secondary"
+                          size="sm"
+                          [disabled]="!defaults.personal_defaults_allowed || !!defaultExpertBusy()"
+                          [loading]="defaultExpertBusy() === type"
+                          (clicked)="customizeDefaultExpert(type)"
+                        >
+                          {{ 'settings.expertDefaults.customize' | transloco }}
                         </app-button>
+                        @if (defaults.defaults[type].personal && !defaults.personal_defaults_allowed) {
+                          <app-button
+                            variant="ghost"
+                            size="sm"
+                            [disabled]="!!defaultExpertBusy()"
+                            (clicked)="setDefaultExpert(type, '')"
+                          >
+                            {{ 'settings.expertDefaults.clear' | transloco }}
+                          </app-button>
+                        }
                       </div>
-                      <p class="subs-login-hint">
-                        {{ 'settings.subscriptions.browser.remoteHint' | transloco }}
-                      </p>
-                    }
-                    <app-button variant="ghost" size="sm" (clicked)="cancelLogin()">
-                      {{ 'settings.subscriptions.cancel' | transloco }}
-                    </app-button>
-                  } @else {
-                    <app-button variant="ghost" size="sm" (clicked)="dismissLogin()">
-                      {{ 'settings.subscriptions.dismiss' | transloco }}
-                    </app-button>
+                    </div>
                   }
-
-                  @if (loginError()) {
-                    <p class="subs-login-error">{{ loginError() }}</p>
-                  }
+                  <div class="actions-row">
+                    <app-button variant="ghost" size="sm" (clicked)="openExperts()">
+                      {{ 'settings.expertDefaults.manage' | transloco }}
+                    </app-button>
+                  </div>
                 </div>
               }
-            } @else if (!subsLoading()) {
-              <!-- Proxy disabled: explain instead of offering a Connect button
-                   that would 502 on the first login call. -->
-              <div class="subs-disabled-notice">
-                <p class="subs-disabled-title">
-                  {{ 'settings.subscriptions.disabledTitle' | transloco }}
-                </p>
-                <p class="subs-disabled-desc">
-                  {{ 'settings.subscriptions.disabledDesc' | transloco }}
-                </p>
-                <code class="subs-disabled-code">codexProxy.enabled: true</code>
-              </div>
-            }
-          </section>
+            </section>
 
-          <!-- Cloud Storage Section (Admin Only, Phase 4) -->
-          <section class="settings-section section-spacer">
-            <h2 class="section-title">{{ 'settings.cloud.title' | transloco }}</h2>
-            <p class="section-desc">
-              {{ 'settings.cloud.desc' | transloco }}
-            </p>
+            <!-- Preferences Section -->
+            <section class="settings-section section-spacer">
+              <h2 class="section-title">{{ 'settings.preferences.title' | transloco }}</h2>
+              <p class="section-desc">{{ 'settings.preferences.desc' | transloco }}</p>
 
-            @if (cloudLoading()) {
-              <p class="section-desc">{{ 'settings.cloud.loading' | transloco }}</p>
-            } @else if (cloudSettings(); as s) {
-              <!-- Status row -->
-              <div class="subs-status-card">
-                <span
-                  class="subs-status-dot"
-                  [class.connected]="s.effective.is_initialized"
-                ></span>
-                <span class="subs-status-text">
-                  {{ 'settings.cloud.active' | transloco }}
-                  <strong>{{ s.effective.backend_id }}</strong>
-                  @if (s.effective.is_initialized) {
-                    &mdash; {{ 'settings.cloud.initialized' | transloco }}
-                  } @else {
-                    &mdash; {{ 'settings.cloud.notInitialized' | transloco }}
+              <div class="form-block">
+                <div class="form-row two-col">
+                  <app-form-field [label]="'settings.preferences.defaultModel' | transloco">
+                    <app-select
+                      [value]="prefModel() ?? resolved().default_model ?? ''"
+                      (changed)="onPrefChange(prefModel, resolved().default_model, $event)"
+                    >
+                      @for (group of modelService.models(); track group.group) {
+                        <optgroup
+                          [label]="
+                            group.configured
+                              ? group.group
+                              : group.group + ' ' + ('settings.preferences.noApiKey' | transloco)
+                          "
+                        >
+                          @for (model of group.models; track model) {
+                            <option [value]="model">
+                              {{ model
+                              }}{{
+                                !prefModel() && model === resolved().default_model
+                                  ? ' (' + ('common.default' | transloco) + ')'
+                                  : ''
+                              }}
+                            </option>
+                          }
+                        </optgroup>
+                      }
+                    </app-select>
+                  </app-form-field>
+                  <app-form-field [label]="'settings.preferences.auxModel' | transloco">
+                    <app-select
+                      [value]="prefAuxModel() ?? resolved().default_auxiliary_model ?? ''"
+                      (changed)="onPrefChange(prefAuxModel, resolved().default_auxiliary_model, $event)"
+                    >
+                      @for (m of modelService.auxiliaryModels(); track m.id) {
+                        <option [value]="m.id">
+                          {{ m.label
+                          }}{{
+                            !prefAuxModel() && m.id === resolved().default_auxiliary_model
+                              ? ' (' + ('common.default' | transloco) + ')'
+                              : ''
+                          }}{{ m.configured ? '' : ' ' + ('common.noKey' | transloco) }}
+                        </option>
+                      }
+                    </app-select>
+                  </app-form-field>
+                </div>
+                <div class="form-row two-col">
+                  <app-form-field [label]="'settings.preferences.autonomy' | transloco">
+                    <app-select
+                      [value]="prefAutonomy() ?? resolved().default_autonomy ?? ''"
+                      (changed)="onPrefChange(prefAutonomy, resolved().default_autonomy, $event)"
+                    >
+                      <option value="full">
+                        {{ 'settings.preferences.autonomyFull' | transloco
+                        }}{{
+                          !prefAutonomy() && resolved().default_autonomy === 'full'
+                            ? ' (' + ('common.default' | transloco) + ')'
+                            : ''
+                        }}
+                      </option>
+                      <option value="review">
+                        {{ 'settings.preferences.autonomyReview' | transloco
+                        }}{{
+                          !prefAutonomy() && resolved().default_autonomy === 'review'
+                            ? ' (' + ('common.default' | transloco) + ')'
+                            : ''
+                        }}
+                      </option>
+                      <option value="partial">
+                        {{ 'settings.preferences.autonomyPartial' | transloco
+                        }}{{
+                          !prefAutonomy() && resolved().default_autonomy === 'partial'
+                            ? ' (' + ('common.default' | transloco) + ')'
+                            : ''
+                        }}
+                      </option>
+                      <option value="guided">
+                        {{ 'settings.preferences.autonomyGuided' | transloco
+                        }}{{
+                          !prefAutonomy() && resolved().default_autonomy === 'guided'
+                            ? ' (' + ('common.default' | transloco) + ')'
+                            : ''
+                        }}
+                      </option>
+                      <option value="dependent">
+                        {{ 'settings.preferences.autonomyDependent' | transloco
+                        }}{{
+                          !prefAutonomy() && resolved().default_autonomy === 'dependent'
+                            ? ' (' + ('common.default' | transloco) + ')'
+                            : ''
+                        }}
+                      </option>
+                    </app-select>
+                  </app-form-field>
+                  <app-form-field [label]="'settings.preferences.reasoning' | transloco">
+                    <app-select
+                      [value]="prefReasoning() ?? resolved().default_reasoning_level ?? ''"
+                      (changed)="
+                        onPrefChange(prefReasoning, resolved().default_reasoning_level, $event)
+                      "
+                    >
+                      <option value="low">
+                        {{ 'settings.preferences.reasoningLow' | transloco
+                        }}{{
+                          !prefReasoning() && resolved().default_reasoning_level === 'low'
+                            ? ' (' + ('common.default' | transloco) + ')'
+                            : ''
+                        }}
+                      </option>
+                      <option value="medium">
+                        {{ 'settings.preferences.reasoningMedium' | transloco
+                        }}{{
+                          !prefReasoning() && resolved().default_reasoning_level === 'medium'
+                            ? ' (' + ('common.default' | transloco) + ')'
+                            : ''
+                        }}
+                      </option>
+                      <option value="high">
+                        {{ 'settings.preferences.reasoningHigh' | transloco
+                        }}{{
+                          !prefReasoning() && resolved().default_reasoning_level === 'high'
+                            ? ' (' + ('common.default' | transloco) + ')'
+                            : ''
+                        }}
+                      </option>
+                    </app-select>
+                  </app-form-field>
+                </div>
+
+                <h3 class="subsection-title">{{ 'settings.preferences.helperModels' | transloco }}</h3>
+                <div class="form-row two-col">
+                  <app-form-field
+                    [label]="'settings.preferences.visionModel' | transloco"
+                    [hint]="'settings.preferences.visionHint' | transloco"
+                  >
+                    <app-select
+                      [value]="prefVisionModel() ?? resolved().default_vision_model ?? ''"
+                      (changed)="onPrefChange(prefVisionModel, resolved().default_vision_model, $event)"
+                    >
+                      @for (m of modelService.visionModels(); track m.id) {
+                        <option [value]="m.id">
+                          {{ m.label
+                          }}{{
+                            !prefVisionModel() && m.id === resolved().default_vision_model
+                              ? ' (' + ('common.default' | transloco) + ')'
+                              : ''
+                          }}{{ m.configured ? '' : ' ' + ('common.noKey' | transloco) }}
+                        </option>
+                      }
+                    </app-select>
+                  </app-form-field>
+                  <app-form-field
+                    [label]="'settings.preferences.whisperModel' | transloco"
+                    [hint]="'settings.preferences.whisperHint' | transloco"
+                  >
+                    <app-select
+                      [value]="prefWhisperModel() ?? resolved().default_whisper_model ?? ''"
+                      (changed)="
+                        onPrefChange(prefWhisperModel, resolved().default_whisper_model, $event)
+                      "
+                    >
+                      @for (m of modelService.whisperModels(); track m.id) {
+                        <option [value]="m.id">
+                          {{ m.label
+                          }}{{
+                            !prefWhisperModel() && m.id === resolved().default_whisper_model
+                              ? ' (' + ('common.default' | transloco) + ')'
+                              : ''
+                          }}{{ m.configured ? '' : ' ' + ('common.noKey' | transloco) }}
+                        </option>
+                      }
+                    </app-select>
+                  </app-form-field>
+                </div>
+                <div class="form-row two-col">
+                  <app-form-field
+                    [label]="'settings.preferences.embeddingModel' | transloco"
+                    [hint]="'settings.preferences.embeddingHint' | transloco"
+                  >
+                    <app-select
+                      [value]="prefEmbeddingModel() ?? resolved().default_embedding_model ?? ''"
+                      (changed)="
+                        onPrefChange(prefEmbeddingModel, resolved().default_embedding_model, $event)
+                      "
+                    >
+                      @for (m of modelService.embeddingModels(); track m.id) {
+                        <option [value]="m.id">
+                          {{ m.label }}{{ m.dimensions ? ' (' + m.dimensions + 'd)' : ''
+                          }}{{
+                            !prefEmbeddingModel() && m.id === resolved().default_embedding_model
+                              ? ' (' + ('common.default' | transloco) + ')'
+                              : ''
+                          }}{{ m.configured ? '' : ' ' + ('common.noKey' | transloco) }}
+                        </option>
+                      }
+                    </app-select>
+                  </app-form-field>
+                  <app-form-field
+                    [label]="'settings.preferences.embeddingProvider' | transloco"
+                    [hint]="'settings.preferences.embeddingProviderHint' | transloco"
+                  >
+                    <app-select
+                      [value]="prefEmbeddingProvider() ?? resolved().embedding_provider ?? ''"
+                      (changed)="
+                        onPrefChange(prefEmbeddingProvider, resolved().embedding_provider, $event)
+                      "
+                    >
+                      <option value="local">
+                        {{ 'settings.preferences.providerLocal' | transloco
+                        }}{{
+                          !prefEmbeddingProvider() && resolved().embedding_provider === 'local'
+                            ? ' (' + ('common.default' | transloco) + ')'
+                            : ''
+                        }}
+                      </option>
+                      <option value="openrouter">
+                        {{ 'settings.preferences.providerOpenrouter' | transloco
+                        }}{{
+                          !prefEmbeddingProvider() && resolved().embedding_provider === 'openrouter'
+                            ? ' (' + ('common.default' | transloco) + ')'
+                            : ''
+                        }}
+                      </option>
+                    </app-select>
+                  </app-form-field>
+                </div>
+
+                <div class="actions-row">
+                  <app-button
+                    variant="primary"
+                    size="md"
+                    [loading]="savingPrefs()"
+                    [disabled]="savingPrefs()"
+                    (clicked)="savePreferences()"
+                  >
+                    {{
+                      savingPrefs()
+                        ? ('common.saving' | transloco)
+                        : ('settings.preferences.save' | transloco)
+                    }}
+                  </app-button>
+                  @if (prefsSaved()) {
+                    <app-badge tone="success" size="sm">{{ 'common.saved' | transloco }}</app-badge>
                   }
-                </span>
-                <app-button
-                  variant="ghost"
-                  size="sm"
-                  [ariaLabel]="'settings.cloud.refresh' | transloco"
-                  (clicked)="loadCloudSettings()"
-                >
-                  <app-icon size="sm">refresh</app-icon>
-                </app-button>
+                </div>
               </div>
+            </section>
 
-              <!-- Backend selector -->
-              <app-form-field [label]="'settings.cloud.backend' | transloco">
-                <app-select
-                  [value]="cloudForm().backend_id"
-                  (changed)="updateCloudForm('backend_id', $event ?? '')"
+            <!-- Persistent Agent Section -->
+            <section class="settings-section section-spacer">
+              <h2 class="section-title">{{ 'settings.persistent.title' | transloco }}</h2>
+              <p class="section-desc">{{ 'settings.persistent.desc' | transloco }}</p>
+
+              <div class="form-block">
+                <app-form-field
+                  [label]="'settings.persistent.model' | transloco"
+                  [hint]="
+                    paModel()
+                      ? ''
+                      : resolved().persistent_agent?.model
+                        ? ('settings.persistent.defaultPrefix' | transloco) +
+                          ' ' +
+                          (resolved().persistent_agent?.model || '')
+                        : ''
+                  "
                 >
-                  @for (backend of s.allowed_backends; track backend) {
-                    <option [value]="backend">{{ backend }}</option>
-                  }
-                </app-select>
-              </app-form-field>
-
-              <!-- Common URL fields -->
-              <app-form-field [label]="'settings.cloud.baseUrl' | transloco">
-                <app-input
-                  [value]="cloudForm().base_url || ''"
-                  (changed)="updateCloudForm('base_url', $event)"
-                />
-              </app-form-field>
-              <app-form-field [label]="'settings.cloud.publicUrl' | transloco">
-                <app-input
-                  [value]="cloudForm().public_url || ''"
-                  (changed)="updateCloudForm('public_url', $event)"
-                />
-              </app-form-field>
-
-              @if (cloudForm().backend_id === 'opencloud') {
-                <app-form-field [label]="'settings.cloud.keycloakIssuer' | transloco">
                   <app-input
-                    [value]="cloudForm().keycloak_issuer || ''"
-                    (changed)="updateCloudForm('keycloak_issuer', $event)"
+                    [value]="paModel() ?? ''"
+                    [placeholder]="
+                      resolved().persistent_agent?.model ??
+                      ('settings.persistent.modelPlaceholder' | transloco)
+                    "
+                    (changed)="onPaModelChange($event)"
                   />
                 </app-form-field>
-                <app-form-field [label]="'settings.cloud.keycloakClientId' | transloco">
-                  <app-input
-                    [value]="cloudForm().keycloak_client_id || ''"
-                    (changed)="updateCloudForm('keycloak_client_id', $event)"
-                  />
+                <app-form-field
+                  [label]="'settings.persistent.permissionMode' | transloco"
+                  [hint]="
+                    capabilities.permissionRestricted()
+                      ? ('grants.locked.permission_mode' | transloco)
+                      : ''
+                  "
+                >
+                  <app-select
+                    [value]="paPermissionMode() ?? resolved().persistent_agent?.permission_mode ?? ''"
+                    (changed)="
+                      onPrefChange(
+                        paPermissionMode,
+                        resolved().persistent_agent?.permission_mode,
+                        $event
+                      )
+                    "
+                  >
+                    <option value="supervised">
+                      {{ 'settings.persistent.permissionSupervised' | transloco
+                      }}{{
+                        !paPermissionMode() &&
+                        resolved().persistent_agent?.permission_mode === 'supervised'
+                          ? ' (' + ('common.default' | transloco) + ')'
+                          : ''
+                      }}
+                    </option>
+                    <option
+                      value="auto_accept"
+                      [disabled]="!capabilities.allowsPermissionMode('auto_accept')"
+                    >
+                      {{ 'settings.persistent.permissionAutoAccept' | transloco
+                      }}{{
+                        !paPermissionMode() &&
+                        resolved().persistent_agent?.permission_mode === 'auto_accept'
+                          ? ' (' + ('common.default' | transloco) + ')'
+                          : ''
+                      }}
+                    </option>
+                    <option
+                      value="autonomous"
+                      [disabled]="!capabilities.allowsPermissionMode('autonomous')"
+                    >
+                      {{ 'settings.persistent.permissionAutonomous' | transloco
+                      }}{{
+                        !paPermissionMode() &&
+                        resolved().persistent_agent?.permission_mode === 'autonomous'
+                          ? ' (' + ('common.default' | transloco) + ')'
+                          : ''
+                      }}
+                    </option>
+                  </app-select>
                 </app-form-field>
-                <app-form-field [label]="'settings.cloud.adminRole' | transloco">
-                  <app-input
-                    [value]="cloudForm().admin_role_claim_value || ''"
-                    (changed)="updateCloudForm('admin_role_claim_value', $event)"
-                  />
+                <app-form-field
+                  [label]="'settings.persistent.workspaceBackend' | transloco"
+                  [hint]="'settings.persistent.workspaceBackendHint' | transloco"
+                >
+                  <app-select
+                    [value]="
+                      paWorkspaceBackend() ?? resolved().persistent_agent?.workspace_backend ?? ''
+                    "
+                    (changed)="
+                      onPrefChange(
+                        paWorkspaceBackend,
+                        resolved().persistent_agent?.workspace_backend,
+                        $event
+                      )
+                    "
+                  >
+                    <option value="virtual">
+                      {{ 'settings.persistent.workspaceVirtual' | transloco
+                      }}{{
+                        !paWorkspaceBackend() &&
+                        resolved().persistent_agent?.workspace_backend === 'virtual'
+                          ? ' (' + ('common.default' | transloco) + ')'
+                          : ''
+                      }}
+                    </option>
+                    <option value="sandbox">
+                      {{ 'settings.persistent.workspaceSandbox' | transloco
+                      }}{{
+                        !paWorkspaceBackend() &&
+                        resolved().persistent_agent?.workspace_backend === 'sandbox'
+                          ? ' (' + ('common.default' | transloco) + ')'
+                          : ''
+                      }}
+                    </option>
+                    <option value="none">
+                      {{ 'settings.persistent.workspaceNone' | transloco
+                      }}{{
+                        !paWorkspaceBackend() &&
+                        resolved().persistent_agent?.workspace_backend === 'none'
+                          ? ' (' + ('common.default' | transloco) + ')'
+                          : ''
+                      }}
+                    </option>
+                  </app-select>
                 </app-form-field>
-                <app-form-field [label]="'settings.cloud.spaceQuota' | transloco">
+                <div class="form-row two-col">
+                  <app-form-field [label]="'settings.persistent.idleTimeout' | transloco">
+                    <app-input
+                      type="number"
+                      [value]="paIdleTimeoutText()"
+                      [placeholder]="(resolved().persistent_agent?.idle_timeout_minutes ?? 30) + ''"
+                      (changed)="onPaIdleTimeoutChange($event)"
+                    />
+                  </app-form-field>
+                  <app-form-field [label]="'settings.persistent.headlessMode' | transloco">
+                    <app-select
+                      [value]="paHeadlessMode() ?? ''"
+                      (changed)="paHeadlessMode.set($any($event || null))"
+                    >
+                      <option value="">
+                        {{ 'settings.persistent.headlessModeDefault' | transloco }}
+                      </option>
+                      <option value="eager">
+                        {{ 'settings.persistent.headlessModeEager' | transloco }}
+                      </option>
+                      <option value="polite">
+                        {{ 'settings.persistent.headlessModePolite' | transloco }}
+                      </option>
+                    </app-select>
+                  </app-form-field>
+                </div>
+                <app-form-field
+                  [label]="'settings.persistent.attentionSleep' | transloco"
+                  [hint]="'settings.persistent.attentionSleepHint' | transloco"
+                >
                   <app-input
                     type="number"
-                    [value]="cloudQuotaText()"
-                    (changed)="onCloudQuotaChange($event)"
+                    [value]="paAttentionSleepText()"
+                    placeholder="60"
+                    (changed)="onPaAttentionSleepChange($event)"
                   />
                 </app-form-field>
-              }
+                <div class="actions-row">
+                  <app-button
+                    variant="primary"
+                    size="md"
+                    [loading]="savingPA()"
+                    [disabled]="savingPA()"
+                    (clicked)="savePersistentAgent()"
+                  >
+                    {{
+                      savingPA()
+                        ? ('common.saving' | transloco)
+                        : ('settings.persistent.save' | transloco)
+                    }}
+                  </app-button>
+                  @if (paSaved()) {
+                    <app-badge tone="success" size="sm">{{ 'common.saved' | transloco }}</app-badge>
+                  }
+                </div>
+              </div>
+            </section>
+          }
+          @case ('provider-keys') {
+            <!-- LLM provider keys: the user's own, used ahead of the system keys.
+                 Not the PAT page (settings.apiKeys.*, linked further down). -->
+            <section class="settings-section">
+              <h2 class="section-title">{{ 'settings.providerKeys.title' | transloco }}</h2>
+              <p class="section-desc">{{ 'settings.providerKeys.desc' | transloco }}</p>
 
-              @if (cloudForm().backend_id === 'nextcloud') {
-                <app-form-field [label]="'settings.cloud.adminUser' | transloco">
-                  <app-input
-                    [value]="cloudForm().admin_user || ''"
-                    (changed)="updateCloudForm('admin_user', $event)"
-                  />
-                </app-form-field>
-                <app-form-field [label]="'settings.cloud.agentUser' | transloco">
-                  <app-input
-                    [value]="cloudForm().agent_user || ''"
-                    (changed)="updateCloudForm('agent_user', $event)"
-                  />
-                </app-form-field>
-              }
-
-              <!-- Credentials ref -->
-              <app-form-field [label]="'settings.cloud.credentialsRef' | transloco">
-                <app-input
-                  [value]="cloudCredentialsRef()"
-                  placeholder="env:OPENCLOUD_KEYCLOAK_CLIENT_SECRET"
-                  (changed)="cloudCredentialsRef.set($event)"
-                />
-              </app-form-field>
-
-              <!-- Secret provenance -->
-              @if (secretProvenanceEntries().length > 0) {
-                <div class="subs-accounts secret-provenance">
-                  <h3 class="form-title">{{ 'settings.cloud.secretProvenance' | transloco }}</h3>
-                  @for (entry of secretProvenanceEntries(); track entry.field) {
-                    <div class="subs-account-row">
-                      <span class="mono">{{ entry.field }}</span>
-                      <span class="mono">{{ entry.env_var }}</span>
-                      <span class="subs-account-state" [class.connected]="entry.set">
-                        {{
-                          entry.set
-                            ? ('settings.cloud.secretSet' | transloco)
-                            : ('settings.cloud.secretUnset' | transloco)
-                        }}
+              <!-- Key List -->
+              @if (settingsService.apiKeys().length > 0) {
+                <div class="key-table">
+                  <div class="key-header">
+                    <span class="col-provider">{{ 'settings.providerKeys.colProvider' | transloco }}</span>
+                    <span class="col-prefix">{{ 'settings.providerKeys.colKey' | transloco }}</span>
+                    <span class="col-label">{{ 'settings.providerKeys.colLabel' | transloco }}</span>
+                    <span class="col-updated">{{ 'settings.providerKeys.colUpdated' | transloco }}</span>
+                    <span class="col-action"></span>
+                  </div>
+                  @for (key of settingsService.apiKeys(); track key.id) {
+                    <div class="key-row">
+                      <span class="col-provider">{{ providerLabel(key.provider) }}</span>
+                      <span class="col-prefix mono">{{ key.key_prefix }}...</span>
+                      <span class="col-label">{{ key.label || '-' }}</span>
+                      <span class="col-updated">{{ formatDate(key.updated_at) }}</span>
+                      <span class="col-action">
+                        <app-button variant="danger" size="sm" (clicked)="deleteApiKey(key.provider)">
+                          {{ 'common.delete' | transloco }}
+                        </app-button>
                       </span>
                     </div>
                   }
                 </div>
+              } @else {
+                <p class="empty-state">{{ 'settings.providerKeys.empty' | transloco }}</p>
               }
 
-              <!-- Buttons -->
-              <div class="cloud-button-row">
-                <app-button
-                  variant="primary"
-                  size="md"
-                  [loading]="cloudTesting()"
-                  [disabled]="cloudBusy()"
-                  (clicked)="testCloudSettings()"
-                >
-                  {{
-                    (cloudTesting() ? 'settings.cloud.testing' : 'settings.cloud.test') | transloco
-                  }}
-                </app-button>
-                <app-button
-                  variant="primary"
-                  size="md"
-                  [loading]="cloudSaving()"
-                  [disabled]="cloudBusy()"
-                  (clicked)="saveCloudSettings()"
-                >
-                  {{
-                    (cloudSaving() ? 'settings.cloud.saving' : 'settings.cloud.saveReload')
-                      | transloco
-                  }}
-                </app-button>
-                @if (s.overlay.present) {
-                  <app-button
-                    variant="danger"
-                    size="md"
-                    [disabled]="cloudBusy()"
-                    (clicked)="resetCloudSettings()"
+              <!-- Set Key Form -->
+              <div class="create-form">
+                <h3 class="form-title">{{ 'settings.providerKeys.addTitle' | transloco }}</h3>
+                <div class="form-row two-col">
+                  <app-select
+                    [value]="keyProvider()"
+                    [disabled]="settingKey()"
+                    (changed)="onKeyProviderChange($event)"
                   >
-                    {{ 'settings.cloud.resetEnv' | transloco }}
-                  </app-button>
-                }
-              </div>
-
-              @if (cloudMessage()) {
-                <p
-                  class="section-desc cloud-message"
-                  [class.subs-login-error]="cloudMessageIsError()"
+                    @for (p of providers; track p.value) {
+                      <option [value]="p.value">{{ p.label }}</option>
+                    }
+                  </app-select>
+                  <app-input
+                    [value]="keyLabel()"
+                    [placeholder]="'settings.providerKeys.labelPlaceholder' | transloco"
+                    [disabled]="settingKey()"
+                    (changed)="keyLabel.set($event)"
+                  />
+                </div>
+                <div class="form-row">
+                  <app-input
+                    type="password"
+                    [value]="keyValue()"
+                    [placeholder]="'settings.providerKeys.keyPlaceholder' | transloco"
+                    [disabled]="settingKey()"
+                    (changed)="keyValue.set($event)"
+                  />
+                </div>
+                <app-button
+                  variant="primary"
+                  size="md"
+                  [loading]="settingKey()"
+                  [disabled]="settingKey() || !keyValue().trim()"
+                  (clicked)="saveApiKey()"
                 >
-                  {{ cloudMessage() }}
-                </p>
-              }
+                  {{
+                    settingKey()
+                      ? ('common.saving' | transloco)
+                      : ('settings.providerKeys.saveButton' | transloco)
+                  }}
+                </app-button>
+              </div>
+            </section>
+          }
+          @case ('notifications') {
+            <!-- Communication Preferences Section -->
+            <section class="settings-section section-spacer">
+              <h2 class="section-title">{{ 'settings.communication.title' | transloco }}</h2>
+              <p class="section-desc">{{ 'settings.communication.desc' | transloco }}</p>
 
-              @if (s.overlay.present) {
-                <p class="section-desc cloud-overlay-info">
-                  {{ 'settings.cloud.persistedOverlayLastSaved' | transloco }}
-                  @if (s.overlay.updated_at) {
-                    {{ formatDate(s.overlay.updated_at) }}
+              <div class="form-block">
+                <app-form-field [label]="'settings.communication.replyDelivery' | transloco">
+                  <app-select
+                    [value]="commDelivery()"
+                    (changed)="commDelivery.set($event ?? 'next_strategic_phase')"
+                  >
+                    <option value="next_strategic_phase">
+                      {{ 'settings.communication.deliveryNextStrategic' | transloco }}
+                    </option>
+                    <option value="immediate_interrupt">
+                      {{ 'settings.communication.deliveryImmediate' | transloco }}
+                    </option>
+                    <option value="llm_triage">
+                      {{ 'settings.communication.deliveryLlmTriage' | transloco }}
+                    </option>
+                  </app-select>
+                </app-form-field>
+
+                <app-form-field [label]="'settings.communication.channels' | transloco">
+                  <div class="channel-list">
+                    <app-checkbox
+                      size="sm"
+                      [checked]="commChannelEmail()"
+                      (changed)="commChannelEmail.set($event)"
+                      >Email</app-checkbox
+                    >
+                    <app-checkbox
+                      size="sm"
+                      [checked]="commChannelNtfy()"
+                      (changed)="commChannelNtfy.set($event)"
+                      >Ntfy</app-checkbox
+                    >
+                    <app-checkbox
+                      size="sm"
+                      [checked]="commChannelSlack()"
+                      (changed)="commChannelSlack.set($event)"
+                      >Slack</app-checkbox
+                    >
+                    <app-checkbox
+                      size="sm"
+                      [checked]="commChannelDiscord()"
+                      (changed)="commChannelDiscord.set($event)"
+                      >Discord</app-checkbox
+                    >
+                  </div>
+                </app-form-field>
+
+                <app-checkbox [checked]="commQuietEnabled()" (changed)="commQuietEnabled.set($event)">
+                  {{ 'settings.communication.quietHours' | transloco }}
+                </app-checkbox>
+
+                @if (commQuietEnabled()) {
+                  <div class="form-row two-col quiet-hours-row">
+                    <app-form-field [label]="'settings.communication.start' | transloco">
+                      <input
+                        type="time"
+                        class="time-input"
+                        [value]="commQuietStart()"
+                        (input)="commQuietStart.set(asInputValue($event))"
+                      />
+                    </app-form-field>
+                    <app-form-field [label]="'settings.communication.end' | transloco">
+                      <input
+                        type="time"
+                        class="time-input"
+                        [value]="commQuietEnd()"
+                        (input)="commQuietEnd.set(asInputValue($event))"
+                      />
+                    </app-form-field>
+                  </div>
+                  <app-form-field [label]="'settings.communication.timezone' | transloco">
+                    <app-input
+                      [value]="commQuietTimezone()"
+                      [placeholder]="'settings.communication.timezonePlaceholder' | transloco"
+                      (changed)="commQuietTimezone.set($event)"
+                    />
+                  </app-form-field>
+                }
+
+                <div class="actions-row">
+                  <app-button
+                    variant="primary"
+                    size="md"
+                    [loading]="savingComm()"
+                    [disabled]="savingComm()"
+                    (clicked)="saveCommunication()"
+                  >
+                    {{
+                      savingComm()
+                        ? ('common.saving' | transloco)
+                        : ('settings.communication.save' | transloco)
+                    }}
+                  </app-button>
+                  @if (commSaved()) {
+                    <app-badge tone="success" size="sm">{{ 'common.saved' | transloco }}</app-badge>
                   }
-                  @if (s.overlay.updated_by) {
-                    by {{ s.overlay.updated_by }}
+                </div>
+              </div>
+            </section>
+          }
+          @case ('mcp') {
+            <!-- MCP Tokens Section -->
+            @if (externalClientsEnabled) {
+              <section class="settings-section section-spacer">
+                <h2 class="section-title">{{ 'settings.mcp.title' | transloco }}</h2>
+                <p class="section-desc">{{ 'settings.mcp.desc' | transloco }}</p>
+
+                <!-- Token List -->
+                @if (tokenService.tokens().length > 0) {
+                  <div class="token-table">
+                    <div class="token-header">
+                      <span class="col-name">{{ 'settings.mcp.colName' | transloco }}</span>
+                      <span class="col-prefix">{{ 'settings.mcp.colToken' | transloco }}</span>
+                      <span class="col-scope">{{ 'settings.mcp.colScope' | transloco }}</span>
+                      <span class="col-origin">{{ 'settings.mcp.colOrigin' | transloco }}</span>
+                      <span class="col-used">{{ 'settings.mcp.colLastUsed' | transloco }}</span>
+                      <span class="col-expires">{{ 'settings.mcp.colExpires' | transloco }}</span>
+                      <span class="col-action"></span>
+                    </div>
+                    @for (token of activeTokens(); track token.id) {
+                      <div class="token-row">
+                        <span class="col-name">{{ token.name }}</span>
+                        <span class="col-prefix mono">{{ token.token_prefix }}...</span>
+                        <span class="col-scope">{{ formatScope(token.scope) }}</span>
+                        <span class="col-origin">{{ formatOrigin(token.origin) }}</span>
+                        <span class="col-used">{{
+                          token.last_used_at
+                            ? formatDate(token.last_used_at)
+                            : ('common.never' | transloco)
+                        }}</span>
+                        <span class="col-expires">{{
+                          token.expires_at ? formatDate(token.expires_at) : ('common.never' | transloco)
+                        }}</span>
+                        <span class="col-action">
+                          <app-button variant="danger" size="sm" (clicked)="revokeToken(token.id)">
+                            {{ 'settings.mcp.revoke' | transloco }}
+                          </app-button>
+                        </span>
+                      </div>
+                    }
+                  </div>
+                } @else {
+                  <p class="empty-state">{{ 'settings.mcp.empty' | transloco }}</p>
+                }
+
+                <!-- Newly Created Token -->
+                @if (newToken(); as nt) {
+                  <div class="new-token-banner">
+                    <p class="new-token-warning">{{ 'settings.mcp.copyWarning' | transloco }}</p>
+                    <div class="new-token-row">
+                      <input
+                        type="text"
+                        class="new-token-input"
+                        [value]="nt.token"
+                        readonly
+                        #tokenInput
+                      />
+                      <app-button variant="primary" size="md" (clicked)="copyToken(tokenInput)">
+                        {{ copied() ? ('common.copied' | transloco) : ('common.copy' | transloco) }}
+                      </app-button>
+                    </div>
+                  </div>
+                }
+
+                <!-- Create Token Form -->
+                <div class="create-form">
+                  <h3 class="form-title">{{ 'settings.mcp.createTitle' | transloco }}</h3>
+                  <div class="form-row">
+                    <app-input
+                      [value]="newName()"
+                      [placeholder]="'settings.mcp.namePlaceholder' | transloco"
+                      [disabled]="creating()"
+                      (changed)="newName.set($event)"
+                    />
+                  </div>
+                  <div class="form-row two-col">
+                    <app-select
+                      [value]="newScope()"
+                      [disabled]="creating()"
+                      (changed)="newScope.set($event ?? 'user')"
+                    >
+                      <option value="user">{{ 'settings.mcp.scopeUser' | transloco }}</option>
+                      @for (p of projects(); track p.id) {
+                        <option [value]="'project:' + p.id">
+                          {{ 'settings.mcp.scopeProjectPrefix' | transloco }} {{ p.name }}
+                        </option>
+                      }
+                      @if (userService.currentUser()?.is_admin) {
+                        <option value="all">{{ 'settings.mcp.scopeAll' | transloco }}</option>
+                      }
+                    </app-select>
+                    <app-select
+                      [value]="newExpiryText()"
+                      [disabled]="creating()"
+                      (changed)="onNewExpiryChange($event)"
+                    >
+                      <option value="">{{ 'settings.mcp.expiryNever' | transloco }}</option>
+                      <option value="30">{{ 'settings.mcp.expiry30' | transloco }}</option>
+                      <option value="90">{{ 'settings.mcp.expiry90' | transloco }}</option>
+                      <option value="365">{{ 'settings.mcp.expiry365' | transloco }}</option>
+                    </app-select>
+                  </div>
+                  @if (createError(); as err) {
+                    <p class="form-error" role="alert">{{ err }}</p>
                   }
-                </p>
-              }
+                  <app-button
+                    variant="primary"
+                    size="md"
+                    [loading]="creating()"
+                    [disabled]="creating() || !newName().trim()"
+                    (clicked)="createToken()"
+                  >
+                    {{
+                      creating()
+                        ? ('settings.mcp.creating' | transloco)
+                        : ('settings.mcp.create' | transloco)
+                    }}
+                  </app-button>
+                </div>
+
+                <!-- Connection Instructions (shown after token creation) -->
+                @if (newToken()) {
+                  <div class="instructions">
+                    <h3 class="form-title">{{ 'settings.mcp.claudeCodeTitle' | transloco }}</h3>
+                    <p class="section-desc" [innerHTML]="'settings.mcp.claudeCodeDesc' | transloco"></p>
+                    <div class="code-block-wrapper">
+                      <pre class="code-block">{{ mcpJsonSnippet() }}</pre>
+                      <app-button
+                        class="code-copy-btn"
+                        variant="primary"
+                        size="sm"
+                        (clicked)="copyText(mcpJsonSnippet())"
+                      >
+                        {{
+                          snippetCopied() ? ('common.copied' | transloco) : ('common.copy' | transloco)
+                        }}
+                      </app-button>
+                    </div>
+                  </div>
+                }
+
+                <!-- Web UI Connector Instructions -->
+                <div class="instructions">
+                  <h3 class="form-title">{{ 'settings.mcp.webConnectorTitle' | transloco }}</h3>
+                  <p class="section-desc">{{ 'settings.mcp.webConnectorDesc' | transloco }}</p>
+                  <div class="connector-url-row">
+                    <input
+                      type="text"
+                      class="readonly-input mono"
+                      [value]="mcpServerUrl()"
+                      readonly
+                      #mcpUrlInput
+                    />
+                    <app-button
+                      variant="primary"
+                      size="md"
+                      (clicked)="copyText(mcpUrlInput.value, 'connector')"
+                    >
+                      {{
+                        connectorCopied() ? ('common.copied' | transloco) : ('common.copy' | transloco)
+                      }}
+                    </app-button>
+                  </div>
+                  <p class="section-hint">{{ 'settings.mcp.webConnectorHint' | transloco }}</p>
+                </div>
+              </section>
             }
-          </section>
+          }
+          <!-- The two admin-only sections are routed under /admin, behind
+               adminGuard; the @if is the template's own belt and braces. -->
+          @case ('subscriptions') {
+            @if (userService.currentUser()?.is_admin) {
+              <section class="settings-section section-spacer">
+                <h2 class="section-title">{{ 'settings.subscriptions.title' | transloco }}</h2>
+                <p class="section-desc">{{ 'settings.subscriptions.desc' | transloco }}</p>
+
+                <!-- Proxy reachability is reported separately from account state:
+                     an unreachable proxy is "not enabled", not "signed out". -->
+                <div class="subs-status-card">
+                  @if (subsLoading()) {
+                    <span class="subs-status-text">{{
+                      'settings.subscriptions.checking' | transloco
+                    }}</span>
+                  } @else {
+                    <span class="subs-status-dot" [class.connected]="subsStatus().connected"></span>
+                    <span class="subs-status-text">
+                      @if (!subsStatus().reachable) {
+                        {{ 'settings.subscriptions.notEnabled' | transloco }}
+                      } @else {
+                        {{
+                          (subsStatus().connected
+                            ? 'settings.subscriptions.connected'
+                            : 'settings.subscriptions.notConnected'
+                          ) | transloco
+                        }}
+                        @if (subsStatus().model_count > 0) {
+                          &mdash;
+                          {{
+                            'settings.subscriptions.modelsAvailable'
+                              | transloco: {count: subsStatus().model_count}
+                          }}
+                        }
+                      }
+                    </span>
+                    <app-button
+                      variant="ghost"
+                      size="sm"
+                      [ariaLabel]="'settings.subscriptions.refreshStatus' | transloco"
+                      (clicked)="loadSubscriptions()"
+                    >
+                      <app-icon size="sm">refresh</app-icon>
+                    </app-button>
+                  }
+                </div>
+
+                <!-- Connected accounts -->
+                @if (subsStatus().accounts.length > 0) {
+                  <div class="subs-accounts">
+                    @for (acct of subsStatus().accounts; track acct.account_id) {
+                      <div class="subs-account-row">
+                        <span class="subs-account-provider">{{ subscriptionProviderLabel(acct.provider) }}</span>
+                        <span class="mono">{{ acct.email || acct.label || acct.account_id }}</span>
+                        <span
+                          class="subs-account-state"
+                          [class.connected]="acct.state === 'connected'"
+                          [class.warn]="acct.state === 'cooldown' || acct.state === 'disabled'"
+                          [class.bad]="acct.state === 'error'"
+                          [title]="acct.state_detail || ''"
+                        >
+                          {{ 'settings.subscriptions.states.' + acct.state | transloco }}
+                        </span>
+                        <span class="subs-account-scope">{{
+                          'settings.subscriptions.scope.' + acct.scope | transloco
+                        }}</span>
+                        @if (usageFor(acct.account_id); as usage) {
+                          @if (usage.available) {
+                            <app-button
+                              variant="ghost"
+                              size="sm"
+                              (clicked)="toggleUsage(acct.account_id)"
+                            >
+                              {{ 'settings.subscriptions.usage.toggle' | transloco }}
+                            </app-button>
+                          } @else {
+                            <span class="subs-usage-na">{{
+                              'settings.subscriptions.usage.unavailable' | transloco
+                            }}</span>
+                          }
+                        } @else {
+                          <app-button
+                            variant="ghost"
+                            size="sm"
+                            (clicked)="loadUsage(acct.account_id)"
+                          >
+                            {{ 'settings.subscriptions.usage.check' | transloco }}
+                          </app-button>
+                        }
+                        <app-button
+                          variant="ghost"
+                          size="sm"
+                          (clicked)="disconnectAccount(acct.account_id)"
+                        >
+                          {{ 'settings.subscriptions.disconnect' | transloco }}
+                        </app-button>
+                      </div>
+
+                      <!-- Usage bars: only for providers with a verified reader. -->
+                      @if (expandedUsage() === acct.account_id && usageFor(acct.account_id); as usage) {
+                        @if (usage.available) {
+                          <div class="subs-usage">
+                            <div class="subs-usage-title">
+                              {{ 'settings.subscriptions.usage.title' | transloco }}
+                              @if (usage.plan_type) {
+                                <span class="subs-usage-plan">{{ usage.plan_type }}</span>
+                              }
+                              @if (usage.limit_reached) {
+                                <span class="subs-usage-limit">{{
+                                  'settings.subscriptions.usage.limitReached' | transloco
+                                }}</span>
+                              }
+                            </div>
+                            @if (usage.primary; as w) {
+                              <div class="subs-usage-row">
+                                <div class="subs-usage-meta">
+                                  <span class="subs-usage-name">{{
+                                    'settings.subscriptions.usage.session' | transloco
+                                  }}</span>
+                                  @if (w.reset_after_seconds) {
+                                    <span class="subs-usage-reset">{{
+                                      'settings.subscriptions.usage.resetsIn'
+                                        | transloco: {time: formatResetIn(w.reset_after_seconds)}
+                                    }}</span>
+                                  }
+                                </div>
+                                <div class="subs-usage-track">
+                                  <div
+                                    class="subs-usage-fill"
+                                    [class]="usageTone(w.used_percent)"
+                                    [style.width.%]="w.used_percent ?? 0"
+                                  ></div>
+                                </div>
+                                <span class="subs-usage-pct">{{ w.used_percent ?? 0 }}%</span>
+                              </div>
+                            }
+                            @if (usage.secondary; as w) {
+                              <div class="subs-usage-row">
+                                <div class="subs-usage-meta">
+                                  <span class="subs-usage-name">{{
+                                    'settings.subscriptions.usage.weekly' | transloco
+                                  }}</span>
+                                  @if (w.reset_after_seconds) {
+                                    <span class="subs-usage-reset">{{
+                                      'settings.subscriptions.usage.resetsIn'
+                                        | transloco: {time: formatResetIn(w.reset_after_seconds)}
+                                    }}</span>
+                                  }
+                                </div>
+                                <div class="subs-usage-track">
+                                  <div
+                                    class="subs-usage-fill"
+                                    [class]="usageTone(w.used_percent)"
+                                    [style.width.%]="w.used_percent ?? 0"
+                                  ></div>
+                                </div>
+                                <span class="subs-usage-pct">{{ w.used_percent ?? 0 }}%</span>
+                              </div>
+                            }
+                            <p class="subs-usage-note">
+                              {{ 'settings.subscriptions.usage.disclaimer' | transloco }}
+                            </p>
+                          </div>
+                        }
+                      }
+                    }
+                  </div>
+                }
+
+                @if (subsStatus().reachable) {
+                  <!-- Provider chooser -->
+                  <div class="subs-connect">
+                    <h3 class="form-title">{{ 'settings.subscriptions.addTitle' | transloco }}</h3>
+                    <div class="subs-provider-grid">
+                      @for (p of subsStatus().providers; track p.key) {
+                        <div class="subs-provider-card" [class.busy]="activeLogin()?.provider === p.key">
+                          <div class="subs-provider-head">
+                            <span class="subs-provider-label">{{ subscriptionProviderLabel(p.key) }}</span>
+                            @if (p.connected_accounts > 0) {
+                              <app-badge tone="success" size="xs">{{
+                                'settings.subscriptions.connectedCount'
+                                  | transloco: {count: p.connected_accounts}
+                              }}</app-badge>
+                            }
+                            @if (!p.inference_verified) {
+                              <app-badge tone="warning" size="xs">{{
+                                'settings.subscriptions.unverified' | transloco
+                              }}</app-badge>
+                            }
+                          </div>
+                          <p class="subs-provider-flow">
+                            {{ 'settings.subscriptions.flows.' + p.login_flow | transloco }}
+                          </p>
+                          @for (note of p.notes; track note) {
+                            <p class="subs-provider-note">{{ note }}</p>
+                          }
+                          <app-button
+                            variant="secondary"
+                            size="sm"
+                            [loading]="activeLogin()?.provider === p.key && loginBusy()"
+                            [disabled]="!!activeLogin() && activeLogin()?.provider !== p.key"
+                            (clicked)="connectProvider(p.key)"
+                          >
+                            {{ 'settings.subscriptions.connect' | transloco }}
+                          </app-button>
+                        </div>
+                      }
+                    </div>
+                  </div>
+
+                  <!-- In-flight authorization -->
+                  @if (activeLogin(); as login) {
+                    <div class="subs-login">
+                      <p class="subs-login-title">
+                        {{
+                          'settings.subscriptions.login.' + login.status
+                            | transloco: {provider: subscriptionProviderLabel(login.provider)}
+                        }}
+                      </p>
+
+                      @if (login.status === 'pending' || login.status === 'verifying') {
+                        @if (login.flow === 'device') {
+                          <ol class="subs-login-steps">
+                            <li>
+                              {{ 'settings.subscriptions.device.step1' | transloco }}
+                              <a [href]="login.auth_url" target="_blank" rel="noopener">{{
+                                login.auth_url
+                              }}</a>
+                            </li>
+                            @if (login.user_code) {
+                              <li>
+                                {{ 'settings.subscriptions.device.step2' | transloco }}
+                                <code class="subs-user-code">{{ login.user_code }}</code>
+                              </li>
+                            }
+                            <li>{{ 'settings.subscriptions.device.step3' | transloco }}</li>
+                          </ol>
+                          <p class="subs-login-hint">
+                            {{
+                              'settings.subscriptions.device.expires'
+                                | transloco: {time: formatExpiry(login.expires_at)}
+                            }}
+                          </p>
+                        } @else {
+                          <ol class="subs-login-steps">
+                            <li>
+                              {{ 'settings.subscriptions.browser.step1' | transloco }}
+                              <a [href]="login.auth_url" target="_blank" rel="noopener">{{
+                                'settings.subscriptions.browser.openLink' | transloco
+                              }}</a>
+                            </li>
+                            <li>{{ 'settings.subscriptions.browser.step2' | transloco }}</li>
+                            <li>{{ 'settings.subscriptions.browser.step3' | transloco }}</li>
+                          </ol>
+                          <div class="subs-callback-row">
+                            <app-input
+                              [value]="callbackUrl()"
+                              [placeholder]="
+                                'settings.subscriptions.browser.callbackPlaceholder' | transloco
+                              "
+                              (changed)="callbackUrl.set($event)"
+                            />
+                            <app-button
+                              variant="primary"
+                              size="sm"
+                              [loading]="callbackSubmitting()"
+                              [disabled]="callbackSubmitting()"
+                              (clicked)="submitCallback()"
+                            >
+                              {{ 'settings.subscriptions.browser.complete' | transloco }}
+                            </app-button>
+                          </div>
+                          <p class="subs-login-hint">
+                            {{ 'settings.subscriptions.browser.remoteHint' | transloco }}
+                          </p>
+                        }
+                        <app-button variant="ghost" size="sm" (clicked)="cancelLogin()">
+                          {{ 'settings.subscriptions.cancel' | transloco }}
+                        </app-button>
+                      } @else {
+                        <app-button variant="ghost" size="sm" (clicked)="dismissLogin()">
+                          {{ 'settings.subscriptions.dismiss' | transloco }}
+                        </app-button>
+                      }
+
+                      @if (loginError()) {
+                        <p class="subs-login-error">{{ loginError() }}</p>
+                      }
+                    </div>
+                  }
+                } @else if (!subsLoading()) {
+                  <!-- Proxy disabled: explain instead of offering a Connect button
+                       that would 502 on the first login call. -->
+                  <div class="subs-disabled-notice">
+                    <p class="subs-disabled-title">
+                      {{ 'settings.subscriptions.disabledTitle' | transloco }}
+                    </p>
+                    <p class="subs-disabled-desc">
+                      {{ 'settings.subscriptions.disabledDesc' | transloco }}
+                    </p>
+                    <code class="subs-disabled-code">codexProxy.enabled: true</code>
+                  </div>
+                }
+              </section>
+            }
+          }
+          @case ('cloud') {
+            @if (userService.currentUser()?.is_admin) {
+              <section class="settings-section section-spacer">
+                <h2 class="section-title">{{ 'settings.cloud.title' | transloco }}</h2>
+                <p class="section-desc">
+                  {{ 'settings.cloud.desc' | transloco }}
+                </p>
+
+                @if (cloudLoading()) {
+                  <p class="section-desc">{{ 'settings.cloud.loading' | transloco }}</p>
+                } @else if (cloudSettings(); as s) {
+                  <!-- Status row -->
+                  <div class="subs-status-card">
+                    <span
+                      class="subs-status-dot"
+                      [class.connected]="s.effective.is_initialized"
+                    ></span>
+                    <span class="subs-status-text">
+                      {{ 'settings.cloud.active' | transloco }}
+                      <strong>{{ s.effective.backend_id }}</strong>
+                      @if (s.effective.is_initialized) {
+                        &mdash; {{ 'settings.cloud.initialized' | transloco }}
+                      } @else {
+                        &mdash; {{ 'settings.cloud.notInitialized' | transloco }}
+                      }
+                    </span>
+                    <app-button
+                      variant="ghost"
+                      size="sm"
+                      [ariaLabel]="'settings.cloud.refresh' | transloco"
+                      (clicked)="loadCloudSettings()"
+                    >
+                      <app-icon size="sm">refresh</app-icon>
+                    </app-button>
+                  </div>
+
+                  <!-- Backend selector -->
+                  <app-form-field [label]="'settings.cloud.backend' | transloco">
+                    <app-select
+                      [value]="cloudForm().backend_id"
+                      (changed)="updateCloudForm('backend_id', $event ?? '')"
+                    >
+                      @for (backend of s.allowed_backends; track backend) {
+                        <option [value]="backend">{{ backend }}</option>
+                      }
+                    </app-select>
+                  </app-form-field>
+
+                  <!-- Common URL fields -->
+                  <app-form-field [label]="'settings.cloud.baseUrl' | transloco">
+                    <app-input
+                      [value]="cloudForm().base_url || ''"
+                      (changed)="updateCloudForm('base_url', $event)"
+                    />
+                  </app-form-field>
+                  <app-form-field [label]="'settings.cloud.publicUrl' | transloco">
+                    <app-input
+                      [value]="cloudForm().public_url || ''"
+                      (changed)="updateCloudForm('public_url', $event)"
+                    />
+                  </app-form-field>
+
+                  @if (cloudForm().backend_id === 'opencloud') {
+                    <app-form-field [label]="'settings.cloud.keycloakIssuer' | transloco">
+                      <app-input
+                        [value]="cloudForm().keycloak_issuer || ''"
+                        (changed)="updateCloudForm('keycloak_issuer', $event)"
+                      />
+                    </app-form-field>
+                    <app-form-field [label]="'settings.cloud.keycloakClientId' | transloco">
+                      <app-input
+                        [value]="cloudForm().keycloak_client_id || ''"
+                        (changed)="updateCloudForm('keycloak_client_id', $event)"
+                      />
+                    </app-form-field>
+                    <app-form-field [label]="'settings.cloud.adminRole' | transloco">
+                      <app-input
+                        [value]="cloudForm().admin_role_claim_value || ''"
+                        (changed)="updateCloudForm('admin_role_claim_value', $event)"
+                      />
+                    </app-form-field>
+                    <app-form-field [label]="'settings.cloud.spaceQuota' | transloco">
+                      <app-input
+                        type="number"
+                        [value]="cloudQuotaText()"
+                        (changed)="onCloudQuotaChange($event)"
+                      />
+                    </app-form-field>
+                  }
+
+                  @if (cloudForm().backend_id === 'nextcloud') {
+                    <app-form-field [label]="'settings.cloud.adminUser' | transloco">
+                      <app-input
+                        [value]="cloudForm().admin_user || ''"
+                        (changed)="updateCloudForm('admin_user', $event)"
+                      />
+                    </app-form-field>
+                    <app-form-field [label]="'settings.cloud.agentUser' | transloco">
+                      <app-input
+                        [value]="cloudForm().agent_user || ''"
+                        (changed)="updateCloudForm('agent_user', $event)"
+                      />
+                    </app-form-field>
+                  }
+
+                  <!-- Credentials ref -->
+                  <app-form-field [label]="'settings.cloud.credentialsRef' | transloco">
+                    <app-input
+                      [value]="cloudCredentialsRef()"
+                      placeholder="env:OPENCLOUD_KEYCLOAK_CLIENT_SECRET"
+                      (changed)="cloudCredentialsRef.set($event)"
+                    />
+                  </app-form-field>
+
+                  <!-- Secret provenance -->
+                  @if (secretProvenanceEntries().length > 0) {
+                    <div class="subs-accounts secret-provenance">
+                      <h3 class="form-title">{{ 'settings.cloud.secretProvenance' | transloco }}</h3>
+                      @for (entry of secretProvenanceEntries(); track entry.field) {
+                        <div class="subs-account-row">
+                          <span class="mono">{{ entry.field }}</span>
+                          <span class="mono">{{ entry.env_var }}</span>
+                          <span class="subs-account-state" [class.connected]="entry.set">
+                            {{
+                              entry.set
+                                ? ('settings.cloud.secretSet' | transloco)
+                                : ('settings.cloud.secretUnset' | transloco)
+                            }}
+                          </span>
+                        </div>
+                      }
+                    </div>
+                  }
+
+                  <!-- Buttons -->
+                  <div class="cloud-button-row">
+                    <app-button
+                      variant="primary"
+                      size="md"
+                      [loading]="cloudTesting()"
+                      [disabled]="cloudBusy()"
+                      (clicked)="testCloudSettings()"
+                    >
+                      {{
+                        (cloudTesting() ? 'settings.cloud.testing' : 'settings.cloud.test') | transloco
+                      }}
+                    </app-button>
+                    <app-button
+                      variant="primary"
+                      size="md"
+                      [loading]="cloudSaving()"
+                      [disabled]="cloudBusy()"
+                      (clicked)="saveCloudSettings()"
+                    >
+                      {{
+                        (cloudSaving() ? 'settings.cloud.saving' : 'settings.cloud.saveReload')
+                          | transloco
+                      }}
+                    </app-button>
+                    @if (s.overlay.present) {
+                      <app-button
+                        variant="danger"
+                        size="md"
+                        [disabled]="cloudBusy()"
+                        (clicked)="resetCloudSettings()"
+                      >
+                        {{ 'settings.cloud.resetEnv' | transloco }}
+                      </app-button>
+                    }
+                  </div>
+
+                  @if (cloudMessage()) {
+                    <p
+                      class="section-desc cloud-message"
+                      [class.subs-login-error]="cloudMessageIsError()"
+                    >
+                      {{ cloudMessage() }}
+                    </p>
+                  }
+
+                  @if (s.overlay.present) {
+                    <p class="section-desc cloud-overlay-info">
+                      {{ 'settings.cloud.persistedOverlayLastSaved' | transloco }}
+                      @if (s.overlay.updated_at) {
+                        {{ formatDate(s.overlay.updated_at) }}
+                      }
+                      @if (s.overlay.updated_by) {
+                        by {{ s.overlay.updated_by }}
+                      }
+                    </p>
+                  }
+                }
+              </section>
+            }
+          }
         }
       </div>
     </div>
@@ -1843,6 +1856,12 @@ const EXPIRY_OPTIONS = [
       .settings-section + .settings-section,
       .section-spacer {
         margin-top: 24px;
+      }
+
+      /* A page opens on whichever card its section starts with; the header's
+         own margin already spaces it. */
+      .page-header + .settings-section {
+        margin-top: 0;
       }
 
       .section-title {
@@ -2644,7 +2663,13 @@ export class SettingsComponent implements OnInit, OnDestroy {
   readonly viewMode = inject(ViewModeService);
   private readonly apiService = inject(ApiService);
   private readonly router = inject(Router);
+  private readonly route = inject(ActivatedRoute);
   private readonly transloco = inject(TranslocoService);
+
+  /** Each section is its own route config, so the router builds a new
+   * component per section and the snapshot never goes stale. */
+  readonly section: SettingsSection = this.route.snapshot.data['section'] ?? 'general';
+  readonly titleKey = SECTION_TITLE_KEYS[this.section];
 
   // Provider list for dropdown
   readonly providers = PROVIDERS;
@@ -3167,8 +3192,10 @@ export class SettingsComponent implements OnInit, OnDestroy {
       }
     });
 
-    // Load projects reactively — waits for currentUserId on F5 refresh
+    // Load projects reactively — waits for currentUserId on F5 refresh.
+    // Only the MCP token form scopes by project.
     effect(() => {
+      if (this.section !== 'mcp') return;
       const userId = this.userService.currentUserId();
       if (userId) {
         this.apiService.getProjects(userId).subscribe({
@@ -3185,18 +3212,21 @@ export class SettingsComponent implements OnInit, OnDestroy {
     // (currentUser() is null when ngOnInit runs after a hard reload).
     // Guarded by `_adminLoadersFired` so subsequent user signal updates
     // (e.g. background refresh) don't re-trigger the fetches.
+    // Each loader runs only on the section that renders its panel.
     effect(() => {
       if (this._adminLoadersFired) return;
       const user = this.userService.currentUser();
       if (user?.is_admin) {
         this._adminLoadersFired = true;
-        this.loadSubscriptions();
-        this.loadCloudSettings();
+        if (this.section === 'subscriptions') this.loadSubscriptions();
+        if (this.section === 'cloud') this.loadCloudSettings();
         // Seed the Voice Library add-gate switch with its persisted state.
-        this.apiService.getTtsLibrarySetting().subscribe((row) => {
-          this.ttsLibraryFlag.set(row.enabled);
-          this.libraryAddEnabled.set(row.enabled);
-        });
+        if (this.section === 'general') {
+          this.apiService.getTtsLibrarySetting().subscribe((row) => {
+            this.ttsLibraryFlag.set(row.enabled);
+            this.libraryAddEnabled.set(row.enabled);
+          });
+        }
       }
     });
 
@@ -3205,6 +3235,7 @@ export class SettingsComponent implements OnInit, OnDestroy {
     // previews), not a static catalog like Kokoro/OpenAI. Depends only on
     // ttsBackend(); the one-shot flag keeps it from re-firing.
     effect(() => {
+      if (this.section !== 'general') return;
       if (this.ttsBackend() !== 'elevenlabs' || this._elevenVoicesLoaded) return;
       this._elevenVoicesLoaded = true;
       this.elevenVoicesLoading.set(true);
@@ -3221,11 +3252,18 @@ export class SettingsComponent implements OnInit, OnDestroy {
   activeTokens = () => this.tokenService.tokens().filter((t) => !t.revoked_at);
 
   ngOnInit(): void {
+    if (this.section === 'mcp' && !this.externalClientsEnabled) {
+      // Same rule as the SSH keys page: no external clients, no MCP page.
+      void this.router.navigateByUrl('/settings/general');
+      return;
+    }
+    // Model lists feed the voice, defaults and MCP pickers; preferences feed
+    // every user section. The rest load only where they render.
     this.modelService.load();
-    if (this.externalClientsEnabled) this.tokenService.loadTokens();
-    this.settingsService.loadApiKeys();
     this.settingsService.loadPreferences();
-    this.loadExpertDefaults();
+    if (this.section === 'mcp') this.tokenService.loadTokens();
+    if (this.section === 'provider-keys') this.settingsService.loadApiKeys();
+    if (this.section === 'defaults') this.loadExpertDefaults();
     // Admin-only loaders (subscriptions + cloud settings) are triggered
     // by the effect in the constructor — that path waits for currentUser()
     // to populate, which is the only thing that works on a hard F5 reload.
@@ -3274,14 +3312,6 @@ export class SettingsComponent implements OnInit, OnDestroy {
         n: Math.floor(diffMs / 3600_000),
       });
     return d.toLocaleDateString(this.transloco.getActiveLang(), { month: 'short', day: 'numeric' });
-  }
-
-  goToApiKeys(): void {
-    this.router.navigateByUrl('/settings/api-keys');
-  }
-
-  goToSshKeys(): void {
-    this.router.navigateByUrl('/settings/ssh-keys');
   }
 
   mcpJsonSnippet = () => {

@@ -10,6 +10,16 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import UUID
 
 import pytest
+from orchestrator.application import preparation as preparation_composition
+from orchestrator.services import config_resolver as config_resolver_module
+from orchestrator.services import deployment_gates as deployment_gates_module
+from orchestrator.services import grant_enforcement as grant_enforcement_module
+from orchestrator.services import (
+    session_config_resolution as session_config_resolution_module,
+)
+from orchestrator.services import (
+    thread_project_authorization as thread_project_authorization_module,
+)
 
 os.environ.setdefault("VECTOR_DB_URL", "postgresql://test@localhost/test")
 
@@ -56,7 +66,7 @@ def test_orchestrator_images_smoke_import_always_on_drain() -> None:
 
 
 def test_drain_singleton_wires_app_vector_and_fresh_resolver() -> None:
-    orchestrator.main._session_memory_runtime.reset()
+    orchestrator.main.app.state.resources.session_memory_runtime.reset()
     executor_instance = object()
     drain_instance = object()
     with (
@@ -69,18 +79,20 @@ def test_drain_singleton_wires_app_vector_and_fresh_resolver() -> None:
             return_value=drain_instance,
         ) as drain_cls,
     ):
-        first = orchestrator.main._session_memory_runtime.drain()
-        second = orchestrator.main._session_memory_runtime.drain()
+        first = orchestrator.main.app.state.resources.session_memory_runtime.drain()
+        second = orchestrator.main.app.state.resources.session_memory_runtime.drain()
 
     assert first is drain_instance
     assert second is drain_instance
     executor_cls.assert_called_once_with(
-        orchestrator.main.postgres_db,
-        orchestrator.main.vector_db,
-        orchestrator.main._session_memory_runtime.resolve_effect_config,
+        orchestrator.main.app.state.resources.postgres_db,
+        orchestrator.main.app.state.resources.vector_db,
+        orchestrator.main.app.state.resources.session_memory_runtime.resolve_effect_config,
     )
-    drain_cls.assert_called_once_with(orchestrator.main.postgres_db, executor_instance)
-    orchestrator.main._session_memory_runtime.reset()
+    drain_cls.assert_called_once_with(
+        orchestrator.main.app.state.resources.postgres_db, executor_instance
+    )
+    orchestrator.main.app.state.resources.session_memory_runtime.reset()
 
 
 @pytest.mark.asyncio
@@ -96,28 +108,40 @@ async def test_config_resolver_reauthorizes_captured_project_without_redirect() 
 
     with (
         patch.object(
-            orchestrator.main.postgres_db, "get_project", AsyncMock(return_value={})
+            orchestrator.main.app.state.resources.postgres_db,
+            "get_project",
+            AsyncMock(return_value={}),
         ),
         patch.object(
-            orchestrator.main.postgres_db, "get_user", AsyncMock(return_value=owner)
+            orchestrator.main.app.state.resources.postgres_db,
+            "get_user",
+            AsyncMock(return_value=owner),
         ),
         patch.object(
-            orchestrator.main,
-            "_authorize_thread_project_ids",
+            thread_project_authorization_module,
+            "authorize_thread_project_ids",
             AsyncMock(return_value=[str(PROJECT_ID)]),
         ) as authorize,
         patch.object(
-            orchestrator.main,
-            "_resolve_session_config",
+            session_config_resolution_module,
+            "resolve_session_config",
             AsyncMock(return_value=resolved),
         ) as session_resolve,
     ):
-        result = await orchestrator.main._session_memory_runtime.resolve_effect_config(
+        result = await orchestrator.main.app.state.resources.session_memory_runtime.resolve_effect_config(
             thread, "project", PROJECT_ID
         )
 
     assert result is resolved
-    authorize.assert_awaited_once_with(owner, [str(PROJECT_ID)])
+    # The authorization is the owner's, bound by the composition to this
+    # application's store.
+    authorize.assert_awaited_once()
+    assert authorize.await_args.args == (owner, [str(PROJECT_ID)])
+    assert set(authorize.await_args.kwargs) == {"dependencies"}
+    assert (
+        authorize.await_args.kwargs["dependencies"].store
+        is orchestrator.main.app.state.resources.postgres_db
+    )
     resolved_thread = session_resolve.await_args.args[0]
     assert resolved_thread["project_id"] == PROJECT_ID
     assert thread["project_id"] != PROJECT_ID
@@ -128,14 +152,16 @@ async def test_config_resolver_reauthorizes_captured_project_without_redirect() 
 async def test_config_resolver_missing_captured_project_is_retryable() -> None:
     with (
         patch.object(
-            orchestrator.main.postgres_db, "get_project", AsyncMock(return_value=None)
+            orchestrator.main.app.state.resources.postgres_db,
+            "get_project",
+            AsyncMock(return_value=None),
         ),
         patch.object(
-            orchestrator.main, "_resolve_session_config", AsyncMock()
+            session_config_resolution_module, "resolve_session_config", AsyncMock()
         ) as resolve,
     ):
         with pytest.raises(RuntimeError, match="project no longer exists"):
-            await orchestrator.main._session_memory_runtime.resolve_effect_config(
+            await orchestrator.main.app.state.resources.session_memory_runtime.resolve_effect_config(
                 {"id": THREAD_ID, "metadata": {}}, "project", PROJECT_ID
             )
 
@@ -146,20 +172,24 @@ async def test_config_resolver_missing_captured_project_is_retryable() -> None:
 async def test_config_resolver_project_scope_requires_thread_owner() -> None:
     with (
         patch.object(
-            orchestrator.main.postgres_db, "get_project", AsyncMock(return_value={})
+            orchestrator.main.app.state.resources.postgres_db,
+            "get_project",
+            AsyncMock(return_value={}),
         ),
         patch.object(
-            orchestrator.main.postgres_db, "get_user", AsyncMock()
+            orchestrator.main.app.state.resources.postgres_db, "get_user", AsyncMock()
         ) as get_user,
         patch.object(
-            orchestrator.main, "_authorize_thread_project_ids", AsyncMock()
+            thread_project_authorization_module,
+            "authorize_thread_project_ids",
+            AsyncMock(),
         ) as authorize,
         patch.object(
-            orchestrator.main, "_resolve_session_config", AsyncMock()
+            session_config_resolution_module, "resolve_session_config", AsyncMock()
         ) as resolve,
     ):
         with pytest.raises(RuntimeError, match="requires an owning user"):
-            await orchestrator.main._session_memory_runtime.resolve_effect_config(
+            await orchestrator.main.app.state.resources.session_memory_runtime.resolve_effect_config(
                 {"id": THREAD_ID, "user_id": None, "metadata": {}},
                 "project",
                 PROJECT_ID,
@@ -175,16 +205,25 @@ async def test_experts_off_default_keeps_attach_fallback() -> None:
     status: dict[str, object] = {}
     with (
         patch.object(
-            orchestrator.main.postgres_db, "fetchrow", AsyncMock(return_value=None)
+            orchestrator.main.app.state.resources.postgres_db,
+            "fetchrow",
+            AsyncMock(return_value=None),
         ),
-        patch.object(orchestrator.main, "_is_experts_db_enabled", return_value=False),
         patch.object(
-            orchestrator.main, "_user_experts_enabled", AsyncMock()
+            deployment_gates_module, "is_experts_db_enabled", return_value=False
+        ),
+        patch.object(
+            grant_enforcement_module, "user_experts_enabled", AsyncMock()
         ) as user_gate,
-        patch.object(orchestrator.main, "resolve_config", MagicMock()) as resolve,
+        patch.object(config_resolver_module, "resolve_config", MagicMock()) as resolve,
     ):
-        result = await orchestrator.main._resolve_session_config(
-            {"id": THREAD_ID}, {}, status=status
+        result = await session_config_resolution_module.resolve_session_config(
+            {"id": THREAD_ID},
+            {},
+            status=status,
+            dependencies=preparation_composition.session_config_dependencies(
+                orchestrator.main.app.state.resources
+            ),
         )
 
     assert result is None

@@ -1,5 +1,6 @@
 """Exact failed-attach abort rotation and readback contract."""
 
+from orchestrator.services.workspace_lifecycle import WorkspaceOwner
 from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -12,6 +13,18 @@ import orchestrator.main as main
 # workspace-binding service and the successor path reads it from there.
 from orchestrator.services.workspace_binding import CANVAS_WORKSPACE_GENERATION_KEY
 from orchestrator.services.workspace_lifecycle import EnsureOutcome, EnsureResult
+from orchestrator.application import sessions as sessions_composition
+from orchestrator.security import access as access_module
+from orchestrator.services import container_provisioner as container_provisioner_module
+from orchestrator.services import (
+    session_attach_binding as session_attach_binding_module,
+)
+from orchestrator.services import (
+    session_attach_recovery as session_attach_recovery_module,
+)
+from orchestrator.services import session_provisioner as session_provisioner_module
+from orchestrator.services import thread_mount_rows as thread_mount_rows_module
+from orchestrator.services import workspace_suspension as workspace_suspension_module
 
 THREAD_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaa1"
 AGENT_ID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbb2"
@@ -30,7 +43,7 @@ def _thread(*, workspace: bool = False, **updates):
         metadata.update(
             {
                 "workspace_container": {
-                    main.WORKSPACE_RUNTIME_INCARNATION_KEY: WORKSPACE_RUNTIME,
+                    container_provisioner_module.WORKSPACE_RUNTIME_INCARNATION_KEY: WORKSPACE_RUNTIME,
                 },
                 "_workspace_binding": {"generation": WORKSPACE_GENERATION},
             }
@@ -74,7 +87,7 @@ def _successor_thread(
         "pod_ip": "10.42.0.25",
         "port": 30022,
         CANVAS_WORKSPACE_GENERATION_KEY: WORKSPACE_GENERATION,
-        main.WORKSPACE_RUNTIME_INCARNATION_KEY: workspace_runtime,
+        container_provisioner_module.WORKSPACE_RUNTIME_INCARNATION_KEY: workspace_runtime,
     }
     if workspace_runtime is None:
         workspace["pod_ip"] = None
@@ -139,13 +152,18 @@ async def _release(
     async def acquire():
         yield conn
 
-    with patch.object(main.postgres_db, "acquire", side_effect=acquire):
-        outcome = await main._release_session_attach_binding(
+    with patch.object(
+        main.app.state.resources.postgres_db, "acquire", side_effect=acquire
+    ):
+        outcome = await session_attach_binding_module.release_session_attach_binding(
             AGENT_ID,
             THREAD_ID,
             expected_runtime_generation=RUNTIME_GENERATION,
             expected_attach_token=ATTACH_TOKEN,
             **kwargs,
+            dependencies=sessions_composition.session_attach_binding_dependencies(
+                main.app.state.resources
+            ),
         )
     return outcome, conn, transaction
 
@@ -153,6 +171,24 @@ async def _release(
 @asynccontextmanager
 async def _owned_lifecycle_lock(*_args, **_kwargs):
     yield True
+
+
+def _assert_bound_call(mock, *args, awaited: bool = True, **kwargs) -> None:
+    """``mock`` (a patched owner operation) ran once with exactly these
+    arguments, plus the ``dependencies`` the application's composition built
+    for it from the application's store."""
+
+    if awaited:
+        mock.assert_awaited_once()
+        call = mock.await_args
+    else:
+        mock.assert_called_once()
+        call = mock.call_args
+    assert call.args == args
+    passed = {key: value for key, value in call.kwargs.items() if key != "dependencies"}
+    assert passed == kwargs
+    dependencies = call.kwargs["dependencies"]
+    assert dependencies.store is main.app.state.resources.postgres_db
 
 
 async def _release_agent_via_owner(request, thread_id):
@@ -164,16 +200,20 @@ async def _release_agent_via_owner(request, thread_id):
     the router. These cases are about the outcomes, so they call the service
     and hand it the body the fake request would have yielded.
 
-    Dependencies come from ``main._agent_thread_status_dependencies()`` rather
-    than a hand-built object on purpose: the factory reads main's attributes at
-    call time, so every ``patch.object(main, ...)`` below still steers exactly
-    what it steered before the extraction.
+    Dependencies come from ``sessions.agent_thread_status_dependencies`` of
+    the application rather than a hand-built object on purpose: the factory
+    binds each owner operation when it runs, so every patch of an owner below
+    still steers exactly what it steered before the extraction.
     """
     from orchestrator.services import agent_thread_status
 
     body = await request.json()
     return await agent_thread_status.release_thread_agent(
-        thread_id, body, dependencies=main._agent_thread_status_dependencies()
+        thread_id,
+        body,
+        dependencies=sessions_composition.agent_thread_status_dependencies(
+            main.app.state.resources
+        ),
     )
 
 
@@ -326,23 +366,25 @@ async def test_http_boundary_preserves_exact_release_outcome(outcome):
         }
     )
     with (
-        patch.object(main, "require_internal", AsyncMock()),
+        patch.object(access_module, "require_internal", AsyncMock()),
         patch.object(
-            main.postgres_db,
+            main.app.state.resources.postgres_db,
             "get_thread",
             AsyncMock(return_value=None),
         ) as get_thread,
         patch.object(
-            main,
-            "_release_session_attach_binding",
+            session_attach_binding_module,
+            "release_session_attach_binding",
             AsyncMock(return_value=outcome),
         ) as release,
         patch.object(
-            main,
-            "_acknowledge_retiring_failed_attach",
+            session_attach_binding_module,
+            "acknowledge_retiring_failed_attach",
             AsyncMock(return_value=False),
         ) as acknowledge_retirement,
-        patch.object(main, "_schedule_attach_abort_successor") as schedule,
+        patch.object(
+            session_attach_recovery_module, "schedule_attach_abort_successor"
+        ) as schedule,
     ):
         response = await _release_agent_via_owner(request, THREAD_ID)
 
@@ -350,7 +392,8 @@ async def test_http_boundary_preserves_exact_release_outcome(outcome):
     # Exact append-only outcome readback remains reachable after a concurrent
     # permanent thread deletion; generic thread absence is never itself proof.
     get_thread.assert_not_awaited()
-    release.assert_awaited_once_with(
+    _assert_bound_call(
+        release,
         AGENT_ID,
         THREAD_ID,
         expected_runtime_generation=RUNTIME_GENERATION,
@@ -362,7 +405,8 @@ async def test_http_boundary_preserves_exact_release_outcome(outcome):
         workspace_runtime_incarnation=WORKSPACE_RUNTIME,
     )
     if outcome == "unsafe":
-        acknowledge_retirement.assert_awaited_once_with(
+        _assert_bound_call(
+            acknowledge_retirement,
             AGENT_ID,
             THREAD_ID,
             expected_runtime_generation=RUNTIME_GENERATION,
@@ -375,8 +419,10 @@ async def test_http_boundary_preserves_exact_release_outcome(outcome):
     else:
         acknowledge_retirement.assert_not_awaited()
     if outcome in {"released", "already_detached"}:
-        schedule.assert_called_once_with(
+        _assert_bound_call(
+            schedule,
             THREAD_ID,
+            awaited=False,
             retired_runtime_generation=RUNTIME_GENERATION,
             retired_attach_token=ATTACH_TOKEN,
             retired_agent_id=AGENT_ID,
@@ -401,18 +447,20 @@ async def test_http_boundary_routes_failed_attach_proof_into_retirement_only():
         }
     )
     with (
-        patch.object(main, "require_internal", AsyncMock()),
+        patch.object(access_module, "require_internal", AsyncMock()),
         patch.object(
-            main,
-            "_release_session_attach_binding",
+            session_attach_binding_module,
+            "release_session_attach_binding",
             AsyncMock(return_value="unsafe"),
         ),
         patch.object(
-            main,
-            "_acknowledge_retiring_failed_attach",
+            session_attach_binding_module,
+            "acknowledge_retiring_failed_attach",
             AsyncMock(return_value=True),
         ) as acknowledge_retirement,
-        patch.object(main, "_schedule_attach_abort_successor") as schedule,
+        patch.object(
+            session_attach_recovery_module, "schedule_attach_abort_successor"
+        ) as schedule,
     ):
         response = await _release_agent_via_owner(request, THREAD_ID)
 
@@ -427,7 +475,7 @@ async def test_retiring_pre_setup_latch_derives_existing_workspace_receipt():
     acknowledge = AsyncMock(return_value={"version": 1})
     with (
         patch.object(
-            main.postgres_db,
+            main.app.state.resources.postgres_db,
             "get_thread",
             AsyncMock(
                 return_value={
@@ -437,12 +485,12 @@ async def test_retiring_pre_setup_latch_derives_existing_workspace_receipt():
             ),
         ),
         patch.object(
-            main.postgres_db,
+            main.app.state.resources.postgres_db,
             "acknowledge_pinned_thread_local_quiescence",
             acknowledge,
         ),
     ):
-        assert await main._acknowledge_retiring_failed_attach(
+        assert await session_attach_binding_module.acknowledge_retiring_failed_attach(
             AGENT_ID,
             THREAD_ID,
             expected_runtime_generation=RUNTIME_GENERATION,
@@ -451,6 +499,9 @@ async def test_retiring_pre_setup_latch_derives_existing_workspace_receipt():
             local_quiescence_protocol="agent_attach_not_started_v1",
             workspace_generation=WORKSPACE_GENERATION,
             workspace_runtime_incarnation=WORKSPACE_RUNTIME,
+            dependencies=sessions_composition.session_attach_binding_dependencies(
+                main.app.state.resources
+            ),
         )
 
     acknowledge.assert_awaited_once_with(
@@ -472,14 +523,18 @@ async def test_retiring_pre_setup_latch_derives_existing_workspace_receipt():
 async def test_retiring_failed_attach_lost_ack_reads_append_only_outcome():
     readback = AsyncMock(return_value=True)
     with (
-        patch.object(main.postgres_db, "get_thread", AsyncMock(return_value=None)),
         patch.object(
-            main.postgres_db,
+            main.app.state.resources.postgres_db,
+            "get_thread",
+            AsyncMock(return_value=None),
+        ),
+        patch.object(
+            main.app.state.resources.postgres_db,
             "has_exact_pinned_runtime_retirement_outcome",
             readback,
         ),
     ):
-        assert await main._acknowledge_retiring_failed_attach(
+        assert await session_attach_binding_module.acknowledge_retiring_failed_attach(
             AGENT_ID,
             THREAD_ID,
             expected_runtime_generation=RUNTIME_GENERATION,
@@ -488,6 +543,9 @@ async def test_retiring_failed_attach_lost_ack_reads_append_only_outcome():
             local_quiescence_protocol="agent_runtime_zero_v1",
             workspace_generation=None,
             workspace_runtime_incarnation=None,
+            dependencies=sessions_composition.session_attach_binding_dependencies(
+                main.app.state.resources
+            ),
         )
 
     readback.assert_awaited_once_with(
@@ -533,39 +591,47 @@ async def test_exact_attach_abort_strongly_owns_successor_provisioning():
         yield conn
 
     provision = AsyncMock()
-    main._attach_abort_successor_tasks.clear()
+    main.app.state.resources.attach_abort_successor_tasks.clear()
     with (
-        patch.object(main.postgres_db, "acquire", side_effect=acquire),
         patch.object(
-            main.postgres_db,
+            main.app.state.resources.postgres_db, "acquire", side_effect=acquire
+        ),
+        patch.object(
+            main.app.state.resources.postgres_db,
             "get_thread",
             AsyncMock(side_effect=[current, current]),
         ),
         patch.object(
-            main.postgres_db,
+            main.app.state.resources.postgres_db,
             "try_thread_advisory_lock",
             side_effect=_owned_lifecycle_lock,
         ),
         patch.object(
-            main,
-            "_thread_project_ids",
+            thread_mount_rows_module,
+            "thread_project_ids",
             AsyncMock(return_value=["project-a"]),
         ),
         patch(
             "orchestrator.services.provision_or_assign.provision_or_assign", provision
         ),
     ):
-        task = main._schedule_attach_abort_successor(
+        task = session_attach_recovery_module.schedule_attach_abort_successor(
             THREAD_ID,
             retired_runtime_generation=RUNTIME_GENERATION,
             retired_attach_token=ATTACH_TOKEN,
             retired_agent_id=AGENT_ID,
+            dependencies=sessions_composition.session_attach_recovery_dependencies(
+                main.app.state.resources
+            ),
         )
-        duplicate = main._schedule_attach_abort_successor(
+        duplicate = session_attach_recovery_module.schedule_attach_abort_successor(
             THREAD_ID,
             retired_runtime_generation=RUNTIME_GENERATION,
             retired_attach_token=ATTACH_TOKEN,
             retired_agent_id=AGENT_ID,
+            dependencies=sessions_composition.session_attach_recovery_dependencies(
+                main.app.state.resources
+            ),
         )
         assert duplicate is task
         await task
@@ -616,50 +682,59 @@ async def test_workspace_zero_abort_recreates_exact_pod_and_health_checks_ide(
     events.attach_mock(provision, "provision")
 
     with (
-        patch.object(main.postgres_db, "get_thread", get_thread),
+        patch.object(main.app.state.resources.postgres_db, "get_thread", get_thread),
         patch.object(
-            main.postgres_db,
+            main.app.state.resources.postgres_db,
             "try_thread_advisory_lock",
             side_effect=_owned_lifecycle_lock,
         ),
         patch.object(
-            main.postgres_db,
+            main.app.state.resources.postgres_db,
             "clear_pinned_attach_abort_workspace_endpoint",
             clear_endpoint,
         ),
         patch.object(
-            main.container_provisioner,
+            container_provisioner_module.container_provisioner,
             "workspace_pod_authority",
             pod_authority,
         ),
         patch.object(
-            main.container_provisioner,
+            container_provisioner_module.container_provisioner,
             "delete_workspace",
             delete_workspace,
         ),
         patch.object(
-            main.container_provisioner,
+            container_provisioner_module.container_provisioner,
             "wait_for_workspace_code_server",
             code_server,
         ),
-        patch.object(main, "ensure_session_workspace", ensure_workspace),
-        patch.object(main, "_thread_project_ids", AsyncMock(return_value=[])),
+        patch.object(
+            session_provisioner_module, "ensure_session_workspace", ensure_workspace
+        ),
+        patch.object(
+            thread_mount_rows_module, "thread_project_ids", AsyncMock(return_value=[])
+        ),
         patch(
             "orchestrator.services.provision_or_assign.provision_or_assign", provision
         ),
     ):
         assert (
-            await main._reconcile_attach_abort_successor(_workspace_zero_candidate())
+            await session_attach_recovery_module.reconcile_attach_abort_successor(
+                _workspace_zero_candidate(),
+                dependencies=sessions_composition.session_attach_recovery_dependencies(
+                    main.app.state.resources
+                ),
+            )
             is True
         )
 
     pod_authority.assert_awaited_once_with(
-        main.WorkspaceOwner.session(THREAD_ID),
+        WorkspaceOwner.session(THREAD_ID),
         expected_runtime_incarnation=WORKSPACE_RUNTIME,
     )
     if old_pod_authority == "exact_live":
         delete_workspace.assert_awaited_once_with(
-            main.WorkspaceOwner.session(THREAD_ID),
+            WorkspaceOwner.session(THREAD_ID),
             expected_runtime_incarnation=WORKSPACE_RUNTIME,
             captured_teardown_uid=WORKSPACE_RUNTIME,
             wait_for_exact_absence=True,
@@ -678,14 +753,14 @@ async def test_workspace_zero_abort_recreates_exact_pod_and_health_checks_ide(
     )
     ensure_workspace.assert_awaited_once_with(
         THREAD_ID,
-        db=main.postgres_db,
-        provisioner=main.container_provisioner,
-        suspension=main.workspace_suspension_service,
+        db=main.app.state.resources.postgres_db,
+        provisioner=container_provisioner_module.container_provisioner,
+        suspension=workspace_suspension_module.workspace_suspension_service,
         expected_runtime_generation=SUCCESSOR_GENERATION,
         _pinned_runtime_lock_held=True,
     )
     code_server.assert_awaited_once_with(
-        main.WorkspaceOwner.session(THREAD_ID),
+        WorkspaceOwner.session(THREAD_ID),
         expected_runtime_incarnation=SUCCESSOR_WORKSPACE_RUNTIME,
     )
     provision.assert_awaited_once()
@@ -702,17 +777,17 @@ async def test_workspace_zero_health_failure_keeps_successor_unbound_and_retryab
     provision = AsyncMock()
     with (
         patch.object(
-            main.postgres_db,
+            main.app.state.resources.postgres_db,
             "get_thread",
             AsyncMock(return_value=replacement),
         ),
         patch.object(
-            main.postgres_db,
+            main.app.state.resources.postgres_db,
             "try_thread_advisory_lock",
             side_effect=_owned_lifecycle_lock,
         ),
         patch.object(
-            main.container_provisioner,
+            container_provisioner_module.container_provisioner,
             "wait_for_workspace_code_server",
             AsyncMock(return_value=False),
         ) as health,
@@ -721,7 +796,12 @@ async def test_workspace_zero_health_failure_keeps_successor_unbound_and_retryab
         ),
     ):
         assert (
-            await main._reconcile_attach_abort_successor(_workspace_zero_candidate())
+            await session_attach_recovery_module.reconcile_attach_abort_successor(
+                _workspace_zero_candidate(),
+                dependencies=sessions_composition.session_attach_recovery_dependencies(
+                    main.app.state.resources
+                ),
+            )
             is False
         )
 
@@ -734,14 +814,18 @@ async def test_workspace_zero_abort_fails_closed_for_static_docker_workspace():
     docker = _successor_thread(provisioner="docker")
     provision = AsyncMock()
     with (
-        patch.object(main.postgres_db, "get_thread", AsyncMock(return_value=docker)),
         patch.object(
-            main.postgres_db,
+            main.app.state.resources.postgres_db,
+            "get_thread",
+            AsyncMock(return_value=docker),
+        ),
+        patch.object(
+            main.app.state.resources.postgres_db,
             "try_thread_advisory_lock",
             side_effect=_owned_lifecycle_lock,
         ),
         patch.object(
-            main.container_provisioner,
+            container_provisioner_module.container_provisioner,
             "delete_workspace",
             AsyncMock(),
         ) as delete_workspace,
@@ -750,7 +834,12 @@ async def test_workspace_zero_abort_fails_closed_for_static_docker_workspace():
         ),
     ):
         assert (
-            await main._reconcile_attach_abort_successor(_workspace_zero_candidate())
+            await session_attach_recovery_module.reconcile_attach_abort_successor(
+                _workspace_zero_candidate(),
+                dependencies=sessions_composition.session_attach_recovery_dependencies(
+                    main.app.state.resources
+                ),
+            )
             is False
         )
 
@@ -765,34 +854,45 @@ async def test_workspace_zero_delete_cas_loss_never_recreates_or_touches_u2():
     ensure_workspace = AsyncMock()
     provision = AsyncMock()
     with (
-        patch.object(main.postgres_db, "get_thread", AsyncMock(return_value=old)),
         patch.object(
-            main.postgres_db,
+            main.app.state.resources.postgres_db,
+            "get_thread",
+            AsyncMock(return_value=old),
+        ),
+        patch.object(
+            main.app.state.resources.postgres_db,
             "try_thread_advisory_lock",
             side_effect=_owned_lifecycle_lock,
         ),
         patch.object(
-            main.postgres_db,
+            main.app.state.resources.postgres_db,
             "clear_pinned_attach_abort_workspace_endpoint",
             AsyncMock(return_value=False),
         ) as clear_endpoint,
         patch.object(
-            main.container_provisioner,
+            container_provisioner_module.container_provisioner,
             "workspace_pod_authority",
             AsyncMock(return_value="exact_live"),
         ),
         patch.object(
-            main.container_provisioner,
+            container_provisioner_module.container_provisioner,
             "delete_workspace",
             delete_workspace,
         ),
-        patch.object(main, "ensure_session_workspace", ensure_workspace),
+        patch.object(
+            session_provisioner_module, "ensure_session_workspace", ensure_workspace
+        ),
         patch(
             "orchestrator.services.provision_or_assign.provision_or_assign", provision
         ),
     ):
         assert (
-            await main._reconcile_attach_abort_successor(_workspace_zero_candidate())
+            await session_attach_recovery_module.reconcile_attach_abort_successor(
+                _workspace_zero_candidate(),
+                dependencies=sessions_composition.session_attach_recovery_dependencies(
+                    main.app.state.resources
+                ),
+            )
             is False
         )
 
@@ -835,12 +935,18 @@ async def test_attach_abort_successor_owner_never_adopts_a_later_generation():
         yield conn
 
     provision = AsyncMock()
-    main._attach_abort_successor_tasks.clear()
+    main.app.state.resources.attach_abort_successor_tasks.clear()
     with (
-        patch.object(main.postgres_db, "acquire", side_effect=acquire),
-        patch.object(main.postgres_db, "get_thread", AsyncMock(return_value=current)),
         patch.object(
-            main.postgres_db,
+            main.app.state.resources.postgres_db, "acquire", side_effect=acquire
+        ),
+        patch.object(
+            main.app.state.resources.postgres_db,
+            "get_thread",
+            AsyncMock(return_value=current),
+        ),
+        patch.object(
+            main.app.state.resources.postgres_db,
             "try_thread_advisory_lock",
             side_effect=_owned_lifecycle_lock,
         ),
@@ -848,11 +954,14 @@ async def test_attach_abort_successor_owner_never_adopts_a_later_generation():
             "orchestrator.services.provision_or_assign.provision_or_assign", provision
         ),
     ):
-        await main._schedule_attach_abort_successor(
+        await session_attach_recovery_module.schedule_attach_abort_successor(
             THREAD_ID,
             retired_runtime_generation=RUNTIME_GENERATION,
             retired_attach_token=ATTACH_TOKEN,
             retired_agent_id=AGENT_ID,
+            dependencies=sessions_composition.session_attach_recovery_dependencies(
+                main.app.state.resources
+            ),
         )
 
     provision.assert_not_awaited()
@@ -881,20 +990,39 @@ async def test_durable_successor_candidate_retries_after_transient_failure():
     }
     provision = AsyncMock(side_effect=[RuntimeError("transient"), None])
     with (
-        patch.object(main.postgres_db, "get_thread", AsyncMock(return_value=current)),
         patch.object(
-            main.postgres_db,
+            main.app.state.resources.postgres_db,
+            "get_thread",
+            AsyncMock(return_value=current),
+        ),
+        patch.object(
+            main.app.state.resources.postgres_db,
             "try_thread_advisory_lock",
             side_effect=_owned_lifecycle_lock,
         ),
-        patch.object(main, "_thread_project_ids", AsyncMock(return_value=[])),
+        patch.object(
+            thread_mount_rows_module, "thread_project_ids", AsyncMock(return_value=[])
+        ),
         patch(
             "orchestrator.services.provision_or_assign.provision_or_assign", provision
         ),
     ):
         with pytest.raises(RuntimeError, match="transient"):
-            await main._reconcile_attach_abort_successor(candidate)
-        assert await main._reconcile_attach_abort_successor(candidate) is True
+            await session_attach_recovery_module.reconcile_attach_abort_successor(
+                candidate,
+                dependencies=sessions_composition.session_attach_recovery_dependencies(
+                    main.app.state.resources
+                ),
+            )
+        assert (
+            await session_attach_recovery_module.reconcile_attach_abort_successor(
+                candidate,
+                dependencies=sessions_composition.session_attach_recovery_dependencies(
+                    main.app.state.resources
+                ),
+            )
+            is True
+        )
 
     assert provision.await_count == 2
     assert all(
@@ -915,9 +1043,9 @@ async def test_http_boundary_refuses_a_claim_without_process_zero():
         }
     )
     with (
-        patch.object(main, "require_internal", AsyncMock()),
+        patch.object(access_module, "require_internal", AsyncMock()),
         patch.object(
-            main.postgres_db,
+            main.app.state.resources.postgres_db,
             "get_thread",
             AsyncMock(return_value={"id": THREAD_ID}),
         ),

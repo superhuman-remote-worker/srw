@@ -18,8 +18,9 @@ import pytest
 
 from tests import b08_completion_helpers as b08_helpers
 
-import orchestrator.main
 from orchestrator.services.notification_service import RecordResult
+from orchestrator.services import completion_effects as completion_effects_module
+from orchestrator.services import notification_service as notification_service_module
 
 JOB_ID = str(uuid.uuid4())
 USER_ID = str(uuid.uuid4())
@@ -29,7 +30,9 @@ SUDO_ID = str(uuid.uuid4())
 @pytest.fixture
 def record(monkeypatch):
     mock = AsyncMock(return_value=RecordResult("n-1", True, {"in_app": True}))
-    monkeypatch.setattr(orchestrator.main.notification_service, "record", mock)
+    monkeypatch.setattr(
+        notification_service_module.notification_service, "record", mock
+    )
     return mock
 
 
@@ -167,25 +170,20 @@ class TestNotifyOperatorFreeze:
 class TestCompletionEffectDedupKey:
     def test_journalled_effect_uses_the_command_id(self):
         runner = SimpleNamespace(command_id="cmd-42")
-        key = (
-            orchestrator.main.completion_effect_operations.completion_effect_dedup_key(
-                runner, "freeze_notification", JOB_ID
-            )
+        key = completion_effects_module.completion_effect_dedup_key(
+            runner, "freeze_notification", JOB_ID
         )
         assert key == "freeze_notification:cmd-42"
         # Stable across retries and restarts of the same command.
-        assert (
-            key
-            == orchestrator.main.completion_effect_operations.completion_effect_dedup_key(
-                runner, "freeze_notification", JOB_ID
-            )
+        assert key == completion_effects_module.completion_effect_dedup_key(
+            runner, "freeze_notification", JOB_ID
         )
 
     def test_runner_less_route_gets_a_fresh_key_each_time(self):
-        a = orchestrator.main.completion_effect_operations.completion_effect_dedup_key(
+        a = completion_effects_module.completion_effect_dedup_key(
             None, "freeze_notification", JOB_ID
         )
-        b = orchestrator.main.completion_effect_operations.completion_effect_dedup_key(
+        b = completion_effects_module.completion_effect_dedup_key(
             None, "freeze_notification", JOB_ID
         )
         assert a != b

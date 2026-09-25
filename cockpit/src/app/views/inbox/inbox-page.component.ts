@@ -7,10 +7,15 @@ import {
     OnDestroy,
     OnInit,
     signal,
+    TemplateRef,
+    ViewChild,
 } from '@angular/core';
+import {NgTemplateOutlet} from '@angular/common';
 import {ActivatedRoute} from '@angular/router';
 import {TranslocoPipe, TranslocoService} from '@jsverse/transloco';
 import {ViewportService} from '../../core/services/viewport.service';
+import {SidebarService} from '../../core/services/sidebar.service';
+import {RailTakeoverService} from '../../core/services/rail-takeover.service';
 import {ActionCenterService} from '../../core/services/action-center.service';
 import {NotificationService} from '../../core/services/notification.service';
 import {ActionItem} from '../../core/models/action.model';
@@ -53,6 +58,7 @@ function relativeTime(iso: string, nowLabel: string, now: number): string {
   selector: 'app-inbox-page',
   standalone: true,
   imports: [
+    NgTemplateOutlet,
     SidebarToggleComponent,
     TranslocoPipe,
     AppChipComponent,
@@ -65,129 +71,151 @@ function relativeTime(iso: string, nowLabel: string, now: number): string {
     SeenObserverDirective,
   ],
   template: `
-    <div class="inbox" (keydown)="onKeydown($event)">
-      <!-- Header -->
-      <header class="inbox-header">
-        <div class="header-left">
-          <app-sidebar-toggle />
-          @if (isMobileDetail()) {
-            <app-icon-button
-              size="sm"
-              [ariaLabel]="'inbox.backBtn' | transloco"
-              [tooltip]="'inbox.backBtn' | transloco"
-              (clicked)="deselect()"
-            >
-              <app-icon size="sm">arrow_back</app-icon>
-            </app-icon-button>
+    <!-- The feed's parts, rendered in the page or — on desktop with the rail
+         open — lent to the rail, so the page never needs a list column of its
+         own beside it (navigation_fixed_rail.md F9). -->
+    <ng-template #chipsTpl>
+      <app-chip
+        [selected]="activeFilter() === null"
+        (clicked)="setFilter(null)"
+      >
+        {{ 'inbox.filters.all' | transloco }}
+        @if (actionCenter.counts().total > 0) {
+          <span class="chip-count">{{ actionCenter.counts().total }}</span>
+        }
+      </app-chip>
+      @for (chip of categoryChips(); track chip.category) {
+        <app-chip
+          [selected]="activeFilter() === chip.category"
+          (clicked)="setFilter(chip.category)"
+        >
+          <app-icon size="sm">{{ chip.icon }}</app-icon>
+          {{ ('notifications.category.' + chip.category) | transloco }}
+          @if (chip.pending > 0) {
+            <span class="chip-count">{{ chip.pending }}</span>
           }
-          <h1 class="header-title">{{ 'inbox.title' | transloco }}</h1>
-        </div>
+        </app-chip>
+      }
+    </ng-template>
 
-        <div class="filter-chips">
-          <app-chip
-            [selected]="activeFilter() === null"
-            (clicked)="setFilter(null)"
-          >
-            {{ 'inbox.filters.all' | transloco }}
-            @if (actionCenter.counts().total > 0) {
-              <span class="chip-count">{{ actionCenter.counts().total }}</span>
+    <ng-template #statusTpl>
+      <span
+        class="sse-dot"
+        [class.connected]="notifications.isConnected()"
+        [title]="(notifications.isConnected() ? 'inbox.sseConnected' : 'inbox.sseDisconnected') | transloco"
+      ></span>
+      <app-icon-button
+        size="sm"
+        [ariaLabel]="'inbox.refresh' | transloco"
+        [tooltip]="'inbox.refresh' | transloco"
+        (clicked)="refresh()"
+      >
+        <app-icon size="sm">refresh</app-icon>
+      </app-icon-button>
+    </ng-template>
+
+    <ng-template #feedTpl>
+      @if (filteredItems().length === 0) {
+        <div class="empty-list">
+          <app-icon size="inherit" class="empty-icon">inbox</app-icon>
+          <span class="empty-text">
+            @if (activeFilter()) {
+              {{ 'inbox.list.emptyCategory' | transloco }}
+            } @else {
+              {{ 'inbox.list.emptyAll' | transloco }}
             }
-          </app-chip>
-          @for (chip of categoryChips(); track chip.category) {
-            <app-chip
-              [selected]="activeFilter() === chip.category"
-              (clicked)="setFilter(chip.category)"
-            >
-              <app-icon size="sm">{{ chip.icon }}</app-icon>
-              {{ ('notifications.category.' + chip.category) | transloco }}
-              @if (chip.pending > 0) {
-                <span class="chip-count">{{ chip.pending }}</span>
-              }
-            </app-chip>
-          }
+          </span>
         </div>
-
-        <div class="header-right">
-          <span
-            class="sse-dot"
-            [class.connected]="notifications.isConnected()"
-            [title]="(notifications.isConnected() ? 'inbox.sseConnected' : 'inbox.sseDisconnected') | transloco"
-          ></span>
-          <app-icon-button
-            size="sm"
-            [ariaLabel]="'inbox.refresh' | transloco"
-            [tooltip]="'inbox.refresh' | transloco"
-            (clicked)="refresh()"
+      } @else {
+        @for (item of filteredItems(); track item.id; let i = $index) {
+          <button
+            class="list-item"
+            [class.selected]="selectedItem()?.id === item.id"
+            [class.pending]="item.status === 'pending'"
+            [class.resolved]="item.status === 'resolved'"
+            [attr.data-index]="i"
+            [appSeenObserver]="item.notification.id"
+            (click)="selectItem(item)"
           >
-            <app-icon size="sm">refresh</app-icon>
-          </app-icon-button>
-        </div>
-      </header>
-
-      <!-- Body: list + detail -->
-      <div class="inbox-body" [class.mobile-detail]="isMobileDetail()">
-        <!-- Left: Item List -->
-        <div class="list-panel" role="feed" [attr.aria-label]="'inbox.listAriaLabel' | transloco">
-          @if (filteredItems().length === 0) {
-            <div class="empty-list">
-              <app-icon size="inherit" class="empty-icon">inbox</app-icon>
-              <span class="empty-text">
-                @if (activeFilter()) {
-                  {{ 'inbox.list.emptyCategory' | transloco }}
-                } @else {
-                  {{ 'inbox.list.emptyAll' | transloco }}
+            <div class="item-urgency-bar" [class]="'urgency-' + urgencyColor(item)"></div>
+            <app-icon size="lg" class="item-type-icon" [class]="'cat-' + item.category">
+              {{ iconFor(item) }}
+            </app-icon>
+            <div class="item-content">
+              <div class="item-title-row">
+                <span class="item-title">{{ item.title }}</span>
+                @if (!item.notification.seen_at) {
+                  <span class="unread-dot"></span>
                 }
-              </span>
-            </div>
-          } @else {
-            @for (item of filteredItems(); track item.id; let i = $index) {
-              <button
-                class="list-item"
-                [class.selected]="selectedItem()?.id === item.id"
-                [class.pending]="item.status === 'pending'"
-                [class.resolved]="item.status === 'resolved'"
-                [attr.data-index]="i"
-                [appSeenObserver]="item.notification.id"
-                (click)="selectItem(item)"
-              >
-                <div class="item-urgency-bar" [class]="'urgency-' + urgencyColor(item)"></div>
-                <app-icon size="lg" class="item-type-icon" [class]="'cat-' + item.category">
-                  {{ iconFor(item) }}
-                </app-icon>
-                <div class="item-content">
-                  <div class="item-title-row">
-                    <span class="item-title">{{ item.title }}</span>
-                    @if (!item.notification.seen_at) {
-                      <span class="unread-dot"></span>
-                    }
-                    <span class="item-time">{{ relativeTime(item.timestamp) }}</span>
-                  </div>
-                  <div class="item-subtitle">
-                    @if (item.status === 'resolved') {
-                      <app-badge tone="neutral" size="xs" [uppercase]="true">
-                        {{ 'inbox.list.resolved' | transloco }}
-                      </app-badge>
-                    } @else if (item.notification.severity === 'critical' || item.notification.severity === 'high') {
-                      <app-badge [tone]="item.notification.severity === 'critical' ? 'danger' : 'warning'" size="xs" [uppercase]="true">
-                        {{ ('notifications.severity.' + item.notification.severity) | transloco }}
-                      </app-badge>
-                    }
-                    <span class="item-subtitle-text">{{ item.subtitle || (('notifications.category.' + item.category) | transloco) }}</span>
-                  </div>
-                </div>
-              </button>
-            }
-            @if (notifications.feedNextBefore()) {
-              <div class="load-more">
-                <app-button variant="ghost" size="sm" (clicked)="actionCenter.loadMore()">
-                  {{ 'notifications.loadMore' | transloco }}
-                </app-button>
+                <span class="item-time">{{ relativeTime(item.timestamp) }}</span>
               </div>
-            }
-          }
-        </div>
+              <div class="item-subtitle">
+                @if (item.status === 'resolved') {
+                  <app-badge tone="neutral" size="xs" [uppercase]="true">
+                    {{ 'inbox.list.resolved' | transloco }}
+                  </app-badge>
+                } @else if (item.notification.severity === 'critical' || item.notification.severity === 'high') {
+                  <app-badge [tone]="item.notification.severity === 'critical' ? 'danger' : 'warning'" size="xs" [uppercase]="true">
+                    {{ ('notifications.severity.' + item.notification.severity) | transloco }}
+                  </app-badge>
+                }
+                <span class="item-subtitle-text">{{ item.subtitle || (('notifications.category.' + item.category) | transloco) }}</span>
+              </div>
+            </div>
+          </button>
+        }
+        @if (notifications.feedNextBefore()) {
+          <div class="load-more">
+            <app-button variant="ghost" size="sm" (clicked)="actionCenter.loadMore()">
+              {{ 'notifications.loadMore' | transloco }}
+            </app-button>
+          </div>
+        }
+      }
+    </ng-template>
 
-        <!-- Right: Detail Panel -->
+    <!-- What the rail shows: the feed with its own title, status and filters. -->
+    <ng-template #railFeed>
+      <div class="rail-feed-head">
+        <h1 class="header-title">{{ 'inbox.title' | transloco }}</h1>
+        <div class="header-right"><ng-container [ngTemplateOutlet]="statusTpl" /></div>
+      </div>
+      <div class="filter-chips filter-chips--wrap"><ng-container [ngTemplateOutlet]="chipsTpl" /></div>
+      <div class="rail-feed" role="feed" [attr.aria-label]="'inbox.listAriaLabel' | transloco">
+        <ng-container [ngTemplateOutlet]="feedTpl" />
+      </div>
+    </ng-template>
+
+    <div class="inbox">
+      @if (!listInRail()) {
+        <header class="inbox-header">
+          <div class="header-left">
+            <app-sidebar-toggle />
+            @if (isMobileDetail()) {
+              <app-icon-button
+                size="sm"
+                [ariaLabel]="'inbox.backBtn' | transloco"
+                [tooltip]="'inbox.backBtn' | transloco"
+                (clicked)="deselect()"
+              >
+                <app-icon size="sm">arrow_back</app-icon>
+              </app-icon-button>
+            }
+            <h1 class="header-title">{{ 'inbox.title' | transloco }}</h1>
+          </div>
+          <div class="filter-chips"><ng-container [ngTemplateOutlet]="chipsTpl" /></div>
+          <div class="header-right"><ng-container [ngTemplateOutlet]="statusTpl" /></div>
+        </header>
+      }
+
+      <!-- Body: list + detail, or the detail alone while the rail holds the list -->
+      <div class="inbox-body" [class.mobile-detail]="isMobileDetail()">
+        @if (!listInRail()) {
+          <div class="list-panel" role="feed" [attr.aria-label]="'inbox.listAriaLabel' | transloco">
+            <ng-container [ngTemplateOutlet]="feedTpl" />
+          </div>
+        }
+
         <div class="detail-panel">
           @if (selectedItem(); as item) {
             <app-notification-detail [item]="item" />
@@ -300,6 +328,28 @@ function relativeTime(iso: string, nowLabel: string, now: number): string {
       transition: background 0.3s;
     }
     .sse-dot.connected { background: var(--success); }
+
+    /* ===== FEED IN THE RAIL ===== */
+
+    /* These rules travel with the template: the rail renders the page's own
+       template, so the page's scoped styles still apply there. */
+    .rail-feed-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      padding: 8px 12px 6px 16px;
+    }
+
+    .filter-chips--wrap {
+      flex-wrap: wrap;
+      overflow: visible;
+      padding: 0 12px 10px;
+    }
+
+    .rail-feed {
+      border-top: 1px solid var(--surface-0);
+    }
 
     /* ===== BODY: TWO-PANEL ===== */
 
@@ -489,8 +539,11 @@ function relativeTime(iso: string, nowLabel: string, now: number): string {
 
     /* ===== DETAIL ===== */
 
+    /* With the feed in the rail the pane spans the whole content area; keep
+       the detail at a readable measure instead of stretching its lines. */
     app-notification-detail {
       display: block;
+      max-width: var(--content-max-width);
       padding: 16px 20px;
     }
 
@@ -600,10 +653,27 @@ export class InboxPageComponent implements OnInit, OnDestroy {
     return !!this.selectedItem() && this.isMobile();
   });
 
+  private readonly sidebar = inject(SidebarService);
+  private readonly takeover = inject(RailTakeoverService);
+
+  /**
+   * The feed lives in the rail on desktop while the rail is open, and in the
+   * page otherwise: on a phone the rail is a drawer the user has to open, and
+   * a collapsed rail would hide the feed altogether.
+   */
+  readonly listInRail = computed(() => !this.isMobile() && !this.sidebar.collapsed());
+
+  /** Top level of the template, so it resolves before ngOnInit. */
+  @ViewChild('railFeed', {static: true}) private readonly railFeed?: TemplateRef<unknown>;
+
   ngOnInit(): void {
     // SSE is opened at app-shell init (App constructor effect) so it's
     // already up by the time the user navigates to Inbox.
     this.actionCenter.refreshAll();
+
+    // The same condition that stops the page rendering the feed, so the feed
+    // is always in exactly one place as the viewport or the rail changes.
+    if (this.railFeed) this.takeover.claim(this.railFeed, this.listInRail);
 
     // Tick every second — run outside Angular zone to avoid
     // ExpressionChangedAfterItHasBeenChecked errors, then re-enter zone
@@ -644,6 +714,7 @@ export class InboxPageComponent implements OnInit, OnDestroy {
 
   ngOnDestroy(): void {
     if (this.countdownTimer) clearInterval(this.countdownTimer);
+    if (this.railFeed) this.takeover.release(this.railFeed);
   }
 
   // --- Deep-link ---

@@ -16,10 +16,12 @@ import {ExpertsPageComponent} from './views/experts/experts-page.component';
 import {ExpertEditorComponent} from './views/experts/expert-editor.component';
 import {SkillsPageComponent} from './views/skills/skills-page.component';
 import {SkillEditorComponent} from './views/skills/skill-editor.component';
-import {AdminShellComponent} from './views/admin/admin-shell.component';
 import {authGuard} from './core/guards/auth.guard';
 import {adminGuard} from './core/guards/admin.guard';
 import {projectAccessGuard} from './core/guards/project-access.guard';
+
+const loadSettings = () =>
+  import('./views/settings/settings.component').then((m) => m.SettingsComponent);
 
 export const routes: Routes = [
   // Instant landing (knowledge-base/knowledge/features/instant_landing_session.md): the root is a
@@ -75,14 +77,17 @@ export const routes: Routes = [
       import('./views/automations/automations-page.component').then(m => m.AutomationsPageComponent),
     canActivate: [authGuard],
   },
-  // Load account and subscription settings when opened, keeping their controls
-  // out of the initial chat bundle as with the other settings/admin pages.
-  {
-    path: 'settings',
-    loadComponent: () =>
-      import('./views/settings/settings.component').then(m => m.SettingsComponent),
-    canActivate: [authGuard],
-  },
+  // Settings is one page per section, all rendered by SettingsComponent from
+  // the route's `section` (navigation_fixed_rail.md §5). Loaded on demand,
+  // keeping account and subscription controls out of the initial chat bundle
+  // as with the other settings/admin pages. The rail lists the sections;
+  // /settings itself is only the door, so old links land on General.
+  {path: 'settings', pathMatch: 'full', redirectTo: 'settings/general'},
+  {path: 'settings/general', loadComponent: loadSettings, canActivate: [authGuard], data: {section: 'general'}},
+  {path: 'settings/defaults', loadComponent: loadSettings, canActivate: [authGuard], data: {section: 'defaults'}},
+  {path: 'settings/provider-keys', loadComponent: loadSettings, canActivate: [authGuard], data: {section: 'provider-keys'}},
+  {path: 'settings/notifications', loadComponent: loadSettings, canActivate: [authGuard], data: {section: 'notifications'}},
+  {path: 'settings/mcp', loadComponent: loadSettings, canActivate: [authGuard], data: {section: 'mcp'}},
   { path: 'settings/api-keys', component: ApiKeysPageComponent, canActivate: [authGuard] },
   // SSH key management also loads on demand; its key-generation instructions
   // are only needed when this page is opened.
@@ -100,16 +105,17 @@ export const routes: Routes = [
   // them — keeping them in the initial bundle taxed every page load to serve a
   // handful of admin visits, and pushed the build past its initial-bundle
   // budget.
-  // Admin is one gated section, not six separate rail links. The shell
-  // (AdminShellComponent) renders the sub-nav and is small enough to load
-  // eagerly; each page underneath stays on loadComponent exactly as before
-  // (see the comment above) so this refactor doesn't undo that budget work.
-  // Guards move from each of the six routes onto this shared parent — same
-  // effective protection, asserted in app.routes.spec.ts so a future edit
-  // can't drop it silently.
+  // Admin is the Administration group of Settings, not a separate area: the
+  // settings rail lists these routes under its own heading for admins
+  // (navigation_fixed_rail.md F4). The parent is componentless — the rail owns
+  // the sub-navigation now — and exists to carry the guards once for every
+  // child, asserted in app.routes.spec.ts so a future edit can't drop them
+  // silently. Each page stays on loadComponent (see the comment above).
+  // Subscriptions and cloud storage are Settings sections that only admins
+  // can use; they live here so they inherit adminGuard instead of relying on
+  // a template @if.
   {
     path: 'admin',
-    component: AdminShellComponent,
     canActivate: [authGuard, adminGuard],
     children: [
       {path: '', pathMatch: 'full', redirectTo: 'models'},
@@ -143,6 +149,8 @@ export const routes: Routes = [
         loadComponent: () =>
           import('./views/admin/capacity/admin-capacity.component').then(m => m.AdminCapacityComponent),
       },
+      {path: 'subscriptions', loadComponent: loadSettings, data: {section: 'subscriptions'}},
+      {path: 'cloud', loadComponent: loadSettings, data: {section: 'cloud'}},
     ],
   },
   // The page was 'admin/llm' until the catalog grew past chat models — it now

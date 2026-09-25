@@ -38,6 +38,16 @@ import pytest
 import tests.conftest  # noqa: F401 — applies license/crypto/env shims + sys.path
 import orchestrator.main as main
 from shared.backend_kinds import LITE_BACKENDS
+from orchestrator.application import preparation as preparation_composition
+from orchestrator.services import container_provisioner as container_provisioner_module
+from orchestrator.services import (
+    job_datasource_selection as job_datasource_selection_module,
+)
+from orchestrator.services import job_dispatcher as job_dispatcher_module
+from orchestrator.services import (
+    job_workspace_authority as job_workspace_authority_module,
+)
+from orchestrator.services import subjob_completion as subjob_completion_module
 
 
 READY_CONTAINER = {
@@ -118,7 +128,7 @@ def patch_get_job(monkeypatch):
 
     def _apply(parent_row):
         mock = AsyncMock(return_value=_stamp_workspace(parent_row))
-        monkeypatch.setattr(main.postgres_db, "get_job", mock)
+        monkeypatch.setattr(main.app.state.resources.postgres_db, "get_job", mock)
         return mock
 
     return _apply
@@ -131,14 +141,24 @@ class TestNonInheriting:
     async def test_no_parent_proceeds(self, patch_get_job):
         mock = patch_get_job(None)
         job = {"id": "j", "parent_job_id": None, "context": {}}
-        assert await main._resolve_subjob_inherited_workspace(job) == ("proceed", None)
+        assert await job_workspace_authority_module.resolve_subjob_inherited_workspace(
+            job,
+            dependencies=preparation_composition.job_workspace_authority_dependencies(
+                main.app.state.resources
+            ),
+        ) == ("proceed", None)
         mock.assert_not_awaited()  # never touches the DB
 
     @pytest.mark.asyncio
     async def test_subjob_without_inherited_keys_proceeds(self, patch_get_job):
         mock = patch_get_job(None)
         job = _subjob({"scholar_target": "parent-uuid"})
-        assert await main._resolve_subjob_inherited_workspace(job) == ("proceed", None)
+        assert await job_workspace_authority_module.resolve_subjob_inherited_workspace(
+            job,
+            dependencies=preparation_composition.job_workspace_authority_dependencies(
+                main.app.state.resources
+            ),
+        ) == ("proceed", None)
         mock.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -148,7 +168,12 @@ class TestNonInheriting:
             {"status": "waiting", "context": {"workspace_container": READY_CONTAINER}}
         )
         job = _subjob(_inherited(container=dict(READY_CONTAINER)))
-        assert await main._resolve_subjob_inherited_workspace(job) == ("proceed", None)
+        assert await job_workspace_authority_module.resolve_subjob_inherited_workspace(
+            job,
+            dependencies=preparation_composition.job_workspace_authority_dependencies(
+                main.app.state.resources
+            ),
+        ) == ("proceed", None)
         mock.assert_awaited_once_with("parent-uuid")
 
 
@@ -172,7 +197,12 @@ class TestSelfProvisionedDiscrimination:
         # consulting the (workspace-less) parent.
         mock = patch_get_job(None)
         job = _subjob({"workspace_container": dict(READY_CONTAINER)})
-        assert await main._resolve_subjob_inherited_workspace(job) == ("proceed", None)
+        assert await job_workspace_authority_module.resolve_subjob_inherited_workspace(
+            job,
+            dependencies=preparation_composition.job_workspace_authority_dependencies(
+                main.app.state.resources
+            ),
+        ) == ("proceed", None)
         mock.assert_not_awaited()
 
     @pytest.mark.asyncio
@@ -191,14 +221,24 @@ class TestSelfProvisionedDiscrimination:
                 }
             }
         )
-        assert await main._resolve_subjob_inherited_workspace(job) == ("proceed", None)
+        assert await job_workspace_authority_module.resolve_subjob_inherited_workspace(
+            job,
+            dependencies=preparation_composition.job_workspace_authority_dependencies(
+                main.app.state.resources
+            ),
+        ) == ("proceed", None)
         mock.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_self_provisioned_vm_proceeds_without_flag(self, patch_get_job):
         mock = patch_get_job(None)
         job = _subjob({"vm": {"status": "creating", "requested": True}})
-        assert await main._resolve_subjob_inherited_workspace(job) == ("proceed", None)
+        assert await job_workspace_authority_module.resolve_subjob_inherited_workspace(
+            job,
+            dependencies=preparation_composition.job_workspace_authority_dependencies(
+                main.app.state.resources
+            ),
+        ) == ("proceed", None)
         mock.assert_not_awaited()
 
 
@@ -251,7 +291,7 @@ class TestContainerInheritance:
             return True
 
         get_job = AsyncMock(side_effect=_get_job)
-        monkeypatch.setattr(main.postgres_db, "get_job", get_job)
+        monkeypatch.setattr(main.app.state.resources.postgres_db, "get_job", get_job)
         reserve = AsyncMock(
             return_value={
                 "id": "44444444-4444-4444-8444-444444444444",
@@ -260,38 +300,47 @@ class TestContainerInheritance:
             }
         )
         monkeypatch.setattr(
-            main.postgres_db,
+            main.app.state.resources.postgres_db,
             "reserve_managed_repository_workspace_creation",
             reserve,
         )
         authorize = AsyncMock(return_value=True)
         monkeypatch.setattr(
-            main.postgres_db,
+            main.app.state.resources.postgres_db,
             "authorize_managed_repository_workspace_creation_runtime",
             authorize,
         )
         settle = AsyncMock(return_value=True)
         monkeypatch.setattr(
-            main.postgres_db,
+            main.app.state.resources.postgres_db,
             "settle_managed_repository_workspace_creation_reservation",
             settle,
         )
         monkeypatch.setattr(
-            main.postgres_db,
+            main.app.state.resources.postgres_db,
             "abort_managed_repository_workspace_creation_reservation",
             AsyncMock(return_value=True),
         )
         cas = AsyncMock(side_effect=_adopt)
         monkeypatch.setattr(
-            main.postgres_db, "adopt_legacy_k8s_job_workspace_runtime", cas
+            main.app.state.resources.postgres_db,
+            "adopt_legacy_k8s_job_workspace_runtime",
+            cas,
         )
         attest = AsyncMock(return_value=attestation)
         monkeypatch.setattr(
-            main.container_provisioner, "attest_workspace_runtime", attest
+            container_provisioner_module.container_provisioner,
+            "attest_workspace_runtime",
+            attest,
         )
         child = _subjob(_inherited(container=dict(old_runtime)), parent_id=parent_id)
 
-        assert await main._resolve_subjob_inherited_workspace(child) == (
+        assert await job_workspace_authority_module.resolve_subjob_inherited_workspace(
+            child,
+            dependencies=preparation_composition.job_workspace_authority_dependencies(
+                main.app.state.resources
+            ),
+        ) == (
             "proceed",
             None,
         )
@@ -314,7 +363,12 @@ class TestContainerInheritance:
         )
         job = _subjob(_inherited())
 
-        assert await main._resolve_subjob_inherited_workspace(job) == (
+        assert await job_workspace_authority_module.resolve_subjob_inherited_workspace(
+            job,
+            dependencies=preparation_composition.job_workspace_authority_dependencies(
+                main.app.state.resources
+            ),
+        ) == (
             "proceed",
             None,
         )
@@ -328,7 +382,12 @@ class TestContainerInheritance:
             {"status": "waiting", "context": {"workspace_container": READY_CONTAINER}}
         )
         job = _subjob(_inherited(container=dict(STALE_CONTAINER)))
-        result = await main._resolve_subjob_inherited_workspace(job)
+        result = await job_workspace_authority_module.resolve_subjob_inherited_workspace(
+            job,
+            dependencies=preparation_composition.job_workspace_authority_dependencies(
+                main.app.state.resources
+            ),
+        )
         assert result == ("proceed", None)
         # In-memory context now carries the parent's ready host/pod_ip.
         assert job["context"]["workspace_container"]["status"] == "ready"
@@ -343,7 +402,12 @@ class TestContainerInheritance:
             }
         )
         job = _subjob(_inherited(container=dict(STALE_CONTAINER)), age_s=5.0)
-        assert await main._resolve_subjob_inherited_workspace(job) == ("wait", None)
+        assert await job_workspace_authority_module.resolve_subjob_inherited_workspace(
+            job,
+            dependencies=preparation_composition.job_workspace_authority_dependencies(
+                main.app.state.resources
+            ),
+        ) == ("wait", None)
         # Inherited snapshot left untouched while waiting.
         assert job["context"]["workspace_container"] == STALE_CONTAINER
 
@@ -357,9 +421,17 @@ class TestContainerInheritance:
         )
         job = _subjob(
             _inherited(container=dict(STALE_CONTAINER)),
-            age_s=main._INHERIT_WORKSPACE_MAX_WAIT_S + 60,
+            age_s=job_workspace_authority_module.INHERIT_WORKSPACE_MAX_WAIT_S + 60,
         )
-        action, msg = await main._resolve_subjob_inherited_workspace(job)
+        (
+            action,
+            msg,
+        ) = await job_workspace_authority_module.resolve_subjob_inherited_workspace(
+            job,
+            dependencies=preparation_composition.job_workspace_authority_dependencies(
+                main.app.state.resources
+            ),
+        )
         assert action == "fail"
         assert "Timed out" in msg
 
@@ -384,7 +456,12 @@ class TestContainerInheritance:
             ).isoformat(),
         }
         job = _subjob(ctx, age_s=3 * 3600)  # spawned 3h ago, woke 30s ago
-        assert await main._resolve_subjob_inherited_workspace(job) == ("wait", None)
+        assert await job_workspace_authority_module.resolve_subjob_inherited_workspace(
+            job,
+            dependencies=preparation_composition.job_workspace_authority_dependencies(
+                main.app.state.resources
+            ),
+        ) == ("wait", None)
 
     @pytest.mark.asyncio
     async def test_resumed_subjob_budget_still_bounded_after_wake(self, patch_get_job):
@@ -401,11 +478,22 @@ class TestContainerInheritance:
             "attempt": 2,
             "next_retry_at": (
                 datetime.now(timezone.utc)
-                - timedelta(seconds=main._INHERIT_WORKSPACE_MAX_WAIT_S + 60)
+                - timedelta(
+                    seconds=job_workspace_authority_module.INHERIT_WORKSPACE_MAX_WAIT_S
+                    + 60
+                )
             ).isoformat(),
         }
         job = _subjob(ctx, age_s=6 * 3600)
-        action, msg = await main._resolve_subjob_inherited_workspace(job)
+        (
+            action,
+            msg,
+        ) = await job_workspace_authority_module.resolve_subjob_inherited_workspace(
+            job,
+            dependencies=preparation_composition.job_workspace_authority_dependencies(
+                main.app.state.resources
+            ),
+        )
         assert action == "fail"
         assert "Timed out" in msg
 
@@ -418,7 +506,15 @@ class TestContainerInheritance:
             }
         )
         job = _subjob(_inherited(container=dict(STALE_CONTAINER)))
-        action, msg = await main._resolve_subjob_inherited_workspace(job)
+        (
+            action,
+            msg,
+        ) = await job_workspace_authority_module.resolve_subjob_inherited_workspace(
+            job,
+            dependencies=preparation_composition.job_workspace_authority_dependencies(
+                main.app.state.resources
+            ),
+        )
         assert action == "fail"
         assert "unavailable" in msg
 
@@ -431,7 +527,15 @@ class TestContainerInheritance:
             }
         )
         job = _subjob(_inherited(container=dict(READY_CONTAINER)))
-        action, msg = await main._resolve_subjob_inherited_workspace(job)
+        (
+            action,
+            msg,
+        ) = await job_workspace_authority_module.resolve_subjob_inherited_workspace(
+            job,
+            dependencies=preparation_composition.job_workspace_authority_dependencies(
+                main.app.state.resources
+            ),
+        )
         assert action == "fail"
         assert "unavailable" in msg
 
@@ -444,14 +548,30 @@ class TestContainerInheritance:
             }
         )
         job = _subjob(_inherited(container=dict(STALE_CONTAINER)))
-        action, _ = await main._resolve_subjob_inherited_workspace(job)
+        (
+            action,
+            _,
+        ) = await job_workspace_authority_module.resolve_subjob_inherited_workspace(
+            job,
+            dependencies=preparation_composition.job_workspace_authority_dependencies(
+                main.app.state.resources
+            ),
+        )
         assert action == "fail"
 
     @pytest.mark.asyncio
     async def test_parent_missing_fails_fast(self, patch_get_job):
         patch_get_job(None)
         job = _subjob(_inherited(container=dict(STALE_CONTAINER)))
-        action, msg = await main._resolve_subjob_inherited_workspace(job)
+        (
+            action,
+            msg,
+        ) = await job_workspace_authority_module.resolve_subjob_inherited_workspace(
+            job,
+            dependencies=preparation_composition.job_workspace_authority_dependencies(
+                main.app.state.resources
+            ),
+        )
         assert action == "fail"
         assert "no longer exists" in msg
 
@@ -463,7 +583,12 @@ class TestContainerInheritance:
             {"status": "waiting", "context": {"workspace_container": READY_CONTAINER}}
         )
         job = _subjob(json.dumps(_inherited(container=dict(STALE_CONTAINER))))
-        result = await main._resolve_subjob_inherited_workspace(job)
+        result = await job_workspace_authority_module.resolve_subjob_inherited_workspace(
+            job,
+            dependencies=preparation_composition.job_workspace_authority_dependencies(
+                main.app.state.resources
+            ),
+        )
         assert result == ("proceed", None)
         assert job["context"]["workspace_container"]["status"] == "ready"
 
@@ -473,7 +598,12 @@ class TestVmInheritance:
     async def test_stale_vm_overlays_parent_ready_vm(self, patch_get_job):
         patch_get_job({"status": "waiting", "context": {"vm": READY_VM}})
         job = _subjob(_inherited(vm={"status": "creating", "requested": True}))
-        result = await main._resolve_subjob_inherited_workspace(job)
+        result = await job_workspace_authority_module.resolve_subjob_inherited_workspace(
+            job,
+            dependencies=preparation_composition.job_workspace_authority_dependencies(
+                main.app.state.resources
+            ),
+        )
         assert result == ("proceed", None)
         assert job["context"]["vm"]["status"] == "ready"
         assert job["context"]["vm"]["ssh_host"] == READY_VM["ssh_host"]
@@ -486,7 +616,12 @@ class TestVmInheritance:
         job = _subjob(
             _inherited(vm={"status": "creating", "requested": True}), age_s=5.0
         )
-        assert await main._resolve_subjob_inherited_workspace(job) == ("wait", None)
+        assert await job_workspace_authority_module.resolve_subjob_inherited_workspace(
+            job,
+            dependencies=preparation_composition.job_workspace_authority_dependencies(
+                main.app.state.resources
+            ),
+        ) == ("wait", None)
 
 
 class TestFailSubjobUnblocksParent:
@@ -510,17 +645,23 @@ class TestFailSubjobUnblocksParent:
         parent_row = {"id": "parent-uuid", "status": "waiting", "context": {}}
 
         monkeypatch.setattr(
-            main.postgres_db,
+            main.app.state.resources.postgres_db,
             "update_job_status",
             AsyncMock(side_effect=fake_update_status),
         )
         monkeypatch.setattr(
-            main.postgres_db, "get_job", AsyncMock(return_value=parent_row)
+            main.app.state.resources.postgres_db,
+            "get_job",
+            AsyncMock(return_value=parent_row),
         )
         monkeypatch.setattr(
-            main.postgres_db, "merge_job_context", AsyncMock(side_effect=fake_merge)
+            main.app.state.resources.postgres_db,
+            "merge_job_context",
+            AsyncMock(side_effect=fake_merge),
         )
-        monkeypatch.setattr(main, "_trigger_dispatch", lambda *a, **k: None)
+        monkeypatch.setattr(
+            job_dispatcher_module, "trigger_dispatch", lambda *a, **k: None
+        )
         return calls
 
     @pytest.mark.asyncio
@@ -530,7 +671,13 @@ class TestFailSubjobUnblocksParent:
         job["status"] = "created"
         job["creation_order"] = None
 
-        await main._fail_subjob_and_unblock_parent(job, "cannot inherit: boom")
+        await job_workspace_authority_module.fail_subjob_and_unblock_parent(
+            job,
+            "cannot inherit: boom",
+            dependencies=preparation_composition.job_workspace_authority_dependencies(
+                main.app.state.resources
+            ),
+        )
 
         # 1. Scholar marked failed with the diagnostic message.
         assert ("scholar-uuid", "failed", "cannot inherit: boom") in patch_db["status"]
@@ -548,7 +695,13 @@ class TestFailSubjobUnblocksParent:
         job["status"] = "created"
         job["creation_order"] = None
 
-        await main._fail_subjob_and_unblock_parent(job, "workspace gone")
+        await job_workspace_authority_module.fail_subjob_and_unblock_parent(
+            job,
+            "workspace gone",
+            dependencies=preparation_composition.job_workspace_authority_dependencies(
+                main.app.state.resources
+            ),
+        )
 
         assert ("critic-uuid", "failed", "workspace gone") in patch_db["status"]
         # No unblock: parent was never transitioned to created.
@@ -568,19 +721,27 @@ class TestFailSubjobUnblocksParent:
         update = AsyncMock(return_value=False)
         scholar = AsyncMock()
         delegation = AsyncMock()
-        monkeypatch.setattr(main.postgres_db, "update_job_status", update)
         monkeypatch.setattr(
-            main.subjob_completion_operations,
+            main.app.state.resources.postgres_db, "update_job_status", update
+        )
+        monkeypatch.setattr(
+            subjob_completion_module,
             "handle_scholar_completion",
             scholar,
         )
         monkeypatch.setattr(
-            main.subjob_completion_operations,
+            subjob_completion_module,
             "handle_delegation_child_completion",
             delegation,
         )
 
-        await main._fail_subjob_and_unblock_parent(job, "cannot inherit")
+        await job_workspace_authority_module.fail_subjob_and_unblock_parent(
+            job,
+            "cannot inherit",
+            dependencies=preparation_composition.job_workspace_authority_dependencies(
+                main.app.state.resources
+            ),
+        )
 
         update.assert_awaited_once_with(
             "scholar-uuid",
@@ -628,26 +789,30 @@ class TestScholarMaterializationFailure:
             lambda **_kwargs: "instructions",
         )
         monkeypatch.setattr(
-            main,
-            "_revalidate_job_datasource_selection",
+            job_datasource_selection_module,
+            "revalidate_job_datasource_selection",
             AsyncMock(return_value=([datasource_id], {datasource_id: 4})),
         )
         monkeypatch.setattr(
-            main,
-            "_datasource_selection_provenance",
+            job_datasource_selection_module,
+            "datasource_selection_provenance",
             AsyncMock(return_value={"datasource_ids": [datasource_id]}),
         )
         monkeypatch.setattr(
-            main.postgres_db,
+            main.app.state.resources.postgres_db,
             "get_user",
             AsyncMock(return_value={"id": owner_id}),
         )
         update_status = AsyncMock()
         merge_context = AsyncMock()
-        monkeypatch.setattr(main.postgres_db, "update_job_status", update_status)
-        monkeypatch.setattr(main.postgres_db, "merge_job_context", merge_context)
         monkeypatch.setattr(
-            main.postgres_db,
+            main.app.state.resources.postgres_db, "update_job_status", update_status
+        )
+        monkeypatch.setattr(
+            main.app.state.resources.postgres_db, "merge_job_context", merge_context
+        )
+        monkeypatch.setattr(
+            main.app.state.resources.postgres_db,
             "create_job",
             AsyncMock(
                 side_effect=DatasourceMaterializationAuthorizationError(
@@ -656,7 +821,7 @@ class TestScholarMaterializationFailure:
             ),
         )
         dispatch = MagicMock()
-        monkeypatch.setattr(main, "_trigger_dispatch", dispatch)
+        monkeypatch.setattr(job_dispatcher_module, "trigger_dispatch", dispatch)
 
         with pytest.raises(DatasourceMaterializationAuthorizationError):
             await b08_helpers.spawn_scholar_subjob(job, "worker", {}, {})

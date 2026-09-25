@@ -22,6 +22,12 @@ from orchestrator.schemas.agent_child_threads import (
 )
 from orchestrator.routers import job_inspection as job_inspection_routes
 from shared.persistent_input_delivery import InputDeliveryConflict
+from orchestrator.application import jobs as jobs_composition
+from orchestrator.application import sessions as sessions_composition
+from orchestrator.schemas import agent_child_threads as agent_child_threads_module
+from orchestrator.security import access as access_module
+from shared import session_subagent_authority as session_subagent_authority_module
+import fastapi as fastapi_module
 
 
 PARENT = uuid.UUID("10000000-0000-4000-8000-000000000001")
@@ -48,7 +54,9 @@ def _child_thread_routes_resolve_from_main(monkeypatch):
     monkeypatch.setattr(
         _child_routes,
         "get_agent_child_thread_dependencies",
-        lambda request: m._agent_child_threads_dependencies(),
+        lambda request: sessions_composition.agent_child_threads_dependencies(
+            m.app.state.resources
+        ),
     )
 
 
@@ -147,15 +155,17 @@ class TestSessionCreateRoute:
     @pytest.mark.asyncio
     async def test_internal_gate_precedes_the_database(self, monkeypatch):
         db = SimpleNamespace(create_session_subagent_thread=AsyncMock())
-        gate = AsyncMock(side_effect=m.HTTPException(status_code=401, detail="no"))
-        monkeypatch.setattr(m, "postgres_db", db)
-        monkeypatch.setattr(m, "require_internal", gate)
-        body = m.AgentSessionSubagentCreateRequest(
+        gate = AsyncMock(
+            side_effect=fastapi_module.HTTPException(status_code=401, detail="no")
+        )
+        monkeypatch.setattr(m.app.state.resources, "postgres_db", db)
+        monkeypatch.setattr(access_module, "require_internal", gate)
+        body = agent_child_threads_module.AgentSessionSubagentCreateRequest(
             parent_authority=_pinned_authority(),
             handle="reviewer-0001",
             subagent_type="reviewer",
         )
-        with pytest.raises(m.HTTPException) as excinfo:
+        with pytest.raises(fastapi_module.HTTPException) as excinfo:
             await _child_routes.agent_create_session_subagent_thread(
                 SimpleNamespace(), str(PARENT), body
             )
@@ -174,9 +184,11 @@ class TestSessionCreateRoute:
                 }
             )
         )
-        monkeypatch.setattr(m, "postgres_db", db)
-        monkeypatch.setattr(m, "require_internal", AsyncMock(return_value=None))
-        body = m.AgentSessionSubagentCreateRequest(
+        monkeypatch.setattr(m.app.state.resources, "postgres_db", db)
+        monkeypatch.setattr(
+            access_module, "require_internal", AsyncMock(return_value=None)
+        )
+        body = agent_child_threads_module.AgentSessionSubagentCreateRequest(
             parent_authority=_pinned_authority(),
             subagent_id=CHILD,
             handle="reviewer-0001",
@@ -224,21 +236,23 @@ class TestSessionCreateRoute:
     async def test_typed_authority_refusal_is_409(self, monkeypatch):
         db = SimpleNamespace(
             create_session_subagent_thread=AsyncMock(
-                side_effect=m.SessionParentAuthorityRefused(
+                side_effect=session_subagent_authority_module.SessionParentAuthorityRefused(
                     "stateless_background_unsupported"
                 )
             )
         )
-        monkeypatch.setattr(m, "postgres_db", db)
-        monkeypatch.setattr(m, "require_internal", AsyncMock(return_value=None))
-        body = m.AgentSessionSubagentCreateRequest(
+        monkeypatch.setattr(m.app.state.resources, "postgres_db", db)
+        monkeypatch.setattr(
+            access_module, "require_internal", AsyncMock(return_value=None)
+        )
+        body = agent_child_threads_module.AgentSessionSubagentCreateRequest(
             parent_authority=_stateless_authority(),
             handle="reviewer-0001",
             subagent_type="reviewer",
             run_in_background=True,
             initial_status="queued",
         )
-        with pytest.raises(m.HTTPException) as excinfo:
+        with pytest.raises(fastapi_module.HTTPException) as excinfo:
             await _child_routes.agent_create_session_subagent_thread(
                 SimpleNamespace(), str(PARENT), body
             )
@@ -259,10 +273,12 @@ class TestSessionLifecycleRoutes:
             get_session_subagent_thread_by_call=AsyncMock(return_value=row),
         )
         gate = AsyncMock(return_value=None)
-        monkeypatch.setattr(m, "postgres_db", db)
-        monkeypatch.setattr(m, "require_internal", gate)
-        query = m.AgentSessionSubagentQueryRequest(parent_authority=_pinned_authority())
-        by_call = m.AgentSessionSubagentByCallRequest(
+        monkeypatch.setattr(m.app.state.resources, "postgres_db", db)
+        monkeypatch.setattr(access_module, "require_internal", gate)
+        query = agent_child_threads_module.AgentSessionSubagentQueryRequest(
+            parent_authority=_pinned_authority()
+        )
+        by_call = agent_child_threads_module.AgentSessionSubagentByCallRequest(
             parent_authority=_pinned_authority(), parent_tool_call_id="call-1"
         )
 
@@ -294,9 +310,11 @@ class TestSessionLifecycleRoutes:
                 }
             )
         )
-        monkeypatch.setattr(m, "postgres_db", db)
-        monkeypatch.setattr(m, "require_internal", AsyncMock(return_value=None))
-        body = m.AgentSessionSubagentReopenRequest(
+        monkeypatch.setattr(m.app.state.resources, "postgres_db", db)
+        monkeypatch.setattr(
+            access_module, "require_internal", AsyncMock(return_value=None)
+        )
+        body = agent_child_threads_module.AgentSessionSubagentReopenRequest(
             parent_authority=_pinned_authority(), runtime_generation=GENERATION
         )
         result = await _child_routes.agent_reopen_session_subagent_thread(
@@ -311,7 +329,7 @@ class TestSessionLifecycleRoutes:
         )
 
         db.reopen_session_subagent_thread.return_value = {"result": "stale"}
-        with pytest.raises(m.HTTPException) as excinfo:
+        with pytest.raises(fastapi_module.HTTPException) as excinfo:
             await _child_routes.agent_reopen_session_subagent_thread(
                 SimpleNamespace(), str(PARENT), CHILD, body
             )
@@ -331,9 +349,11 @@ class TestSessionLifecycleRoutes:
         db = SimpleNamespace(
             terminalize_session_subagent_thread=AsyncMock(return_value=applied)
         )
-        monkeypatch.setattr(m, "postgres_db", db)
-        monkeypatch.setattr(m, "require_internal", AsyncMock(return_value=None))
-        body = m.AgentSessionSubagentTerminalRequest(
+        monkeypatch.setattr(m.app.state.resources, "postgres_db", db)
+        monkeypatch.setattr(
+            access_module, "require_internal", AsyncMock(return_value=None)
+        )
+        body = agent_child_threads_module.AgentSessionSubagentTerminalRequest(
             parent_authority=_pinned_authority(),
             runtime_generation=GENERATION,
             subagent_status="completed",
@@ -363,7 +383,7 @@ class TestSessionLifecycleRoutes:
         db.terminalize_session_subagent_thread.side_effect = InputDeliveryConflict(
             "different transcript"
         )
-        with pytest.raises(m.HTTPException) as excinfo:
+        with pytest.raises(fastapi_module.HTTPException) as excinfo:
             await _child_routes.agent_terminalize_session_subagent_thread(
                 SimpleNamespace(), str(PARENT), CHILD, body
             )
@@ -380,11 +400,15 @@ class TestOwnerRosterRoute:
         guard = AsyncMock(
             return_value=({"id": "owner"}, {"id": PARENT, "kind": "session"})
         )
-        monkeypatch.setattr(m, "postgres_db", db)
-        monkeypatch.setattr(m, "require_thread_owner", guard)
+        monkeypatch.setattr(m.app.state.resources, "postgres_db", db)
+        monkeypatch.setattr(access_module, "require_thread_owner", guard)
         request = SimpleNamespace()
         result = await job_inspection_routes.get_session_subagents(
-            request, str(PARENT), dependencies=m._job_inspection_dependencies()
+            request,
+            str(PARENT),
+            dependencies=jobs_composition.job_inspection_dependencies(
+                m.app.state.resources
+            ),
         )
         assert result["parent_thread_id"] == str(PARENT)
         assert result["count"] == 1
@@ -394,25 +418,31 @@ class TestOwnerRosterRoute:
     @pytest.mark.asyncio
     async def test_denial_and_non_session_never_read_children(self, monkeypatch):
         db = SimpleNamespace(list_session_subagent_threads=AsyncMock())
-        guard = AsyncMock(side_effect=m.HTTPException(status_code=403, detail="no"))
-        monkeypatch.setattr(m, "postgres_db", db)
-        monkeypatch.setattr(m, "require_thread_owner", guard)
-        with pytest.raises(m.HTTPException) as excinfo:
+        guard = AsyncMock(
+            side_effect=fastapi_module.HTTPException(status_code=403, detail="no")
+        )
+        monkeypatch.setattr(m.app.state.resources, "postgres_db", db)
+        monkeypatch.setattr(access_module, "require_thread_owner", guard)
+        with pytest.raises(fastapi_module.HTTPException) as excinfo:
             await job_inspection_routes.get_session_subagents(
                 SimpleNamespace(),
                 str(PARENT),
-                dependencies=m._job_inspection_dependencies(),
+                dependencies=jobs_composition.job_inspection_dependencies(
+                    m.app.state.resources
+                ),
             )
         assert excinfo.value.status_code == 403
         db.list_session_subagent_threads.assert_not_awaited()
 
         guard.side_effect = None
         guard.return_value = ({"id": "owner"}, {"id": PARENT, "kind": "subagent"})
-        with pytest.raises(m.HTTPException) as excinfo:
+        with pytest.raises(fastapi_module.HTTPException) as excinfo:
             await job_inspection_routes.get_session_subagents(
                 SimpleNamespace(),
                 str(PARENT),
-                dependencies=m._job_inspection_dependencies(),
+                dependencies=jobs_composition.job_inspection_dependencies(
+                    m.app.state.resources
+                ),
             )
         assert excinfo.value.status_code == 404
         db.list_session_subagent_threads.assert_not_awaited()

@@ -86,6 +86,32 @@ from shared.runtime.core.tool_policy import (
 )
 from agent.tools.registry import TOOL_REGISTRY, get_tools_by_category
 from orchestrator.services import session_config_resolution  # noqa: E402
+from orchestrator.application import access as access_composition
+from orchestrator.application import projects as projects_composition
+from orchestrator.application import sessions as sessions_composition
+from orchestrator.schemas import thread_admission as thread_admission_module
+from orchestrator.schemas import thread_config as thread_config_module
+from orchestrator.security import access as _access_module
+from orchestrator.security import auth as auth_module
+from orchestrator.services import agent_provisioner as agent_provisioner_module
+from orchestrator.services import container_provisioner as container_provisioner_module
+from orchestrator.services import deployment_gates as deployment_gates_module
+from orchestrator.services import docker_provisioner as docker_provisioner_module
+from orchestrator.services import grant_enforcement as grant_enforcement_module
+from orchestrator.services import officer_conference as officer_conference_module
+from orchestrator.services import (
+    persistent_provisioner as persistent_provisioner_module,
+)
+from orchestrator.services import session_tool_policy as session_tool_policy_module
+from orchestrator.services import (
+    stateless_workspace_scheduler as stateless_workspace_scheduler_module,
+)
+from orchestrator.services import thread_admission as services_thread_admission_module
+from orchestrator.services import thread_mount_rows as thread_mount_rows_module
+from orchestrator.services import (
+    thread_project_authorization as thread_project_authorization_module,
+)
+import fastapi as fastapi_module
 
 #: The categories the cockpit's New Session form renders as checkboxes, in
 #: order. Mirror of SESSION_TOOL_CATEGORIES in
@@ -423,29 +449,30 @@ class TestTheGateIsNotThePDP:
 
 class TestOrchestratorWrapper:
     def test_a_rejection_becomes_a_400(self):
-        import orchestrator.main as orch_main
+        from orchestrator.services import session_tool_policy
 
-        with pytest.raises(orch_main.HTTPException) as exc:
-            orch_main._validated_tool_overrides({"tools": {"canvas": ["run_command"]}})
+        with pytest.raises(fastapi_module.HTTPException) as exc:
+            session_tool_policy.validated_tool_overrides(
+                {"tools": {"canvas": ["run_command"]}}
+            )
         assert exc.value.status_code == 400
         assert "run_command" in exc.value.detail
 
     def test_the_fragment_helper_replaces_tools_without_mutating_the_input(self):
-        import orchestrator.main as orch_main
-
         original = {"tools": {"git": True}, "autonomy": "full"}
-        result = orch_main._with_validated_tool_overrides(original)
+        result = session_tool_policy_module.with_validated_tool_overrides(original)
 
         assert result["tools"] == sorted_git_expansion()
         assert result["autonomy"] == "full"
         assert original["tools"] == {"git": True}, "caller-owned fragment mutated"
 
     def test_a_fragment_without_tools_is_returned_untouched(self):
-        import orchestrator.main as orch_main
-
         fragment = {"llm": {"model": "x"}}
-        assert orch_main._with_validated_tool_overrides(fragment) is fragment
-        assert orch_main._with_validated_tool_overrides(None) is None
+        assert (
+            session_tool_policy_module.with_validated_tool_overrides(fragment)
+            is fragment
+        )
+        assert session_tool_policy_module.with_validated_tool_overrides(None) is None
 
 
 def sorted_git_expansion() -> dict[str, list[str]]:
@@ -492,40 +519,49 @@ async def _create_job(db, request, body):
     user = {"id": USER_ID, "is_admin": False}
     patches = [
         patch.object(access_module, "_INTERNAL_KEY", "secret"),
-        patch("orchestrator.main.require_approved_user", AsyncMock(return_value=user)),
+        patch(
+            "orchestrator.security.auth.require_approved_user",
+            AsyncMock(return_value=user),
+        ),
         patch(
             "orchestrator.security.access.require_approved_user",
             AsyncMock(return_value=user),
         ),
-        patch("orchestrator.main.postgres_db", db),
+        patch("orchestrator.main.app.state.resources.postgres_db", db),
         patch(
-            "orchestrator.main._enforce_readiness_gate", AsyncMock(return_value=None)
-        ),
-        patch("orchestrator.main._thread_project_ids", AsyncMock(return_value=[])),
-        patch(
-            "orchestrator.main._revalidate_thread_project_ids",
-            AsyncMock(return_value=[]),
-        ),
-        patch(
-            "orchestrator.main._require_job_project_access",
+            "orchestrator.application.access.enforce_readiness_gate",
             AsyncMock(return_value=None),
         ),
         patch(
-            "orchestrator.main._is_experts_db_enabled", MagicMock(return_value=False)
-        ),
-        patch(
-            "orchestrator.main._inherit_parent_datasource_ids",
+            "orchestrator.services.thread_mount_rows.thread_project_ids",
             AsyncMock(return_value=[]),
         ),
         patch(
-            "orchestrator.main._enforce_job_create_grants", AsyncMock(return_value=None)
+            "orchestrator.services.thread_project_authorization.revalidate_thread_project_ids",
+            AsyncMock(return_value=[]),
+        ),
+        patch(
+            "orchestrator.application.jobs.require_job_project_access",
+            AsyncMock(return_value=None),
+        ),
+        patch(
+            "orchestrator.services.deployment_gates.is_experts_db_enabled",
+            MagicMock(return_value=False),
+        ),
+        patch(
+            "orchestrator.services.job_datasource_selection.inherit_parent_datasource_ids",
+            AsyncMock(return_value=[]),
+        ),
+        patch(
+            "orchestrator.services.grant_enforcement.enforce_job_create_grants",
+            AsyncMock(return_value=None),
         ),
         patch("orchestrator.services.job_provisioning.provision_job_repo", AsyncMock()),
         patch(
-            "orchestrator.main.subjob_completion_operations.spawn_scholar_subjob",
+            "orchestrator.services.subjob_completion.spawn_scholar_subjob",
             AsyncMock(return_value=None),
         ),
-        patch("orchestrator.main._trigger_dispatch", MagicMock()),
+        patch("orchestrator.services.job_dispatcher.trigger_dispatch", MagicMock()),
     ]
     with ExitStack() as stack:
         for p in patches:
@@ -542,7 +578,7 @@ class TestJobCreateBoundary:
         ``tools.<anything>: [<any registered name>]`` straight through, with
         only a dispatch PDP that keys off the CATEGORY behind it."""
         from fastapi import HTTPException
-        from orchestrator.main import JobCreate
+        from orchestrator.schemas.job_create import JobCreate
 
         with pytest.raises(HTTPException) as exc:
             await _create_job(
@@ -563,7 +599,7 @@ class TestJobCreateBoundary:
         and ``create_job`` forwards a MODEL-AUTHORED config_override
         verbatim — which is precisely a caller that can write this fragment."""
         from fastapi import HTTPException
-        from orchestrator.main import JobCreate
+        from orchestrator.schemas.job_create import JobCreate
 
         parent = str(uuid.uuid4())
         job_db.get_job = AsyncMock(
@@ -590,7 +626,7 @@ class TestJobCreateBoundary:
     async def test_a_legitimate_fragment_is_persisted_normalised(
         self, job_db, job_request
     ):
-        from orchestrator.main import JobCreate
+        from orchestrator.schemas.job_create import JobCreate
 
         await _create_job(
             job_db,
@@ -614,7 +650,7 @@ class TestJobCreateBoundary:
         """``src/api/orchestrator_client.py`` POSTs this exact fragment for
         every self-verifying job — the one real internal caller with a
         ``tools`` block on this endpoint."""
-        from orchestrator.main import JobCreate
+        from orchestrator.schemas.job_create import JobCreate
 
         await _create_job(
             job_db,
@@ -636,7 +672,7 @@ class TestJobCreateBoundary:
 
     @pytest.mark.asyncio
     async def test_a_job_without_tools_is_untouched(self, job_db, job_request):
-        from orchestrator.main import JobCreate
+        from orchestrator.schemas.job_create import JobCreate
 
         await _create_job(
             job_db,
@@ -736,30 +772,38 @@ def session_create_env(monkeypatch):
     )
     user = {"id": SESSION_USER_ID, "is_admin": False}
 
-    monkeypatch.setattr(main, "postgres_db", db)
-    monkeypatch.setattr(main, "require_approved_user", AsyncMock(return_value=user))
-    monkeypatch.setattr(main, "_enforce_readiness_gate", AsyncMock())
+    monkeypatch.setattr(main.app.state.resources, "postgres_db", db)
     monkeypatch.setattr(
-        main, "_authorize_thread_project_ids", AsyncMock(return_value=[])
+        auth_module, "require_approved_user", AsyncMock(return_value=user)
+    )
+    monkeypatch.setattr(access_composition, "enforce_readiness_gate", AsyncMock())
+    monkeypatch.setattr(
+        thread_project_authorization_module,
+        "authorize_thread_project_ids",
+        AsyncMock(return_value=[]),
     )
     monkeypatch.setattr(
         session_config_resolution,
         "resolve_session_account_defaults",
         AsyncMock(return_value={}),
     )
-    monkeypatch.setattr(main, "_is_experts_db_enabled", MagicMock(return_value=False))
-    monkeypatch.setattr(main, "_user_experts_enabled", AsyncMock(return_value=False))
+    monkeypatch.setattr(
+        deployment_gates_module, "is_experts_db_enabled", MagicMock(return_value=False)
+    )
+    monkeypatch.setattr(
+        grant_enforcement_module, "user_experts_enabled", AsyncMock(return_value=False)
+    )
     # Keep this endpoint-boundary fixture hermetic. The real create path also
     # initializes cloud/Git services and schedules workspace/agent provisioning;
     # those integrations have their own tests and can otherwise wait on local
     # developer services here.
     monkeypatch.setattr(
-        main,
+        main.app.state.resources,
         "gitea_client",
         SimpleNamespace(is_initialized=False, is_configured=False),
     )
     monkeypatch.setattr(
-        main.main_cloud_router,
+        main.app.state.resources.main_cloud_router,
         "for_owner",
         MagicMock(
             return_value=SimpleNamespace(
@@ -769,18 +813,34 @@ def session_create_env(monkeypatch):
         ),
     )
     monkeypatch.setattr(
-        main, "container_provisioner", SimpleNamespace(is_available=False)
+        container_provisioner_module,
+        "container_provisioner",
+        SimpleNamespace(is_available=False),
     )
-    monkeypatch.setattr(main, "docker_provisioner", SimpleNamespace(is_available=False))
-    monkeypatch.setattr(main, "agent_provisioner", SimpleNamespace(is_available=False))
-    monkeypatch.setattr(main, "STATELESS_SESSION_ENABLED", False)
+    monkeypatch.setattr(
+        docker_provisioner_module,
+        "docker_provisioner",
+        SimpleNamespace(is_available=False),
+    )
+    monkeypatch.setattr(
+        agent_provisioner_module,
+        "agent_provisioner",
+        SimpleNamespace(is_available=False),
+    )
+    monkeypatch.setattr(
+        main.app.state.resources.settings, "stateless_session_enabled", False
+    )
     grants = AsyncMock()
-    monkeypatch.setattr(main, "_enforce_session_create_grants", grants)
+    monkeypatch.setattr(
+        grant_enforcement_module, "enforce_session_create_grants", grants
+    )
     return main, db, conn, grants
 
 
 def _thread_create_body(main, config_override):
-    return main.ThreadCreateRequest(title="t", config_override=config_override)
+    return thread_admission_module.ThreadCreateRequest(
+        title="t", config_override=config_override
+    )
 
 
 def _persisted_thread_override(db) -> dict:
@@ -801,14 +861,19 @@ class TestSessionCreateBoundary:
             )
         )
         monkeypatch.setattr(
-            main,
+            main.app.state.resources,
             "main_cloud_router",
             SimpleNamespace(active_instance_id=None, for_owner=for_owner),
         )
 
-        result = await main.create_thread(
-            main.ThreadCreateRequest(title="session without main cloud"),
+        result = await services_thread_admission_module.create_thread(
+            thread_admission_module.ThreadCreateRequest(
+                title="session without main cloud"
+            ),
             MagicMock(),
+            dependencies=sessions_composition.thread_admission_dependencies(
+                main.app.state.resources
+            ),
         )
 
         assert result == {"thread_id": SESSION_THREAD_ID, "status": "created"}
@@ -831,14 +896,17 @@ class TestSessionCreateBoundary:
     ):
         main, db, _, grants = session_create_env
 
-        with pytest.raises(main.HTTPException) as exc:
-            await main.create_thread(
-                main.ThreadCreateRequest(
+        with pytest.raises(fastapi_module.HTTPException) as exc:
+            await services_thread_admission_module.create_thread(
+                thread_admission_module.ThreadCreateRequest(
                     title="hand-rolled officer",
                     project_id=SESSION_THREAD_ID,
                     config_override={"officer": officer},
                 ),
                 MagicMock(),
+                dependencies=sessions_composition.thread_admission_dependencies(
+                    main.app.state.resources
+                ),
             )
 
         assert exc.value.status_code == 400
@@ -852,14 +920,17 @@ class TestSessionCreateBoundary:
         main, db, _, grants = session_create_env
         db.get_user_role_in_project = AsyncMock(return_value="editor")
 
-        with pytest.raises(main.HTTPException) as exc:
-            await main.create_thread(
-                main.ThreadCreateRequest(
+        with pytest.raises(fastapi_module.HTTPException) as exc:
+            await services_thread_admission_module.create_thread(
+                thread_admission_module.ThreadCreateRequest(
                     title="hand-rolled officer",
                     project_id=SESSION_THREAD_ID,
                     config_override={"officer": {"enabled": True}},
                 ),
                 MagicMock(),
+                dependencies=sessions_composition.thread_admission_dependencies(
+                    main.app.state.resources
+                ),
             )
 
         assert exc.value.status_code == 403
@@ -875,19 +946,26 @@ class TestSessionCreateBoundary:
         self, session_create_env, monkeypatch, release_enabled, expected_status
     ):
         main, db, _, _ = session_create_env
-        monkeypatch.setattr(main, "OFFICER_AUTO_PULL_RELEASE_ENABLED", release_enabled)
+        monkeypatch.setattr(
+            main.app.state.resources.settings,
+            "officer_auto_pull_release_enabled",
+            release_enabled,
+        )
         monkeypatch.setattr(
             session_config_resolution,
             "resolve_session_account_defaults",
             AsyncMock(return_value={"officer": {"enabled": True, "auto_pull": True}}),
         )
 
-        with pytest.raises(main.HTTPException) as exc:
-            await main.create_thread(
-                main.ThreadCreateRequest(
+        with pytest.raises(fastapi_module.HTTPException) as exc:
+            await services_thread_admission_module.create_thread(
+                thread_admission_module.ThreadCreateRequest(
                     title="default-derived officer", project_id=SESSION_THREAD_ID
                 ),
                 MagicMock(),
+                dependencies=sessions_composition.thread_admission_dependencies(
+                    main.app.state.resources
+                ),
             )
 
         assert exc.value.status_code == expected_status
@@ -912,13 +990,16 @@ class TestSessionCreateBoundary:
         )
 
         with pytest.raises(
-            main.HTTPException, match="owned by the durable Officer Post"
+            fastapi_module.HTTPException, match="owned by the durable Officer Post"
         ):
-            await main.create_thread(
-                main.ThreadCreateRequest(
+            await services_thread_admission_module.create_thread(
+                thread_admission_module.ThreadCreateRequest(
                     title="default-derived officer", project_id=SESSION_THREAD_ID
                 ),
                 MagicMock(),
+                dependencies=sessions_composition.thread_admission_dependencies(
+                    main.app.state.resources
+                ),
             )
 
         db.create_thread.assert_not_awaited()
@@ -931,17 +1012,22 @@ class TestSessionCreateBoundary:
         main, db, _, _ = session_create_env
         db.get_user_role_in_project = AsyncMock(return_value=role)
         find_open = AsyncMock(return_value=None)
-        monkeypatch.setattr(main, "_find_open_conference_thread", find_open)
+        monkeypatch.setattr(
+            officer_conference_module, "find_open_conference_thread", find_open
+        )
 
-        with pytest.raises(main.HTTPException) as exc:
-            await main.create_thread(
-                main.ThreadCreateRequest(
+        with pytest.raises(fastapi_module.HTTPException) as exc:
+            await services_thread_admission_module.create_thread(
+                thread_admission_module.ThreadCreateRequest(
                     title="Officer conference",
                     project_id=SESSION_THREAD_ID,
                     project_ids=[SESSION_THREAD_ID],
                     config_override={"officer": {"conference": True}},
                 ),
                 MagicMock(),
+                dependencies=sessions_composition.thread_admission_dependencies(
+                    main.app.state.resources
+                ),
             )
 
         assert exc.value.status_code == 403
@@ -958,12 +1044,16 @@ class TestSessionCreateBoundary:
         main, db, conn, _ = session_create_env
         workspace_create = AsyncMock(return_value=True)
         schedule_workspace = MagicMock()
-        monkeypatch.setattr(main, "STATELESS_SESSION_ENABLED", True)
         monkeypatch.setattr(
-            main, "_schedule_stateless_workspace_ensure", schedule_workspace
+            main.app.state.resources.settings, "stateless_session_enabled", True
         )
         monkeypatch.setattr(
-            main,
+            stateless_workspace_scheduler_module,
+            "schedule_stateless_workspace_ensure",
+            schedule_workspace,
+        )
+        monkeypatch.setattr(
+            container_provisioner_module,
             "container_provisioner",
             SimpleNamespace(
                 is_available=True,
@@ -972,7 +1062,7 @@ class TestSessionCreateBoundary:
             ),
         )
         monkeypatch.setattr(
-            main,
+            agent_provisioner_module,
             "agent_provisioner",
             SimpleNamespace(is_available=True, in_cluster=True),
         )
@@ -982,12 +1072,15 @@ class TestSessionCreateBoundary:
             "orchestrator.services.provision_or_assign.provision_or_assign",
             pinned_provision,
         ):
-            result = await main.create_thread(
-                main.ThreadCreateRequest(
+            result = await services_thread_admission_module.create_thread(
+                thread_admission_module.ThreadCreateRequest(
                     title="stateless sandbox",
                     config_override={"workspace": {"backend": "sandbox"}},
                 ),
                 MagicMock(),
+                dependencies=sessions_composition.thread_admission_dependencies(
+                    main.app.state.resources
+                ),
             )
             await asyncio.sleep(0)
 
@@ -1007,7 +1100,17 @@ class TestSessionCreateBoundary:
         assert initial["workspace_container"]["provisioner"] == "k8s"
         conn.execute.assert_not_awaited()
         db.merge_thread_workspace_context.assert_not_awaited()
-        schedule_workspace.assert_called_once_with(SESSION_THREAD_ID)
+        # R1.B12: the owner is bound with its dependency object; the registry
+        # must be this application's single-flight registry.
+        schedule_workspace.assert_called_once()
+        assert schedule_workspace.call_args.args == (SESSION_THREAD_ID,)
+        assert set(schedule_workspace.call_args.kwargs) == {"dependencies"}
+        schedule_dependencies = schedule_workspace.call_args.kwargs["dependencies"]
+        assert schedule_dependencies.store is db
+        assert (
+            schedule_dependencies.registry
+            is main.app.state.resources.stateless_workspace_ensure_registry
+        )
         workspace_create.assert_not_awaited()
         pinned_provision.assert_not_awaited()
 
@@ -1020,12 +1123,16 @@ class TestSessionCreateBoundary:
         main, db, _, _ = session_create_env
         schedule_workspace = MagicMock()
         db.create_thread.side_effect = RuntimeError("insert failed")
-        monkeypatch.setattr(main, "STATELESS_SESSION_ENABLED", True)
         monkeypatch.setattr(
-            main, "_schedule_stateless_workspace_ensure", schedule_workspace
+            main.app.state.resources.settings, "stateless_session_enabled", True
         )
         monkeypatch.setattr(
-            main,
+            stateless_workspace_scheduler_module,
+            "schedule_stateless_workspace_ensure",
+            schedule_workspace,
+        )
+        monkeypatch.setattr(
+            container_provisioner_module,
             "container_provisioner",
             SimpleNamespace(
                 is_available=True,
@@ -1035,12 +1142,15 @@ class TestSessionCreateBoundary:
         )
 
         with pytest.raises(HTTPException, match="insert failed") as exc:
-            await main.create_thread(
-                main.ThreadCreateRequest(
+            await services_thread_admission_module.create_thread(
+                thread_admission_module.ThreadCreateRequest(
                     title="stateless sandbox",
                     config_override={"workspace": {"backend": "sandbox"}},
                 ),
                 MagicMock(),
+                dependencies=sessions_composition.thread_admission_dependencies(
+                    main.app.state.resources
+                ),
             )
 
         assert exc.value.status_code == 500
@@ -1053,9 +1163,11 @@ class TestSessionCreateBoundary:
         import asyncio
 
         main, db, _, _ = session_create_env
-        monkeypatch.setattr(main, "STATELESS_SESSION_ENABLED", False)
         monkeypatch.setattr(
-            main,
+            main.app.state.resources.settings, "stateless_session_enabled", False
+        )
+        monkeypatch.setattr(
+            container_provisioner_module,
             "container_provisioner",
             SimpleNamespace(
                 is_available=True,
@@ -1064,7 +1176,7 @@ class TestSessionCreateBoundary:
             ),
         )
         monkeypatch.setattr(
-            main,
+            agent_provisioner_module,
             "agent_provisioner",
             SimpleNamespace(is_available=True, in_cluster=True),
         )
@@ -1074,12 +1186,15 @@ class TestSessionCreateBoundary:
             "orchestrator.services.provision_or_assign.provision_or_assign",
             pinned_provision,
         ):
-            await main.create_thread(
-                main.ThreadCreateRequest(
+            await services_thread_admission_module.create_thread(
+                thread_admission_module.ThreadCreateRequest(
                     title="pinned sandbox",
                     config_override={"workspace": {"backend": "sandbox"}},
                 ),
                 MagicMock(),
+                dependencies=sessions_composition.thread_admission_dependencies(
+                    main.app.state.resources
+                ),
             )
             await asyncio.sleep(0)
 
@@ -1094,9 +1209,11 @@ class TestSessionCreateBoundary:
         import asyncio
 
         main, db, conn, _ = session_create_env
-        monkeypatch.setattr(main, "STATELESS_SESSION_ENABLED", True)
         monkeypatch.setattr(
-            main,
+            main.app.state.resources.settings, "stateless_session_enabled", True
+        )
+        monkeypatch.setattr(
+            container_provisioner_module,
             "container_provisioner",
             SimpleNamespace(
                 is_available=True,
@@ -1105,7 +1222,7 @@ class TestSessionCreateBoundary:
             ),
         )
         monkeypatch.setattr(
-            main,
+            agent_provisioner_module,
             "agent_provisioner",
             SimpleNamespace(is_available=True, in_cluster=True),
         )
@@ -1118,10 +1235,14 @@ class TestSessionCreateBoundary:
         else:
             expert_id = str(uuid.uuid4())
             monkeypatch.setattr(
-                main, "_is_experts_db_enabled", MagicMock(return_value=True)
+                deployment_gates_module,
+                "is_experts_db_enabled",
+                MagicMock(return_value=True),
             )
             monkeypatch.setattr(
-                main, "_user_experts_enabled", AsyncMock(return_value=True)
+                grant_enforcement_module,
+                "user_experts_enabled",
+                AsyncMock(return_value=True),
             )
             # R1.B06: session admission moved to services/thread_admission, which
             # imports the resolver directly; patching main would be inert.
@@ -1147,9 +1268,14 @@ class TestSessionCreateBoundary:
             "orchestrator.services.provision_or_assign.provision_or_assign",
             pinned_provision,
         ):
-            await main.create_thread(
-                main.ThreadCreateRequest(title=f"{class_source} officer"),
+            await services_thread_admission_module.create_thread(
+                thread_admission_module.ThreadCreateRequest(
+                    title=f"{class_source} officer"
+                ),
                 MagicMock(),
+                dependencies=sessions_composition.thread_admission_dependencies(
+                    main.app.state.resources
+                ),
             )
             await asyncio.sleep(0)
 
@@ -1192,21 +1318,23 @@ class TestSessionCreateBoundary:
             )
         )
         monkeypatch.setattr(
-            main,
+            persistent_provisioner_module,
             "persistent_provisioner",
             SimpleNamespace(is_available=True, create_agent_pod=dedicated_create),
         )
         monkeypatch.setattr(
-            main,
+            agent_provisioner_module,
             "agent_provisioner",
             SimpleNamespace(is_available=True, in_cluster=True),
         )
-        monkeypatch.setattr(main, "OFFICER_AUTO_PULL_RELEASE_ENABLED", True)
+        monkeypatch.setattr(
+            main.app.state.resources.settings, "officer_auto_pull_release_enabled", True
+        )
         monkeypatch.setattr(
             thread_admission, "ensure_virtual_thread_workspace_binding", AsyncMock()
         )
         warm_provision = AsyncMock()
-        request = main.ThreadCreateRequest(
+        request = thread_admission_module.ThreadCreateRequest(
             title="commissioned officer",
             project_id=SESSION_THREAD_ID,
             config_name="centurion",
@@ -1232,7 +1360,13 @@ class TestSessionCreateBoundary:
             "orchestrator.services.provision_or_assign.provision_or_assign",
             warm_provision,
         ):
-            await main.create_thread(request, MagicMock())
+            await services_thread_admission_module.create_thread(
+                request,
+                MagicMock(),
+                dependencies=sessions_composition.thread_admission_dependencies(
+                    main.app.state.resources
+                ),
+            )
             await asyncio.sleep(0)
 
         dedicated_create.assert_awaited_once_with(
@@ -1258,12 +1392,15 @@ class TestSessionCreateBoundary:
             "orchestrator.services.datasource_policy.default_datasource_selection",
             resolver,
         ):
-            await main.create_thread(
-                main.ThreadCreateRequest(
+            await services_thread_admission_module.create_thread(
+                thread_admission_module.ThreadCreateRequest(
                     title="t",
                     use_datasource_defaults=True,
                 ),
                 MagicMock(),
+                dependencies=sessions_composition.thread_admission_dependencies(
+                    main.app.state.resources
+                ),
             )
 
         # Execution now owns workspace selection, and the documented account/role
@@ -1290,9 +1427,12 @@ class TestSessionCreateBoundary:
         tools anyway."""
         main, db, conn, _ = session_create_env
 
-        await main.create_thread(
+        await services_thread_admission_module.create_thread(
             _thread_create_body(main, {"tools": {"research": [], "git": []}}),
             MagicMock(),
+            dependencies=sessions_composition.thread_admission_dependencies(
+                main.app.state.resources
+            ),
         )
 
         persisted = _persisted_thread_override(db)
@@ -1303,11 +1443,14 @@ class TestSessionCreateBoundary:
     async def test_the_whole_form_deselect_survives(self, session_create_env):
         main, db, conn, _ = session_create_env
 
-        await main.create_thread(
+        await services_thread_admission_module.create_thread(
             _thread_create_body(
                 main, {"tools": {c: [] for c in COCKPIT_SESSION_CATEGORIES}}
             ),
             MagicMock(),
+            dependencies=sessions_composition.thread_admission_dependencies(
+                main.app.state.resources
+            ),
         )
 
         persisted = _persisted_thread_override(db)
@@ -1320,9 +1463,12 @@ class TestSessionCreateBoundary:
         fix must not hand the agent tools the grant check never saw."""
         main, _, _, grants = session_create_env
 
-        await main.create_thread(
+        await services_thread_admission_module.create_thread(
             _thread_create_body(main, {"tools": {"shell": ["run_command"]}}),
             MagicMock(),
+            dependencies=sessions_composition.thread_admission_dependencies(
+                main.app.state.resources
+            ),
         )
 
         fragment = grants.await_args.args[0]
@@ -1332,10 +1478,13 @@ class TestSessionCreateBoundary:
     async def test_a_smuggle_is_a_400_and_nothing_is_created(self, session_create_env):
         main, db, _, _ = session_create_env
 
-        with pytest.raises(main.HTTPException) as exc:
-            await main.create_thread(
+        with pytest.raises(fastapi_module.HTTPException) as exc:
+            await services_thread_admission_module.create_thread(
                 _thread_create_body(main, {"tools": {"canvas": ["run_command"]}}),
                 MagicMock(),
+                dependencies=sessions_composition.thread_admission_dependencies(
+                    main.app.state.resources
+                ),
             )
         assert exc.value.status_code == 400
         assert "run_command" in exc.value.detail
@@ -1393,11 +1542,15 @@ def session_patch_env(monkeypatch):
             "delivery_override": config_override
         }
     )
-    monkeypatch.setattr(main, "postgres_db", db)
-    monkeypatch.setattr(main, "require_internal", AsyncMock())
-    monkeypatch.setattr(main, "_thread_project_ids", AsyncMock(return_value=[]))
+    monkeypatch.setattr(main.app.state.resources, "postgres_db", db)
+    monkeypatch.setattr(_access_module, "require_internal", AsyncMock())
+    monkeypatch.setattr(
+        thread_mount_rows_module, "thread_project_ids", AsyncMock(return_value=[])
+    )
     grants = AsyncMock()
-    monkeypatch.setattr(main, "_enforce_session_create_grants", grants)
+    monkeypatch.setattr(
+        grant_enforcement_module, "enforce_session_create_grants", grants
+    )
     return main, db, grants
 
 
@@ -1413,10 +1566,12 @@ class TestSessionRuntimeUpdateBoundary:
         await thread_config_update.agent_update_thread_config(
             MagicMock(),
             SESSION_THREAD_ID,
-            main.AgentThreadConfigUpdateRequest(
+            thread_config_module.AgentThreadConfigUpdateRequest(
                 config_override={"tools": {"research": [], "canvas": []}}
             ),
-            dependencies=main._thread_config_update_dependencies(),
+            dependencies=sessions_composition.thread_config_update_dependencies(
+                main.app.state.resources
+            ),
         )
 
         merged = db.merge_thread_config_override.await_args.args[1]
@@ -1428,14 +1583,16 @@ class TestSessionRuntimeUpdateBoundary:
     ):
         main, db, _ = session_patch_env
 
-        with pytest.raises(main.HTTPException) as exc:
+        with pytest.raises(fastapi_module.HTTPException) as exc:
             await thread_config_update.agent_update_thread_config(
                 MagicMock(),
                 SESSION_THREAD_ID,
-                main.AgentThreadConfigUpdateRequest(
+                thread_config_module.AgentThreadConfigUpdateRequest(
                     config_override={"tools": {"citation": ["run_command"]}}
                 ),
-                dependencies=main._thread_config_update_dependencies(),
+                dependencies=sessions_composition.thread_config_update_dependencies(
+                    main.app.state.resources
+                ),
             )
         assert exc.value.status_code == 400
         db.merge_thread_config_override.assert_not_awaited()
@@ -1476,11 +1633,13 @@ class TestSessionRuntimeUpdateBoundary:
             await thread_config_update.agent_update_thread_config(
                 MagicMock(),
                 SESSION_THREAD_ID,
-                main.AgentThreadConfigUpdateRequest(
+                thread_config_module.AgentThreadConfigUpdateRequest(
                     config_override={"tools": {"sql": []}},
                     datasource_ids=[SESSION_DATASOURCE_ID],
                 ),
-                dependencies=main._thread_config_update_dependencies(),
+                dependencies=sessions_composition.thread_config_update_dependencies(
+                    main.app.state.resources
+                ),
             )
 
         fragment = grants.await_args.args[0]
@@ -1609,7 +1768,7 @@ class TestAutomationBoundary:
         # The store now arrives on `AutomationsDependencies`, which the cases
         # below hand in explicitly — calling a declaration directly never
         # resolves its `Depends(...)` default.
-        monkeypatch.setattr("orchestrator.main.postgres_db", db)
+        monkeypatch.setattr("orchestrator.main.app.state.resources.postgres_db", db)
         monkeypatch.setattr(
             mod, "require_approved_user", AsyncMock(return_value=caller)
         )
@@ -1724,13 +1883,13 @@ class TestProjectDefaultOverrideBoundary:
             add_project_member=AsyncMock(),
             update_project=AsyncMock(return_value=True),
         )
-        monkeypatch.setattr(main, "postgres_db", db)
+        monkeypatch.setattr(main.app.state.resources, "postgres_db", db)
         monkeypatch.setattr(
-            main,
+            auth_module,
             "require_approved_user",
             AsyncMock(return_value={"id": SESSION_USER_ID, "is_admin": False}),
         )
-        monkeypatch.setattr(main, "require_project_owner", AsyncMock())
+        monkeypatch.setattr(_access_module, "require_project_owner", AsyncMock())
         return main, db
 
     @pytest.mark.asyncio
@@ -1740,7 +1899,7 @@ class TestProjectDefaultOverrideBoundary:
 
         main, db = project_env
 
-        with pytest.raises(main.HTTPException) as exc:
+        with pytest.raises(fastapi_module.HTTPException) as exc:
             await create_project(
                 ProjectCreate(
                     name="p",
@@ -1748,7 +1907,9 @@ class TestProjectDefaultOverrideBoundary:
                     default_config_override={"tools": {"canvas": ["run_command"]}},
                 ),
                 MagicMock(),
-                dependencies=main._projects_dependencies(),
+                dependencies=projects_composition.projects_dependencies(
+                    main.app.state.resources
+                ),
             )
         assert exc.value.status_code == 400
         db.create_project.assert_not_awaited()
@@ -1760,14 +1921,16 @@ class TestProjectDefaultOverrideBoundary:
 
         main, db = project_env
 
-        with pytest.raises(main.HTTPException) as exc:
+        with pytest.raises(fastapi_module.HTTPException) as exc:
             await update_project(
                 "p1",
                 ProjectUpdate(
                     default_config_override={"tools": {"knowledge": ["run_command"]}}
                 ),
                 MagicMock(),
-                dependencies=main._projects_dependencies(),
+                dependencies=projects_composition.projects_dependencies(
+                    main.app.state.resources
+                ),
             )
         assert exc.value.status_code == 400
         db.update_project.assert_not_awaited()
@@ -1786,7 +1949,9 @@ class TestProjectDefaultOverrideBoundary:
             "p1",
             ProjectUpdate(name="renamed"),
             MagicMock(),
-            dependencies=main._projects_dependencies(),
+            dependencies=projects_composition.projects_dependencies(
+                main.app.state.resources
+            ),
         )
 
         assert db.update_project.await_args.args[0] == "p1"
@@ -1807,7 +1972,9 @@ class TestProjectDefaultOverrideBoundary:
             "p1",
             ProjectUpdate(default_config_override={"memory": {"project_scoped": True}}),
             MagicMock(),
-            dependencies=main._projects_dependencies(),
+            dependencies=projects_composition.projects_dependencies(
+                main.app.state.resources
+            ),
         )
 
         assert db.update_project.await_args.kwargs["default_config_override"] == {
@@ -1980,9 +2147,9 @@ class TestExpertWriteBoundary:
             ),
             fork_and_set_user_expert_default=AsyncMock(return_value={"id": "e3"}),
         )
-        monkeypatch.setattr(main, "postgres_db", db)
+        monkeypatch.setattr(main.app.state.resources, "postgres_db", db)
         monkeypatch.setattr(
-            main,
+            auth_module,
             "require_approved_user",
             AsyncMock(return_value={"id": SESSION_USER_ID, "is_admin": False}),
         )
@@ -2000,15 +2167,19 @@ class TestExpertWriteBoundary:
         # here does. `_strip_save_grants`'s stub echoes the config back
         # unchanged with nothing dropped — the pass-through analog of
         # `_enforce_expert_save`'s no-op for the other four routes.
-        monkeypatch.setattr(main, "_enforce_expert_save", AsyncMock())
-        monkeypatch.setattr(main, "_enforce_expert_save_prelude", AsyncMock())
         monkeypatch.setattr(
-            main,
-            "_strip_save_grants",
+            grant_enforcement_module, "enforce_expert_save", AsyncMock()
+        )
+        monkeypatch.setattr(
+            grant_enforcement_module, "enforce_expert_save_prelude", AsyncMock()
+        )
+        monkeypatch.setattr(
+            grant_enforcement_module,
+            "strip_save_grants",
             AsyncMock(side_effect=lambda config, **_kwargs: (config, [])),
         )
         monkeypatch.setattr(
-            main, "user_visible_project_ids", AsyncMock(return_value=[])
+            _access_module, "user_visible_project_ids", AsyncMock(return_value=[])
         )
         monkeypatch.setattr(
             expert_authoring_module,
@@ -2031,7 +2202,7 @@ class TestExpertWriteBoundary:
     async def test_create_rejects_a_smuggle_and_stores_nothing(self, expert_env):
         main, db = expert_env
 
-        with pytest.raises(main.HTTPException) as exc:
+        with pytest.raises(fastapi_module.HTTPException) as exc:
             await catalogue_route(expert_routes.create_expert)(
                 MagicMock(), self._create_body(main, self.SMUGGLE)
             )
@@ -2044,7 +2215,7 @@ class TestExpertWriteBoundary:
     async def test_update_rejects_a_smuggle_and_stores_nothing(self, expert_env):
         main, db = expert_env
 
-        with pytest.raises(main.HTTPException) as exc:
+        with pytest.raises(fastapi_module.HTTPException) as exc:
             await catalogue_route(expert_routes.update_expert)(
                 MagicMock(),
                 str(uuid.uuid4()),
@@ -2061,7 +2232,7 @@ class TestExpertWriteBoundary:
         between deployments."""
         main, db = expert_env
 
-        with pytest.raises(main.HTTPException) as exc:
+        with pytest.raises(fastapi_module.HTTPException) as exc:
             await catalogue_route(expert_routes.import_expert)(
                 MagicMock(), self._create_body(main, self.SMUGGLE)
             )
@@ -2087,7 +2258,7 @@ class TestExpertWriteBoundary:
             "resolve_root_expert",
             AsyncMock(return_value=selection),
         ):
-            with pytest.raises(main.HTTPException) as exc:
+            with pytest.raises(fastapi_module.HTTPException) as exc:
                 await catalogue_route(expert_routes.fork_my_expert_default)(
                     MagicMock(), "session", expert_schemas.ExpertDefaultForkRequest()
                 )
@@ -2104,7 +2275,7 @@ class TestExpertWriteBoundary:
         other boundary), but copying it is a new write by a new principal."""
         main, db = expert_env
 
-        with pytest.raises(main.HTTPException) as exc:
+        with pytest.raises(fastapi_module.HTTPException) as exc:
             await catalogue_route(expert_routes.duplicate_expert)(
                 MagicMock(), str(uuid.uuid4())
             )
@@ -2155,7 +2326,7 @@ class TestExpertWriteBoundary:
         resolve. Same 400 as every other boundary gives it."""
         main, db = expert_env
 
-        with pytest.raises(main.HTTPException) as exc:
+        with pytest.raises(fastapi_module.HTTPException) as exc:
             await catalogue_route(expert_routes.create_expert)(
                 MagicMock(), self._create_body(main, {"tools": {"shell": True}})
             )
@@ -2186,7 +2357,7 @@ class TestExpertWriteBoundary:
         only ever see a list."""
         main, _db = expert_env
         seen = AsyncMock()
-        monkeypatch.setattr(main, "_enforce_expert_save", seen)
+        monkeypatch.setattr(grant_enforcement_module, "enforce_expert_save", seen)
 
         await catalogue_route(expert_routes.create_expert)(
             MagicMock(), self._create_body(main, {"tools": {"shell": False}})
@@ -2298,14 +2469,14 @@ class TestExpertWriteBoundary:
             ),
             fork_and_set_user_expert_default=AsyncMock(return_value={"id": "e3"}),
         )
-        monkeypatch.setattr(main, "postgres_db", db)
+        monkeypatch.setattr(main.app.state.resources, "postgres_db", db)
         monkeypatch.setattr(
-            main,
+            auth_module,
             "require_approved_user",
             AsyncMock(return_value={"id": SESSION_USER_ID, "is_admin": False}),
         )
         monkeypatch.setattr(
-            main, "user_visible_project_ids", AsyncMock(return_value=[])
+            _access_module, "user_visible_project_ids", AsyncMock(return_value=[])
         )
         monkeypatch.setattr(
             expert_authoring_module,
@@ -2343,7 +2514,9 @@ class TestExpertWriteBoundary:
         failure points somewhere that greps."""
         main, db = kill_switch_env
         monkeypatch.setattr(
-            main, "_user_experts_enabled", AsyncMock(return_value=False)
+            grant_enforcement_module,
+            "user_experts_enabled",
+            AsyncMock(return_value=False),
         )
         existing_id = str(uuid.uuid4())
 
@@ -2387,7 +2560,7 @@ class TestExpertWriteBoundary:
             )(MagicMock(), existing_id),
         }
 
-        with pytest.raises(main.HTTPException) as exc:
+        with pytest.raises(fastapi_module.HTTPException) as exc:
             await calls[route_id]()
 
         assert exc.value.status_code == 403

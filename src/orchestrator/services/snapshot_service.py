@@ -2372,3 +2372,32 @@ class SnapshotService:
 
 # Module-level singleton
 snapshot_service = SnapshotService()
+
+
+async def snapshot_gc_sweeper(
+    shutdown_event: asyncio.Event, *, snapshots: SnapshotService
+) -> None:
+    """Background task that runs snapshot garbage collection daily.
+
+    Applies retention policies, soft-deletes expired snapshots, and
+    purges items past the 7-day grace period.
+    """
+    logger.info("Snapshot GC sweeper started")
+    gc_interval = 24 * 3600  # 24 hours
+
+    while not shutdown_event.is_set():
+        try:
+            if snapshots.is_available:
+                stats = await snapshots.run_gc()
+                if stats.get("soft_deleted") or stats.get("purged"):
+                    logger.info("Snapshot GC: %s", stats)
+        except Exception as e:
+            logger.error("Error in snapshot GC sweeper: %s", e)
+
+        try:
+            await asyncio.wait_for(shutdown_event.wait(), timeout=gc_interval)
+            break
+        except asyncio.TimeoutError:
+            pass
+
+    logger.info("Snapshot GC sweeper stopped")

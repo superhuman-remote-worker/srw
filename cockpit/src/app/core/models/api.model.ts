@@ -1913,10 +1913,15 @@ export interface Thread {
   created_at: string;
   last_activity: string;
   ended_at?: string | null;
-  /** Safe, derived public projection of an in-progress pinned retirement.
+  /** Absent on orchestrators predating the stateless lane. */
+  execution_lane?: 'pinned' | 'stateless';
+  /** Safe, derived public projection of an in-progress retirement: a pinned
+   *  one, or a stateless End/Delete a retryable fence left pending.
    *  Raw retirement tokens/context never belong in an owner payload. */
   runtime_retirement_pending?: boolean;
   retirement_disposition?: 'ended' | 'suspended' | null;
+  /** True only while a retirement is pending AND it is a permanent Delete. */
+  retirement_permanent?: boolean;
   workspace_lifecycle?: WorkspaceLifecycleView | null;
   /** Bounded progress for this exact pinned VM creation source. */
   vm_creation?: VMCreationView | null;

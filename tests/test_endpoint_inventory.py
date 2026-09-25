@@ -1,7 +1,9 @@
 """C2 — endpoint inventory snapshot test.
 
-Re-runs ``scripts/check_endpoint_auth.py`` against the declared application in
-``src/orchestrator/main.py`` and its included routers. Mounted HTTP methods and
+Re-runs ``scripts/check_endpoint_auth.py`` against the declared application —
+``app`` in ``src/orchestrator/main.py``, or ``include_routers(app)`` in
+``src/orchestrator/application/routes.py`` once main.py only calls the
+application factory — and its included routers. Mounted HTTP methods and
 WebSockets under /api, /auth and /wopi must match the committed manifest at
 ``policy/endpoint_inventory.txt``. Unmounted routers and framework-generated
 routes are excluded; unsupported dynamic composition fails explicitly.
@@ -46,11 +48,24 @@ def test_missing_source_is_an_error(tmp_path):
         script.collect_endpoints(tmp_path / "missing" / "main.py")
 
 
-def test_existing_source_may_have_no_endpoints(tmp_path):
+def test_existing_application_may_have_no_endpoints(tmp_path):
+    script = _load_script()
+    main = tmp_path / "main.py"
+    main.write_text("from fastapi import FastAPI\napp = FastAPI()\n")
+    assert script.collect_endpoints(main) == []
+
+
+def test_source_without_a_composition_entry_is_an_error(tmp_path):
+    """No FastAPI instance and no ``include_routers``: loud, never empty.
+
+    Once main.py only calls an application factory, a renamed or missing
+    registration function must not read as an application without routes.
+    """
     script = _load_script()
     main = tmp_path / "main.py"
     main.write_text("app = object()\n")
-    assert script.collect_endpoints(main) == []
+    with pytest.raises(script.UnsupportedRouteError, match="named FastAPI instance"):
+        script.collect_endpoints(main)
 
 
 def test_endpoint_inventory_matches_manifest():

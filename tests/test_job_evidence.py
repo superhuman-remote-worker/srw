@@ -29,6 +29,7 @@ from orchestrator.services.job_evidence import (
     public_manifest,
     read_evidence_entry,
 )
+from orchestrator.application import jobs as jobs_composition
 
 JOB_ID = "11111111-2222-3333-4444-555555555555"
 HEAD_SHA = "abc123def4567890abc123def4567890abc123de"
@@ -848,7 +849,10 @@ class TestEvidenceRead:
 def _patch_caller_and_db(user: dict, db):
     stack = ExitStack()
     stack.enter_context(
-        patch("orchestrator.main.require_approved_user", AsyncMock(return_value=user))
+        patch(
+            "orchestrator.security.auth.require_approved_user",
+            AsyncMock(return_value=user),
+        )
     )
     stack.enter_context(
         patch(
@@ -856,7 +860,7 @@ def _patch_caller_and_db(user: dict, db):
             AsyncMock(return_value=user),
         )
     )
-    stack.enter_context(patch("orchestrator.main.postgres_db", db))
+    stack.enter_context(patch("orchestrator.main.app.state.resources.postgres_db", db))
     return stack
 
 
@@ -874,7 +878,7 @@ class TestEvidenceRouteAuthorization:
     ):
         """A guessed/leaked evidence ID from another project is denied by the
         server scope gate before the manifest is even parsed."""
-        from orchestrator.main import _job_artifacts_dependencies
+        import orchestrator.main
         from orchestrator.routers.job_artifacts import read_job_evidence_route
 
         job_a["context"] = {
@@ -888,7 +892,9 @@ class TestEvidenceRouteAuthorization:
                     str(job_a["id"]),
                     "ev_1",
                     offset=0,
-                    dependencies=_job_artifacts_dependencies(),
+                    dependencies=jobs_composition.job_artifacts_dependencies(
+                        orchestrator.main.app.state.resources
+                    ),
                 )
         assert excinfo.value.status_code == 403
 
@@ -896,7 +902,7 @@ class TestEvidenceRouteAuthorization:
     async def test_non_member_denied_listing(
         self, user_b, fake_db, fake_request, job_a
     ):
-        from orchestrator.main import _job_artifacts_dependencies
+        import orchestrator.main
         from orchestrator.routers.job_artifacts import list_job_evidence_route
 
         with _patch_caller_and_db(user_b, fake_db):
@@ -904,7 +910,9 @@ class TestEvidenceRouteAuthorization:
                 await list_job_evidence_route(
                     fake_request,
                     str(job_a["id"]),
-                    dependencies=_job_artifacts_dependencies(),
+                    dependencies=jobs_composition.job_artifacts_dependencies(
+                        orchestrator.main.app.state.resources
+                    ),
                 )
         assert excinfo.value.status_code == 403
 
@@ -912,7 +920,7 @@ class TestEvidenceRouteAuthorization:
     async def test_owner_reads_manifest_and_unknown_id_404s(
         self, user_a, fake_db, fake_request, job_a
     ):
-        from orchestrator.main import _job_artifacts_dependencies
+        import orchestrator.main
         from orchestrator.routers.job_artifacts import (
             list_job_evidence_route,
             read_job_evidence_route,
@@ -937,7 +945,9 @@ class TestEvidenceRouteAuthorization:
             listing = await list_job_evidence_route(
                 fake_request,
                 str(job_a["id"]),
-                dependencies=_job_artifacts_dependencies(),
+                dependencies=jobs_composition.job_artifacts_dependencies(
+                    orchestrator.main.app.state.resources
+                ),
             )
             assert [e["id"] for e in listing["entries"]] == ["ev_1"]
             assert "inline_content" not in listing["entries"][0]
@@ -947,7 +957,9 @@ class TestEvidenceRouteAuthorization:
                     str(job_a["id"]),
                     "ev_does_not_exist",
                     offset=0,
-                    dependencies=_job_artifacts_dependencies(),
+                    dependencies=jobs_composition.job_artifacts_dependencies(
+                        orchestrator.main.app.state.resources
+                    ),
                 )
         assert excinfo.value.status_code == 404
 
@@ -955,7 +967,7 @@ class TestEvidenceRouteAuthorization:
     async def test_route_failure_never_exposes_private_coordinates(
         self, user_a, fake_db, fake_request, job_a, caplog
     ):
-        from orchestrator.main import _job_artifacts_dependencies
+        import orchestrator.main
         from orchestrator.routers.job_artifacts import read_job_evidence_route
 
         job_a["context"] = {
@@ -978,7 +990,9 @@ class TestEvidenceRouteAuthorization:
                         str(job_a["id"]),
                         "ev_1",
                         offset=0,
-                        dependencies=_job_artifacts_dependencies(),
+                        dependencies=jobs_composition.job_artifacts_dependencies(
+                            orchestrator.main.app.state.resources
+                        ),
                     )
         assert excinfo.value.status_code == 500
         assert private_detail not in str(excinfo.value.detail)
@@ -988,7 +1002,7 @@ class TestEvidenceRouteAuthorization:
     async def test_completion_report_route_404_when_absent(
         self, user_a, fake_db, fake_request, job_a
     ):
-        from orchestrator.main import _job_artifacts_dependencies
+        import orchestrator.main
         from orchestrator.routers.job_artifacts import get_job_completion_report_route
 
         with _patch_caller_and_db(user_a, fake_db):
@@ -996,6 +1010,8 @@ class TestEvidenceRouteAuthorization:
                 await get_job_completion_report_route(
                     fake_request,
                     str(job_a["id"]),
-                    dependencies=_job_artifacts_dependencies(),
+                    dependencies=jobs_composition.job_artifacts_dependencies(
+                        orchestrator.main.app.state.resources
+                    ),
                 )
         assert excinfo.value.status_code == 404

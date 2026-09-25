@@ -33,8 +33,8 @@ def application_sources(tmp_path, monkeypatch):
             del sys.modules[key]
 
 
-def mounted_identities(app):
-    """Read actual FastAPI route contexts, including schema-hidden HTTP and WS.
+def mounted_sequence(app):
+    """Read actual FastAPI route contexts, in match order, incl. hidden HTTP and WS.
 
     New FastAPI versions retain included routers; older versions copy their
     routes directly. This compatibility stays in the test oracle, not the
@@ -55,10 +55,14 @@ def mounted_identities(app):
         else:
             path = context.path if context is not None else route.path
         if isinstance(route, routing.APIRoute):
-            result.extend((method, path) for method in route.methods)
+            result.extend((method, path) for method in sorted(route.methods))
         elif isinstance(route, routing.APIWebSocketRoute):
             result.append(("WS", path))
-    return sorted(result)
+    return result
+
+
+def mounted_identities(app):
+    return sorted(mounted_sequence(app))
 
 
 def identities(routes):
@@ -532,3 +536,404 @@ def test_extracted_admin_gate_retains_the_existing_inventory_label(
     after_manifest = script.render_manifest(script.collect_endpoints(after))
     assert "admin:_require_admin" in before_manifest
     assert after_manifest == before_manifest
+
+
+# -- Function form: main.py calls a factory, application/routes.py registers --
+
+_FACTORY_MAIN = """
+from .application import create_app
+
+app = create_app()
+"""
+
+_FACTORY_PACKAGE = """
+from fastapi import FastAPI
+
+from .routes import include_routers
+
+
+def create_app() -> FastAPI:
+    app = FastAPI(title='fixture')
+    include_routers(app)
+    return app
+"""
+
+
+def _factory_application(files):
+    return {
+        "main.py": _FACTORY_MAIN,
+        "application/__init__.py": _FACTORY_PACKAGE,
+        **files,
+    }
+
+
+def test_registration_function_is_discovered_in_include_order_like_real_fastapi(
+    application_sources,
+):
+    main, package = application_sources(
+        _factory_application(
+            {
+                "application/routes.py": """
+                \"\"\"The application's router registration.\"\"\"
+                from fastapi import FastAPI
+
+                from .. import settings
+                from ..routers import alpha as alpha_routes
+                from ..routers.zeta import router as zeta_router
+
+
+                def include_routers(app: FastAPI) -> None:
+                    \"\"\"Register every router, in match order.\"\"\"
+                    app.include_router(zeta_router)
+                    settings.configure(store_factory=lambda: settings.STORE)
+                    app.include_router(alpha_routes.router, prefix='/api')
+                    settings.configure_from_environment(settings.STORE)
+                    app.router.include_router(alpha_routes.end_router)
+                """,
+                "settings.py": """
+                STORE = object()
+                def configure(*, store_factory):
+                    return None
+                def configure_from_environment(store):
+                    return None
+                """,
+                "routers/__init__.py": "",
+                "routers/zeta.py": """
+                from fastapi import APIRouter
+                router = APIRouter(prefix='/api/zeta')
+                @router.get('/first')
+                def first():
+                    return None
+                """,
+                "routers/alpha.py": """
+                from fastapi import APIRouter
+                router = APIRouter(prefix='/v1')
+                end_router = APIRouter(prefix='/api/end')
+                unused = APIRouter(prefix='/api/unused')
+                @router.api_route('/item', methods=['GET', 'HEAD'])
+                def item():
+                    return None
+                @router.websocket('/socket')
+                async def socket(websocket):
+                    pass
+                @end_router.post('/last')
+                def last():
+                    return None
+                @unused.get('/ghost')
+                def ghost():
+                    return None
+                """,
+            }
+        )
+    )
+    script = _load_script()
+    app = importlib.import_module(package + ".main").app
+
+    assert identities(script.discover_routes(main)) == mounted_identities(app)
+    discovery = script._RouteDiscovery(main)
+    application = discovery.registration_function(
+        main.parent / "application" / "routes.py", "include_routers"
+    )
+    ordered = [(route.method, route.path) for route in discovery.expand(application)]
+    assert ordered == mounted_sequence(app)
+    assert ordered == [
+        ("GET", "/api/zeta/first"),
+        ("GET", "/api/v1/item"),
+        ("HEAD", "/api/v1/item"),
+        ("WS", "/api/v1/socket"),
+        ("POST", "/api/end/last"),
+    ]
+
+
+def test_moved_routes_keep_identity_nosec_public_and_gate_labels(
+    application_sources,
+):
+    readiness = """
+    # nosec: public auth-bootstrap (Bearer-required, intentionally pre-approval — onboarding first paint)
+    @{owner}.get('/api/system/readiness')
+    async def system_readiness(request: Request):
+        await get_current_user(request, postgres_db)
+    """
+    project_job = """
+    @{owner}.post(
+        '/api/projects/{{project_id}}/jobs',
+        operation_id='create_project_job_api_projects__project_id__jobs_post',
+    )
+    async def create_project_job(request: Request, project_id: str):
+        await require_project_member(request, postgres_db, project_id, min_role='editor')
+    """
+    jobs = """
+    from fastapi import APIRouter
+    router = APIRouter(prefix='/api/jobs')
+    @router.get('')
+    def list_jobs():
+        require_approved_user()
+    """
+
+    def joined(*parts):
+        return "".join(textwrap.dedent(part) for part in parts)
+
+    before, before_package = application_sources(
+        {
+            "main.py": joined(
+                """
+                from fastapi import FastAPI, Request
+                from .routers.jobs import router as jobs_router
+                app = FastAPI()
+                app.include_router(jobs_router)
+                """,
+                readiness.format(owner="app"),
+                project_job.format(owner="app"),
+            ),
+            "routers/__init__.py": "",
+            "routers/jobs.py": jobs,
+        }
+    )
+    after, after_package = application_sources(
+        _factory_application(
+            {
+                "application/routes.py": """
+                from fastapi import FastAPI
+                from ..routers.jobs import router as jobs_router
+                from ..routers.system_readiness import router as system_readiness_router
+                from ..routers.project_jobs import router as project_jobs_router
+                def include_routers(app: FastAPI) -> None:
+                    app.include_router(jobs_router)
+                    app.include_router(system_readiness_router)
+                    app.include_router(project_jobs_router)
+                """,
+                "routers/__init__.py": "",
+                "routers/jobs.py": jobs,
+                "routers/system_readiness.py": joined(
+                    "from fastapi import APIRouter, Request\nrouter = APIRouter()\n",
+                    readiness.format(owner="router"),
+                ),
+                "routers/project_jobs.py": joined(
+                    "from fastapi import APIRouter, Request\nrouter = APIRouter()\n",
+                    project_job.format(owner="router"),
+                ),
+            }
+        )
+    )
+    script = _load_script()
+    for main, package in ((before, before_package), (after, after_package)):
+        app = importlib.import_module(package + ".main").app
+        assert identities(script.discover_routes(main)) == mounted_identities(app)
+    endpoints = script.collect_endpoints(after)
+    assert script.render_manifest(endpoints) == script.render_manifest(
+        script.collect_endpoints(before)
+    )
+    assert {(e.method, e.path): e.classification for e in endpoints} == {
+        ("GET", "/api/jobs"): "gated:require_approved_user",
+        ("GET", "/api/system/readiness"): (
+            "public:auth-bootstrap (Bearer-required, intentionally "
+            "pre-approval — onboarding first paint)"
+        ),
+        ("POST", "/api/projects/{project_id}/jobs"): "gated:require_project_member",
+    }
+
+
+_ROUTES_MODULE = """from fastapi import APIRouter
+router = APIRouter(prefix='/api/x')
+@router.get('/item')
+def item(): pass
+"""
+
+
+@pytest.mark.parametrize(
+    ("body", "reason"),
+    [
+        (
+            "if ENABLED:\n        app.include_router(router)",
+            "conditional, looped or nested",
+        ),
+        (
+            "for item in [router]:\n        app.include_router(item)",
+            "conditional, looped or nested",
+        ),
+        (
+            "try:\n        app.include_router(router)\n    finally:\n        pass",
+            "conditional, looped or nested",
+        ),
+        (
+            "with context():\n        app.include_router(router)",
+            "conditional, looped or nested",
+        ),
+        ("def nested():\n        pass", "conditional, looped or nested"),
+        ("alias = app\n    alias.include_router(router)", "Assign is not supported"),
+        ("return app.include_router(router)", "Return is not supported"),
+        ("register(app)", "registration helper"),
+        ("helpers.register(app=app)", "registration helper"),
+        ("configure(store=(alias := app))", "assignment expressions"),
+        ("app.mount('/api', other_app)", "mount route mutation"),
+        ("app.add_api_route('/api/y', handler)", "add_api_route route mutation"),
+        ("app.include_router(make_router())", "requires a named APIRouter"),
+        ("app.include_router(app)", "requires a named APIRouter"),
+        (
+            "app.include_router(router, prefix=PREFIX)",
+            "router prefix must be a literal",
+        ),
+    ],
+)
+def test_unsupported_registration_function_body_fails(
+    application_sources, body, reason
+):
+    main, _package = application_sources(
+        _factory_application(
+            {
+                "application/routes.py": _ROUTES_MODULE
+                + f"def include_routers(app):\n    {body}\n",
+            }
+        )
+    )
+    script = _load_script()
+    with pytest.raises(script.UnsupportedRouteError, match=reason) as raised:
+        script.discover_routes(main)
+    assert str(main.parent / "application" / "routes.py") in str(raised.value)
+
+
+@pytest.mark.parametrize(
+    ("definition", "reason"),
+    [
+        (
+            "def other(app):\n    app.include_router(router)",
+            r"include_routers\(\) is not defined",
+        ),
+        (
+            "async def include_routers(app):\n    app.include_router(router)",
+            "plain, undecorated synchronous",
+        ),
+        (
+            "@decorate\ndef include_routers(app):\n    app.include_router(router)",
+            "plain, undecorated synchronous",
+        ),
+        (
+            "def include_routers(app, extra):\n    app.include_router(extra)",
+            "exactly one parameter",
+        ),
+        (
+            "def include_routers(app, *, extra=None):\n    app.include_router(router)",
+            "exactly one parameter",
+        ),
+        ("def include_routers():\n    pass", "exactly one parameter"),
+        (
+            "def include_routers(app):\n    pass\n"
+            "def include_routers(app):\n    app.include_router(router)",
+            "exactly once",
+        ),
+        (
+            "def include_routers(app):\n    app.include_router(router)\n"
+            "include_routers = other",
+            "exactly once",
+        ),
+        (
+            "if ENABLED:\n"
+            "    def include_routers(app):\n        app.include_router(router)",
+            "exactly once",
+        ),
+    ],
+)
+def test_registration_function_shape_is_exact(application_sources, definition, reason):
+    main, _package = application_sources(
+        _factory_application({"application/routes.py": _ROUTES_MODULE + definition})
+    )
+    script = _load_script()
+    with pytest.raises(script.UnsupportedRouteError, match=reason):
+        script.discover_routes(main)
+
+
+@pytest.mark.parametrize(
+    ("main_source", "reason"),
+    [
+        (
+            "from fastapi import FastAPI\napp = FastAPI()\n",
+            "exactly one composition entry",
+        ),
+        (
+            _FACTORY_MAIN + "@app.get('/api/late')\ndef late(): pass\n",
+            r"route registration on 'app' outside include_routers\(\)",
+        ),
+        (
+            _FACTORY_MAIN + "app.include_router(router)\n",
+            r"route registration on 'app' outside include_routers\(\)",
+        ),
+        (
+            _FACTORY_MAIN + "if DEBUG:\n    app.include_router(router)\n",
+            "conditional, looped or nested",
+        ),
+        (_FACTORY_MAIN + "register(app)\n", "registration helper"),
+        (_FACTORY_MAIN + "app.mount('/api', other)\n", "mount route mutation"),
+        (
+            "from fastapi import APIRouter\napp = APIRouter()\n",
+            "must be built by the application factory",
+        ),
+    ],
+)
+def test_function_form_main_module_must_not_register_on_the_application(
+    application_sources, main_source, reason
+):
+    main, _package = application_sources(
+        _factory_application(
+            {
+                "main.py": main_source,
+                "application/routes.py": _ROUTES_MODULE
+                + "def include_routers(app):\n    app.include_router(router)\n",
+            }
+        )
+    )
+    script = _load_script()
+    with pytest.raises(script.UnsupportedRouteError, match=reason) as raised:
+        script.discover_routes(main)
+    assert str(main) in str(raised.value)
+
+
+def test_function_form_main_module_may_configure_the_application(
+    application_sources,
+):
+    """State, middleware and handlers on the factory app are not registration."""
+    main, package = application_sources(
+        _factory_application(
+            {
+                "main.py": _FACTORY_MAIN
+                + """
+from starlette.middleware.gzip import GZipMiddleware
+
+app.state.store = object()
+app.add_middleware(GZipMiddleware)
+
+@app.exception_handler(ValueError)
+async def value_error(request, exc):
+    return None
+
+@app.middleware('http')
+async def passthrough(request, call_next):
+    return await call_next(request)
+
+async def lifespan(app):
+    yield app.state.store
+
+if __name__ == '__main__':
+    run(app)
+""",
+                "application/routes.py": _ROUTES_MODULE
+                + "def include_routers(app):\n    app.include_router(router)\n",
+            }
+        )
+    )
+    script = _load_script()
+    assert (
+        identities(script.discover_routes(main))
+        == mounted_identities(importlib.import_module(package + ".main").app)
+        == [("GET", "/api/x/item")]
+    )
+
+
+def test_function_form_entry_is_an_explicit_constant():
+    script = _load_script()
+    assert script.APPLICATION_ROUTES == (
+        script.ORCHESTRATOR / "application" / "routes.py"
+    )
+    assert script.MAIN_PY.parent / script.APPLICATION_ROUTES_RELATIVE == (
+        script.APPLICATION_ROUTES
+    )
+    assert script.ROUTES_FUNCTION == "include_routers"

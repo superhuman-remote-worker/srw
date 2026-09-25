@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-import asyncio
+from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
@@ -39,25 +40,23 @@ def _get_db(request: Request) -> Any:
     return request.app.state.store
 
 
-def _kick_workspace_provisioning(thread_id: str, db: Any) -> None:
+@dataclass(frozen=True)
+class SharedBrowserDependencies:
+    """Built per request by ``app.state.shared_browser_dependencies_factory``.
+
+    ``kick_workspace_provisioning(thread_id, db)`` starts the idempotent
+    session workspace reconcile without waiting for it; the application binds
+    its provisioner and suspension service (R1.B12 caller closure).
+    """
+
+    kick_workspace_provisioning: Callable[[str, Any], None]
+
+
+def _kick_workspace_provisioning(request: Request, thread_id: str, db: Any) -> None:
     """Fire-and-forget the idempotent session workspace reconcile."""
 
-    # Not R1.B04's: these three application collaborators keep their
-    # `orchestrator.main` lookup until their own caller-boundary batch moves them.
-    from orchestrator.main import (  # type: ignore
-        container_provisioner,
-        ensure_session_workspace,
-        workspace_suspension_service,
-    )
-
-    asyncio.create_task(
-        ensure_session_workspace(
-            thread_id,
-            db=db,
-            provisioner=container_provisioner,
-            suspension=workspace_suspension_service,
-        )
-    )
+    dependencies = request.app.state.shared_browser_dependencies_factory()
+    dependencies.kick_workspace_provisioning(thread_id, db)
 
 
 class BrowserOpenRequest(BaseModel):
@@ -110,7 +109,7 @@ async def open_shared_browser(
     capability = browser_capability(thread)
     _require_openable(capability, require_ready=False)
     if not capability.workspace_ready:
-        _kick_workspace_provisioning(thread_id, db)
+        _kick_workspace_provisioning(request, thread_id, db)
         return JSONResponse(
             status_code=202,
             content={"status": "provisioning"},
@@ -161,6 +160,7 @@ async def open_shared_browser(
 
 __all__ = [
     "BrowserOpenRequest",
+    "SharedBrowserDependencies",
     "get_browser_capability",
     "open_shared_browser",
     "router",

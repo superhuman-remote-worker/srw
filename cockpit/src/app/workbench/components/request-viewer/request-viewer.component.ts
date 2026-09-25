@@ -3,6 +3,7 @@ import { FormsModule } from '@angular/forms';
 import { RequestService } from '../../services/request.service';
 import { LLMMessage } from '../../request.model';
 import { AppSpinnerComponent } from '../../../ui/spinner';
+import { AppButtonComponent } from '../../../ui/button';
 
 /**
  * Request Viewer component that displays LLM request/response conversations.
@@ -11,7 +12,7 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
 @Component({
   selector: 'app-request-viewer',
   standalone: true,
-  imports: [FormsModule, AppSpinnerComponent],
+  imports: [FormsModule, AppSpinnerComponent, AppButtonComponent],
   template: `
     <div class="viewer-container">
       <!-- Search Bar -->
@@ -23,13 +24,13 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
           [(ngModel)]="docIdInput"
           (keyup.enter)="onLoad()"
         />
-        <button
-          class="load-btn"
-          (click)="onLoad()"
-          [disabled]="requestService.isLoading()"
+        <app-button
+          size="sm"
+          [loading]="requestService.isLoading()"
+          (clicked)="onLoad()"
         >
-          {{ requestService.isLoading() ? 'Loading...' : 'Load' }}
-        </button>
+          Load
+        </app-button>
       </div>
 
       <!-- Error State -->
@@ -238,8 +239,12 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
         flex-shrink: 0;
       }
 
+      /* min-width: 0 lets the field give up width in a narrow panel; without
+         it the placeholder's intrinsic width pushed the Load button out of
+         view. */
       .doc-id-input {
         flex: 1;
+        min-width: 0;
         padding: 6px 10px;
         border: 1px solid var(--border-color);
         border-radius: var(--radius-control);
@@ -254,25 +259,8 @@ import { AppSpinnerComponent } from '../../../ui/spinner';
         border-color: var(--accent-color);
       }
 
-      .load-btn {
-        padding: 6px 16px;
-        border: none;
-        border-radius: var(--radius-control);
-        background: var(--accent-color);
-        color: var(--on-accent, var(--timeline-bg));
-        font-size: 12px;
-        font-weight: 500;
-        cursor: pointer;
-        transition: all 0.15s ease;
-      }
-
-      .load-btn:hover:not(:disabled) {
-        filter: brightness(1.1);
-      }
-
-      .load-btn:disabled {
-        opacity: 0.6;
-        cursor: not-allowed;
+      .search-bar app-button {
+        flex-shrink: 0;
       }
 
       /* Error Banner */

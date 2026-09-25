@@ -8,18 +8,23 @@ The independent HTTP tests mount their own factories instead.
 
 from collections.abc import Awaitable, Callable
 from typing import Any
+from orchestrator.application import catalogue as catalogue_composition
 
 
 def catalogue_service():
-    from orchestrator.main import _expert_catalog_service
+    import orchestrator.main
 
-    return _expert_catalog_service()
+    return catalogue_composition.expert_catalog_service(
+        orchestrator.main.app.state.resources
+    )
 
 
 def authoring_service():
-    from orchestrator.main import _expert_catalog_dependencies
+    import orchestrator.main
 
-    return _expert_catalog_dependencies().authoring
+    return catalogue_composition.expert_catalog_dependencies(
+        orchestrator.main.app.state.resources
+    ).authoring
 
 
 def catalogue_state():
@@ -32,9 +37,15 @@ def catalogue_route(handler: Callable[..., Awaitable[Any]]):
     """Bind a new router handler to the current explicit application ports."""
 
     async def invoke(*args, **kwargs):
-        from orchestrator.main import _expert_catalog_dependencies
+        import orchestrator.main
 
-        return await handler(*args, deps=_expert_catalog_dependencies(), **kwargs)
+        return await handler(
+            *args,
+            deps=catalogue_composition.expert_catalog_dependencies(
+                orchestrator.main.app.state.resources
+            ),
+            **kwargs,
+        )
 
     return invoke
 

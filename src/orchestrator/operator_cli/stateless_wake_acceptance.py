@@ -199,25 +199,26 @@ class StatelessWakeGate:
             run_id=str(args.run_id or "inspect"),
             owner_user_id=args.owner_user_id,
         )
-        self.main: Any = None
+        self.resources: Any = None
         self.session_wake: Any = None
         self.db: Any = None
         self.provisioner: Any = None
         self.namespace = ""
 
     async def connect(self) -> None:
-        try:
-            import orchestrator.main as orchestrator_main
-            from orchestrator.services import session_wake
-        except ImportError:  # repository-layout invocation in tests/dev
-            from orchestrator import main as orchestrator_main
-            from orchestrator.services import session_wake
+        # The supported composition boundary for a process that needs the
+        # application's operations without serving HTTP: build one
+        # application's resources (no connection, no task) and reach each
+        # operation through the composition function that owns it.
+        from orchestrator.application import build_application_resources
+        from orchestrator.services import agent_provisioner as agent_provisioner_module
+        from orchestrator.services import session_wake
 
-        self.main = orchestrator_main
+        self.resources = build_application_resources()
         self.session_wake = session_wake
-        self.db = orchestrator_main.postgres_db
+        self.db = self.resources.postgres_db
         await self.db.connect()
-        self.provisioner = orchestrator_main.agent_provisioner
+        self.provisioner = agent_provisioner_module.agent_provisioner
         self.provisioner.connect(self.db)
         self.namespace = str(getattr(self.provisioner, "_namespace", "") or "")
 
@@ -600,9 +601,15 @@ class StatelessWakeGate:
         thread = await self.db.get_thread(str(self.state.thread_id))
         if thread is None:
             raise GateError("fixture_missing", "fixture thread disappeared")
-        result = await self.main._thread_input_stateless(
+        from orchestrator.application import transport as transport_composition
+        from orchestrator.services import stateless_input_admission
+
+        result = await stateless_input_admission.admit_stateless_input(
             thread,
             f"Reply exactly GATE-{self.state.run_id}-{label}; do not use tools.",
+            dependencies=transport_composition.stateless_input_dependencies(
+                self.resources
+            ),
         )
         return int(result["turn_id"]), int(result["queue"]["input_seq"])
 
@@ -980,7 +987,13 @@ class StatelessWakeGate:
                 if thread is None:
                     break
                 try:
-                    await self.main._end_thread_flow(
+                    from orchestrator.application import (
+                        controls as controls_composition,
+                    )
+
+                    await controls_composition.thread_retirement_operations(
+                        self.resources
+                    ).end_thread_flow(
                         self.state.thread_id,
                         thread,
                         permanent=True,

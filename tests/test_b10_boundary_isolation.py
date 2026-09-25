@@ -11,6 +11,12 @@ These cases hold that closure. A regression to a process-wide lookup — a route
 reading module state instead of its own application's, a second application's
 store or ledger answering for the first, or the drain falling back to the
 application module — fails here rather than in production.
+
+R1.B12 moved all composition out of ``orchestrator.main`` (now only the
+entrypoint) into ``orchestrator.application``: startup lives in
+``application/lifecycle.py`` and ``application/background_tasks.py``, and the
+static checks below read those modules. Neither the entrypoint nor the
+composition package may be imported by the B10 modules.
 """
 
 from __future__ import annotations
@@ -49,9 +55,14 @@ from orchestrator.services import (
 )
 
 from ._mounted_router import mount_router
+from orchestrator.application import lifecycle as lifecycle_composition
+from orchestrator.application import transport as transport_composition
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 MAIN = ROOT / "src" / "orchestrator" / "main.py"
+APPLICATION = ROOT / "src" / "orchestrator" / "application"
+LIFECYCLE = APPLICATION / "lifecycle.py"
+BACKGROUND_TASKS = APPLICATION / "background_tasks.py"
 THREAD_ID = "11111111-2222-4333-8444-555555555555"
 
 B10_MODULES = [
@@ -92,14 +103,14 @@ def test_b10_module_never_imports_the_application_module(module) -> None:
     offending = [
         name
         for name in _imports_of(module)
-        if name == "orchestrator.main"
-        or name.startswith("orchestrator.main.")
-        or name == "orchestrator.main"
+        if name in {"orchestrator.main", "orchestrator.application"}
+        or name.startswith(("orchestrator.main.", "orchestrator.application."))
     ]
     assert offending == []
     source = pathlib.Path(module.__file__).read_text()
-    assert 'import_module("orchestrator.main")' not in source
-    assert 'sys.modules["orchestrator.main"]' not in source
+    for application_module in ("orchestrator.main", "orchestrator.application"):
+        assert f'import_module("{application_module}")' not in source
+        assert f'sys.modules["{application_module}"]' not in source
 
 
 # --------------------------------------------------------------------------- #
@@ -264,9 +275,13 @@ def test_turn_locks_belong_to_one_application() -> None:
 def test_the_application_owns_one_turn_lock_registry() -> None:
     import orchestrator.main as main
 
-    first = main._thread_transport_dependencies().turn_locks
-    second = main._thread_transport_dependencies().turn_locks
-    assert first is second is main._thread_turn_locks
+    first = transport_composition.thread_transport_dependencies(
+        main.app.state.resources
+    ).turn_locks
+    second = transport_composition.thread_transport_dependencies(
+        main.app.state.resources
+    ).turn_locks
+    assert first is second is main.app.state.resources.thread_turn_locks
     assert isinstance(first, thread_turn_locks.ThreadTurnLocks)
 
 
@@ -370,12 +385,35 @@ async def test_unbinding_forgets_only_that_store() -> None:
     )
 
 
-def _lifespan() -> ast.AsyncFunctionDef:
-    tree = ast.parse(MAIN.read_text())
-    return next(
-        node
-        for node in tree.body
-        if isinstance(node, ast.AsyncFunctionDef) and node.name == "lifespan"
+def _top_level_functions(path: pathlib.Path) -> dict[str, ast.AST]:
+    return {
+        node.name: node
+        for node in ast.parse(path.read_text()).body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+
+
+def _lifespan() -> ast.Module:
+    """The application's startup, in order (R1.B11 moved it from ``lifespan``
+    into three phases: stores, service binding, background tasks; R1.B12 moved
+    the phases into ``orchestrator.application``)."""
+    lifecycle_functions = _top_level_functions(LIFECYCLE)
+    background_functions = _top_level_functions(BACKGROUND_TASKS)
+    # The concatenation below is the startup order only while
+    # ``start_application`` runs the phases in exactly this order.
+    start = ast.unparse(lifecycle_functions["start_application"])
+    assert (
+        start.index("await open_stores(resources)")
+        < start.index("await bind_services(resources)")
+        < start.index("await background_tasks_composition.start_background_tasks(")
+    )
+    return ast.Module(
+        body=[
+            *lifecycle_functions["open_stores"].body,
+            *lifecycle_functions["bind_services"].body,
+            *background_functions["start_background_tasks"].body,
+        ],
+        type_ignores=[],
     )
 
 
@@ -388,31 +426,29 @@ def test_the_composition_step_is_a_plain_call_and_lifespan_stays_a_context_manag
     up on ``_bind_officer_wake_metering``, leaving ``lifespan`` a bare async
     generator (the boot tests caught it). Pin both halves structurally.
     """
-    tree = ast.parse(MAIN.read_text())
-    nodes = {
-        node.name: node
-        for node in tree.body
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-    }
-    bind = nodes["_bind_officer_wake_metering"]
+    nodes = _top_level_functions(LIFECYCLE)
+    bind = nodes["bind_officer_wake_metering"]
     assert isinstance(bind, ast.FunctionDef) and bind.decorator_list == []
     lifespan = nodes["lifespan"]
     assert [ast.unparse(d) for d in lifespan.decorator_list] == ["asynccontextmanager"]
 
     import contextlib
 
-    import orchestrator.main as main
-
-    assert isinstance(main.lifespan(object()), contextlib.AbstractAsyncContextManager)
+    assert isinstance(
+        lifecycle_composition.lifespan(object()),
+        contextlib.AbstractAsyncContextManager,
+    )
 
 
 def test_lifespan_binds_the_ledger_after_building_it_and_before_the_sweeper() -> None:
     body = ast.unparse(_lifespan())
-    built = body.index("usage_ledger = UsageLedger(")
-    bound = body.index("_bind_officer_wake_metering()")
-    sweeper = body.index("session_wake_sweeper_loop(postgres_db, _shutdown_event)")
+    built = body.index("resources.usage_ledger = UsageLedger(")
+    bound = body.index("bind_officer_wake_metering(resources)")
+    sweeper = body.index(
+        "session_wake_sweeper_loop(resources.postgres_db, resources.shutdown_event)"
+    )
     assert built < bound < sweeper
-    assert body.count("_bind_officer_wake_metering()") == 1
+    assert body.count("bind_officer_wake_metering(resources)") == 1
 
 
 def test_the_composition_step_binds_the_application_store_to_its_ledger(
@@ -422,12 +458,12 @@ def test_the_composition_step_binds_the_application_store_to_its_ledger(
 
     store = SimpleNamespace()
     ledger = SimpleNamespace(is_available=True)
-    monkeypatch.setattr(main, "postgres_db", store)
-    monkeypatch.setattr(main, "usage_ledger", None)
-    main._bind_officer_wake_metering()
+    monkeypatch.setattr(main.app.state.resources, "postgres_db", store)
+    monkeypatch.setattr(main.app.state.resources, "usage_ledger", None)
+    lifecycle_composition.bind_officer_wake_metering(main.app.state.resources)
 
     assert session_wake._bound_usage_ledger(store) is None
-    monkeypatch.setattr(main, "usage_ledger", ledger)
+    monkeypatch.setattr(main.app.state.resources, "usage_ledger", ledger)
     assert session_wake._bound_usage_ledger(store) is ledger
 
 
@@ -453,8 +489,11 @@ def test_lifespan_keeps_leader_gated_tasks_over_the_moved_bodies() -> None:
     for name in ("thread_permission_notify_sweeper", "attention_sleep_sweeper"):
         call = f"session_attention_operations.{name}"
         assert call in body
-        start = body.rindex("run_when_leader(", 0, body.index(call))
-        assert "asyncio.create_task(" in body[max(0, start - 40) : start]
+        # R1.B11: lifespan starts leader-only loops through its task set.
+        at = body.index(call)
+        gated = body.rindex("tasks.start_leader_gated(", 0, at)
+        plain = body.rfind("tasks.start(", 0, at)
+        assert gated > plain
 
 
 @pytest.mark.asyncio
@@ -463,11 +502,15 @@ async def test_application_attention_dependencies_see_the_recycler_bound_later(
 ) -> None:
     import orchestrator.main as main
 
-    monkeypatch.setattr(main, "_persistent_thread_recycler", None)
-    dependencies = main._session_attention_dependencies()
+    monkeypatch.setattr(main.app.state.resources, "persistent_thread_recycler", None)
+    dependencies = transport_composition.session_attention_dependencies(
+        main.app.state.resources
+    )
     assert dependencies.persistent_thread_recycler() is None
     recycler = object()
-    monkeypatch.setattr(main, "_persistent_thread_recycler", recycler)
+    monkeypatch.setattr(
+        main.app.state.resources, "persistent_thread_recycler", recycler
+    )
     assert dependencies.persistent_thread_recycler() is recycler
     await asyncio.sleep(0)
 
@@ -528,30 +571,48 @@ MOVED_FROM_MAIN = {
 }
 
 
-def test_main_no_longer_defines_the_moved_operations() -> None:
-    tree = ast.parse(MAIN.read_text())
+def _defined_names(path: pathlib.Path) -> set[str]:
     defined = set()
-    for node in tree.body:
+    for node in ast.parse(path.read_text()).body:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             defined.add(node.name)
         elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
             defined.add(node.target.id)
         elif isinstance(node, ast.Assign):
             defined.update(t.id for t in node.targets if isinstance(t, ast.Name))
-    assert defined & MOVED_FROM_MAIN == set()
+    return defined
 
 
-def test_the_one_retained_wrapper_has_its_named_operator_consumer() -> None:
+def test_main_no_longer_defines_the_moved_operations() -> None:
+    # The composition that main held moved to ``orchestrator.application``
+    # (R1.B12); neither may define a moved operation again.
+    for path in (MAIN, *sorted(APPLICATION.glob("*.py"))):
+        assert _defined_names(path) & MOVED_FROM_MAIN == set(), path.name
+
+
+def test_the_operator_harness_admits_input_through_the_composition_boundary() -> None:
+    """The stateless-wake operator harness was the one consumer of the last
+    retained ``main`` wrapper (``_thread_input_stateless``). R1.B12 removed the
+    wrapper: the harness builds one application's resources and calls the
+    admission owner with the transport composition's dependencies."""
     harness = (
         ROOT / "src" / "orchestrator" / "operator_cli" / "stateless_wake_acceptance.py"
     ).read_text()
-    assert "self.main._thread_input_stateless(" in harness
-    tree = ast.parse(MAIN.read_text())
-    wrapper = next(
-        node
-        for node in tree.body
-        if isinstance(node, ast.AsyncFunctionDef)
-        and node.name == "_thread_input_stateless"
+    assert "orchestrator.main" not in harness
+    assert "_thread_input_stateless" not in harness
+    assert "build_application_resources()" in harness
+    admission = ast.unparse(
+        next(
+            node
+            for node in ast.walk(ast.parse(harness))
+            if isinstance(node, ast.Call)
+            and ast.unparse(node.func)
+            == "stateless_input_admission.admit_stateless_input"
+        )
     )
-    assert "stateless_wake_acceptance" in (ast.get_docstring(wrapper) or "")
-    assert "admit_stateless_input" in ast.unparse(wrapper)
+    assert (
+        "dependencies=transport_composition.stateless_input_dependencies("
+        "self.resources)" in admission
+    )
+    assert "_thread_input_stateless" not in _defined_names(MAIN)
+    assert callable(transport_composition.stateless_input_dependencies)

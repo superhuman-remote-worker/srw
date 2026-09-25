@@ -28,14 +28,11 @@ def test_readiness_route_registered() -> None:
     # Local import — defers main.app construction until pytest has set up
     # the env var sys.path tweaks above.
     from orchestrator.main import app
+    from tests._route_inventory import mounted_routes
 
-    paths: set[tuple[str, str]] = set()
-    for route in app.routes:
-        methods = getattr(route, "methods", None) or set()
-        path = getattr(route, "path", "")
-        for m in methods:
-            paths.add((m, path))
-    assert ("GET", "/api/system/readiness") in paths
+    # R1.B12: the route is served by the included ``system_readiness``
+    # router, which FastAPI >= 0.139 no longer flattens into ``app.routes``.
+    assert ("GET", "/api/system/readiness") in mounted_routes(app)
 
 
 class _FakeDb:

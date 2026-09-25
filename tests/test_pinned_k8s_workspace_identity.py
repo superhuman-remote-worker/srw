@@ -17,6 +17,11 @@ from orchestrator import main
 from orchestrator.services import thread_workspace_delivery
 from orchestrator.services.container_provisioner import WorkspaceRuntimeAttestation
 from orchestrator.services.container_provisioner import WorkspaceRuntimeAuthorityError
+from orchestrator.application import preparation as preparation_composition
+from orchestrator.application import sessions as sessions_composition
+from orchestrator.schemas import thread_config as thread_config_module
+from orchestrator.security import access as access_module
+from orchestrator.services import container_provisioner as container_provisioner_module
 
 
 JOB_ID = "11111111-1111-4111-8111-111111111111"
@@ -106,7 +111,7 @@ def _thread() -> tuple[dict, dict, dict]:
 @pytest.mark.asyncio
 async def test_pinned_job_attestation_replaces_endpoint_with_exact_runtime():
     with patch.object(
-        main.container_provisioner,
+        container_provisioner_module.container_provisioner,
         "attest_workspace_runtime",
         AsyncMock(return_value=_attestation()),
     ):
@@ -125,7 +130,7 @@ async def test_pinned_job_attestation_replaces_endpoint_with_exact_runtime():
 async def test_pinned_job_same_ip_successor_is_refused_before_delivery():
     with (
         patch.object(
-            main.container_provisioner,
+            container_provisioner_module.container_provisioner,
             "attest_workspace_runtime",
             AsyncMock(return_value=_attestation(RUNTIME_B)),
         ),
@@ -142,11 +147,15 @@ async def test_pinned_thread_same_ip_successor_is_refused_before_key_payload():
     thread, workspace, binding = _thread()
     with (
         patch.object(
-            main.container_provisioner,
+            container_provisioner_module.container_provisioner,
             "attest_workspace_runtime",
             AsyncMock(return_value=_attestation(RUNTIME_B)),
         ),
-        patch.object(main.postgres_db, "get_thread", AsyncMock(return_value=thread)),
+        patch.object(
+            main.app.state.resources.postgres_db,
+            "get_thread",
+            AsyncMock(return_value=thread),
+        ),
         pytest.raises(HTTPException) as refused,
     ):
         await thread_workspace_delivery.attest_pinned_thread_k8s_workspace(
@@ -156,7 +165,9 @@ async def test_pinned_thread_same_ip_successor_is_refused_before_key_payload():
             workspace,
             binding,
             "sandbox",
-            dependencies=main._thread_workspace_delivery_dependencies(),
+            dependencies=preparation_composition.thread_workspace_delivery_dependencies(
+                main.app.state.resources
+            ),
         )
 
     assert refused.value.status_code == 409
@@ -167,11 +178,15 @@ async def test_pinned_thread_positive_attestation_binds_backing_and_host_key():
     thread, workspace, binding = _thread()
     with (
         patch.object(
-            main.container_provisioner,
+            container_provisioner_module.container_provisioner,
             "attest_workspace_runtime",
             AsyncMock(return_value=_attestation()),
         ),
-        patch.object(main.postgres_db, "get_thread", AsyncMock(return_value=thread)),
+        patch.object(
+            main.app.state.resources.postgres_db,
+            "get_thread",
+            AsyncMock(return_value=thread),
+        ),
     ):
         result = await thread_workspace_delivery.attest_pinned_thread_k8s_workspace(
             THREAD_ID,
@@ -180,7 +195,9 @@ async def test_pinned_thread_positive_attestation_binds_backing_and_host_key():
             workspace,
             binding,
             "sandbox",
-            dependencies=main._thread_workspace_delivery_dependencies(),
+            dependencies=preparation_composition.thread_workspace_delivery_dependencies(
+                main.app.state.resources
+            ),
         )
 
     assert result == _attestation()
@@ -190,7 +207,7 @@ async def test_pinned_thread_positive_attestation_binds_backing_and_host_key():
 async def test_vm_hot_upgrade_keeps_separate_authority_path():
     expected = {"status": "provisioning", "thread_id": THREAD_ID}
     with (
-        patch.object(main, "require_internal", AsyncMock()),
+        patch.object(access_module, "require_internal", AsyncMock()),
         # R1.B06: the VM fork is a call *inside* services/thread_config_update,
         # so the double has to live there — patching main would be inert.
         patch.object(
@@ -202,8 +219,10 @@ async def test_vm_hot_upgrade_keeps_separate_authority_path():
         result = await thread_config_update.agent_upgrade_thread_to_workspace(
             MagicMock(),
             THREAD_ID,
-            main.ThreadWorkspaceUpgradeRequest(target_tier="vm"),
-            dependencies=main._thread_config_update_dependencies(),
+            thread_config_module.ThreadWorkspaceUpgradeRequest(target_tier="vm"),
+            dependencies=sessions_composition.thread_config_update_dependencies(
+                main.app.state.resources
+            ),
         )
 
     assert result == expected

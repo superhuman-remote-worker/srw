@@ -27,6 +27,20 @@ edges without importing the application. Constructor and include prefixes are
 composed, literal api_route methods are expanded, and WebSockets use METHOD WS.
 Unincluded routers are excluded. Unsupported dynamic composition is an error.
 
+Composition entry — exactly one of these two forms, else discovery fails:
+
+  * module form: ``main.py`` binds ``app = FastAPI(...)`` and registers routes
+    and routers on it in its own top-level statements;
+  * function form: ``main.py`` builds ``app`` through an application factory
+    and registers nothing on it (the module form's rules, which must yield no
+    registration), and ``APPLICATION_ROUTES``
+    (``orchestrator/application/routes.py``) defines ``ROUTES_FUNCTION``
+    (``include_routers(app)``). Its single parameter is the application,
+    mounted with no prefix, and its body is a straight-line sequence of call
+    statements read in order under the module form's rules. The factory is
+    not traced: that the assembled app really runs this function is proved by
+    the import-time oracle in tests/test_endpoint_discovery.py.
+
 The policy inventory covers declared /api, /auth and /wopi routes; other mounted
 identities are reported separately. Framework-generated docs/OpenAPI routes are
 outside this source inventory. Gate-name classification is separate from route
@@ -45,11 +59,34 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 ORCHESTRATOR = REPO_ROOT / "src" / "orchestrator"
 MAIN_PY = ORCHESTRATOR / "main.py"
+# Function-form composition entry, resolved next to the main module (so a
+# fixture package can carry its own). See the module docstring.
+APPLICATION_ROUTES_RELATIVE = Path("application", "routes.py")
+APPLICATION_ROUTES = ORCHESTRATOR / APPLICATION_ROUTES_RELATIVE
+ROUTES_FUNCTION = "include_routers"
 MANIFEST = REPO_ROOT / "policy" / "endpoint_inventory.txt"
 
 HTTP_METHODS = {"get", "post", "put", "patch", "delete", "head", "options", "trace"}
 INVENTORY_PREFIXES = ("/api", "/auth", "/wopi")
 ROUTE_DECORATORS = HTTP_METHODS | {"api_route", "websocket"}
+_COMPOUND_STATEMENTS = tuple(
+    getattr(ast, name)
+    for name in (
+        "If",
+        "For",
+        "AsyncFor",
+        "While",
+        "With",
+        "AsyncWith",
+        "Try",
+        "TryStar",
+        "Match",
+        "FunctionDef",
+        "AsyncFunctionDef",
+        "ClassDef",
+    )
+    if hasattr(ast, name)
+)
 UNSUPPORTED_REGISTRATIONS = {
     "add_api_route",
     "add_api_websocket_route",
@@ -192,6 +229,10 @@ class _Router:
     variable: str
     prefix: str
     is_app: bool
+    # Function-form application: ``variable`` is not a constructor binding
+    # (the registration function's parameter, or main.py's factory-built app)
+    # and is resolved through the event scope instead.
+    scoped: bool = False
 
 
 @dataclass(frozen=True)
@@ -363,6 +404,7 @@ class _RouteDiscovery:
         self.resolved: dict[
             tuple[Path, str], _Router | _RouteOperation | _QualifiedName | None
         ] = {}
+        self.registration_bodies: dict[_Router, list[ast.stmt]] = {}
 
     def fail(self, source: _Source, node: ast.AST, message: str):
         raise UnsupportedRouteError(
@@ -461,11 +503,19 @@ class _RouteDiscovery:
             return _RouteOperation(value, attribute)
         return None
 
-    def expression(self, source: _Source, node: ast.expr):
+    def expression(self, source: _Source, node: ast.expr, scope=None):
+        """Resolve a name/attribute chain; ``scope`` holds function-local names.
+
+        Inside the registration function its parameter shadows any module
+        binding of the same name, exactly as Python resolves it; every other
+        name is a module global, because the body may not bind locals.
+        """
         if isinstance(node, ast.Name):
+            if scope and node.id in scope:
+                return scope[node.id]
             return self.binding(source, node.id)
         if isinstance(node, ast.Attribute):
-            return self.attribute(self.expression(source, node.value), node.attr)
+            return self.attribute(self.expression(source, node.value, scope), node.attr)
         return None
 
     def literal(self, source: _Source, node: ast.expr, label: str) -> str:
@@ -542,10 +592,112 @@ class _RouteDiscovery:
         finally:
             self.resolving.remove(key)
 
-    def mentions(self, source: _Source, node: ast.AST, router: _Router) -> bool:
+    def registration_function(self, path: Path, name: str) -> _Router:
+        """The function-form application: ``def <name>(app)`` in ``path``.
+
+        Only the shape the composition contract names is accepted — one
+        module-level, undecorated, synchronous definition with exactly one
+        parameter — so no second binding can stand in for the application.
+        """
+        source = self.source(path)
+        definitions = [
+            node
+            for node in ast.walk(source.tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+            and node.name == name
+        ]
+        if not definitions:
+            self.fail(source, source.tree, f"{name}() is not defined")
+        top_level = [node for node in source.statements if node in definitions]
+        if len(definitions) != 1 or len(top_level) != 1 or name in source.bindings:
+            self.fail(
+                source,
+                definitions[-1],
+                f"{name}() must be defined exactly once, at module level, and never rebound",
+            )
+        function = top_level[0]
+        if not isinstance(function, ast.FunctionDef) or function.decorator_list:
+            self.fail(
+                source,
+                function,
+                f"{name}() must be a plain, undecorated synchronous function",
+            )
+        arguments = function.args
+        positional = [*arguments.posonlyargs, *arguments.args]
+        if (
+            len(positional) != 1
+            or arguments.vararg
+            or arguments.kwarg
+            or arguments.kwonlyargs
+            or arguments.defaults
+        ):
+            self.fail(
+                source,
+                function,
+                f"{name}() must take exactly one parameter, the application",
+            )
+        router = _Router(source.path, positional[0].arg, "", True, scoped=True)
+        self.registration_bodies[router] = self.registration_body(source, function)
+        return router
+
+    def registration_body(
+        self, source: _Source, function: ast.FunctionDef
+    ) -> list[ast.stmt]:
+        """The function body as straight-line call statements, or an error.
+
+        A local binding could alias the application (or shadow a router name)
+        where module-level resolution cannot see it, so the body binds nothing:
+        no assignments, walrus expressions or nested definitions, and no
+        control flow. Literal ``if True/False`` is resolved like the module.
+        """
+        body = function.body
+        if (
+            body
+            and isinstance(body[0], ast.Expr)
+            and isinstance(body[0].value, ast.Constant)
+            and isinstance(body[0].value.value, str)
+        ):
+            body = body[1:]
+        label = f"{function.name}()"
+        statements = []
+        for node in _statements(body):
+            if isinstance(node, ast.Pass):
+                continue
+            if isinstance(node, _COMPOUND_STATEMENTS):
+                self.fail(
+                    source,
+                    node,
+                    f"conditional, looped or nested route registration is not supported in {label}",
+                )
+            if not (isinstance(node, ast.Expr) and isinstance(node.value, ast.Call)):
+                self.fail(
+                    source,
+                    node,
+                    f"{label} must be a straight-line sequence of call statements; "
+                    f"{type(node).__name__} is not supported",
+                )
+            walrus = next(
+                (item for item in ast.walk(node) if isinstance(item, ast.NamedExpr)),
+                None,
+            )
+            if walrus is not None:
+                self.fail(
+                    source,
+                    walrus,
+                    f"assignment expressions are not supported in {label}",
+                )
+            statements.append(node)
+        return statements
+
+    def scope(self, router: _Router) -> dict[str, _Router] | None:
+        return {router.variable: router} if router.scoped else None
+
+    def mentions(
+        self, source: _Source, node: ast.AST, router: _Router, scope=None
+    ) -> bool:
         for item in ast.walk(node):
             if isinstance(item, (ast.Name, ast.Attribute)):
-                value = self.expression(source, item)
+                value = self.expression(source, item, scope)
                 if (
                     value == router
                     or isinstance(value, _RouteOperation)
@@ -556,7 +708,8 @@ class _RouteDiscovery:
 
     def events(self, router: _Router):
         source = self.source(router.source_path)
-        for node in source.statements:
+        scope = self.scope(router)
+        for node in self.registration_bodies.get(router, source.statements):
             if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
                 for call in ast.walk(node):
                     if isinstance(call, ast.Call) and isinstance(
@@ -567,7 +720,7 @@ class _RouteDiscovery:
                             in ROUTE_DECORATORS
                             | UNSUPPORTED_REGISTRATIONS
                             | {"include_router"}
-                            and self.mentions(source, call.func.value, router)
+                            and self.mentions(source, call.func.value, router, scope)
                         ):
                             self.fail(
                                 source,
@@ -580,7 +733,7 @@ class _RouteDiscovery:
                 if any(
                     isinstance(attribute, ast.Attribute)
                     and attribute.attr in {"routes", "router", "prefix", "route_class"}
-                    and self.expression(source, attribute.value) == router
+                    and self.expression(source, attribute.value, scope) == router
                     for target in targets
                     for attribute in ast.walk(target)
                 ):
@@ -592,14 +745,14 @@ class _RouteDiscovery:
                     if not isinstance(decorator, ast.Call):
                         continue
                     if not isinstance(decorator.func, ast.Attribute):
-                        if self.mentions(source, decorator, router):
+                        if self.mentions(source, decorator, router, scope):
                             self.fail(
                                 source,
                                 decorator,
                                 "dynamic route decorator is not supported",
                             )
                         continue
-                    owner = self.expression(source, decorator.func.value)
+                    owner = self.expression(source, decorator.func.value, scope)
                     method = decorator.func.attr
                     if method not in ROUTE_DECORATORS | UNSUPPORTED_REGISTRATIONS:
                         continue
@@ -619,18 +772,18 @@ class _RouteDiscovery:
             elif isinstance(node, ast.Expr) and isinstance(node.value, ast.Call):
                 call = node.value
                 if not isinstance(call.func, ast.Attribute):
-                    if self.mentions(source, call, router):
+                    if self.mentions(source, call, router, scope):
                         self.fail(
                             source,
                             call,
                             "passing a router to a registration helper is not supported",
                         )
                     continue
-                owner = self.expression(source, call.func.value)
+                owner = self.expression(source, call.func.value, scope)
                 if owner == router and call.func.attr == "include_router":
                     yield node.lineno, call
                 elif call.func.attr in UNSUPPORTED_REGISTRATIONS and self.mentions(
-                    source, call.func.value, router
+                    source, call.func.value, router, scope
                 ):
                     self.fail(
                         source,
@@ -644,7 +797,7 @@ class _RouteDiscovery:
                         and call.func.attr == "include_router"
                     )
                     and any(
-                        self.mentions(source, argument, router)
+                        self.mentions(source, argument, router, scope)
                         for argument in [
                             *call.args,
                             *(item.value for item in call.keywords),
@@ -678,7 +831,7 @@ class _RouteDiscovery:
                             in ROUTE_DECORATORS
                             | UNSUPPORTED_REGISTRATIONS
                             | {"include_router"}
-                            and self.mentions(source, call.func.value, router)
+                            and self.mentions(source, call.func.value, router, scope)
                         ):
                             self.fail(
                                 source,
@@ -751,6 +904,7 @@ class _RouteDiscovery:
                     source.tree,
                     "route registration after include_router is version-dependent; declare routes before inclusion",
                 )
+        scope = self.scope(router)
         result = []
         for _line, event in events:
             if isinstance(event, tuple):
@@ -766,52 +920,92 @@ class _RouteDiscovery:
                     None,
                 )
             )
-            child = self.expression(source, child_node) if child_node else None
+            child = self.expression(source, child_node, scope) if child_node else None
             if not isinstance(child, _Router) or child.is_app:
                 self.fail(
                     source,
                     event,
                     "include_router requires a named APIRouter from a resolvable source module",
                 )
+            # The registration function only runs once its module has been
+            # imported, so every module-level route of a sibling router is
+            # already declared: the late-registration hazard cannot arise.
+            included_at = (
+                None
+                if router in self.registration_bodies
+                else (source.path, event.lineno)
+            )
             result.extend(
                 replace(route, path=prefix + route.path)
-                for route in self.expand(
-                    child, (*stack, router), (source.path, event.lineno)
-                )
+                for route in self.expand(child, (*stack, router), included_at)
             )
         return result
 
 
 def discover_routes(
-    main_path: Path = MAIN_PY, *, app_var: str = "app"
+    main_path: Path = MAIN_PY,
+    *,
+    app_var: str = "app",
+    routes_path: Path | None = None,
+    routes_function: str = ROUTES_FUNCTION,
 ) -> list[DiscoveredRoute]:
     """Enumerate declared mounted identities, including WS and out-of-policy paths.
 
+    The entry is ``main_path``'s ``app_var`` when it is a named FastAPI
+    instance (module form), else ``routes_function`` in ``routes_path``
+    (function form; default ``APPLICATION_ROUTES_RELATIVE`` beside
+    ``main_path``). Neither or both is an error, never an empty inventory.
     Framework-generated docs/OpenAPI routes and ASGI mounts are not inferred.
     Unsupported source registration forms fail explicitly rather than producing
     a misleading partial inventory.
     """
     if not main_path.is_file():
         raise FileNotFoundError(f"Orchestrator route source is missing: {main_path}")
+    if routes_path is None:
+        routes_path = main_path.parent / APPLICATION_ROUTES_RELATIVE
     discovery = _RouteDiscovery(main_path)
     source = discovery.source(main_path)
     app = discovery.binding(source, app_var)
-    if app is None:
-        if any(
-            isinstance(node, ast.Name)
-            and isinstance(node.ctx, ast.Load)
-            and node.id == app_var
-            for node in ast.walk(source.tree)
-        ):
+    module_form = isinstance(app, _Router) and app.is_app
+    if routes_path.is_file():
+        if module_form:
             discovery.fail(
-                source, source.tree, f"{app_var!r} must be a named FastAPI instance"
+                source,
+                source.tree,
+                f"{app_var!r} is a FastAPI instance here and {routes_path} also "
+                "exists; exactly one composition entry is supported",
             )
-        return []
-    if not isinstance(app, _Router) or not app.is_app:
+        if app is not None:
+            discovery.fail(
+                source,
+                source.tree,
+                f"{app_var!r} must be built by the application factory when "
+                f"{routes_path} registers its routes",
+            )
+        # main.py keeps the module form's rules for the factory-built app: it
+        # may configure state, middleware and handlers, but registering a
+        # route or router on it (or passing it to a helper) is an error.
+        factory_app = _Router(source.path, app_var, "", True, scoped=True)
+        for _line, event in discovery.events(factory_app):
+            discovery.fail(
+                source,
+                event[1] if isinstance(event, tuple) else event,
+                f"route registration on {app_var!r} outside {routes_function}() is "
+                f"not supported; register it in {routes_path}",
+            )
+        application = discovery.registration_function(routes_path, routes_function)
+    elif module_form:
+        application = app
+    else:
         discovery.fail(
-            source, source.tree, f"{app_var!r} must be a named FastAPI instance"
+            source,
+            source.tree,
+            f"{app_var!r} must be a named FastAPI instance, or {routes_path} must "
+            f"define {routes_function}(app)",
         )
-    return sorted(discovery.expand(app), key=lambda route: (route.path, route.method))
+    return sorted(
+        discovery.expand(application), key=lambda route: (route.path, route.method)
+    )
 
 
 def in_inventory_scope(route: DiscoveredRoute) -> bool:

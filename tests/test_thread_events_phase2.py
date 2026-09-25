@@ -24,12 +24,13 @@ import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from orchestrator.application import transport as transport_composition
 
 
 def test_pruner_preserves_receipts_until_owner_request_is_terminal():
-    import orchestrator.main as om
+    from orchestrator.services import retention_sweepers
 
-    source = inspect.getsource(om.thread_events_prune_sweeper)
+    source = inspect.getsource(retention_sweepers.thread_events_prune_sweeper)
     assert source.count("request.id = thread_events.control_request_id") == 2
     assert source.count("request.id = thread_events.interrupt_request_id") == 2
     assert source.count("request.outcome IS NULL") == 4
@@ -1009,12 +1010,16 @@ class TestPerTurnLock:
         import orchestrator.main as om
         from orchestrator.services.thread_turn_locks import ThreadTurnLocks
 
-        assert isinstance(om._thread_turn_locks, ThreadTurnLocks)
-        first = om._thread_transport_dependencies()
-        second = om._thread_transport_dependencies()
+        assert isinstance(om.app.state.resources.thread_turn_locks, ThreadTurnLocks)
+        first = transport_composition.thread_transport_dependencies(
+            om.app.state.resources
+        )
+        second = transport_composition.thread_transport_dependencies(
+            om.app.state.resources
+        )
         assert first is not second
-        assert first.turn_locks is om._thread_turn_locks
-        assert second.turn_locks is om._thread_turn_locks
+        assert first.turn_locks is om.app.state.resources.thread_turn_locks
+        assert second.turn_locks is om.app.state.resources.thread_turn_locks
 
 
 # ---------------------------------------------------------------------------

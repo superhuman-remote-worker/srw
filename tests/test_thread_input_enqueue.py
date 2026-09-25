@@ -31,6 +31,14 @@ from orchestrator.services import pinned_forwarding
 from orchestrator.services.stateless_input_admission import StatelessInputDependencies
 from orchestrator.services.thread_turn_locks import ThreadTurnLocks
 from shared.pinned_session_identity import PinnedSessionBinding
+from orchestrator.application import preparation as preparation_composition
+from orchestrator.application import transport as transport_composition
+from orchestrator.services import container_provisioner as container_provisioner_module
+from orchestrator.services import session_provisioner as session_provisioner_module
+from orchestrator.services import (
+    stateless_workspace_scheduler as stateless_workspace_scheduler_module,
+)
+from orchestrator.services import workspace_suspension as workspace_suspension_module
 
 THREAD_ID = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
 USER = {"id": "user-1", "is_admin": False}
@@ -604,11 +612,15 @@ async def test_suspended_sandbox_input_commits_then_schedules_workspace_restore(
     )
     conn = FakeConn()
     db = FakeDB(thread, conn)
-    monkeypatch.setattr(orch_main, "postgres_db", db)
+    monkeypatch.setattr(orch_main.app.state.resources, "postgres_db", db)
     ensure_workspace = AsyncMock()
-    monkeypatch.setattr(orch_main, "ensure_session_workspace", ensure_workspace)
-    orch_main._stateless_workspace_ensure_registry.discard(THREAD_ID)
-    stateless_input = orch_main._stateless_input_dependencies()
+    monkeypatch.setattr(
+        session_provisioner_module, "ensure_session_workspace", ensure_workspace
+    )
+    orch_main.app.state.resources.stateless_workspace_ensure_registry.discard(THREAD_ID)
+    stateless_input = transport_composition.stateless_input_dependencies(
+        orch_main.app.state.resources
+    )
     assert stateless_input.store is db
 
     out = await thread_transport.thread_input(
@@ -636,8 +648,8 @@ async def test_suspended_sandbox_input_commits_then_schedules_workspace_restore(
     ensure_workspace.assert_awaited_once_with(
         THREAD_ID,
         db=db,
-        provisioner=orch_main.container_provisioner,
-        suspension=orch_main.workspace_suspension_service,
+        provisioner=container_provisioner_module.container_provisioner,
+        suspension=workspace_suspension_module.workspace_suspension_service,
     )
     admit = next(c for c in conn.calls if c[0] == "fetchval" and "run_queue" in c[1])
     assert admit[3] == 1
@@ -681,21 +693,34 @@ async def test_stateless_workspace_ensure_scheduler_is_single_flight(monkeypatch
         await release.wait()
 
     ensure.side_effect = _ensure
-    monkeypatch.setattr(orch_main, "ensure_session_workspace", ensure)
+    monkeypatch.setattr(session_provisioner_module, "ensure_session_workspace", ensure)
     # R1.B05 moved the module dict into an application-owned registry; the
     # single-flight property under test is unchanged.
-    orch_main._stateless_workspace_ensure_registry.discard(THREAD_ID)
+    orch_main.app.state.resources.stateless_workspace_ensure_registry.discard(THREAD_ID)
 
-    first = orch_main._schedule_stateless_workspace_ensure(THREAD_ID)
+    first = stateless_workspace_scheduler_module.schedule_stateless_workspace_ensure(
+        THREAD_ID,
+        dependencies=preparation_composition.stateless_workspace_schedule_dependencies(
+            orch_main.app.state.resources
+        ),
+    )
     await started.wait()
-    second = orch_main._schedule_stateless_workspace_ensure(THREAD_ID)
+    second = stateless_workspace_scheduler_module.schedule_stateless_workspace_ensure(
+        THREAD_ID,
+        dependencies=preparation_composition.stateless_workspace_schedule_dependencies(
+            orch_main.app.state.resources
+        ),
+    )
 
     assert second is first
     ensure.assert_awaited_once()
     release.set()
     await first
     await asyncio.sleep(0)
-    assert orch_main._stateless_workspace_ensure_registry.get(THREAD_ID) is None
+    assert (
+        orch_main.app.state.resources.stateless_workspace_ensure_registry.get(THREAD_ID)
+        is None
+    )
 
 
 @pytest.mark.asyncio

@@ -107,15 +107,29 @@ def _deps(**over: Any) -> tcu.ThreadConfigUpdateDependencies:
             create_pinned_thread_workspace=AsyncMock(return_value=True),
         ),
         recovery_store=recovery_store,
-        apply_thread_config_update_locked=AsyncMock(
-            return_value=({"llm": {"model": "m"}}, ["d1"])
-        ),
         enforce_workspace_upgrade_grants=AsyncMock(),
         require_internal=AsyncMock(),
         require_thread_owner=AsyncMock(return_value=({"id": "u-1"}, _pinned_thread())),
+        thread_project_ids=AsyncMock(return_value=[]),
+        authorize_thread_datasource_selection=AsyncMock(return_value=([], {})),
+        build_datasource_tool_override=MagicMock(return_value={}),
+        datasource_selection_provenance=AsyncMock(return_value={}),
+        enforce_session_create_grants=AsyncMock(),
+        inject_model_credentials=AsyncMock(),
+        log_security_event=AsyncMock(),
     )
     fields.update(over)
     return tcu.ThreadConfigUpdateDependencies(**fields)
+
+
+@pytest.fixture(autouse=True)
+def locked_commit_core(monkeypatch) -> AsyncMock:
+    """The commit core is characterized in test_b12_thread_config_update_policy;
+    here it is stubbed at its owner so these tests pin only the routes and the
+    transaction wrapper around it."""
+    core = AsyncMock(return_value=({"llm": {"model": "m"}}, ["d1"]))
+    monkeypatch.setattr(tcu, "apply_thread_config_update_locked", core)
+    return core
 
 
 class TestChangeSummary:

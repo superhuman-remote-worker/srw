@@ -24,6 +24,16 @@ import os
 from unittest.mock import AsyncMock
 
 import pytest
+from orchestrator.application import preparation as preparation_composition
+from orchestrator.application import projects as projects_composition
+from orchestrator.services import dispatch_credentials as dispatch_credentials_module
+from orchestrator.services import (
+    job_dispatch_credentials as job_dispatch_credentials_module,
+)
+from orchestrator.services import (
+    session_config_resolution as session_config_resolution_module,
+)
+from shared.runtime.core import model_registry as model_registry_module
 
 os.environ.setdefault("VECTOR_DB_URL", "postgresql://test@localhost/test")
 
@@ -44,7 +54,9 @@ async def _build_kb_embedding_service():
     this module's fixtures monkeypatch.
     """
     return await knowledge_index.build_kb_embedding_service(
-        dependencies=orchestrator.main._knowledge_index_dependencies()
+        dependencies=projects_composition.knowledge_index_dependencies(
+            orchestrator.main.app.state.resources
+        )
     )
 
 
@@ -92,8 +104,8 @@ def patched_main(monkeypatch):
         return None
 
     monkeypatch.setattr(
-        orchestrator.main,
-        "_resolve_model",
+        model_registry_module,
+        "resolve_model",
         AsyncMock(side_effect=fake_resolve),
         raising=True,
     )
@@ -109,24 +121,24 @@ def patched_main(monkeypatch):
         return None
 
     monkeypatch.setattr(
-        orchestrator.main.postgres_db,
+        orchestrator.main.app.state.resources.postgres_db,
         "get_user_llm_endpoint",
         AsyncMock(side_effect=fake_get_endpoint),
     )
     monkeypatch.setattr(
-        orchestrator.main.postgres_db,
+        orchestrator.main.app.state.resources.postgres_db,
         "resolve_api_keys_for_job",
         AsyncMock(return_value={}),
     )
     # No user-default fallback — the incident scenario is purely
     # job-override-driven.
     monkeypatch.setattr(
-        orchestrator.main.postgres_db,
+        orchestrator.main.app.state.resources.postgres_db,
         "get_user_settings",
         AsyncMock(return_value={}),
     )
     monkeypatch.setattr(
-        orchestrator.main.postgres_db,
+        orchestrator.main.app.state.resources.postgres_db,
         "resolve_default_for_capability",
         AsyncMock(return_value=None),
     )
@@ -150,7 +162,13 @@ class TestPhaseOverrideCredentialInjection:
             }
         }
 
-        result = await orchestrator.main._inject_dispatch_credentials(_job(), override)
+        result = await job_dispatch_credentials_module.inject_dispatch_credentials(
+            _job(),
+            override,
+            dependencies=preparation_composition.job_dispatch_credential_dependencies(
+                orchestrator.main.app.state.resources
+            ),
+        )
 
         assert result["llm"]["tactical"]["base_url"] == CODEX_BASE_URL
         assert result["llm"]["tactical"]["api_key"] == CODEX_API_KEY
@@ -194,7 +212,14 @@ class TestPhaseOverrideCredentialInjection:
         assert blob["agent"]["llm"].get("base_url") is None
 
         delivered = await inject_blob_credentials(
-            blob, lambda co: orchestrator.main._inject_dispatch_credentials(_job(), co)
+            blob,
+            lambda co: job_dispatch_credentials_module.inject_dispatch_credentials(
+                _job(),
+                co,
+                dependencies=preparation_composition.job_dispatch_credential_dependencies(
+                    orchestrator.main.app.state.resources
+                ),
+            ),
         )
 
         llm = delivered["agent"]["llm"]
@@ -208,7 +233,13 @@ class TestPhaseOverrideCredentialInjection:
         """Same hole existed for top-level `auxiliary` overrides."""
         override = {"auxiliary": {"model": "gpt-5.3-codex-spark"}}
 
-        result = await orchestrator.main._inject_dispatch_credentials(_job(), override)
+        result = await job_dispatch_credentials_module.inject_dispatch_credentials(
+            _job(),
+            override,
+            dependencies=preparation_composition.job_dispatch_credential_dependencies(
+                orchestrator.main.app.state.resources
+            ),
+        )
 
         assert result["auxiliary"]["base_url"] == CODEX_BASE_URL
         assert result["auxiliary"]["api_key"] == CODEX_API_KEY
@@ -228,7 +259,13 @@ class TestPhaseOverrideCredentialInjection:
             }
         }
 
-        result = await orchestrator.main._inject_dispatch_credentials(_job(), override)
+        result = await job_dispatch_credentials_module.inject_dispatch_credentials(
+            _job(),
+            override,
+            dependencies=preparation_composition.job_dispatch_credential_dependencies(
+                orchestrator.main.app.state.resources
+            ),
+        )
 
         assert result["llm"]["tactical"]["base_url"] == CODEX_BASE_URL
         assert result["llm"]["tactical"]["api_key"] == CODEX_API_KEY
@@ -242,9 +279,13 @@ class TestPhaseOverrideCredentialInjection:
         downstream agent to surface a clear error."""
         override = {"llm": {"tactical": {"model": "does-not-exist"}}}
 
-        with caplog.at_level("WARNING", logger=orchestrator.main.logger.name):
-            result = await orchestrator.main._inject_dispatch_credentials(
-                _job(), override
+        with caplog.at_level("WARNING", logger=preparation_composition.logger.name):
+            result = await job_dispatch_credentials_module.inject_dispatch_credentials(
+                _job(),
+                override,
+                dependencies=preparation_composition.job_dispatch_credential_dependencies(
+                    orchestrator.main.app.state.resources
+                ),
             )
 
         assert result["llm"]["tactical"]["model"] == "does-not-exist"
@@ -257,7 +298,13 @@ class TestPhaseOverrideCredentialInjection:
     @pytest.mark.asyncio
     async def test_empty_override_is_a_noop(self, patched_main):
         """No phase sections → no injection, no crashes."""
-        result = await orchestrator.main._inject_dispatch_credentials(_job(), {})
+        result = await job_dispatch_credentials_module.inject_dispatch_credentials(
+            _job(),
+            {},
+            dependencies=preparation_composition.job_dispatch_credential_dependencies(
+                orchestrator.main.app.state.resources
+            ),
+        )
 
         assert "tactical" not in result.get("llm", {})
         assert "strategic" not in result.get("llm", {})
@@ -294,8 +341,8 @@ def patched_main_phase_prefs(monkeypatch):
         )
 
     monkeypatch.setattr(
-        orchestrator.main,
-        "_resolve_model",
+        model_registry_module,
+        "resolve_model",
         AsyncMock(side_effect=fake_resolve),
         raising=True,
     )
@@ -309,17 +356,17 @@ def patched_main_phase_prefs(monkeypatch):
         }
 
     monkeypatch.setattr(
-        orchestrator.main.postgres_db,
+        orchestrator.main.app.state.resources.postgres_db,
         "get_user_llm_endpoint",
         AsyncMock(side_effect=fake_get_endpoint),
     )
     monkeypatch.setattr(
-        orchestrator.main.postgres_db,
+        orchestrator.main.app.state.resources.postgres_db,
         "resolve_api_keys_for_job",
         AsyncMock(return_value={}),
     )
     monkeypatch.setattr(
-        orchestrator.main.postgres_db,
+        orchestrator.main.app.state.resources.postgres_db,
         "get_user_settings",
         AsyncMock(
             return_value={
@@ -329,7 +376,7 @@ def patched_main_phase_prefs(monkeypatch):
         ),
     )
     monkeypatch.setattr(
-        orchestrator.main.postgres_db,
+        orchestrator.main.app.state.resources.postgres_db,
         "resolve_default_for_capability",
         AsyncMock(return_value=None),
     )
@@ -342,8 +389,12 @@ class TestPerPhaseAccountDefaultsRemoved:
     ):
         """The loop scenario: an explicit top-level model, no phase pins on the
         job. Account phase defaults must NOT add strategic/tactical pins."""
-        result = await orchestrator.main._inject_dispatch_credentials(
-            _job(), {"llm": {"model": "gpt-5.5"}}
+        result = await job_dispatch_credentials_module.inject_dispatch_credentials(
+            _job(),
+            {"llm": {"model": "gpt-5.5"}},
+            dependencies=preparation_composition.job_dispatch_credential_dependencies(
+                orchestrator.main.app.state.resources
+            ),
         )
         assert result["llm"]["model"] == "gpt-5.5"
         assert "strategic" not in result["llm"]
@@ -353,7 +404,13 @@ class TestPerPhaseAccountDefaultsRemoved:
     async def test_account_phase_defaults_not_injected_on_empty_override(
         self, patched_main_phase_prefs
     ):
-        result = await orchestrator.main._inject_dispatch_credentials(_job(), {})
+        result = await job_dispatch_credentials_module.inject_dispatch_credentials(
+            _job(),
+            {},
+            dependencies=preparation_composition.job_dispatch_credential_dependencies(
+                orchestrator.main.app.state.resources
+            ),
+        )
         assert "strategic" not in result.get("llm", {})
         assert "tactical" not in result.get("llm", {})
 
@@ -394,28 +451,28 @@ def patched_main_openrouter(monkeypatch):
         return None
 
     monkeypatch.setattr(
-        orchestrator.main,
-        "_resolve_model",
+        model_registry_module,
+        "resolve_model",
         AsyncMock(side_effect=fake_resolve),
         raising=True,
     )
     monkeypatch.setattr(
-        orchestrator.main.postgres_db,
+        orchestrator.main.app.state.resources.postgres_db,
         "get_user_llm_endpoint",
         AsyncMock(return_value=None),
     )
     monkeypatch.setattr(
-        orchestrator.main.postgres_db,
+        orchestrator.main.app.state.resources.postgres_db,
         "resolve_api_keys_for_job",
         AsyncMock(return_value={"openrouter": OR_KEY}),
     )
     monkeypatch.setattr(
-        orchestrator.main.postgres_db,
+        orchestrator.main.app.state.resources.postgres_db,
         "get_user_settings",
         AsyncMock(return_value={}),
     )
     monkeypatch.setattr(
-        orchestrator.main.postgres_db,
+        orchestrator.main.app.state.resources.postgres_db,
         "resolve_default_for_capability",
         AsyncMock(return_value=None),
     )
@@ -431,7 +488,13 @@ class TestSystemProviderRouting:
         OpenAI factory default."""
         override = {"llm": {"model": "minimax/minimax-m3"}}
 
-        result = await orchestrator.main._inject_dispatch_credentials(_job(), override)
+        result = await job_dispatch_credentials_module.inject_dispatch_credentials(
+            _job(),
+            override,
+            dependencies=preparation_composition.job_dispatch_credential_dependencies(
+                orchestrator.main.app.state.resources
+            ),
+        )
 
         assert result["llm"]["provider"] == "openrouter"
         assert result["llm"]["api_key"] == OR_KEY
@@ -444,7 +507,13 @@ class TestSystemProviderRouting:
         must reach them."""
         override = {"llm": {"tactical": {"model": "minimax/minimax-m3"}}}
 
-        result = await orchestrator.main._inject_dispatch_credentials(_job(), override)
+        result = await job_dispatch_credentials_module.inject_dispatch_credentials(
+            _job(),
+            override,
+            dependencies=preparation_composition.job_dispatch_credential_dependencies(
+                orchestrator.main.app.state.resources
+            ),
+        )
 
         assert result["llm"]["tactical"]["provider"] == "openrouter"
         assert result["llm"]["tactical"]["api_key"] == OR_KEY
@@ -456,7 +525,13 @@ class TestSystemProviderRouting:
         """Injection is additive (setdefault) — an explicit provider wins."""
         override = {"llm": {"model": "minimax/minimax-m3", "provider": "openai"}}
 
-        result = await orchestrator.main._inject_dispatch_credentials(_job(), override)
+        result = await job_dispatch_credentials_module.inject_dispatch_credentials(
+            _job(),
+            override,
+            dependencies=preparation_composition.job_dispatch_credential_dependencies(
+                orchestrator.main.app.state.resources
+            ),
+        )
 
         assert result["llm"]["provider"] == "openai"
 
@@ -500,8 +575,8 @@ def patched_main_ctx(monkeypatch):
         return None
 
     monkeypatch.setattr(
-        orchestrator.main,
-        "_resolve_model",
+        model_registry_module,
+        "resolve_model",
         AsyncMock(side_effect=fake_resolve),
         raising=True,
     )
@@ -517,20 +592,22 @@ def patched_main_ctx(monkeypatch):
         return None
 
     monkeypatch.setattr(
-        orchestrator.main.postgres_db,
+        orchestrator.main.app.state.resources.postgres_db,
         "get_user_llm_endpoint",
         AsyncMock(side_effect=fake_get_endpoint),
     )
     monkeypatch.setattr(
-        orchestrator.main.postgres_db,
+        orchestrator.main.app.state.resources.postgres_db,
         "resolve_api_keys_for_job",
         AsyncMock(return_value={}),
     )
     monkeypatch.setattr(
-        orchestrator.main.postgres_db, "get_user_settings", AsyncMock(return_value={})
+        orchestrator.main.app.state.resources.postgres_db,
+        "get_user_settings",
+        AsyncMock(return_value={}),
     )
     monkeypatch.setattr(
-        orchestrator.main.postgres_db,
+        orchestrator.main.app.state.resources.postgres_db,
         "resolve_default_for_capability",
         AsyncMock(return_value=None),
     )
@@ -540,8 +617,12 @@ class TestContextWindowInjection:
     @pytest.mark.asyncio
     async def test_top_level_window_injected(self, patched_main_ctx):
         """A per-model context_window lands on the top-level llm section."""
-        result = await orchestrator.main._inject_dispatch_credentials(
-            _job(), {"llm": {"model": "ctx-32k"}}
+        result = await job_dispatch_credentials_module.inject_dispatch_credentials(
+            _job(),
+            {"llm": {"model": "ctx-32k"}},
+            dependencies=preparation_composition.job_dispatch_credential_dependencies(
+                orchestrator.main.app.state.resources
+            ),
         )
         assert result["llm"]["model_max_context_tokens"] == 32000
         # Routing creds still injected alongside.
@@ -550,32 +631,48 @@ class TestContextWindowInjection:
     @pytest.mark.asyncio
     async def test_none_window_not_injected(self, patched_main_ctx):
         """No context_window → the key is absent (agent falls back to family)."""
-        result = await orchestrator.main._inject_dispatch_credentials(
-            _job(), {"llm": {"model": "ctx-none"}}
+        result = await job_dispatch_credentials_module.inject_dispatch_credentials(
+            _job(),
+            {"llm": {"model": "ctx-none"}},
+            dependencies=preparation_composition.job_dispatch_credential_dependencies(
+                orchestrator.main.app.state.resources
+            ),
         )
         assert "model_max_context_tokens" not in result["llm"]
 
     @pytest.mark.asyncio
     async def test_zero_window_not_injected(self, patched_main_ctx):
         """Explicit 0 is rejected by the truthy guard (Pydantic round-trips 0)."""
-        result = await orchestrator.main._inject_dispatch_credentials(
-            _job(), {"llm": {"model": "ctx-zero"}}
+        result = await job_dispatch_credentials_module.inject_dispatch_credentials(
+            _job(),
+            {"llm": {"model": "ctx-zero"}},
+            dependencies=preparation_composition.job_dispatch_credential_dependencies(
+                orchestrator.main.app.state.resources
+            ),
         )
         assert "model_max_context_tokens" not in result["llm"]
 
     @pytest.mark.asyncio
     async def test_caller_pinned_window_wins(self, patched_main_ctx):
         """Injection is additive (setdefault) — an explicit window wins."""
-        result = await orchestrator.main._inject_dispatch_credentials(
-            _job(), {"llm": {"model": "ctx-32k", "model_max_context_tokens": 64000}}
+        result = await job_dispatch_credentials_module.inject_dispatch_credentials(
+            _job(),
+            {"llm": {"model": "ctx-32k", "model_max_context_tokens": 64000}},
+            dependencies=preparation_composition.job_dispatch_credential_dependencies(
+                orchestrator.main.app.state.resources
+            ),
         )
         assert result["llm"]["model_max_context_tokens"] == 64000
 
     @pytest.mark.asyncio
     async def test_chat_phase_section_gets_window(self, patched_main_ctx):
         """Strategic/tactical phase pins (capability='chat') get the window."""
-        result = await orchestrator.main._inject_dispatch_credentials(
-            _job(), {"llm": {"tactical": {"model": "ctx-32k"}}}
+        result = await job_dispatch_credentials_module.inject_dispatch_credentials(
+            _job(),
+            {"llm": {"tactical": {"model": "ctx-32k"}}},
+            dependencies=preparation_composition.job_dispatch_credential_dependencies(
+                orchestrator.main.app.state.resources
+            ),
         )
         assert result["llm"]["tactical"]["model_max_context_tokens"] == 32000
 
@@ -583,8 +680,12 @@ class TestContextWindowInjection:
     async def test_auxiliary_section_does_not_get_window(self, patched_main_ctx):
         """Capability gating: auxiliary sections are not context-window-derived,
         but still get their routing creds."""
-        result = await orchestrator.main._inject_dispatch_credentials(
-            _job(), {"auxiliary": {"model": "ctx-32k"}}
+        result = await job_dispatch_credentials_module.inject_dispatch_credentials(
+            _job(),
+            {"auxiliary": {"model": "ctx-32k"}},
+            dependencies=preparation_composition.job_dispatch_credential_dependencies(
+                orchestrator.main.app.state.resources
+            ),
         )
         assert result["auxiliary"]["base_url"] == CTX_BASE_URL
         assert "model_max_context_tokens" not in result["auxiliary"]
@@ -611,8 +712,8 @@ def _patch_resolve_provider(monkeypatch, *, provider: str):
         )
 
     monkeypatch.setattr(
-        orchestrator.main,
-        "_resolve_model",
+        model_registry_module,
+        "resolve_model",
         AsyncMock(side_effect=fake_resolve),
         raising=True,
     )
@@ -628,7 +729,7 @@ def _patch_resolve_provider(monkeypatch, *, provider: str):
         return None
 
     monkeypatch.setattr(
-        orchestrator.main.postgres_db,
+        orchestrator.main.app.state.resources.postgres_db,
         "get_user_llm_endpoint",
         AsyncMock(side_effect=fake_get_endpoint),
     )
@@ -641,11 +742,14 @@ class TestEndpointDirectRouting:
     async def test_codex_model_hits_endpoint(self, monkeypatch):
         _patch_resolve_provider(monkeypatch, provider="codex")
         section = {"model": "gpt-5.5"}
-        await orchestrator.main._inject_model_credentials(
+        await dispatch_credentials_module.inject_model_credentials(
             section=section,
             model_id="gpt-5.5",
             user_id="u",
             resolved_keys={},
+            dependencies=preparation_composition.dispatch_credential_dependencies(
+                orchestrator.main.app.state.resources
+            ),
         )
         assert section["base_url"] == CODEX_BASE_URL
         assert section["api_key"] == CODEX_API_KEY
@@ -655,11 +759,14 @@ class TestEndpointDirectRouting:
     async def test_openai_endpoint_model_hits_endpoint(self, monkeypatch):
         _patch_resolve_provider(monkeypatch, provider="openai")
         section = {"model": "gemma-4-moe"}
-        await orchestrator.main._inject_model_credentials(
+        await dispatch_credentials_module.inject_model_credentials(
             section=section,
             model_id="gemma-4-moe",
             user_id="u",
             resolved_keys={},
+            dependencies=preparation_composition.dispatch_credential_dependencies(
+                orchestrator.main.app.state.resources
+            ),
         )
         assert section["base_url"] == CODEX_BASE_URL
         assert section["api_key"] == CODEX_API_KEY
@@ -677,11 +784,14 @@ class TestEndpointDirectRouting:
             "api_key": "sk-stale",
             "provider": "openai",  # stale factory from the same prior model
         }
-        await orchestrator.main._inject_model_credentials(
+        await dispatch_credentials_module.inject_model_credentials(
             section=section,
             model_id="gpt-5.5",
             user_id="u",
             resolved_keys={},
+            dependencies=preparation_composition.dispatch_credential_dependencies(
+                orchestrator.main.app.state.resources
+            ),
         )
         assert section["base_url"] == CODEX_BASE_URL
         assert section["api_key"] == CODEX_API_KEY
@@ -697,11 +807,14 @@ class TestEndpointDirectRouting:
             "base_url": "https://byo-codex.example/v1",
             "api_key": "sk-byo",
         }
-        await orchestrator.main._inject_model_credentials(
+        await dispatch_credentials_module.inject_model_credentials(
             section=section,
             model_id="gpt-5.5",
             user_id="u",
             resolved_keys={},
+            dependencies=preparation_composition.dispatch_credential_dependencies(
+                orchestrator.main.app.state.resources
+            ),
         )
         assert section["base_url"] == CODEX_BASE_URL
         assert section["api_key"] == CODEX_API_KEY
@@ -756,8 +869,8 @@ def patched_main_embedding(monkeypatch):
         return None
 
     monkeypatch.setattr(
-        orchestrator.main,
-        "_resolve_model",
+        model_registry_module,
+        "resolve_model",
         AsyncMock(side_effect=fake_resolve),
         raising=True,
     )
@@ -773,24 +886,26 @@ def patched_main_embedding(monkeypatch):
         return None
 
     monkeypatch.setattr(
-        orchestrator.main.postgres_db,
+        orchestrator.main.app.state.resources.postgres_db,
         "get_user_llm_endpoint",
         AsyncMock(side_effect=fake_get_endpoint),
     )
     monkeypatch.setattr(
-        orchestrator.main.postgres_db,
+        orchestrator.main.app.state.resources.postgres_db,
         "resolve_api_keys_for_job",
         AsyncMock(return_value={}),
     )
     monkeypatch.setattr(
-        orchestrator.main.postgres_db, "get_user_settings", AsyncMock(return_value={})
+        orchestrator.main.app.state.resources.postgres_db,
+        "get_user_settings",
+        AsyncMock(return_value={}),
     )
 
     async def fake_default(capability):
         return EMB_MODEL if capability == "embedding" else None
 
     monkeypatch.setattr(
-        orchestrator.main.postgres_db,
+        orchestrator.main.app.state.resources.postgres_db,
         "resolve_default_for_capability",
         AsyncMock(side_effect=fake_default),
     )
@@ -802,8 +917,13 @@ class TestEmbeddingCredentialReliability:
     async def test_system_default_injected_without_user(self, patched_main_embedding):
         """No user_id → user block skipped; the system-default fallback still
         injects the embedding endpoint + key (the core asymmetry fix)."""
-        result = await orchestrator.main._inject_dispatch_credentials(
-            _job_no_user(), {}, include_kb_profile=True
+        result = await job_dispatch_credentials_module.inject_dispatch_credentials(
+            _job_no_user(),
+            {},
+            include_kb_profile=True,
+            dependencies=preparation_composition.job_dispatch_credential_dependencies(
+                orchestrator.main.app.state.resources
+            ),
         )
         env = result["env_keys"]
         assert env["EMBEDDING_MODEL"] == EMB_MODEL
@@ -819,7 +939,7 @@ class TestEmbeddingCredentialReliability:
     @pytest.mark.asyncio
     async def test_kb_profile_is_system_owned(self, patched_main_embedding):
         """A request cannot make KB queries use a user/BYO vector profile."""
-        result = await orchestrator.main._inject_dispatch_credentials(
+        result = await job_dispatch_credentials_module.inject_dispatch_credentials(
             _job_no_user(),
             {
                 "env_keys": {
@@ -830,6 +950,9 @@ class TestEmbeddingCredentialReliability:
                 }
             },
             include_kb_profile=True,
+            dependencies=preparation_composition.job_dispatch_credential_dependencies(
+                orchestrator.main.app.state.resources
+            ),
         )
         env = result["env_keys"]
         assert env["KB_EMBEDDING_MODEL"] == EMB_MODEL
@@ -841,7 +964,7 @@ class TestEmbeddingCredentialReliability:
     async def test_unscoped_job_receives_no_system_kb_secret(
         self, patched_main_embedding
     ):
-        result = await orchestrator.main._inject_dispatch_credentials(
+        result = await job_dispatch_credentials_module.inject_dispatch_credentials(
             _job_no_user(),
             {
                 "env_keys": {
@@ -849,6 +972,9 @@ class TestEmbeddingCredentialReliability:
                     "KB_EMBEDDING_API_KEY": "caller-key",
                 }
             },
+            dependencies=preparation_composition.job_dispatch_credential_dependencies(
+                orchestrator.main.app.state.resources
+            ),
         )
 
         assert not any(
@@ -859,8 +985,13 @@ class TestEmbeddingCredentialReliability:
     async def test_central_indexer_uses_dispatched_kb_profile(
         self, patched_main_embedding
     ):
-        dispatched = await orchestrator.main._inject_dispatch_credentials(
-            _job_no_user(), {}, include_kb_profile=True
+        dispatched = await job_dispatch_credentials_module.inject_dispatch_credentials(
+            _job_no_user(),
+            {},
+            include_kb_profile=True,
+            dependencies=preparation_composition.job_dispatch_credential_dependencies(
+                orchestrator.main.app.state.resources
+            ),
         )
         service = await _build_kb_embedding_service()
         env = dispatched["env_keys"]
@@ -882,23 +1013,28 @@ class TestEmbeddingCredentialReliability:
         monkeypatch.setenv("EMBEDDING_API_KEY", "dev-system-key")
         monkeypatch.setenv("EMBEDDING_DIMENSIONS", "4096")
         monkeypatch.setattr(
-            orchestrator.main.postgres_db,
+            orchestrator.main.app.state.resources.postgres_db,
             "resolve_default_for_capability",
             AsyncMock(return_value=None),
         )
         monkeypatch.setattr(
-            orchestrator.main.postgres_db,
+            orchestrator.main.app.state.resources.postgres_db,
             "resolve_api_keys_for_job",
             AsyncMock(return_value={}),
         )
         monkeypatch.setattr(
-            orchestrator.main.postgres_db,
+            orchestrator.main.app.state.resources.postgres_db,
             "get_user_settings",
             AsyncMock(return_value={}),
         )
 
-        result = await orchestrator.main._inject_dispatch_credentials(
-            _job_no_user(), {}, include_kb_profile=True
+        result = await job_dispatch_credentials_module.inject_dispatch_credentials(
+            _job_no_user(),
+            {},
+            include_kb_profile=True,
+            dependencies=preparation_composition.job_dispatch_credential_dependencies(
+                orchestrator.main.app.state.resources
+            ),
         )
         service = await _build_kb_embedding_service()
         env = result["env_keys"]
@@ -916,7 +1052,13 @@ class TestEmbeddingCredentialReliability:
     ):
         """A job WITH a user but no embedding preference still resolves the
         system default embedding key."""
-        result = await orchestrator.main._inject_dispatch_credentials(_job(), {})
+        result = await job_dispatch_credentials_module.inject_dispatch_credentials(
+            _job(),
+            {},
+            dependencies=preparation_composition.job_dispatch_credential_dependencies(
+                orchestrator.main.app.state.resources
+            ),
+        )
         assert result["env_keys"]["EMBEDDING_API_KEY"] == EMB_API_KEY
 
     @pytest.mark.asyncio
@@ -924,16 +1066,24 @@ class TestEmbeddingCredentialReliability:
         self, patched_main_embedding
     ):
         """A pre-present EMBEDDING_MODEL must NOT skip _API_KEY injection."""
-        result = await orchestrator.main._inject_dispatch_credentials(
-            _job_no_user(), {"env_keys": {"EMBEDDING_MODEL": EMB_MODEL}}
+        result = await job_dispatch_credentials_module.inject_dispatch_credentials(
+            _job_no_user(),
+            {"env_keys": {"EMBEDDING_MODEL": EMB_MODEL}},
+            dependencies=preparation_composition.job_dispatch_credential_dependencies(
+                orchestrator.main.app.state.resources
+            ),
         )
         assert result["env_keys"]["EMBEDDING_API_KEY"] == EMB_API_KEY
 
     @pytest.mark.asyncio
     async def test_preset_api_key_is_not_overwritten(self, patched_main_embedding):
         """A per-job/BYO embedding key already in env_keys wins (additive)."""
-        result = await orchestrator.main._inject_dispatch_credentials(
-            _job_no_user(), {"env_keys": {"EMBEDDING_API_KEY": "user-byo"}}
+        result = await job_dispatch_credentials_module.inject_dispatch_credentials(
+            _job_no_user(),
+            {"env_keys": {"EMBEDDING_API_KEY": "user-byo"}},
+            dependencies=preparation_composition.job_dispatch_credential_dependencies(
+                orchestrator.main.app.state.resources
+            ),
         )
         assert result["env_keys"]["EMBEDDING_API_KEY"] == "user-byo"
 
@@ -944,9 +1094,13 @@ class TestEmbeddingCredentialReliability:
         """Endpoint has a base_url but the key didn't decrypt (api_key=None):
         do NOT inject a base_url-without-key half-credential, and log loudly."""
         patched_main_embedding["api_key"] = None
-        with caplog.at_level("ERROR", logger=orchestrator.main.logger.name):
-            result = await orchestrator.main._inject_dispatch_credentials(
-                _job_no_user(), {}
+        with caplog.at_level("ERROR", logger=preparation_composition.logger.name):
+            result = await job_dispatch_credentials_module.inject_dispatch_credentials(
+                _job_no_user(),
+                {},
+                dependencies=preparation_composition.job_dispatch_credential_dependencies(
+                    orchestrator.main.app.state.resources
+                ),
             )
         env = result.get("env_keys", {})
         assert "EMBEDDING_API_KEY" not in env
@@ -989,7 +1143,13 @@ class TestModelSlotCredentialInjection:
             }
         }
 
-        result = await orchestrator.main._inject_dispatch_credentials(_job(), override)
+        result = await job_dispatch_credentials_module.inject_dispatch_credentials(
+            _job(),
+            override,
+            dependencies=preparation_composition.job_dispatch_credential_dependencies(
+                orchestrator.main.app.state.resources
+            ),
+        )
 
         roster_wide = result["subagents"]["llm"]
         assert roster_wide["base_url"] == CODEX_BASE_URL
@@ -1005,7 +1165,13 @@ class TestModelSlotCredentialInjection:
     async def test_summarization_pin_gets_endpoint_injected(self, patched_main):
         override = {"llm": {"summarization": {"model": "gpt-5.3-codex-spark"}}}
 
-        result = await orchestrator.main._inject_dispatch_credentials(_job(), override)
+        result = await job_dispatch_credentials_module.inject_dispatch_credentials(
+            _job(),
+            override,
+            dependencies=preparation_composition.job_dispatch_credential_dependencies(
+                orchestrator.main.app.state.resources
+            ),
+        )
 
         assert result["llm"]["summarization"]["base_url"] == CODEX_BASE_URL
         assert result["llm"]["summarization"]["api_key"] == CODEX_API_KEY
@@ -1017,9 +1183,13 @@ class TestModelSlotCredentialInjection:
         override = {
             "subagents": {"roster": {"reviewer": {"llm": {"model": "does-not-exist"}}}}
         }
-        with caplog.at_level("WARNING", logger=orchestrator.main.logger.name):
-            result = await orchestrator.main._inject_dispatch_credentials(
-                _job(), override
+        with caplog.at_level("WARNING", logger=preparation_composition.logger.name):
+            result = await job_dispatch_credentials_module.inject_dispatch_credentials(
+                _job(),
+                override,
+                dependencies=preparation_composition.job_dispatch_credential_dependencies(
+                    orchestrator.main.app.state.resources
+                ),
             )
 
         entry = result["subagents"]["roster"]["reviewer"]["llm"]
@@ -1073,7 +1243,14 @@ class TestModelSlotCredentialInjection:
             assert "api_key" not in entry["llm"]
 
         delivered = await inject_blob_credentials(
-            blob, lambda co: orchestrator.main._inject_dispatch_credentials(_job(), co)
+            blob,
+            lambda co: job_dispatch_credentials_module.inject_dispatch_credentials(
+                _job(),
+                co,
+                dependencies=preparation_composition.job_dispatch_credential_dependencies(
+                    orchestrator.main.app.state.resources
+                ),
+            ),
         )
 
         for name in ("explorer", "pinned", "inline"):
@@ -1199,8 +1376,13 @@ class TestModelSlotCredentialInjection:
             },
         }
 
-        out = await orchestrator.main._inject_thread_dispatch_credentials(
-            co, user_id="u", project_id="p"
+        out = await dispatch_credentials_module.inject_thread_dispatch_credentials(
+            co,
+            user_id="u",
+            project_id="p",
+            dependencies=preparation_composition.dispatch_credential_dependencies(
+                orchestrator.main.app.state.resources
+            ),
         )
 
         assert out["subagents"]["llm"]["base_url"] == CODEX_BASE_URL
@@ -1230,7 +1412,9 @@ class TestRosterPrefetch:
         """Shared Catalog selectors use their stored revision, not image files."""
         never = AsyncMock(side_effect=AssertionError("must not be called"))
         for name in ("get_expert_by_id", "get_expert_visible_by_id", "get_user"):
-            monkeypatch.setattr(orchestrator.main.postgres_db, name, never)
+            monkeypatch.setattr(
+                orchestrator.main.app.state.resources.postgres_db, name, never
+            )
         canonical = {"manifest_uid": "catalog-revision", "config": {}}
         read_catalog = AsyncMock(return_value=canonical)
         monkeypatch.setattr(
@@ -1238,17 +1422,20 @@ class TestRosterPrefetch:
             read_catalog,
         )
 
-        out = await orchestrator.main._prefetch_roster_refs(
+        out = await session_config_resolution_module.prefetch_roster_refs(
             expert_row={
                 "config": {"subagents": {"roster": {"e": {"$ref": _LIBRARY_REF}}}}
             },
             overrides=({"llm": {"model": "x"}}, None, {"subagents": "malformed"}),
             user_id="u",
+            dependencies=preparation_composition.session_config_dependencies(
+                orchestrator.main.app.state.resources
+            ),
         )
 
         assert out == {_LIBRARY_REF: canonical}
         read_catalog.assert_awaited_once_with(
-            orchestrator.main.postgres_db, _LIBRARY_REF
+            orchestrator.main.app.state.resources.postgres_db, _LIBRARY_REF
         )
         never.assert_not_awaited()
 
@@ -1260,23 +1447,26 @@ class TestRosterPrefetch:
 
         row = {"id": self.EXPERT_REF, "name": "helper", "expert_type": "worker"}
         monkeypatch.setattr(
-            orchestrator.main.postgres_db,
+            orchestrator.main.app.state.resources.postgres_db,
             "get_expert_by_id",
             AsyncMock(return_value=row),
         )
         monkeypatch.setattr(
-            orchestrator.main.postgres_db,
+            orchestrator.main.app.state.resources.postgres_db,
             "get_expert_visible_by_id",
             AsyncMock(side_effect=AssertionError("expert refs are fetched by id")),
         )
 
-        out = await orchestrator.main._prefetch_roster_refs(
+        out = await session_config_resolution_module.prefetch_roster_refs(
             expert_row={
                 "config": json.dumps(
                     {"subagents": {"roster": {"h": {"$ref": self.EXPERT_REF}}}}
                 )
             },
             user_id="u",
+            dependencies=preparation_composition.session_config_dependencies(
+                orchestrator.main.app.state.resources
+            ),
         )
 
         assert out == {self.EXPERT_REF: row}
@@ -1287,7 +1477,7 @@ class TestRosterPrefetch:
         the runner's visibility, so an override cannot pull another user's
         private expert into a job — the invisible one is simply absent."""
         monkeypatch.setattr(
-            orchestrator.main.postgres_db,
+            orchestrator.main.app.state.resources.postgres_db,
             "get_user",
             AsyncMock(return_value={"id": "u", "is_admin": False}),
         )
@@ -1297,14 +1487,16 @@ class TestRosterPrefetch:
             return {"id": ref, "name": "shared"} if ref == self.OVERRIDE_REF else None
 
         monkeypatch.setattr(
-            orchestrator.main.postgres_db,
+            orchestrator.main.app.state.resources.postgres_db,
             "get_expert_visible_by_id",
             AsyncMock(side_effect=visible),
         )
         by_id = AsyncMock(side_effect=AssertionError("override refs never bypass"))
-        monkeypatch.setattr(orchestrator.main.postgres_db, "get_expert_by_id", by_id)
+        monkeypatch.setattr(
+            orchestrator.main.app.state.resources.postgres_db, "get_expert_by_id", by_id
+        )
 
-        out = await orchestrator.main._prefetch_roster_refs(
+        out = await session_config_resolution_module.prefetch_roster_refs(
             overrides=(
                 {
                     "subagents": {
@@ -1317,6 +1509,9 @@ class TestRosterPrefetch:
             ),
             user_id="u",
             project_ids=["p"],
+            dependencies=preparation_composition.session_config_dependencies(
+                orchestrator.main.app.state.resources
+            ),
         )
 
         assert set(out) == {self.OVERRIDE_REF}
@@ -1325,13 +1520,16 @@ class TestRosterPrefetch:
     @pytest.mark.asyncio
     async def test_override_refs_without_a_runner_fall_back_to_id(self, monkeypatch):
         monkeypatch.setattr(
-            orchestrator.main.postgres_db,
+            orchestrator.main.app.state.resources.postgres_db,
             "get_expert_by_id",
             AsyncMock(return_value={"id": self.OVERRIDE_REF}),
         )
 
-        out = await orchestrator.main._prefetch_roster_refs(
-            overrides=({"subagents": {"roster": {"a": {"$ref": self.OVERRIDE_REF}}}},)
+        out = await session_config_resolution_module.prefetch_roster_refs(
+            overrides=({"subagents": {"roster": {"a": {"$ref": self.OVERRIDE_REF}}}},),
+            dependencies=preparation_composition.session_config_dependencies(
+                orchestrator.main.app.state.resources
+            ),
         )
 
         assert set(out) == {self.OVERRIDE_REF}
@@ -1391,8 +1589,8 @@ def patched_main_subs(monkeypatch):
         return None
 
     monkeypatch.setattr(
-        orchestrator.main,
-        "_resolve_model",
+        model_registry_module,
+        "resolve_model",
         AsyncMock(side_effect=fake_resolve),
         raising=True,
     )
@@ -1406,20 +1604,22 @@ def patched_main_subs(monkeypatch):
         }
 
     monkeypatch.setattr(
-        orchestrator.main.postgres_db,
+        orchestrator.main.app.state.resources.postgres_db,
         "get_user_llm_endpoint",
         AsyncMock(side_effect=fake_get_endpoint),
     )
     monkeypatch.setattr(
-        orchestrator.main.postgres_db,
+        orchestrator.main.app.state.resources.postgres_db,
         "resolve_api_keys_for_job",
         AsyncMock(return_value={}),
     )
     monkeypatch.setattr(
-        orchestrator.main.postgres_db, "get_user_settings", AsyncMock(return_value={})
+        orchestrator.main.app.state.resources.postgres_db,
+        "get_user_settings",
+        AsyncMock(return_value={}),
     )
     monkeypatch.setattr(
-        orchestrator.main.postgres_db,
+        orchestrator.main.app.state.resources.postgres_db,
         "resolve_default_for_capability",
         AsyncMock(return_value=None),
     )
@@ -1430,8 +1630,12 @@ class TestRouteHeaderInjection:
     async def test_claude_sourced_model_gets_visible_thinking_betas(
         self, patched_main_subs
     ):
-        result = await orchestrator.main._inject_dispatch_credentials(
-            _job(), {"llm": {"model": "claude-opus-5"}}
+        result = await job_dispatch_credentials_module.inject_dispatch_credentials(
+            _job(),
+            {"llm": {"model": "claude-opus-5"}},
+            dependencies=preparation_composition.job_dispatch_credential_dependencies(
+                orchestrator.main.app.state.resources
+            ),
         )
         betas = result["llm"]["extra_headers"]["Anthropic-Beta"]
         assert "claude-code-20250219" in betas
@@ -1443,16 +1647,24 @@ class TestRouteHeaderInjection:
         self, patched_main_subs
     ):
         """One endpoint, many accounts — the header follows the account."""
-        result = await orchestrator.main._inject_dispatch_credentials(
-            _job(), {"llm": {"model": "gpt-5.6-sol"}}
+        result = await job_dispatch_credentials_module.inject_dispatch_credentials(
+            _job(),
+            {"llm": {"model": "gpt-5.6-sol"}},
+            dependencies=preparation_composition.job_dispatch_credential_dependencies(
+                orchestrator.main.app.state.resources
+            ),
         )
         assert result["llm"]["extra_headers"] is None
 
     @pytest.mark.asyncio
     async def test_row_without_routing_metadata_gets_no_betas(self, patched_main_subs):
         """Fails closed: an un-attributed row keeps its current behaviour."""
-        result = await orchestrator.main._inject_dispatch_credentials(
-            _job(), {"llm": {"model": "legacy-row"}}
+        result = await job_dispatch_credentials_module.inject_dispatch_credentials(
+            _job(),
+            {"llm": {"model": "legacy-row"}},
+            dependencies=preparation_composition.job_dispatch_credential_dependencies(
+                orchestrator.main.app.state.resources
+            ),
         )
         assert result["llm"]["extra_headers"] is None
 
@@ -1461,8 +1673,12 @@ class TestRouteHeaderInjection:
         self, patched_main_subs
     ):
         """The header is a property of the proxy transport, not of Anthropic."""
-        result = await orchestrator.main._inject_dispatch_credentials(
-            _job(), {"llm": {"model": "plain-endpoint-claude"}}
+        result = await job_dispatch_credentials_module.inject_dispatch_credentials(
+            _job(),
+            {"llm": {"model": "plain-endpoint-claude"}},
+            dependencies=preparation_composition.job_dispatch_credential_dependencies(
+                orchestrator.main.app.state.resources
+            ),
         )
         assert result["llm"]["extra_headers"] is None
 
@@ -1471,21 +1687,28 @@ class TestRouteHeaderInjection:
         """Swapping off a Claude account must CLEAR the header, not leave it —
         hence the explicit None sentinel the agent-side deep_merge acts on,
         the same contract provider/base_url/api_key already use."""
-        result = await orchestrator.main._inject_dispatch_credentials(
+        result = await job_dispatch_credentials_module.inject_dispatch_credentials(
             _job(),
             {"llm": {"model": "gpt-5.6-sol", "extra_headers": {"Anthropic-Beta": "x"}}},
+            dependencies=preparation_composition.job_dispatch_credential_dependencies(
+                orchestrator.main.app.state.resources
+            ),
         )
         # A caller-pinned value still wins; a *stale* one is what this guards,
         # so assert the shape the swap path produces from a clean section.
-        result2 = await orchestrator.main._inject_dispatch_credentials(
-            _job(), {"llm": {"model": "gpt-5.6-sol"}}
+        result2 = await job_dispatch_credentials_module.inject_dispatch_credentials(
+            _job(),
+            {"llm": {"model": "gpt-5.6-sol"}},
+            dependencies=preparation_composition.job_dispatch_credential_dependencies(
+                orchestrator.main.app.state.resources
+            ),
         )
         assert result2["llm"]["extra_headers"] is None
         assert result["llm"]["extra_headers"] == {"Anthropic-Beta": "x"}
 
     @pytest.mark.asyncio
     async def test_caller_pinned_header_wins(self, patched_main_subs):
-        result = await orchestrator.main._inject_dispatch_credentials(
+        result = await job_dispatch_credentials_module.inject_dispatch_credentials(
             _job(),
             {
                 "llm": {
@@ -1493,6 +1716,9 @@ class TestRouteHeaderInjection:
                     "extra_headers": {"Anthropic-Beta": "operator-pinned"},
                 }
             },
+            dependencies=preparation_composition.job_dispatch_credential_dependencies(
+                orchestrator.main.app.state.resources
+            ),
         )
         assert result["llm"]["extra_headers"]["Anthropic-Beta"] == "operator-pinned"
 
@@ -1500,8 +1726,12 @@ class TestRouteHeaderInjection:
     async def test_nested_slot_gets_the_header_too(self, patched_main_subs):
         """A summarization/roster slot on a Claude account needs it as much as
         the main model does."""
-        result = await orchestrator.main._inject_dispatch_credentials(
-            _job(), {"llm": {"summarization": {"model": "claude-opus-5"}}}
+        result = await job_dispatch_credentials_module.inject_dispatch_credentials(
+            _job(),
+            {"llm": {"summarization": {"model": "claude-opus-5"}}},
+            dependencies=preparation_composition.job_dispatch_credential_dependencies(
+                orchestrator.main.app.state.resources
+            ),
         )
         betas = result["llm"]["summarization"]["extra_headers"]["Anthropic-Beta"]
         assert "redact-thinking" not in betas
@@ -1514,7 +1744,7 @@ async def test_empty_install_quietly_skips_kb_embeddings(monkeypatch, caplog, pr
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("EMBEDDING_PROVIDER", provider)
     monkeypatch.setattr(
-        orchestrator.main.postgres_db,
+        orchestrator.main.app.state.resources.postgres_db,
         "resolve_default_for_capability",
         AsyncMock(return_value=None),
     )

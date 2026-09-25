@@ -14,6 +14,9 @@ from fastapi.testclient import TestClient
 
 from tests._mounted_router import mount_router
 from orchestrator.schemas.expert_catalog import ExpertInfo
+from orchestrator.application import catalogue as catalogue_composition
+from orchestrator.services import config_overrides as config_overrides_module
+from orchestrator.services import session_tool_policy as session_tool_policy_module
 
 
 USER_ID = "00000000-0000-0000-0000-000000000101"
@@ -85,14 +88,14 @@ def catalogue_wire(monkeypatch):
         ExpertCatalogDependencies(
             store=store,
             state=state,
-            get_config_dir=main._get_config_dir,
+            get_config_dir=catalogue_composition.get_config_dir,
             load_settings_matrix=main.app.state.catalogue_resources.load_settings_matrix,
             experts_enabled=lambda: settings.experts_enabled,
             skills_enabled=lambda: settings.skills_enabled,
             account_defaults_layer=AsyncMock(return_value={}),
             visible_project_ids=AsyncMock(return_value=[]),
-            with_validated_tool_overrides=main._with_validated_tool_overrides,
-            looks_like_uuid=main._looks_like_uuid,
+            with_validated_tool_overrides=session_tool_policy_module.with_validated_tool_overrides,
+            looks_like_uuid=config_overrides_module.looks_like_uuid,
             forge=None,
         )
     )

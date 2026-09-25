@@ -27,6 +27,9 @@ from shared.runtime.core.expert_resolution import (
     ASSEMBLER_OWNED_PROMPT_TOKENS,
     validate_expert_persona_placeholders,
 )
+from orchestrator.security import access as access_module
+from orchestrator.security import auth as auth_module
+from orchestrator.services import grant_enforcement as grant_enforcement_module
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -120,7 +123,7 @@ async def test_copy_boundary_accepts_clean_prompts_and_refuses_legacy_tokens(
     monkeypatch,
 ):
     created = AsyncMock(return_value={"id": "copy"})
-    monkeypatch.setattr(main.postgres_db, "create_expert", created)
+    monkeypatch.setattr(main.app.state.resources.postgres_db, "create_expert", created)
     source = {
         "name": "source",
         "display_name": "Source",
@@ -157,15 +160,21 @@ async def test_duplicate_route_returns_422_for_a_legacy_source(monkeypatch):
     fake = AsyncMock()
     fake.get_expert_visible_by_id = AsyncMock(return_value=source)
     fake.create_expert = AsyncMock(side_effect=AssertionError("must not write"))
-    monkeypatch.setattr(main, "postgres_db", fake)
+    monkeypatch.setattr(main.app.state.resources, "postgres_db", fake)
     monkeypatch.setattr(
-        main,
+        auth_module,
         "require_approved_user",
         AsyncMock(return_value={"id": str(uuid4()), "is_admin": False}),
     )
-    monkeypatch.setattr(main, "user_visible_project_ids", AsyncMock(return_value=[]))
-    monkeypatch.setattr(main, "_enforce_expert_save_prelude", AsyncMock())
-    monkeypatch.setattr(main, "_strip_save_grants", AsyncMock(return_value=({}, [])))
+    monkeypatch.setattr(
+        access_module, "user_visible_project_ids", AsyncMock(return_value=[])
+    )
+    monkeypatch.setattr(
+        grant_enforcement_module, "enforce_expert_save_prelude", AsyncMock()
+    )
+    monkeypatch.setattr(
+        grant_enforcement_module, "strip_save_grants", AsyncMock(return_value=({}, []))
+    )
 
     with pytest.raises(HTTPException, match="reserved prompt placeholders") as exc:
         await catalogue_route(expert_routes.duplicate_expert)(AsyncMock(), source_id)
@@ -191,9 +200,9 @@ async def test_personal_default_fork_returns_422_for_a_legacy_source(monkeypatch
     fake.fork_and_set_user_expert_default = AsyncMock(
         side_effect=AssertionError("must not write")
     )
-    monkeypatch.setattr(main, "postgres_db", fake)
+    monkeypatch.setattr(main.app.state.resources, "postgres_db", fake)
     monkeypatch.setattr(
-        main,
+        auth_module,
         "require_approved_user",
         AsyncMock(return_value={"id": str(uuid4()), "is_admin": False}),
     )

@@ -2,12 +2,13 @@
 
 Three things are proven here, in this order:
 
-1. **Reference wiring.** ``_lane_j_wiring`` below builds every dependency object
-   lane J's modules take, reading ``orchestrator.main``'s globals *at call
-   time*. It is the exact specification the root integrator implements as
-   ``main._<name>_dependencies()`` factories, and every test in this file goes
-   through it — so a field that cannot be resolved late is a failure here, not
-   a surprise at integration.
+1. **Reference wiring.** The ``_*_deps`` factories below build every dependency
+   object lane J's modules take, reading the owning modules and the
+   application's resources *at call time*. They are the exact specification the
+   composition implements (R1.B12: ``orchestrator.application.preparation`` /
+   ``controls``, formerly ``main._<name>_dependencies()``), and every test in
+   this file goes through them — so a field that cannot be resolved late is a
+   failure here, not a surprise at integration.
 
 2. **Parity against the current ``main`` implementation.** Much of lane J is
    only covered through mocked callers, and several nodes had no test at all
@@ -19,12 +20,13 @@ Three things are proven here, in this order:
    here, so the move is provably behaviour-preserving rather than
    assumption-preserving.
 
-3. **Late binding, per port-contract §P3.** A ``main`` wrapper does NOT
-   intercept a call made inside a service. Every dependency field that exists
-   because a caller (or its test) patches the name on ``main`` gets a test that
-   patches that name, rebuilds the dependency object through the reference
-   factory, calls the service, and asserts the stub was reached — asserting a
-   value only the stub could produce, never merely "it didn't crash".
+3. **Late binding, per port-contract §P3.** A wrapper does NOT intercept a
+   call made inside a service. Every dependency field gets a test that patches
+   its owner, rebuilds the dependency object through the reference factory AND
+   through the application's composition factory, and asserts the stub was
+   reached — asserting a value only the stub could produce, never merely "it
+   didn't crash". Running both sides through one table is also the parity
+   proof between the reference wiring and the application's.
 
 The fences (``attest_pinned_k8s_job_workspace``,
 ``pinned_k8s_job_workspace_authority_is_current``, the two stateless
@@ -36,8 +38,10 @@ file.
 from __future__ import annotations
 
 
+from orchestrator.services.workspace_lifecycle import EnsureOutcome
 from tests import b08_completion_helpers as b08_helpers
 
+import inspect
 import json
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
@@ -62,24 +66,73 @@ from orchestrator.services.container_provisioner import (
     WorkspaceRuntimeAuthorityError,
 )
 from orchestrator.services.workspace_lifecycle import WorkspaceOwner
+from orchestrator.application import access as access_composition
+from orchestrator.application import catalogue as catalogue_composition
+from orchestrator.application import completion as completion_composition
+from orchestrator.application import controls as controls_composition
+from orchestrator.application import http as http_composition
+from orchestrator.application import jobs as jobs_composition
+from orchestrator.application import preparation as preparation_composition
+from orchestrator.application import sessions as sessions_composition
+from orchestrator.application.resources import bound
+from orchestrator.security import access as access_module
+from orchestrator.services import (
+    agent_datasource_payload as agent_datasource_payload_module,
+)
+from orchestrator.services import config_resolver as config_resolver_module
+from orchestrator.services import container_provisioner as container_provisioner_module
+from orchestrator.services import deployment_gates as deployment_gates_module
+from orchestrator.services import dispatch_credentials as dispatch_credentials_module
+from orchestrator.services import grant_enforcement as grant_enforcement_module
+from orchestrator.services import (
+    job_datasource_selection as job_datasource_selection_module,
+)
+from orchestrator.services import (
+    job_dispatch_credentials as job_dispatch_credentials_module,
+)
+from orchestrator.services import job_dispatcher as job_dispatcher_module
+from orchestrator.services import job_mutation_target as job_mutation_target_module
+from orchestrator.services import job_start_bundle as job_start_bundle_module
+from orchestrator.services import (
+    job_workspace_authority as job_workspace_authority_module,
+)
+from orchestrator.services import job_workspace_runtime as job_workspace_runtime_module
+from orchestrator.services import (
+    managed_repository_authority as managed_repository_authority_module,
+)
+from orchestrator.services import runtime_actor as runtime_actor_module
+from orchestrator.services import (
+    session_config_resolution as session_config_resolution_module,
+)
+from orchestrator.services import subjob_completion as subjob_completion_module
+from orchestrator.services import (
+    thread_datasource_authorization as thread_datasource_authorization_module,
+)
+from orchestrator.services import vm_provisioner as vm_provisioner_module
+from orchestrator.services import workspace_lifecycle as workspace_lifecycle_module
+from orchestrator.services import workspace_suspension as workspace_suspension_module
+from orchestrator.services import workspace_tier_policy as workspace_tier_policy_module
+from shared.runtime.core import model_registry as model_registry_module
+import functools
 
 
 # =============================================================================
-# Reference wiring — the factories the root integrator writes into main
+# Reference wiring — the factories the composition implements
 # =============================================================================
 #
-# Every field reads ``main.<name>`` inside the factory body, so a
-# monkeypatched application global is observed on the next build. Capturing any
-# of these at import time is exactly the defect §P1 forbids.
+# Every field reads its owner (``<module>.<name>``) or the application's
+# resources inside the factory body, so a monkeypatched owner is observed on
+# the next build. Capturing any of these at import time is exactly the defect
+# §P1 forbids.
 
 
 def _datasource_payload_deps() -> (
     agent_datasource_payload.DatasourcePayloadDependencies
 ):
     return agent_datasource_payload.DatasourcePayloadDependencies(
-        logger=main.logger,
-        mcp_datasources_enabled=main._mcp_datasources_enabled,
-        mcp_stdio_enabled=main._mcp_stdio_enabled,
+        logger=preparation_composition.logger,
+        mcp_datasources_enabled=deployment_gates_module.mcp_datasources_enabled,
+        mcp_stdio_enabled=deployment_gates_module.mcp_stdio_enabled,
     )
 
 
@@ -87,21 +140,29 @@ def _datasource_selection_deps() -> (
     job_datasource_selection.JobDatasourceSelectionDependencies
 ):
     return job_datasource_selection.JobDatasourceSelectionDependencies(
-        store=main.postgres_db,
-        authorize_thread_datasource_selection=main._authorize_thread_datasource_selection,
-        backend_from_override=main._backend_from_override,
-        revalidate_selection=main._revalidate_job_datasource_selection,
+        store=main.app.state.resources.postgres_db,
+        authorize_thread_datasource_selection=bound(
+            thread_datasource_authorization_module.authorize_thread_datasource_selection,
+            sessions_composition.thread_datasource_authorization_dependencies,
+            main.app.state.resources,
+        ),
+        backend_from_override=workspace_tier_policy_module.backend_from_override,
+        revalidate_selection=bound(
+            job_datasource_selection_module.revalidate_job_datasource_selection,
+            preparation_composition.job_datasource_selection_dependencies,
+            main.app.state.resources,
+        ),
     )
 
 
 def _workspace_runtime_deps() -> job_workspace_runtime.JobWorkspaceRuntimeDependencies:
     return job_workspace_runtime.JobWorkspaceRuntimeDependencies(
-        store=main.postgres_db,
-        vm_mode=lambda: main.vm_provisioner.mode,
-        workspace_provisioner=main.container_provisioner,
-        vm_workspaces_on_pod_network=main.vm_workspaces_on_pod_network,
-        stateless_worker_enabled=lambda: main.STATELESS_WORKER_ENABLED,
-        backend_from_override=main._backend_from_override,
+        store=main.app.state.resources.postgres_db,
+        vm_mode=lambda: vm_provisioner_module.vm_provisioner.mode,
+        workspace_provisioner=container_provisioner_module.container_provisioner,
+        vm_workspaces_on_pod_network=access_module.vm_workspaces_on_pod_network,
+        stateless_worker_enabled=lambda: main.app.state.resources.settings.stateless_worker_enabled,
+        backend_from_override=workspace_tier_policy_module.backend_from_override,
     )
 
 
@@ -109,19 +170,31 @@ def _workspace_authority_deps() -> (
     job_workspace_authority.JobWorkspaceAuthorityDependencies
 ):
     return job_workspace_authority.JobWorkspaceAuthorityDependencies(
-        store=main.postgres_db,
-        logger=main.logger,
-        workspace_provisioner=main.container_provisioner,
-        vm_provisioner=main.vm_provisioner,
-        vm_mode=lambda: main.vm_provisioner.mode,
-        ensure_workspace=main.ensure_workspace,
-        workspace_suspension=main.workspace_suspension_service,
+        store=main.app.state.resources.postgres_db,
+        logger=preparation_composition.logger,
+        workspace_provisioner=container_provisioner_module.container_provisioner,
+        vm_provisioner=vm_provisioner_module.vm_provisioner,
+        vm_mode=lambda: vm_provisioner_module.vm_provisioner.mode,
+        ensure_workspace=workspace_lifecycle_module.ensure_workspace,
+        workspace_suspension=workspace_suspension_module.workspace_suspension_service,
         handle_scholar_completion=b08_helpers.handle_scholar_completion,
         handle_delegation_child_completion=b08_helpers.handle_delegation_child_completion,
-        resolve_inherited_workspace=main._resolve_subjob_inherited_workspace,
-        fail_subjob_and_unblock_parent=main._fail_subjob_and_unblock_parent,
+        resolve_inherited_workspace=bound(
+            job_workspace_authority_module.resolve_subjob_inherited_workspace,
+            preparation_composition.job_workspace_authority_dependencies,
+            main.app.state.resources,
+        ),
+        fail_subjob_and_unblock_parent=bound(
+            job_workspace_authority_module.fail_subjob_and_unblock_parent,
+            preparation_composition.job_workspace_authority_dependencies,
+            main.app.state.resources,
+        ),
         workspace_runtime_unchanged_before_delivery=(
-            main._workspace_runtime_unchanged_before_delivery
+            bound(
+                job_workspace_authority_module.workspace_runtime_unchanged_before_delivery,
+                preparation_composition.job_workspace_authority_dependencies,
+                main.app.state.resources,
+            )
         ),
     )
 
@@ -130,81 +203,163 @@ def _dispatch_credential_deps() -> (
     job_dispatch_credentials.DispatchCredentialDependencies
 ):
     return job_dispatch_credentials.DispatchCredentialDependencies(
-        store=main.postgres_db,
-        logger=main.logger,
-        resolve_model=main._resolve_model,
-        inject_model_credentials=main._inject_model_credentials,
-        inject_env_key_credentials=main._inject_env_key_credentials,
-        inject_search_credentials=main._inject_search_credentials,
-        inject_system_kb_embedding_profile=main._inject_system_kb_embedding_profile,
-        dispatch_llm_provider_fallback=main._dispatch_llm_provider_fallback,
-        nested_model_slots=main._nested_model_slots,
+        store=main.app.state.resources.postgres_db,
+        logger=preparation_composition.logger,
+        resolve_model=model_registry_module.resolve_model,
+        inject_model_credentials=bound(
+            dispatch_credentials_module.inject_model_credentials,
+            preparation_composition.dispatch_credential_dependencies,
+            main.app.state.resources,
+        ),
+        inject_env_key_credentials=bound(
+            dispatch_credentials_module.inject_env_key_credentials,
+            preparation_composition.dispatch_credential_dependencies,
+            main.app.state.resources,
+        ),
+        inject_search_credentials=bound(
+            dispatch_credentials_module.inject_search_credentials,
+            preparation_composition.dispatch_credential_dependencies,
+            main.app.state.resources,
+        ),
+        inject_system_kb_embedding_profile=bound(
+            dispatch_credentials_module.inject_system_kb_embedding_profile,
+            preparation_composition.dispatch_credential_dependencies,
+            main.app.state.resources,
+        ),
+        dispatch_llm_provider_fallback=dispatch_credentials_module.dispatch_llm_provider_fallback,
+        nested_model_slots=dispatch_credentials_module.nested_model_slots,
     )
 
 
 def _start_bundle_deps() -> job_start_bundle.JobStartBundleDependencies:
     return job_start_bundle.JobStartBundleDependencies(
-        store=main.postgres_db,
-        logger=main.logger,
-        forge=main.gitea_client,
+        store=main.app.state.resources.postgres_db,
+        logger=preparation_composition.logger,
+        forge=main.app.state.resources.gitea_client,
         workspace_runtime=_workspace_runtime_deps(),
-        inject_dispatch_credentials=main._inject_dispatch_credentials,
-        resolve_authorized_job_datasources=main._resolve_authorized_job_datasources,
-        job_project_repositories=main._job_project_repositories,
-        apply_cloud_storage_override=main._apply_cloud_storage_override,
-        build_datasources_payload=main._build_datasources_payload,
-        build_datasource_tool_override=main._build_datasource_tool_override,
-        prepare_job_primary_repository_authority=main.prepare_job_primary_repository_authority,
-        prepare_project_repository_authority=main.prepare_project_repository_authority,
-        authorize_job_repository_transport=main.authorize_job_repository_transport,
-        mint_worker_runtime_actor=main.mint_worker_runtime_actor,
-        inject_blob_credentials=main.inject_blob_credentials,
-        grant_denied_error=main.GrantDenied,
-        lite_workspace_config_error=main.LiteWorkspaceConfigError,
-        backend_from_override=main._backend_from_override,
-        inject_lite_workspace_config=main._inject_lite_workspace_config,
-        is_experts_db_enabled=main._is_experts_db_enabled,
-        user_experts_enabled=main._user_experts_enabled,
-        enforce_dispatch_grants=main._enforce_dispatch_grants,
-        grant_violations_detail=main._grant_violations_detail,
-        resolve_default_models=main._resolve_default_models,
-        prefetch_roster_refs=main._prefetch_roster_refs,
-        seed_registry_model_overrides=main._seed_registry_model_overrides,
-        gather_in_scope_skills=main._gather_in_scope_skills,
-        resolve_config=main.resolve_config,
-        vm_workspaces_on_pod_network=main.vm_workspaces_on_pod_network,
+        inject_dispatch_credentials=bound(
+            job_dispatch_credentials_module.inject_dispatch_credentials,
+            preparation_composition.job_dispatch_credential_dependencies,
+            main.app.state.resources,
+        ),
+        resolve_authorized_job_datasources=bound(
+            job_datasource_selection_module.resolve_authorized_job_datasources,
+            preparation_composition.job_datasource_selection_dependencies,
+            main.app.state.resources,
+        ),
+        job_project_repositories=bound(
+            job_start_bundle_module.job_project_repositories,
+            preparation_composition.job_start_bundle_dependencies,
+            main.app.state.resources,
+        ),
+        apply_cloud_storage_override=agent_datasource_payload_module.apply_cloud_storage_override,
+        build_datasources_payload=bound(
+            agent_datasource_payload_module.build_datasources_payload,
+            preparation_composition.datasource_payload_dependencies,
+            main.app.state.resources,
+        ),
+        build_datasource_tool_override=bound(
+            agent_datasource_payload_module.build_datasource_tool_override,
+            preparation_composition.datasource_payload_dependencies,
+            main.app.state.resources,
+        ),
+        prepare_job_primary_repository_authority=managed_repository_authority_module.prepare_job_primary_repository_authority,
+        prepare_project_repository_authority=managed_repository_authority_module.prepare_project_repository_authority,
+        authorize_job_repository_transport=managed_repository_authority_module.authorize_job_repository_transport,
+        mint_worker_runtime_actor=runtime_actor_module.mint_worker_runtime_actor,
+        inject_blob_credentials=config_resolver_module.inject_blob_credentials,
+        grant_denied_error=grant_enforcement_module.GrantDenied,
+        lite_workspace_config_error=workspace_tier_policy_module.LiteWorkspaceConfigError,
+        backend_from_override=workspace_tier_policy_module.backend_from_override,
+        inject_lite_workspace_config=workspace_tier_policy_module.inject_lite_workspace_config,
+        is_experts_db_enabled=deployment_gates_module.is_experts_db_enabled,
+        user_experts_enabled=bound(
+            grant_enforcement_module.user_experts_enabled,
+            preparation_composition.grant_enforcement_dependencies,
+            main.app.state.resources,
+        ),
+        enforce_dispatch_grants=bound(
+            grant_enforcement_module.enforce_dispatch_grants,
+            preparation_composition.grant_enforcement_dependencies,
+            main.app.state.resources,
+        ),
+        grant_violations_detail=grant_enforcement_module.grant_violations_detail,
+        resolve_default_models=bound(
+            session_config_resolution_module.resolve_default_models,
+            preparation_composition.session_config_dependencies,
+            main.app.state.resources,
+        ),
+        prefetch_roster_refs=bound(
+            session_config_resolution_module.prefetch_roster_refs,
+            preparation_composition.session_config_dependencies,
+            main.app.state.resources,
+        ),
+        seed_registry_model_overrides=bound(
+            dispatch_credentials_module.seed_registry_model_overrides,
+            preparation_composition.dispatch_credential_dependencies,
+            main.app.state.resources,
+        ),
+        gather_in_scope_skills=(
+            lambda *args, **kwargs: catalogue_composition.expert_catalog_service(
+                main.app.state.resources
+            ).gather_in_scope_skills(*args, **kwargs)
+        ),
+        resolve_config=config_resolver_module.resolve_config,
+        vm_workspaces_on_pod_network=access_module.vm_workspaces_on_pod_network,
     )
 
 
 def _job_assignment_deps() -> job_assignment_routes.JobAssignmentDependencies:
     return job_assignment_routes.JobAssignmentDependencies(
-        store=main.postgres_db,
-        logger=main.logger,
-        require_admin=main._require_admin,
-        vm_mode=lambda: main.vm_provisioner.mode,
-        completion_commands_enabled=lambda: main.COMPLETION_COMMANDS_ENABLED,
-        prepare_job_workspace_runtime=main._prepare_job_workspace_runtime,
-        prepare_job_repository_before_claim=main._prepare_job_repository_before_claim,
+        store=main.app.state.resources.postgres_db,
+        # The assignment route's dependencies are composed by ``controls``, so
+        # the injected logger is that module's (R1.B12).
+        logger=controls_composition.logger,
+        require_admin=functools.partial(
+            access_composition.require_admin, main.app.state.resources
+        ),
+        vm_mode=lambda: vm_provisioner_module.vm_provisioner.mode,
+        completion_commands_enabled=lambda: main.app.state.resources.settings.completion_commands_enabled,
+        prepare_job_workspace_runtime=bound(
+            job_workspace_authority_module.prepare_job_workspace_runtime,
+            preparation_composition.job_workspace_authority_dependencies,
+            main.app.state.resources,
+        ),
+        prepare_job_repository_before_claim=bound(
+            job_start_bundle_module.prepare_job_repository_before_claim,
+            preparation_composition.job_start_bundle_dependencies,
+            main.app.state.resources,
+        ),
         resume_missing_workspace=lambda *args, **kwargs: (
             job_workspace_runtime.resume_missing_workspace(
                 *args,
                 **kwargs,
-                dependencies=main._job_workspace_runtime_dependencies(),
+                dependencies=preparation_composition.job_workspace_runtime_dependencies(
+                    main.app.state.resources
+                ),
             )
         ),
-        guard_completion_control=main._completion_control_boundary.guard,
-        claim_completion_control=main._completion_control_boundary.claim,
-        abort_completion_control_claim=main._completion_control_boundary.abort,
+        guard_completion_control=main.app.state.resources.completion_control_boundary.guard,
+        claim_completion_control=main.app.state.resources.completion_control_boundary.claim,
+        abort_completion_control_claim=main.app.state.resources.completion_control_boundary.abort,
         completion_resume_guard_kwargs=(
-            main._completion_control_boundary.resume_guard_kwargs
+            main.app.state.resources.completion_control_boundary.resume_guard_kwargs
         ),
         dispatch_job_to_agent=lambda job, agent: (
-            main._job_delivery_operations().dispatch(job, agent)
+            controls_composition.job_delivery_operations(
+                main.app.state.resources
+            ).dispatch(job, agent)
         ),
         resume_job_on_agent=lambda job, agent: (
-            main._job_delivery_operations().resume(job, agent)
+            controls_composition.job_delivery_operations(
+                main.app.state.resources
+            ).resume(job, agent)
         ),
-        trigger_dispatch=main._trigger_dispatch,
+        trigger_dispatch=bound(
+            job_dispatcher_module.trigger_dispatch,
+            jobs_composition.job_dispatch_dependencies,
+            main.app.state.resources,
+        ),
     )
 
 
@@ -289,7 +444,7 @@ class TestPureHelperParity:
     def test_mask_repository_transport(self, url):
         assert job_start_bundle.mask_repository_transport(
             url
-        ) == main._mask_repository_transport(url)
+        ) == job_start_bundle_module.mask_repository_transport(url)
 
     def test_mask_repository_transport_drops_userinfo(self):
         masked = job_start_bundle.mask_repository_transport(
@@ -314,26 +469,26 @@ class TestPureHelperParity:
         job = {"id": "j", "context": context}
         assert job_start_bundle.redispatch_livelock_trip(
             job
-        ) == main._redispatch_livelock_trip(job)
+        ) == job_start_bundle_module.redispatch_livelock_trip(job)
 
     def test_redispatch_livelock_trip_counts_and_delay_constants(self):
         # The redispatch loop is bounded by these two; a change to either is a
         # behaviour change, not a refactor.
         assert (
             job_start_bundle.FRESH_PINNED_RECIPIENT_ATTESTATION_ATTEMPTS
-            == main._FRESH_PINNED_RECIPIENT_ATTESTATION_ATTEMPTS
+            == job_mutation_target_module.FRESH_PINNED_RECIPIENT_ATTESTATION_ATTEMPTS
             == 8
         )
         assert (
             job_start_bundle.FRESH_PINNED_RECIPIENT_ATTESTATION_DELAY_S
-            == main._FRESH_PINNED_RECIPIENT_ATTESTATION_DELAY_S
+            == job_mutation_target_module.FRESH_PINNED_RECIPIENT_ATTESTATION_DELAY_S
             == 0.25
         )
 
     def test_pinned_job_mutation_target_shape(self):
         assert (
             job_start_bundle.PinnedJobMutationTarget._fields
-            == main._PinnedJobMutationTarget._fields
+            == job_mutation_target_module.PinnedJobMutationTarget._fields
             == ("agent", "recipient")
         )
 
@@ -351,25 +506,27 @@ class TestPureHelperParity:
     )
     def test_context_readers(self, context):
         job = {"id": "j", "context": context}
-        assert job_workspace_runtime.get_vm_context(job) == main._get_vm_context(job)
+        assert job_workspace_runtime.get_vm_context(
+            job
+        ) == job_workspace_runtime_module.get_vm_context(job)
         assert job_workspace_runtime.get_container_context(
             job
-        ) == main._get_container_context(job)
+        ) == job_workspace_runtime_module.get_container_context(job)
         assert job_workspace_runtime.get_infra_transient_context(
             job
-        ) == main._get_infra_transient_context(job)
+        ) == job_workspace_runtime_module.get_infra_transient_context(job)
 
     def test_workspace_context_keys_constant(self):
         assert (
             job_workspace_runtime.WORKSPACE_CONTEXT_KEYS
-            == main._WORKSPACE_CONTEXT_KEYS
+            == job_workspace_runtime_module.WORKSPACE_CONTEXT_KEYS
             == {"vm": "vm", "sandbox": "workspace_container"}
         )
 
     def test_inherit_wait_budget_constant(self):
         assert (
             job_workspace_authority.INHERIT_WORKSPACE_MAX_WAIT_S
-            == main._INHERIT_WORKSPACE_MAX_WAIT_S
+            == job_workspace_authority_module.INHERIT_WORKSPACE_MAX_WAIT_S
         )
 
     @pytest.mark.parametrize(
@@ -399,7 +556,7 @@ class TestPureHelperParity:
     def test_stateless_worker_workspace_owner(self, job):
         assert job_workspace_runtime.stateless_worker_workspace_owner(
             job
-        ) == main._stateless_worker_workspace_owner(job)
+        ) == job_workspace_runtime_module.stateless_worker_workspace_owner(job)
 
     @pytest.mark.parametrize(
         "ctx,env",
@@ -418,7 +575,7 @@ class TestPureHelperParity:
             monkeypatch.setenv("SSH_KEY_PATH", env)
         assert job_workspace_runtime.container_ssh_key_path(
             ctx
-        ) == main._container_ssh_key_path(ctx)
+        ) == job_workspace_runtime_module.container_ssh_key_path(ctx)
 
     @pytest.mark.parametrize("replace_endpoint", [False, True])
     @pytest.mark.parametrize(
@@ -445,7 +602,7 @@ class TestPureHelperParity:
         mine = job_workspace_runtime.inject_container_workspace_config(
             _copy.deepcopy(override), dict(ctx), replace_endpoint=replace_endpoint
         )
-        theirs = main._inject_container_workspace_config(
+        theirs = job_workspace_runtime_module.inject_container_workspace_config(
             _copy.deepcopy(override), dict(ctx), replace_endpoint=replace_endpoint
         )
         assert mine == theirs
@@ -470,7 +627,7 @@ class TestPureHelperParity:
         mine = job_workspace_runtime.inject_vm_workspace_config(
             _copy.deepcopy(override), dict(ctx), replace_endpoint=replace_endpoint
         )
-        theirs = main._inject_vm_workspace_config(
+        theirs = job_workspace_runtime_module.inject_vm_workspace_config(
             _copy.deepcopy(override), dict(ctx), replace_endpoint=replace_endpoint
         )
         assert mine == theirs
@@ -509,7 +666,9 @@ class TestPureHelperParity:
         job = {"id": "j", "context": ctx}
         assert job_workspace_runtime.apply_sticky_sudo_denial(
             job, _copy.deepcopy(override)
-        ) == main._apply_sticky_sudo_denial(job, _copy.deepcopy(override))
+        ) == job_workspace_runtime_module.apply_sticky_sudo_denial(
+            job, _copy.deepcopy(override)
+        )
 
     @pytest.mark.parametrize(
         "rows",
@@ -525,7 +684,7 @@ class TestPureHelperParity:
     def test_repository_datasource_names(self, rows):
         assert job_datasource_selection.repository_datasource_names(
             rows
-        ) == main._repository_datasource_names(rows)
+        ) == job_datasource_selection_module.repository_datasource_names(rows)
 
 
 # =============================================================================
@@ -548,7 +707,7 @@ class TestExactDatasourceResolution:
 
         return (
             run(job_datasource_selection.require_exact_datasource_resolution),
-            run(main._require_exact_datasource_resolution),
+            run(job_datasource_selection_module.require_exact_datasource_resolution),
         )
 
     @pytest.mark.parametrize(
@@ -681,7 +840,12 @@ class TestDatasourcePayload:
             rows, dependencies=_datasource_payload_deps()
         )
         assert payload[0]["credentials"] == {}
-        assert payload == main._build_datasources_payload(rows)
+        assert payload == agent_datasource_payload_module.build_datasources_payload(
+            rows,
+            dependencies=preparation_composition.datasource_payload_dependencies(
+                main.app.state.resources
+            ),
+        )
 
     def test_email_stays_credentialed_at_every_tier(self):
         rows = [
@@ -697,7 +861,12 @@ class TestDatasourcePayload:
             rows, dependencies=_datasource_payload_deps()
         )
         assert payload[0]["credentials"] == {"password": "imap"}
-        assert payload == main._build_datasources_payload(rows)
+        assert payload == agent_datasource_payload_module.build_datasources_payload(
+            rows,
+            dependencies=preparation_composition.datasource_payload_dependencies(
+                main.app.state.resources
+            ),
+        )
 
     def test_only_one_email_datasource_is_forwarded(self):
         rows = [
@@ -708,7 +877,12 @@ class TestDatasourcePayload:
             rows, dependencies=_datasource_payload_deps()
         )
         assert [entry["name"] for entry in payload] == ["first"]
-        assert payload == main._build_datasources_payload(rows)
+        assert payload == agent_datasource_payload_module.build_datasources_payload(
+            rows,
+            dependencies=preparation_composition.datasource_payload_dependencies(
+                main.app.state.resources
+            ),
+        )
 
     def test_kb_row_is_stripped_of_url_and_credentials(self):
         rows = [
@@ -726,7 +900,12 @@ class TestDatasourcePayload:
         assert payload[0]["connection_url"] is None
         assert payload[0]["credentials"] == {}
         assert payload[0]["project_read_only"] is True
-        assert payload == main._build_datasources_payload(rows)
+        assert payload == agent_datasource_payload_module.build_datasources_payload(
+            rows,
+            dependencies=preparation_composition.datasource_payload_dependencies(
+                main.app.state.resources
+            ),
+        )
 
     def test_repository_carries_internal_id_and_config(self):
         rows = [
@@ -745,19 +924,35 @@ class TestDatasourcePayload:
         assert payload[0]["datasource_id"] == rows[0]["id"]
         assert payload[0]["config"] == {"forge": "gitea"}
         assert payload[0]["require_default_branch"] is True
-        assert payload == main._build_datasources_payload(rows)
+        assert payload == agent_datasource_payload_module.build_datasources_payload(
+            rows,
+            dependencies=preparation_composition.datasource_payload_dependencies(
+                main.app.state.resources
+            ),
+        )
 
     @pytest.mark.parametrize("rows", [None, [], [_ds(credentials="{not json")]])
     def test_payload_parity_edges(self, rows):
         assert agent_datasource_payload.build_datasources_payload(
             rows, dependencies=_datasource_payload_deps()
-        ) == main._build_datasources_payload(rows)
+        ) == agent_datasource_payload_module.build_datasources_payload(
+            rows,
+            dependencies=preparation_composition.datasource_payload_dependencies(
+                main.app.state.resources
+            ),
+        )
 
     def test_tool_override_parity(self):
         rows = [_ds(), _ds(type="neo4j", name="graph")]
         assert agent_datasource_payload.build_datasource_tool_override(
             rows, {"tools": {"custom": ["x"]}}, dependencies=_datasource_payload_deps()
-        ) == main._build_datasource_tool_override(rows, {"tools": {"custom": ["x"]}})
+        ) == agent_datasource_payload_module.build_datasource_tool_override(
+            rows,
+            {"tools": {"custom": ["x"]}},
+            dependencies=preparation_composition.datasource_payload_dependencies(
+                main.app.state.resources
+            ),
+        )
 
     def test_tool_override_does_not_mutate_the_caller_override(self):
         override = {"tools": {"custom": ["x"]}}
@@ -772,7 +967,7 @@ class TestDatasourcePayload:
         mine = [_ds(type="webdav", project_read_only=False)]
         theirs = [_ds(type="webdav", project_read_only=False)]
         agent_datasource_payload.apply_cloud_storage_override(mine, context)
-        main._apply_cloud_storage_override(theirs, context)
+        agent_datasource_payload_module.apply_cloud_storage_override(theirs, context)
         assert mine == theirs
 
 
@@ -796,10 +991,17 @@ class TestWorkspaceTierPredicates:
     )
     def test_needs_vm_and_sandbox_parity(self, job):
         deps = _workspace_runtime_deps()
-        assert job_workspace_runtime.job_needs_vm(job) == main._job_needs_vm(job)
+        assert job_workspace_runtime.job_needs_vm(
+            job
+        ) == job_workspace_runtime_module.job_needs_vm(job)
         assert job_workspace_runtime.job_needs_sandbox(
             job, dependencies=deps
-        ) == main._job_needs_sandbox(job)
+        ) == job_workspace_runtime_module.job_needs_sandbox(
+            job,
+            dependencies=preparation_composition.job_workspace_runtime_dependencies(
+                main.app.state.resources
+            ),
+        )
 
     def test_ambiguous_contract_never_guesses_a_tier(self):
         """An unresolvable contract refuses both tiers rather than picking one.
@@ -849,7 +1051,10 @@ class TestWorkspaceTierPredicates:
         assert job_workspace_runtime.resume_missing_workspace(
             job, dependencies=_workspace_runtime_deps()
         ) == job_workspace_runtime.resume_missing_workspace(
-            job, dependencies=main._job_workspace_runtime_dependencies()
+            job,
+            dependencies=preparation_composition.job_workspace_runtime_dependencies(
+                main.app.state.resources
+            ),
         )
 
     @pytest.mark.parametrize("replace_endpoint", [False, True])
@@ -878,7 +1083,9 @@ class TestWorkspaceTierPredicates:
                 job,
                 {"llm": {"model": "m"}},
                 replace_endpoint=replace_endpoint,
-                dependencies=main._job_workspace_runtime_dependencies(),
+                dependencies=preparation_composition.job_workspace_runtime_dependencies(
+                    main.app.state.resources
+                ),
             )
         )
         assert mine_cfg == theirs_cfg
@@ -900,14 +1107,14 @@ class TestWorkspaceTierPredicates:
 class TestStatelessAdmissionGate:
     def _deps(self, *, available, in_cluster, pod_network, enabled):
         return job_workspace_runtime.JobWorkspaceRuntimeDependencies(
-            store=main.postgres_db,
-            vm_mode=lambda: main.vm_provisioner.mode,
+            store=main.app.state.resources.postgres_db,
+            vm_mode=lambda: vm_provisioner_module.vm_provisioner.mode,
             workspace_provisioner=SimpleNamespace(
                 is_available=available, in_cluster=in_cluster
             ),
             vm_workspaces_on_pod_network=lambda: pod_network,
             stateless_worker_enabled=lambda: enabled,
-            backend_from_override=main._backend_from_override,
+            backend_from_override=workspace_tier_policy_module.backend_from_override,
         )
 
     def test_external_vm_is_forced_pinned_even_when_stateless_requested(self):
@@ -987,19 +1194,21 @@ class TestStatelessAdmissionGate:
 
     def test_parity_with_main_across_the_matrix(self, monkeypatch):
         for enabled in (False, True):
-            monkeypatch.setattr(main, "STATELESS_WORKER_ENABLED", enabled)
+            monkeypatch.setattr(
+                main.app.state.resources.settings, "stateless_worker_enabled", enabled
+            )
             for available in (False, True):
                 for in_cluster in (False, True):
                     for pod_network in (False, True):
                         monkeypatch.setattr(
-                            main,
+                            container_provisioner_module,
                             "container_provisioner",
                             SimpleNamespace(
                                 is_available=available, in_cluster=in_cluster
                             ),
                         )
                         monkeypatch.setattr(
-                            main,
+                            access_module,
                             "vm_workspaces_on_pod_network",
                             lambda _pod=pod_network: _pod,
                         )
@@ -1027,7 +1236,11 @@ class TestStatelessAdmissionGate:
                                             job_workspace_runtime.resolve_requested_job_execution_lane,
                                             dependencies=deps,
                                         ) == run(
-                                            main._resolve_requested_job_execution_lane
+                                            bound(
+                                                job_workspace_runtime_module.resolve_requested_job_execution_lane,
+                                                preparation_composition.job_workspace_runtime_dependencies,
+                                                main.app.state.resources,
+                                            )
                                         )
 
 
@@ -1047,10 +1260,10 @@ def _authority_deps(**overrides):
     """
     base = dict(
         store=MagicMock(),
-        logger=main.logger,
+        logger=preparation_composition.logger,
         workspace_provisioner=MagicMock(),
         vm_provisioner=MagicMock(),
-        vm_mode=lambda: main.vm_provisioner.mode,
+        vm_mode=lambda: vm_provisioner_module.vm_provisioner.mode,
         ensure_workspace=AsyncMock(),
         workspace_suspension=MagicMock(),
         handle_scholar_completion=AsyncMock(),
@@ -1207,7 +1420,10 @@ class TestPinnedK8sAttestationFence:
             job, dependencies=_authority_deps(workspace_provisioner=provisioner)
         )
         theirs = await job_workspace_authority.attest_pinned_k8s_job_workspace(
-            job, dependencies=main._job_workspace_authority_dependencies()
+            job,
+            dependencies=preparation_composition.job_workspace_authority_dependencies(
+                main.app.state.resources
+            ),
         )
         assert mine[1] is None and theirs[1] is None
         provisioner.attest_workspace_runtime.assert_not_awaited()
@@ -1656,7 +1872,7 @@ class TestScholarParentProvisioning:
         store.merge_job_context = AsyncMock()
         ensure = AsyncMock(
             return_value=SimpleNamespace(
-                outcome=main.EnsureOutcome.PENDING, status="provisioning"
+                outcome=EnsureOutcome.PENDING, status="provisioning"
             )
         )
         outcome = await job_workspace_authority.provision_parent_workspace_for_scholar(
@@ -1677,9 +1893,7 @@ class TestScholarParentProvisioning:
             }
         )
         ensure = AsyncMock(
-            return_value=SimpleNamespace(
-                outcome=main.EnsureOutcome.FAILED, status="failed"
-            )
+            return_value=SimpleNamespace(outcome=EnsureOutcome.FAILED, status="failed")
         )
         fail = AsyncMock()
         outcome = await job_workspace_authority.provision_parent_workspace_for_scholar(
@@ -1717,9 +1931,7 @@ class TestScholarParentProvisioning:
 
         store.acquire = MagicMock(return_value=_Acquire())
         ensure = AsyncMock(
-            return_value=SimpleNamespace(
-                outcome=main.EnsureOutcome.READY, status="ready"
-            )
+            return_value=SimpleNamespace(outcome=EnsureOutcome.READY, status="ready")
         )
         outcome = await job_workspace_authority.provision_parent_workspace_for_scholar(
             {"id": "scholar-1", "config_name": "scholar"},
@@ -1806,7 +2018,7 @@ class TestDispatchCredentialComposition:
 
     @pytest.mark.asyncio
     async def test_kb_profile_is_stripped_when_not_requested(self, monkeypatch):
-        monkeypatch.setattr(main, "postgres_db", _NullStore())
+        monkeypatch.setattr(main.app.state.resources, "postgres_db", _NullStore())
         override = {
             "env_keys": {
                 "KB_EMBEDDING_MODEL": "stale",
@@ -1825,16 +2037,22 @@ class TestDispatchCredentialComposition:
 
     @pytest.mark.asyncio
     async def test_kb_profile_is_requested_through_the_injected_seam(self, monkeypatch):
-        monkeypatch.setattr(main, "postgres_db", _NullStore())
+        monkeypatch.setattr(main.app.state.resources, "postgres_db", _NullStore())
         seen = {}
 
-        async def fake_profile(env_keys):
+        async def fake_profile(env_keys, *, dependencies):
+            # R1.B12: the owner is bound with its dependency object.
+            seen["dependencies"] = dependencies
             seen["env_keys"] = env_keys
             env_keys["KB_EMBEDDING_MODEL"] = "kb-model"
             env_keys["KB_EMBEDDING_API_KEY"] = "kb-key"
             return "kb-model"
 
-        monkeypatch.setattr(main, "_inject_system_kb_embedding_profile", fake_profile)
+        monkeypatch.setattr(
+            dispatch_credentials_module,
+            "inject_system_kb_embedding_profile",
+            fake_profile,
+        )
         out = await job_dispatch_credentials.inject_dispatch_credentials(
             dict(self.JOB),
             {},
@@ -1844,10 +2062,14 @@ class TestDispatchCredentialComposition:
         # A value only the stub could produce (§P3 proof).
         assert out["env_keys"]["KB_EMBEDDING_MODEL"] == "kb-model"
         assert seen["env_keys"] is out["env_keys"]
+        assert isinstance(
+            seen["dependencies"],
+            dispatch_credentials_module.DispatchCredentialDependencies,
+        )
 
     @pytest.mark.asyncio
     async def test_parity_with_main_for_the_same_inputs(self, monkeypatch):
-        monkeypatch.setattr(main, "postgres_db", _NullStore())
+        monkeypatch.setattr(main.app.state.resources, "postgres_db", _NullStore())
         base = {
             "llm": {"model": "gpt-x", "provider": "openai"},
             "env_keys": {"KB_EMBEDDING_MODEL": "stale"},
@@ -1859,14 +2081,18 @@ class TestDispatchCredentialComposition:
             _copy.deepcopy(base),
             dependencies=_dispatch_credential_deps(),
         )
-        theirs = await main._inject_dispatch_credentials(
-            dict(self.JOB), _copy.deepcopy(base)
+        theirs = await job_dispatch_credentials_module.inject_dispatch_credentials(
+            dict(self.JOB),
+            _copy.deepcopy(base),
+            dependencies=preparation_composition.job_dispatch_credential_dependencies(
+                main.app.state.resources
+            ),
         )
         assert mine == theirs
 
     @pytest.mark.asyncio
     async def test_a_none_override_is_created_and_returned(self, monkeypatch):
-        monkeypatch.setattr(main, "postgres_db", _NullStore())
+        monkeypatch.setattr(main.app.state.resources, "postgres_db", _NullStore())
         out = await job_dispatch_credentials.inject_dispatch_credentials(
             dict(self.JOB), None, dependencies=_dispatch_credential_deps()
         )
@@ -1874,7 +2100,7 @@ class TestDispatchCredentialComposition:
 
     @pytest.mark.asyncio
     async def test_the_resolve_model_seam_is_reached(self, monkeypatch):
-        monkeypatch.setattr(main, "postgres_db", _NullStore())
+        monkeypatch.setattr(main.app.state.resources, "postgres_db", _NullStore())
         meta = SimpleNamespace(
             origin="custom",
             endpoint_id="endpoint-1",
@@ -1886,7 +2112,7 @@ class TestDispatchCredentialComposition:
             subscription_sources=None,
         )
         resolve = AsyncMock(return_value=meta)
-        monkeypatch.setattr(main, "_resolve_model", resolve)
+        monkeypatch.setattr(model_registry_module, "resolve_model", resolve)
         out = await job_dispatch_credentials.inject_dispatch_credentials(
             dict(self.JOB),
             {"llm": {"model": "pinned"}},
@@ -1900,7 +2126,7 @@ class TestDispatchCredentialComposition:
     @pytest.mark.asyncio
     async def test_no_credential_value_is_logged(self, monkeypatch, caplog):
         monkeypatch.setattr(
-            main,
+            main.app.state.resources,
             "postgres_db",
             _NullStore(
                 resolve_api_keys_for_job=AsyncMock(
@@ -1963,23 +2189,25 @@ class _RecordingStore(_NullStore):
 def bundle_env(monkeypatch):
     """Wire the lane-J bundle against stubs, through the reference factory."""
     store = _RecordingStore()
-    monkeypatch.setattr(main, "postgres_db", store)
-    monkeypatch.setattr(main, "_is_experts_db_enabled", lambda: False)
+    monkeypatch.setattr(main.app.state.resources, "postgres_db", store)
+    monkeypatch.setattr(deployment_gates_module, "is_experts_db_enabled", lambda: False)
     monkeypatch.setattr(
-        main, "_resolve_authorized_job_datasources", AsyncMock(return_value=[])
+        job_datasource_selection_module,
+        "resolve_authorized_job_datasources",
+        AsyncMock(return_value=[]),
     )
     monkeypatch.setattr(
-        main,
-        "_inject_dispatch_credentials",
+        job_dispatch_credentials_module,
+        "inject_dispatch_credentials",
         AsyncMock(side_effect=lambda job, co, **kw: co or {}),
     )
     monkeypatch.setattr(
-        main,
-        "_inject_lite_workspace_config",
+        workspace_tier_policy_module,
+        "inject_lite_workspace_config",
         lambda co, prefix=None: {**(co or {}), "workspace": {"backend": "virtual"}},
     )
     monkeypatch.setattr(
-        main,
+        runtime_actor_module,
         "mint_worker_runtime_actor",
         AsyncMock(return_value=SimpleNamespace(to_payload=lambda: {"actor": "worker"})),
     )
@@ -2025,8 +2253,8 @@ class TestJobStartBundle:
         self, bundle_env, monkeypatch
     ):
         monkeypatch.setattr(
-            main,
-            "_resolve_authorized_job_datasources",
+            job_datasource_selection_module,
+            "resolve_authorized_job_datasources",
             AsyncMock(
                 side_effect=HTTPException(
                     status_code=403,
@@ -2052,8 +2280,8 @@ class TestJobStartBundle:
         """Credential resolution can outlive the queue lease, so the whole
         build must be read-only from a stale claimant's point of view."""
         monkeypatch.setattr(
-            main,
-            "_resolve_authorized_job_datasources",
+            job_datasource_selection_module,
+            "resolve_authorized_job_datasources",
             AsyncMock(side_effect=HTTPException(status_code=403, detail="gone")),
         )
         assert (
@@ -2083,8 +2311,8 @@ class TestJobStartBundle:
         self, bundle_env, monkeypatch
     ):
         monkeypatch.setattr(
-            main,
-            "_resolve_authorized_job_datasources",
+            job_datasource_selection_module,
+            "resolve_authorized_job_datasources",
             AsyncMock(
                 return_value=[
                     {
@@ -2108,9 +2336,13 @@ class TestJobStartBundle:
     @pytest.mark.asyncio
     async def test_a_lite_config_error_fails_the_job(self, bundle_env, monkeypatch):
         def boom(config_override, prefix=None):
-            raise main.LiteWorkspaceConfigError("no object store configured")
+            raise workspace_tier_policy_module.LiteWorkspaceConfigError(
+                "no object store configured"
+            )
 
-        monkeypatch.setattr(main, "_inject_lite_workspace_config", boom)
+        monkeypatch.setattr(
+            workspace_tier_policy_module, "inject_lite_workspace_config", boom
+        )
         assert (
             await job_start_bundle.build_job_start_request(
                 _bundle_job(), dependencies=_start_bundle_deps()
@@ -2130,7 +2362,7 @@ class TestJobStartBundle:
         job = _bundle_job(backend="sandbox")
         job["context"]["workspace_container"] = READY_CONTAINER
         monkeypatch.setattr(
-            main,
+            managed_repository_authority_module,
             "authorize_job_repository_transport",
             AsyncMock(return_value=(None, None, [])),
         )
@@ -2160,24 +2392,50 @@ class TestJobStartBundle:
     async def test_a_grant_denial_is_never_downgraded_to_the_raw_override(
         self, bundle_env, monkeypatch
     ):
-        monkeypatch.setattr(main, "_is_experts_db_enabled", lambda: True)
-        monkeypatch.setattr(main, "_user_experts_enabled", AsyncMock(return_value=True))
-        monkeypatch.setattr(main, "_resolve_default_models", AsyncMock(return_value={}))
-        monkeypatch.setattr(main, "_gather_in_scope_skills", AsyncMock(return_value=[]))
         monkeypatch.setattr(
-            main, "_seed_registry_model_overrides", AsyncMock(return_value={})
+            deployment_gates_module, "is_experts_db_enabled", lambda: True
         )
-        monkeypatch.setattr(main, "_prefetch_roster_refs", AsyncMock(return_value={}))
         monkeypatch.setattr(
-            main,
+            grant_enforcement_module,
+            "user_experts_enabled",
+            AsyncMock(return_value=True),
+        )
+        monkeypatch.setattr(
+            session_config_resolution_module,
+            "resolve_default_models",
+            AsyncMock(return_value={}),
+        )
+        monkeypatch.setattr(
+            catalogue_composition,
+            "expert_catalog_service",
+            lambda _resources: SimpleNamespace(
+                gather_in_scope_skills=AsyncMock(return_value=[])
+            ),
+        )
+        monkeypatch.setattr(
+            dispatch_credentials_module,
+            "seed_registry_model_overrides",
+            AsyncMock(return_value={}),
+        )
+        monkeypatch.setattr(
+            session_config_resolution_module,
+            "prefetch_roster_refs",
+            AsyncMock(return_value={}),
+        )
+        monkeypatch.setattr(
+            config_resolver_module,
             "resolve_config",
             lambda **kwargs: (kwargs["capture"].__setitem__("merged_fragment", {}))
             or {"llm": {}},
         )
         monkeypatch.setattr(
-            main,
-            "_enforce_dispatch_grants",
-            AsyncMock(side_effect=main.GrantDenied(["tools.shell not granted"])),
+            grant_enforcement_module,
+            "enforce_dispatch_grants",
+            AsyncMock(
+                side_effect=grant_enforcement_module.GrantDenied(
+                    ["tools.shell not granted"]
+                )
+            ),
         )
         assert (
             await job_start_bundle.build_job_start_request(
@@ -2192,24 +2450,44 @@ class TestJobStartBundle:
     async def test_an_unroutable_pinned_model_fails_the_job(
         self, bundle_env, monkeypatch
     ):
-        monkeypatch.setattr(main, "_is_experts_db_enabled", lambda: True)
         monkeypatch.setattr(
-            main, "_user_experts_enabled", AsyncMock(return_value=False)
+            deployment_gates_module, "is_experts_db_enabled", lambda: True
         )
-        monkeypatch.setattr(main, "_resolve_default_models", AsyncMock(return_value={}))
-        monkeypatch.setattr(main, "_gather_in_scope_skills", AsyncMock(return_value=[]))
         monkeypatch.setattr(
-            main, "_seed_registry_model_overrides", AsyncMock(return_value={})
+            grant_enforcement_module,
+            "user_experts_enabled",
+            AsyncMock(return_value=False),
         )
-        monkeypatch.setattr(main, "_prefetch_roster_refs", AsyncMock(return_value={}))
         monkeypatch.setattr(
-            main,
+            session_config_resolution_module,
+            "resolve_default_models",
+            AsyncMock(return_value={}),
+        )
+        monkeypatch.setattr(
+            catalogue_composition,
+            "expert_catalog_service",
+            lambda _resources: SimpleNamespace(
+                gather_in_scope_skills=AsyncMock(return_value=[])
+            ),
+        )
+        monkeypatch.setattr(
+            dispatch_credentials_module,
+            "seed_registry_model_overrides",
+            AsyncMock(return_value={}),
+        )
+        monkeypatch.setattr(
+            session_config_resolution_module,
+            "prefetch_roster_refs",
+            AsyncMock(return_value={}),
+        )
+        monkeypatch.setattr(
+            config_resolver_module,
             "resolve_config",
             lambda **kwargs: (kwargs["capture"].__setitem__("merged_fragment", {}))
             or {"llm": {"model": "pinned"}},
         )
         monkeypatch.setattr(
-            main,
+            config_resolver_module,
             "inject_blob_credentials",
             AsyncMock(side_effect=lambda resolved, inject: resolved),
         )
@@ -2232,24 +2510,44 @@ class TestJobStartBundle:
     async def test_a_delivered_blob_suppresses_the_flat_override(
         self, bundle_env, monkeypatch
     ):
-        monkeypatch.setattr(main, "_is_experts_db_enabled", lambda: True)
         monkeypatch.setattr(
-            main, "_user_experts_enabled", AsyncMock(return_value=False)
+            deployment_gates_module, "is_experts_db_enabled", lambda: True
         )
-        monkeypatch.setattr(main, "_resolve_default_models", AsyncMock(return_value={}))
-        monkeypatch.setattr(main, "_gather_in_scope_skills", AsyncMock(return_value=[]))
         monkeypatch.setattr(
-            main, "_seed_registry_model_overrides", AsyncMock(return_value={})
+            grant_enforcement_module,
+            "user_experts_enabled",
+            AsyncMock(return_value=False),
         )
-        monkeypatch.setattr(main, "_prefetch_roster_refs", AsyncMock(return_value={}))
         monkeypatch.setattr(
-            main,
+            session_config_resolution_module,
+            "resolve_default_models",
+            AsyncMock(return_value={}),
+        )
+        monkeypatch.setattr(
+            catalogue_composition,
+            "expert_catalog_service",
+            lambda _resources: SimpleNamespace(
+                gather_in_scope_skills=AsyncMock(return_value=[])
+            ),
+        )
+        monkeypatch.setattr(
+            dispatch_credentials_module,
+            "seed_registry_model_overrides",
+            AsyncMock(return_value={}),
+        )
+        monkeypatch.setattr(
+            session_config_resolution_module,
+            "prefetch_roster_refs",
+            AsyncMock(return_value={}),
+        )
+        monkeypatch.setattr(
+            config_resolver_module,
             "resolve_config",
             lambda **kwargs: (kwargs["capture"].__setitem__("merged_fragment", {}))
             or {"llm": {"model": "m"}},
         )
         monkeypatch.setattr(
-            main,
+            config_resolver_module,
             "inject_blob_credentials",
             AsyncMock(side_effect=lambda resolved, inject: resolved),
         )
@@ -2267,8 +2565,8 @@ class TestJobStartBundle:
         self, bundle_env, monkeypatch
     ):
         monkeypatch.setattr(
-            main,
-            "_inject_dispatch_credentials",
+            job_dispatch_credentials_module,
+            "inject_dispatch_credentials",
             AsyncMock(side_effect=RuntimeError("resolver exploded")),
         )
         assert (
@@ -2282,10 +2580,10 @@ class TestJobStartBundle:
 class TestJobRepositoryPreparation:
     @pytest.mark.asyncio
     async def test_authority_error_leaves_the_job_unclaimed(self, monkeypatch):
-        monkeypatch.setattr(main, "postgres_db", _NullStore())
+        monkeypatch.setattr(main.app.state.resources, "postgres_db", _NullStore())
         error = ManagedRepositoryAuthorityError("scoped_key_missing")
         monkeypatch.setattr(
-            main,
+            managed_repository_authority_module,
             "prepare_job_primary_repository_authority",
             AsyncMock(side_effect=error),
         )
@@ -2300,9 +2598,9 @@ class TestJobRepositoryPreparation:
     async def test_a_transport_exception_message_is_never_logged(
         self, monkeypatch, caplog
     ):
-        monkeypatch.setattr(main, "postgres_db", _NullStore())
+        monkeypatch.setattr(main.app.state.resources, "postgres_db", _NullStore())
         monkeypatch.setattr(
-            main,
+            managed_repository_authority_module,
             "prepare_job_primary_repository_authority",
             AsyncMock(
                 side_effect=RuntimeError("https://user:tok@gitea.internal/org/repo.git")
@@ -2335,12 +2633,16 @@ class TestJobRepositoryPreparation:
                 ]
             )
         )
-        monkeypatch.setattr(main, "postgres_db", store)
+        monkeypatch.setattr(main.app.state.resources, "postgres_db", store)
         monkeypatch.setattr(
-            main, "prepare_job_primary_repository_authority", AsyncMock()
+            managed_repository_authority_module,
+            "prepare_job_primary_repository_authority",
+            AsyncMock(),
         )
         monkeypatch.setattr(
-            main, "prepare_project_repository_authority", project_authority
+            managed_repository_authority_module,
+            "prepare_project_repository_authority",
+            project_authority,
         )
         assert (
             await job_start_bundle.prepare_job_repository_before_claim(
@@ -2375,7 +2677,7 @@ class TestJobDatasourceSelection:
     @pytest.mark.asyncio
     async def test_the_snapshot_must_match_the_junction_exactly(self, monkeypatch):
         monkeypatch.setattr(
-            main,
+            main.app.state.resources,
             "postgres_db",
             _NullStore(list_job_datasource_ids=AsyncMock(return_value=[])),
         )
@@ -2388,7 +2690,7 @@ class TestJobDatasourceSelection:
     @pytest.mark.asyncio
     async def test_a_duplicated_snapshot_entry_is_refused(self, monkeypatch):
         monkeypatch.setattr(
-            main,
+            main.app.state.resources,
             "postgres_db",
             _NullStore(
                 list_job_datasource_ids=AsyncMock(
@@ -2410,7 +2712,7 @@ class TestJobDatasourceSelection:
     @pytest.mark.asyncio
     async def test_a_malformed_context_is_refused_not_ignored(self, monkeypatch):
         monkeypatch.setattr(
-            main,
+            main.app.state.resources,
             "postgres_db",
             _NullStore(list_job_datasource_ids=AsyncMock(return_value=[])),
         )
@@ -2426,7 +2728,7 @@ class TestJobDatasourceSelection:
         self, monkeypatch
     ):
         monkeypatch.setattr(
-            main,
+            main.app.state.resources,
             "postgres_db",
             _NullStore(
                 list_job_datasource_ids=AsyncMock(return_value=[SNAPSHOT_ID]),
@@ -2441,7 +2743,11 @@ class TestJobDatasourceSelection:
             seen.update(kwargs)
             return (ids, {SNAPSHOT_ID: 7})
 
-        monkeypatch.setattr(main, "_authorize_thread_datasource_selection", authorize)
+        monkeypatch.setattr(
+            thread_datasource_authorization_module,
+            "authorize_thread_datasource_selection",
+            authorize,
+        )
         (
             selected,
             revisions,
@@ -2460,7 +2766,7 @@ class TestJobDatasourceSelection:
     @pytest.mark.asyncio
     async def test_a_system_owned_job_is_trusted_inheritance(self, monkeypatch):
         monkeypatch.setattr(
-            main,
+            main.app.state.resources,
             "postgres_db",
             _NullStore(list_job_datasource_ids=AsyncMock(return_value=[SNAPSHOT_ID])),
         )
@@ -2470,7 +2776,11 @@ class TestJobDatasourceSelection:
             seen.update(kwargs)
             return (ids, {})
 
-        monkeypatch.setattr(main, "_authorize_thread_datasource_selection", authorize)
+        monkeypatch.setattr(
+            thread_datasource_authorization_module,
+            "authorize_thread_datasource_selection",
+            authorize,
+        )
         await job_datasource_selection.revalidate_job_datasource_selection(
             _selection_job(), dependencies=_datasource_selection_deps()
         )
@@ -2482,7 +2792,7 @@ class TestJobDatasourceSelection:
     ):
         """§P3: the service must consult ``main``'s seam, not its own function."""
         monkeypatch.setattr(
-            main,
+            main.app.state.resources,
             "postgres_db",
             _NullStore(
                 resolve_datasources_for_job=AsyncMock(
@@ -2491,7 +2801,11 @@ class TestJobDatasourceSelection:
             ),
         )
         revalidate = AsyncMock(return_value=([SNAPSHOT_ID], {SNAPSHOT_ID: 9}))
-        monkeypatch.setattr(main, "_revalidate_job_datasource_selection", revalidate)
+        monkeypatch.setattr(
+            job_datasource_selection_module,
+            "revalidate_job_datasource_selection",
+            revalidate,
+        )
         rows = await job_datasource_selection.resolve_authorized_job_datasources(
             _selection_job(), dependencies=_datasource_selection_deps()
         )
@@ -2503,7 +2817,7 @@ class TestJobDatasourceSelection:
         self, monkeypatch
     ):
         monkeypatch.setattr(
-            main,
+            main.app.state.resources,
             "postgres_db",
             _NullStore(
                 resolve_datasources_for_job=AsyncMock(
@@ -2512,8 +2826,8 @@ class TestJobDatasourceSelection:
             ),
         )
         monkeypatch.setattr(
-            main,
-            "_revalidate_job_datasource_selection",
+            job_datasource_selection_module,
+            "revalidate_job_datasource_selection",
             AsyncMock(return_value=([SNAPSHOT_ID], {SNAPSHOT_ID: 9})),
         )
         with pytest.raises(HTTPException) as exc:
@@ -2528,14 +2842,18 @@ class TestJobDatasourceSelection:
     ):
         """``datasource_ids: []`` on the parent thread means none, not unset."""
         monkeypatch.setattr(
-            main,
+            main.app.state.resources,
             "postgres_db",
             _NullStore(
                 get_thread=AsyncMock(return_value={"metadata": {"datasource_ids": []}})
             ),
         )
         revalidate = AsyncMock(return_value=(["should-not-be-used"], {}))
-        monkeypatch.setattr(main, "_revalidate_job_datasource_selection", revalidate)
+        monkeypatch.setattr(
+            job_datasource_selection_module,
+            "revalidate_job_datasource_selection",
+            revalidate,
+        )
         assert (
             await job_datasource_selection.inherit_parent_datasource_ids(
                 thread_id="t1",
@@ -2551,7 +2869,7 @@ class TestJobDatasourceSelection:
         self, monkeypatch
     ):
         monkeypatch.setattr(
-            main,
+            main.app.state.resources,
             "postgres_db",
             _NullStore(
                 get_thread=AsyncMock(return_value={"metadata": {}}),
@@ -2559,8 +2877,8 @@ class TestJobDatasourceSelection:
             ),
         )
         monkeypatch.setattr(
-            main,
-            "_revalidate_job_datasource_selection",
+            job_datasource_selection_module,
+            "revalidate_job_datasource_selection",
             AsyncMock(return_value=([SNAPSHOT_ID], {})),
         )
         assert await job_datasource_selection.inherit_parent_datasource_ids(
@@ -2572,7 +2890,9 @@ class TestJobDatasourceSelection:
     @pytest.mark.asyncio
     async def test_a_missing_parent_job_inherits_nothing(self, monkeypatch):
         monkeypatch.setattr(
-            main, "postgres_db", _NullStore(get_job=AsyncMock(return_value=None))
+            main.app.state.resources,
+            "postgres_db",
+            _NullStore(get_job=AsyncMock(return_value=None)),
         )
         assert (
             await job_datasource_selection.inherit_parent_datasource_ids(
@@ -2594,7 +2914,7 @@ class TestJobDatasourceSelection:
             {"id": "d1", "type": "postgresql"},
         ]
         monkeypatch.setattr(
-            main,
+            main.app.state.resources,
             "postgres_db",
             _NullStore(get_datasource_policy_rows=AsyncMock(return_value=rows)),
         )
@@ -2606,7 +2926,7 @@ class TestJobDatasourceSelection:
 
     @pytest.mark.asyncio
     async def test_a_full_tier_selection_is_untouched(self, monkeypatch):
-        monkeypatch.setattr(main, "postgres_db", _NullStore())
+        monkeypatch.setattr(main.app.state.resources, "postgres_db", _NullStore())
         ids = ["r1", "d1"]
         assert (
             await job_datasource_selection.filter_implicit_lite_datasource_ids(
@@ -2659,7 +2979,7 @@ class TestAssignRouteIdentity:
     def _extracted_route(self):
         from fastapi import FastAPI
 
-        app = FastAPI(default_response_class=main.CustomJSONResponse)
+        app = FastAPI(default_response_class=http_composition.CustomJSONResponse)
         app.include_router(job_assignment_routes.router)
         from tests._route_inventory import iter_mounted_route_objects
 
@@ -2697,11 +3017,11 @@ class TestAssignRouteIdentity:
         mine = self._extracted_route()
         assert (
             isinstance(mine.response_class, DefaultPlaceholder)
-            or mine.response_class is main.CustomJSONResponse
+            or mine.response_class is http_composition.CustomJSONResponse
         )
 
         payload = {"status": "assigned", "agent_id": "AID", "job_id": "JID"}
-        app = FastAPI(default_response_class=main.CustomJSONResponse)
+        app = FastAPI(default_response_class=http_composition.CustomJSONResponse)
 
         @app.post("/reference")
         async def reference() -> dict[str, str]:
@@ -2724,9 +3044,9 @@ class TestAssignRouteIdentity:
                     job_has_checkpoint=AsyncMock(return_value=False),
                     claim_job_for_agent=AsyncMock(return_value=True),
                 ),
-                logger=main.logger,
+                logger=preparation_composition.logger,
                 require_admin=AsyncMock(),
-                vm_mode=lambda: main.vm_provisioner.mode,
+                vm_mode=lambda: vm_provisioner_module.vm_provisioner.mode,
                 completion_commands_enabled=lambda: False,
                 prepare_job_workspace_runtime=AsyncMock(
                     return_value=(
@@ -2817,9 +3137,9 @@ class TestAssignRouteIdentity:
 def _assign_deps(**overrides):
     base = dict(
         store=_NullStore(),
-        logger=main.logger,
+        logger=preparation_composition.logger,
         require_admin=AsyncMock(),
-        vm_mode=lambda: main.vm_provisioner.mode,
+        vm_mode=lambda: vm_provisioner_module.vm_provisioner.mode,
         completion_commands_enabled=lambda: False,
         prepare_job_workspace_runtime=AsyncMock(),
         prepare_job_repository_before_claim=AsyncMock(return_value=True),
@@ -3094,381 +3414,675 @@ class TestAssignRouteBehaviour:
 
 
 # =============================================================================
-# 12. Late-bound resolution proof for every dependency field (§P1/§P3)
+# 12. Late-bound resolution and parity with the application's composition
+#     (§P1/§P3)
 # =============================================================================
 #
-# Each row is (factory, field, main attribute, how to read the value back).
-# ``direct`` fields must BE the patched object; ``called`` fields are wrapped in
-# a lambda by the factory and must RETURN the patched value. A field missing
-# from this table fails ``test_every_dependency_field_is_covered``, so the proof
-# cannot silently stop covering a new field.
+# Each row is (reference factory, field, mode, owner, bound dependencies).
+# Every row runs twice: once through the reference factory above and once
+# through the application's own factory (``_APPLICATION_FACTORIES``), so the
+# table is both the late-binding proof and the reference-vs-application parity
+# proof. Before R1.B12 the owner of every field was a ``main`` global; now it is
+# the owning module (patched there) or the application's resources.
+#
+# Modes:
+#   _OWNER     the field IS ``module.attribute`` read when the factory runs
+#   _BOUND     ``bound(module.attribute, dependencies, resources)``: wraps the
+#              patched owner and forwards the call plus ``dependencies=``
+#   _FORWARDS  a function/lambda that forwards to ``module.attribute`` at call
+#              time with ``dependencies=`` of the named factory
+#   _RESOURCE  read from ``resources.<path>`` when the factory runs
+#   _SETTING   a callable reading ``resources.settings.<name>`` per call
+#   _VM_MODE   a callable reading ``vm_provisioner.mode`` per call
+#   _DELIVERY  forwards to ``controls.job_delivery_operations(resources).<op>``
+#   _ADMIN     ``access.require_admin`` bound to this application's resources
+#   _CATALOGUE forwards to ``catalogue.expert_catalog_service(resources)
+#              .gather_in_scope_skills`` per call
+#   _CONSTANT  an exception class: identity with its owner, nothing to patch
+#
+# A field missing from this table fails ``test_every_dependency_field_is_covered``,
+# so the proof cannot silently stop covering a new field.
 
-_DIRECT = "direct"
-_CALLED = "called"
+_OWNER = "owner"
+_BOUND = "bound"
+_FORWARDS = "forwards"
+_RESOURCE = "resource"
+_SETTING = "setting"
+_VM_MODE = "vm_mode"
 _DELIVERY = "delivery"
+_ADMIN = "admin"
+_CATALOGUE = "catalogue"
+_CONSTANT = "constant"
+
+_PREP = preparation_composition
 
 LATE_BINDING_TABLE = [
-    (_datasource_payload_deps, "logger", "logger", _DIRECT),
+    (_datasource_payload_deps, "logger", _OWNER, (_PREP, "logger"), None),
     (
         _datasource_payload_deps,
         "mcp_datasources_enabled",
-        "_mcp_datasources_enabled",
-        _DIRECT,
+        _OWNER,
+        (deployment_gates_module, "mcp_datasources_enabled"),
+        None,
     ),
-    (_datasource_payload_deps, "mcp_stdio_enabled", "_mcp_stdio_enabled", _DIRECT),
-    (_datasource_selection_deps, "store", "postgres_db", _DIRECT),
+    (
+        _datasource_payload_deps,
+        "mcp_stdio_enabled",
+        _OWNER,
+        (deployment_gates_module, "mcp_stdio_enabled"),
+        None,
+    ),
+    (_datasource_selection_deps, "store", _RESOURCE, "postgres_db", None),
     (
         _datasource_selection_deps,
         "authorize_thread_datasource_selection",
-        "_authorize_thread_datasource_selection",
-        _DIRECT,
+        _BOUND,
+        (
+            thread_datasource_authorization_module,
+            "authorize_thread_datasource_selection",
+        ),
+        sessions_composition.thread_datasource_authorization_dependencies,
     ),
     (
         _datasource_selection_deps,
         "backend_from_override",
-        "_backend_from_override",
-        _DIRECT,
+        _OWNER,
+        (workspace_tier_policy_module, "backend_from_override"),
+        None,
     ),
     (
         _datasource_selection_deps,
         "revalidate_selection",
-        "_revalidate_job_datasource_selection",
-        _DIRECT,
+        _BOUND,
+        (job_datasource_selection_module, "revalidate_job_datasource_selection"),
+        _PREP.job_datasource_selection_dependencies,
     ),
-    (_workspace_runtime_deps, "store", "postgres_db", _DIRECT),
-    (_workspace_runtime_deps, "vm_mode", "vm_provisioner", _CALLED),
+    (_workspace_runtime_deps, "store", _RESOURCE, "postgres_db", None),
+    (_workspace_runtime_deps, "vm_mode", _VM_MODE, None, None),
     (
         _workspace_runtime_deps,
         "workspace_provisioner",
-        "container_provisioner",
-        _DIRECT,
+        _OWNER,
+        (container_provisioner_module, "container_provisioner"),
+        None,
     ),
     (
         _workspace_runtime_deps,
         "vm_workspaces_on_pod_network",
-        "vm_workspaces_on_pod_network",
-        _DIRECT,
+        _OWNER,
+        (access_module, "vm_workspaces_on_pod_network"),
+        None,
     ),
     (
         _workspace_runtime_deps,
         "stateless_worker_enabled",
-        "STATELESS_WORKER_ENABLED",
-        _CALLED,
+        _SETTING,
+        "stateless_worker_enabled",
+        None,
     ),
     (
         _workspace_runtime_deps,
         "backend_from_override",
-        "_backend_from_override",
-        _DIRECT,
+        _OWNER,
+        (workspace_tier_policy_module, "backend_from_override"),
+        None,
     ),
-    (_workspace_authority_deps, "store", "postgres_db", _DIRECT),
-    (_workspace_authority_deps, "logger", "logger", _DIRECT),
+    (_workspace_authority_deps, "store", _RESOURCE, "postgres_db", None),
+    (_workspace_authority_deps, "logger", _OWNER, (_PREP, "logger"), None),
     (
         _workspace_authority_deps,
         "workspace_provisioner",
-        "container_provisioner",
-        _DIRECT,
+        _OWNER,
+        (container_provisioner_module, "container_provisioner"),
+        None,
     ),
-    (_workspace_authority_deps, "vm_provisioner", "vm_provisioner", _DIRECT),
-    (_workspace_authority_deps, "vm_mode", "vm_provisioner", _CALLED),
-    (_workspace_authority_deps, "ensure_workspace", "ensure_workspace", _DIRECT),
+    (
+        _workspace_authority_deps,
+        "vm_provisioner",
+        _OWNER,
+        (vm_provisioner_module, "vm_provisioner"),
+        None,
+    ),
+    (_workspace_authority_deps, "vm_mode", _VM_MODE, None, None),
+    (
+        _workspace_authority_deps,
+        "ensure_workspace",
+        _OWNER,
+        (workspace_lifecycle_module, "ensure_workspace"),
+        None,
+    ),
     (
         _workspace_authority_deps,
         "workspace_suspension",
-        "workspace_suspension_service",
-        _DIRECT,
+        _OWNER,
+        (workspace_suspension_module, "workspace_suspension_service"),
+        None,
     ),
     (
         _workspace_authority_deps,
         "handle_scholar_completion",
-        "b08_helpers.handle_scholar_completion",
-        _DIRECT,
+        _FORWARDS,
+        (subjob_completion_module, "handle_scholar_completion"),
+        completion_composition.scholar_completion_dependencies,
     ),
     (
         _workspace_authority_deps,
         "handle_delegation_child_completion",
-        "b08_helpers.handle_delegation_child_completion",
-        _DIRECT,
+        _FORWARDS,
+        (subjob_completion_module, "handle_delegation_child_completion"),
+        completion_composition.delegation_completion_dependencies,
     ),
     (
         _workspace_authority_deps,
         "resolve_inherited_workspace",
-        "_resolve_subjob_inherited_workspace",
-        _DIRECT,
+        _BOUND,
+        (job_workspace_authority_module, "resolve_subjob_inherited_workspace"),
+        _PREP.job_workspace_authority_dependencies,
     ),
     (
         _workspace_authority_deps,
         "fail_subjob_and_unblock_parent",
-        "_fail_subjob_and_unblock_parent",
-        _DIRECT,
+        _BOUND,
+        (job_workspace_authority_module, "fail_subjob_and_unblock_parent"),
+        _PREP.job_workspace_authority_dependencies,
     ),
     (
         _workspace_authority_deps,
         "workspace_runtime_unchanged_before_delivery",
-        "_workspace_runtime_unchanged_before_delivery",
-        _DIRECT,
+        _BOUND,
+        (
+            job_workspace_authority_module,
+            "workspace_runtime_unchanged_before_delivery",
+        ),
+        _PREP.job_workspace_authority_dependencies,
     ),
-    (_dispatch_credential_deps, "store", "postgres_db", _DIRECT),
-    (_dispatch_credential_deps, "logger", "logger", _DIRECT),
-    (_dispatch_credential_deps, "resolve_model", "_resolve_model", _DIRECT),
+    (_dispatch_credential_deps, "store", _RESOURCE, "postgres_db", None),
+    (_dispatch_credential_deps, "logger", _OWNER, (_PREP, "logger"), None),
+    (
+        _dispatch_credential_deps,
+        "resolve_model",
+        _OWNER,
+        (model_registry_module, "resolve_model"),
+        None,
+    ),
     (
         _dispatch_credential_deps,
         "inject_model_credentials",
-        "_inject_model_credentials",
-        _DIRECT,
+        _BOUND,
+        (dispatch_credentials_module, "inject_model_credentials"),
+        _PREP.dispatch_credential_dependencies,
     ),
     (
         _dispatch_credential_deps,
         "inject_env_key_credentials",
-        "_inject_env_key_credentials",
-        _DIRECT,
+        _BOUND,
+        (dispatch_credentials_module, "inject_env_key_credentials"),
+        _PREP.dispatch_credential_dependencies,
     ),
     (
         _dispatch_credential_deps,
         "inject_search_credentials",
-        "_inject_search_credentials",
-        _DIRECT,
+        _BOUND,
+        (dispatch_credentials_module, "inject_search_credentials"),
+        _PREP.dispatch_credential_dependencies,
     ),
     (
         _dispatch_credential_deps,
         "inject_system_kb_embedding_profile",
-        "_inject_system_kb_embedding_profile",
-        _DIRECT,
+        _BOUND,
+        (dispatch_credentials_module, "inject_system_kb_embedding_profile"),
+        _PREP.dispatch_credential_dependencies,
     ),
     (
         _dispatch_credential_deps,
         "dispatch_llm_provider_fallback",
-        "_dispatch_llm_provider_fallback",
-        _DIRECT,
+        _OWNER,
+        (dispatch_credentials_module, "dispatch_llm_provider_fallback"),
+        None,
     ),
-    (_dispatch_credential_deps, "nested_model_slots", "_nested_model_slots", _DIRECT),
-    (_start_bundle_deps, "store", "postgres_db", _DIRECT),
-    (_start_bundle_deps, "logger", "logger", _DIRECT),
-    (_start_bundle_deps, "forge", "gitea_client", _DIRECT),
+    (
+        _dispatch_credential_deps,
+        "nested_model_slots",
+        _OWNER,
+        (dispatch_credentials_module, "nested_model_slots"),
+        None,
+    ),
+    (_start_bundle_deps, "store", _RESOURCE, "postgres_db", None),
+    (_start_bundle_deps, "logger", _OWNER, (_PREP, "logger"), None),
+    (_start_bundle_deps, "forge", _RESOURCE, "gitea_client", None),
     (
         _start_bundle_deps,
         "inject_dispatch_credentials",
-        "_inject_dispatch_credentials",
-        _DIRECT,
+        _BOUND,
+        (job_dispatch_credentials_module, "inject_dispatch_credentials"),
+        _PREP.job_dispatch_credential_dependencies,
     ),
     (
         _start_bundle_deps,
         "resolve_authorized_job_datasources",
-        "_resolve_authorized_job_datasources",
-        _DIRECT,
+        _BOUND,
+        (job_datasource_selection_module, "resolve_authorized_job_datasources"),
+        _PREP.job_datasource_selection_dependencies,
     ),
     (
         _start_bundle_deps,
         "job_project_repositories",
-        "_job_project_repositories",
-        _DIRECT,
+        _BOUND,
+        (job_start_bundle_module, "job_project_repositories"),
+        _PREP.job_start_bundle_dependencies,
     ),
     (
         _start_bundle_deps,
         "apply_cloud_storage_override",
-        "_apply_cloud_storage_override",
-        _DIRECT,
+        _OWNER,
+        (agent_datasource_payload_module, "apply_cloud_storage_override"),
+        None,
     ),
     (
         _start_bundle_deps,
         "build_datasources_payload",
-        "_build_datasources_payload",
-        _DIRECT,
+        _BOUND,
+        (agent_datasource_payload_module, "build_datasources_payload"),
+        _PREP.datasource_payload_dependencies,
     ),
     (
         _start_bundle_deps,
         "build_datasource_tool_override",
-        "_build_datasource_tool_override",
-        _DIRECT,
+        _BOUND,
+        (agent_datasource_payload_module, "build_datasource_tool_override"),
+        _PREP.datasource_payload_dependencies,
     ),
     (
         _start_bundle_deps,
         "authorize_job_repository_transport",
-        "authorize_job_repository_transport",
-        _DIRECT,
+        _OWNER,
+        (managed_repository_authority_module, "authorize_job_repository_transport"),
+        None,
     ),
     (
         _start_bundle_deps,
         "mint_worker_runtime_actor",
-        "mint_worker_runtime_actor",
-        _DIRECT,
+        _OWNER,
+        (runtime_actor_module, "mint_worker_runtime_actor"),
+        None,
     ),
     (
         _start_bundle_deps,
         "inject_blob_credentials",
-        "inject_blob_credentials",
-        _DIRECT,
+        _OWNER,
+        (config_resolver_module, "inject_blob_credentials"),
+        None,
     ),
     (
         _start_bundle_deps,
         "prepare_job_primary_repository_authority",
-        "prepare_job_primary_repository_authority",
-        _DIRECT,
+        _OWNER,
+        (
+            managed_repository_authority_module,
+            "prepare_job_primary_repository_authority",
+        ),
+        None,
     ),
     (
         _start_bundle_deps,
         "prepare_project_repository_authority",
-        "prepare_project_repository_authority",
-        _DIRECT,
+        _OWNER,
+        (managed_repository_authority_module, "prepare_project_repository_authority"),
+        None,
     ),
-    (_start_bundle_deps, "grant_denied_error", "GrantDenied", _DIRECT),
+    (
+        _start_bundle_deps,
+        "grant_denied_error",
+        _CONSTANT,
+        (grant_enforcement_module, "GrantDenied"),
+        None,
+    ),
     (
         _start_bundle_deps,
         "lite_workspace_config_error",
-        "LiteWorkspaceConfigError",
-        _DIRECT,
+        _CONSTANT,
+        (workspace_tier_policy_module, "LiteWorkspaceConfigError"),
+        None,
     ),
-    (_start_bundle_deps, "backend_from_override", "_backend_from_override", _DIRECT),
+    (
+        _start_bundle_deps,
+        "backend_from_override",
+        _OWNER,
+        (workspace_tier_policy_module, "backend_from_override"),
+        None,
+    ),
     (
         _start_bundle_deps,
         "inject_lite_workspace_config",
-        "_inject_lite_workspace_config",
-        _DIRECT,
+        _OWNER,
+        (workspace_tier_policy_module, "inject_lite_workspace_config"),
+        None,
     ),
-    (_start_bundle_deps, "is_experts_db_enabled", "_is_experts_db_enabled", _DIRECT),
-    (_start_bundle_deps, "user_experts_enabled", "_user_experts_enabled", _DIRECT),
+    (
+        _start_bundle_deps,
+        "is_experts_db_enabled",
+        _OWNER,
+        (deployment_gates_module, "is_experts_db_enabled"),
+        None,
+    ),
+    (
+        _start_bundle_deps,
+        "user_experts_enabled",
+        _BOUND,
+        (grant_enforcement_module, "user_experts_enabled"),
+        _PREP.grant_enforcement_dependencies,
+    ),
     (
         _start_bundle_deps,
         "enforce_dispatch_grants",
-        "_enforce_dispatch_grants",
-        _DIRECT,
+        _BOUND,
+        (grant_enforcement_module, "enforce_dispatch_grants"),
+        _PREP.grant_enforcement_dependencies,
     ),
     (
         _start_bundle_deps,
         "grant_violations_detail",
-        "_grant_violations_detail",
-        _DIRECT,
+        _OWNER,
+        (grant_enforcement_module, "grant_violations_detail"),
+        None,
     ),
-    (_start_bundle_deps, "resolve_default_models", "_resolve_default_models", _DIRECT),
-    (_start_bundle_deps, "prefetch_roster_refs", "_prefetch_roster_refs", _DIRECT),
+    (
+        _start_bundle_deps,
+        "resolve_default_models",
+        _BOUND,
+        (session_config_resolution_module, "resolve_default_models"),
+        _PREP.session_config_dependencies,
+    ),
+    (
+        _start_bundle_deps,
+        "prefetch_roster_refs",
+        _BOUND,
+        (session_config_resolution_module, "prefetch_roster_refs"),
+        _PREP.session_config_dependencies,
+    ),
     (
         _start_bundle_deps,
         "seed_registry_model_overrides",
-        "_seed_registry_model_overrides",
-        _DIRECT,
+        _BOUND,
+        (dispatch_credentials_module, "seed_registry_model_overrides"),
+        _PREP.dispatch_credential_dependencies,
     ),
-    (_start_bundle_deps, "gather_in_scope_skills", "_gather_in_scope_skills", _DIRECT),
-    (_start_bundle_deps, "resolve_config", "resolve_config", _DIRECT),
+    (_start_bundle_deps, "gather_in_scope_skills", _CATALOGUE, None, None),
+    (
+        _start_bundle_deps,
+        "resolve_config",
+        _OWNER,
+        (config_resolver_module, "resolve_config"),
+        None,
+    ),
     (
         _start_bundle_deps,
         "vm_workspaces_on_pod_network",
-        "vm_workspaces_on_pod_network",
-        _DIRECT,
+        _OWNER,
+        (access_module, "vm_workspaces_on_pod_network"),
+        None,
     ),
-    (_job_assignment_deps, "store", "postgres_db", _DIRECT),
-    (_job_assignment_deps, "logger", "logger", _DIRECT),
-    (_job_assignment_deps, "require_admin", "_require_admin", _DIRECT),
-    (_job_assignment_deps, "vm_mode", "vm_provisioner", _CALLED),
+    (_job_assignment_deps, "store", _RESOURCE, "postgres_db", None),
+    (
+        _job_assignment_deps,
+        "logger",
+        _OWNER,
+        (controls_composition, "logger"),
+        None,
+    ),
+    (_job_assignment_deps, "require_admin", _ADMIN, None, None),
+    (_job_assignment_deps, "vm_mode", _VM_MODE, None, None),
     (
         _job_assignment_deps,
         "completion_commands_enabled",
-        "COMPLETION_COMMANDS_ENABLED",
-        _CALLED,
+        _SETTING,
+        "completion_commands_enabled",
+        None,
     ),
     (
         _job_assignment_deps,
         "prepare_job_workspace_runtime",
-        "_prepare_job_workspace_runtime",
-        _DIRECT,
+        _BOUND,
+        (job_workspace_authority_module, "prepare_job_workspace_runtime"),
+        _PREP.job_workspace_authority_dependencies,
     ),
     (
         _job_assignment_deps,
         "prepare_job_repository_before_claim",
-        "_prepare_job_repository_before_claim",
-        _DIRECT,
+        _BOUND,
+        (job_start_bundle_module, "prepare_job_repository_before_claim"),
+        _PREP.job_start_bundle_dependencies,
+    ),
+    (
+        _job_assignment_deps,
+        "resume_missing_workspace",
+        _FORWARDS,
+        (job_workspace_runtime_module, "resume_missing_workspace"),
+        _PREP.job_workspace_runtime_dependencies,
     ),
     (
         _job_assignment_deps,
         "guard_completion_control",
-        "_completion_control_boundary.guard",
-        _DIRECT,
+        _RESOURCE,
+        "completion_control_boundary.guard",
+        None,
     ),
     (
         _job_assignment_deps,
         "claim_completion_control",
-        "_completion_control_boundary.claim",
-        _DIRECT,
+        _RESOURCE,
+        "completion_control_boundary.claim",
+        None,
     ),
     (
         _job_assignment_deps,
         "abort_completion_control_claim",
-        "_completion_control_boundary.abort",
-        _DIRECT,
+        _RESOURCE,
+        "completion_control_boundary.abort",
+        None,
     ),
     (
         _job_assignment_deps,
         "completion_resume_guard_kwargs",
-        "_completion_control_boundary.resume_guard_kwargs",
-        _DIRECT,
+        _RESOURCE,
+        "completion_control_boundary.resume_guard_kwargs",
+        None,
     ),
-    (_job_assignment_deps, "dispatch_job_to_agent", "dispatch", _DELIVERY),
-    (_job_assignment_deps, "resume_job_on_agent", "resume", _DELIVERY),
-    (_job_assignment_deps, "trigger_dispatch", "_trigger_dispatch", _DIRECT),
+    (_job_assignment_deps, "dispatch_job_to_agent", _DELIVERY, "dispatch", None),
+    (_job_assignment_deps, "resume_job_on_agent", _DELIVERY, "resume", None),
+    (
+        _job_assignment_deps,
+        "trigger_dispatch",
+        _BOUND,
+        (job_dispatcher_module, "trigger_dispatch"),
+        jobs_composition.job_dispatch_dependencies,
+    ),
 ]
 
 # Nested dependency objects; their own fields are proven through their factory.
 _NESTED_FIELDS = {
     (_start_bundle_deps, "workspace_runtime"),
-    (_job_assignment_deps, "resume_missing_workspace"),
 }
+
+# The application's composition factory each reference factory specifies.
+_APPLICATION_FACTORIES = {
+    _datasource_payload_deps: _PREP.datasource_payload_dependencies,
+    _datasource_selection_deps: _PREP.job_datasource_selection_dependencies,
+    _workspace_runtime_deps: _PREP.job_workspace_runtime_dependencies,
+    _workspace_authority_deps: _PREP.job_workspace_authority_dependencies,
+    _dispatch_credential_deps: _PREP.job_dispatch_credential_dependencies,
+    _start_bundle_deps: _PREP.job_start_bundle_dependencies,
+    _job_assignment_deps: controls_composition.job_assignment_dependencies,
+}
+
+_SIDES = ("reference", "application")
+
+
+def _build(factory, side):
+    if side == "reference":
+        return factory()
+    return _APPLICATION_FACTORIES[factory](main.app.state.resources)
+
+
+class _Recorder:
+    """An owner double that records its call and returns a unique sentinel."""
+
+    def __init__(self, *, is_async):
+        self.calls = []
+        self.result = object()
+        self.is_async = is_async
+
+    def make(self):
+        recorder = self
+
+        if self.is_async:
+
+            async def fake(*args, **kwargs):
+                recorder.calls.append((args, kwargs))
+                return recorder.result
+
+        else:
+
+            def fake(*args, **kwargs):
+                recorder.calls.append((args, kwargs))
+                return recorder.result
+
+        return fake
+
+
+async def _call(field, *args, **kwargs):
+    result = field(*args, **kwargs)
+    if inspect.isawaitable(result):
+        result = await result
+    return result
 
 
 class TestLateBoundResolution:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("side", _SIDES)
     @pytest.mark.parametrize(
-        "factory,field,main_name,mode",
+        "factory,field,mode,owner,bound_dependencies",
         LATE_BINDING_TABLE,
-        ids=[f"{f.__name__}.{name}" for f, name, _m, _k in LATE_BINDING_TABLE],
+        ids=[f"{f.__name__}.{name}" for f, name, *_rest in LATE_BINDING_TABLE],
     )
-    def test_a_patched_application_global_reaches_the_dependency_object(
-        self, factory, field, main_name, mode, monkeypatch
+    async def test_a_patched_owner_reaches_the_dependency_object(
+        self, factory, field, mode, owner, bound_dependencies, side, monkeypatch
     ):
+        resources = main.app.state.resources
+        if mode == _CONSTANT:
+            module, attribute = owner
+            assert getattr(_build(factory, side), field) is getattr(module, attribute)
+            return
+        if mode == _OWNER:
+            module, attribute = owner
+            sentinel = type("Sentinel", (Exception,), {})
+            monkeypatch.setattr(module, attribute, sentinel)
+            assert getattr(_build(factory, side), field) is sentinel
+            return
+        if mode in (_BOUND, _FORWARDS):
+            module, attribute = owner
+            recorder = _Recorder(is_async=mode == _FORWARDS)
+            fake = recorder.make()
+            monkeypatch.setattr(module, attribute, fake)
+            value = getattr(_build(factory, side), field)
+            if mode == _BOUND:
+                # ``bound`` forwards any call shape unchanged.
+                assert value.__wrapped__ is fake
+                args, kwargs = ("argument",), {"key": "value"}
+            else:
+                # The forwarding lambdas take their operation's two positionals.
+                args, kwargs = ("first", "second"), {}
+            assert await _call(value, *args, **kwargs) is recorder.result
+            [(called_args, called_kwargs)] = recorder.calls
+            forwarded = dict(called_kwargs)
+            dependencies = forwarded.pop("dependencies")
+            assert called_args == args
+            assert forwarded == kwargs
+            assert type(dependencies) is type(bound_dependencies(resources))
+            return
+        if mode == _RESOURCE:
+            sentinel = object()
+            *parents, attribute = owner.split(".")
+            if parents:
+                [parent] = parents
+                current = getattr(resources, parent)
+                replacement = SimpleNamespace(
+                    guard=current.guard,
+                    claim=current.claim,
+                    abort=current.abort,
+                    resume_guard_kwargs=current.resume_guard_kwargs,
+                )
+                setattr(replacement, attribute, sentinel)
+                monkeypatch.setattr(resources, parent, replacement)
+            else:
+                monkeypatch.setattr(resources, attribute, sentinel)
+            assert getattr(_build(factory, side), field) is sentinel
+            return
+        if mode == _SETTING:
+            monkeypatch.setattr(resources.settings, owner, "sentinel-flag")
+            assert getattr(_build(factory, side), field)() == "sentinel-flag"
+            return
+        if mode == _VM_MODE:
+            monkeypatch.setattr(
+                vm_provisioner_module,
+                "vm_provisioner",
+                SimpleNamespace(mode="sentinel-vm-mode"),
+            )
+            assert getattr(_build(factory, side), field)() == "sentinel-vm-mode"
+            return
         if mode == _DELIVERY:
             sentinel = object()
-            operation = SimpleNamespace(
-                **{main_name: lambda *_args, **_kwargs: sentinel}
-            )
-            monkeypatch.setattr(main, "_job_delivery_operations", lambda: operation)
-            assert getattr(factory(), field)({}, {}) is sentinel
-            return
-        if mode == _CALLED and main_name == "vm_provisioner":
-            monkeypatch.setattr(
-                main, "vm_provisioner", SimpleNamespace(mode="sentinel-vm-mode")
-            )
-            assert getattr(factory(), field)() == "sentinel-vm-mode"
-            return
-        if mode == _CALLED:
-            monkeypatch.setattr(main, main_name, "sentinel-flag")
-            assert getattr(factory(), field)() == "sentinel-flag"
-            return
-        sentinel = type("Sentinel", (Exception,), {})
-        owner = main
-        *parents, attribute = main_name.split(".")
-        if parents and parents[0] == "b08_helpers":
-            owner = b08_helpers
-            parents = parents[1:]
-        for parent in parents:
-            owner = getattr(owner, parent)
-        monkeypatch.setattr(owner, attribute, sentinel)
-        assert getattr(factory(), field) is sentinel
+            seen = []
+            operation = SimpleNamespace(**{owner: lambda *_args, **_kwargs: sentinel})
 
+            def delivery_operations(application_resources):
+                seen.append(application_resources)
+                return operation
+
+            monkeypatch.setattr(
+                controls_composition, "job_delivery_operations", delivery_operations
+            )
+            assert getattr(_build(factory, side), field)({}, {}) is sentinel
+            assert seen == [resources]
+            return
+        if mode == _ADMIN:
+            recorder = _Recorder(is_async=True)
+            monkeypatch.setattr(access_composition, "require_admin", recorder.make())
+            value = getattr(_build(factory, side), field)
+            assert await _call(value, "request") is recorder.result
+            assert recorder.calls == [((resources, "request"), {})]
+            return
+        if mode == _CATALOGUE:
+            recorder = _Recorder(is_async=True)
+            seen = []
+
+            def catalogue_service(application_resources):
+                seen.append(application_resources)
+                return SimpleNamespace(gather_in_scope_skills=recorder.make())
+
+            monkeypatch.setattr(
+                catalogue_composition, "expert_catalog_service", catalogue_service
+            )
+            value = getattr(_build(factory, side), field)
+            assert await _call(value, "argument", key="value") is recorder.result
+            assert recorder.calls == [(("argument",), {"key": "value"})]
+            assert seen == [resources]
+            return
+        raise AssertionError(f"unknown mode {mode!r}")
+
+    @pytest.mark.parametrize("side", _SIDES)
     @pytest.mark.parametrize(
-        "factory",
-        [
-            _datasource_payload_deps,
-            _datasource_selection_deps,
-            _workspace_runtime_deps,
-            _workspace_authority_deps,
-            _dispatch_credential_deps,
-            _start_bundle_deps,
-            _job_assignment_deps,
-        ],
-        ids=lambda f: f.__name__,
+        "factory", list(_APPLICATION_FACTORIES), ids=lambda f: f.__name__
     )
-    def test_every_dependency_field_is_covered(self, factory):
+    def test_every_dependency_field_is_covered(self, factory, side):
         import dataclasses
 
-        declared = {f.name for f in dataclasses.fields(factory())}
-        proven = {field for fac, field, _n, _m in LATE_BINDING_TABLE if fac is factory}
+        reference = factory()
+        built = _build(factory, side)
+        # The application builds the very dependency type the reference specifies.
+        assert type(built) is type(reference)
+        declared = {f.name for f in dataclasses.fields(built)}
+        proven = {row[1] for row in LATE_BINDING_TABLE if row[0] is factory}
         nested = {field for fac, field in _NESTED_FIELDS if fac is factory}
         assert declared == proven | nested, (
             f"{factory.__name__} has unproven dependency fields: "

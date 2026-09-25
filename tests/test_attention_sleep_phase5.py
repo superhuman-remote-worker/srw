@@ -18,6 +18,7 @@ from orchestrator.routers import thread_permissions
 from orchestrator.routers.thread_permissions import ThreadPermissionDependencies
 from orchestrator.services import magic_link_pages, session_attention
 from orchestrator.services.session_attention import SessionAttentionDependencies
+from orchestrator.application import transport as transport_composition
 
 
 # ---------------------------------------------------------------------------
@@ -806,9 +807,11 @@ class TestPhase5WakeIfSuspended:
         import orchestrator.main as om
 
         store = MagicMock()
-        monkeypatch.setattr(om, "postgres_db", store)
+        monkeypatch.setattr(om.app.state.resources, "postgres_db", store)
 
-        wake = om._thread_permission_dependencies().wake_after_permission_decision
+        wake = transport_composition.thread_permission_dependencies(
+            om.app.state.resources
+        ).wake_after_permission_decision
 
         assert wake.func is session_attention.wake_after_permission_decision
         attention = wake.keywords["dependencies"]

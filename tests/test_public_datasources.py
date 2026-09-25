@@ -12,6 +12,7 @@ from fastapi import HTTPException
 from orchestrator.database.postgres import PostgresDB
 from orchestrator.routers.datasources import create_datasource, update_datasource
 from orchestrator.schemas.datasources import DatasourceCreate, DatasourceUpdate
+from orchestrator.services import datasource_config as datasource_config_module
 
 # Every test in this module is async (endpoint + helper coverage).
 pytestmark = pytest.mark.asyncio
@@ -46,7 +47,9 @@ def _route_deps(user: dict, db):
     Mirrors tests/test_datasource_access.py — kept local so this file stays
     self-contained.
     """
-    from orchestrator.main import _mcp_datasources_enabled, _validate_mcp_datasource
+    from orchestrator.services.deployment_gates import (
+        mcp_datasources_enabled as _mcp_datasources_enabled,
+    )
     from orchestrator.routers.datasources import DatasourcesDependencies
     from orchestrator.services.datasources import DatasourceDependencies
     from orchestrator.services.kb_task_registry import KbDatasourceTaskRegistry
@@ -66,7 +69,7 @@ def _route_deps(user: dict, db):
                 inject_system_kb_embedding_profile=AsyncMock(return_value=None),
             ),
             mcp_datasources_enabled=_mcp_datasources_enabled,
-            validate_mcp_datasource=_validate_mcp_datasource,
+            validate_mcp_datasource=datasource_config_module.validate_mcp_datasource,
         ),
         require_approved_user=AsyncMock(return_value=user),
     )

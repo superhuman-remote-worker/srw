@@ -10,6 +10,38 @@ import pytest
 from orchestrator import main as orch_main
 from shared.runtime_actor import RuntimeActorContext
 from orchestrator.services import session_attach_payload
+from orchestrator.application import controls as controls_composition
+from orchestrator.application import preparation as preparation_composition
+from orchestrator.services import container_provisioner as container_provisioner_module
+from orchestrator.services import deployment_gates as deployment_gates_module
+from orchestrator.services import grant_enforcement as grant_enforcement_module
+from orchestrator.services import (
+    job_datasource_selection as job_datasource_selection_module,
+)
+from orchestrator.services import (
+    job_dispatch_credentials as job_dispatch_credentials_module,
+)
+from orchestrator.services import job_mutation_target as job_mutation_target_module
+from orchestrator.services import job_start_bundle as job_start_bundle_module
+from orchestrator.services import (
+    job_workspace_authority as job_workspace_authority_module,
+)
+from orchestrator.services import (
+    managed_repository_authority as managed_repository_authority_module,
+)
+from orchestrator.services import runtime_actor as runtime_actor_module
+from orchestrator.services import (
+    session_config_resolution as session_config_resolution_module,
+)
+from orchestrator.services import (
+    thread_datasource_authorization as thread_datasource_authorization_module,
+)
+from orchestrator.services import thread_mount_rows as thread_mount_rows_module
+from orchestrator.services import (
+    thread_project_authorization as thread_project_authorization_module,
+)
+from shared import pinned_session_identity as pinned_session_identity_module
+import httpx
 
 DATASOURCE_ID = "22222222-2222-4222-8222-222222222222"
 FOREIGN_ID = "33333333-3333-4333-8333-333333333333"
@@ -81,29 +113,41 @@ def _credential_passthrough(_job_row, config, **_kwargs):
 @pytest.mark.asyncio
 async def test_fresh_dispatch_payload_uses_resolved_repository_uuid():
     with (
-        patch.object(orch_main.postgres_db, "fetchrow", AsyncMock(return_value=None)),
         patch.object(
-            orch_main,
-            "_resolve_authorized_job_datasources",
+            orch_main.app.state.resources.postgres_db,
+            "fetchrow",
+            AsyncMock(return_value=None),
+        ),
+        patch.object(
+            job_datasource_selection_module,
+            "resolve_authorized_job_datasources",
             AsyncMock(return_value=[_repository_row()]),
         ),
         patch.object(
-            orch_main, "_job_project_repositories", AsyncMock(return_value=None)
+            job_start_bundle_module,
+            "job_project_repositories",
+            AsyncMock(return_value=None),
         ),
         patch.object(
-            orch_main,
+            managed_repository_authority_module,
             "authorize_job_repository_transport",
             AsyncMock(return_value=(None, None, None)),
         ),
-        patch.object(orch_main, "_is_experts_db_enabled", return_value=False),
-        patch.object(orch_main, "_user_experts_enabled", AsyncMock(return_value=False)),
         patch.object(
-            orch_main,
-            "_inject_dispatch_credentials",
+            deployment_gates_module, "is_experts_db_enabled", return_value=False
+        ),
+        patch.object(
+            grant_enforcement_module,
+            "user_experts_enabled",
+            AsyncMock(return_value=False),
+        ),
+        patch.object(
+            job_dispatch_credentials_module,
+            "inject_dispatch_credentials",
             AsyncMock(side_effect=_credential_passthrough),
         ),
         patch.object(
-            orch_main,
+            runtime_actor_module,
             "mint_worker_runtime_actor",
             AsyncMock(return_value=_worker_actor()),
         ),
@@ -152,45 +196,53 @@ async def test_resume_payload_uses_resolved_repository_uuid():
 
     with (
         patch.object(
-            orch_main,
-            "_prepare_job_workspace_runtime",
+            job_workspace_authority_module,
+            "prepare_job_workspace_runtime",
             AsyncMock(return_value=("proceed", job, None)),
         ),
         patch.object(
-            orch_main,
-            "_resolve_authorized_job_datasources",
+            job_datasource_selection_module,
+            "resolve_authorized_job_datasources",
             AsyncMock(return_value=[_repository_row()]),
         ),
         patch.object(
-            orch_main, "_job_project_repositories", AsyncMock(return_value=None)
+            job_start_bundle_module,
+            "job_project_repositories",
+            AsyncMock(return_value=None),
         ),
         patch.object(
-            orch_main,
+            managed_repository_authority_module,
             "authorize_job_repository_transport",
             AsyncMock(return_value=(None, None, None)),
         ),
-        patch.object(orch_main, "_is_experts_db_enabled", return_value=False),
-        patch.object(orch_main, "_user_experts_enabled", AsyncMock(return_value=False)),
         patch.object(
-            orch_main,
-            "_inject_dispatch_credentials",
+            deployment_gates_module, "is_experts_db_enabled", return_value=False
+        ),
+        patch.object(
+            grant_enforcement_module,
+            "user_experts_enabled",
+            AsyncMock(return_value=False),
+        ),
+        patch.object(
+            job_dispatch_credentials_module,
+            "inject_dispatch_credentials",
             AsyncMock(side_effect=_credential_passthrough),
         ),
         patch.object(
-            orch_main,
+            runtime_actor_module,
             "mint_worker_runtime_actor",
             AsyncMock(return_value=_worker_actor()),
         ),
         patch.object(
-            orch_main,
-            "_workspace_runtime_unchanged_before_delivery",
+            job_workspace_authority_module,
+            "workspace_runtime_unchanged_before_delivery",
             AsyncMock(return_value=True),
         ),
         patch.object(
-            orch_main.container_provisioner,
+            container_provisioner_module.container_provisioner,
             "attest_workspace_runtime",
             AsyncMock(
-                return_value=orch_main.WorkspaceRuntimeAttestation(
+                return_value=container_provisioner_module.WorkspaceRuntimeAttestation(
                     backing_id=f"k8s-pvc:test:{RUNTIME_ID}",
                     workspace_generation=RUNTIME_ID,
                     runtime_incarnation=RUNTIME_ID,
@@ -202,22 +254,22 @@ async def test_resume_payload_uses_resolved_repository_uuid():
             ),
         ),
         patch.object(
-            orch_main.job_workspace_authority,
+            job_workspace_authority_module,
             "pinned_k8s_job_workspace_authority_is_current",
             AsyncMock(return_value=True),
         ),
         patch.object(
-            orch_main,
-            "_prepare_pinned_job_mutation_target",
+            controls_composition,
+            "prepare_pinned_job_mutation_target",
             AsyncMock(
-                return_value=orch_main._PinnedJobMutationTarget(
+                return_value=job_mutation_target_module.PinnedJobMutationTarget(
                     {
                         "id": AGENT_ID,
                         "status": "ready",
                         "pod_ip": "10.0.0.8",
                         "pod_port": 8080,
                     },
-                    orch_main.PinnedJobRecipient(
+                    pinned_session_identity_module.PinnedJobRecipient(
                         expected_agent_id=AGENT_ID,
                         expected_pod_uid=None,
                         expected_process_generation=RUNTIME_GENERATION,
@@ -227,15 +279,21 @@ async def test_resume_payload_uses_resolved_repository_uuid():
             ),
         ),
         patch.object(
-            orch_main.postgres_db,
+            orch_main.app.state.resources.postgres_db,
             "managed_repository_authorities_are_current",
             AsyncMock(return_value=True),
         ),
-        patch.object(orch_main.postgres_db, "update_job_status", AsyncMock()),
-        patch.object(orch_main.postgres_db, "heartbeat", AsyncMock()),
-        patch.object(orch_main.postgres_db, "acquire", acquire),
-        patch.object(orch_main.httpx, "AsyncClient", _Client),
-        patch.object(orch_main, "COMPLETION_COMMANDS_ENABLED", False),
+        patch.object(
+            orch_main.app.state.resources.postgres_db, "update_job_status", AsyncMock()
+        ),
+        patch.object(
+            orch_main.app.state.resources.postgres_db, "heartbeat", AsyncMock()
+        ),
+        patch.object(orch_main.app.state.resources.postgres_db, "acquire", acquire),
+        patch.object(httpx, "AsyncClient", _Client),
+        patch.object(
+            orch_main.app.state.resources.settings, "completion_commands_enabled", False
+        ),
     ):
         accepted = await control_seams.resume_job_on_agent(
             job,
@@ -279,28 +337,40 @@ async def test_persistent_reattach_payload_uses_resolved_repository_uuid():
     )
     with (
         patch.object(
-            orch_main.postgres_db, "get_thread", AsyncMock(return_value=thread)
-        ),
-        patch.object(orch_main, "_thread_project_ids", AsyncMock(return_value=[])),
-        patch.object(
-            orch_main, "_revalidate_thread_project_ids", AsyncMock(return_value=[])
+            orch_main.app.state.resources.postgres_db,
+            "get_thread",
+            AsyncMock(return_value=thread),
         ),
         patch.object(
-            orch_main,
-            "_resolve_authorized_thread_datasources",
+            thread_mount_rows_module, "thread_project_ids", AsyncMock(return_value=[])
+        ),
+        patch.object(
+            thread_project_authorization_module,
+            "revalidate_thread_project_ids",
+            AsyncMock(return_value=[]),
+        ),
+        patch.object(
+            thread_datasource_authorization_module,
+            "resolve_authorized_thread_datasources",
             AsyncMock(return_value=[_repository_row()]),
         ),
         patch.object(
-            orch_main, "_resolve_session_config", AsyncMock(return_value=None)
+            session_config_resolution_module,
+            "resolve_session_config",
+            AsyncMock(return_value=None),
         ),
         patch.object(
-            orch_main, "mint_thread_runtime_actor", AsyncMock(return_value=actor)
+            runtime_actor_module,
+            "mint_thread_runtime_actor",
+            AsyncMock(return_value=actor),
         ),
     ):
         payload = await session_attach_payload.assemble_session_attach_payload(
             thread["id"],
             runtime_agent_id=AGENT_ID,
-            dependencies=orch_main._session_attach_payload_dependencies(),
+            dependencies=preparation_composition.session_attach_payload_dependencies(
+                orch_main.app.state.resources
+            ),
         )
 
     assert payload is not None

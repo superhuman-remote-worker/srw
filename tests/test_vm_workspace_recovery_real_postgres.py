@@ -2,26 +2,31 @@
 
 from __future__ import annotations
 
+import dataclasses
+
 import asyncio
 import json
 import os
 from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from uuid import UUID, uuid4
 from urllib.parse import urlsplit
+from uuid import UUID, uuid4
 
 import asyncpg
 import pytest
 import pytest_asyncio
 from testcontainers.community.postgres import PostgresContainer
 
-from orchestrator.services.vm_workspace_recovery_store import VMWorkspaceRecoveryStore
+import shared.worker_queue as worker_queue
+from orchestrator.database.postgres import PostgresDB
+from orchestrator.services import (
+    vm_workspace_recovery_store as vm_workspace_recovery_store_module,
+)
 from orchestrator.services.vm_workspace_recovery_store import (
+    VMWorkspaceRecoveryStore,
     WorkspaceRecoveryControlConflict,
 )
-from orchestrator.database.postgres import PostgresDB
-import shared.worker_queue as worker_queue
 from shared.run_queue import reap_expired, unpark_unit
 from shared.workspace_recovery import (
     RecoveryAttemptDisposition,
@@ -29,7 +34,6 @@ from shared.workspace_recovery import (
     WorkspaceRecoveryDisposition,
     workspace_recovery_enabled,
 )
-
 
 SCHEMA_FILE = (
     Path(__file__).resolve().parents[1]
@@ -587,6 +591,7 @@ async def test_controller_cleanup_reservation_resumes_only_while_open(app_pg) ->
 @pytest.mark.asyncio
 async def test_nested_vm_cleanup_child_survives_parent_completion(app_pg) -> None:
     from types import SimpleNamespace
+
     from orchestrator.services.vm_workspace_recovery_store import (
         acquire_vm_cleanup_permit,
     )
@@ -1829,6 +1834,7 @@ async def test_reporter_and_active_sibling_replay_exact_committed_hold(
     app_pg, missing_attempt
 ):
     from types import SimpleNamespace
+
     from orchestrator.services.unit_claim_bundle import (
         get_workspace_recovery_disposition,
     )
@@ -1902,18 +1908,28 @@ async def test_disabled_bundle_then_enabled_hold_never_refunds_executable_attemp
     app_pg, monkeypatch
 ):
     import httpx
-    from orchestrator import main as orch_main
+
     from tests.test_claim_bundle import (
-        recovery_protocol_app,
-        UNIT_ID,
         POD_NAME,
         POD_UID,
+        UNIT_ID,
+        recovery_protocol_app,
     )
 
     app, db, _ = recovery_protocol_app(monkeypatch, ready=True)
     db.acquire = app_pg.acquire
     store = VMWorkspaceRecoveryStore(app_pg)
-    monkeypatch.setattr(orch_main, "VMWorkspaceRecoveryStore", lambda db: store)
+    # The workspace-recovery routes construct their store from the owner at
+    # call time; the claim bundle takes the one its dependency factory builds,
+    # which ``recovery_protocol_app`` replaced with a protocol double — restore
+    # the real store on both paths.
+    monkeypatch.setattr(
+        vm_workspace_recovery_store_module, "VMWorkspaceRecoveryStore", lambda db: store
+    )
+    protocol_claim_dependencies = app.state.unit_claim_bundle_dependencies_factory
+    app.state.unit_claim_bundle_dependencies_factory = lambda: dataclasses.replace(
+        protocol_claim_dependencies(), recovery_store=store
+    )
     job_id = UUID(UNIT_ID)
     async with app_pg.acquire() as conn:
         await conn.execute(

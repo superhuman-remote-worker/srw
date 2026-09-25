@@ -25,6 +25,8 @@ from orchestrator.services.completion_finalizer import (
 )
 from orchestrator.services.job_completion_commands import accept_completion_command
 from shared import worker_queue
+from orchestrator.services import job_dispatcher as job_dispatcher_module
+from orchestrator.services import verification_workflow as verification_workflow_module
 
 
 SCHEMA_FILE = (
@@ -408,7 +410,7 @@ async def test_s27_reviewing_cas_and_effect_marker_commit_together(
         pg, target_lane=target_lane
     )
     db = _pool_db(pg)
-    monkeypatch.setattr(orchestrator.main, "postgres_db", db)
+    monkeypatch.setattr(orchestrator.main.app.state.resources, "postgres_db", db)
     runner = await _claimed_runner(db, accepted.command_id)
     critic = await db.get_job(str(critic_id))
 
@@ -467,9 +469,9 @@ async def test_s27_approval_consumes_the_reviewed_completion_decision(pg, monkey
             target_id,
         )
     db = _pool_db(pg)
-    monkeypatch.setattr(orchestrator.main, "postgres_db", db)
+    monkeypatch.setattr(orchestrator.main.app.state.resources, "postgres_db", db)
     monkeypatch.setattr(
-        orchestrator.main.verification_operations,
+        verification_workflow_module,
         "resolve_critic_outcome",
         lambda *_args: ("approved", "round 2 approved"),
     )
@@ -504,7 +506,7 @@ async def test_s27_oversized_findings_persist_in_domain_not_effect_detail(
         pg, finding_claim=large_claim
     )
     db = _pool_db(pg)
-    monkeypatch.setattr(orchestrator.main, "postgres_db", db)
+    monkeypatch.setattr(orchestrator.main.app.state.resources, "postgres_db", db)
     runner = await _claimed_runner(db, accepted.command_id)
     critic = await db.get_job(str(critic_id))
 
@@ -549,7 +551,7 @@ async def test_s27_stateless_return_uses_ledger_recomputed_after_queue_lock(
         finding_claim="hint finding must not survive",
     )
     db = _pool_db(pg)
-    monkeypatch.setattr(orchestrator.main, "postgres_db", db)
+    monkeypatch.setattr(orchestrator.main.app.state.resources, "postgres_db", db)
     original_enqueue = worker_queue.enqueue_worker_batch_wake
 
     async def enqueue_then_change_ledger(conn, **kwargs):
@@ -616,10 +618,10 @@ async def test_s27_stateless_return_uses_ledger_recomputed_after_queue_lock(
 async def test_s27_multibyte_escalation_is_bounded_before_domain_write(pg, monkeypatch):
     accepted, target_id, critic_id = await _critic_verdict_fixture(pg)
     db = _pool_db(pg)
-    monkeypatch.setattr(orchestrator.main, "postgres_db", db)
+    monkeypatch.setattr(orchestrator.main.app.state.resources, "postgres_db", db)
     huge_reason = "誤" * 20_000
     monkeypatch.setattr(
-        orchestrator.main.verification_operations,
+        verification_workflow_module,
         "resolve_critic_outcome",
         lambda *_args: ("escalate", huge_reason),
     )
@@ -657,7 +659,7 @@ async def test_s27_human_decision_supersedes_effect_without_followup(pg, monkeyp
         pg, target_status="pending_review"
     )
     db = _pool_db(pg)
-    monkeypatch.setattr(orchestrator.main, "postgres_db", db)
+    monkeypatch.setattr(orchestrator.main.app.state.resources, "postgres_db", db)
     runner = await _claimed_runner(db, accepted.command_id)
     critic = await db.get_job(str(critic_id))
 
@@ -783,7 +785,7 @@ async def _verification_parent_fixture(pg, *, with_workspace: bool = False):
 async def test_s30_materializes_one_critic_before_external_handoff(pg, monkeypatch):
     accepted, parent_id = await _verification_parent_fixture(pg)
     db = _pool_db(pg)
-    monkeypatch.setattr(orchestrator.main, "postgres_db", db)
+    monkeypatch.setattr(orchestrator.main.app.state.resources, "postgres_db", db)
     runner = await _claimed_runner(db, accepted.command_id)
     parent = await db.get_job(str(parent_id))
 
@@ -823,7 +825,7 @@ async def test_s30_materializes_one_critic_before_external_handoff(pg, monkeypat
 async def test_s30_inherits_parent_workspace_without_rebinding_runtime(pg, monkeypatch):
     accepted, parent_id = await _verification_parent_fixture(pg, with_workspace=True)
     db = _pool_db(pg)
-    monkeypatch.setattr(orchestrator.main, "postgres_db", db)
+    monkeypatch.setattr(orchestrator.main.app.state.resources, "postgres_db", db)
     runner = await _claimed_runner(db, accepted.command_id)
     parent = await db.get_job(str(parent_id))
 
@@ -855,15 +857,15 @@ async def test_s30_inherits_parent_workspace_without_rebinding_runtime(pg, monke
 async def test_s30_create_job_and_effect_marker_roll_back_as_one_unit(pg, monkeypatch):
     accepted, parent_id = await _verification_parent_fixture(pg)
     db = _pool_db(pg)
-    monkeypatch.setattr(orchestrator.main, "postgres_db", db)
+    monkeypatch.setattr(orchestrator.main.app.state.resources, "postgres_db", db)
     workspace_handoff = AsyncMock()
     dispatch = MagicMock()
     monkeypatch.setattr(
-        orchestrator.main.verification_operations,
+        verification_workflow_module,
         "setup_verification_critic_workspace",
         workspace_handoff,
     )
-    monkeypatch.setattr(orchestrator.main, "_trigger_dispatch", dispatch)
+    monkeypatch.setattr(job_dispatcher_module, "trigger_dispatch", dispatch)
     runner = await _claimed_runner(db, accepted.command_id)
     parent = await db.get_job(str(parent_id))
 
@@ -904,7 +906,7 @@ async def test_s30_multibyte_delivery_error_is_bounded_before_domain_write(
 ):
     accepted, parent_id = await _verification_parent_fixture(pg)
     db = _pool_db(pg)
-    monkeypatch.setattr(orchestrator.main, "postgres_db", db)
+    monkeypatch.setattr(orchestrator.main.app.state.resources, "postgres_db", db)
     runner = await _claimed_runner(db, accepted.command_id)
     parent = await db.get_job(str(parent_id))
     huge_error = "配" * 20_000
@@ -950,7 +952,7 @@ async def test_s30_reviewing_or_round_miss_supersedes_without_spawn(
 ):
     accepted, parent_id = await _verification_parent_fixture(pg)
     db = _pool_db(pg)
-    monkeypatch.setattr(orchestrator.main, "postgres_db", db)
+    monkeypatch.setattr(orchestrator.main.app.state.resources, "postgres_db", db)
     runner = await _claimed_runner(db, accepted.command_id)
     parent = await db.get_job(str(parent_id))
     async with pg.acquire() as conn:

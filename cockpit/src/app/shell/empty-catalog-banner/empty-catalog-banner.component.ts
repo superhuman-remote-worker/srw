@@ -25,7 +25,7 @@ import {UserService} from '../../core/services/user.service';
             </a>
           } @else {
             {{ 'emptyCatalog.bannerUser' | transloco }}
-            <a routerLink="/settings" class="banner-link">
+            <a routerLink="/settings/provider-keys" class="banner-link">
               {{ 'nav.settings' | transloco }} →
             </a>
           }

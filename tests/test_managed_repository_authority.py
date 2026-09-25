@@ -136,7 +136,7 @@ def test_gitea_canonical_url_discards_misconfigured_admin_userinfo(
 
 
 def test_public_job_ingress_recursively_strips_repository_authority() -> None:
-    from orchestrator.main import JobCreate
+    from orchestrator.schemas.job_create import JobCreate
 
     body = JobCreate(
         description="caller cannot author repository authority",
@@ -732,7 +732,7 @@ def test_workspace_materialization_wipes_untransferred_keys_on_early_failure(
 
 
 def test_internal_transport_repr_and_errors_are_secret_free() -> None:
-    from orchestrator.main import JobStartRequest
+    from orchestrator.schemas.job_runtime import JobStartRequest
 
     authority = _authority()
     payload = _runtime_payload(authority)

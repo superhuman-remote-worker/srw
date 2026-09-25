@@ -14,6 +14,7 @@ from orchestrator.services.cloud.protected_reader_authority import (
 from orchestrator.services.cloud_staging.source_identity import (
     ProtectedMountSourceIdentity,
 )
+from orchestrator.application import controls as controls_composition
 
 
 _THREAD = "11111111-1111-4111-8111-111111111111"
@@ -113,7 +114,9 @@ def test_retirement_stage_receipt_accepts_exact_immutable_source():
         thread,
         row,
         never_delivered_protected_reader_shape=(
-            orchestrator.main._pinned_retirement_operations().never_delivered_protected_reader_shape
+            controls_composition.pinned_retirement_operations(
+                orchestrator.main.app.state.resources
+            ).never_delivered_protected_reader_shape
         ),
     )
 
@@ -151,7 +154,9 @@ def test_retirement_stage_receipt_rejects_source_identity_drift(mutate):
         thread,
         row,
         never_delivered_protected_reader_shape=(
-            orchestrator.main._pinned_retirement_operations().never_delivered_protected_reader_shape
+            controls_composition.pinned_retirement_operations(
+                orchestrator.main.app.state.resources
+            ).never_delivered_protected_reader_shape
         ),
     ) == (
         False,

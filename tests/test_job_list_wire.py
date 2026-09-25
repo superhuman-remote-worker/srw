@@ -19,6 +19,12 @@ from fastapi import FastAPI, HTTPException
 
 from orchestrator import main
 from orchestrator.routers.job_reads import router as job_reads_router
+from orchestrator.application import http as http_composition
+from orchestrator.application import jobs as jobs_composition
+from orchestrator.security import access as access_module
+from orchestrator.security import auth as auth_module
+from orchestrator.services import job_queries as job_queries_module
+import functools
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -89,13 +95,15 @@ def wire(monkeypatch):
     audit = SimpleNamespace(
         is_available=False, get_audit_counts=AsyncMock(return_value={})
     )
-    monkeypatch.setattr(main, "postgres_db", db)
-    monkeypatch.setattr(main, "require_approved_user", approved)
-    monkeypatch.setattr(main, "user_visible_project_ids", visible)
-    monkeypatch.setattr(main, "audit_reader", audit)
+    monkeypatch.setattr(main.app.state.resources, "postgres_db", db)
+    monkeypatch.setattr(auth_module, "require_approved_user", approved)
+    monkeypatch.setattr(access_module, "user_visible_project_ids", visible)
+    monkeypatch.setattr(main.app.state.resources, "audit_reader", audit)
     # Mount the production read router, retaining decorator response metadata.
-    app = FastAPI(default_response_class=main.CustomJSONResponse)
-    app.state.job_reads_dependencies_factory = main._job_reads_dependencies
+    app = FastAPI(default_response_class=http_composition.CustomJSONResponse)
+    app.state.job_reads_dependencies_factory = functools.partial(
+        jobs_composition.job_reads_dependencies, main.app.state.resources
+    )
     app.include_router(job_reads_router)
     return SimpleNamespace(
         app=app, user=user, db=db, visible=visible, audit=audit, result=result
@@ -366,7 +374,11 @@ async def test_mcp_project_scope_remains_an_additional_narrowing_filter(wire):
         ({"origin": "all"}, 422, "Unknown job origin"),
         ({"project_id": "typo"}, 422, "not a uuid"),
         ([("project_id", "none"), ("project_id", PROJECT)], 422, "cannot be combined"),
-        ({"offset": main.JOBS_MAX_OFFSET + 1}, 400, "exceeds the maximum"),
+        (
+            {"offset": job_queries_module.JOBS_MAX_OFFSET + 1},
+            400,
+            "exceeds the maximum",
+        ),
     ],
 )
 async def test_handler_error_details_survive_http_and_never_query_storage(

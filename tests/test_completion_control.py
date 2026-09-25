@@ -23,6 +23,18 @@ from orchestrator.routers import job_diff as job_diff_routes
 from orchestrator.routers import job_controls as job_control_routes
 from orchestrator.routers import job_lifecycle as job_lifecycle_routes
 from orchestrator.services import agent_messaging
+from orchestrator.application import controls as controls_composition
+from orchestrator.application import workflows as workflows_composition
+from orchestrator.application import workspace as workspace_composition
+from orchestrator.schemas import messaging as messaging_module
+from orchestrator.security import access as access_module
+from orchestrator.services import grant_enforcement as grant_enforcement_module
+from orchestrator.services import job_dispatcher as job_dispatcher_module
+from orchestrator.services import job_workspace_runtime as job_workspace_runtime_module
+from orchestrator.services import notification_service as notification_service_module
+from orchestrator.services import (
+    vm_workspace_recovery_store as vm_workspace_recovery_store_module,
+)
 
 
 async def _resume_endpoint(request, job_id, body):
@@ -30,7 +42,9 @@ async def _resume_endpoint(request, job_id, body):
         request,
         job_id,
         body,
-        dependencies=main._job_control_route_dependencies(),
+        dependencies=controls_composition.job_control_route_dependencies(
+            main.app.state.resources
+        ),
     )
 
 
@@ -39,7 +53,9 @@ async def _approve_endpoint(request, job_id, body):
         request,
         job_id,
         body,
-        dependencies=main._job_control_route_dependencies(),
+        dependencies=controls_composition.job_control_route_dependencies(
+            main.app.state.resources
+        ),
     )
 
 
@@ -47,7 +63,9 @@ async def _agent_release_endpoint(request, job_id, **kwargs):
     return await job_lifecycle_routes.agent_release_job(
         request,
         job_id,
-        dependencies=main._job_mutation_route_dependencies(),
+        dependencies=controls_composition.job_mutation_route_dependencies(
+            main.app.state.resources
+        ),
         **kwargs,
     )
 
@@ -64,7 +82,9 @@ def _send_agent_message(job_id, body):
         MagicMock(),
         job_id,
         body,
-        dependencies=main._agent_messaging_dependencies(),
+        dependencies=workflows_composition.agent_messaging_dependencies(
+            main.app.state.resources
+        ),
     )
 
 
@@ -212,10 +232,14 @@ async def test_no_command_allows_control():
 async def test_flag_off_guard_never_builds_completion_service():
     getter = MagicMock()
     with (
-        patch.object(main, "COMPLETION_COMMANDS_ENABLED", False),
-        patch.object(main._completion_runtime, "control", getter),
+        patch.object(
+            main.app.state.resources.settings, "completion_commands_enabled", False
+        ),
+        patch.object(main.app.state.resources.completion_runtime, "control", getter),
     ):
-        await main._completion_control_boundary.guard(str(uuid4()), source="test")
+        await main.app.state.resources.completion_control_boundary.guard(
+            str(uuid4()), source="test"
+        )
     getter.assert_not_called()
 
 
@@ -233,7 +257,7 @@ async def test_public_control_endpoints_return_exact_409_before_mutation(
     endpoint, auth_name, monkeypatch
 ):
     monkeypatch.setattr(
-        main.VMWorkspaceRecoveryStore,
+        vm_workspace_recovery_store_module.VMWorkspaceRecoveryStore,
         "unresolved_participation",
         AsyncMock(return_value=None),
     )
@@ -245,9 +269,11 @@ async def test_public_control_endpoints_return_exact_409_before_mutation(
     db.queue_job_for_resume = AsyncMock()
     db.queue_stateless_job_for_resume = AsyncMock()
     with (
-        patch.object(main, auth_name, authorized),
-        patch.object(main._completion_control_boundary, "guard", guard),
-        patch.object(main, "postgres_db", db),
+        patch.object(access_module, auth_name, authorized),
+        patch.object(
+            main.app.state.resources.completion_control_boundary, "guard", guard
+        ),
+        patch.object(main.app.state.resources, "postgres_db", db),
     ):
         with pytest.raises(HTTPException) as exc:
             if endpoint is _resume_endpoint:
@@ -257,12 +283,15 @@ async def test_public_control_endpoints_return_exact_409_before_mutation(
             else:
                 # The diff routes carry ``auth_name`` as a field default on
                 # their route dependencies, so the same gate is short-circuited
-                # there rather than on ``main``.
+                # there rather than on the access module.
                 await endpoint(
                     MagicMock(),
                     job_id,
                     dependencies=dataclasses.replace(
-                        main._job_diff_dependencies(), **{auth_name: authorized}
+                        workspace_composition.job_diff_dependencies(
+                            main.app.state.resources
+                        ),
+                        **{auth_name: authorized},
                     ),
                 )
 
@@ -286,11 +315,15 @@ async def test_blocking_reply_internal_resume_guard_precedes_queue_mutation():
     db.queue_job_for_resume = AsyncMock()
     guard = AsyncMock(side_effect=HTTPException(409, "completion finalizing"))
     with (
-        patch.object(main, "postgres_db", db),
-        patch.object(main._completion_control_boundary, "guard", guard),
+        patch.object(main.app.state.resources, "postgres_db", db),
+        patch.object(
+            main.app.state.resources.completion_control_boundary, "guard", guard
+        ),
     ):
         with pytest.raises(HTTPException) as exc:
-            await main._job_control_operations().internal_resume_job(job_id, "reply")
+            await controls_composition.job_control_operations(
+                main.app.state.resources
+            ).internal_resume_job(job_id, "reply")
     assert exc.value.detail == "completion finalizing"
     db.queue_job_for_resume.assert_not_awaited()
 
@@ -300,7 +333,7 @@ async def test_flag_on_pinned_resume_queues_without_agent_selection_or_post(
     monkeypatch,
 ):
     monkeypatch.setattr(
-        main.VMWorkspaceRecoveryStore,
+        vm_workspace_recovery_store_module.VMWorkspaceRecoveryStore,
         "unresolved_participation",
         AsyncMock(return_value=None),
     )
@@ -318,21 +351,29 @@ async def test_flag_on_pinned_resume_queues_without_agent_selection_or_post(
     db.get_agent = AsyncMock()
     db.list_agents = AsyncMock()
     with (
-        patch.object(main, "COMPLETION_COMMANDS_ENABLED", True),
         patch.object(
-            main,
+            main.app.state.resources.settings, "completion_commands_enabled", True
+        ),
+        patch.object(
+            access_module,
             "require_internal_or_job_access",
             AsyncMock(return_value=({}, job)),
         ),
-        patch.object(main._completion_control_boundary, "guard", AsyncMock()),
-        patch.object(main, "_user_experts_enabled", AsyncMock(return_value=False)),
         patch.object(
-            main.job_workspace_runtime,
+            main.app.state.resources.completion_control_boundary, "guard", AsyncMock()
+        ),
+        patch.object(
+            grant_enforcement_module,
+            "user_experts_enabled",
+            AsyncMock(return_value=False),
+        ),
+        patch.object(
+            job_workspace_runtime_module,
             "resume_missing_workspace",
             return_value=None,
         ),
-        patch.object(main, "postgres_db", db),
-        patch.object(main, "_trigger_dispatch", MagicMock()),
+        patch.object(main.app.state.resources, "postgres_db", db),
+        patch.object(job_dispatcher_module, "trigger_dispatch", MagicMock()),
     ):
         result = await _resume_endpoint(MagicMock(), job_id, None)
 
@@ -360,10 +401,12 @@ async def test_delayed_agent_release_reports_owner_conflict_without_dispatch():
     db.pause_job = AsyncMock(return_value=False)
     trigger = MagicMock()
     with (
-        patch.object(main, "COMPLETION_COMMANDS_ENABLED", True),
-        patch.object(main, "require_internal", AsyncMock()),
-        patch.object(main, "postgres_db", db),
-        patch.object(main, "_trigger_dispatch", trigger),
+        patch.object(
+            main.app.state.resources.settings, "completion_commands_enabled", True
+        ),
+        patch.object(access_module, "require_internal", AsyncMock()),
+        patch.object(main.app.state.resources, "postgres_db", db),
+        patch.object(job_dispatcher_module, "trigger_dispatch", trigger),
     ):
         with pytest.raises(HTTPException) as exc:
             await _agent_release_endpoint(MagicMock(), job_id, agent_id=old_agent)
@@ -398,10 +441,12 @@ async def test_leased_agent_release_routes_to_recovery_without_dispatch(enabled)
     db.pause_job = AsyncMock()
     trigger = MagicMock()
     with (
-        patch.object(main, "COMPLETION_COMMANDS_ENABLED", enabled),
-        patch.object(main, "require_internal", AsyncMock()),
-        patch.object(main, "postgres_db", db),
-        patch.object(main, "_trigger_dispatch", trigger),
+        patch.object(
+            main.app.state.resources.settings, "completion_commands_enabled", enabled
+        ),
+        patch.object(access_module, "require_internal", AsyncMock()),
+        patch.object(main.app.state.resources, "postgres_db", db),
+        patch.object(job_dispatcher_module, "trigger_dispatch", trigger),
     ):
         result = await _agent_release_endpoint(MagicMock(), job_id, agent_id=agent_id)
 
@@ -459,7 +504,7 @@ async def test_blocking_message_loser_has_zero_notification_side_effects():
     db.log_message = AsyncMock()
     notifier = MagicMock()
     notifier.record_agent_message = AsyncMock()
-    body = main.MessageSendRequest(
+    body = messaging_module.MessageSendRequest(
         to="user",
         subject="Need input",
         message="Please answer",
@@ -467,9 +512,11 @@ async def test_blocking_message_loser_has_zero_notification_side_effects():
         agent_id=agent_id,
     )
     with (
-        patch.object(main, "COMPLETION_COMMANDS_ENABLED", True),
-        patch.object(main, "postgres_db", db),
-        patch.object(main, "notification_service", notifier),
+        patch.object(
+            main.app.state.resources.settings, "completion_commands_enabled", True
+        ),
+        patch.object(main.app.state.resources, "postgres_db", db),
+        patch.object(notification_service_module, "notification_service", notifier),
     ):
         with pytest.raises(HTTPException) as exc:
             await _send_agent_message(job_id, body)
@@ -497,8 +544,10 @@ async def test_flag_off_cascade_pause_preserves_unusable_agent_early_return(assi
     )
     db.pause_job = AsyncMock()
     with (
-        patch.object(main, "COMPLETION_COMMANDS_ENABLED", False),
-        patch.object(main, "postgres_db", db),
+        patch.object(
+            main.app.state.resources.settings, "completion_commands_enabled", False
+        ),
+        patch.object(main.app.state.resources, "postgres_db", db),
     ):
         await control_seams.cascade_pause_to_children(str(uuid4()))
 

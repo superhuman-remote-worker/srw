@@ -23,7 +23,10 @@ def _patch_caller_and_db(user: dict, db):
     """Same patch stack used across F2/F3/F5/F6 test files."""
     stack = ExitStack()
     stack.enter_context(
-        patch("orchestrator.main.require_approved_user", AsyncMock(return_value=user))
+        patch(
+            "orchestrator.security.auth.require_approved_user",
+            AsyncMock(return_value=user),
+        )
     )
     stack.enter_context(
         patch(
@@ -31,7 +34,7 @@ def _patch_caller_and_db(user: dict, db):
             AsyncMock(return_value=user),
         )
     )
-    stack.enter_context(patch("orchestrator.main.postgres_db", db))
+    stack.enter_context(patch("orchestrator.main.app.state.resources.postgres_db", db))
     return stack
 
 
@@ -92,9 +95,12 @@ class TestSudoSseFilter:
         request.is_disconnected = AsyncMock(side_effect=lambda: queue.empty())
 
         with _patch_caller_and_db(user_a, fake_db):
-            with patch("orchestrator.main.sudo_gate.subscribe_sse", lambda: queue):
+            with patch(
+                "orchestrator.services.sudo_gate.sudo_gate.subscribe_sse", lambda: queue
+            ):
                 with patch(
-                    "orchestrator.main.sudo_gate.unsubscribe_sse", lambda q: None
+                    "orchestrator.services.sudo_gate.sudo_gate.unsubscribe_sse",
+                    lambda q: None,
                 ):
                     response = await sudo_sse_events(request)
                     chunks = [chunk async for chunk in response.body_iterator]
@@ -119,7 +125,7 @@ class TestSudoSseFilter:
         request = MagicMock(cookies={}, headers={})
         with _patch_caller_and_db(user_a, fake_db):
             with patch(
-                "orchestrator.main.sudo_gate.list_requests",
+                "orchestrator.services.sudo_gate.sudo_gate.list_requests",
                 AsyncMock(return_value=[row]),
             ):
                 listed = await list_sudo_requests(
@@ -130,7 +136,8 @@ class TestSudoSseFilter:
                     limit=50,
                 )
             with patch(
-                "orchestrator.main.sudo_gate.get_request", AsyncMock(return_value=row)
+                "orchestrator.services.sudo_gate.sudo_gate.get_request",
+                AsyncMock(return_value=row),
             ):
                 fetched = await get_sudo_request(request, "thread-sudo")
 
@@ -159,9 +166,12 @@ class TestSudoSseFilter:
         request.is_disconnected = _is_disconnected
 
         with _patch_caller_and_db(user_a, fake_db):
-            with patch("orchestrator.main.sudo_gate.subscribe_sse", lambda: queue):
+            with patch(
+                "orchestrator.services.sudo_gate.sudo_gate.subscribe_sse", lambda: queue
+            ):
                 with patch(
-                    "orchestrator.main.sudo_gate.unsubscribe_sse", lambda q: None
+                    "orchestrator.services.sudo_gate.sudo_gate.unsubscribe_sse",
+                    lambda q: None,
                 ):
                     response = await sudo_sse_events(request)
                     out = bytearray()
@@ -198,9 +208,12 @@ class TestSudoSseFilter:
         request.is_disconnected = _is_disconnected
 
         with _patch_caller_and_db(user_admin, fake_db):
-            with patch("orchestrator.main.sudo_gate.subscribe_sse", lambda: queue):
+            with patch(
+                "orchestrator.services.sudo_gate.sudo_gate.subscribe_sse", lambda: queue
+            ):
                 with patch(
-                    "orchestrator.main.sudo_gate.unsubscribe_sse", lambda q: None
+                    "orchestrator.services.sudo_gate.sudo_gate.unsubscribe_sse",
+                    lambda q: None,
                 ):
                     response = await sudo_sse_events(request)
                     out = bytearray()
@@ -256,9 +269,12 @@ class TestSudoSseFilter:
         request.is_disconnected = _is_disconnected
 
         with _patch_caller_and_db(user_a, fake_db):
-            with patch("orchestrator.main.sudo_gate.subscribe_sse", lambda: queue):
+            with patch(
+                "orchestrator.services.sudo_gate.sudo_gate.subscribe_sse", lambda: queue
+            ):
                 with patch(
-                    "orchestrator.main.sudo_gate.unsubscribe_sse", lambda q: None
+                    "orchestrator.services.sudo_gate.sudo_gate.unsubscribe_sse",
+                    lambda q: None,
                 ):
                     response = await sudo_sse_events(request)
                     out = bytearray()

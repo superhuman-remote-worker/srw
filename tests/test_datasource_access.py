@@ -47,6 +47,7 @@ from orchestrator.schemas.datasources import (
     ProjectDatasourceSettings,
 )
 from orchestrator.security import access
+from orchestrator.services import datasource_config as datasource_config_module
 
 
 # =============================================================================
@@ -80,7 +81,9 @@ def _ds_deps(user: dict, db):
     the dataclass default, i.e. the real function from
     ``orchestrator.security.access``.
     """
-    from orchestrator.main import _mcp_datasources_enabled, _validate_mcp_datasource
+    from orchestrator.services.deployment_gates import (
+        mcp_datasources_enabled as _mcp_datasources_enabled,
+    )
     from orchestrator.routers.datasources import DatasourcesDependencies
     from orchestrator.services.datasources import DatasourceDependencies
     from orchestrator.services.kb_task_registry import KbDatasourceTaskRegistry
@@ -100,7 +103,7 @@ def _ds_deps(user: dict, db):
                 inject_system_kb_embedding_profile=AsyncMock(return_value=None),
             ),
             mcp_datasources_enabled=_mcp_datasources_enabled,
-            validate_mcp_datasource=_validate_mcp_datasource,
+            validate_mcp_datasource=datasource_config_module.validate_mcp_datasource,
         ),
         require_approved_user=AsyncMock(return_value=user),
     )

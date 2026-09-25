@@ -15,6 +15,7 @@ import yaml
 import orchestrator.main as orchestrator_main
 
 from shared.runtime.core.tool_policy import enumerate_only_members
+from orchestrator.application import catalogue as catalogue_composition
 
 
 @pytest.mark.asyncio
@@ -56,7 +57,7 @@ async def test_db_expert_detail_includes_settings_matrix_and_no_defaults_tools(
     expert_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
     monkeypatch.setenv("EXPERTS_DB_ENABLED", "true")
     monkeypatch.setattr(
-        orchestrator_main.postgres_db,
+        orchestrator_main.app.state.resources.postgres_db,
         "get_expert_by_id",
         AsyncMock(
             return_value={
@@ -131,12 +132,12 @@ class TestAccountDefaultsLayer:
     def account_user(self, monkeypatch):
         """A user whose account pins a model but no session workspace tier."""
         monkeypatch.setattr(
-            orchestrator_main.postgres_db,
+            orchestrator_main.app.state.resources.postgres_db,
             "get_user_settings",
             AsyncMock(return_value={"default_model": "account-pinned-model"}),
         )
         monkeypatch.setattr(
-            orchestrator_main.postgres_db,
+            orchestrator_main.app.state.resources.postgres_db,
             "resolve_default_for_capability",
             AsyncMock(return_value=None),
         )
@@ -175,7 +176,7 @@ class TestAccountDefaultsLayer:
         self, monkeypatch, account_user
     ):
         monkeypatch.setattr(
-            orchestrator_main.postgres_db,
+            orchestrator_main.app.state.resources.postgres_db,
             "get_user_settings",
             AsyncMock(
                 return_value={"persistent_agent": {"workspace_backend": "sandbox"}}
@@ -210,7 +211,7 @@ class TestAccountDefaultsLayer:
         expert_id = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
         monkeypatch.setenv("EXPERTS_DB_ENABLED", "true")
         monkeypatch.setattr(
-            orchestrator_main.postgres_db,
+            orchestrator_main.app.state.resources.postgres_db,
             "get_expert_by_id",
             AsyncMock(
                 return_value={
@@ -296,12 +297,12 @@ class TestPublicBaseIdsAfterTheRootSplit:
     @pytest.mark.asyncio
     async def test_session_base_id_with_account_defaults(self, monkeypatch):
         monkeypatch.setattr(
-            orchestrator_main.postgres_db,
+            orchestrator_main.app.state.resources.postgres_db,
             "get_user_settings",
             AsyncMock(return_value={"default_model": "account-pinned-model"}),
         )
         monkeypatch.setattr(
-            orchestrator_main.postgres_db,
+            orchestrator_main.app.state.resources.postgres_db,
             "resolve_default_for_capability",
             AsyncMock(return_value=None),
         )
@@ -384,7 +385,7 @@ def test_scan_experts_adds_the_role_tag():
     for e in experts:
         assert e.tags.count(e.expert_type) == 1, e.id
     by_id = {e.id: e for e in experts}
-    config_dir = orchestrator_main._get_config_dir()
+    config_dir = catalogue_composition.get_config_dir()
 
     def authored(expert_id: str) -> list[str]:
         raw = _srw_config_fragment(
@@ -500,7 +501,7 @@ class TestRoleParameter:
         expert_id = "cccccccc-cccc-4ccc-8ccc-cccccccccccc"
         monkeypatch.setenv("EXPERTS_DB_ENABLED", "true")
         monkeypatch.setattr(
-            orchestrator_main.postgres_db,
+            orchestrator_main.app.state.resources.postgres_db,
             "get_expert_by_id",
             AsyncMock(
                 return_value={
@@ -531,7 +532,7 @@ class TestRoleParameter:
         expert_id = "dddddddd-dddd-4ddd-8ddd-dddddddddddd"
         monkeypatch.setenv("EXPERTS_DB_ENABLED", "true")
         monkeypatch.setattr(
-            orchestrator_main.postgres_db,
+            orchestrator_main.app.state.resources.postgres_db,
             "get_expert_by_id",
             AsyncMock(
                 return_value={
@@ -553,12 +554,12 @@ class TestRoleParameter:
             ),
         )
         monkeypatch.setattr(
-            orchestrator_main.postgres_db,
+            orchestrator_main.app.state.resources.postgres_db,
             "get_user_settings",
             AsyncMock(return_value={}),
         )
         monkeypatch.setattr(
-            orchestrator_main.postgres_db,
+            orchestrator_main.app.state.resources.postgres_db,
             "resolve_default_for_capability",
             AsyncMock(return_value=None),
         )
@@ -600,12 +601,12 @@ class TestBundledWorkspacePreferences:
     def virtual_default_user(self, monkeypatch):
         """A logged-in owner with no saved tier → the platform default ``virtual``."""
         monkeypatch.setattr(
-            orchestrator_main.postgres_db,
+            orchestrator_main.app.state.resources.postgres_db,
             "get_user_settings",
             AsyncMock(return_value={}),
         )
         monkeypatch.setattr(
-            orchestrator_main.postgres_db,
+            orchestrator_main.app.state.resources.postgres_db,
             "resolve_default_for_capability",
             AsyncMock(return_value=None),
         )

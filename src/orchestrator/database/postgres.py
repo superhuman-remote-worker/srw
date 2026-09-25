@@ -18718,11 +18718,34 @@ class PostgresDB:
         ):
             return []
         async with self.acquire() as conn:
+            # Stateless End's Begin admits the terminal intent for the exact
+            # live runtime in the same transaction as its retirement marker.
+            # Until End has durably drained the residents and retired the
+            # shell for that runtime, the explicit owner (End, Delete or
+            # Resume retrying the marker) holds it: deleting the Pod first
+            # would destroy the only object that can produce those proofs.
             rows = await conn.fetch(
                 "SELECT * FROM managed_repository_workspace_cleanup_intents "
-                "WHERE settled_at IS NULL AND intent_generation > $1 "
-                "AND next_attempt_at <= now() "
-                "ORDER BY intent_generation LIMIT $2",
+                "AS intent WHERE intent.settled_at IS NULL "
+                "AND intent.intent_generation > $1 "
+                "AND intent.next_attempt_at <= now() "
+                "AND NOT EXISTS (SELECT 1 FROM threads AS owner "
+                "WHERE intent.owner_kind = 'thread' "
+                "AND intent.scope = 'workspace_container' "
+                "AND owner.id = intent.owner_id "
+                "AND owner.execution_lane = 'stateless' "
+                "AND owner.metadata #> '{_stateless_workspace_retirement_pending}'"
+                " = 'true'::jsonb "
+                "AND owner.metadata #>> "
+                "'{_stateless_claim_retirement,runtime_incarnation}' "
+                "= intent.runtime_incarnation::text "
+                "AND NOT (COALESCE(owner.metadata #> "
+                "'{_stateless_claim_retirement,residents_retired}' "
+                "= 'true'::jsonb, FALSE) "
+                "AND COALESCE(owner.metadata #> "
+                "'{_stateless_claim_retirement,remote_retired}' "
+                "= 'true'::jsonb, FALSE))) "
+                "ORDER BY intent.intent_generation LIMIT $2",
                 after_generation,
                 limit,
             )
@@ -41102,6 +41125,123 @@ class PostgresDB:
             )
         return row is not None
 
+    async def acknowledge_stateless_thread_runtime_process_zero(
+        self,
+        thread_id: str,
+        *,
+        terminal_token: int,
+        runtime_incarnation: str,
+    ) -> bool:
+        """Record an absent runtime's durable process-zero receipt as proof.
+
+        The finalizer release writes the ``stateless_workspace`` receipt only
+        after observing every container of the exact Pod UID terminated, and
+        before it lets the object go.  When that Pod is already absent, the
+        receipt is the same evidence ``exact_terminal`` would have shown, so
+        it may acknowledge both stages exactly as
+        :meth:`acknowledge_stateless_thread_shell_absent` does.  The receipt
+        is required inside this UPDATE for the marker's own runtime; a bare
+        404, a predecessor's receipt, or the resident SSH proof's generic
+        ``workspace_container`` receipt authorizes nothing.
+        """
+        try:
+            expected_runtime = _canonical_uuid_text(
+                runtime_incarnation,
+                label="stateless workspace runtime incarnation",
+            )
+        except RuntimeError:
+            return False
+        acknowledgement = json.dumps(
+            {
+                "kind": "workspace_runtime_terminal",
+                "terminal_token": int(terminal_token),
+                "runtime_incarnation": expected_runtime,
+                "evidence": "process_zero_receipt",
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        async with self.acquire() as conn:
+            row = await conn.fetchval(
+                """
+                UPDATE threads
+                SET metadata = jsonb_set(
+                    jsonb_set(
+                        jsonb_set(
+                            jsonb_set(
+                                jsonb_set(
+                                    jsonb_set(
+                                        COALESCE(metadata, '{}'::jsonb),
+                                        '{_stateless_resident_retirement_ack}',
+                                        $4::jsonb,
+                                        true
+                                    ),
+                                    '{_stateless_shell_retirement_ack}',
+                                    $4::jsonb,
+                                    true
+                                ),
+                                '{_stateless_claim_retirement,residents_retired}',
+                                'true'::jsonb,
+                                false
+                            ),
+                            '{_stateless_claim_retirement,residents_retired_by}',
+                            '"workspace_runtime_terminal"'::jsonb,
+                            true
+                        ),
+                        '{_stateless_claim_retirement,remote_retired}',
+                        'true'::jsonb,
+                        false
+                    ),
+                    '{_stateless_claim_retirement,remote_retired_by}',
+                    '"workspace_runtime_terminal"'::jsonb,
+                    true
+                )
+                WHERE id = $1::uuid
+                  AND execution_lane = 'stateless'
+                  AND status = 'ended'
+                  AND metadata #> '{_stateless_workspace_retirement_pending}'
+                      = 'true'::jsonb
+                  AND metadata #>
+                       '{_stateless_claim_retirement,terminal_token}'
+                      = to_jsonb($2::bigint)
+                  AND metadata #>
+                       '{_stateless_claim_retirement,claimant_quiesced}'
+                      = 'true'::jsonb
+                  AND NOT (COALESCE(metadata, '{}'::jsonb)
+                           ? '_stateless_claim_losses')
+                  AND metadata #>
+                       '{_stateless_claim_retirement,shell_retirement_required}'
+                      = 'true'::jsonb
+                  AND metadata #>
+                       '{_stateless_claim_retirement,resident_cleanup_required}'
+                      = 'true'::jsonb
+                  AND metadata #>>
+                       '{_stateless_claim_retirement,runtime_incarnation}'
+                      = $3::text
+                  AND EXISTS (
+                      SELECT 1 FROM run_queue
+                      WHERE unit_id = $1::uuid
+                        AND unit_kind = 'session_turn'
+                        AND state = 'done'
+                        AND lease_token = $2::bigint
+                  )
+                  AND EXISTS (
+                      SELECT 1 FROM managed_repository_process_zero_receipts
+                      WHERE owner_kind = 'thread'
+                        AND owner_id = $1::uuid
+                        AND scope = 'stateless_workspace'
+                        AND provisioner = 'k8s'
+                        AND runtime_incarnation = $3::text
+                  )
+                RETURNING id
+                """,
+                thread_id,
+                int(terminal_token),
+                expected_runtime,
+                acknowledgement,
+            )
+        return row is not None
+
     async def mark_stateless_thread_snapshot_restore_required(
         self, thread_id: str, *, terminal_token: int
     ) -> bool:
@@ -42533,7 +42673,11 @@ class PostgresDB:
         return [dict(row) for row in rows]
 
     async def list_retryable_pinned_retirements(
-        self, *, grace_seconds: int = 900, limit: int = 25
+        self,
+        *,
+        grace_seconds: int = 900,
+        limit: int = 25,
+        proven_grace_seconds: int | None = None,
     ) -> list[Dict[str, Any]]:
         """Return durable retirements whose local runtime can no longer finish.
 
@@ -42544,9 +42688,22 @@ class PostgresDB:
         after a generous grace and when the captured agent is absent/offline;
         a live process retains ownership of its local quiescence and final
         settlement call.
+
+        That grace covers a live runtime still draining *before* its final
+        settlement request. ``proven_grace_seconds`` (off by default) admits,
+        after that shorter grace, the two shapes where no such drain remains:
+        the exact agent already appended its local-quiescence receipt for
+        this token/generation, or a permanent delete of an ended, ownerless
+        generation that a soft settlement already quiesced. Such rows carry
+        ``nominated_before_grace`` so the caller never hands them to crash
+        recovery before the full grace; the End funnel revalidates both
+        proofs exactly under the lifecycle lock.
         """
 
         bounded_grace = max(0, int(grace_seconds))
+        bounded_proven_grace = (
+            None if proven_grace_seconds is None else max(0, int(proven_grace_seconds))
+        )
         bounded_limit = max(1, min(int(limit), 100))
         async with self.acquire() as conn:
             rows = await conn.fetch(
@@ -42557,20 +42714,60 @@ class PostgresDB:
                        t.runtime_retirement_started_at,
                        t.runtime_retirement_authorized_at,
                        t.runtime_retirement_context,
-                       a.status::text AS agent_status
+                       a.status::text AS agent_status,
+                       t.runtime_retirement_started_at
+                           > now() - make_interval(secs => $1::double precision)
+                           AS nominated_before_grace
                   FROM threads AS t
              LEFT JOIN agents AS a ON a.id = t.agent_id
                  WHERE t.execution_lane = 'pinned'
                    AND t.runtime_retirement_token IS NOT NULL
                    AND t.runtime_retirement_authorized_at IS NOT NULL
-                   AND t.runtime_retirement_started_at
-                       <= now() - make_interval(secs => $1::double precision)
+                   AND (
+                       t.runtime_retirement_started_at
+                           <= now() - make_interval(secs => $1::double precision)
+                       OR (
+                           $3::double precision IS NOT NULL
+                           AND t.runtime_retirement_started_at
+                               <= now()
+                                  - make_interval(secs => $3::double precision)
+                           AND (
+                               (
+                                   t.runtime_retirement_local_quiescence
+                                       ->> 'retirement_token'
+                                       = t.runtime_retirement_token::text
+                                   AND t.runtime_retirement_local_quiescence
+                                       ->> 'runtime_generation'
+                                       = t.runtime_generation::text
+                               )
+                               OR (
+                                   t.runtime_retirement_permanent = true
+                                   AND t.status = 'ended'
+                                   AND t.agent_id IS NULL
+                                   AND t.control_admission_agent_id IS NULL
+                                   AND t.runtime_attach_token IS NULL
+                                   AND EXISTS (
+                                       SELECT 1
+                                         FROM thread_runtime_retirement_outcomes
+                                              AS outcome
+                                        WHERE outcome.thread_id = t.id
+                                          AND outcome.runtime_generation
+                                              = t.runtime_generation
+                                          AND outcome.disposition = 'ended'
+                                          AND outcome.permanent = false
+                                          AND outcome.outcome = 'settled'
+                                   )
+                               )
+                           )
+                       )
+                   )
                    AND (t.agent_id IS NULL OR a.id IS NULL OR a.status = 'offline')
                  ORDER BY t.runtime_retirement_started_at ASC, t.id ASC
                  LIMIT $2
                 """,
                 float(bounded_grace),
                 bounded_limit,
+                None if bounded_proven_grace is None else float(bounded_proven_grace),
             )
         return [dict(row) for row in rows]
 

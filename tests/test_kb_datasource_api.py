@@ -11,14 +11,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from fastapi import HTTPException
 
-from orchestrator.main import (
-    ThreadCreateRequest,
-    _authorize_thread_project_ids,
-    _build_datasources_payload,
-    _revalidate_thread_project_ids,
-    _thread_has_knowledge_scope,
-    _thread_creation_project_ids,
-    create_thread,
+from orchestrator.schemas.thread_admission import ThreadCreateRequest
+import orchestrator.main
+from orchestrator.services.thread_project_authorization import (
+    thread_creation_project_ids as _thread_creation_project_ids,
 )
 from orchestrator.routers.datasources import (
     DatasourcesDependencies,
@@ -43,6 +39,17 @@ from orchestrator.services.kb_datasources import (
 from orchestrator.services.kb_task_registry import KbDatasourceTaskRegistry
 from orchestrator.services.knowledge_index import KnowledgeIndexDependencies
 from shared.runtime.services.knowledge_store import KbWatermark
+from orchestrator.application import preparation as preparation_composition
+from orchestrator.application import sessions as sessions_composition
+from orchestrator.services import (
+    agent_datasource_payload as agent_datasource_payload_module,
+)
+from orchestrator.services import datasource_config as datasource_config_module
+from orchestrator.services import deployment_gates as deployment_gates_module
+from orchestrator.services import thread_admission as thread_admission_module
+from orchestrator.services import (
+    thread_project_authorization as thread_project_authorization_module,
+)
 
 
 def _ds_deps(store=None, **gates) -> DatasourcesDependencies:
@@ -54,7 +61,6 @@ def _ds_deps(store=None, **gates) -> DatasourcesDependencies:
     which is exactly what an unpatched ``main`` global used to resolve to. The
     MCP predicates come from ``main`` itself so their behavior is unchanged.
     """
-    from orchestrator import main
 
     db = MagicMock() if store is None else store
     return DatasourcesDependencies(
@@ -70,8 +76,8 @@ def _ds_deps(store=None, **gates) -> DatasourcesDependencies:
                 tasks=KbDatasourceTaskRegistry(),
                 inject_system_kb_embedding_profile=AsyncMock(return_value=None),
             ),
-            mcp_datasources_enabled=main._mcp_datasources_enabled,
-            validate_mcp_datasource=main._validate_mcp_datasource,
+            mcp_datasources_enabled=deployment_gates_module.mcp_datasources_enabled,
+            validate_mcp_datasource=datasource_config_module.validate_mcp_datasource,
         ),
         **gates,
     )
@@ -165,7 +171,7 @@ def test_kb_dispatch_payload_is_source_qualified_and_credential_free():
     datasource_id = UUID("11111111-2222-3333-4444-555555555555")
     sentinel_token = "TOKEN_MUST_NOT_REACH_AGENT"
     sentinel_key = "KEY_MUST_NOT_REACH_AGENT"
-    result = _build_datasources_payload(
+    result = agent_datasource_payload_module.build_datasources_payload(
         [
             {
                 "id": datasource_id,
@@ -182,7 +188,10 @@ def test_kb_dispatch_payload_is_source_qualified_and_credential_free():
                 "config": {"root_path": "docs/knowledge"},
                 "project_read_only": False,
             }
-        ]
+        ],
+        dependencies=preparation_composition.datasource_payload_dependencies(
+            orchestrator.main.app.state.resources
+        ),
     )
 
     assert result == [
@@ -787,7 +796,7 @@ async def test_thread_attachment_rejects_an_inaccessible_private_kb():
     )
 
     with (
-        patch("orchestrator.main.postgres_db", db),
+        patch("orchestrator.main.app.state.resources.postgres_db", db),
         pytest.raises(HTTPException) as exc,
     ):
         await control_seams.authorize_thread_datasource_ids(
@@ -818,7 +827,7 @@ async def test_thread_attachment_allows_kb_but_not_clone_repo_on_lite_tier():
     )
     db.get_datasource_policy_rows = AsyncMock(side_effect=lambda _ids: [policy_row])
 
-    with patch("orchestrator.main.postgres_db", db):
+    with patch("orchestrator.main.app.state.resources.postgres_db", db):
         selected = await control_seams.authorize_thread_datasource_ids(
             {"id": owner_id},
             [str(datasource_id), str(datasource_id)],
@@ -859,8 +868,11 @@ async def test_persisted_thread_datasource_is_denied_after_access_revocation():
     )
 
     with (
-        patch("orchestrator.main.postgres_db", db),
-        patch("orchestrator.main._thread_project_ids", AsyncMock(return_value=[])),
+        patch("orchestrator.main.app.state.resources.postgres_db", db),
+        patch(
+            "orchestrator.services.thread_mount_rows.thread_project_ids",
+            AsyncMock(return_value=[]),
+        ),
         pytest.raises(HTTPException) as exc,
     ):
         await control_seams.revalidate_thread_datasource_selection(
@@ -895,8 +907,11 @@ async def test_persisted_thread_revalidation_preserves_global_and_system_semanti
     )
 
     with (
-        patch("orchestrator.main.postgres_db", db),
-        patch("orchestrator.main._thread_project_ids", AsyncMock(return_value=[])),
+        patch("orchestrator.main.app.state.resources.postgres_db", db),
+        patch(
+            "orchestrator.services.thread_mount_rows.thread_project_ids",
+            AsyncMock(return_value=[]),
+        ),
     ):
         (
             global_selection,
@@ -931,12 +946,15 @@ async def test_persisted_thread_project_scope_is_denied_after_membership_revocat
     db.get_user_role_in_project = AsyncMock(return_value=None)
 
     with (
-        patch("orchestrator.main.postgres_db", db),
+        patch("orchestrator.main.app.state.resources.postgres_db", db),
         pytest.raises(HTTPException) as exc,
     ):
-        await _revalidate_thread_project_ids(
+        await thread_project_authorization_module.revalidate_thread_project_ids(
             {"id": "thread-1", "user_id": owner_id},
             [str(project_id)],
+            dependencies=sessions_composition.thread_project_authorization_dependencies(
+                orchestrator.main.app.state.resources
+            ),
         )
 
     assert exc.value.status_code == 403
@@ -956,15 +974,23 @@ async def test_thread_creation_rejects_unavailable_project_without_enumeration()
     db.create_thread = AsyncMock()
 
     with (
-        patch("orchestrator.main.require_approved_user", AsyncMock(return_value=user)),
-        patch("orchestrator.main.postgres_db", db),
         patch(
-            "orchestrator.main._enforce_readiness_gate", AsyncMock(return_value=None)
+            "orchestrator.security.auth.require_approved_user",
+            AsyncMock(return_value=user),
+        ),
+        patch("orchestrator.main.app.state.resources.postgres_db", db),
+        patch(
+            "orchestrator.application.access.enforce_readiness_gate",
+            AsyncMock(return_value=None),
         ),
         pytest.raises(HTTPException) as exc,
     ):
-        await create_thread(
-            ThreadCreateRequest(project_ids=[str(project_id)]), object()
+        await thread_admission_module.create_thread(
+            ThreadCreateRequest(project_ids=[str(project_id)]),
+            object(),
+            dependencies=sessions_composition.thread_admission_dependencies(
+                orchestrator.main.app.state.resources
+            ),
         )
 
     assert exc.value.status_code == 403
@@ -1028,10 +1054,13 @@ async def test_thread_project_authorization_preserves_admin_access():
     db.get_project = AsyncMock(return_value={"id": project_id})
     db.get_user_role_in_project = AsyncMock()
 
-    with patch("orchestrator.main.postgres_db", db):
-        selected = await _authorize_thread_project_ids(
+    with patch("orchestrator.main.app.state.resources.postgres_db", db):
+        selected = await thread_project_authorization_module.authorize_thread_project_ids(
             {"id": UUID(int=1), "is_admin": True},
             [str(project_id), str(project_id)],
+            dependencies=sessions_composition.thread_project_authorization_dependencies(
+                orchestrator.main.app.state.resources
+            ),
         )
 
     assert selected == [str(project_id)]
@@ -1084,12 +1113,12 @@ async def test_resume_revalidates_datasources_before_mutating_thread_status():
 
     with (
         patch(
-            "orchestrator.main.require_thread_owner",
+            "orchestrator.security.access.require_thread_owner",
             AsyncMock(return_value=(user, thread)),
         ),
-        patch("orchestrator.main.postgres_db", db),
+        patch("orchestrator.main.app.state.resources.postgres_db", db),
         patch(
-            "orchestrator.main.thread_resume_operations.thread_config_drift",
+            "orchestrator.services.thread_resume.thread_config_drift",
             AsyncMock(return_value=drift),
         ),
         pytest.raises(HTTPException) as exc,
@@ -1136,12 +1165,12 @@ async def test_resume_blocks_revoked_native_project_scope_before_status_mutation
 
     with (
         patch(
-            "orchestrator.main.require_thread_owner",
+            "orchestrator.security.access.require_thread_owner",
             AsyncMock(return_value=(user, thread)),
         ),
-        patch("orchestrator.main.postgres_db", db),
+        patch("orchestrator.main.app.state.resources.postgres_db", db),
         patch(
-            "orchestrator.main.thread_resume_operations.thread_config_drift",
+            "orchestrator.services.thread_resume.thread_config_drift",
             AsyncMock(return_value=drift),
         ),
         pytest.raises(HTTPException) as exc,
@@ -1163,15 +1192,27 @@ async def test_thread_kb_credential_gate_is_narrow():
         ]
     )
 
-    with patch("orchestrator.main.postgres_db", db):
-        assert not await _thread_has_knowledge_scope(
-            project_ids=[], datasource_ids=[str(UUID(int=1))]
+    with patch("orchestrator.main.app.state.resources.postgres_db", db):
+        assert not await thread_project_authorization_module.thread_has_knowledge_scope(
+            project_ids=[],
+            datasource_ids=[str(UUID(int=1))],
+            dependencies=sessions_composition.thread_project_authorization_dependencies(
+                orchestrator.main.app.state.resources
+            ),
         )
-        assert await _thread_has_knowledge_scope(
-            project_ids=[], datasource_ids=[str(UUID(int=2))]
+        assert await thread_project_authorization_module.thread_has_knowledge_scope(
+            project_ids=[],
+            datasource_ids=[str(UUID(int=2))],
+            dependencies=sessions_composition.thread_project_authorization_dependencies(
+                orchestrator.main.app.state.resources
+            ),
         )
-        assert await _thread_has_knowledge_scope(
-            project_ids=[str(UUID(int=3))], datasource_ids=[]
+        assert await thread_project_authorization_module.thread_has_knowledge_scope(
+            project_ids=[str(UUID(int=3))],
+            datasource_ids=[],
+            dependencies=sessions_composition.thread_project_authorization_dependencies(
+                orchestrator.main.app.state.resources
+            ),
         )
 
     # Native project scope short-circuits without an unnecessary datasource read.
