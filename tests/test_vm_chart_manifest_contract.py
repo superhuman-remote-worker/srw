@@ -47,6 +47,7 @@ def attempt_render(
     chart: Chart,
     *overrides: str,
     api_versions: tuple[str, ...] = (),
+    namespace: str = RELEASE_NAMESPACE,
 ) -> subprocess.CompletedProcess[str]:
     cmd = [
         "helm",
@@ -54,7 +55,7 @@ def attempt_render(
         "t",
         str(ROOT / chart.path),
         "--namespace",
-        RELEASE_NAMESPACE,
+        namespace,
         "-f",
         str(ROOT / chart.values),
     ]
@@ -69,8 +70,11 @@ def render_chart(
     chart: Chart,
     *overrides: str,
     api_versions: tuple[str, ...] = (),
+    namespace: str = RELEASE_NAMESPACE,
 ) -> str:
-    result = attempt_render(chart, *overrides, api_versions=api_versions)
+    result = attempt_render(
+        chart, *overrides, api_versions=api_versions, namespace=namespace
+    )
     assert result.returncode == 0, result.stderr
     return result.stdout
 
@@ -213,6 +217,40 @@ def test_mode_controls_same_cluster_object_set(
                 assert doc["metadata"].get("namespace") == RELEASE_NAMESPACE
     else:
         assert not controller_docs, f"{mode} unexpectedly rendered {kinds}"
+
+
+@pytest.mark.parametrize("namespace", ("superhuman-remote-worker", "vm-runtime"))
+def test_vm_controller_datavolume_source_cas_permission_is_namespaced(
+    namespace: str,
+) -> None:
+    rendered = documents(render_chart(MAIN, namespace=namespace))
+    role = next(
+        doc for doc in rendered
+        if doc.get("kind") == "Role"
+        and doc["metadata"]["name"].endswith("-vm-controller")
+    )
+    assert role["metadata"]["namespace"] == namespace
+    datavolume_rules = [
+        rule for rule in role["rules"]
+        if rule["apiGroups"] == ["cdi.kubevirt.io"]
+        and rule["resources"] == ["datavolumes"]
+    ]
+    assert len(datavolume_rules) == 1
+    assert set(datavolume_rules[0]["verbs"]) == {
+        "get", "list", "create", "delete", "patch", "update",
+    }
+    binding = next(
+        doc for doc in rendered
+        if doc.get("kind") == "RoleBinding"
+        and doc["metadata"]["name"] == role["metadata"]["name"]
+    )
+    assert binding["metadata"]["namespace"] == namespace
+    assert binding["subjects"][0]["namespace"] == namespace
+    assert all(
+        "datavolumes" not in rule.get("resources", [])
+        for doc in rendered if doc.get("kind") == "ClusterRole"
+        for rule in doc["rules"]
+    )
 
 
 def test_same_cluster_controller_env_is_literal_and_http_only() -> None:

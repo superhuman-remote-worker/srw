@@ -35,10 +35,11 @@ rules:
   # precondition after the DataVolume, rather than trusting the cascade, so
   # a superseded incarnation's disk can never be purged by mistake. Without
   # the verb every captured teardown 403s and the job's VM context is left
-  # `ready` forever.
+  # `ready` forever. Golden source pin publication and cancellation tombstones
+  # replace the same DataVolume with a resourceVersion CAS, which needs update.
   - apiGroups: ["cdi.kubevirt.io"]
     resources: ["datavolumes"]
-    verbs: ["get", "list", "create", "delete", "patch"]
+    verbs: ["get", "list", "create", "delete", "patch", "update"]
   - apiGroups: [""]
     resources: ["persistentvolumeclaims"]
     verbs: ["get", "list", "delete"]
