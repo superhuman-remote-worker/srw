@@ -14,6 +14,42 @@ from orchestrator.services.manifest_resolution import LiveManifestResolver
 from orchestrator.services.manifest_store import ManifestStore
 from shared.runtime.core.workspace_selection import execution_workspace_config
 
+_BUILD_YOUR_OWN_IMAGE = (
+    "Build your own image FROM an SRW base image and name it in "
+    "environment.image (see examples/manifests/container-workspace-templates.md)."
+)
+_IMAGE_REFERENCE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/@-]*")
+
+
+def _sandbox_workspace_config(recipe: dict) -> dict:
+    """Render a container template; SRW never builds or initializes images."""
+    environment = recipe.get("environment", {})
+    if environment.get("prepare") or environment.get("cache", "Reuse") != "Reuse":
+        raise HTTPException(
+            422, "Container templates can't run prepare steps. " + _BUILD_YOUR_OWN_IMAGE
+        )
+    if "initialize" in recipe:
+        raise HTTPException(
+            422,
+            "Container templates don't support initialize; bake setup into the "
+            "image. " + _BUILD_YOUR_OWN_IMAGE,
+        )
+    sandbox: dict = {}
+    if "image" in environment:
+        image = environment["image"]
+        if _IMAGE_REFERENCE.fullmatch(image) is None:
+            raise HTTPException(
+                422, "Container image must be a registry image reference."
+            )
+        sandbox["image"] = image
+        if "pullPolicy" in environment:
+            sandbox["pull_policy"] = environment["pullPolicy"]
+    resources = recipe.get("resources", {})
+    for field in ("cpu", "memory", "storage"):
+        if field in resources:
+            sandbox[field] = resources[field]
+    return {"sandbox": sandbox} if sandbox else {}
+
 
 def srw_workspace_config(
     workspace: dict | None, *, instance_recipe: dict | None = None
@@ -48,6 +84,8 @@ def srw_workspace_config(
     result = {"backend": recipe["backend"]}
     if not set(recipe) & {"resources", "environment", "initialize"}:
         return result
+    if recipe["backend"] == "sandbox":
+        return {**result, **_sandbox_workspace_config(recipe)}
     if recipe["backend"] != "vm":
         raise HTTPException(
             422, "SRW template images, resources and initialization require backend vm."
@@ -78,7 +116,7 @@ def srw_workspace_config(
         image = environment["image"]
         # The VM controller embeds this registry reference in its disk manifest.
         # Accept registry paths/tags/digests, never whitespace or YAML syntax.
-        if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/@-]*", image) is None:
+        if _IMAGE_REFERENCE.fullmatch(image) is None:
             raise HTTPException(422, "VM image must be a registry image reference.")
         vm["image"] = image
     resources = recipe.get("resources", {})

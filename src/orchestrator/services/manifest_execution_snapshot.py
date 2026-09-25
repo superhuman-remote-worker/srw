@@ -596,14 +596,17 @@ async def prepare_srw_session_patch(
 
     if backend_of(old_workspace) == backend_of(new_workspace):
         _, old_policy = srw_snapshot_config(current)
-        if (policy.get("workspace") or {}).get("vm") != (
-            old_policy.get("workspace") or {}
-        ).get("vm"):
-            raise HTTPException(
-                422,
-                "Session settings cannot change the captured VM image or resources; "
-                "create a new session with the selected workspace.",
-            )
+        captured_messages = {
+            "vm": "Session settings cannot change the captured VM image or "
+            "resources; create a new session with the selected workspace.",
+            "sandbox": "Session settings cannot change the captured container "
+            "image or resources; create a new session with the selected workspace.",
+        }
+        for captured, message in captured_messages.items():
+            if (policy.get("workspace") or {}).get(captured) != (
+                old_policy.get("workspace") or {}
+            ).get(captured):
+                raise HTTPException(422, message)
         for key in ("document", "resolved"):
             prepared[key]["spec"]["execution"]["workspace"] = deepcopy(
                 current[key]["spec"]["execution"]["workspace"]

@@ -10,7 +10,7 @@ from typing import Any
 
 from shared.workspace_contract import normalize_workspace_backend
 
-INFRASTRUCTURE_KEYS = frozenset({"backend", "vm"})
+INFRASTRUCTURE_KEYS = frozenset({"backend", "vm", "sandbox"})
 
 
 def execution_workspace_config(*layers: dict | None, role: str = "worker") -> dict:
