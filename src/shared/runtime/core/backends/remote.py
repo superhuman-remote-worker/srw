@@ -2719,13 +2719,21 @@ __SRW_WORKSPACE_UID_ZERO_PY__
         the workspace user cannot inspect it. Close this terminal backend's
         own writer channel before opening the proof exec; the still-active
         SSH transport is sufficient for that exec and ``_ensure_connected()``
-        will not recreate SFTP.
+        will not recreate SFTP. ``$HOME`` is resolved through this channel,
+        so cache it first: later terminal scripts on this backend still build
+        their paths from it.
         """
         self._ensure_connected()
         with self._sftp_lock:
             sftp = self._sftp
             self._sftp = None
             if sftp is not None:
+                if self._home_dir is None:
+                    try:
+                        self._home_dir = sftp.normalize(".")
+                    except (OSError, paramiko.SSHException):
+                        # Uncached, a later home-relative path fails closed.
+                        pass
                 sftp.close()
 
     def _tmux_exec_checked(
