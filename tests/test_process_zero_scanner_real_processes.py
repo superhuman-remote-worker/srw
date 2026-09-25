@@ -201,7 +201,7 @@ class TestTaggedScan:
             terminate=terminate,
             fixtures=[
                 {"name": "z", "kind": "zombie", "env": tagged},
-                {"name": "holder", "kind": "non_reaping_parent", "env": tagged},
+                {"name": "holder", "kind": "non_reaping_parent", "child_env": tagged},
                 {"name": "untagged", "kind": "sleeper"},
             ],
         )
@@ -224,7 +224,7 @@ class TestTaggedScan:
             terminate=True,
             fixtures=[
                 {"name": "z", "kind": "zombie", "env": tagged},
-                {"name": "holder", "kind": "non_reaping_parent", "env": tagged},
+                {"name": "holder", "kind": "non_reaping_parent", "child_env": tagged},
                 {"name": "stubborn", "kind": "term_ignorer", "env": tagged},
                 {"name": "untagged", "kind": "sleeper"},
                 {"name": "foreign", "kind": "sleeper", "env": foreign},

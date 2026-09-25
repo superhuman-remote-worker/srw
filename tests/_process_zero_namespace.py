@@ -219,6 +219,9 @@ class Driver:
         env = self._env(spec)
         record: dict = {"kind": kind}
         tag = spec.get("env", {}).get(self.tag_env, "")
+        if kind == "non_reaping_parent":
+            # The holder itself stays untagged; only its exited child is.
+            tag = spec.get("child_env", {}).get(self.tag_env, "")
         if kind in _SHELL_LOOPS:
             argv = ["sh", "-c", _SHELL_LOOPS[kind]]
         elif kind == "dead_leader":
