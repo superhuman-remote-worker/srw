@@ -215,6 +215,10 @@ class VMCreationPreflightStore:
         if job is None:
             raise VMCreationRetryConflict("job_changed")
         current = _object(job["context"])
+        from shared.worker_execution_hold import worker_execution_held
+
+        if worker_execution_held(current):
+            raise VMCreationRetryConflict("worker_execution_pending")
         current_vm = _object(current.get("vm"))
         current_prior = _preflight(current_vm)
         current_old = _object(current.get("last_vm"))

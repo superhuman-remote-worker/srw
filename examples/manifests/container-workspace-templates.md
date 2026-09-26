@@ -267,8 +267,28 @@ report a typed `workspace_unavailable` stop on its first observation instead of
 releasing it for another graph attempt. Other backend and retry contracts remain
 separate. These guarantees require the updated worker and orchestrator.
 
-This does not yet qualify worker process loss or a completion report that fails
-before acceptance: an uncheckpointed failure can still be retried by a successor.
+With migration 0293 and the updated worker and orchestrator, a typed container
+stop whose report fails before acceptance, or an expired container worker
+attempt after bundle authorization, enters a separate execution hold. The queue
+token is revoked; the workspace, checkpoint and retry counters are preserved.
+The command outcome is unknown, so no successor automatically replays it.
+
+This is a safety-only hold. Resume, admin reassignment and reprovisioning are
+blocked while previous execution remains unresolved; Cancel keeps its normal
+policy. The hold does not prove the executor or its remote commands stopped and
+does not authorize cleanup. This release has no settlement or manual clearing
+path for the marker. Historical attempts lacking exact identity also cannot
+be made resumable by inferring a replacement Pod's identity. A separate stop
+evidence protocol is still required to support recovery from these holds.
+
+Deploy this boundary with a coordinated upgrade: stop new claims, drain work,
+and stop every old worker, orchestrator, reaper and control writer before
+applying the migration and upgrading all components. Verify their versions
+before re-enabling execution and controls. Migration 0293 preserves the marker;
+only the updated application enforces all execution admission checks. A mixed
+version rolling deployment is not protected. Do not roll back to older binaries
+while any execution holds exist unless equivalent guards have been backported.
+
 Stateless execution with completion-command admission disabled also retains its
 existing pre-report retry behavior. Automatic replay remains unqualified across
-these boundaries; an accepted hold does not prove an interrupted command safe.
+that boundary; an accepted hold does not prove an interrupted command safe.

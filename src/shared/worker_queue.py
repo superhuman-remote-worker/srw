@@ -1205,6 +1205,19 @@ async def release_worker_batch(
     )
 
 
+async def hold_failed_container_worker_report(
+    db: Any, *, unit_id: UUID | str, lease_token: int
+) -> str:
+    """Restrict a failed typed report; never claim completion or stop proof."""
+    from shared.worker_execution_hold import hold_container_worker_attempt
+
+    async with _connection(db) as conn:
+        return await hold_container_worker_attempt(
+            conn, job_id=unit_id, lease_token=lease_token,
+            reason="typed_report_unaccepted",
+        )
+
+
 async def rotate_worker_batch(
     db: Any,
     *,

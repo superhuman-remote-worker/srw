@@ -875,7 +875,7 @@ async def test_explicit_resume_unparks_then_updates_job_in_one_transaction():
         raise AssertionError(normalized)
 
     conn.fetchrow = AsyncMock(side_effect=fetchrow)
-    conn.fetchval = AsyncMock(return_value=True)
+    conn.fetchval = AsyncMock(side_effect=lambda sql, *args: False if "_worker_execution_hold" in sql else True)
     db = _db_with_conn(conn)
 
     assert await db.queue_stateless_job_for_resume(
@@ -889,7 +889,7 @@ async def test_explicit_resume_unparks_then_updates_job_in_one_transaction():
         if call.args and "WITH cur AS" in call.args[0]
     )
     assert enqueue_call.args[6] == 13
-    conn.fetchval.assert_awaited_once()
+    assert conn.fetchval.await_count == 2
     assert "state = 'parked'" in conn.fetchval.await_args.args[0]
     assert any(
         "execution_lane = 'stateless'" in call.args[0]
@@ -925,6 +925,7 @@ async def test_delegation_resume_keeps_waiting_status_cas_inside_queue_transacti
         raise AssertionError(normalized)
 
     conn.fetchrow = AsyncMock(side_effect=fetchrow)
+    conn.fetchval = AsyncMock(return_value=False)
     db = _db_with_conn(conn)
 
     assert await db.queue_stateless_job_for_resume(
@@ -963,6 +964,7 @@ async def test_resume_during_old_terminal_lease_records_newer_wake_watermark():
         raise AssertionError(normalized)
 
     conn.fetchrow = AsyncMock(side_effect=fetchrow)
+    conn.fetchval = AsyncMock(return_value=False)
     db = _db_with_conn(conn)
 
     assert await db.queue_stateless_job_for_resume(

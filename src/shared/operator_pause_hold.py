@@ -40,6 +40,11 @@ import json
 from collections.abc import Mapping
 from typing import Any
 
+from shared.worker_execution_hold import (
+    WORKER_EXECUTION_HOLD_KEY,
+    worker_execution_held_sql,
+)
+
 OPERATOR_PAUSE_HOLD_CONTEXT_KEY = "_operator_pause_hold"
 OPERATOR_PAUSE_HOLD_VERSION = 1
 LAST_OPERATOR_PAUSE_HOLD_CONTEXT_KEY = "last_operator_pause_hold"
@@ -50,7 +55,7 @@ def operator_pause_hold_present_sql(context_expression: str = "context") -> str:
 
     return (
         f"(COALESCE({context_expression}, '{{}}'::jsonb) "
-        f"? '{OPERATOR_PAUSE_HOLD_CONTEXT_KEY}')"
+        f"? '{OPERATOR_PAUSE_HOLD_CONTEXT_KEY}' OR {worker_execution_held_sql(context_expression)})"
     )
 
 
@@ -75,7 +80,7 @@ def operator_pause_held_ancestor_sql(job_id_expression: str) -> str:
     )
     SELECT 1 FROM held_lineage
       JOIN jobs AS held_ancestor ON held_ancestor.id = held_lineage.ancestor_id
-     WHERE held_ancestor.status = 'paused'
+     WHERE (held_ancestor.status = 'paused' OR {worker_execution_held_sql("held_ancestor.context")})
        AND {operator_pause_hold_present_sql("held_ancestor.context")}
 )"""
 
@@ -169,7 +174,11 @@ def _context(value: Any) -> Mapping[str, Any]:
 def operator_pause_hold_present(context: Any) -> bool:
     """Python mirror of :func:`operator_pause_hold_present_sql` for a context."""
 
-    return OPERATOR_PAUSE_HOLD_CONTEXT_KEY in _context(context)
+    current = _context(context)
+    return (
+        OPERATOR_PAUSE_HOLD_CONTEXT_KEY in current
+        or WORKER_EXECUTION_HOLD_KEY in current
+    )
 
 
 def operator_pause_lift_already_consumed(

@@ -110,6 +110,9 @@ async def test_worker_reaper_resolves_exact_attempt_before_exhaustion(
     monkeypatch, evidence
 ):
     monkeypatch.setenv("VM_WORKSPACE_RECOVERY_ENABLED", "true")
+    # This unit isolates the VM protocol after positive non-container classification.
+    monkeypatch.setattr("shared.worker_execution_hold.hold_container_worker_attempt",
+                        AsyncMock(return_value="not_applicable"))
     conn = _conn()
     conn.queue_row = {
         **_queue(state="leased", token=8, attempts=5),
@@ -1478,7 +1481,7 @@ async def test_loop_leader_gates_on_reaper_advisory_lock(monkeypatch):
     conn.fetchval = _fetchval
     conn.execute = AsyncMock()
 
-    async def _reap(c, *, grace_seconds, session_steal=None):
+    async def _reap(c, *, grace_seconds, session_steal=None, worker_steal=None):
         assert c is conn
         shutdown.set()  # one cycle, then stop
         return []
@@ -1544,7 +1547,7 @@ async def test_loop_survives_cycle_errors_and_recontends(monkeypatch):
     conn.execute = AsyncMock()
     rounds = []
 
-    async def _reap(c, *, grace_seconds, session_steal=None):
+    async def _reap(c, *, grace_seconds, session_steal=None, worker_steal=None):
         rounds.append(1)
         if len(rounds) == 1:
             raise ConnectionError("db blip")

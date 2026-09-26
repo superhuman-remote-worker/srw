@@ -290,12 +290,19 @@ def format_job_detail(job: dict[str, Any]) -> str:
 
 def _operator_pause_hold_lines(job: dict[str, Any]) -> list[str]:
     """Say so when an operator pause holds the job until an explicit resume."""
+    from shared.worker_execution_hold import (
+        WORKER_EXECUTION_HOLD_KEY,
+        WORKER_EXECUTION_HOLD_MESSAGE,
+    )
+
     context = job.get("context")
     if isinstance(context, str):
         try:
             context = json.loads(context)
         except (json.JSONDecodeError, ValueError):
             return []
+    if isinstance(context, dict) and WORKER_EXECUTION_HOLD_KEY in context:
+        return ["Worker execution hold: " + WORKER_EXECUTION_HOLD_MESSAGE]
     hold = context.get("_operator_pause_hold") if isinstance(context, dict) else None
     if hold is None:
         return []

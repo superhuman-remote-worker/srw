@@ -1585,28 +1585,47 @@ async def _try_steal_worker_with_recovery(
 ) -> StolenUnit | None:
     """Let exact recovery evidence decide before the ordinary exhaustion CAS."""
     try:
-        store = VMWorkspaceRecoveryStore(conn)
-        disposition = await store.get_attempt_disposition(
-            conn, job_id=candidate["unit_id"], lease_token=candidate["lease_token"]
+        from shared.worker_execution_hold import hold_container_worker_attempt
+
+        decision = await hold_container_worker_attempt(
+            conn, job_id=candidate["unit_id"], lease_token=candidate["lease_token"],
+            reason="post_bundle_executor_loss", grace_seconds=grace_seconds,
         )
-        # Admission owns canonical workspace -> queue -> job locking and
-        # revalidates both expiry and attempt evidence after those locks.
-        if await store.admit_hold_from_reaper(
-            conn,
-            disposition=disposition,
-            job_id=candidate["unit_id"],
-            lease_token=candidate["lease_token"],
-            grace_seconds=grace_seconds,
-        ):
+        if decision != "not_applicable":
             return None
-        # Non-VM workers retain the queue-only steal and exhaustion behavior.
-        row = await conn.fetchrow(
-            _REAP_STEAL_SQL,
-            candidate["unit_id"],
-            candidate["lease_token"],
-            backoff_seconds,
-            grace_seconds,
-        )
+        if workspace_recovery_enabled():
+            store = VMWorkspaceRecoveryStore(conn)
+            disposition = await store.get_attempt_disposition(
+                conn, job_id=candidate["unit_id"], lease_token=candidate["lease_token"]
+            )
+            # Admission owns canonical workspace -> queue -> job locking and
+            # revalidates both expiry and attempt evidence after those locks.
+            if await store.admit_hold_from_reaper(
+                conn,
+                disposition=disposition,
+                job_id=candidate["unit_id"],
+                lease_token=candidate["lease_token"],
+                grace_seconds=grace_seconds,
+            ):
+                return None
+        # A bundle may have been issued since the first classification. Keep
+        # this final classification's queue/Job locks through the ordinary
+        # steal; otherwise pre-bundle proof could authorize post-bundle replay.
+        # VM recovery above retains its existing canonical lock order.
+        async with conn.transaction():
+            decision = await hold_container_worker_attempt(
+                conn, job_id=candidate["unit_id"], lease_token=candidate["lease_token"],
+                reason="post_bundle_executor_loss", grace_seconds=grace_seconds,
+            )
+            if decision != "not_applicable":
+                return None
+            row = await conn.fetchrow(
+                _REAP_STEAL_SQL,
+                candidate["unit_id"],
+                candidate["lease_token"],
+                backoff_seconds,
+                grace_seconds,
+            )
         if row is None:
             return None
         return StolenUnit(
@@ -1641,16 +1660,11 @@ async def reap_cycle(
     opens its own transaction. Per-row errors are contained so one bad unit
     never blocks the rest of the pass.
     """
-    recovery_options = (
-        {"worker_steal": _try_steal_worker_with_recovery}
-        if workspace_recovery_enabled()
-        else {}
-    )
     stolen = await reap_expired(
         conn,
         grace_seconds=grace_seconds,
         session_steal=_try_steal_session_with_claim_loss,
-        **recovery_options,
+        worker_steal=_try_steal_worker_with_recovery,
     )
     for unit in stolen:
         # Greppable ops line — one per steal (M6 fault-injection anchors on it).

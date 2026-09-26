@@ -156,9 +156,8 @@ async def test_actual_streaming_workspace_error_is_reported_without_required_fal
         assert reported["should_stop"] is True
         assert reported["error"]["type"] == "workspace_unavailable"
         assert "goal_achieved" not in reported
-        # This test covers routing into the exact report protocol. Its mocked
-        # unaccepted response still releases; durable report-only/loss handling
-        # is a separately reproduced gap and is not claimed fixed here.
+        # This test covers routing into the exact report protocol. The
+        # separate report-loss module verifies the unaccepted-response hold.
     finally:
         current_lease.set(previous_lease)
         await close_fenced_checkpointer_pool()

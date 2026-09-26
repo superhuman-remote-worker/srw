@@ -41,6 +41,11 @@ from shared.operator_pause_hold import (
     operator_pause_lift_already_consumed,
     operator_pause_lift_token,
 )
+from shared.worker_execution_hold import (
+    WORKER_EXECUTION_HOLD_MESSAGE,
+    worker_execution_held,
+    worker_execution_held_sql,
+)
 from shared.pinned_job_delivery import stamp_pinned_resume_input_ids
 from orchestrator.services.vm_workspace_recovery_store import (
     acquire_vm_cleanup_permit,
@@ -129,6 +134,8 @@ class JobControlOperations:
     ) -> dict[str, Any]:
         """Provision a VM after the router has authorized job access."""
 
+        if worker_execution_held(job.get("context")):
+            raise HTTPException(status_code=409, detail=WORKER_EXECUTION_HOLD_MESSAGE)
         assigned_backend = resolve_workspace_contract(job).assigned_backend
         if assigned_backend != "vm":
             raise HTTPException(
@@ -848,6 +855,8 @@ class JobControlOperations:
         can call it directly. ``req`` is only needed on the internal-actor branch
         (no ``user``), which a notification action never takes."""
         require_srw_runtime(job)
+        if worker_execution_held(job.get("context")):
+            raise HTTPException(409, WORKER_EXECUTION_HOLD_MESSAGE)
         # An explicit resume is the authority that lifts an operator pause
         # hold, but only the hold on the row this request was authorized
         # against: every pinned re-queue/claim below CASes on it, so a pause
@@ -2335,6 +2344,8 @@ class JobControlOperations:
             job = await self.dependencies.store.get_job(job_id)
             if not job:
                 raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
+            if worker_execution_held(job.get("context")):
+                raise HTTPException(status_code=409, detail=WORKER_EXECUTION_HOLD_MESSAGE)
             require_srw_runtime(job)
             if self.dependencies.redispatch_livelock_trip(job) is not None:
                 raise HTTPException(
@@ -2485,7 +2496,8 @@ class JobControlOperations:
                         "    assigned_agent_id = NULL, execution_lane = 'pinned', "
                         "    updated_at = CURRENT_TIMESTAMP "
                         "WHERE id = $2::uuid AND status::text = $3::text "
-                        f"AND execution_lane = $4::text{control_guard} RETURNING id",
+                        f"AND execution_lane = $4::text{control_guard} "
+                        f"AND NOT {worker_execution_held_sql()} RETURNING id",
                         *update_args,
                     )
                     if updated is None:
@@ -2680,6 +2692,8 @@ class JobControlOperations:
         if not job:
             raise HTTPException(status_code=404, detail=f"Job '{job_id}' not found")
         require_srw_runtime(job)
+        if worker_execution_held(job.get("context")):
+            raise HTTPException(409, WORKER_EXECUTION_HOLD_MESSAGE)
         if self.dependencies.redispatch_livelock_trip(job) is not None:
             raise HTTPException(
                 status_code=409,

@@ -142,6 +142,7 @@ from shared.worker_queue import (
     claim_worker_batch,
     complete_worker_batch,
     get_worker_completion_acceptance,
+    hold_failed_container_worker_report,
     renew_worker_batch,
     release_worker_batch,
     rotate_worker_batch,
@@ -927,6 +928,7 @@ class StatelessTurnExecutor:
         self._worker_preempted = asyncio.Event()
         self._worker_preempt_status: Optional[str] = None
         self._worker_terminal_report_generation: tuple[str, int] | None = None
+        self._worker_container_report_uncertain = False
         self._worker_completion_accepted_generation: tuple[str, int] | None = None
         self._worker_workspace_recovery: WorkspaceRecoveryHandoff | None = None
         self._worker_workspace_recovery_code: WorkspaceRecoveryCode | None = None
@@ -1618,6 +1620,7 @@ class StatelessTurnExecutor:
         self._worker_preempted = asyncio.Event()
         self._worker_preempt_status = None
         self._worker_terminal_report_generation = None
+        self._worker_container_report_uncertain = False
         self._worker_completion_accepted_generation = None
         self._worker_workspace_recovery = None
         self._worker_workspace_recovery_code = None
@@ -1721,6 +1724,11 @@ class StatelessTurnExecutor:
                 int(token),
             )
             if report_started:
+                if await self._hold_unaccepted_container_report(claim):
+                    with contextlib.suppress(Exception):
+                        await self._cleanup_worker_runtime(preserve_shell=True)
+                    timing["outcome"] = "held:worker_execution_outcome_unknown"
+                    return
                 # Once an HTTP report has begun, correction 8 owns every
                 # ambiguous tail failure. Never issue a second report from
                 # this generation and never park it: preserve runtime state,
@@ -2191,6 +2199,15 @@ class StatelessTurnExecutor:
         # failures preserve tmux and re-report; the exact coded pre-write 422
         # below instead follows ordinary bounded retry/parking semantics.
         self._worker_terminal_report_generation = (job_id, int(token))
+        error = wire_payload.get("error")
+        self._worker_container_report_uncertain = bool(
+            self._completion_commands_enabled
+            and self._worker_workspace_backend == "sandbox"
+            and self._worker_workspace_provisioner == "k8s"
+            and wire_payload.get("goal_achieved", False) is False
+            and isinstance(error, dict)
+            and error.get("type") == "workspace_unavailable"
+        )
         started_at = time.perf_counter()
         try:
             reported = await client.report_completion(
@@ -2204,6 +2221,7 @@ class StatelessTurnExecutor:
             # follows ordinary retry/parking semantics rather than the
             # ambiguous-HTTP no-park path.
             self._worker_terminal_report_generation = None
+            self._worker_container_report_uncertain = False
             logger.error(
                 "worker completion definitively refused: unit=%s token=%d code=%s",
                 job_id,
@@ -2233,6 +2251,8 @@ class StatelessTurnExecutor:
             return f"released:{exc.code}"
         finally:
             self._add_worker_finish_timing(timing, started_at)
+        if reported:
+            self._worker_container_report_uncertain = False
         if await self._resolve_workspace_recovery(claim):
             return await self._handoff_workspace_recovery(claim=claim)
         if not reported:
@@ -2264,6 +2284,7 @@ class StatelessTurnExecutor:
                     failed_report_status = renewal.job_status
                     self._observe_worker_renewal(job_id, renewal)
             if accepted_completion is not None:
+                self._worker_container_report_uncertain = False
                 logger.info(
                     "worker completion already accepted: unit=%s token=%d "
                     "command=%s state=%s after ambiguous HTTP result",
@@ -2284,6 +2305,15 @@ class StatelessTurnExecutor:
             if self._lease.lost.is_set():
                 await self._cleanup_worker_runtime(preserve_shell=True)
                 return "error"
+            # Pause does not settle an interrupted command. Record its
+            # separate restriction before the ordinary preemption path can
+            # close the queue and leave an explicitly liftable pause.
+            if (
+                failed_report_status == "paused"
+                and await self._hold_unaccepted_container_report(claim)
+            ):
+                await self._cleanup_worker_runtime(preserve_shell=True)
+                return "held:worker_execution_outcome_unknown"
             if self._worker_preempted.is_set():
                 await self._finish_external_worker_preempt(
                     claim,
@@ -2291,6 +2321,9 @@ class StatelessTurnExecutor:
                     timing=timing,
                 )
                 return "preempted"
+            if await self._hold_unaccepted_container_report(claim):
+                await self._cleanup_worker_runtime(preserve_shell=True)
+                return "held:worker_execution_outcome_unknown"
             await self._cleanup_worker_runtime(
                 preserve_shell=failed_report_status
                 not in {"completed", "failed", "cancelled"}
@@ -3193,6 +3226,18 @@ class StatelessTurnExecutor:
     async def _cleanup_worker_runtime_locked(self, *, preserve_shell: bool) -> None:
         agent = _pa()._agent
         if agent is not None:
+            if self._worker_container_report_uncertain:
+                # This reduces outstanding local work; it never settles the
+                # durable barrier or proves a remote command stopped.
+                try:
+                    await self._join_worker_local_task(asyncio.create_task(
+                        agent.quiesce_worker_workspace_recovery()
+                    ))
+                except (Exception, asyncio.CancelledError) as exc:
+                    self.request_stop()
+                    if isinstance(exc, asyncio.CancelledError):
+                        raise
+                    logger.warning("Container worker local retirement remains unknown", exc_info=True)
             if self._lease.lost.is_set():
                 # Local lease loss is already sufficient to revoke effect
                 # authority.  Do not ask quiesce/its DB probe to rediscover the
@@ -3246,6 +3291,8 @@ class StatelessTurnExecutor:
         park_on_exhaustion: bool = True,
         timing: dict[str, Any] | None = None,
     ) -> None:
+        if reason == "terminal_report_failed" and await self._hold_unaccepted_container_report(claim):
+            return
         if self._lease.lost.is_set() or self._worker_quarantined:
             logger.info(
                 "run_queue release: worker unit=%s token=%d reason=%s "
@@ -3281,6 +3328,24 @@ class StatelessTurnExecutor:
             reason,
             state,
         )
+
+    async def _hold_unaccepted_container_report(self, claim: WorkerClaim) -> bool:
+        if not self._worker_container_report_uncertain:
+            return False
+        if self._worker_completion_accepted_generation == (str(claim.unit_id), int(claim.lease_token)):
+            self._worker_container_report_uncertain = False
+            return False
+        try:
+            decision = await hold_failed_container_worker_report(
+                self._db, unit_id=claim.unit_id, lease_token=claim.lease_token,
+            )
+            if decision in {"held", "superseded"}:
+                self._lease.mark_lost()
+        except Exception:
+            # No fallback release: a still-leased attempt is reconsidered by
+            # the exact expired-attempt reaper after this worker retires.
+            logger.exception("Container worker report hold unavailable; refusing graph retry")
+        return True
 
     async def _serve_claim(self, claim: ClaimedUnit) -> None:
         pa = _pa()

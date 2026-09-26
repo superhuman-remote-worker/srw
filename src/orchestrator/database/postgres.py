@@ -131,6 +131,7 @@ from shared.container_recovery import (
     ContainerRecoveryCleanup,
     container_recovery_resume_allowed_sql,
 )
+from shared.worker_execution_hold import WORKER_EXECUTION_HOLD_KEY, worker_execution_held_sql
 from shared.operator_pause_hold import (
     HELD_FEEDBACK_REASON,
     OPERATOR_PAUSE_HOLD_CONTEXT_KEY,
@@ -283,6 +284,7 @@ _SERVER_OWNED_OFFICER_CONTEXT_KEYS = frozenset(
 # bundle: this is the last-line defense for direct service/database callers.
 _SERVER_OWNED_MANAGED_REPOSITORY_CONTEXT_KEYS = frozenset(
     {
+        WORKER_EXECUTION_HOLD_KEY,
         "git_remote_url",
         "repo_name",
         "managed_repository_credentials",
@@ -1108,6 +1110,7 @@ def _stateless_resume_context(
     """Attach durable per-resume identities to one-shot worker inputs."""
 
     merged = dict(context_merge or {})
+    merged.pop(WORKER_EXECUTION_HOLD_KEY, None)
     merged["worker_resume_id"] = str(uuid4())
     if merged.get("queued_feedback") is not None:
         merged.setdefault("queued_feedback_reason", None)
@@ -10619,7 +10622,7 @@ class PostgresDB:
         Returns:
             True if the row was updated, False if not found / id invalid / no keys
         """
-        if not keys:
+        if not keys or WORKER_EXECUTION_HOLD_KEY in keys:
             return False
 
         try:
@@ -11824,6 +11827,7 @@ class PostgresDB:
             "WHERE id = $1 "
             "AND ($2::text <> 'vm' OR NOT (COALESCE(context, '{}'::jsonb) ? '_vm_creation_pending'))"
             f" AND ($2::text <> 'workspace_container' OR {container_recovery_resume_allowed_sql('context')})"
+            f" AND NOT {worker_execution_held_sql('context')}"
         )
         async with self.acquire() as conn:
             result = await conn.execute(query, uuid_val, key)
@@ -12420,6 +12424,7 @@ class PostgresDB:
              WHERE id = $1
                AND status::text = $4::text
                AND {normalized_config_backend} = $5::text
+               AND NOT {worker_execution_held_sql()}
                AND (
                    NOT (COALESCE(context, '{{}}'::jsonb)
                        ? '_workspace_contract')
@@ -16138,6 +16143,8 @@ class PostgresDB:
                     )
                 except RuntimeError:
                     return None
+                if owner_kind == "job" and WORKER_EXECUTION_HOLD_KEY in owner_state:
+                    return None
                 state_key = "ide_session" if scope == "ide" else scope
                 raw_runtime = owner_state.get(state_key)
                 if raw_runtime is not None and not isinstance(raw_runtime, dict):
@@ -17264,7 +17271,9 @@ class PostgresDB:
             async with conn.transaction():
                 table = "jobs" if owner_kind == "job" else "threads"
                 owner_status = await conn.fetchval(
-                    f"SELECT status::text FROM {table} WHERE id = $1 FOR UPDATE",
+                    f"SELECT status::text FROM {table} WHERE id = $1 "
+                    + (f"AND NOT {worker_execution_held_sql('context')} " if owner_kind == "job" else "")
+                    + "FOR UPDATE",
                     owner_uuid,
                 )
                 if (
@@ -17331,7 +17340,9 @@ class PostgresDB:
         async with self.acquire() as conn:
             async with conn.transaction():
                 owner_status = await conn.fetchval(
-                    f"SELECT status::text FROM {table} WHERE id = $1 FOR UPDATE",
+                    f"SELECT status::text FROM {table} WHERE id = $1 "
+                    + (f"AND NOT {worker_execution_held_sql('context')} " if owner_kind == "job" else "")
+                    + "FOR UPDATE",
                     owner_uuid,
                 )
                 if (
@@ -17410,7 +17421,9 @@ class PostgresDB:
         async with self.acquire() as conn:
             async with conn.transaction():
                 owner_status = await conn.fetchval(
-                    f"SELECT status::text FROM {table} WHERE id = $1 FOR UPDATE",
+                    f"SELECT status::text FROM {table} WHERE id = $1 "
+                    + (f"AND NOT {worker_execution_held_sql('context')} " if owner_kind == "job" else "")
+                    + "FOR UPDATE",
                     owner_uuid,
                 )
                 if (
@@ -17614,7 +17627,9 @@ class PostgresDB:
         async with self.acquire() as conn:
             async with conn.transaction():
                 owner_status = await conn.fetchval(
-                    f"SELECT status::text FROM {table} WHERE id = $1 FOR UPDATE",
+                    f"SELECT status::text FROM {table} WHERE id = $1 "
+                    + (f"AND NOT {worker_execution_held_sql('context')} " if owner_kind == "job" else "")
+                    + "FOR UPDATE",
                     owner_uuid,
                 )
                 if (
@@ -26146,6 +26161,7 @@ class PostgresDB:
             hold_args = (str(lift_operator_pause_hold),)
             claim_context = operator_pause_hold_lift_sql("context")
             hold_guard = "AND " + operator_pause_hold_matches_sql("context", "$4")
+        hold_guard += " AND NOT " + worker_execution_held_sql("context")
         async with self.acquire() as conn:
             query = f"""
                     UPDATE jobs
@@ -31892,6 +31908,8 @@ class PostgresDB:
         (the token of the row it authorized); the CAS then also requires that
         exact hold, so a stale resume cannot lift a newer pause.
         """
+        context_merge = dict(context_merge or {})
+        context_merge.pop(WORKER_EXECUTION_HOLD_KEY, None)
         # Fixed literals chosen by trusted booleans — never caller SQL.
         drop_decision = " - 'completion_decision'" if void_completion_decision else ""
         # Accepted new execution closes its human-wait episode in this same
@@ -31982,6 +32000,7 @@ class PostgresDB:
             )
         if lift_operator_pause_hold is not None:
             hold_guard += " AND " + container_recovery_resume_allowed_sql("context")
+            hold_guard += " AND NOT " + worker_execution_held_sql("context")
         # Feedback queued behind a hold (by internal resumes, then the lifting
         # resume) is appended in order rather than replaced; `context` here is
         # the pre-update row, so the lifting write still sees its hold.
@@ -32445,9 +32464,15 @@ class PostgresDB:
                         )
                     ):
                         raise _ResumeCASLostError
-                    if await reset_worker_batch_attempts(conn, job_id=job_uuid) is None:
+                    execution_held = await conn.fetchval(
+                        f"SELECT {worker_execution_held_sql('context')} FROM jobs WHERE id=$1 FOR UPDATE",
+                        job_uuid,
+                    )
+                    if execution_held and lift_operator_pause_hold is not None:
                         raise _ResumeCASLostError
-                    if admitted.state == "parked":
+                    if not execution_held and await reset_worker_batch_attempts(conn, job_id=job_uuid) is None:
+                        raise _ResumeCASLostError
+                    if admitted.state == "parked" and not execution_held:
                         # This is an explicit human/operator resume, so it is a
                         # legitimate poison-row recovery decision. Revive and
                         # reset attempts inside the same queue-first transaction.
@@ -32554,6 +32579,7 @@ class PostgresDB:
                            ) <> 'true')
                            AND ($2::text <> 'vm' OR NOT (COALESCE(context, '{{}}'::jsonb) ? '_vm_creation_pending'))
                           AND ($2::text <> 'workspace_container' OR {container_recovery_resume_allowed_sql("context")})
+                          AND NOT {worker_execution_held_sql("context")}
                         RETURNING id
                         """,
                         job_uuid,
@@ -32639,6 +32665,7 @@ class PostgresDB:
                           AND ($2::text <> 'vm' OR NOT (COALESCE(context, '{{}}'::jsonb) ? '_vm_creation_pending'))
                           AND ({_completion_control_owned_active_sql("context", "$4")})
                           AND ($2::text <> 'workspace_container' OR {container_recovery_resume_allowed_sql("context")})
+                          AND NOT {worker_execution_held_sql("context")}
                         RETURNING id
                         """,
                         job_uuid,

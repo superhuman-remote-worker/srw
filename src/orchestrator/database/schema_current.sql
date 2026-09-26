@@ -11545,6 +11545,33 @@ $$;
 
 
 --
+-- Name: preserve_job_worker_execution_hold(); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.preserve_job_worker_execution_hold() RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+BEGIN
+    IF COALESCE(OLD.context, '{}'::jsonb) ? '_worker_execution_hold'
+       AND (NOT (COALESCE(NEW.context, '{}'::jsonb) ? '_worker_execution_hold')
+            OR NEW.context->'_worker_execution_hold'
+               IS DISTINCT FROM OLD.context->'_worker_execution_hold') THEN
+        RAISE EXCEPTION 'A pending worker execution hold is immutable'
+            USING ERRCODE = '23514';
+    END IF;
+    RETURN NEW;
+END;
+$$;
+
+
+--
+-- Name: FUNCTION preserve_job_worker_execution_hold(); Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON FUNCTION public.preserve_job_worker_execution_hold() IS 'Restriction only: no process-zero, cleanup, replay or settlement authority. Phase A has no clearing writer; malformed presence remains restrictive.';
+
+
+--
 -- Name: prevent_active_vm_remote_operation_rebind(); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -30456,6 +30483,13 @@ CREATE TRIGGER infra_usage_day_state_one_way_seal BEFORE INSERT OR DELETE OR UPD
 --
 
 CREATE TRIGGER infrastructure_storage_resource_mappings_append_only BEFORE DELETE OR UPDATE ON public.infrastructure_storage_resource_mappings FOR EACH ROW EXECUTE FUNCTION public.protect_infrastructure_storage_resource_mapping();
+
+
+--
+-- Name: jobs jobs_worker_execution_hold_immutable; Type: TRIGGER; Schema: public; Owner: -
+--
+
+CREATE TRIGGER jobs_worker_execution_hold_immutable BEFORE UPDATE OF context ON public.jobs FOR EACH ROW EXECUTE FUNCTION public.preserve_job_worker_execution_hold();
 
 
 --
