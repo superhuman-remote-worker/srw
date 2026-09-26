@@ -1588,7 +1588,7 @@ class VMCreationRetryStore:
                     # No-effect settlement needs the historical immutable
                     # source, not permission to resume the old owner.
                     thread = await conn.fetchrow(
-                        "SELECT id FROM threads WHERE id=$1 FOR UPDATE",
+                        "SELECT * FROM threads WHERE id=$1 FOR UPDATE",
                         candidate["thread_id"],
                     )
                     row = _record(await conn.fetchrow(
@@ -1605,6 +1605,12 @@ class VMCreationRetryStore:
                     return {"settled": True, "disposition": "never_issued"}
                 if row["state"] != "cancel_requested":
                     raise VMCreationRetryConflict("job_not_cancelled")
+                if row["owner_kind"] == "thread" and not await conn.fetchval(
+                    "SELECT public.valid_thread_vm_creation_retirement_source(r,true) "
+                    "FROM vm_creation_retries r WHERE r.request_id=$1",
+                    row["request_id"],
+                ):
+                    raise VMCreationRetryConflict("thread_retirement_source_changed")
                 if (
                     row["cancellation_disposition"] is not None
                     or row["canonical_request"].get("workspace_storage") is not None
@@ -1677,7 +1683,7 @@ class VMCreationRetryStore:
                         "AND metadata->'vm'->>'vm_uid' IS NULL "
                         "AND metadata->'vm'->>'rootdisk_pvc_uid' IS NULL "
                         "RETURNING id",
-                        row["thread_id"], row["thread_runtime_generation"],
+                        row["thread_id"], thread["runtime_generation"],
                         str(row["request_id"]), row["request_digest"],
                     )
                     if cleared is None:

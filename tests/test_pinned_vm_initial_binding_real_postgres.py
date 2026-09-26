@@ -446,7 +446,9 @@ async def test_unissued_bound_initial_source_can_enter_normal_end(db, monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_historical_prebind_source_end_remains_fenced(db, monkeypatch):
+async def test_historical_prebind_source_end_captures_cleanup_only_authority(
+    db, monkeypatch
+):
     thread_id, policy, override, dependencies = await _initial_vm(db, monkeypatch)
     old = await db.get_thread(str(thread_id))
     assert await dependencies.vm_provisioner.create_thread_vm(
@@ -461,6 +463,9 @@ async def test_historical_prebind_source_end_remains_fenced(db, monkeypatch):
         "action"
     ] == "admitted"
     current = await _bind_protected_agent(db, thread_id)
+    async with db.acquire() as conn, conn.transaction():
+        with pytest.raises(VMCreationRetryConflict, match="thread_changed"):
+            await VMCreationRetryStore(db)._thread_scope(conn, source)
     result = await db.begin_pinned_thread_retirement(
         str(thread_id),
         permanent=True,
@@ -468,10 +473,31 @@ async def test_historical_prebind_source_end_remains_fenced(db, monkeypatch):
         expected_agent_id=str(current["agent_id"]),
         expected_attach_token=str(current["runtime_attach_token"]),
     )
-    assert result == {
-        "state": "malformed",
-        "reason": "physical_runtime_identity_malformed",
-    }
+    assert result["state"] == "pending", result
+    captured = result["context"]["vm_creation_source"]
+    assert captured["cleanup_protocol"] == "initial_attach_abort_v1"
+    assert captured["request_id"] == str(source["request_id"])
+    assert captured["thread_runtime_generation"] == str(
+        source["thread_runtime_generation"]
+    )
+    assert (
+        captured["thread_agent_id"] is None and captured["thread_attach_token"] is None
+    )
+    assert result["context"]["agent_id"] == str(current["agent_id"])
+    assert (
+        await db.fetchrow(
+            "SELECT * FROM vm_creation_retries WHERE request_id=$1",
+            source["request_id"],
+        )
+        == source
+    )
+    assert (
+        await db.fetchval(
+            "SELECT count(*) FROM vm_creation_effects WHERE request_id=$1",
+            source["request_id"],
+        )
+        == 0
+    )
     assert (
         await db.fetchval(
             "SELECT state FROM vm_resource_reservations WHERE request_id=$1",

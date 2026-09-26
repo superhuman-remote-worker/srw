@@ -36,6 +36,7 @@ from orchestrator.services.vm_workspace_recovery_store import (
     complete_vm_cleanup_permit,
 )
 from shared.pinned_workspace_evidence import has_pinned_physical_workspace_evidence
+from shared.pinned_vm_creation_retirement import initial_vm_creation_retirement_source
 
 
 @dataclass(frozen=True, slots=True)
@@ -546,8 +547,10 @@ class PinnedRetirementOperations:
             and context.get("agent_id") is None
             and context.get("runtime_attach_token") is None
         )
+        vm_creation_source = initial_vm_creation_retirement_source(context)
+        vm_creation_zero = vm_creation_source is not None
         workspace_create_pending = bool(workspace_provision_intent)
-        if pre_provision_intent_zero or workspace_create_pending:
+        if pre_provision_intent_zero or workspace_create_pending or vm_creation_zero:
             expected_protocol = "agent_runtime_zero_v1"
         elif backend == "sandbox":
             if (
@@ -572,7 +575,7 @@ class PinnedRetirementOperations:
             expected_protocol = None
         expected_workspace_generation = (
             None
-            if pre_provision_intent_zero or workspace_create_pending
+            if pre_provision_intent_zero or workspace_create_pending or vm_creation_zero
             else sandbox_generation
             if backend == "sandbox"
             else vm.get("provision_generation")
@@ -581,7 +584,7 @@ class PinnedRetirementOperations:
         )
         expected_workspace_runtime = (
             None
-            if pre_provision_intent_zero or workspace_create_pending
+            if pre_provision_intent_zero or workspace_create_pending or vm_creation_zero
             else sandbox_runtime
             if backend == "sandbox"
             else vm.get("vm_uid")
@@ -603,6 +606,10 @@ class PinnedRetirementOperations:
             and str(receipt.get("agent_id") or "") == str(context.get("agent_id") or "")
             and str(receipt.get("runtime_attach_token") or "")
             == str(context.get("runtime_attach_token") or "")
+            and (not vm_creation_zero or (
+                receipt.get("vm_creation_request_id") == vm_creation_source["request_id"]
+                and receipt.get("vm_creation_provision_generation") == vm_creation_source["provision_generation"]
+            ))
             and str(receipt.get("settle_status") or "")
             == str(context.get("settle_status") or "")
             and expected_protocol is not None
@@ -1623,6 +1630,34 @@ class PinnedRetirementOperations:
             credential_runtime_started=vm.get("credential_runtime_started"),
         )
 
+    async def _settle_vm_creation_source(
+        self, retirement: Mapping[str, Any], *, require_initial_agent_zero: bool = False,
+    ) -> bool:
+        """Resolve only terminal issuance debt before proving the current actor zero."""
+        context = retirement.get("context") or {}
+        source = context.get("vm_creation_source")
+        if not isinstance(source, Mapping) or not source.get("request_id"):
+            return False
+        identity = dict(
+            runtime_generation=str(retirement.get("generation") or ""),
+            retirement_token=str(retirement.get("token") or ""),
+            require_initial_agent_zero=require_initial_agent_zero,
+        )
+        thread_id = str(context.get("thread_id") or "")
+        if await self.dependencies.store.pinned_vm_creation_source_settled(thread_id, **identity):
+            return True
+        from orchestrator.services.vm_creation_retry_store import VMCreationRetryStore
+
+        # Issued/unknown effects and source pins remain pending for the exact
+        # disposition controller. A completed disposition is checked above;
+        # it must not be replayed through the never-issued-only API.
+        result = await VMCreationRetryStore(self.dependencies.store).settle_never_issued(
+            request_id=str(source["request_id"]),
+        )
+        return result.get("settled") is True and await self.dependencies.store.pinned_vm_creation_source_settled(
+            thread_id, **identity,
+        )
+
     async def _recover_captured_sandbox_process_zero(
         self,
         retirement: Mapping[str, Any],
@@ -1690,10 +1725,20 @@ class PinnedRetirementOperations:
         captured_vm_identity = self._captured_vm_recovery_identity(
             context, permanent=permanent
         )
+        vm_creation_zero = initial_vm_creation_retirement_source(context) is not None
+        if vm_creation_zero:
+            if not await self._settle_vm_creation_source(
+                retirement, require_initial_agent_zero=True,
+            ):
+                return False
+            # The shape helper permits only nonphysical repository labels;
+            # all source effects/debt have independently settled above.
+            captured_workspace = {}
         if (
             workspace_backend != "sandbox"
             and not virtual_binding_agent_zero_only
             and not lite_agent_zero_only
+            and not vm_creation_zero
             and captured_vm_identity is None
         ):
             # Unknown backends and incomplete VM authority remain fail-closed.
@@ -2080,21 +2125,8 @@ class PinnedRetirementOperations:
         # stable remote grant key. The scheduler uses this same cross-replica lock.
         if not await self._pinned_retirement_is_current(retirement):
             raise RuntimeError("pinned retirement authority changed")
-        creation_source = context.get("vm_creation_source")
-        if creation_source is not None:
-            if not isinstance(creation_source, Mapping) or not creation_source.get(
-                "request_id"
-            ):
-                raise RuntimeError("captured thread VM creation source is malformed")
-            from orchestrator.services.vm_creation_retry_store import VMCreationRetryStore
-
-            # An issued or uncertain API effect is not physical absence. The
-            # retry/disposition observer must settle the exact source first;
-            # this leaves End and its shared resource charge pending.
-            source_outcome = await VMCreationRetryStore(
-                self.dependencies.store
-            ).settle_never_issued(request_id=str(creation_source["request_id"]))
-            if source_outcome.get("settled") is not True:
+        if context.get("vm_creation_source") is not None:
+            if not await self._settle_vm_creation_source(retirement):
                 raise RuntimeError("thread VM creation disposition is pending")
         if (
             permanent

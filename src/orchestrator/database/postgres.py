@@ -2029,8 +2029,12 @@ def _pinned_retirement_local_quiescence_matches(
         and context.get("agent_id") is None
         and context.get("runtime_attach_token") is None
     )
+    from shared.pinned_vm_creation_retirement import initial_vm_creation_retirement_source
+
+    vm_creation_source = initial_vm_creation_retirement_source(context)
+    vm_creation_zero = vm_creation_source is not None
     workspace_create_pending = bool(workspace_provision_intent)
-    if pre_provision_intent_zero or workspace_create_pending:
+    if pre_provision_intent_zero or workspace_create_pending or vm_creation_zero:
         expected_protocol = "agent_runtime_zero_v1"
     elif backend == "sandbox":
         if (
@@ -2055,7 +2059,7 @@ def _pinned_retirement_local_quiescence_matches(
         expected_protocol = None
     expected_workspace_generation = (
         None
-        if pre_provision_intent_zero or workspace_create_pending
+        if pre_provision_intent_zero or workspace_create_pending or vm_creation_zero
         else vm.get("provision_generation")
         if backend in {"vm", "remote"}
         else sandbox_generation
@@ -2064,7 +2068,7 @@ def _pinned_retirement_local_quiescence_matches(
     )
     expected_workspace_runtime = (
         None
-        if pre_provision_intent_zero or workspace_create_pending
+        if pre_provision_intent_zero or workspace_create_pending or vm_creation_zero
         else vm.get("vm_uid")
         if backend in {"vm", "remote"}
         else sandbox_runtime
@@ -2073,6 +2077,7 @@ def _pinned_retirement_local_quiescence_matches(
     )
     if (
         not pre_provision_intent_zero
+        and not vm_creation_zero
         and backend in {"vm", "remote"}
         and (not expected_workspace_generation or not expected_workspace_runtime)
     ):
@@ -2090,6 +2095,10 @@ def _pinned_retirement_local_quiescence_matches(
         and str(receipt.get("agent_id") or "") == str(context.get("agent_id") or "")
         and str(receipt.get("runtime_attach_token") or "")
         == str(context.get("runtime_attach_token") or "")
+        and (not vm_creation_zero or (
+            receipt.get("vm_creation_request_id") == vm_creation_source["request_id"]
+            and receipt.get("vm_creation_provision_generation") == vm_creation_source["provision_generation"]
+        ))
         and str(receipt.get("settle_status") or "") == final_status
         and str(receipt.get("quiescence_protocol") or "") == expected_protocol
         and str(receipt.get("quiescence_actor") or "") in {"agent", "orchestrator"}
@@ -38979,13 +38988,17 @@ class PostgresDB:
                                 creation_request = json.loads(creation_request)
                             if isinstance(configuration, str):
                                 configuration = json.loads(configuration)
+                            cleanup_protocol = await conn.fetchval(
+                                "SELECT public.thread_vm_creation_cleanup_lineage(t,r) "
+                                "FROM threads t JOIN vm_creation_retries r ON r.thread_id=t.id "
+                                "WHERE t.id=$1 AND r.request_id=$2",
+                                parsed_thread_id, UUID(request_id),
+                            )
                             if not (
                                 creation["owner_kind"] == "thread"
                                 and creation["thread_id"] == parsed_thread_id
                                 and creation["job_id"] is None
-                                and str(creation["thread_runtime_generation"]) == generation
-                                and creation["thread_agent_id"] == thread["agent_id"]
-                                and creation["thread_attach_token"] == thread["runtime_attach_token"]
+                                and cleanup_protocol in {"exact", "initial_attach_abort_v1"}
                                 and str(creation["provision_generation"])
                                 == str(vm_context["provision_generation"])
                                 and creation["state"] in {
@@ -39016,7 +39029,8 @@ class PostgresDB:
                                 "provision_generation": str(creation["provision_generation"]),
                                 "request_digest": creation["request_digest"],
                                 "controller_configuration_digest": creation["controller_configuration_digest"],
-                                "thread_runtime_generation": generation,
+                                "thread_runtime_generation": str(creation["thread_runtime_generation"]),
+                                "cleanup_protocol": cleanup_protocol,
                                 "thread_agent_id": str(creation["thread_agent_id"])
                                 if creation["thread_agent_id"] is not None else None,
                                 "thread_attach_token": str(creation["thread_attach_token"])
@@ -39450,6 +39464,21 @@ class PostgresDB:
             if existing != "cancel_requested":
                 raise RuntimeError("retiring thread VM creation source changed")
 
+    async def pinned_vm_creation_source_settled(
+        self, thread_id: str, *, runtime_generation: str, retirement_token: str,
+        require_initial_agent_zero: bool = False,
+    ) -> bool:
+        """Positive no-VM/disposition proof for this current authorized End."""
+        return bool(await self.fetchval(
+            "SELECT CASE WHEN $4::boolean THEN "
+            "public.pinned_vm_creation_agent_zero_source(t.id,t.runtime_generation,t.runtime_retirement_token) "
+            "ELSE public.thread_vm_creation_never_issued_source(t.id,"
+            "t.runtime_retirement_context->'vm_creation_source'->>'provision_generation') END "
+            "FROM threads t WHERE t.id=$1::uuid AND t.runtime_generation=$2::uuid "
+            "AND t.runtime_retirement_token=$3::uuid",
+            thread_id, runtime_generation, retirement_token, require_initial_agent_zero,
+        ))
+
     async def acknowledge_pinned_thread_local_quiescence(
         self,
         thread_id: str,
@@ -39633,7 +39662,14 @@ class PostgresDB:
                     )
                     or ""
                 )
-                if workspace_provision_intent:
+                from shared.pinned_vm_creation_retirement import initial_vm_creation_retirement_source
+
+                vm_creation_source = initial_vm_creation_retirement_source(context)
+                vm_creation_zero = vm_creation_source is not None and bool(await conn.fetchval(
+                    "SELECT public.pinned_vm_creation_agent_zero_source($1,$2,$3)",
+                    parsed_thread, parsed_generation, parsed_retirement,
+                ))
+                if workspace_provision_intent or vm_creation_zero:
                     expected_protocol = "agent_runtime_zero_v1"
                 elif workspace_backend == "sandbox":
                     if bool(sandbox_generation) != bool(sandbox_runtime):
@@ -39660,7 +39696,7 @@ class PostgresDB:
                     }.get(workspace_backend)
                 if expected_protocol != expected_quiescence_protocol:
                     return None
-                if workspace_provision_intent:
+                if workspace_provision_intent or vm_creation_zero:
                     captured_workspace_generation = ""
                     captured_workspace_runtime = ""
                 elif workspace_backend == "sandbox":
@@ -39705,6 +39741,11 @@ class PostgresDB:
                         captured_workspace_runtime or None
                     ),
                 }
+                if vm_creation_zero:
+                    receipt.update(
+                        vm_creation_request_id=vm_creation_source["request_id"],
+                        vm_creation_provision_generation=vm_creation_source["provision_generation"],
+                    )
                 if existing is not None:
                     # Agent and orchestrator recovery may race after the exact
                     # agent Pod is stopped. Their physical proof is identical;

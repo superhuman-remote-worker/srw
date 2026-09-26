@@ -43,6 +43,12 @@ class VMCreationDispositionStore:
         )
         if row["owner_kind"] != "thread":
             return row, owner
+        if not await conn.fetchval(
+            "SELECT public.valid_thread_vm_creation_retirement_source(r,$2) "
+            "FROM vm_creation_retries r WHERE r.request_id=$1",
+            row["request_id"], row["state"] != "settled",
+        ):
+            raise VMCreationRetryConflict("thread_retirement_source_changed")
         context = _json(owner["runtime_retirement_context"])
         if not isinstance(context, dict):
             raise VMCreationRetryConflict("thread_retirement_source_changed")
@@ -55,7 +61,6 @@ class VMCreationDispositionStore:
             owner["runtime_retirement_token"] is None
             or owner["runtime_retirement_authorized_at"] is None
             or context.get("settle_status") != "ended"
-            or owner["runtime_generation"] != row["thread_runtime_generation"]
             or source is None
             or source.get("request_id") != str(row["request_id"])
             or source.get("provision_generation") != str(row["provision_generation"])
@@ -1023,7 +1028,7 @@ class VMCreationDispositionStore:
                         "AND runtime_retirement_context->'vm_creation_source'->>'request_id'=$4 "
                         "AND metadata->'vm'=runtime_retirement_context->'vm_creation_source'->'captured_vm' "
                         "AND metadata->'vm'->>'vm_uid' IS NULL RETURNING id",
-                        row["thread_id"], row["thread_runtime_generation"],
+                        row["thread_id"], owner["runtime_generation"],
                         UUID(disposition["retirement_token"]), str(row["request_id"]),
                     )
                     if cleared is None:
