@@ -357,25 +357,16 @@ async def test_initial_emptydir_soft_end_can_resume_or_permanently_end(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "unsafe", ["restarted", "init", "ephemeral", "missing_finalizer", "replacement_pvc"]
-)
-async def test_initial_end_refuses_unproven_fresh_never_started_runtime(
+@pytest.mark.parametrize("unsafe", ["missing_finalizer", "replacement_pvc"])
+async def test_initial_end_refuses_unproven_fresh_owned_storage(
     database, actor, monkeypatch, unsafe
 ):
-    from copy import deepcopy
     from uuid import uuid4
     from fastapi import HTTPException
 
     case = await workspace_attempt(database, actor, monkeypatch)
     pod = case.cluster.objects["pod"]
-    if unsafe == "restarted":
-        pod.status.container_statuses[0].restart_count = 1
-    elif unsafe in {"init", "ephemeral"}:
-        status = deepcopy(pod.status.container_statuses[0])
-        status.started = True
-        setattr(pod.status, f"{unsafe}_container_statuses", [status])
-    elif unsafe == "missing_finalizer":
+    if unsafe == "missing_finalizer":
         pod.metadata.finalizers = []
     else:
         case.cluster.objects["pvc"].metadata.uid = str(uuid4())
@@ -390,6 +381,36 @@ async def test_initial_end_refuses_unproven_fresh_never_started_runtime(
     assert (await database.get_thread(case.thread_id))["status"] == "created"
     assert case.cluster.pod_deletes == 0
     assert case.cluster.pod_create_calls == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("running", ["restarted", "init", "ephemeral"])
+async def test_initial_running_capture_does_not_confer_stop_proof(
+    database, actor, monkeypatch, running
+):
+    from copy import deepcopy
+    from orchestrator.services.workspace_lifecycle import WorkspaceOwner
+
+    case = await workspace_attempt(database, actor, monkeypatch)
+    pod = case.cluster.objects["pod"]
+    if running == "restarted":
+        pod.status.container_statuses[0].restart_count = 1
+    else:
+        status = deepcopy(pod.status.container_statuses[0])
+        status.started = True
+        setattr(pod.status, f"{running}_container_statuses", [status])
+    captured = await case.provisioner.capture_initial_stateless_creation_retirement(
+        WorkspaceOwner.session(case.thread_id)
+    )
+    assert captured is not None
+    assert captured["runtime_incarnation"] == pod.metadata.uid
+    assert (await database.get_thread(case.thread_id))["status"] == "created"
+    assert case.cluster.pod_deletes == 0
+    assert not await database.fetchval(
+        "SELECT EXISTS(SELECT 1 FROM managed_repository_process_zero_receipts "
+        "WHERE owner_id=$1::uuid)",
+        case.thread_id,
+    )
 
 
 @pytest.mark.asyncio

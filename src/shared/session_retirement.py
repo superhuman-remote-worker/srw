@@ -90,7 +90,7 @@ def _optional_authority_text(value: Any, *, label: str) -> str | None:
 
 
 def initial_creation_retirement_authority(value: Any) -> dict[str, Any]:
-    """Parse the captured, never-started initial creation; not a stop proof."""
+    """Parse the exact unpublished initial creation; never a process-stop proof."""
 
     fields = {
         "generation",

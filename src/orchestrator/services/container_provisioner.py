@@ -6380,7 +6380,7 @@ class ContainerProvisioner:
                     pod,
                     reservation_id=str(reservation["id"]),
                 )
-                if not await self._cancelled_creation_has_fresh_unstarted_runtime(
+                if not await self._creation_has_fresh_owned_storage(
                     owner,
                     reservation,
                     pod=pod,
@@ -7547,12 +7547,29 @@ class ContainerProvisioner:
         ordinary cleanup finalizer still proves termination before deletion.
         """
 
+        return _pod_never_started_a_container(
+            pod
+        ) and await self._creation_has_fresh_owned_storage(owner, reservation, pod=pod)
+
+    async def _creation_has_fresh_owned_storage(
+        self,
+        owner: WorkspaceOwner,
+        reservation: dict[str, Any],
+        *,
+        pod: Any,
+    ) -> bool:
+        """Verify fresh attempt storage without claiming that its processes stopped.
+
+        Initial Session End additionally proves the unused first-generation
+        authority at SQL. It may retire an unpublished Running Pod, but still
+        needs the exact all-container stop receipt before finalizer release.
+        Other terminal-intent reuse retains the never-started check above.
+        """
         if (
             owner.kind not in {"job", "session"}
             or reservation.get("scope") != "workspace_container"
             or reservation.get("operation_kind") != "create"
             or not self._has_stateless_process_zero_finalizer(pod)
-            or not _pod_never_started_a_container(pod)
         ):
             return False
         try:
