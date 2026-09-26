@@ -111,8 +111,10 @@ async def test_worker_reaper_resolves_exact_attempt_before_exhaustion(
 ):
     monkeypatch.setenv("VM_WORKSPACE_RECOVERY_ENABLED", "true")
     # This unit isolates the VM protocol after positive non-container classification.
-    monkeypatch.setattr("shared.worker_execution_hold.hold_container_worker_attempt",
-                        AsyncMock(return_value="not_applicable"))
+    monkeypatch.setattr(
+        "shared.worker_execution_hold.hold_container_worker_attempt",
+        AsyncMock(return_value="not_applicable"),
+    )
     conn = _conn()
     conn.queue_row = {
         **_queue(state="leased", token=8, attempts=5),

@@ -1588,8 +1588,11 @@ async def _try_steal_worker_with_recovery(
         from shared.worker_execution_hold import hold_container_worker_attempt
 
         decision = await hold_container_worker_attempt(
-            conn, job_id=candidate["unit_id"], lease_token=candidate["lease_token"],
-            reason="post_bundle_executor_loss", grace_seconds=grace_seconds,
+            conn,
+            job_id=candidate["unit_id"],
+            lease_token=candidate["lease_token"],
+            reason="post_bundle_executor_loss",
+            grace_seconds=grace_seconds,
         )
         if decision != "not_applicable":
             return None
@@ -1614,8 +1617,11 @@ async def _try_steal_worker_with_recovery(
         # VM recovery above retains its existing canonical lock order.
         async with conn.transaction():
             decision = await hold_container_worker_attempt(
-                conn, job_id=candidate["unit_id"], lease_token=candidate["lease_token"],
-                reason="post_bundle_executor_loss", grace_seconds=grace_seconds,
+                conn,
+                job_id=candidate["unit_id"],
+                lease_token=candidate["lease_token"],
+                reason="post_bundle_executor_loss",
+                grace_seconds=grace_seconds,
             )
             if decision != "not_applicable":
                 return None

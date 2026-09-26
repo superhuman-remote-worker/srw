@@ -875,7 +875,11 @@ async def test_explicit_resume_unparks_then_updates_job_in_one_transaction():
         raise AssertionError(normalized)
 
     conn.fetchrow = AsyncMock(side_effect=fetchrow)
-    conn.fetchval = AsyncMock(side_effect=lambda sql, *args: False if "_worker_execution_hold" in sql else True)
+    conn.fetchval = AsyncMock(
+        side_effect=lambda sql, *args: False
+        if "_worker_execution_hold" in sql
+        else True
+    )
     db = _db_with_conn(conn)
 
     assert await db.queue_stateless_job_for_resume(
