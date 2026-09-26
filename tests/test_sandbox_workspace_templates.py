@@ -96,6 +96,20 @@ def test_container_initialize_is_refused_with_the_alternative():
     assert "bake setup into the image" in denied.value.detail
 
 
+@pytest.mark.parametrize(
+    "recipe",
+    [
+        {"backend": "virtual", "environment": {"image": IMAGE}},
+        {"backend": "virtual", "resources": {"memory": "3Gi"}},
+    ],
+)
+def test_a_lite_template_names_every_backend_that_takes_images(recipe):
+    with pytest.raises(HTTPException) as denied:
+        srw_workspace_config({"template": {"inline": recipe}})
+    assert denied.value.status_code == 422
+    assert "require backend sandbox or vm" in denied.value.detail
+
+
 def test_malformed_container_image_is_refused():
     with pytest.raises(HTTPException) as denied:
         srw_workspace_config(

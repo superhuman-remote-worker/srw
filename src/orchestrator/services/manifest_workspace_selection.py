@@ -88,7 +88,9 @@ def srw_workspace_config(
         return {**result, **_sandbox_workspace_config(recipe)}
     if recipe["backend"] != "vm":
         raise HTTPException(
-            422, "SRW template images, resources and initialization require backend vm."
+            422,
+            "SRW template images and resources require backend sandbox or vm; "
+            "initialization requires backend vm.",
         )
     environment = recipe.get("environment", {})
     vm = {}
