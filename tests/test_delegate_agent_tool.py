@@ -253,6 +253,16 @@ class TestSchemaAndRegistry:
         ]
         assert props["fork"]["default"] is False
         assert props["owned_paths"]["type"] == "array"
+        assert props["owned_paths"]["default"] == []
+        arguments = {
+            "description": "inspect",
+            "prompt": "inspect",
+            "subagent_type": "explorer",
+        }
+        first = tool.tool_call_schema.model_validate(arguments)
+        second = tool.tool_call_schema.model_validate(arguments)
+        first.owned_paths.append("src/**")
+        assert second.owned_paths == []
         assert "explorer" in props["subagent_type"]["description"]
         # The injected call id is invisible to the model and to tools/<name>.md.
         assert "tool_call_id" not in props

@@ -266,7 +266,10 @@ def create_delegate_agent_tools(context: ToolContext) -> List[Any]:
             ),
         )
         owned_paths: List[str] = Field(
-            default_factory=list,
+            # LangChain's schema subset builder preserves defaults but older
+            # supported releases drop default_factory, making this required.
+            # Pydantic copies this mutable default for each validated call.
+            default=[],
             description=(
                 "Workspace-relative globs this child may write, e.g. "
                 '["src/pkg/**", "tests/test_pkg.py"]. Required when the '

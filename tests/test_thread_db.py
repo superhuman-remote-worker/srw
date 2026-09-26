@@ -1234,11 +1234,16 @@ class TestEndThread:
                 "metadata": {},
             }
         )
-        conn.fetchval = AsyncMock(return_value="tid-1")
+        # First read proves no open workspace creation intent before Resume.
+        conn.fetchval = AsyncMock(side_effect=[False, "tid-1"])
         db = _make_db_with_conn(conn)
 
         assert await db.resume_thread("tid-1") is True
 
+        assert (
+            "thread_workspace_provision_intents"
+            in conn.fetchval.await_args_list[0].args[0]
+        )
         sql = " ".join(conn.fetchval.call_args[0][0].split())
         assert "status = 'created'" in sql
         assert "agent_id = NULL" in sql
