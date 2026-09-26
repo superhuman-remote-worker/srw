@@ -4,9 +4,9 @@ import {ChangeDetectionStrategy, Component} from '@angular/core';
  * SRW vexillum — the standard-with-banner brand mark, drawn inline so it
  * follows the accent axis: the banner is --accent-color, the lettering and
  * the two inlays are --on-accent, the staff is currentColor (host colour
- * --text-secondary). Same geometry as assets/icons/icon-mark.svg, which stays
- * frozen in the Porphyry red for the favicon and PWA icons (static files
- * cannot read a token).
+ * --text-secondary). Same geometry as assets/icons/icon-mark.svg, which is
+ * frozen in the default Tyrian purple for the favicon and PWA icons (static
+ * files cannot read a token), so they stay purple under every accent.
  *
  * Decorative: its one call site (the chat hero) names the product in the
  * title right underneath, so the SVG is hidden from assistive tech.

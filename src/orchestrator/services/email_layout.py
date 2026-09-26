@@ -46,7 +46,7 @@ class Action:
     """A call-to-action button.
 
     variant:
-      "primary" -- solid porphyry, the default CTA
+      "primary" -- solid Tyrian (the default accent), the default CTA
       "approve" -- solid laurel
       "deny"    -- GHOST (card fill, danger border/text)
 
@@ -62,8 +62,8 @@ class Action:
     def __post_init__(self) -> None:
         # Fail loudly rather than falling through to `primary`. An unrecognised
         # variant is realistically a typo on "approve" ("Approve", "approved"),
-        # and _button_cell's else-branch would then render it solid porphyry --
-        # putting a solid button next to the solid laurel Approve at 1.24:1,
+        # and _button_cell's else-branch would then render it solid Tyrian --
+        # putting a solid button next to the solid laurel Approve at 1.17:1,
         # which is the exact defect this layout exists to eliminate. A silent
         # default here reintroduces it in the one place nobody would look.
         if self.variant not in VARIANTS:
