@@ -5916,7 +5916,53 @@ class PostgresDB:
         completion_finalizing_by: str | None = None,
         worker_queue_exhausted: bool = False,
     ) -> Dict[str, Any] | None:
-        """Retain exhausted container work behind the existing explicit-resume fence.
+        return await self._hold_workspace_recovery_attention(
+            job_id,
+            expected_workspace=expected_workspace,
+            expected_agent_id=expected_agent_id,
+            recovery_cap=recovery_cap,
+            error_detail=error_detail,
+            completion_command_id=completion_command_id,
+            completion_finalizing_by=completion_finalizing_by,
+            worker_queue_exhausted=worker_queue_exhausted,
+        )
+
+    async def hold_unavailable_workspace_recovery(
+        self,
+        job_id: str,
+        *,
+        expected_workspace: Dict[str, Any],
+        expected_agent_id: str | None,
+        error_detail: str,
+        completion_command_id: str | None = None,
+        completion_finalizing_by: str | None = None,
+    ) -> Dict[str, Any] | None:
+        """Hold an interrupted command without granting cleanup or replay."""
+        return await self._hold_workspace_recovery_attention(
+            job_id,
+            expected_workspace=expected_workspace,
+            expected_agent_id=expected_agent_id,
+            recovery_cap=0,
+            error_detail=error_detail,
+            completion_command_id=completion_command_id,
+            completion_finalizing_by=completion_finalizing_by,
+            interrupted_command=True,
+        )
+
+    async def _hold_workspace_recovery_attention(
+        self,
+        job_id: str,
+        *,
+        expected_workspace: Dict[str, Any],
+        expected_agent_id: str | None,
+        recovery_cap: int,
+        error_detail: str,
+        completion_command_id: str | None = None,
+        completion_finalizing_by: str | None = None,
+        worker_queue_exhausted: bool = False,
+        interrupted_command: bool = False,
+    ) -> Dict[str, Any] | None:
+        """Retain uncertain container work behind the existing explicit-resume fence.
 
         A retry budget is neither a terminal user instruction nor process-zero
         proof. This write grants no cleanup authority and never changes runtime
@@ -5954,6 +6000,10 @@ class PostgresDB:
                 if isinstance(context, str):
                     context = json.loads(context)
                 workspace = context.get("workspace_container") or {}
+                if "recovery_cleanup" in workspace:
+                    # That receipt owns a physical continuation and must never
+                    # be acknowledged through this pure no-cleanup hold path.
+                    return None
                 previous = workspace.get("recovery_completion_outcome")
                 if (
                     command_uuid is not None
@@ -5970,6 +6020,7 @@ class PostgresDB:
                     or job["control_active"]
                     or OPERATOR_PAUSE_HOLD_CONTEXT_KEY in context
                     or workspace.get("provisioner") != "k8s"
+                    or (interrupted_command and workspace.get("status") != "ready")
                     or workspace.get("_runtime_incarnation") != runtime_uid
                     or any(
                         workspace.get(key) != expected_workspace.get(key)
@@ -6047,6 +6098,19 @@ class PostgresDB:
                         is None
                     ):
                         return None
+                if interrupted_command and command_uuid is not None:
+                    payload = command["payload"]
+                    if isinstance(payload, str):
+                        payload = json.loads(payload)
+                    error = payload.get("error") if isinstance(payload, dict) else None
+                    if (
+                        not isinstance(payload, dict)
+                        or payload.get("should_stop") is not True
+                        or payload.get("goal_achieved") is not False
+                        or not isinstance(error, dict)
+                        or error.get("type") != "workspace_unavailable"
+                    ):
+                        return None
                 attempts = int(workspace.get("recovery_attempts") or 0) + (
                     0
                     if worker_queue_exhausted
@@ -6057,7 +6121,10 @@ class PostgresDB:
                     )
                     else 1
                 )
-                if not worker_queue_exhausted and attempts <= recovery_cap:
+                if (
+                    not (worker_queue_exhausted or interrupted_command)
+                    and attempts <= recovery_cap
+                ):
                     return None
                 outcome = {
                     "status": "handled",
@@ -6067,12 +6134,15 @@ class PostgresDB:
                     "held_for_resume": True,
                     "actions": [
                         (
-                            "worker reported exhausted workspace retries; "
+                            "workspace transport lost; interrupted command outcome is unknown; "
+                            if interrupted_command
+                            else "worker reported exhausted workspace retries; "
                             if worker_queue_exhausted
                             else f"workspace recovery exhausted after {recovery_cap} attempts; "
                         )
                         + "workspace and checkpoints retained; explicit Resume required"
                     ],
+                    **({"cleanup_pending": False} if interrupted_command else {}),
                 }
                 updates = {"recovery_attempts": attempts}
                 if command_uuid is not None:
@@ -6088,6 +6158,11 @@ class PostgresDB:
                     if worker_queue_exhausted
                     else "workspace_recovery",
                     "detail": str(error_detail)[:1000],
+                    **(
+                        {"reason": "interrupted_command_outcome_unknown"}
+                        if interrupted_command
+                        else {}
+                    ),
                 }
                 hold = operator_pause_hold_jsonb_sql(
                     hold_id_parameter="$5",
@@ -6120,7 +6195,9 @@ class PostgresDB:
                     json.dumps(freeze),
                     outcome["actions"][0],
                     str(uuid4()),
-                    "workspace_recovery_exhausted",
+                    "workspace_recovery_unavailable"
+                    if interrupted_command
+                    else "workspace_recovery_exhausted",
                     None,
                     command_uuid,
                     completion_finalizing_by,

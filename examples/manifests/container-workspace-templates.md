@@ -251,7 +251,18 @@ Resume; it does not create an empty replacement volume. Cancel retains its
 normal terminal cleanup policy, and an older recovery receipt cannot follow
 that policy into storage deletion.
 
-These guarantees require the updated orchestrator. They do not qualify the
-separate live-TCP-probe retry path or worker retries that occur before a
-completion report is accepted. TCP reachability alone does not establish that
-replaying an interrupted command is safe.
+If the TCP probe succeeds, the Job still pauses for explicit Resume: connectivity
+does not establish whether the interrupted command ran. This path retains the
+running workspace and creates no cleanup intent. Duplicate accepted reports
+acknowledge the same hold without another attempt or automatic dispatch.
+
+With completion-command admission enabled, stateless Kubernetes container workers
+report a typed `workspace_unavailable` stop on its first observation instead of
+releasing it for another graph attempt. Other backend and retry contracts remain
+separate. These guarantees require the updated worker and orchestrator.
+
+This does not yet qualify worker process loss or a completion report that fails
+before acceptance: an uncheckpointed failure can still be retried by a successor.
+Stateless execution with completion-command admission disabled also retains its
+existing pre-report retry behavior. Automatic replay remains unqualified across
+these boundaries; an accepted hold does not prove an interrupted command safe.

@@ -4,7 +4,7 @@ knowledge-base/knowledge/issues/maxsessions_parallel_tools_false_workspace_death
 
 1. Probe before punch — on a ``workspace_unavailable`` report the orchestrator
    TCP-probes the workspace sshd; a listening pod is NOT deleted (the report
-   was a misclassification or a transient), only paused + re-dispatched. The
+   still leaves command effects unknown), only held for explicit Resume. The
    attempts counter still increments either way so a report-loop stays bounded.
 2. Counter reset — a handled completion that is not ``workspace_unavailable``
    resets ``recovery_attempts`` (one recovered blip must not poison the job).
@@ -134,6 +134,12 @@ class TestHandlePodWorkspaceRecovery:
     async def test_live_pod_is_not_deleted(self):
         db, delete_workspace, trigger_dispatch, probe = _make_deps(pod_alive=True)
         job = _job()
+        held = {
+            "new_status": "paused",
+            "held_for_resume": True,
+            "cleanup_pending": False,
+        }
+        db.hold_unavailable_workspace_recovery.return_value = held
 
         result = await handle_pod_workspace_recovery(
             job,
@@ -146,13 +152,10 @@ class TestHandlePodWorkspaceRecovery:
         )
 
         delete_workspace.assert_not_awaited()
-        merged = db.merge_workspace_container_context.await_args.args[1]
-        # The warm pod stays adoptable: no teardown markers.
-        assert merged.get("status") != "deleted"
-        assert "pod_ip" not in merged
-        assert merged["recovery_attempts"] == 1
-        assert result["new_status"] == "paused"
-        trigger_dispatch.assert_called_once()
+        assert result == held
+        db.merge_workspace_container_context.assert_not_awaited()
+        db.pause_job_shed_freeze.assert_not_awaited()
+        trigger_dispatch.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_durable_reconciled_cleanup_failure_remains_retryable(self):
@@ -187,24 +190,6 @@ class TestHandlePodWorkspaceRecovery:
 
         db.merge_workspace_container_context.assert_not_awaited()
         db.pause_job_shed_freeze.assert_not_awaited()
-
-    @pytest.mark.asyncio
-    async def test_counter_increments_even_when_pod_alive(self):
-        db, delete_workspace, trigger_dispatch, probe = _make_deps(pod_alive=True)
-        job = _job(attempts=1)
-
-        await handle_pod_workspace_recovery(
-            job,
-            job["id"],
-            _ERROR,
-            db=db,
-            delete_workspace=delete_workspace,
-            trigger_dispatch=trigger_dispatch,
-            probe=probe,
-        )
-
-        merged = db.merge_workspace_container_context.await_args.args[1]
-        assert merged["recovery_attempts"] == 2
 
     @pytest.mark.asyncio
     async def test_exhausted_cap_retains_workspace_under_explicit_resume_hold(self):

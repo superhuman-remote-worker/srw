@@ -488,8 +488,8 @@ async def handle_pod_workspace_recovery(
     reports get a hold without cleanup. Explicit Resume requires native cleanup
     settlement and the retained PVC. Exhaustion also holds without deletion.
 
-    The historical live-probe automatic retry remains unchanged and separately
-    unqualified: TCP liveness does not establish that a tool had no effects.
+    A live probe retains the runtime under a no-cleanup attention hold; TCP
+    liveness does not establish that an interrupted tool had no effects.
     See knowledge-base/knowledge/features/workspace_pvc_branch_a_implementation.md (G1) and
     knowledge-base/knowledge/issues/maxsessions_parallel_tools_false_workspace_death.md (D).
 
@@ -662,121 +662,29 @@ async def handle_pod_workspace_recovery(
     if not pod_alive:
         return await _hold_dead_workspace()
 
-    if completion_command_id is not None or expected_status is not None:
-        logger.warning(
-            f"Job {job_id}: workspace reported unavailable but sshd probe on "
-            f"{host}:{port} succeeded — keeping pod, re-dispatch "
-            f"(attempt {attempts}/{cap})"
-        )
-        container_updates = {
-            "recovery_attempts": attempts,
-            "previous_error": error.get("message") or "workspace_unavailable",
-        }
-        action = (
-            f"workspace recovery: pod alive on probe — kept, re-dispatch "
-            f"(attempt {attempts}/{cap})"
-        )
-
-        outcome = {
+    # A responsive sshd says nothing about an interrupted command's effects.
+    # Retain this live runtime, but require an explicit Resume decision.
+    outcome = await db.hold_unavailable_workspace_recovery(
+        job_id,
+        expected_workspace=container_ctx,
+        expected_agent_id=job.get("assigned_agent_id"),
+        error_detail=error.get("message") or "workspace_unavailable",
+        completion_command_id=completion_command_id,
+        completion_finalizing_by=completion_finalizing_by,
+    )
+    if outcome is None:
+        if (
+            completion_command_id is not None
+            or job.get("execution_lane") == "stateless"
+        ):
+            raise RuntimeError("workspace recovery lost its attention disposition term")
+        return {
             "status": "handled",
             "job_id": job_id,
             "new_status": "paused",
-            "actions": [action],
-            "paused": True,
+            "paused": False,
+            "actions": [],
         }
-        pause_kwargs: dict[str, Any] = {}
-        if completion_command_id is not None:
-            container_updates.update(
-                {
-                    "recovery_attempt_command_id": completion_command_id,
-                    "recovery_delete_pending": False,
-                    "recovery_completion_command_id": completion_command_id,
-                    "recovery_completion_outcome": outcome,
-                }
-            )
-            pause_kwargs = {
-                "completion_command_id": completion_command_id,
-                "completion_finalizing_by": completion_finalizing_by,
-            }
-        # The same processing->paused CAS must win before either mode can
-        # invalidate runtime context or retire the captured pod. The legacy
-        # completion has no durable command and must not write its markers.
-        paused = await db.pause_job_shed_freeze(
-            job_id,
-            workspace_context_updates=container_updates,
-            **pause_kwargs,
-        )
-        if not paused:
-            outcome["paused"] = False
-            return outcome
-
-        trigger_dispatch()
-        if completion_command_id is None:
-            outcome.pop("paused")
-        return outcome
-
-    logger.warning(
-        f"Job {job_id}: workspace reported unavailable but sshd probe on "
-        f"{host}:{port} succeeded — keeping pod, re-dispatch "
-        f"(attempt {attempts}/{cap})"
-    )
-    container_updates = {
-        "recovery_attempts": attempts,
-        "previous_error": error.get("message") or "workspace_unavailable",
-    }
-    if completion_command_id is not None:
-        container_updates["recovery_attempt_command_id"] = completion_command_id
-    merge_kwargs = (
-        {
-            "completion_command_id": completion_command_id,
-            "completion_finalizing_by": completion_finalizing_by,
-        }
-        if completion_command_id is not None
-        else {}
-    )
-    merged = await db.merge_workspace_container_context(
-        job_id, container_updates, **merge_kwargs
-    )
-    if completion_command_id is not None and not merged:
-        raise RuntimeError("workspace recovery lost its counter-update term")
-    action = (
-        f"workspace recovery: pod alive on probe — kept, re-dispatch "
-        f"(attempt {attempts}/{cap})"
-    )
-
-    # The pause clears the agent + flips to paused (→ resume=True on
-    # re-dispatch) AND sheds any row-level freeze into
-    # context.last_freeze_data: paused + freeze_data set is invisible to
-    # get_dispatchable_jobs, so a freeze surviving this transition would park
-    # the job forever
-    # (knowledge-base/knowledge/issues/recovery_pause_repersists_stale_freeze_invisible_job.md).
-    # Gate the dispatch on the processing→paused transition so a duplicate
-    # completion can't double-dispatch.
-    outcome: dict[str, Any] = {
-        "status": "handled",
-        "job_id": job_id,
-        "new_status": "paused",
-        "actions": [action],
-    }
-    if completion_command_id is not None:
-        # Internal replay discriminator only.  Keeping it off the legacy arm
-        # preserves the exact pre-flag response contract.
-        outcome["paused"] = True
-    pause_kwargs: dict[str, Any] = {}
-    if completion_command_id is not None or completion_finalizing_by is not None:
-        pause_kwargs = {
-            "completion_command_id": completion_command_id,
-            "completion_finalizing_by": completion_finalizing_by,
-            "workspace_context_updates": {
-                "recovery_completion_command_id": completion_command_id,
-                "recovery_completion_outcome": outcome,
-            },
-        }
-    paused = await db.pause_job_shed_freeze(job_id, **pause_kwargs)
-    if paused:
-        trigger_dispatch()
-    if completion_command_id is not None and not paused:
-        outcome["paused"] = False
     return outcome
 
 

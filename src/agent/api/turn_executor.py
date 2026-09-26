@@ -931,6 +931,7 @@ class StatelessTurnExecutor:
         self._worker_workspace_recovery: WorkspaceRecoveryHandoff | None = None
         self._worker_workspace_recovery_code: WorkspaceRecoveryCode | None = None
         self._worker_workspace_backend: str | None = None
+        self._worker_workspace_provisioner: str | None = None
         self._worker_quarantined = False
         self._worker_runtime_quiesced = False
         self._worker_retirement_lock = asyncio.Lock()
@@ -1621,6 +1622,7 @@ class StatelessTurnExecutor:
         self._worker_workspace_recovery = None
         self._worker_workspace_recovery_code = None
         self._worker_workspace_backend = None
+        self._worker_workspace_provisioner = None
         self._worker_runtime_quiesced = False
         self._worker_recovery_handoff_done = False
         self._worker_lease_disposition_uncertain = False
@@ -1895,6 +1897,7 @@ class StatelessTurnExecutor:
         self._worker_workspace_backend = (request.workspace_runtime or {}).get(
             "assigned_backend"
         )
+        self._worker_workspace_provisioner = request.workspace_provisioner
         timing["mcp_attached"] = self._worker_mcp_attached(request)
         metadata = self._worker_job_metadata(request)
         context = request.context or {}
@@ -2079,6 +2082,24 @@ class StatelessTurnExecutor:
             return "rotated"
 
         if self._worker_stop_is_recoverable(final_state, freeze_type):
+            payload, _ = self._worker_completion_wire_payload(final_state)
+            error = payload.get("error")
+            if (
+                self._completion_commands_enabled
+                and self._worker_workspace_backend == "sandbox"
+                and self._worker_workspace_provisioner == "k8s"
+                and payload.get("should_stop") is True
+                and payload.get("goal_achieved") is False
+                and isinstance(error, dict)
+                and error.get("type") == "workspace_unavailable"
+            ):
+                # An interrupted tool may already have effects. Queue backoff
+                # would re-enter the graph without evidence that replay is safe.
+                # The existing report protocol holds the exact accepted claim;
+                # connectivity and cleanup disposition belong to the server.
+                return await self._report_worker_terminal(
+                    claim, final_state, client=client, timing=timing
+                )
             if unit.attempts_since_completion >= claim.max_attempts:
                 final_state = self._worker_retry_exhausted_state(
                     final_state,
