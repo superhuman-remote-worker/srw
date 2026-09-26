@@ -17912,9 +17912,12 @@ class PostgresDB:
         claimant: str,
         claim_token: int,
         runtime_incarnation: str,
+        allow_existing_terminal_intent: bool = False,
     ) -> dict[str, Any] | None:
         """Atomically hand one cancelled, exact runtime to cleanup authority."""
 
+        if type(allow_existing_terminal_intent) is not bool:
+            return None
         if owner_kind not in {"job", "thread"} or scope not in {
             "workspace_container",
             "ide",
@@ -18012,18 +18015,14 @@ class PostgresDB:
                     or str(reservation.get("phase") or "") != "runtime_bound"
                 ):
                     return None
-                if bool(
-                    await conn.fetchval(
-                        "SELECT EXISTS (SELECT 1 FROM "
-                        "managed_repository_workspace_cleanup_intents "
-                        "WHERE owner_kind = $1 AND owner_id = $2 AND scope = $3 "
-                        "AND settled_at IS NULL FOR UPDATE)",
-                        owner_kind,
-                        owner_uuid,
-                        scope,
-                    )
-                ):
-                    return None
+                pending = await conn.fetchrow(
+                    "SELECT * FROM managed_repository_workspace_cleanup_intents "
+                    "WHERE owner_kind = $1 AND owner_id = $2 AND scope = $3 "
+                    "AND settled_at IS NULL FOR UPDATE",
+                    owner_kind,
+                    owner_uuid,
+                    scope,
+                )
 
                 target = str(reservation.get("cancel_target_disposition") or "")
                 resource_policy = str(reservation.get("cancel_resource_policy") or "")
@@ -18056,6 +18055,75 @@ class PostgresDB:
                     != "terminal_reclaim"
                 ):
                     return None
+
+                if pending is not None:
+                    # A terminal transition can revoke an interrupted creator
+                    # and admit this exact runtime's cleanup in one transaction.
+                    # Preserve that sole cleanup generation; closing creation
+                    # lets its ordinary guarded capture/termination continue.
+                    # The caller opts in only after proving a never-started
+                    # retained Pod with fresh storage under the mutation guard.
+                    try:
+                        fingerprint = _strict_json_object(
+                            pending.get("lifecycle_fingerprint"),
+                            label="cleanup lifecycle fingerprint",
+                        )
+                    except RuntimeError:
+                        return None
+                    if (
+                        not allow_existing_terminal_intent
+                        or owner_kind != "job"
+                        or scope != "workspace_container"
+                        or owner.get("owner_status") != "cancelled"
+                        or reservation.get("operation_kind") != "create"
+                        or current_runtime != runtime
+                        or raw_runtime.get("status") != "retiring_process_zero"
+                        or raw_runtime.get("provisioner") != "k8s"
+                        or raw_runtime.get("_creation_reservation_id")
+                        != str(reservation["id"])
+                        or raw_runtime.get("_creation_claim_token") != str(claim_token)
+                        or target != "deleted"
+                        or not reclaim
+                        or locked_terminal_token != 0
+                        or reservation.get("cancel_suspended_at") is not None
+                        or reservation.get("cancel_snapshot_restore_required")
+                        is not False
+                        or str(pending.get("runtime_incarnation")) != runtime
+                        or str(pending.get("pod_uid")) != runtime
+                        or pending.get("intent_source") != "current"
+                        or pending.get("admission_source") != "explicit"
+                        or pending.get("target_disposition") != target
+                        or pending.get("resource_policy") != resource_policy
+                        or pending.get("reclaim_shared_resources") is not True
+                        or pending.get("terminal_queue_token") != locked_terminal_token
+                        or fingerprint.get("admitted_by") != "terminal_owner_transition"
+                        or fingerprint.get("owner_status") != "cancelled"
+                        or pending.get("phase") != "prepared"
+                        or pending.get("capture_complete") is not False
+                        or pending.get("resources_captured_at") is not None
+                        or pending.get("resource_location") is not None
+                        or pending.get("claimed_by") is not None
+                        or pending.get("claim_expires_at") is not None
+                        or pending.get("claim_token") != 0
+                        or pending.get("attempts") != 0
+                        or pending.get("suspended_at") is not None
+                        or pending.get("snapshot_restore_required") is not False
+                        or pending.get("result_kind") is not None
+                    ):
+                        return None
+                    closed = await conn.execute(
+                        "UPDATE managed_repository_workspace_creation_reservations "
+                        "SET settled_at = now(), phase = 'aborted', "
+                        "result_kind = 'aborted' WHERE id = $1 "
+                        "AND settled_at IS NULL AND claimed_by = $2 "
+                        "AND claim_token = $3 AND expires_at > now()",
+                        reservation["id"],
+                        claimant,
+                        claim_token,
+                    )
+                    if closed != "UPDATE 1":
+                        raise RuntimeError("cancelled creation handoff was lost")
+                    return dict(pending)
 
                 # Publish the exact A fence while the matching reservation and
                 # fresh token are still live.  The trigger verifies both.

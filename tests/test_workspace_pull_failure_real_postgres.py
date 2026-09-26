@@ -10,6 +10,7 @@ process-zero finalizer is released.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import datetime, timezone
 from pathlib import Path
@@ -358,6 +359,295 @@ async def test_a_pull_failed_job_can_be_deleted_before_any_sweep(db, monkeypatch
     p.attest_workspace_runtime.assert_not_awaited()
     async with db.acquire() as conn:
         await conn.execute("DELETE FROM jobs WHERE id=$1", job)
+
+
+async def _interrupted_pull(db, monkeypatch, *, kept_volume=False):
+    job = await _job(db)
+    owner = WorkspaceOwner.job(str(job))
+    cluster = NeverPullingCluster()
+    p = _provisioner(monkeypatch, db, cluster)
+    if kept_volume:
+        cluster.create_namespaced_persistent_volume_claim(
+            body={
+                "metadata": {
+                    "name": f"pvc-{owner.pod_name}",
+                    "namespace": p._namespace,
+                    "labels": {
+                        "app": "srw-workspace",
+                        "srw/component": "workspace-pvc",
+                        "srw.io/component": "agent-workspace",
+                        owner.label_key: owner.id,
+                    },
+                },
+                "spec": {
+                    "accessModes": ["ReadWriteOnce"],
+                    "storageClassName": p._storage_class,
+                },
+            }
+        )
+    pulling = asyncio.Event()
+
+    async def wait_during_pull(*_args, **_kwargs):
+        # Pause only the readiness wait: creation, UID capture, owner
+        # projection and the advisory mutation guard are production code.
+        (status,) = cluster.objects["pod"].status.container_statuses
+        status.state.waiting.reason = "ContainerCreating"
+        status.state.waiting.message = "Pulling image"
+        pulling.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(p, "_wait_for_ready", wait_during_pull)
+    creator = asyncio.create_task(p.create_workspace(owner))
+    try:
+        await asyncio.wait_for(pulling.wait(), timeout=10)
+        runtime_uid = cluster.objects["pod"].metadata.uid
+        assert (await _workspace(db, job))["_runtime_incarnation"] == runtime_uid
+        assert await _open_authority(db, job) == {"reservations": 1, "intents": 0}
+
+        # This refusal is distinct from the durable two-owner deadlock below:
+        # cancellation cannot commit while the original creator holds its
+        # cross-replica physical-mutation guard.
+        with pytest.raises(
+            asyncpg.SerializationError, match="Workspace mutation is still in progress"
+        ):
+            await db.cancel_job(str(job))
+        async with db.acquire() as conn:
+            assert (
+                await conn.fetchval("SELECT status::text FROM jobs WHERE id=$1", job)
+                == "created"
+            )
+        assert await _open_authority(db, job) == {"reservations": 1, "intents": 0}
+    finally:
+        creator.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await creator
+    return job, owner, cluster, p, runtime_uid
+
+
+@pytest.mark.asyncio
+async def test_cancel_after_interrupted_image_pull_settles_both_cleanup_owners(
+    db, monkeypatch
+):
+    """A creator restart during a pull must not strand terminal cancellation."""
+
+    job, owner, cluster, p, runtime_uid = await _interrupted_pull(db, monkeypatch)
+
+    # Task interruption models the creator stopping after all accepted UIDs
+    # are durable but before readiness/settlement. It releases the guard; the
+    # Pod is still pulling and cancellation now commits through the real
+    # terminal-owner trigger.
+    assert await db.cancel_job(str(job))
+    assert await _open_authority(db, job) == {"reservations": 1, "intents": 1}
+    async with db.acquire() as conn:
+        reservation = await conn.fetchrow(
+            "SELECT phase, runtime_incarnation, cancel_requested_at FROM "
+            "managed_repository_workspace_creation_reservations "
+            "WHERE owner_id=$1 AND settled_at IS NULL",
+            job,
+        )
+        intent = await conn.fetchrow(
+            "SELECT * FROM "
+            "managed_repository_workspace_cleanup_intents "
+            "WHERE owner_id=$1 AND settled_at IS NULL",
+            job,
+        )
+    assert reservation["phase"] == "runtime_bound"
+    assert reservation["cancel_requested_at"] is not None
+    assert str(reservation["runtime_incarnation"]) == runtime_uid
+    assert str(intent["runtime_incarnation"]) == runtime_uid
+    assert intent["capture_complete"] is False
+
+    assert await p.reconcile_pending_workspace_creation_reservations(limit=25) == {
+        "handed_off": 1,
+        "aborted": 0,
+        "retryable": 0,
+    }
+    assert await _open_authority(db, job) == {"reservations": 0, "intents": 1}
+    assert cluster.pod_deletes == 0
+    async with db.acquire() as conn:
+        assert (
+            await conn.fetchrow(
+                "SELECT * FROM managed_repository_workspace_cleanup_intents WHERE id=$1",
+                intent["id"],
+            )
+            == intent
+        )
+
+    # A fresh provisioner models restart: no caller-local state may be needed.
+    p = _provisioner(monkeypatch, db, cluster)
+    sweeps = [await p.reconcile_pending_workspace_cleanup_intents(limit=25)]
+    p = _provisioner(monkeypatch, db, cluster)
+    sweeps.append(await p.reconcile_pending_workspace_cleanup_intents(limit=25))
+    remaining = await _open_authority(db, job)
+    assert remaining == {"reservations": 0, "intents": 0}, (
+        f"same-runtime cancellation did not converge: sweeps={sweeps}, "
+        f"open_authority={remaining}, objects={sorted(cluster.objects)}, "
+        f"pod_deletes={cluster.pod_deletes}"
+    )
+    assert cluster.objects == {}
+    assert cluster.pod_deletes == 1
+    assert (await _workspace(db, job))["status"] == "deleted"
+    assert sweeps == [
+        {"settled": 1, "superseded": 0, "retryable": 0},
+        {"settled": 0, "superseded": 0, "retryable": 0},
+    ]
+    async with db.acquire() as conn:
+        assert (
+            await conn.fetchval(
+                "SELECT count(*) FROM managed_repository_workspace_cleanup_intents "
+                "WHERE owner_id=$1",
+                job,
+            )
+            == 1
+        )
+        assert (
+            await conn.fetchval(
+                "SELECT count(*) FROM managed_repository_process_zero_receipts "
+                "WHERE owner_id=$1 AND runtime_incarnation=$2",
+                job,
+                runtime_uid,
+            )
+            == 1
+        )
+        await conn.execute("DELETE FROM jobs WHERE id=$1", job)
+
+
+@pytest.mark.asyncio
+async def test_interrupted_creation_without_terminal_intent_keeps_legacy_handoff(
+    db, monkeypatch
+):
+    job, owner, cluster, p, runtime_uid = await _interrupted_pull(db, monkeypatch)
+
+    cancellation = await p.request_workspace_creation_cancellation(
+        owner, target_disposition="suspended", reclaim_shared_resources=False
+    )
+    assert cancellation["reconciliation_outcome"] == "handed_off"
+    assert await _open_authority(db, job) == {"reservations": 0, "intents": 1}
+    async with db.acquire() as conn:
+        intent = await conn.fetchrow(
+            "SELECT * FROM managed_repository_workspace_cleanup_intents "
+            "WHERE owner_id=$1",
+            job,
+        )
+    assert str(intent["runtime_incarnation"]) == runtime_uid
+    assert intent["resource_policy"] == "preserve"
+    assert intent["target_disposition"] == "suspended"
+    assert intent["capture_complete"] is True
+
+    assert await p.reconcile_pending_workspace_cleanup_intents(limit=25) == {
+        "settled": 1,
+        "superseded": 0,
+        "retryable": 0,
+    }
+    assert set(cluster.objects) == {"pvc"}
+    assert (await _workspace(db, job))["status"] == "suspended"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("unsafe", ["kept-volume", "ran-container", "no-finalizer"])
+async def test_interrupted_pull_reuse_keeps_unproven_data_and_runtime_held(
+    db, monkeypatch, unsafe
+):
+    job, owner, cluster, p, runtime_uid = await _interrupted_pull(
+        db, monkeypatch, kept_volume=unsafe == "kept-volume"
+    )
+    if unsafe == "ran-container":
+        cluster.objects["pod"].status.container_statuses[0].restart_count = 1
+    elif unsafe == "no-finalizer":
+        cluster.objects["pod"].metadata.finalizers = []
+    assert await db.cancel_job(str(job))
+
+    counts = await p.reconcile_pending_workspace_cleanup_intents(limit=25)
+    assert counts["settled"] == 0
+    assert await _open_authority(db, job) == {"reservations": 1, "intents": 1}
+    assert set(cluster.objects) == {"pvc", "service", "pod"}
+    assert cluster.pod_deletes == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "conflict",
+    ["successor", "capture", "claimed", "terminal-token", "stale-claim"],
+)
+async def test_cancelled_creation_reuse_refuses_conflicting_or_stale_authority(
+    db, monkeypatch, conflict
+):
+    job, owner, cluster, p, runtime_uid = await _interrupted_pull(db, monkeypatch)
+    assert await db.cancel_job(str(job))
+    reservation = await db.request_managed_repository_workspace_creation_cancellation(
+        str(job),
+        owner_kind="job",
+        scope="workspace_container",
+        target_disposition="deleted",
+        reclaim_shared_resources=True,
+        claimant="cancel-test",
+    )
+    assert reservation is not None
+    async with db.acquire() as conn:
+        if conflict == "successor":
+            await conn.execute(
+                "UPDATE managed_repository_workspace_cleanup_intents "
+                "SET runtime_incarnation=$2, pod_uid=$2 WHERE owner_id=$1",
+                job,
+                uuid4(),
+            )
+        elif conflict == "capture":
+            await conn.execute(
+                "UPDATE managed_repository_workspace_cleanup_intents "
+                "SET pvc_uid=$2, capture_complete=TRUE, resources_captured_at=now(), "
+                "phase='captured' WHERE owner_id=$1",
+                job,
+                uuid4(),
+            )
+        elif conflict == "claimed":
+            intent_id = await conn.fetchval(
+                "SELECT id FROM managed_repository_workspace_cleanup_intents "
+                "WHERE owner_id=$1",
+                job,
+            )
+        elif conflict == "terminal-token":
+            await conn.execute(
+                "UPDATE managed_repository_workspace_cleanup_intents "
+                "SET terminal_queue_token=1 WHERE owner_id=$1",
+                job,
+            )
+    if conflict == "claimed":
+        assert (
+            await db.claim_managed_repository_workspace_cleanup_intent(
+                str(intent_id), claimant="other-cleaner", lease_seconds=300
+            )
+            is not None
+        )
+
+    async with db.acquire() as conn:
+        before = await conn.fetchrow(
+            "SELECT row_to_json(i)::text AS intent, row_to_json(r)::text AS reservation "
+            "FROM managed_repository_workspace_cleanup_intents i JOIN "
+            "managed_repository_workspace_creation_reservations r "
+            "ON r.owner_id=i.owner_id WHERE r.owner_id=$1",
+            job,
+        )
+    result = await db.convert_cancelled_workspace_creation_to_cleanup_intent(
+        str(job),
+        owner_kind="job",
+        scope="workspace_container",
+        reservation_generation=int(reservation["reservation_generation"]),
+        claimant="cancel-test",
+        claim_token=int(reservation["claim_token"]) - (conflict == "stale-claim"),
+        runtime_incarnation=runtime_uid,
+        allow_existing_terminal_intent=True,
+    )
+    assert result is None
+    async with db.acquire() as conn:
+        after = await conn.fetchrow(
+            "SELECT row_to_json(i)::text AS intent, row_to_json(r)::text AS reservation "
+            "FROM managed_repository_workspace_cleanup_intents i JOIN "
+            "managed_repository_workspace_creation_reservations r "
+            "ON r.owner_id=i.owner_id WHERE r.owner_id=$1",
+            job,
+        )
+    assert before == after
+    assert cluster.pod_deletes == 0
 
 
 @pytest.mark.asyncio

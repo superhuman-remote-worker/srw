@@ -6719,8 +6719,54 @@ class ContainerProvisioner:
             claimant=str(reservation["claimed_by"]),
             claim_token=int(reservation["claim_token"]),
             runtime_incarnation=runtime,
+            allow_existing_terminal_intent=(
+                await self._cancelled_creation_has_fresh_unstarted_runtime(
+                    owner, reservation, pod=pod
+                )
+            ),
         )
         return "handed_off" if isinstance(intent, dict) else "retryable"
+
+    async def _cancelled_creation_has_fresh_unstarted_runtime(
+        self,
+        owner: WorkspaceOwner,
+        reservation: dict[str, Any],
+        *,
+        pod: Any,
+    ) -> bool:
+        """Gate terminal-intent reuse without bypassing a kept volume's archive.
+
+        Called under the creation reconciler's mutation guard after exact Pod
+        and reservation checks. Never-started status is not process-zero: the
+        ordinary cleanup finalizer still proves termination before deletion.
+        """
+
+        if (
+            owner.kind != "job"
+            or reservation.get("scope") != "workspace_container"
+            or reservation.get("operation_kind") != "create"
+            or not self._has_stateless_process_zero_finalizer(pod)
+            or not _pod_never_started_a_container(pod)
+        ):
+            return False
+        try:
+            pvc_name = self._workspace_pvc_name_from_pod(pod, owner=owner)
+            if pvc_name is None:
+                return reservation.get("pvc_uid") is None
+            pvc = await self._bounded_kubernetes_call(
+                self._core_api.read_namespaced_persistent_volume_claim,
+                name=pvc_name,
+                namespace=self._namespace,
+            )
+            pvc_uid = self._require_stateless_pvc_identity(
+                pvc, owner=owner, pvc_name=pvc_name, allow_any_storage_class=True
+            )
+            self._require_workspace_creation_reservation_annotation(
+                pvc, reservation_id=str(reservation["id"])
+            )
+            return str(reservation.get("pvc_uid") or "") == pvc_uid
+        except Exception:
+            return False
 
     async def reconcile_pending_workspace_creation_reservations(
         self,
