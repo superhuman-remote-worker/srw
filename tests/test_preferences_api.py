@@ -27,10 +27,10 @@ EXPECTED_DEFAULTS = {
     "default_autonomy": "full",
     "default_reasoning_level": "medium",
     "default_auxiliary_model": "registry-aux",
-    "default_vision_model": "env-vision",
+    "default_vision_model": "registry-vision",
     "default_whisper_model": "env-whisper",
     "default_tts_model": "registry-tts",
-    "default_embedding_model": "env-embedding",
+    "default_embedding_model": "registry-embedding",
     "embedding_provider": "env-provider",
     "admin_view_mode": "all",
     "persistent_agent": {
@@ -59,7 +59,10 @@ def preferences_api(monkeypatch, user_a):
             side_effect={
                 "chat": "registry-chat",
                 "auxiliary": "registry-aux",
+                "vision": "registry-vision",
                 "tts": "registry-tts",
+                "embedding": "registry-embedding",
+                # No whisper default: WHISPER_MODEL is the fallback.
             }.get
         ),
     )
@@ -142,7 +145,10 @@ async def test_get_preserves_saved_preferences_and_registry_defaults(preferences
     assert api.db.resolve_default_for_capability.await_args_list == [
         call("chat"),
         call("auxiliary"),
+        call("vision"),
+        call("whisper"),
         call("tts"),
+        call("embedding"),
     ]
     api.db.update_user_settings.assert_not_awaited()
 
@@ -167,7 +173,9 @@ async def test_registry_miss_falls_back_to_role_and_helper_environment(preferenc
     expected.update(
         default_model="yaml-worker",
         default_auxiliary_model="yaml-aux",
+        default_vision_model="env-vision",
         default_tts_model="env-tts",
+        default_embedding_model="env-embedding",
     )
     expected["persistent_agent"]["model"] = "yaml-session"
     assert response.json()["_resolved"] == expected
@@ -197,10 +205,11 @@ async def test_empty_role_defaults_preserve_none_and_platform_fallbacks(
         default_autonomy=None,
         default_reasoning_level=None,
         default_auxiliary_model=None,
-        default_vision_model="gpt-4o",
-        default_whisper_model="whisper-1",
-        default_tts_model="tts-1",
-        default_embedding_model="qwen3-embedding-8b",
+        # No registry default and no env: no model name is invented.
+        default_vision_model=None,
+        default_whisper_model=None,
+        default_tts_model=None,
+        default_embedding_model=None,
         embedding_provider="local",
     )
     expected["persistent_agent"]["model"] = None

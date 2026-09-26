@@ -39,25 +39,29 @@ async def resolve_preference_defaults(
     # Fall back to the YAML model only when the registry has no capability default.
     registry_chat = await db.resolve_default_for_capability("chat")
     registry_aux = await db.resolve_default_for_capability("auxiliary")
-    # TTS is orchestrator-only (the read-aloud feature), resolved from the model
-    # registry by resolve_capability_credentials — NOT an agent env-helper like
-    # vision/whisper/embedding below. Resolve it the same way here so the Settings
-    # voice picker shows the model actually in effect (and thus the right voice
-    # list); env TTS_MODEL is only a last-ditch fallback.
+    # Helper models resolve the way dispatch resolves them (the user's pick, then
+    # this registry default — job_dispatch_credentials / resolve_capability_
+    # credentials), so Settings shows the model actually in effect: TTS for the
+    # voice picker's voice list, vision/whisper/embedding for the agent. The env
+    # var is only a last-ditch fallback; with neither, the default is None
+    # ("nothing configured") rather than a model name the catalog may not hold.
+    registry_vision = await db.resolve_default_for_capability("vision")
+    registry_whisper = await db.resolve_default_for_capability("whisper")
     registry_tts = await db.resolve_default_for_capability("tts")
+    registry_embedding = await db.resolve_default_for_capability("embedding")
 
     return {
         "default_model": registry_chat or llm.get("model"),
         "default_autonomy": worker_cfg.get("autonomy"),
         "default_reasoning_level": llm.get("reasoning_level"),
         "default_auxiliary_model": registry_aux or aux.get("model") or llm.get("model"),
-        # Helper-model defaults match the environment fallbacks in
-        # src/agent/services/{vision_helper,audio_helper}.py and
-        # src/shared/runtime/services/embedding_service.py.
-        "default_vision_model": environ.get("VISION_MODEL", "gpt-4o"),
-        "default_whisper_model": environ.get("WHISPER_MODEL", "whisper-1"),
-        "default_tts_model": registry_tts or environ.get("TTS_MODEL", "tts-1"),
-        "default_embedding_model": environ.get("EMBEDDING_MODEL", "qwen3-embedding-8b"),
+        "default_vision_model": registry_vision or environ.get("VISION_MODEL"),
+        "default_whisper_model": registry_whisper or environ.get("WHISPER_MODEL"),
+        "default_tts_model": registry_tts or environ.get("TTS_MODEL"),
+        "default_embedding_model": (
+            registry_embedding or environ.get("EMBEDDING_MODEL")
+        ),
+        # Not a model: mirrors embedding_service's provider default.
         "embedding_provider": environ.get("EMBEDDING_PROVIDER", "local"),
         # Admin "View as" default — fleet-wide visibility unless the admin
         # has explicitly narrowed to their own data.

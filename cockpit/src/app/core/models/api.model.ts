@@ -916,10 +916,12 @@ export interface ResolvedDefaults {
   default_autonomy?: string;
   default_reasoning_level?: string;
   default_auxiliary_model?: string;
-  default_vision_model?: string;
-  default_whisper_model?: string;
-  default_tts_model?: string;
-  default_embedding_model?: string;
+  /** Registry default for the capability (as dispatch resolves it), else the
+   * env fallback; null when neither names a model. */
+  default_vision_model?: string | null;
+  default_whisper_model?: string | null;
+  default_tts_model?: string | null;
+  default_embedding_model?: string | null;
   embedding_provider?: string;
   persistent_agent?: {
     model?: string;

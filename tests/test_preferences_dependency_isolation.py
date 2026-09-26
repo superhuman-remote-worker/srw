@@ -97,7 +97,10 @@ async def test_two_concurrent_apps_keep_identity_settings_and_defaults_independe
                 == f"registry-{index}-auxiliary"
             )
             assert body["_resolved"]["default_tts_model"] == f"registry-{index}-tts"
-            assert body["_resolved"]["default_vision_model"] == f"vision-{index}"
+            # The registry wins over this app's VISION_MODEL, as at dispatch.
+            assert (
+                body["_resolved"]["default_vision_model"] == f"registry-{index}-vision"
+            )
             assert body["_resolved"]["default_autonomy"] == f"autonomy-{index}"
             assert body["_resolved"]["default_reasoning_level"] == f"reasoning-{index}"
             assert (
