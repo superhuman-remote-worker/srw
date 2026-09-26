@@ -73,6 +73,19 @@ weaker adversarial boundary than a restricted container. Disable FUSE or its
 privileged mode where possible, isolate workspace nodes, and use the VM tier for
 work that needs a stronger boundary.
 
+That FUSE profile applies only to the installation workspace image and to
+repositories listed in `workspace.images.trustedRepositories`. A WorkspaceTemplate
+may name any other image. Such a custom image runs unprivileged: no `/dev/fuse`,
+no `SYS_ADMIN` and seccomp `RuntimeDefault`. It therefore gets no cloud mount.
+`workspace.customImages.privileged: true` gives custom images the full profile.
+Enable it only if you trust everyone who can author workspace templates, because
+the template's image then decides what runs as root in a privileged container.
+
+Even unprivileged, a template image runs with the workspace owner's secrets, so
+use images only from authors you trust. Container resources come only from the
+selected template; callers can't set them through `config_override`. See
+[container workspace templates](../examples/manifests/container-workspace-templates.md).
+
 ## Defense in depth
 
 The separation above is the primary architectural boundary. Other controls
@@ -114,7 +127,11 @@ Before exposing a deployment or connecting valuable systems:
    manager rather than values files.
 3. Confirm NetworkPolicy enforcement with the actual cluster CNI.
 4. Disable privileged FUSE workspaces unless the feature is required; isolate
-   workspace nodes when it is enabled.
+   workspace nodes when it is enabled. Keep `workspace.customImages.privileged`
+   off, and add only images you trust to
+   `workspace.images.trustedRepositories`. Cap what one workspace may request
+   with a namespace `LimitRange` and `ResourceQuota`; SRW sets no ceilings of
+   its own.
 5. Prefer VM workspaces for adversarial repositories or privileged commands.
 6. Restrict connector permissions, network destinations, and data scopes to the
    minimum needed by one project.

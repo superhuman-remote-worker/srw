@@ -108,12 +108,18 @@ workspace alone never grants a tool.
 | Tier | Process and storage model | Typical capabilities | Important limits |
 |---|---|---|---|
 | **Virtual** | Durable object-backed files, materialized through the workspace API | File read/write and eligible Canvas flows | No shell, git, repository checkout, direct browser, or live application |
-| **Container** | Per-job or per-session workspace pod, normally reached by SSH/SFTP | Files, shell, git, repository checkout, browser, and IDE flows | Shares the Kubernetes node kernel; FUSE mode may require a privileged container |
+| **Container** | Per-job or per-session workspace pod, normally reached by SSH/SFTP; its image, CPU, memory and storage come from the selected WorkspaceTemplate | Files, shell, git, repository checkout, browser, and IDE flows | Shares the Kubernetes node kernel; FUSE mode may require a privileged container, which custom template images get only when the operator allows it |
 | **VM** | Per-workload QEMU/KubeVirt virtual machine | Full workspace and gated privileged operations | More expensive and slower; requires an enabled provisioner and user grant |
 | **None** | No workspace | Conversation and independently configured remote tools | No workspace files, shell, git, or direct browser |
 
 The platform default is Virtual. A live session can move only along supported
 upgrade paths; moving back to a lower tier requires a new session.
+
+Container and VM workspaces are shaped by WorkspaceTemplates, and admission
+freezes the selected template into the execution. For containers, the
+provisioner applies it to every pod it creates for that Job or Session. See
+[container workspace templates](../examples/manifests/container-workspace-templates.md)
+for images, resources and the privilege rules.
 
 ## Experts, skills, and tools
 

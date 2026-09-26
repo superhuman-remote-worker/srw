@@ -14,7 +14,9 @@ spec:
 
 An execution freezes the template when it is admitted. Every later pod for that
 Job or Session uses the same values, including restores, wakes and End/Resume.
-Editing the template affects new executions only.
+Editing the template affects new executions only. A Session's settings can't
+change its frozen image or resources: such a change fails with 422, and a
+virtual Session upgraded to a container only switches the backend.
 
 ## How the numbers map to Kubernetes
 
@@ -48,7 +50,9 @@ Build your image `FROM` an SRW base image so it inherits that contract.
 - **Use images only from authors you trust.** The image runs with the workspace
   owner's secrets: the credential connectors attached to the work and its
   repository credentials. With `workspace.customImages.privileged: true` it also
-  gets the owner's cloud-storage credentials.
+  gets the owner's cloud-storage credentials. On a protected-cloud Session, an
+  unprivileged custom image briefly receives the read-only cloud credential
+  before the Session fails (see [Privilege](#privilege)).
 - **`config_override` can't set the image or resources.** Both
   `config_override.workspace.container` (the old unvalidated side door) and
   `config_override.workspace.sandbox` (the template's own rendered form) fail
@@ -70,33 +74,46 @@ Build your image `FROM` an SRW base image so it inherits that contract.
   the chart's `global.imagePullSecrets` doesn't reach them. Add your pull secret
   to that ServiceAccount, or configure registry credentials on the nodes. An
   `unauthorized` pull is retried until the pull budget runs out.
-- **Pull failures.** `InvalidImageName` and `ErrImageNeverPull` fail at once.
-  `ErrImagePull`, `ImagePullBackOff` and `CreateContainerConfigError` fail after
-  `workspace.imagePullTimeoutSeconds` (default 600 seconds). A pod the cluster
-  itself rejects (a `ResourceQuota` or `LimitRange` 403) fails at once with the
-  cluster's own message. A Job fails with "Workspace image `<ref>` could not be
-  pulled: `<reason>`". On a Job's first creation on a fresh volume, its pod,
-  service and volume are then cleaned up within about a minute; a restored Job,
-  or one recreated over a kept volume, keeps them. Deleting the Job during that
-  minute may return 503 once; retry and it succeeds. The job dispatcher creates
-  Job containers one at a time, so while a custom image is still pulling,
-  dispatch of other Jobs waits up to that budget — prefer small images, and
-  lower the budget if that matters to you.
+
+## When a workspace can't start
+
+**Test a new image with a Job first.** A Job reports why its image failed and
+cleans up after itself; a Session doesn't (see below).
+
+- **How pull failures are classified.** These rules apply to custom images. A
+  pod using the installation image keeps the plain 120-second readiness wait.
+  - `InvalidImageName` and `ErrImageNeverPull` fail at once.
+  - `ErrImagePull`, `ImagePullBackOff` and `CreateContainerConfigError` fail once
+    `workspace.imagePullTimeoutSeconds` has passed (default 600 seconds).
+  - A pod the cluster itself rejects (a `ResourceQuota` or `LimitRange` 403)
+    fails at once with the cluster's own message.
+- **Jobs.**
+  - A Job fails with "Workspace image `<ref>` could not be pulled: `<reason>`".
+  - On a Job's first creation on a fresh volume, its pod, service and volume are
+    then cleaned up within about a minute. A restored Job, or one recreated over
+    a kept volume, keeps them.
+  - Deleting the Job during that minute may return 503 once; retry and it
+    succeeds.
+- **Dispatch waits for pulls.** The job dispatcher creates Job containers one at
+  a time. While a custom image is still pulling, dispatch of other Jobs waits
+  for up to the pull budget. Prefer small images, and lower the budget if that
+  matters to you.
 - **Don't cancel a Job while its image is pulling.** That can leave its
   workspace resources behind (a known issue). Let the Job fail on its own; it
   fails within the pull budget.
 - **Other start failures give no message.** When a templated Job's pod never
   becomes ready for another reason, its workspace stays `creating` and the Job
-  waits with no error. Examples are an image without the workspace contract,
-  whose container exits or never opens sshd, and resources no node can fit when
-  no `LimitRange` rejects them.
+  waits with no error. Examples:
+  - an image without the workspace contract, whose container exits or never
+    opens sshd;
+  - resources no node can fit, when no `LimitRange` rejects them.
+
   Check the pod's status and events with `kubectl describe pod
   workspace-<first 12 characters of the Job ID>` in the workspace namespace.
-- **A Session can't recover from a pull failure.** A Session whose image can't
-  be pulled logs the reason, and its workspace then stays stuck: it isn't
-  retried, and the Session can't be ended or deleted from the UI or the API.
-  An operator has to remove it. Test a new image with a Job first: a Job fails
-  cleanly with the message and its resources are cleaned up.
+- **Sessions can't recover from a pull failure.** A Session whose image can't be
+  pulled logs the reason, and its workspace then stays stuck. It isn't retried,
+  and the Session can't be ended or deleted from the UI or the API. An operator
+  has to remove it.
 
 ## Privilege
 
