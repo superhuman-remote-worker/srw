@@ -305,6 +305,44 @@ async def test_other_account_template_and_unsupported_recipes_fail_before_creati
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "workspace,message",
+    [
+        (
+            {
+                "template": {
+                    "inline": {
+                        "backend": "virtual",
+                        "environment": {"image": "registry.example/x:1"},
+                    }
+                }
+            },
+            "Virtual workspaces do not support OS images",
+        ),
+        (
+            {"template": {"inline": {"backend": "none", "resources": {"cpu": 1}}}},
+            "workspace must be null or a manifest template/instanceRef binding",
+        ),
+    ],
+)
+async def test_invalid_template_selection_is_a_client_error(
+    database, actor, workspace, message
+):
+    """The resolver's and the binding schema's refusals are 422s, never 500s."""
+    with pytest.raises(HTTPException) as refused:
+        await select_execution_workspace(
+            database,
+            actor,
+            role="worker",
+            project_id=None,
+            workspace=workspace,
+            supplied=True,
+        )
+    assert refused.value.status_code == 422
+    assert message in refused.value.detail
+
+
+@pytest.mark.asyncio
 async def test_project_workspace_default_precedence_and_activation_race(
     database, actor
 ):

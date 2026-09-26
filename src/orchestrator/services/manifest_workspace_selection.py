@@ -12,6 +12,7 @@ from orchestrator.services.manifest_workspace_binding import (
 )
 from orchestrator.services.manifest_resolution import LiveManifestResolver
 from orchestrator.services.manifest_store import ManifestStore
+from shared.manifests.errors import ManifestError
 from shared.runtime.core.workspace_selection import execution_workspace_config
 
 _BUILD_YOUR_OWN_IMAGE = (
@@ -213,12 +214,20 @@ async def select_execution_workspace(
             supplied = True
     if not supplied:
         return fallback, None
-    validate_workspace_selection(workspace)
+    # A caller's malformed binding or unsupported template is a client error on
+    # every admission route and form preview, never an internal one.
+    try:
+        validate_workspace_selection(workspace)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from None
     resolved = deepcopy(workspace)
     if resolved and "template" in resolved:
-        resolved["template"] = await resolver.selection(
-            "WorkspaceTemplate", resolved["template"], scope, dependencies
-        )
+        try:
+            resolved["template"] = await resolver.selection(
+                "WorkspaceTemplate", resolved["template"], scope, dependencies
+            )
+        except ManifestError as exc:
+            raise HTTPException(422, str(exc)) from None
     instance_recipe = None
     instance_generation = None
     if resolved and "instanceRef" in resolved:
