@@ -15,8 +15,9 @@ spec:
 An execution freezes the template when it is admitted. Every later pod for that
 Job or Session uses the same values, including restores, wakes and End/Resume.
 Editing the template affects new executions only. A Session's settings can't
-change its frozen image or resources: such a change fails with 422, and a
-virtual Session upgraded to a container only switches the backend.
+change its frozen image or resources; such a change is refused. A pinned virtual
+Session that switches to a container changes only its backend and gets the
+installation defaults. A stateless Session can't change its tier at all.
 
 ## How the numbers map to Kubernetes
 
