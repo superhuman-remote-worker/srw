@@ -45,6 +45,11 @@ try:
 except ImportError:
     asyncpg = None
 
+from orchestrator.database.dispatch_discovery import (
+    JobDiscoveryCursor,
+    discovery_page_bounds,
+)
+
 from orchestrator.services.datasource_policy_errors import (
     DatasourcePolicyError as DatasourcePolicyError,
     DatasourcePolicyValidationError as DatasourcePolicyValidationError,
@@ -32124,11 +32129,18 @@ class PostgresDB:
             )
             return row is not None
 
+    async def get_job_discovery_cutoff(self) -> datetime:
+        """Server clock for one finite discovery sweep, never an execution grant."""
+        async with self.acquire() as conn:
+            return await conn.fetchval("SELECT clock_timestamp()")
+
     async def get_dispatchable_jobs(
         self,
         limit: int = 20,
         *,
         completion_commands_enabled: bool = False,
+        discovery_after: JobDiscoveryCursor | None = None,
+        discovery_cutoff: datetime | None = None,
     ) -> List[Dict[str, Any]]:
         """Get jobs waiting for assignment, ordered by priority then creation time.
 
@@ -32154,6 +32166,9 @@ class PostgresDB:
         )
         completion_exclusion = _completion_sweep_exclusion_clause(
             completion_commands_enabled, job_alias="j"
+        )
+        page_bounds, page_args = discovery_page_bounds(
+            discovery_after, discovery_cutoff
         )
         async with self.acquire() as conn:
             rows = await conn.fetch(
@@ -32223,10 +32238,12 @@ class PostgresDB:
                       JOIN jobs blocked ON blocked.id = a2.parent_job_id
                       WHERE blocked.status IN ('paused', 'cancelled', 'failed')
                   )
-                ORDER BY j.priority DESC, j.created_at ASC
+                {page_bounds}
+                ORDER BY j.priority DESC, j.created_at ASC NULLS LAST, j.id ASC
                 LIMIT $1
                 """,
                 limit,
+                *page_args,
             )
         return [dict(row) for row in rows]
 
@@ -32235,6 +32252,8 @@ class PostgresDB:
         limit: int = 50,
         *,
         completion_commands_enabled: bool = False,
+        discovery_after: JobDiscoveryCursor | None = None,
+        discovery_cutoff: datetime | None = None,
     ) -> List[Dict[str, Any]]:
         """Return stateless jobs whose workspace may be preflighted/enqueued.
 
@@ -32251,6 +32270,9 @@ class PostgresDB:
         )
         completion_exclusion = _completion_sweep_exclusion_clause(
             completion_commands_enabled, job_alias="j"
+        )
+        page_bounds, page_args = discovery_page_bounds(
+            discovery_after, discovery_cutoff
         )
         async with self.acquire() as conn:
             rows = await conn.fetch(
@@ -32302,10 +32324,12 @@ class PostgresDB:
                       JOIN jobs blocked ON blocked.id = a2.parent_job_id
                       WHERE blocked.status IN ('paused', 'cancelled', 'failed')
                   )
-                ORDER BY j.priority DESC, j.created_at ASC
+                {page_bounds}
+                ORDER BY j.priority DESC, j.created_at ASC NULLS LAST, j.id ASC
                 LIMIT $1
                 """,
                 limit,
+                *page_args,
             )
         return [dict(row) for row in rows]
 

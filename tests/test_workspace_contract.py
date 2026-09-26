@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 from orchestrator.services import job_dispatcher
 from orchestrator.services.workspace_lifecycle import (
     EnsureOutcome,
@@ -832,6 +834,7 @@ async def test_completion_recovery_reprovisions_and_retires_the_stale_marker(
             status="creating",
         )
 
+    db.get_job_discovery_cutoff = AsyncMock(return_value=datetime.now(timezone.utc))
     db.get_admittable_stateless_jobs = AsyncMock(
         side_effect=lambda **_kwargs: [deepcopy(db.jobs[job["id"]])]
     )

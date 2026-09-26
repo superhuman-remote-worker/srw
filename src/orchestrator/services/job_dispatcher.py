@@ -21,10 +21,12 @@ import logging
 import os
 import time
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any, Awaitable, Callable, Coroutine
 
 from fastapi import HTTPException
 
+from orchestrator.database.dispatch_discovery import JobDiscoveryCursor, discovery_order
 from orchestrator.security.access import vm_workspaces_on_pod_network
 from orchestrator.services.dispatch_guards import (
     VM_CAPACITY_POLL,
@@ -78,6 +80,8 @@ logger = logging.getLogger(__name__)
 MUTATION_PREFLIGHT_LIMIT = 2
 READY_PREFLIGHT_LIMIT = 2
 PENDING_PREFLIGHT_LIMIT = 100
+DISCOVERY_HEAD_LIMIT = 10
+DISCOVERY_PROGRESS_LIMIT = 40
 
 
 class _MutationRequired(Exception):
@@ -87,6 +91,20 @@ class _MutationRequired(Exception):
 class _OwnerChanged(Exception):
     def __init__(self, job: dict[str, Any]):
         self.job = job
+
+
+@dataclass(frozen=True, slots=True)
+class _PendingPreflight:
+    job: dict[str, Any]
+    mutation: bool
+    # Only an explicit missing-runtime deferral is sticky, for this raw row.
+    forced_snapshot: str | None = None
+
+
+@dataclass(slots=True)
+class _DiscoverySweep:
+    cutoff: datetime
+    after: JobDiscoveryCursor | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -110,7 +128,8 @@ class JobDispatchState:
     pause_pending_job_ids: set[str] = field(default_factory=set)
     tasks: set[asyncio.Task[Any]] = field(default_factory=set)
     preflight_tasks: set[asyncio.Task[Any]] = field(default_factory=set)
-    pending: dict[str, tuple[dict[str, Any], bool]] = field(default_factory=dict)
+    pending: dict[str, _PendingPreflight] = field(default_factory=dict)
+    discovery: dict[str, _DiscoverySweep] = field(default_factory=dict)
     active: dict[str, tuple[str, bool]] = field(default_factory=dict)
     completed: dict[str, _PreparedCandidate] = field(default_factory=dict)
     runner: asyncio.Task[Any] | None = None
@@ -141,6 +160,7 @@ class JobDispatchState:
 
         self.closing = True
         self.requested = None
+        self.discovery.clear()
         self.pending.clear()
         self.completed.clear()
         pending = list(self.tasks)
@@ -158,6 +178,7 @@ class JobDispatchState:
         """Stop this leader's workspace work, retaining normal SDK joins."""
         self.scheduling_paused = True
         self.requested = None
+        self.discovery.clear()
         self.pending.clear()
         self.completed.clear()
         pending = set(self.preflight_tasks)
@@ -207,6 +228,11 @@ class JobDispatchDependencies:
 def _needs_mutation(job: dict[str, Any], dependencies: JobDispatchDependencies) -> bool:
     if _scholar_provision_parent_id(job):
         return True
+    if stateless_worker_workspace_owner(job).id != str(job["id"]):
+        # An inheritor's stored snapshot is intentionally stale. Its resolver
+        # waits for the parent; it cannot create before Ready is established.
+        # A missing live runtime still takes the explicit mutation deferral.
+        return False
     if _job_needs_vm(job):
         return _get_vm_context(job).get("status") != "ready"
     if dependencies.job_needs_sandbox(job):
@@ -306,24 +332,45 @@ def _enqueue(
     dependencies: JobDispatchDependencies,
     *,
     mutation: bool | None = None,
+    forced_snapshot: str | None = None,
 ) -> None:
     state = dependencies.state
     job_id = str(job["id"])
     if not _may_schedule(state) or job_id in state.active or job_id in state.completed:
         return
+    previous = state.pending.get(job_id)
+    if previous is not None and previous.forced_snapshot == _snapshot(job):
+        forced_snapshot = previous.forced_snapshot
+    candidate = _PendingPreflight(
+        job,
+        forced_snapshot is not None
+        or (_needs_mutation(job, dependencies) if mutation is None else mutation),
+        forced_snapshot,
+    )
     if (
         job_id not in state.pending
         and len(state.pending) + len(state.active) + len(state.completed)
         >= PENDING_PREFLIGHT_LIMIT
     ):
-        return
-    # An explicit Ready-to-mutation deferral must survive another discovery.
-    forced = state.pending.get(job_id, ({}, False))[1]
-    state.pending[job_id] = (
-        job,
-        forced
-        or (_needs_mutation(job, dependencies) if mutation is None else mutation),
-    )
+        # Replace only a queued discovery hint. Active and completed work retain
+        # their authority and ownership; an evicted row returns on a later sweep.
+        replaceable = [
+            (other_id, other)
+            for other_id, other in state.pending.items()
+            if (not candidate.mutation and other.mutation)
+            or (
+                candidate.mutation == other.mutation
+                and int(job.get("priority") or 0) > int(other.job.get("priority") or 0)
+            )
+        ]
+        if not replaceable:
+            return
+        evicted_id, _ = max(
+            replaceable,
+            key=lambda item: (item[1].mutation, discovery_order(item[1].job)),
+        )
+        state.pending.pop(evicted_id)
+    state.pending[job_id] = candidate
 
 
 async def _run_preflight(
@@ -365,15 +412,14 @@ async def _run_preflight(
                     current, vm_mode=dependencies.vm_provisioner.mode
                 )
                 if after is not None and after != before:
-                    state.pending[job_id] = (current, False)
+                    state.pending[job_id] = _PendingPreflight(current, False)
     except _MutationRequired:
         if not state.closing:
-            state.pending[job_id] = (job, True)
+            state.pending[job_id] = _PendingPreflight(job, True, raw_snapshot)
     except _OwnerChanged as changed:
         if not state.closing:
-            state.pending[job_id] = (
-                changed.job,
-                _needs_mutation(changed.job, dependencies),
+            state.pending[job_id] = _PendingPreflight(
+                changed.job, _needs_mutation(changed.job, dependencies)
             )
     except Exception:
         logger.exception(
@@ -393,7 +439,10 @@ def _pump_preflights(dependencies: JobDispatchDependencies) -> None:
     counts = {True: 0, False: 0}
     for _, mutation in state.active.values():
         counts[mutation] += 1
-    for job_id, (job, mutation) in list(state.pending.items()):
+    for job_id, candidate in sorted(
+        state.pending.items(), key=lambda item: discovery_order(item[1].job)
+    ):
+        job, mutation = candidate.job, candidate.mutation
         owner = _owner_key(job)
         limit = MUTATION_PREFLIGHT_LIMIT if mutation else READY_PREFLIGHT_LIMIT
         if owner in active_owners or counts[mutation] >= limit:
@@ -431,6 +480,41 @@ async def dispatch_pending_jobs(*, dependencies: JobDispatchDependencies) -> Non
     await _dispatch_pass(dependencies=dependencies, discover=True)
 
 
+async def _discover_jobs(dependencies: JobDispatchDependencies) -> list[dict[str, Any]]:
+    """Visit a fresh priority head and a finite forward page per enabled lane."""
+    state = dependencies.state
+    lanes = []
+    if dependencies.auto_assign_enabled:
+        lanes.append(("pinned", dependencies.store.get_dispatchable_jobs))
+    if dependencies.stateless_worker_enabled:
+        lanes.append(("stateless", dependencies.store.get_admittable_stateless_jobs))
+    cutoff = None
+    observed: dict[str, dict[str, Any]] = {}
+    for lane, read_page in lanes:
+        if lane not in state.discovery:
+            if cutoff is None:
+                cutoff = await dependencies.store.get_job_discovery_cutoff()
+            state.discovery[lane] = _DiscoverySweep(cutoff)
+        sweep = state.discovery[lane]
+        guard = dependencies.completion_control_boundary.dispatch_guard_kwargs()
+        head = await read_page(limit=DISCOVERY_HEAD_LIMIT, **guard)
+        page = await read_page(
+            limit=DISCOVERY_PROGRESS_LIMIT,
+            discovery_after=sweep.after,
+            discovery_cutoff=sweep.cutoff,
+            **guard,
+        )
+        # Advance over every observed row even if it is already owned or the
+        # local set is full. Otherwise queue pressure pins global discovery.
+        if len(page) == DISCOVERY_PROGRESS_LIMIT:
+            sweep.after = JobDiscoveryCursor.from_job(page[-1])
+        else:
+            state.discovery.pop(lane)
+        for job in head + page:
+            observed[str(job["id"])] = job
+    return list(observed.values())
+
+
 async def _dispatch_pass(
     *, dependencies: JobDispatchDependencies, discover: bool
 ) -> None:
@@ -452,21 +536,7 @@ async def _dispatch_pass(
         state.tick_started_at = time.monotonic()
         try:
             if discover:
-                jobs = []
-                if dependencies.auto_assign_enabled:
-                    jobs.extend(
-                        await dependencies.store.get_dispatchable_jobs(
-                            limit=50,
-                            **dependencies.completion_control_boundary.dispatch_guard_kwargs(),
-                        )
-                    )
-                if dependencies.stateless_worker_enabled:
-                    jobs.extend(
-                        await dependencies.store.get_admittable_stateless_jobs(
-                            limit=50,
-                            **dependencies.completion_control_boundary.dispatch_guard_kwargs(),
-                        )
-                    )
+                jobs = await _discover_jobs(dependencies)
                 for job in jobs:
                     _enqueue(job, dependencies)
             candidates = list(state.completed.values())

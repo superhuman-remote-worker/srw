@@ -7,6 +7,7 @@ from tests import _b09_control_seams as control_seams
 
 import asyncio
 import json
+from datetime import datetime, timezone
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import ANY, AsyncMock, MagicMock
@@ -1140,6 +1141,11 @@ async def test_stateless_dispatch_refusal_cannot_overwrite_winning_control(
     )
     monkeypatch.setattr(
         main.app.state.resources.postgres_db,
+        "get_job_discovery_cutoff",
+        AsyncMock(return_value=datetime.now(timezone.utc)),
+    )
+    monkeypatch.setattr(
+        main.app.state.resources.postgres_db,
         "get_admittable_stateless_jobs",
         AsyncMock(return_value=[job]),
     )
@@ -1204,6 +1210,11 @@ async def test_stateless_workspace_failure_uses_scanned_status_cas(monkeypatch):
     )
     monkeypatch.setattr(
         container_provisioner_module.container_provisioner, "_in_cluster", True
+    )
+    monkeypatch.setattr(
+        main.app.state.resources.postgres_db,
+        "get_job_discovery_cutoff",
+        AsyncMock(return_value=datetime.now(timezone.utc)),
     )
     monkeypatch.setattr(
         main.app.state.resources.postgres_db,
@@ -1274,6 +1285,11 @@ async def test_dispatcher_waits_instead_of_failing_uidless_k8s_runtime(monkeypat
     monkeypatch.setattr(main.app.state.resources.settings, "auto_assign_enabled", False)
     monkeypatch.setattr(
         main.app.state.resources.settings, "stateless_worker_enabled", True
+    )
+    monkeypatch.setattr(
+        main.app.state.resources.postgres_db,
+        "get_job_discovery_cutoff",
+        AsyncMock(return_value=datetime.now(timezone.utc)),
     )
     monkeypatch.setattr(
         main.app.state.resources.postgres_db,
@@ -1350,6 +1366,11 @@ async def test_vm_lane_repair_losing_status_cas_does_not_close_queue(monkeypatch
     )
     monkeypatch.setattr(
         main.app.state.resources.postgres_db,
+        "get_job_discovery_cutoff",
+        AsyncMock(return_value=datetime.now(timezone.utc)),
+    )
+    monkeypatch.setattr(
+        main.app.state.resources.postgres_db,
         "get_admittable_stateless_jobs",
         AsyncMock(return_value=[job]),
     )
@@ -1414,6 +1435,11 @@ async def test_same_cluster_vm_dispatch_stays_stateless_and_reaches_admission(
     monkeypatch.setattr(main.app.state.resources.settings, "auto_assign_enabled", False)
     monkeypatch.setattr(
         main.app.state.resources.settings, "stateless_worker_enabled", True
+    )
+    monkeypatch.setattr(
+        main.app.state.resources.postgres_db,
+        "get_job_discovery_cutoff",
+        AsyncMock(return_value=datetime.now(timezone.utc)),
     )
     monkeypatch.setattr(
         main.app.state.resources.postgres_db,

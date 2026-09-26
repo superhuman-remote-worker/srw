@@ -114,7 +114,7 @@ async def test_ready_missing_pod_defers_creation_until_mutation_slot_is_free(
         await scheduler.dispatch_pending_jobs(dependencies=deps)
         await until(lambda: "missing" in deps.state.pending)
         assert started == ["first", "second"]
-        assert deps.state.pending["missing"][1] is True
+        assert deps.state.pending["missing"].mutation is True
         gates["first"].set()
         await until(lambda: "missing" in started)
         assert sum(mutation for _, mutation in deps.state.active.values()) <= 2
@@ -187,7 +187,7 @@ async def test_trigger_storm_coalesces_and_shutdown_joins_started_sdk_call(monke
             scheduler.trigger_dispatch(dependencies=deps)
         assert len(deps.state.tasks) == 1
         await until(started.is_set)
-        assert len(store.called("get_dispatchable_jobs")) == 1
+        assert len(store.called("get_dispatchable_jobs")) == 2
         drain = asyncio.create_task(deps.state.drain())
         await asyncio.sleep(0.02)
         assert not drain.done()

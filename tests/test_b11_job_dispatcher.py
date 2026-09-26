@@ -13,12 +13,14 @@ import asyncio
 import dataclasses
 import inspect
 import logging
+from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from orchestrator.database.dispatch_discovery import discovery_order
 from orchestrator.security.access import vm_workspaces_on_pod_network
 from orchestrator.services import job_dispatcher
 from orchestrator.services.job_dispatcher import (
@@ -98,13 +100,36 @@ class FakeStore:
     def called(self, name: str) -> list[tuple[tuple, dict]]:
         return [(a, k) for n, a, k in self.calls if n == name]
 
+    async def get_job_discovery_cutoff(self):
+        return datetime.now(timezone.utc)
+
+    def _page(self, jobs, *, limit, discovery_after=None, discovery_cutoff=None, **_):
+        rows = sorted(jobs, key=discovery_order)
+        if discovery_cutoff is not None:
+            rows = [
+                row
+                for row in rows
+                if row.get("created_at") is None
+                or row["created_at"] <= discovery_cutoff
+            ]
+        if discovery_after is not None:
+            key = discovery_order(
+                {
+                    "id": discovery_after.job_id,
+                    "priority": discovery_after.priority,
+                    "created_at": discovery_after.created_at,
+                }
+            )
+            rows = [row for row in rows if discovery_order(row) > key]
+        return rows[:limit]
+
     async def get_dispatchable_jobs(self, **kwargs):
         self._record("get_dispatchable_jobs", **kwargs)
-        return list(self.pinned)
+        return self._page(self.pinned, **kwargs)
 
     async def get_admittable_stateless_jobs(self, **kwargs):
         self._record("get_admittable_stateless_jobs", **kwargs)
-        return list(self.stateless)
+        return self._page(self.stateless, **kwargs)
 
     async def update_job_status(self, *args, **kwargs):
         self._record("update_job_status", *args, **kwargs)
@@ -324,10 +349,12 @@ class TestEarlyGates:
         await dispatch_pending_jobs(
             dependencies=_deps(pinned_only, auto_assign_enabled=True)
         )
-        assert [n for n, *_ in pinned_only.calls] == ["get_dispatchable_jobs"]
-        assert pinned_only.called("get_dispatchable_jobs") == [
-            ((), {"limit": 50, **GUARD_KWARGS})
-        ]
+        assert [n for n, *_ in pinned_only.calls] == ["get_dispatchable_jobs"] * 2
+        pages = pinned_only.called("get_dispatchable_jobs")
+        assert [kwargs["limit"] for _, kwargs in pages] == [10, 40]
+        assert all(
+            kwargs["completion_generation_guard"] == "fenced" for _, kwargs in pages
+        )
 
         stateless_only = FakeStore()
         await dispatch_pending_jobs(
@@ -339,10 +366,12 @@ class TestEarlyGates:
         )
         assert [n for n, *_ in stateless_only.calls] == [
             "get_admittable_stateless_jobs"
-        ]
-        assert stateless_only.called("get_admittable_stateless_jobs") == [
-            ((), {"limit": 50, **GUARD_KWARGS})
-        ]
+        ] * 2
+        pages = stateless_only.called("get_admittable_stateless_jobs")
+        assert [kwargs["limit"] for _, kwargs in pages] == [10, 40]
+        assert all(
+            kwargs["completion_generation_guard"] == "fenced" for _, kwargs in pages
+        )
 
 
 # =============================================================================
@@ -376,7 +405,7 @@ class TestLockSerialization:
             dispatch_pending_jobs(dependencies=deps),
         )
 
-        assert entered == 2
+        assert entered == 4
         assert peak == 1
 
     @pytest.mark.asyncio
@@ -392,7 +421,7 @@ class TestLockSerialization:
 
         deps.state.lock.release()
         await asyncio.wait_for(task, 1.0)
-        assert [n for n, *_ in store.calls] == ["get_dispatchable_jobs"]
+        assert [n for n, *_ in store.calls] == ["get_dispatchable_jobs"] * 2
 
 
 # =============================================================================

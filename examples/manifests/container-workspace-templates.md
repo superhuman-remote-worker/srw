@@ -99,10 +99,13 @@ cleans up after itself; a Session doesn't (see below).
   mutations and two independent Ready checks at a time. A pulling image or busy
   workspace mutation lock keeps its own operation pending while discovered
   Ready Jobs can dispatch. Up to 100 Jobs are owned locally, including active
-  work. The existing discovery window remains 50 Jobs per execution lane; this
-  does not guarantee fairness for Jobs outside that window. Leadership loss
-  and shutdown drain owned work, including started Kubernetes calls, before
-  releasing its mutation guards. This behavior requires an orchestrator upgrade
+  work. Each discovery tick checks new priority arrivals and advances through
+  eligible Jobs, reading at most 50 rows per execution lane. A full local queue
+  can replace a waiting mutation hint with Ready work without cancelling active
+  creators. Normal new arrivals cannot extend an existing discovery sweep
+  indefinitely; continuously changing priorities have no fixed latency guarantee.
+  Leadership loss and shutdown drain owned work, including started Kubernetes
+  calls, before releasing its mutation guards. This behavior requires an orchestrator upgrade
   and does not repair historical pending creation attempts after restart.
 - **Don't cancel a Job while its image is pulling.** That can leave its
   workspace resources behind (a known issue). Let the Job fail on its own; it
