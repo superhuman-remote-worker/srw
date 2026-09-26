@@ -8114,10 +8114,7 @@ describe('PersistentChatService — stateless End (busy, retryable, pending retr
     }
   });
 
-  // Guard (holds before and after): the pinned lane keeps its End contract —
-  // a 503 still fails the End, and a declined mid-turn prompt still hands
-  // control back as a finished request (the caller leaves as before).
-  it('keeps pinned End failures and the turn_in_flight decline unchanged', async () => {
+  it('keeps pinned End failures unaccepted and a declined busy session open', async () => {
     const confirmSpy = vi.spyOn(globalThis, 'confirm').mockReturnValue(false);
     try {
       const fenced = createService();
@@ -8141,7 +8138,7 @@ describe('PersistentChatService — stateless End (busy, retryable, pending retr
       );
 
       const outcome = await midTurn.service.endSession();
-      expect(outcome === 'kept' || outcome === 'retryable').toBe(false);
+      expect(outcome).toBe('kept');
       expect(confirmSpy).toHaveBeenCalledWith('sessions.confirmEndMidTurn');
       expect(midTurn.mockHttp.delete).toHaveBeenCalledTimes(1);
       expect(midTurn.service.threadStatus()).toBe('active');

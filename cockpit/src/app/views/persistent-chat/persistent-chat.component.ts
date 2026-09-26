@@ -4189,10 +4189,12 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
             outcome = await this.chat.endSession();
         } catch (e: any) {
             this.toast.danger(this.errors.translate(e, 'errors.sessions.endFailed'));
+            this.isDisconnecting.set(false);
+            return;
         }
         if (outcome !== 'done') {
             // The session is still here: the user declined to stop a busy
-            // stateless turn (`kept`), or cleanup has not finished and End is
+            // turn (`kept`), or cleanup has not finished and End is
             // the retry (`retryable`). Stay, with End usable again.
             if (outcome === 'retryable') {
                 this.toast.warning(this.transloco.translate('errors.sessions.endRetryable'));

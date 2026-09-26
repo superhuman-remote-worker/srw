@@ -625,19 +625,24 @@ describe('disconnectAndLeave', () => {
         expect(isDisconnecting()).toBe(false);
     });
 
-    // Guard (holds before and after): a finished End and any other failure
-    // keep today's behaviour — leave for /sessions, toasting the failure.
-    it('leaves after a finished End, and after any other failure with the danger toast', async () => {
+    it('leaves after an accepted End', async () => {
         const done = makeHost(() => Promise.resolve('done'));
         await PersistentChatComponent.prototype.disconnectAndLeave.call(done.host);
         expect(done.navigate).toHaveBeenCalledWith(['/sessions']);
         expect(done.danger).not.toHaveBeenCalled();
         expect(done.warning).not.toHaveBeenCalled();
 
-        const failed = makeHost(() => Promise.reject({status: 500}));
+    });
+
+    it.each([0, 409, 503, 500])('keeps failed End visible and retryable for HTTP %s', async (status) => {
+        const failed = makeHost(() => Promise.reject({status}));
         await PersistentChatComponent.prototype.disconnectAndLeave.call(failed.host);
         expect(failed.danger).toHaveBeenCalledWith('errors.sessions.endFailed');
         expect(failed.warning).not.toHaveBeenCalled();
+        expect(failed.navigate).not.toHaveBeenCalled();
+        expect(failed.isDisconnecting()).toBe(false);
+        failed.host.chat.endSession = vi.fn().mockResolvedValue('done');
+        await PersistentChatComponent.prototype.disconnectAndLeave.call(failed.host);
         expect(failed.navigate).toHaveBeenCalledWith(['/sessions']);
     });
 });

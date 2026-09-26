@@ -515,10 +515,9 @@ const CONFIG_UPDATE_ACK_TIMEOUT_MS = 30_000;
 
 /**
  * How an `endSession` request finished, for the caller that owns navigation.
- * - `done`: the End was accepted (or there was no thread), or the pinned
- *   mid-turn prompt ran its course — the caller carries on as it always has.
- * - `kept`: a stateless session was still busy and the user declined to stop
- *   its unfinished turn; nothing was ended.
+ * - `done`: the End was accepted, or there was no thread.
+ * - `kept`: the session was busy and the user declined to stop its unfinished
+ *   turn; nothing was ended.
  * - `retryable`: a stateless End met a retryable retirement fence (503). It
  *   may already have begun; the thread row was re-read, and End is the retry.
  * Any other failure still rejects.
@@ -4819,7 +4818,7 @@ export class PersistentChatService {
         if (proceed) {
           return this.endSession(true);
         }
-        return 'done';
+        return 'kept';
       }
       if (this._isStatelessEndBusyError(err) && !force) {
         // The stateless turn/unit is still leased or has pending input or
