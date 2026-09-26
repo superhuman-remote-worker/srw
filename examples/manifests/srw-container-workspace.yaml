@@ -9,7 +9,7 @@ spec:
     memory: 4Gi
     storage: 30Gi
   environment:
-    # Build your own image FROM an SRW base and pin it by digest for a stable
-    # environment. See container-workspace-templates.md.
-    image: ghcr.io/superhuman-remote-worker/srw-workspace:latest
+    # A placeholder: replace it with your own image, built FROM an SRW base
+    # image and pinned by digest. See container-workspace-templates.md.
+    image: registry.example/team/workspace@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
     pullPolicy: IfNotPresent
