@@ -138,7 +138,7 @@ def _settled_restore_runtime(
     runtime = _captured_workspace_runtime(workspace)
     try:
         receipt_runtime = _canonical_uuid(
-            creation.get("runtime_incarnation"), label="restore runtime"
+            str(creation.get("runtime_incarnation") or ""), label="restore runtime"
         )
     except RuntimeError:
         return None
@@ -2319,17 +2319,32 @@ class WorkspaceSuspensionService:
             else:
                 retired_runtime = _captured_workspace_runtime(ws_ctx)
                 if (
-                    retired_runtime is None
-                    or ws_ctx.get("status") != "suspended"
-                    or ws_ctx.get(WORKSPACE_SNAPSHOT_RESTORE_REQUIRED_KEY) is not True
+                    strict_terminal_snapshot
+                    and ws_ctx.get("status") == "deleted"
+                    and retired_runtime is None
+                    and stateless_creation_generation is not None
                 ):
-                    return False
-                suspension = (
-                    await self._container_provisioner.get_settled_workspace_suspension(
+                    # Metadata alone never authorizes this UID-less shape.
+                    # Resolve the original suspension through its exact derived
+                    # cleanup receipt and current unattempted restore marker.
+                    suspension = await self._db.get_stateless_thread_workspace_restore_predecessor(
+                        thread_id, generation=stateless_creation_generation
+                    )
+                    if not isinstance(suspension, dict):
+                        return False
+                    retired_runtime = str(suspension["runtime_incarnation"])
+                else:
+                    if (
+                        retired_runtime is None
+                        or ws_ctx.get("status") != "suspended"
+                        or ws_ctx.get(WORKSPACE_SNAPSHOT_RESTORE_REQUIRED_KEY)
+                        is not True
+                    ):
+                        return False
+                    suspension = await self._container_provisioner.get_settled_workspace_suspension(
                         owner,
                         expected_runtime_incarnation=retired_runtime,
                     )
-                )
                 if not isinstance(suspension, dict):
                     return False
                 try:

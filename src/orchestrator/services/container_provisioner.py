@@ -1103,7 +1103,7 @@ class ContainerProvisioner:
                 ):
                     return False
                 if (
-                    workspace.get("status") != "ready"
+                    workspace.get("status") not in {"ready", "restoring"}
                     or WORKSPACE_RUNTIME_CREATION_KEY in workspace
                 ):
                     # True means the Pod was accepted, even when its first
@@ -2033,6 +2033,30 @@ class ContainerProvisioner:
             return False
 
         expected_retained_pvc_uid = None
+        if (
+            owner.kind == "session"
+            and stateless_creation_generation is not None
+            and _creation_reservation.get("operation_kind") == "restore"
+        ):
+            predecessor = (
+                await self._db.get_stateless_thread_workspace_restore_predecessor(
+                    owner.id, generation=stateless_creation_generation
+                )
+            )
+            if (
+                predecessor is None
+                or _creation_reservation.get("claimed_by")
+                != f"container-restore:{predecessor['id']}"
+                or predecessor["resource_location"].get("namespace") != self._namespace
+                or bool((_creation_plan.get("pvc") or {}).get("enabled"))
+                != (predecessor["pvc_uid"] is not None)
+            ):
+                return False
+            # The existing retained-PVC path performs GET-only validation
+            # before any CREATE; missing/replaced storage never becomes fresh.
+            expected_retained_pvc_uid = (
+                str(predecessor["pvc_uid"]) if predecessor["pvc_uid"] else None
+            )
         if owner.kind == "session" and stateless_creation_generation is not None:
             previous = await self._db.get_thread(owner.id)
             previous_metadata = thread_metadata_object(previous)
@@ -4458,6 +4482,28 @@ class ContainerProvisioner:
         generation: str,
         expected_runtime_incarnation: str,
     ) -> bool:
+        current = await self._db.get_thread(owner.id)
+        workspace = thread_metadata_object(current).get("workspace_container") or {}
+        marker = workspace.get(WORKSPACE_RUNTIME_CREATION_KEY) or {}
+        if isinstance(marker, Mapping) and marker.get("mode") == "restore":
+            # A settled suspended predecessor cannot re-enter retirement. Its
+            # exact process-zero/suspension receipt authorizes only clearing A.
+            async with self._workspace_mutation_guard(
+                owner, scope="workspace_container"
+            ) as owned:
+                if (
+                    not owned
+                    or await self.workspace_pod_authority(
+                        owner, expected_runtime_incarnation=expected_runtime_incarnation
+                    )
+                    != "exact_absent"
+                ):
+                    return False
+                return await self._db.clear_stateless_thread_workspace_runtime_for_recreation(
+                    owner.id,
+                    generation=generation,
+                    expected_runtime_incarnation=expected_runtime_incarnation,
+                )
         prepared = await self.prepare_workspace_cleanup_intent(
             owner,
             expected_runtime_incarnation=expected_runtime_incarnation,
@@ -4579,7 +4625,7 @@ class ContainerProvisioner:
         generation: str,
         reservation: dict[str, Any],
     ) -> bool:
-        """Verify atomic Ready's receipt while the caller holds the mutation guard.
+        """Verify atomic endpoint publication's receipt while the caller holds the mutation guard.
 
         This is deliberately read-only: a failed/lost verification cannot undo
         a committed Ready publication or settle a historical markerless row.
@@ -4594,7 +4640,6 @@ class ContainerProvisioner:
             or current.get("status") == "ended"
             or str(current.get("runtime_generation") or "") != generation
             or not isinstance(workspace, Mapping)
-            or workspace.get("status") != "ready"
             or WORKSPACE_RUNTIME_CREATION_KEY in workspace
             or workspace.get(WORKSPACE_RUNTIME_INCARNATION_KEY)
             != str(reservation.get("runtime_incarnation") or "")
@@ -4608,8 +4653,28 @@ class ContainerProvisioner:
         settled = await self.get_current_workspace_creation_result(
             owner, operation_kind=reservation["operation_kind"]
         )
+        restore_debt = workspace.get("_snapshot_restore_required", False)
+        if reservation["operation_kind"] == "restore":
+            publication_matches = isinstance(settled, dict) and (
+                (
+                    workspace.get("status") == "restoring"
+                    and restore_debt is True
+                    and settled.get("restore_work_completed_at") is None
+                )
+                or (
+                    workspace.get("status") == "ready"
+                    and restore_debt is False
+                    and settled.get("restore_work_completed_at") is not None
+                    and settled.get("restore_work_result_kind") == "ready"
+                )
+            )
+        else:
+            publication_matches = (
+                workspace.get("status") == "ready" and restore_debt is False
+            )
         return bool(
-            isinstance(settled, dict)
+            publication_matches
+            and isinstance(settled, dict)
             and settled.get("owner_kind") == "thread"
             and str(settled.get("owner_id") or "") == owner.id
             and settled.get("scope") == "workspace_container"

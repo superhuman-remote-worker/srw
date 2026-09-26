@@ -590,23 +590,13 @@ async def test_restore_continuation_keeps_suspension_operation_and_volume(
         expected_runtime_incarnation=case.pod_uid,
     )
     assert prepared["state"] == "prepared"
-    # Seed only the completed predecessor-clearing projection. The predecessor
-    # above really settled with a process-zero receipt and its finalizer gone.
-    # Running the separate recreation-finalization path here currently tries
-    # to reactivate that retired UID as deleting, which the DB correctly rejects.
-    # This test owns continuation after restore creation, not that transition.
-    async with database.acquire() as conn:
-        async with conn.transaction():
-            # This isolated fixture projection cannot pass the current cleanup
-            # trigger either. Restore the trigger before exercising any code.
-            await conn.execute("SET LOCAL session_replication_role = replica")
-            await conn.execute(
-                "UPDATE threads SET metadata = jsonb_set(metadata, "
-                "'{workspace_container}', metadata->'workspace_container' || "
-                '\'{"status":"restoring","pod_ip":null,'
-                '"_runtime_incarnation":null}\'::jsonb) WHERE id=$1::uuid',
-                case.thread_id,
-            )
+    # Follow the production predecessor-clearing edge with every authority
+    # trigger enabled. The predecessor was really retired and settled above.
+    assert await case.provisioner.finalize_stateless_workspace_recreation_deletion(
+        case.owner,
+        generation=generation,
+        expected_runtime_incarnation=case.pod_uid,
+    )
     assert not await case.provisioner.create_workspace(
         case.owner,
         stateless_creation_generation=generation,

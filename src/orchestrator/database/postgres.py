@@ -20134,6 +20134,176 @@ class PostgresDB:
                 )
                 return result == "UPDATE 1"
 
+    async def _stateless_restore_predecessor_on_conn(
+        self,
+        conn,
+        thread_uuid: UUID,
+        row,
+        *,
+        generation: str,
+        expected_runtime: str,
+    ) -> tuple[dict[str, Any], dict[str, Any] | None] | None:
+        """Resolve suspended A, or its exact cleared projection, under owner lock."""
+        try:
+            metadata, workspace, runtime, marker = _stateless_runtime_creation_context(
+                row
+            )
+        except RuntimeError:
+            return None
+        if (
+            marker is None
+            or marker["mode"] != "restore"
+            or marker["generation"] != generation
+            or marker["attempted"] is not False
+            or marker["replaces_uid"] != expected_runtime
+            or workspace.get("_snapshot_restore_required") is not True
+            or (runtime, workspace.get("status"))
+            not in {(expected_runtime, "suspended"), (None, "deleted")}
+        ):
+            return None
+        latest = await conn.fetchrow(
+            "SELECT * FROM managed_repository_workspace_cleanup_intents "
+            "WHERE owner_kind='thread' AND owner_id=$1 AND scope='workspace_container' "
+            "ORDER BY intent_generation DESC LIMIT 1 FOR UPDATE",
+            thread_uuid,
+        )
+        if latest is None:
+            return None
+        derived = dict(latest) if runtime is None else None
+        source = latest
+        if derived is not None:
+            try:
+                lineage = _strict_json_object(
+                    derived["lifecycle_fingerprint"],
+                    label="restore predecessor lineage",
+                )
+                source_id = UUID(str(lineage.get("suspension_intent_id")))
+            except (RuntimeError, ValueError, TypeError):
+                return None
+            if lineage != {
+                "admitted_by": "stateless_restore_predecessor_clear",
+                "suspension_intent_id": str(source_id),
+            }:
+                return None
+            source = await conn.fetchrow(
+                "SELECT * FROM managed_repository_workspace_cleanup_intents "
+                "WHERE id=$1 AND owner_kind='thread' AND owner_id=$2 "
+                "AND scope='workspace_container' FOR SHARE",
+                source_id,
+                thread_uuid,
+            )
+        if source is None:
+            return None
+        for intent, target in ((source, "suspended"), (derived, "deleted")):
+            if intent is None:
+                continue
+            if (
+                str(intent["thread_runtime_generation"]) != generation
+                or str(intent["runtime_incarnation"]) != expected_runtime
+                or str(intent["pod_uid"]) != expected_runtime
+                or intent["target_disposition"] != target
+                or intent["resource_policy"] != "preserve"
+                or intent["reclaim_shared_resources"] is not False
+                or intent["result_kind"] != "settled"
+                or intent["phase"] != "settled"
+                or intent["settled_at"] is None
+                or intent["cleanup_completed_at"] is None
+                or intent["projection_transaction_id"] is None
+                or intent["capture_complete"] is not True
+                or intent["resources_captured_at"] is None
+                or intent["snapshot_restore_required"] is not True
+            ):
+                return None
+        if (
+            source["suspended_at"] is None
+            or workspace.get("suspended_at") != source["suspended_at"].isoformat()
+            or derived is not None
+            and (
+                derived["intent_generation"] <= source["intent_generation"]
+                or any(
+                    derived[key] != source[key]
+                    for key in (
+                        "pod_uid",
+                        "pvc_uid",
+                        "seed_configmap_uid",
+                        "service_uid",
+                        "resource_location",
+                    )
+                )
+            )
+            or await conn.fetchval(
+                "SELECT EXISTS (SELECT 1 FROM managed_repository_workspace_cleanup_intents "
+                "WHERE owner_kind='thread' AND owner_id=$1 AND scope='workspace_container' "
+                "AND settled_at IS NULL)",
+                thread_uuid,
+            )
+            or not await conn.fetchval(
+                "SELECT EXISTS (SELECT 1 FROM managed_repository_process_zero_receipts "
+                "WHERE owner_kind='thread' AND owner_id=$1 AND scope='workspace_container' "
+                "AND provisioner='k8s' AND runtime_incarnation=$2)",
+                thread_uuid,
+                expected_runtime,
+            )
+        ):
+            return None
+        try:
+            location = _strict_json_object(
+                source["resource_location"], label="restore predecessor location"
+            )
+        except RuntimeError:
+            return None
+        backing_kind = "pvc" if source["pvc_uid"] is not None else "pod"
+        backing_uid = source["pvc_uid"] or source["pod_uid"]
+        binding = metadata.get("_workspace_binding")
+        if (
+            not location.get("namespace")
+            or not isinstance(binding, dict)
+            or binding.get("kind") != "remote"
+            or binding.get("backing_id")
+            != f"k8s-{backing_kind}:{location['namespace']}:{backing_uid}"
+        ):
+            return None
+        return {**dict(source), "resource_location": location}, derived
+
+    async def get_stateless_thread_workspace_restore_predecessor(
+        self,
+        thread_id: str,
+        *,
+        generation: str,
+    ) -> dict[str, Any] | None:
+        """Read original suspension only through an exact cleared restore receipt."""
+        try:
+            thread_uuid = UUID(str(thread_id))
+        except (ValueError, TypeError):
+            return None
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    "SELECT status::text AS status, execution_lane, runtime_generation, metadata "
+                    "FROM threads WHERE id=$1 FOR UPDATE",
+                    thread_uuid,
+                )
+                if row is None:
+                    return None
+                try:
+                    _, _, runtime, marker = _stateless_runtime_creation_context(row)
+                except RuntimeError:
+                    return None
+                if (
+                    runtime is not None
+                    or marker is None
+                    or marker["replaces_uid"] is None
+                ):
+                    return None
+                proof = await self._stateless_restore_predecessor_on_conn(
+                    conn,
+                    thread_uuid,
+                    row,
+                    generation=generation,
+                    expected_runtime=marker["replaces_uid"],
+                )
+                return proof[0] if proof is not None and proof[1] is not None else None
+
     async def clear_stateless_thread_workspace_runtime_for_recreation(
         self,
         thread_id: str,
@@ -20171,6 +20341,82 @@ class PostgresDB:
                     )
                 except RuntimeError:
                     return False
+                if marker is not None and marker["mode"] == "restore":
+                    proof = await self._stateless_restore_predecessor_on_conn(
+                        conn,
+                        thread_uuid,
+                        row,
+                        generation=generation,
+                        expected_runtime=expected_runtime,
+                    )
+                    if proof is None:
+                        return False
+                    suspension, derived = proof
+                    if derived is not None:
+                        return True
+                    if await conn.fetchval(
+                        "SELECT EXISTS (SELECT 1 FROM managed_repository_workspace_creation_reservations "
+                        "WHERE owner_kind='thread' AND owner_id=$1 AND scope='workspace_container' "
+                        "AND settled_at IS NULL)",
+                        thread_uuid,
+                    ):
+                        return False
+                    # A is already physically cleaned and process-zero. This
+                    # is only its cleared projection, not another delete grant.
+                    # Keep the suspension immutable as B's operation lineage.
+                    cleared_id = await conn.fetchval(
+                        "INSERT INTO managed_repository_workspace_cleanup_intents ("
+                        "owner_kind, owner_id, thread_runtime_generation, scope, runtime_incarnation, "
+                        "target_disposition, resource_policy, lifecycle_fingerprint, "
+                        "pod_uid, seed_configmap_uid, pvc_uid, service_uid, capture_complete, "
+                        "resources_captured_at, snapshot_restore_required, resource_location, phase) "
+                        "VALUES ('thread',$1,$2,'workspace_container',$3,'deleted','preserve',"
+                        "$4::jsonb,$3,$5,$6,$7,true,$8,true,$9::jsonb,'captured') RETURNING id",
+                        thread_uuid,
+                        suspension["thread_runtime_generation"],
+                        suspension["runtime_incarnation"],
+                        json.dumps(
+                            {
+                                "admitted_by": "stateless_restore_predecessor_clear",
+                                "suspension_intent_id": str(suspension["id"]),
+                            }
+                        ),
+                        suspension["seed_configmap_uid"],
+                        suspension["pvc_uid"],
+                        suspension["service_uid"],
+                        suspension["resources_captured_at"],
+                        json.dumps(suspension["resource_location"]),
+                    )
+                    settled = await conn.execute(
+                        "UPDATE managed_repository_workspace_cleanup_intents "
+                        "SET result_kind='settled', phase='settled', cleanup_completed_at=now(), "
+                        "settled_at=now() WHERE id=$1 AND settled_at IS NULL",
+                        cleared_id,
+                    )
+                    if settled != "UPDATE 1":
+                        raise RuntimeError(
+                            "restore predecessor projection lost cleanup receipt"
+                        )
+                    workspace.update(
+                        {
+                            "status": "deleted",
+                            "pod_ip": None,
+                            "pod_name": None,
+                            _STATELESS_RUNTIME_INCARNATION_KEY: None,
+                        }
+                    )
+                    metadata["workspace_container"] = workspace
+                    updated = await conn.execute(
+                        "UPDATE threads SET metadata=$2::jsonb, last_activity=CURRENT_TIMESTAMP "
+                        "WHERE id=$1",
+                        thread_uuid,
+                        json.dumps(metadata),
+                    )
+                    if updated != "UPDATE 1":
+                        raise RuntimeError(
+                            "restore predecessor projection lost owner row"
+                        )
+                    return True
                 if (
                     runtime is None
                     and str(workspace.get("status") or "") == "deleted"
@@ -20229,7 +20475,7 @@ class PostgresDB:
         creation_claim_token: int,
         host: str | None = None,
     ) -> dict[str, Any] | None:
-        """Publish Ready and settle its exact creation in one owner-ordered transaction."""
+        """Publish the endpoint and settle creation in one owner-ordered transaction."""
 
         try:
             thread_uuid = UUID(str(thread_id))
@@ -20354,7 +20600,9 @@ class PostgresDB:
                 }
                 workspace.update(
                     {
-                        "status": "ready",
+                        "status": "restoring"
+                        if marker["mode"] == "restore"
+                        else "ready",
                         "provisioner": "k8s",
                         "pod_ip": pod_ip,
                         "port": port,

@@ -122,6 +122,17 @@ cleans up after itself; a Session doesn't (see below).
   committed together, so a normal retry observes that runtime. This guarantee
   requires the updated orchestrator. Upgrading does not repair historical Ready
   workspaces whose reservation was left open by an earlier version.
+- **Stateless restore preserves the suspension and retained volume.** Once the
+  suspended Pod is proven absent, a separate exact cleanup receipt clears its
+  physical runtime projection. The original suspension remains the authority
+  for the replacement. A restore with a retained PVC requires that exact PVC
+  before creating resources; a missing or replaced PVC leaves restore pending
+  without a fresh volume fallback. Clearing an absent Pod alone does not prove
+  its PVC survived.
+  The replacement endpoint and its creation settlement commit together as
+  `restoring`. Only exact restore-work completion clears snapshot debt and
+  publishes Ready for work and Canvas. This requires the updated orchestrator;
+  it does not repair historical unproven lifecycle projections.
 - **End also handles an initial stateless startup failure.** If the first fresh
   container has a recorded Pod identity and no container has started, normal
   End can stop it without waiting for its image or SSH. End retains its exact
