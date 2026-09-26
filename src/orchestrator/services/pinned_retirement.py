@@ -1271,6 +1271,24 @@ class PinnedRetirementOperations:
             raise RuntimeError("captured agent workspace claim authority is incomplete")
         return values
 
+    def _captured_protected_agent_pod(self, retirement: Mapping[str, Any]) -> bool:
+        """Whether Begin captured an exact finalizer-protected agent Pod.
+
+        Every such Pod — dedicated with or without an agent workspace claim,
+        or a bound warm pool Pod — needs its captured identity stopped and its
+        finalizer released by retirement; nothing else ever will.
+        """
+
+        context = retirement.get("context")
+        agent_pod = context.get("agent_pod") if isinstance(context, Mapping) else None
+        return bool(
+            isinstance(agent_pod, Mapping)
+            and str(agent_pod.get("pod_name") or "")
+            and str(agent_pod.get("pod_uid") or "")
+            and str(agent_pod.get("namespace") or "")
+            and agent_pod.get("protection_protocol") == "finalizer_v1"
+        )
+
     def _historical_retirement_guard(
         self,
         retirement: Mapping[str, Any],
@@ -2637,15 +2655,19 @@ class PinnedRetirementOperations:
 
         if defer_agent_workspace_claim_until_caller_exit:
             # A permanent final ACK is sent by the same agent process whose Pod
-            # mounts this claim. Its append-only local-quiescence receipt proves
-            # the runtime stopped all writers, but Kubernetes cannot remove the
-            # PVC until this HTTP response lets that caller exit. Leave the claim
-            # completely untouched; an owner/reconciler retry exact-stops the
-            # captured Pod first and then resumes the ordinary fenced cleanup.
+            # carries SRW's protection finalizer (and may mount this claim). Its
+            # append-only local-quiescence receipt proves the runtime stopped
+            # all writers, but the Pod can only be retired, and its PVC removed,
+            # after this HTTP response lets that caller exit. Leave the Pod and
+            # claim completely untouched; an owner/reconciler retry exact-stops
+            # the captured Pod first and then resumes the ordinary cleanup.
             if (
                 not permanent
                 or cleanup_agent_pod
-                or self._captured_agent_workspace_claim(retirement) is None
+                or not (
+                    self._captured_agent_workspace_claim(retirement) is not None
+                    or self._captured_protected_agent_pod(retirement)
+                )
             ):
                 raise RuntimeError("agent workspace cleanup handoff is malformed")
             return
@@ -2699,6 +2721,7 @@ class PinnedRetirementOperations:
     recover_agent_pod_provision_intent_zero = _recover_agent_pod_provision_intent_zero
     captured_virtual_binding_agent_zero_only = _captured_virtual_binding_agent_zero_only
     captured_agent_workspace_claim = _captured_agent_workspace_claim
+    captured_protected_agent_pod = _captured_protected_agent_pod
     reconcile_agent_workspace_claim_for_retirement = (
         _reconcile_agent_workspace_claim_for_retirement
     )

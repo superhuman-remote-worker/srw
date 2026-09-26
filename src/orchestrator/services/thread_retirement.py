@@ -2098,12 +2098,20 @@ async def _end_thread_flow_owned(
                     if isinstance(context, Mapping)
                     else None
                 )
+                # The retiring agent's own permanent ACK cannot wait for its
+                # Pod to be stopped. Any finalizer-protected Pod (claim-bearing,
+                # claim-less or warm) is handed to the durable retry, which
+                # stops it exactly once the caller exited; deleting the thread
+                # now would leave that Pod Terminating with no owner.
                 agent_workspace_exit_handoff = bool(
                     permanent
                     and retiring_agent_response_pending
                     and runtime_exposed
                     and local_quiescence
-                    and raw_agent_workspace_claim not in (None, {})
+                    and (
+                        raw_agent_workspace_claim not in (None, {})
+                        or pinned.captured_protected_agent_pod(retirement)
+                    )
                 )
                 await _cleanup_pinned_thread_retirement(
                     retirement,
