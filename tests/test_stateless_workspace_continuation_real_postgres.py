@@ -267,6 +267,112 @@ async def test_ensure_continues_exact_open_creation_with_frozen_image(
 
 
 @pytest.mark.asyncio
+async def test_ensure_continues_exact_creation_after_lease_expiry(
+    database, actor, monkeypatch
+):
+    case = await pending_workspace(database, actor, monkeypatch)
+    original = case.creation
+    # Match the reservation duration guard while expiring only this test row.
+    await database.execute(
+        "UPDATE managed_repository_workspace_creation_reservations "
+        "SET created_at = now() - interval '1 hour', "
+        "expires_at = now() - interval '1 second' WHERE id = $1",
+        original["id"],
+    )
+    case.cluster.become_ready()
+    wait_for_ready = case.provisioner._wait_for_ready
+    observed_rotation = []
+
+    async def observe_rotated_claim(*args, **kwargs):
+        # Observe after reclaim, before Ready/settlement, then run the actual
+        # waiter. Both tokens face the same live, still-open reservation.
+        rotated = await reservation(database, case.thread_id)
+        projected = metadata(await database.get_thread(case.thread_id))[
+            "workspace_container"
+        ]
+        assert rotated["settled_at"] is None
+        assert rotated["claim_token"] > original["claim_token"]
+        assert projected["_creation_reservation_id"] == str(original["id"])
+        assert projected["_creation_claim_token"] == str(rotated["claim_token"])
+        assert projected["_runtime_incarnation"] == case.pod_uid
+        authority = {
+            "owner_kind": "thread",
+            "scope": "workspace_container",
+            "reservation_generation": original["reservation_generation"],
+            "claimant": original["claimed_by"],
+        }
+        assert await database.managed_repository_workspace_creation_claim_is_current(
+            case.thread_id, **authority, claim_token=rotated["claim_token"]
+        )
+        assert (
+            not await database.managed_repository_workspace_creation_claim_is_current(
+                case.thread_id, **authority, claim_token=original["claim_token"]
+            )
+        )
+        assert (
+            await database.mark_managed_repository_workspace_creation_started(
+                case.thread_id, **authority, claim_token=original["claim_token"]
+            )
+            is None
+        )
+        observed_rotation.append(rotated["claim_token"])
+        return await wait_for_ready(*args, **kwargs)
+
+    monkeypatch.setattr(case.provisioner, "_wait_for_ready", observe_rotated_claim)
+    await ensure_session_workspace(
+        case.thread_id,
+        db=database,
+        provisioner=case.provisioner,
+        suspension=case.suspension,
+    )
+    settled = await reservation(database, case.thread_id)
+    assert observed_rotation == [settled["claim_token"]]
+    for key in (
+        "id",
+        "reservation_generation",
+        "thread_runtime_generation",
+        "desired_manifest_digest",
+        "claimed_by",
+        "operation_kind",
+        "runtime_incarnation",
+        "pod_uid",
+        "pvc_uid",
+        "service_uid",
+    ):
+        assert settled[key] == original[key]
+    assert settled["phase"] == "settled"
+    assert settled["settled_at"] is not None
+    after = await database.get_thread(case.thread_id)
+    current = metadata(after)["workspace_container"]
+    assert after["runtime_generation"] == case.before["runtime_generation"]
+    assert current["status"] == "ready"
+    assert "_runtime_creation" not in current
+    assert current["_creation_claim_token"] == str(settled["claim_token"])
+    assert current["_creation_reservation_id"] == str(original["id"])
+    assert current["_runtime_incarnation"] == case.pod_uid
+    for kind, uid in (
+        ("pod", case.pod_uid),
+        ("pvc", case.pvc_uid),
+        ("service", case.service_uid),
+    ):
+        assert case.cluster.objects[kind].metadata.uid == uid
+    assert case.cluster.pod_create_calls == 1
+    assert case.cluster.pod_deletes == 0
+    assert (
+        await read_execution(database, "Session", case.thread_id)
+        == case.original_snapshot
+    )
+    ready = await ensure_session_workspace(
+        case.thread_id,
+        db=database,
+        provisioner=case.provisioner,
+        suspension=case.suspension,
+    )
+    assert ready.outcome == EnsureOutcome.READY
+    assert case.cluster.pod_create_calls == 1
+
+
+@pytest.mark.asyncio
 async def test_continuation_keeps_elapsed_custom_image_pull_budget(
     database, actor, monkeypatch, caplog
 ):
