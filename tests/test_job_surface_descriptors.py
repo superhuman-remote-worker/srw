@@ -158,6 +158,7 @@ def test_shared_surface_imports_only_stdlib_httpx_and_shared_contracts() -> None
         "shared.runtime_actor",
         "shared.job_outcome",
         "shared.expert_reference",
+        "shared.worker_execution_hold",
     )
     for path in SHARED_ROOT.rglob("*.py"):
         tree = ast.parse(path.read_text(encoding="utf-8"))

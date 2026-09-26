@@ -22,6 +22,7 @@ import pytest_asyncio
 from testcontainers.postgres import PostgresContainer
 
 from orchestrator.database.postgres import PostgresDB
+from tests._container_recovery_schema import create_empty_container_recovery_ledger
 from orchestrator.services.job_completion_commands import (
     CompletionFenceRejected,
     accept_completion_command,
@@ -258,6 +259,8 @@ async def runtime_db(pg_url):
         );
         TRUNCATE jobs, agents, srw_execution_specs, run_queue, vm_idle_operations;
     """)
+    async with db.acquire() as conn:
+        await create_empty_container_recovery_ledger(conn)
     yield db
     await db.disconnect()
 
