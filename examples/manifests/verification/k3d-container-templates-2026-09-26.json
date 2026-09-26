@@ -1,0 +1,207 @@
+{
+  "gate": "container-workspace-templates-slice-a1",
+  "status": "passed-with-concerns",
+  "date": "2026-09-26",
+  "context": "k3d-srw",
+  "namespace": "srw",
+  "commit": "f07a3b77e8b47882b985b397575f3f44c82ea67c",
+  "idPolicy": "Job, Session and Pod identifiers are recorded only as the first 10 hex characters of sha256(id).",
+  "stack": {
+    "orchestratorFilesMatchCommit": true,
+    "workspacePvcEnabled": true,
+    "workspaceFuseEnabled": true,
+    "workspaceFusePrivileged": true,
+    "trustedImageRepositories": [],
+    "customImagesPrivileged": false,
+    "imagePullTimeoutSeconds": 600,
+    "statelessSessionEnabled": true,
+    "installationImageTag": "tilt-<hash> (no :sha- tag, so drift detection is inactive on this stack)",
+    "chatModel": "MiniMax-M3"
+  },
+  "testImage": {
+    "reference": "srw-registry:5000/srw-a1-test:1",
+    "base": "installation workspace image (srw-registry:5000/srw-workspace:tilt-90903d4c26c425c3)",
+    "addedTool": "hello (Ubuntu package)",
+    "digest": "sha256:9dab365fb319143d249fe3b00a3cbb731fa075b0b48c23ba48afc0ae55160d84"
+  },
+  "template": {
+    "backend": "sandbox",
+    "resources": {"cpu": 1, "memory": "3Gi", "storage": "15Gi"},
+    "environment": {"image": "srw-registry:5000/srw-a1-test:1"}
+  },
+  "cases": [
+    {
+      "case": "job-custom-image-resources-pvc",
+      "result": "passed",
+      "job": "ab0805ca98",
+      "observed": {
+        "frozenPolicy": {"cpu": 1, "image": "srw-registry:5000/srw-a1-test:1", "memory": "3Gi", "storage": "15Gi", "pull_policy": "IfNotPresent"},
+        "image": "srw-registry:5000/srw-a1-test:1",
+        "imagePullPolicy": "IfNotPresent",
+        "requests": {"cpu": "250m", "memory": "3Gi"},
+        "limits": {"cpu": "1 (API-canonical form of the rendered 1000m)", "memory": "3Gi"},
+        "privileged": false,
+        "capabilitiesAdd": ["CHOWN", "DAC_OVERRIDE", "FOWNER", "SETGID", "SETUID", "NET_BIND_SERVICE", "SYS_CHROOT", "KILL", "AUDIT_WRITE"],
+        "seccompProfile": "RuntimeDefault",
+        "devFuseVolume": false,
+        "devFuseInContainer": false,
+        "buildShaLabel": false,
+        "workspaceVolume": "PVC",
+        "pvcRequestAndCapacity": "15Gi",
+        "helloInPod": "Hello, world!",
+        "agentRun": "engineer expert called shell_execute('hello'): exit 0, stdout 'Hello, world!'; Job reached pending_review"
+      },
+      "note": "A first Job on the default general-worker expert showed the same pod values but that expert has no shell tool, so it could not run hello; it was cancelled."
+    },
+    {
+      "case": "job-control-default-image",
+      "result": "reference",
+      "job": "8f734c2ccf",
+      "observed": {
+        "image": "installation image",
+        "requests": {"cpu": "500m", "memory": "1Gi"},
+        "limits": {"cpu": "2", "memory": "4Gi"},
+        "privileged": true,
+        "capabilitiesAddIncludesSysAdmin": true,
+        "seccompProfile": "Unconfined",
+        "devFuseVolume": true,
+        "pvcRequest": "10Gi"
+      }
+    },
+    {
+      "case": "job-emptydir-storage",
+      "result": "passed",
+      "job": "646ffeed9e",
+      "settings": "workspace.pvcEnabled=false in the gitignored local values, same window as the privilege switch",
+      "observed": {
+        "workspaceVolume": {"emptyDir": {"sizeLimit": "15Gi"}},
+        "requests": {"cpu": "250m", "ephemeral-storage": "15Gi", "memory": "3Gi"},
+        "limits": {"cpu": "1", "memory": "3Gi"}
+      }
+    },
+    {
+      "case": "session-stateless-wake-new-generation",
+      "result": "passed",
+      "session": "9579901e94",
+      "lane": "stateless",
+      "recreation": "End then Resume (pod retired, new generation created on the same PVC)",
+      "observed": {
+        "podBefore": "e894697224",
+        "podAfter": "e85a4d9773",
+        "identicalAcrossRecreation": ["image", "imagePullPolicy", "requests", "limits", "securityContext", "seccompProfile", "workspace PVC", "no dev-fuse", "no build-sha label"],
+        "requests": {"cpu": "250m", "memory": "3Gi"},
+        "limits": {"cpu": "1", "memory": "3Gi"},
+        "pvc": {"hash": "dbf199285b", "size": "15Gi", "sameClaimAfterWake": true},
+        "cloudMountGateDeniesFuse": true,
+        "cloudPath": "WebDAV cloud sync (no rclone mount in the pod)",
+        "helloInPod": "Hello, world!"
+      },
+      "note": "The Session expert (assistant) has no shell tool, so the agent could not run hello; the pod-level exec proves the tool is present."
+    },
+    {
+      "case": "session-pinned-suspend-restore-end-resume",
+      "result": "passed",
+      "session": "c61fa45c9f",
+      "lane": "pinned",
+      "howPinned": "Conference class on an officer-less Project; STATELESS_SESSION_ENABLED=true sends ordinary sandbox Sessions to the stateless lane",
+      "recreations": [
+        {"trigger": "End (snapshot uploaded, pod deleted) then Resume", "podBefore": "eaeca0603d", "podAfter": "8b0c3ee84a", "identical": true},
+        {"trigger": "agent-initiated end (boot_ws_timeout) -> orchestrator suspend path (snapshot uploaded, pod deleted) then Resume", "podBefore": "8b0c3ee84a", "podAfter": "69e700311f", "identical": true}
+      ],
+      "observed": {
+        "image": "srw-registry:5000/srw-a1-test:1",
+        "requests": {"cpu": "250m", "memory": "3Gi"},
+        "limits": {"cpu": "1", "memory": "3Gi"},
+        "privileged": false,
+        "pvc": {"hash": "a54c23a658", "size": "15Gi", "sameClaimAcrossRecreations": true},
+        "helloInPod": "Hello, world!"
+      }
+    },
+    {
+      "case": "privilege-switch-on",
+      "result": "passed",
+      "settings": "workspace.customImages.privileged=true (orchestrator env WORKSPACE_CUSTOM_IMAGES_PRIVILEGED=true), then reverted and confirmed false",
+      "job": "646ffeed9e",
+      "session": "eb1ae11234",
+      "observed": {
+        "privileged": true,
+        "capabilitiesAddIncludesSysAdmin": true,
+        "seccompProfile": "Unconfined",
+        "devFuseVolume": true,
+        "devFuseInContainer": true,
+        "jobAgentRun": "shell_execute('hello'): exit 0, 'Hello, world!'",
+        "sessionCloudMount": "fuse.rclone mounted at /cloud/home in the custom-image Session pod",
+        "cloudMountGateDeniesFuseWithSwitchOn": false
+      }
+    },
+    {
+      "case": "unpullable-image-job",
+      "result": "passed",
+      "job": "2b6c4a1a01",
+      "image": "srw-registry:5000/does-not-exist:1",
+      "observed": {
+        "podStates": ["ErrImagePull", "ImagePullBackOff"],
+        "status": "failed",
+        "secondsFromCreateToFailed": 601,
+        "errorMessage": "Workspace container failed: Workspace image srw-registry:5000/does-not-exist:1 could not be pulled: ImagePullBackOff (Back-off pulling image \"srw-registry:5000/does-not-exist:1\": ErrImagePull: rpc error: code = NotFound desc = failed to pull and unpack image \"srw-registry:5000/does-not-exist:1\": failed to resolve reference \"srw-registry:5000/does-not-exist:1\": srw-registry:5000/does-not-exist:1: not found)"
+      },
+      "concern": "The failed Job's Pod, PVC and Service were never torn down: workspace_container stays retiring_process_zero, the reaper logs 'force-deleted' every minute without deleting, and DELETE /api/jobs returns 503 'Workspace authority retirement is incomplete' (teardown needs a Kubernetes-ready Pod). Kubernetes resources were removed by hand; the Job row remains."
+    },
+    {
+      "case": "unpullable-image-session",
+      "result": "passed-with-concern",
+      "session": "53d1eaf9ed",
+      "observed": {
+        "orchestratorLogSecondsFromCreate": 601,
+        "logMessage": "Failed to create workspace container for session <id>: Workspace image srw-registry:5000/does-not-exist:1 could not be pulled: ImagePullBackOff (...)"
+      },
+      "concern": "No retry or self-heal followed. The Session's workspace stays 'created' with _runtime_creation.attempted=true; End returns 503 'Stateless workspace creation and restore must reach exact Ready authority before retirement', even after the image was made pullable and the Pod became Ready. Kubernetes resources were removed by hand; the Session row remains."
+    },
+    {
+      "case": "refusal-prepare-template",
+      "result": "passed",
+      "status": 422,
+      "detail": "Container templates can't run prepare steps. Build your own image FROM an SRW base image and name it in environment.image (see examples/manifests/container-workspace-templates.md).",
+      "surfaces": ["POST /api/jobs", "POST /api/persistent/threads", "POST /api/persistent/threads/preview", "POST /api/persistent/tool-groups/preview (worker)", "POST /api/persistent/tool-groups/preview (session)"]
+    },
+    {
+      "case": "refusal-side-door",
+      "result": "passed-with-concern",
+      "status": 422,
+      "detail": "config_override.workspace.container are no longer supported. Put the image and resources in a WorkspaceTemplate (environment.image, resources) and select it with `workspace`.",
+      "surfaces": ["POST /api/jobs", "POST /api/persistent/threads", "POST /api/persistent/threads/preview"],
+      "sandboxKeyAtJobCreate": {"status": 422, "detail": "config_override.workspace.sandbox are no longer supported. Put the image and resources in a WorkspaceTemplate (environment.image, resources) and select it with `workspace`."},
+      "concern": "POST /api/persistent/tool-groups/preview (the New Session/Job form preview) returns 200 for config_override.workspace.container and .sandbox: it drops the key with a warning instead of refusing."
+    },
+    {
+      "case": "rollout-does-not-recycle-custom-workspaces",
+      "result": "passed-non-discriminating",
+      "method": "Temporary LABEL line appended to docker/Dockerfile.workspace (a comment-only change keeps the image digest, so Tilt would not change the tag); reverted with git checkout",
+      "observed": {
+        "workspaceImageBefore": "tilt-90903d4c26c425c3",
+        "workspaceImageAfter": "tilt-82e0724e23a85968",
+        "workspaceImageAfterRevert": "tilt-da53b66ad07059d3",
+        "reconcilerTicksAfterRollout": 2,
+        "customImagePodsUnchanged": ["9c311ea5bc", "63026f0bb3", "e85a4d9773", "75f40fe7f7"],
+        "pinnedSessionPod": "69e700311f survived the rollout and two reconciler ticks, then its agent ended it (boot_ws_timeout), not drift",
+        "customImagePodsCarryBuildSha": false,
+        "labelLogicWithShaTaggedInstallImage": {"defaultImagePod": "abc1234", "customImagePod": null},
+        "expectedWorkspaceShasOnThisStack": []
+      },
+      "note": "With tilt-<hash> tags expected_workspace_shas() is empty, so the reconciler skips drift checks for every pod. The check cannot fail here; the label logic is the discriminating evidence."
+    }
+  ],
+  "cleanup": {
+    "jobsDeleted": ["dfcf3f8fbd", "ab0805ca98", "8f734c2ccf", "646ffeed9e"],
+    "sessionsDeleted": ["9579901e94", "c61fa45c9f"],
+    "wedgedRowsLeft": {
+      "job": ["2b6c4a1a01 (failed; delete refused)"],
+      "sessions": ["53d1eaf9ed (created; End refused; queued input parked retry_exhausted)", "eb1ae11234 (ended; permanent delete refused: stateless retirement intent pending after emptyDir End)"]
+    },
+    "kubernetesResourcesFromTheseIdsRemaining": 0,
+    "manualKubernetesCleanup": "Removed the stateless-process-zero finalizer from the two unpullable Pods and deleted their Pods, PVCs and Services by hand",
+    "testImages": "Removed from the local podman store, the srw-registry repositories and the k3d node image cache",
+    "valuesLocalRestored": true,
+    "dockerfileWorkspaceDiff": "none"
+  }
+}
