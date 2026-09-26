@@ -29282,6 +29282,13 @@ CREATE UNIQUE INDEX managed_repository_workspace_creation_one_active ON public.m
 
 
 --
+-- Name: managed_repository_workspace_creation_owner_history; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX managed_repository_workspace_creation_owner_history ON public.managed_repository_workspace_creation_reservations USING btree (owner_kind, owner_id, scope, id);
+
+
+--
 -- Name: managed_repository_workspace_restore_work_claim_unique; Type: INDEX; Schema: public; Owner: -
 --
 
