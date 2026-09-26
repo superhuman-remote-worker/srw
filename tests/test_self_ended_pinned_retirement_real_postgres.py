@@ -943,3 +943,165 @@ async def test_active_warm_pool_permanent_ack_hands_the_exact_pod_to_retry(
     assert result.get("status") == "deleted", result
     assert await db.get_thread(ids["thread"]) is None
     assert ("agents-a", ids["pod_name"]) not in api.pods
+
+
+# ---------------------------------------------------------------------------
+# Warm-pool protection ledger settles with the life it protected
+# ---------------------------------------------------------------------------
+
+
+async def _bind_warm_life(db, monkeypatch):
+    """Bind a warm dual pool Pod to a pinned session through the attach path."""
+
+    from orchestrator.services.pinned_agent_authority import (
+        reserve_pinned_warm_agent_binding,
+    )
+
+    ids = await authority_fixtures._seed_warm_pool_binding(db, bound=False)
+    api = authority_fixtures.StatefulPinnedK8sApi()
+    authority_fixtures._install_warm_pool_pod(api, ids)
+    monkeypatch.setenv("PINNED_LEGACY_AGENT_NAMESPACES", "agents-a")
+    provisioner = authority_fixtures._production_warm_provisioner(
+        db, api, namespace="agents-a"
+    )
+    monkeypatch.setattr(main.app.state.resources, "postgres_db", db)
+    monkeypatch.setattr(agent_provisioner_module, "agent_provisioner", provisioner)
+    monkeypatch.setattr(
+        main.app.state.resources.session_router,
+        "teardown_route",
+        AsyncMock(return_value=True),
+    )
+    async with db.acquire() as conn:
+        metadata = _json(
+            await conn.fetchval(
+                "SELECT metadata FROM threads WHERE id=$1::uuid", ids["thread"]
+            )
+        )
+        metadata["config_override"]["officer"]["enabled"] = False
+        await conn.execute(
+            "DELETE FROM project_officers WHERE thread_id=$1::uuid", ids["thread"]
+        )
+        await conn.execute(
+            "UPDATE threads SET metadata=$2::jsonb WHERE id=$1::uuid",
+            ids["thread"],
+            json.dumps(metadata),
+        )
+    bound = await reserve_pinned_warm_agent_binding(
+        db,
+        agent_provisioner=provisioner,
+        persistent_provisioner=None,
+        thread_id=ids["thread"],
+        agent_id=ids["agent"],
+        expected_runtime_generation=ids["runtime_generation"],
+    )
+    assert bound.bound
+    life = {
+        **ids,
+        "generation": ids["runtime_generation"],
+        "attach_token": bound.attach_token,
+    }
+    stack = NS(
+        db=db,
+        retirement=controls_composition.thread_retirement_operations(
+            main.app.state.resources
+        ),
+    )
+    return life, api, provisioner, stack
+
+
+async def _warm_protections(db, life):
+    rows = await db.fetch(
+        "SELECT protection_id,status,release_outcome,released_at,agent_id,pod_uid "
+        "FROM thread_agent_warm_binding_protections WHERE thread_id=$1::uuid",
+        life["thread"],
+    )
+    return [dict(row) for row in rows]
+
+
+async def _assert_warm_ledger_settled(db, life, *, outcome):
+    rows = await _warm_protections(db, life)
+    assert len(rows) == 1, rows
+    row = rows[0]
+    assert (row["status"], row["release_outcome"]) == ("released", outcome), row
+    assert row["released_at"] is not None
+    assert str(row["agent_id"]) == life["agent"]
+    assert row["pod_uid"] == life["pod_uid"]
+    # Nothing actionable is left for this life: no bound/releasing record, and
+    # the agent-active uniqueness slot is free again.
+    assert not await db.fetchval(
+        "SELECT count(*) FROM thread_agent_warm_binding_protections "
+        "WHERE agent_id=$1::uuid "
+        "AND status IN ('planned','protecting','protected','bound','releasing')",
+        life["agent"],
+    )
+
+
+@pytest.mark.asyncio
+async def test_active_warm_permanent_delete_settles_its_warm_protection(
+    db, monkeypatch
+):
+    """The exact stop of a warm Pod must also settle its durable protection.
+
+    A ``bound`` row whose thread row is gone can never move again (``bound``
+    only leaves through ``releasing``, which the reciprocity check fences on
+    the thread row), so the settlement has to happen with the delete.
+    """
+
+    life, api, _, stack = await _bind_warm_life(db, monkeypatch)
+    handoff = await _owner_permanent_then_agent_ack(stack, life)
+    assert handoff.get("retiring_agent_exit_authorized") is True
+    api.mark_terminal("agents-a", life["pod_name"])
+
+    result = await _durable_retry(stack, life)
+
+    assert result.get("status") == "deleted", result
+    assert await db.get_thread(life["thread"]) is None
+    assert ("agents-a", life["pod_name"]) not in api.pods
+    await _assert_warm_ledger_settled(db, life, outcome="exact_absent_v1")
+    agent = await db.fetchrow(
+        "SELECT status,thread_id FROM agents WHERE id=$1::uuid", life["agent"]
+    )
+    assert agent is None or (agent["status"], agent["thread_id"]) == ("offline", None)
+
+
+@pytest.mark.asyncio
+async def test_warm_self_end_releases_its_protection_then_deletes(db, monkeypatch):
+    """A warm Pod's own End returns it to the pool; Delete leaves history."""
+
+    life, api, _, stack = await _bind_warm_life(db, monkeypatch)
+    retirement = await db.begin_pinned_thread_retirement(
+        life["thread"],
+        permanent=False,
+        settle_status="ended",
+        initiator="agent",
+        expected_runtime_generation=life["generation"],
+        expected_agent_id=life["agent"],
+        expected_attach_token=life["attach_token"],
+        authorize_immediately=True,
+    )
+    assert retirement["state"] == "pending"
+    await _ack_local_quiescence(db, life, retirement)
+    ended = await stack.retirement.end_thread_flow(
+        life["thread"],
+        await db.get_thread(life["thread"]),
+        permanent=False,
+        force=True,
+        expected_runtime_generation=life["generation"],
+        expected_agent_id=life["agent"],
+        expected_attach_token=life["attach_token"],
+        settle_status="ended",
+        local_runtime_quiesced=True,
+        retiring_agent_response_pending=False,
+    )
+    assert ended == {"status": "ended"}
+    pod = api.pods[("agents-a", life["pod_name"])]
+    assert pod.metadata.finalizers == []
+    await _assert_warm_ledger_settled(db, life, outcome="exact_live_unprotected_v1")
+
+    outcomes = await _delete_until_settled(stack, life["thread"])
+
+    assert outcomes[-1] == "deleted", outcomes
+    assert await db.get_thread(life["thread"]) is None
+    # The pool owns its Pod: the session's Delete never stops it.
+    assert ("agents-a", life["pod_name"]) in api.pods
+    await _assert_warm_ledger_settled(db, life, outcome="exact_live_unprotected_v1")
