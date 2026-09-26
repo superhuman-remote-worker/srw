@@ -15,6 +15,10 @@ from collections.abc import Callable
 from typing import Any, Optional
 from uuid import uuid4
 
+from orchestrator.services.blocking_effect import joined_async_call
+from orchestrator.services.session_creation_continuation import (
+    SessionCreationContinuationRunner,
+)
 from orchestrator.services.container_provisioner import (
     WORKSPACE_RUNTIME_CREATION_KEY,
     WORKSPACE_RUNTIME_INCARNATION_KEY,
@@ -435,6 +439,17 @@ async def workspace_idle_sweeper(
         else None
     )
     terminal_vm_task: asyncio.Task[int] | None = None
+    creation_runner = None
+    creation_task = None
+    if callable(getattr(type(store), "list_current_session_creation_candidates", None)):
+        creation_runner = SessionCreationContinuationRunner(
+            db=store,
+            provisioner=provisioner,
+            shutdown_event=shutdown_event,
+        )
+        creation_task = asyncio.create_task(
+            creation_runner.run(), name="session-creation-runner"
+        )
     try:
         while not shutdown_event.is_set():
             # Session workspace reconcile (safety-net): recreate failed/missing
@@ -483,12 +498,23 @@ async def workspace_idle_sweeper(
                 pass
 
     finally:
-        if terminal_vm_task is not None:
-            terminal_vm_task.cancel()
-            try:
-                await terminal_vm_task
-            except asyncio.CancelledError:
-                pass
-            except Exception:
-                logger.exception("Terminal Job VM cleanup reconcile held on shutdown")
+        try:
+            if creation_runner is not None:
+                creation_runner.stop()
+
+                async def join_creation_runner():
+                    await creation_task
+
+                await joined_async_call(join_creation_runner())
+        finally:
+            if terminal_vm_task is not None:
+                terminal_vm_task.cancel()
+                try:
+                    await terminal_vm_task
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    logger.exception(
+                        "Terminal Job VM cleanup reconcile held on shutdown"
+                    )
     logger.info("Workspace idle sweeper stopped")

@@ -32,6 +32,10 @@ from uuid import UUID, uuid4
 from shared.container_recovery import ContainerRecoveryCleanup
 from shared.workspace_recovery import WorkspaceRecoveryCode
 
+from orchestrator.database.session_creation_candidates import SessionCreationCandidate
+from orchestrator.services.session_creation_observation import (
+    SessionCreationObservationBudget,
+)
 from orchestrator.services import resolve_ssh_key_path, workspace_metering
 from orchestrator.services.blocking_effect import joined_blocking_call
 from orchestrator.services.ssh_helpers import (
@@ -906,9 +910,14 @@ class ContainerProvisioner:
         )
 
     async def _session_observation_checkpoint(
-        self, owner: WorkspaceOwner, generation: str | None
+        self,
+        owner: WorkspaceOwner,
+        generation: str | None,
+        observation_check: SessionCreationObservationBudget | None = None,
     ) -> None:
         """Scheduling only: never abandon a begun effect or change its source."""
+        if observation_check is not None:
+            observation_check()
         if owner.kind != "session" or generation is None:
             return
         check = getattr(
@@ -937,6 +946,8 @@ class ContainerProvisioner:
         memory_limit: str = "4Gi",
         image: Optional[str] = None,
         runtime_lock_held: bool = False,
+        expected_creation: SessionCreationCandidate | None = None,
+        observation_check: SessionCreationObservationBudget | None = None,
     ) -> bool:
         """Create one pinned workspace under its cross-replica lifecycle lock.
 
@@ -963,8 +974,19 @@ class ContainerProvisioner:
                     memory_limit=memory_limit,
                     image=image,
                     runtime_lock_held=True,
+                    expected_creation=expected_creation,
+                    observation_check=observation_check,
                 )
 
+        if expected_creation is not None and (
+            expected_creation.thread_id != thread_id
+            or expected_creation.lane != "pinned"
+            or expected_creation.namespace != self._namespace
+            or not await self._db.current_session_creation_candidate_is_exact(
+                expected_creation
+            )
+        ):
+            return False
         current = await self._db.get_thread(thread_id)
         if (
             not isinstance(current, Mapping)
@@ -1004,7 +1026,7 @@ class ContainerProvisioner:
         ):
             return False
         await self._session_observation_checkpoint(
-            WorkspaceOwner.session(thread_id), runtime_generation
+            WorkspaceOwner.session(thread_id), runtime_generation, observation_check
         )
         return await self._create_pinned_workspace_legacy(
             WorkspaceOwner.session(thread_id),
@@ -1025,6 +1047,8 @@ class ContainerProvisioner:
                 dict(raw_binding) if raw_binding is not None else None
             ),
             pinned_runtime_lock_held=True,
+            expected_creation=expected_creation,
+            observation_check=observation_check,
         )
 
     async def create_workspace(
@@ -1639,6 +1663,7 @@ class ContainerProvisioner:
         owner: WorkspaceOwner,
         *,
         scope: Literal["workspace_container", "ide"],
+        wait: bool = True,
     ):
         """Own the cross-replica physical-mutation domain for one scope."""
 
@@ -1651,7 +1676,7 @@ class ContainerProvisioner:
             owner.id,
             owner_kind=("thread" if owner.kind == "session" else "job"),
             scope=scope,
-            wait=True,
+            wait=wait,
             wait_timeout_s=120.0,
         ) as acquired:
             yield bool(acquired)
@@ -3238,6 +3263,8 @@ class ContainerProvisioner:
         expected_workspace_context: dict[str, Any] | None = None,
         expected_binding_context: dict[str, Any] | None = None,
         pinned_runtime_lock_held: bool = False,
+        expected_creation: SessionCreationCandidate | None = None,
+        observation_check: SessionCreationObservationBudget | None = None,
     ) -> bool:
         """Create a workspace container for a job or persistent thread.
 
@@ -3499,6 +3526,11 @@ class ContainerProvisioner:
                 retained_service_uid=retained_service_uid,
                 network_tier=network_tier,
                 manifest_fingerprint=manifest_fingerprint,
+                **(
+                    {"expected_existing_attempt_id": expected_creation.source_id}
+                    if expected_creation is not None
+                    else {}
+                ),
             )
             if not isinstance(pinned_intent, dict):
                 return False
@@ -4032,6 +4064,14 @@ class ContainerProvisioner:
                 pull_image=(
                     profile.image if profile.image != self._workspace_image else None
                 ),
+                **(
+                    {
+                        "readiness_started_at": self._background_pod_clock(created_pod),
+                        "pull_started_at": self._background_pod_clock(created_pod),
+                    }
+                    if expected_creation is not None
+                    else {}
+                ),
                 authority_check=(
                     lambda: self._session_observation_checkpoint(
                         owner, pinned_runtime_generation
@@ -4039,6 +4079,7 @@ class ContainerProvisioner:
                 )
                 if strict_pinned
                 else None,
+                observation_check=observation_check,
             )
             if pod_ip:
                 if seed_cm is not None:
@@ -4921,14 +4962,28 @@ class ContainerProvisioner:
         *,
         generation: str,
         expected_runtime_incarnation: str,
+        expected_creation: SessionCreationCandidate | None = None,
+        observation_check: SessionCreationObservationBudget | None = None,
     ) -> bool:
         """Resume only the creation row already bound to the caller's exact UID."""
 
         async with self._workspace_mutation_guard(
-            owner, scope="workspace_container"
+            owner, scope="workspace_container", wait=expected_creation is None
         ) as owned:
             if not owned:
                 return False
+            if expected_creation is not None and (
+                expected_creation.thread_id != owner.id
+                or expected_creation.lane != "stateless"
+                or expected_creation.namespace != self._namespace
+                or not await self._db.current_session_creation_candidate_is_exact(
+                    expected_creation
+                )
+            ):
+                return False
+            await self._session_observation_checkpoint(
+                owner, generation, observation_check
+            )
             validate = getattr(
                 type(self._db),
                 "validate_stateless_thread_workspace_creation_attempt",
@@ -4974,6 +5029,14 @@ class ContainerProvisioner:
                 lease_seconds=1800,
                 operation_kind=operation_kind,
                 desired_manifest_digest=str(captured["desired_manifest_digest"]),
+                **(
+                    {
+                        "expected_existing_reservation_id": expected_creation.source_id,
+                        "expected_existing_claim_token": expected_creation.claim_token,
+                    }
+                    if expected_creation is not None
+                    else {}
+                ),
             )
             if (
                 not isinstance(reservation, dict)
@@ -4992,6 +5055,8 @@ class ContainerProvisioner:
                 generation=generation,
                 expected_runtime_incarnation=expected_runtime_incarnation,
                 _creation_reservation=reservation,
+                expected_creation=expected_creation,
+                observation_check=observation_check,
             ):
                 return False
             return await self._stateless_workspace_creation_is_settled(
@@ -5090,6 +5155,8 @@ class ContainerProvisioner:
         memory_limit: str = "4Gi",
         image: Optional[str] = None,
         _creation_reservation: dict[str, Any] | None = None,
+        expected_creation: SessionCreationCandidate | None = None,
+        observation_check: SessionCreationObservationBudget | None = None,
     ) -> bool:
         """Resume one attempted create without ever issuing create-by-name."""
 
@@ -5118,6 +5185,8 @@ class ContainerProvisioner:
                 owner,
                 generation=generation,
                 expected_runtime_incarnation=expected_runtime,
+                expected_creation=expected_creation,
+                observation_check=observation_check,
             )
         validate_impl = getattr(
             type(self._db),
@@ -5189,12 +5258,39 @@ class ContainerProvisioner:
                     getattr(getattr(claim, "spec", None), "storage_class_name", "")
                     or ""
                 )
+            if expected_creation is not None and (
+                pvc_uid != expected_creation.pvc_uid
+                or runtime_incarnation != expected_creation.pod_uid
+            ):
+                return False
             seed_configmap = self._require_stateless_pod_storage_binding(
                 pod,
                 owner=owner,
                 expected_pvc_name=pvc_name,
                 expected_seed_configmap=_UNSPECIFIED_RESOURCE_BINDING,
             )
+            if expected_creation is not None:
+                if (seed_configmap is None) != (
+                    expected_creation.seed_configmap_uid is None
+                ):
+                    return False
+                if seed_configmap is not None:
+                    seed = await self._bounded_kubernetes_call(
+                        self._core_api.read_namespaced_config_map,
+                        name=seed_configmap,
+                        namespace=self._namespace,
+                    )
+                    if (
+                        self._require_stateless_seed_configmap_identity(
+                            seed,
+                            owner=owner,
+                            generation=generation,
+                            pod_name=owner.pod_name,
+                            creation_reservation_id=str(_creation_reservation["id"]),
+                        )
+                        != expected_creation.seed_configmap_uid
+                    ):
+                        return False
             publish_impl = getattr(
                 type(self._db),
                 "publish_stateless_thread_workspace_runtime",
@@ -5223,6 +5319,11 @@ class ContainerProvisioner:
                     expected_owner=owner,
                     expected_creation_generation=generation,
                     creation_reservation_id=str(_creation_reservation["id"]),
+                    expected_configmap_uid=(
+                        expected_creation.seed_configmap_uid
+                        if expected_creation
+                        else None
+                    ),
                     mutation_authority=lambda: self._workspace_creation_reservation_is_current(
                         owner,
                         _creation_reservation,
@@ -5234,7 +5335,7 @@ class ContainerProvisioner:
                 return False
 
             if pvc_name:
-                if (
+                if expected_creation is None and (
                     not await self._workspace_creation_reservation_is_current(
                         owner,
                         _creation_reservation,
@@ -5266,6 +5367,11 @@ class ContainerProvisioner:
                 reservation_service_uid = self._require_stateless_service_identity(
                     reservation_service, owner=owner
                 )
+                if (
+                    expected_creation is not None
+                    and reservation_service_uid != expected_creation.service_uid
+                ):
+                    return False
                 if not await self._record_workspace_creation_resource(
                     owner,
                     _creation_reservation,
@@ -5308,9 +5414,15 @@ class ContainerProvisioner:
                 expected_seed_configmap=seed_configmap,
                 pull_image=settings.image,
                 pull_started_at=getattr(pod.metadata, "creation_timestamp", None),
+                **(
+                    {"readiness_started_at": self._background_pod_clock(pod)}
+                    if expected_creation is not None
+                    else {}
+                ),
                 authority_check=lambda: self._session_observation_checkpoint(
                     owner, generation
                 ),
+                observation_check=observation_check,
             )
             if not pod_ip:
                 return True
@@ -13929,6 +14041,11 @@ class ContainerProvisioner:
                         ),
                         label="workspace seed ConfigMap UID",
                     )
+                if (
+                    expected_configmap_uid is not None
+                    and configmap_uid != expected_configmap_uid
+                ):
+                    return False
                 if expected_provision_attempt is not None:
                     configmap_uid = self._require_pinned_workspace_resource_identity(
                         configmap,
@@ -14865,6 +14982,40 @@ class ContainerProvisioner:
             await asyncio.sleep(1)
         return False
 
+    @staticmethod
+    def _background_pod_clock(pod: Any) -> datetime:
+        started = getattr(getattr(pod, "metadata", None), "creation_timestamp", None)
+        if (
+            not isinstance(started, datetime)
+            or started.tzinfo is None
+            or started > datetime.now(timezone.utc)
+        ):
+            raise WorkspaceRuntimeAuthorityError(
+                "exact workspace Pod observation clock unavailable"
+            )
+        return started
+
+    @staticmethod
+    def _background_ready_clock(pod: Any, created_at: datetime) -> datetime:
+        ready = [
+            condition
+            for condition in (getattr(pod.status, "conditions", None) or ())
+            if getattr(condition, "type", None) == "Ready"
+            and getattr(condition, "status", None) == "True"
+        ]
+        started = (
+            getattr(ready[0], "last_transition_time", None) if len(ready) == 1 else None
+        )
+        if (
+            not isinstance(started, datetime)
+            or started.tzinfo is None
+            or not created_at <= started <= datetime.now(timezone.utc)
+        ):
+            raise WorkspaceRuntimeAuthorityError(
+                "exact workspace Pod Ready clock unavailable"
+            )
+        return started
+
     async def _wait_for_ready(
         self,
         pod_name: str,
@@ -14880,6 +15031,8 @@ class ContainerProvisioner:
         expected_component: str | None = None,
         pull_image: str | None = None,
         pull_started_at: datetime | None = None,
+        readiness_started_at: datetime | None = None,
+        observation_check: SessionCreationObservationBudget | None = None,
         authority_check: Callable[[], Awaitable[None]] | None = None,
     ) -> Optional[str]:
         """Poll until the pod is ready and accepts the configured SSH key.
@@ -14897,7 +15050,19 @@ class ContainerProvisioner:
                 extends up to that budget.
         """
         loop = asyncio.get_event_loop()
-        deadline = loop.time() + timeout
+        elapsed = (
+            max(0, (datetime.now(timezone.utc) - readiness_started_at).total_seconds())
+            if readiness_started_at is not None
+            else 0
+        )
+        physical_budget = (
+            max(timeout, self._image_pull_timeout if pull_image is not None else 0)
+            if readiness_started_at is not None
+            else timeout
+        )
+        # Preserve a negative remainder: clamping it would renew the global
+        # SSH cap on every discovery after the physical deadline expired.
+        deadline = loop.time() + physical_budget - elapsed
         pull_remaining = self._image_pull_timeout
         if pull_started_at is not None:
             pull_remaining = max(
@@ -14910,7 +15075,13 @@ class ContainerProvisioner:
         pull_deadline = loop.time() + pull_remaining if pull_image is not None else None
         pull_observation: Any = None
 
-        while loop.time() < deadline:
+        # Even an expired resumed observation reads the exact Pod once, so
+        # image-pull failure is diagnosed against its original physical clock.
+        first_observation = readiness_started_at is not None
+        while first_observation or loop.time() < deadline:
+            first_observation = False
+            if observation_check is not None:
+                observation_check()
             if authority_check is not None:
                 await authority_check()
             try:
@@ -14935,6 +15106,10 @@ class ContainerProvisioner:
                         expected_pod_name=expected_pod_name,
                         expected_component=expected_component,
                     )
+                if observation_check is not None:
+                    # The first exact Pod read is still preparation. Start is
+                    # one-shot, so later polls cannot renew this quantum.
+                    observation_check.start()
                 if pull_image is not None:
                     # Classified only after the identity fence above, so a pod
                     # that is not this runtime stays an authority error.
@@ -14954,6 +15129,25 @@ class ContainerProvisioner:
                     if pod.status.container_statuses and all(
                         cs.ready for cs in pod.status.container_statuses
                     ):
+                        ssh_budget = self._ssh_auth_ready_timeout
+                        if readiness_started_at is not None:
+                            ready_at = self._background_ready_clock(
+                                pod, readiness_started_at
+                            )
+                            ssh_budget = min(
+                                self._ssh_auth_ready_timeout
+                                - max(
+                                    0,
+                                    (
+                                        datetime.now(timezone.utc) - ready_at
+                                    ).total_seconds(),
+                                ),
+                                deadline + self._ssh_auth_ready_timeout - loop.time(),
+                            )
+                            if ssh_budget <= 0:
+                                raise WorkspaceSSHAuthenticationError(
+                                    "Workspace background SSH readiness budget expired"
+                                )
                         key_path = resolve_ssh_key_path()
                         try:
                             fingerprint = workspace_private_key_fingerprint(key_path)
@@ -14963,7 +15157,12 @@ class ContainerProvisioner:
                         ready, attempts, last_error = await wait_for_agent_ssh(
                             pod.status.pod_ip,
                             30022,
-                            deadline_s=self._ssh_auth_ready_timeout,
+                            deadline_s=ssh_budget,
+                            **(
+                                {"observation_check": observation_check}
+                                if observation_check is not None
+                                else {}
+                            ),
                             connect_timeout_s=self._ssh_auth_connect_timeout,
                             interval_s=self._ssh_auth_poll_interval,
                             key_path=key_path,
@@ -15022,6 +15221,8 @@ class ContainerProvisioner:
             except Exception:
                 pass
 
+            if readiness_started_at is not None and loop.time() >= deadline:
+                break
             await asyncio.sleep(2)
 
         if (

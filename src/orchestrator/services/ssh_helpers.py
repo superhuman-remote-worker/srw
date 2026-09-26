@@ -553,6 +553,7 @@ async def wait_for_agent_ssh(
     interval_s: float,
     key_path: Optional[str] = None,
     expected_host_key_fingerprint: Optional[str] = None,
+    observation_check: Callable[[], None] | None = None,
     authority_check: Callable[[], Awaitable[None]] | None = None,
 ) -> tuple[bool, int, str]:
     """Poll until ``agent-host@ssh_host`` accepts an authenticated SSH command.
@@ -569,6 +570,8 @@ async def wait_for_agent_ssh(
     last_error = ""
 
     while True:
+        if observation_check is not None:
+            observation_check()
         if authority_check is not None:
             await authority_check()
         attempts += 1
@@ -632,7 +635,11 @@ async def wait_for_agent_ssh(
             if authority_check is not None:
                 await authority_check()
             if proc.returncode == 0:
+                # A successful joined probe may finish exact finalization past
+                # the scheduling quantum. Lifecycle authority still applies.
                 return True, attempts, ""
+            if observation_check is not None:
+                observation_check()
 
             last_error = stderr.decode("utf-8", errors="replace").strip()
         if len(last_error) > 500:

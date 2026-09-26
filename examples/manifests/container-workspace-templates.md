@@ -120,9 +120,32 @@ cleans up after itself; a Session doesn't (see below).
   and yields to End. A resource write or final Ready publication must finish
   first. HTTP 503 with `session_workspace_lifecycle_busy` means End was not
   accepted and should be retried. A protected Session can return `ending`
-  while its agent is still stopping. If the request disconnects before End is accepted, reconnecting
-  or polling can continue the same pending workspace. Unattended initial
-  Sessions are not automatically rediscovered after that interruption.
+  while its agent is still stopping. If the request disconnects before End is
+  accepted, reconnecting or polling can continue the same pending workspace.
+- **Background recovery continues exact initial Session creations.** After a
+  caller disconnects or an orchestrator restarts, the sweeper can rediscover an
+  open initial container creation whose Pod and expected resource UIDs were
+  already recorded. It continues that source; it does not start unused Sessions
+  or create replacement resources. Busy owners and held sources do not block
+  later pages. Each process owns at most two observers and yields between
+  completed effects after a two-second observation quantum. The quantum begins
+  after bounded recorded-resource validation and the first exact Pod
+  observation; preparation still checks stop and lifecycle authority. A
+  successful SSH probe may complete exact Ready finalization after the quantum;
+  lifecycle End and current-source checks still apply. Started SDK calls and
+  probes stay joined during End and shutdown.
+
+  This excludes retained successors, restore/history, VM workspaces, and pinned
+  attempts whose original actor/attach tuple differs from the current one.
+  Their existing explicit lifecycle paths remain available. The background
+  container runner does not repair or replace VM maintenance.
+
+  Background timeouts retain the exact Pod's creation clock. Physical readiness
+  uses the larger of the existing readiness and applicable custom-image pull
+  budgets. SSH uses the exact Ready transition plus its authentication budget,
+  capped by the physical deadline plus that same SSH budget, so repeated Ready
+  transitions cannot extend it indefinitely. Missing or malformed timestamps
+  hold recovery; a new observation never starts a new budget.
 - **Other start failures give no message.** When a templated Job's pod never
   becomes ready for another reason, its workspace stays `creating` and the Job
   waits with no error. Examples:

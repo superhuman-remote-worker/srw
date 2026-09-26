@@ -37,7 +37,7 @@ src/orchestrator/services/container_provisioner.py  ContainerProvisioner._releas
 src/orchestrator/services/container_provisioner.py  ContainerProvisioner._release_pinned_retirement_workspace  remote-effect  self._snapshot_service.capture_vm_snapshot  295d0c16a879  #1  pinned-host-key
 src/orchestrator/services/container_provisioner.py  ContainerProvisioner._seed_workspace_state  remote-effect  seed_ide_profile  bedb406715e6  #1  fresh-k8s-attestation
 src/orchestrator/services/container_provisioner.py  ContainerProvisioner._wait_for_ready  ssh  WorkspaceSSHAuthenticationError  ef1993caad57  #1  pinned-host-key
-src/orchestrator/services/container_provisioner.py  ContainerProvisioner._wait_for_ready  ssh  wait_for_agent_ssh  1d3058b8c128  #1  read-only-probe
+src/orchestrator/services/container_provisioner.py  ContainerProvisioner._wait_for_ready  ssh  wait_for_agent_ssh  54d995ac8195  #1  read-only-probe
 src/orchestrator/services/container_provisioner.py  ContainerProvisioner.release_workspace  remote-effect  self._snapshot_service.capture_vm_snapshot  8fbdf2e3ec4d  #1  fresh-k8s-attestation
 src/orchestrator/services/container_provisioner.py  ContainerProvisioner.wait_for_workspace_code_server  http  client.get  26953bc71144  #1  fresh-k8s-attestation
 src/orchestrator/services/ide_proxy.py  IdeProxyService._attest_k8s_target  remote-effect  IdeProxyTarget  e974ce0ee82c  #1  fresh-k8s-attestation

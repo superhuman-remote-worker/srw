@@ -16072,6 +16072,8 @@ class PostgresDB:
         lease_seconds: int = 1800,
         operation_kind: str = "create",
         desired_manifest_digest: str,
+        expected_existing_reservation_id: str | None = None,
+        expected_existing_claim_token: int | None = None,
     ) -> dict[str, Any] | None:
         """Claim one durable creation generation before any Kubernetes effect.
 
@@ -16103,7 +16105,20 @@ class PostgresDB:
             return None
         try:
             owner_uuid = UUID(str(owner_id))
+            expected_existing = (
+                UUID(str(expected_existing_reservation_id))
+                if expected_existing_reservation_id is not None
+                else None
+            )
         except (TypeError, ValueError):
+            return None
+        if (expected_existing is None) != (expected_existing_claim_token is None) or (
+            expected_existing_claim_token is not None
+            and (
+                type(expected_existing_claim_token) is not int
+                or expected_existing_claim_token <= 0
+            )
+        ):
             return None
         table = "jobs" if owner_kind == "job" else "threads"
         json_column = "context" if owner_kind == "job" else "metadata"
@@ -16151,7 +16166,8 @@ class PostgresDB:
                     return None
                 raw_runtime = raw_runtime if isinstance(raw_runtime, dict) else {}
                 if (
-                    owner_kind == "job" and scope == "workspace_container"
+                    owner_kind == "job"
+                    and scope == "workspace_container"
                     and "recovery_cleanup" in raw_runtime
                     and OPERATOR_PAUSE_HOLD_CONTEXT_KEY in owner_state
                 ):
@@ -16273,6 +16289,12 @@ class PostgresDB:
                     owner_uuid,
                     scope,
                 )
+                if expected_existing is not None and (
+                    active is None
+                    or active["id"] != expected_existing
+                    or active["claim_token"] != expected_existing_claim_token
+                ):
+                    return None
                 if active is not None and str(active.get("operation_kind") or "") != (
                     operation_kind
                 ):
@@ -21542,6 +21564,7 @@ class PostgresDB:
         retained_service_uid: str | None,
         network_tier: str,
         manifest_fingerprint: str,
+        expected_existing_attempt_id: str | None = None,
     ) -> Dict[str, Any] | None:
         """Durably name every pinned Kubernetes create before its first effect.
 
@@ -21567,6 +21590,11 @@ class PostgresDB:
             parsed_thread = UUID(str(thread_id))
             parsed_generation = UUID(str(expected_runtime_generation))
             parsed_attempt = UUID(str(attempt_id))
+            expected_existing = (
+                UUID(str(expected_existing_attempt_id))
+                if expected_existing_attempt_id is not None
+                else None
+            )
             parsed_agent = (
                 UUID(str(expected_agent_id)) if expected_agent_id is not None else None
             )
@@ -21665,6 +21693,12 @@ class PostgresDB:
                     "AND status IN ('planned','revoking','fenced') FOR UPDATE",
                     parsed_thread,
                 )
+                if expected_existing is not None and (
+                    existing is None or existing["attempt_id"] != expected_existing
+                ):
+                    # Background continuation cannot reserve a new source or
+                    # follow a successor selected by stale metadata.
+                    return None
                 if existing is not None:
                     marker = current_workspace or {}
                     if not (
@@ -36275,6 +36309,63 @@ class PostgresDB:
                         str(expected_generation),
                     )
                 return result
+
+    async def list_current_session_creation_candidates(self, *, after=None, limit=32):
+        """Page durable sources; invalid hints still advance the scan cursor."""
+        from orchestrator.database.session_creation_candidates import (
+            SESSION_CREATION_SCAN_SQL,
+            SessionCreationCursor,
+            SessionCreationPage,
+            candidate_from_record,
+        )
+
+        bounded_limit = max(1, min(int(limit), 64))
+        rows = await self.fetch(
+            SESSION_CREATION_SCAN_SQL,
+            None,
+            after.created_at if after else None,
+            UUID(after.thread_id) if after else None,
+            UUID(after.source_id) if after else None,
+            bounded_limit,
+        )
+        cursor = (
+            SessionCreationCursor(
+                rows[-1]["created_at"],
+                str(rows[-1]["thread_id"]),
+                str(rows[-1]["source_id"]),
+            )
+            if rows
+            else after
+        )
+        return SessionCreationPage(
+            candidates=tuple(
+                candidate
+                for row in rows
+                if (candidate := candidate_from_record(row)) is not None
+            ),
+            cursor=cursor,
+            exhausted=len(rows) < bounded_limit,
+        )
+
+    async def current_session_creation_candidate_is_exact(self, candidate) -> bool:
+        """Recheck the immutable source and current owner under a caller's guard."""
+        from orchestrator.database.session_creation_candidates import (
+            SESSION_CREATION_SCAN_SQL,
+            SessionCreationCandidate,
+            candidate_from_record,
+        )
+
+        if not isinstance(candidate, SessionCreationCandidate):
+            return False
+        rows = await self.fetch(
+            SESSION_CREATION_SCAN_SQL,
+            UUID(candidate.thread_id),
+            None,
+            None,
+            None,
+            2,
+        )
+        return len(rows) == 1 and candidate_from_record(rows[0]) == candidate
 
     async def list_threads_needing_workspace(self) -> List[Dict[str, Any]]:
         """Active sessions whose workspace_container entry exists but is not ready or
