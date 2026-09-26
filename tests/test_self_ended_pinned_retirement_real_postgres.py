@@ -27,7 +27,7 @@ from __future__ import annotations
 import asyncio
 import json
 from types import SimpleNamespace as NS
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 from uuid import uuid4
 
 import pytest
@@ -766,3 +766,180 @@ async def test_active_resumed_life_deletion_still_stops_only_its_captured_pod(
     assert sorted(stack.k8s.removed_pods) == sorted(
         [first["pod_uid"], current["pod_uid"]]
     )
+
+
+# ---------------------------------------------------------------------------
+# Active permanent Delete: the agent's own final ACK hands the exact Pod to
+# the durable retry for every finalizer-protected Pod, not only claim-bearing
+# ones — otherwise the thread is deleted while its exited Pod stays
+# Terminating under SRW's finalizer with no owner left.
+# ---------------------------------------------------------------------------
+
+
+async def _owner_permanent_then_agent_ack(stack, life):
+    """Owner DELETE while live, then the agent's exact final ACK."""
+
+    owner = await stack.retirement.end_thread_flow(
+        life["thread"],
+        await stack.db.get_thread(life["thread"]),
+        permanent=True,
+        force=True,
+    )
+    assert owner["status"] == "ending"
+    pending = await stack.db.get_thread(life["thread"])
+    retirement = {
+        "token": str(pending["runtime_retirement_token"]),
+        "generation": life["generation"],
+        "context": _json(pending["runtime_retirement_context"]),
+    }
+    await _ack_local_quiescence(stack.db, life, retirement)
+    return await stack.retirement.end_thread_flow(
+        life["thread"],
+        await stack.db.get_thread(life["thread"]),
+        permanent=True,
+        force=True,
+        expected_runtime_generation=life["generation"],
+        expected_agent_id=life["agent"],
+        expected_attach_token=life["attach_token"],
+        local_runtime_quiesced=True,
+        retiring_agent_response_pending=True,
+    )
+
+
+async def _durable_retry(stack, life):
+    """What ``retry_pending_pinned_retirement`` runs once the actor is gone."""
+
+    thread = await stack.db.get_thread(life["thread"])
+    if thread is None:
+        return {"status": "deleted"}
+    return await stack.retirement.end_thread_flow(
+        life["thread"],
+        thread,
+        permanent=True,
+        force=True,
+        expected_runtime_generation=life["generation"],
+        expected_agent_id=life["agent"],
+        expected_attach_token=life["attach_token"],
+        require_expected_agent_offline=False,
+        settle_status="ended",
+        local_runtime_quiesced=True,
+    )
+
+
+@pytest.mark.asyncio
+async def test_active_claimless_permanent_ack_hands_the_exact_pod_to_retry(stack):
+    ids = await _thread(stack.db)
+    life = await _bind_life(stack, ids, with_claim=False)
+
+    handoff = await _owner_permanent_then_agent_ack(stack, life)
+
+    assert handoff.get("status") == "ending", handoff
+    assert handoff.get("retiring_agent_exit_authorized") is True
+    assert await stack.db.get_thread(ids["thread"]) is not None
+    pod = _pod(stack, life)
+    assert pod is not None and pod.metadata.finalizers == [PINNED_AUTHORITY_FINALIZER]
+    assert pod.metadata.deletion_timestamp is None
+
+    # The authorized agent exits; once its heartbeats age out the durable
+    # retry (proven receipt) finishes the same token.
+    stack.k8s.exit_and_reap(life)
+    result = await _durable_retry(stack, life)
+
+    assert result.get("status") == "deleted", result
+    assert await stack.db.get_thread(ids["thread"]) is None
+    assert _pod(stack, life) is None
+    assert stack.k8s.removed_pods == [life["pod_uid"]]
+
+
+@pytest.mark.asyncio
+async def test_active_claimless_retry_refuses_a_pod_that_did_not_exit(stack):
+    """The retry stops only the exact captured Pod; a live one is deleted and
+    waited for, never unprotected while its containers run."""
+
+    ids = await _thread(stack.db)
+    life = await _bind_life(stack, ids, with_claim=False)
+    handoff = await _owner_permanent_then_agent_ack(stack, life)
+    assert handoff.get("retiring_agent_exit_authorized") is True
+
+    with pytest.raises(HTTPException) as retry:
+        await _durable_retry(stack, life)
+
+    assert retry.value.status_code == 503
+    pod = _pod(stack, life)
+    assert pod is not None
+    assert pod.metadata.finalizers == [PINNED_AUTHORITY_FINALIZER]
+    assert await stack.db.get_thread(ids["thread"]) is not None
+
+
+@pytest.mark.asyncio
+async def test_active_warm_pool_permanent_ack_hands_the_exact_pod_to_retry(
+    db, monkeypatch
+):
+    """A warm dual Pod bound to the session is protected the same way."""
+
+    from orchestrator.services.pinned_agent_authority import (
+        reserve_pinned_warm_agent_binding,
+    )
+
+    ids = await authority_fixtures._seed_warm_pool_binding(db, bound=False)
+    api = authority_fixtures.StatefulPinnedK8sApi()
+    authority_fixtures._install_warm_pool_pod(api, ids)
+    monkeypatch.setenv("PINNED_LEGACY_AGENT_NAMESPACES", "agents-a")
+    provisioner = authority_fixtures._production_warm_provisioner(
+        db, api, namespace="agents-a"
+    )
+    monkeypatch.setattr(main.app.state.resources, "postgres_db", db)
+    monkeypatch.setattr(agent_provisioner_module, "agent_provisioner", provisioner)
+    monkeypatch.setattr(
+        main.app.state.resources.session_router,
+        "teardown_route",
+        AsyncMock(return_value=True),
+    )
+    async with db.acquire() as conn:
+        metadata = _json(
+            await conn.fetchval(
+                "SELECT metadata FROM threads WHERE id=$1::uuid", ids["thread"]
+            )
+        )
+        metadata["config_override"]["officer"]["enabled"] = False
+        await conn.execute(
+            "DELETE FROM project_officers WHERE thread_id=$1::uuid", ids["thread"]
+        )
+        await conn.execute(
+            "UPDATE threads SET metadata=$2::jsonb WHERE id=$1::uuid",
+            ids["thread"],
+            json.dumps(metadata),
+        )
+    bound = await reserve_pinned_warm_agent_binding(
+        db,
+        agent_provisioner=provisioner,
+        persistent_provisioner=None,
+        thread_id=ids["thread"],
+        agent_id=ids["agent"],
+        expected_runtime_generation=ids["runtime_generation"],
+    )
+    assert bound.bound
+    life = {
+        **ids,
+        "generation": ids["runtime_generation"],
+        "attach_token": bound.attach_token,
+    }
+    pod = api.pods[("agents-a", ids["pod_name"])]
+    assert pod.metadata.finalizers == [PINNED_AUTHORITY_FINALIZER]
+    retirement_ops = controls_composition.thread_retirement_operations(
+        main.app.state.resources
+    )
+    stack = NS(db=db, retirement=retirement_ops)
+
+    handoff = await _owner_permanent_then_agent_ack(stack, life)
+
+    assert handoff.get("status") == "ending", handoff
+    assert handoff.get("retiring_agent_exit_authorized") is True
+    assert pod.metadata.finalizers == [PINNED_AUTHORITY_FINALIZER]
+
+    api.mark_terminal("agents-a", ids["pod_name"])
+    result = await _durable_retry(stack, life)
+
+    assert result.get("status") == "deleted", result
+    assert await db.get_thread(ids["thread"]) is None
+    assert ("agents-a", ids["pod_name"]) not in api.pods
