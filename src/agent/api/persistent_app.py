@@ -5241,6 +5241,7 @@ async def _terminate_session(
         return
     termination_session = _session
     termination_identity = _attached_retirement_identity()
+    termination_thread_id = _thread_id
 
     async def _run() -> str | None:
         global _terminating, _termination_task
@@ -5263,6 +5264,11 @@ async def _terminate_session(
                         # These callers are watchdog tasks. The common teardown
                         # cancels/joins them while this child remains shielded,
                         # so only the surviving exact owner can schedule exit.
+                        _schedule_exit(delay=1.0)
+                    elif result != "actuator_requested" and _dedicated_pod_owes_exit(
+                        reason, termination_thread_id, mark_thread=mark_thread
+                    ):
+                        # A handed-off VM End is still pending; the Pod stays.
                         _schedule_exit(delay=1.0)
                     return result
                 except asyncio.CancelledError:
@@ -5315,6 +5321,32 @@ async def _terminate_session(
 
 
 _EXACT_RETIREMENT_SETTLEMENT_RETRY_DELAYS = (0.0, 0.25, 1.0, 3.0)
+
+# A dedicated Pod (``--thread-id``; the provisioner stamps
+# SESSION_BOUND_THREAD_ID) serves exactly one thread. When the Pod's own
+# teardown settles that thread's End, the orchestrator deliberately leaves the
+# Pod alone — its request is the caller — and historical claimant retirement
+# only acts on a terminal Pod, so the process must exit itself, exactly as the
+# watchdog-driven End does. Pool and dual Pods carry no bound thread; the pool
+# owns their lifecycle. See
+# knowledge-base/knowledge/issues/agent_initiated_pinned_end_wedges_permanent_delete.md.
+_DEDICATED_SELF_END_REASONS = frozenset(
+    {"archive", "idle_timeout", "loop_complete", "loop_crash"}
+)
+
+
+def _dedicated_pod_owes_exit(
+    reason: str, thread_id: Optional[str], *, mark_thread: bool
+) -> bool:
+    """Whether a settled self-End leaves this dedicated Pod without a purpose."""
+
+    return bool(
+        mark_thread
+        and reason in _DEDICATED_SELF_END_REASONS
+        and not _stateless_mode()
+        and thread_id
+        and os.environ.get("SESSION_BOUND_THREAD_ID", "") == str(thread_id)
+    )
 
 
 async def _request_vm_retirement_actuator(
