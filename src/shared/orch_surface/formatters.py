@@ -300,6 +300,11 @@ def _operator_pause_hold_lines(job: dict[str, Any]) -> list[str]:
     if hold is None:
         return []
     detail = hold if isinstance(hold, dict) else {}
+    if detail.get("source") == "workspace_recovery_exhausted":
+        return [
+            "Workspace recovery hold: retries exhausted; workspace and checkpoints "
+            "retained until an explicit Resume or Cancel"
+        ]
     return [
         "Operator pause hold: held until an explicit resume "
         f"(paused_by={detail.get('paused_by') or 'internal'}, "

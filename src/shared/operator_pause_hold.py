@@ -1,4 +1,4 @@
-"""Durable operator-pause boundary shared by the pinned and stateless lanes.
+"""Durable explicit-resume boundary shared by the pinned and stateless lanes.
 
 A public pause parks the job as ``paused``, unassigned and freeze-free. That
 is also the runnable shape every system-initiated pause (dispatcher
@@ -19,6 +19,12 @@ re-queues or claims the job, and only while the marker is still the one that
 request observed: the caller passes :func:`operator_pause_lift_token` of the
 row it authorized, and a newer pause makes the write lose its CAS instead of
 being crossed.
+
+The same restriction also holds infrastructure recovery after its bounded
+retry budget is exhausted. That source is ``workspace_recovery_exhausted``;
+it records no human actor and grants no cleanup or execution authority. The
+historical context key stays stable so every existing admission/claim fence
+also covers this source.
 
 Presence alone holds, whatever the value's shape (fail-closed). The marker is
 jobs-row state, so it survives orchestrator and worker restarts. Stdlib-only:
@@ -101,7 +107,7 @@ def operator_pause_hold_lift_sql(context_expression: str) -> str:
 
 
 HELD_FEEDBACK_REASON = (
-    "This job was held by an operator pause. Every message that arrived while "
+    "This job was held pending an explicit resume. Every message that arrived while "
     "it was held is included below, oldest first, followed by any feedback "
     "given with the resume."
 )
@@ -136,7 +142,7 @@ def operator_pause_hold_merged_feedback_sql(
 def operator_pause_hold_jsonb_sql(
     *, hold_id_parameter: str, source_parameter: str, paused_by_parameter: str
 ) -> str:
-    """SQL ``jsonb`` value for a new hold written by a public pause."""
+    """SQL ``jsonb`` value for a hold requiring an explicit resume."""
 
     return (
         "jsonb_build_object("

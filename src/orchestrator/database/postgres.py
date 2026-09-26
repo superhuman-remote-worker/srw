@@ -96,6 +96,7 @@ from shared.deliverable_contract import (
     pr_repositories,
 )
 from shared.workspace_contract import (
+    WorkspaceContractError,
     WORKSPACE_CONTRACT_CONTEXT_KEY,
     WORKSPACE_DISPATCH_AUTHORITY_CONTEXT_KEY,
     configured_workspace_backend,
@@ -5885,6 +5886,199 @@ class PostgresDB:
                     *hold_args,
                 )
         return row is not None
+
+    async def hold_exhausted_workspace_recovery(
+        self,
+        job_id: str,
+        *,
+        expected_workspace: Dict[str, Any],
+        expected_agent_id: str | None,
+        recovery_cap: int,
+        error_detail: str,
+        completion_command_id: str | None = None,
+        completion_finalizing_by: str | None = None,
+    ) -> Dict[str, Any] | None:
+        """Retain exhausted container work behind the existing explicit-resume fence.
+
+        A retry budget is neither a terminal user instruction nor process-zero
+        proof. This write grants no cleanup authority and never changes runtime
+        coordinates. Queue-first serialization also covers stateless reports;
+        their exact accepted queue term must already be terminalized.
+        """
+        if (completion_command_id is None) != (completion_finalizing_by is None):
+            raise ValueError("completion command and finalizer must be paired")
+        try:
+            job_uuid = UUID(job_id)
+            runtime_uid = str(UUID(str(expected_workspace.get("_runtime_incarnation"))))
+            agent_uuid = UUID(str(expected_agent_id)) if expected_agent_id else None
+            command_uuid = (
+                UUID(completion_command_id) if completion_command_id else None
+            )
+        except (TypeError, ValueError):
+            return None
+
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                queue = await conn.fetchrow(
+                    "SELECT state, unit_kind, lease_token FROM run_queue "
+                    "WHERE unit_id=$1 FOR UPDATE",
+                    job_uuid,
+                )
+                job = await conn.fetchrow(
+                    f"SELECT status::text, execution_lane, assigned_agent_id, context, config_override, "
+                    f"({_completion_control_active_sql('context')}) AS control_active "
+                    "FROM jobs WHERE id=$1 FOR UPDATE",
+                    job_uuid,
+                )
+                if job is None:
+                    return None
+                context = job["context"] or {}
+                if isinstance(context, str):
+                    context = json.loads(context)
+                workspace = context.get("workspace_container") or {}
+                previous = workspace.get("recovery_completion_outcome")
+                if (
+                    command_uuid is not None
+                    and workspace.get("recovery_completion_command_id")
+                    == str(command_uuid)
+                    and isinstance(previous, dict)
+                    and previous.get("held_for_resume") is True
+                ):
+                    # A lost response is replayable even after Resume/Cancel.
+                    # Do not restamp the hold, counter, or a successor's state.
+                    return dict(previous)
+                if (
+                    job["status"] != "processing"
+                    or job["control_active"]
+                    or OPERATOR_PAUSE_HOLD_CONTEXT_KEY in context
+                    or workspace.get("provisioner") != "k8s"
+                    or workspace.get("_runtime_incarnation") != runtime_uid
+                    or any(
+                        workspace.get(key) != expected_workspace.get(key)
+                        for key in (
+                            "_creation_reservation_id",
+                            "_creation_claim_token",
+                            "_canvas_workspace_generation",
+                            "status",
+                            "namespace",
+                            "pod_name",
+                        )
+                    )
+                    or workspace.get("recovery_attempts")
+                    != expected_workspace.get("recovery_attempts")
+                ):
+                    return None
+                try:
+                    if (
+                        resolve_workspace_contract(dict(job)).assigned_backend
+                        != "sandbox"
+                    ):
+                        return None
+                except WorkspaceContractError:
+                    return None
+                if job["execution_lane"] == "pinned":
+                    if agent_uuid is None or job["assigned_agent_id"] != agent_uuid:
+                        return None
+                elif job["execution_lane"] != "stateless" or command_uuid is None:
+                    return None
+                if command_uuid is not None:
+                    command = await conn.fetchrow(
+                        "SELECT accepted_agent_id, accepted_lease_token FROM job_completion_commands "
+                        "WHERE id=$1 AND job_id=$2 AND state='finalizing' AND finalizing_by=$3 "
+                        "AND lease_expires_at>clock_timestamp() AND deadline_at>clock_timestamp()",
+                        command_uuid,
+                        job_uuid,
+                        completion_finalizing_by,
+                    )
+                    if command is None:
+                        return None
+                    if job["execution_lane"] == "stateless":
+                        if (
+                            queue is None
+                            or queue["unit_kind"] != "worker_batch"
+                            or queue["state"] != "done"
+                            or queue["lease_token"] != command["accepted_lease_token"]
+                        ):
+                            return None
+                    elif command["accepted_agent_id"] != agent_uuid:
+                        return None
+                elif await conn.fetchval(
+                    "SELECT EXISTS(SELECT 1 FROM job_completion_commands "
+                    "WHERE job_id=$1 AND state IN ('pending','finalizing','parked'))",
+                    job_uuid,
+                ):
+                    # An accepted durable report owns finalization; a delayed
+                    # legacy report cannot acquire a parallel disposition.
+                    return None
+                attempts = int(workspace.get("recovery_attempts") or 0) + (
+                    0
+                    if command_uuid is not None
+                    and workspace.get("recovery_attempt_command_id")
+                    == str(command_uuid)
+                    else 1
+                )
+                if attempts <= recovery_cap:
+                    return None
+                outcome = {
+                    "status": "handled",
+                    "job_id": job_id,
+                    "new_status": "paused",
+                    "paused": True,
+                    "held_for_resume": True,
+                    "actions": [
+                        f"workspace recovery exhausted after {recovery_cap} attempts; "
+                        "workspace and checkpoints retained; explicit Resume required"
+                    ],
+                }
+                updates = {"recovery_attempts": attempts}
+                if command_uuid is not None:
+                    updates.update(
+                        recovery_attempt_command_id=str(command_uuid),
+                        recovery_completion_command_id=str(command_uuid),
+                        recovery_completion_outcome=outcome,
+                    )
+                freeze = {
+                    "freeze_type": "workspace_recovery_attention",
+                    "recovery_attempts": attempts,
+                    "detail": str(error_detail)[:1000],
+                }
+                hold = operator_pause_hold_jsonb_sql(
+                    hold_id_parameter="$5",
+                    source_parameter="$6",
+                    paused_by_parameter="$7",
+                )
+                # The explicit hold already fences every runnable path. Keep
+                # its attention description here, not in freeze_data: internal
+                # reply/Resume stashes that column and must not overwrite the
+                # original checkpoint freeze with an infrastructure diagnosis.
+                hold = f"({hold} || jsonb_build_object('attention',$3::jsonb))"
+                changed = await conn.fetchval(
+                    f"""UPDATE jobs SET status='paused', assigned_agent_id=NULL,
+                        context=jsonb_set(
+                            COALESCE(context,'{{}}'::jsonb)
+                            || CASE WHEN freeze_data IS NULL THEN '{{}}'::jsonb
+                               ELSE jsonb_build_object('last_freeze_data',freeze_data) END
+                            || jsonb_build_object('{OPERATOR_PAUSE_HOLD_CONTEXT_KEY}',{hold}),
+                            '{{workspace_container}}',context->'workspace_container'||$2::jsonb),
+                        freeze_data=NULL,error_message=$4,updated_at=clock_timestamp()
+                        WHERE id=$1 AND ($8::uuid IS NULL OR EXISTS (
+                            SELECT 1 FROM job_completion_commands command
+                            WHERE command.id=$8 AND command.job_id=jobs.id
+                              AND command.state='finalizing' AND command.finalizing_by=$9
+                              AND command.lease_expires_at>clock_timestamp()
+                              AND command.deadline_at>clock_timestamp()))
+                        RETURNING id""",
+                    job_uuid,
+                    json.dumps(updates),
+                    json.dumps(freeze),
+                    outcome["actions"][0],
+                    str(uuid4()),
+                    "workspace_recovery_exhausted",
+                    None,
+                    command_uuid,
+                    completion_finalizing_by,
+                )
+                return outcome if changed is not None else None
 
     async def pause_job_shed_freeze(
         self,

@@ -203,3 +203,16 @@ the full profile.
   lacks your image's tools. Sessions run code-server inside the workspace, which
   your image must provide.
 - A virtual Session upgraded to a container gets the installation defaults.
+
+## Recovery after a running workspace becomes unavailable
+
+When a Kubernetes workspace's unavailable completion reports exhaust
+`WORKSPACE_RECOVERY_MAX_ATTEMPTS` (default `3`), the Job pauses and requires an
+explicit Resume. Its workspace files and checkpoints remain retained. Messages
+and internal retries do not lift this hold. The workspace remains allocated;
+Resume retries work on the retained workspace, while Cancel uses normal terminal
+cleanup. The status detail explains that workspace recovery needs attention.
+
+This requires the updated orchestrator and applies to workspace-unavailable
+completion reports. Worker queue exhaustion has a separate recovery path.
+Previously failed Jobs are not retroactively restored by this change.

@@ -240,3 +240,21 @@ class TestJobErrorFormatters:
             assert "effective=unavailable" in rendered
             assert "stale sandbox" in rendered
             assert "host" not in rendered
+
+
+def test_workspace_recovery_hold_has_accurate_origin():
+    detail = format_job_detail(
+        {
+            "id": "recovery-held",
+            "status": "paused",
+            "context": {
+                "_operator_pause_hold": {
+                    "source": "workspace_recovery_exhausted",
+                    "paused_by": None,
+                }
+            },
+        }
+    )
+    assert "Workspace recovery hold" in detail
+    assert "workspace and checkpoints retained" in detail
+    assert "Operator pause hold" not in detail

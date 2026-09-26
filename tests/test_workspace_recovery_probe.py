@@ -8,8 +8,8 @@ knowledge-base/knowledge/issues/maxsessions_parallel_tools_false_workspace_death
    attempts counter still increments either way so a report-loop stays bounded.
 2. Counter reset — a handled completion that is not ``workspace_unavailable``
    resets ``recovery_attempts`` (one recovered blip must not poison the job).
-3. No leak on fail-loud — exhausting the cap deletes the just-provisioned pod
-   (PVC kept) instead of orphaning it.
+3. Exhaustion preserves work under an explicit Resume hold. Retry count alone
+   does not authorize deleting the Pod, PVC, or checkpoints.
 """
 
 import asyncio
@@ -364,10 +364,11 @@ class TestHandlePodWorkspaceRecovery:
         assert merged["recovery_attempts"] == 2
 
     @pytest.mark.asyncio
-    async def test_exhausted_cap_fails_loud_and_deletes_pod(self):
+    async def test_exhausted_cap_retains_workspace_under_explicit_resume_hold(self):
         db, delete_workspace, trigger_dispatch, probe = _make_deps(pod_alive=True)
         job = _job(attempts=3)
-
+        held = {"new_status": "paused", "held_for_resume": True, "paused": True}
+        db.hold_exhausted_workspace_recovery.return_value = held
         result = await handle_pod_workspace_recovery(
             job,
             job["id"],
@@ -377,15 +378,12 @@ class TestHandlePodWorkspaceRecovery:
             trigger_dispatch=trigger_dispatch,
             probe=probe,
         )
-
-        assert result["new_status"] == "failed"
-        # No leak: the just-provisioned pod is torn down (PVC kept).
-        delete_workspace.assert_awaited_once_with(job["id"])
-        db.update_job_status.assert_awaited_once()
-        kwargs = db.update_job_status.await_args.kwargs
-        assert kwargs["status"] == "failed"
-        assert kwargs["freeze_data"]["recovery_attempts"] == 4
+        assert result == held
+        delete_workspace.assert_not_awaited()
+        trigger_dispatch.assert_not_called()
+        db.update_job_status.assert_not_awaited()
         db.pause_job_shed_freeze.assert_not_awaited()
+        db.hold_exhausted_workspace_recovery.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_no_dispatch_when_pause_loses_race(self):
