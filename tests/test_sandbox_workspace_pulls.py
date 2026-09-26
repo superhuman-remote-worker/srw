@@ -420,3 +420,356 @@ async def test_a_pinned_session_pull_failure_is_logged_and_ends_like_a_timeout(
     assert db.intent["status"] == timeout_db.intent["status"] == "planned"
     assert db.published.keys() == timeout_db.published.keys()
     assert db.workspace["status"] == timeout_db.workspace["status"] == "pending"
+
+
+# -----------------------------------------------------------------------------
+# A pull-failed Job leaves nothing behind (Task 11a)
+#
+# The dispatcher fails the Job after create_workspace returns False. That
+# terminal transition cancels the creation reservation *and* admits a cleanup
+# intent for the same runtime, and neither can settle while the other is open
+# (convert_cancelled_workspace_creation_to_cleanup_intent refuses while an
+# unsettled intent exists). So the creation itself must hand its never-started
+# runtime to the ordinary cancellation -> cleanup protocol before it returns,
+# while it still holds the mutation guard and the reservation.
+# -----------------------------------------------------------------------------
+
+
+def container_status(**fields):
+    fields.setdefault("name", "workspace")
+    fields.setdefault("ready", False)
+    fields.setdefault("restart_count", 0)
+    fields.setdefault(
+        "state",
+        SimpleNamespace(
+            waiting=SimpleNamespace(reason="ImagePullBackOff", message="not found"),
+            running=None,
+            terminated=None,
+        ),
+    )
+    fields.setdefault(
+        "last_state", SimpleNamespace(waiting=None, running=None, terminated=None)
+    )
+    return SimpleNamespace(**fields)
+
+
+def pod_status(*statuses, phase="Pending", ephemeral=()):
+    return SimpleNamespace(
+        phase=phase,
+        pod_ip="10.42.0.185",
+        container_statuses=list(statuses),
+        init_container_statuses=[],
+        ephemeral_container_statuses=list(ephemeral),
+    )
+
+
+EXITED = SimpleNamespace(exit_code=1, reason="Error", started_at=NOW)
+EVER_STARTED = {
+    "running": pod_status(
+        container_status(
+            ready=True,
+            started=True,
+            state=SimpleNamespace(
+                waiting=None, running=SimpleNamespace(), terminated=None
+            ),
+        ),
+        phase="Running",
+    ),
+    "terminated": pod_status(
+        container_status(
+            state=SimpleNamespace(waiting=None, running=None, terminated=EXITED)
+        ),
+        phase="Failed",
+    ),
+    # What the kubelet reports once a never-started Pod is deleted. It is
+    # terminal evidence, not never-started evidence: the finalizer protocol
+    # owns that state.
+    "terminated-unknown": pod_status(
+        container_status(
+            state=SimpleNamespace(
+                waiting=None,
+                running=None,
+                terminated=SimpleNamespace(
+                    exit_code=137, reason="ContainerStatusUnknown", started_at=None
+                ),
+            )
+        ),
+        phase="Failed",
+    ),
+    "restarted": pod_status(container_status(restart_count=1)),
+    "last-state-terminated": pod_status(
+        container_status(
+            last_state=SimpleNamespace(waiting=None, running=None, terminated=EXITED)
+        )
+    ),
+    "started": pod_status(container_status(started=True)),
+    "ready": pod_status(container_status(ready=True)),
+    "ephemeral-debug-running": pod_status(
+        container_status(),
+        ephemeral=[
+            container_status(
+                name="debugger",
+                state=SimpleNamespace(
+                    waiting=None, running=SimpleNamespace(), terminated=None
+                ),
+            )
+        ],
+    ),
+    "running-phase": pod_status(container_status(), phase="Running"),
+    "unreadable-statuses": SimpleNamespace(
+        phase="Pending", container_statuses="garbage"
+    ),
+}
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        pod_status(container_status()),
+        pod_status(
+            container_status(
+                state=SimpleNamespace(
+                    waiting=SimpleNamespace(reason="InvalidImageName", message="x"),
+                    running=None,
+                    terminated=None,
+                )
+            )
+        ),
+        pod_status(),
+        SimpleNamespace(phase="Pending", container_statuses=None),
+    ],
+    ids=["image-pull-backoff", "invalid-image-name", "no-statuses", "statuses-none"],
+)
+def test_a_pod_whose_container_never_ran_is_never_started(status):
+    assert provisioner_module._pod_never_started_a_container(
+        SimpleNamespace(status=status)
+    )
+
+
+@pytest.mark.parametrize("status", EVER_STARTED.values(), ids=EVER_STARTED.keys())
+def test_a_pod_whose_container_ever_ran_is_not_never_started(status):
+    assert not provisioner_module._pod_never_started_a_container(
+        SimpleNamespace(status=status)
+    )
+
+
+def settling_job_provisioner(monkeypatch, *, pod_status_override=None):
+    provisioner = job_provisioner(monkeypatch, SandboxSettings(image=IMAGE))
+    cluster = {}
+
+    def create_pod(*, body, **_kwargs):
+        cluster["pod"] = failing_pull(body)
+        if pod_status_override is not None:
+            cluster["pod"].status = pod_status_override
+        return cluster["pod"]
+
+    provisioner._core_api.create_namespaced_pod.side_effect = create_pod
+    provisioner._core_api.read_namespaced_pod.side_effect = lambda **_: cluster["pod"]
+    order = []
+    diagnostic = provisioner._record_creation_diagnostic
+
+    async def record_diagnostic(*args, **kwargs):
+        order.append("diagnostic")
+        return await diagnostic(*args, **kwargs)
+
+    provisioner._record_creation_diagnostic = record_diagnostic
+    real_settle = (
+        _TemplatedJobDB.settle_managed_repository_workspace_creation_reservation
+    )
+    settles = []
+
+    async def settle(db, owner_id, **kwargs):
+        order.append("settle")
+        settles.append({"owner_id": owner_id, **kwargs})
+        return await real_settle(db, owner_id, **kwargs)
+
+    monkeypatch.setattr(
+        _TemplatedJobDB,
+        "settle_managed_repository_workspace_creation_reservation",
+        settle,
+    )
+    return provisioner, order, settles
+
+
+@pytest.mark.asyncio
+async def test_a_pull_failed_job_settles_its_creation_on_the_never_started_pod(
+    monkeypatch,
+):
+    provisioner, order, settles = settling_job_provisioner(monkeypatch)
+
+    assert await provisioner.create_workspace(WorkspaceOwner.job(JOB_ID)) is False
+
+    # The Job keeps its reason, written while the reservation was still open,
+    # and the generation then closes on exactly the Pod it created. The Job's
+    # terminal cleanup, not this request, deletes that Pod.
+    assert job_context_updates(provisioner)[-1] == {"error": PULL_FAILURE}
+    assert order == ["diagnostic", "settle"]
+    ((settled,),) = [settles]
+    assert settled["owner_kind"] == "job"
+    assert settled["scope"] == "workspace_container"
+    assert settled["runtime_incarnation"] == _TEST_POD_UID
+    assert provisioner._db._creation_reservation["phase"] == "settled"
+    provisioner._core_api.delete_namespaced_pod.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", EVER_STARTED.values(), ids=EVER_STARTED.keys())
+async def test_a_pull_failure_never_settles_on_a_pod_that_ever_ran(monkeypatch, status):
+    provisioner, _order, settles = settling_job_provisioner(
+        monkeypatch, pod_status_override=status
+    )
+    provisioner._wait_for_ready = AsyncMock(
+        side_effect=WorkspaceImagePullError(PULL_FAILURE)
+    )
+
+    assert await provisioner.create_workspace(WorkspaceOwner.job(JOB_ID)) is False
+
+    assert settles == []
+    assert provisioner._db._creation_reservation["settled_at"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("owner", "error", "strict_stateless"),
+    [
+        (
+            WorkspaceOwner.session("66666666-7777-4888-8999-aaaaaaaaaaaa"),
+            WorkspaceImagePullError(PULL_FAILURE),
+            True,
+        ),
+        (
+            WorkspaceOwner.session("66666666-7777-4888-8999-aaaaaaaaaaaa"),
+            WorkspaceImagePullError(PULL_FAILURE),
+            False,
+        ),
+        (WorkspaceOwner.job(JOB_ID), ApiException(status=403), False),
+        (WorkspaceOwner.job(JOB_ID), RuntimeError("seed failed"), False),
+    ],
+    ids=["stateless-session", "pinned-session", "quota-rejection", "other-failure"],
+)
+async def test_only_a_job_pull_failure_is_settled(owner, error, strict_stateless):
+    provisioner = ContainerProvisioner()
+    provisioner._db = _TemplatedJobDB()
+    provisioner._core_api = MagicMock()
+
+    settled = await provisioner._settle_failed_job_creation(
+        owner,
+        {"id": "r", "runtime_incarnation": _TEST_POD_UID},
+        error,
+        strict_stateless=strict_stateless,
+    )
+
+    assert settled is False
+    provisioner._core_api.read_namespaced_pod.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "change", ["superseded-reservation", "replacement-pod", "pod-unreadable"]
+)
+async def test_settling_needs_the_exact_current_creation_and_never_raises(
+    monkeypatch, change
+):
+    provisioner, _order, settles = settling_job_provisioner(monkeypatch)
+    real_settle = provisioner._settle_failed_job_creation
+    observed = {}
+
+    async def settle_failed(owner_, reservation, error, **kwargs):
+        if change == "superseded-reservation":
+            provisioner._workspace_creation_reservation_is_current = AsyncMock(
+                return_value=False
+            )
+        elif change == "replacement-pod":
+            reservation = {
+                **reservation,
+                "runtime_incarnation": "99999999-9999-4999-8999-999999999999",
+            }
+        else:
+            provisioner._core_api.read_namespaced_pod.side_effect = RuntimeError(
+                "apiserver unavailable"
+            )
+        observed["settled"] = await real_settle(owner_, reservation, error, **kwargs)
+        return observed["settled"]
+
+    provisioner._settle_failed_job_creation = settle_failed
+
+    assert await provisioner.create_workspace(WorkspaceOwner.job(JOB_ID)) is False
+
+    assert observed["settled"] is False
+    assert settles == []
+    assert provisioner._db._creation_reservation["settled_at"] is None
+
+
+class _TerminalReclaimDB:
+    def __init__(self, *, captured):
+        self.intent = {
+            "intent_generation": 7,
+            "target_disposition": "deleted",
+            "resource_policy": "terminal_reclaim",
+            "reclaim_shared_resources": True,
+            "capture_complete": captured,
+            "resources_captured_at": NOW if captured else None,
+        }
+
+    async def get_managed_repository_workspace_cleanup_intent(self, *_a, **_k):
+        return dict(self.intent)
+
+
+def replaying_provisioner(status, *, finalizers=("default",), captured=False):
+    owner = WorkspaceOwner.job(JOB_ID)
+    provisioner = ContainerProvisioner()
+    provisioner._k8s_available = True
+    provisioner._db = _TerminalReclaimDB(captured=captured)
+    retained = _owned_pod(owner, namespace=provisioner._namespace)
+    retained.metadata.finalizers = (
+        [provisioner_module.STATELESS_WORKSPACE_PROCESS_ZERO_FINALIZER]
+        if finalizers == ("default",)
+        else list(finalizers)
+    )
+    retained.status = status
+    provisioner._core_api = SimpleNamespace(read_namespaced_pod=None)
+    provisioner._bounded_kubernetes_call = AsyncMock(return_value=retained)
+    provisioner.workspace_pod_authority = AsyncMock(return_value="exact_live")
+    provisioner.reconcile_workspace_cleanup_intent = AsyncMock(
+        return_value=provisioner_module.WorkspaceCleanupOutcome("settled", 7)
+    )
+    return owner, provisioner
+
+
+@pytest.mark.asyncio
+async def test_deleting_a_failed_job_reconciles_its_never_started_pod_without_ssh():
+    owner, provisioner = replaying_provisioner(pod_status(container_status()))
+
+    outcome = await provisioner.replay_terminal_workspace_cleanup(
+        owner, expected_runtime_incarnation=_TEST_POD_UID
+    )
+
+    assert outcome.settled
+    provisioner.reconcile_workspace_cleanup_intent.assert_awaited_once_with(
+        owner, expected_runtime_incarnation=_TEST_POD_UID, intent_generation=7
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("captured", [False, True], ids=["uncaptured", "captured"])
+@pytest.mark.parametrize(
+    ("status", "finalizers"),
+    [(status, ("default",)) for status in EVER_STARTED.values()]
+    + [(pod_status(container_status()), ())],
+    ids=[*EVER_STARTED.keys(), "never-started-without-finalizer"],
+)
+async def test_deleting_a_job_keeps_ssh_retirement_for_any_other_live_pod(
+    status, finalizers, captured
+):
+    owner, provisioner = replaying_provisioner(
+        status, finalizers=finalizers, captured=captured
+    )
+
+    # None sends the caller to today's SSH attestation and captured release.
+    assert (
+        await provisioner.replay_terminal_workspace_cleanup(
+            owner, expected_runtime_incarnation=_TEST_POD_UID
+        )
+        is None
+    )
+    provisioner.reconcile_workspace_cleanup_intent.assert_not_awaited()

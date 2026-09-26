@@ -400,6 +400,57 @@ def _pod_has_exact_process_zero(pod: Any) -> bool:
     ) or _deleting_pod_was_never_scheduled(pod)
 
 
+def _container_never_started(container: Any) -> bool:
+    state = getattr(container, "state", None)
+    last_state = getattr(container, "last_state", None)
+    return not (
+        getattr(state, "running", None) is not None
+        or getattr(state, "terminated", None) is not None
+        or getattr(container, "restart_count", 0) not in (0, None)
+        or any(
+            getattr(last_state, field, None) is not None
+            for field in ("waiting", "running", "terminated")
+        )
+        or getattr(container, "started", None) is True
+        or getattr(container, "ready", None) is True
+    )
+
+
+def _pod_never_started_a_container(pod: Any) -> bool:
+    """Prove from Pod status that no container of this Pod has run a process.
+
+    Narrower than process-zero: it is a point-in-time fact about a *Pending*
+    Pod.  It only decides that a pull-failed Job creation may settle on that
+    Pod, and that the Job's terminal cleanup needs no SSH attestation (there
+    is no endpoint and nothing to snapshot); the finalizer protocol still
+    proves every container terminated before release.  Every reported
+    container (regular, init and ephemeral/debug) must never have been
+    running or terminated, never restarted, carry no ``lastState``, and not
+    report started or ready.  A Pod
+    with no container status yet qualifies; any other phase, or unreadable
+    status arrays, does not.  Terminated states are rejected even when they
+    look synthetic (``ContainerStatusUnknown`` after deletion): terminal
+    evidence belongs to the finalizer protocol, not to this shortcut.
+    """
+
+    status = getattr(pod, "status", None)
+    if getattr(status, "phase", None) != "Pending":
+        return False
+    for status_field in (
+        "container_statuses",
+        "init_container_statuses",
+        "ephemeral_container_statuses",
+    ):
+        statuses = getattr(status, status_field, None)
+        if statuses is None:
+            continue
+        if not isinstance(statuses, (list, tuple)):
+            return False
+        if not all(_container_never_started(container) for container in statuses):
+            return False
+    return True
+
+
 def _env_flag(name: str, default: bool) -> bool:
     raw = os.environ.get(name)
     if raw is None:
@@ -2721,7 +2772,16 @@ class ContainerProvisioner:
             # Once the durable reservation crosses its external-effect edge,
             # every response is potentially ambiguous.  Do not perform
             # name-based rollback or publish a failure projection here; the
-            # reservation reconciler owns the exact observed resources.
+            # reservation reconciler owns the exact observed resources. The
+            # one exception is a Job's classified pull failure on a Pod that
+            # never ran: that outcome is exact, so the generation settles on it
+            # before the Job's terminal transition can wedge the reservation.
+            await self._settle_failed_job_creation(
+                owner,
+                _creation_reservation,
+                e,
+                strict_stateless=strict_stateless,
+            )
             return False
 
     async def _create_pinned_workspace_legacy(
@@ -5749,6 +5809,31 @@ class ContainerProvisioner:
             return getattr(error, "status", None) == 404
         return False
 
+    async def _exact_workspace_pod_never_started(
+        self,
+        owner: WorkspaceOwner,
+        *,
+        runtime_incarnation: str,
+    ) -> bool:
+        """Whether the exact, retained, non-deleting Pod never ran a container."""
+
+        try:
+            pod = await self._bounded_kubernetes_call(
+                self._core_api.read_namespaced_pod,
+                name=owner.pod_name,
+                namespace=self._namespace,
+            )
+            observed = self._require_workspace_pod_owner(
+                pod, owner=owner, allow_owner_unlabeled=False
+            )
+        except Exception:
+            return False
+        return bool(
+            observed == runtime_incarnation
+            and self._has_stateless_process_zero_finalizer(pod)
+            and _pod_never_started_a_container(pod)
+        )
+
     async def replay_terminal_workspace_cleanup(
         self,
         owner: WorkspaceOwner,
@@ -5760,7 +5845,14 @@ class ContainerProvisioner:
         A fresh/live cleanup still uses terminal identity and SSH capture.
         An absent Pod may instead replay the existing terminal-reclaim tuple,
         but only with its exact current process-zero receipt. No new intent or
-        resource identity is admitted by this path.
+        resource identity is admitted for an absent Pod.
+
+        One live case needs no SSH either: the exact Pod never started a
+        container (a custom image that could not be pulled). It has no endpoint
+        to attest and nothing to snapshot, so the terminal-reclaim intent is
+        reconciled as the lifecycle sweep would: live identity capture, then
+        the finalizer protocol, which still waits for every container to be
+        observed terminated before the receipt and the finalizer release.
         """
 
         read = getattr(
@@ -5779,14 +5871,25 @@ class ContainerProvisioner:
             intent.get("target_disposition") != "deleted"
             or intent.get("resource_policy") != "terminal_reclaim"
             or intent.get("reclaim_shared_resources") is not True
-            or intent.get("capture_complete") is not True
-            or intent.get("resources_captured_at") is None
         ):
             return None
         authority = await self.workspace_pod_authority(
             owner,
             expected_runtime_incarnation=expected_runtime_incarnation,
         )
+        if authority == "exact_live" and await self._exact_workspace_pod_never_started(
+            owner, runtime_incarnation=expected_runtime_incarnation
+        ):
+            return await self.reconcile_workspace_cleanup_intent(
+                owner,
+                expected_runtime_incarnation=expected_runtime_incarnation,
+                intent_generation=int(intent["intent_generation"]),
+            )
+        if (
+            intent.get("capture_complete") is not True
+            or intent.get("resources_captured_at") is None
+        ):
+            return None
         if authority in {"exact_live", "exact_terminal"}:
             return None
         if authority != "exact_absent" or (
@@ -14055,6 +14158,116 @@ class ContainerProvisioner:
             return
         if current:
             await self._set_context(owner, {"error": message})
+
+    async def _settle_failed_job_creation(
+        self,
+        owner: WorkspaceOwner,
+        reservation: dict[str, Any],
+        exc: BaseException,
+        *,
+        strict_stateless: bool,
+    ) -> bool:
+        """Settle a pull-failed Job's reservation on its never-started Pod.
+
+        The dispatcher fails the Job once this creation returns False. If the
+        reservation were still open, that terminal transition would cancel it
+        *and* admit a cleanup intent for the same runtime, and the two refuse
+        each other forever: a cancelled reservation is handed to cleanup only
+        while no cleanup intent is open, and the intent captures resources only
+        once the reservation is handed off. The Pod, its Service, its PVC and
+        its finalizer would stay, and the Job could not be deleted.
+
+        The reservation stays open on failure because a failed response is
+        normally ambiguous. Here it is not: the waiter just observed the exact
+        Pod, and its UID is already bound in the Job's context. So settle the
+        generation on that exact runtime, as the not-ready-timeout path already
+        does, while this creation still holds the owner/scope mutation guard and
+        the reservation. The Job's terminal transition then admits an ordinary
+        terminal cleanup, which retires the Pod through the finalizer protocol
+        (UID-preconditioned delete, every container observed terminated,
+        process-zero receipt, finalizer release) and reclaims its PVC and
+        Service.
+
+        Only a Pod that never started a container is settled here; any other
+        failure keeps today's behaviour. Best effort and never raises: it runs
+        inside the creation's failure handler, which returns False either way.
+        """
+
+        if (
+            owner.kind != "job"
+            or strict_stateless
+            or not isinstance(exc, WorkspaceImagePullError)
+        ):
+            return False
+        settle = getattr(
+            type(self._db),
+            "settle_managed_repository_workspace_creation_reservation",
+            None,
+        )
+        if not callable(settle):
+            return False
+        try:
+            # The reservation row may carry the UID as a uuid.UUID.
+            runtime = _canonical_runtime_uuid(
+                str(reservation.get("runtime_incarnation") or ""),
+                label="failed workspace creation runtime",
+            )
+            if not await self._workspace_creation_reservation_is_current(
+                owner, reservation, scope="workspace_container"
+            ):
+                return False
+            pod = await self._bounded_kubernetes_call(
+                self._core_api.read_namespaced_pod,
+                name=owner.pod_name,
+                namespace=self._namespace,
+            )
+            if (
+                self._require_workspace_pod_owner(
+                    pod, owner=owner, allow_owner_unlabeled=False
+                )
+                != runtime
+            ):
+                return False
+            self._require_workspace_creation_reservation_annotation(
+                pod, reservation_id=str(reservation["id"])
+            )
+            if not _pod_never_started_a_container(pod):
+                logger.warning(
+                    "Leaving the pull-failed workspace creation open: Pod %s "
+                    "may have run a container (%s %s)",
+                    owner.pod_name,
+                    owner.kind,
+                    owner.id,
+                )
+                return False
+            settled = bool(
+                await settle(
+                    self._db,
+                    owner.id,
+                    owner_kind="job",
+                    scope="workspace_container",
+                    reservation_generation=int(reservation["reservation_generation"]),
+                    claimant=str(reservation["claimed_by"]),
+                    claim_token=int(reservation["claim_token"]),
+                    runtime_incarnation=runtime,
+                )
+            )
+        except Exception:
+            logger.exception(
+                "Could not settle the pull-failed workspace creation for %s %s",
+                owner.kind,
+                owner.id,
+            )
+            return False
+        if settled:
+            logger.info(
+                "Settled the pull-failed workspace creation on never-started "
+                "Pod %s; the Job's terminal cleanup retires it (%s %s)",
+                owner.pod_name,
+                owner.kind,
+                owner.id,
+            )
+        return settled
 
     async def _set_context(self, owner: WorkspaceOwner, updates: dict) -> bool:
         """Atomically merge updates into the workspace context for a job or session."""
