@@ -4416,6 +4416,109 @@ class ContainerProvisioner:
         await workspace_metering.close_interval(self._db, owner)
         return True
 
+    async def _continue_stateless_workspace_creation_reservation(
+        self,
+        owner: WorkspaceOwner,
+        *,
+        generation: str,
+        expected_runtime_incarnation: str,
+    ) -> bool:
+        """Resume only the creation row already bound to the caller's exact UID."""
+
+        async with self._workspace_mutation_guard(
+            owner, scope="workspace_container"
+        ) as owned:
+            if not owned:
+                return False
+            validate = getattr(
+                type(self._db),
+                "validate_stateless_thread_workspace_creation_attempt",
+                None,
+            )
+            if not callable(validate) or not await validate(
+                self._db,
+                owner.id,
+                generation=generation,
+                attempted=True,
+                expected_runtime_incarnation=expected_runtime_incarnation,
+            ):
+                return False
+            current = await self._db.get_thread(owner.id)
+            metadata = current.get("metadata") if current else None
+            if isinstance(metadata, str):
+                metadata = json.loads(metadata)
+            workspace = (metadata or {}).get("workspace_container") or {}
+            operation_kind = (workspace.get("_runtime_creation") or {}).get("mode")
+            if operation_kind not in {"create", "restore"}:
+                return False
+            captured = await self.get_current_workspace_creation_result(
+                owner, operation_kind=operation_kind
+            )
+            if (
+                not isinstance(captured, dict)
+                or str(captured.get("thread_runtime_generation") or "") != generation
+                or str(captured.get("runtime_incarnation") or "")
+                != expected_runtime_incarnation
+                or captured.get("phase") != "runtime_bound"
+                or captured.get("settled_at") is not None
+                or captured.get("cancel_requested_at") is not None
+            ):
+                return False
+            # The guard prevents retirement or a successor from changing the
+            # captured row between this read and same-row lease reacquisition.
+            # Preserve restore's suspension-derived claimant and manifest too.
+            reservation = await self._db.reserve_managed_repository_workspace_creation(
+                owner.id,
+                owner_kind="thread",
+                scope="workspace_container",
+                claimant=str(captured["claimed_by"]),
+                lease_seconds=1800,
+                operation_kind=operation_kind,
+                desired_manifest_digest=str(captured["desired_manifest_digest"]),
+            )
+            if (
+                not isinstance(reservation, dict)
+                or reservation.get("id") != captured["id"]
+                or reservation.get("reservation_generation")
+                != captured["reservation_generation"]
+                or str(reservation.get("runtime_incarnation") or "")
+                != expected_runtime_incarnation
+                or not await self._start_workspace_creation_reservation(
+                    owner, reservation, scope="workspace_container"
+                )
+            ):
+                return False
+            if not await self.continue_stateless_workspace_creation(
+                owner,
+                generation=generation,
+                expected_runtime_incarnation=expected_runtime_incarnation,
+                _creation_reservation=reservation,
+            ):
+                return False
+            current = await self._db.get_thread(owner.id)
+            metadata = current.get("metadata") if current else None
+            if isinstance(metadata, str):
+                metadata = json.loads(metadata)
+            workspace = (metadata or {}).get("workspace_container") or {}
+            if (
+                workspace.get("status") != "ready"
+                or "_runtime_creation" in workspace
+                or workspace.get(WORKSPACE_RUNTIME_INCARNATION_KEY)
+                != expected_runtime_incarnation
+            ):
+                return False
+            return bool(
+                await self._db.settle_managed_repository_workspace_creation_reservation(
+                    owner.id,
+                    owner_kind="thread",
+                    scope="workspace_container",
+                    reservation_generation=int(reservation["reservation_generation"]),
+                    claimant=str(reservation["claimed_by"]),
+                    claim_token=int(reservation["claim_token"]),
+                    runtime_incarnation=expected_runtime_incarnation,
+                )
+            )
+
     async def continue_stateless_workspace_creation(
         self,
         owner: WorkspaceOwner,
@@ -4434,8 +4537,6 @@ class ContainerProvisioner:
         del cpu_limit, memory_limit, image
         if owner.kind != "session" or not self._k8s_available or self._db is None:
             return False
-        if not isinstance(_creation_reservation, dict):
-            return False
         try:
             generation = _canonical_runtime_uuid(
                 generation,
@@ -4451,6 +4552,14 @@ class ContainerProvisioner:
             )
         except ValueError:
             return False
+        if not isinstance(_creation_reservation, dict):
+            if expected_runtime is None:
+                return False
+            return await self._continue_stateless_workspace_creation_reservation(
+                owner,
+                generation=generation,
+                expected_runtime_incarnation=expected_runtime,
+            )
         validate_impl = getattr(
             type(self._db),
             "validate_stateless_thread_workspace_creation_attempt",
@@ -4624,6 +4733,11 @@ class ContainerProvisioner:
                 memory=actual_memory,
             )
             ready_timeout = self._reattach_ready_timeout if pvc_name else 120
+            settings = SandboxSettings()
+            if callable(getattr(type(self._db), "fetchrow", None)):
+                settings = await resolve_sandbox_settings(
+                    self._db, owner.kind, owner.id
+                )
             pod_ip = await self._wait_for_ready(
                 owner.pod_name,
                 timeout=ready_timeout,
@@ -4633,6 +4747,8 @@ class ContainerProvisioner:
                 expected_network_tier=network_tier,
                 expected_pvc_name=pvc_name,
                 expected_seed_configmap=seed_configmap,
+                pull_image=settings.image,
+                pull_started_at=getattr(pod.metadata, "creation_timestamp", None),
             )
             if not pod_ip:
                 return True
@@ -13638,6 +13754,7 @@ class ContainerProvisioner:
         expected_pod_name: str | None = None,
         expected_component: str | None = None,
         pull_image: str | None = None,
+        pull_started_at: datetime | None = None,
     ) -> Optional[str]:
         """Poll until the pod is ready and accepts the configured SSH key.
 
@@ -13655,9 +13772,16 @@ class ContainerProvisioner:
         """
         loop = asyncio.get_event_loop()
         deadline = loop.time() + timeout
-        pull_deadline = (
-            loop.time() + self._image_pull_timeout if pull_image is not None else None
-        )
+        pull_remaining = self._image_pull_timeout
+        if pull_started_at is not None:
+            pull_remaining = max(
+                0,
+                pull_remaining
+                - max(
+                    0, (datetime.now(timezone.utc) - pull_started_at).total_seconds()
+                ),
+            )
+        pull_deadline = loop.time() + pull_remaining if pull_image is not None else None
         pull_observation: Any = None
 
         while loop.time() < deadline:
