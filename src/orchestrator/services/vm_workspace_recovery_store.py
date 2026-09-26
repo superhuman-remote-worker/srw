@@ -1608,7 +1608,23 @@ class VMWorkspaceRecoveryStore:
                 "AND expires_at>clock_timestamp())",
                 owner_kind, owner_id,
             ):
-                return CleanupPermit(allowed=False, reason="active_workspace_access")
+                wake_scope = None
+                if owner_kind == "job" and source == "controller_vm_create" and parent_id is None:
+                    from orchestrator.services.vm_creation_retry_store import VMCreationRetryStore
+
+                    wake_scope = await VMCreationRetryStore(self.db).idle_wake_access_scope_on_conn(
+                        conn, owner_id=owner_id, pvc_uid=pvc_uid,
+                        reservation_request_id=request_id, intent_digest=intent_digest,
+                    )
+                if wake_scope is None or await conn.fetchval(
+                    "SELECT EXISTS(SELECT 1 FROM vm_idle_access_leases "
+                    "WHERE owner_kind=$1 AND owner_id=$2 AND closed_at IS NULL "
+                    "AND expires_at>clock_timestamp() AND (wake_id IS DISTINCT FROM $3 "
+                    "OR provision_generation IS DISTINCT FROM $4 OR vm_uid IS DISTINCT FROM $5))",
+                    owner_kind, owner_id, wake_scope["wake_id"],
+                    wake_scope["provision_generation"], wake_scope["vm_uid"],
+                ):
+                    return CleanupPermit(allowed=False, reason="active_workspace_access")
         if (
             owner_kind == "job"
             and source in {"completion_workspace_teardown", "kept_disk"}

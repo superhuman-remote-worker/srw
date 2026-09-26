@@ -456,8 +456,9 @@ async def test_default_wake_preserves_native_authority_refusals(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("requesting_access", [False, True])
 async def test_native_wake_exact_grant_issues_one_effect_and_replay_only_observes(
-    db, monkeypatch
+    db, monkeypatch, requesting_access
 ):
     from orchestrator.services.vm_creation_retry_store import (
         VMCreationRetryConflict,
@@ -468,6 +469,14 @@ async def test_native_wake_exact_grant_issues_one_effect_and_replay_only_observe
     secret = b"idle-wake-resource-secret-at-least-32-bytes"
     monkeypatch.setenv("VM_LIFECYCLE_HMAC_SECRET", secret.decode())
     policy, retry, _, wake, identity = await suspended_charged_job(db, monkeypatch)
+    if requesting_access:
+        from orchestrator.services.vm_idle_access import VMIdleAccessStore
+
+        leases = await asyncio.gather(*(VMIdleAccessStore(db).request(
+            owner_kind="job", owner_id=str(retry["job_id"]), kind="ide",
+            user_id=str(uuid4()), connection_id=str(uuid4()),
+        ) for _ in range(2)))
+        assert all(leases)
     assert await application_service(db, monkeypatch).reconcile_once() == 1
     source = await resolve_wake(db, monkeypatch, policy, wake, identity)
     admitted = await policy.admit(request_id=str(source["request_id"]))

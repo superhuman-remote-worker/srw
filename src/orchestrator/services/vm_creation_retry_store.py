@@ -744,6 +744,85 @@ class VMCreationRetryStore:
                     )
                 return result
 
+    async def idle_wake_access_scope_on_conn(
+        self, conn, *, owner_id, pvc_uid, reservation_request_id, intent_digest,
+    ):
+        """Prove the one native successor whose waiting access cannot use old compute.
+
+        Caller already owns the canonical owner/PVC and Job locks. Derive all
+        authority from persisted rows; a source label alone grants no exemption.
+        """
+        from orchestrator.services.vm_creation_preflight import _preflight, _execution_binding
+
+        job = await conn.fetchrow("SELECT * FROM jobs WHERE id=$1", owner_id)
+        if job is None:
+            return None
+        try:
+            context = _json(job["context"]) or {}
+            vm = context.get("vm") or {}
+            prior = _preflight(vm)
+            if not prior or prior["state"] != "admitted" or pvc_uid is None:
+                return None
+            row = _record(await conn.fetchrow(
+                "SELECT * FROM vm_creation_retries WHERE request_id=$1",
+                UUID(prior["request_id"]),
+            ))
+            now = await conn.fetchval("SELECT clock_timestamp()")
+            if (
+                row is None or row["owner_kind"] != "job" or row["job_id"] != owner_id
+                or row["state"] != "reconciling" or row["claim_token"] is None
+                or row["claim_expires_at"] is None or row["claim_expires_at"] <= now
+                or row["expected_pvc_uid"] != pvc_uid
+                or prior.get("expected_pvc_uid") != str(pvc_uid)
+                or prior["request"] != row["canonical_request"]
+                or prior["request_digest"] != row["request_digest"]
+                or canonical_request_digest(row["canonical_request"]) != row["request_digest"]
+                or canonical_configuration_digest(row["controller_configuration"])
+                != row["controller_configuration_digest"]
+                or _execution_binding(prior) != {
+                    key: row[key] for key in (
+                        "execution_id", "execution_revision", "execution_generation", "admission_deadline",
+                    )
+                }
+                or reservation_request_id != uuid5(NAMESPACE_URL, "vm-create:" + str(row["request_id"]))
+                or cleanup_intent_digest(_creation_intent(row)) != intent_digest
+            ):
+                return None
+            await self._current(conn, job, row["provision_generation"], retry=row)
+            operation_id = vm.get("idle_wake_operation_id")
+            await self._validate_idle_wake_on_conn(
+                conn, job, operation_id, row["provision_generation"], row["request_id"],
+            )
+            operation = await conn.fetchrow(
+                "SELECT * FROM vm_idle_operations WHERE id=$1", UUID(operation_id),
+            )
+            old = context.get("last_vm") or {}
+            evidence = _json(operation["stop_evidence"]) or {}
+            expected = {
+                "operation_id": str(operation["id"]),
+                "generation": str(operation["provision_generation"]),
+                "vm_uid": str(operation["vm_uid"]), "vmi_uid": str(operation["vmi_uid"]),
+                "launcher_uid": str(operation["launcher_uid"]), "pvc_uid": str(operation["pvc_uid"]),
+            }
+            if (
+                operation["wake_id"] is None or operation["pvc_uid"] != pvc_uid
+                or operation["retained_kind"] != "rootdisk" or operation["wake_ready_at"] is not None
+                or old.get("status") != "suspended" or old.get("rootdisk") != "kept"
+                or evidence.get("version") != 1 or evidence.get("kind") != "vm_idle_physical_stop"
+                or any(evidence.get(key) != value for key, value in expected.items())
+                or any(evidence.get(key) is not True for key in (
+                    "vm_absent", "vmi_absent", "launcher_absent", "retained_pvc", "controller_authenticated",
+                ))
+                or evidence.get("same_generation_replacement") is not False
+            ):
+                return None
+            predecessor, cleanup_id = await self._own_predecessor(conn, job, pvc_uid, prior)
+            if predecessor != row["predecessor_evidence"] or cleanup_id != row["predecessor_cleanup_admission_id"]:
+                return None
+            return {key: operation[key] for key in ("wake_id", "provision_generation", "vm_uid")}
+        except (VMCreationRetryConflict, ValueError, KeyError, TypeError, AttributeError):
+            return None
+
     async def authorize_controller(
         self, *, request_id: str, claim_token: str, observed: dict
     ) -> dict:
