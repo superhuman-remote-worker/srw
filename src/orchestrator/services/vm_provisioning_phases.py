@@ -110,6 +110,32 @@ class VMProvisioningPhaseStore:
                 or updates.get("ssh_registration_id") != registration
             ):
                 return False
+            from orchestrator.services.vm_thread_network import verified_source
+            from shared.vm_network_profile import reusable_profile_evidence
+
+            frozen = verified_source(
+                retry, thread_id=thread_id, generation=generation,
+                request_id=str(retry["request_id"]),
+            )
+            if frozen is None:
+                return False
+            profile = frozen.get("network_profile")
+            if profile is None:
+                if updates.get("network_profile_evidence") is not None:
+                    return False
+            elif (
+                not isinstance(updates.get("interface_mac"), str)
+                or not updates["interface_mac"]
+                or not reusable_profile_evidence(
+                updates.get("network_profile_evidence"), profile,
+                provision_generation=generation, vm_uid=vm_uid,
+                pvc_uid=str(retry["observed_pvc_uid"]),
+                vmi_uid=vm.get("vmi_uid"),
+                launcher_uid=updates.get("active_pod_uid"),
+                interface_mac=updates["interface_mac"],
+                )
+            ):
+                return False
             if retry["thread_wake_operation_id"] is not None:
                 wake = await conn.fetchrow(
                     "SELECT id,owner_kind,owner_id,phase,closed_at,wake_generation,"

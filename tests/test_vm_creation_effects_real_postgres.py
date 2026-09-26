@@ -1,6 +1,7 @@
 """Single-flight create effects using actual cleanup, job and claim locks."""
 
 import asyncio
+import json
 from uuid import UUID, uuid4
 import pytest
 
@@ -8,7 +9,7 @@ from orchestrator.services.vm_creation_retry_store import (
     VMCreationRetryStore,
     VMCreationRetryConflict,
 )
-from shared.vm_creation_issuance import seal_creation_carrier
+from shared.vm_creation_issuance import seal_creation_carrier, verify_creation_carrier
 from tests.test_vm_creation_retry_real_postgres import (
     db as _db_fixture,
     postgres_db_fixture,  # noqa: F401
@@ -110,6 +111,698 @@ async def test_two_replicas_receive_only_one_effect_grant(db, monkeypatch):
     results = await asyncio.gather(begin(), begin())
     assert sum(result["actuation_allowed"] for result in results) == 1
     assert {result["disposition"] for result in results} == {"issued", "observe_only"}
+    winner = next(result for result in results if result["actuation_allowed"])
+    loser = next(result for result in results if not result["actuation_allowed"])
+    assert len(bytes.fromhex(winner["issuer_receipt"])) == 32
+    assert winner["issuer_receipt"] == winner["issuer_receipt"].lower()
+    assert "issuer_receipt" not in loser
+    inspected = await store.inspect(request_id=str(row["request_id"]))
+    assert "issuer_receipt" not in str(inspected)
+    assert "issuer_receipt_sha256" not in str(inspected)
+    assert winner["issuer_receipt"] not in str(inspected)
+    async with db.acquire() as conn:
+        stored_hash = await conn.fetchval(
+            "SELECT issuer_receipt_sha256 FROM vm_creation_effects WHERE request_id=$1",
+            row["request_id"],
+        )
+    assert len(stored_hash) == 32
+    assert stored_hash.hex() not in str(inspected)
+
+
+@pytest.mark.asyncio
+async def test_receipt_surrenders_only_its_issued_effect_and_schedules_failure(db, monkeypatch):
+    store, row, claim, carrier = await reserved(db, monkeypatch)
+    grant = await store.begin_effect(
+        request_id=str(row["request_id"]), claim_token=str(claim["claim_token"]),
+        carrier=carrier,
+    )
+    receipt = grant["issuer_receipt"]
+    arguments = dict(
+        request_id=str(row["request_id"]), effect_nonce=grant["effect_nonce"],
+        carrier=carrier, issuer_receipt=receipt,
+        reason="resource_inventory_unavailable",
+    )
+    for invalid in (None, "a" * 64, receipt.upper(), receipt[:-1]):
+        with pytest.raises((ValueError, VMCreationRetryConflict)):
+            await store.record_not_attempted(**{**arguments, "issuer_receipt": invalid})
+    with pytest.raises((ValueError, VMCreationRetryConflict)):
+        await store.record_not_attempted(**{**arguments, "effect_nonce": str(uuid4())})
+    with pytest.raises((ValueError, VMCreationRetryConflict)):
+        await store.record_not_attempted(**{**arguments, "reason": "unknown"})
+    with pytest.raises((ValueError, VMCreationRetryConflict)):
+        await store.observe_effect(
+            request_id=str(row["request_id"]), carrier=carrier,
+            observation={"outcome": "not_attempted", "reason": "resource_inventory_unavailable"},
+        )
+
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE vm_creation_retries SET backoff_attempt=6,"
+            "transport_outage_started_at=clock_timestamp()-interval '90 seconds' "
+            "WHERE request_id=$1", row["request_id"],
+        )
+        before = await conn.fetchrow(
+            "SELECT revision,transport_outage_started_at FROM vm_creation_retries "
+            "WHERE request_id=$1", row["request_id"],
+        )
+    assert await store.record_not_attempted(**arguments) == {
+        "recorded": True, "effect_state": "rejected",
+    }
+    async with db.acquire() as conn:
+        scheduled = await conn.fetchrow(
+            "SELECT state,reason,revision,backoff_attempt,claim_token,claim_expires_at,"
+            "transport_outage_started_at,extract(epoch FROM next_probe_at-updated_at) AS delay "
+            "FROM vm_creation_retries WHERE request_id=$1", row["request_id"],
+        )
+        evidence = await conn.fetchval(
+            "SELECT evidence FROM vm_creation_effects WHERE effect_nonce=$1",
+            UUID(grant["effect_nonce"]),
+        )
+    assert scheduled["state"] == "queued"
+    assert scheduled["revision"] == before["revision"] + 1
+    assert scheduled["backoff_attempt"] == 7
+    assert scheduled["claim_token"] is None
+    assert scheduled["claim_expires_at"] is None
+    assert scheduled["transport_outage_started_at"] == before["transport_outage_started_at"]
+    assert 300 <= scheduled["delay"] <= 360
+    assert json.loads(evidence) == {"outcome": "not_attempted", "reason": "resource_inventory_unavailable"}
+    assert await store.claim_due(limit=1) == []
+    with pytest.raises(VMCreationRetryConflict):
+        await store.begin_effect(
+            request_id=str(row["request_id"]), claim_token=str(claim["claim_token"]),
+            carrier=carrier,
+        )
+    assert await store.apply_observation(
+        request_id=str(row["request_id"]), claim_token=str(claim["claim_token"]),
+        expected_revision=claim["revision"], observation={"outcome": "observation_wait"},
+    ) is False
+
+
+@pytest.mark.asyncio
+async def test_duplicate_surrender_after_successor_is_a_pure_read(db, monkeypatch):
+    store, row, claim, carrier = await reserved(db, monkeypatch)
+    grant = await store.begin_effect(
+        request_id=str(row["request_id"]), claim_token=str(claim["claim_token"]),
+        carrier=carrier,
+    )
+    old = dict(
+        request_id=str(row["request_id"]), effect_nonce=grant["effect_nonce"],
+        carrier=carrier, issuer_receipt=grant["issuer_receipt"],
+        reason="resource_inventory_unavailable",
+    )
+    await store.record_not_attempted(**old)
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE vm_creation_retries SET next_probe_at=clock_timestamp()-interval '1 second' "
+            "WHERE request_id=$1", row["request_id"],
+        )
+    successor_claim = (await store.claim_due(limit=1))[0]
+    successor = seal_creation_carrier(
+        {**verify_creation_carrier(carrier, secret=SECRET), "effect_nonce": str(uuid4())},
+        namespace="agent-vms", uid=carrier["metadata"]["uid"],
+        resource_version="3", secret=SECRET,
+    )
+    successor_grant = await store.begin_effect(
+        request_id=str(row["request_id"]),
+        claim_token=str(successor_claim["claim_token"]), carrier=successor,
+    )
+    assert successor_grant["actuation_allowed"] is True
+    async with db.acquire() as conn:
+        before = await conn.fetchrow(
+            "SELECT state,reason,revision,claim_token,claim_expires_at,backoff_attempt,"
+            "next_probe_at,transport_outage_started_at,updated_at FROM vm_creation_retries "
+            "WHERE request_id=$1", row["request_id"],
+        )
+        effects_before = await conn.fetch(
+            "SELECT effect_nonce,state,evidence,resolved_at FROM vm_creation_effects "
+            "WHERE request_id=$1 ORDER BY effect_number", row["request_id"],
+        )
+    assert await store.record_not_attempted(**old) == {
+        "recorded": True, "effect_state": "rejected",
+    }
+    async with db.acquire() as conn:
+        after = await conn.fetchrow(
+            "SELECT state,reason,revision,claim_token,claim_expires_at,backoff_attempt,"
+            "next_probe_at,transport_outage_started_at,updated_at FROM vm_creation_retries "
+            "WHERE request_id=$1", row["request_id"],
+        )
+        effects_after = await conn.fetch(
+            "SELECT effect_nonce,state,evidence,resolved_at FROM vm_creation_effects "
+            "WHERE request_id=$1 ORDER BY effect_number", row["request_id"],
+        )
+    assert after == before
+    assert effects_after == effects_before
+    with pytest.raises(VMCreationRetryConflict, match="creation_effect_changed"):
+        await store.record_not_attempted(**{**old, "reason": "resource_node_changed"})
+    with pytest.raises(VMCreationRetryConflict, match="creation_effect_changed"):
+        await store.record_not_attempted(**{
+            **old, "effect_nonce": successor_grant["effect_nonce"],
+        })
+
+
+@pytest.mark.asyncio
+async def test_nonretryable_refusal_overrides_queued_but_preserves_attention(db, monkeypatch):
+    store, row, claim, carrier = await reserved(db, monkeypatch)
+    grant = await store.begin_effect(
+        request_id=str(row["request_id"]), claim_token=str(claim["claim_token"]),
+        carrier=carrier,
+    )
+    assert await store.apply_observation(
+        request_id=str(row["request_id"]), claim_token=str(claim["claim_token"]),
+        expected_revision=claim["revision"], observation={"outcome": "observation_wait"},
+    )
+    arguments = dict(
+        request_id=str(row["request_id"]), effect_nonce=grant["effect_nonce"],
+        carrier=carrier, issuer_receipt=grant["issuer_receipt"],
+        reason="resource_node_changed",
+    )
+    assert await store.record_not_attempted(**arguments) == {
+        "recorded": True, "effect_state": "rejected",
+    }
+    async with db.acquire() as conn:
+        attention = await conn.fetchrow(
+            "SELECT state,reason,backoff_attempt,claim_token FROM vm_creation_retries "
+            "WHERE request_id=$1", row["request_id"],
+        )
+    assert attention["state"] == "attention"
+    assert attention["reason"] == "vm_creation_retry_blocked"
+    assert attention["backoff_attempt"] == 1
+    assert attention["claim_token"] is None
+    assert await store.claim_due(limit=1) == []
+
+
+@pytest.mark.asyncio
+async def test_late_surrender_does_not_downgrade_existing_attention(db, monkeypatch):
+    store, row, claim, carrier = await reserved(db, monkeypatch)
+    grant = await store.begin_effect(
+        request_id=str(row["request_id"]), claim_token=str(claim["claim_token"]),
+        carrier=carrier,
+    )
+    assert await store.apply_observation(
+        request_id=str(row["request_id"]), claim_token=str(claim["claim_token"]),
+        expected_revision=claim["revision"], observation={"outcome": "blocked"},
+    )
+    async with db.acquire() as conn:
+        before = await conn.fetchrow(
+            "SELECT state,reason,revision,backoff_attempt,next_probe_at "
+            "FROM vm_creation_retries WHERE request_id=$1", row["request_id"],
+        )
+    assert before["state"] == "attention"
+    await store.record_not_attempted(
+        request_id=str(row["request_id"]), effect_nonce=grant["effect_nonce"],
+        carrier=carrier, issuer_receipt=grant["issuer_receipt"],
+        reason="resource_inventory_unavailable",
+    )
+    async with db.acquire() as conn:
+        after = await conn.fetchrow(
+            "SELECT state,reason,revision,backoff_attempt,next_probe_at,claim_token "
+            "FROM vm_creation_retries WHERE request_id=$1", row["request_id"],
+        )
+    assert after["state"] == before["state"]
+    assert after["reason"] == before["reason"]
+    assert after["backoff_attempt"] == before["backoff_attempt"]
+    assert after["next_probe_at"] == before["next_probe_at"]
+    assert after["revision"] == before["revision"] + 1
+    assert after["claim_token"] is None
+
+
+@pytest.mark.asyncio
+async def test_two_surrenders_race_to_one_revision(db, monkeypatch):
+    store, row, claim, carrier = await reserved(db, monkeypatch)
+    grant = await store.begin_effect(
+        request_id=str(row["request_id"]), claim_token=str(claim["claim_token"]),
+        carrier=carrier,
+    )
+    arguments = dict(
+        request_id=str(row["request_id"]), effect_nonce=grant["effect_nonce"],
+        carrier=carrier, issuer_receipt=grant["issuer_receipt"],
+        reason="resource_inventory_unavailable",
+    )
+    async with db.acquire() as conn:
+        original_revision = await conn.fetchval(
+            "SELECT revision FROM vm_creation_retries WHERE request_id=$1",
+            row["request_id"],
+        )
+    start = asyncio.Event()
+
+    async def surrender():
+        await start.wait()
+        return await store.record_not_attempted(**arguments)
+
+    first = asyncio.create_task(surrender())
+    second = asyncio.create_task(surrender())
+    start.set()
+    assert await asyncio.wait_for(asyncio.gather(first, second), 5) == [
+        {"recorded": True, "effect_state": "rejected"},
+        {"recorded": True, "effect_state": "rejected"},
+    ]
+    async with db.acquire() as conn:
+        assert await conn.fetchval(
+            "SELECT revision FROM vm_creation_retries WHERE request_id=$1",
+            row["request_id"],
+        ) == original_revision + 1
+
+
+@pytest.mark.asyncio
+async def test_late_surrender_after_cancel_preserves_cancel_and_replay(db, monkeypatch):
+    store, row, claim, carrier = await reserved(db, monkeypatch)
+    grant = await store.begin_effect(
+        request_id=str(row["request_id"]), claim_token=str(claim["claim_token"]),
+        carrier=carrier,
+    )
+    assert await db.linearize_pinned_cancel(str(row["job_id"]), expected_status="paused")
+    arguments = dict(
+        request_id=str(row["request_id"]), effect_nonce=grant["effect_nonce"],
+        carrier=carrier, issuer_receipt=grant["issuer_receipt"],
+        reason="resource_node_changed",
+    )
+    assert await store.record_not_attempted(**arguments) == {
+        "recorded": True, "effect_state": "rejected",
+    }
+    async with db.acquire() as conn:
+        before = await conn.fetchrow(
+            "SELECT state,reason,revision,claim_token,backoff_attempt,next_probe_at,updated_at "
+            "FROM vm_creation_retries WHERE request_id=$1", row["request_id"],
+        )
+    assert before["state"] == "cancel_requested"
+    assert before["claim_token"] is None
+    assert await store.record_not_attempted(**arguments) == {
+        "recorded": True, "effect_state": "rejected",
+    }
+    async with db.acquire() as conn:
+        after = await conn.fetchrow(
+            "SELECT state,reason,revision,claim_token,backoff_attempt,next_probe_at,updated_at "
+            "FROM vm_creation_retries WHERE request_id=$1", row["request_id"],
+        )
+    assert after == before
+
+
+@pytest.mark.asyncio
+async def test_historical_null_receipt_and_sibling_receipt_cannot_surrender(db, monkeypatch):
+    store, row, _, carrier = await reserved(db, monkeypatch)
+    values = verify_creation_carrier(carrier, secret=SECRET)
+    async with db.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO vm_creation_effects(effect_nonce,request_id,effect_number,"
+            "effect_kind,carrier_uid,carrier_namespace,carrier_intent) "
+            "VALUES($1,$2,1,$3,$4,$5,$6::jsonb)",
+            UUID(values["effect_nonce"]), row["request_id"], values["effect_kind"],
+            UUID(carrier["metadata"]["uid"]), carrier["metadata"]["namespace"],
+            json.dumps(values),
+        )
+    with pytest.raises(VMCreationRetryConflict, match="creation_effect_changed"):
+        await store.record_not_attempted(
+            request_id=str(row["request_id"]), effect_nonce=values["effect_nonce"],
+            carrier=carrier, issuer_receipt="b" * 64,
+            reason="resource_node_changed",
+        )
+    async with db.acquire() as conn:
+        assert await conn.fetchval(
+            "SELECT state FROM vm_creation_effects WHERE effect_nonce=$1",
+            UUID(values["effect_nonce"]),
+        ) == "issued"
+
+    # A separate issuer's valid receipt has no authority over this effect.
+    other_store, other_row, other_claim, other_carrier = await reserved(db, monkeypatch)
+    other_grant = await other_store.begin_effect(
+        request_id=str(other_row["request_id"]),
+        claim_token=str(other_claim["claim_token"]), carrier=other_carrier,
+    )
+    with pytest.raises(VMCreationRetryConflict, match="creation_effect_changed"):
+        await store.record_not_attempted(
+            request_id=str(row["request_id"]), effect_nonce=values["effect_nonce"],
+            carrier=carrier, issuer_receipt=other_grant["issuer_receipt"],
+            reason="resource_node_changed",
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("terminal", ["observed", "api_rejected"])
+async def test_terminal_public_effect_cannot_be_replaced_by_surrender(
+    db, monkeypatch, terminal,
+):
+    store, row, claim, carrier = await reserved(db, monkeypatch)
+    grant = await store.begin_effect(
+        request_id=str(row["request_id"]), claim_token=str(claim["claim_token"]),
+        carrier=carrier,
+    )
+    observation = (
+        disk_observation(carrier)
+        if terminal == "observed"
+        else {
+            "outcome": "rejected",
+            "api_status": {
+                "kind": "Status", "apiVersion": "v1", "status": "Failure",
+                "reason": "Invalid", "code": 422,
+            },
+        }
+    )
+    await store.observe_effect(
+        request_id=str(row["request_id"]), carrier=carrier,
+        observation=observation,
+    )
+    with pytest.raises(VMCreationRetryConflict, match="creation_effect_changed"):
+        await store.record_not_attempted(
+            request_id=str(row["request_id"]), effect_nonce=grant["effect_nonce"],
+            carrier=carrier, issuer_receipt=grant["issuer_receipt"],
+            reason="resource_node_changed",
+        )
+    async with db.acquire() as conn:
+        assert await conn.fetchval(
+            "SELECT state FROM vm_creation_effects WHERE effect_nonce=$1",
+            UUID(grant["effect_nonce"]),
+        ) == ("observed" if terminal == "observed" else "rejected")
+
+
+@pytest.mark.asyncio
+async def test_surrender_waits_for_owner_lock_before_effect_resolution(db, monkeypatch):
+    store, row, claim, carrier = await reserved(db, monkeypatch)
+    grant = await store.begin_effect(
+        request_id=str(row["request_id"]), claim_token=str(claim["claim_token"]),
+        carrier=carrier,
+    )
+    entered = asyncio.Event()
+    finished_locks = asyncio.Event()
+    original = store._unused_grant_owner_locks
+
+    async def traced_locks(conn, retry):
+        entered.set()
+        await original(conn, retry)
+        finished_locks.set()
+
+    monkeypatch.setattr(store, "_unused_grant_owner_locks", traced_locks)
+    async with db.acquire() as lock_conn:
+        async with lock_conn.transaction():
+            await lock_conn.execute(
+                "SELECT pg_advisory_xact_lock(hashtextextended($1,0))",
+                f"workspace-recovery:job:{row['job_id']}",
+            )
+            task = asyncio.create_task(store.record_not_attempted(
+                request_id=str(row["request_id"]), effect_nonce=grant["effect_nonce"],
+                carrier=carrier, issuer_receipt=grant["issuer_receipt"],
+                reason="resource_node_changed",
+            ))
+            await asyncio.wait_for(entered.wait(), 5)
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(finished_locks.wait(), 0.1)
+            assert not task.done()
+    assert await asyncio.wait_for(task, 5) == {
+        "recorded": True, "effect_state": "rejected",
+    }
+
+
+@pytest.mark.asyncio
+async def test_new_effect_issuance_resets_capped_wait_to_first_probe(db, monkeypatch):
+    store, row, claim, carrier = await reserved(db, monkeypatch)
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE vm_creation_retries SET backoff_attempt=6,"
+            "next_probe_at=clock_timestamp()+interval '1 hour' WHERE request_id=$1",
+            row["request_id"],
+        )
+
+    assert (await store.begin_effect(
+        request_id=str(row["request_id"]),
+        claim_token=str(claim["claim_token"]), carrier=carrier,
+    ))["actuation_allowed"] is True
+    async with db.acquire() as conn:
+        progress = await conn.fetchrow(
+            "SELECT backoff_attempt,extract(epoch FROM next_probe_at-updated_at) "
+            "AS delay FROM vm_creation_retries WHERE request_id=$1", row["request_id"],
+        )
+    assert progress["backoff_attempt"] == 0
+    assert 0 < progress["delay"] <= 5
+
+    assert await store.apply_observation(
+        request_id=str(row["request_id"]),
+        claim_token=str(claim["claim_token"]), expected_revision=claim["revision"],
+        observation={"outcome": "observation_wait"},
+    )
+    async with db.acquire() as conn:
+        scheduled = await conn.fetchrow(
+            "SELECT state,backoff_attempt,"
+            "extract(epoch FROM next_probe_at-updated_at) AS delay "
+            "FROM vm_creation_retries WHERE request_id=$1", row["request_id"],
+        )
+    assert scheduled["state"] == "queued"
+    assert scheduled["backoff_attempt"] == 1
+    assert 5 <= scheduled["delay"] <= 6
+
+
+@pytest.mark.asyncio
+async def test_observed_effect_resets_capped_wait_to_first_probe(db, monkeypatch):
+    store, row, claim, carrier = await reserved(db, monkeypatch)
+    await store.begin_effect(
+        request_id=str(row["request_id"]),
+        claim_token=str(claim["claim_token"]), carrier=carrier,
+    )
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE vm_creation_retries SET backoff_attempt=6,"
+            "next_probe_at=clock_timestamp()+interval '1 hour' WHERE request_id=$1",
+            row["request_id"],
+        )
+    assert await store.observe_effect(
+        request_id=str(row["request_id"]), carrier=carrier,
+        observation=disk_observation(carrier),
+    ) == {"recorded": True, "effect_state": "observed"}
+    async with db.acquire() as conn:
+        progress = await conn.fetchrow(
+            "SELECT backoff_attempt,extract(epoch FROM next_probe_at-updated_at) "
+            "AS delay FROM vm_creation_retries WHERE request_id=$1", row["request_id"],
+        )
+    assert progress["backoff_attempt"] == 0
+    assert 0 < progress["delay"] <= 5
+
+
+@pytest.mark.asyncio
+async def test_duplicate_effect_calls_do_not_reset_backoff(db, monkeypatch):
+    store, row, claim, carrier = await reserved(db, monkeypatch)
+    await store.begin_effect(
+        request_id=str(row["request_id"]),
+        claim_token=str(claim["claim_token"]), carrier=carrier,
+    )
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE vm_creation_retries SET backoff_attempt=6,"
+            "next_probe_at=clock_timestamp()+interval '1 hour' WHERE request_id=$1",
+            row["request_id"],
+        )
+    assert (await store.begin_effect(
+        request_id=str(row["request_id"]),
+        claim_token=str(claim["claim_token"]), carrier=carrier,
+    ))["actuation_allowed"] is False
+    async with db.acquire() as conn:
+        assert await conn.fetchval(
+            "SELECT backoff_attempt FROM vm_creation_retries WHERE request_id=$1",
+            row["request_id"],
+        ) == 6
+
+    observation = disk_observation(carrier)
+    await store.observe_effect(
+        request_id=str(row["request_id"]), carrier=carrier,
+        observation=observation,
+    )
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE vm_creation_retries SET backoff_attempt=6,"
+            "next_probe_at=clock_timestamp()+interval '1 hour' WHERE request_id=$1",
+            row["request_id"],
+        )
+    assert await store.observe_effect(
+        request_id=str(row["request_id"]), carrier=carrier,
+        observation=observation,
+    ) == {"recorded": True, "effect_state": "observed"}
+    async with db.acquire() as conn:
+        unchanged = await conn.fetchrow(
+            "SELECT backoff_attempt,extract(epoch FROM next_probe_at-clock_timestamp()) "
+            "AS due_in FROM vm_creation_retries WHERE request_id=$1", row["request_id"],
+        )
+    assert unchanged["backoff_attempt"] == 6
+    assert unchanged["due_in"] > 3000
+
+
+@pytest.mark.asyncio
+async def test_no_progress_observation_keeps_capped_wait(db, monkeypatch):
+    store, row, claim, _ = await reserved(db, monkeypatch)
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE vm_creation_retries SET backoff_attempt=6 WHERE request_id=$1",
+            row["request_id"],
+        )
+    assert await store.apply_observation(
+        request_id=str(row["request_id"]),
+        claim_token=str(claim["claim_token"]), expected_revision=claim["revision"],
+        observation={"outcome": "observation_wait"},
+    )
+    async with db.acquire() as conn:
+        scheduled = await conn.fetchrow(
+            "SELECT state,backoff_attempt,"
+            "extract(epoch FROM next_probe_at-updated_at) AS delay "
+            "FROM vm_creation_retries WHERE request_id=$1", row["request_id"],
+        )
+    assert scheduled["state"] == "queued"
+    assert scheduled["backoff_attempt"] == 7
+    assert 300 <= scheduled["delay"] <= 360
+
+
+@pytest.mark.asyncio
+async def test_rejected_effect_does_not_reset_capped_retry(db, monkeypatch):
+    from shared.vm_creation_issuance import verify_creation_carrier
+
+    store, row, claim, carrier = await reserved(db, monkeypatch)
+    await store.begin_effect(
+        request_id=str(row["request_id"]),
+        claim_token=str(claim["claim_token"]), carrier=carrier,
+    )
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE vm_creation_retries SET backoff_attempt=6,"
+            "next_probe_at=clock_timestamp()+interval '1 hour' WHERE request_id=$1",
+            row["request_id"],
+        )
+    assert await store.observe_effect(
+        request_id=str(row["request_id"]), carrier=carrier,
+        observation={
+            "outcome": "rejected",
+            "api_status": {
+                "kind": "Status", "apiVersion": "v1", "status": "Failure",
+                "reason": "Invalid", "code": 422,
+            },
+        },
+    ) == {"recorded": True, "effect_state": "rejected"}
+    async with db.acquire() as conn:
+        unchanged = await conn.fetchrow(
+            "SELECT backoff_attempt,extract(epoch FROM next_probe_at-clock_timestamp()) "
+            "AS due_in FROM vm_creation_retries WHERE request_id=$1", row["request_id"],
+        )
+    assert unchanged["backoff_attempt"] == 6
+    assert unchanged["due_in"] > 3000
+    next_values = {
+        **verify_creation_carrier(carrier, secret=SECRET),
+        "effect_nonce": str(uuid4()),
+    }
+    next_carrier = seal_creation_carrier(
+        next_values,
+        namespace="agent-vms",
+        uid=carrier["metadata"]["uid"],
+        resource_version="3",
+        secret=SECRET,
+    )
+    assert (await store.begin_effect(
+        request_id=str(row["request_id"]),
+        claim_token=str(claim["claim_token"]), carrier=next_carrier,
+    ))["actuation_allowed"] is True
+    async with db.acquire() as conn:
+        retried = await conn.fetchrow(
+            "SELECT backoff_attempt,extract(epoch FROM next_probe_at-clock_timestamp()) "
+            "AS due_in FROM vm_creation_retries WHERE request_id=$1", row["request_id"],
+        )
+    assert retried["backoff_attempt"] == 6
+    assert retried["due_in"] > 3000
+    assert await store.apply_observation(
+        request_id=str(row["request_id"]),
+        claim_token=str(claim["claim_token"]), expected_revision=claim["revision"],
+        observation={"outcome": "observation_wait"},
+    )
+    async with db.acquire() as conn:
+        assert await conn.fetchval(
+            "SELECT backoff_attempt FROM vm_creation_retries WHERE request_id=$1",
+            row["request_id"],
+        ) == 7
+
+
+@pytest.mark.asyncio
+async def test_late_progress_cannot_replace_claim_or_clear_transport_outage(
+    db, monkeypatch
+):
+    store, row, claim, carrier = await reserved(db, monkeypatch)
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE vm_creation_retries SET backoff_attempt=6 WHERE request_id=$1",
+            row["request_id"],
+        )
+    assert await store.apply_observation(
+        request_id=str(row["request_id"]),
+        claim_token=str(claim["claim_token"]), expected_revision=claim["revision"],
+        observation={"outcome": "transport_unknown"},
+    )
+    assert (await store.begin_effect(
+        request_id=str(row["request_id"]),
+        claim_token=str(claim["claim_token"]), carrier=carrier,
+    ))["actuation_allowed"] is True
+    async with db.acquire() as conn:
+        held = await conn.fetchrow(
+            "SELECT revision,backoff_attempt,claim_token,transport_outage_started_at "
+            "FROM vm_creation_retries WHERE request_id=$1", row["request_id"],
+        )
+        await conn.execute(
+            "UPDATE vm_creation_retries SET next_probe_at=clock_timestamp()-interval '1 second' "
+            "WHERE request_id=$1", row["request_id"],
+        )
+    assert held["backoff_attempt"] == 0
+    assert held["claim_token"] == claim["claim_token"]
+    assert held["transport_outage_started_at"] is not None
+    assert await store.claim_due(limit=1) == []
+
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE vm_creation_retries SET transport_outage_started_at="
+            "clock_timestamp()-interval '901 seconds' WHERE request_id=$1",
+            row["request_id"],
+        )
+    assert await store.apply_observation(
+        request_id=str(row["request_id"]),
+        claim_token=str(claim["claim_token"]), expected_revision=held["revision"],
+        observation={"outcome": "transport_unknown"},
+    )
+    async with db.acquire() as conn:
+        attention = await conn.fetchrow(
+            "SELECT state,claim_token FROM vm_creation_retries WHERE request_id=$1",
+            row["request_id"],
+        )
+    assert attention["state"] == "attention"
+    assert attention["claim_token"] is None
+    assert await store.claim_due(limit=1) == []
+
+
+@pytest.mark.asyncio
+async def test_observed_progress_after_cancel_cannot_reopen_creation(db, monkeypatch):
+    store, row, claim, carrier = await reserved(db, monkeypatch)
+    await store.begin_effect(
+        request_id=str(row["request_id"]),
+        claim_token=str(claim["claim_token"]), carrier=carrier,
+    )
+    await db.linearize_pinned_cancel(str(row["job_id"]), expected_status="paused")
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE vm_creation_retries SET backoff_attempt=6,"
+            "next_probe_at=clock_timestamp()+interval '1 hour' WHERE request_id=$1",
+            row["request_id"],
+        )
+    assert await store.observe_effect(
+        request_id=str(row["request_id"]), carrier=carrier,
+        observation=disk_observation(carrier),
+    ) == {"recorded": True, "effect_state": "observed"}
+    async with db.acquire() as conn:
+        cancelled = await conn.fetchrow(
+            "SELECT state,claim_token,backoff_attempt FROM vm_creation_retries "
+            "WHERE request_id=$1", row["request_id"],
+        )
+        await conn.execute(
+            "UPDATE vm_creation_retries SET next_probe_at=clock_timestamp()-interval '1 second' "
+            "WHERE request_id=$1", row["request_id"],
+        )
+    assert cancelled["state"] == "cancel_requested"
+    assert cancelled["claim_token"] is None
+    assert cancelled["backoff_attempt"] == 0
+    cancellation_claim = (await store.claim_due(limit=1))[0]
+    assert cancellation_claim["state"] == "cancel_requested"
+    with pytest.raises(VMCreationRetryConflict):
+        await store.begin_effect(
+            request_id=str(row["request_id"]),
+            claim_token=str(cancellation_claim["claim_token"]), carrier=carrier,
+        )
 
 
 @pytest.mark.asyncio

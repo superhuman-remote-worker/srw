@@ -110,6 +110,16 @@ Genuine Job and pinned-session creates then use the same durable reservation
 ledger; Kubernetes still makes the final placement decision. Validate both
 owner paths and physical release before treating a live cluster as qualified.
 
+If a winning VM creation handler refuses before entering a Kubernetes or
+attachment create method, its exact private receipt can settle that issued
+effect as `not_attempted`. A receipt-proven pre-create refusal may then proceed
+through ordinary retry or cancellation. An absent object alone, an older grant
+without a receipt, a lost winning response, or a create method already entered
+cannot prove no effect; the reservation remains held. On cancellation, the
+source, retained disk, Secret and attachment still require their exact physical
+evidence and completion. Capacity is released only when the ordinary
+disposition settles, including when a retained workspace keeps its disk.
+
 To turn enforcement off, invoke `begin-drain` with the enforce receipt first.
 This stops fresh grants while existing v3 effects and charged cleanup continue
 to reconcile. **Keep the original all-true Helm policy and inventory publisher

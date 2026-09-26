@@ -21453,6 +21453,16 @@ class PostgresDB:
                         != creation_source["request_digest"]
                     or canonical_configuration_digest(configuration)
                         != creation_source["controller_configuration_digest"]
+                    or (
+                        configuration.get("network_profile_policy")
+                        != {
+                            "version": 1,
+                            "image": request.get("vm_image"),
+                            "profile": request.get("network_profile"),
+                        }
+                        if request.get("network_profile") is not None
+                        else configuration.get("network_profile_policy") is not None
+                    )
                 ):
                     return False
             except (KeyError, TypeError, ValueError, AttributeError):
@@ -21504,7 +21514,7 @@ class PostgresDB:
                     return False
                 open_idle = await conn.fetchrow(
                     "SELECT id,release_kind,phase,stop_verified_at,wake_generation,"
-                    "wake_request_id,provision_generation,vm_uid,pvc_uid,"
+                    "wake_request_id,provision_generation,vm_uid,vmi_uid,launcher_uid,pvc_uid,"
                     "thread_runtime_generation,thread_retirement_token,"
                     "thread_terminal_intent_at "
                     "FROM vm_idle_operations WHERE owner_kind='thread' "
@@ -21547,6 +21557,26 @@ class PostgresDB:
                     )
                     if not settled_retirement:
                         return False
+                    from orchestrator.services.vm_thread_network import (
+                        inherited_profile_on_conn,
+                    )
+
+                    inherited_ok, inherited_profile, inherited_image = await inherited_profile_on_conn(
+                        conn, thread_id=parsed_thread,
+                        operation=open_idle, vm=current_vm or {},
+                    )
+                    if not inherited_ok:
+                        return False
+                    if creation_source is not None:
+                        if (
+                            parsed_request_id != open_idle["wake_request_id"]
+                            or request.get("network_profile") != inherited_profile
+                            or inherited_profile is not None
+                            and request.get("vm_image") != inherited_image
+                        ):
+                            return False
+                    elif inherited_profile is not None:
+                        return False
                 elif parsed_wake is not None or any(
                     proposed.get(key) is not None for key in (
                         "idle_wake_operation_id", "idle_wake_request_id",
@@ -21554,6 +21584,19 @@ class PostgresDB:
                     )
                 ):
                     return False
+                elif creation_source is not None:
+                    from shared.vm_network_profile import selected_profile
+
+                    if (
+                        request.get("network_profile") != selected_profile(
+                            request.get("vm_image"),
+                            prepared=(
+                                request.get("preparation") is not None
+                                or (current_vm or {}).get("rootdisk_pvc_uid") is not None
+                            ),
+                        )
+                    ):
+                        return False
                 current_vm_status = str((current_vm or {}).get("status") or "")
                 if poll:
                     if (
@@ -21885,6 +21928,7 @@ class PostgresDB:
         )
         query = (
             "SELECT id::text AS entity_id, user_id::text AS user_id, "
+            "runtime_generation::text AS runtime_generation, "
             "COALESCE(metadata->'workspace_preparation',metadata->'vm') AS vm FROM threads WHERE ("
             + status_clause
             + (

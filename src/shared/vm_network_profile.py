@@ -55,7 +55,7 @@ def selected_profile(image: object, *, prepared: bool = False) -> dict | None:
 def reusable_profile_evidence(
     value: object, profile: object, *, provision_generation: object,
     vm_uid: object, pvc_uid: object, vmi_uid: object = None,
-    launcher_uid: object = None,
+    launcher_uid: object = None, interface_mac: object = None,
 ) -> bool:
     """A first-boot pinned-SSH receipt for this exact disk and runtime."""
     try:
@@ -77,6 +77,8 @@ def reusable_profile_evidence(
             return False
         if identity is not None and observed != identity:
             return False
+    if interface_mac is not None and value.get("interface_mac") != interface_mac:
+        return False
     try:
         boot_id = str(UUID(value["guest_boot_id"]))
     except (KeyError, TypeError, ValueError, AttributeError):

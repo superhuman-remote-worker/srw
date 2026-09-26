@@ -505,9 +505,39 @@ class VMReadinessService:
 
         host_key_fingerprint = vm.get("ssh_host_key_fingerprint")
         frozen_request = _vm_object(_vm_object(vm.get("creation_preflight")).get("request"))
-        network_profile = (
-            frozen_request.get("network_profile") if entity_type == "job" else None
-        )
+        network_profile = frozen_request.get("network_profile") if entity_type == "job" else None
+        if entity_type == "thread" and vm.get("creation_request_id") is not None:
+            from orchestrator.services.vm_thread_network import verified_source
+
+            try:
+                source = await self._db.fetchrow(
+                    "SELECT * FROM vm_creation_retries WHERE request_id=$1 "
+                    "AND owner_kind='thread' AND thread_id=$2",
+                    UUID(vm["creation_request_id"]), UUID(entity_id),
+                )
+                request = verified_source(
+                    source, thread_id=entity_id, generation=generation,
+                    request_id=vm["creation_request_id"],
+                )
+            except (TypeError, ValueError, AttributeError, KeyError):
+                request = None
+            if (
+                request is None or source["thread_runtime_generation"] is None
+                or str(source["thread_runtime_generation"])
+                != row.get("runtime_generation")
+            ):
+                await self._transient_failure(
+                    key, entity_type, entity_id, generation, vm,
+                    "Thread VM creation source changed", reprobe=reprobe,
+                )
+                return
+            network_profile = request.get("network_profile")
+        elif entity_type == "thread" and vm.get("network_profile_evidence") is not None:
+            await self._transient_failure(
+                key, entity_type, entity_id, generation, vm,
+                "Thread VM profile source is absent", reprobe=reprobe,
+            )
+            return
         if not isinstance(host_key_fingerprint, str) or not host_key_fingerprint:
             await self._transient_failure(
                 key,
@@ -579,6 +609,9 @@ class VMReadinessService:
                     pvc_uid=status.get("rootdisk_pvc_uid"),
                     vmi_uid=status.get("vmi_uid"),
                     launcher_uid=status.get("active_pod_uid"),
+                    interface_mac=(
+                        status.get("interface_mac") if entity_type == "thread" else None
+                    ),
                 )
             )
         if unchanged_ready_identity and (network_profile is None or exact_profile_receipt):
@@ -699,6 +732,8 @@ class VMReadinessService:
                 "network_file_sha256": guest_network["network_profile_rule"]["network_file_sha256"],
                 "name_only_dhcp": True,
             }
+            if entity_type == "thread":
+                network_profile_evidence["interface_mac"] = status.get("interface_mac")
 
         async def mutation_authority() -> tuple[str, int, str] | None:
             """Re-prove the exact launcher immediately before each SSH write."""
@@ -855,6 +890,8 @@ class VMReadinessService:
         }
         if network_profile_evidence is not None:
             ready_updates["network_profile_evidence"] = network_profile_evidence
+            if entity_type == "thread":
+                ready_updates["interface_mac"] = status.get("interface_mac")
         if (
             entity_type == "job"
             and getattr(self._db, "supports_vm_phase_observations", False) is True
@@ -884,7 +921,7 @@ class VMReadinessService:
                 entity_id, generation, registration_id,
                 status.get("vm_uid"), ready_updates,
             )
-            if promoted is None:
+            if promoted is None and vm.get("creation_request_id") is None:
                 promoted = bool(await self._db.merge_thread_vm_context_if_current(
                     entity_id, registration_id, ready_updates,
                 ))

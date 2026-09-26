@@ -7868,12 +7868,30 @@ CREATE FUNCTION public.guard_vm_creation_effect_identity() RETURNS trigger
     AS $$
 BEGIN
     IF ROW(NEW.effect_nonce,NEW.request_id,NEW.effect_number,NEW.effect_kind,
-           NEW.carrier_uid,NEW.carrier_namespace,NEW.carrier_intent,NEW.issued_at)
+           NEW.carrier_uid,NEW.carrier_namespace,NEW.carrier_intent,NEW.issued_at,
+           NEW.issuer_receipt_sha256)
        IS DISTINCT FROM
        ROW(OLD.effect_nonce,OLD.request_id,OLD.effect_number,OLD.effect_kind,
-           OLD.carrier_uid,OLD.carrier_namespace,OLD.carrier_intent,OLD.issued_at)
+           OLD.carrier_uid,OLD.carrier_namespace,OLD.carrier_intent,OLD.issued_at,
+           OLD.issuer_receipt_sha256)
        OR (OLD.state<>'issued' AND NEW IS DISTINCT FROM OLD) THEN
         RAISE EXCEPTION 'VM creation effect identity or resolved evidence is immutable' USING ERRCODE='23514';
+    END IF;
+    IF NEW.evidence->>'outcome'='not_attempted' AND (
+        NEW.state='rejected'
+        AND NEW.issuer_receipt_sha256 IS NOT NULL
+        AND NEW.evidence=jsonb_build_object(
+            'outcome','not_attempted','reason',NEW.evidence->>'reason')
+        AND NEW.evidence->>'reason' IN (
+            'resource_inventory_unavailable','resource_node_changed',
+            'creation_carrier_changed','creation_observed_object_missing',
+            'creation_observed_object_changed','retained_disk_changed',
+            'workspace_recovery_held','workspace_attachment_unproven',
+            'creation_existing_vm_unproven',
+            'creation_rootdisk_source_unproven')
+    ) IS NOT TRUE THEN
+        RAISE EXCEPTION 'Invalid unused creation grant evidence'
+            USING ERRCODE='23514';
     END IF;
     RETURN NEW;
 END;
@@ -7926,6 +7944,11 @@ BEGIN
     END IF;
     IF NEW.state <> OLD.state AND NOT (
         (OLD.state='queued' AND NEW.state IN ('reconciling','cancel_requested','succeeded')) OR
+        (OLD.state='queued' AND NEW.state='attention'
+         AND NEW.reason='vm_creation_retry_blocked'
+         AND NEW.claim_token IS NULL AND NEW.claim_expires_at IS NULL
+         AND NEW.revision=OLD.revision+1
+         AND public.valid_vm_creation_unused_grant_attention(NEW)) OR
         (OLD.state='reconciling' AND NEW.state IN ('queued','attention','succeeded','cancel_requested')) OR
         (OLD.state='attention' AND NEW.state IN ('queued','cancel_requested','succeeded')) OR
         (OLD.state='cancel_requested' AND NEW.state='settled')
@@ -15961,6 +15984,34 @@ $$;
 
 
 --
+-- Name: valid_vm_creation_unused_grant_attention(public.vm_creation_retries); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.valid_vm_creation_unused_grant_attention(retry public.vm_creation_retries) RETURNS boolean
+    LANGUAGE sql STABLE
+    AS $$
+    SELECT EXISTS(
+        SELECT 1 FROM public.vm_creation_effects e
+        WHERE e.request_id=retry.request_id
+          AND e.effect_number=(
+              SELECT max(effect_number) FROM public.vm_creation_effects
+              WHERE request_id=retry.request_id)
+          AND e.state='rejected'
+          AND e.issuer_receipt_sha256 IS NOT NULL
+          AND e.evidence=jsonb_build_object(
+              'outcome','not_attempted','reason',e.evidence->>'reason')
+          AND e.evidence->>'reason' IN (
+              'resource_node_changed','creation_carrier_changed',
+              'creation_observed_object_missing',
+              'creation_observed_object_changed','retained_disk_changed',
+              'workspace_recovery_held','workspace_attachment_unproven',
+              'creation_existing_vm_unproven',
+              'creation_rootdisk_source_unproven')
+    );
+$$;
+
+
+--
 -- Name: validate_inventory_epoch_last_complete_snapshot(); Type: FUNCTION; Schema: public; Owner: -
 --
 
@@ -23451,6 +23502,7 @@ CREATE TABLE public.vm_creation_effects (
     evidence jsonb DEFAULT '{}'::jsonb NOT NULL,
     issued_at timestamp with time zone DEFAULT clock_timestamp() NOT NULL,
     resolved_at timestamp with time zone,
+    issuer_receipt_sha256 bytea,
     CONSTRAINT vm_creation_effects_carrier_intent_check CHECK ((jsonb_typeof(carrier_intent) = 'object'::text)),
     CONSTRAINT vm_creation_effects_carrier_namespace_check CHECK ((carrier_namespace <> ''::text)),
     CONSTRAINT vm_creation_effects_check CHECK (((state = 'issued'::text) = (resolved_at IS NULL))),
@@ -23458,7 +23510,8 @@ CREATE TABLE public.vm_creation_effects (
     CONSTRAINT vm_creation_effects_effect_kind_check CHECK ((effect_kind = ANY (ARRAY['workspace_attach'::text, 'rootdisk'::text, 'cloud_init'::text, 'vm'::text]))),
     CONSTRAINT vm_creation_effects_effect_number_check CHECK ((effect_number > 0)),
     CONSTRAINT vm_creation_effects_evidence_check CHECK ((jsonb_typeof(evidence) = 'object'::text)),
-    CONSTRAINT vm_creation_effects_state_check CHECK ((state = ANY (ARRAY['issued'::text, 'observed'::text, 'rejected'::text])))
+    CONSTRAINT vm_creation_effects_state_check CHECK ((state = ANY (ARRAY['issued'::text, 'observed'::text, 'rejected'::text]))),
+    CONSTRAINT vm_creation_issuer_receipt_sha256_length CHECK (((issuer_receipt_sha256 IS NULL) OR (octet_length(issuer_receipt_sha256) = 32)))
 );
 
 

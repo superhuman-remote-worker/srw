@@ -49,6 +49,11 @@ async def _dispatch(request, operation, method):
                 or str(UUID(payload["claim_token"])) != payload["claim_token"]
             ):
                 raise ValueError("Invalid observer identity")
+        if method == "record_not_attempted" and (
+            not isinstance(payload.get("effect_nonce"), str)
+            or str(UUID(payload["effect_nonce"])) != payload["effect_nonce"]
+        ):
+            raise ValueError("Invalid effect identity")
         result = await getattr(_store_factory(), method)(**payload)
         if method == "authorize_controller":
             result = {**result, "actuation_allowed": False}
@@ -90,6 +95,13 @@ async def begin_effect(request: Request) -> JSONResponse:
 @router.post("/observe-effect")
 async def observe_effect(request: Request) -> JSONResponse:
     return await _dispatch(request, "creation_retry_observe_effect", "observe_effect")
+
+
+@router.post("/record-not-attempted")
+async def record_not_attempted(request: Request) -> JSONResponse:
+    return await _dispatch(
+        request, "creation_retry_record_not_attempted", "record_not_attempted"
+    )
 
 
 @router.post("/settle-never-issued")

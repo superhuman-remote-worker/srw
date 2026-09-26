@@ -3199,6 +3199,7 @@ class VMProvisioner:
             # A PVC name is reusable.  Only the newly admitted immutable UID
             # may authenticate this incarnation's rootdisk for metering.
             "rootdisk_pvc_uid": None,
+            "network_profile_evidence": None,
             "identity_authenticated": False,
             "identity_provision_generation": None,
             "creation_request": None,
@@ -3385,6 +3386,10 @@ class VMProvisioner:
             resource_enforced = configured_enforcement_required()
         except ValueError:
             return False
+        if not resource_enforced and os.getenv(
+            "VM_NETWORK_PROFILE_ENABLED", "false"
+        ).lower() == "true":
+            return False
         creation_source = None
         if resource_enforced:
             # A claimed immutable source is the only route to a v3 effect. A
@@ -3430,6 +3435,46 @@ class VMProvisioner:
             )
 
             try:
+                from shared.vm_network_profile import selected_profile
+
+                if wake_operation_id is not None:
+                    from orchestrator.services.vm_thread_network import (
+                        document, profile_enabled,
+                    )
+
+                    predecessor = await self._db.fetchrow(
+                        "SELECT canonical_request FROM vm_creation_retries "
+                        "WHERE owner_kind='thread' AND thread_id=$1 "
+                        "AND provision_generation=$2",
+                        UUID(thread_id), UUID(str((expected_vm_context or {}).get(
+                            "provision_generation"
+                        ))),
+                    )
+                    prior_request = document(predecessor["canonical_request"]) if (
+                        predecessor is not None
+                    ) else None
+                    inherited = prior_request.get("network_profile") if (
+                        prior_request is not None
+                    ) else None
+                    if prior_request is None and profile_enabled():
+                        return False
+                    if network_profile is not None and network_profile != inherited:
+                        return False
+                    network_profile = inherited
+                    if inherited is not None:
+                        if vm_image not in (None, prior_request.get("vm_image")):
+                            return False
+                        vm_image = prior_request.get("vm_image")
+                else:
+                    selected = selected_profile(
+                        vm_image,
+                        prepared=(preparation is not None or (expected_vm_context or {}).get(
+                            "rootdisk_pvc_uid"
+                        ) is not None),
+                    )
+                    if network_profile is not None and network_profile != selected:
+                        return False
+                    network_profile = selected
                 network_tier = (
                     await self._db.get_workspace_network_tier(thread_id, "thread")
                     or DEFAULT_NETWORK_TIER

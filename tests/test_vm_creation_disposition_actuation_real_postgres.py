@@ -15,6 +15,7 @@ from tests.test_vm_creation_effects_real_postgres import (
     observed_creation,
     SECRET,
 )
+from tests.test_vm_creation_disposition_real_postgres import cancelled_unused_vm
 from shared.vm_creation_disposition import disposition_identity
 from vm_controller import controller as settings
 from vm_controller.creation_disposition import CreationDisposer
@@ -27,13 +28,21 @@ def consumer_metadata(name):
     return {"name": name, "namespace": settings.VM_NAMESPACE, "uid": str(uuid4())}
 
 
-async def runtime(db, setup, monkeypatch):
+async def runtime(db, setup, monkeypatch, *, unused_vm=False):
     ctrl, api, _, _ = setup
     monkeypatch.setattr(settings, "LIFECYCLE_HMAC_SECRET", SECRET)
-    store, row, lease, observations = await observed_creation(
-        db, monkeypatch, stop_after="cloud_init"
-    )
-    await db.linearize_pinned_cancel(str(row["job_id"]), expected_status="paused")
+    if unused_vm:
+        store, row, lease, observations, grant = await cancelled_unused_vm(db, monkeypatch)
+        assert await store.record_not_attempted(
+            request_id=str(row["request_id"]), effect_nonce=grant["effect_nonce"],
+            carrier=lease, issuer_receipt=grant["issuer_receipt"],
+            reason="resource_node_changed",
+        ) == {"recorded": True, "effect_state": "rejected"}
+    else:
+        store, row, lease, observations = await observed_creation(
+            db, monkeypatch, stop_after="cloud_init"
+        )
+        await db.linearize_pinned_cancel(str(row["job_id"]), expected_status="paused")
     observations["rootdisk"]["pvc"]["metadata"]["labels"] = deepcopy(
         observations["rootdisk"]["object"]["metadata"]["labels"]
     )
@@ -127,6 +136,40 @@ async def runtime(db, setup, monkeypatch):
 
     ctrl._workspace_cleanup_authority_request = authority
     return ctrl, api, store, row, lease
+
+
+@pytest.mark.asyncio
+async def test_unused_vm_grant_disposes_exact_partial_resources_before_parent_release(
+    db, setup, monkeypatch,
+):
+    ctrl, api, store, row, lease = await runtime(
+        db, setup, monkeypatch, unused_vm=True,
+    )
+    frozen = await store.freeze_disposition(
+        request_id=str(row["request_id"]), carrier=lease,
+    )
+    assert frozen["frozen"] is True
+    assert await db.fetchval(
+        "SELECT completed_at IS NULL FROM vm_workspace_cleanup_admissions "
+        "WHERE id=$1", UUID(frozen["disposition"]["admission_id"]),
+    ) is True
+    for _ in range(8):
+        result = await CreationDisposer(ctrl).run(disposition_identity(row))
+        if result["status"] == "creation_disposed":
+            break
+    assert result["status"] == "creation_disposed", result
+    state = await store.inspect(request_id=str(row["request_id"]))
+    assert state["state"] == "settled"
+    assert set(state["cancellation_completion"]) == {
+        "cloud_init", "rootdisk", "source", "workspace_attachment",
+    }
+    assert [kind for kind, _, _ in api.deletes if kind != "Lease"] == [
+        "Secret", "DataVolume", "PersistentVolumeClaim",
+    ]
+    assert await db.fetchval(
+        "SELECT completed_at IS NOT NULL FROM vm_workspace_cleanup_admissions "
+        "WHERE id=$1", UUID(frozen["disposition"]["admission_id"]),
+    ) is True
 
 
 @pytest.mark.asyncio

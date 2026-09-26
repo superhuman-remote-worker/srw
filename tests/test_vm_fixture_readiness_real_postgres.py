@@ -293,6 +293,8 @@ async def test_b_wait_adapter_uses_real_release_then_existing_authority(
         "ready": True, "provision_generation": str(row["provision_generation"]),
         "vm_uid": vm["vm_uid"], "rootdisk_pvc_uid": vm["rootdisk_pvc_uid"],
         "active_pod_uid": vm["active_pod_uid"],
+        "vmi_uid": vmi_uid,
+        "interface_mac": "02:00:00:00:00:41",
         "provisioning": {"vmi_uid": vmi_uid},
     }
     scenario = object.__new__(LiveScenario)

@@ -27,6 +27,10 @@ from orchestrator.services.session_runtime_admission import (
 )
 from orchestrator.services.thread_retirement import end_thread_flow
 from orchestrator.services.thread_resume import resume_thread
+from shared.vm_creation_issuance import canonical_configuration_digest
+from shared.vm_creation_retry import canonical_request_digest
+from shared.vm_network_profile import NETWORK_PROFILE
+from shared.vm_launcher_profile import predict_launcher
 from shared.persistent_input_delivery import (
     InputDeliveryAuthorityLost, persist_input_delivery,
     transition_input_delivery,
@@ -37,11 +41,14 @@ from tests.test_b10_session_queries_real_postgres import (
     _schema_applied,  # noqa: F401
     _thread,
 )
+from tests.test_vm_resource_configuration import whole_launcher_configuration
+from tests.test_vm_resource_whole_store_real_postgres import environment
 
 MIGRATION = (
     Path(__file__).resolve().parents[1]
     / "src/orchestrator/database/migrations/app/0277_vm_idle_pinned_session.sql"
 )
+PROFILE_IMAGE = "registry.example/session@sha256:" + "a" * 64
 
 
 @pytest_asyncio.fixture(scope="module")
@@ -128,6 +135,76 @@ async def ready_pinned_thread(db, monkeypatch):
         "vmi_uid": str(vmi_uid), "launcher_uid": str(launcher_uid),
         "pvc_uid": str(pvc_uid),
     }
+
+
+async def seed_profiled_ready_source(db, thread_id, identity):
+    """Seed the persisted profile lineage for a suspended predecessor fixture."""
+    owner = await db.fetchrow(
+        "SELECT runtime_generation,agent_id,runtime_attach_token,metadata "
+        "FROM threads WHERE id=$1", thread_id,
+    )
+    original_vm = json.loads(owner["metadata"])["vm"]
+    request_id, admission_id = uuid4(), uuid4()
+    request = {
+        "job_id": str(thread_id), "entity_type": "thread",
+        "provision_generation": identity["generation"],
+        "vm_image": PROFILE_IMAGE, "network_profile": NETWORK_PROFILE,
+    }
+    configuration = whole_launcher_configuration()
+    configuration["network_profile_policy"] = {
+        "version": 1, "image": PROFILE_IMAGE, "profile": NETWORK_PROFILE,
+    }
+    await db.execute(
+        "INSERT INTO vm_workspace_cleanup_admissions "
+        "(id,owner_kind,owner_id,pvc_uid,source,request_id,intent_digest,"
+        "completed_at,outcome) VALUES($1,'thread',$2,$3,'network-profile-test',"
+        "$4,'fixture',clock_timestamp(),'completed')",
+        admission_id, thread_id, identity["pvc_uid"], uuid4(),
+    )
+    await db.execute(
+        "UPDATE threads SET metadata=jsonb_set(metadata,'{vm}',"
+        "metadata->'vm' || $2::jsonb) WHERE id=$1",
+        thread_id, json.dumps({
+            "status": "provisioning", "creation_request_id": str(request_id),
+        }),
+    )
+    await db.execute(
+        "INSERT INTO vm_creation_retries "
+        "(request_id,owner_kind,thread_id,thread_runtime_generation,"
+        "thread_agent_id,thread_attach_token,provision_generation,origin,"
+        "request_digest,canonical_request,controller_configuration_digest,"
+        "controller_configuration,creation_admission_id,state,reason,"
+        "observed_vm_uid,observed_pvc_uid,resolved_at) "
+        "VALUES($1,'thread',$2,$3,$4,$5,$6,'initial',$7,$8::jsonb,$9,"
+        "$10::jsonb,$11,'succeeded','creation_adopted',$12,$13,clock_timestamp())",
+        request_id, thread_id, owner["runtime_generation"],
+        owner["agent_id"], owner["runtime_attach_token"],
+        identity["generation"], canonical_request_digest(request),
+        json.dumps(request), canonical_configuration_digest(configuration),
+        json.dumps(configuration), admission_id,
+        identity["vm_uid"], identity["pvc_uid"],
+    )
+    receipt = {
+        "profile": NETWORK_PROFILE,
+        "provision_generation": identity["generation"],
+        "vm_uid": identity["vm_uid"], "pvc_uid": identity["pvc_uid"],
+        "vmi_uid": identity["vmi_uid"], "launcher_uid": identity["launcher_uid"],
+        "interface_mac": "02:00:00:00:00:41",
+        "guest_boot_id": str(uuid4()),
+        "cloud_init_instance_id": "instance-one",
+        "cloud_init_cached_instance_id": "instance-one",
+        "network_file_sha256": "a" * 64,
+        "name_only_dhcp": True,
+    }
+    await db.execute(
+        "UPDATE threads SET metadata=jsonb_set(metadata,'{vm}',"
+        "metadata->'vm' || $2::jsonb) WHERE id=$1",
+        thread_id, json.dumps({
+            "status": original_vm["status"],
+            "network_profile_evidence": receipt,
+            "interface_mac": "02:00:00:00:00:41",
+        }),
+    )
 
 
 @pytest.mark.asyncio
@@ -469,13 +546,31 @@ async def test_input_admission_and_idle_nomination_have_one_thread_lock_winner(
     "second_execution", [
         False, True, "terminal", "terminal_before_release_wake",
         "terminal_before_create",
-        "terminal_pre_ready",
+        "terminal_pre_ready", "unprofiled_enabled",
+        "profiled_allowlist_drift", "profiled_stale_receipt",
+        "profiled_missing_receipt",
     ],
 )
 async def test_two_connections_join_one_thread_wake_and_preserve_pause_clock(
     db, monkeypatch, second_execution,
 ):
     thread_id, body, identity = await ready_pinned_thread(db, monkeypatch)
+    if second_execution in {
+        "profiled_allowlist_drift", "profiled_stale_receipt",
+        "profiled_missing_receipt",
+    }:
+        # This synthetic historical source has no resource charge. Resource
+        # teardown is covered by its own suite; this case exercises the real
+        # owner transaction and source/receipt checks after physical stop.
+        await seed_profiled_ready_source(db, thread_id, identity)
+
+        async def no_historical_charge(*_args, **_kwargs):
+            return None
+
+        monkeypatch.setattr(
+            "orchestrator.services.vm_idle_lifecycle._idle_resource_binding_on_conn",
+            no_historical_charge,
+        )
     await update_thread_status(
         str(thread_id), body,
         dependencies=SimpleNamespace(
@@ -604,6 +699,164 @@ async def test_two_connections_join_one_thread_wake_and_preserve_pause_clock(
         assert str(operation["id"]) in {
             str(row["id"]) for row in await idle.pending_operations(limit=16)
         }
+        return
+    if second_execution == "unprofiled_enabled":
+        monkeypatch.setenv("VM_NETWORK_PROFILE_ENABLED", "true")
+        waking = await idle.request_thread_wake(
+            str(thread_id), execution_requested=True,
+        )
+        assert waking is not None
+        owner = await db.get_thread(str(thread_id))
+        previous = json.loads(owner["metadata"])["vm"]
+        proposed = VMProvisioner._fresh_provision_ctx()
+        proposed.update(
+            status="provisioning",
+            provision_generation=str(waking["wake_generation"]),
+            idle_wake_operation_id=str(waking["id"]),
+            idle_wake_request_id=str(waking["wake_request_id"]),
+            idle_predecessor_pvc_uid=identity["pvc_uid"],
+        )
+        assert not await db.begin_pinned_thread_vm_provisioning(
+            str(thread_id),
+            expected_runtime_generation=str(owner["runtime_generation"]),
+            expected_agent_id=None, expected_attach_token=None,
+            expected_vm_context=previous, provision_context=proposed,
+            wake_operation_id=str(waking["id"]),
+        )
+        assert await db.fetchval(
+            "SELECT count(*) FROM vm_creation_retries WHERE thread_id=$1",
+            thread_id,
+        ) == 0
+        return
+    if second_execution in {
+        "profiled_allowlist_drift", "profiled_stale_receipt",
+        "profiled_missing_receipt",
+    }:
+        store, inventory, _, _ = await environment(db)
+        configuration = whole_launcher_configuration()
+        configuration.update(namespace="workers", storage_class="local")
+        resource = configuration["resource_admission"]
+        resource["cluster_id"] = inventory.cluster_id
+        resource["policy_digest"] = inventory.policy_digest
+        resource["template_profile"].update(
+            storage_class="local", guest_vcpus=8,
+            guest_memory_bytes=16 * 1024**3,
+        )
+        resource["launcher_prediction"]["vector"] = predict_launcher(
+            store.launcher_profile, guest_vcpus=8,
+            guest_memory_bytes=16 * 1024**3,
+        ).to_six_dict()
+        resource["host_mapping"]["vector"] = store.cost.cost(
+            8, "16Gi"
+        ).to_six_dict()
+        configuration["network_profile_policy"] = {
+            "version": 1, "image": PROFILE_IMAGE, "profile": NETWORK_PROFILE,
+        }
+        monkeypatch.setenv("VM_CREATION_RETRY_ENABLED", "true")
+        monkeypatch.setenv(
+            "VM_RESOURCE_ADMISSION_CONFIG", json.dumps(store.policy_document),
+        )
+        monkeypatch.setenv("VM_NETWORK_PROFILE_ENABLED", "false")
+        monkeypatch.setenv(
+            "VM_NETWORK_PROFILE_IMAGE_ALLOWLIST",
+            "registry.example/other@sha256:" + "b" * 64,
+        )
+        waking = await idle.request_thread_wake(
+            str(thread_id), execution_requested=True,
+        )
+        assert waking is not None
+        if second_execution == "profiled_stale_receipt":
+            await db.execute(
+                "UPDATE threads SET metadata=jsonb_set(metadata,"
+                "'{vm,network_profile_evidence,vmi_uid}',to_jsonb($2::text)) "
+                "WHERE id=$1", thread_id, str(uuid4()),
+            )
+        elif second_execution == "profiled_missing_receipt":
+            await db.execute(
+                "UPDATE threads SET metadata=jsonb_set(metadata,"
+                "'{vm,network_profile_evidence}','null'::jsonb) "
+                "WHERE id=$1", thread_id,
+            )
+        owner = await db.get_thread(str(thread_id))
+        previous = json.loads(owner["metadata"])["vm"]
+
+        async def resolve(_client, request, *, secret):
+            assert request["network_profile"] == NETWORK_PROFILE
+            assert request["vm_image"] == PROFILE_IMAGE
+            return {"request": request, "controller_configuration": configuration}
+
+        monkeypatch.setattr(
+            "orchestrator.services.vm_creation_transport.resolve_vm_creation_configuration",
+            resolve,
+        )
+        provisioner = VMProvisioner()
+        provisioner._db = db
+        provisioner._http_client = object()
+        provisioner._lifecycle_hmac_secret = b"thread-profile-test-secret"
+        if second_execution == "profiled_allowlist_drift":
+            assert await provisioner.create_thread_vm(
+                str(thread_id),
+                vm_image="registry.example/forged@sha256:" + "c" * 64,
+                cpu_cores=8, memory="16Gi",
+                wake_operation_id=str(waking["id"]),
+                expected_runtime_generation=str(owner["runtime_generation"]),
+                expected_agent_id=None, expected_attach_token=None,
+                expected_vm_context=previous,
+            ) is False
+            assert await db.fetchval(
+                "SELECT count(*) FROM vm_creation_retries WHERE thread_id=$1 "
+                "AND provision_generation=$2",
+                thread_id, waking["wake_generation"],
+            ) == 0
+        accepted = await provisioner.create_thread_vm(
+            str(thread_id), vm_image=PROFILE_IMAGE, cpu_cores=8, memory="16Gi",
+            wake_operation_id=str(waking["id"]),
+            expected_runtime_generation=str(owner["runtime_generation"]),
+            expected_agent_id=None, expected_attach_token=None,
+            expected_vm_context=previous,
+        )
+        assert accepted is (second_execution == "profiled_allowlist_drift")
+        successor = await db.fetchrow(
+            "SELECT request_id,canonical_request,request_digest,expected_pvc_uid "
+            "FROM vm_creation_retries WHERE thread_id=$1 "
+            "AND provision_generation=$2",
+            thread_id, waking["wake_generation"],
+        )
+        if second_execution in {"profiled_stale_receipt", "profiled_missing_receipt"}:
+            assert successor is None
+            assert await db.fetchval(
+                "SELECT count(*) FROM vm_resource_waiters WHERE thread_id=$1",
+                thread_id,
+            ) == 0
+        else:
+            assert successor["request_id"] == waking["wake_request_id"]
+            assert successor["expected_pvc_uid"] == waking["pvc_uid"]
+            frozen = json.loads(successor["canonical_request"])
+            assert frozen["network_profile"] == NETWORK_PROFILE
+            assert successor["request_digest"] == canonical_request_digest(frozen)
+            assert await db.fetchval(
+                "SELECT count(*) FROM vm_resource_waiters WHERE request_id=$1",
+                waking["wake_request_id"],
+            ) == 1
+            current = await db.get_thread(str(thread_id))
+            monkeypatch.setenv("VM_NETWORK_PROFILE_ENABLED", "true")
+            assert await provisioner.create_thread_vm(
+                str(thread_id), poll=True,
+                expected_runtime_generation=str(current["runtime_generation"]),
+                expected_agent_id=None, expected_attach_token=None,
+                expected_vm_context=json.loads(current["metadata"])["vm"],
+            ) is True
+            assert await db.fetchval(
+                "SELECT count(*) FROM vm_creation_retries WHERE thread_id=$1 "
+                "AND provision_generation=$2",
+                thread_id, waking["wake_generation"],
+            ) == 1
+        assert await db.fetchval(
+            "SELECT count(*) FROM vm_creation_effects e JOIN vm_creation_retries r "
+            "ON r.request_id=e.request_id WHERE r.thread_id=$1 "
+            "AND r.provision_generation=$2",
+            thread_id, waking["wake_generation"],
+        ) == 0
         return
     if second_execution == "terminal_before_create":
         waking = await idle.request_thread_wake(

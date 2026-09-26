@@ -5,6 +5,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from orchestrator.routers import vm_creation_retry_authority as authority
+from orchestrator.services.vm_creation_retry_store import VMCreationRetryConflict
 from shared.vm_lifecycle_auth import (
     AUTH_FIELD,
     sign_payload,
@@ -201,3 +202,72 @@ def test_store_unavailability_returns_only_a_signed_safe_reason(monkeypatch):
         secret=SECRET,
         expected_correlation_id=value[AUTH_FIELD]["request_id"],
     )
+
+
+def test_record_not_attempted_requires_its_own_signature_and_canonical_nonce(monkeypatch):
+    action = AsyncMock(return_value={"recorded": True, "effect_state": "rejected"})
+    test_client = client(monkeypatch, SimpleNamespace(record_not_attempted=action))
+    path = "/api/internal/vm-creation-retries/record-not-attempted"
+    payload = {
+        "request_id": str(uuid4()), "effect_nonce": str(uuid4()),
+        "carrier": {}, "issuer_receipt": "a" * 64,
+        "reason": "resource_inventory_unavailable",
+    }
+    assert test_client.post(path, json=payload).status_code == 401
+    wrong = sign_payload(payload, direction="request", operation="creation_retry_begin_effect", secret=SECRET)
+    assert test_client.post(path, json=wrong).status_code == 401
+    for bad_nonce in ("", str(uuid4()).upper(), "not-a-uuid"):
+        bad = sign_payload(
+            {**payload, "effect_nonce": bad_nonce}, direction="request",
+            operation="creation_retry_record_not_attempted", secret=SECRET,
+        )
+        response = test_client.post(path, json=bad)
+        assert response.status_code == 400
+        assert "issuer_receipt" not in response.text
+        assert "a" * 64 not in response.text
+    action.assert_not_awaited()
+    signed = sign_payload(
+        payload, direction="request", operation="creation_retry_record_not_attempted",
+        secret=SECRET,
+    )
+    response = test_client.post(path, json=signed)
+    assert response.status_code == 200
+    assert verify_payload(
+        response.json(), direction="response",
+        operation="creation_retry_record_not_attempted", secret=SECRET,
+        expected_correlation_id=signed[AUTH_FIELD]["request_id"],
+    )
+    assert unsigned_payload(response.json()) == {"recorded": True, "effect_state": "rejected"}
+    assert "issuer_receipt" not in response.text
+    assert "a" * 64 not in response.text
+    action.assert_awaited_once_with(**payload)
+
+
+@pytest.mark.parametrize(
+    "failure,status",
+    [(VMCreationRetryConflict("creation_effect_changed"), 200),
+     (RuntimeError("private-receipt-do-not-echo"), 503)],
+)
+def test_record_not_attempted_errors_do_not_echo_receipt(monkeypatch, failure, status):
+    store = SimpleNamespace(record_not_attempted=AsyncMock(side_effect=failure))
+    payload = {
+        "request_id": str(uuid4()), "effect_nonce": str(uuid4()),
+        "carrier": {}, "issuer_receipt": "b" * 64,
+        "reason": "resource_node_changed",
+    }
+    signed = sign_payload(
+        payload, direction="request", operation="creation_retry_record_not_attempted",
+        secret=SECRET,
+    )
+    response = client(monkeypatch, store).post(
+        "/api/internal/vm-creation-retries/record-not-attempted", json=signed,
+    )
+    assert response.status_code == status
+    assert verify_payload(
+        response.json(), direction="response",
+        operation="creation_retry_record_not_attempted", secret=SECRET,
+        expected_correlation_id=signed[AUTH_FIELD]["request_id"],
+    )
+    assert "b" * 64 not in response.text
+    assert "issuer_receipt" not in response.text
+    assert "private-receipt-do-not-echo" not in response.text

@@ -4,6 +4,7 @@ from collections.abc import Mapping
 import time
 
 from shared.vm_resource_admission import ResourceAdmissionError, ResourceVector
+from shared.vm_resource_inventory import SelectedResourceChanged
 from shared.vm_resource_placement import node_exclusion
 
 
@@ -113,3 +114,29 @@ async def fresh_resource_effect_node(controller, row, grant):
         raise
     except Exception:
         raise ResourceAdmissionError("resource_inventory_unavailable") from None
+
+
+async def targeted_resource_effect_node(controller, row, grant, *, pvc_name=None):
+    """Final live placement proof after the effect grant, before its POST."""
+    collector = getattr(controller, "resource_inventory_collector", None)
+    if collector is None or not hasattr(collector, "collect_effect_proof"):
+        raise ResourceAdmissionError("resource_inventory_unavailable")
+    if row["expected_pvc_uid"] is not None and pvc_name is None:
+        raise ResourceAdmissionError("resource_inventory_unavailable")
+    try:
+        resource = row["controller_configuration"]["resource_admission"]
+        snapshot = await collector.collect_effect_proof(
+            node_name=grant["node_name"],
+            storage_class_name=resource["template_profile"]["storage_class"],
+            pvc_name=pvc_name if row["expected_pvc_uid"] is not None else None,
+        )
+    except (SelectedResourceChanged, ResourceAdmissionError):
+        raise ResourceAdmissionError("resource_node_changed") from None
+    except Exception:
+        raise ResourceAdmissionError("resource_inventory_unavailable") from None
+    validate_resource_effect_node(
+        snapshot,
+        grant=grant,
+        resource=resource,
+        expected_pvc_uid=row["expected_pvc_uid"],
+    )

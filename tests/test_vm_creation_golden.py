@@ -278,11 +278,18 @@ async def test_golden_source_replacement_at_grant_boundary_has_no_job_disk_write
         return await original(path, body, operation=operation)
 
     ctrl._workspace_cleanup_authority_request = changing
-    assert (await ctrl._do_create_serialized(payload))["status"] == "creation_attention"
+    assert (await ctrl._do_create_serialized(payload))["status"] == "creation_pending"
     assert "DataVolume" not in api.writes
     assert "Secret" not in api.writes
     assert "VirtualMachine" not in api.writes
-    assert (await ctrl._do_create_serialized(payload))["status"] == "creation_pending"
+    assert authority.row["effects"][0]["state"] == "rejected"
+    assert authority.row["effects"][0]["evidence"] == {
+        "outcome": "not_attempted",
+        "reason": "creation_rootdisk_source_unproven",
+    }
+    assert len(authority.surrenders) == 1
+    assert authority.surrenders[0]["reason"] == "creation_rootdisk_source_unproven"
+    assert (await ctrl._do_create_serialized(payload))["status"] == "creation_attention"
     assert "DataVolume" not in api.writes
 
 

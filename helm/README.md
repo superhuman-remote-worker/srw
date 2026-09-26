@@ -919,6 +919,26 @@ its compatibility before activation. Keep this switch off until the source,
 attachment, cancellation and live acceptance gates in the failed-creation retry
 plan have passed.
 
+For an existing compatible durable-creation deployment, roll out unused-grant
+acknowledgement in this order: apply migrations `0284` and `0285` and upgrade
+all orchestrators that accept the new authority operation while pinning
+`vmController.image.tag` to the currently deployed compatible controller image;
+then upgrade the controller image. The chart renders the controller image
+independently in `helm/templates/vm-controller/deployment.yaml`; this protocol
+needs no new chart flag. An older controller ignores the extra receipt in a
+successful grant. A newer controller talking to an older orchestrator cannot
+surrender a grant and must retain its uncertain effect. This sequence applies
+to the unused-grant extension; the phase-aware-controller prerequisite above
+still applies when introducing that earlier recovery contract.
+
+Only the handler that received a winning grant can acknowledge that it refused
+before entering a create method. Its exact private receipt settles that effect
+as `not_attempted`. An absent Kubernetes object, an old grant without a receipt,
+a lost winning response, and any create method already entered remain uncertain
+and held. An acknowledged grant does not itself release capacity: cancellation
+still follows the normal exact source, disk, attachment and physical-absence
+disposition before releasing the reservation.
+
 Retained-disk restarts can opt into the closed single-NIC NoCloud DHCP profile
 with `vmController.networkProfile.enabled: true` and an explicit
 `vmController.networkProfile.imageAllowlist` of full `repository@sha256:<digest>`
@@ -936,11 +956,21 @@ digest when the profile is enabled.
 A selected profile is frozen in creation intent and inherited by retries, idle
 wakes and retained workspace handoffs even if new admission is later disabled.
 Reuse also requires authenticated first-boot evidence of the effective
-name-only DHCP rule and current guest network identity. Existing disks without
+name-only DHCP rule and current guest network identity. Existing Job disks without
 that immutable profile and proof remain warm at idle release and enter a visible
 recoverable hold on retained successor admission, regardless of the fresh
-admission switch;
-the setting does not migrate or edit their guest configuration.
+admission switch. The setting does not migrate or edit their guest configuration.
+
+Pinned Sessions using durable same-cluster creation and resource enforcement
+select the profile for fresh, unprepared allowlisted images. Readiness and wake
+check the frozen creation source and exact disk, VM, VMI, launcher and network
+receipt; Session receipt reuse also checks the interface MAC. A qualified Session
+disk keeps its original image/profile when the admission flag or allowlist
+changes. Missing or mismatched evidence holds its wake. Unprofiled historical
+Session disks are held when the profile is enabled; with it disabled, their
+existing legacy behavior is preserved. Before enabling this profile for retained
+Session workspaces, verify the exact guest image and a same-PVC restart with a
+changed VMI UID and MAC. Prepared images need separate qualification.
 
 Durable recovery is installed reader-first. Its database records, job projection,
 Retry/Cancel controls, disk retention pins and cleanup guards remain active even

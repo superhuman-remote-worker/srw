@@ -2,7 +2,7 @@
 
 from copy import deepcopy
 from types import SimpleNamespace
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 import yaml
@@ -130,6 +130,40 @@ def test_profile_configuration_requires_explicit_immutable_compatible_image(monk
     changed["vm_image"] = "registry.example/srw-vm:latest"
     with pytest.raises(ValueError):
         resolve_creation_configuration(controller, changed)
+
+
+def test_typed_thread_configuration_can_replay_frozen_profile_after_allowlist_drift(
+    monkeypatch,
+):
+    from shared.vm_network_profile import NETWORK_PROFILE
+    from tests.test_vm_resource_policy import enforcement_snapshot
+
+    controller = _controller(monkeypatch)
+    monkeypatch.setattr(settings, "VM_NAMESPACE", "workers")
+    monkeypatch.setenv(
+        "VM_NETWORK_PROFILE_IMAGE_ALLOWLIST",
+        "registry.example/other@sha256:" + "b" * 64,
+    )
+    request = {**_request(), "entity_type": "thread",
+               "network_profile": NETWORK_PROFILE}
+    policy = enforcement_snapshot()
+    resolved = resolve_creation_configuration(
+        controller, request, _resource_policy_snapshot=policy,
+    )
+    assert resolved["request"]["network_profile"] == NETWORK_PROFILE
+    assert resolved["controller_configuration"]["network_profile_policy"]["image"] == IMAGE
+    with pytest.raises(ValueError):
+        resolve_creation_configuration(controller, request)
+    with pytest.raises(ValueError):
+        resolve_creation_configuration(
+            controller, {**request, "entity_type": "job"},
+            _resource_policy_snapshot=policy,
+        )
+    with pytest.raises(ValueError):
+        resolve_creation_configuration(
+            controller, {**request, "vm_image": "registry.example/srw-vm:latest"},
+            _resource_policy_snapshot=policy,
+        )
 
 
 @pytest.mark.asyncio
@@ -411,7 +445,10 @@ async def test_authenticated_profile_successor_rejects_stale_rule_and_cache(monk
 
 
 @pytest.mark.asyncio
-async def test_first_boot_readiness_requires_profile_rule_and_records_exact_disk(monkeypatch):
+@pytest.mark.parametrize("entity_type", ["job", "thread"])
+async def test_first_boot_readiness_requires_profile_rule_and_records_exact_disk(
+    monkeypatch, entity_type,
+):
     from unittest.mock import AsyncMock
     from orchestrator.services.container_provisioner import WorkspaceRuntimeAttestation
     from orchestrator.services.vm_readiness import VMReadinessService
@@ -421,6 +458,50 @@ async def test_first_boot_readiness_requires_profile_rule_and_records_exact_disk
     vm_uid, pvc_uid = str(uuid4()), str(uuid4())
     vmi_uid, launcher_uid = str(uuid4()), str(uuid4())
     row = candidate(creation_preflight={"request": {"network_profile": NETWORK_PROFILE}})
+    if entity_type == "thread":
+        from shared.vm_creation_issuance import canonical_configuration_digest
+        from shared.vm_creation_retry import canonical_request_digest
+
+        request_id, runtime_generation = str(uuid4()), str(uuid4())
+        request = {
+            "entity_type": "thread", "job_id": row["entity_id"],
+            "provision_generation": GENERATION,
+            "network_profile": NETWORK_PROFILE,
+        }
+        from tests.test_vm_resource_configuration import whole_launcher_configuration
+
+        configuration = whole_launcher_configuration()
+        configuration["network_profile_policy"] = {
+            "version": 1, "image": IMAGE, "profile": NETWORK_PROFILE,
+        }
+        request["vm_image"] = IMAGE
+        source = {
+            "request_id": request_id, "owner_kind": "thread",
+            "thread_id": row["entity_id"],
+            "thread_runtime_generation": runtime_generation,
+            "provision_generation": GENERATION,
+            "canonical_request": request,
+            "request_digest": canonical_request_digest(request),
+            "controller_configuration": configuration,
+            "controller_configuration_digest": canonical_configuration_digest(
+                configuration
+            ),
+        }
+        row["runtime_generation"] = runtime_generation
+        row["vm"].pop("creation_preflight")
+        row["vm"]["creation_request_id"] = request_id
+
+        class ThreadDB(FakeDB):
+            async def fetchrow(self, query, *args):
+                assert "vm_creation_retries" in query
+                assert args == (UUID(request_id), UUID(row["entity_id"]))
+                return source
+
+        def make_db():
+            return ThreadDB(threads=[row])
+    else:
+        def make_db():
+            return FakeDB(jobs=[row])
     status = {
         "ready": True, "phase": "Running", "pod_ip": "10.42.0.10",
         "active_pod_uid": launcher_uid, "vmi_uid": vmi_uid,
@@ -439,7 +520,7 @@ async def test_first_boot_readiness_requires_profile_rule_and_records_exact_disk
     monkeypatch.setattr("orchestrator.services.vm_readiness.seed_ide_config_for_user", AsyncMock(return_value=True))
     qualifier = AsyncMock(return_value=None)
     monkeypatch.setattr("orchestrator.services.vm_readiness.qualify_recovery_successor", qualifier)
-    db = FakeDB(jobs=[row])
+    db = make_db()
     provisioner = FakeProvisioner(status)
     provisioner.attest_workspace_runtime = AsyncMock(return_value=attestation)
     await VMReadinessService(db, provisioner, trigger_dispatch=lambda: None).run_cycle()
@@ -453,7 +534,7 @@ async def test_first_boot_readiness_requires_profile_rule_and_records_exact_disk
             "network_profile_rule": {"network_file_sha256": "a" * 64},
         },
     }
-    db = FakeDB(jobs=[row])
+    db = make_db()
     provisioner = FakeProvisioner(status)
     provisioner.attest_workspace_runtime = AsyncMock(return_value=attestation)
     await VMReadinessService(db, provisioner, trigger_dispatch=lambda: None).run_cycle()
@@ -462,11 +543,18 @@ async def test_first_boot_readiness_requires_profile_rule_and_records_exact_disk
     assert evidence["vm_uid"] == vm_uid
     assert evidence["vmi_uid"] == vmi_uid
     assert evidence["launcher_uid"] == launcher_uid
+    if entity_type == "thread":
+        assert evidence["interface_mac"] == status["interface_mac"]
+    else:
+        assert "interface_mac" not in evidence
     assert evidence["name_only_dhcp"] is True
 
 
 @pytest.mark.asyncio
-async def test_profiled_ready_reprobe_reuses_exact_receipt_and_requalifies_stale_identity(monkeypatch):
+@pytest.mark.parametrize("entity_type", ["job", "thread"])
+async def test_profiled_ready_reprobe_reuses_exact_receipt_and_requalifies_stale_identity(
+    monkeypatch, entity_type,
+):
     from unittest.mock import AsyncMock
     from orchestrator.services.container_provisioner import WorkspaceRuntimeAttestation
     from orchestrator.services.vm_readiness import VMReadinessService
@@ -502,7 +590,52 @@ async def test_profiled_ready_reprobe_reuses_exact_receipt_and_requalifies_stale
     monkeypatch.setattr("orchestrator.services.vm_readiness.seed_ide_config_for_user", seed)
     monkeypatch.setattr("orchestrator.services.vm_readiness.qualify_recovery_successor", qualifier)
     row = candidate(creation_preflight={"request": {"network_profile": NETWORK_PROFILE}})
-    db = FakeDB(jobs=[row])
+    if entity_type == "thread":
+        from shared.vm_creation_issuance import canonical_configuration_digest
+        from shared.vm_creation_retry import canonical_request_digest
+        from tests.test_vm_resource_configuration import whole_launcher_configuration
+
+        request_id, runtime_generation = str(uuid4()), str(uuid4())
+        request = {
+            "entity_type": "thread", "job_id": row["entity_id"],
+            "provision_generation": GENERATION, "vm_image": IMAGE,
+            "network_profile": NETWORK_PROFILE,
+        }
+        configuration = whole_launcher_configuration()
+        configuration["network_profile_policy"] = {
+            "version": 1, "image": IMAGE, "profile": NETWORK_PROFILE,
+        }
+        source = {
+            "request_id": request_id, "owner_kind": "thread",
+            "thread_id": row["entity_id"],
+            "thread_runtime_generation": runtime_generation,
+            "provision_generation": GENERATION,
+            "canonical_request": request,
+            "request_digest": canonical_request_digest(request),
+            "controller_configuration": configuration,
+            "controller_configuration_digest": canonical_configuration_digest(
+                configuration
+            ),
+        }
+        row["runtime_generation"] = runtime_generation
+        row["vm"].pop("creation_preflight")
+        row["vm"]["creation_request_id"] = request_id
+
+        class ThreadDB(FakeDB):
+            async def fetchrow(self, query, *args):
+                assert "vm_creation_retries" in query
+                assert args == (UUID(request_id), UUID(row["entity_id"]))
+                return source
+
+        def make_db(*, ready=False):
+            return ThreadDB(ready_threads=[row] if ready else [],
+                            threads=[] if ready else [row])
+    else:
+        def make_db(*, ready=False):
+            return FakeDB(ready_jobs=[row] if ready else [],
+                          jobs=[] if ready else [row])
+
+    db = make_db()
     provisioner = FakeProvisioner(status)
     provisioner.attest_workspace_runtime = AsyncMock(return_value=attestation)
     service = VMReadinessService(db, provisioner, trigger_dispatch=lambda: None, ready_rescan_s=0)
@@ -517,8 +650,12 @@ async def test_profiled_ready_reprobe_reuses_exact_receipt_and_requalifies_stale
     ready_row = {**row, "vm": ready_vm}
     original_writes = list(provisioner.writes)
     original_registration = db.promotions[0][2]
-    db.jobs.clear()
-    db.ready_jobs = [ready_row]
+    if entity_type == "thread":
+        db.threads.clear()
+        db.ready_threads = [ready_row]
+    else:
+        db.jobs.clear()
+        db.ready_jobs = [ready_row]
     await service.run_cycle()
     assert provisioner.writes == original_writes
     assert len(db.promotions) == 1
@@ -529,7 +666,11 @@ async def test_profiled_ready_reprobe_reuses_exact_receipt_and_requalifies_stale
 
     for stale_receipt in (None, {**receipt, "pvc_uid": str(uuid4())}, {**receipt, "vmi_uid": str(uuid4())}):
         changed_row = {**ready_row, "vm": {**ready_vm, "network_profile_evidence": stale_receipt}}
-        changed_db = FakeDB(ready_jobs=[changed_row])
+        changed_db = make_db(ready=True)
+        if entity_type == "thread":
+            changed_db.ready_threads = [changed_row]
+        else:
+            changed_db.ready_jobs = [changed_row]
         changed_provisioner = FakeProvisioner(status)
         changed_provisioner.attest_workspace_runtime = AsyncMock(return_value=attestation)
         await VMReadinessService(changed_db, changed_provisioner, trigger_dispatch=lambda: None).run_cycle()
@@ -538,9 +679,105 @@ async def test_profiled_ready_reprobe_reuses_exact_receipt_and_requalifies_stale
     assert qualifier.await_count == 4
 
     changed_status = {**status, "vmi_uid": str(uuid4())}
-    changed_db = FakeDB(ready_jobs=[ready_row])
+    changed_db = make_db(ready=True)
+    if entity_type == "thread":
+        changed_db.ready_threads = [ready_row]
+    else:
+        changed_db.ready_jobs = [ready_row]
     changed_provisioner = FakeProvisioner(changed_status)
     changed_provisioner.attest_workspace_runtime = AsyncMock(return_value=attestation)
     await VMReadinessService(changed_db, changed_provisioner, trigger_dispatch=lambda: None).run_cycle()
     assert changed_provisioner.writes[0][3]["status"] == "ssh_pending"
     assert changed_db.promotions == []
+
+    if entity_type == "thread":
+        changed_mac = {**status, "interface_mac": "02:00:00:00:00:42"}
+        changed_db = make_db(ready=True)
+        changed_db.ready_threads = [ready_row]
+        changed_provisioner = FakeProvisioner(changed_mac)
+        changed_provisioner.attest_workspace_runtime = AsyncMock(return_value=attestation)
+        await VMReadinessService(
+            changed_db, changed_provisioner, trigger_dispatch=lambda: None
+        ).run_cycle()
+        assert changed_provisioner.writes[0][3]["status"] == "ssh_pending"
+        assert changed_db.promotions[0][3]["network_profile_evidence"]["interface_mac"] == (
+            "02:00:00:00:00:42"
+        )
+
+
+@pytest.mark.asyncio
+async def test_pinned_thread_wake_release_requires_exact_successor_profile_receipt():
+    from orchestrator.services.vm_thread_network import successor_profile_on_conn
+    from shared.vm_creation_issuance import canonical_configuration_digest
+    from shared.vm_creation_retry import canonical_request_digest
+    from shared.vm_network_profile import NETWORK_PROFILE
+    from tests.test_vm_resource_configuration import whole_launcher_configuration
+
+    thread_id, operation_id, request_id, generation = (uuid4() for _ in range(4))
+    vm_uid, pvc_uid, vmi_uid, launcher_uid = (uuid4() for _ in range(4))
+    request = {
+        "job_id": str(thread_id), "entity_type": "thread",
+        "provision_generation": str(generation), "vm_image": IMAGE,
+        "network_profile": NETWORK_PROFILE,
+    }
+    configuration = whole_launcher_configuration()
+    configuration["network_profile_policy"] = {
+        "version": 1, "image": IMAGE, "profile": NETWORK_PROFILE,
+    }
+    source = {
+        "request_id": request_id, "owner_kind": "thread",
+        "thread_id": thread_id, "provision_generation": generation,
+        "thread_wake_operation_id": operation_id,
+        "expected_pvc_uid": pvc_uid, "observed_pvc_uid": pvc_uid,
+        "observed_vm_uid": vm_uid, "state": "succeeded",
+        "canonical_request": request,
+        "request_digest": canonical_request_digest(request),
+        "controller_configuration": configuration,
+        "controller_configuration_digest": canonical_configuration_digest(
+            configuration
+        ),
+    }
+    operation = {
+        "id": operation_id, "wake_request_id": request_id,
+        "wake_generation": generation, "pvc_uid": pvc_uid,
+    }
+    vm = {
+        "vm_uid": str(vm_uid), "rootdisk_pvc_uid": str(pvc_uid),
+        "vmi_uid": str(vmi_uid), "active_pod_uid": str(launcher_uid),
+        "interface_mac": "02:00:00:00:00:41",
+    }
+    receipt = {
+        "profile": NETWORK_PROFILE,
+        "provision_generation": str(generation),
+        "vm_uid": str(vm_uid), "pvc_uid": str(pvc_uid),
+        "vmi_uid": str(vmi_uid), "launcher_uid": str(launcher_uid),
+        "interface_mac": "02:00:00:00:00:41",
+        "guest_boot_id": str(uuid4()),
+        "cloud_init_instance_id": "instance-one",
+        "cloud_init_cached_instance_id": "instance-one",
+        "network_file_sha256": "a" * 64,
+        "name_only_dhcp": True,
+    }
+
+    class SourceConnection:
+        async def fetchrow(self, query, *args):
+            assert "vm_creation_retries" in query
+            assert args == (request_id, thread_id)
+            return source
+
+    conn = SourceConnection()
+    assert not await successor_profile_on_conn(
+        conn, thread_id=thread_id, operation=operation, vm=vm,
+    )
+    vm["network_profile_evidence"] = {**receipt, "vmi_uid": str(uuid4())}
+    assert not await successor_profile_on_conn(
+        conn, thread_id=thread_id, operation=operation, vm=vm,
+    )
+    vm["network_profile_evidence"] = receipt
+    assert await successor_profile_on_conn(
+        conn, thread_id=thread_id, operation=operation, vm=vm,
+    )
+    source["state"] = "queued"
+    assert not await successor_profile_on_conn(
+        conn, thread_id=thread_id, operation=operation, vm=vm,
+    )

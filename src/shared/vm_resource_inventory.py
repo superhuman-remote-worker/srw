@@ -58,6 +58,10 @@ class InventoryError(ValueError):
     """A fixed safe reason; never return validation details from a raw object."""
 
 
+class SelectedResourceChanged(InventoryError):
+    """Selected live placement evidence conclusively differs from the grant."""
+
+
 def _record(value, fields):
     if not isinstance(value, dict) or set(value) != set(fields):
         raise InventoryError("invalid_inventory")

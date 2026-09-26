@@ -15,6 +15,7 @@ from kubernetes.client import ApiClient
 from kubernetes.client.exceptions import ApiException
 
 from shared.vm_creation_retry import canonical_request_digest
+from shared.vm_creation_unused_grant import NOT_ATTEMPTED_REASONS
 from shared.vm_creation_issuance import (
     canonical_configuration_digest,
     CREATION_INTENT_ANNOTATION,
@@ -1118,43 +1119,96 @@ class CreationActuator:
             )
             if grant.get("actuation_allowed") is not True:
                 return pending
-            if "resource_grant" in values:
-                from shared.vm_resource_admission import ResourceAdmissionError
-                from shared.vm_resource_effect_node import fresh_resource_effect_node
+            # Only a recognized refusal in these guards proves this handler
+            # never entered a create method with its winning grant.
+            try:
+                _effect_stage(kind, "grant_carrier_read")
+                current = await self.read("lease", carrier["metadata"]["name"])
+                if current is not None:
+                    try:
+                        current_values = verify_creation_carrier(
+                            current, secret=self.secret
+                        )
+                    except ValueError as exc:
+                        if type(exc) is CreationUnproven:
+                            raise
+                        raise CreationUnproven("creation_carrier_changed") from None
+                else:
+                    current_values = None
+                if (
+                    not current
+                    or current["metadata"]["uid"] != carrier["metadata"]["uid"]
+                    or current_values != values
+                ):
+                    raise CreationUnproven("creation_carrier_changed")
+                _effect_stage(kind, "grant_previous")
+                await self.exact_previous(row, current)
+                _effect_stage(kind, "grant_disk")
+                disk_name, _, _ = await self.disk(
+                    row, require_attachment=kind != "workspace_attach"
+                )
+                _effect_stage(kind, "grant_absence")
+                await self.require_vm_absent(row)
+                if kind == "workspace_attach":
+                    _effect_stage(kind, "attachment_validate")
+                    try:
+                        await CreationAttachment(self).validate(row, attachment)
+                    except ValueError as exc:
+                        if type(exc) is CreationUnproven:
+                            raise
+                        raise CreationUnproven(
+                            "workspace_attachment_unproven"
+                        ) from None
+                if kind == "rootdisk" or (
+                    kind != "workspace_attach"
+                    and row.get("prepared_origin") is not None
+                ):
+                    _effect_stage(kind, "grant_source_validate")
+                    try:
+                        await sources.validate(row, rootdisk_source)
+                    except ValueError as exc:
+                        if type(exc) is CreationUnproven:
+                            raise
+                        raise CreationUnproven(
+                            "creation_rootdisk_source_unproven"
+                        ) from None
+                if "resource_grant" in values:
+                    from shared.vm_resource_admission import ResourceAdmissionError
+                    from shared.vm_resource_effect_node import targeted_resource_effect_node
 
+                    try:
+                        _mark_creation_stage("resource_node")
+                        await targeted_resource_effect_node(
+                            self.controller,
+                            row,
+                            values["resource_grant"],
+                            pvc_name=disk_name if row["expected_pvc_uid"] else None,
+                        )
+                    except ResourceAdmissionError as exc:
+                        raise CreationUnproven(str(exc)) from None
+            except CreationUnproven as exc:
+                if (
+                    type(exc) is not CreationUnproven
+                    or len(exc.args) != 1
+                    or type(exc.args[0]) is not str
+                    or exc.args[0] not in NOT_ATTEMPTED_REASONS
+                ):
+                    raise
+                receipt = grant.get("issuer_receipt")
+                if type(receipt) is not str:
+                    return pending
                 try:
-                    _mark_creation_stage("resource_node")
-                    await fresh_resource_effect_node(
-                        self.controller,
-                        row,
-                        values["resource_grant"],
+                    await self.authority(
+                        "record-not-attempted",
+                        request_id=row["request_id"],
+                        effect_nonce=values["effect_nonce"],
+                        carrier=carrier,
+                        issuer_receipt=receipt,
+                        reason=exc.args[0],
                     )
-                except ResourceAdmissionError as exc:
-                    raise CreationUnproven(str(exc)) from None
-            # The returned CAS grants only this one API call. Any subsequent
-            # refusal/transport loss remains conservatively issued-unknown.
-            _effect_stage(kind, "grant_carrier_read")
-            current = await self.read("lease", carrier["metadata"]["name"])
-            if (
-                not current
-                or current["metadata"]["uid"] != carrier["metadata"]["uid"]
-                or verify_creation_carrier(current, secret=self.secret) != values
-            ):
-                raise CreationUnproven("creation_carrier_changed")
-            _effect_stage(kind, "grant_previous")
-            await self.exact_previous(row, current)
-            _effect_stage(kind, "grant_disk")
-            await self.disk(row, require_attachment=kind != "workspace_attach")
-            _effect_stage(kind, "grant_absence")
-            await self.require_vm_absent(row)
-            if kind == "workspace_attach":
-                _effect_stage(kind, "attachment_validate")
-                await CreationAttachment(self).validate(row, attachment)
-            if kind == "rootdisk" or (
-                kind != "workspace_attach" and row.get("prepared_origin") is not None
-            ):
-                _effect_stage(kind, "grant_source_validate")
-                await sources.validate(row, rootdisk_source)
+                except Exception:
+                    return pending
+                return pending
             if body is not None:
                 try:
                     _effect_stage(kind, "api_create")

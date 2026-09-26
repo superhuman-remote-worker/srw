@@ -120,8 +120,13 @@ def _passing_evidence() -> dict:
         },
         "replacement": {
             "state": "recovered",
-            "pvc_uid_before": "pvc-1",
-            "pvc_uid_after": "pvc-1",
+            "profiled_fixture": True,
+            "pvc_uid_before": "1535a95e-6dd8-468b-ad16-37e0d9a4aa88",
+            "pvc_uid_after": "1535a95e-6dd8-468b-ad16-37e0d9a4aa88",
+            "vmi_uid_before": "126b3b28-81ca-4841-97bf-8806cc53e772",
+            "vmi_uid_after": "9cb0c155-e71b-4e35-9282-cbcb846b1c0e",
+            "interface_mac_before": "02:00:00:00:00:41",
+            "interface_mac_after": "02:00:00:00:00:42",
             "marker_before": "marker-7",
             "marker_after": "marker-7",
             "checkpoint_before": "checkpoint-9",
@@ -139,7 +144,25 @@ def _passing_evidence() -> dict:
             "resume_receipt": {
                 "kind": "vm_workspace_recovery",
                 "claim_token": 1,
-                "successor": {"ssh_registration_id": "registration-1"},
+                "stop_receipt_digest": "sha256:" + "a" * 64,
+                "successor": {
+                    "ssh_registration_id": "registration-1",
+                    "vmi_uid": "9cb0c155-e71b-4e35-9282-cbcb846b1c0e",
+                    "launcher_uid": "f1fb1665-6b5d-4956-b662-ebd49f4d1267",
+                    "interface_mac": "02:00:00:00:00:42",
+                },
+            },
+            "network_profile_receipt_before": {
+                "vm_uid": "98b88058-9492-4f08-8d51-98571324d11e",
+                "pvc_uid": "1535a95e-6dd8-468b-ad16-37e0d9a4aa88",
+                "vmi_uid": "126b3b28-81ca-4841-97bf-8806cc53e772",
+                "launcher_uid": "e73090a6-9bc6-4c75-9548-b1cae1e9785b",
+            },
+            "network_profile_receipt_after": {
+                "vm_uid": "98b88058-9492-4f08-8d51-98571324d11e",
+                "pvc_uid": "1535a95e-6dd8-468b-ad16-37e0d9a4aa88",
+                "vmi_uid": "9cb0c155-e71b-4e35-9282-cbcb846b1c0e",
+                "launcher_uid": "f1fb1665-6b5d-4956-b662-ebd49f4d1267",
             },
             "retention_pin": {
                 "controller_pin_uid": "pin-1",
@@ -164,6 +187,64 @@ def _passing_evidence() -> dict:
 def test_pass_requires_real_substrate_and_every_api_db_evidence_gate() -> None:
     gate.validate_acceptance_evidence(_passing_evidence())
 
+
+def test_unprofiled_job_receipts_do_not_need_network_profile_fields() -> None:
+    evidence = _passing_evidence()
+    replacement = evidence["replacement"]
+    replacement["profiled_fixture"] = False
+    replacement["network_profile_receipt_before"] = None
+    replacement["network_profile_receipt_after"] = None
+    gate.validate_acceptance_evidence(evidence)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("vmi_uid_after", "126b3b28-81ca-4841-97bf-8806cc53e772"),
+        ("vmi_uid_before", None),
+        ("vmi_uid_after", None),
+        ("vmi_uid_after", "not-a-uuid"),
+        ("interface_mac_after", "02:00:00:00:00:41"),
+        ("interface_mac_after", None),
+        ("interface_mac_after", "02:00:00:00:00:gg"),
+        ("interface_mac_before", None),
+        ("interface_mac_before", "not-a-mac"),
+    ],
+)
+def test_replacement_requires_observed_changed_vmi_and_mac(field, value) -> None:
+    evidence = _passing_evidence()
+    evidence["replacement"][field] = value
+    with pytest.raises(gate.GateFailure):
+        gate.validate_acceptance_evidence(evidence)
+
+
+@pytest.mark.parametrize(
+    ("section", "field", "value"),
+    [
+        ("stop_receipt", "vmi_uid", "9cb0c155-e71b-4e35-9282-cbcb846b1c0e"),
+        ("resume_successor", "vmi_uid", "126b3b28-81ca-4841-97bf-8806cc53e772"),
+        ("resume_successor", "interface_mac", "02:00:00:00:00:43"),
+        ("resume_receipt", "stop_receipt_digest", "sha256:" + "b" * 64),
+        ("network_profile_receipt_before", "vmi_uid", "9cb0c155-e71b-4e35-9282-cbcb846b1c0e"),
+        ("network_profile_receipt_after", "launcher_uid", "e73090a6-9bc6-4c75-9548-b1cae1e9785b"),
+        ("network_profile_receipt_after", "interface_mac", "02:00:00:00:00:43"),
+    ],
+)
+def test_replacement_rejects_stale_stop_resume_or_network_receipt(
+    section, field, value,
+) -> None:
+    evidence = _passing_evidence()
+    replacement = evidence["replacement"]
+    target = (
+        replacement["resume_receipt"]["successor"]
+        if section == "resume_successor" else replacement[section]
+    )
+    target[field] = value
+    with pytest.raises(gate.GateFailure):
+        gate.validate_acceptance_evidence(evidence)
+
+
+def test_existing_evidence_gates_still_reject_missing_or_conflicting_values() -> None:
     mutations = (
         ("substrate", "longhorn", False),
         ("substrate", "longhorn_workloads_ready", False),
@@ -201,6 +282,7 @@ def test_pass_requires_real_substrate_and_every_api_db_evidence_gate() -> None:
         ("replacement", "resume_receipt", {}),
         ("replacement", "retention_pin", {}),
         ("replacement", "network_qualified", False),
+        ("replacement", "network_profile_receipt_before", None),
         ("replacement", "root_pv_csi_driver", "hostpath.csi.k8s.io"),
         ("replacement", "longhorn_volume_healthy", False),
     )

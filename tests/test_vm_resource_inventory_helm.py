@@ -206,21 +206,59 @@ def test_whole_launcher_policy_is_one_digest_and_exact_namespaced_rbac(tmp_path)
     assert left == right
     canonical = json.loads(left)
     assert canonical["policy"] == policy
-    settings = InventorySettings.from_environment({
-        "VM_RESOURCE_ADMISSION_CONFIG": left, "VM_LIFECYCLE_HMAC_SECRET": "s" * 32,
-    })
+    settings = InventorySettings.from_environment(
+        {
+            "VM_RESOURCE_ADMISSION_CONFIG": left,
+            "VM_LIFECYCLE_HMAC_SECRET": "s" * 32,
+        }
+    )
     assert settings.protocol == 2
     for deployment in (controller, _orchestrator(docs)):
-        assert deployment["spec"]["template"]["metadata"]["annotations"]["checksum/vm-resource-policy"] == settings.policy_digest.removeprefix("sha256:")
-    installation = next(doc for doc in docs if doc["kind"] == "Role" and doc["metadata"]["name"].endswith("resource-installation"))
+        assert deployment["spec"]["template"]["metadata"]["annotations"][
+            "checksum/vm-resource-policy"
+        ] == settings.policy_digest.removeprefix("sha256:")
+    installation = next(
+        doc
+        for doc in docs
+        if doc["kind"] == "Role"
+        and doc["metadata"]["name"].endswith("resource-installation")
+    )
     assert installation["metadata"]["namespace"] == "kubevirt"
-    assert installation["rules"] == [{
-        "apiGroups": ["kubevirt.io"], "resources": ["kubevirts"],
-        "resourceNames": ["kubevirt"], "verbs": ["get"],
-    }]
+    assert installation["rules"] == [
+        {
+            "apiGroups": ["kubevirt.io"],
+            "resources": ["kubevirts"],
+            "resourceNames": ["kubevirt"],
+            "verbs": ["get"],
+        }
+    ]
+    observer = next(
+        doc
+        for doc in docs
+        if doc["kind"] == "ClusterRole"
+        and doc["metadata"]["name"].endswith("resource-observer")
+    )
+    assert observer["rules"] == [
+        {
+            "apiGroups": [""],
+            "resources": ["nodes", "pods", "persistentvolumes"],
+            "verbs": ["list"],
+        },
+        {
+            "apiGroups": ["storage.k8s.io"],
+            "resources": ["storageclasses"],
+            "verbs": ["list"],
+        },
+        {"apiGroups": [""], "resources": ["persistentvolumes"], "verbs": ["get"]},
+        {
+            "apiGroups": ["storage.k8s.io"],
+            "resources": ["storageclasses"],
+            "verbs": ["get"],
+        },
+    ]
 
 
-def test_enabled_policy_matches_both_processes_and_rbac_is_list_only():
+def test_protocol_one_policy_matches_both_processes_and_rbac_is_list_only():
     import yaml
 
     result = enabled()
