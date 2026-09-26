@@ -61,11 +61,17 @@ Build your image `FROM` an SRW base image so it inherits that contract.
   `workspace.imagePullTimeoutSeconds` (default 600 seconds). A pod the cluster
   itself rejects (a `ResourceQuota` or `LimitRange` 403) fails at once with the
   cluster's own message. A Job fails with "Workspace image `<ref>` could not be
-  pulled: `<reason>`"; a Session logs the reason and retries on its next
-  workspace check. The job dispatcher creates Job containers one at a time, so
-  while a custom image is still pulling, dispatch of other Jobs waits up to
-  that budget — prefer small images, and lower the budget if that matters to
-  you.
+  pulled: `<reason>`", and its pod, service and volume are then cleaned up
+  within about a minute. Deleting the Job during that minute may return 503
+  once; retry and it succeeds. The job dispatcher creates Job containers one at
+  a time, so while a custom image is still pulling, dispatch of other Jobs
+  waits up to that budget — prefer small images, and lower the budget if that
+  matters to you.
+- **A Session can't recover from a pull failure.** A Session whose image can't
+  be pulled logs the reason, and its workspace then stays stuck: it isn't
+  retried, and the Session can't be ended or deleted from the UI or the API.
+  An operator has to remove it. Test a new image with a Job first: a Job fails
+  cleanly with the message and its resources are cleaned up.
 
 ## Privilege
 
