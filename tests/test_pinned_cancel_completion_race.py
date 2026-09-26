@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from tests import b08_completion_helpers as b08_helpers
 
 from unittest.mock import AsyncMock, MagicMock
@@ -14,6 +15,7 @@ from orchestrator import main
 from orchestrator.database.postgres import PostgresDB
 from orchestrator.services import completion
 from tests import test_completion_control_real_postgres as postgres_fixtures
+from tests import test_container_recovery_retention_real_postgres as retention
 from tests.test_job_completion_endpoint_wrapper import (
     _patch_normal_route_dependencies,
     _route_job,
@@ -39,12 +41,16 @@ class _RacingPostgres:
         PostgresDB._emit_workspace_recovery_cancel
     )
     _queue_job_for_resume_on_conn = PostgresDB._queue_job_for_resume_on_conn
+    _hold_workspace_recovery_attention = PostgresDB._hold_workspace_recovery_attention
+    transaction_scope = PostgresDB.transaction_scope
 
     def __init__(self, pool, job, *, race_at="update_job_status"):
         self.pool = pool
+        self._pool = pool
         self.job = job
         self.race_at = race_at
         self.cancelled = False
+        self.cancelled_context = None
         self.read_statuses = []
         self.status_write_attempts = []
         self.delete_checkpoint_thread = AsyncMock()
@@ -54,7 +60,23 @@ class _RacingPostgres:
         self.increment_job_llm_outage_attempt = AsyncMock(return_value={"attempt": 1})
 
     def acquire(self):
-        return self.pool.acquire()
+        return PostgresDB.acquire(self)
+
+    async def prepare_dead_workspace_recovery(self, job_id, **kwargs):
+        await self._cancel_before("prepare_dead_workspace_recovery")
+        return await PostgresDB.prepare_dead_workspace_recovery(self, job_id, **kwargs)
+
+    async def hold_exhausted_workspace_recovery(self, job_id, **kwargs):
+        await self._cancel_before("hold_exhausted_workspace_recovery")
+        return await PostgresDB.hold_exhausted_workspace_recovery(
+            self, job_id, **kwargs
+        )
+
+    async def hold_unavailable_workspace_recovery(self, job_id, **kwargs):
+        await self._cancel_before("hold_unavailable_workspace_recovery")
+        return await PostgresDB.hold_unavailable_workspace_recovery(
+            self, job_id, **kwargs
+        )
 
     async def get_job(self, job_id):
         async with self.acquire() as conn:
@@ -75,6 +97,12 @@ class _RacingPostgres:
             completion_commands_enabled=False,
         )
         self.cancelled = True
+        async with self.acquire() as conn:
+            self.cancelled_context = json.loads(
+                await conn.fetchval(
+                    "SELECT context FROM jobs WHERE id=$1", UUID(self.job["id"])
+                )
+            )
 
     async def update_job_status(self, job_id, **kwargs):
         self.status_write_attempts.append(kwargs)
@@ -95,6 +123,15 @@ class _RacingPostgres:
 
 
 async def _database(pg, *, context=None, race_at="update_job_status"):
+    if context is not None and "workspace_container" in context:
+        native = PostgresDB()
+        native._pool = pg
+        _, job = await retention.recovery_job(
+            native, attempts=context["workspace_container"].get("recovery_attempts", 0)
+        )
+        return _RacingPostgres(
+            pg, {**_route_job(), **job, "id": str(job["id"])}, race_at=race_at
+        )
     async with pg.acquire() as conn:
         job_id = await conn.fetchval(
             "INSERT INTO jobs (description,status,execution_lane) "
@@ -160,8 +197,14 @@ async def test_real_postgres_recovery_pause_loss_stops_completion_tail(
 ):
     db = await _database(
         pg,
-        context={"vm": {"requested": True}} if recovery == "vm" else {},
-        race_at="pause_job_shed_freeze" if recovery == "pod" else "pause_job",
+        context=(
+            {"vm": {"requested": True}}
+            if recovery == "vm"
+            else {"workspace_container": {}}
+            if recovery == "pod"
+            else {}
+        ),
+        race_at="prepare_dead_workspace_recovery" if recovery == "pod" else "pause_job",
     )
     terminal, cleanup = _isolate(monkeypatch, db)
     monkeypatch.setattr(
@@ -210,7 +253,11 @@ async def test_real_postgres_pod_recovery_exhaustion_loses_before_delete(
     monkeypatch, pg
 ):
     monkeypatch.setenv("WORKSPACE_RECOVERY_MAX_ATTEMPTS", "3")
-    db = await _database(pg, context={"workspace_container": {"recovery_attempts": 3}})
+    db = await _database(
+        pg,
+        context={"workspace_container": {"recovery_attempts": 3}},
+        race_at="hold_exhausted_workspace_recovery",
+    )
     job = await db.get_job(db.job["id"])
     delete = AsyncMock(return_value=True)
     dispatch = MagicMock()
@@ -237,7 +284,11 @@ async def test_real_postgres_pod_recovery_loses_before_context_or_delete(pg, pod
     db = await _database(
         pg,
         context={"workspace_container": {"host": "test-workspace", "port": 22}},
-        race_at="pause_job_shed_freeze",
+        race_at=(
+            "hold_unavailable_workspace_recovery"
+            if pod_alive
+            else "prepare_dead_workspace_recovery"
+        ),
     )
     job = await db.get_job(db.job["id"])
     delete = AsyncMock(return_value=True)
@@ -257,12 +308,18 @@ async def test_real_postgres_pod_recovery_loses_before_context_or_delete(pg, pod
     assert (await db.get_job(job["id"]))["status"] == "cancelled"
     async with db.acquire() as conn:
         assert (
-            await conn.fetchval(
-                "SELECT context->'workspace_container' FROM jobs WHERE id=$1",
-                UUID(job["id"]),
+            json.loads(
+                await conn.fetchval(
+                    "SELECT context->'workspace_container' FROM jobs WHERE id=$1",
+                    UUID(job["id"]),
+                )
             )
-            is None
+            == db.cancelled_context["workspace_container"]
         )
+    assert (
+        db.cancelled_context["workspace_container"]["_runtime_incarnation"]
+        == job["context"]["workspace_container"]["_runtime_incarnation"]
+    )
     db.merge_workspace_container_context.assert_not_awaited()
     db.delete_checkpoint_thread.assert_not_awaited()
     delete.assert_not_awaited()

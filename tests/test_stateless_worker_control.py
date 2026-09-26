@@ -456,6 +456,7 @@ async def test_create_job_explicit_lane_is_bound_and_invalid_lane_rejected(monke
 async def test_leased_cancel_publishes_status_without_pruning_checkpoint():
     conn = MagicMock()
     conn.transaction.return_value = _AsyncCM()
+    conn.execute = AsyncMock(return_value="UPDATE 1")
 
     async def fetchrow(sql, *_args):
         normalized = " ".join(sql.split())
@@ -490,6 +491,10 @@ async def test_leased_cancel_publishes_status_without_pruning_checkpoint():
     # A response-lost retry after cleanup cleared the marker must be able to
     # re-arm idempotent cleanup instead of waiting the full settle timeout.
     assert "status::text <> 'cancelled' OR NOT" in cancel_sql
+    conn.execute.assert_awaited_once()
+    marker_sql, marker_job_id = conn.execute.await_args.args
+    assert "_stateless_cancel_cleanup_pending" in marker_sql
+    assert marker_job_id == UUID(JOB_ID)
 
 
 @pytest.mark.asyncio
