@@ -3178,6 +3178,14 @@ class ContainerProvisioner:
             ):
                 return False
 
+            if pinned_intent.get("retained_source_attempt_id") is not None:
+                if not await self._db.admit_retained_pinned_workspace_creation_effects(
+                    owner.id,
+                    runtime_generation=pinned_runtime_generation,
+                    attempt_id=pinned_attempt_id,
+                ):
+                    return False
+
         # Workspace storage (Branch a): PVC-backed for BOTH owner kinds when
         # WORKSPACE_PVC_ENABLED — the volume is named by the owner UUID, survives
         # pod crashes, and reattaches by that deterministic name on recreate
@@ -9543,8 +9551,6 @@ class ContainerProvisioner:
         )
         if not exact:
             return {"state": "replacement", "uid": None}
-        if getattr(metadata, "deletion_timestamp", None) is not None:
-            return {"state": "exact_deleting", "uid": uid}
         opposite_owner = "srw/job-id" if owner.kind == "session" else "srw/thread-id"
         fence_labels = self._workspace_provision_fence_labels(
             owner=owner,
@@ -9580,6 +9586,8 @@ class ContainerProvisioner:
             )
         ):
             return {"state": "replacement", "uid": None}
+        if getattr(metadata, "deletion_timestamp", None) is not None:
+            return {"state": "exact_deleting", "uid": uid}
         return {"state": "exact_fence" if fence else "exact_original", "uid": uid}
 
     async def _delete_workspace_provision_resource_exact(
@@ -9842,6 +9850,7 @@ class ContainerProvisioner:
         intent: Mapping[str, Any],
         *,
         permanent: bool,
+        expected_retirement_token: str | None = None,
     ) -> dict[str, str | None] | None:
         """Close every potential create from one revoked pinned attempt."""
 
@@ -9871,6 +9880,99 @@ class ContainerProvisioner:
             return None
         if not names["pod"]:
             return None
+        if self._db is not None or intent.get("cleanup_disposition") is not None:
+            if self._db is None or not expected_retirement_token:
+                return None
+            current = await self._db.revoke_pinned_thread_workspace_provision_intent(
+                thread_id,
+                expected_runtime_generation=runtime_generation,
+                expected_retirement_token=expected_retirement_token,
+                expected_attempt_id=attempt_id,
+            )
+            if not isinstance(current, Mapping) or any(
+                str(current.get(key) or "") != str(intent.get(key) or "")
+                for key in (
+                    "status",
+                    "pod_name",
+                    "pod_uid",
+                    "pvc_name",
+                    "pvc_uid",
+                    "seed_configmap_name",
+                    "seed_configmap_uid",
+                    "fence_pod_uid",
+                    "fence_pvc_uid",
+                    "fence_configmap_uid",
+                    "fence_service_uid",
+                    "service_name",
+                    "service_uid",
+                    "namespace",
+                    "network_tier",
+                    "cleanup_disposition",
+                    "cleanup_retirement_token",
+                    "retained_pvc_uid",
+                    "retained_service_uid",
+                    "retained_source_attempt_id",
+                    "creation_effects_admitted_at",
+                )
+            ):
+                return None
+        if intent.get("cleanup_disposition") is not None:
+            if intent.get("cleanup_disposition") != (
+                "purge" if permanent else "retain"
+            ):
+                return None
+            if intent.get(
+                "pod_uid"
+            ) and not await self._stop_pinned_workspace_provision_pod(
+                intent, expected_retirement_token=expected_retirement_token
+            ):
+                return None
+            if not intent.get("pod_uid") and not (
+                intent.get("retained_source_attempt_id") is not None
+                and intent.get("creation_effects_admitted_at") is None
+            ):
+                return None
+            if not permanent:
+                # Issued storage UIDs are durable authority even though this
+                # failed-start attempt never published an authenticated binding.
+                for resource in ("pvc", "service"):
+                    uid = str(
+                        intent.get(f"{resource}_uid") or retained.get(resource) or ""
+                    )
+                    if names[resource] and not uid:
+                        return None
+                    if not uid:
+                        continue
+                    observed = await self._workspace_provision_resource_authority(
+                        owner=owner,
+                        resource=resource,
+                        name=names[resource],
+                        namespace=namespace,
+                        runtime_generation=runtime_generation,
+                        attempt_id=attempt_id,
+                        network_tier=network_tier,
+                    )
+                    if (
+                        observed.get("state") != "exact_original"
+                        or observed.get("uid") != uid
+                    ):
+                        # A restored retained object carries its source's labels.
+                        if uid != retained.get(
+                            resource
+                        ) or not await self._retained_pinned_resource_is_exact(
+                            owner,
+                            resource=resource,
+                            name=names[resource],
+                            namespace=namespace,
+                            uid=uid,
+                        ):
+                            return None
+                    retained[resource] = uid
+            else:
+                for resource in ("pvc", "service"):
+                    retained[resource] = str(
+                        intent.get(f"{resource}_uid") or ""
+                    ) or retained.get(resource)
         fences: dict[str, str | None] = {
             "fence_pod_uid": str(intent.get("fence_pod_uid") or "") or None,
             "fence_pvc_uid": str(intent.get("fence_pvc_uid") or "") or None,
@@ -9954,6 +10056,120 @@ class ContainerProvisioner:
                 return None
             fences[fence_field] = fence_uid
         return fences
+
+    async def _retained_pinned_resource_is_exact(
+        self,
+        owner: WorkspaceOwner,
+        *,
+        resource: str,
+        name: str,
+        namespace: str,
+        uid: str,
+    ) -> bool:
+        reader = {
+            "pvc": self._core_api.read_namespaced_persistent_volume_claim,
+            "service": self._core_api.read_namespaced_service,
+        }.get(resource)
+        if reader is None:
+            return False
+        try:
+            observed = await self._bounded_kubernetes_call(
+                reader, name=name, namespace=namespace
+            )
+            metadata = observed.metadata
+            return bool(
+                metadata.uid == uid
+                and metadata.name == name
+                and metadata.namespace == namespace
+                and metadata.deletion_timestamp is None
+                and metadata.labels.get(owner.label_key) == owner.id
+                and metadata.labels.get("srw/component")
+                == f"workspace-{'pvc' if resource == 'pvc' else 'svc'}"
+            )
+        except Exception:
+            return False
+
+    async def _stop_pinned_workspace_provision_pod(
+        self, intent: Mapping[str, Any], *, expected_retirement_token: str
+    ) -> bool:
+        """Retain stop evidence for an unpublished Pod before releasing its finalizer."""
+        owner = WorkspaceOwner.session(str(intent["thread_id"]))
+        namespace, pod_name, uid = (
+            str(intent[key]) for key in ("namespace", "pod_name", "pod_uid")
+        )
+        authority = dict(
+            expected_runtime_generation=str(intent["runtime_generation"]),
+            expected_retirement_token=expected_retirement_token,
+            expected_attempt_id=str(intent["attempt_id"]),
+            namespace=namespace,
+            pod_name=pod_name,
+            pod_uid=uid,
+        )
+        proven = await self._db.pinned_workspace_provision_stop_is_current(
+            owner.id, **authority
+        )
+        try:
+            pod = await self._bounded_kubernetes_call(
+                self._core_api.read_namespaced_pod, name=pod_name, namespace=namespace
+            )
+        except Exception as exc:
+            return bool(getattr(exc, "status", None) == 404 and proven)
+        observed = await self._workspace_provision_resource_authority(
+            owner=owner,
+            resource="pod",
+            name=pod_name,
+            namespace=namespace,
+            runtime_generation=authority["expected_runtime_generation"],
+            attempt_id=authority["expected_attempt_id"],
+            network_tier=str(intent["network_tier"]),
+        )
+        if observed.get("state") == "exact_fence":
+            return bool(proven)
+        if (
+            observed.get("state") not in {"exact_original", "exact_deleting"}
+            or observed.get("uid") != uid
+        ):
+            return False
+        if not proven and not self._has_stateless_process_zero_finalizer(pod):
+            return False
+        if not await self._delete_workspace_provision_resource_exact(
+            resource="pod", name=pod_name, namespace=namespace, uid=uid
+        ):
+            return False
+        try:
+            pod = await self._bounded_kubernetes_call(
+                self._core_api.read_namespaced_pod, name=pod_name, namespace=namespace
+            )
+        except Exception as exc:
+            return bool(getattr(exc, "status", None) == 404 and proven)
+        if str(pod.metadata.uid) != uid or not _pod_has_exact_process_zero(pod):
+            return False
+        if not await self._db.pinned_workspace_provision_stop_is_current(
+            owner.id, **authority, record=True
+        ):
+            return False
+        finalizers = list(pod.metadata.finalizers or [])
+        if STATELESS_WORKSPACE_PROCESS_ZERO_FINALIZER not in finalizers:
+            return True
+        index = finalizers.index(STATELESS_WORKSPACE_PROCESS_ZERO_FINALIZER)
+        try:
+            await self._bounded_kubernetes_call(
+                self._core_api.patch_namespaced_pod,
+                name=pod_name,
+                namespace=namespace,
+                body=[
+                    {"op": "test", "path": "/metadata/uid", "value": uid},
+                    {
+                        "op": "test",
+                        "path": f"/metadata/finalizers/{index}",
+                        "value": STATELESS_WORKSPACE_PROCESS_ZERO_FINALIZER,
+                    },
+                    {"op": "remove", "path": f"/metadata/finalizers/{index}"},
+                ],
+            )
+            return True
+        except Exception:
+            return False
 
     async def delete_pinned_workspace_provision_fences_exact(
         self, intent: Mapping[str, Any]

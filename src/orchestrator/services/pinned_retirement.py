@@ -1468,6 +1468,7 @@ class PinnedRetirementOperations:
         fences = await self.dependencies.container_provisioner.fence_pinned_workspace_provision_intent(
             current,
             permanent=permanent,
+            expected_retirement_token=token,
         )
         if not isinstance(fences, Mapping):
             raise RuntimeError("workspace provision name fencing is retryable")
@@ -1671,6 +1672,12 @@ class PinnedRetirementOperations:
             captured_binding, Mapping
         ):
             return False
+        try:
+            workspace_create_pending = (
+                self._captured_workspace_provision_intent(retirement) is not None
+            )
+        except RuntimeError:
+            return False
         workspace_backend = str(context.get("workspace_backend") or "sandbox")
         virtual_binding_agent_zero_only = (
             self._captured_virtual_binding_agent_zero_only(
@@ -1846,7 +1853,12 @@ class PinnedRetirementOperations:
                     quiescence_actor="orchestrator",
                 )
                 return receipt is not None
-            if not workspace and (not binding or virtual_binding_agent_zero_only):
+            if workspace_create_pending or (
+                not workspace and (not binding or virtual_binding_agent_zero_only)
+            ):
+                # Pending create has its own exact Pod-stop/fence obligation.
+                # This receipt covers only the separately captured agent; the
+                # End funnel must still retire the unpublished workspace intent.
                 receipt = await self.dependencies.store.acknowledge_pinned_thread_local_quiescence(
                     thread_id,
                     expected_runtime_generation=generation,

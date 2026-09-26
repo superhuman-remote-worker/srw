@@ -371,6 +371,8 @@ async def stale_agent_detector(
     # Restarting the detector safely resets this scheduling hint.
     initial_retirement_cursor: tuple[datetime, str] | None = None
     initial_retirement_batch_size = 25
+    pinned_retirement_cursor: tuple[datetime, str] | None = None
+    pinned_retirement_batch_size = 25
 
     while not shutdown_event.is_set():
         try:
@@ -596,13 +598,25 @@ async def stale_agent_detector(
                 "pending_pinned_retirements",
                 dependencies.store.list_retryable_pinned_retirements(
                     grace_seconds=PINNED_RETIREMENT_RETRY_GRACE_SECONDS,
-                    limit=25,
+                    limit=pinned_retirement_batch_size,
                     proven_grace_seconds=PINNED_RETIREMENT_PROVEN_RETRY_GRACE_SECONDS,
+                    after=pinned_retirement_cursor,
                 ),
             )
             if pending_retirements:
                 retired = 0
                 for candidate in pending_retirements:
+                    if (
+                        isinstance(candidate, Mapping)
+                        and isinstance(
+                            candidate.get("runtime_retirement_started_at"), datetime
+                        )
+                        and candidate.get("id")
+                    ):
+                        pinned_retirement_cursor = (
+                            candidate["runtime_retirement_started_at"],
+                            str(candidate["id"]),
+                        )
                     if isinstance(candidate, Mapping) and await _step(
                         "retry_pending_pinned_retirement",
                         retry_pending_pinned_retirement(
@@ -621,6 +635,11 @@ async def stale_agent_detector(
                         "this pass; each refusal is logged above",
                         unresolved,
                     )
+            if (
+                pending_retirements is not None
+                and len(pending_retirements) < pinned_retirement_batch_size
+            ):
+                pinned_retirement_cursor = None
 
             # An admitted initial stateless End needs no claimant drain or
             # SSH endpoint. Retry its full End funnel, including business

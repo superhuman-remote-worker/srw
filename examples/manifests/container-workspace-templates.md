@@ -143,9 +143,31 @@ cleans up after itself; a Session doesn't (see below).
   physical deletion may take more than one pass.
 
   This applies only to an open initial creation with exact resource identity.
-  Pinned startup failures, missing Pod identity, restored or previously retained
-  workspaces, closed historical creations, and historical Ready workspaces with
-  an open reservation remain outside this recovery path.
+  Missing Pod identity, restored or previously retained stateless workspaces,
+  closed historical creations, and historical Ready workspaces with an open
+  reservation remain outside this recovery path.
+- **Pinned Sessions can End a failed workspace creation.** Normal End retains the
+  exact PVC and Service while retiring the recorded Pod, including when an
+  agent attached after workspace creation began. Permanent End purges that
+  storage. Accepted End requests remain durable after a disconnect and retry
+  through the background reconciler.
+
+  Resume waits until the previous creation's inert resource fences have passed
+  their ten-minute request horizon and normal cleanup removes them. During this
+  wait the API returns `workspace_predecessor_cleanup_pending` with a
+  `retry_after` time. The Session remains ended; Resume has not been accepted
+  or scheduled, so retry it after cleanup finishes. Permanent End remains
+  available during the wait.
+
+  Once Resume is accepted, it claims one successor creation with the exact retained
+  PVC and Service. A lost response reuses that claim. End remains available
+  before the successor starts, and another pull failure preserves the same
+  storage. A failed restart follows the same flow. Ready still requires
+  authenticated workspace readiness. Resume requires the original creation
+  plan; changed image or template settings may hold creation until those
+  original settings are restored. A missing
+  or replaced resource, missing issued Pod identity, or unproven process stop
+  leaves an explicit cleanup hold; `force` does not bypass that evidence.
 
 ## Privilege
 

@@ -4084,32 +4084,16 @@ async def test_planned_agent_create_intent_cannot_be_reissued_after_end_begins(d
 
 
 @pytest.mark.asyncio
-async def test_planned_workspace_create_is_fenced_before_soft_settlement(db):
-    """An admitted multi-object create is external authority, not fake process exposure."""
+async def test_planned_workspace_create_is_fenced_before_soft_settlement(
+    db, monkeypatch
+):
+    """An issued create settles only after its exact Pod stops and is fenced."""
 
-    ids = await _seed(db, bind_agent=False, publish_agent_pod=False)
-    before = await db.get_thread(ids["thread"])
-    generation = str(before["runtime_generation"])
-    attempt = str(uuid4())
-    pod_name = f"ws-thread-{ids['thread'][:12]}"
-    intent = await db.reserve_pinned_thread_workspace_provision_intent(
-        ids["thread"],
-        expected_runtime_generation=generation,
-        expected_agent_id=None,
-        expected_attach_token=None,
-        expected_workspace_context=None,
-        expected_binding_context=None,
-        attempt_id=attempt,
-        namespace="superhuman-remote-worker",
-        pod_name=pod_name,
-        pvc_name=None,
-        seed_configmap_name=None,
-        service_name=None,
-        retained_service_uid=None,
-        network_tier="internet-only",
-        manifest_fingerprint="a" * 64,
-    )
-    assert intent is not None and str(intent["attempt_id"]) == attempt
+    from tests import test_pinned_failed_start_end_real_postgres as failed_start
+
+    ids, cluster, provider, intent = await failed_start._failed_start(db, monkeypatch)
+    generation = str(intent["runtime_generation"])
+    attempt = str(intent["attempt_id"])
     pending = await db.get_thread(ids["thread"])
     assert pending["runtime_authority_exposed"] is False
     assert _json(pending["metadata"])["workspace_container"] == {
@@ -4143,16 +4127,25 @@ async def test_planned_workspace_create_is_fenced_before_soft_settlement(db):
         expected_attempt_id=attempt,
     )
     assert revoked is not None and revoked["status"] == "revoking"
-    fence_uid = str(uuid4())
+    assert not await db.settle_pinned_thread_retirement(
+        ids["thread"],
+        token=retirement["token"],
+        generation=generation,
+        final_status="ended",
+    )
+    fences = await provider.fence_pinned_workspace_provision_intent(
+        revoked, permanent=False, expected_retirement_token=retirement["token"]
+    )
+    assert fences is not None
+    fence_uid = fences["fence_pod_uid"]
+    assert fence_uid != intent["pod_uid"]
+    assert cluster.objects["pvc"].metadata.uid == intent["pvc_uid"]
     assert await db.fence_pinned_thread_workspace_provision_intent(
         ids["thread"],
         expected_runtime_generation=generation,
         expected_retirement_token=retirement["token"],
         expected_attempt_id=attempt,
-        fence_pod_uid=fence_uid,
-        fence_pvc_uid=None,
-        fence_configmap_uid=None,
-        fence_service_uid=None,
+        **fences,
         permanent=False,
     )
     assert await db.settle_pinned_thread_retirement(
@@ -4178,83 +4171,28 @@ async def test_planned_workspace_create_is_fenced_before_soft_settlement(db):
     assert fence["gc_after"] is not None
     assert not await db.retire_pinned_thread_workspace_provision_fence(
         attempt,
-        expected_fence_pod_uid=fence_uid,
-        expected_fence_pvc_uid=None,
-        expected_fence_configmap_uid=None,
-        expected_fence_service_uid=None,
+        **{f"expected_{key}": value for key, value in fences.items()},
     )
 
 
 @pytest.mark.asyncio
-async def test_permanent_workspace_create_fence_survives_thread_delete(db):
-    ids = await _seed(db, bind_agent=False, publish_agent_pod=False)
-    before = await db.get_thread(ids["thread"])
-    generation = str(before["runtime_generation"])
-    attempt = str(uuid4())
-    assert await db.reserve_pinned_thread_workspace_provision_intent(
-        ids["thread"],
-        expected_runtime_generation=generation,
-        expected_agent_id=None,
-        expected_attach_token=None,
-        expected_workspace_context=None,
-        expected_binding_context=None,
-        attempt_id=attempt,
-        namespace="superhuman-remote-worker",
-        pod_name=f"ws-thread-{ids['thread'][:12]}",
-        pvc_name=None,
-        seed_configmap_name=None,
-        service_name=None,
-        retained_service_uid=None,
-        network_tier="internet-only",
-        manifest_fingerprint="b" * 64,
-    )
-    retirement = await db.begin_pinned_thread_retirement(ids["thread"], permanent=True)
-    assert retirement["state"] == "pending"
-    assert await db.authorize_pinned_thread_retirement(
-        ids["thread"],
-        token=retirement["token"],
-        generation=generation,
-        settle_status="ended",
-    )
-    assert await db.revoke_pinned_thread_workspace_provision_intent(
-        ids["thread"],
-        expected_runtime_generation=generation,
-        expected_retirement_token=retirement["token"],
-        expected_attempt_id=attempt,
-    )
-    fence_uid = str(uuid4())
-    assert await db.fence_pinned_thread_workspace_provision_intent(
-        ids["thread"],
-        expected_runtime_generation=generation,
-        expected_retirement_token=retirement["token"],
-        expected_attempt_id=attempt,
-        fence_pod_uid=fence_uid,
-        fence_pvc_uid=None,
-        fence_configmap_uid=None,
-        fence_service_uid=None,
-        permanent=True,
-    )
-    assert await db.clear_pinned_retirement_physical_runtime_endpoint(
-        ids["thread"],
-        runtime_generation=generation,
-        retirement_token=retirement["token"],
-        completed_external_cleanup_protocol="workspace_provision_fence_v1",
-    )
-    await db.delete_thread(
-        ids["thread"],
-        expected_runtime_retirement_token=retirement["token"],
-        expected_runtime_generation=generation,
-    )
+async def test_permanent_workspace_create_fence_survives_thread_delete(db, monkeypatch):
+    from tests import test_pinned_failed_start_end_real_postgres as failed_start
+
+    ids, cluster, provider, intent = await failed_start._failed_start(db, monkeypatch)
+    await failed_start._retire_unbound(db, provider, ids["thread"], permanent=True)
     assert await db.get_thread(ids["thread"]) is None
     async with db.acquire() as conn:
         retained = await conn.fetchrow(
-            "SELECT thread_id,status,fence_pod_uid FROM "
-            "thread_workspace_provision_intents WHERE attempt_id=$1::uuid",
-            UUID(attempt),
+            "SELECT thread_id,status,fence_pod_uid,purge_completed_at FROM "
+            "thread_workspace_provision_intents WHERE attempt_id=$1",
+            intent["attempt_id"],
         )
     assert str(retained["thread_id"]) == ids["thread"]
     assert retained["status"] == "fenced"
-    assert retained["fence_pod_uid"] == fence_uid
+    assert retained["purge_completed_at"] is not None
+    assert retained["fence_pod_uid"] != intent["pod_uid"]
+    assert retained["fence_pod_uid"] == cluster.objects["pod"].metadata.uid
 
 
 @pytest.mark.asyncio

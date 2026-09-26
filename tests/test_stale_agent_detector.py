@@ -1259,6 +1259,7 @@ async def test_sweep_reports_unresolved_pinned_retirements(caplog):
         grace_seconds=detector.PINNED_RETIREMENT_RETRY_GRACE_SECONDS,
         limit=25,
         proven_grace_seconds=detector.PINNED_RETIREMENT_PROVEN_RETRY_GRACE_SECONDS,
+        after=None,
     )
     unresolved = [r for r in caplog.records if "remain unresolved" in r.getMessage()]
     assert len(unresolved) == 1
@@ -2191,3 +2192,54 @@ async def test_initial_retirement_cursor_survives_retry_and_discovery_failures(
     ]
     assert retry.await_count == 50
     assert db.gc_offline_agents.await_count == 4
+
+
+@pytest.mark.asyncio
+async def test_pinned_retirement_scan_reaches_later_candidates_after_refusals(
+    monkeypatch,
+):
+    from datetime import datetime, timezone
+    from uuid import uuid4
+
+    class ImmediateCadence(asyncio.Event):
+        async def wait(self):
+            if not self.is_set():
+                raise asyncio.TimeoutError()
+            return True
+
+    shutdown = ImmediateCadence()
+    db = _mock_db(shutdown)
+    rows = [
+        {
+            "id": str(uuid4()),
+            "runtime_retirement_started_at": datetime.now(timezone.utc),
+        }
+        for _ in range(26)
+    ]
+    requests = []
+    attempted = []
+
+    async def discover(**kwargs):
+        requests.append(kwargs.get("after"))
+        if len(requests) == 4:
+            shutdown.set()
+        if len(requests) == 2:
+            raise RuntimeError("discovery unavailable")
+        return rows[25:] if kwargs.get("after") is not None else rows[:25]
+
+    async def retry(candidate, **_):
+        attempted.append(candidate["id"])
+        if candidate is rows[0]:
+            raise RuntimeError("candidate unavailable")
+        return candidate is rows[-1]
+
+    db.mark_stale_agents_offline = AsyncMock(return_value=[])
+    db.list_retryable_pinned_retirements = AsyncMock(side_effect=discover)
+    monkeypatch.setattr(detector, "retry_pending_pinned_retirement", retry)
+    await detector.stale_agent_detector(
+        shutdown, dependencies=_detector_dependencies(db)
+    )
+
+    assert rows[-1]["id"] in attempted
+    cursor = (rows[24]["runtime_retirement_started_at"], rows[24]["id"])
+    assert requests == [None, cursor, cursor, None]

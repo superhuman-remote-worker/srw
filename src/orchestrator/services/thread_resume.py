@@ -536,11 +536,27 @@ async def resume_thread(
                 status_code=503,
                 detail="Stateless workspace lifecycle lock acquisition timed out",
             ) from exc
-    elif not await postgres_db.resume_thread(thread_id):
-        raise HTTPException(
-            status_code=409,
-            detail="Thread could not be resumed while workspace cleanup is active",
+    else:
+        wait_probe = getattr(
+            type(postgres_db), "get_pinned_retained_creation_wait", None
         )
+        pending_fence = (
+            await wait_probe(postgres_db, thread_id) if callable(wait_probe) else None
+        )
+        if pending_fence is not None:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "code": "workspace_predecessor_cleanup_pending",
+                    "message": "Workspace cleanup is still waiting for prior creation requests to expire. The session remains ended; retry Resume after cleanup finishes.",
+                    "retry_after": pending_fence["gc_after"].isoformat(),
+                },
+            )
+        if not await postgres_db.resume_thread(thread_id):
+            raise HTTPException(
+                status_code=409,
+                detail="Thread could not be resumed while workspace cleanup is active",
+            )
 
     # The pre-resume owner snapshot is terminal by construction. Every
     # provisioning decision below must use the exact row reopened by the

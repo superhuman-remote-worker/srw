@@ -20891,8 +20891,17 @@ class PostgresDB:
                         str(existing["status"]) == "planned"
                         and str(existing["runtime_generation"])
                         == str(parsed_generation)
-                        and existing["created_agent_id"] == parsed_agent
-                        and existing["created_attach_token"] == parsed_attach
+                        and (
+                            (
+                                existing["created_agent_id"] == parsed_agent
+                                and existing["created_attach_token"] == parsed_attach
+                            )
+                            or (
+                                existing["retained_source_attempt_id"] is not None
+                                and existing["created_agent_id"] is None
+                                and existing["created_attach_token"] is None
+                            )
+                        )
                         and str(existing["namespace"]) == parsed_namespace
                         and str(existing["pod_name"]) == parsed_pod_name
                         and existing["pvc_name"] == parsed_pvc_name
@@ -20971,6 +20980,10 @@ class PostgresDB:
                 previous_binding = current_binding or {}
                 retained_generation: UUID | None = None
                 retained_pvc_uid: str | None = None
+                if metadata.get("_pinned_retained_creation_attempt") is not None:
+                    # Retained Resume atomically reserves its one successor in
+                    # SQL. A metadata pointer cannot authorize another create.
+                    return None
                 if previous_binding:
                     kind = previous_binding.get("kind")
                     backing_id = str(previous_binding.get("backing_id") or "")
@@ -21129,8 +21142,18 @@ class PostgresDB:
                     in {"created", "active", "awaiting_user", "suspended"}
                     and thread["runtime_generation"] == parsed_generation
                     and thread["runtime_retirement_token"] is None
-                    and thread["agent_id"] == intent["created_agent_id"]
-                    and thread["runtime_attach_token"] == intent["created_attach_token"]
+                    and (
+                        (
+                            thread["agent_id"] == intent["created_agent_id"]
+                            and thread["runtime_attach_token"]
+                            == intent["created_attach_token"]
+                        )
+                        or (
+                            intent["retained_source_attempt_id"] is not None
+                            and intent["created_agent_id"] is None
+                            and intent["created_attach_token"] is None
+                        )
+                    )
                     and isinstance(workspace, dict)
                     and str(workspace.get("_workspace_provision_attempt") or "")
                     == str(parsed_attempt)
@@ -21263,8 +21286,18 @@ class PostgresDB:
                     in {"created", "active", "awaiting_user", "suspended"}
                     and thread["runtime_generation"] == parsed_generation
                     and thread["runtime_retirement_token"] is None
-                    and thread["agent_id"] == intent["created_agent_id"]
-                    and thread["runtime_attach_token"] == intent["created_attach_token"]
+                    and (
+                        (
+                            thread["agent_id"] == intent["created_agent_id"]
+                            and thread["runtime_attach_token"]
+                            == intent["created_attach_token"]
+                        )
+                        or (
+                            intent["retained_source_attempt_id"] is not None
+                            and intent["created_agent_id"] is None
+                            and intent["created_attach_token"] is None
+                        )
+                    )
                     and isinstance(workspace, dict)
                     and str(workspace.get("_workspace_provision_attempt") or "")
                     == str(parsed_attempt)
@@ -21320,6 +21353,7 @@ class PostgresDB:
                 updated_metadata = dict(metadata)
                 updated_metadata["workspace_container"] = ready
                 updated_metadata["_workspace_binding"] = binding
+                updated_metadata.pop("_pinned_retained_creation_attempt", None)
                 updated = await conn.execute(
                     "UPDATE threads SET metadata=$4::jsonb,last_activity=now() "
                     "WHERE id=$1::uuid AND runtime_generation=$2::uuid "
@@ -21367,7 +21401,7 @@ class PostgresDB:
         async with self.acquire() as conn:
             async with conn.transaction():
                 row = await conn.fetchrow(
-                    "SELECT runtime_retirement_context FROM threads "
+                    "SELECT runtime_retirement_context,runtime_retirement_permanent FROM threads "
                     "WHERE id=$1::uuid AND execution_lane='pinned' "
                     "AND runtime_generation=$2::uuid "
                     "AND runtime_retirement_token=$3::uuid "
@@ -21403,21 +21437,209 @@ class PostgresDB:
                     and str(intent["runtime_generation"]) == str(parsed_generation)
                 ):
                     return None
+                disposition = (
+                    "purge" if row["runtime_retirement_permanent"] else "retain"
+                )
                 if str(intent["status"]) in {"revoking", "fenced", "retired"}:
+                    if (
+                        intent["retained_resume_generation"] is not None
+                        or intent["retained_successor_attempt_id"] is not None
+                    ):
+                        return None
+                    if (
+                        intent["cleanup_disposition"] is None
+                        and intent["status"] == "revoking"
+                    ):
+                        adopted = await conn.fetchrow(
+                            "UPDATE thread_workspace_provision_intents SET "
+                            "cleanup_disposition=$2,cleanup_retirement_token=$3 "
+                            "WHERE attempt_id=$1 RETURNING *",
+                            parsed_attempt,
+                            disposition,
+                            parsed_retirement,
+                        )
+                        return dict(adopted)
+                    if (
+                        intent["cleanup_disposition"] == "retain"
+                        and disposition == "purge"
+                    ):
+                        if str(intent["status"]) not in {"fenced", "retired"}:
+                            return None
+                        upgraded = await conn.fetchrow(
+                            "UPDATE thread_workspace_provision_intents SET "
+                            "cleanup_disposition='purge',cleanup_retirement_token=$2 "
+                            "WHERE attempt_id=$1 RETURNING *",
+                            parsed_attempt,
+                            parsed_retirement,
+                        )
+                        return dict(upgraded)
+                    if intent["cleanup_disposition"] is not None and (
+                        intent["cleanup_disposition"] != disposition
+                        or intent["cleanup_retirement_token"] != parsed_retirement
+                    ):
+                        return None
                     return dict(intent)
                 if str(intent["status"]) != "planned":
                     return None
                 changed = await conn.execute(
                     "UPDATE thread_workspace_provision_intents "
-                    "SET status='revoking' "
+                    "SET status='revoking',cleanup_disposition=$2,cleanup_retirement_token=$3 "
                     "WHERE attempt_id=$1::uuid AND status='planned'",
                     parsed_attempt,
+                    disposition,
+                    parsed_retirement,
                 )
                 if changed != "UPDATE 1":
                     raise RuntimeError("workspace intent revocation lost")
                 refreshed = dict(intent)
                 refreshed["status"] = "revoking"
+                refreshed["cleanup_disposition"] = disposition
+                refreshed["cleanup_retirement_token"] = parsed_retirement
                 return refreshed
+
+    async def pinned_workspace_provision_stop_is_current(
+        self,
+        thread_id: str,
+        *,
+        expected_runtime_generation: str,
+        expected_retirement_token: str,
+        expected_attempt_id: str,
+        namespace: str,
+        pod_name: str,
+        pod_uid: str,
+        record: bool = False,
+    ) -> bool:
+        """Revalidate intent retirement before admitting/replaying exact Pod stop.
+
+        Only the Kubernetes adapter passes ``record=True`` after a positive
+        process-stop observation. An older proof may replay across a permanent
+        upgrade, but every destructive use still owns the current token.
+        """
+        try:
+            thread, generation, token, attempt = (
+                UUID(str(value))
+                for value in (
+                    thread_id,
+                    expected_runtime_generation,
+                    expected_retirement_token,
+                    expected_attempt_id,
+                )
+            )
+        except (ValueError, TypeError):
+            return False
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                current = await conn.fetchrow(
+                    "SELECT runtime_retirement_context FROM threads WHERE id=$1 "
+                    "AND execution_lane='pinned' AND runtime_generation=$2 "
+                    "AND runtime_retirement_token=$3 "
+                    "AND runtime_retirement_authorized_at IS NOT NULL FOR UPDATE",
+                    thread,
+                    generation,
+                    token,
+                )
+                intent = await conn.fetchrow(
+                    "SELECT * FROM thread_workspace_provision_intents WHERE attempt_id=$1 FOR UPDATE",
+                    attempt,
+                )
+                if current is None or intent is None:
+                    return False
+                context = _strict_json_object(
+                    current["runtime_retirement_context"], label="retirement context"
+                )
+                captured = context.get("workspace_provision_intent")
+                if not (
+                    isinstance(captured, dict)
+                    and str(captured.get("attempt_id") or "") == str(attempt)
+                    and captured.get("pod_uid") == pod_uid
+                    and intent["thread_id"] == thread
+                    and intent["runtime_generation"] == generation
+                    and intent["cleanup_retirement_token"] == token
+                    and intent["status"] in {"revoking", "fenced", "retired"}
+                    and intent["namespace"] == namespace
+                    and intent["pod_name"] == pod_name
+                    and intent["pod_uid"] == pod_uid
+                    and bool(pod_uid)
+                    and intent["retained_resume_generation"] is None
+                    and intent["retained_successor_attempt_id"] is None
+                ):
+                    return False
+                if record:
+                    await conn.execute(
+                        "INSERT INTO thread_workspace_provision_stop_receipts "
+                        "(attempt_id,thread_id,runtime_generation,retirement_token,namespace,pod_name,pod_uid) "
+                        "SELECT $1,$2,$3,$4,$5,$6,$7 WHERE NOT EXISTS "
+                        "(SELECT 1 FROM thread_workspace_provision_stop_receipts WHERE attempt_id=$1) "
+                        "ON CONFLICT DO NOTHING",
+                        attempt,
+                        thread,
+                        generation,
+                        token,
+                        namespace,
+                        pod_name,
+                        pod_uid,
+                    )
+                return bool(
+                    await conn.fetchval(
+                        "SELECT EXISTS (SELECT 1 FROM thread_workspace_provision_stop_receipts "
+                        "WHERE attempt_id=$1 AND thread_id=$2 AND runtime_generation=$3 "
+                        "AND namespace=$4 AND pod_name=$5 AND pod_uid=$6)",
+                        attempt,
+                        thread,
+                        generation,
+                        namespace,
+                        pod_name,
+                        pod_uid,
+                    )
+                )
+
+    async def admit_retained_pinned_workspace_creation_effects(
+        self, thread_id: str, *, runtime_generation: str, attempt_id: str
+    ) -> bool:
+        """Serialize first retained-successor effects against durable End."""
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                thread = await conn.fetchrow(
+                    "SELECT metadata FROM threads WHERE id=$1::uuid "
+                    "AND runtime_generation=$2::uuid AND execution_lane='pinned' "
+                    "AND runtime_retirement_token IS NULL "
+                    "AND status IN ('created','active','awaiting_user','suspended') "
+                    "AND metadata->'workspace_container'->>'_workspace_provision_attempt'=$3 "
+                    "AND metadata->'workspace_container'->>'_workspace_provision_generation'=($2::uuid)::text FOR UPDATE",
+                    thread_id,
+                    runtime_generation,
+                    attempt_id,
+                )
+                if thread is None:
+                    return False
+                return bool(
+                    await conn.fetchval(
+                        "UPDATE thread_workspace_provision_intents SET "
+                        "creation_effects_admitted_at=COALESCE(creation_effects_admitted_at,now()) "
+                        "WHERE attempt_id=$1::uuid AND thread_id=$2::uuid "
+                        "AND runtime_generation=$3::uuid AND retained_source_attempt_id IS NOT NULL "
+                        "AND status='planned' RETURNING true",
+                        attempt_id,
+                        thread_id,
+                        runtime_generation,
+                    )
+                )
+
+    async def get_pinned_retained_creation_wait(
+        self, thread_id: str
+    ) -> Dict[str, Any] | None:
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT intent.gc_after FROM threads thread "
+                "JOIN thread_workspace_provision_intents intent ON "
+                "intent.attempt_id::text=thread.metadata->>'_pinned_retained_creation_attempt' "
+                "AND intent.thread_id=thread.id AND intent.runtime_generation=thread.runtime_generation "
+                "WHERE thread.id=$1::uuid AND thread.execution_lane='pinned' "
+                "AND thread.status='ended' AND thread.runtime_retirement_token IS NULL "
+                "AND intent.status='fenced' AND intent.cleanup_disposition='retain'",
+                thread_id,
+            )
+        return dict(row) if row is not None else None
 
     async def fence_pinned_thread_workspace_provision_intent(
         self,
@@ -21541,6 +21763,11 @@ class PostgresDB:
                     and (
                         intent["pvc_name"] is None
                         or (not permanent and intent["retained_pvc_uid"] is not None)
+                        or (
+                            not permanent
+                            and intent["cleanup_disposition"] == "retain"
+                            and intent["pvc_uid"] is not None
+                        )
                         or intent_status == "retired"
                         or fences["fence_pvc_uid"]
                     )
@@ -21552,6 +21779,11 @@ class PostgresDB:
                         intent["service_name"] is None
                         or (
                             not permanent and intent["retained_service_uid"] is not None
+                        )
+                        or (
+                            not permanent
+                            and intent["cleanup_disposition"] == "retain"
+                            and intent["service_uid"] is not None
                         )
                         or intent_status == "retired"
                         or fences["fence_service_uid"]
@@ -21617,6 +21849,15 @@ class PostgresDB:
                                 "workspace intent fence publication lost"
                             )
 
+                if (
+                    permanent
+                    and intent["cleanup_disposition"] == "purge"
+                    and intent["purge_completed_at"] is None
+                ):
+                    await conn.execute(
+                        "UPDATE thread_workspace_provision_intents SET purge_completed_at=now() WHERE attempt_id=$1",
+                        parsed_attempt,
+                    )
                 if not permanent:
                     binding_unchanged = dict(
                         metadata.get("_workspace_binding") or {}
@@ -21654,6 +21895,13 @@ class PostgresDB:
                     )
                     updated_metadata = dict(metadata)
                     updated_metadata["workspace_container"] = cleared
+                    if intent["cleanup_disposition"] == "retain" and (
+                        intent["pvc_uid"] is not None
+                        or intent["retained_pvc_uid"] is not None
+                    ):
+                        updated_metadata["_pinned_retained_creation_attempt"] = str(
+                            parsed_attempt
+                        )
                     updated = await conn.execute(
                         "UPDATE threads SET metadata=$4::jsonb,last_activity=now() "
                         "WHERE id=$1::uuid AND runtime_generation=$2::uuid "
@@ -38543,17 +38791,24 @@ class PostgresDB:
                         and (
                             str(workspace_intent_row["status"]) != "planned"
                             or (
-                                created_agent_text
-                                == (
-                                    str(thread["agent_id"])
-                                    if thread.get("agent_id") is not None
-                                    else None
+                                (
+                                    created_agent_text is None
+                                    and created_attach_text is None
                                 )
-                                and created_attach_text
-                                == (
-                                    str(thread["runtime_attach_token"])
-                                    if thread.get("runtime_attach_token") is not None
-                                    else None
+                                or (
+                                    created_agent_text
+                                    == (
+                                        str(thread["agent_id"])
+                                        if thread.get("agent_id") is not None
+                                        else None
+                                    )
+                                    and created_attach_text
+                                    == (
+                                        str(thread["runtime_attach_token"])
+                                        if thread.get("runtime_attach_token")
+                                        is not None
+                                        else None
+                                    )
                                 )
                             )
                         )
@@ -42333,6 +42588,12 @@ class PostgresDB:
                 ):
                     return False
                 stateless = str(thread["execution_lane"] or "") == "stateless"
+                if not stateless and await conn.fetchval(
+                    "SELECT EXISTS(SELECT 1 FROM thread_workspace_provision_intents "
+                    "WHERE thread_id=$1::uuid AND status IN ('planned','revoking','fenced'))",
+                    thread_id,
+                ):
+                    return False
                 resume_creation_mode: str | None = None
                 if stateless:
                     from shared.session_retirement import (
@@ -43552,6 +43813,7 @@ class PostgresDB:
         grace_seconds: int = 900,
         limit: int = 25,
         proven_grace_seconds: int | None = None,
+        after: tuple[datetime, str] | None = None,
     ) -> list[Dict[str, Any]]:
         """Return durable retirements whose local runtime can no longer finish.
 
@@ -43636,12 +43898,16 @@ class PostgresDB:
                        )
                    )
                    AND (t.agent_id IS NULL OR a.id IS NULL OR a.status = 'offline')
+                   AND ($4::timestamptz IS NULL OR
+                        (t.runtime_retirement_started_at,t.id) > ($4,$5::uuid))
                  ORDER BY t.runtime_retirement_started_at ASC, t.id ASC
                  LIMIT $2
                 """,
                 float(bounded_grace),
                 bounded_limit,
                 None if bounded_proven_grace is None else float(bounded_proven_grace),
+                after[0] if after is not None else None,
+                UUID(after[1]) if after is not None else None,
             )
         return [dict(row) for row in rows]
 

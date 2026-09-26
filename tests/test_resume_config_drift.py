@@ -539,3 +539,35 @@ class TestResumeConfigDrift:
         assert DS_CORRUPT not in str(exc.value.detail)
         fake_db.resume_thread.assert_not_awaited()
         fake_db.record_thread_config_drift_ack.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_retained_creation_wait_preserves_ended_and_does_not_schedule_resume(
+    user_a, thread_a, fake_db, fake_request, monkeypatch
+):
+    from datetime import datetime, timezone
+    from tests._b09_control_seams import resume_thread
+
+    thread = _ended_thread(thread_a)
+    thread["execution_lane"] = "pinned"
+    until = datetime.now(timezone.utc)
+
+    async def pending_fence(self, thread_id):
+        assert thread_id == str(thread["id"])
+        return {"gc_after": until}
+
+    monkeypatch.setattr(
+        type(fake_db), "get_pinned_retained_creation_wait", pending_fence, raising=False
+    )
+    with _patch_caller_and_db(user_a, fake_db):
+        with patch(
+            "orchestrator.services.thread_resume.thread_config_drift", _fake_drift([])
+        ):
+            with pytest.raises(HTTPException) as refused:
+                await resume_thread(str(thread["id"]), fake_request)
+    assert refused.value.status_code == 409
+    assert refused.value.detail["code"] == "workspace_predecessor_cleanup_pending"
+    assert refused.value.detail["retry_after"] == until.isoformat()
+    assert thread["status"] == "ended"
+    assert thread["runtime_generation"] == ENDED_RUNTIME_GENERATION
+    fake_db.resume_thread.assert_not_awaited()
