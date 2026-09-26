@@ -245,5 +245,266 @@
     "testImages": "Removed from the local podman store, the srw-registry repositories and the k3d node image cache",
     "valuesLocalRestored": true,
     "dockerfileWorkspaceDiff": "none"
+  },
+  "final_tree_reverification": {
+    "status": "passed-with-concerns",
+    "statusNote": "Cases 1-4, 6 and 7 passed. Case 5 failed in part: a virtual template with an image gets a pre-existing 500, not the new 422; the new wording is live for the inputs that reach it.",
+    "date": "2026-09-26",
+    "window": "09:20-09:51 UTC",
+    "context": "k3d-srw",
+    "namespace": "srw",
+    "commit": "29742cbbf7d53d19ec19820c3be36293a4cba770",
+    "newSinceFirstPass": ["ec9e4c746", "52496c16c", "f588d6509", "e6ab0cead", "f4bbbdd50", "29742cbbf"],
+    "idPolicy": "As above: Job, Session, Project and Pod identifiers are the first 10 hex characters of sha256(id); Pods by UID, PVCs by name.",
+    "stack": {
+      "orchestratorFilesMatchCommit": true,
+      "filesCompared": "29 orchestrator-image .py files changed since 4b8ffb120 match by md5 (the 3 src/vm_controller files are not in this image); the uvicorn worker started after the last sync and every file still matched after both rollouts",
+      "workspacePvcEnabled": true,
+      "workspaceFuseEnabled": true,
+      "workspaceFusePrivileged": true,
+      "customImagesPrivileged": false,
+      "statelessSessionEnabled": true,
+      "installationImageTag": "tilt-da53b66ad07059d3",
+      "chatModel": "MiniMax-M3"
+    },
+    "testImage": {
+      "reference": "srw-registry:5000/srw-a1-test:1",
+      "base": "installation workspace image (srw-registry:5000/srw-workspace:tilt-da53b66ad07059d3)",
+      "addedTool": "hello (Ubuntu package)",
+      "digest": "sha256:f7820d9d4735476f5bd967b799b71508d0f501d94957057fceef196be78187c6"
+    },
+    "phase1Settings": {"imagePullTimeoutSeconds": 600, "trustedImageRepositories": []},
+    "phase2Settings": {
+      "values": {"workspace.imagePullTimeoutSeconds": 60, "workspace.images.trustedRepositories": ["srw-registry:5000/srw-a1-test:1"]},
+      "orchestratorEnv": {"WORKSPACE_IMAGE_PULL_TIMEOUT_SECONDS": "60", "WORKSPACE_TRUSTED_IMAGE_REPOSITORIES": "[\"srw-registry:5000/srw-a1-test:1\"]"},
+      "inPodTrustedRepositories": ["srw-registry:5000/srw-a1-test", "srw-registry:5000/srw-workspace"],
+      "restored": {"valuesLocalMd5MatchesBackup": true, "WORKSPACE_IMAGE_PULL_TIMEOUT_SECONDS": "600", "WORKSPACE_TRUSTED_IMAGE_REPOSITORIES": "[]", "inPodTrustedRepositories": ["srw-registry:5000/srw-workspace"]}
+    },
+    "cases": [
+      {
+        "case": "1-job-custom-image",
+        "result": "passed",
+        "job": "68f7d49cde",
+        "observed": {
+          "frozenPolicy": {"cpu": 1, "image": "srw-registry:5000/srw-a1-test:1", "memory": "3Gi", "storage": "15Gi", "pull_policy": "IfNotPresent"},
+          "image": "srw-registry:5000/srw-a1-test:1",
+          "imagePullPolicy": "IfNotPresent",
+          "requests": {"cpu": "250m", "memory": "3Gi"},
+          "limits": {"cpu": "1 (API-canonical form of the rendered 1000m)", "memory": "3Gi"},
+          "privileged": "absent",
+          "capabilitiesAdd": ["CHOWN", "DAC_OVERRIDE", "FOWNER", "SETGID", "SETUID", "NET_BIND_SERVICE", "SYS_CHROOT", "KILL", "AUDIT_WRITE"],
+          "sysAdmin": false,
+          "allowPrivilegeEscalation": true,
+          "seccompProfile": "RuntimeDefault",
+          "devFuseVolume": false,
+          "buildShaLabel": false,
+          "workspaceVolume": "PVC",
+          "pvcRequestAndCapacity": "15Gi",
+          "secondsFromCreateToReady": 18.6,
+          "helloInPod": "Hello, world!"
+        },
+        "teardown": {"cancelStatus": 503, "cancelDetail": "Workspace authority retirement is incomplete", "jobStatusAfterCancel": "cancelled", "podAndPvcGoneWithinSeconds": 5, "serviceGoneWithinSeconds": 40, "deleteStatus": 200, "kubernetesResourcesLeft": 0},
+        "note": "The cancel 503 is not A1: the default-image control Job (case 2) and the trusted-image Job (case 6) return the same 503 while the cancel takes effect."
+      },
+      {
+        "case": "2-job-control-default-image",
+        "result": "passed",
+        "job": "4bd91d9088",
+        "template": {"backend": "sandbox"},
+        "observed": {
+          "image": "installation image",
+          "imagePullPolicy": "IfNotPresent",
+          "requests": {"cpu": "500m", "memory": "1Gi"},
+          "limits": {"cpu": "2", "memory": "4Gi"},
+          "privileged": true,
+          "capabilitiesAddIncludesSysAdmin": true,
+          "seccompProfile": "Unconfined",
+          "devFuseVolume": true,
+          "pvcRequest": "10Gi",
+          "secondsFromCreateToReady": 16
+        },
+        "teardown": {"cancelStatus": 503, "jobStatusAfterCancel": "cancelled", "deleteStatus": 200, "kubernetesResourcesLeft": 0}
+      },
+      {
+        "case": "3-session-stateless-end-resume",
+        "result": "passed",
+        "session": "91db846fc7",
+        "lane": "stateless",
+        "recreation": "End (pod retired, PVC kept) then Resume (new pod on the same PVC)",
+        "observed": {
+          "podBefore": "576a1992e2",
+          "podAfter": "4d584a117a",
+          "identicalAcrossRecreation": ["image", "imagePullPolicy", "requests", "limits", "privileged false", "no SYS_ADMIN", "allowPrivilegeEscalation true", "seccomp RuntimeDefault", "no dev-fuse", "no build-sha label", "workspace PVC"],
+          "image": "srw-registry:5000/srw-a1-test:1",
+          "requests": {"cpu": "250m", "memory": "3Gi"},
+          "limits": {"cpu": "1", "memory": "3Gi"},
+          "pvc": {"hash": "a7b278c520", "size": "15Gi", "sameClaimAfterResume": true},
+          "helloInPod": "Hello, world! (before End and after Resume)"
+        },
+        "teardown": "Permanent delete returned 503 'Stateless workspace retirement remains incomplete', End then 409 'A different stateless retirement intent is still pending', and a permanent delete 20 s later 200; no Kubernetes resources left"
+      },
+      {
+        "case": "4-session-patch-guard",
+        "result": "passed",
+        "route": "PATCH /api/persistent/threads/{id}/config",
+        "evilPatch": {"workspace": {"backend": "sandbox", "sandbox": {"image": "evil.example/x:1", "cpu": 64}}},
+        "virtualStateless": {
+          "session": "6638991159",
+          "evilPatch": {"status": 409, "detail": "A stateless session cannot change its workspace tier through generic config mutation"},
+          "bareUpgrade": {"status": 409, "detail": "A stateless session cannot change its workspace tier through generic config mutation"},
+          "sandboxBlockWithoutBackend": {"status": 422, "detail": "Session settings cannot change the captured container image or resources; create a new session with the selected workspace."},
+          "snapshotUnchanged": true
+        },
+        "virtualPinned": {
+          "session": "ed6fea48c7",
+          "howPinned": "Conference class on a temporary officer-less Project (d22f635794); ended before patching because the route refuses a connected pinned Session",
+          "whileConnected": {"status": 409, "detail": "Session is connected to an agent ..."},
+          "evilPatchAfterEnd": {"status": 422, "detail": "Session settings cannot change the captured container image or resources; create a new session with the selected workspace."},
+          "evilVmPatchAfterEnd": {"status": 422, "detail": "Session settings cannot change the captured VM image or resources; create a new session with the selected workspace."},
+          "snapshotUnchanged": true
+        },
+        "tierUpgrade": {
+          "productRoute": "The cockpit's upgrade verb is a WebSocket control to a pinned agent, whose live sandbox hot-upgrade refuses on Kubernetes ('use the normal pause/redispatch path'); a stateless Session has no control socket and its config PATCH refuses a tier change (409). What remains is the owner config PATCH with a bare backend on a disconnected pinned Session, the same fragment the agent persists after a live upgrade.",
+          "patch": {"workspace": {"backend": "sandbox"}},
+          "status": 200,
+          "frozenAfter": {"generation": 2, "workspace": {"template": {"inline": {"backend": "sandbox"}}}, "threadConfigWorkspace": {"backend": "sandbox"}},
+          "podAfterResume": {"pod": "cbd34bcd8b", "image": "installation image", "requests": {"cpu": "500m", "memory": "1Gi"}, "limits": {"cpu": "2", "memory": "4Gi"}, "privileged": true, "capabilitiesAddIncludesSysAdmin": true, "devFuseVolume": true, "seccompProfile": "Unconfined", "pvcRequest": "10Gi"}
+        },
+        "sandboxSession": {
+          "session": "91db846fc7",
+          "sameBackendSandboxChange": {"status": 422, "detail": "Session settings cannot change the captured container image or resources; create a new session with the selected workspace."},
+          "sandboxOnlyChange": {"status": 422},
+          "backendChangeCarryingSandbox": {"status": 409, "detail": "A stateless session cannot change its workspace tier through generic config mutation"},
+          "snapshotUnchanged": true
+        },
+        "snapshotCheck": "srw_execution_specs generation, revision and md5 of document and resolved, the revision-row count and threads.metadata.config_override.workspace were identical before and after every refused PATCH",
+        "note": "The 52496c16c comparison (backend change carrying sandbox or vm) is reachable only on the pinned lane; on the stateless lane the older tier guard refuses first with 409. Both leave the snapshot unchanged."
+      },
+      {
+        "case": "5-refusals",
+        "result": "failed-in-part",
+        "surfaces": ["POST /api/jobs", "POST /api/persistent/threads", "POST /api/persistent/threads/preview", "POST /api/persistent/tool-groups/preview (session)", "POST /api/persistent/tool-groups/preview (worker)"],
+        "sideDoor": {
+          "result": "passed",
+          "status": 422,
+          "combinations": "config_override.workspace.container and .sandbox on all five surfaces",
+          "detail": "config_override.workspace.<container|sandbox> are no longer supported. Put the image and resources in a WorkspaceTemplate (environment.image, resources) and select it with `workspace`."
+        },
+        "prepare": {
+          "result": "passed",
+          "status": 422,
+          "inputs": ["environment.prepare", "environment.cache: Rebuild"],
+          "detail": "Container templates can't run prepare steps. Build your own image FROM an SRW base image and name it in environment.image (see examples/manifests/container-workspace-templates.md)."
+        },
+        "liteTemplate": {
+          "result": "failed-as-specified",
+          "virtualWithImage": {
+            "template": {"backend": "virtual", "environment": {"image": "srw-registry:5000/srw-a1-test:1"}},
+            "createStatus": 500,
+            "createDetail": "Virtual workspaces do not support OS images, initialization or allocated compute.",
+            "previewStatus": 500,
+            "previewDetail": "Internal server error"
+          },
+          "newWordingReached": {
+            "inputs": [{"backend": "virtual", "resources": {"storage": "5Gi"}}, {"backend": "virtual", "resources": {}}],
+            "status": 422,
+            "surfaces": "all five",
+            "detail": "SRW template images and resources require backend sandbox or vm; initialization requires backend vm."
+          },
+          "rootCause": "select_execution_workspace resolves the template (LiveManifestResolver.selection -> shared/manifests/resolution.py:236-247, from b58616cf0 on 2026-09-09) before srw_workspace_config. For a virtual template with environment, cpu, memory or initialize the resolver raises ManifestError, a ValueError rather than an HTTPException: job admission's catch-all turns it into 500 and the preview routes leave it unhandled. The e6ab0cead unit test calls srw_workspace_config directly, so it never meets the resolver. The new wording is live but only for inputs the resolver lets through."
+        },
+        "extra": {
+          "noneTemplateWithImage": "422 from request validation ('workspace must be null or a manifest template/instanceRef binding') on the create routes and the threads preview; 500 on the tool-groups preview (ValueError from validate_workspace_selection at manifest_workspace_selection.py:216, uncaught; from 349b150ca5 on 2026-09-10)",
+          "ordinaryPreviewStatus": 200,
+          "validCustomTemplatePreviewStatus": 200,
+          "rowsCreatedByProbes": 0
+        }
+      },
+      {
+        "case": "6-trusted-entry-with-tag",
+        "result": "passed",
+        "job": "1b06657b19",
+        "settings": "phase 2 (trusted entry written with its tag)",
+        "observed": {
+          "image": "srw-registry:5000/srw-a1-test:1",
+          "privileged": true,
+          "capabilitiesAddIncludesSysAdmin": true,
+          "devFuseVolume": true,
+          "devFuseMount": "/dev/fuse",
+          "seccompProfile": "Unconfined",
+          "requests": {"cpu": "250m", "memory": "3Gi"},
+          "limits": {"cpu": "1", "memory": "3Gi"},
+          "pvcRequest": "15Gi"
+        },
+        "teardown": {"cancelStatus": 503, "jobStatusAfterCancel": "cancelled", "deleteStatus": 200, "kubernetesResourcesLeft": 0}
+      },
+      {
+        "case": "7-unpullable-job",
+        "result": "passed",
+        "job": "eea6733a32",
+        "settings": "phase 2 (imagePullTimeoutSeconds 60)",
+        "image": "srw-registry:5000/does-not-exist:1",
+        "absentBeforehand": {"registry": true, "nodeImageCache": true},
+        "timeline": {
+          "createdAt": "09:43:44.400Z",
+          "podStates": ["ErrImagePull", "ImagePullBackOff"],
+          "failedAt": "09:44:46.098Z",
+          "secondsFromCreateToFailed": 61.7,
+          "settledAt": "09:44:46.090Z",
+          "podDeletionAcceptedAt": "09:45:24.031Z",
+          "serviceDeletedAt": "09:45:25.405Z",
+          "pvcReconciledAt": "09:45:25.425Z",
+          "secondsFromCreateToResourcesGone": 101.0,
+          "secondsFromFailedToResourcesGone": 39.3,
+          "pollSawPodServicePvcAndFinalizerGoneAt": "09:45:30Z",
+          "deleteAt": "09:45:43Z"
+        },
+        "observed": {
+          "status": "failed",
+          "errorMessage": "Workspace container failed: Workspace image srw-registry:5000/does-not-exist:1 could not be pulled: ErrImagePull (rpc error: code = NotFound desc = failed to pull and unpack image \"srw-registry:5000/does-not-exist:1\": failed to resolve reference \"srw-registry:5000/does-not-exist:1\": srw-registry:5000/does-not-exist:1: not found)",
+          "settleLog": "Settled the pull-failed workspace creation on never-started Pod workspace-<id>; the Job's terminal cleanup retires it",
+          "statelessProcessZeroFinalizerReleased": true,
+          "deleteStatus": 200,
+          "deleteAttempts": 1,
+          "kubernetesResourcesLeft": 0,
+          "manualKubernetesCleanup": false
+        }
+      }
+    ],
+    "concerns": [
+      {
+        "concern": "lite-template-image-refusal-is-500",
+        "case": "5-refusals",
+        "a1": "not a regression: the resolver check predates A1; e6ab0cead's wording is unreachable for templates with an image",
+        "detail": "A virtual template with an image gets 500 on every surface; it never reaches the new 422 wording. See case 5 liteTemplate.rootCause."
+      },
+      {
+        "concern": "tool-groups-preview-500-on-malformed-workspace",
+        "a1": "no (349b150ca5)",
+        "detail": "POST /api/persistent/tool-groups/preview returns 500 for a workspace the create routes refuse with 422."
+      },
+      {
+        "concern": "job-cancel-returns-503-while-cancelling",
+        "a1": "no (identical on the default-image control Job)",
+        "detail": "PUT /api/jobs/{id}/cancel returns 503 'Workspace authority retirement is incomplete' after about 26-30 s, yet the Job is cancelled and its Pod, Service and PVC are removed without help."
+      },
+      {
+        "concern": "pinned-session-fence-claim-retained",
+        "a1": "no (pinned agent retirement)",
+        "detail": "After the pinned Session ed6fea48c7 was permanently deleted, an inert fence claim pvc-agent-s-<id> (Pending, no volume, finalizer srw.io/pinned-authority-protection) was created at the durable pinned retirement retry and then retained as 'ownerless' by the reaper. A kubectl delete removed it; the orchestrator released its finalizer within about a minute."
+      }
+    ],
+    "cleanup": {
+      "jobsDeleted": ["68f7d49cde", "4bd91d9088", "1b06657b19", "eea6733a32"],
+      "sessionsDeleted": ["91db846fc7", "6638991159", "ed6fea48c7"],
+      "projectDeleted": "d22f635794",
+      "allDeletedThroughApi": true,
+      "kubernetesResourcesFromTheseIdsRemaining": 0,
+      "manualKubernetesCleanup": "kubectl delete of the one inert pinned-agent fence claim listed under concerns; no finalizer was removed by hand",
+      "testImages": "srw-a1-test removed from the local podman store, the srw-registry repositories and the k3d node image cache; the base image copy pulled into podman for the build was removed; the installation image stays on the node",
+      "valuesLocalRestored": true,
+      "preExistingWedgedRowsTouched": false,
+      "orchestratorRollouts": 2
+    }
   }
 }
