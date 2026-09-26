@@ -1457,9 +1457,32 @@ class VMIdleLifecycleStore:
                 or _uuid(vm.get("vm_uid")) != operation["vm_uid"]
                 or _uuid(vm.get("rootdisk_pvc_uid")) != operation["pvc_uid"]
                 or vm.get("_suspend_remote_io_closed") != operation_id
-                or vm.get("status") != "suspending"
+                or vm.get("status") not in {"suspending", "deleted"}
             ):
                 return False
+            if vm.get("status") == "deleted":
+                # Native HTTP teardown publishes deleted before physical stop
+                # settles. Only its completed exact idle permit can bridge that
+                # projection; absence or a generic deletion is not authority.
+                from orchestrator.services.vm_workspace_recovery_store import cleanup_intent_digest
+
+                intent = {
+                    "owner_kind": "job", "owner_id": str(owner_id),
+                    "provision_generation": str(operation["provision_generation"]),
+                    "vm_uid": str(operation["vm_uid"]),
+                    "pvc_uid": str(operation["pvc_uid"]),
+                    "purge_disk": False, "resource": "vm_workspace",
+                    "source": "vm_idle_release",
+                }
+                if operation["closed_at"] is not None or not await conn.fetchval(
+                    "SELECT EXISTS(SELECT 1 FROM vm_workspace_cleanup_admissions "
+                    "WHERE owner_kind='job' AND owner_id=$1 AND pvc_uid=$2 "
+                    "AND source='vm_idle_release' AND intent_digest=$3 "
+                    "AND parent_admission_id IS NULL "
+                    "AND completed_at IS NOT NULL AND outcome='completed')",
+                    owner_id, operation["pvc_uid"], cleanup_intent_digest(intent),
+                ):
+                    return False
             vm.update(status="suspended", rootdisk="kept")
             context["vm"] = vm
             await conn.execute(
@@ -1473,6 +1496,7 @@ class VMIdleLifecycleStore:
             )
             wake_requested = bool(
                 operation["terminal_source_command_id"] is None
+                and job["status"] not in {"completed", "failed", "cancelled"}
                 and (
                     current_episode is None
                     or current_episode.episode_id != str(operation["episode_id"])
