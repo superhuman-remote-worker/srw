@@ -809,7 +809,11 @@ async def test_created_resume_retained_vm_uses_existing_pending_delivery(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("request_id", [None, str(uuid4()), "malformed"], ids=["absent", "different", "malformed"])
+@pytest.mark.parametrize(
+    "request_id",
+    [None, str(uuid4()), "malformed"],
+    ids=["absent", "different", "malformed"],
+)
 async def test_marked_initial_vm_requires_its_exact_durable_source(
     db, monkeypatch, request_id
 ):

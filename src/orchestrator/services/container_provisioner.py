@@ -2253,7 +2253,8 @@ class ContainerProvisioner:
             if "recovery_cleanup" in previous_workspace:
                 retained = await self._db.get_workspace_recovery_storage(owner.id)
                 if (
-                    retained is None or "_operator_pause_hold" in previous_context
+                    retained is None
+                    or "_operator_pause_hold" in previous_context
                     or not (_creation_plan.get("pvc") or {}).get("enabled")
                     or not await self.validate_workspace_recovery_storage(owner.id)
                 ):
@@ -6615,7 +6616,8 @@ class ContainerProvisioner:
             # claim token. Recovery is constrained to its original preserve
             # policy and held owner at every existing external effect fence.
             return await self._db.workspace_recovery_cleanup_is_current(
-                intent["_recovery_receipt"], claimant=claimant,
+                intent["_recovery_receipt"],
+                claimant=claimant,
                 claim_token=int(intent["claim_token"]),
             )
         check = getattr(
@@ -6886,7 +6888,9 @@ class ContainerProvisioner:
         )
         if not isinstance(intent, dict):
             return _WORKSPACE_CLEANUP_RETRYABLE
-        if _recovery_receipt is not None and not _recovery_receipt.matches_intent(intent):
+        if _recovery_receipt is not None and not _recovery_receipt.matches_intent(
+            intent
+        ):
             return _WORKSPACE_CLEANUP_RETRYABLE
         if intent.get("result_kind") == "settled":
             if (
@@ -6907,8 +6911,11 @@ class ContainerProvisioner:
         if str(intent.get("target_disposition") or "") == "ambiguous":
             return _WORKSPACE_CLEANUP_RETRYABLE
 
-        if _recovery_receipt is not None and not await self._db.workspace_recovery_cleanup_is_current(
-            _recovery_receipt.as_dict()
+        if (
+            _recovery_receipt is not None
+            and not await self._db.workspace_recovery_cleanup_is_current(
+                _recovery_receipt.as_dict()
+            )
         ):
             return _WORKSPACE_CLEANUP_RETRYABLE
         if intent.get("resources_captured_at") is None:
@@ -6933,7 +6940,9 @@ class ContainerProvisioner:
             ):
                 return _WORKSPACE_CLEANUP_RETRYABLE
 
-        if _recovery_receipt is not None and not _recovery_receipt.matches_intent(intent):
+        if _recovery_receipt is not None and not _recovery_receipt.matches_intent(
+            intent
+        ):
             return _WORKSPACE_CLEANUP_RETRYABLE
         claimant = str(intent.get("claimed_by") or f"container-provisioner:{uuid4()}")
         claimed = await claim_intent(
@@ -7090,8 +7099,11 @@ class ContainerProvisioner:
             intent_generation=int(intent["intent_generation"]),
             claimant=claimant,
             claim_token=int(intent["claim_token"]),
-            **({"recovery_receipt": _recovery_receipt.as_dict()}
-               if _recovery_receipt is not None else {}),
+            **(
+                {"recovery_receipt": _recovery_receipt.as_dict()}
+                if _recovery_receipt is not None
+                else {}
+            ),
         )
         if not settled:
             return _WORKSPACE_CLEANUP_RETRYABLE

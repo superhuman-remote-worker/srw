@@ -925,23 +925,44 @@ async def agent_get_thread_workspace_locked(
         # Admission follows the real binding and current authorization. A
         # restart between binding and this poll simply repeats this boundary.
         # No lifecycle lock may be nested under the caller's datasource lock.
-        if not all((presented_agent_id, presented_runtime_generation, presented_attach_token)):
-            raise HTTPException(409, "Initial VM creation requires exact runtime identity")
+        if not all(
+            (presented_agent_id, presented_runtime_generation, presented_attach_token)
+        ):
+            raise HTTPException(
+                409, "Initial VM creation requires exact runtime identity"
+            )
         if metadata.get("vm") is None:
             current = await ensure_initial_thread_vm(
-                thread, store=postgres_db, provisioner=dependencies.vm_provisioner,
+                thread,
+                store=postgres_db,
+                provisioner=dependencies.vm_provisioner,
             )
         else:
-            if vm.get("status") not in {
-                "provisioning", "created", "starting", "ssh_pending", "failed",
-                "waiting_capacity", "waiting_golden", "waiting_headscale", "waiting_preparation",
-            } or not vm.get("provision_generation") or vm.get("rootdisk") == "kept":
+            if (
+                vm.get("status")
+                not in {
+                    "provisioning",
+                    "created",
+                    "starting",
+                    "ssh_pending",
+                    "failed",
+                    "waiting_capacity",
+                    "waiting_golden",
+                    "waiting_headscale",
+                    "waiting_preparation",
+                }
+                or not vm.get("provision_generation")
+                or vm.get("rootdisk") == "kept"
+            ):
                 raise HTTPException(409, "VM workspace is not an initial creation")
             current = await postgres_db.get_thread(thread_id)
         if not _thread_accepts_runtime(current):
             raise HTTPException(409, "Initial VM runtime changed during admission")
         await _require_pinned_workspace_credential_owner(
-            current, presented_agent_id, presented_runtime_generation, presented_attach_token,
+            current,
+            presented_agent_id,
+            presented_runtime_generation,
+            presented_attach_token,
         )
         if thread_metadata_object(current).get("vm") is not None:
             await require_current_initial_vm_source(current, store=postgres_db)

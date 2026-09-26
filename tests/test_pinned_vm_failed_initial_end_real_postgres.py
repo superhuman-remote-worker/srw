@@ -32,9 +32,10 @@ from tests.test_vm_resource_thread_source_real_postgres import (
 )
 from tests.test_vm_creation_actuation import setup as _setup_fixture, SECRET
 
-setup = _setup_fixture
 from shared.vm_creation_issuance import seal_creation_carrier
 from vm_controller.creation_actuation import CreationActuator
+
+setup = _setup_fixture
 
 
 @pytest_asyncio.fixture(scope="module")
