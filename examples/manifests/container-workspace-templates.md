@@ -192,6 +192,12 @@ cleans up after itself; a Session doesn't (see below).
   or replaced resource, missing issued Pod identity, or unproven process stop
   leaves an explicit cleanup hold; `force` does not bypass that evidence.
 
+  Creation retries read and adopt resources whose UIDs are already recorded in
+  the pinned intent. They may update ownership on the exact seed ConfigMap, but
+  never create a replacement Pod, PVC, ConfigMap, or Service when that recorded
+  object is missing, terminating, or replaced. The original intent remains held
+  for normal lifecycle recovery.
+
 ## Privilege
 
 Workspaces from the installation image, and from repositories listed in

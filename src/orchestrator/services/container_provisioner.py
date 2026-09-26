@@ -3549,7 +3549,8 @@ class ContainerProvisioner:
             retained_pvc_uid = (
                 str((pinned_intent or {}).get("retained_pvc_uid") or "") or None
             )
-            if strict_pinned and retained_pvc_uid is not None:
+            recorded_pvc_uid = (pinned_intent or {}).get("pvc_uid")
+            if strict_pinned and (retained_pvc_uid or recorded_pvc_uid):
                 try:
                     retained_claim = await self._bounded_kubernetes_call(
                         self._core_api.read_namespaced_persistent_volume_claim,
@@ -3564,7 +3565,10 @@ class ContainerProvisioner:
                 except Exception:
                     return False
                 pvc_status = (
-                    "reused" if observed_retained_uid == retained_pvc_uid else None
+                    "reused"
+                    if observed_retained_uid
+                    == str(recorded_pvc_uid or retained_pvc_uid)
+                    else None
                 )
             else:
                 pvc_labels = {owner.label_key: owner.id}
@@ -3610,6 +3614,7 @@ class ContainerProvisioner:
                         expected_runtime_generation=pinned_runtime_generation,
                         expected_attempt_id=pinned_attempt_id,
                         retained_uid=retained_pvc_uid,
+                        recorded_uid=recorded_pvc_uid,
                     )
                 except Exception:
                     return False
@@ -3635,22 +3640,25 @@ class ContainerProvisioner:
             pvc_reattach = pvc_status == "reused" and not fresh
 
         try:
-            seed_cm = await self._create_seed_configmap(
-                pod_name,
-                seed_files,
-                seed_exts,
-                needs_state=seed_needs_state,
-                expected_owner=owner,
-                expected_creation_generation=(
-                    stateless_creation_generation if strict_stateless else None
-                ),
-                expected_provision_attempt=(
-                    pinned_attempt_id if strict_pinned else None
-                ),
-                expected_runtime_generation=(
-                    pinned_runtime_generation if strict_pinned else None
-                ),
-            )
+            if strict_pinned and (pinned_intent or {}).get("seed_configmap_uid"):
+                seed_cm = seed_cm_name
+            else:
+                seed_cm = await self._create_seed_configmap(
+                    pod_name,
+                    seed_files,
+                    seed_exts,
+                    needs_state=seed_needs_state,
+                    expected_owner=owner,
+                    expected_creation_generation=(
+                        stateless_creation_generation if strict_stateless else None
+                    ),
+                    expected_provision_attempt=(
+                        pinned_attempt_id if strict_pinned else None
+                    ),
+                    expected_runtime_generation=(
+                        pinned_runtime_generation if strict_pinned else None
+                    ),
+                )
         except WorkspaceRuntimeAuthorityError as error:
             logger.error(
                 "Stateless seed ConfigMap preparation failed for %s: %s",
@@ -3674,6 +3682,7 @@ class ContainerProvisioner:
                     expected_name=seed_cm_name,
                     expected_runtime_generation=pinned_runtime_generation,
                     expected_attempt_id=pinned_attempt_id,
+                    recorded_uid=(pinned_intent or {}).get("seed_configmap_uid"),
                 )
             except Exception:
                 return False
@@ -3779,20 +3788,31 @@ class ContainerProvisioner:
                     )
                     return False
             else:
-                (
-                    created_pod,
-                    reused_existing_pod,
-                ) = await self._create_pod_resolving_teardown(
-                    pod_manifest,
-                    pod_name,
-                    owner=owner,
-                    expected_provision_attempt=(
-                        pinned_attempt_id if strict_pinned else None
-                    ),
-                    expected_runtime_generation=(
-                        pinned_runtime_generation if strict_pinned else None
-                    ),
-                )
+                recorded_pod_uid = (pinned_intent or {}).get("pod_uid")
+                if strict_pinned and recorded_pod_uid:
+                    # An immutable issued UID never authorizes another POST,
+                    # even if the API currently reports the name absent.
+                    created_pod = await self._bounded_kubernetes_call(
+                        self._core_api.read_namespaced_pod,
+                        name=pod_name,
+                        namespace=self._namespace,
+                    )
+                    reused_existing_pod = True
+                else:
+                    (
+                        created_pod,
+                        reused_existing_pod,
+                    ) = await self._create_pod_resolving_teardown(
+                        pod_manifest,
+                        pod_name,
+                        owner=owner,
+                        expected_provision_attempt=(
+                            pinned_attempt_id if strict_pinned else None
+                        ),
+                        expected_runtime_generation=(
+                            pinned_runtime_generation if strict_pinned else None
+                        ),
+                    )
                 if created_pod is None:
                     return False
                 runtime_incarnation = self._require_workspace_pod_owner(
@@ -3810,6 +3830,7 @@ class ContainerProvisioner:
                             expected_name=pod_name,
                             expected_runtime_generation=pinned_runtime_generation,
                             expected_attempt_id=pinned_attempt_id,
+                            recorded_uid=recorded_pod_uid,
                         )
                     )
                     publish_impl = getattr(
@@ -3833,11 +3854,11 @@ class ContainerProvisioner:
                     expected_pvc_name=pvc_name,
                     expected_seed_configmap=(
                         _UNSPECIFIED_RESOURCE_BINDING
-                        if reused_existing_pod
+                        if reused_existing_pod and not strict_pinned
                         else seed_cm
                     ),
                 )
-                if reused_existing_pod:
+                if reused_existing_pod and not strict_pinned:
                     if observed_seed is not None:
                         existing_seed_bound = True
                         seed_configmap = await self._bounded_kubernetes_call(
@@ -3873,6 +3894,7 @@ class ContainerProvisioner:
                     seed_cm,
                     created_pod,
                     expected_owner=owner,
+                    expected_configmap_uid=pinned_seed_configmap_uid,
                     expected_creation_generation=(
                         stateless_creation_generation if strict_stateless else None
                     ),
@@ -3893,7 +3915,11 @@ class ContainerProvisioner:
                 retained_service = (
                     str((pinned_intent or {}).get("retained_service_uid") or "") or None
                 )
-                service_created = bool(retained_service) if strict_pinned else False
+                service_created = (
+                    bool(retained_service or (pinned_intent or {}).get("service_uid"))
+                    if strict_pinned
+                    else False
+                )
                 if not service_created:
                     service_created = await self._create_service(
                         owner,
@@ -3924,6 +3950,7 @@ class ContainerProvisioner:
                             expected_name=owner.pod_name,
                             expected_runtime_generation=(pinned_runtime_generation),
                             expected_attempt_id=pinned_attempt_id,
+                            recorded_uid=(pinned_intent or {}).get("service_uid"),
                             retained_uid=(
                                 str(
                                     (pinned_intent or {}).get("retained_service_uid")
@@ -13148,6 +13175,7 @@ class ContainerProvisioner:
         expected_runtime_generation: str,
         expected_attempt_id: str,
         retained_uid: str | None = None,
+        recorded_uid: str | None = None,
     ) -> str:
         """Prove one pinned create result belongs to its durable attempt.
 
@@ -13191,6 +13219,10 @@ class ContainerProvisioner:
         ):
             raise WorkspaceRuntimeAuthorityError(
                 "workspace provision resource name changed"
+            )
+        if recorded_uid is not None and uid != str(recorded_uid):
+            raise WorkspaceRuntimeAuthorityError(
+                "recorded workspace resource identity changed"
             )
         if retained_uid is not None:
             if uid != str(retained_uid):
@@ -13808,6 +13840,7 @@ class ContainerProvisioner:
         pod_obj: Any,
         *,
         expected_owner: WorkspaceOwner | None = None,
+        expected_configmap_uid: str | None = None,
         expected_creation_generation: str | None = None,
         expected_provision_attempt: str | None = None,
         expected_runtime_generation: str | None = None,
@@ -13904,6 +13937,7 @@ class ContainerProvisioner:
                         expected_name=cm_name,
                         expected_runtime_generation=(expected_runtime_generation),
                         expected_attempt_id=expected_provision_attempt,
+                        recorded_uid=expected_configmap_uid,
                     )
                 resource_version = str(
                     getattr(
