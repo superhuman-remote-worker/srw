@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 from orchestrator.services import job_dispatcher
-from orchestrator.services.workspace_lifecycle import EnsureOutcome, WorkspaceOwner
+from orchestrator.services.workspace_lifecycle import (
+    EnsureOutcome,
+    EnsureResult,
+    WorkspaceOwner,
+)
+from tests.test_b11_job_dispatcher import dispatch_pending_jobs as run_dispatch_and_wait
 from copy import deepcopy
-from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from uuid import uuid4
 
@@ -810,6 +814,8 @@ async def test_completion_recovery_reprovisions_and_retires_the_stale_marker(
 
     async def provision_replacement(owner, **kwargs):
         assert owner == WorkspaceOwner.job(job["id"])
+        if kwargs["current_status"] == "ready":
+            return EnsureResult(EnsureOutcome.READY, status="ready")
         assert kwargs["current_status"] == "deleted"
         db.jobs[job["id"]]["context"]["workspace_container"].update(
             {
@@ -821,7 +827,7 @@ async def test_completion_recovery_reprovisions_and_retires_the_stale_marker(
                 "_runtime_incarnation": replacement.runtime_incarnation,
             }
         )
-        return SimpleNamespace(
+        return EnsureResult(
             outcome=EnsureOutcome.PENDING,
             status="creating",
         )
@@ -853,29 +859,22 @@ async def test_completion_recovery_reprovisions_and_retires_the_stale_marker(
     ensure_workspace = AsyncMock(side_effect=provision_replacement)
     monkeypatch.setattr(job_dispatcher, "ensure_workspace", ensure_workspace)
 
-    # First real dispatcher pass sees the deleted lifecycle state and starts
-    # ordinary provisioning without trying to attest the vanished predecessor.
-    await job_dispatcher.dispatch_pending_jobs(
+    monkeypatch.setattr(
+        orch_main.app.state.resources,
+        "job_dispatch_state",
+        job_dispatcher.JobDispatchState(),
+    )
+    # The owned create observes deleted, then its completion wakes a fresh
+    # ready preflight. That pass retires the predecessor marker by exact CAS
+    # before admitting the server-created successor; it never re-attests the
+    # vanished predecessor or treats the old marker as successor authority.
+    await run_dispatch_and_wait(
         dependencies=jobs_composition.job_dispatch_dependencies(
             orch_main.app.state.resources
         )
     )
     ensure_workspace.assert_awaited_once()
-    live_attestation.assert_not_awaited()
-    db.admit_stateless_worker_job.assert_not_awaited()
-
-    # The replacement callback left the predecessor marker beside its new UID.
-    # That successor was created by this server under a durable reservation, so
-    # it is not an adopted runtime: the next dispatcher pass retires the stale
-    # marker by exact snapshot CAS and admits the resumed job exactly once.
-    # Refreshing the marker instead would be a second adoption of a Pod nobody
-    # adopted, and leaving it would make every later pre-network check
-    # re-attest the vanished predecessor and refuse delivery for good.
-    await job_dispatcher.dispatch_pending_jobs(
-        dependencies=jobs_composition.job_dispatch_dependencies(
-            orch_main.app.state.resources
-        )
-    )
+    assert ensure_workspace.await_args.kwargs["current_status"] == "deleted"
 
     resumed = await db.get_job(job["id"])
     runtime = resumed["context"]["workspace_container"]

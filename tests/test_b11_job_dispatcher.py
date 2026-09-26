@@ -25,7 +25,7 @@ from orchestrator.services.job_dispatcher import (
     JobDispatchDependencies,
     JobDispatchState,
     auto_assign_dispatcher,
-    dispatch_pending_jobs,
+    dispatch_pending_jobs as schedule_pending_jobs,
     trigger_dispatch,
 )
 
@@ -88,7 +88,8 @@ class FakeStore:
         self.checkpoints = checkpoints or {}
         self.candidates = candidates or []
         self.admissions = admissions or {}
-        self.jobs = jobs or {}
+        self.jobs = {str(job["id"]): job for job in self.pinned + self.stateless}
+        self.jobs.update(jobs or {})
         self.calls: list[tuple[str, tuple, dict]] = []
 
     def _record(self, name: str, *args: Any, **kwargs: Any) -> None:
@@ -209,6 +210,16 @@ def no_dispatcher_error(caplog):
 
 async def _drain_tasks() -> None:
     for _ in range(5):
+        await asyncio.sleep(0)
+
+
+async def dispatch_pending_jobs(*, dependencies):
+    """Existing decision tests await the explicitly owned preflight work."""
+    await schedule_pending_jobs(dependencies=dependencies)
+    while dependencies.state.tasks:
+        await asyncio.wait_for(
+            asyncio.gather(*list(dependencies.state.tasks)), timeout=2
+        )
         await asyncio.sleep(0)
 
 
@@ -647,7 +658,7 @@ class TestPreemption:
         await dispatch_pending_jobs(dependencies=_deps(store, delivery=delivery))
         await _drain_tasks()
 
-        assert store.called("get_job") == [(("parent",), {})]
+        assert (("parent",), {}) in store.called("get_job")
         delivery.initiate_pause.assert_not_awaited()
 
 
@@ -699,7 +710,7 @@ class TestTriggerDispatch:
 
         assert len(created) == expected_tasks
         if created:
-            assert created[0].get_coro().__qualname__ == "dispatch_pending_jobs"
+            assert created[0].get_coro().__qualname__ == "_run_requested_dispatches"
             # Owned by the application's dispatch state until it finishes.
             assert created[0] in deps.state.tasks
             await asyncio.wait_for(created[0], 1.0)

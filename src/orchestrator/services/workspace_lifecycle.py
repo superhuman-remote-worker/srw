@@ -72,6 +72,7 @@ _RESTORE_REQUIRED_STATUSES = {
 class EnsureResult:
     outcome: EnsureOutcome
     status: Optional[str] = None
+    mutation_required: bool = False
 
 
 async def _create(
@@ -331,6 +332,7 @@ async def ensure_workspace(
     allow_stateless_create: bool = False,
     stateless_creation_refused: bool = False,
     pinned_runtime_lock_held: bool = False,
+    recreate_missing: bool = True,
 ) -> "EnsureResult":
     """Idempotently drive owner's workspace toward 'ready'. Owner-agnostic
     extraction of the job dispatcher's container branch (main.py).
@@ -348,7 +350,9 @@ async def ensure_workspace(
       the exact terminal UID is deleted with a UID precondition and recreated;
       absence, replacement, and ambiguity fail closed without effects.
     * Legacy/non-incarnation 'ready' rows retain their phase-only liveness
-      probe for compatibility.
+      probe for compatibility. ``recreate_missing=False`` lets the dispatcher
+      defer that legacy fallback to its bounded mutation lane; it does not
+      alter the strict incarnation or creation-authority paths above it.
     """
     s = current_status
     if stateless_creation_refused:
@@ -469,6 +473,12 @@ async def ensure_workspace(
             else:
                 live = await probe(owner)
             if live is False:
+                if not recreate_missing:
+                    # A dispatcher ready-check may discover drift, but only
+                    # its bounded mutation lane may enter creation.
+                    return EnsureResult(
+                        EnsureOutcome.PENDING, status=s, mutation_required=True
+                    )
                 if (
                     require_runtime_incarnation
                     and stateless_creation_generation is None

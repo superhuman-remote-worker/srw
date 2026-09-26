@@ -95,10 +95,15 @@ cleans up after itself; a Session doesn't (see below).
     a kept volume, keeps them.
   - Deleting the Job during that minute may return 503 once; retry and it
     succeeds.
-- **Dispatch waits for pulls.** The job dispatcher creates Job containers one at
-  a time. While a custom image is still pulling, dispatch of other Jobs waits
-  for up to the pull budget. Prefer small images, and lower the budget if that
-  matters to you.
+- **Workspace preparation is bounded.** Each orchestrator admits two workspace
+  mutations and two independent Ready checks at a time. A pulling image or busy
+  workspace mutation lock keeps its own operation pending while discovered
+  Ready Jobs can dispatch. Up to 100 Jobs are owned locally, including active
+  work. The existing discovery window remains 50 Jobs per execution lane; this
+  does not guarantee fairness for Jobs outside that window. Leadership loss
+  and shutdown drain owned work, including started Kubernetes calls, before
+  releasing its mutation guards. This behavior requires an orchestrator upgrade
+  and does not repair historical pending creation attempts after restart.
 - **Don't cancel a Job while its image is pulling.** That can leave its
   workspace resources behind (a known issue). Let the Job fail on its own; it
   fails within the pull budget.

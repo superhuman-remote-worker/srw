@@ -2,6 +2,7 @@
 
 from orchestrator.services import job_dispatcher
 from orchestrator.services.workspace_lifecycle import EnsureOutcome
+from tests.test_b11_job_dispatcher import dispatch_pending_jobs as run_dispatch_and_wait
 from tests import _b09_control_seams as control_seams
 
 import asyncio
@@ -1147,7 +1148,16 @@ async def test_stateless_dispatch_refusal_cannot_overwrite_winning_control(
         main.app.state.resources.postgres_db, "update_job_status", update
     )
 
-    await job_dispatcher.dispatch_pending_jobs(
+    monkeypatch.setattr(
+        main.app.state.resources,
+        "job_dispatch_state",
+        job_dispatcher.JobDispatchState(),
+    )
+    monkeypatch.setattr(
+        main.app.state.resources.postgres_db, "get_job", AsyncMock(return_value=job)
+    )
+
+    await run_dispatch_and_wait(
         dependencies=jobs_composition.job_dispatch_dependencies(
             main.app.state.resources
         )
@@ -1207,6 +1217,7 @@ async def test_stateless_workspace_failure_uses_scanned_status_cas(monkeypatch):
             return_value=SimpleNamespace(
                 outcome=EnsureOutcome.FAILED,
                 status="failed",
+                mutation_required=False,
             )
         ),
     )
@@ -1215,7 +1226,16 @@ async def test_stateless_workspace_failure_uses_scanned_status_cas(monkeypatch):
         main.app.state.resources.postgres_db, "update_job_status", update
     )
 
-    await job_dispatcher.dispatch_pending_jobs(
+    monkeypatch.setattr(
+        main.app.state.resources,
+        "job_dispatch_state",
+        job_dispatcher.JobDispatchState(),
+    )
+    monkeypatch.setattr(
+        main.app.state.resources.postgres_db, "get_job", AsyncMock(return_value=job)
+    )
+
+    await run_dispatch_and_wait(
         dependencies=jobs_composition.job_dispatch_dependencies(
             main.app.state.resources
         )
@@ -1273,7 +1293,16 @@ async def test_dispatcher_waits_instead_of_failing_uidless_k8s_runtime(monkeypat
     provision = AsyncMock(side_effect=AssertionError("provisioning attempted"))
     monkeypatch.setattr(job_dispatcher, "ensure_workspace", provision)
 
-    await job_dispatcher.dispatch_pending_jobs(
+    monkeypatch.setattr(
+        main.app.state.resources,
+        "job_dispatch_state",
+        job_dispatcher.JobDispatchState(),
+    )
+    monkeypatch.setattr(
+        main.app.state.resources.postgres_db, "get_job", AsyncMock(return_value=job)
+    )
+
+    await run_dispatch_and_wait(
         dependencies=jobs_composition.job_dispatch_dependencies(
             main.app.state.resources
         )
@@ -1326,7 +1355,16 @@ async def test_vm_lane_repair_losing_status_cas_does_not_close_queue(monkeypatch
     )
     monkeypatch.setattr(main.app.state.resources.postgres_db, "acquire", acquire)
 
-    await job_dispatcher.dispatch_pending_jobs(
+    monkeypatch.setattr(
+        main.app.state.resources,
+        "job_dispatch_state",
+        job_dispatcher.JobDispatchState(),
+    )
+    monkeypatch.setattr(
+        main.app.state.resources.postgres_db, "get_job", AsyncMock(return_value=job)
+    )
+
+    await run_dispatch_and_wait(
         dependencies=jobs_composition.job_dispatch_dependencies(
             main.app.state.resources
         )
@@ -1401,7 +1439,16 @@ async def test_same_cluster_vm_dispatch_stays_stateless_and_reaches_admission(
         main.app.state.resources.postgres_db, "admit_stateless_worker_job", admitted
     )
 
-    await job_dispatcher.dispatch_pending_jobs(
+    monkeypatch.setattr(
+        main.app.state.resources,
+        "job_dispatch_state",
+        job_dispatcher.JobDispatchState(),
+    )
+    monkeypatch.setattr(
+        main.app.state.resources.postgres_db, "get_job", AsyncMock(return_value=job)
+    )
+
+    await run_dispatch_and_wait(
         dependencies=jobs_composition.job_dispatch_dependencies(
             main.app.state.resources
         )

@@ -793,7 +793,9 @@ async def test_triggered_dispatch_is_stopped_before_the_pools_close(monkeypatch)
         settings={"auto_assign_enabled": True},
     )
     triggered = [
-        e["label"] for e in recorder.created if "dispatch_pending_jobs" in e["label"]
+        e["label"]
+        for e in recorder.created
+        if "_run_requested_dispatches" in e["label"]
     ]
     assert triggered, "the trigger must have scheduled a dispatch"
     stopped = set(recorder.awaited) | set(recorder.cancelled)
