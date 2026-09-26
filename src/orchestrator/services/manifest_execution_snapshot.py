@@ -594,19 +594,21 @@ async def prepare_srw_session_patch(
             .get("backend", "none")
         )
 
+    # Checked on every patch, whatever the backend transition: only admission
+    # validates these blocks, so a tier change may bind a bare backend only.
+    _, old_policy = srw_snapshot_config(current)
+    captured_messages = {
+        "vm": "Session settings cannot change the captured VM image or "
+        "resources; create a new session with the selected workspace.",
+        "sandbox": "Session settings cannot change the captured container "
+        "image or resources; create a new session with the selected workspace.",
+    }
+    for captured, message in captured_messages.items():
+        if (policy.get("workspace") or {}).get(captured) != (
+            old_policy.get("workspace") or {}
+        ).get(captured):
+            raise HTTPException(422, message)
     if backend_of(old_workspace) == backend_of(new_workspace):
-        _, old_policy = srw_snapshot_config(current)
-        captured_messages = {
-            "vm": "Session settings cannot change the captured VM image or "
-            "resources; create a new session with the selected workspace.",
-            "sandbox": "Session settings cannot change the captured container "
-            "image or resources; create a new session with the selected workspace.",
-        }
-        for captured, message in captured_messages.items():
-            if (policy.get("workspace") or {}).get(captured) != (
-                old_policy.get("workspace") or {}
-            ).get(captured):
-                raise HTTPException(422, message)
         for key in ("document", "resolved"):
             prepared[key]["spec"]["execution"]["workspace"] = deepcopy(
                 current[key]["spec"]["execution"]["workspace"]

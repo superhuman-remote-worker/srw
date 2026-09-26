@@ -23,13 +23,13 @@ from shared.runtime.core.session_config_patch import patch_frozen_session
 WORK = "22222222-2222-4222-8222-222222222222"
 
 
-def frozen():
+def frozen(workspace=None):
     config = {
         "agent_id": "session",
         "display_name": "Captured Session",
         "llm": {"model": "gpt-4o", "temperature": 0.3, "top_p": 0.73},
         "limits": {"context_threshold_tokens": 54321},
-        "workspace": {"backend": "none"},
+        "workspace": workspace or {"backend": "none"},
         "interactive": {"permission_mode": "supervised"},
         "autonomy": "review",
         "tools": {"shell": []},
@@ -192,3 +192,72 @@ async def test_managed_patch_failure_precedes_any_local_mutation(monkeypatch, fr
     assert session.config is config
     assert session.execution_snapshot == {"generation": 4}
     assert send.await_args.args[1] == "error"
+
+
+UNCHECKED_SANDBOX = {"image": "evil.example/x y", "cpu": "lots"}
+UNCHECKED_VM = {"image": "evil.example/x y", "cpu_cores": 999}
+
+
+def settings_db():
+    return SimpleNamespace(
+        get_system_setting=AsyncMock(return_value={"value": {"enabled": False}})
+    )
+
+
+async def patch_workspace(current, workspace):
+    prepared, _ = await prepare_srw_session_patch(
+        settings_db(), current, {"id": WORK}, {}, [], {"workspace": workspace}
+    )
+    prepared["generation"] = prepared["expected_generation"] + 1
+    return prepared
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "captured,workspace",
+    [
+        ("virtual", {"backend": "sandbox", "sandbox": UNCHECKED_SANDBOX}),
+        ("sandbox", {"backend": "virtual", "sandbox": UNCHECKED_SANDBOX}),
+        ("virtual", {"backend": "vm", "vm": UNCHECKED_VM}),
+    ],
+)
+async def test_a_tier_change_never_freezes_caller_written_workspace_settings(
+    captured, workspace
+):
+    current, _ = frozen({"backend": captured})
+    with pytest.raises(HTTPException) as denied:
+        await patch_workspace(current, workspace)
+    assert denied.value.status_code == 422
+    assert "cannot change the captured" in denied.value.detail
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "steps",
+    [
+        [{"backend": "virtual", "sandbox": UNCHECKED_SANDBOX}, {"backend": "sandbox"}],
+        [{"backend": "virtual"}, {"backend": "sandbox", "sandbox": UNCHECKED_SANDBOX}],
+    ],
+)
+async def test_a_round_trip_through_virtual_cannot_smuggle_container_settings(steps):
+    current, _ = frozen({"backend": "sandbox"})
+    with pytest.raises(HTTPException) as denied:
+        for workspace in steps:
+            current = await patch_workspace(current, workspace)
+    assert denied.value.status_code == 422
+    _, policy = srw_snapshot_config(current)
+    assert "sandbox" not in policy["workspace"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("target", ["sandbox", "vm"])
+async def test_a_bare_tier_upgrade_binds_only_the_new_backend(target):
+    # The live upgrade persists exactly this fragment (persistent_app
+    # _handle_workspace_upgrade). It keeps the installation defaults.
+    current, _ = frozen({"backend": "virtual"})
+    prepared = await patch_workspace(current, {"backend": target})
+    _, policy = srw_snapshot_config(prepared)
+    assert policy["workspace"] == {"backend": target}
+    assert prepared["resolved"]["spec"]["execution"]["workspace"] == {
+        "template": {"inline": {"backend": target}}
+    }

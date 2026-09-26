@@ -98,3 +98,41 @@ async def test_resolver_reads_the_captured_session_settings(database, actor):
             storage="15Gi",
         )
     )
+
+
+@pytest.mark.asyncio
+async def test_virtual_session_upgrade_binds_only_the_backend(database, actor):
+    workspace, receipt = await select_execution_workspace(
+        database,
+        actor,
+        role="session",
+        project_id=None,
+        supplied=True,
+        workspace={"template": {"inline": {"backend": "virtual"}}},
+    )
+    thread_id = await database.create_thread(
+        user_id=str(actor["id"]),
+        datasource_ids=[],
+        initial_metadata={"config_override": {"workspace": workspace}},
+        workspace_selection=receipt,
+    )
+    current = await read_execution(database, "Session", thread_id)
+    thread = await database.get_thread(thread_id)
+    metadata = json.loads(thread["metadata"])
+    with pytest.raises(HTTPException) as denied:
+        await prepare_srw_session_patch(
+            database,
+            current,
+            thread,
+            metadata,
+            [],
+            {"workspace": {"backend": "sandbox", "sandbox": {"image": "x y"}}},
+        )
+    assert denied.value.status_code == 422
+    assert "container image or resources" in denied.value.detail
+    prepared, _ = await prepare_srw_session_patch(
+        database, current, thread, metadata, [], {"workspace": {"backend": "sandbox"}}
+    )
+    _, policy = srw_snapshot_config(prepared)
+    assert policy["workspace"]["backend"] == "sandbox"
+    assert "sandbox" not in policy["workspace"]
