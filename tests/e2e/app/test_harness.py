@@ -1655,6 +1655,18 @@ def _render_documents(values_files) -> list[dict]:
     return [document for document in yaml.safe_load_all(rendered) if document]
 
 
+def test_fixture_endpoint_is_the_in_namespace_service_name() -> None:
+    """Host DNS search domains must not sit on the provider's lookup path."""
+
+    values = yaml.safe_load(harness.VALUES_FILE.read_text(encoding="utf-8"))
+    endpoints = values["llm"]["seed"]["systemEndpoints"]
+    assert [endpoint["baseUrl"] for endpoint in endpoints] == [
+        harness.PROVIDER_SERVICE_BASE
+    ]
+    host = harness.PROVIDER_SERVICE_BASE.split("//", 1)[1].split(":", 1)[0]
+    assert "." not in host
+
+
 def test_secure_profiles_add_only_the_secure_origin_overlay() -> None:
     transport = harness.resolve_profile("session-transport")
     secure = harness.resolve_profile("session-transport-secure")

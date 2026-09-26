@@ -164,7 +164,12 @@ llm:
     enabled: true
     systemEndpoints:
       - label: SRW deterministic E2E fixture
-        baseUrl: http://srw-e2e-model-fixture.srw-e2e.svc.cluster.local:8000/v1
+        # The in-namespace Service name, not the cluster FQDN: owned k3d Pods
+        # inherit the host's DNS search domains, and a name below ndots:5 is
+        # tried against them first. A slow host resolver then outlasts the
+        # SDK's connect timeout, so the attach-time embedding dimension probe
+        # never reached the fixture. harness.py PROVIDER_SERVICE_BASE matches.
+        baseUrl: http://srw-e2e-model-fixture:8000/v1
         apiKeyRef:
           secretName: srw-e2e-model-fixture
           key: inference-api-key

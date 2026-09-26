@@ -88,9 +88,8 @@ PROVIDER_IMAGE_PLACEHOLDER: Final = "srw-e2e-model-fixture:local"
 # not create one, which is what lets the lane render under `secrets.create:
 # false`.
 PROTECTED_EFFECT_SECRET_NAME: Final = "srw-e2e-protected-effect"
-PROVIDER_SERVICE_BASE: Final = (
-    "http://srw-e2e-model-fixture.srw-e2e.svc.cluster.local:8000/v1"
-)
+# Resolved in-namespace; see the fixture endpoint note in values-e2e.yaml.
+PROVIDER_SERVICE_BASE: Final = "http://srw-e2e-model-fixture:8000/v1"
 DEFAULT_STATE_ROOT: Final = REPO_ROOT / "cockpit/test-results/app-harness"
 STATE_ROOT_MARKER: Final = ".srw-application-e2e-root.json"
 RUN_DIRECTORY_MARKER: Final = ".srw-application-e2e-run.json"
