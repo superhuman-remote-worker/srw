@@ -423,3 +423,37 @@ async def test_attention_mode_requires_the_actual_accepted_typed_failure(db, pay
     before = await retention.current_job(db, job_id)
     assert await hold_unknown(db, job, runner) is None
     assert await retention.current_job(db, job_id) == before
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("source", ["live", "checkpoint"])
+@pytest.mark.parametrize(
+    "goal,reported",
+    [(False, True), (None, False), (True, False), ("false", False), (0, False)],
+)
+async def test_container_typed_stop_preserves_explicit_goal_wire_values(
+    worker_runtime, monkeypatch, source, goal, reported
+):
+    claim = worker._claim(attempts=1, max_attempts=5)
+    final = {
+        "should_stop": True,
+        "goal_achieved": goal,
+        "error": {"type": "workspace_unavailable", "recoverable": True},
+        "freeze_data": None,
+    }
+    if source == "checkpoint":
+        # The exact checkpoint envelope is wire authority over live fields.
+        final = {
+            **final,
+            "goal_achieved": False,
+            "completion_report_payload": dict(final),
+        }
+    executor, _, client, _, rotate, _, release = worker._install(
+        monkeypatch, claim, final
+    )
+    configure_bundle(client)
+    executor._completion_commands_enabled = True
+    await executor._serve_worker_claim(claim)
+    assert client.report_completion.await_count == int(reported)
+    assert release.await_count == int(not reported)
+    rotate.assert_not_awaited()

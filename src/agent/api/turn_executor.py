@@ -2089,7 +2089,7 @@ class StatelessTurnExecutor:
                 and self._worker_workspace_backend == "sandbox"
                 and self._worker_workspace_provisioner == "k8s"
                 and payload.get("should_stop") is True
-                and payload.get("goal_achieved") is False
+                and payload.get("goal_achieved", False) is False
                 and isinstance(error, dict)
                 and error.get("type") == "workspace_unavailable"
             ):
