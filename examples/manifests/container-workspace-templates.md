@@ -233,3 +233,25 @@ not consume a new workspace recovery attempt or authorize another graph step,
 a connection probe, or cleanup. The original checkpoint and freeze remain
 available. Reports without a known typed workspace cause keep their existing
 completion behavior; error-message text alone is never treated as evidence.
+
+For an accepted completion reporting an unavailable Kubernetes workspace, a
+failed TCP probe now pauses the Job before cleanup. It retains the exact runtime
+identity and admits preserve-only cleanup for that Pod. Cleanup must prove
+process zero and exact Pod absence before Resume; a lost cleanup reply retries
+the same durable intent. Files on the PVC and checkpoints remain retained. A
+legacy pinned report without an accepted completion command receives an attention
+hold without automatic cleanup. Stateless reports without a durable completion
+command are refused by this cleanup path. The interrupted command's outcome is
+unknown, so no automatic redispatch is authorized by the failed probe.
+
+After cleanup settles, explicit Resume verifies the captured PVC still exists
+with the same UID. The successor creator checks it again and reuses that volume.
+A missing or replaced PVC, an uncaptured volume, or incomplete cleanup refuses
+Resume; it does not create an empty replacement volume. Cancel retains its
+normal terminal cleanup policy, and an older recovery receipt cannot follow
+that policy into storage deletion.
+
+These guarantees require the updated orchestrator. They do not qualify the
+separate live-TCP-probe retry path or worker retries that occur before a
+completion report is accepted. TCP reachability alone does not establish that
+replaying an interrupted command is safe.

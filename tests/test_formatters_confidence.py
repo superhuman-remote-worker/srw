@@ -258,3 +258,23 @@ def test_workspace_recovery_hold_has_accurate_origin():
     assert "Workspace recovery hold" in detail
     assert "workspace and checkpoints retained" in detail
     assert "Operator pause hold" not in detail
+
+
+def test_interrupted_workspace_hold_reports_uncertainty_and_resume_gate():
+    detail = format_job_detail(
+        {
+            "id": "uncertain-workspace",
+            "status": "paused",
+            "context": {
+                "_operator_pause_hold": {
+                    "source": "workspace_recovery_unavailable",
+                    "paused_by": None,
+                },
+                "workspace_container": {"recovery_cleanup": {"phase": "pending"}},
+            },
+        }
+    )
+    assert "Workspace recovery hold" in detail
+    assert "interrupted command outcome is unknown" in detail
+    assert "cleanup must settle before Resume" in detail
+    assert "Operator pause hold" not in detail

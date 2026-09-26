@@ -29,6 +29,7 @@ from datetime import datetime, timezone
 from types import MappingProxyType
 from typing import Any, Awaitable, Callable, Literal, Optional
 from uuid import UUID, uuid4
+from shared.container_recovery import ContainerRecoveryCleanup
 from shared.workspace_recovery import WorkspaceRecoveryCode
 
 from orchestrator.services import resolve_ssh_key_path, workspace_metering
@@ -2243,6 +2244,28 @@ class ContainerProvisioner:
             return False
 
         expected_retained_pvc_uid = None
+        if owner.kind == "job":
+            previous = await self._db.get_job(owner.id)
+            previous_context = (previous or {}).get("context") or {}
+            if isinstance(previous_context, str):
+                previous_context = json.loads(previous_context)
+            previous_workspace = previous_context.get("workspace_container") or {}
+            if "recovery_cleanup" in previous_workspace:
+                retained = await self._db.get_workspace_recovery_storage(owner.id)
+                if (
+                    retained is None or "_operator_pause_hold" in previous_context
+                    or not (_creation_plan.get("pvc") or {}).get("enabled")
+                    or not await self.validate_workspace_recovery_storage(owner.id)
+                ):
+                    return False
+                expected_retained_pvc_uid = str(retained["pvc_uid"])
+            # Re-entry after publishing B retains its captured volume authority
+            # in the exact reservation, even after A's receipt moved to history.
+            captured_pvc = _creation_reservation.get("pvc_uid")
+            if captured_pvc is not None:
+                if expected_retained_pvc_uid not in {None, str(captured_pvc)}:
+                    return False
+                expected_retained_pvc_uid = str(captured_pvc)
         if (
             owner.kind == "session"
             and stateless_creation_generation is not None
@@ -6587,6 +6610,14 @@ class ContainerProvisioner:
         *,
         claimant: str,
     ) -> bool:
+        if "_recovery_receipt" in intent:
+            # The same intent can be promoted by Cancel without rotating its
+            # claim token. Recovery is constrained to its original preserve
+            # policy and held owner at every existing external effect fence.
+            return await self._db.workspace_recovery_cleanup_is_current(
+                intent["_recovery_receipt"], claimant=claimant,
+                claim_token=int(intent["claim_token"]),
+            )
         check = getattr(
             type(self._db),
             "managed_repository_workspace_cleanup_claim_is_current",
@@ -6744,12 +6775,55 @@ class ContainerProvisioner:
             intent_generation=int(intent["intent_generation"]),
         )
 
+    async def validate_workspace_recovery_storage(self, job_id: str) -> bool:
+        """GET-only validation before Resume and again before successor effects."""
+        source = await self._db.get_workspace_recovery_storage(job_id)
+        if source is None or not self._k8s_available:
+            return False
+        location = source.get("resource_location") or {}
+        if isinstance(location, str):
+            location = json.loads(location)
+        if location.get("namespace") != self._namespace:
+            return False
+        owner = WorkspaceOwner.job(job_id)
+        try:
+            pvc = await self._bounded_kubernetes_call(
+                self._core_api.read_namespaced_persistent_volume_claim,
+                name=_pvc_name_for(owner),
+                namespace=self._namespace,
+            )
+            uid = self._require_stateless_pvc_identity(
+                pvc,
+                owner=owner,
+                pvc_name=_pvc_name_for(owner),
+                allow_any_storage_class=True,
+            )
+        except Exception:
+            return False
+        return uid == str(source["pvc_uid"])
+
+    async def reconcile_workspace_recovery_cleanup(
+        self,
+        value: dict[str, Any],
+    ) -> WorkspaceCleanupOutcome:
+        """Continue one admitted preserve intent, never create recovery authority."""
+        receipt = ContainerRecoveryCleanup.parse(value)
+        if receipt is None:
+            return _WORKSPACE_CLEANUP_RETRYABLE
+        return await self.reconcile_workspace_cleanup_intent(
+            WorkspaceOwner.job(receipt.job_id),
+            expected_runtime_incarnation=receipt.runtime_incarnation,
+            intent_generation=receipt.intent_generation,
+            _recovery_receipt=receipt,
+        )
+
     async def reconcile_workspace_cleanup_intent(
         self,
         owner: WorkspaceOwner,
         *,
         expected_runtime_incarnation: str,
         intent_generation: int | None = None,
+        _recovery_receipt: ContainerRecoveryCleanup | None = None,
     ) -> WorkspaceCleanupOutcome:
         """Idempotently reconcile one durable cleanup intent to settlement."""
 
@@ -6764,6 +6838,7 @@ class ContainerProvisioner:
                 owner,
                 expected_runtime_incarnation=expected_runtime_incarnation,
                 intent_generation=intent_generation,
+                _recovery_receipt=_recovery_receipt,
             )
 
     async def _reconcile_workspace_cleanup_intent_guarded(
@@ -6772,6 +6847,7 @@ class ContainerProvisioner:
         *,
         expected_runtime_incarnation: str,
         intent_generation: int | None = None,
+        _recovery_receipt: ContainerRecoveryCleanup | None = None,
     ) -> WorkspaceCleanupOutcome:
         """Reconcile after taking the dedicated cross-replica mutation guard."""
 
@@ -6810,6 +6886,8 @@ class ContainerProvisioner:
         )
         if not isinstance(intent, dict):
             return _WORKSPACE_CLEANUP_RETRYABLE
+        if _recovery_receipt is not None and not _recovery_receipt.matches_intent(intent):
+            return _WORKSPACE_CLEANUP_RETRYABLE
         if intent.get("result_kind") == "settled":
             if (
                 owner.kind == "session"
@@ -6829,6 +6907,10 @@ class ContainerProvisioner:
         if str(intent.get("target_disposition") or "") == "ambiguous":
             return _WORKSPACE_CLEANUP_RETRYABLE
 
+        if _recovery_receipt is not None and not await self._db.workspace_recovery_cleanup_is_current(
+            _recovery_receipt.as_dict()
+        ):
+            return _WORKSPACE_CLEANUP_RETRYABLE
         if intent.get("resources_captured_at") is None:
             suspended_value = intent.get("suspended_at")
             intent = await self.prepare_workspace_cleanup_intent(
@@ -6851,6 +6933,8 @@ class ContainerProvisioner:
             ):
                 return _WORKSPACE_CLEANUP_RETRYABLE
 
+        if _recovery_receipt is not None and not _recovery_receipt.matches_intent(intent):
+            return _WORKSPACE_CLEANUP_RETRYABLE
         claimant = str(intent.get("claimed_by") or f"container-provisioner:{uuid4()}")
         claimed = await claim_intent(
             self._db,
@@ -6861,6 +6945,12 @@ class ContainerProvisioner:
         if not isinstance(claimed, dict):
             return _WORKSPACE_CLEANUP_RETRYABLE
         intent = claimed
+        if _recovery_receipt is not None:
+            if not _recovery_receipt.matches_intent(intent):
+                return _WORKSPACE_CLEANUP_RETRYABLE
+            intent = {**intent, "_recovery_receipt": _recovery_receipt.as_dict()}
+            if not await self._cleanup_claim_is_current(intent, claimant=claimant):
+                return _WORKSPACE_CLEANUP_RETRYABLE
         captured_pod_uid = intent.get("pod_uid")
         if captured_pod_uid is not None and str(captured_pod_uid) != str(
             expected_runtime_incarnation
@@ -7000,6 +7090,8 @@ class ContainerProvisioner:
             intent_generation=int(intent["intent_generation"]),
             claimant=claimant,
             claim_token=int(intent["claim_token"]),
+            **({"recovery_receipt": _recovery_receipt.as_dict()}
+               if _recovery_receipt is not None else {}),
         )
         if not settled:
             return _WORKSPACE_CLEANUP_RETRYABLE

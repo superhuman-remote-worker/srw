@@ -938,6 +938,7 @@ async def complete_job_legacy(
                         error,
                         db=postgres_db,
                         delete_workspace=_delete_pod,
+                        cleanup_service=container_provisioner,
                         trigger_dispatch=_trigger_dispatch,
                         completion_command_id=(
                             _effect_runner.command_id

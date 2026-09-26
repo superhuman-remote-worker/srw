@@ -127,6 +127,10 @@ from orchestrator.services.cloud.protected_reader_authority import (
 from orchestrator.services.cloud_staging.source_identity import (
     ProtectedMountSourceIdentity,
 )
+from shared.container_recovery import (
+    ContainerRecoveryCleanup,
+    container_recovery_resume_allowed_sql,
+)
 from shared.operator_pause_hold import (
     HELD_FEEDBACK_REASON,
     OPERATOR_PAUSE_HOLD_CONTEXT_KEY,
@@ -6123,6 +6127,387 @@ class PostgresDB:
                 )
                 return outcome if changed is not None else None
 
+    async def prepare_dead_workspace_recovery(
+        self,
+        job_id: str,
+        *,
+        expected_workspace: Dict[str, Any],
+        expected_agent_id: str | None,
+        error_detail: str,
+        completion_command_id: str | None = None,
+        completion_finalizing_by: str | None = None,
+    ) -> Dict[str, Any] | None:
+        """Atomically hold uncertain work and admit only exact preserve cleanup.
+
+        A legacy report gets a restrictive hold, without a cleanup continuation.
+        Durable reports retain a pending receipt until physical cleanup settles.
+        This never infers process zero or permission to rerun an interrupted tool.
+        """
+        if (completion_command_id is None) != (completion_finalizing_by is None):
+            raise ValueError("completion command and finalizer must be paired")
+        try:
+            job_uuid = UUID(job_id)
+            runtime = str(UUID(str(expected_workspace.get("_runtime_incarnation"))))
+            agent_uuid = UUID(str(expected_agent_id)) if expected_agent_id else None
+            command_uuid = UUID(completion_command_id) if completion_command_id else None
+        except (TypeError, ValueError):
+            return None
+        async with self.transaction_scope():
+            async with self.acquire() as conn:
+                queue = await conn.fetchrow(
+                    "SELECT state,unit_kind,lease_token FROM run_queue WHERE unit_id=$1 FOR UPDATE",
+                    job_uuid,
+                )
+                job = await conn.fetchrow(
+                    f"SELECT status::text,execution_lane,assigned_agent_id,context,config_override,"
+                    f"({_completion_control_active_sql('context')}) AS control_active "
+                    "FROM jobs WHERE id=$1 FOR UPDATE",
+                    job_uuid,
+                )
+                if job is None:
+                    return None
+                context = _strict_json_object(job["context"], label="context")
+                workspace = context.get("workspace_container") or {}
+                if not isinstance(workspace, dict):
+                    return None
+                receipt = ContainerRecoveryCleanup.parse(workspace.get("recovery_cleanup"))
+                if receipt is not None and receipt.command_id == str(command_uuid):
+                    intent = await conn.fetchrow(
+                        "SELECT * FROM managed_repository_workspace_cleanup_intents WHERE id=$1",
+                        UUID(receipt.intent_id),
+                    )
+                    previous = workspace.get("recovery_completion_outcome")
+                    if (
+                        intent is None
+                        or not receipt.matches_intent(intent)
+                        or not receipt.matches_owner(job["status"], context)
+                        or not isinstance(previous, dict)
+                    ):
+                        return None
+                    if receipt.phase == "settled" and intent["result_kind"] == "settled":
+                        return dict(previous)
+                    if (
+                        not await conn.fetchval(
+                            "SELECT EXISTS(SELECT 1 FROM job_completion_commands WHERE id=$1 "
+                            "AND job_id=$2 AND state='finalizing' AND finalizing_by=$3 "
+                            "AND lease_expires_at>clock_timestamp() AND deadline_at>clock_timestamp())",
+                            command_uuid,
+                            job_uuid,
+                            completion_finalizing_by,
+                        )
+                        or job["control_active"]
+                    ):
+                        return None
+                    return {**previous, "cleanup_receipt": receipt.as_dict()}
+                if (
+                    job["status"] != "processing"
+                    or job["control_active"]
+                    or OPERATOR_PAUSE_HOLD_CONTEXT_KEY in context
+                    or not isinstance(workspace, dict)
+                    or workspace != expected_workspace
+                    or workspace.get("provisioner") != "k8s"
+                    or workspace.get("status") != "ready"
+                    or workspace.get("_runtime_incarnation") != runtime
+                ):
+                    return None
+                try:
+                    if resolve_workspace_contract(dict(job)).assigned_backend != "sandbox":
+                        return None
+                except WorkspaceContractError:
+                    return None
+                if job["execution_lane"] == "pinned":
+                    if agent_uuid is None or job["assigned_agent_id"] != agent_uuid:
+                        return None
+                elif job["execution_lane"] != "stateless" or command_uuid is None:
+                    return None
+                if command_uuid is not None:
+                    command = await conn.fetchrow(
+                        "SELECT accepted_agent_id,accepted_lease_token FROM job_completion_commands "
+                        "WHERE id=$1 AND job_id=$2 AND state='finalizing' AND finalizing_by=$3 "
+                        "AND lease_expires_at>clock_timestamp() AND deadline_at>clock_timestamp()",
+                        command_uuid,
+                        job_uuid,
+                        completion_finalizing_by,
+                    )
+                    if command is None:
+                        return None
+                    if job["execution_lane"] == "stateless":
+                        if (
+                            queue is None
+                            or queue["unit_kind"] != "worker_batch"
+                            or queue["state"] != "done"
+                            or queue["lease_token"] != command["accepted_lease_token"]
+                        ):
+                            return None
+                    elif command["accepted_agent_id"] != agent_uuid:
+                        return None
+                elif await conn.fetchval(
+                    "SELECT EXISTS(SELECT 1 FROM job_completion_commands WHERE job_id=$1 "
+                    "AND state IN ('pending','finalizing','parked'))",
+                    job_uuid,
+                ):
+                    return None
+                hold_id = str(uuid4())
+                attempts = int(workspace.get("recovery_attempts") or 0) + 1
+                outcome = {
+                    "status": "handled",
+                    "job_id": job_id,
+                    "new_status": "paused",
+                    "paused": True,
+                    "held_for_resume": True,
+                    "cleanup_pending": command_uuid is not None,
+                    "actions": [
+                        "workspace transport lost; interrupted command outcome is unknown; "
+                        "workspace storage and checkpoints retained; explicit Resume required"
+                    ],
+                }
+                updates = {"recovery_attempts": attempts}
+                if command_uuid is not None:
+                    # Do not let the general cleanup preparer cancel an open
+                    # creator or classify somebody else's ambiguous intent.
+                    if not await conn.fetchval(
+                        "SELECT EXISTS(SELECT 1 FROM managed_repository_workspace_creation_reservations "
+                        "WHERE id::text=$1 AND owner_kind='job' AND owner_id=$2 "
+                        "AND scope='workspace_container' AND runtime_incarnation=$3::uuid "
+                        "AND claim_token::text=$4 AND result_kind='settled' AND settled_at IS NOT NULL) "
+                        "AND NOT EXISTS(SELECT 1 FROM managed_repository_workspace_creation_reservations "
+                        "WHERE owner_kind='job' AND owner_id=$2 AND scope='workspace_container' AND settled_at IS NULL) "
+                        "AND NOT EXISTS(SELECT 1 FROM managed_repository_workspace_cleanup_intents "
+                        "WHERE owner_kind='job' AND owner_id=$2 AND scope='workspace_container' AND settled_at IS NULL)",
+                        workspace.get("_creation_reservation_id"),
+                        job_uuid,
+                        runtime,
+                        workspace.get("_creation_claim_token"),
+                    ):
+                        return None
+                    intent = await self.prepare_managed_repository_workspace_cleanup_intent(
+                        job_id,
+                        owner_kind="job",
+                        scope="workspace_container",
+                        runtime_incarnation=runtime,
+                        target_disposition="deleted",
+                        reclaim_shared_resources=False,
+                        resources_captured=False,
+                    )
+                    if intent is None or intent.get("settled_at") is not None:
+                        # Nested helpers may write before a refusal. Roll the
+                        # entire owner transaction back instead of committing
+                        # a partial cancellation or retirement projection.
+                        raise RuntimeError("workspace recovery cleanup admission refused")
+                    receipt = ContainerRecoveryCleanup(
+                        job_id,
+                        str(command_uuid),
+                        hold_id,
+                        runtime,
+                        str(intent["id"]),
+                        int(intent["intent_generation"]),
+                    )
+                    if not receipt.matches_intent(intent):
+                        raise RuntimeError("workspace recovery cleanup authority changed")
+                    updates.update(
+                        recovery_cleanup=receipt.as_dict(),
+                        recovery_attempt_command_id=str(command_uuid),
+                        recovery_completion_command_id=str(command_uuid),
+                        recovery_completion_outcome=outcome,
+                    )
+                hold = operator_pause_hold_jsonb_sql(
+                    hold_id_parameter="$5",
+                    source_parameter="$6",
+                    paused_by_parameter="$7",
+                )
+                changed = await conn.fetchval(
+                    f"""UPDATE jobs SET status='paused',assigned_agent_id=NULL,
+                        context=jsonb_set(
+                            COALESCE(context,'{{}}'::jsonb)
+                            || CASE WHEN freeze_data IS NULL THEN '{{}}'::jsonb
+                               ELSE jsonb_build_object('last_freeze_data',freeze_data) END
+                            || jsonb_build_object('{OPERATOR_PAUSE_HOLD_CONTEXT_KEY}',
+                                {hold} || jsonb_build_object('attention',$3::jsonb)),
+                            '{{workspace_container}}',context->'workspace_container'||$2::jsonb),
+                        freeze_data=NULL,error_message=$4,updated_at=clock_timestamp()
+                        WHERE id=$1 AND ($8::uuid IS NULL OR EXISTS (
+                            SELECT 1 FROM job_completion_commands command WHERE command.id=$8
+                              AND command.job_id=jobs.id AND command.state='finalizing'
+                              AND command.finalizing_by=$9
+                              AND command.lease_expires_at>clock_timestamp()
+                              AND command.deadline_at>clock_timestamp())) RETURNING id""",
+                    job_uuid,
+                    json.dumps(updates),
+                    json.dumps(
+                        {
+                            "reason": "interrupted_command_outcome_unknown",
+                            "detail": str(error_detail)[:1000],
+                        }
+                    ),
+                    outcome["actions"][0],
+                    hold_id,
+                    "workspace_recovery_unavailable",
+                    None,
+                    command_uuid,
+                    completion_finalizing_by,
+                )
+                if changed is None:
+                    raise RuntimeError(
+                        "workspace recovery lost its finalizer admission term"
+                    )
+                return {
+                    **outcome,
+                    **({"cleanup_receipt": receipt.as_dict()} if receipt else {}),
+                }
+
+    async def workspace_recovery_cleanup_is_current(
+        self,
+        value: Any,
+        *,
+        claimant: str | None = None,
+        claim_token: int | None = None,
+    ) -> bool:
+        """The constrained recovery actor cannot follow a promoted cleanup policy."""
+        receipt = ContainerRecoveryCleanup.parse(value)
+        if receipt is None or (claimant is None) != (claim_token is None):
+            return False
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                f"SELECT status::text,context,({_completion_control_active_sql('context')}) AS control_active "
+                "FROM jobs WHERE id=$1",
+                UUID(receipt.job_id),
+            )
+            if (
+                row is None
+                or row["control_active"]
+                or not receipt.matches_owner(
+                    row["status"], _strict_json_object(row["context"], label="context")
+                )
+            ):
+                return False
+            intent = await conn.fetchrow(
+                "SELECT *, claim_expires_at>clock_timestamp() AS claim_live "
+                "FROM managed_repository_workspace_cleanup_intents WHERE id=$1",
+                UUID(receipt.intent_id),
+            )
+            return bool(
+                intent is not None
+                and receipt.matches_intent(intent)
+                and intent["settled_at"] is None
+                and (
+                    claimant is None
+                    or (
+                        intent["claimed_by"] == claimant
+                        and intent["claim_token"] == claim_token
+                        and intent["claim_live"] is True
+                    )
+                )
+            )
+
+    async def complete_workspace_recovery_cleanup(
+        self,
+        value: Any,
+        *,
+        completion_finalizing_by: str,
+    ) -> Dict[str, Any] | None:
+        """Acknowledge physical preserve settlement without lifting its hold."""
+        receipt = ContainerRecoveryCleanup.parse(value)
+        if receipt is None:
+            return None
+        async with self.transaction_scope():
+            async with self.acquire() as conn:
+                await conn.fetchrow(
+                    "SELECT unit_id FROM run_queue WHERE unit_id=$1 FOR UPDATE",
+                    UUID(receipt.job_id),
+                )
+                row = await conn.fetchrow(
+                    "SELECT status::text,context FROM jobs WHERE id=$1 FOR UPDATE",
+                    UUID(receipt.job_id),
+                )
+                if row is None:
+                    return None
+                context = _strict_json_object(row["context"], label="context")
+                if not receipt.matches_owner(row["status"], context):
+                    return None
+                workspace = context["workspace_container"]
+                intent = await conn.fetchrow(
+                    "SELECT * FROM managed_repository_workspace_cleanup_intents WHERE id=$1",
+                    UUID(receipt.intent_id),
+                )
+                if (
+                    intent is None
+                    or not receipt.matches_intent(intent)
+                    or intent["result_kind"] != "settled"
+                    or intent["settled_at"] is None
+                ):
+                    return None
+                outcome = {
+                    **workspace["recovery_completion_outcome"],
+                    "cleanup_pending": False,
+                }
+                if workspace["recovery_cleanup"]["phase"] == "settled":
+                    return outcome
+                changed = await conn.fetchval(
+                    "UPDATE jobs SET context=jsonb_set(context,'{workspace_container}',"
+                    "context->'workspace_container'||$2::jsonb),updated_at=clock_timestamp() "
+                    "WHERE id=$1 AND EXISTS(SELECT 1 FROM job_completion_commands "
+                    "WHERE id=$3 AND job_id=$1 AND state='finalizing' AND finalizing_by=$4 "
+                    "AND lease_expires_at>clock_timestamp() AND deadline_at>clock_timestamp()) RETURNING id",
+                    UUID(receipt.job_id),
+                    json.dumps(
+                        {
+                            "recovery_cleanup": {**receipt.as_dict(), "phase": "settled"},
+                            "recovery_completion_outcome": outcome,
+                        }
+                    ),
+                    UUID(receipt.command_id),
+                    completion_finalizing_by,
+                )
+                return outcome if changed else None
+
+    async def get_workspace_recovery_storage(self, job_id: str) -> Dict[str, Any] | None:
+        """Resolve the exact settled predecessor; context alone proves nothing."""
+        try:
+            job_uuid = UUID(job_id)
+        except (TypeError, ValueError):
+            return None
+        async with self.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT status::text,context FROM jobs WHERE id=$1", job_uuid
+            )
+            if row is None or row["status"] != "paused":
+                return None
+            context = _strict_json_object(row["context"], label="context")
+            workspace = context.get("workspace_container") or {}
+            if not isinstance(workspace, dict):
+                return None
+            receipt = ContainerRecoveryCleanup.parse(workspace.get("recovery_cleanup"))
+            hold = (
+                context.get(OPERATOR_PAUSE_HOLD_CONTEXT_KEY)
+                or context.get("last_operator_pause_hold")
+                or {}
+            )
+            if (
+                receipt is None
+                or receipt.phase != "settled"
+                or receipt.job_id != job_id
+                or not isinstance(hold, dict)
+                or hold.get("hold_id") != receipt.hold_id
+                or hold.get("source") != "workspace_recovery_unavailable"
+                or workspace.get("_runtime_incarnation") != receipt.runtime_incarnation
+                or workspace.get("status") != "deleted"
+            ):
+                return None
+            intent = await conn.fetchrow(
+                "SELECT * FROM managed_repository_workspace_cleanup_intents WHERE id=$1",
+                UUID(receipt.intent_id),
+            )
+            if (
+                intent is None
+                or not receipt.matches_intent(intent)
+                or intent["result_kind"] != "settled"
+                or intent["settled_at"] is None
+                or intent["resources_captured_at"] is None
+                or intent["pvc_uid"] is None
+            ):
+                return None
+            return dict(intent)
+
     async def pause_job_shed_freeze(
         self,
         job_id: str,
@@ -11352,6 +11737,7 @@ class PostgresDB:
         query = (
             "UPDATE jobs "
             "SET context = CASE "
+            "        WHEN $2::text='workspace_container' AND context->'workspace_container' ? 'recovery_cleanup' THEN context "
             "        WHEN COALESCE(context, '{}'::jsonb) ? $2::text "
             "        THEN (COALESCE(context, '{}'::jsonb) - $2::text) "
             "             || jsonb_build_object('last_' || $2::text, context -> $2::text) "
@@ -11360,6 +11746,7 @@ class PostgresDB:
             "    updated_at = CURRENT_TIMESTAMP "
             "WHERE id = $1 "
             "AND ($2::text <> 'vm' OR NOT (COALESCE(context, '{}'::jsonb) ? '_vm_creation_pending'))"
+            f" AND ($2::text <> 'workspace_container' OR {container_recovery_resume_allowed_sql('context')})"
         )
         async with self.acquire() as conn:
             result = await conn.execute(query, uuid_val, key)
@@ -11853,12 +12240,30 @@ class PostgresDB:
                 f" AND NOT ({_completion_control_active_sql('context')})"
             )
 
+        successor = (
+            "(context->'workspace_container' ? 'recovery_cleanup' "
+            "AND $1::jsonb->>'_runtime_incarnation' IS NOT NULL "
+            "AND $1::jsonb->>'_runtime_incarnation' IS DISTINCT FROM "
+            "context->'workspace_container'->>'_runtime_incarnation')"
+        )
+        context_base = (
+            f"CASE WHEN {successor} THEN COALESCE(context,'{{}}'::jsonb) "
+            "||jsonb_build_object('last_workspace_container',context->'workspace_container') "
+            "ELSE COALESCE(context,'{}'::jsonb) END"
+        )
+        workspace_base = (
+            f"CASE WHEN {successor} THEN (context->'workspace_container') "
+            "- 'recovery_cleanup' - 'recovery_completion_command_id' "
+            "- 'recovery_completion_outcome' - 'recovery_attempt_command_id' "
+            "- 'recovery_delete_pending' "
+            "ELSE COALESCE(context->'workspace_container','{}'::jsonb) END"
+        )
         query = (
             "UPDATE jobs "
             "SET context = jsonb_set("
-            "    COALESCE(context, '{}'::jsonb), "
+            f"    {context_base}, "
             "    '{workspace_container}', "
-            "    COALESCE(context->'workspace_container', '{}'::jsonb) || $1::jsonb"
+            f"    ({workspace_base}) || $1::jsonb"
             "), "
             "    updated_at = CURRENT_TIMESTAMP "
             f"WHERE id = $2{command_guard}"
@@ -15661,6 +16066,12 @@ class PostgresDB:
                 if raw_runtime is not None and not isinstance(raw_runtime, dict):
                     return None
                 raw_runtime = raw_runtime if isinstance(raw_runtime, dict) else {}
+                if (
+                    owner_kind == "job" and scope == "workspace_container"
+                    and "recovery_cleanup" in raw_runtime
+                    and OPERATOR_PAUSE_HOLD_CONTEXT_KEY in owner_state
+                ):
+                    return None
                 existing_runtime = raw_runtime.get(_STATELESS_RUNTIME_INCARNATION_KEY)
                 # The single explicit adoption authority the guard below asks
                 # for.  It recognises only what the previous release could
@@ -19622,9 +20033,13 @@ class PostgresDB:
         intent_generation: int,
         claimant: str,
         claim_token: int,
+        recovery_receipt: Dict[str, Any] | None = None,
     ) -> bool:
         """Atomically publish cleanup-complete and the exact final projection."""
 
+        constrained = ContainerRecoveryCleanup.parse(recovery_receipt)
+        if recovery_receipt is not None and constrained is None:
+            return False
         if owner_kind not in {"job", "thread"} or scope not in {
             "workspace_container",
             "ide",
@@ -19663,6 +20078,19 @@ class PostgresDB:
                     "WHERE id = $1 FOR UPDATE",
                     owner_uuid,
                 )
+                if constrained is not None and (
+                    owner_kind != "job" or scope != "workspace_container"
+                    or constrained.job_id != str(owner_uuid)
+                    or owner is None
+                    or not constrained.matches_owner(
+                        owner["owner_status"], _strict_json_object(owner["state"], label="context")
+                    )
+                    or await conn.fetchval(
+                        f"SELECT ({_completion_control_active_sql('context')}) FROM jobs WHERE id=$1",
+                        owner_uuid,
+                    )
+                ):
+                    return False
                 observed_intent = await conn.fetchrow(
                     "SELECT resource_policy FROM "
                     "managed_repository_workspace_cleanup_intents "
@@ -19710,7 +20138,7 @@ class PostgresDB:
                     expected_runtime,
                     intent_generation,
                 )
-                if intent is None:
+                if intent is None or (constrained is not None and not constrained.matches_intent(intent)):
                     return False
                 if intent.get("result_kind") == "superseded":
                     return False
@@ -25709,6 +26137,7 @@ class PostgresDB:
                        {status_guard}
                        {control_guard}
                        {hold_guard}
+                       AND {container_recovery_resume_allowed_sql("context")}
                     RETURNING id
                     """
             # A flag stops new idle nominations, never the dispatch fence of
@@ -31474,6 +31903,8 @@ class PostgresDB:
             hold_guard = " AND " + operator_pause_hold_matches_sql(
                 "context", f"${len(args)}"
             )
+        if lift_operator_pause_hold is not None:
+            hold_guard += " AND " + container_recovery_resume_allowed_sql("context")
         # Feedback queued behind a hold (by internal resumes, then the lifting
         # resume) is appended in order rather than replaced; `context` here is
         # the pre-update row, so the lifting write still sees its hold.
@@ -32019,16 +32450,17 @@ class PostgresDB:
                     ):
                         raise _ResumeCASLostError
                     shed = await conn.fetchrow(
-                        """
+                        f"""
                         UPDATE jobs
                            SET context = CASE
-                                WHEN COALESCE(context, '{}'::jsonb) ? $2::text
-                                THEN (COALESCE(context, '{}'::jsonb) - $2::text)
+                                WHEN $2::text='workspace_container' AND context->'workspace_container' ? 'recovery_cleanup' THEN context
+                                WHEN COALESCE(context, '{{}}'::jsonb) ? $2::text
+                                THEN (COALESCE(context, '{{}}'::jsonb) - $2::text)
                                      || jsonb_build_object(
                                             'last_' || $2::text,
                                             context -> $2::text
                                         )
-                                ELSE COALESCE(context, '{}'::jsonb)
+                                ELSE COALESCE(context, '{{}}'::jsonb)
                                END,
                                updated_at = CURRENT_TIMESTAMP
                          WHERE id = $1
@@ -32043,7 +32475,8 @@ class PostgresDB:
                            AND ($2::text <> 'vm' OR COALESCE(
                                context->'vm'->>'retirement_cleanup_pending', ''
                            ) <> 'true')
-                           AND ($2::text <> 'vm' OR NOT (COALESCE(context, '{}'::jsonb) ? '_vm_creation_pending'))
+                           AND ($2::text <> 'vm' OR NOT (COALESCE(context, '{{}}'::jsonb) ? '_vm_creation_pending'))
+                          AND ($2::text <> 'workspace_container' OR {container_recovery_resume_allowed_sql("context")})
                         RETURNING id
                         """,
                         job_uuid,
@@ -32113,6 +32546,7 @@ class PostgresDB:
                         f"""
                         UPDATE jobs
                         SET context = CASE
+                                WHEN $2::text='workspace_container' AND context->'workspace_container' ? 'recovery_cleanup' THEN context
                             WHEN COALESCE(context, '{{}}'::jsonb) ? $2::text
                             THEN (COALESCE(context, '{{}}'::jsonb) - $2::text)
                                  || jsonb_build_object(
@@ -32127,6 +32561,7 @@ class PostgresDB:
                           AND status::text=$3::text
                           AND ($2::text <> 'vm' OR NOT (COALESCE(context, '{{}}'::jsonb) ? '_vm_creation_pending'))
                           AND ({_completion_control_owned_active_sql("context", "$4")})
+                          AND ($2::text <> 'workspace_container' OR {container_recovery_resume_allowed_sql("context")})
                         RETURNING id
                         """,
                         job_uuid,

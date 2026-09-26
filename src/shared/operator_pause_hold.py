@@ -24,7 +24,10 @@ The same restriction also holds infrastructure recovery after its bounded
 retry budget is exhausted. That source is ``workspace_recovery_exhausted``;
 it records no human actor and grants no cleanup or execution authority. The
 historical context key stays stable so every existing admission/claim fence
-also covers this source.
+also covers this source. ``workspace_recovery_unavailable`` likewise holds an
+interrupted command whose outcome is unknown. Its separate typed cleanup
+receipt, when present, must settle before explicit Resume; the hold itself
+never grants cleanup or execution authority.
 
 Presence alone holds, whatever the value's shape (fail-closed). The marker is
 jobs-row state, so it survives orchestrator and worker restarts. Stdlib-only:

@@ -211,6 +211,7 @@ def job_control_operations(
     return job_controls.JobControlOperations(
         job_controls.JobControlDependencies(
             store=resources.postgres_db,
+            validate_workspace_recovery_storage=container_provisioner_module.container_provisioner.validate_workspace_recovery_storage,
             logger=logger,
             completion_control=resources.completion_control_boundary,
             completion_commands_enabled=lambda: resources.settings.completion_commands_enabled,

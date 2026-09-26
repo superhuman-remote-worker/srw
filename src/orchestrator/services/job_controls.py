@@ -115,6 +115,7 @@ class JobControlDependencies:
     get_container_context: Callable[[Mapping[str, Any]], Mapping[str, Any]]
     get_vm_context: Callable[[Mapping[str, Any]], Mapping[str, Any]]
     recovery_store: Any
+    validate_workspace_recovery_storage: Callable[[str], Awaitable[bool]] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -853,6 +854,13 @@ class JobControlOperations:
         # that lands after this read makes the resume lose instead of being
         # crossed.
         operator_pause_lift = operator_pause_lift_token(job)
+        recovery_context = self.dependencies.get_container_context(job)
+        if "recovery_cleanup" in recovery_context:
+            validate_storage = self.dependencies.validate_workspace_recovery_storage
+            if validate_storage is None or not await validate_storage(job_id):
+                raise HTTPException(
+                    409, "Workspace recovery cleanup or exact retained storage is not ready"
+                )
         recovery = await self.dependencies.recovery_store.unresolved_participation(
             UUID(job_id)
         )
@@ -1310,9 +1318,10 @@ class JobControlOperations:
                                     raise RuntimeError(
                                         "workspace preflight requires a context key"
                                     )
-                                await self.dependencies.store.shed_workspace_context(
+                                if not await self.dependencies.store.shed_workspace_context(
                                     job_id, workspace_context_key
-                                )
+                                ):
+                                    raise HTTPException(409, "Workspace cleanup is still pending")
                             queued = await self.dependencies.store.queue_job_for_resume(
                                 job_id,
                                 context_merge,
@@ -1455,9 +1464,10 @@ class JobControlOperations:
                         {**job, "id": job_id}, source="missing_workspace_resume"
                     )
                 elif job.get("execution_lane") != "stateless":
-                    await self.dependencies.store.shed_workspace_context(
+                    if not await self.dependencies.store.shed_workspace_context(
                         job_id, workspace_context_key
-                    )
+                    ):
+                        raise HTTPException(409, "Workspace cleanup is still pending")
                 return await _queue_for_dispatch(
                     f"No live {missing_workspace} workspace — queued for re-provisioning",
                     workspace_preflight_required=True,

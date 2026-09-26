@@ -3099,6 +3099,11 @@ class _PinnedSessionContainerDB(_CreationReservationDBDouble):
         self.published = {}
         self.ready = None
 
+    async def get_job(self, job_id):
+        # The same double also covers fresh Job creation. No retained recovery
+        # predecessor exists in those cases.
+        return {"id": job_id, "status": "paused", "context": {}}
+
     @asynccontextmanager
     async def thread_advisory_lock(self, _thread_id):
         yield True

@@ -300,6 +300,18 @@ def _operator_pause_hold_lines(job: dict[str, Any]) -> list[str]:
     if hold is None:
         return []
     detail = hold if isinstance(hold, dict) else {}
+    if detail.get("source") == "workspace_recovery_unavailable":
+        workspace = context.get("workspace_container") or {}
+        receipt = workspace.get("recovery_cleanup") if isinstance(workspace, dict) else None
+        gate = (
+            "; cleanup must settle before Resume"
+            if isinstance(receipt, dict) and receipt.get("phase") != "settled"
+            else "; explicit Resume required"
+        )
+        return [
+            "Workspace recovery hold: interrupted command outcome is unknown; "
+            "workspace storage and checkpoints retained" + gate
+        ]
     if detail.get("source") == "workspace_recovery_exhausted":
         return [
             "Workspace recovery hold: retries exhausted; workspace and checkpoints "
