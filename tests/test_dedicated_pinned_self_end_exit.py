@@ -134,6 +134,18 @@ async def test_unmarked_termination_does_not_exit():
 
 
 @pytest.mark.asyncio
+async def test_stateless_executor_never_exits_on_a_session_end():
+    """A stateless executor serves many claims; its teardown never exits it."""
+
+    inner = AsyncMock(return_value=None)
+    with _attached_runtime(inner=inner, bound_thread=THREAD) as exit_fn:
+        with patch.object(pa, "_stateless_mode", return_value=True):
+            await pa._terminate_session("idle_timeout")
+
+    exit_fn.assert_not_called()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("reason", ["shutdown", "rest_detach", "legacy", "drain"])
 async def test_orchestrator_or_process_driven_teardown_keeps_its_own_exit_owner(
     reason,

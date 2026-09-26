@@ -416,6 +416,65 @@ async def test_self_ended_claim_bearing_proof_is_unchanged(stack):
     assert proof["pvc_name"] == life["claim"]["pvc_name"]
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fault", ["actor_pod_uid", "pool_marker", "warm_marker"])
+async def test_claimless_capture_requires_every_exact_relation(stack, fault):
+    """An incomplete claim-less shape records nothing and never blocks End."""
+
+    ids = await _thread(stack.db)
+    life = await _bind_life(stack, ids, with_claim=False)
+    async with stack.db.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute("SET LOCAL session_replication_role='replica'")
+            if fault == "actor_pod_uid":
+                await conn.execute(
+                    "UPDATE thread_agent_pod_provision_intents SET pod_uid=$2 "
+                    "WHERE attempt_id=$1::uuid",
+                    life["attempt"],
+                    str(uuid4()),
+                )
+            elif fault == "pool_marker":
+                await conn.execute(
+                    "UPDATE threads SET metadata=metadata #- "
+                    "'{agent_pod,provision_attempt}' WHERE id=$1::uuid",
+                    ids["thread"],
+                )
+            else:
+                await conn.execute(
+                    "UPDATE threads SET metadata=jsonb_set(metadata,"
+                    "'{agent_pod,warm_binding_protection}',to_jsonb($2::text)) "
+                    "WHERE id=$1::uuid",
+                    ids["thread"],
+                    str(uuid4()),
+                )
+
+    retirement = await stack.db.begin_pinned_thread_retirement(
+        life["thread"],
+        permanent=False,
+        settle_status="ended",
+        initiator="agent",
+        expected_runtime_generation=life["generation"],
+        expected_agent_id=life["agent"],
+        expected_attach_token=life["attach_token"],
+        authorize_immediately=True,
+    )
+    if retirement.get("state") != "pending":
+        # The shape is refused before any settlement; nothing can be captured.
+        assert await _outcome_proof(stack.db, life) is None
+        return
+    await _ack_local_quiescence(stack.db, life, retirement)
+    settled = await stack.db.settle_pinned_thread_retirement(
+        ids["thread"],
+        token=retirement["token"],
+        generation=retirement["generation"],
+        final_status="ended",
+    )
+    # A warm marker without its bound protection row is refused outright;
+    # the other shapes settle normally but capture no Pod relation.
+    assert settled is (fault != "warm_marker")
+    assert await _outcome_proof(stack.db, life) is None
+
+
 # ---------------------------------------------------------------------------
 # Self-ended life → Pod exits → permanent Delete reaches 404
 # ---------------------------------------------------------------------------
