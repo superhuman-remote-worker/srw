@@ -115,6 +115,13 @@ cleans up after itself; a Session doesn't (see below).
   later becomes ready, a stateless Session can finish that same creation while
   its reservation remains open. Retries preserve the original image-pull budget;
   they do not reopen closed historical creation attempts.
+- **Stateless Ready publication settles creation atomically.** The trusted Ready
+  binding, creation-marker removal, and exact reservation settlement share one
+  database transaction. An interruption before commit leaves the creation open
+  for the same Pod; losing the commit response leaves Ready and settlement
+  committed together, so a normal retry observes that runtime. This guarantee
+  requires the updated orchestrator. Upgrading does not repair historical Ready
+  workspaces whose reservation was left open by an earlier version.
 - **End also handles an initial stateless startup failure.** If the first fresh
   container has a recorded Pod identity and no container has started, normal
   End can stop it without waiting for its image or SSH. End retains its exact
@@ -126,8 +133,8 @@ cleans up after itself; a Session doesn't (see below).
 
   This applies only to an open initial creation with exact resource identity.
   Pinned startup failures, missing Pod identity, restored or previously retained
-  workspaces, closed historical creations, and a crash after Ready but before
-  creation settlement remain outside this recovery path.
+  workspaces, closed historical creations, and historical Ready workspaces with
+  an open reservation remain outside this recovery path.
 
 ## Privilege
 

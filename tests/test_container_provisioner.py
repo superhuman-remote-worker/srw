@@ -2840,6 +2840,13 @@ class _StrictCreationDB(_CreationReservationDBDouble):
     async def complete_stateless_thread_workspace_creation(self, thread_id, **kwargs):
         self.events.append(("complete", thread_id, kwargs))
         if self.completed:
+            self._creation_reservation.update(
+                phase="settled",
+                result_kind="settled",
+                settled_at="now",
+                thread_runtime_generation=kwargs["generation"],
+            )
+            self.thread["execution_lane"] = "stateless"
             self.thread["runtime_generation"] = kwargs["generation"]
             self.thread["metadata"]["workspace_container"] = {
                 "status": "ready",
@@ -2848,6 +2855,11 @@ class _StrictCreationDB(_CreationReservationDBDouble):
                 "_creation_claim_token": str(kwargs["creation_claim_token"]),
             }
         return self.completed
+
+    async def get_current_managed_repository_workspace_creation_result(
+        self, _thread_id, **_kwargs
+    ):
+        return dict(self._creation_reservation)
 
     async def clear_stateless_thread_workspace_runtime_for_recreation(
         self, thread_id, **kwargs

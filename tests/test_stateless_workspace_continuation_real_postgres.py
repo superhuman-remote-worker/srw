@@ -123,7 +123,13 @@ async def reservation(database, thread_id):
 
 
 async def workspace_attempt(
-    database, actor, monkeypatch, *, first_wait="pull_error", pvc_enabled=True
+    database,
+    actor,
+    monkeypatch,
+    *,
+    first_wait="pull_error",
+    pvc_enabled=True,
+    expected_first_outcome=None,
 ):
     workspace, selection = await select_execution_workspace(
         database,
@@ -209,7 +215,12 @@ async def workspace_attempt(
             thread_id, db=database, provisioner=provisioner, suspension=suspension
         )
     assert first.outcome == (
-        EnsureOutcome.FAILED if first_wait == "pull_error" else EnsureOutcome.PENDING
+        expected_first_outcome
+        or (
+            EnsureOutcome.FAILED
+            if first_wait == "pull_error"
+            else EnsureOutcome.PENDING
+        )
     )
     before = await database.get_thread(thread_id)
     pending = metadata(before)["workspace_container"]

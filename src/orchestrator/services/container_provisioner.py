@@ -1110,6 +1110,11 @@ class ContainerProvisioner:
                     # waiter timed out. Keep that pending-success contract and
                     # the reservation open for the exact existing continuation.
                     return True
+                return await self._stateless_workspace_creation_is_settled(
+                    owner,
+                    generation=stateless_creation_generation,
+                    reservation=reservation,
+                )
         if not created:
             if reservation.get("external_mutation_started_at") is None:
                 abort = getattr(
@@ -4563,29 +4568,70 @@ class ContainerProvisioner:
                 _creation_reservation=reservation,
             ):
                 return False
-            current = await self._db.get_thread(owner.id)
-            metadata = current.get("metadata") if current else None
-            if isinstance(metadata, str):
-                metadata = json.loads(metadata)
-            workspace = (metadata or {}).get("workspace_container") or {}
-            if (
-                workspace.get("status") != "ready"
-                or "_runtime_creation" in workspace
-                or workspace.get(WORKSPACE_RUNTIME_INCARNATION_KEY)
-                != expected_runtime_incarnation
-            ):
-                return False
-            return bool(
-                await self._db.settle_managed_repository_workspace_creation_reservation(
-                    owner.id,
-                    owner_kind="thread",
-                    scope="workspace_container",
-                    reservation_generation=int(reservation["reservation_generation"]),
-                    claimant=str(reservation["claimed_by"]),
-                    claim_token=int(reservation["claim_token"]),
-                    runtime_incarnation=expected_runtime_incarnation,
+            return await self._stateless_workspace_creation_is_settled(
+                owner, generation=generation, reservation=reservation
+            )
+
+    async def _stateless_workspace_creation_is_settled(
+        self,
+        owner: WorkspaceOwner,
+        *,
+        generation: str,
+        reservation: dict[str, Any],
+    ) -> bool:
+        """Verify atomic Ready's receipt while the caller holds the mutation guard.
+
+        This is deliberately read-only: a failed/lost verification cannot undo
+        a committed Ready publication or settle a historical markerless row.
+        """
+
+        current = await self._db.get_thread(owner.id)
+        workspace = thread_metadata_object(current).get("workspace_container")
+        if (
+            owner.kind != "session"
+            or not isinstance(current, Mapping)
+            or current.get("execution_lane") != "stateless"
+            or current.get("status") == "ended"
+            or str(current.get("runtime_generation") or "") != generation
+            or not isinstance(workspace, Mapping)
+            or workspace.get("status") != "ready"
+            or WORKSPACE_RUNTIME_CREATION_KEY in workspace
+            or workspace.get(WORKSPACE_RUNTIME_INCARNATION_KEY)
+            != str(reservation.get("runtime_incarnation") or "")
+            or workspace.get(WORKSPACE_CREATION_RESERVATION_CONTEXT_KEY)
+            != str(reservation["id"])
+            or workspace.get(WORKSPACE_CREATION_CLAIM_TOKEN_CONTEXT_KEY)
+            != str(reservation["claim_token"])
+            or reservation.get("operation_kind") not in {"create", "restore"}
+        ):
+            return False
+        settled = await self.get_current_workspace_creation_result(
+            owner, operation_kind=reservation["operation_kind"]
+        )
+        return bool(
+            isinstance(settled, dict)
+            and settled.get("owner_kind") == "thread"
+            and str(settled.get("owner_id") or "") == owner.id
+            and settled.get("scope") == "workspace_container"
+            and str(settled.get("thread_runtime_generation") or "") == generation
+            and settled.get("phase") == "settled"
+            and settled.get("result_kind") == "settled"
+            and settled.get("settled_at") is not None
+            and settled.get("cancel_requested_at") is None
+            and all(
+                settled.get(key) is not None
+                and str(settled[key]) == str(reservation.get(key))
+                for key in (
+                    "id",
+                    "reservation_generation",
+                    "claim_token",
+                    "claimed_by",
+                    "operation_kind",
+                    "desired_manifest_digest",
+                    "runtime_incarnation",
                 )
             )
+        )
 
     async def continue_stateless_workspace_creation(
         self,

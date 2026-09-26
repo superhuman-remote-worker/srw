@@ -20229,7 +20229,7 @@ class PostgresDB:
         creation_claim_token: int,
         host: str | None = None,
     ) -> dict[str, Any] | None:
-        """Atomically bind and publish Ready for the exact create authority."""
+        """Publish Ready and settle its exact creation in one owner-ordered transaction."""
 
         try:
             thread_uuid = UUID(str(thread_id))
@@ -20305,6 +20305,28 @@ class PostgresDB:
                 ):
                     return None
 
+                # Lock owner before reservation, as admission/cancellation do.
+                # Ready's identity trigger still needs this open authority, so
+                # publish first and settle second, within this transaction.
+                reservation = await conn.fetchrow(
+                    "SELECT * FROM managed_repository_workspace_creation_reservations "
+                    "WHERE id = $1::uuid AND owner_kind = 'thread' AND owner_id = $2 "
+                    "AND scope = 'workspace_container' "
+                    "AND thread_runtime_generation = $3::uuid "
+                    "AND claim_token = $4 AND runtime_incarnation = $5::uuid "
+                    "AND operation_kind = $6 AND phase = 'runtime_bound' "
+                    "AND settled_at IS NULL AND cancel_requested_at IS NULL "
+                    "AND expires_at > now() FOR UPDATE",
+                    reservation_id,
+                    thread_uuid,
+                    generation,
+                    creation_claim_token,
+                    runtime_incarnation,
+                    marker["mode"],
+                )
+                if reservation is None:
+                    return None
+
                 binding = metadata.get("_workspace_binding")
                 if binding is not None and not isinstance(binding, dict):
                     return None
@@ -20356,7 +20378,22 @@ class PostgresDB:
                     json.dumps(metadata),
                 )
                 if result != "UPDATE 1":
-                    return None
+                    raise RuntimeError("stateless Ready publication lost owner row")
+                settled = await conn.execute(
+                    "UPDATE managed_repository_workspace_creation_reservations "
+                    "SET settled_at = now(), phase = 'settled', result_kind = 'settled' "
+                    "WHERE id = $1 AND claim_token = $2 "
+                    "AND phase = 'runtime_bound' AND settled_at IS NULL "
+                    "AND cancel_requested_at IS NULL AND expires_at > now()",
+                    reservation["id"],
+                    creation_claim_token,
+                )
+                if settled != "UPDATE 1":
+                    # Never commit a Ready projection with its marker removed
+                    # unless this exact reservation closes in the same commit.
+                    raise RuntimeError(
+                        "stateless Ready publication lost creation authority"
+                    )
                 return {
                     "workspace_generation": workspace_generation,
                     "runtime_incarnation": runtime_incarnation,
