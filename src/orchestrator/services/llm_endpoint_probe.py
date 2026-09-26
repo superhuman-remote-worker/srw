@@ -84,6 +84,24 @@ def _capability_hints(model_id: str) -> list[str]:
     return ["chat", "auxiliary"]
 
 
+def _is_web_page(resp: httpx.Response) -> bool:
+    """True when the body is an HTML page rather than an API response.
+
+    An HTML page means the base URL reaches a web UI or a non-LLM service
+    (SearXNG answers ``/models`` with its 404 page). Echoing the page as the
+    error would bury the one useful fact under markup.
+    """
+    content_type = resp.headers.get("content-type", "").lower()
+    return "html" in content_type or resp.text.lstrip().startswith("<")
+
+
+def _web_page_error(resp: httpx.Response, probe_url: str) -> str:
+    return (
+        f"HTTP {resp.status_code}: {probe_url} answered with a web page, "
+        "not an OpenAI-compatible model list."
+    )
+
+
 async def probe_endpoint_models(
     base_url: str,
     api_key: str | None,
@@ -115,7 +133,13 @@ async def probe_endpoint_models(
         return ProbeResult(
             ok=False,
             status=resp.status_code,
-            error=(resp.text[:500] if resp.text else None),
+            # JSON error bodies (a bad key, an unknown route) are what LLM
+            # servers send and stay verbatim.
+            error=(
+                _web_page_error(resp, probe_url)
+                if _is_web_page(resp)
+                else (resp.text[:500] if resp.text else None)
+            ),
             probe_url=probe_url,
         )
 
@@ -125,7 +149,11 @@ async def probe_endpoint_models(
         return ProbeResult(
             ok=False,
             status=resp.status_code,
-            error=f"Response body is not JSON: {e}",
+            error=(
+                _web_page_error(resp, probe_url)
+                if _is_web_page(resp)
+                else f"Response body is not JSON: {e}"
+            ),
             probe_url=probe_url,
         )
 

@@ -767,7 +767,7 @@ export interface LlmEndpointDiscoveryResult {
   ok: boolean;
   status: number | null;
   error: string | null;
-  probe_url: string;
+  probe_url: string | null;
   models: LlmEndpointDiscoveredModel[];
 }
 

@@ -186,6 +186,24 @@ def _validate_llm_endpoint_url(base_url: str, allow_insecure: bool) -> str:
     return parsed.geturl()
 
 
+def _service_adapter(row: Mapping[str, Any]) -> str | None:
+    """The non-OpenAI adapter a catalog row is served through, if any.
+
+    Search/fetch providers (SearXNG, Tavily, Crawl4AI) and ElevenLabs TTS share
+    the endpoint table with model servers but speak their own APIs; their rows
+    name the adapter in ``params_json.provider``. ``openai`` names the
+    OpenAI-compatible shape itself, so it is not a separate adapter.
+    """
+    params = row.get("params_json")
+    provider = params.get("provider") if isinstance(params, Mapping) else None
+    if not isinstance(provider, str):
+        return None
+    provider = provider.strip()
+    if not provider or provider.lower() == "openai":
+        return None
+    return provider
+
+
 def _serialize_endpoint(
     row: dict[str, Any], *, manifest: dict[str, Any] | None = None
 ) -> dict[str, Any]:
@@ -528,6 +546,28 @@ class ProviderCatalogService:
         if _endpoint_is_subscription_proxy(endpoint):
             result = await self._subscription_discovery(endpoint)
             return {"subscription": True, "status": None, **result.to_public()}
+
+        # A search/fetch/TTS service has no /models route; probing it only
+        # returns the service's own 404 page. An endpoint without rows yet is
+        # still probed — that is the add-endpoint-then-discover flow.
+        catalog_rows = await self.store.list_models(
+            provider_kind="endpoint", provider_ref=str(endpoint["id"])
+        )
+        adapters = [_service_adapter(row) for row in catalog_rows]
+        if adapters and all(adapters):
+            names = ", ".join(sorted({a for a in adapters if a}))
+            return {
+                "subscription": False,
+                "ok": False,
+                "status": None,
+                "error": (
+                    f"{endpoint['label']} is served by the {names} adapter, not an "
+                    "OpenAI-compatible model server, so it has no model list to "
+                    "discover."
+                ),
+                "probe_url": None,
+                "models": [],
+            }
 
         result = await self.probe(
             base_url=endpoint["base_url"],

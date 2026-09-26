@@ -76,6 +76,24 @@ function isSubscriptionEndpoint(ep: LlmEndpoint | undefined): boolean {
   return LEGACY_SUBSCRIPTION_LABELS.includes(ep.label);
 }
 
+/**
+ * The non-OpenAI adapter(s) serving every catalog row on an endpoint
+ * (SearXNG, Tavily, ElevenLabs…), or null when any row is a plain model or
+ * the endpoint has no rows yet. Such a service has no `/models` route to
+ * discover. Mirrors `_service_adapter` in
+ * `src/orchestrator/services/provider_catalog.py`, which refuses the probe.
+ */
+function serviceAdapterFor(rows: readonly CatalogModel[]): string | null {
+  const adapters = new Set<string>();
+  for (const row of rows) {
+    const provider = row.params_json?.['provider'];
+    const name = typeof provider === 'string' ? provider.trim() : '';
+    if (!name || name.toLowerCase() === 'openai') return null;
+    adapters.add(name);
+  }
+  return adapters.size > 0 ? [...adapters].sort().join(', ') : null;
+}
+
 /** The discover route answers one of two shapes; `subscription` picks them apart. */
 function isSubscriptionDiscovery(
   result: LlmEndpointDiscoveryResult | SubscriptionDiscoveryResult,
@@ -384,17 +402,24 @@ export function reasoningStarveWarning(ctx: number | null): string | null {
                   }
                 }
                 <div class="discover-actions">
-                  <app-button
-                    variant="secondary"
-                    size="sm"
-                    [loading]="discovering()"
-                    [disabled]="discovering()"
-                    (clicked)="discoverFromEndpoint(endpointRef)"
-                  >
-                    {{ discovering() ? 'Discovering…' : 'Discover available models' }}
-                  </app-button>
+                  @if (selectedService(); as service) {
+                    <span class="muted">
+                      {{ service.label }} is served by the {{ service.adapter }} adapter,
+                      not a model server — there is no model list to discover.
+                    </span>
+                  } @else {
+                    <app-button
+                      variant="secondary"
+                      size="sm"
+                      [loading]="discovering()"
+                      [disabled]="discovering()"
+                      (clicked)="discoverFromEndpoint(endpointRef)"
+                    >
+                      {{ discovering() ? 'Discovering…' : 'Discover available models' }}
+                    </app-button>
+                  }
                   @if (discoverError()) {
-                    <app-badge tone="danger" size="xs">{{ discoverError() }}</app-badge>
+                    <span class="discover-error" role="alert">{{ discoverError() }}</span>
                   } @else if (discoveredModels().length > 0) {
                     <span class="muted">
                       Click a model to autofill ID and label:
@@ -926,6 +951,13 @@ export function reasoningStarveWarning(ctx: number | null): string | null {
       gap: 10px;
       flex-wrap: wrap;
     }
+    .discover-error {
+      flex: 1 1 240px;
+      min-width: 0;
+      color: var(--danger);
+      font-size: 12px;
+      overflow-wrap: anywhere;
+    }
     .discover-list {
       margin-top: 10px;
       display: flex;
@@ -1331,6 +1363,21 @@ export class AdminCatalogComponent implements OnInit {
     return opts;
   });
 
+  /** Set when the selected endpoint is a search/fetch/TTS service. */
+  readonly selectedService = computed<{label: string; adapter: string} | null>(() => {
+    const endpointId = this.selectedEndpointRef();
+    if (!endpointId) return null;
+    const adapter = serviceAdapterFor(
+      this.models
+        .models()
+        .filter((m) => m.provider_kind === 'endpoint' && m.provider_ref === endpointId),
+    );
+    if (!adapter) return null;
+    const label =
+      this.providers.systemEndpoints().find((e) => e.id === endpointId)?.label ?? adapter;
+    return {label, adapter};
+  });
+
   /** True when the form provider is the shared subscription proxy. */
   readonly selectedIsSubscription = computed(() =>
     isSubscriptionEndpoint(
@@ -1394,7 +1441,8 @@ export class AdminCatalogComponent implements OnInit {
     this.formError.set('');
     this.discoveredModels.set([]);
     this.discoverError.set('');
-    this.discoverFromEndpoint(endpointId);
+    // A known search/fetch/TTS service gets the inline note, not a probe.
+    if (!this.selectedService()) this.discoverFromEndpoint(endpointId);
     queueMicrotask(() => {
       this.discoverPaneRef()?.nativeElement.scrollIntoView({
         behavior: 'smooth',

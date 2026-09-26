@@ -489,6 +489,58 @@ async def test_plain_discovery_keeps_plain_shape_and_refuses_bulk_import(catalog
 
 
 @pytest.mark.asyncio
+async def test_service_endpoint_discovery_explains_instead_of_probing(catalogue):
+    catalogue.store.get_system_llm_endpoint.return_value = endpoint_row(
+        label="SearXNG", base_url="http://srw-searxng:8080"
+    )
+    catalogue.store.list_models.return_value = [
+        model_row(
+            model_id="searxng",
+            capabilities=["search"],
+            params_json={"provider": "searxng", "ops": ["search"]},
+        )
+    ]
+    response = await catalogue.request(
+        "POST", f"/api/admin/providers/endpoints/{ROW_ID}/discover"
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["subscription"] is False
+    assert body["ok"] is False
+    assert body["models"] == []
+    assert body["probe_url"] is None
+    assert "SearXNG is served by the searxng adapter" in body["error"]
+    catalogue.store.list_models.assert_awaited_once_with(
+        provider_kind="endpoint", provider_ref=ROW_ID
+    )
+    catalogue.probe.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_endpoint_with_a_model_row_is_still_probed(catalogue):
+    catalogue.store.get_system_llm_endpoint.return_value = endpoint_row()
+    catalogue.store.list_models.return_value = [
+        model_row(
+            model_id="searxng",
+            capabilities=["search"],
+            params_json={"provider": "searxng", "ops": ["search"]},
+        ),
+        model_row(model_id="qwen3-32b", capabilities=["chat"]),
+        model_row(
+            model_id="tts-1",
+            capabilities=["tts"],
+            params_json={"provider": "openai"},
+        ),
+    ]
+    response = await catalogue.request(
+        "POST", f"/api/admin/providers/endpoints/{ROW_ID}/discover"
+    )
+    assert response.status_code == 200
+    assert response.json()["ok"] is True
+    catalogue.probe.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_model_subscription_routing_metadata_survives_projection(catalogue):
     from shared.subscription_routing import (
         PROTOCOL_OPENAI_RESPONSES,
