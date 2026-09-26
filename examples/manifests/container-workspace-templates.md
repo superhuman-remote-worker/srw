@@ -111,10 +111,12 @@ cleans up after itself; a Session doesn't (see below).
 
   Check the pod's status and events with `kubectl describe pod
   workspace-<first 12 characters of the Job ID>` in the workspace namespace.
-- **Sessions can't recover from a pull failure.** A Session whose image can't be
-  pulled logs the reason, and its workspace then stays stuck. It isn't retried,
-  and the Session can't be ended or deleted from the UI or the API. An operator
-  has to remove it.
+- **Stateless Sessions can continue an open creation.** If the original Pod
+  later becomes ready, a stateless Session can finish that same creation while
+  its reservation remains open. Retries preserve the original image-pull budget;
+  they do not reopen closed historical creation attempts. Ending or deleting a
+  Session after a failed start, and pinned-Session startup failures, still need
+  operator handling.
 
 ## Privilege
 

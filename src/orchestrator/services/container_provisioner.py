@@ -40,6 +40,7 @@ from orchestrator.services.ssh_helpers import (
 from orchestrator.services.workspace_binding import CANVAS_WORKSPACE_GENERATION_KEY
 from orchestrator.services.ide_credentials import IDE_CREDENTIAL_ENV, ide_credential
 from orchestrator.services.workspace_lifecycle import WorkspaceOwner
+from orchestrator.services.stateless_workspace_gate import thread_metadata_object
 from orchestrator.services.managed_repository_process_retirement import (
     retire_managed_repository_processes,
 )
@@ -1082,6 +1083,33 @@ class ContainerProvisioner:
                 _creation_plan=creation_plan,
                 _creation_profile=profile,
             )
+            if (
+                created
+                and owner.kind == "session"
+                and stateless_creation_generation is not None
+            ):
+                current = await self._db.get_thread(owner.id)
+                workspace = thread_metadata_object(current).get("workspace_container")
+                if (
+                    not isinstance(workspace, Mapping)
+                    or str((current or {}).get("runtime_generation") or "")
+                    != stateless_creation_generation
+                    or workspace.get(WORKSPACE_RUNTIME_INCARNATION_KEY)
+                    != str(reservation.get("runtime_incarnation") or "")
+                    or workspace.get(WORKSPACE_CREATION_RESERVATION_CONTEXT_KEY)
+                    != str(reservation["id"])
+                    or workspace.get(WORKSPACE_CREATION_CLAIM_TOKEN_CONTEXT_KEY)
+                    != str(reservation["claim_token"])
+                ):
+                    return False
+                if (
+                    workspace.get("status") != "ready"
+                    or WORKSPACE_RUNTIME_CREATION_KEY in workspace
+                ):
+                    # True means the Pod was accepted, even when its first
+                    # waiter timed out. Keep that pending-success contract and
+                    # the reservation open for the exact existing continuation.
+                    return True
         if not created:
             if reservation.get("external_mutation_started_at") is None:
                 abort = getattr(

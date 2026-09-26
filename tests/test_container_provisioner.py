@@ -2796,6 +2796,7 @@ class TestCreateWorkspace:
 class _StrictCreationDB(_CreationReservationDBDouble):
     def __init__(self, events=None):
         self._init_creation_reservation()
+        self.thread = {"user_id": None, "metadata": {}}
         self.events = events if events is not None else []
         self.valid = True
         self.claimed = True
@@ -2825,10 +2826,27 @@ class _StrictCreationDB(_CreationReservationDBDouble):
 
     async def publish_stateless_thread_workspace_runtime(self, thread_id, **kwargs):
         self.events.append(("publish", thread_id, kwargs))
+        if self.published:
+            self.thread["runtime_generation"] = kwargs["generation"]
+            self.thread["metadata"]["workspace_container"] = {
+                "status": "created",
+                "_runtime_incarnation": kwargs["runtime_incarnation"],
+                "_creation_reservation_id": kwargs["creation_reservation_id"],
+                "_creation_claim_token": str(kwargs["creation_claim_token"]),
+                "_runtime_creation": {"attempted": True},
+            }
         return self.published
 
     async def complete_stateless_thread_workspace_creation(self, thread_id, **kwargs):
         self.events.append(("complete", thread_id, kwargs))
+        if self.completed:
+            self.thread["runtime_generation"] = kwargs["generation"]
+            self.thread["metadata"]["workspace_container"] = {
+                "status": "ready",
+                "_runtime_incarnation": kwargs["runtime_incarnation"],
+                "_creation_reservation_id": kwargs["creation_reservation_id"],
+                "_creation_claim_token": str(kwargs["creation_claim_token"]),
+            }
         return self.completed
 
     async def clear_stateless_thread_workspace_runtime_for_recreation(
@@ -2853,7 +2871,7 @@ class _StrictCreationDB(_CreationReservationDBDouble):
         return "internet-only"
 
     async def get_thread(self, *_args):
-        return {"user_id": None}
+        return self.thread
 
     async def record_stateless_thread_workspace_process_zero(self, thread_id, **kwargs):
         self.events.append(("record_process_zero", thread_id, kwargs))

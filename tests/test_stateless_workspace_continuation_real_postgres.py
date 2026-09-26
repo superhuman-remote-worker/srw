@@ -122,7 +122,7 @@ async def reservation(database, thread_id):
     return dict(rows[0])
 
 
-async def pending_workspace(database, actor, monkeypatch):
+async def workspace_attempt(database, actor, monkeypatch, *, first_wait="pull_error"):
     workspace, selection = await select_execution_workspace(
         database,
         actor,
@@ -190,10 +190,25 @@ async def pending_workspace(database, actor, monkeypatch):
     )
     suspension = SimpleNamespace()
 
-    first = await ensure_session_workspace(
-        thread_id, db=database, provisioner=provisioner, suspension=suspension
+    with monkeypatch.context() as waiter_patch:
+        if first_wait == "not_ready":
+            waiter_patch.setattr(
+                provisioner, "_wait_for_ready", AsyncMock(return_value=None)
+            )
+        elif first_wait == "ready":
+            wait_for_ready = provisioner._wait_for_ready
+
+            async def ready_on_first_wait(*args, **kwargs):
+                cluster.become_ready()
+                return await wait_for_ready(*args, **kwargs)
+
+            waiter_patch.setattr(provisioner, "_wait_for_ready", ready_on_first_wait)
+        first = await ensure_session_workspace(
+            thread_id, db=database, provisioner=provisioner, suspension=suspension
+        )
+    assert first.outcome == (
+        EnsureOutcome.FAILED if first_wait == "pull_error" else EnsureOutcome.PENDING
     )
-    assert first.outcome == EnsureOutcome.FAILED
     before = await database.get_thread(thread_id)
     pending = metadata(before)["workspace_container"]
     pod_uid = cluster.objects["pod"].metadata.uid
@@ -201,9 +216,15 @@ async def pending_workspace(database, actor, monkeypatch):
     service_uid = cluster.objects["service"].metadata.uid
     creation = await reservation(database, thread_id)
     assert pending["_runtime_incarnation"] == pod_uid
-    assert pending["_runtime_creation"]["attempted"] is True
-    assert creation["phase"] == "runtime_bound"
-    assert creation["settled_at"] is None
+    if first_wait == "ready":
+        assert "_runtime_creation" not in pending
+        assert pending["status"] == "ready"
+        assert creation["phase"] == "settled"
+        assert creation["settled_at"] is not None
+    else:
+        assert pending["_runtime_creation"]["attempted"] is True
+        assert creation["phase"] == "runtime_bound"
+        assert creation["settled_at"] is None
     assert cluster.objects["pod"].spec.containers[0]["image"] == IMAGE
     return SimpleNamespace(
         thread_id=thread_id,
@@ -221,10 +242,87 @@ async def pending_workspace(database, actor, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_initial_ready_settles_exact_creation(database, actor, monkeypatch):
+    case = await workspace_attempt(database, actor, monkeypatch, first_wait="ready")
+    workspace = metadata(case.before)["workspace_container"]
+    assert workspace["_creation_reservation_id"] == str(case.creation["id"])
+    assert workspace["_creation_claim_token"] == str(case.creation["claim_token"])
+    assert str(case.creation["thread_runtime_generation"]) == str(
+        case.before["runtime_generation"]
+    )
+    assert case.creation["claimed_by"] == (
+        f"container-create:{case.before['runtime_generation']}"
+    )
+    assert case.cluster.pod_create_calls == 1
+    assert case.cluster.pod_deletes == 0
+    assert (
+        await read_execution(database, "Session", case.thread_id)
+        == case.original_snapshot
+    )
+
+
+@pytest.mark.asyncio
+async def test_initial_not_ready_keeps_creation_open_for_same_pod_continuation(
+    database, actor, monkeypatch
+):
+    case = await workspace_attempt(database, actor, monkeypatch, first_wait="not_ready")
+    assert metadata(case.before)["workspace_container"]["status"] == "created"
+    case.cluster.become_ready()
+    await ensure_session_workspace(
+        case.thread_id,
+        db=database,
+        provisioner=case.provisioner,
+        suspension=case.suspension,
+    )
+    settled = await reservation(database, case.thread_id)
+    for key in (
+        "id",
+        "reservation_generation",
+        "thread_runtime_generation",
+        "claim_token",
+        "claimed_by",
+        "operation_kind",
+        "desired_manifest_digest",
+        "runtime_incarnation",
+        "pod_uid",
+        "pvc_uid",
+        "service_uid",
+    ):
+        assert settled[key] == case.creation[key]
+    assert settled["phase"] == "settled"
+    assert settled["settled_at"] is not None
+    after = await database.get_thread(case.thread_id)
+    workspace = metadata(after)["workspace_container"]
+    assert after["runtime_generation"] == case.before["runtime_generation"]
+    assert workspace["status"] == "ready"
+    assert "_runtime_creation" not in workspace
+    assert workspace["_runtime_incarnation"] == case.pod_uid
+    assert (
+        await read_execution(database, "Session", case.thread_id)
+        == case.original_snapshot
+    )
+    for kind, uid in (
+        ("pod", case.pod_uid),
+        ("pvc", case.pvc_uid),
+        ("service", case.service_uid),
+    ):
+        assert case.cluster.objects[kind].metadata.uid == uid
+    ready = await ensure_session_workspace(
+        case.thread_id,
+        db=database,
+        provisioner=case.provisioner,
+        suspension=case.suspension,
+    )
+    assert ready.outcome == EnsureOutcome.READY
+    assert case.cluster.pod_create_calls == 1
+    assert case.cluster.pod_deletes == 0
+
+
+@pytest.mark.asyncio
 async def test_ensure_continues_exact_open_creation_with_frozen_image(
     database, actor, monkeypatch
 ):
-    case = await pending_workspace(database, actor, monkeypatch)
+    case = await workspace_attempt(database, actor, monkeypatch)
     thread_id, provisioner = case.thread_id, case.provisioner
     cluster, suspension = case.cluster, case.suspension
     pod_uid, pvc_uid, service_uid = case.pod_uid, case.pvc_uid, case.service_uid
@@ -270,7 +368,7 @@ async def test_ensure_continues_exact_open_creation_with_frozen_image(
 async def test_ensure_continues_exact_creation_after_lease_expiry(
     database, actor, monkeypatch
 ):
-    case = await pending_workspace(database, actor, monkeypatch)
+    case = await workspace_attempt(database, actor, monkeypatch)
     original = case.creation
     # Match the reservation duration guard while expiring only this test row.
     await database.execute(
@@ -376,7 +474,7 @@ async def test_ensure_continues_exact_creation_after_lease_expiry(
 async def test_continuation_keeps_elapsed_custom_image_pull_budget(
     database, actor, monkeypatch, caplog
 ):
-    case = await pending_workspace(database, actor, monkeypatch)
+    case = await workspace_attempt(database, actor, monkeypatch)
     caplog.clear()
     result = await asyncio.wait_for(
         case.provisioner.continue_stateless_workspace_creation(
@@ -400,7 +498,7 @@ async def test_continuation_keeps_elapsed_custom_image_pull_budget(
 async def test_not_ready_continuation_keeps_reservation_open_until_ready(
     database, actor, monkeypatch
 ):
-    case = await pending_workspace(database, actor, monkeypatch)
+    case = await workspace_attempt(database, actor, monkeypatch)
     with monkeypatch.context() as waiting:
         waiting.setattr(
             case.provisioner, "_wait_for_ready", AsyncMock(return_value=None)
@@ -434,7 +532,7 @@ async def test_not_ready_continuation_keeps_reservation_open_until_ready(
 async def test_restore_continuation_keeps_suspension_operation_and_volume(
     database, actor, monkeypatch
 ):
-    case = await pending_workspace(database, actor, monkeypatch)
+    case = await workspace_attempt(database, actor, monkeypatch)
     case.cluster.become_ready()
     await ensure_session_workspace(
         case.thread_id,
@@ -564,7 +662,7 @@ async def test_restore_continuation_keeps_suspension_operation_and_volume(
 async def test_continuation_refuses_changed_or_missing_authority(
     database, actor, monkeypatch, refusal
 ):
-    case = await pending_workspace(database, actor, monkeypatch)
+    case = await workspace_attempt(database, actor, monkeypatch)
     case.cluster.become_ready()
     generation = str(case.before["runtime_generation"])
     runtime = case.pod_uid
