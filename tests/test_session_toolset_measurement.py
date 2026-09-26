@@ -940,6 +940,51 @@ class TestPreviewEndpoint:
                 await _preview_tool_groups(ToolGroupPreviewRequest(), fake_request)
         assert exc.value.status_code == 403
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("expert_type", ["session", "worker"])
+    @pytest.mark.parametrize("key", ["container", "sandbox"])
+    async def test_the_form_preview_refuses_the_workspace_side_door(
+        self, user_a, fake_db, fake_request, key, expert_type
+    ):
+        """Spec acceptance 5: the 422 in the form preview, as at admission.
+
+        Container image/resources come only from the selected
+        WorkspaceTemplate. A caller-authored ``workspace.container`` (the old
+        side door) or ``workspace.sandbox`` (the template's rendered form) is
+        refused on the raw request, before workspace selection or
+        ``bind_execution_workspace`` could quietly drop it.
+        """
+        from fastapi import HTTPException
+
+        select = AsyncMock(side_effect=AssertionError("selection must not run"))
+        with (
+            patch(
+                "orchestrator.security.auth.require_approved_user", _approved(user_a)
+            ),
+            patch("orchestrator.main.app.state.resources.postgres_db", fake_db),
+            patch(
+                "orchestrator.services.manifest_workspace_selection."
+                "select_execution_workspace",
+                select,
+            ),
+        ):
+            with pytest.raises(HTTPException) as exc:
+                await _preview_tool_groups(
+                    ToolGroupPreviewRequest(
+                        expert_type=expert_type,
+                        config_override={
+                            "workspace": {key: {"image": "registry.example/x:1"}}
+                        },
+                    ),
+                    fake_request,
+                )
+        assert exc.value.status_code == 422
+        assert (
+            "are no longer supported. Put the image and resources in a "
+            "WorkspaceTemplate" in exc.value.detail
+        )
+        select.assert_not_awaited()
+
 
 class TestEnumerateOnlyRidesBothReads:
     """A settings surface cannot offer "shell on" unless it is told the names.

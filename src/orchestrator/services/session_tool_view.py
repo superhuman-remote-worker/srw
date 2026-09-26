@@ -24,7 +24,10 @@ from fastapi import HTTPException, Request
 
 from orchestrator.services import session_config_resolution
 from orchestrator.services.agent_toolset_probe import origin_fields, unmeasured
-from orchestrator.services.config_overrides import looks_like_uuid
+from orchestrator.services.config_overrides import (
+    looks_like_uuid,
+    refuse_execution_owned_workspace_keys,
+)
 from orchestrator.services.deployment_gates import is_experts_db_enabled
 from orchestrator.services.session_tool_policy import (
     legacy_session_tool_policy,
@@ -223,6 +226,10 @@ async def preview_tool_groups(
     request, handed to workspace selection unchanged. See
     ``POST /api/persistent/tool-groups/preview`` for the contract.
     """
+    # The form preview answers for the same raw override admission will see,
+    # so it refuses the container side door with admission's 422 instead of
+    # letting workspace binding drop it with a warning.
+    refuse_execution_owned_workspace_keys(body.config_override)
     store = dependencies.store
     is_worker = body.expert_type == "worker"
     default_base = "worker_base" if is_worker else "session_base"
