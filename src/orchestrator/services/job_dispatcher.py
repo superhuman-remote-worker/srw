@@ -43,6 +43,7 @@ from orchestrator.services.dispatch_guards import (
     resume_lane_applies,
     vm_provisioning_decision,
 )
+from orchestrator.services.job_workspace_authority import project_inherited_workspace
 from orchestrator.services.job_workspace_runtime import (
     get_container_context as _get_container_context,
 )
@@ -88,6 +89,13 @@ class _OwnerChanged(Exception):
         self.job = job
 
 
+@dataclass(frozen=True, slots=True)
+class _PreparedCandidate:
+    job: dict[str, Any]
+    durable_snapshot: str
+    inherited_parent_id: str | None
+
+
 @dataclass(slots=True)
 class JobDispatchState:
     """Serialization state one application's dispatcher owns.
@@ -104,7 +112,7 @@ class JobDispatchState:
     preflight_tasks: set[asyncio.Task[Any]] = field(default_factory=set)
     pending: dict[str, tuple[dict[str, Any], bool]] = field(default_factory=dict)
     active: dict[str, tuple[str, bool]] = field(default_factory=dict)
-    completed: dict[str, dict[str, Any]] = field(default_factory=dict)
+    completed: dict[str, _PreparedCandidate] = field(default_factory=dict)
     runner: asyncio.Task[Any] | None = None
     requested: JobDispatchDependencies | None = None
     discover_requested: bool = False
@@ -248,6 +256,7 @@ def _snapshot(job: dict[str, Any]) -> str:
             key: job.get(key)
             for key in (
                 "status",
+                "parent_job_id",
                 "execution_lane",
                 "assigned_agent_id",
                 "freeze_data",
@@ -262,17 +271,33 @@ def _snapshot(job: dict[str, Any]) -> str:
 
 
 async def _current_candidate(
-    job: dict[str, Any], dependencies: JobDispatchDependencies
+    candidate: _PreparedCandidate, dependencies: JobDispatchDependencies
 ) -> bool:
+    job = candidate.job
     current = await dependencies.store.get_job(str(job["id"]))
-    return bool(
+    if not (
         _may_schedule(dependencies.state)
         and _eligible(current, dependencies)
-        and _snapshot(current) == _snapshot(job)
+        and _snapshot(current) == candidate.durable_snapshot
+    ):
+        return False
+    expected = workspace_runtime_authority_digest(
+        job, vm_mode=dependencies.vm_provisioner.mode
+    )
+    if expected is None:
+        return False
+    if candidate.inherited_parent_id is not None:
+        parent = await dependencies.store.get_job(candidate.inherited_parent_id)
+        current = copy.deepcopy(current)
+        action, _ = project_inherited_workspace(current, parent)
+        if action != "proceed":
+            return False
+    return bool(
+        _may_schedule(dependencies.state)
         and workspace_runtime_authority_digest(
-            job, vm_mode=dependencies.vm_provisioner.mode
+            current, vm_mode=dependencies.vm_provisioner.mode
         )
-        is not None
+        == expected
     )
 
 
@@ -311,6 +336,11 @@ async def _run_preflight(
             return
         if _owner_key(job) != state.active[job_id][0]:
             raise _OwnerChanged(job)
+        raw_snapshot = _snapshot(job)
+        inherited_owner = stateless_worker_workspace_owner(job).id
+        inherited_parent_id = (
+            inherited_owner if inherited_owner != str(job["id"]) else None
+        )
         before = workspace_runtime_authority_digest(
             job, vm_mode=dependencies.vm_provisioner.mode
         )
@@ -318,7 +348,13 @@ async def _run_preflight(
             job, dependencies=dependencies, mutation=mutation
         )
         if candidate is not None:
-            state.completed[job_id] = copy.deepcopy(candidate)
+            state.completed[job_id] = _PreparedCandidate(
+                copy.deepcopy(candidate),
+                raw_snapshot
+                if inherited_parent_id is not None
+                else _snapshot(candidate),
+                inherited_parent_id,
+            )
         elif mutation:
             # A creator may finish Ready but deliberately return PENDING. Only
             # that newly durable authority wakes a fresh ready verification;
@@ -436,8 +472,9 @@ async def _dispatch_pass(
             candidates = list(state.completed.values())
             state.completed.clear()
             dispatchable = []
-            for job in candidates:
-                if not await _current_candidate(job, dependencies):
+            for candidate in candidates:
+                job = candidate.job
+                if not await _current_candidate(candidate, dependencies):
                     continue
                 if job.get("execution_lane") == "stateless":
                     (
@@ -463,7 +500,7 @@ async def _dispatch_pass(
                             job["id"],
                         )
                 else:
-                    dispatchable.append(job)
+                    dispatchable.append(candidate)
             await _match_jobs(dispatchable, dependencies=dependencies)
             _pump_preflights(dependencies)
         except Exception:
@@ -1105,8 +1142,10 @@ async def _preflight_job(
 
 
 async def _match_jobs(
-    dispatchable_jobs: list[dict[str, Any]], *, dependencies: JobDispatchDependencies
+    prepared: list[_PreparedCandidate], *, dependencies: JobDispatchDependencies
 ) -> None:
+    dispatchable_jobs = [candidate.job for candidate in prepared]
+    candidates_by_id = {str(candidate.job["id"]): candidate for candidate in prepared}
     if not dispatchable_jobs:
         return
 
@@ -1142,7 +1181,7 @@ async def _match_jobs(
             break  # No more free agents
 
         job_id = str(job["id"])
-        if not await _current_candidate(job, dependencies):
+        if not await _current_candidate(candidates_by_id[job_id], dependencies):
             continue
         # Atomically claim the job for this agent BEFORE notifying the
         # pod. Closes the dual-leader double-assign that leader election

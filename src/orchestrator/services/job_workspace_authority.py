@@ -438,6 +438,41 @@ async def resolve_subjob_inherited_workspace(
         )
         return ("wait", None)
 
+    result = project_inherited_workspace(job, parent)
+    if result[0] == "proceed":
+        dependencies.logger.info(
+            "Dispatcher: subjob %s inheriting parent %s runtime — "
+            "resolved live at dispatch",
+            job.get("id"),
+            parent_id,
+        )
+    return result
+
+
+def project_inherited_workspace(
+    job: dict[str, Any], parent: dict[str, Any] | None
+) -> tuple[str, str | None]:
+    """Apply the existing inheritance contract to already-read rows only.
+
+    This mutates only the caller's in-memory child projection. Adoption and
+    external runtime proofs remain the async resolver's responsibility; the
+    dispatcher can repeat these same contract/phase checks on fresh rows at
+    its claim boundary without doing remote work under its assignment lock.
+    """
+    parent_id = job.get("parent_job_id")
+    ctx = job.get("context") or {}
+    if isinstance(ctx, str):
+        try:
+            ctx = json.loads(ctx)
+        except (TypeError, ValueError):
+            return ("fail", "Child workspace context is invalid.")
+    if (
+        not parent_id
+        or not isinstance(ctx, dict)
+        or not ctx.get("inherits_parent_workspace")
+    ):
+        return ("fail", "Child has no parent workspace inheritance authority.")
+
     if not parent:
         return (
             "fail",
@@ -489,23 +524,11 @@ async def resolve_subjob_inherited_workspace(
         ctx["workspace_container"] = parent_container
         ctx.pop("vm", None)
         job["context"] = ctx
-        dependencies.logger.info(
-            "Dispatcher: subjob %s inheriting parent %s sandbox runtime — "
-            "resolved live at dispatch",
-            job.get("id"),
-            parent_id,
-        )
         return ("proceed", None)
     if inherited_backend == "vm" and parent_vm.get("status") == "ready":
         ctx["vm"] = parent_vm
         ctx.pop("workspace_container", None)
         job["context"] = ctx
-        dependencies.logger.info(
-            "Dispatcher: subjob %s inheriting parent %s VM runtime — resolved "
-            "live at dispatch",
-            job.get("id"),
-            parent_id,
-        )
         return ("proceed", None)
 
     # Parent workspace is dead (reaped/failed) or the parent itself reached a
