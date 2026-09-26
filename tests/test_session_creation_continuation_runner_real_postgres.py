@@ -563,17 +563,47 @@ async def test_background_clock_allows_valid_late_pull_without_charging_pre_pod_
     provider = reconstructed_provider(db, case, monkeypatch)
     provider._reattach_ready_timeout = 1
     provider._image_pull_timeout = 3 if pre_pod_delay else 8
-    provider._ssh_auth_ready_timeout = 0.5
+    # This positive case covers physical-clock origin, not SSH expiry. Keep
+    # room for real PostgreSQL admission under load; expiry has separate tests.
+    provider._ssh_auth_ready_timeout = 30
     pod_start = case.cluster.objects["pod"].metadata.creation_timestamp
     assert (datetime.now(timezone.utc) - pod_start).total_seconds() > 1
     if pre_pod_delay:
         assert (pod_start - source["created_at"]).total_seconds() >= 2.5
     make_ready(case, monkeypatch)
+    ready_start = case.cluster.objects["pod"].status.conditions[0].last_transition_time
+    physical_clocks = []
+    ready_clocks = []
+    actual_wait = provider._wait_for_ready
+    actual_ready_clock = provider._background_ready_clock
+
+    async def observed_wait(*args, **kwargs):
+        physical_clocks.append(
+            (kwargs.get("pull_started_at"), kwargs.get("readiness_started_at"))
+        )
+        return await actual_wait(*args, **kwargs)
+
+    def observed_ready_clock(pod, created_at):
+        result = actual_ready_clock(pod, created_at)
+        ready_clocks.append((created_at, result))
+        return result
+
+    monkeypatch.setattr(provider, "_wait_for_ready", observed_wait)
+    monkeypatch.setattr(provider, "_background_ready_clock", observed_ready_clock)
+    # Candidate discovery and guarded continuation can exceed the old 0.5s
+    # SSH fixture budget under load; exercise that delay deliberately.
+    await asyncio.sleep(0.75)
     (candidate,) = (await db.list_current_session_creation_candidates()).candidates
     runner = SessionCreationContinuationRunner(
         db=db, provisioner=provider, shutdown_event=asyncio.Event()
     )
     assert await runner._continue(candidate)
+    assert physical_clocks and all(
+        clock == (pod_start, pod_start) for clock in physical_clocks
+    )
+    assert ready_clocks and all(
+        clock == (pod_start, ready_start) for clock in ready_clocks
+    )
     assert (
         metadata(await db.get_thread(case.thread_id))["workspace_container"]["status"]
         == "ready"
