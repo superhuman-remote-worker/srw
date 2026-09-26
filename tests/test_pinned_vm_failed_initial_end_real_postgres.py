@@ -271,7 +271,7 @@ async def test_normal_end_settles_never_issued_initial_source_across_proven_bind
     )
 
 
-async def _partial_after_aborts(db, monkeypatch, last_effect):
+async def _partial_after_aborts(db, monkeypatch, last_effect, *, permanent=True):
     from orchestrator.services.vm_creation_disposition_store import (
         VMCreationDispositionStore,
     )
@@ -294,7 +294,7 @@ async def _partial_after_aborts(db, monkeypatch, last_effect):
     current = await _bind_protected_agent(db, thread_id)
     for _ in range(2):
         current = await _abort_and_rebind_same_pod(db, current)
-    retirement = await _begin(db, current)
+    retirement = await _begin(db, current, permanent=permanent)
     assert retirement["state"] == "pending", retirement
     await _authorize(db, current, retirement)
     return (
@@ -981,17 +981,24 @@ async def test_lost_replies_and_aborted_preflight_preserve_source_and_require_cu
         runtime_generation=retirement["generation"],
         retirement_token=retirement["token"],
     )
-    # Separate audit-ownership design is required: immutable creation history
-    # retains a restrictive thread FK. Do not silently erase that history.
-    with pytest.raises(
-        asyncpg.ForeignKeyViolationError, match="vm_creation_retries_thread_id_fkey"
-    ):
-        await db.delete_thread(
-            str(current["id"]),
-            expected_runtime_retirement_token=retirement["token"],
-            expected_runtime_generation=retirement["generation"],
+    # Stable audit ownership retains the settled source byte-for-byte after
+    # exact permanent End removes its live thread.
+    settled_source = await db.fetchrow(
+        "SELECT * FROM vm_creation_retries WHERE request_id=$1", source["request_id"]
+    )
+    await db.delete_thread(
+        str(current["id"]),
+        expected_runtime_retirement_token=retirement["token"],
+        expected_runtime_generation=retirement["generation"],
+    )
+    assert await db.get_thread(str(current["id"])) is None
+    assert (
+        await db.fetchrow(
+            "SELECT * FROM vm_creation_retries WHERE request_id=$1",
+            source["request_id"],
         )
-    assert await db.get_thread(str(current["id"])) is not None
+        == settled_source
+    )
 
 
 async def _current_zero_arguments(db, current, retirement):
