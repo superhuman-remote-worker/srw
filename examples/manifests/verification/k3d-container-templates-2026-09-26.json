@@ -418,6 +418,16 @@
           "ordinaryPreviewStatus": 200,
           "validCustomTemplatePreviewStatus": 200,
           "rowsCreatedByProbes": 0
+        },
+        "resolution": {
+          "result": "passed after fix",
+          "commit": "00dce49a0",
+          "fix": "select_execution_workspace maps the resolver's ManifestError and the binding schema's ValueError to 422",
+          "verifiedLive": "2026-09-26 on k3d-srw after Tilt sync (pod file md5 matched)",
+          "virtualTemplateWithImage": "422 'Virtual workspaces do not support OS images, initialization or allocated compute.' on all five surfaces",
+          "noneTemplateWithResources": "422 'workspace must be null or a manifest template/instanceRef binding' on both tool-groups previews",
+          "control": "plain tool-groups preview 200",
+          "rowsCreatedByProbes": 0
         }
       },
       {
