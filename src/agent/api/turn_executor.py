@@ -129,7 +129,7 @@ from shared.cloud_push_tasks import (
 )
 from shared.subagent_lifecycle import SubagentLifecycleError
 from shared.runtime.core.workspace_backend import WorkspaceUnavailableError
-from shared.worker_errors import worker_error_cause
+from shared.worker_errors import worker_error_cause, worker_workspace_exhaustion_cause
 from shared.workspace_recovery import (
     WorkspaceRecoveryCode,
     WorkspaceRecoveryDisposition,
@@ -2206,7 +2206,12 @@ class StatelessTurnExecutor:
             and self._worker_workspace_provisioner == "k8s"
             and wire_payload.get("goal_achieved", False) is False
             and isinstance(error, dict)
-            and error.get("type") == "workspace_unavailable"
+            and (
+                error.get("type") == "workspace_unavailable"
+                # Native budget exhaustion preserves the typed workspace cause;
+                # losing that report leaves the same command outcome unknown.
+                or worker_workspace_exhaustion_cause(error) is not None
+            )
         )
         started_at = time.perf_counter()
         try:
