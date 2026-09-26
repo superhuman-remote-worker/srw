@@ -123,6 +123,19 @@ def test_policy_from_env_always_trusts_the_installation_repository(monkeypatch):
     assert loaded.pull_timeout_seconds == 900
 
 
+def test_policy_from_env_normalises_a_configured_tag_or_digest(monkeypatch):
+    monkeypatch.setenv("WORKSPACE_IMAGE", "ghcr.io/org/srw-workspace:v1")
+    monkeypatch.setenv(
+        "WORKSPACE_TRUSTED_IMAGE_REPOSITORIES",
+        '["registry.example/team/ws:v2", "localhost:5005/ws@sha256:' + "f" * 64 + '"]',
+    )
+    loaded = SandboxImagePolicy.from_env()
+    assert loaded.trusted_repositories == frozenset(
+        {"ghcr.io/org/srw-workspace", "registry.example/team/ws", "localhost:5005/ws"}
+    )
+    assert loaded.trusts("registry.example/team/ws:v3")
+
+
 def test_policy_from_env_rejects_a_non_list(monkeypatch):
     monkeypatch.setenv("WORKSPACE_TRUSTED_IMAGE_REPOSITORIES", '"ghcr.io/org/x"')
     with pytest.raises(ValueError):

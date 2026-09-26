@@ -128,8 +128,9 @@ class SandboxImagePolicy:
         fuse_enabled = _env_flag("WORKSPACE_FUSE_ENABLED", True)
         return cls(
             default_image=default_image,
+            # An operator may paste a full reference; only its repository counts.
             trusted_repositories=frozenset(
-                [image_repository(default_image), *configured]
+                image_repository(item) for item in [default_image, *configured]
             ),
             custom_images_privileged=_env_opt_in(
                 "WORKSPACE_CUSTOM_IMAGES_PRIVILEGED", False
