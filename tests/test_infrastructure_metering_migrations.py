@@ -377,7 +377,7 @@ APP_INPUT_DELIVERY_CONSTRAINTS_NOT_VALID = (
 )
 APP_CURRENT_MIGRATION_HEAD = (
     ROOT
-    / "src/orchestrator/database/migrations/app/0300_ide_restore_zero_effect_cancellation.sql"
+    / "src/orchestrator/database/migrations/app/0301_capture_claimless_retired_agent_pod.sql"
 )
 AUDIT_EXPANSION = (
     ROOT

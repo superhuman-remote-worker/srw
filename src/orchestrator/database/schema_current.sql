@@ -818,8 +818,7 @@ BEGIN
                   CONSTRAINT = 'retired_agent_pod_identity_authority';
     END IF;
     -- The existing insert-authority trigger first validates the exact live
-    -- retirement and local-quiescence receipt. Only soft, claim-bearing actors
-    -- leave a reusable workspace whose historical Pod needs this relation.
+    -- retirement and local-quiescence receipt.
     IF NEW.permanent OR NEW.agent_id IS NULL THEN
         RETURN NEW;
     END IF;
@@ -827,11 +826,45 @@ BEGIN
      WHERE id = NEW.thread_id FOR SHARE;
     marker := owner_row.runtime_retirement_context->'agent_pod';
     captured_agent := owner_row.runtime_retirement_context->'agent';
-    IF marker->>'protection_protocol' IS DISTINCT FROM 'finalizer_v1'
-       OR owner_row.runtime_retirement_context->'agent_workspace_claim'
-          IS NULL
+    IF marker->>'protection_protocol' IS DISTINCT FROM 'finalizer_v1' THEN
+        RETURN NEW;
+    END IF;
+
+    IF owner_row.runtime_retirement_context->'agent_workspace_claim' IS NULL
        OR owner_row.runtime_retirement_context->'agent_workspace_claim'
           IN ('null'::jsonb, '{}'::jsonb) THEN
+        SELECT * INTO actor_row FROM public.agents
+         WHERE id = NEW.agent_id FOR SHARE;
+        SELECT * INTO intent_row FROM public.thread_agent_pod_provision_intents
+         WHERE attempt_id::text = marker->>'provision_attempt'
+           AND thread_id = NEW.thread_id FOR SHARE;
+        IF actor_row.id IS NULL OR intent_row.attempt_id IS NULL
+           OR marker ? 'warm_binding_protection'
+           OR intent_row.workspace_claim_id IS NOT NULL
+           OR owner_row.agent_id IS DISTINCT FROM NEW.agent_id
+           OR owner_row.runtime_attach_token IS DISTINCT FROM NEW.runtime_attach_token
+           OR actor_row.thread_id IS DISTINCT FROM NEW.thread_id
+           OR actor_row.hostname IS DISTINCT FROM marker->>'pod_name'
+           OR actor_row.pod_uid IS DISTINCT FROM marker->>'pod_uid'
+           OR actor_row.hostname IS DISTINCT FROM captured_agent->>'hostname'
+           OR actor_row.pod_uid IS DISTINCT FROM captured_agent->>'pod_uid'
+           OR intent_row.runtime_generation IS DISTINCT FROM NEW.runtime_generation
+           OR intent_row.status IS DISTINCT FROM 'published'
+           OR intent_row.pod_name IS DISTINCT FROM actor_row.hostname
+           OR intent_row.pod_uid IS DISTINCT FROM actor_row.pod_uid
+           OR intent_row.namespace IS DISTINCT FROM marker->>'namespace'
+           OR intent_row.protection_protocol IS DISTINCT FROM 'finalizer_v1' THEN
+            RETURN NEW;
+        END IF;
+        NEW.retired_agent_pod := jsonb_build_object(
+            'version', 1,
+            'pod_name', intent_row.pod_name,
+            'pod_uid', intent_row.pod_uid,
+            'namespace', intent_row.namespace,
+            'provisioner', intent_row.provisioner,
+            'provision_attempt', intent_row.attempt_id,
+            'protection_protocol', intent_row.protection_protocol
+        );
         RETURN NEW;
     END IF;
 

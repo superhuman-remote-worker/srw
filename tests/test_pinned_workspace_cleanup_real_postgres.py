@@ -20,6 +20,7 @@ from tests import test_persistent_recycler_real_postgres as authority
 from tests.test_workspace_cleanup_retry_real_postgres import _absent_pod_provisioner
 from orchestrator.application import controls as controls_composition
 from orchestrator.application import preparation as preparation_composition
+from orchestrator.services import agent_provisioner as agent_provisioner_module
 from orchestrator.services import container_provisioner as container_provisioner_module
 from orchestrator.services import dispatch_credentials as dispatch_credentials_module
 from orchestrator.services import (
@@ -159,6 +160,13 @@ async def _scenario(db, monkeypatch):
     p._core_api.patch_namespaced_pod.side_effect = patch_pod
     monkeypatch.setattr(main.app.state.resources, "postgres_db", db)
     monkeypatch.setattr(container_provisioner_module, "container_provisioner", p)
+    # A soft End's agent exits itself; permanent End re-attests that exact
+    # settled Pod (here already reaped) before it clears the thread.
+    monkeypatch.setattr(
+        agent_provisioner_module,
+        "agent_provisioner",
+        authority._exited_agent_pod_provisioner(),
+    )
     monkeypatch.setattr(
         main.app.state.resources.session_router,
         "teardown_route",

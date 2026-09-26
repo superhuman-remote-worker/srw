@@ -329,6 +329,20 @@ class _K8sError(Exception):
         self.status = status
 
 
+def _exited_agent_pod_provisioner() -> AgentProvisioner:
+    """The soft-ended dedicated agent Pod exited and ``reap_pods`` removed it.
+
+    Permanent End retires every exact settled dedicated Pod (0301), so a
+    fixture whose agent Pod is not otherwise modelled must say it is gone.
+    """
+
+    provisioner = AgentProvisioner()
+    provisioner._k8s_available = True
+    provisioner._core_api = MagicMock()
+    provisioner._core_api.read_namespaced_pod.side_effect = _K8sError(404)
+    return provisioner
+
+
 class StatefulPinnedK8sApi:
     """Small API-server model: deletion waits for the SRW finalizer."""
 
@@ -2134,11 +2148,13 @@ async def test_permanent_delete_reclaims_same_generation_retained_k8s_pvc(db):
     )
     provisioner.capture_workspace_teardown_identity = AsyncMock(return_value=identity)
     provisioner.release_workspace = AsyncMock(return_value=True)
+    exited_agent = _exited_agent_pod_provisioner()
     with (
         patch.object(orch_main.app.state.resources, "postgres_db", db),
         patch.object(
             container_provisioner_module, "container_provisioner", provisioner
         ),
+        patch.object(agent_provisioner_module, "agent_provisioner", exited_agent),
         patch.object(
             orch_main.app.state.resources.session_router,
             "teardown_route",
@@ -2151,6 +2167,11 @@ async def test_permanent_delete_reclaims_same_generation_retained_k8s_pvc(db):
             permanent,
             cleanup_agent_pod=False,
         )
+    # The soft-settled agent Pod was re-attested by its exact name.
+    assert {
+        call.kwargs["name"]
+        for call in exited_agent._core_api.read_namespaced_pod.call_args_list
+    } == {f"persistent-{ids['thread'][:12]}"}
 
     provisioner.release_workspace.assert_awaited_once_with(
         WorkspaceOwner.session(ids["thread"]),

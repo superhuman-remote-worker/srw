@@ -1271,6 +1271,69 @@ class PinnedRetirementOperations:
             raise RuntimeError("captured agent workspace claim authority is incomplete")
         return values
 
+    def _historical_retirement_guard(
+        self,
+        retirement: Mapping[str, Any],
+    ) -> Callable[[], Awaitable[None]]:
+        """Re-assert permanent authority and local quiescence per mutation."""
+
+        context = retirement.get("context") or {}
+        thread_id = str(context.get("thread_id") or "")
+        generation = str(retirement.get("generation") or "")
+        token = str(retirement.get("token") or "")
+
+        async def assert_current_historical_retirement() -> None:
+            current = await self.dependencies.store.get_thread(thread_id)
+            if not (
+                current
+                and str(current.get("runtime_generation") or "") == generation
+                and str(current.get("runtime_retirement_token") or "") == token
+                and current.get("runtime_retirement_permanent") is True
+                and current.get("runtime_retirement_authorized_at") is not None
+            ):
+                raise RuntimeError("historical claimant retirement authority changed")
+            if not (
+                not self._retirement_context_runtime_exposed(retirement)
+                or self._retirement_has_exact_local_quiescence(retirement, current)
+                or await self.dependencies.store.pinned_thread_has_prior_soft_settlement(
+                    thread_id,
+                    runtime_generation=generation,
+                    retirement_token=token,
+                )
+            ):
+                raise RuntimeError(
+                    "historical claimant cleanup requires local quiescence"
+                )
+
+        return assert_current_historical_retirement
+
+    async def _retire_historical_unclaimed_agent_pods_for_retirement(
+        self,
+        retirement: Mapping[str, Any],
+    ) -> None:
+        """Permanently retire exited dedicated Pods that mounted no claim.
+
+        A claim-bearing Pod is retired with its claim below. A claim-less one
+        (``workspace.pvcEnabled`` false) has nothing to fence, but its SRW
+        protection finalizer still needs the exact settled relation 0301
+        records; without it the exited Pod stays Terminating for ever.
+        """
+
+        if not bool(retirement.get("permanent")):
+            return
+        context = retirement.get("context") or {}
+        from orchestrator.services.historical_agent_pod_cleanup import (
+            retire_historical_unclaimed_agent_pods,
+        )
+
+        await retire_historical_unclaimed_agent_pods(
+            self.dependencies.store,
+            thread_id=str(context.get("thread_id") or ""),
+            current_pod=context.get("agent_pod") or {},
+            assert_current=self._historical_retirement_guard(retirement),
+            agent_provisioner=self.dependencies.agent_provisioner,
+        )
+
     async def _reconcile_agent_workspace_claim_for_retirement(
         self,
         retirement: Mapping[str, Any],
@@ -1320,34 +1383,11 @@ class PinnedRetirementOperations:
             retire_historical_claimant_pods,
         )
 
-        async def assert_current_claim_retirement() -> None:
-            current = await self.dependencies.store.get_thread(thread_id)
-            if not (
-                current
-                and str(current.get("runtime_generation") or "") == generation
-                and str(current.get("runtime_retirement_token") or "") == token
-                and current.get("runtime_retirement_permanent") is True
-                and current.get("runtime_retirement_authorized_at") is not None
-            ):
-                raise RuntimeError("historical claimant retirement authority changed")
-            if not (
-                not self._retirement_context_runtime_exposed(retirement)
-                or self._retirement_has_exact_local_quiescence(retirement, current)
-                or await self.dependencies.store.pinned_thread_has_prior_soft_settlement(
-                    thread_id,
-                    runtime_generation=generation,
-                    retirement_token=token,
-                )
-            ):
-                raise RuntimeError(
-                    "historical claimant cleanup requires local quiescence"
-                )
-
         await retire_historical_claimant_pods(
             self.dependencies.store,
             claim=claim,
             current_pod=context.get("agent_pod") or {},
-            assert_current=assert_current_claim_retirement,
+            assert_current=self._historical_retirement_guard(retirement),
             agent_provisioner=self.dependencies.agent_provisioner,
         )
 
@@ -2610,6 +2650,10 @@ class PinnedRetirementOperations:
                 raise RuntimeError("agent workspace cleanup handoff is malformed")
             return
 
+        # Exited dedicated Pods of earlier lives that mounted no claim; the
+        # claim-bearing ones are retired with their claim just below.
+        await self._retire_historical_unclaimed_agent_pods_for_retirement(retirement)
+
         # A bootstrap Pod can have a distinct persistent PVC whose create was
         # already sent before registration. Soft settlement retains/re-attests the
         # exact UID. Permanent settlement deletes only exact claimants and leaves
@@ -2657,6 +2701,9 @@ class PinnedRetirementOperations:
     captured_agent_workspace_claim = _captured_agent_workspace_claim
     reconcile_agent_workspace_claim_for_retirement = (
         _reconcile_agent_workspace_claim_for_retirement
+    )
+    retire_historical_unclaimed_agent_pods_for_retirement = (
+        _retire_historical_unclaimed_agent_pods_for_retirement
     )
     recover_captured_process_zero = _recover_captured_sandbox_process_zero
     complete_retiring_soft_warm_binding_release = (

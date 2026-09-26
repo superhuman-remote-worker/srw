@@ -154,14 +154,16 @@ async def retire_terminal_claimant_pod(
     pod_uid: str,
     namespace: str,
     expected_labels: dict[str, str],
-    pvc_name: str,
+    pvc_name: str | None,
     known_successor_uids: frozenset[str] = frozenset(),
 ) -> bool:
-    """Retire one historically authorized, terminal PVC claimant.
+    """Retire one historically authorized, terminal dedicated agent Pod.
 
     This is not process-zero recovery for an active actor. The caller must
     possess immutable settlement/handoff proof and current retirement authority.
     A UID/RV patch binds all finalizer preconditions to the same fresh Pod read.
+    ``pvc_name`` is the claim a claimant must still mount; ``None`` is a
+    claim-less dedicated Pod, identified by its UID and labels alone.
     """
 
     async def read():
@@ -176,12 +178,17 @@ async def retire_terminal_claimant_pod(
         return (
             str(getattr(metadata, "uid", "")) == pod_uid
             and all(labels.get(key) == value for key, value in expected_labels.items())
-            and any(
-                getattr(
-                    getattr(volume, "persistent_volume_claim", None), "claim_name", None
+            and (
+                pvc_name is None
+                or any(
+                    getattr(
+                        getattr(volume, "persistent_volume_claim", None),
+                        "claim_name",
+                        None,
+                    )
+                    == pvc_name
+                    for volume in volumes
                 )
-                == pvc_name
-                for volume in volumes
             )
             and pod_containers_are_terminal(pod)
         )

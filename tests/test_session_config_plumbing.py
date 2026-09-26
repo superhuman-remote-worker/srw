@@ -2563,6 +2563,8 @@ class TestEndedSessionKeepsItsVolume:
             # and the durable idle-operation probe finds no physical-stop row.
             reserve_pinned_thread_idle_terminal_end=AsyncMock(return_value="none"),
             fetchrow=AsyncMock(return_value=None),
+            # No dedicated agent Pod was ever published for this thread.
+            fetch=AsyncMock(return_value=[]),
             begin_pinned_thread_retirement=AsyncMock(return_value=retirement),
             authorize_pinned_thread_retirement=AsyncMock(return_value=True),
             settle_pinned_thread_retirement=AsyncMock(return_value=True),
