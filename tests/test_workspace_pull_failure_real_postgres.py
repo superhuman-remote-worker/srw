@@ -404,13 +404,13 @@ async def _interrupted_pull(db, monkeypatch, *, kept_volume=False):
         assert (await _workspace(db, job))["_runtime_incarnation"] == runtime_uid
         assert await _open_authority(db, job) == {"reservations": 1, "intents": 0}
 
-        # This refusal is distinct from the durable two-owner deadlock below:
-        # cancellation cannot commit while the original creator holds its
-        # cross-replica physical-mutation guard.
-        with pytest.raises(
-            asyncpg.SerializationError, match="Workspace mutation is still in progress"
-        ):
-            await db.cancel_job(str(job))
+        # All accepted UIDs are durable before a Job observes readiness.
+        # Its guard is free here; actual in-flight SDK calls are covered by
+        # test_active_workspace_creator_cancel_real_postgres.
+        async with db.workspace_runtime_mutation_lock(
+            str(job), owner_kind="job", scope="workspace_container", wait=False
+        ) as acquired:
+            assert acquired
         async with db.acquire() as conn:
             assert (
                 await conn.fetchval("SELECT status::text FROM jobs WHERE id=$1", job)

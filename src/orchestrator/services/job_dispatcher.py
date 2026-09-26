@@ -1164,7 +1164,7 @@ async def _preflight_job(
                 job_id,
                 status="failed",
                 error_message=msg,
-                expected_status=(str(job.get("status")) if stateless_worker else None),
+                expected_status=str(job.get("status")),
             )
             return None
         if res.outcome is EnsureOutcome.PENDING:

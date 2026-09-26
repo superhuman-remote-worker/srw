@@ -26,6 +26,7 @@ from collections.abc import Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
+from types import MappingProxyType
 from typing import Any, Awaitable, Callable, Literal, Optional
 from uuid import UUID, uuid4
 from shared.workspace_recovery import WorkspaceRecoveryCode
@@ -140,6 +141,30 @@ class WorkspaceRuntimeAuthorityError(RuntimeError):
 
 class WorkspaceImagePullError(RuntimeError):
     """A custom workspace image could not be pulled within its budget."""
+
+
+class _WorkspaceCreationAuthorityLost(WorkspaceRuntimeAuthorityError):
+    """Readiness observation outlived its exact durable creation claim."""
+
+
+@dataclass(frozen=True)
+class _PreparedWorkspaceCreation:
+    """Joined and UID-published preparation; grants no continuation authority."""
+
+    owner: WorkspaceOwner
+    _creation_reservation: Mapping[str, Any]
+    strict_stateless: bool
+    stateless_creation_generation: str | None
+    pod_name: str
+    runtime_incarnation: str
+    network_tier: str
+    pvc_name: str | None
+    seed_cm: str | None
+    pvc_reattach: bool
+    seed_needs_state: bool
+    mutation_authority: Callable[[], Awaitable[bool]]
+    namespace: str
+    pull_image: str | None
 
 
 class WorkspaceRuntimeRecoveryRequired(WorkspaceRuntimeAuthorityError):
@@ -1059,17 +1084,8 @@ class ContainerProvisioner:
         )
         if not isinstance(reservation, dict):
             return False
-        # The reservation is durable before any Kubernetes side effect.  The
-        # dedicated session-level advisory guard then stays held until every
-        # accepted UID has been persisted, so cleanup/cancellation cannot
-        # observe a half-published generation while a client thread is still
-        # completing an ambiguous API call.
-        async with self._workspace_mutation_guard(
-            owner, scope="workspace_container"
-        ) as mutation_owned:
-            if not mutation_owned:
-                return False
-            created = await self._create_workspace_reserved(
+        if owner.kind == "job":
+            created = await self._create_job_workspace_reserved(
                 owner,
                 cpu=cpu,
                 memory=memory,
@@ -1083,38 +1099,65 @@ class ContainerProvisioner:
                 _creation_plan=creation_plan,
                 _creation_profile=profile,
             )
-            if (
-                created
-                and owner.kind == "session"
-                and stateless_creation_generation is not None
-            ):
-                current = await self._db.get_thread(owner.id)
-                workspace = thread_metadata_object(current).get("workspace_container")
-                if (
-                    not isinstance(workspace, Mapping)
-                    or str((current or {}).get("runtime_generation") or "")
-                    != stateless_creation_generation
-                    or workspace.get(WORKSPACE_RUNTIME_INCARNATION_KEY)
-                    != str(reservation.get("runtime_incarnation") or "")
-                    or workspace.get(WORKSPACE_CREATION_RESERVATION_CONTEXT_KEY)
-                    != str(reservation["id"])
-                    or workspace.get(WORKSPACE_CREATION_CLAIM_TOKEN_CONTEXT_KEY)
-                    != str(reservation["claim_token"])
-                ):
+        else:
+            # The reservation is durable before any Kubernetes side effect.  The
+            # dedicated session-level advisory guard then stays held until every
+            # accepted UID has been persisted, so cleanup/cancellation cannot
+            # observe a half-published generation while a client thread is still
+            # completing an ambiguous API call.
+            async with self._workspace_mutation_guard(
+                owner, scope="workspace_container"
+            ) as mutation_owned:
+                if not mutation_owned:
                     return False
-                if (
-                    workspace.get("status") not in {"ready", "restoring"}
-                    or WORKSPACE_RUNTIME_CREATION_KEY in workspace
-                ):
-                    # True means the Pod was accepted, even when its first
-                    # waiter timed out. Keep that pending-success contract and
-                    # the reservation open for the exact existing continuation.
-                    return True
-                return await self._stateless_workspace_creation_is_settled(
+                created = await self._create_workspace_reserved(
                     owner,
-                    generation=stateless_creation_generation,
-                    reservation=reservation,
+                    cpu=cpu,
+                    memory=memory,
+                    cpu_limit=cpu_limit,
+                    memory_limit=memory_limit,
+                    image=image,
+                    fresh=fresh,
+                    stateless_creation_generation=stateless_creation_generation,
+                    allow_stateless_create=allow_stateless_create,
+                    _creation_reservation=reservation,
+                    _creation_plan=creation_plan,
+                    _creation_profile=profile,
                 )
+                if (
+                    created
+                    and owner.kind == "session"
+                    and stateless_creation_generation is not None
+                ):
+                    current = await self._db.get_thread(owner.id)
+                    workspace = thread_metadata_object(current).get(
+                        "workspace_container"
+                    )
+                    if (
+                        not isinstance(workspace, Mapping)
+                        or str((current or {}).get("runtime_generation") or "")
+                        != stateless_creation_generation
+                        or workspace.get(WORKSPACE_RUNTIME_INCARNATION_KEY)
+                        != str(reservation.get("runtime_incarnation") or "")
+                        or workspace.get(WORKSPACE_CREATION_RESERVATION_CONTEXT_KEY)
+                        != str(reservation["id"])
+                        or workspace.get(WORKSPACE_CREATION_CLAIM_TOKEN_CONTEXT_KEY)
+                        != str(reservation["claim_token"])
+                    ):
+                        return False
+                    if (
+                        workspace.get("status") not in {"ready", "restoring"}
+                        or WORKSPACE_RUNTIME_CREATION_KEY in workspace
+                    ):
+                        # True means the Pod was accepted, even when its first
+                        # waiter timed out. Keep that pending-success contract and
+                        # the reservation open for the exact existing continuation.
+                        return True
+                    return await self._stateless_workspace_creation_is_settled(
+                        owner,
+                        generation=stateless_creation_generation,
+                        reservation=reservation,
+                    )
         if not created:
             if reservation.get("external_mutation_started_at") is None:
                 abort = getattr(
@@ -1993,7 +2036,143 @@ class ContainerProvisioner:
                 reservation["runtime_incarnation"] = resource_uid
         return recorded
 
+    async def _prepared_workspace_authority_is_current(
+        self,
+        prepared: _PreparedWorkspaceCreation,
+        *,
+        observed_pod_ip: str | None = None,
+    ) -> bool:
+        """Re-attest exact issued resources after reacquiring the Job guard."""
+        owner = prepared.owner
+        reservation = prepared._creation_reservation
+        try:
+            if (
+                prepared.namespace != self._namespace
+                or not await self._workspace_creation_reservation_is_current(
+                    owner, reservation, scope="workspace_container"
+                )
+            ):
+                return False
+            pod = await self._bounded_kubernetes_call(
+                self._core_api.read_namespaced_pod,
+                name=prepared.pod_name,
+                namespace=prepared.namespace,
+            )
+            self._require_workspace_pod_connection_identity(
+                pod,
+                owner=owner,
+                expected_runtime_incarnation=prepared.runtime_incarnation,
+                expected_creation_generation=prepared.stateless_creation_generation,
+                expected_network_tier=prepared.network_tier,
+                expected_pvc_name=prepared.pvc_name,
+                expected_seed_configmap=prepared.seed_cm,
+            )
+            self._require_workspace_creation_reservation_annotation(
+                pod, reservation_id=str(reservation["id"])
+            )
+            if observed_pod_ip is not None and (
+                pod.status.phase != "Running"
+                or pod.status.pod_ip != observed_pod_ip
+                or not pod.status.container_statuses
+                or not all(status.ready for status in pod.status.container_statuses)
+            ):
+                return False
+            if prepared.seed_cm is not None:
+                seed = await self._bounded_kubernetes_call(
+                    self._core_api.read_namespaced_config_map,
+                    name=prepared.seed_cm,
+                    namespace=prepared.namespace,
+                )
+                seed_uid = self._require_stateless_seed_configmap_identity(
+                    seed,
+                    owner=owner,
+                    pod_name=prepared.pod_name,
+                    creation_reservation_id=str(reservation["id"]),
+                )
+                self._require_seed_configmap_pod_owner_reference(
+                    seed,
+                    pod_name=prepared.pod_name,
+                    runtime_incarnation=prepared.runtime_incarnation,
+                )
+                if seed_uid != str(reservation.get("seed_configmap_uid") or ""):
+                    return False
+            if prepared.pvc_name is not None:
+                pvc = await self._bounded_kubernetes_call(
+                    self._core_api.read_namespaced_persistent_volume_claim,
+                    name=prepared.pvc_name,
+                    namespace=prepared.namespace,
+                )
+                pvc_uid = self._require_stateless_pvc_identity(
+                    pvc,
+                    owner=owner,
+                    pvc_name=prepared.pvc_name,
+                    allow_any_storage_class=True,
+                )
+                service = await self._bounded_kubernetes_call(
+                    self._core_api.read_namespaced_service,
+                    name=prepared.pod_name,
+                    namespace=prepared.namespace,
+                )
+                service_uid = self._require_stateless_service_identity(
+                    service, owner=owner
+                )
+                if pvc_uid != str(
+                    reservation.get("pvc_uid") or ""
+                ) or service_uid != str(reservation.get("service_uid") or ""):
+                    return False
+            return await self._workspace_creation_reservation_is_current(
+                owner, reservation, scope="workspace_container"
+            )
+        except Exception:
+            return False
+
     async def _create_workspace_reserved(
+        self, owner: WorkspaceOwner, **kwargs: Any
+    ) -> bool:
+        """Session caller retains its encompassing mutation guard."""
+        prepared = await self._prepare_workspace_reserved(owner, **kwargs)
+        if not isinstance(prepared, _PreparedWorkspaceCreation):
+            return prepared
+        try:
+            pod_ip = await self._observe_prepared_workspace(prepared)
+        except Exception as exc:
+            return await self._complete_prepared_workspace(
+                prepared, readiness_error=exc
+            )
+        return await self._complete_prepared_workspace(prepared, pod_ip=pod_ip)
+
+    async def _create_job_workspace_reserved(
+        self, owner: WorkspaceOwner, **kwargs: Any
+    ) -> bool:
+        """Keep real writes joined, allowing owner Cancel during observation."""
+        async with self._workspace_mutation_guard(
+            owner, scope="workspace_container"
+        ) as owned:
+            if not owned:
+                return False
+            prepared = await self._prepare_workspace_reserved(owner, **kwargs)
+        if not isinstance(prepared, _PreparedWorkspaceCreation):
+            return prepared
+        pod_ip = None
+        readiness_error = None
+        try:
+            pod_ip = await self._observe_prepared_workspace(prepared)
+        except _WorkspaceCreationAuthorityLost:
+            return False
+        except Exception as exc:
+            readiness_error = exc
+        async with self._workspace_mutation_guard(
+            owner, scope="workspace_container"
+        ) as owned:
+            if not owned or not await self._prepared_workspace_authority_is_current(
+                prepared, observed_pod_ip=pod_ip
+            ):
+                return False
+            return await self._complete_prepared_workspace(
+                prepared, pod_ip=pod_ip, readiness_error=readiness_error
+            )
+
+    async def _prepare_workspace_reserved(
         self,
         owner: WorkspaceOwner,
         cpu: str = "500m",
@@ -2007,7 +2186,7 @@ class ContainerProvisioner:
         _creation_reservation: dict[str, Any] | None = None,
         _creation_plan: dict[str, Any] | None = None,
         _creation_profile: SandboxPodProfile | None = None,
-    ) -> bool:
+    ) -> _PreparedWorkspaceCreation | bool:
         """Create a workspace container for a job or persistent thread.
 
         Args:
@@ -2591,21 +2770,20 @@ class ContainerProvisioner:
                 memory=metered_memory,
             )
 
-            # Wait for pod IP. A reattach gets the longer window so a transient
-            # node reboot recovers without discarding data; a fresh create keeps
-            # the standard 120s.
-            ready_timeout = self._reattach_ready_timeout if pvc_reattach else 120
-            pod_ip = await self._wait_for_ready(
-                pod_name,
-                timeout=ready_timeout,
-                expected_owner=owner,
-                expected_runtime_incarnation=runtime_incarnation,
-                expected_creation_generation=(
-                    stateless_creation_generation if strict_stateless else None
-                ),
-                expected_network_tier=network_tier,
-                expected_pvc_name=pvc_name,
-                expected_seed_configmap=seed_cm,
+            return _PreparedWorkspaceCreation(
+                owner=owner,
+                _creation_reservation=MappingProxyType(dict(_creation_reservation)),
+                strict_stateless=strict_stateless,
+                stateless_creation_generation=stateless_creation_generation,
+                pod_name=pod_name,
+                runtime_incarnation=runtime_incarnation,
+                network_tier=network_tier,
+                pvc_name=pvc_name,
+                seed_cm=seed_cm,
+                pvc_reattach=pvc_reattach,
+                seed_needs_state=seed_needs_state,
+                mutation_authority=mutation_authority,
+                namespace=self._namespace,
                 pull_image=(
                     _creation_profile.image
                     if _creation_profile is not None
@@ -2613,6 +2791,104 @@ class ContainerProvisioner:
                     else None
                 ),
             )
+        except Exception as e:
+            logger.error(
+                "Failed to create workspace container for %s %s: %s",
+                owner.kind,
+                owner.id,
+                e,
+            )
+            await self._record_creation_diagnostic(
+                owner,
+                _creation_reservation,
+                e,
+                strict_stateless=strict_stateless,
+            )
+            # Once the durable reservation crosses its external-effect edge,
+            # every response is potentially ambiguous.  Do not perform
+            # name-based rollback or publish a failure projection here; the
+            # reservation reconciler owns the exact observed resources. The
+            # one exception is a Job's classified pull failure on a Pod that
+            # never ran: that outcome is exact, so the generation settles on it
+            # before the Job's terminal transition can wedge the reservation.
+            await self._settle_failed_job_creation(
+                owner,
+                _creation_reservation,
+                e,
+                strict_stateless=strict_stateless,
+                fresh_storage=not pvc_reattach,
+            )
+            return False
+
+    async def _observe_prepared_workspace(
+        self, prepared: _PreparedWorkspaceCreation
+    ) -> str | None:
+        owner = prepared.owner
+        _creation_reservation = prepared._creation_reservation
+        strict_stateless = prepared.strict_stateless
+        stateless_creation_generation = prepared.stateless_creation_generation
+        pod_name = prepared.pod_name
+        runtime_incarnation = prepared.runtime_incarnation
+        network_tier = prepared.network_tier
+        pvc_name = prepared.pvc_name
+        seed_cm = prepared.seed_cm
+        pvc_reattach = prepared.pvc_reattach
+
+        async def check_authority() -> None:
+            try:
+                current = await self._workspace_creation_reservation_is_current(
+                    owner, _creation_reservation, scope="workspace_container"
+                )
+            except Exception as exc:
+                raise _WorkspaceCreationAuthorityLost(
+                    "workspace creation authority unavailable"
+                ) from exc
+            if not current:
+                raise _WorkspaceCreationAuthorityLost(
+                    "workspace creation authority revoked"
+                )
+
+        # Wait for pod IP. A reattach gets the longer window so a transient
+        # node reboot recovers without discarding data; a fresh create keeps
+        # the standard 120s.
+        ready_timeout = self._reattach_ready_timeout if pvc_reattach else 120
+        return await self._wait_for_ready(
+            pod_name,
+            timeout=ready_timeout,
+            expected_owner=owner,
+            expected_runtime_incarnation=runtime_incarnation,
+            expected_creation_generation=(
+                stateless_creation_generation if strict_stateless else None
+            ),
+            expected_network_tier=network_tier,
+            expected_pvc_name=pvc_name,
+            expected_seed_configmap=seed_cm,
+            pull_image=prepared.pull_image,
+            authority_check=(check_authority if owner.kind == "job" else None),
+        )
+
+    async def _complete_prepared_workspace(
+        self,
+        prepared: _PreparedWorkspaceCreation,
+        *,
+        pod_ip: str | None = None,
+        readiness_error: Exception | None = None,
+    ) -> bool:
+        owner = prepared.owner
+        _creation_reservation = prepared._creation_reservation
+        strict_stateless = prepared.strict_stateless
+        stateless_creation_generation = prepared.stateless_creation_generation
+        pod_name = prepared.pod_name
+        runtime_incarnation = prepared.runtime_incarnation
+        network_tier = prepared.network_tier
+        pvc_name = prepared.pvc_name
+        seed_cm = prepared.seed_cm
+        pvc_reattach = prepared.pvc_reattach
+        seed_needs_state = prepared.seed_needs_state
+        mutation_authority = prepared.mutation_authority
+        try:
+            if readiness_error is not None:
+                raise readiness_error
             if pod_ip:
                 if seed_cm is not None:
                     ready_seed = await self._bounded_kubernetes_call(
@@ -14399,6 +14675,7 @@ class ContainerProvisioner:
         expected_component: str | None = None,
         pull_image: str | None = None,
         pull_started_at: datetime | None = None,
+        authority_check: Callable[[], Awaitable[None]] | None = None,
     ) -> Optional[str]:
         """Poll until the pod is ready and accepts the configured SSH key.
 
@@ -14429,6 +14706,8 @@ class ContainerProvisioner:
         pull_observation: Any = None
 
         while loop.time() < deadline:
+            if authority_check is not None:
+                await authority_check()
             try:
                 pod = await self._bounded_kubernetes_call(
                     self._core_api.read_namespaced_pod,
@@ -14483,6 +14762,11 @@ class ContainerProvisioner:
                             connect_timeout_s=self._ssh_auth_connect_timeout,
                             interval_s=self._ssh_auth_poll_interval,
                             key_path=key_path,
+                            **(
+                                {"authority_check": authority_check}
+                                if authority_check is not None
+                                else {}
+                            ),
                         )
                         if ready:
                             if expected_owner is not None:
@@ -14506,6 +14790,8 @@ class ContainerProvisioner:
                                     expected_pod_name=expected_pod_name,
                                     expected_component=expected_component,
                                 )
+                            if authority_check is not None:
+                                await authority_check()
                             logger.info(
                                 "Workspace SSH authenticated: %s @ %s:30022 "
                                 "(attempts=%d, key=%s)",

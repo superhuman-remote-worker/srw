@@ -107,9 +107,15 @@ cleans up after itself; a Session doesn't (see below).
   Leadership loss and shutdown drain owned work, including started Kubernetes
   calls, before releasing its mutation guards. This behavior requires an orchestrator upgrade
   and does not repair historical pending creation attempts after restart.
-- **Don't cancel a Job while its image is pulling.** That can leave its
-  workspace resources behind (a known issue). Let the Job fail on its own; it
-  fails within the pull budget.
+- **Jobs can be cancelled while their image is pulling.** Once resource
+  creation has returned and its exact identities are recorded, cancellation
+  can commit during image or SSH readiness polling. The creator stops when it
+  observes the cancelled claim, and normal retirement owns cleanup. A started
+  resource write must finish before cancellation can commit: that busy
+  interval returns HTTP 409 with `Retry-After: 1`; retry the request. This
+  response does not mean cancellation was accepted. Ready publication and any
+  final workspace seeding also retain their mutation guard. Session startup
+  locks are unchanged by this Job cancellation behavior.
 - **Other start failures give no message.** When a templated Job's pod never
   becomes ready for another reason, its workspace stays `creating` and the Job
   waits with no error. Examples:

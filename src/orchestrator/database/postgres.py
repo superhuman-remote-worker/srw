@@ -4968,8 +4968,6 @@ class PostgresDB:
                         UPDATE jobs
                            SET status = 'cancelled',
                                assigned_agent_id = NULL,
-                               context = COALESCE(context, '{{}}'::jsonb)
-                                   || '{{"_stateless_cancel_cleanup_pending": true}}'::jsonb,
                                updated_at = CURRENT_TIMESTAMP
                          WHERE id = $1
                            AND execution_lane = 'stateless'
@@ -4992,6 +4990,17 @@ class PostgresDB:
                     )
                     if row is None:
                         raise _CancelCASLostError
+                    # Terminal creation-claim rotation must preserve every
+                    # non-runtime context field for its exact SQL authority
+                    # projection. Add the cleanup marker in a second statement
+                    # under these same queue/owner locks and transaction: no
+                    # caller can observe cancellation without its cleanup hold.
+                    await conn.execute(
+                        "UPDATE jobs SET context = COALESCE(context, '{}'::jsonb) "
+                        "|| '{\"_stateless_cancel_cleanup_pending\": true}'::jsonb "
+                        "WHERE id=$1",
+                        job_uuid,
+                    )
                     recovery_cancellation = (
                         await self._resolve_workspace_recovery_cancel_participant(
                             conn, job_uuid

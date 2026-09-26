@@ -821,6 +821,18 @@ class JobControlOperations:
         except HTTPException:
             raise
         except Exception as exc:
+            if getattr(exc, "sqlstate", None) == "40001" and str(exc) in {
+                "Workspace mutation is still in progress",
+                "IDE mutation is still in progress",
+            }:
+                # The terminal-owner transaction rolled back while a joined
+                # physical write still owns its guard. Nothing was accepted;
+                # use the existing control-conflict retry response.
+                raise HTTPException(
+                    status_code=409,
+                    detail=str(exc),
+                    headers={"Retry-After": "1"},
+                ) from exc
             raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     async def _finish_cancel(self, job_id: str, job: dict[str, Any]) -> None:

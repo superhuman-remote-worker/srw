@@ -25,7 +25,7 @@ import shlex
 import tempfile
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import AsyncIterator, Optional
+from typing import AsyncIterator, Awaitable, Callable, Optional
 
 import paramiko
 
@@ -553,6 +553,7 @@ async def wait_for_agent_ssh(
     interval_s: float,
     key_path: Optional[str] = None,
     expected_host_key_fingerprint: Optional[str] = None,
+    authority_check: Callable[[], Awaitable[None]] | None = None,
 ) -> tuple[bool, int, str]:
     """Poll until ``agent-host@ssh_host`` accepts an authenticated SSH command.
 
@@ -568,6 +569,8 @@ async def wait_for_agent_ssh(
     last_error = ""
 
     while True:
+        if authority_check is not None:
+            await authority_check()
         attempts += 1
         known_hosts_line: Optional[str] = None
         if expected_host_key_fingerprint is not None:
@@ -626,6 +629,8 @@ async def wait_for_agent_ssh(
             except SubprocessOutputLimit:
                 stderr = b"ssh readiness probe output exceeded limit"
 
+            if authority_check is not None:
+                await authority_check()
             if proc.returncode == 0:
                 return True, attempts, ""
 

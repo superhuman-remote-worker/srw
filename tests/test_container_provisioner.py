@@ -2658,6 +2658,11 @@ class TestCreateWorkspace:
         mock_core_api.create_namespaced_pod = MagicMock(
             side_effect=lambda **kw: _pod_from_manifest(kw["body"])
         )
+        mock_core_api.read_namespaced_pod.side_effect = lambda **kw: (
+            _pod_from_manifest(
+                mock_core_api.create_namespaced_pod.call_args.kwargs["body"]
+            )
+        )
         provisioner._core_api = mock_core_api
 
         with patch.object(
@@ -5083,6 +5088,7 @@ class TestCreateWorkspacePvc:
             return _pod_from_manifest(kw["body"])
 
         core.create_namespaced_pod = create_pod
+        core.read_namespaced_pod.side_effect = lambda **kw: _pod_from_manifest(pod_body)
         if pvc_body is not None:
 
             def create_claim(**kw):
@@ -5503,6 +5509,9 @@ class TestWorkspaceService:
             _pvc_from_manifest(pvc_body)
         )
         core.read_namespaced_service = lambda **_kw: _service_from_manifest(svc_body)
+        core.read_namespaced_pod.side_effect = lambda **kw: (
+            _pod_from_manifest(core.create_namespaced_pod.call_args.kwargs["body"])
+        )
         p._core_api = core
 
         with patch.object(p, "_wait_for_ready", new_callable=AsyncMock) as w:
