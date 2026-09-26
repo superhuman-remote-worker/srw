@@ -89,6 +89,49 @@ def _optional_authority_text(value: Any, *, label: str) -> str | None:
     return value
 
 
+def initial_creation_retirement_authority(value: Any) -> dict[str, Any]:
+    """Parse the captured, never-started initial creation; not a stop proof."""
+
+    fields = {
+        "generation",
+        "reservation_id",
+        "reservation_generation",
+        "claim_token",
+        "runtime_incarnation",
+        "pvc_uid",
+        "service_uid",
+        "seed_configmap_uid",
+        "namespace",
+    }
+    if not isinstance(value, dict) or set(value) != fields:
+        raise RuntimeError("initial creation retirement authority is malformed")
+    result = dict(value)
+    for field in (
+        "generation",
+        "reservation_id",
+        "runtime_incarnation",
+        "pvc_uid",
+        "service_uid",
+        "seed_configmap_uid",
+    ):
+        raw = result[field]
+        if raw is None and field in {"pvc_uid", "service_uid", "seed_configmap_uid"}:
+            continue
+        try:
+            if not isinstance(raw, str) or str(UUID(raw)) != raw:
+                raise ValueError()
+        except (ValueError, TypeError, AttributeError) as exc:
+            raise RuntimeError(
+                "initial creation retirement identity is malformed"
+            ) from exc
+    for field in ("reservation_generation", "claim_token"):
+        if _exact_nonnegative_int(result[field], label=field) <= 0:
+            raise RuntimeError("initial creation retirement claim is malformed")
+    if not isinstance(result["namespace"], str) or not result["namespace"].strip():
+        raise RuntimeError("initial creation retirement namespace is malformed")
+    return result
+
+
 def _retirement_ack_matches(
     root: dict[str, Any],
     marker: dict[str, Any],
@@ -190,6 +233,26 @@ def stateless_retirement_authority(
         )
     if marker["workspace_absence_proven"]:
         raise RuntimeError("terminal workspace absence proof is unsupported")
+    if "initial_creation" in marker:
+        initial = initial_creation_retirement_authority(marker["initial_creation"])
+        if (
+            initial["runtime_incarnation"] != marker["runtime_incarnation"]
+            or marker["terminal_token"] <= 0
+            or not marker["claimant_quiesced"]
+            or not marker["shell_retirement_required"]
+            or not marker["resident_cleanup_required"]
+            or any(
+                marker[field] is not None
+                for field in (
+                    "workspace_generation",
+                    "endpoint_generation",
+                    "host_key_fingerprint",
+                )
+            )
+        ):
+            raise RuntimeError(
+                "initial creation retirement disagrees with terminal authority"
+            )
 
     # Compatibility for acknowledgements written by the first S2 build: its
     # nested jsonb_set used create_if_missing=false, so PostgreSQL could commit
@@ -332,6 +395,20 @@ def stateless_settled_retirement_authority(
     )
     if settled["cleanup_complete"] is not True:
         raise RuntimeError("settled retirement lacks cleanup proof")
+    if "initial_creation" in settled:
+        initial = initial_creation_retirement_authority(settled["initial_creation"])
+        expected_backing = (
+            f"k8s-pvc:{initial['namespace']}:{initial['pvc_uid']}"
+            if initial["pvc_uid"] is not None
+            else None
+        )
+        if (
+            initial["runtime_incarnation"] != settled["runtime_incarnation"]
+            or settled["terminal_token"] <= 0
+            or settled["snapshot_restore_required"] is not False
+            or backing_id != expected_backing
+        ):
+            raise RuntimeError("settled initial creation authority disagrees")
     return settled
 
 

@@ -122,7 +122,9 @@ async def reservation(database, thread_id):
     return dict(rows[0])
 
 
-async def workspace_attempt(database, actor, monkeypatch, *, first_wait="pull_error"):
+async def workspace_attempt(
+    database, actor, monkeypatch, *, first_wait="pull_error", pvc_enabled=True
+):
     workspace, selection = await select_execution_workspace(
         database,
         actor,
@@ -166,7 +168,7 @@ async def workspace_attempt(database, actor, monkeypatch, *, first_wait="pull_er
     provisioner._k8s_available = True
     provisioner._namespace = "agent-workspaces"
     provisioner._storage_class = "test-storage"
-    provisioner._pvc_enabled = True
+    provisioner._pvc_enabled = pvc_enabled
     provisioner._core_api = cluster
     stub_plan_inputs(monkeypatch, provisioner)
     for name in ("open_interval", "close_interval"):
@@ -212,8 +214,8 @@ async def workspace_attempt(database, actor, monkeypatch, *, first_wait="pull_er
     before = await database.get_thread(thread_id)
     pending = metadata(before)["workspace_container"]
     pod_uid = cluster.objects["pod"].metadata.uid
-    pvc_uid = cluster.objects["pvc"].metadata.uid
-    service_uid = cluster.objects["service"].metadata.uid
+    pvc_uid = cluster.objects["pvc"].metadata.uid if pvc_enabled else None
+    service_uid = cluster.objects["service"].metadata.uid if pvc_enabled else None
     creation = await reservation(database, thread_id)
     assert pending["_runtime_incarnation"] == pod_uid
     if first_wait == "ready":

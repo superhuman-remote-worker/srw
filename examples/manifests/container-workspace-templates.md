@@ -114,9 +114,20 @@ cleans up after itself; a Session doesn't (see below).
 - **Stateless Sessions can continue an open creation.** If the original Pod
   later becomes ready, a stateless Session can finish that same creation while
   its reservation remains open. Retries preserve the original image-pull budget;
-  they do not reopen closed historical creation attempts. Ending or deleting a
-  Session after a failed start, and pinned-Session startup failures, still need
-  operator handling.
+  they do not reopen closed historical creation attempts.
+- **End also handles an initial stateless startup failure.** If the first fresh
+  container has a recorded Pod identity and no container has started, normal
+  End can stop it without waiting for its image or SSH. End retains its exact
+  PVC; Resume reuses that volume and refuses a missing or replaced PVC.
+  Permanent End deletes the recorded resources, including when upgrading an
+  earlier soft End. Initial emptyDir workspaces can resume with fresh storage.
+  Once accepted, cleanup and End settlement retry after a client disconnect;
+  physical deletion may take more than one pass.
+
+  This applies only to an open initial creation with exact resource identity.
+  Pinned startup failures, missing Pod identity, restored or previously retained
+  workspaces, closed historical creations, and a crash after Ready but before
+  creation settlement remain outside this recovery path.
 
 ## Privilege
 

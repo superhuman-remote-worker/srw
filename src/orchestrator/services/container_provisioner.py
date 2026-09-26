@@ -1813,6 +1813,11 @@ class ContainerProvisioner:
                     # reinterpret that rollout drift as foreign ownership.
                     allow_any_storage_class=True,
                 )
+                if (
+                    reservation.get("pvc_uid") is not None
+                    and str(reservation["pvc_uid"]) != pvc_uid
+                ):
+                    return False
                 service = await self._bounded_kubernetes_call(
                     self._core_api.read_namespaced_service,
                     name=owner.pod_name,
@@ -2022,6 +2027,30 @@ class ContainerProvisioner:
         ) != str(_creation_reservation.get("desired_manifest_digest") or ""):
             return False
 
+        expected_retained_pvc_uid = None
+        if owner.kind == "session" and stateless_creation_generation is not None:
+            previous = await self._db.get_thread(owner.id)
+            previous_metadata = thread_metadata_object(previous)
+            previous_workspace = previous_metadata.get("workspace_container") or {}
+            if (
+                previous_workspace.get("status") == "deleted"
+                and previous_workspace.get("_creation_reservation_id")
+                and not previous_metadata.get("_workspace_binding")
+            ):
+                retained = await self._db.get_retained_initial_workspace_storage(
+                    owner.id
+                )
+                if (
+                    retained is None
+                    or retained["pvc_uid"] is not None
+                    and not (_creation_plan.get("pvc") or {}).get("enabled")
+                    or not await self.validate_retained_initial_workspace_storage(
+                        owner, _mutation_guard_held=True
+                    )
+                ):
+                    return False
+                expected_retained_pvc_uid = retained["pvc_uid"]
+
         strict_stateless = stateless_creation_generation is not None
         cpu = str(_creation_plan["cpu"])
         memory = str(_creation_plan["memory"])
@@ -2146,6 +2175,7 @@ class ContainerProvisioner:
                     expected_owner=owner,
                     creation_reservation_id=str(_creation_reservation["id"]),
                     mutation_authority=mutation_authority,
+                    expected_retained_pvc_uid=expected_retained_pvc_uid,
                 )
                 if not pvc_status:
                     return False
@@ -2162,6 +2192,11 @@ class ContainerProvisioner:
                         allow_any_storage_class=True,
                     )
                 except Exception:
+                    return False
+                if (
+                    expected_retained_pvc_uid is not None
+                    and reservation_pvc_uid != expected_retained_pvc_uid
+                ):
                     return False
                 if not await self._record_workspace_creation_resource(
                     owner=owner,
@@ -2614,6 +2649,11 @@ class ContainerProvisioner:
                             ),
                             expected_network_tier=network_tier,
                             expected_seed_configmap=seed_cm,
+                            expected_pvc_uid=(
+                                str(_creation_reservation["pvc_uid"])
+                                if _creation_reservation.get("pvc_uid")
+                                else None
+                            ),
                         )
                         if strict_stateless:
                             complete_impl = getattr(
@@ -5700,7 +5740,10 @@ class ContainerProvisioner:
                         scope="workspace_container",
                         runtime_incarnation=runtime,
                     )
-                    if isinstance(handed_off, dict):
+                    if (
+                        isinstance(handed_off, dict)
+                        and handed_off.get("resources_captured_at") is not None
+                    ):
                         return handed_off
         prepare = getattr(
             type(self._db),
@@ -5772,6 +5815,49 @@ class ContainerProvisioner:
                 )
             except (WorkspaceRuntimeAuthorityError, ValueError):
                 return claimed
+        if owner.kind == "session":
+            read_initial = getattr(
+                type(self._db), "get_stateless_initial_creation_retirement", None
+            )
+            initial = (
+                await read_initial(self._db, owner.id)
+                if callable(read_initial)
+                else None
+            )
+            current = await self._db.get_thread(owner.id)
+            current_metadata = thread_metadata_object(current)
+            retirement = current_metadata.get(
+                "_stateless_claim_retirement"
+            ) or current_metadata.get("_stateless_workspace_retirement_settled")
+            if (
+                isinstance(retirement, dict)
+                and "initial_creation" in retirement
+                and initial is None
+            ):
+                return claimed
+            initial_upgrade = False
+            if initial is not None:
+                settled = current_metadata.get(
+                    "_stateless_workspace_retirement_settled"
+                )
+                initial_upgrade = bool(
+                    isinstance(settled, dict)
+                    and settled.get("permanent") is True
+                    and await self.workspace_pod_authority(
+                        owner, expected_runtime_incarnation=runtime
+                    )
+                    == "exact_absent"
+                )
+            if initial is not None and (
+                initial["namespace"] != self._namespace
+                or initial["runtime_incarnation"] != runtime
+                or any(
+                    getattr(identity, field) != initial[field]
+                    and not (initial_upgrade and getattr(identity, field) is None)
+                    for field in ("pvc_uid", "service_uid", "seed_configmap_uid")
+                )
+            ):
+                return claimed
         if identity.pod_uid not in {None, runtime}:
             return claimed
         captured = await record_resources(
@@ -5786,6 +5872,164 @@ class ContainerProvisioner:
             resource_location=self.workspace_cleanup_location(owner),
         )
         return captured if isinstance(captured, dict) else claimed
+
+    async def validate_retained_initial_workspace_storage(
+        self,
+        owner: WorkspaceOwner,
+        *,
+        _mutation_guard_held: bool = False,
+    ) -> bool:
+        """Require the preserved PVC's UID before Resume and again before create."""
+        if not _mutation_guard_held:
+            async with self._workspace_mutation_guard(
+                owner, scope="workspace_container"
+            ) as owned:
+                return bool(
+                    owned
+                    and await self.validate_retained_initial_workspace_storage(
+                        owner,
+                        _mutation_guard_held=True,
+                    )
+                )
+        retained = await self._db.get_retained_initial_workspace_storage(owner.id)
+        if retained is None or retained["namespace"] != self._namespace:
+            return False
+        if (
+            await self.workspace_pod_authority(
+                owner,
+                expected_runtime_incarnation=retained["runtime_incarnation"],
+            )
+            != "exact_absent"
+        ):
+            return False
+        try:
+            pvc = await self._bounded_kubernetes_call(
+                self._core_api.read_namespaced_persistent_volume_claim,
+                name=_pvc_name_for(owner),
+                namespace=self._namespace,
+            )
+        except Exception as exc:
+            return getattr(exc, "status", None) == 404 and retained["pvc_uid"] is None
+        try:
+            observed = self._require_stateless_pvc_identity(
+                pvc,
+                owner=owner,
+                pvc_name=_pvc_name_for(owner),
+                allow_any_storage_class=True,
+            )
+            self._require_workspace_creation_reservation_annotation(
+                pvc,
+                reservation_id=retained["reservation_id"],
+            )
+        except WorkspaceRuntimeAuthorityError:
+            return False
+        return observed == retained["pvc_uid"]
+
+    async def capture_initial_stateless_creation_retirement(
+        self,
+        owner: WorkspaceOwner,
+    ) -> dict[str, Any] | None:
+        """Observe an exact fresh initial Pod without requiring it to become Ready.
+
+        Release the physical mutation guard before Begin: its terminal trigger
+        acquires that same domain on its own transaction connection.
+        """
+        if owner.kind != "session" or self._db is None or not self._k8s_available:
+            return None
+        async with self._workspace_mutation_guard(
+            owner, scope="workspace_container"
+        ) as owned:
+            if not owned:
+                return None
+            reservation = (
+                await self._db.get_current_managed_repository_workspace_creation_result(
+                    owner.id,
+                    owner_kind="thread",
+                    scope="workspace_container",
+                    operation_kind="create",
+                )
+            )
+            if not isinstance(reservation, dict) or (
+                reservation.get("settled_at") is not None
+                or reservation.get("cancel_requested_at") is not None
+                or reservation.get("phase") != "runtime_bound"
+            ):
+                return None
+            reservation = await self._db.reserve_managed_repository_workspace_creation(
+                owner.id,
+                owner_kind="thread",
+                scope="workspace_container",
+                claimant=str(reservation["claimed_by"]),
+                operation_kind="create",
+                desired_manifest_digest=str(reservation["desired_manifest_digest"]),
+            )
+            if not isinstance(reservation, dict):
+                return None
+            runtime = str(reservation.get("runtime_incarnation") or "")
+            try:
+                pod = await self._bounded_kubernetes_call(
+                    self._core_api.read_namespaced_pod,
+                    name=owner.pod_name,
+                    namespace=self._namespace,
+                )
+                if (
+                    self._require_workspace_pod_owner(
+                        pod,
+                        owner=owner,
+                        allow_owner_unlabeled=False,
+                    )
+                    != runtime
+                ):
+                    return None
+                self._require_workspace_creation_reservation_annotation(
+                    pod,
+                    reservation_id=str(reservation["id"]),
+                )
+                if not await self._cancelled_creation_has_fresh_unstarted_runtime(
+                    owner,
+                    reservation,
+                    pod=pod,
+                ):
+                    return None
+                identity = await self.capture_workspace_teardown_identity(
+                    owner,
+                    expected_runtime_incarnation=runtime,
+                )
+                for field in (
+                    "pod_uid",
+                    "pvc_uid",
+                    "service_uid",
+                    "seed_configmap_uid",
+                ):
+                    expected = reservation.get(field)
+                    if getattr(identity, field) != (
+                        str(expected) if expected is not None else None
+                    ):
+                        return None
+                if not await self._workspace_creation_reservation_is_current(
+                    owner,
+                    reservation,
+                    scope="workspace_container",
+                ):
+                    return None
+            except Exception:
+                return None
+            return {
+                "generation": str(reservation["thread_runtime_generation"]),
+                "reservation_id": str(reservation["id"]),
+                "reservation_generation": int(reservation["reservation_generation"]),
+                "claim_token": int(reservation["claim_token"]),
+                "runtime_incarnation": runtime,
+                "namespace": self._namespace,
+                **{
+                    field: getattr(identity, field)
+                    for field in (
+                        "pvc_uid",
+                        "service_uid",
+                        "seed_configmap_uid",
+                    )
+                },
+            }
 
     async def request_workspace_creation_cancellation(
         self,
@@ -6864,12 +7108,35 @@ class ContainerProvisioner:
             claim_token=int(reservation["claim_token"]),
             runtime_incarnation=runtime,
             allow_existing_terminal_intent=(
-                await self._cancelled_creation_has_fresh_unstarted_runtime(
+                await self._cancelled_creation_may_reuse_terminal_intent(
                     owner, reservation, pod=pod
                 )
             ),
         )
         return "handed_off" if isinstance(intent, dict) else "retryable"
+
+    async def _cancelled_creation_may_reuse_terminal_intent(
+        self,
+        owner: WorkspaceOwner,
+        reservation: dict[str, Any],
+        *,
+        pod: Any,
+    ) -> bool:
+        if owner.kind == "session":
+            initial = await self._db.get_stateless_initial_creation_retirement(owner.id)
+            return bool(
+                initial is not None
+                and initial["reservation_id"] == str(reservation["id"])
+                and initial["namespace"] == self._namespace
+                and initial["runtime_incarnation"]
+                == str(reservation["runtime_incarnation"])
+                and self._has_stateless_process_zero_finalizer(pod)
+            )
+        return await self._cancelled_creation_has_fresh_unstarted_runtime(
+            owner,
+            reservation,
+            pod=pod,
+        )
 
     async def _cancelled_creation_has_fresh_unstarted_runtime(
         self,
@@ -6886,7 +7153,7 @@ class ContainerProvisioner:
         """
 
         if (
-            owner.kind != "job"
+            owner.kind not in {"job", "session"}
             or reservation.get("scope") != "workspace_container"
             or reservation.get("operation_kind") != "create"
             or not self._has_stateless_process_zero_finalizer(pod)
@@ -11338,6 +11605,7 @@ class ContainerProvisioner:
         expected_owner: WorkspaceOwner | None = None,
         creation_reservation_id: str | None = None,
         mutation_authority: Callable[[], Awaitable[bool]] | None = None,
+        expected_retained_pvc_uid: str | None = None,
     ) -> Optional[str]:
         """Create a PVC for workspace data. Idempotent.
 
@@ -11347,6 +11615,27 @@ class ContainerProvisioner:
         if not self._k8s_available:
             return None
         resolved_storage_class = storage_class or self._storage_class
+
+        if expected_retained_pvc_uid is not None:
+            try:
+                if expected_owner is None or (
+                    mutation_authority is not None and not await mutation_authority()
+                ):
+                    return None
+                retained = await self._bounded_kubernetes_call(
+                    self._core_api.read_namespaced_persistent_volume_claim,
+                    name=pvc_name,
+                    namespace=self._namespace,
+                )
+                observed_uid = self._require_stateless_pvc_identity(
+                    retained,
+                    owner=expected_owner,
+                    pvc_name=pvc_name,
+                    allow_any_storage_class=True,
+                )
+                return "reused" if observed_uid == expected_retained_pvc_uid else None
+            except Exception:
+                return None
 
         pvc_labels = {
             "app": "srw-workspace",

@@ -512,6 +512,16 @@ async def resume_thread(
                         status_code=503,
                         detail="Stateless workspace retirement remains incomplete",
                     )
+                settled = locked_metadata.get("_stateless_workspace_retirement_settled")
+                if isinstance(settled, dict) and "initial_creation" in settled:
+                    from orchestrator.services.workspace_lifecycle import WorkspaceOwner
+
+                    if not await container_provisioner.validate_retained_initial_workspace_storage(
+                        WorkspaceOwner.session(thread_id)
+                    ):
+                        raise HTTPException(
+                            503, "Retained initial workspace storage changed"
+                        )
                 if not await postgres_db.resume_thread(thread_id):
                     raise HTTPException(
                         status_code=409,

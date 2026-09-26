@@ -282,6 +282,53 @@ async def retry_pending_pinned_retirement(
     }
 
 
+async def retry_initial_creation_retirement(
+    candidate: Mapping[str, Any],
+    *,
+    dependencies: StaleAgentDetectorDependencies,
+) -> bool:
+    """Replay only an admitted initial stateless End through all business effects."""
+    from shared.session_retirement import (
+        stateless_retirement_authority,
+        stateless_settled_retirement_authority,
+    )
+
+    try:
+        marker = stateless_retirement_authority(candidate.get("metadata"))
+        if marker is None:
+            marker = stateless_settled_retirement_authority(candidate.get("metadata"))
+            if marker is None or marker["permanent"] is not True:
+                return False
+    except RuntimeError:
+        return False
+    if "initial_creation" not in marker:
+        return False
+    generation = str(candidate.get("runtime_generation") or "")
+    if marker["initial_creation"]["generation"] != generation:
+        return False
+    thread_id = str(candidate.get("id") or "")
+    thread = await dependencies.store.get_thread(thread_id)
+    if thread is None:
+        return True
+    try:
+        result = await dependencies.thread_retirement_operations().end_thread_flow(
+            thread_id,
+            dict(thread),
+            permanent=marker["permanent"],
+            force=True,
+            expected_runtime_generation=generation,
+            expected_stateless_retirement_token=marker["terminal_token"],
+        )
+    except HTTPException as exc:
+        if exc.status_code not in {409, 503}:
+            raise
+        logger.info(
+            "Initial workspace End retry held for thread %s: %s", thread_id, exc.detail
+        )
+        return False
+    return result.get("status") == ("deleted" if marker["permanent"] else "ended")
+
+
 async def stale_agent_detector(
     shutdown_event: asyncio.Event, *, dependencies: StaleAgentDetectorDependencies
 ) -> None:
@@ -566,6 +613,24 @@ async def stale_agent_detector(
                         "%d durable pinned retirement(s) remain unresolved after "
                         "this pass; each refusal is logged above",
                         unresolved,
+                    )
+
+            # An admitted initial stateless End needs no claimant drain or
+            # SSH endpoint. Retry its full End funnel, including business
+            # settlement after the independent physical cleanup sweep.
+            initial_retirements = await _step(
+                "pending_initial_creation_retirements",
+                dependencies.store.list_retryable_initial_creation_retirements(
+                    limit=25
+                ),
+            )
+            for candidate in initial_retirements or []:
+                if isinstance(candidate, Mapping):
+                    await _step(
+                        "retry_initial_creation_retirement",
+                        retry_initial_creation_retirement(
+                            candidate, dependencies=dependencies
+                        ),
                     )
 
             # Static Docker containers survive owner termination.  Their

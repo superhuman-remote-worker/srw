@@ -259,6 +259,7 @@ async def reconcile_stateless_thread_retirement(
     # binding/runtime publication, so even a backing-less 404 can follow a
     # crash plus force deletion while the partitioned process still runs.
     workspace_absence_proven = False
+    initial_creation = None
     preflight_thread = await postgres_db.get_thread(thread_id)
     if preflight_thread is None:
         return {"state": "missing"}
@@ -308,7 +309,22 @@ async def reconcile_stateless_thread_retirement(
                     "workspace reconciliation must publish an exact UID first"
                 ),
             )
-        if creation_pending or restore_pending:
+        if (
+            isinstance(pending_authority, dict)
+            and "initial_creation" in pending_authority
+        ):
+            initial_creation = pending_authority["initial_creation"]
+        elif creation_pending and not restore_pending:
+            capture_initial = getattr(
+                type(container_provisioner),
+                "capture_initial_stateless_creation_retirement",
+                None,
+            )
+            if callable(capture_initial):
+                initial_creation = await capture_initial(
+                    container_provisioner, WorkspaceOwner.session(thread_id)
+                )
+        if (creation_pending or restore_pending) and initial_creation is None:
             # Cancellation after the one-shot Pod call may leave a published
             # UID but no Ready binding/fingerprint. Terminal retirement cannot
             # infer those fields or mutate the thread to ended first: doing so
@@ -373,6 +389,11 @@ async def reconcile_stateless_thread_retirement(
                 force=requested_force,
                 permanent=permanent,
                 workspace_absence_proven=workspace_absence_proven,
+                **(
+                    {"initial_creation": initial_creation}
+                    if initial_creation is not None
+                    else {}
+                ),
             )
         except RuntimeError as exc:
             raise HTTPException(
@@ -407,7 +428,11 @@ async def reconcile_stateless_thread_retirement(
         if permanent:
             backing_id = closure.get("backing_id")
             runtime_incarnation = closure.get("runtime_incarnation")
-            if isinstance(backing_id, str) and backing_id.startswith("k8s-"):
+            if (
+                isinstance(backing_id, str)
+                and backing_id.startswith("k8s-")
+                or "initial_creation" in closure
+            ):
                 # Soft End already proved process zero and removed the exact
                 # Pod. Permanent upgrade creates a new terminal-reclaim
                 # generation: preserve authority cannot authorize PVC deletion.
@@ -467,6 +492,42 @@ async def reconcile_stateless_thread_retirement(
         )
 
     terminal_token = int(closure.get("terminal_token") or 0)
+    if initial_creation is not None:
+        # No Ready binding ever existed. The captured initial creation may skip
+        # SSH and snapshots, but shell/resident ACKs still require actual stop.
+        initial = await postgres_db.get_stateless_initial_creation_retirement(thread_id)
+        if initial != initial_creation or not closure.get("claimant_quiesced"):
+            raise HTTPException(503, "Initial workspace retirement authority changed")
+        cleanup = await container_provisioner.reconcile_workspace_cleanup_intent(
+            WorkspaceOwner.session(thread_id),
+            expected_runtime_incarnation=initial["runtime_incarnation"],
+        )
+        if not isinstance(cleanup, WorkspaceCleanupOutcome) or not cleanup.settled:
+            raise HTTPException(503, "Initial workspace cleanup remains incomplete")
+        if not await postgres_db.get_stateless_initial_creation_retirement(
+            thread_id,
+            require_settled=True,
+        ) or not await postgres_db.acknowledge_stateless_thread_runtime_process_zero(
+            thread_id,
+            terminal_token=terminal_token,
+            runtime_incarnation=initial["runtime_incarnation"],
+        ):
+            raise HTTPException(503, "Initial workspace stop proof remains incomplete")
+        if (
+            not permanent
+            and not await postgres_db.finish_stateless_thread_workspace_retirement(
+                thread_id
+            )
+        ):
+            raise HTTPException(
+                503, "Initial workspace retirement settlement remains incomplete"
+            )
+        return {
+            "state": "settled",
+            "thread": await postgres_db.get_thread(thread_id),
+            "closure": closure,
+        }
+
     deadline = time.monotonic() + float(
         os.environ.get("STATELESS_TERMINAL_CLAIM_ACK_TIMEOUT_S", "25")
     )
@@ -1058,6 +1119,7 @@ async def end_thread_flow(
     officer_post_required: bool = False,
     include_officer_handoff: bool = False,
     expected_runtime_generation: str | None = None,
+    expected_stateless_retirement_token: int | None = None,
     expected_agent_id: str | None = None,
     expected_attach_token: str | None = None,
     require_expected_agent_offline: bool = False,
@@ -1988,6 +2050,36 @@ async def end_thread_flow(
                     ),
                 )
             fresh_metadata = thread_metadata_object(fresh_thread)
+            if expected_stateless_retirement_token is not None:
+                try:
+                    from shared.session_retirement import (
+                        stateless_retirement_authority,
+                        stateless_settled_retirement_authority,
+                    )
+
+                    expected_marker = stateless_retirement_authority(
+                        fresh_metadata
+                    ) or stateless_settled_retirement_authority(fresh_metadata)
+                except RuntimeError as exc:
+                    raise HTTPException(
+                        409, "Initial retirement authority changed"
+                    ) from exc
+                if (
+                    expected_marker is None
+                    or str(fresh_thread.get("runtime_generation"))
+                    != expected_runtime_generation
+                    or type(expected_stateless_retirement_token) is not int
+                    or expected_marker["terminal_token"]
+                    != expected_stateless_retirement_token
+                    or expected_marker["permanent"] is not permanent
+                    or "initial_creation" not in expected_marker
+                ):
+                    raise HTTPException(409, "Initial retirement authority changed")
+            elif expected_runtime_generation is not None and (
+                str(fresh_thread.get("runtime_generation"))
+                != expected_runtime_generation
+            ):
+                raise HTTPException(409, "Thread runtime generation changed")
             marker_pending = bool(
                 "_stateless_workspace_retirement_pending" in fresh_metadata
             )
