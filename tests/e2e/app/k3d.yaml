@@ -7,11 +7,15 @@ metadata:
 servers: 1
 agents: 1
 image: rancher/k3s:v1.31.5-k3s1
-# Configure the internal server load balancer for HTTP while asking Docker for
-# a dynamic host port. The browser runs on this cluster's private bridge and
-# uses port 80 directly; host port 80 may belong to a developer cluster.
+# Configure the internal server load balancer for HTTP and HTTPS while asking
+# Docker for dynamic host ports. The browser runs on this cluster's private
+# bridge and uses ports 80/443 directly; host ports 80/443 may belong to a
+# developer cluster. Only secure-origin profiles serve TLS on 443.
 ports:
   - port: "0:80"
+    nodeFilters:
+      - loadbalancer
+  - port: "0:443"
     nodeFilters:
       - loadbalancer
 options:

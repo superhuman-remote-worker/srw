@@ -665,10 +665,13 @@ def test_dependency_images_use_host_platform_archives_before_k3d_import(
         assert command[-2:] == ["--mode", "direct"]
 
 
-def test_k3d_profile_configures_http_with_a_dynamic_host_port() -> None:
+def test_k3d_profile_configures_http_and_https_with_dynamic_host_ports() -> None:
     profile = yaml.safe_load(harness.K3D_TEMPLATE.read_text(encoding="utf-8"))
 
-    assert profile["ports"] == [{"port": "0:80", "nodeFilters": ["loadbalancer"]}]
+    assert profile["ports"] == [
+        {"port": "0:80", "nodeFilters": ["loadbalancer"]},
+        {"port": "0:443", "nodeFilters": ["loadbalancer"]},
+    ]
 
 
 @pytest.mark.parametrize(
@@ -1544,6 +1547,8 @@ def test_stateless_sandbox_profile_renders_current_executor_and_workspace_images
         "officer-watchdog",
         "session-attention",
         "session-transport",
+        "session-transport-secure",
+        "pinned-secure",
     ],
 )
 def test_session_profiles_do_not_render_an_extra_catalog_provider(
@@ -1631,6 +1636,168 @@ def test_session_transport_profile_adds_only_one_warm_dual_pool_agent() -> None:
     # The base e2e profile already pins AGENT_BUFFER to "0"; the overlay
     # restates it so the one-warm-agent intent does not depend on that.
     assert changed == {"MIN_AGENTS", "MAX_AGENTS"}
+
+
+def _render_documents(values_files) -> list[dict]:
+    command = [
+        "helm",
+        "template",
+        "srw-e2e",
+        str(harness.REPO_ROOT / "helm"),
+        "-n",
+        harness.NAMESPACE,
+    ]
+    for values_file in values_files:
+        command.extend(("-f", str(values_file)))
+    rendered = subprocess.run(
+        command, check=True, capture_output=True, text=True, timeout=120
+    ).stdout
+    return [document for document in yaml.safe_load_all(rendered) if document]
+
+
+def test_secure_profiles_add_only_the_secure_origin_overlay() -> None:
+    transport = harness.resolve_profile("session-transport")
+    secure = harness.resolve_profile("session-transport-secure")
+    assert secure.values_files == (
+        *transport.values_files,
+        harness.SECURE_ORIGIN_VALUES_FILE,
+    )
+    assert secure.secure_origin and not transport.secure_origin
+    assert secure.base_url == "https://srw-e2e.test"
+    assert transport.base_url == harness.BASE_URL
+    assert (
+        dataclasses.replace(
+            secure,
+            name=transport.name,
+            values_files=transport.values_files,
+            secure_origin=False,
+        )
+        == transport
+    )
+
+    pinned = harness.resolve_profile("pinned-secure")
+    assert pinned.values_files == (
+        harness.VALUES_FILE,
+        harness.DUAL_POOL_VALUES_FILE,
+        harness.SECURE_ORIGIN_VALUES_FILE,
+    )
+    assert (pinned.workspace_backend, pinned.execution_lane) == ("virtual", "pinned")
+    assert pinned.secure_origin and not pinned.stateless_agents
+
+
+@pytest.mark.skipif(shutil.which("helm") is None, reason="Helm is not installed")
+@pytest.mark.parametrize(
+    "profile_name,pvc_enabled",
+    [("session-transport-secure", "true"), ("pinned-secure", "false")],
+)
+def test_secure_profiles_render_tls_ingress_and_session_socket_origin(
+    profile_name: str, pvc_enabled: str
+) -> None:
+    documents = _render_documents(harness.resolve_profile(profile_name).values_files)
+    config = next(
+        document["data"]
+        for document in documents
+        if document.get("kind") == "ConfigMap"
+        and document.get("metadata", {}).get("name") == "srw-e2e-config"
+    )
+    assert config["WORKSPACE_PVC_ENABLED"] == pvc_enabled
+    ingresses = [
+        document for document in documents if document.get("kind") == "Ingress"
+    ]
+    assert ingresses
+    for ingress in ingresses:
+        annotations = ingress["metadata"].get("annotations") or {}
+        assert (
+            annotations.get("traefik.ingress.kubernetes.io/router.entrypoints")
+            == "websecure"
+        ), ingress["metadata"]["name"]
+        for block in ingress["spec"].get("tls") or []:
+            assert block["secretName"] in harness.SECURE_ORIGIN_TLS_SECRETS
+    orchestrator = next(
+        document
+        for document in documents
+        if document.get("kind") == "Deployment"
+        and document.get("metadata", {}).get("name") == "srw-e2e-orchestrator"
+    )
+    environment = {
+        item["name"]: item.get("value")
+        for container in orchestrator["spec"]["template"]["spec"]["containers"]
+        for item in container.get("env") or []
+    }
+    assert environment["SESSION_INGRESS_HOST"] == "srw-e2e.test"
+    assert environment["SESSION_INGRESS_TLS_SECRET"] == "srw-e2e-session-tls"
+    assert json.loads(environment["SESSION_INGRESS_ANNOTATIONS"]) == {
+        "traefik.ingress.kubernetes.io/router.entrypoints": "websecure",
+        "traefik.ingress.kubernetes.io/router.tls": "true",
+    }
+    assert "https://srw-e2e.test" in json.dumps(config)
+
+
+def test_secure_origin_certificate_is_run_scoped_and_verifiable() -> None:
+    from cryptography import x509
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.x509.oid import ExtendedKeyUsageOID
+
+    ca_pem, chain_pem, key_pem = harness.mint_secure_origin_certificate(
+        "20260926-000000-abcdef12"
+    )
+    ca = x509.load_pem_x509_certificate(ca_pem.encode())
+    chain = x509.load_pem_x509_certificates(chain_pem.encode())
+    leaf = chain[0]
+    assert chain[1] == ca
+    leaf.verify_directly_issued_by(ca)
+    assert ca.extensions.get_extension_for_class(x509.BasicConstraints).value.ca
+    names = leaf.extensions.get_extension_for_class(
+        x509.SubjectAlternativeName
+    ).value.get_values_for_type(x509.DNSName)
+    assert names == ["srw-e2e.test", "*.srw-e2e.test"]
+    assert leaf.extensions.get_extension_for_class(
+        x509.ExtendedKeyUsage
+    ).value == x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH])
+    assert (leaf.not_valid_after_utc - leaf.not_valid_before_utc).days <= 8
+    assert "PRIVATE KEY" in key_pem and "PRIVATE KEY" not in chain_pem + ca_pem
+    from cryptography.hazmat.primitives import serialization
+
+    key = serialization.load_pem_private_key(key_pem.encode(), password=None)
+    assert isinstance(key, ec.EllipticCurvePrivateKey)
+    assert key.public_key() == leaf.public_key()
+    # A second run never shares a CA.
+    other_ca, _, _ = harness.mint_secure_origin_certificate("20260926-000000-abcdef13")
+    assert other_ca != ca_pem
+
+
+def test_secure_origin_tls_goes_to_secrets_over_stdin_and_keeps_only_the_ca(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[tuple[list[str], str | None]] = []
+
+    class Runner:
+        def run(self, command, *, input_text=None, **_kwargs):
+            calls.append((list(command), input_text))
+
+    application = harness.ApplicationE2EHarness(tmp_path / "state")
+    application.runner = Runner()
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    ledger = {
+        "run_id": "20260926-000000-abcdef12",
+        "kubeconfig": str(tmp_path / "kubeconfig.yaml"),
+        "run_dir": str(run_dir),
+    }
+    monkeypatch.setattr(application, "_run_dir", lambda _ledger: run_dir)
+    monkeypatch.setattr(application, "_kubectl", lambda _ledger, *args: list(args))
+
+    application._install_secure_origin_tls(ledger)
+
+    applied = [json.loads(text) for _command, text in calls]
+    assert [secret["metadata"]["name"] for secret in applied] == list(
+        harness.SECURE_ORIGIN_TLS_SECRETS
+    )
+    assert all(secret["type"] == "kubernetes.io/tls" for secret in applied)
+    assert all(command == ["apply", "-f", "-"] for command, _ in calls)
+    kept = sorted(path.name for path in run_dir.iterdir())
+    assert kept == ["secure-origin-ca.pem"]
+    assert "PRIVATE KEY" not in (run_dir / "secure-origin-ca.pem").read_text()
 
 
 @pytest.mark.skipif(shutil.which("helm") is None, reason="Helm is not installed")

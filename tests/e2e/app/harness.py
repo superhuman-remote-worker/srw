@@ -43,6 +43,7 @@ CLOUD_SANDBOX_VALUES_FILE: Final = ASSET_ROOT / "values-cloud-sandbox.yaml"
 OFFICER_WATCHDOG_VALUES_FILE: Final = ASSET_ROOT / "values-officer-watchdog.yaml"
 SESSION_ATTENTION_VALUES_FILE: Final = ASSET_ROOT / "values-session-attention.yaml"
 DUAL_POOL_VALUES_FILE: Final = ASSET_ROOT / "values-dual-pool.yaml"
+SECURE_ORIGIN_VALUES_FILE: Final = ASSET_ROOT / "values-secure-origin.yaml"
 PROVIDER_MANIFEST: Final = ASSET_ROOT / "deterministic_provider/kubernetes.yaml"
 PROVIDER_DOCKERFILE: Final = ASSET_ROOT / "deterministic_provider/Dockerfile"
 PLAYWRIGHT_RUNNER_DOCKERFILE: Final = ASSET_ROOT / "Dockerfile.playwright"
@@ -71,6 +72,16 @@ COLLABORA_HELM_REPOSITORY: Final = "https://collaboraonline.github.io/online"
 RELEASE: Final = "srw-e2e"
 BASE_HOST: Final = "srw-e2e.test"
 BASE_URL: Final = f"http://{BASE_HOST}"
+SECURE_BASE_URL: Final = f"https://{BASE_HOST}"
+# Every TLS Secret the secure-origin overlay's Ingresses name. One run-owned
+# leaf certificate covers them all (see values-secure-origin.yaml).
+SECURE_ORIGIN_TLS_SECRETS: Final = (
+    f"{RELEASE}-cockpit-tls",
+    f"{RELEASE}-api-tls",
+    f"{RELEASE}-keycloak-tls",
+    f"{RELEASE}-gitea-tls",
+    f"{RELEASE}-session-tls",
+)
 PROVIDER_IMAGE_PLACEHOLDER: Final = "srw-e2e-model-fixture:local"
 # The protected-effect lane's dedicated HMAC Secret. The cloud profile names
 # it through `nextcloud.protectedEffect.hmacSecretName`; the chart then does
@@ -168,6 +179,14 @@ class ApplicationE2EProfile:
     #: flags above: a later profile composing this overlay must not silently
     #: lose the property the check depends on.
     persistent_reconciliation_enabled: bool = False
+    #: This profile serves the stack over HTTPS with a run-owned certificate
+    #: (values-secure-origin.yaml): the browser gets a secure context and the
+    #: minted wss:// session URL reaches the Pod through the real ingress.
+    secure_origin: bool = False
+
+    @property
+    def base_url(self) -> str:
+        return SECURE_BASE_URL if self.secure_origin else BASE_URL
 
 
 APPLICATION_E2E_PROFILES: Final = {
@@ -286,6 +305,46 @@ APPLICATION_E2E_PROFILES: Final = {
         ),
         stateless_agents=True,
         forge_enabled=True,
+    ),
+    # R3.2 follow-up: the same stack over HTTPS, so the real browser has a
+    # secure context and the session socket crosses the per-session ingress.
+    "session-transport-secure": ApplicationE2EProfile(
+        name="session-transport-secure",
+        values_files=(
+            VALUES_FILE,
+            STATELESS_SANDBOX_VALUES_FILE,
+            FORGE_SANDBOX_VALUES_FILE,
+            SESSION_ATTENTION_VALUES_FILE,
+            DUAL_POOL_VALUES_FILE,
+            SECURE_ORIGIN_VALUES_FILE,
+        ),
+        workspace_backend="sandbox",
+        execution_lane="stateless",
+        include_workspace_image=True,
+        additional_deployments=("srw-e2e-agent-stateless", "srw-e2e-greenmail"),
+        additional_statefulsets=(
+            "srw-e2e-gitea",
+            "srw-e2e-garage",
+            "srw-e2e-auditdb",
+        ),
+        stateless_agents=True,
+        forge_enabled=True,
+        secure_origin=True,
+    ),
+    # The pinned/virtual baseline (workspace.pvcEnabled false, so dedicated
+    # session Pods mount no agent workspace claim) with one warm dual pool
+    # agent, over the same secure origin: the claim-less half of the
+    # self-ended pinned retirement matrix.
+    "pinned-secure": ApplicationE2EProfile(
+        name="pinned-secure",
+        values_files=(
+            VALUES_FILE,
+            DUAL_POOL_VALUES_FILE,
+            SECURE_ORIGIN_VALUES_FILE,
+        ),
+        workspace_backend="virtual",
+        execution_lane="pinned",
+        secure_origin=True,
     ),
 }
 
@@ -960,7 +1019,7 @@ class StateStore:
                 "namespace": NAMESPACE,
                 "release": RELEASE,
                 "profile": profile.name,
-                "base_url": BASE_URL,
+                "base_url": profile.base_url,
                 "run_dir": str(run_dir),
                 "kubeconfig": str(run_dir / "kubeconfig.yaml"),
                 "created_by_run": False,
@@ -1416,6 +1475,83 @@ def render_provider_manifest(provider_image: str) -> str:
     if len(service_part) != 2 or "port: 8001" in service_part[1]:
         raise SafetyError("provider control port must not be exposed by a Service")
     return rendered
+
+
+def mint_secure_origin_certificate(run_id: str) -> tuple[str, str, str]:
+    """Return (CA certificate, leaf certificate chain, leaf key) as PEM text.
+
+    A fresh run-scoped CA signs one short-lived serverAuth leaf for the owned
+    hostnames. Nothing here is shared with, or trusted by, any other stack.
+    """
+
+    import datetime as _dt
+
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
+
+    validate_run_id(run_id)
+    now = _dt.datetime.now(_dt.timezone.utc)
+    ca_key = ec.generate_private_key(ec.SECP256R1())
+    ca_name = x509.Name(
+        [x509.NameAttribute(NameOID.COMMON_NAME, f"SRW owned E2E CA {run_id}")]
+    )
+    ca_cert = (
+        x509.CertificateBuilder()
+        .subject_name(ca_name)
+        .issuer_name(ca_name)
+        .public_key(ca_key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - _dt.timedelta(minutes=5))
+        .not_valid_after(now + _dt.timedelta(days=7))
+        .add_extension(x509.BasicConstraints(ca=True, path_length=0), critical=True)
+        .add_extension(
+            x509.KeyUsage(
+                digital_signature=False,
+                content_commitment=False,
+                key_encipherment=False,
+                data_encipherment=False,
+                key_agreement=False,
+                key_cert_sign=True,
+                crl_sign=True,
+                encipher_only=False,
+                decipher_only=False,
+            ),
+            critical=True,
+        )
+        .sign(ca_key, hashes.SHA256())
+    )
+    leaf_key = ec.generate_private_key(ec.SECP256R1())
+    leaf_cert = (
+        x509.CertificateBuilder()
+        .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, BASE_HOST)]))
+        .issuer_name(ca_name)
+        .public_key(leaf_key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - _dt.timedelta(minutes=5))
+        .not_valid_after(now + _dt.timedelta(days=7))
+        .add_extension(
+            x509.SubjectAlternativeName(
+                [x509.DNSName(BASE_HOST), x509.DNSName(f"*.{BASE_HOST}")]
+            ),
+            critical=False,
+        )
+        .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+        .add_extension(
+            x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH]), critical=False
+        )
+        .sign(ca_key, hashes.SHA256())
+    )
+    pem = serialization.Encoding.PEM
+    ca_pem = ca_cert.public_bytes(pem).decode("ascii")
+    chain_pem = leaf_cert.public_bytes(pem).decode("ascii") + ca_pem
+    key_pem = leaf_key.private_bytes(
+        pem,
+        serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption(),
+    ).decode("ascii")
+    return ca_pem, chain_pem, key_pem
 
 
 def playwright_command(
@@ -2185,6 +2321,35 @@ class ApplicationE2EHarness:
         ledger["verified_node_images"] = verified
         self.store.persist(ledger)
 
+    def _install_secure_origin_tls(self, ledger: Mapping[str, Any]) -> None:
+        """Mint and apply the run-owned certificate for the secure overlay.
+
+        The CA key exists only in this process and is discarded after signing
+        the leaf. The leaf key travels to the TLS Secrets over stdin and is
+        never written to disk; only the public CA certificate is kept in the
+        run directory so drivers and browsers can trust exactly this run.
+        """
+
+        run_dir = self._run_dir(ledger)
+        ca_pem, cert_pem, key_pem = mint_secure_origin_certificate(
+            str(ledger["run_id"])
+        )
+        _atomic_private_write(run_dir / "secure-origin-ca.pem", ca_pem)
+        for name in SECURE_ORIGIN_TLS_SECRETS:
+            self.runner.run(
+                self._kubectl(ledger, "apply", "-f", "-"),
+                input_text=json.dumps(
+                    {
+                        "apiVersion": "v1",
+                        "kind": "Secret",
+                        "metadata": {"name": name, "namespace": NAMESPACE},
+                        "type": "kubernetes.io/tls",
+                        "stringData": {"tls.crt": cert_pem, "tls.key": key_pem},
+                    }
+                ),
+                label=f"secure-origin TLS Secret {name}",
+            )
+
     def create_secrets_and_fixture(self, ledger: dict[str, Any]) -> None:
         run_dir = self._run_dir(ledger)
         bundle = SecretBundle.generate(str(ledger["run_id"]))
@@ -2243,6 +2408,8 @@ class ApplicationE2EHarness:
                 input_text=json.dumps(manifest),
                 label=f"generated Kubernetes Secret {index}",
             )
+        if profile_from_ledger(ledger).secure_origin:
+            self._install_secure_origin_tls(ledger)
         provider_manifest = render_provider_manifest(str(ledger["images"]["provider"]))
         self.runner.run(
             self._kubectl(ledger, "-n", NAMESPACE, "apply", "-f", "-"),
@@ -2872,7 +3039,7 @@ class ApplicationE2EHarness:
             container_run_dir = f"/work/cockpit/test-results/app/{ledger['run_id']}"
             environment.update(
                 {
-                    "APP_E2E_BASE_URL": BASE_URL,
+                    "APP_E2E_BASE_URL": profile.base_url,
                     "APP_E2E_ALLOW_REMOTE": "1",
                     "APP_E2E_OWNED_CLUSTER": "1",
                     "APP_E2E_BROWSER_ATTEMPT": str(browser_attempt),
@@ -2901,6 +3068,7 @@ class ApplicationE2EHarness:
                 network=network,
                 ingress_ip=ingress_ip,
                 host_gateway=gateway,
+                base_url=profile.base_url,
                 runner_image=str(ledger["images"]["playwright"]),
                 run_id=str(ledger["run_id"]),
             )
@@ -3360,10 +3528,13 @@ class ApplicationE2EHarness:
         ) as forward:
             assert forward.local_port is not None
             root = f"http://127.0.0.1:{forward.local_port}"
+            origin = str(ledger.get("base_url") or BASE_URL)
+            if origin not in {BASE_URL, SECURE_BASE_URL}:
+                raise SafetyError("ownership ledger base URL is invalid")
             headers = {
                 "Cookie": cookie_header,
                 "X-CSRF": "1",
-                "Origin": BASE_URL,
+                "Origin": origin,
                 "Host": BASE_HOST,
             }
             for thread_id in reversed(thread_ids):
