@@ -18501,11 +18501,31 @@ BEGIN
                       CONSTRAINT = 'thread_agent_warm_binding_reciprocity';
         END IF;
     ELSIF NEW.status = 'releasing' THEN
-        IF thread_row.id IS NULL
-           OR thread_row.agent_id IS NOT DISTINCT FROM NEW.agent_id
-           OR agent_row.id IS NULL
+        -- Soft settlement keeps the thread row and clears its agent. A
+        -- permanent retirement deletes the row in the same transaction and
+        -- leaves its append-only outcome for exactly this life instead.
+        IF agent_row.id IS NULL
            OR agent_row.thread_id IS NOT NULL
-           OR agent_row.status::text <> 'draining' THEN
+           OR agent_row.status::text <> 'draining'
+           OR (
+                thread_row.id IS NOT NULL
+                AND thread_row.agent_id IS NOT DISTINCT FROM NEW.agent_id
+           )
+           OR (
+                thread_row.id IS NULL
+                AND NOT EXISTS (
+                    SELECT 1
+                      FROM public.thread_runtime_retirement_outcomes outcome
+                     WHERE outcome.thread_id = NEW.thread_id
+                       AND outcome.runtime_generation = NEW.runtime_generation
+                       AND outcome.agent_id = NEW.agent_id
+                       AND outcome.runtime_attach_token
+                           = NEW.runtime_attach_token
+                       AND outcome.permanent
+                       AND outcome.disposition = 'ended'
+                       AND outcome.outcome = 'deleted'
+                )
+           ) THEN
             RAISE EXCEPTION 'warm binding release is not fenced'
                 USING ERRCODE = '23514',
                       CONSTRAINT = 'thread_agent_warm_binding_reciprocity';

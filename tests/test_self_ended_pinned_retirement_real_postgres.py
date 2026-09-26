@@ -1009,6 +1009,37 @@ async def _bind_warm_life(db, monkeypatch):
     return life, api, provisioner, stack
 
 
+async def _warm_agent_self_end(stack, life):
+    """The warm Pod's own teardown (idle timeout / ``archive``)."""
+
+    db = stack.db
+    retirement = await db.begin_pinned_thread_retirement(
+        life["thread"],
+        permanent=False,
+        settle_status="ended",
+        initiator="agent",
+        expected_runtime_generation=life["generation"],
+        expected_agent_id=life["agent"],
+        expected_attach_token=life["attach_token"],
+        authorize_immediately=True,
+    )
+    assert retirement["state"] == "pending"
+    await _ack_local_quiescence(db, life, retirement)
+    ended = await stack.retirement.end_thread_flow(
+        life["thread"],
+        await db.get_thread(life["thread"]),
+        permanent=False,
+        force=True,
+        expected_runtime_generation=life["generation"],
+        expected_agent_id=life["agent"],
+        expected_attach_token=life["attach_token"],
+        settle_status="ended",
+        local_runtime_quiesced=True,
+        retiring_agent_response_pending=False,
+    )
+    assert ended == {"status": "ended"}
+
+
 async def _warm_protections(db, life):
     rows = await db.fetch(
         "SELECT protection_id,status,release_outcome,released_at,agent_id,pod_uid "
@@ -1069,31 +1100,7 @@ async def test_warm_self_end_releases_its_protection_then_deletes(db, monkeypatc
     """A warm Pod's own End returns it to the pool; Delete leaves history."""
 
     life, api, _, stack = await _bind_warm_life(db, monkeypatch)
-    retirement = await db.begin_pinned_thread_retirement(
-        life["thread"],
-        permanent=False,
-        settle_status="ended",
-        initiator="agent",
-        expected_runtime_generation=life["generation"],
-        expected_agent_id=life["agent"],
-        expected_attach_token=life["attach_token"],
-        authorize_immediately=True,
-    )
-    assert retirement["state"] == "pending"
-    await _ack_local_quiescence(db, life, retirement)
-    ended = await stack.retirement.end_thread_flow(
-        life["thread"],
-        await db.get_thread(life["thread"]),
-        permanent=False,
-        force=True,
-        expected_runtime_generation=life["generation"],
-        expected_agent_id=life["agent"],
-        expected_attach_token=life["attach_token"],
-        settle_status="ended",
-        local_runtime_quiesced=True,
-        retiring_agent_response_pending=False,
-    )
-    assert ended == {"status": "ended"}
+    await _warm_agent_self_end(stack, life)
     pod = api.pods[("agents-a", life["pod_name"])]
     assert pod.metadata.finalizers == []
     await _assert_warm_ledger_settled(db, life, outcome="exact_live_unprotected_v1")
@@ -1105,3 +1112,74 @@ async def test_warm_self_end_releases_its_protection_then_deletes(db, monkeypatc
     # The pool owns its Pod: the session's Delete never stops it.
     assert ("agents-a", life["pod_name"]) in api.pods
     await _assert_warm_ledger_settled(db, life, outcome="exact_live_unprotected_v1")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "no_outcome",
+        "soft_outcome",
+        "other_attach_token",
+        "other_generation",
+        "agent_not_draining",
+        None,
+    ],
+)
+async def test_absent_thread_warm_release_needs_its_exact_permanent_outcome(
+    db, monkeypatch, fault
+):
+    """``releasing`` without a thread row is fenced only by this life's
+    permanent ``deleted`` outcome and a detached, draining actor."""
+
+    import asyncpg
+
+    life, _, _, _ = await _bind_warm_life(db, monkeypatch)
+    protection = (await _warm_protections(db, life))[0]["protection_id"]
+    async with db.acquire() as conn:
+        async with conn.transaction():
+            # Stage the post-delete shape without the application path.
+            await conn.execute("SET LOCAL session_replication_role='replica'")
+            await conn.execute(
+                "UPDATE agents SET thread_id=NULL,status=$2 WHERE id=$1::uuid",
+                life["agent"],
+                "session" if fault == "agent_not_draining" else "draining",
+            )
+            await conn.execute("DELETE FROM threads WHERE id=$1::uuid", life["thread"])
+            if fault != "no_outcome":
+                await conn.execute(
+                    "INSERT INTO thread_runtime_retirement_outcomes (thread_id,"
+                    "runtime_generation,retirement_token,agent_id,"
+                    "runtime_attach_token,disposition,permanent,outcome) "
+                    "VALUES ($1::uuid,$2::uuid,$3::uuid,$4::uuid,$5::uuid,"
+                    "'ended',$6,$7)",
+                    life["thread"],
+                    str(uuid4()) if fault == "other_generation" else life["generation"],
+                    str(uuid4()),
+                    life["agent"],
+                    (
+                        str(uuid4())
+                        if fault == "other_attach_token"
+                        else life["attach_token"]
+                    ),
+                    fault != "soft_outcome",
+                    "settled" if fault == "soft_outcome" else "deleted",
+                )
+
+    async def release():
+        async with db.acquire() as conn:
+            async with conn.transaction():
+                return await conn.execute(
+                    "UPDATE thread_agent_warm_binding_protections SET "
+                    "status='releasing',release_started_at=transaction_timestamp() "
+                    "WHERE protection_id=$1::uuid AND status='bound'",
+                    protection,
+                )
+
+    if fault is None:
+        assert await release() == "UPDATE 1"
+        assert (await _warm_protections(db, life))[0]["status"] == "releasing"
+    else:
+        with pytest.raises(asyncpg.exceptions.CheckViolationError):
+            await release()
+        assert (await _warm_protections(db, life))[0]["status"] == "bound"
