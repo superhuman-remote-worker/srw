@@ -21,6 +21,7 @@ import logging
 import os
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Literal
 
 from fastapi import HTTPException
@@ -365,6 +366,12 @@ async def stale_agent_detector(
             logger.error(f"Stale agent detector step '{name}' failed: {e}")
             return None
 
+    # A held End must not monopolize the oldest bounded batch. This cursor
+    # survives sweeps, advances even on refusal/failure, and wraps at the end.
+    # Restarting the detector safely resets this scheduling hint.
+    initial_retirement_cursor: tuple[datetime, str] | None = None
+    initial_retirement_batch_size = 25
+
     while not shutdown_event.is_set():
         try:
             # 1. Heartbeat-based: mark non-responsive agents offline
@@ -621,17 +628,27 @@ async def stale_agent_detector(
             initial_retirements = await _step(
                 "pending_initial_creation_retirements",
                 dependencies.store.list_retryable_initial_creation_retirements(
-                    limit=25
+                    limit=initial_retirement_batch_size,
+                    after=initial_retirement_cursor,
                 ),
             )
             for candidate in initial_retirements or []:
                 if isinstance(candidate, Mapping):
+                    initial_retirement_cursor = (
+                        candidate["ended_at"],
+                        str(candidate["id"]),
+                    )
                     await _step(
                         "retry_initial_creation_retirement",
                         retry_initial_creation_retirement(
                             candidate, dependencies=dependencies
                         ),
                     )
+            if (
+                initial_retirements is not None
+                and len(initial_retirements) < initial_retirement_batch_size
+            ):
+                initial_retirement_cursor = None
 
             # Static Docker containers survive owner termination.  Their
             # exact inventory lease plus the terminal job/thread row is the

@@ -573,3 +573,104 @@ async def test_resumed_ready_publication_refuses_replaced_retained_volume(
     )
     assert str(latest["pvc_uid"]) == case.pvc_uid
     assert latest["settled_at"] is None
+
+
+@pytest.mark.asyncio
+async def test_background_scan_advances_past_held_batch_and_wraps(
+    database, actor, monkeypatch
+):
+    """An accepted 26th End must not depend on 25 unsafe holds clearing."""
+    import asyncio
+    from uuid import UUID, uuid4
+
+    from orchestrator.services import stale_agent_detector as detector
+    from tests.test_stale_agent_detector import _detector_dependencies, _mock_db
+
+    begin = type(database).begin_stateless_thread_workspace_retirement
+
+    async def disconnected(store, *args, **kwargs):
+        await begin(store, *args, **kwargs)
+        raise asyncio.CancelledError()
+
+    cases = {}
+    with monkeypatch.context() as patch:
+        patch.setattr(
+            type(database), "begin_stateless_thread_workspace_retirement", disconnected
+        )
+        for _ in range(26):
+            case = await workspace_attempt(
+                database, actor, monkeypatch, first_wait="not_ready"
+            )
+            cases[case.thread_id] = case
+            with pytest.raises(asyncio.CancelledError):
+                await end_case(database, case)
+
+    # Scheduling hints may tie. Keep the accepted authority untouched and
+    # exercise the UUID part of the cursor against an actual PostgreSQL sort.
+    first = await database.get_thread(next(iter(cases)))
+    await database.execute(
+        "UPDATE threads SET ended_at=$1 WHERE id=ANY($2::uuid[])",
+        first["ended_at"],
+        [UUID(thread_id) for thread_id in cases],
+    )
+    ordered = sorted(cases)
+    for thread_id in ordered[:25]:
+        cases[thread_id].cluster.objects["pvc"].metadata.uid = str(uuid4())
+
+    class ImmediateCadence(asyncio.Event):
+        async def wait(self):
+            if not self.is_set():
+                raise asyncio.TimeoutError()
+            return True
+
+    shutdown = ImmediateCadence()
+    store = _mock_db(shutdown)
+    sweep = 0
+    pages = []
+    visits = []
+
+    def next_sweep(**_):
+        nonlocal sweep
+        sweep += 1
+        if sweep == 3:
+            shutdown.set()
+        return []
+
+    async def discover(**kwargs):
+        rows = await database.list_retryable_initial_creation_retirements(**kwargs)
+        pages.append([str(row["id"]) for row in rows])
+        return rows
+
+    async def real_end(thread_id, thread, **kwargs):
+        visits.append((sweep, thread_id))
+        return await end_thread_flow(
+            thread_id,
+            thread,
+            **kwargs,
+            dependencies=retirement_dependencies(database, cases[thread_id]),
+        )
+
+    store.mark_stale_agents_offline = AsyncMock(side_effect=next_sweep)
+    store.list_retryable_initial_creation_retirements = AsyncMock(side_effect=discover)
+    store.get_thread = database.get_thread
+    await detector.stale_agent_detector(
+        shutdown,
+        dependencies=_detector_dependencies(
+            store,
+            thread_retirement_operations=lambda: SimpleNamespace(
+                end_thread_flow=real_end
+            ),
+        ),
+    )
+
+    assert pages == [ordered[:25], ordered[25:], ordered[:25]]
+    assert (2, ordered[25]) in visits
+    assert (await database.get_thread(ordered[25]))["status"] == "ended"
+    settled = metadata(await database.get_thread(ordered[25]))
+    assert "_stateless_workspace_retirement_settled" in settled
+    for thread_id in ordered[:25]:
+        assert (1, thread_id) in visits and (3, thread_id) in visits
+        assert cases[thread_id].cluster.pod_deletes == 0
+        assert "_stateless_workspace_retirement_pending" in metadata(
+            await database.get_thread(thread_id)
+        )

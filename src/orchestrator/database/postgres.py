@@ -40500,8 +40500,13 @@ class PostgresDB:
         self,
         *,
         limit: int = 25,
+        after: tuple[datetime, str] | None = None,
     ) -> list[dict[str, Any]]:
-        """Bounded hints for full End replay of this exact initial-start protocol."""
+        """Bounded hints for full End replay, after the last examined row.
+
+        The cursor is scheduling state only; each candidate still needs exact
+        lifecycle authority before End can perform any side effects.
+        """
         rows = await self.fetch(
             "SELECT thread.* FROM threads AS thread JOIN run_queue AS queue "
             "ON queue.unit_id=thread.id AND queue.unit_kind='session_turn' "
@@ -40513,8 +40518,11 @@ class PostgresDB:
             "OR (thread.metadata#>'{_stateless_workspace_retirement_settled,permanent}'='true'::jsonb "
             "AND jsonb_typeof(thread.metadata#>'{_stateless_workspace_retirement_settled,initial_creation}')='object' "
             "AND thread.metadata#>'{_stateless_workspace_retirement_settled,terminal_token}'=to_jsonb(queue.lease_token))) "
+            "AND ($2::timestamptz IS NULL OR (thread.ended_at,thread.id)>($2,$3::uuid)) "
             "ORDER BY thread.ended_at, thread.id LIMIT $1",
             max(1, min(int(limit), 250)),
+            after[0] if after is not None else None,
+            after[1] if after is not None else None,
         )
         return [dict(row) for row in rows]
 

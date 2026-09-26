@@ -2141,3 +2141,53 @@ def test_detector_dependencies_are_a_frozen_explicit_port():
     with pytest.raises(dataclasses.FrozenInstanceError):
         dependencies.store = None
     assert not hasattr(dependencies, "__dict__")
+
+
+@pytest.mark.asyncio
+async def test_initial_retirement_cursor_survives_retry_and_discovery_failures(
+    monkeypatch,
+):
+    from datetime import datetime, timezone
+    from uuid import uuid4
+
+    class ImmediateCadence(asyncio.Event):
+        async def wait(self):
+            if not self.is_set():
+                raise asyncio.TimeoutError()
+            return True
+
+    shutdown = ImmediateCadence()
+    db = _mock_db(shutdown)
+    rows = [
+        {"id": str(uuid4()), "ended_at": datetime.now(timezone.utc)} for _ in range(25)
+    ]
+    sweep = 0
+
+    def next_sweep(**_):
+        nonlocal sweep
+        sweep += 1
+        if sweep == 4:
+            shutdown.set()
+        return []
+
+    db.mark_stale_agents_offline = AsyncMock(side_effect=next_sweep)
+    db.list_retryable_initial_creation_retirements = AsyncMock(
+        side_effect=[rows, RuntimeError("discovery unavailable"), [], rows]
+    )
+    retry = AsyncMock(side_effect=RuntimeError("retry unavailable"))
+    monkeypatch.setattr(detector, "retry_initial_creation_retirement", retry)
+    await detector.stale_agent_detector(
+        shutdown, dependencies=_detector_dependencies(db)
+    )
+    cursor = (rows[-1]["ended_at"], rows[-1]["id"])
+    assert [
+        call.kwargs
+        for call in db.list_retryable_initial_creation_retirements.await_args_list
+    ] == [
+        {"limit": 25, "after": None},
+        {"limit": 25, "after": cursor},
+        {"limit": 25, "after": cursor},
+        {"limit": 25, "after": None},
+    ]
+    assert retry.await_count == 50
+    assert db.gc_offline_agents.await_count == 4
