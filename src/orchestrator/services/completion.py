@@ -23,6 +23,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from shared.worker_errors import worker_workspace_exhaustion_cause
+from shared.workspace_contract import WorkspaceContractError, resolve_workspace_contract
 from shared.job_freeze_types import (
     CONTINUE_AS_NEW_FREEZE_TYPES,
     ERROR_IMMUNE_FREEZE_TYPES,
@@ -407,7 +409,26 @@ async def probe_workspace_ssh(host: str, port: int, timeout: float = 3.0) -> boo
     return True
 
 
-def should_reset_recovery_counter(container_ctx: dict[str, Any], error: Any) -> bool:
+def is_container_worker_workspace_exhaustion(
+    job: dict[str, Any] | None, error: Any
+) -> bool:
+    """This retention protocol is qualified only for stateless Kubernetes containers."""
+    if not isinstance(job, dict) or job.get("execution_lane") != "stateless":
+        return False
+    if (
+        worker_workspace_exhaustion_cause(error) is None
+        or _get_ctx(job).get("provisioner") != "k8s"
+    ):
+        return False
+    try:
+        return resolve_workspace_contract(job).assigned_backend == "sandbox"
+    except WorkspaceContractError:
+        return False
+
+
+def should_reset_recovery_counter(
+    container_ctx: dict[str, Any], error: Any, *, job: dict[str, Any] | None = None
+) -> bool:
     """True when a handled completion should zero ``recovery_attempts``.
 
     The counter only ever incremented before, so a single recovered blip
@@ -417,12 +438,16 @@ def should_reset_recovery_counter(container_ctx: dict[str, Any], error: Any) -> 
     """
     if int(container_ctx.get("recovery_attempts") or 0) <= 0:
         return False
-    if isinstance(error, dict) and error.get("type") == "workspace_unavailable":
+    if (
+        isinstance(error, dict) and error.get("type") == "workspace_unavailable"
+    ) or is_container_worker_workspace_exhaustion(job, error):
         return False
     return True
 
 
-def should_persist_completion_freeze(result: dict[str, Any]) -> bool:
+def should_persist_completion_freeze(
+    result: dict[str, Any], *, job: dict[str, Any] | None = None
+) -> bool:
     """False when a completion report's freeze_data must NOT be persisted.
 
     An agent that dies before its graph runs (``workspace_unavailable``) can
@@ -436,7 +461,8 @@ def should_persist_completion_freeze(result: dict[str, Any]) -> bool:
     """
     error = result.get("error")
     return not (
-        isinstance(error, dict) and error.get("type") == "workspace_unavailable"
+        (isinstance(error, dict) and error.get("type") == "workspace_unavailable")
+        or is_container_worker_workspace_exhaustion(job, error)
     )
 
 
@@ -560,7 +586,8 @@ async def handle_pod_workspace_recovery(
         0 if same_command_attempt else 1
     )
     cap = int(os.environ.get("WORKSPACE_RECOVERY_MAX_ATTEMPTS", "3"))
-    if attempts > cap:
+    worker_exhausted = is_container_worker_workspace_exhaustion(job, error)
+    if attempts > cap or worker_exhausted:
         outcome = await db.hold_exhausted_workspace_recovery(
             job_id,
             expected_workspace=container_ctx,
@@ -569,6 +596,7 @@ async def handle_pod_workspace_recovery(
             error_detail=error.get("message") or "workspace_unavailable",
             completion_command_id=completion_command_id,
             completion_finalizing_by=completion_finalizing_by,
+            **({"worker_queue_exhausted": True} if worker_exhausted else {}),
         )
         if outcome is None:
             if completion_command_id is not None:

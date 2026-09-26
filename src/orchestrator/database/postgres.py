@@ -5897,6 +5897,7 @@ class PostgresDB:
         error_detail: str,
         completion_command_id: str | None = None,
         completion_finalizing_by: str | None = None,
+        worker_queue_exhausted: bool = False,
     ) -> Dict[str, Any] | None:
         """Retain exhausted container work behind the existing explicit-resume fence.
 
@@ -5983,7 +5984,7 @@ class PostgresDB:
                     return None
                 if command_uuid is not None:
                     command = await conn.fetchrow(
-                        "SELECT accepted_agent_id, accepted_lease_token FROM job_completion_commands "
+                        "SELECT accepted_agent_id, accepted_lease_token, payload FROM job_completion_commands "
                         "WHERE id=$1 AND job_id=$2 AND state='finalizing' AND finalizing_by=$3 "
                         "AND lease_expires_at>clock_timestamp() AND deadline_at>clock_timestamp()",
                         command_uuid,
@@ -6010,14 +6011,36 @@ class PostgresDB:
                     # An accepted durable report owns finalization; a delayed
                     # legacy report cannot acquire a parallel disposition.
                     return None
+                if worker_queue_exhausted:
+                    # An accepted worker report can request retention, never
+                    # cleanup authority or another attempt. Re-read its typed
+                    # cause instead of trusting the caller's mode switch.
+                    from shared.worker_errors import worker_workspace_exhaustion_cause
+
+                    if job["execution_lane"] != "stateless" or command_uuid is None:
+                        return None
+                    payload = command["payload"]
+                    if isinstance(payload, str):
+                        payload = json.loads(payload)
+                    if (
+                        not isinstance(payload, dict)
+                        or payload.get("should_stop") is not True
+                        or payload.get("goal_achieved") is not False
+                        or worker_workspace_exhaustion_cause(payload.get("error"))
+                        is None
+                    ):
+                        return None
                 attempts = int(workspace.get("recovery_attempts") or 0) + (
                     0
-                    if command_uuid is not None
-                    and workspace.get("recovery_attempt_command_id")
-                    == str(command_uuid)
+                    if worker_queue_exhausted
+                    or (
+                        command_uuid is not None
+                        and workspace.get("recovery_attempt_command_id")
+                        == str(command_uuid)
+                    )
                     else 1
                 )
-                if attempts <= recovery_cap:
+                if not worker_queue_exhausted and attempts <= recovery_cap:
                     return None
                 outcome = {
                     "status": "handled",
@@ -6026,8 +6049,12 @@ class PostgresDB:
                     "paused": True,
                     "held_for_resume": True,
                     "actions": [
-                        f"workspace recovery exhausted after {recovery_cap} attempts; "
-                        "workspace and checkpoints retained; explicit Resume required"
+                        (
+                            "worker reported exhausted workspace retries; "
+                            if worker_queue_exhausted
+                            else f"workspace recovery exhausted after {recovery_cap} attempts; "
+                        )
+                        + "workspace and checkpoints retained; explicit Resume required"
                     ],
                 }
                 updates = {"recovery_attempts": attempts}
@@ -6040,6 +6067,9 @@ class PostgresDB:
                 freeze = {
                     "freeze_type": "workspace_recovery_attention",
                     "recovery_attempts": attempts,
+                    "budget": "worker_queue"
+                    if worker_queue_exhausted
+                    else "workspace_recovery",
                     "detail": str(error_detail)[:1000],
                 }
                 hold = operator_pause_hold_jsonb_sql(

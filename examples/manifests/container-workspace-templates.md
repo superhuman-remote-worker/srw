@@ -216,3 +216,11 @@ cleanup. The status detail explains that workspace recovery needs attention.
 This requires the updated orchestrator and applies to workspace-unavailable
 completion reports. Worker queue exhaustion has a separate recovery path.
 Previously failed Jobs are not retroactively restored by this change.
+
+For stateless Kubernetes container Jobs, an exhausted worker report that retains
+a typed workspace failure also enters this explicit Resume hold. The worker
+queue budget and the workspace recovery budget remain separate: this hold does
+not consume a new workspace recovery attempt or authorize another graph step,
+a connection probe, or cleanup. The original checkpoint and freeze remain
+available. Reports without a known typed workspace cause keep their existing
+completion behavior; error-message text alone is never treated as evidence.

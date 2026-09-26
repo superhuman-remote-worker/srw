@@ -129,6 +129,7 @@ from shared.cloud_push_tasks import (
 )
 from shared.subagent_lifecycle import SubagentLifecycleError
 from shared.runtime.core.workspace_backend import WorkspaceUnavailableError
+from shared.worker_errors import worker_error_cause
 from shared.workspace_recovery import (
     WorkspaceRecoveryCode,
     WorkspaceRecoveryDisposition,
@@ -1777,7 +1778,18 @@ class StatelessTurnExecutor:
                 and not self._lease.lost.is_set()
             ):
                 final_state = self._worker_retry_exhausted_state(
-                    self._worker_driver_error_state(str(exc), job_id=unit_id),
+                    self._worker_driver_error_state(
+                        str(exc),
+                        job_id=unit_id,
+                        cause=(
+                            {"type": exc.code.value}
+                            if isinstance(exc, ClaimBundleError)
+                            and isinstance(exc.code, WorkspaceRecoveryCode)
+                            else {"type": "workspace_unavailable"}
+                            if isinstance(exc, WorkspaceUnavailableError)
+                            else None
+                        ),
+                    ),
                     attempts=unit.attempts_since_completion,
                     max_attempts=claim.max_attempts,
                 )
@@ -3032,6 +3044,7 @@ class StatelessTurnExecutor:
         message: str,
         *,
         job_id: str | None = None,
+        cause: dict[str, Any] | None = None,
     ) -> Dict[str, Any]:
         return {
             "job_id": job_id,
@@ -3041,6 +3054,7 @@ class StatelessTurnExecutor:
                 "type": "worker_driver_error",
                 "recoverable": True,
                 "message": str(message),
+                **({"cause": dict(cause)} if cause is not None else {}),
             },
         }
 
@@ -3062,6 +3076,16 @@ class StatelessTurnExecutor:
         exhausted = dict(final_state)
         prior_error = final_state.get("error")
         error = dict(prior_error) if isinstance(prior_error, dict) else {}
+        # Preserve typed setup failures as well as graph-reported causes. A
+        # generic driver failure carries no invented workspace diagnosis.
+        cause = worker_error_cause(
+            error.get("cause")
+            if error.get("type") == "worker_driver_error"
+            and isinstance(error.get("cause"), dict)
+            else prior_error
+        )
+        if cause is not None:
+            error["cause"] = cause
         prior_freeze = final_state.get("freeze_data")
         reason = error.get("message")
         if not reason and isinstance(prior_freeze, dict):

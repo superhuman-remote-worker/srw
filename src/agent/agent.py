@@ -28,6 +28,7 @@ from langchain_core.language_models import BaseChatModel
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.checkpoint.base import BaseCheckpointSaver
 
+from shared.worker_errors import worker_error_cause
 from shared.runtime.core.loader import (
     AgentConfig,
     LLMConfig,
@@ -1734,6 +1735,7 @@ class UniversalAgent:
                 "checkpoint; suppressing further graph work",
                 job_id,
             )
+            prior_cause = worker_error_cause(error)
             return {
                 "job_id": job_id,
                 "should_stop": True,
@@ -1742,6 +1744,7 @@ class UniversalAgent:
                     "type": "worker_retry_budget_exhausted",
                     "recoverable": True,
                     "message": "worker queue retry budget exhausted",
+                    **({"cause": prior_cause} if prior_cause is not None else {}),
                 },
             }
 

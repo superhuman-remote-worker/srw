@@ -211,6 +211,7 @@ async def complete_job_legacy(
         determine_job_status,
         handle_pod_workspace_recovery,
         is_curation_enabled,
+        is_container_worker_workspace_exhaustion,
         is_late_completion_report,
         is_verification_enabled,
         should_persist_completion_freeze,
@@ -648,7 +649,7 @@ async def complete_job_legacy(
         # the job paused-but-invisible to the dispatcher
         # (knowledge-base/knowledge/issues/recovery_pause_repersists_stale_freeze_invisible_job.md).
         if result.get("freeze_data"):
-            if should_persist_completion_freeze(result):
+            if should_persist_completion_freeze(result, job=job):
                 job["freeze_data"] = result["freeze_data"]
 
                 async def _persist_reported_freeze() -> dict[str, Any]:
@@ -873,7 +874,12 @@ async def complete_job_legacy(
             if infra_pause_outcome is not None:
                 return infra_pause_outcome
 
-        if isinstance(error, dict) and error.get("type") == "workspace_unavailable":
+        worker_workspace_exhausted = is_container_worker_workspace_exhaustion(
+            job, error
+        )
+        if (
+            isinstance(error, dict) and error.get("type") == "workspace_unavailable"
+        ) or worker_workspace_exhausted:
             # Decide on the ORIGINAL job (before any stamp): a pod/sandbox job has
             # no vm.requested, so _job_needs_vm is False and it recovers via PVC
             # reattach; only a true VM job takes the legacy VM path below.
@@ -1100,7 +1106,7 @@ async def complete_job_legacy(
         # clear a lingering recovery strike so an old blip cannot make a later,
         # unrelated one exhaust the cap early.
         # knowledge-base/knowledge/issues/maxsessions_parallel_tools_false_workspace_death.md (D).
-        if should_reset_recovery_counter(_get_container_context(job), error):
+        if should_reset_recovery_counter(_get_container_context(job), error, job=job):
 
             async def _reset_recovery_strikes() -> dict[str, Any]:
                 try:
