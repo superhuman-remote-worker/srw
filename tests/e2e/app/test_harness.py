@@ -1267,6 +1267,67 @@ def test_provider_cleanup_refuses_global_unscoped_rejections(
     assert "DELETE" not in requests
 
 
+@pytest.mark.parametrize(
+    "probe_state",
+    [
+        pytest.param({"active_probe_window": "attach-001"}, id="still-open"),
+        pytest.param(
+            {
+                "probe_windows": [
+                    {"window_id": "attach-001", "closed": True, "settled": False}
+                ]
+            },
+            id="unsettled",
+        ),
+    ],
+)
+def test_provider_cleanup_refuses_unsettled_startup_probe_windows(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cleanup_clock, probe_state
+) -> None:
+    run_id = "provider-probe-run"
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    ledger = {
+        "kubeconfig": str(tmp_path / "kubeconfig.yaml"),
+        "run_dir": str(run_dir),
+    }
+    settled = {
+        "pending_calls": 0,
+        "remaining_required_responses": 0,
+        "unexpected_count": 0,
+        "calls": [{"outcome": "success"}],
+    }
+    overview = {
+        "runs": [settled],
+        "unscoped_unexpected_calls": 0,
+        "unscoped_calls_truncated": 0,
+        "unscoped_calls": [],
+        "active_probe_window": None,
+        "probe_windows": [],
+        **probe_state,
+    }
+    requests: list[str] = []
+
+    def fake_request(url: str, **kwargs):
+        requests.append(kwargs.get("method", "GET"))
+        if url.endswith(f"/{run_id}"):
+            return 200, json.dumps(settled).encode()
+        return 200, json.dumps(overview).encode()
+
+    application = harness.ApplicationE2EHarness(tmp_path / "state")
+    monkeypatch.setattr(
+        application,
+        "_load_secrets",
+        lambda _ledger: type("Secrets", (), {"provider_control_token": "token"})(),
+    )
+    monkeypatch.setattr(harness, "_http_request", fake_request)
+    monkeypatch.setenv("APP_E2E_PROVIDER_SETTLE_SECONDS", "0")
+
+    with pytest.raises(harness.HarnessError, match="startup-probe windows"):
+        application._cleanup_provider_run(ledger, {"run_id": run_id})
+    assert "DELETE" not in requests
+
+
 def test_exact_cleanup_request_receives_the_full_remaining_lifecycle_budget(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

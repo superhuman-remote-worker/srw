@@ -3502,6 +3502,21 @@ class ApplicationE2EHarness:
                 raise HarnessError(
                     "provider cleanup found rejected or unscoped requests"
                 )
+            # Startup dimension probes are accounted by bounded probe windows;
+            # an open, short or over-full window is a failed accounting too.
+            probe_windows = overview.get("probe_windows", [])
+            if overview.get("active_probe_window") is not None or not (
+                isinstance(probe_windows, list)
+                and all(
+                    isinstance(window, dict)
+                    and window.get("closed") is True
+                    and window.get("settled") is True
+                    for window in probe_windows
+                )
+            ):
+                raise HarnessError(
+                    "provider cleanup found unsettled startup-probe windows"
+                )
             write_private_json(
                 self._run_dir(ledger) / "provider-cleanup-state.json",
                 {"scenario": state, "overview": overview},

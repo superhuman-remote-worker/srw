@@ -57,6 +57,14 @@ _CORRELATION_RE = re.compile(
 )
 _DIAGNOSTIC_MODELS = frozenset({CHAT_MODEL_ID, EMBEDDING_MODEL_ID, RERANK_MODEL_ID})
 _MAX_UNSCOPED_DIAGNOSTICS: Final = 4096
+# EmbeddingService.verify_dimensions() embeds exactly this text at every
+# session attach (and worker memory initialisation), without any run
+# correlation. Only this exact request shape can be absorbed by a probe window.
+STARTUP_PROBE_INPUT: Final = "dimension probe"
+_STARTUP_PROBE_KEYS: Final = frozenset({"model", "input", "encoding_format"})
+_STARTUP_PROBE_FORMATS: Final = frozenset({"base64", "float"})
+_MAX_PROBE_WINDOWS: Final = 256
+
 
 
 class ArmScenarioRequest(BaseModel):
@@ -79,6 +87,27 @@ class ArmScenarioRequest(BaseModel):
     required_responses: int = Field(default=1, ge=1, le=100)
     chunk_delay_ms: int = Field(default=100, ge=0, le=2_000)
     sentinel_sha256: str | None = Field(default=None, pattern=r"^[a-f0-9]{64}$")
+
+
+class ArmProbeWindowRequest(BaseModel):
+    """Expect a bounded number of startup dimension probes from one operation."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    expected_probes: int = Field(ge=1, le=32)
+
+
+@dataclass
+class ProbeWindow:
+    """One operation's startup-probe budget; never erased once armed."""
+
+    window_id: str
+    expected_probes: int
+    armed_at: str
+    consumed_probes: int = 0
+    excess_probes: int = 0
+    closed: bool = False
+    calls: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -163,6 +192,113 @@ class ScenarioStore:
         self._runs: dict[str, RunState] = {}
         self._unscoped_unexpected_calls = 0
         self._unscoped_calls: list[dict[str, Any]] = []
+        self._probe_windows: dict[str, ProbeWindow] = {}
+        self._active_probe_window: str | None = None
+
+    async def arm_probe_window(
+        self, window_id: str, request: ArmProbeWindowRequest
+    ) -> dict[str, Any]:
+        """Open the only active window; windows are serial and never reused."""
+
+        _validate_run_id(window_id)
+        async with self._lock:
+            if window_id in self._probe_windows:
+                raise ScenarioError(
+                    409,
+                    "probe_window_exists",
+                    "This probe window id was already used.",
+                )
+            if self._active_probe_window is not None:
+                raise ScenarioError(
+                    409,
+                    "probe_window_active",
+                    "Another probe window is still open; close it first.",
+                )
+            if len(self._probe_windows) >= _MAX_PROBE_WINDOWS:
+                raise ScenarioError(
+                    409, "probe_window_limit", "Too many probe windows were armed."
+                )
+            window = ProbeWindow(
+                window_id=window_id,
+                expected_probes=request.expected_probes,
+                armed_at=_observed_at(),
+            )
+            self._probe_windows[window_id] = window
+            self._active_probe_window = window_id
+            return self._serialize_window(window)
+
+    async def probe_window_state(self, window_id: str) -> dict[str, Any]:
+        _validate_run_id(window_id)
+        async with self._lock:
+            window = self._probe_windows.get(window_id)
+            if window is None:
+                raise ScenarioError(
+                    404, "probe_window_not_found", "No such probe window."
+                )
+            return self._serialize_window(window)
+
+    async def close_probe_window(self, window_id: str) -> dict[str, Any]:
+        """Stop absorbing probes; the record (and any failure) is retained."""
+
+        _validate_run_id(window_id)
+        async with self._lock:
+            window = self._probe_windows.get(window_id)
+            if window is None:
+                raise ScenarioError(
+                    404, "probe_window_not_found", "No such probe window."
+                )
+            window.closed = True
+            if self._active_probe_window == window_id:
+                self._active_probe_window = None
+            return self._serialize_window(window)
+
+    async def absorb_startup_probe(self, payload: dict[str, Any]) -> bool | None:
+        """Account an exact startup probe against the open window.
+
+        ``True``: consumed within budget. ``False``: an excess probe, recorded
+        as a failure on the window. ``None``: not a windowed probe — the
+        ordinary run-correlation rules (and their failures) apply unchanged.
+        """
+
+        if not _is_startup_probe(payload):
+            return None
+        async with self._lock:
+            window_id = self._active_probe_window
+            if window_id is None:
+                return None
+            window = self._probe_windows[window_id]
+            within_budget = window.consumed_probes < window.expected_probes
+            if within_budget:
+                window.consumed_probes += 1
+            else:
+                window.excess_probes += 1
+            window.calls.append(
+                {
+                    "window_id": window_id,
+                    "sequence": len(window.calls) + 1,
+                    "observed_at": _observed_at(),
+                    "endpoint": "embeddings",
+                    "model": EMBEDDING_MODEL_ID,
+                    "outcome": "success"
+                    if within_budget
+                    else "unexpected_excess_probe",
+                }
+            )
+            return within_budget
+
+    @staticmethod
+    def _serialize_window(window: ProbeWindow) -> dict[str, Any]:
+        return {
+            "window_id": window.window_id,
+            "expected_probes": window.expected_probes,
+            "consumed_probes": window.consumed_probes,
+            "excess_probes": window.excess_probes,
+            "armed_at": window.armed_at,
+            "closed": window.closed,
+            "settled": window.consumed_probes == window.expected_probes
+            and window.excess_probes == 0,
+            "calls": list(window.calls),
+        }
 
     async def arm(self, run_id: str, request: ArmScenarioRequest) -> dict[str, Any]:
         _validate_run_id(run_id)
@@ -248,6 +384,11 @@ class ScenarioStore:
                     self._unscoped_unexpected_calls - len(self._unscoped_calls),
                 ),
                 "unscoped_calls": list(self._unscoped_calls),
+                "active_probe_window": self._active_probe_window,
+                "probe_windows": [
+                    self._serialize_window(window)
+                    for window in self._probe_windows.values()
+                ],
             }
 
     def _record_unscoped_locked(
@@ -266,9 +407,7 @@ class ScenarioStore:
         diagnostic = {
             "sequence": sequence,
             "correlation_id": f"unscoped:{sequence}",
-            "observed_at": datetime.now(timezone.utc)
-            .isoformat(timespec="milliseconds")
-            .replace("+00:00", "Z"),
+            "observed_at": _observed_at(),
             "endpoint": endpoint,
             "model": _diagnostic_model(model),
             "stream": stream if isinstance(stream, bool) else False,
@@ -923,6 +1062,26 @@ def create_inference_app(
             payload = await _accounted_json_object(
                 request, store=store, endpoint="embeddings"
             )
+            probe = await store.absorb_startup_probe(payload)
+            if probe is False:
+                raise ScenarioError(
+                    409,
+                    "probe_window_exhausted",
+                    "The open probe window already received every expected probe.",
+                )
+            if probe is True:
+                return {
+                    "object": "list",
+                    "data": [
+                        {
+                            "object": "embedding",
+                            "embedding": _stable_embedding(STARTUP_PROBE_INPUT),
+                            "index": 0,
+                        }
+                    ],
+                    "model": EMBEDDING_MODEL_ID,
+                    "usage": {"prompt_tokens": 0, "total_tokens": 0},
+                }
             run_id = await store.resolve_run(payload, endpoint="embeddings")
             try:
                 model = _required_string(payload, "model")
@@ -1068,6 +1227,27 @@ def create_control_app(store: ScenarioStore, *, control_token: str) -> FastAPI:
             return _error_response(404, "scenario_not_found", "No scenario is armed.")
         return {"run_id": run_id, "reset": True}
 
+    @app.post("/control/probe-windows/{window_id}/arm", status_code=201)
+    async def arm_probe_window(window_id: str, arm_request: ArmProbeWindowRequest):
+        try:
+            return await store.arm_probe_window(window_id, arm_request)
+        except ScenarioError as exc:
+            return _scenario_error_response(exc)
+
+    @app.get("/control/probe-windows/{window_id}")
+    async def probe_window_state(window_id: str):
+        try:
+            return await store.probe_window_state(window_id)
+        except ScenarioError as exc:
+            return _scenario_error_response(exc)
+
+    @app.delete("/control/probe-windows/{window_id}")
+    async def close_probe_window(window_id: str):
+        try:
+            return await store.close_probe_window(window_id)
+        except ScenarioError as exc:
+            return _scenario_error_response(exc)
+
     return app
 
 
@@ -1153,6 +1333,26 @@ def _required_string(payload: dict[str, Any], key: str) -> str:
             400, "invalid_request", f"{key} must be a non-empty string."
         )
     return value
+
+
+def _observed_at() -> str:
+    return (
+        datetime.now(timezone.utc)
+        .isoformat(timespec="milliseconds")
+        .replace("+00:00", "Z")
+    )
+
+
+def _is_startup_probe(payload: dict[str, Any]) -> bool:
+    """The exact uncorrelated request ``verify_dimensions()`` makes."""
+
+    raw_input = payload.get("input")
+    return bool(
+        set(payload) <= _STARTUP_PROBE_KEYS
+        and payload.get("model") == EMBEDDING_MODEL_ID
+        and (raw_input == STARTUP_PROBE_INPUT or raw_input == [STARTUP_PROBE_INPUT])
+        and payload.get("encoding_format", "float") in _STARTUP_PROBE_FORMATS
+    )
 
 
 def _validate_run_id(run_id: str) -> None:

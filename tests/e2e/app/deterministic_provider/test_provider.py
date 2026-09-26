@@ -1419,3 +1419,182 @@ async def test_auxiliary_schemas_are_modelled_and_an_unknown_one_is_not(
     state = (await control.get(f"/control/scenarios/{run_id}")).json()
     assert state["unexpected_count"] == 1
     assert state["pending_calls"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Startup dimension-probe windows
+# ---------------------------------------------------------------------------
+
+# Exactly what EmbeddingService.verify_dimensions() sends through the OpenAI
+# SDK (which requests base64 unless told otherwise).
+PROBE_REQUEST = {
+    "model": EMBEDDING_MODEL_ID,
+    "input": "dimension probe",
+    "encoding_format": "base64",
+}
+
+
+async def arm_probe_window(
+    control: httpx.AsyncClient, window_id: str, expected_probes: int
+) -> httpx.Response:
+    return await control.post(
+        f"/control/probe-windows/{window_id}/arm",
+        json={"expected_probes": expected_probes},
+    )
+
+
+async def test_unwindowed_startup_probe_stays_a_visible_unscoped_rejection(
+    control: httpx.AsyncClient,
+    inference: httpx.AsyncClient,
+) -> None:
+    response = await inference.post("/v1/embeddings", json=PROBE_REQUEST)
+
+    assert response.status_code == 409
+    overview = (await control.get("/control/scenarios")).json()
+    assert overview["unscoped_unexpected_calls"] == 1
+    assert overview["unscoped_calls"][0]["outcome"] == (
+        "run_correlation_required_no_active_scenario"
+    )
+    assert overview["active_probe_window"] is None
+    assert overview["probe_windows"] == []
+
+
+async def test_armed_window_answers_and_accounts_every_expected_probe(
+    control: httpx.AsyncClient,
+    inference: httpx.AsyncClient,
+) -> None:
+    armed = await arm_probe_window(control, "attach-dual-001", 2)
+    assert armed.status_code == 201
+    assert armed.json()["expected_probes"] == 2
+
+    for request in (PROBE_REQUEST, {**PROBE_REQUEST, "input": ["dimension probe"]}):
+        response = await inference.post("/v1/embeddings", json=request)
+        assert response.status_code == 200
+        body = response.json()
+        assert body["model"] == EMBEDDING_MODEL_ID
+        vector = body["data"][0]["embedding"]
+        assert len(vector) == EMBEDDING_DIMENSIONS
+        assert all(isinstance(value, float) for value in vector)
+
+    state = (await control.get("/control/probe-windows/attach-dual-001")).json()
+    assert state["consumed_probes"] == 2
+    assert state["excess_probes"] == 0
+    assert state["settled"] is True
+    assert [call["outcome"] for call in state["calls"]] == ["success", "success"]
+    assert [call["sequence"] for call in state["calls"]] == [1, 2]
+    overview = (await control.get("/control/scenarios")).json()
+    assert overview["unscoped_unexpected_calls"] == 0
+    assert overview["active_probe_window"] == "attach-dual-001"
+
+
+async def test_excess_probe_is_refused_and_leaves_the_window_unsettled(
+    control: httpx.AsyncClient,
+    inference: httpx.AsyncClient,
+) -> None:
+    await arm_probe_window(control, "attach-one-001", 1)
+    assert (
+        await inference.post("/v1/embeddings", json=PROBE_REQUEST)
+    ).status_code == 200
+
+    excess = await inference.post("/v1/embeddings", json=PROBE_REQUEST)
+
+    assert excess.status_code == 409
+    assert excess.json()["error"]["type"] == "probe_window_exhausted"
+    state = (await control.get("/control/probe-windows/attach-one-001")).json()
+    assert state["consumed_probes"] == 1
+    assert state["excess_probes"] == 1
+    assert state["settled"] is False
+    assert state["calls"][-1]["outcome"] == "unexpected_excess_probe"
+
+
+@pytest.mark.parametrize(
+    "request_body",
+    [
+        pytest.param({**PROBE_REQUEST, "input": "memory text"}, id="other-input"),
+        pytest.param({**PROBE_REQUEST, "model": "other-embedding"}, id="wrong-model"),
+        pytest.param({**PROBE_REQUEST, "dimensions": 1024}, id="extra-field"),
+        pytest.param(
+            {**PROBE_REQUEST, "input": ["dimension probe", "dimension probe"]},
+            id="batch",
+        ),
+        pytest.param({**PROBE_REQUEST, "encoding_format": "binary"}, id="format"),
+        pytest.param(
+            {**PROBE_REQUEST, "input": "E2E-other-run dimension probe"},
+            id="correlated",
+        ),
+    ],
+)
+async def test_window_absorbs_only_the_exact_probe_shape(
+    control: httpx.AsyncClient,
+    inference: httpx.AsyncClient,
+    request_body: dict,
+) -> None:
+    await arm_probe_window(control, "attach-shape-001", 1)
+
+    response = await inference.post("/v1/embeddings", json=request_body)
+
+    assert response.status_code in {400, 409}
+    state = (await control.get("/control/probe-windows/attach-shape-001")).json()
+    assert state["consumed_probes"] == 0
+    assert state["calls"] == []
+    overview = (await control.get("/control/scenarios")).json()
+    assert overview["unscoped_unexpected_calls"] == 1
+
+
+async def test_window_takes_the_probe_before_a_single_armed_scenario(
+    control: httpx.AsyncClient,
+    inference: httpx.AsyncClient,
+) -> None:
+    await arm(control, "run-with-probe-001")
+    await arm_probe_window(control, "attach-run-001", 1)
+
+    assert (
+        await inference.post("/v1/embeddings", json=PROBE_REQUEST)
+    ).status_code == 200
+
+    run = (await control.get("/control/scenarios/run-with-probe-001")).json()
+    assert run["calls"] == []
+    state = (await control.get("/control/probe-windows/attach-run-001")).json()
+    assert state["consumed_probes"] == 1
+
+
+async def test_windows_are_serial_unique_and_closing_keeps_the_record(
+    control: httpx.AsyncClient,
+    inference: httpx.AsyncClient,
+) -> None:
+    assert (await arm_probe_window(control, "attach-a-001", 1)).status_code == 201
+    second = await arm_probe_window(control, "attach-b-001", 1)
+    assert second.status_code == 409
+    assert second.json()["error"]["type"] == "probe_window_active"
+
+    closed = await control.delete("/control/probe-windows/attach-a-001")
+    assert closed.status_code == 200
+    assert closed.json()["closed"] is True
+    assert closed.json()["settled"] is False
+    reused = await arm_probe_window(control, "attach-a-001", 1)
+    assert reused.status_code == 409
+    assert reused.json()["error"]["type"] == "probe_window_exists"
+
+    after_close = await inference.post("/v1/embeddings", json=PROBE_REQUEST)
+    assert after_close.status_code == 409
+    overview = (await control.get("/control/scenarios")).json()
+    assert overview["active_probe_window"] is None
+    assert [window["window_id"] for window in overview["probe_windows"]] == [
+        "attach-a-001"
+    ]
+    assert overview["probe_windows"][0]["settled"] is False
+    assert overview["unscoped_unexpected_calls"] == 1
+
+
+async def test_probe_window_validation_is_fail_closed(
+    control: httpx.AsyncClient,
+) -> None:
+    for body in ({"expected_probes": 0}, {"expected_probes": 33}, {}):
+        response = await control.post(
+            "/control/probe-windows/attach-bad-001/arm", json=body
+        )
+        assert response.status_code == 422
+    invalid = await arm_probe_window(control, "bad window!", 1)
+    assert invalid.status_code in {400, 404, 422}
+    missing = await control.get("/control/probe-windows/attach-none-001")
+    assert missing.status_code == 404
