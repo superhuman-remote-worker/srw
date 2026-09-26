@@ -453,12 +453,12 @@ def container_status(**fields):
     return SimpleNamespace(**fields)
 
 
-def pod_status(*statuses, phase="Pending", ephemeral=()):
+def pod_status(*statuses, phase="Pending", ephemeral=(), init=()):
     return SimpleNamespace(
         phase=phase,
         pod_ip="10.42.0.185",
         container_statuses=list(statuses),
-        init_container_statuses=[],
+        init_container_statuses=list(init),
         ephemeral_container_statuses=list(ephemeral),
     )
 
@@ -516,6 +516,32 @@ EVER_STARTED = {
         ],
     ),
     "running-phase": pod_status(container_status(), phase="Running"),
+    # Pending pods whose only evidence is the container state itself: the
+    # phase gate cannot hide the terminated check or the init-container scan.
+    "pending-terminated-main": pod_status(
+        container_status(
+            state=SimpleNamespace(waiting=None, running=None, terminated=EXITED)
+        )
+    ),
+    "pending-completed-init-container": pod_status(
+        container_status(),
+        init=[
+            container_status(
+                name="setup",
+                state=SimpleNamespace(
+                    waiting=None,
+                    running=None,
+                    terminated=SimpleNamespace(
+                        exit_code=0, reason="Completed", started_at=NOW
+                    ),
+                ),
+            )
+        ],
+    ),
+    # The runtime created the container even though it reports waiting.
+    "container-id": pod_status(
+        container_status(container_id="containerd://0123456789abcdef")
+    ),
     "unreadable-statuses": SimpleNamespace(
         phase="Pending", container_statuses="garbage"
     ),
@@ -654,13 +680,103 @@ async def test_only_a_job_pull_failure_is_settled(owner, error, strict_stateless
 
     settled = await provisioner._settle_failed_job_creation(
         owner,
-        {"id": "r", "runtime_incarnation": _TEST_POD_UID},
+        {"id": "r", "runtime_incarnation": _TEST_POD_UID, "operation_kind": "create"},
         error,
         strict_stateless=strict_stateless,
+        fresh_storage=True,
     )
 
     assert settled is False
     provisioner._core_api.read_namespaced_pod.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("operation_kind", "fresh_storage"),
+    [
+        ("restore", True),
+        ("reattach", True),
+        ("adopt", True),
+        (None, True),
+        ("create", False),
+    ],
+    ids=["restore", "reattach", "adopt", "unknown", "reused-claim"],
+)
+async def test_only_a_fresh_create_is_settled(operation_kind, fresh_storage):
+    # Settling hands the volume to the Job's terminal reclaim, which deletes
+    # it. A kept claim may hold user data that still needs its archive.
+    provisioner = ContainerProvisioner()
+    provisioner._db = _TemplatedJobDB()
+    provisioner._core_api = MagicMock()
+
+    settled = await provisioner._settle_failed_job_creation(
+        WorkspaceOwner.job(JOB_ID),
+        {
+            "id": "r",
+            "runtime_incarnation": _TEST_POD_UID,
+            "operation_kind": operation_kind,
+        },
+        WorkspaceImagePullError(PULL_FAILURE),
+        strict_stateless=False,
+        fresh_storage=fresh_storage,
+    )
+
+    assert settled is False
+    provisioner._core_api.read_namespaced_pod.assert_not_called()
+
+
+def with_workspace_volume(provisioner, *, kept):
+    """Serve a PVC and Service; ``kept`` makes the claim already exist (409)."""
+
+    api = provisioner._core_api
+    pod_create = api.create_namespaced_pod.side_effect
+    pod_read = api.read_namespaced_pod.side_effect
+    fake_cluster(provisioner, [])
+    api.create_namespaced_pod.side_effect = pod_create
+    api.read_namespaced_pod.side_effect = pod_read
+    provisioner._pvc_enabled = True
+    if kept:
+        create_claim = api.create_namespaced_persistent_volume_claim.side_effect
+
+        def already_there(**kwargs):
+            create_claim(**kwargs)
+            raise ApiException(status=409, reason="AlreadyExists")
+
+        api.create_namespaced_persistent_volume_claim.side_effect = already_there
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("operation_kind", "kept", "settles"),
+    [
+        ("create", False, True),
+        ("create", True, False),
+        ("restore", False, False),
+        ("restore", True, False),
+    ],
+    ids=["fresh-create", "create-over-kept-claim", "restore", "restore-kept-claim"],
+)
+async def test_a_pull_failure_settles_only_a_create_with_a_fresh_volume(
+    monkeypatch, operation_kind, kept, settles
+):
+    provisioner, _order, settle_calls = settling_job_provisioner(monkeypatch)
+    with_workspace_volume(provisioner, kept=kept)
+
+    assert (
+        await provisioner.create_workspace(
+            WorkspaceOwner.job(JOB_ID), operation_kind=operation_kind
+        )
+        is False
+    )
+
+    # The Job still gets its reason either way.
+    assert job_context_updates(provisioner)[-1] == {"error": PULL_FAILURE}
+    assert bool(settle_calls) is settles
+    assert (provisioner._db._creation_reservation["settled_at"] is not None) is settles
+    # Nothing is deleted by the failed creation in any case.
+    provisioner._core_api.delete_namespaced_pod.assert_not_called()
+    provisioner._core_api.delete_namespaced_persistent_volume_claim.assert_not_called()
+    provisioner._core_api.delete_namespaced_service.assert_not_called()
 
 
 @pytest.mark.asyncio

@@ -413,6 +413,9 @@ def _container_never_started(container: Any) -> bool:
         )
         or getattr(container, "started", None) is True
         or getattr(container, "ready", None) is True
+        # The runtime assigns an ID once it creates the container; a pull or
+        # config failure never gets that far.
+        or _resource_field(container, "container_id", "containerID")
     )
 
 
@@ -425,8 +428,8 @@ def _pod_never_started_a_container(pod: Any) -> bool:
     is no endpoint and nothing to snapshot); the finalizer protocol still
     proves every container terminated before release.  Every reported
     container (regular, init and ephemeral/debug) must never have been
-    running or terminated, never restarted, carry no ``lastState``, and not
-    report started or ready.  A Pod
+    running or terminated, never restarted, carry no ``lastState`` and no
+    container ID, and not report started or ready.  A Pod
     with no container status yet qualifies; any other phase, or unreadable
     status arrays, does not.  Terminated states are rejected even when they
     look synthetic (``ContainerStatusUnknown`` after deletion): terminal
@@ -2781,6 +2784,7 @@ class ContainerProvisioner:
                 _creation_reservation,
                 e,
                 strict_stateless=strict_stateless,
+                fresh_storage=not pvc_reattach,
             )
             return False
 
@@ -14166,6 +14170,7 @@ class ContainerProvisioner:
         exc: BaseException,
         *,
         strict_stateless: bool,
+        fresh_storage: bool,
     ) -> bool:
         """Settle a pull-failed Job's reservation on its never-started Pod.
 
@@ -14188,15 +14193,21 @@ class ContainerProvisioner:
         process-zero receipt, finalizer release) and reclaims its PVC and
         Service.
 
-        Only a Pod that never started a container is settled here; any other
-        failure keeps today's behaviour. Best effort and never raises: it runs
-        inside the creation's failure handler, which returns False either way.
+        Only a fresh ``create`` whose volume was made by this same attempt (or
+        an emptyDir workspace) is settled, and only on a Pod that never started
+        a container. That terminal reclaim deletes the volume, so a restore,
+        reattach or recreate over a kept claim, which may hold user data that
+        still needs its archive, keeps today's data-preserving behaviour, as
+        does any other failure. Best effort and never raises: it runs inside
+        the creation's failure handler, which returns False either way.
         """
 
         if (
             owner.kind != "job"
             or strict_stateless
             or not isinstance(exc, WorkspaceImagePullError)
+            or str(reservation.get("operation_kind") or "") != "create"
+            or fresh_storage is not True
         ):
             return False
         settle = getattr(

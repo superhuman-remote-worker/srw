@@ -48,6 +48,9 @@ PULL_FAILURE = (
 )
 
 
+# Deliberately overrides the imported module's fixture of the same name: its
+# `db` fixture requests `_schema_applied` by name, and this module needs the full
+# migration chain (terminal-owner trigger, reservation and intent tables).
 @pytest_asyncio.fixture(scope="module")
 async def _schema_applied(pg_dsn):
     async with asyncpg.create_pool(pg_dsn, min_size=1, max_size=2) as pool:
@@ -355,3 +358,42 @@ async def test_a_pull_failed_job_can_be_deleted_before_any_sweep(db, monkeypatch
     p.attest_workspace_runtime.assert_not_awaited()
     async with db.acquire() as conn:
         await conn.execute("DELETE FROM jobs WHERE id=$1", job)
+
+
+@pytest.mark.asyncio
+async def test_a_pull_failure_over_a_kept_volume_settles_nothing(db, monkeypatch):
+    """A kept claim may hold user data: the failed creation leaves it all alone."""
+
+    job = await _job(db)
+    owner = WorkspaceOwner.job(str(job))
+    cluster = NeverPullingCluster()
+    p = _provisioner(monkeypatch, db, cluster)
+    # A volume kept from an earlier runtime (suspension keeps the PVC).
+    cluster.create_namespaced_persistent_volume_claim(
+        body={
+            "metadata": {
+                "name": f"pvc-{owner.pod_name}",
+                "namespace": p._namespace,
+                "labels": {
+                    "app": "srw-workspace",
+                    "srw/component": "workspace-pvc",
+                    "srw.io/component": "agent-workspace",
+                    owner.label_key: owner.id,
+                },
+            },
+            "spec": {
+                "accessModes": ["ReadWriteOnce"],
+                "storageClassName": p._storage_class,
+            },
+        }
+    )
+    kept = cluster.objects["pvc"].metadata.uid
+
+    assert await p.create_workspace(owner) is False
+
+    assert (await _workspace(db, job))["error"] == PULL_FAILURE
+    assert set(cluster.objects) == {"pvc", "service", "pod"}
+    assert cluster.objects["pvc"].metadata.uid == kept
+    assert cluster.pod_deletes == 0
+    # The generation stays open, exactly as before this fix.
+    assert await _open_authority(db, job) == {"reservations": 1, "intents": 0}
