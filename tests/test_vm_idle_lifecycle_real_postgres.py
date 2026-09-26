@@ -104,7 +104,7 @@ async def seed_wait(db, *, original_options=None, attempts=0, job_id=None,
     )
     options = {
         "agent_config": "worker_base", "vm_image": PROFILE_IMAGE if proven_profile else None, "cpu_cores": 8,
-        "memory": "16Gi", "description": "", "network_tier": "restricted",
+        "memory": "16Gi", "disk_size": "30Gi", "description": "", "network_tier": "restricted",
         **(original_options or {}),
     }
     if proven_profile:
@@ -787,7 +787,7 @@ async def test_native_creation_requires_exact_idle_wake_operation(db, monkeypatc
     fresh["provision_generation"] = str(wake["wake_generation"])
     request = build_vm_creation_request(
         job_id=str(owner), agent_config="worker_base", vm_image=PROFILE_IMAGE,
-        cpu_cores=8, memory="16Gi", description="", network_tier="restricted",
+        cpu_cores=8, memory="16Gi", disk_size="30Gi", description="", network_tier="restricted",
         provision_generation=fresh["provision_generation"], network_profile=NETWORK_PROFILE,
     )
     preflight = VMCreationPreflightStore(db)

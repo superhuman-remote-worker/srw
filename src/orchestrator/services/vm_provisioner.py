@@ -981,6 +981,7 @@ class VMProvisioner:
                 creation_preflight_response,
                 idle_wake_predecessor,
                 idle_wake_request,
+                idle_wake_source_request,
             )
             from orchestrator.services.vm_creation_retry_store import (
                 VMCreationRetryConflict,
@@ -1044,8 +1045,15 @@ class VMProvisioner:
                         max_attempts=int(os.getenv("VM_PROVISION_MAX_ATTEMPTS", "3")),
                         current_storage=current_storage,
                     )
+                    async with self._db.acquire() as conn:
+                        source = await conn.fetchrow(
+                            "SELECT * FROM vm_creation_retries "
+                            "WHERE job_id=$1 AND provision_generation=$2",
+                            UUID(job_id), UUID(vm["provision_generation"]),
+                        )
                     request = idle_wake_request(
-                        prior, generation=generation, current_storage=current_storage,
+                        prior, resolved_request=idle_wake_source_request(vm, source),
+                        generation=generation, current_storage=current_storage,
                     )
                 fresh_context = self._fresh_provision_ctx()
                 fresh_context["provision_generation"] = generation

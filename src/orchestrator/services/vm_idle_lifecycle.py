@@ -953,6 +953,7 @@ class VMIdleLifecycleStore:
             from orchestrator.services.vm_creation_preflight import (
                 _execution_binding,
                 idle_wake_predecessor,
+                idle_wake_source_request,
             )
             from orchestrator.services.vm_creation_retry_store import VMCreationRetryConflict
 
@@ -969,6 +970,7 @@ class VMIdleLifecycleStore:
                         "WHERE job_id=$1 AND provision_generation=$2 FOR SHARE",
                         owner_id, expected["generation"],
                     )
+                    raw_request = idle_wake_source_request(vm, ledger)
                     if (
                         not ledger
                         or ledger["state"] != "succeeded"

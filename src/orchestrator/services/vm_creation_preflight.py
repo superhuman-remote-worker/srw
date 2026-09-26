@@ -175,13 +175,62 @@ def idle_wake_predecessor(
     return prior
 
 
-def idle_wake_request(prior, *, generation: str, current_storage=None):
+def idle_wake_source_request(vm, source):
+    """Prove resolved options separately from the unchanged caller preflight.
+
+    The controller may have materialized a default disk size. Only the exact
+    successful immutable source and its frozen configuration can explain that
+    difference; today's defaults and the mutable context snapshot cannot.
+    """
+    from shared.vm_disk_size import quantity_bytes
+
+    prior = _preflight(vm)
+    try:
+        request = _object(source["canonical_request"]) if source else {}
+        if (
+            prior is None
+            or source is None
+            or source["owner_kind"] != "job"
+            or source["state"] != "succeeded"
+            or str(source["request_id"]) != prior["request_id"]
+            or vm.get("creation_request_id") != prior["request_id"]
+            or str(source["job_id"]) != prior["request"]["job_id"]
+            or str(source["provision_generation"]) != vm.get("provision_generation")
+            or str(source["observed_vm_uid"]) != vm.get("vm_uid")
+            or str(source["observed_pvc_uid"]) != vm.get("rootdisk_pvc_uid")
+            or not isinstance(request.get("disk_size"), str)
+            or (quantity_bytes(request.get("disk_size")) or 0) <= 0
+            or canonical_request_digest(request) != source["request_digest"]
+            or any(source[key] != value for key, value in _execution_binding(prior).items())
+        ):
+            raise ValueError("creation source changed")
+        if request != prior["request"]:
+            from orchestrator.services.vm_creation_transport import validate_creation_resolution
+
+            validate_creation_resolution(prior["request"], {
+                "creation_retry_protocol": 1,
+                "request": request,
+                "request_digest": source["request_digest"],
+                "controller_configuration": _object(source["controller_configuration"]),
+                "controller_configuration_digest": source["controller_configuration_digest"],
+            })
+        return deepcopy(request)
+    except (ValueError, TypeError, KeyError, AttributeError) as exc:
+        raise VMCreationRetryConflict("idle_wake_predecessor_unproven") from exc
+
+
+def idle_wake_request(prior, *, resolved_request, generation: str, current_storage=None):
     """Build a successor from captured options, changing only its generation.
 
     A retained binding may gain the controller-attested PVC UID after its
     initial create. Every other storage/accounting field stays immutable.
     """
-    request = deepcopy(prior["request"])
+    if any(
+        resolved_request.get(key) != prior["request"].get(key)
+        for key in ("job_id", "provision_generation", "entity_type")
+    ):
+        raise VMCreationRetryConflict("idle_wake_predecessor_unproven")
+    request = deepcopy(resolved_request)
     request["provision_generation"] = generation
     if current_storage is not None:
         request["workspace_storage"] = deepcopy(current_storage)
@@ -485,8 +534,14 @@ class VMCreationPreflightStore:
                         old_vm, job_id=job_id, pvc_uid=str(idle_wake["pvc_uid"]),
                         max_attempts=max_attempts, current_storage=current_storage,
                     )
+                    source = await conn.fetchrow(
+                        "SELECT * FROM vm_creation_retries "
+                        "WHERE job_id=$1 AND provision_generation=$2 FOR SHARE",
+                        owner, UUID(old_vm["provision_generation"]),
+                    )
                     if request != idle_wake_request(
                         predecessor,
+                        resolved_request=idle_wake_source_request(old_vm, source),
                         generation=str(idle_wake["wake_generation"]),
                         current_storage=current_storage,
                     ):
@@ -813,6 +868,7 @@ class VMCreationPreflightStore:
             capture_vm_creation_request,
         )
         from orchestrator.services.vm_creation_transport import (
+            CreationConfigurationUnavailable,
             validate_creation_resolution,
         )
 
@@ -820,6 +876,14 @@ class VMCreationPreflightStore:
             async with conn.transaction():
                 job, value, _ = await self._claimed(conn, claim)
                 resolved = validate_creation_resolution(value["request"], resolved)
+                if (
+                    _object(_object(job["context"]).get("vm")).get("idle_wake_operation_id")
+                    and resolved["request"] != value["request"]
+                ):
+                    # A retained disk uses its proven original sizing. A new
+                    # controller floor is configuration attention, not a grant
+                    # to enlarge this successor or reset its frozen budget.
+                    raise CreationConfigurationUnavailable()
                 generation = value["request"]["provision_generation"]
                 snapshot = await capture_vm_creation_request(
                     self.db,

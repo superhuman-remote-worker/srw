@@ -403,8 +403,8 @@ async def test_default_wake_preserves_native_authority_refusals(
             "UPDATE jobs SET status='cancelled' WHERE id=$1", retry["job_id"]
         )
     elif changed == "expired":
-        # Seed an already-expired original manifest and matching predecessor
-        # binding, so refusal is deadline expiry rather than a changed binding.
+        # Rewrite the manifest and projection, but preserve the immutable source
+        # deadline. The earlier source-binding guard must reject this forgery.
         deadline = await db.fetchval(
             "UPDATE srw_execution_specs SET created_at=clock_timestamp()-interval '2 hours' "
             "WHERE work_kind='Job' AND work_id=$1 "
@@ -426,7 +426,7 @@ async def test_default_wake_preserves_native_authority_refusals(
 
         with pytest.raises(
             VMCreationRetryConflict,
-            match="job_admission_expired"
+            match="idle_wake_predecessor_unproven"
             if changed == "expired"
             else "idle_wake_unproven",
         ):

@@ -74,6 +74,8 @@ async def charged_idle_wait(db, monkeypatch, *, lane="stateless"):
         db, policy, inventory, lane=lane,
         request_options={
             "vm_image": PROFILED_IMAGE,
+            # Native successful creation has already materialized disk sizing.
+            "disk_size": "30Gi",
             "network_profile": dict(NETWORK_PROFILE),
         },
     )
