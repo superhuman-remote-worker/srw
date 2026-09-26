@@ -333,7 +333,10 @@ APPLICATION_E2E_PROFILES: Final = {
     # The pinned/virtual baseline (workspace.pvcEnabled false, so dedicated
     # session Pods mount no agent workspace claim) with one warm dual pool
     # agent, over the same secure origin: the claim-less half of the
-    # self-ended pinned retirement matrix.
+    # self-ended pinned retirement matrix. Worker jobs still get a Kubernetes
+    # workspace container, so the current-SHA workspace image is built and
+    # pinned too; without it a job's workspace pulls the public ``latest``
+    # image and outlives the provisioner's readiness timeout.
     "pinned-secure": ApplicationE2EProfile(
         name="pinned-secure",
         values_files=(
@@ -343,6 +346,7 @@ APPLICATION_E2E_PROFILES: Final = {
         ),
         workspace_backend="virtual",
         execution_lane="pinned",
+        include_workspace_image=True,
         secure_origin=True,
     ),
 }

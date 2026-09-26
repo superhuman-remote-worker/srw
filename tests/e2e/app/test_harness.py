@@ -1695,6 +1695,8 @@ def test_secure_profiles_add_only_the_secure_origin_overlay() -> None:
     )
     assert (pinned.workspace_backend, pinned.execution_lane) == ("virtual", "pinned")
     assert pinned.secure_origin and not pinned.stateless_agents
+    # Its worker jobs run on the current-SHA workspace image.
+    assert pinned.include_workspace_image is True
 
 
 @pytest.mark.skipif(shutil.which("helm") is None, reason="Helm is not installed")
