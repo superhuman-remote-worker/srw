@@ -13,6 +13,22 @@ from orchestrator.services.vm_workspace_policy import (
 )
 
 
+def is_initial_thread_vm_poll(thread, vm):
+    """Existing wake/restore generations retain their original delivery path."""
+    if thread_metadata_object(thread).get("vm") is None:
+        return True
+    if vm.get("rootdisk") == "kept" or vm.get("idle_wake_operation_id") is not None:
+        return False
+    marker = vm.get("initial_runtime")
+    if marker is None:
+        return False
+    try:
+        generation = str(UUID(str(marker["runtime_generation"])))
+    except (KeyError, TypeError, ValueError) as exc:
+        raise HTTPException(409, "Initial VM runtime marker is malformed") from exc
+    return generation == str(thread["runtime_generation"])
+
+
 async def ensure_initial_thread_vm(thread, *, store, provisioner):
     """Called after the workspace poll has authorized its exact actor and grants.
 
@@ -96,6 +112,20 @@ async def require_current_initial_vm_source(thread, *, store):
     vm = metadata.get("vm")
     if metadata.get("protected_cloud") not in (None, False) or not isinstance(vm, dict):
         raise HTTPException(409, "Initial VM authority is unavailable")
+    marker = vm.get("initial_runtime")
+    if not isinstance(marker, dict) or any(
+        marker.get(key) != str(thread.get(key))
+        for key in ("runtime_generation", "agent_id", "runtime_attach_token")
+    ):
+        raise HTTPException(409, "Initial VM runtime marker changed")
+    if vm.get("creation_request_id") is None:
+        from shared.vm_resource_policy import configured_enforcement_required
+
+        # Preparation has no metadata.vm. Only the legacy one-shot hosting
+        # mode may have a marked physical create without a retry source.
+        if configured_enforcement_required():
+            raise HTTPException(409, "Initial VM creation source is unavailable")
+        return
     if vm.get("creation_request_id") is not None:
         try:
             request_id = UUID(str(vm["creation_request_id"]))

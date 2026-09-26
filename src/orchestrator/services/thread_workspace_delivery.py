@@ -62,6 +62,12 @@ from orchestrator.services.session_runtime_admission import (
     thread_runtime_refusal_detail,
 )
 from orchestrator.services.stateless_workspace_gate import thread_metadata_object
+from orchestrator.services.vm_thread_initial import (
+    ensure_initial_thread_vm,
+    initial_vm_wait_payload,
+    is_initial_thread_vm_poll,
+    require_current_initial_vm_source,
+)
 from orchestrator.services.workspace_binding import (
     remote_canvas_presentation_available,
     virtual_thread_backing_id,
@@ -914,16 +920,11 @@ async def agent_get_thread_workspace_locked(
         and workspace_backend == "vm"
         and dependencies.vm_provisioner is not None
         and vm.get("status") != "ready"
+        and is_initial_thread_vm_poll(thread, vm)
     ):
         # Admission follows the real binding and current authorization. A
         # restart between binding and this poll simply repeats this boundary.
         # No lifecycle lock may be nested under the caller's datasource lock.
-        from orchestrator.services.vm_thread_initial import (
-            ensure_initial_thread_vm,
-            initial_vm_wait_payload,
-            require_current_initial_vm_source,
-        )
-
         if not all((presented_agent_id, presented_runtime_generation, presented_attach_token)):
             raise HTTPException(409, "Initial VM creation requires exact runtime identity")
         if metadata.get("vm") is None:

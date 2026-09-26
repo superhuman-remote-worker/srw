@@ -21791,6 +21791,8 @@ class PostgresDB:
         if not isinstance(provision_context, Mapping):
             return False
         proposed = dict(provision_context)
+        # Only the fresh-initial CAS below may assign this delivery marker.
+        proposed.pop("initial_runtime", None)
         try:
             provision_generation = _canonical_uuid_text(
                 proposed.get("provision_generation"),
@@ -21934,6 +21936,12 @@ class PostgresDB:
                         parsed_thread, execution["id"],
                     ):
                         return False
+                    if not preparation_only:
+                        proposed["initial_runtime"] = {
+                            "runtime_generation": str(parsed_runtime_generation),
+                            "agent_id": str(parsed_agent),
+                            "runtime_attach_token": str(parsed_attach),
+                        }
                 open_idle = await conn.fetchrow(
                     "SELECT id,release_kind,phase,stop_verified_at,wake_generation,"
                     "wake_request_id,provision_generation,vm_uid,vmi_uid,launcher_uid,pvc_uid,"

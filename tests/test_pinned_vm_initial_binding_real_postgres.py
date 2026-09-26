@@ -513,6 +513,17 @@ async def test_repeated_and_restarted_polls_keep_one_source_and_frozen_selection
         )
         == 1
     )
+    assert await db.merge_thread_vm_context_if_provision_generation(
+        str(thread_id),
+        str(before["provision_generation"]),
+        {"status": "starting"},
+    )
+    assert (await _poll(db, rebuilt, current))["vm_status"] == "starting"
+    vm = json.loads((await db.get_thread(str(thread_id)))["metadata"])["vm"]
+    assert vm["initial_runtime"] == {
+        key: str(current[key])
+        for key in ("runtime_generation", "agent_id", "runtime_attach_token")
+    }
 
 
 @pytest.mark.asyncio
@@ -537,9 +548,7 @@ async def test_stale_workspace_poll_cannot_issue_initial_vm(db, monkeypatch, fie
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "old_vm", ["malformed", {}, {"status": "suspended", "rootdisk": "kept"}]
-)
+@pytest.mark.parametrize("old_vm", ["malformed"])
 async def test_existing_malformed_or_retained_vm_is_not_initial_poll_authority(
     db, monkeypatch, old_vm
 ):
@@ -588,7 +597,7 @@ async def test_vm_operator_revocation_precedes_initial_poll_effect(db, monkeypat
 
 
 @pytest.mark.asyncio
-async def test_poll_rejects_a_historical_source_captured_before_binding(
+async def test_poll_does_not_rewrite_a_historical_source_captured_before_binding(
     db, monkeypatch
 ):
     thread_id, _policy, override, dependencies = await _initial_vm(
@@ -604,6 +613,23 @@ async def test_poll_rejects_a_historical_source_captured_before_binding(
         "SELECT * FROM vm_creation_retries WHERE thread_id=$1", thread_id
     )
     current = await _bind_protected_agent(db, thread_id)
+    await _poll(db, dependencies.vm_provisioner, current)
+    # A forged current marker cannot turn the old NULL-actor source into
+    # fresh authority. The source itself remains immutable and incompatible.
+    await db.execute(
+        "UPDATE threads SET metadata=jsonb_set(metadata,'{vm,initial_runtime}',$2::jsonb) WHERE id=$1",
+        thread_id,
+        json.dumps(
+            {
+                key: str(current[key])
+                for key in (
+                    "runtime_generation",
+                    "agent_id",
+                    "runtime_attach_token",
+                )
+            }
+        ),
+    )
     with pytest.raises(HTTPException) as refused:
         await _poll(db, dependencies.vm_provisioner, current)
     assert refused.value.status_code == 409
@@ -704,6 +730,131 @@ async def test_current_config_grant_denial_prevents_source_admission(db, monkeyp
                 dependencies=delivery,
             )
     assert refused.value.status_code == 403
+    assert (
+        await db.fetchval(
+            "SELECT count(*) FROM vm_creation_retries WHERE thread_id=$1", thread_id
+        )
+        == 0
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("old_status", ["suspended", "restoring", "waiting_capacity"])
+async def test_created_resume_retained_vm_uses_existing_pending_delivery(
+    db, monkeypatch, old_status
+):
+    thread_id, _policy, _override, dependencies = await _initial_vm(
+        db, monkeypatch, native=True
+    )
+    current = await _bind_protected_agent(db, thread_id)
+    predecessor_generation = str(uuid4())
+    # Model the existing Resume projection after binding, not a fresh create:
+    # predecessor PVC identity is retained and any initial marker names old G.
+    old_vm = {
+        "status": old_status,
+        "rootdisk": "kept",
+        "rootdisk_pvc_uid": str(uuid4()),
+        "provision_generation": str(uuid4()),
+        "initial_runtime": {"runtime_generation": predecessor_generation},
+    }
+    if old_status == "suspended":
+        old_vm.pop("initial_runtime")
+    elif old_status == "waiting_capacity":
+        old_vm.pop("rootdisk")
+        old_vm["idle_wake_operation_id"] = str(uuid4())
+        old_vm["initial_runtime"] = {
+            key: str(current[key])
+            for key in ("runtime_generation", "agent_id", "runtime_attach_token")
+        }
+    await db.execute(
+        "UPDATE threads SET metadata=jsonb_set(metadata,'{vm}',$2::jsonb) WHERE id=$1",
+        thread_id,
+        json.dumps(old_vm),
+    )
+    payload = await _poll(db, dependencies.vm_provisioner, current)
+    assert payload["vm_status"] == old_status
+    assert "resolved_config" in payload  # existing delivery, not initial shim
+    assert (
+        await db.fetchval(
+            "SELECT count(*) FROM vm_creation_retries WHERE thread_id=$1", thread_id
+        )
+        == 0
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("request_id", [None, str(uuid4()), "malformed"])
+async def test_marked_initial_vm_requires_its_exact_durable_source(
+    db, monkeypatch, request_id
+):
+    thread_id, _policy, _override, dependencies = await _initial_vm(
+        db, monkeypatch, native=True
+    )
+    current = await _bind_protected_agent(db, thread_id)
+    incomplete = {
+        "status": "provisioning",
+        "provision_generation": str(uuid4()),
+        "initial_runtime": {
+            key: str(current[key])
+            for key in (
+                "runtime_generation",
+                "agent_id",
+                "runtime_attach_token",
+            )
+        },
+    }
+    if request_id is not None:
+        incomplete["creation_request_id"] = request_id
+    await db.execute(
+        "UPDATE threads SET metadata=jsonb_set(metadata,'{vm}',$2::jsonb) WHERE id=$1",
+        thread_id,
+        json.dumps(incomplete),
+    )
+    with pytest.raises(HTTPException) as refused:
+        await _poll(db, dependencies.vm_provisioner, current)
+    assert refused.value.status_code == 409
+    assert (
+        await db.fetchval(
+            "SELECT count(*) FROM vm_creation_retries WHERE thread_id=$1", thread_id
+        )
+        == 0
+    )
+
+
+@pytest.mark.asyncio
+async def test_legacy_initial_vm_poll_preserves_its_bound_marker(db, monkeypatch):
+    thread_id, _policy, override, dependencies = await _initial_vm(
+        db, monkeypatch, native=True
+    )
+    monkeypatch.delenv("VM_RESOURCE_ADMISSION_CONFIG")
+    current = await _bind_protected_agent(db, thread_id)
+    monkeypatch.setattr(
+        dependencies.vm_provisioner, "_create_http", AsyncMock(return_value=True)
+    )
+    await _poll(db, dependencies.vm_provisioner, current)
+    vm = json.loads((await db.get_thread(str(thread_id)))["metadata"])["vm"]
+    marker = vm["initial_runtime"]
+    assert "creation_request_id" not in vm
+    assert await db.merge_thread_vm_context_if_provision_generation(
+        str(thread_id),
+        vm["provision_generation"],
+        {"status": "waiting_capacity"},
+    )
+    vm = json.loads((await db.get_thread(str(thread_id)))["metadata"])["vm"]
+    assert await dependencies.vm_provisioner.create_thread_vm(
+        str(thread_id),
+        vm_image=override["workspace"]["vm"]["image"],
+        expected_runtime_generation=str(current["runtime_generation"]),
+        expected_agent_id=str(current["agent_id"]),
+        expected_attach_token=str(current["runtime_attach_token"]),
+        expected_vm_context=vm,
+        poll=True,
+    )
+    after = json.loads((await db.get_thread(str(thread_id)))["metadata"])["vm"]
+    assert after["initial_runtime"] == marker
+    assert (await _poll(db, dependencies.vm_provisioner, current))[
+        "status"
+    ] == "creating"
     assert (
         await db.fetchval(
             "SELECT count(*) FROM vm_creation_retries WHERE thread_id=$1", thread_id

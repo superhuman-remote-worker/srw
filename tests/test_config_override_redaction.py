@@ -15,6 +15,18 @@ from orchestrator.services.thread_projection import redact_thread_metadata
 from orchestrator.application import jobs as jobs_composition
 
 
+def test_thread_vm_initial_runtime_marker_stays_internal():
+    marker = {
+        "runtime_generation": "synthetic-generation",
+        "agent_id": "synthetic-agent",
+        "runtime_attach_token": "synthetic-private-token",
+    }
+    thread = {"metadata": {"vm": {"status": "provisioning", "initial_runtime": marker}}}
+    public = redact_thread_metadata(thread)
+    assert public["metadata"]["vm"] == {"status": "provisioning"}
+    assert thread["metadata"]["vm"]["initial_runtime"] == marker
+
+
 def _full_config_override() -> dict:
     """A config_override carrying every secret-bearing path we inject."""
     return {

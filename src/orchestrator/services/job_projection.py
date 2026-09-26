@@ -314,6 +314,7 @@ def redact_nested_workspace_state(
                 "_docker_workspace_attested",
                 "_docker_workspace_host_key_fingerprint",
                 "quarantine_reason",
+                "initial_runtime",
             )
         ):
             continue
@@ -328,6 +329,7 @@ def redact_nested_workspace_state(
         context.pop("_docker_workspace_attested", None)
         context.pop("_docker_workspace_host_key_fingerprint", None)
         context.pop("quarantine_reason", None)
+        context.pop("initial_runtime", None)
         cleaned[context_key] = context
     if not changed:
         return record
