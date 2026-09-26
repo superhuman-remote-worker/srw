@@ -757,6 +757,42 @@ class VMResourceReservationStore:
         if not _waiter_request_fields_match(waiter, expected):
             raise ResourceAdmissionError("resource_waiter_changed")
         if reservation is None:
+            if (
+                retry["owner_kind"] == "thread"
+                and not disposition_complete
+                and waiter["state"] not in {"cancelled", "released"}
+                and not await conn.fetchval(
+                    "SELECT EXISTS(SELECT 1 FROM vm_resource_reservations "
+                    "WHERE request_id=$1)", retry["request_id"],
+                )
+            ):
+                # No charge ever existed. The exact authorized initial End
+                # can terminalize its unadmitted waiter, but cannot manufacture
+                # charge-release or partial-creation disposition evidence.
+                # An admission, once set, cannot be cleared. The controller
+                # requires it before preparing/pinning a creation source, even
+                # when the frozen configuration permits golden/prepared disks.
+                if waiter["state"] not in {"waiting", "nonfit", "parked"} or not (
+                    await conn.fetchval(
+                        "SELECT r.state='cancel_requested' AND r.origin='initial' "
+                        "AND r.expected_pvc_uid IS NULL AND r.observed_pvc_uid IS NULL "
+                        "AND r.observed_vm_uid IS NULL AND r.thread_wake_operation_id IS NULL "
+                        "AND r.creation_admission_id IS NULL AND r.creation_carrier_uid IS NULL "
+                        "AND r.cancellation_disposition IS NULL "
+                        "AND COALESCE(r.canonical_request->'workspace_storage','null'::jsonb)='null'::jsonb "
+                        "AND NOT EXISTS(SELECT 1 FROM vm_creation_effects e WHERE e.request_id=r.request_id) "
+                        "AND public.valid_thread_vm_creation_retirement_source(r,true) "
+                        "AND public.thread_vm_creation_cleanup_lineage(t,r,true) IS NOT NULL "
+                        "FROM vm_creation_retries r JOIN threads t ON t.id=r.thread_id "
+                        "WHERE r.request_id=$1", retry["request_id"],
+                    )
+                ):
+                    raise ResourceAdmissionError("reservation_release_unproven")
+                await conn.execute(
+                    "UPDATE vm_resource_waiters SET state='cancelled',"
+                    "reason='creation_cancelled',revision=revision+1 "
+                    "WHERE request_id=$1", retry["request_id"],
+                )
             return False
         if (
             reservation["state"] != "reserved"

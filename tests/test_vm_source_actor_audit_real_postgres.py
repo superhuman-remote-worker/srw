@@ -35,9 +35,6 @@ from orchestrator.services.vm_creation_retry_store import (
     VMCreationRetryConflict,
     VMCreationRetryStore,
 )
-from orchestrator.services.vm_resource_waiter_maintenance import (
-    VMResourceWaiterMaintenance,
-)
 
 
 @pytest_asyncio.fixture(scope="module")
@@ -294,30 +291,15 @@ async def test_application_source_poll_and_protected_agent_cleanup_serialize(
             runtime_generation=retirement["generation"],
             retirement_token=retirement["token"],
         )
-        # Separate existing no-reservation case: source settlement leaves its
-        # waiter waiting until normal controller maintenance cancels it. The
-        # audit-owner receipt correctly refuses this unfinished obligation.
+        # Source settlement now terminalizes its exact unadmitted waiter in
+        # the same transaction; no independent maintenance pass is required.
         assert (
             await db.fetchval(
                 "SELECT state FROM vm_resource_waiters WHERE request_id=$1",
                 source["request_id"],
             )
-            == "waiting"
+            == "cancelled"
         )
-        with pytest.raises(
-            asyncpg.CheckViolationError,
-            match="source settlement lacks exact positive End proof",
-        ):
-            await db.delete_thread(
-                str(thread_id),
-                expected_runtime_generation=retirement["generation"],
-                expected_runtime_retirement_token=retirement["token"],
-            )
-        assert (
-            await VMResourceWaiterMaintenance(policy).maintain(
-                request_id=str(source["request_id"])
-            )
-        )["action"] == "cancelled"
         await db.delete_thread(
             str(thread_id),
             expected_runtime_generation=retirement["generation"],
