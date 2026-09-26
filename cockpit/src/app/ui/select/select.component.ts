@@ -15,6 +15,32 @@ import { FocusMonitor } from '@angular/cdk/a11y';
 
 export type SelectSize = 'sm' | 'md' | 'lg';
 
+/**
+ * Re-apply the model value whenever the projected options change.
+ *
+ * Options that render after the value (an async-loaded list) leave the native
+ * select on its first option while the model holds another (or none), and the
+ * customizable select's <selectedcontent> keeps the clone taken before Angular
+ * filled in the option's label — a blank trigger. Assigning `value`, even the
+ * current one, re-syncs both, so the DOM ends up where it would have been had
+ * the options rendered first: the model's option, or no selection when none
+ * matches. Mutations inside the trigger are ignored: the browser rewrites
+ * <selectedcontent> on every assignment, and reacting to that would loop.
+ */
+export function syncOnOptionChange(
+  el: HTMLSelectElement,
+  value: () => unknown,
+): MutationObserver {
+  const trigger = el.querySelector('.app-select__trigger');
+  const observer = new MutationObserver((records) => {
+    if (records.every((r) => trigger?.contains(r.target))) return;
+    const next = value();
+    el.value = next == null ? '' : String(next);
+  });
+  observer.observe(el, {childList: true, subtree: true, characterData: true});
+  return observer;
+}
+
 @Component({
   selector: 'app-select',
   standalone: true,
@@ -66,6 +92,7 @@ export class AppSelectComponent<T = string> implements AfterViewInit {
   private selectEl = viewChild.required<ElementRef<HTMLSelectElement>>('selectEl');
   private focusMonitor = inject(FocusMonitor);
   private host = inject(ElementRef<HTMLElement>);
+  private optionsObserver: MutationObserver | null = null;
 
   constructor() {
     this.focusMonitor.monitor(this.host.nativeElement, true);
@@ -85,9 +112,11 @@ export class AppSelectComponent<T = string> implements AfterViewInit {
     const el = this.selectEl().nativeElement;
     const next = this.value();
     el.value = next == null ? '' : String(next);
+    this.optionsObserver = syncOnOptionChange(el, () => this.value());
   }
 
   ngOnDestroy() {
+    this.optionsObserver?.disconnect();
     this.focusMonitor.stopMonitoring(this.host.nativeElement);
   }
 
