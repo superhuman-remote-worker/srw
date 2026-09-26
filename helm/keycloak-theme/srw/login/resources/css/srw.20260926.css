@@ -12,7 +12,9 @@
  *
  * Filename is versioned: theme resources are served with max-age=2592000 and
  * the /resources/<tag>/ path segment only changes on a KC version migration.
- * Bump the datestamp (and theme.properties) whenever this file changes.
+ * Bump the datestamp (and theme.properties) whenever this file changes. The
+ * logo SVGs are cached the same way: rename them with a new datestamp when
+ * they change, which changes this file too.
  */
 
 /* --- Travertine (light), Tyrian accent ---------------------------------- */
@@ -26,6 +28,12 @@
   --pf-v5-global--BorderColor--100: #dccfb6;
   --pf-v5-global--link--Color: #5f499c;
   --pf-v5-global--link--Color--hover: #574093;
+  /* PatternFly's light-surface rule (.pf-v5-c-form-control, -select, -menu,
+     ...) swaps primary and link to these -dark variants. Unset, the focused
+     input's underline stays PatternFly blue. */
+  --pf-v5-global--primary-color--dark-100: #5f499c;
+  --pf-v5-global--link--Color--dark: #5f499c;
+  --pf-v5-global--link--Color--dark--hover: #574093;
 
   /* Roman shape pass: no rounded corners anywhere. */
   --pf-v5-global--BorderRadius--sm: 0;
@@ -37,7 +45,7 @@
 
   /* keycloak.v2 brand hooks. The 4px card stripe ships PatternFly blue. */
   --keycloak-card-top-color: #5f499c;
-  --keycloak-logo-url: url('../img/srw-logo.svg');
+  --keycloak-logo-url: url('../img/srw-logo.20260926.svg');
   --keycloak-logo-width: 260px;
   --keycloak-logo-height: 56px;
   --keycloak-bg-logo-url: none;
@@ -47,6 +55,8 @@
 .pf-v5-theme-dark {
   --pf-v5-global--primary-color--100: #7f65ca;
   --pf-v5-global--primary-color--200: #8a75cd;
+  /* Dark PatternFly fills primary buttons from --300 (#06c), not --100. */
+  --pf-v5-global--primary-color--300: #7f65ca;
   --pf-v5-global--BackgroundColor--100: #1c1c22;
   --pf-v5-global--BackgroundColor--200: #141418;
   --pf-v5-global--Color--100: #f4f2ee;
@@ -54,7 +64,12 @@
   --pf-v5-global--BorderColor--100: #33333d;
   --pf-v5-global--link--Color: #7f65ca;
   --pf-v5-global--link--Color--hover: #8a75cd;
+  --pf-v5-global--primary-color--dark-100: #7f65ca;
+  --pf-v5-global--link--Color--dark: #7f65ca;
+  --pf-v5-global--link--Color--dark--hover: #8a75cd;
   --keycloak-card-top-color: #7f65ca;
+  /* The light logo's #5f499c is ~2.5:1 on the Senate ground. */
+  --keycloak-logo-url: url('../img/srw-logo-dark.20260926.svg');
 }
 
 /* Page ground. keycloak.v2 paints a dark background image here; we drop it. */

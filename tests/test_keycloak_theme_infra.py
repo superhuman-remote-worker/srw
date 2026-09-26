@@ -176,6 +176,9 @@ def test_light_tokens_match_the_shared_brand_palette() -> None:
         "--pf-v5-global--Color--200": brand.TRAVERTINE["text-secondary"],
         "--pf-v5-global--BorderColor--100": brand.TRAVERTINE["border-color"],
         "--keycloak-card-top-color": brand.TRAVERTINE["accent-color"],
+        # Read inside PatternFly's light-surface components (the inputs).
+        "--pf-v5-global--primary-color--dark-100": brand.TRAVERTINE["accent-color"],
+        "--pf-v5-global--link--Color--dark": brand.TRAVERTINE["accent-color"],
     }
     for token, want in expected.items():
         found = re.search(rf"{re.escape(token)}:\s*(#[0-9a-fA-F]{{3,8}})", root)
@@ -230,12 +233,17 @@ def test_dark_tokens_match_the_shared_senate_palette() -> None:
     expected = {
         "--pf-v5-global--primary-color--100": senate["accent-color"],
         "--pf-v5-global--primary-color--200": senate["accent-hover"],
+        # The dark Sign In button reads --300; it stayed PatternFly blue
+        # while only --100/--200 were set.
+        "--pf-v5-global--primary-color--300": senate["accent-color"],
         "--pf-v5-global--BackgroundColor--100": senate["panel-bg"],
         "--pf-v5-global--BackgroundColor--200": senate["app-bg"],
         "--pf-v5-global--Color--100": senate["text-primary"],
         "--pf-v5-global--Color--200": senate["text-secondary"],
         "--pf-v5-global--BorderColor--100": senate["border-color"],
         "--keycloak-card-top-color": senate["accent-color"],
+        "--pf-v5-global--primary-color--dark-100": senate["accent-color"],
+        "--pf-v5-global--link--Color--dark": senate["accent-color"],
     }
     for token, want in expected.items():
         found = re.search(
@@ -244,6 +252,43 @@ def test_dark_tokens_match_the_shared_senate_palette() -> None:
         assert found, f"{token} missing from the .pf-v5-theme-dark block"
         assert brand.normalize_hex(found.group(1)) == want, (
             f"{token} is {found.group(1)}, $senate-theme says {want}"
+        )
+
+
+def test_each_mode_logo_wears_that_modes_default_accent() -> None:
+    """The logo is a static file, so no token reaches it. It stayed porphyry
+    red for two weeks after the accent went Tyrian, above a purple button.
+
+    Resolves each block's --keycloak-logo-url to the file it names, so a
+    rename that leaves the CSS pointing at a missing file fails here too.
+    """
+    from orchestrator.services import brand
+
+    from tests.test_brand_palette import default_accent_block
+
+    scss = (ROOT / brand.SCSS_TOKEN_SOURCE).read_text()
+    rules = _css_rules(LOGIN_CSS.read_text())
+    blocks = {
+        "travertine": re.search(r":root\s*\{[^}]*\}", rules),
+        "senate": re.search(r"\.pf-v5-theme-dark\s*\{[^}]*\}", rules),
+    }
+    for mode, block in blocks.items():
+        assert block, f"no {mode} rule block in the login CSS"
+        url = re.search(r"--keycloak-logo-url:\s*url\('([^']+)'\)", block.group(0))
+        assert url, f"the {mode} block sets no --keycloak-logo-url"
+        logo = (LOGIN_CSS.parent / url.group(1)).resolve()
+        assert logo.is_file(), f"{url.group(1)} does not exist"
+
+        accent = re.search(
+            r"'accent-color':\s*(#[0-9a-fA-F]{3,8})", default_accent_block(scss, mode)
+        )
+        want = brand.normalize_hex(accent.group(1))
+        fills = {
+            brand.normalize_hex(f)
+            for f in re.findall(r'fill="(#[0-9a-fA-F]{3,8})"', logo.read_text())
+        }
+        assert fills == {want}, (
+            f"{logo.name} fills {sorted(fills)}, {mode} accent is {want}"
         )
 
 

@@ -1273,10 +1273,12 @@ spec:
             items:
               - key: login_theme.properties
                 path: login/theme.properties
-              - key: login_resources_css_srw.20260910.css
-                path: login/resources/css/srw.20260910.css
-              - key: login_resources_img_srw-logo.svg
-                path: login/resources/img/srw-logo.svg
+              - key: login_resources_css_srw.20260926.css
+                path: login/resources/css/srw.20260926.css
+              - key: login_resources_img_srw-logo.20260926.svg
+                path: login/resources/img/srw-logo.20260926.svg
+              - key: login_resources_img_srw-logo-dark.20260926.svg
+                path: login/resources/img/srw-logo-dark.20260926.svg
               - key: email_theme.properties
                 path: email/theme.properties
               - key: email_html_template.ftl
