@@ -351,9 +351,15 @@ async def test_only_a_custom_image_is_watched_for_pull_failures(
     monkeypatch, settings, watched
 ):
     provisioner = job_provisioner(monkeypatch, settings)
-    provisioner._core_api.create_namespaced_pod.side_effect = (
-        lambda *, body, **_: _pod_from_manifest(body)
-    )
+    cluster = {}
+
+    def create_pod(*, body, **_kwargs):
+        cluster["pod"] = _pod_from_manifest(body)
+        return cluster["pod"]
+
+    provisioner._core_api.create_namespaced_pod.side_effect = create_pod
+    # Finalization re-attests the exact issued UID after observation.
+    provisioner._core_api.read_namespaced_pod.side_effect = lambda **_: cluster["pod"]
     provisioner._wait_for_ready = AsyncMock(return_value="10.42.0.100")
 
     assert await provisioner.create_workspace(WorkspaceOwner.job(JOB_ID)) is True

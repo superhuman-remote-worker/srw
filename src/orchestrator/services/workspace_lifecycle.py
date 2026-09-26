@@ -8,9 +8,21 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Literal, Optional
+from typing import Any, Awaitable, Literal, Optional
 
 OwnerKind = Literal["job", "session"]
+
+
+class SessionWorkspaceObservationYielded(RuntimeError):
+    """A Session creator yielded its locks without failing or becoming Ready."""
+
+
+async def run_session_workspace_creation(operation: Awaitable[object]) -> None:
+    """Consume a background creator's scheduling yield without claiming Ready."""
+    try:
+        await operation
+    except SessionWorkspaceObservationYielded:
+        return
 
 
 @dataclass(frozen=True)
@@ -76,6 +88,26 @@ class EnsureResult:
 
 
 async def _create(
+    owner: "WorkspaceOwner",
+    provisioner,
+    *,
+    stateless_creation_generation: str | None = None,
+    allow_stateless_create: bool = False,
+    pinned_runtime_lock_held: bool = False,
+) -> "EnsureResult":
+    try:
+        return await _create_or_yield(
+            owner,
+            provisioner,
+            stateless_creation_generation=stateless_creation_generation,
+            allow_stateless_create=allow_stateless_create,
+            pinned_runtime_lock_held=pinned_runtime_lock_held,
+        )
+    except SessionWorkspaceObservationYielded:
+        return EnsureResult(EnsureOutcome.PENDING, status="pending")
+
+
+async def _create_or_yield(
     owner: "WorkspaceOwner",
     provisioner,
     *,

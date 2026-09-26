@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable, Mapping
+from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass
 from functools import partial
 import json
@@ -11,6 +12,7 @@ import logging
 import os
 import time
 from typing import Any, Literal
+from uuid import UUID
 
 from fastapi import HTTPException
 import httpx
@@ -1109,6 +1111,23 @@ async def reconcile_stateless_thread_retirement(
     return {"state": "settled", "thread": current, "closure": closure}
 
 
+SESSION_END_WORKSPACE_HANDOFF_TIMEOUT_S = 30.0
+
+
+@asynccontextmanager
+async def _end_workspace_ownership(store, thread_id: str, *, lane: str, held: bool):
+    if held:
+        yield True
+    elif lane == "pinned":
+        async with store.try_thread_advisory_lock(thread_id) as owned:
+            yield owned
+    else:
+        async with store.stateless_session_workspace_ensure_lock(
+            thread_id, wait=True
+        ) as owned:
+            yield owned
+
+
 async def end_thread_flow(
     thread_id: str,
     thread: dict[str, Any],
@@ -1128,6 +1147,139 @@ async def end_thread_flow(
     retiring_agent_response_pending: bool = False,
     require_physical_agent_stop: bool = False,
     dependencies: ThreadRetirementDependencies,
+) -> dict[str, Any]:
+    """Join an active Session creator before admitting a fresh physical End."""
+    options = dict(
+        permanent=permanent,
+        force=force,
+        officer_retire_reason=officer_retire_reason,
+        officer_post_required=officer_post_required,
+        include_officer_handoff=include_officer_handoff,
+        expected_runtime_generation=expected_runtime_generation,
+        expected_stateless_retirement_token=expected_stateless_retirement_token,
+        expected_agent_id=expected_agent_id,
+        expected_attach_token=expected_attach_token,
+        require_expected_agent_offline=require_expected_agent_offline,
+        settle_status=settle_status,
+        local_runtime_quiesced=local_runtime_quiesced,
+        retiring_agent_response_pending=retiring_agent_response_pending,
+        require_physical_agent_stop=require_physical_agent_stop,
+        dependencies=dependencies,
+    )
+    store = dependencies.store
+    lane = thread.get("execution_lane")
+    workspace = thread_metadata_object(thread).get("workspace_container")
+    physical_workspace = (
+        isinstance(workspace, Mapping) and workspace.get("provisioner") == "k8s"
+    )
+    signal = getattr(type(store), "session_workspace_observation_yield_request", None)
+    already_authorized = (
+        lane == "pinned"
+        and thread.get("runtime_retirement_token") is not None
+        and thread.get("runtime_retirement_authorized_at") is not None
+    )
+    if (
+        not callable(signal)
+        or lane not in {"pinned", "stateless"}
+        or (
+            declared_thread_workspace_backend(thread) != "sandbox"
+            and not physical_workspace
+        )
+        or already_authorized
+    ):
+        return await _end_thread_flow_owned(thread_id, thread, **options)
+    try:
+        generation = str(UUID(str(thread.get("runtime_generation") or "")))
+    except ValueError as exc:
+        raise HTTPException(409, "Thread runtime generation unavailable") from exc
+    if (
+        expected_runtime_generation is not None
+        and generation != expected_runtime_generation
+    ):
+        raise HTTPException(409, "Thread runtime generation changed")
+
+    captured_actor = (thread.get("agent_id"), thread.get("runtime_attach_token"))
+    deadline = (
+        asyncio.get_running_loop().time() + SESSION_END_WORKSPACE_HANDOFF_TIMEOUT_S
+    )
+    admission_started = False
+    try:
+        async with AsyncExitStack() as ownership:
+            async with signal(
+                store,
+                thread_id,
+                runtime_generation=generation,
+                wait_timeout_s=SESSION_END_WORKSPACE_HANDOFF_TIMEOUT_S,
+            ):
+                remaining = max(0.0, deadline - asyncio.get_running_loop().time())
+                lock = (
+                    store.thread_advisory_lock(thread_id, wait_timeout_s=remaining)
+                    if lane == "pinned"
+                    else store.stateless_session_workspace_ensure_lock(
+                        thread_id, wait=True, wait_timeout_s=remaining
+                    )
+                )
+                # Include the existing lock helper's connection/command wait
+                # in this request's deadline, not just its contention polling.
+                async with asyncio.timeout(remaining):
+                    if not await ownership.enter_async_context(lock):
+                        raise TimeoutError("workspace lifecycle ownership unavailable")
+            # The creator has joined its writes/probes and yielded every
+            # borrowed lock. Drop the scheduling signal before End's own
+            # guarded continuation; only the real lock authorizes Begin.
+            fresh = await store.get_thread(thread_id)
+            if fresh is None:
+                return {"status": "deleted"}
+            if (
+                str(fresh.get("runtime_generation") or "") != generation
+                or fresh.get("execution_lane") != lane
+                or (
+                    fresh.get("status") != "ended"
+                    and (fresh.get("agent_id"), fresh.get("runtime_attach_token"))
+                    != captured_actor
+                )
+            ):
+                raise HTTPException(
+                    409, "Thread runtime identity changed while waiting for End"
+                )
+            admission_started = True
+            return await _end_thread_flow_owned(
+                thread_id, fresh, _workspace_lock_held=True, **options
+            )
+    except TimeoutError as exc:
+        if admission_started:
+            # A cleanup timeout after durable Begin is not a rejected End.
+            raise
+        raise HTTPException(
+            503,
+            detail={
+                "code": "session_workspace_lifecycle_busy",
+                "message": "Workspace work is still owned; End was not accepted. Retry End.",
+            },
+            headers={"Retry-After": "1"},
+        ) from exc
+
+
+async def _end_thread_flow_owned(
+    thread_id: str,
+    thread: dict[str, Any],
+    *,
+    permanent: bool,
+    force: bool,
+    officer_retire_reason: str = "retired",
+    officer_post_required: bool = False,
+    include_officer_handoff: bool = False,
+    expected_runtime_generation: str | None = None,
+    expected_stateless_retirement_token: int | None = None,
+    expected_agent_id: str | None = None,
+    expected_attach_token: str | None = None,
+    require_expected_agent_offline: bool = False,
+    settle_status: Literal["ended", "suspended"] = "ended",
+    local_runtime_quiesced: bool = False,
+    retiring_agent_response_pending: bool = False,
+    require_physical_agent_stop: bool = False,
+    dependencies: ThreadRetirementDependencies,
+    _workspace_lock_held: bool = False,
 ) -> dict[str, Any]:
     """The End funnel body — everything ``end_thread`` does after auth.
 
@@ -1512,9 +1664,11 @@ async def end_thread_flow(
                 )
 
         # The protected-engage producer and every pinned workspace ensure use
-        # this same cross-replica lock. Admission was closed *before* waiting,
-        # so old work can finish/roll back but no replacement may start.
-        async with postgres_db.try_thread_advisory_lock(thread_id) as lock_owner:
+        # this same cross-replica lock. Fresh physical End already owns it;
+        # an admitted retry must still obtain it before further cleanup.
+        async with _end_workspace_ownership(
+            postgres_db, thread_id, lane="pinned", held=_workspace_lock_held
+        ) as lock_owner:
             if not lock_owner:
                 if already_authorized:
                     return _ending_response(retry_after_ms=250)
@@ -2026,8 +2180,8 @@ async def end_thread_flow(
     if initial_stateless_authority is None:
         raise HTTPException(status_code=409, detail="Thread lifecycle changed")
     try:
-        async with postgres_db.stateless_session_workspace_ensure_lock(
-            thread_id, wait=True
+        async with _end_workspace_ownership(
+            postgres_db, thread_id, lane="stateless", held=_workspace_lock_held
         ) as cleanup_owner:
             if not cleanup_owner:
                 raise HTTPException(

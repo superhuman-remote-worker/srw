@@ -266,8 +266,14 @@ async def agent_create_thread(
             and container_provisioner.in_cluster
             and dependencies.backend_from_override(config_override) not in LITE_BACKENDS
         ):
+            from orchestrator.services.workspace_lifecycle import (
+                run_session_workspace_creation,
+            )
+
             asyncio.create_task(
-                container_provisioner.create_pinned_thread_workspace(thread_id)
+                run_session_workspace_creation(
+                    container_provisioner.create_pinned_thread_workspace(thread_id)
+                )
             )
 
         return {"thread_id": thread_id, "status": "created"}

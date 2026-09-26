@@ -36,7 +36,10 @@ from orchestrator.services.completion_lifecycle import (
     LifecycleActionPermit,
     LifecycleRouteDecision,
 )
-from orchestrator.services.workspace_lifecycle import WorkspaceOwner
+from orchestrator.services.workspace_lifecycle import (
+    SessionWorkspaceObservationYielded,
+    WorkspaceOwner,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -950,6 +953,8 @@ class WorkspaceInstanceManager:
                         await self._provisioner.create_pinned_thread_workspace(owner.id)
                     else:
                         await self._provisioner.create_workspace(owner)
+                except SessionWorkspaceObservationYielded:
+                    return
                 except Exception:
                     logger.exception("PVC give_up recreate failed for %s", inst.id)
             return
@@ -985,6 +990,8 @@ class WorkspaceInstanceManager:
                             await self._provisioner.create_workspace(owner)
                     if not await self._permit_external(permit):
                         return
+                except SessionWorkspaceObservationYielded:
+                    return
                 except Exception:
                     logger.exception("PVC give_up recreate failed for %s", inst.id)
                     return

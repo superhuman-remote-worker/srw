@@ -1051,7 +1051,17 @@ async def commit_thread_creation(
 async def _provision_thread_workspace_container(
     tid: str, *, dependencies: ThreadAdmissionDependencies
 ) -> None:
-    ok = await dependencies.container_provisioner.create_pinned_thread_workspace(tid)
+    from orchestrator.services.workspace_lifecycle import (
+        SessionWorkspaceObservationYielded,
+    )
+
+    try:
+        ok = await dependencies.container_provisioner.create_pinned_thread_workspace(
+            tid
+        )
+    except SessionWorkspaceObservationYielded:
+        logger.info("Thread %s: workspace observation yielded to End", tid)
+        return
     if not ok:
         logger.error(
             "Thread %s: workspace container provisioning failed. "

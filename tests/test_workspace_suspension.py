@@ -2864,6 +2864,47 @@ class TestStrictTerminalSessionRestore:
         return svc
 
     @pytest.mark.asyncio
+    async def test_observation_yield_cannot_consume_a_stale_restore_receipt(self):
+        from orchestrator.services.workspace_lifecycle import (
+            SessionWorkspaceObservationYielded,
+        )
+
+        svc = self._service()
+        svc._container_provisioner.create_workspace.side_effect = (
+            SessionWorkspaceObservationYielded("End waiting")
+        )
+
+        assert await self._restore_new(svc) is False
+
+        svc._container_provisioner.create_workspace.assert_awaited_once()
+        svc._container_provisioner.get_workspace_creation_result.assert_not_awaited()
+        svc._extract_snapshot.assert_not_awaited()
+        svc._commit_strict_thread_restore_ready.assert_not_awaited()
+        svc._db.merge_thread_workspace_context_if_runtime.assert_not_awaited()
+        svc._db.merge_thread_workspace_context.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_pinned_observation_yield_does_not_mark_restore_failed(self):
+        from orchestrator.services.workspace_lifecycle import (
+            SessionWorkspaceObservationYielded,
+        )
+
+        before = self._before()
+        before["execution_lane"] = "pinned"
+        svc = self._service(before=before)
+        svc._db.get_thread = AsyncMock(return_value=before)
+        svc._container_provisioner.create_pinned_thread_workspace = AsyncMock(
+            side_effect=SessionWorkspaceObservationYielded("End waiting")
+        )
+
+        assert await svc.restore_thread_workspace(self.THREAD_ID) is False
+
+        svc._container_provisioner.create_pinned_thread_workspace.assert_awaited_once()
+        svc._extract_snapshot.assert_not_awaited()
+        svc._db.merge_thread_workspace_context_if_runtime.assert_not_awaited()
+        svc._db.merge_thread_workspace_context.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_extract_is_pinned_and_exact_tuple_is_reproved_then_committed(self):
         svc = self._service()
 

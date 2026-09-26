@@ -1017,6 +1017,17 @@ def _stateless_session_workspace_ensure_lock_key(thread_id: str) -> int:
     return int.from_bytes(digest, byteorder="big", signed=True)
 
 
+def _session_workspace_yield_lock_key(thread_id: str, generation: str) -> int:
+    """A scheduling signal belongs to one canonical thread generation only."""
+    digest = hashlib.blake2b(
+        b"session_workspace_observation_yield:"
+        + UUID(str(thread_id)).bytes
+        + UUID(str(generation)).bytes,
+        digest_size=8,
+    ).digest()
+    return int.from_bytes(digest, byteorder="big", signed=True)
+
+
 def _workspace_runtime_mutation_lock_name(
     owner_kind: str, owner_id: UUID, scope: str
 ) -> str:
@@ -3036,7 +3047,9 @@ class PostgresDB:
         # and deadlock on their inner locks.
         self._dedicated_advisory_lock_slot_groups = {
             domain: asyncio.Semaphore(dedicated_slots)
-            for domain in ("lifecycle", "datasource", "workspace")
+            for domain in (
+                "lifecycle", "datasource", "workspace", "workspace_observation_yield"
+            )
         }
 
         logger.info("PostgresDB initialized (not connected yet)")
@@ -33274,6 +33287,83 @@ class PostgresDB:
                         raise
                 if slot_acquired:
                     slots.release()
+
+    @asynccontextmanager
+    async def session_workspace_observation_yield_request(
+        self,
+        thread_id: str,
+        *,
+        runtime_generation: str,
+        wait_timeout_s: float = 30.0,
+    ):
+        """Ask exact-generation observers to unwind; admit no lifecycle change.
+
+        Shared signals allow duplicate End callers without one request removing
+        another's signal. Owners consume a separate bounded dedicated budget,
+        never a pooled connection needed by the creator they are waiting for.
+        """
+        from orchestrator.services.blocking_effect import joined_async_call
+
+        key = _session_workspace_yield_lock_key(thread_id, runtime_generation)
+        slots = self._dedicated_advisory_slots("workspace_observation_yield")
+        conn = None
+        slot_owned = False
+        try:
+            async with asyncio.timeout(max(0.0, float(wait_timeout_s))):
+                await slots.acquire()
+                slot_owned = True
+                conn = await asyncpg.connect(
+                    self._connection_string, timeout=5, command_timeout=5
+                )
+                # No exclusive lock is used in this domain. A conflict is an
+                # unavailable scheduling channel, not permission to bypass it.
+                if not await conn.fetchval(
+                    "SELECT pg_try_advisory_lock_shared($1)", key
+                ):
+                    raise TimeoutError("workspace observation signal unavailable")
+            yield
+        finally:
+
+            async def close_signal() -> None:
+                if conn is not None and not conn.is_closed():
+                    try:
+                        # Closing the dedicated session releases every signal
+                        # even if a response to lock acquisition was lost.
+                        await conn.close(timeout=5)
+                    except BaseException:
+                        conn.terminate()
+                        raise
+
+            try:
+                await joined_async_call(close_signal())
+            finally:
+                if slot_owned:
+                    slots.release()
+
+    async def session_workspace_observation_yield_requested(
+        self, thread_id: str, *, runtime_generation: str
+    ) -> bool:
+        """Read a cross-replica signal without joining its caller's lock domain.
+
+        pg_locks is freshly observed rather than MVCC-cached. Taking a trial
+        transaction lock here would retain it in an enclosing transaction and
+        could prevent End from publishing its signal, so discovery is read-only.
+        """
+        key = _session_workspace_yield_lock_key(thread_id, runtime_generation)
+        async with asyncio.timeout(2.0):
+            async with self.acquire() as conn:
+                return bool(
+                    await conn.fetchval(
+                        "SELECT EXISTS(SELECT 1 FROM pg_locks "
+                        "WHERE locktype='advisory' "
+                        "AND database=(SELECT oid FROM pg_database "
+                        "WHERE datname=current_database()) "
+                        "AND classid::bigint=$1 AND objid::bigint=$2 AND objsubid=1 "
+                        "AND mode='ShareLock' AND granted)",
+                        (key >> 32) & 0xFFFFFFFF,
+                        key & 0xFFFFFFFF,
+                    )
+                )
 
     @asynccontextmanager
     async def thread_advisory_lock(

@@ -50,7 +50,10 @@ from orchestrator.services.vm_workspace_recovery_store import (
     completed_cleanup_outcome,
     complete_vm_cleanup_permit,
 )
-from orchestrator.services.workspace_lifecycle import WorkspaceOwner
+from orchestrator.services.workspace_lifecycle import (
+    SessionWorkspaceObservationYielded,
+    WorkspaceOwner,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -2471,6 +2474,8 @@ class WorkspaceSuspensionService:
                                 operation_id=restore_operation_id,
                                 **create_kwargs,
                             )
+                        except SessionWorkspaceObservationYielded:
+                            return False
                         except Exception:
                             logger.warning(
                                 "Workspace restore create response was ambiguous for "
@@ -2721,6 +2726,8 @@ class WorkspaceSuspensionService:
             )
             return True
 
+        except SessionWorkspaceObservationYielded:
+            return False
         except Exception:
             logger.exception("Failed to restore workspace for thread %s", thread_id)
             if strict_terminal_snapshot:

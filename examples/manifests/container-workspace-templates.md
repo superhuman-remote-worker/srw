@@ -114,8 +114,15 @@ cleans up after itself; a Session doesn't (see below).
   resource write must finish before cancellation can commit: that busy
   interval returns HTTP 409 with `Retry-After: 1`; retry the request. This
   response does not mean cancellation was accepted. Ready publication and any
-  final workspace seeding also retain their mutation guard. Session startup
-  locks are unchanged by this Job cancellation behavior.
+  final workspace seeding also retain their mutation guard.
+- **Session End can interrupt image or SSH readiness waits.** Once the exact
+  workspace resources are recorded, the creator finishes its current probe
+  and yields to End. A resource write or final Ready publication must finish
+  first. HTTP 503 with `session_workspace_lifecycle_busy` means End was not
+  accepted and should be retried. A protected Session can return `ending`
+  while its agent is still stopping. If the request disconnects before End is accepted, reconnecting
+  or polling can continue the same pending workspace. Unattended initial
+  Sessions are not automatically rediscovered after that interruption.
 - **Other start failures give no message.** When a templated Job's pod never
   becomes ready for another reason, its workspace stays `creating` and the Job
   waits with no error. Examples:
@@ -148,13 +155,15 @@ cleans up after itself; a Session doesn't (see below).
   publishes Ready for work and Canvas. This requires the updated orchestrator;
   it does not repair historical unproven lifecycle projections.
 - **End also handles an initial stateless startup failure.** If the first fresh
-  container has a recorded Pod identity and no container has started, normal
+  workspace has a recorded Pod identity and has never been published Ready, normal
   End can stop it without waiting for its image or SSH. End retains its exact
   PVC; Resume reuses that volume and refuses a missing or replaced PVC.
   Permanent End deletes the recorded resources, including when upgrading an
   earlier soft End. Initial emptyDir workspaces can resume with fresh storage.
   Once accepted, cleanup and End settlement retry after a client disconnect;
-  physical deletion may take more than one pass.
+  physical deletion may take more than one pass. A Running Pod whose SSH never
+  became ready can use this path too; cleanup still requires positive evidence
+  that every container stopped.
 
   This applies only to an open initial creation with exact resource identity.
   Missing Pod identity, restored or previously retained stateless workspaces,

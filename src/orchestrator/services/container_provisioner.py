@@ -40,7 +40,10 @@ from orchestrator.services.ssh_helpers import (
 )
 from orchestrator.services.workspace_binding import CANVAS_WORKSPACE_GENERATION_KEY
 from orchestrator.services.ide_credentials import IDE_CREDENTIAL_ENV, ide_credential
-from orchestrator.services.workspace_lifecycle import WorkspaceOwner
+from orchestrator.services.workspace_lifecycle import (
+    SessionWorkspaceObservationYielded,
+    WorkspaceOwner,
+)
 from orchestrator.services.stateless_workspace_gate import thread_metadata_object
 from orchestrator.services.managed_repository_process_retirement import (
     retire_managed_repository_processes,
@@ -901,6 +904,28 @@ class ContainerProvisioner:
             pod_ip=pod_ip,
         )
 
+    async def _session_observation_checkpoint(
+        self, owner: WorkspaceOwner, generation: str | None
+    ) -> None:
+        """Scheduling only: never abandon a begun effect or change its source."""
+        if owner.kind != "session" or generation is None:
+            return
+        check = getattr(
+            type(self._db), "session_workspace_observation_yield_requested", None
+        )
+        if not callable(check):
+            return
+        try:
+            requested = await check(self._db, owner.id, runtime_generation=generation)
+        except Exception as exc:
+            raise SessionWorkspaceObservationYielded(
+                "workspace observation scheduling unavailable"
+            ) from exc
+        if requested:
+            raise SessionWorkspaceObservationYielded(
+                "workspace observation yielded to lifecycle request"
+            )
+
     async def create_pinned_thread_workspace(
         self,
         thread_id: str,
@@ -977,6 +1002,9 @@ class ContainerProvisioner:
             for value in (raw_workspace, raw_binding)
         ):
             return False
+        await self._session_observation_checkpoint(
+            WorkspaceOwner.session(thread_id), runtime_generation
+        )
         return await self._create_pinned_workspace_legacy(
             WorkspaceOwner.session(thread_id),
             cpu=cpu,
@@ -1021,6 +1049,7 @@ class ContainerProvisioner:
         # surface fail closed until a distinct fresh-recovery protocol exists.
         if fresh:
             return False
+        await self._session_observation_checkpoint(owner, stateless_creation_generation)
         reserve = getattr(
             type(self._db),
             "reserve_managed_repository_workspace_creation",
@@ -2135,6 +2164,8 @@ class ContainerProvisioner:
             return prepared
         try:
             pod_ip = await self._observe_prepared_workspace(prepared)
+        except SessionWorkspaceObservationYielded:
+            raise
         except Exception as exc:
             return await self._complete_prepared_workspace(
                 prepared, readiness_error=exc
@@ -2835,6 +2866,11 @@ class ContainerProvisioner:
         pvc_reattach = prepared.pvc_reattach
 
         async def check_authority() -> None:
+            if owner.kind == "session":
+                await self._session_observation_checkpoint(
+                    owner, stateless_creation_generation
+                )
+                return
             try:
                 current = await self._workspace_creation_reservation_is_current(
                     owner, _creation_reservation, scope="workspace_container"
@@ -2864,7 +2900,7 @@ class ContainerProvisioner:
             expected_pvc_name=pvc_name,
             expected_seed_configmap=seed_cm,
             pull_image=prepared.pull_image,
-            authority_check=(check_authority if owner.kind == "job" else None),
+            authority_check=check_authority,
         )
 
     async def _complete_prepared_workspace(
@@ -3945,6 +3981,13 @@ class ContainerProvisioner:
                 pull_image=(
                     profile.image if profile.image != self._workspace_image else None
                 ),
+                authority_check=(
+                    lambda: self._session_observation_checkpoint(
+                        owner, pinned_runtime_generation
+                    )
+                )
+                if strict_pinned
+                else None,
             )
             if pod_ip:
                 if seed_cm is not None:
@@ -4232,6 +4275,8 @@ class ContainerProvisioner:
                     return False
 
             return True
+        except SessionWorkspaceObservationYielded:
+            raise
         except Exception as e:
             logger.error(
                 "Failed to create workspace container for %s %s: %s",
@@ -5212,6 +5257,9 @@ class ContainerProvisioner:
                 expected_seed_configmap=seed_configmap,
                 pull_image=settings.image,
                 pull_started_at=getattr(pod.metadata, "creation_timestamp", None),
+                authority_check=lambda: self._session_observation_checkpoint(
+                    owner, generation
+                ),
             )
             if not pod_ip:
                 return True
@@ -5263,6 +5311,8 @@ class ContainerProvisioner:
             # its legacy SFTP task is name-based, unpinned, and detached from
             # lifecycle authority. Pinned/job behavior remains unchanged.
             return True
+        except SessionWorkspaceObservationYielded:
+            raise
         except (WorkspaceRuntimeAuthorityError, WorkspaceSSHAuthenticationError):
             return False
         except Exception:
@@ -14823,6 +14873,8 @@ class ContainerProvisioner:
                             f"the configured SSH key after {attempts} attempt(s) "
                             f"(key={fingerprint}): {last_error or 'authentication failed'}"
                         )
+            except SessionWorkspaceObservationYielded:
+                raise
             except WorkspaceSSHAuthenticationError:
                 raise
             except WorkspaceRuntimeAuthorityError:

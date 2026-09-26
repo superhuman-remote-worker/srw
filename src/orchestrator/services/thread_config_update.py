@@ -1003,7 +1003,13 @@ async def agent_upgrade_thread_to_workspace(
     # The background owner installs the exact T/G/actor provision intent under
     # the lifecycle lock before its first Kubernetes effect.  Do not publish a
     # generic pending marker here: a stale route read must lose cleanly to End.
-    asyncio.create_task(container_provisioner.create_pinned_thread_workspace(thread_id))
+    from orchestrator.services.workspace_lifecycle import run_session_workspace_creation
+
+    asyncio.create_task(
+        run_session_workspace_creation(
+            container_provisioner.create_pinned_thread_workspace(thread_id)
+        )
+    )
 
     return {
         "status": "provisioning",
