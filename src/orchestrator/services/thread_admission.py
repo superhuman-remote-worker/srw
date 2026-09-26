@@ -60,7 +60,6 @@ from __future__ import annotations
 import asyncio
 import copy
 import logging
-from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Protocol
 from uuid import uuid4
@@ -109,7 +108,6 @@ from orchestrator.services.session_tool_policy import validated_tool_overrides
 from orchestrator.services.session_workspace_policy import (
     validated_session_workspace_override,
 )
-from orchestrator.services.stateless_workspace_gate import thread_metadata_object
 from orchestrator.services.thread_project_authorization import (
     ThreadProjectAuthorizationDependencies,
     thread_creation_project_ids,
@@ -1050,66 +1048,6 @@ async def commit_thread_creation(
     return str(thread_id), created_runtime_authority
 
 
-async def _provision_thread_vm(
-    tid: str,
-    cfg: str,
-    config_override: dict,
-    *,
-    dependencies: ThreadAdmissionDependencies,
-) -> None:
-    """Install the VM provision intent under the thread's current authority."""
-    from orchestrator.services.vm_workspace_config import vm_provisioning_options
-
-    store = dependencies.store
-    vm_provisioner = dependencies.vm_provisioner
-    try:
-        async with store.thread_advisory_lock(tid):
-            current = await store.get_thread(tid)
-            current_authority = thread_runtime_authority(current)
-            current_metadata = thread_metadata_object(current or {})
-            raw_vm = current_metadata.get("vm")
-            if raw_vm is not None and not isinstance(raw_vm, Mapping):
-                ok = False
-            elif current_authority is None:
-                ok = False
-            else:
-                options = await vm_provisioning_options(
-                    store,
-                    "Session",
-                    current,
-                    fallback=current_metadata.get("config_override", config_override),
-                )
-                ok = await vm_provisioner.create_thread_vm(
-                    thread_id=tid,
-                    agent_config=cfg,
-                    **options,
-                    expected_runtime_generation=(current_authority.generation),
-                    expected_agent_id=(
-                        str(current["agent_id"])
-                        if current and current.get("agent_id") is not None
-                        else None
-                    ),
-                    expected_attach_token=(
-                        str(current["runtime_attach_token"])
-                        if current and current.get("runtime_attach_token") is not None
-                        else None
-                    ),
-                    expected_vm_context=(dict(raw_vm) if raw_vm is not None else None),
-                )
-    except Exception:
-        logger.exception("Thread %s: VM provisioning request raised", tid)
-        ok = False
-    if not ok:
-        # The provisioner generation-fences failures only after a
-        # successful intent install.  A stale/retired caller must
-        # not mutate the current thread merely to surface an old
-        # request failure.
-        logger.warning(
-            "Thread %s: VM provisioning authority was not admitted",
-            tid,
-        )
-
-
 async def _provision_thread_workspace_container(
     tid: str, *, dependencies: ThreadAdmissionDependencies
 ) -> None:
@@ -1149,29 +1087,16 @@ async def provision_thread_workspace(
     provisioning path below (no_workspace_agent_mode.md §4). The session
     agent builds its lite backend from the mounts injected at attach.
     """
-    config_override = plan.config_override
     if plan.lite_session:
         logger.info(
             "Thread %s: lite workspace backend — no workspace pod provisioned",
             thread_id,
         )
     elif plan.vm_session:
-        # VM tier: the workspace is a KubeVirt VM (metadata.vm), not a
-        # sandbox container. Mark it provisioning SYNCHRONOUSLY so the agent's
-        # attach-time workspace poll (_poll_workspace_ready) observes a VM in
-        # flight (vm_status truthy) and waits on the VM budget instead of
-        # bailing "no workspace provisioned". Then fire create_thread_vm
-        # fire-and-forget (mirrors the container task) with the requested
-        # sizing; the agent pod provisioned below SSHes into the VM once it
-        # reports ready. (knowledge-base/knowledge/features/session_create_on_vm.md)
-        asyncio.create_task(
-            _provision_thread_vm(
-                thread_id,
-                plan.config_name,
-                config_override,
-                dependencies=dependencies,
-            )
-        )
+        # Its immutable creation source must name the protected agent/attach
+        # tuple. Both warm and dedicated agents enter the same authenticated
+        # workspace poll after binding, which admits and resumes fresh creates.
+        logger.info("Thread %s: VM creation awaits pinned agent binding", thread_id)
     elif plan.use_k8s:
         if plan.execution_lane == "stateless":
             # Stateless create shares the same distributed lifecycle owner

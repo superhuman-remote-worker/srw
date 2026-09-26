@@ -834,7 +834,7 @@ class TestCreateThreadOperation:
 
 class TestWorkspaceActuation:
     @pytest.mark.asyncio
-    async def test_vm_create_forwards_the_selected_image_and_rootdisk(self):
+    async def test_vm_create_waits_for_the_authenticated_bound_workspace_poll(self):
         vm = {
             "image": "registry.example/dev-vm:v1",
             "cpu_cores": 12,
@@ -855,12 +855,7 @@ class TestWorkspaceActuation:
         plan = await _plan(ThreadCreateRequest(config_override=override), deps)
         await ta.provision_thread_workspace(plan, THREAD, dependencies=deps)
         await asyncio.sleep(0)
-        called = deps.vm_provisioner.create_thread_vm.await_args.kwargs
-        assert called["vm_image"] == vm["image"]
-        assert called["cpu_cores"] == 12
-        assert called["memory"] == "24Gi"
-        assert called["disk_size"] == "120Gi"
-        assert called["expected_runtime_generation"] == GENERATION
+        deps.vm_provisioner.create_thread_vm.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_a_lite_session_provisions_no_workspace_pod(self):

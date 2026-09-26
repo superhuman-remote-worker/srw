@@ -3271,6 +3271,7 @@ class VMProvisioner:
         expected_vm_context: Mapping[str, Any] | None = None,
         wake_operation_id: str | None = None,
         poll: bool = False,
+        initial_creation: Mapping[str, Any] | None = None,
     ) -> bool | dict[str, Any]:
         """Create a VM for a persistent thread.
 
@@ -3311,6 +3312,7 @@ class VMProvisioner:
                 expected_agent_id=expected_agent_id,
                 expected_attach_token=expected_attach_token,
                 expected_vm_context=expected_vm_context,
+                **({"initial_creation": initial_creation} if initial_creation else {}),
             )
             if preparation_context is None:
                 return waiting
@@ -3521,6 +3523,7 @@ class VMProvisioner:
                 wake_operation_id=wake_operation_id,
                 **({"creation_source": creation_source} if creation_source else {}),
                 **({"poll": True} if poll else {}),
+                **({"initial_creation": initial_creation} if initial_creation else {}),
                 **(
                     {"expected_preparation_context": preparation_context}
                     if preparation_context is not None

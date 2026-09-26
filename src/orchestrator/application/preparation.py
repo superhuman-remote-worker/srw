@@ -536,6 +536,7 @@ def thread_workspace_delivery_dependencies(
 
     return thread_workspace_delivery.ThreadWorkspaceDeliveryDependencies(
         store=resources.postgres_db,
+        vm_provisioner=vm_provisioner_module.vm_provisioner,
         cloud_router=resources.main_cloud_router,
         gitea_client=resources.gitea_client,
         container_provisioner=container_provisioner_module.container_provisioner,

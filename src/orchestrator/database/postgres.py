@@ -21744,6 +21744,7 @@ class PostgresDB:
         preparation_only: bool = False,
         expected_preparation_context: Mapping[str, Any] | None = None,
         creation_source: Mapping[str, Any] | None = None,
+        initial_creation: Mapping[str, Any] | None = None,
     ) -> bool | dict:
         """Install one VM provision generation before any controller effect.
 
@@ -21889,6 +21890,50 @@ class PostgresDB:
                 )
                 if current_vm != expected_vm:
                     return False
+                if initial_creation is not None:
+                    # A workspace poll may start only a genuinely fresh VM
+                    # after protected actor binding. Never reopen historical
+                    # VM, retained-volume, retirement or restore authority.
+                    if (
+                        row["status"] != "created"
+                        or parsed_agent is None or parsed_attach is None
+                        or current_vm is not None or poll or parsed_wake is not None
+                        or metadata.get("_workspace_binding") is not None
+                        or metadata.get("protected_cloud") not in (None, False)
+                    ):
+                        return False
+                    workspace = metadata.get("workspace_container")
+                    if workspace is not None and (
+                        not isinstance(workspace, dict)
+                        or set(workspace) - {"repo_name", "git_remote_url"}
+                    ):
+                        return False
+                    execution = await conn.fetchrow(
+                        "SELECT * FROM srw_execution_specs WHERE work_kind='Session' "
+                        "AND work_id=$1 FOR SHARE", parsed_thread,
+                    )
+                    if execution is None or (
+                        str(execution["id"]) != initial_creation.get("execution_id")
+                        or execution["revision"] != initial_creation.get("execution_revision")
+                        or execution["generation"] != initial_creation.get("execution_generation")
+                        or execution["harness_adapter"] != "srw/v1"
+                    ):
+                        return False
+                    from orchestrator.services.manifest_execution_snapshot import srw_snapshot_config
+
+                    _, initial_policy = srw_snapshot_config(dict(execution))
+                    if (initial_policy.get("workspace") or {}).get("backend") != "vm":
+                        return False
+                    if await conn.fetchval(
+                        "SELECT EXISTS(SELECT 1 FROM vm_creation_retries WHERE thread_id=$1) "
+                        "OR EXISTS(SELECT 1 FROM vm_idle_operations WHERE owner_kind='thread' AND owner_id=$1) "
+                        "OR EXISTS(SELECT 1 FROM thread_runtime_retirement_outcomes WHERE thread_id=$1) "
+                        "OR EXISTS(SELECT 1 FROM thread_runtime_attach_abort_outcomes WHERE thread_id=$1) "
+                        "OR EXISTS(SELECT 1 FROM thread_workspace_provision_intents WHERE thread_id=$1) "
+                        "OR EXISTS(SELECT 1 FROM srw_execution_workspace_bindings WHERE execution_id=$2)",
+                        parsed_thread, execution["id"],
+                    ):
+                        return False
                 open_idle = await conn.fetchrow(
                     "SELECT id,release_kind,phase,stop_verified_at,wake_generation,"
                     "wake_request_id,provision_generation,vm_uid,vmi_uid,launcher_uid,pvc_uid,"
