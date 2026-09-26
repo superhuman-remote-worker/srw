@@ -9,7 +9,6 @@ from __future__ import annotations
 import asyncio
 from contextlib import asynccontextmanager
 import json
-import inspect
 import logging
 import os
 import httpx
@@ -3235,7 +3234,7 @@ class VMIdleLifecycleService:
     """Bounded, replayable Job and pinned-session VM idle adapter."""
 
     def __init__(self, db: Any, provisioner: Any, recovery_store: Any, *,
-                 claimant: str = "vm-idle", before_first_start: Any = None,
+                 claimant: str = "vm-idle",
                  terminal_publication_handler: Any = None,
                  agent_provisioner: Any = None,
                  thread_retirement: Any = None,
@@ -3246,7 +3245,6 @@ class VMIdleLifecycleService:
         self.provisioner = provisioner
         self.recovery_store = recovery_store
         self.claimant = claimant
-        self.before_first_start = before_first_start
         self.terminal_publication_handler = terminal_publication_handler
         self.agent_provisioner = agent_provisioner
         self.thread_retirement = thread_retirement
@@ -3942,26 +3940,11 @@ class VMIdleLifecycleService:
             or operation["stop_verified_at"] is None
         ):
             return False
-        config = _object(os.getenv("VM_RESOURCE_ADMISSION_CONFIG", "{}"))
-        if self.before_first_start is None:
-            if _object(config.get("policy")).get("enforcementEnabled") is True:
-                await self.store.hold(
-                    operation_id, token=operation["claim_token"],
-                    claimant=self.claimant, reason="resource_reservation_unavailable",
-                )
-                return False
-        else:
-            admitted = self.before_first_start(operation)
-            if inspect.isawaitable(admitted):
-                admitted = await admitted
-            if not admitted:
-                await self.store.hold(
-                    operation_id, token=operation["claim_token"],
-                    claimant=self.claimant, reason="resource_reservation_held",
-                )
-                return False
         if not current():
             return False
+        # The typed idle wake publishes only its exact durable preflight.
+        # Resource admission belongs to the resulting immutable retry source;
+        # retry and controller gates prove its grant before any physical start.
         result = await self.provisioner.create_vm(
             owner_id, idle_wake_id=operation_id
         )

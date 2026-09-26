@@ -893,7 +893,7 @@ async def test_real_provisioner_wake_preserves_predecessor_and_effective_options
     provisioner = VMProvisioner()
     provisioner._db = db
     service = module.VMIdleLifecycleService(
-        db, provisioner, object(), before_first_start=lambda _op: True,
+        db, provisioner, object(),
     )
     if lost_response:
         begin = VMCreationPreflightStore.begin
@@ -1039,8 +1039,6 @@ async def test_real_provisioner_wake_preserves_predecessor_and_effective_options
 
 @pytest.mark.asyncio
 async def test_access_only_wake_waits_for_exact_ready_and_never_resumes_job(db, monkeypatch):
-    from orchestrator.services.vm_creation_preflight import VMCreationPreflightStore
-    from orchestrator.services.vm_creation_request import build_vm_creation_request
     from orchestrator.services.vm_provisioner import VMProvisioner
     from orchestrator.services.vm_workspace_recovery_store import cleanup_intent_digest
 
@@ -1088,25 +1086,13 @@ async def test_access_only_wake_waits_for_exact_ready_and_never_resumes_job(db, 
     successor_vmi_uid = str(uuid4())
     successor_launcher_uid = str(uuid4())
 
-    class Provisioner:
-        mode = "same-cluster"
-        lifecycle_available = True
+    class Provisioner(VMProvisioner):
         starts = 0
 
         async def create_vm(self, job_id, *, idle_wake_id):
             self.starts += 1
             assert idle_wake_id == str(op["id"])
-            fresh = VMProvisioner._fresh_provision_ctx()
-            fresh["provision_generation"] = str(wake["wake_generation"])
-            request = build_vm_creation_request(
-                job_id=job_id, agent_config="worker_base", vm_image=PROFILE_IMAGE,
-                cpu_cores=8, memory="16Gi", description="", network_tier="restricted",
-                provision_generation=fresh["provision_generation"], network_profile=NETWORK_PROFILE,
-            )
-            return await VMCreationPreflightStore(db).begin(
-                job_id=job_id, request=request, fresh_context=fresh,
-                idle_wake_id=idle_wake_id,
-            )
+            return await super().create_vm(job_id, idle_wake_id=idle_wake_id)
 
         async def attest_workspace_runtime(self, job_id):
             return SimpleNamespace(
@@ -1118,18 +1104,13 @@ async def test_access_only_wake_waits_for_exact_ready_and_never_resumes_job(db, 
             )
 
     provisioner = Provisioner()
-    reservations = []
-
-    async def reserve(operation):
-        reservations.append((operation["id"], operation["wake_generation"]))
-        return True
-
-    service = module.VMIdleLifecycleService(
-        db, provisioner, object(), before_first_start=reserve,
-    )
+    provisioner._db = db
+    service = module.VMIdleLifecycleService(db, provisioner, object())
     assert await service.reconcile_once() == 1
     assert provisioner.starts == 1
-    assert reservations == [(op["id"], wake["wake_generation"])]
+    pending = json.loads(await db.fetchval("SELECT context FROM jobs WHERE id=$1", owner))
+    assert pending["vm"]["creation_preflight"]["request_id"] == str(wake["wake_request_id"])
+    assert pending["vm"]["creation_preflight"]["expected_pvc_uid"] == identity["pvc_uid"]
     assert await service.reconcile_once() == 0
     context = json.loads(await db.fetchval("SELECT context FROM jobs WHERE id=$1", owner))
     context["vm"].update(
