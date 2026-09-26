@@ -191,6 +191,48 @@
       "note": "With tilt-<hash> tags expected_workspace_shas() is empty, so the reconciler skips drift checks for every pod. The check cannot fail here; the label logic is the discriminating evidence."
     }
   ],
+  "resolutions": [
+    {
+      "concern": "unpullable-image-job",
+      "status": "resolved",
+      "fixedBy": ["a33a7dba9", "a9cce0486"],
+      "change": "A pull-failed Job's creation settles on its never-started Pod, so the Job's terminal cleanup removes the Pod, Service and PVC. Only a fresh create's own volume is settled; a restore or a create over a kept volume keeps its resources.",
+      "reverified": {
+        "date": "2026-09-26",
+        "context": "k3d-srw",
+        "settings": "workspace.imagePullTimeoutSeconds=60 in the gitignored local values, then reverted to 600",
+        "image": "srw-registry:5000/does-not-exist:1",
+        "observed": {
+          "secondsFromCreateToFailed": [61, 60.3],
+          "reservation": "settled",
+          "deleteStatus": 200,
+          "kubernetesResourcesLeft": 0,
+          "manualKubernetesCleanup": false
+        },
+        "note": "A DELETE sent within a second of the failure returned 503 once (PVC protection lag) and 200 on retry. The Job row wedged before the fix (2b6c4a1a01) is not repaired by it."
+      }
+    },
+    {
+      "concern": "refusal-side-door",
+      "status": "resolved",
+      "fixedBy": ["bf82363e8"],
+      "change": "POST /api/persistent/tool-groups/preview refuses config_override.workspace.container and .sandbox instead of dropping them.",
+      "reverified": {
+        "date": "2026-09-26",
+        "context": "k3d-srw",
+        "observed": {
+          "status": 422,
+          "combinations": ["container/session", "container/worker", "sandbox/session", "sandbox/worker"],
+          "ordinaryOverrideStatus": 200
+        }
+      }
+    },
+    {
+      "concern": "unpullable-image-session",
+      "status": "open",
+      "ruling": "Shipped log-only in A1 and tracked as a knowledge-base issue. The reference page tells users to test a new image with a Job first."
+    }
+  ],
   "cleanup": {
     "jobsDeleted": ["dfcf3f8fbd", "ab0805ca98", "8f734c2ccf", "646ffeed9e"],
     "sessionsDeleted": ["9579901e94", "c61fa45c9f"],
