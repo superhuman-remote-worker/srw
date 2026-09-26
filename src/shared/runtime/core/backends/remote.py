@@ -78,6 +78,10 @@ _AUTH_ERROR_MARKERS = (
 _EXEC_MAX_OUTPUT_BYTES = 5 * 1024 * 1024
 _EXEC_POLL_SECONDS = 0.05
 
+# A preceding terminal cleanup transport may still have a closing sshd process.
+# Read-only zero proofs briefly wait for it without weakening the proof.
+_TERMINAL_PROOF_SETTLE_SECONDS = 5.0
+
 # Session-channel opens refused by sshd on a LIVE transport (MaxSessions) are
 # transient concurrency refusals, not workspace death: retry briefly, then
 # surface as RemoteChannelBusyError (an ordinary tool error).
@@ -1339,11 +1343,32 @@ __SRW_WORKSPACE_UID_ZERO_PY__
             inner = self._stateless_retired_resource_fence_shell() + command
             with self._shell_io_lock:
                 self._close_sftp_before_process_zero_proof()
-                output, exit_code = self._exec_with_status(
-                    self._tmux_lock_command(inner, shell="bash"),
-                    timeout=timeout,
-                    retain_tail=True,
+                command = self._tmux_lock_command(inner, shell="bash")
+                started = time.monotonic()
+                deadline = started + timeout
+                settle_deadline = min(
+                    deadline, started + _TERMINAL_PROOF_SETTLE_SECONDS
                 )
+                remaining = timeout
+                while True:
+                    output, exit_code = self._exec_with_status(
+                        command, timeout=remaining, retain_tail=True
+                    )
+                    # OpenSSH can leave the previous cleanup connection's
+                    # non-dumpable same-UID sshd alive after local close. Keep
+                    # this transport, with SFTP closed, and repeat the entire
+                    # read-only fence + zero proof. Rebuilding the terminal
+                    # cleanup backend on every retry perpetuates that race.
+                    # Actual writers (85), stale authority and other failures
+                    # still refuse immediately; persistent ambiguity remains
+                    # held. Repeated commands share the caller's command budget.
+                    now = time.monotonic()
+                    if exit_code != 86 or now >= settle_deadline:
+                        break
+                    time.sleep(min(0.1, settle_deadline - now))
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
             if exit_code != 0:
                 raise WorkspaceUnavailableError(
                     f"Terminal-fenced {operation} failed with exit code {exit_code}"

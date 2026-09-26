@@ -2124,6 +2124,82 @@ class TestRemoteBackendTmuxFences:
 
         assert seen_at_exec == [(None, True)]
 
+    def test_retired_resource_proof_waits_for_previous_ssh_process_to_exit(self):
+        """A closed transport can leave an unreadable sshd sibling briefly."""
+        backend = self._incarnation_backend(token=48)
+        with (
+            patch.object(backend, "_close_sftp_before_process_zero_proof") as close,
+            patch.object(
+                backend,
+                "_exec_with_status",
+                side_effect=[("", 86), ("", 86), ("zero", 0)],
+            ) as execute,
+            patch("shared.runtime.core.backends.remote.time.sleep"),
+        ):
+            assert backend.verify_terminal_claim_resources_retired(":", 30) == "zero"
+        assert execute.call_count == 3
+        close.assert_called_once_with()
+        assert len({call.args[0] for call in execute.call_args_list}) == 1
+
+    @pytest.mark.parametrize("refusal", [75, 78, 79, 80, 81, 85])
+    def test_retired_resource_proof_does_not_retry_authority_or_writer_refusal(
+        self, refusal
+    ):
+        backend = self._incarnation_backend(token=48)
+        with (
+            patch.object(backend, "_close_sftp_before_process_zero_proof"),
+            patch.object(
+                backend, "_exec_with_status", return_value=("", refusal)
+            ) as execute,
+        ):
+            with pytest.raises(WorkspaceUnavailableError, match=f"exit code {refusal}"):
+                backend.verify_terminal_claim_resources_retired(":", 30)
+        execute.assert_called_once()
+
+    def test_retired_resource_proof_rechecks_authority_after_ambiguous_process(self):
+        backend = self._incarnation_backend(token=48)
+        with (
+            patch.object(backend, "_close_sftp_before_process_zero_proof"),
+            patch.object(
+                backend, "_exec_with_status", side_effect=[("", 86), ("", 75)]
+            ) as execute,
+            patch("shared.runtime.core.backends.remote.time.sleep"),
+        ):
+            with pytest.raises(WorkspaceUnavailableError, match="exit code 75"):
+                backend.verify_terminal_claim_resources_retired(":", 30)
+        assert execute.call_count == 2
+
+    @pytest.mark.parametrize("budget", [0.15, 30])
+    def test_retired_resource_proof_keeps_unreadable_processes_held_with_bounded_wait(
+        self, budget
+    ):
+        backend = self._incarnation_backend(token=48)
+        now = [100.0]
+
+        def sleep(seconds):
+            now[0] += seconds
+
+        with (
+            patch.object(backend, "_close_sftp_before_process_zero_proof") as close,
+            patch.object(
+                backend, "_exec_with_status", return_value=("", 86)
+            ) as execute,
+            patch(
+                "shared.runtime.core.backends.remote.time.monotonic",
+                side_effect=lambda: now[0],
+            ),
+            patch("shared.runtime.core.backends.remote.time.sleep", side_effect=sleep),
+        ):
+            with pytest.raises(WorkspaceUnavailableError, match="exit code 86"):
+                backend.verify_terminal_claim_resources_retired(":", budget)
+        assert 1 < execute.call_count <= 52
+        assert now[0] - 100 <= min(budget, 5) + 0.00001
+        close.assert_called_once_with()
+        timeouts = [call.kwargs["timeout"] for call in execute.call_args_list]
+        assert timeouts[0] == budget
+        assert all(0 < value <= budget for value in timeouts)
+        assert timeouts[-1] < timeouts[0]
+
     def test_home_paths_still_resolve_after_the_verification_closed_sftp(self):
         """The post-shell re-proof runs once per resident kind on one backend.
 
