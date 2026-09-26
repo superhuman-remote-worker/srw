@@ -826,9 +826,7 @@ async def test_deleted_owner_ledger_and_original_thread_id_cannot_be_reused(
 
 
 @pytest.mark.asyncio
-async def test_bound_source_agent_audit_fk_still_blocks_normal_agent_gc(
-    db, monkeypatch
-):
+async def test_bound_source_actor_provenance_survives_normal_agent_gc(db, monkeypatch):
     current, original, retirement = await _ready_to_delete(
         db, monkeypatch, soft_first=True
     )
@@ -859,23 +857,9 @@ async def test_bound_source_agent_audit_fk_still_blocks_normal_agent_gc(
         )
         == 0
     )
-    # Separate actor-provenance ownership remains unchanged by this package.
-    # Both normal deregistration and exact offline cleanup reach the existing
-    # restrictive FK, despite the original thread and charge being settled.
-    with pytest.raises(
-        asyncpg.ForeignKeyViolationError,
-        match="vm_creation_retries_thread_agent_id_fkey",
-    ):
-        await db.delete_agent(str(agent["id"]))
-    with pytest.raises(
-        asyncpg.ForeignKeyViolationError,
-        match="vm_creation_retries_thread_agent_id_fkey",
-    ):
-        await db.delete_exact_offline_unbound_agent(
-            str(agent["id"]),
-            expected_hostname=agent["hostname"],
-            expected_pod_uid=agent["pod_uid"],
-        )
+    settled_source = await db.fetchrow(
+        "SELECT * FROM vm_creation_retries WHERE request_id=$1", original["request_id"]
+    )
     unrelated = uuid4()
     await db.execute(
         "INSERT INTO agents(id,config_name,hostname,status,last_heartbeat) VALUES($1,'worker_base','owned-gc-control','offline',now()-interval '25 hours')",
@@ -885,17 +869,18 @@ async def test_bound_source_agent_audit_fk_still_blocks_normal_agent_gc(
         "UPDATE agents SET last_heartbeat=now()-interval '25 hours' WHERE id=$1",
         agent["id"],
     )
-    with pytest.raises(
-        asyncpg.ForeignKeyViolationError,
-        match="vm_creation_retries_thread_agent_id_fkey",
-    ):
-        await db.gc_offline_agents(retention_hours=24)
-    # One historical source rolls back the entire ordinary GC batch, including
-    # another otherwise eligible agent owned only by this test.
+    assert await db.gc_offline_agents(retention_hours=24) == 2
     assert (
         await db.fetchval(
             "SELECT count(*) FROM agents WHERE id=ANY($1::uuid[])",
             [agent["id"], unrelated],
         )
-        == 2
+        == 0
+    )
+    assert (
+        await db.fetchrow(
+            "SELECT * FROM vm_creation_retries WHERE request_id=$1",
+            original["request_id"],
+        )
+        == settled_source
     )

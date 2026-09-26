@@ -8423,9 +8423,15 @@ BEGIN
         IF EXISTS(SELECT 1 FROM public.agents WHERE thread_id=NEW.thread_id) THEN
             RAISE EXCEPTION 'VM thread creation agent mismatch' USING ERRCODE='23514';
         END IF;
-    ELSIF NOT EXISTS(SELECT 1 FROM public.agents
-        WHERE id=NEW.thread_agent_id AND thread_id=NEW.thread_id) THEN
-        RAISE EXCEPTION 'VM thread creation agent mismatch' USING ERRCODE='23514';
+    ELSE
+        -- The actor UUID is immutable historical provenance. Replace the old
+        -- FK's live-row key lock with exact reciprocal tuple protection under
+        -- the already-held thread lock, before accepting a new source.
+        PERFORM 1 FROM public.agents
+            WHERE id=NEW.thread_agent_id AND thread_id=NEW.thread_id FOR SHARE;
+        IF NOT FOUND THEN
+            RAISE EXCEPTION 'VM thread creation agent mismatch' USING ERRCODE='23514';
+        END IF;
     END IF;
     IF NEW.thread_wake_operation_id IS NOT NULL THEN
         SELECT * INTO current_wake FROM public.vm_idle_operations
@@ -16217,6 +16223,13 @@ CREATE TABLE public.vm_creation_retries (
     CONSTRAINT vm_creation_retry_exact_owner CHECK ((((owner_kind = 'job'::text) AND (job_id IS NOT NULL) AND (thread_id IS NULL) AND (thread_runtime_generation IS NULL) AND (thread_agent_id IS NULL) AND (thread_attach_token IS NULL) AND (thread_wake_operation_id IS NULL) AND (thread_owner_user_id IS NULL) AND (thread_owner_project_id IS NULL) AND (execution_id IS NOT NULL) AND (execution_revision IS NOT NULL) AND (execution_generation IS NOT NULL)) OR ((owner_kind = 'thread'::text) AND (job_id IS NULL) AND (thread_id IS NOT NULL) AND (thread_runtime_generation IS NOT NULL) AND ((thread_agent_id IS NULL) = (thread_attach_token IS NULL)) AND (execution_id IS NULL) AND (execution_revision IS NULL) AND (execution_generation IS NULL) AND (admission_deadline IS NULL) AND (predecessor_cleanup_admission_id IS NULL) AND (controller_configuration IS NOT NULL)))),
     CONSTRAINT vm_thread_cancel_carrier_pair CHECK ((((disposition_carrier_uid IS NULL) = (disposition_carrier_namespace IS NULL)) AND ((disposition_carrier_namespace IS NULL) OR (disposition_carrier_namespace <> ''::text))))
 );
+
+
+--
+-- Name: COLUMN vm_creation_retries.thread_agent_id; Type: COMMENT; Schema: public; Owner: -
+--
+
+COMMENT ON COLUMN public.vm_creation_retries.thread_agent_id IS 'Immutable original pinned-thread actor UUID provenance. New sources require an exact live reciprocal actor locked under the current thread; historical sources retain this UUID after protected detach and operational agent GC.';
 
 
 --
@@ -33602,14 +33615,6 @@ ALTER TABLE ONLY public.vm_creation_retries
 
 ALTER TABLE ONLY public.vm_creation_retries
     ADD CONSTRAINT vm_creation_retries_predecessor_cleanup_admission_id_fkey FOREIGN KEY (predecessor_cleanup_admission_id) REFERENCES public.vm_workspace_cleanup_admissions(id);
-
-
---
--- Name: vm_creation_retries vm_creation_retries_thread_agent_id_fkey; Type: FK CONSTRAINT; Schema: public; Owner: -
---
-
-ALTER TABLE ONLY public.vm_creation_retries
-    ADD CONSTRAINT vm_creation_retries_thread_agent_id_fkey FOREIGN KEY (thread_agent_id) REFERENCES public.agents(id);
 
 
 --
