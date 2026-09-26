@@ -648,6 +648,20 @@ BEGIN
                AND intent.scope = scope_name
                AND intent.runtime_incarnation::TEXT = runtime_uid
                AND intent.result_kind IS NULL
+        ) AND NOT (
+            -- A settled deleted Job runtime already reached process zero.
+            -- Admit its new terminal storage intent above, but retain the
+            -- immutable retired projection instead of reactivating its UID.
+            source_kind = 'job'
+            AND scope_name = 'workspace_container'
+            AND runtime_state ->> 'status' = 'deleted'
+            AND public.managed_repository_workspace_has_process_zero_receipt(
+                source_kind, NEW.id, scope_name, runtime_uid
+            )
+            AND public.managed_repository_workspace_cleanup_projection_is_settled(
+                source_kind, NEW.id, scope_name, runtime_uid,
+                runtime_uid, 'deleted'
+            )
         ) THEN
             runtime_state := jsonb_set(
                 runtime_state, ARRAY['status'],
