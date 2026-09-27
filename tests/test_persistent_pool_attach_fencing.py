@@ -84,6 +84,7 @@ def _partial_cleanup_patchers(context):
 
 @pytest.fixture(autouse=True)
 def _restore_pool_globals():
+    # Real attach tests adopt lifecycle identity before session construction.
     saved = (
         app._session,
         app._thread_id,
@@ -95,6 +96,16 @@ def _restore_pool_globals():
         app._failed_attach_workspace_cleanup_context,
         app._orchestrator_client,
         app._heartbeat_task,
+        app._session_runtime_generation,
+        app._session_runtime_attach_token,
+        app._pinned_runtime_generation_enabled,
+        app._pinned_status_identity_enabled,
+        app._retirement_admission_identity,
+        app._retirement_admission_disposition,
+        app._retirement_admission_token,
+        app._retirement_admission_permanent,
+        app._runtime_authorization_admission_open,
+        app._session_generation,
     )
     app._session = None
     app._thread_id = None
@@ -117,6 +128,16 @@ def _restore_pool_globals():
         app._failed_attach_workspace_cleanup_context,
         app._orchestrator_client,
         app._heartbeat_task,
+        app._session_runtime_generation,
+        app._session_runtime_attach_token,
+        app._pinned_runtime_generation_enabled,
+        app._pinned_status_identity_enabled,
+        app._retirement_admission_identity,
+        app._retirement_admission_disposition,
+        app._retirement_admission_token,
+        app._retirement_admission_permanent,
+        app._runtime_authorization_admission_open,
+        app._session_generation,
     ) = saved
 
 
