@@ -692,6 +692,18 @@ class SessionRouterService:
         spec = _value(resource, "spec")
         labels = _value(metadata, "labels")
         annotations = _value(metadata, "annotations") or {}
+        if (
+            isinstance(annotations, dict)
+            and "field.cattle.io/publicEndpoints" not in self._annotations
+        ):
+            # Rancher adds this informational field after creation. Exclude
+            # only that key; configured and other routing annotations must
+            # still match exactly, including during the final re-read.
+            annotations = {
+                key: value
+                for key, value in annotations.items()
+                if key != "field.cattle.io/publicEndpoints"
+            }
         rules = _value(spec, "rules")
         if not isinstance(rules, (list, tuple)) or len(rules) != 1:
             return False
