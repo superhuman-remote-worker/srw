@@ -2010,7 +2010,11 @@ class TestKeptDiskSweep:
         recovery_store.acquire_cleanup_permit.assert_awaited_once()
         provisioner.release_vm_captured.assert_not_awaited()
         db.merge_vm_context.assert_awaited_once_with("job-1", {"rootdisk": None})
-        recovery_store.complete_cleanup_permit.assert_not_awaited()
+        # Recheck durable admission authority even when the caller carries a
+        # completed hint; this acknowledges completion without another purge.
+        recovery_store.complete_cleanup_permit.assert_awaited_once_with(
+            "cleanup-1", outcome="completed"
+        )
 
     @pytest.mark.asyncio
     async def test_control_marker_blocks_kept_disk_destructive_recheck(self):
