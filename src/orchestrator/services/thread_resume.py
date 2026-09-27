@@ -569,6 +569,20 @@ async def resume_thread(
         )
     metadata = thread_metadata_object(thread)
 
+    # Resume may originate from MCP/API or another tab. Publish its accepted
+    # life on the existing shared feed without depending on this caller to
+    # subsequently drive /prepare. This snapshot is fresh after the Resume
+    # transaction, and no await separates its authority check from the hint.
+    from orchestrator.services.session_lifecycle import emit as lifecycle_emit
+
+    lifecycle_emit(
+        str(thread["user_id"]),
+        thread_id,
+        "provisioning",
+        session_runtime_generation=resume_runtime_authority.generation,
+        **({"backend": "vm"} if _thread_workspace_backend(thread) == "vm" else {}),
+    )
+
     async def _resume_runtime_is_current() -> bool:
         return same_thread_runtime_authority(
             await postgres_db.get_thread(thread_id), resume_runtime_authority

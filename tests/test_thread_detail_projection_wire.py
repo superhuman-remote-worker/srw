@@ -115,6 +115,7 @@ def test_detail_route_returns_the_redacted_owner_projection() -> None:
         assert internal not in body
     assert body["runtime_retirement_pending"] is True
     assert body["retirement_disposition"] == "suspended"
+    assert body["session_runtime_generation"] == _raw_row()["runtime_generation"]
 
 
 def test_detail_route_mints_a_missing_handle_and_projects_mounts() -> None:

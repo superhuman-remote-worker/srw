@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 from collections.abc import Mapping
 from typing import Any
+from uuid import UUID
 
 from orchestrator.security.access import redact_config_override
 from orchestrator.services.container_provisioner import (
@@ -73,6 +74,21 @@ def redact_thread_metadata(thread: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(md, dict):
         md = {}
     thread = dict(thread)
+    # The non-secret life identifier is already public on lifecycle events
+    # and /connection. Expose it while starting/ended too so an owner can
+    # distinguish an external Resume from a delayed pre-End status snapshot.
+    try:
+        thread["session_runtime_generation"] = str(
+            UUID(
+                str(
+                    thread.get(
+                        "runtime_generation", thread.get("session_runtime_generation")
+                    )
+                )
+            )
+        )
+    except (ValueError, TypeError, AttributeError):
+        thread["session_runtime_generation"] = None
     md = dict(md)
     if "config_override" in md:
         md["config_override"] = redact_config_override(md["config_override"])

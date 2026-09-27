@@ -54,6 +54,7 @@ function createService() {
         dismissAll: vi.fn(),
     };
     const mockNotifications: any = {
+        isConnected: signal(false),
         lifecycleEvent: signal<{thread_id: string; state: string; reason?: string} | null>(null),
         cloudDiffStagedEvent: signal(null),
     };

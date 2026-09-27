@@ -253,6 +253,7 @@ function createHarness() {
     (globalThis as any).WebSocket = MockWebSocketCtor;
 
     const mockNotifications: any = {
+        isConnected: signal(false),
         lifecycleEvent: signal<Record<string, unknown> | null>(null),
         cloudDiffStagedEvent: signal(null),
     };

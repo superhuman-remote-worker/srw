@@ -142,6 +142,12 @@ const SSE_WATCHDOG_TIMEOUT_MS = 45000;
 // and an ambiguous End's fresh reread can proceed.
 const THREAD_META_RESPONSE_TIMEOUT_MS = 15_000;
 
+interface ThreadLifecycleObservation {
+  status?: unknown;
+  runtime_retirement_pending?: unknown;
+  session_runtime_generation?: unknown;
+}
+
 // After an interrupt POST we wait for the agent to emit `interrupt.ack` /
 // `turn.completed` over SSE to clear the "Stopping…" state. If that frame is
 // lost (silently-stalled stream) the button would wedge forever — re-clicks
@@ -728,6 +734,16 @@ export class PersistentChatService {
       const tid = this.threadId();
       if (!event || !tid || event.thread_id !== tid) return;
       const eventGeneration = this._canonicalRuntimeGeneration(event.session_runtime_generation);
+      if (this.terminalControlThreadId === tid) {
+        // Shared notifications also describe Resume from another client.
+        // They only wake a fresh owner read; neither the event nor a UUID
+        // different from G1 can alone grant successor control authority.
+        if (eventGeneration && eventGeneration !== this.retiredRuntimeGeneration) {
+          if (event.backend === 'vm') this.isVmSession.set(true);
+          untracked(() => void this._reconcileExternalResume(tid));
+        }
+        return;
+      }
       const invalidBinding = this.invalidBindingRuntime;
       if (invalidBinding?.threadId === tid) {
         // A binding refusal is scoped to one exact runtime. Same-G and
@@ -764,6 +780,8 @@ export class PersistentChatService {
       ) {
         return;
       }
+      if (this.successorRuntime?.threadId === tid &&
+          eventGeneration !== this.successorRuntime.generation) return;
       if (
         (event.session_runtime_generation !== undefined && !eventGeneration) ||
         (this.retiredRuntimeGeneration !== null &&
@@ -773,10 +791,6 @@ export class PersistentChatService {
       ) {
         return;
       }
-      // A delayed provisioning/booting/ready event from the just-ended
-      // runtime cannot reopen its startup card. Only explicit Resume clears
-      // this terminal latch.
-      if (this.terminalControlThreadId === tid) return;
       // Once the session is actually live, ignore further lifecycle
       // events (a duplicate from a racing /prepare must not regress
       // the UI). isStartingSession also gates rendering on
@@ -802,6 +816,15 @@ export class PersistentChatService {
           this.error.set(event.reason || 'session preparation failed');
           break;
       }
+    });
+    // The shared feed is ephemeral. A reconnect is a bounded recovery edge
+    // for a Resume notification missed while the browser was offline.
+    effect(() => {
+      if (!this.notifications.isConnected()) return;
+      untracked(() => {
+        const tid = this.threadId();
+        if (tid) void this._reconcileExternalResume(tid);
+      });
     });
     // Live/non-terminal stage publications travel on the app-wide
     // notification SSE. Terminal publications are durably replayed on the
@@ -1728,6 +1751,15 @@ export class PersistentChatService {
   } | null = null;
   /** Most recently terminal runtime on this same-thread review plane. */
   private retiredRuntimeGeneration: string | null = null;
+  private retirementObservationVersion = 0;
+  private endRequest: { threadId: string } | null = null;
+  private successorRuntime: { threadId: string; generation: string } | null = null;
+  private successorRead: {
+    threadId: string;
+    generation: number;
+    version: number;
+    promise: Promise<boolean>;
+  } | null = null;
   /** Thread on which the exact runtime-generation transport contract has
    *  been observed. Keep this across same-thread reconnect/Resume gaps so a
    *  delayed legacy-shaped lifecycle frame cannot mutate the successor UI. */
@@ -1766,6 +1798,9 @@ export class PersistentChatService {
       // delayed journal tail superseded even though /connection has not yet
       // installed the candidate. Only the candidate can cancel its retry.
       return eventGeneration === bindingRecovery.candidateGeneration;
+    }
+    if (this.successorRuntime?.threadId === threadId) {
+      return eventGeneration === this.successorRuntime.generation;
     }
     // A settled suspended frame is authoritative for a control plane already
     // retired by soft End. It must match the retired runtime, not be rejected
@@ -2093,6 +2128,16 @@ export class PersistentChatService {
     exactFrameGeneration: string | null = null,
   ): void {
     if (this.threadId() !== threadId) return;
+    const firstRetirement = this.terminalControlThreadId !== threadId;
+    // A duplicate G1 terminal frame/read is review-plane noise, not a new
+    // owner End. It must not cancel a fresh successor read queued behind it.
+    if (firstRetirement || (exactFrameGeneration &&
+        this.retiredRuntimeGeneration !== exactFrameGeneration)) {
+      this.retirementObservationVersion++;
+    }
+    const successorGeneration = this.successorRuntime?.threadId === threadId
+      ? this.successorRuntime.generation : null;
+    this.successorRuntime = null;
     const invalidBindingGeneration =
       this.invalidBindingRuntime?.threadId === threadId
         ? this.invalidBindingRuntime.generation
@@ -2110,12 +2155,13 @@ export class PersistentChatService {
     if (this.bindingRecoveryRuntime?.threadId === threadId) {
       this.bindingRecoveryRuntime = null;
     }
-    const firstRetirement = this.terminalControlThreadId !== threadId;
     this.terminalControlThreadId = threadId;
     if (exactFrameGeneration) {
       this.retiredRuntimeGeneration = exactFrameGeneration;
     } else if (this.sessionRuntimeGeneration) {
       this.retiredRuntimeGeneration = this.sessionRuntimeGeneration;
+    } else if (successorGeneration) {
+      this.retiredRuntimeGeneration = successorGeneration;
     } else if (invalidBindingGeneration) {
       this.retiredRuntimeGeneration = invalidBindingGeneration;
     } else if (recoveryGeneration) {
@@ -2792,7 +2838,7 @@ export class PersistentChatService {
     threadId: string;
     generation: number;
     lifecycleOnly: boolean;
-    promise: Promise<void>;
+    promise: Promise<ThreadLifecycleObservation | null>;
   } | null = null;
 
   /** Share an in-flight read within a view. An ambiguous End needs a fresh
@@ -2801,15 +2847,19 @@ export class PersistentChatService {
     threadId: string,
     generation = this.connectGeneration,
     opts: { fresh?: boolean; lifecycleOnly?: boolean } = {},
-  ): Promise<void> {
-    if (!this._isCurrentThreadRequest(threadId, generation)) return;
+  ): Promise<ThreadLifecycleObservation | null> {
+    if (!this._isCurrentThreadRequest(threadId, generation)) return null;
     const pending = this.threadMetaRequest;
     if (pending?.threadId === threadId && pending.generation === generation) {
-      await pending.promise;
+      const observation = await pending.promise;
       if (opts.fresh || (pending.lifecycleOnly && !opts.lifecycleOnly)) {
+        // The original caller's finally may still be queued behind this
+        // continuation. Release its settled slot before the required fresh
+        // read, or recursion silently hands back that old observation.
+        if (this.threadMetaRequest === pending) this.threadMetaRequest = null;
         return this.loadThreadMeta(threadId, generation, { ...opts, fresh: false });
       }
-      return;
+      return observation;
     }
     const request = {
       threadId,
@@ -2819,7 +2869,7 @@ export class PersistentChatService {
     };
     this.threadMetaRequest = request;
     try {
-      await request.promise;
+      return await request.promise;
     } finally {
       if (this.threadMetaRequest === request) this.threadMetaRequest = null;
     }
@@ -2830,14 +2880,19 @@ export class PersistentChatService {
     threadId: string,
     generation: number,
     lifecycleOnly: boolean,
-  ): Promise<void> {
+  ): Promise<ThreadLifecycleObservation | null> {
+    const retirementVersion = this.retirementObservationVersion;
     try {
       const thread = await firstValueFrom(
         this.http
           .get<any>(`${environment.apiUrl}/persistent/threads/${threadId}`)
           .pipe(timeout({ first: THREAD_META_RESPONSE_TIMEOUT_MS })),
       );
-      if (!this._isCurrentThreadRequest(threadId, generation)) return;
+      if (!this._isCurrentThreadRequest(threadId, generation) ||
+          retirementVersion !== this.retirementObservationVersion) return null;
+      const runtimeGeneration = this._canonicalRuntimeGeneration(thread.session_runtime_generation);
+      if (this.successorRuntime?.threadId === threadId &&
+          runtimeGeneration !== this.successorRuntime.generation) return null;
       const retirementPending = thread.runtime_retirement_pending === true;
       const retirementDisposition =
         thread.retirement_disposition === 'ended' || thread.retirement_disposition === 'suspended'
@@ -2855,7 +2910,7 @@ export class PersistentChatService {
       if (this.terminalControlThreadId === threadId) {
         const current = this.threadStatus();
         if ((current === 'ended' || current === 'suspended') && effectiveStatus !== current) {
-          return;
+          return thread;
         }
         if (
           current === 'ending' &&
@@ -2863,7 +2918,7 @@ export class PersistentChatService {
           effectiveStatus !== 'ended' &&
           effectiveStatus !== 'suspended'
         ) {
-          return;
+          return thread;
         }
       }
       // A periodic lifecycle read must not overwrite live model/turn state or
@@ -2907,12 +2962,52 @@ export class PersistentChatService {
         }
       }
       if (retirementPending) {
-        this._retireEndingControl(threadId, retirementDisposition);
+        this._retireEndingControl(threadId, retirementDisposition, runtimeGeneration);
       } else if (thread.status === 'ended') {
-        this._retireTerminalControl(threadId);
+        this._retireTerminalControl(threadId, runtimeGeneration);
       }
+      return thread;
     } catch {
       // Non-fatal — UI will show fallback values
+      return null;
+    }
+  }
+
+  /** One fresh read per recovery edge; ended views never poll indefinitely. */
+  private async _reconcileExternalResume(threadId: string): Promise<boolean> {
+    if (this.intentionalClose || this.threadStatus() !== 'ended' ||
+        this.terminalControlThreadId !== threadId || this.endRequest?.threadId === threadId ||
+        !this.retiredRuntimeGeneration) return false;
+    const generation = this.connectGeneration;
+    const version = this.retirementObservationVersion;
+    const pending = this.successorRead;
+    if (pending?.threadId === threadId && pending.generation === generation && pending.version === version) {
+      return pending.promise;
+    }
+    const retired = this.retiredRuntimeGeneration;
+    const oldEpoch = this.sseReplayCursor?.epoch ?? null;
+    const request = { threadId, generation, version, promise: Promise.resolve(false) };
+    request.promise = (async () => {
+      const thread = await this.loadThreadMeta(threadId, generation, { fresh: true, lifecycleOnly: true });
+      if (!this._isCurrentConnect(threadId, generation) || this.intentionalClose ||
+          version !== this.retirementObservationVersion || this.endRequest?.threadId === threadId ||
+          this.terminalControlThreadId !== threadId || this.threadStatus() !== 'ended') return false;
+      const successor = this._canonicalRuntimeGeneration(thread?.session_runtime_generation);
+      if (!successor || successor === retired || thread?.runtime_retirement_pending !== false ||
+          !['created', 'active', 'awaiting_user'].includes(String(thread?.status))) return false;
+      this.resumedFromEpoch = oldEpoch;
+      this._reopenTerminalControl(threadId);
+      this.successorRuntime = { threadId, generation: successor };
+      this.threadStatus.set(thread!.status as ThreadStatus);
+      this.endedAt.set(null);
+      await this.connect(threadId, { preserveReviewPlane: true });
+      return true;
+    })();
+    this.successorRead = request;
+    try {
+      return await request.promise;
+    } finally {
+      if (this.successorRead === request) this.successorRead = null;
     }
   }
 
@@ -3355,6 +3450,7 @@ export class PersistentChatService {
     if (this.intentionalClose) return;
     const tid = this.threadId();
     if (!tid) return;
+    void this._reconcileExternalResume(tid);
     const terminalControl = this.terminalControlThreadId === tid;
     if (this.threadStatus() === 'ended' && !terminalControl) return;
     // `force` (long hidden-tab wake / bfcache restore / page resume) skips
@@ -3781,6 +3877,12 @@ export class PersistentChatService {
     threadId: string,
     connection: ConnectionPayload,
   ): boolean {
+    if (this.successorRuntime?.threadId === threadId &&
+        (connection.pinned_runtime_generation_contract !== 1 ||
+         this._canonicalRuntimeGeneration(connection.session_runtime_generation) !== this.successorRuntime.generation)) {
+      this._scheduleControlWsReconnect(threadId);
+      return false;
+    }
     const recovery = this.bindingRecoveryRuntime;
     if (recovery?.threadId !== threadId) return true;
     const responseGeneration =
@@ -3808,6 +3910,12 @@ export class PersistentChatService {
     this.sessionRuntimeGeneration = exactRuntimeContract
       ? this._canonicalRuntimeGeneration(connection.session_runtime_generation)
       : null;
+    // G2 is now the installed runtime; ordinary exact-generation binding
+    // recovery must remain free to adopt a later G3 if this binding fails.
+    if (this.successorRuntime?.threadId === threadId &&
+        this.sessionRuntimeGeneration === this.successorRuntime.generation) {
+      this.successorRuntime = null;
+    }
     this.controlCapabilities.set(
       connection?.controls && typeof connection.controls === 'object'
         ? {
@@ -4615,7 +4723,10 @@ export class PersistentChatService {
     this.controlWsOpening = false;
     this.controlSocket = 'unknown';
     this.sessionRuntimeGeneration = null;
-    if (!preserveReviewPlane) this.retiredRuntimeGeneration = null;
+    if (!preserveReviewPlane) {
+      this.retiredRuntimeGeneration = null;
+      this.successorRuntime = null;
+    }
     this.sessionSnapshotLoaded = false;
     this.sessionSnapshotFailed = false;
     this.sessionSnapshotCursor = null;
@@ -4843,6 +4954,8 @@ export class PersistentChatService {
         // terminal latch and replay semantics unchanged; reconnecting here
         // would revive G1 control and suppress its later staged-diff event.
         if (this.terminalControlThreadId === threadId) {
+          if (await this._reconcileExternalResume(threadId)) return;
+          if (!this._isCurrentConnect(threadId, generation)) return;
           this.error.set(this.transloco.translate('errors.sessions.stillEnding'));
           void this.loadThreadMeta(threadId, generation);
           if (this._protectedCloud()) void this.refreshCloudDiffCount();
@@ -4885,6 +4998,17 @@ export class PersistentChatService {
    * the thread row is re-read. Neither is ever retried automatically.
    */
   async endSession(force = false): Promise<EndSessionOutcome> {
+    const request = { threadId: this.threadId() ?? '' };
+    this.endRequest = request;
+    this.retirementObservationVersion++;
+    try {
+      return await this._endSession(force);
+    } finally {
+      if (this.endRequest === request) this.endRequest = null;
+    }
+  }
+
+  private async _endSession(force: boolean): Promise<EndSessionOutcome> {
     const threadId = this.threadId();
     if (!threadId) {
       this.disconnect();

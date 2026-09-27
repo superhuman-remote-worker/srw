@@ -1919,6 +1919,8 @@ export interface Thread {
    *  one, or a stateless End/Delete a retryable fence left pending.
    *  Raw retirement tokens/context never belong in an owner payload. */
   runtime_retirement_pending?: boolean;
+  /** Non-secret identity of this life, including starting/ended sessions. */
+  session_runtime_generation?: string | null;
   retirement_disposition?: 'ended' | 'suspended' | null;
   /** True only while a retirement is pending AND it is a permanent Delete. */
   retirement_permanent?: boolean;

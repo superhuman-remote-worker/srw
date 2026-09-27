@@ -135,6 +135,33 @@ def _fake_drift(items: list[DriftItem]) -> AsyncMock:
 
 class TestResumeConfigDrift:
     @pytest.mark.asyncio
+    async def test_native_resume_announces_successor_without_cockpit_prepare(
+        self, user_a, thread_a, fake_db, fake_request
+    ):
+        from tests._b09_control_seams import resume_thread
+
+        thread = _ended_thread(thread_a)
+        thread["metadata"] = {"config_override": {"workspace": {"backend": "vm"}}}
+        with (
+            _patch_caller_and_db(user_a, fake_db),
+            patch(
+                "orchestrator.services.thread_resume.thread_config_drift",
+                _fake_drift([]),
+            ),
+            patch("orchestrator.services.session_lifecycle.emit") as emit,
+        ):
+            result = await resume_thread(str(thread["id"]), fake_request)
+
+        assert result["status"] == "created"
+        emit.assert_called_once_with(
+            str(user_a["id"]),
+            str(thread["id"]),
+            "provisioning",
+            session_runtime_generation=RESUMED_RUNTIME_GENERATION,
+            backend="vm",
+        )
+
+    @pytest.mark.asyncio
     async def test_drift_returns_428_and_does_not_mutate(
         self, user_a, thread_a, fake_db, fake_request
     ):

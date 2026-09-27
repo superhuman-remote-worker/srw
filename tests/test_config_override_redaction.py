@@ -160,6 +160,23 @@ class TestRedactThreadMetadataShape:
         assert out["metadata"]["config_override"]["llm"]["model"] == "m"
         assert "api_key" not in out["metadata"]["config_override"]["llm"]
 
+    def test_public_runtime_generation_is_canonical_and_not_a_capability(self):
+        from uuid import UUID
+
+        generation = UUID("33333333-4444-4555-8666-777777777777")
+        row = {"runtime_generation": generation, "runtime_attach_token": "secret"}
+        out = redact_thread_metadata(row)
+        assert out["session_runtime_generation"] == str(generation)
+        assert "runtime_generation" not in out and "runtime_attach_token" not in out
+        assert row["runtime_generation"] == generation
+        for invalid in (None, "", "not-a-uuid"):
+            assert (
+                redact_thread_metadata({"runtime_generation": invalid}).get(
+                    "session_runtime_generation"
+                )
+                is None
+            )
+
     def test_dict_metadata_stays_object_and_redacts(self):
         md = {
             "config_override": {"llm": {"api_key": "sk-SECRET"}},

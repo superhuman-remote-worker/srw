@@ -216,6 +216,7 @@ function createService(
   // the PersistentChatService constructor effect reads. Tests fire phase
   // transitions by setting this signal directly.
   const mockNotifications: any = {
+    isConnected: signal(false),
     lifecycleEvent: signal<{
       thread_id: string;
       state: string;
@@ -6706,6 +6707,312 @@ describe('PersistentChatService — direct session WS (prepare + connection)', (
     await flushMicrotasks(20);
     expect(ctx.mockHttp.post).toHaveBeenCalledTimes(2);
     expect(ctx.service.outbox()).toEqual([]);
+  });
+
+  it('external Resume: an ended tab joins G2 through the shared lifecycle feed', async () => {
+    const ctx = createService();
+    let runtimeGeneration = SESSION_RUNTIME_GENERATION;
+    ctx.mockHttp.get.mockImplementation((url: string) => activeSessionGet(url).pipe(map((value) => ({
+      ...value,
+      session_runtime_generation: runtimeGeneration,
+      runtime_retirement_pending: false,
+    }))));
+    try {
+      await ctx.service.connect('external-resume');
+      const reviewSse = ctx.sseInstances[0];
+      fireSseOpen(reviewSse);
+      fireSseMessage(reviewSse, {
+        method: 'session.ended',
+        params: { session_runtime_generation: SESSION_RUNTIME_GENERATION },
+      }, '9:42');
+      expect(ctx.service.threadStatus()).toBe('ended');
+
+      runtimeGeneration = SESSION_RUNTIME_GENERATION_B;
+      ctx.notifications.lifecycleEvent.set({
+        thread_id: 'external-resume',
+        state: 'provisioning',
+        session_runtime_generation: SESSION_RUNTIME_GENERATION_B,
+      });
+      TestBed.tick();
+      await flushMicrotasks(30);
+
+      expect(ctx.service.threadStatus()).toBe('active');
+      expect(ctx.service.sessionReady()).toBe(true);
+      expect(ctx.wsInstances).toHaveLength(2);
+      expect(ctx.sseInstances).toHaveLength(2);
+      expect(ctx.sseInstances[1].close).not.toHaveBeenCalled();
+      expect((ctx.service as any).resumedFromEpoch).toBe(9);
+      expect(ctx.mockHttp.post.mock.calls.some((call: any[]) =>
+        String(call[0]).endsWith('/resume'))).toBe(false);
+    } finally {
+      ctx.service.disconnect();
+    }
+  });
+
+  it('external Resume: stale Send reconciles G2 after session_not_ended and flushes once', async () => {
+    const ctx = createService();
+    let runtimeGeneration = SESSION_RUNTIME_GENERATION;
+    ctx.mockHttp.get.mockImplementation((url: string) => activeSessionGet(url).pipe(map((value) => ({
+      ...value,
+      session_runtime_generation: runtimeGeneration,
+      runtime_retirement_pending: false,
+    }))));
+    ctx.mockHttp.post.mockImplementation((url: string) => url.endsWith('/resume')
+      ? throwError(() => ({ status: 409, error: { detail: { code: 'session_not_ended' } } }))
+      : of({ accepted: true, turn_id: 1 }));
+    try {
+      await ctx.service.connect('external-resume-send');
+      fireSseOpen(ctx.sseInstances[0]);
+      fireSseMessage(ctx.sseInstances[0], {
+        method: 'session.ended',
+        params: { session_runtime_generation: SESSION_RUNTIME_GENERATION },
+      }, '9:42');
+      runtimeGeneration = SESSION_RUNTIME_GENERATION_B;
+
+      expect(await ctx.service.sendMessage('send after external Resume')).toBe(true);
+      await flushMicrotasks(30);
+
+      expect.soft(ctx.service.outbox()).toEqual([]);
+      expect.soft(ctx.service.error()).toBeNull();
+      expect.soft(ctx.service.threadStatus()).toBe('active');
+      expect.soft(ctx.mockHttp.post.mock.calls.filter((call: any[]) =>
+        String(call[0]).endsWith('/input'))).toHaveLength(1);
+    } finally {
+      ctx.service.disconnect();
+    }
+  });
+
+  it('external Resume: G2 connection releases the temporary successor guard for later recovery', async () => {
+    const ctx = await externalResumeFixture();
+    try {
+      ctx.wake();
+      await flushMicrotasks(30);
+      expect(ctx.wsInstances).toHaveLength(2);
+      (ctx.service as any)._latchSessionBindingInvalid('external-races', SESSION_RUNTIME_GENERATION_B);
+      ctx.state.generation = '77777777-7777-4777-8777-777777777777';
+      ctx.notifications.lifecycleEvent.set({
+        thread_id: 'external-races', state: 'ready',
+        session_runtime_generation: ctx.state.generation,
+      });
+      TestBed.tick();
+      await flushMicrotasks(30);
+      expect(ctx.wsInstances).toHaveLength(3);
+      expect(ctx.service.sessionReady()).toBe(true);
+      expect(ctx.service.error()).toBeNull();
+    } finally { ctx.service.disconnect(); }
+  });
+
+  async function externalResumeFixture(initiallyEnded = false) {
+    const ctx = createService();
+    const state = { status: initiallyEnded ? 'ended' : 'active', generation: SESSION_RUNTIME_GENERATION };
+    const get = (url: string) => activeSessionGet(url).pipe(map((value) => ({
+      ...value, status: state.status, session_runtime_generation: state.generation,
+      runtime_retirement_pending: false,
+    })));
+    ctx.mockHttp.get.mockImplementation(get);
+    await ctx.service.connect('external-races');
+    fireSseOpen(ctx.sseInstances[0]);
+    if (!initiallyEnded) fireSseMessage(ctx.sseInstances[0], {
+      method: 'session.ended', params: { session_runtime_generation: SESSION_RUNTIME_GENERATION },
+    }, '9:42');
+    state.status = 'created';
+    state.generation = SESSION_RUNTIME_GENERATION_B;
+    const wake = () => {
+      ctx.notifications.lifecycleEvent.set({
+        thread_id: 'external-races', state: 'provisioning', backend: 'vm',
+        session_runtime_generation: SESSION_RUNTIME_GENERATION_B,
+      });
+      TestBed.tick();
+    };
+    return { ...ctx, state, get, wake };
+  }
+
+  it('external Resume: a tab opened ended learns G1 and notices G2 on focus', async () => {
+    const ctx = await externalResumeFixture(true);
+    try {
+      window.dispatchEvent(new Event('focus'));
+      await flushMicrotasks(40);
+      expect(ctx.service.threadStatus()).toBe('created');
+      expect(ctx.service.sessionReady()).toBe(true);
+      expect(ctx.wsInstances).toHaveLength(1);
+    } finally { ctx.service.disconnect(); }
+  });
+
+  it('external Resume: notification reconnection repairs a missed lifecycle edge', async () => {
+    const ctx = await externalResumeFixture();
+    try {
+      ctx.notifications.isConnected.set(true);
+      TestBed.tick();
+      await flushMicrotasks(40);
+      expect(ctx.service.threadStatus()).toBe('created');
+      expect(ctx.service.sessionReady()).toBe(true);
+    } finally { ctx.service.disconnect(); }
+  });
+
+  it('external Resume: cold G2 shows startup while stale G1 connection cannot flush', async () => {
+    const ctx = await externalResumeFixture();
+    const connection = new Subject<any>();
+    ctx.mockHttp.get.mockImplementation((url: string) => url.endsWith('/connection') ? connection : ctx.get(url));
+    try {
+      ctx.wake();
+      await flushMicrotasks(40);
+      expect(ctx.service.threadStatus()).toBe('created');
+      expect(ctx.service.isStartingSession()).toBe(true);
+      expect(ctx.service.isVmSession()).toBe(true);
+      await ctx.service.sendMessage('wait for G2');
+      connection.next({ state: 'ready', control_socket: 'websocket', ws_url: 'ws://stale',
+        pinned_runtime_generation_contract: 1, session_runtime_generation: SESSION_RUNTIME_GENERATION });
+      connection.complete();
+      await flushMicrotasks(30);
+      expect(ctx.service.sessionReady()).toBe(false);
+      expect(ctx.wsInstances).toHaveLength(1);
+      expect(ctx.service.outbox()).toHaveLength(1);
+      expect(ctx.mockHttp.post.mock.calls.filter((c: any[]) => String(c[0]).endsWith('/input'))).toHaveLength(0);
+    } finally { ctx.service.disconnect(); }
+  });
+
+  it('external Resume: a duplicate G1 metadata response does not cancel the fresh G2 read', async () => {
+    const ctx = await externalResumeFixture();
+    await flushMicrotasks(20);
+    const old = new Subject<any>();
+    let reads = 0;
+    ctx.mockHttp.get.mockImplementation((url: string) => {
+      if (url.endsWith('/persistent/threads/external-races') && ++reads === 1) return old;
+      return ctx.get(url);
+    });
+    try {
+      const oldRead = (ctx.service as any).loadThreadMeta('external-races');
+      ctx.wake();
+      const recovery = (ctx.service as any).successorRead.promise;
+      old.next({ status: 'ended', session_runtime_generation: SESSION_RUNTIME_GENERATION,
+        runtime_retirement_pending: false });
+      old.complete();
+      await oldRead;
+      expect(await recovery).toBe(true);
+      await flushMicrotasks(40);
+      expect(ctx.service.threadStatus()).toBe('created');
+      expect(ctx.service.sessionReady()).toBe(true);
+      // Old G1 read, required fresh G2 read, then connect's full hydration.
+      expect(reads).toBe(3);
+    } finally { ctx.service.disconnect(); }
+  });
+
+  it('external Resume: a new G2 End cancels the pending control resolution', async () => {
+    const ctx = await externalResumeFixture();
+    const connection = new Subject<any>();
+    ctx.mockHttp.get.mockImplementation((url: string) => url.endsWith('/connection') ? connection : ctx.get(url));
+    try {
+      ctx.wake();
+      await flushMicrotasks(40);
+      fireSseMessage(ctx.sseInstances[1], {
+        method: 'session.ended', params: { session_runtime_generation: SESSION_RUNTIME_GENERATION_B },
+      }, '10:3');
+      connection.next({ state: 'ready', control_socket: 'websocket', ws_url: 'ws://late-g2',
+        pinned_runtime_generation_contract: 1, session_runtime_generation: SESSION_RUNTIME_GENERATION_B });
+      connection.complete();
+      await flushMicrotasks(30);
+      expect(ctx.service.threadStatus()).toBe('ended');
+      expect(ctx.service.sessionReady()).toBe(false);
+      expect(ctx.wsInstances).toHaveLength(1);
+    } finally { ctx.service.disconnect(); }
+  });
+
+  it('external Resume: an unrelated lifecycle generation cannot change G2 startup', async () => {
+    const ctx = await externalResumeFixture();
+    const connection = new Subject<any>();
+    ctx.mockHttp.get.mockImplementation((url: string) => url.endsWith('/connection') ? connection : ctx.get(url));
+    try {
+      ctx.wake();
+      await flushMicrotasks(40);
+      ctx.notifications.lifecycleEvent.set({
+        thread_id: 'external-races', state: 'failed', reason: 'unrelated runtime',
+        session_runtime_generation: '77777777-7777-4777-8777-777777777777',
+      });
+      TestBed.tick();
+      expect(ctx.service.error()).toBeNull();
+      expect(ctx.service.threadStatus()).toBe('created');
+    } finally { ctx.service.disconnect(); }
+  });
+
+  it('external Resume: stateless stale Send joins G2 and posts input exactly once', async () => {
+    const ctx = createService();
+    let runtimeGeneration = SESSION_RUNTIME_GENERATION;
+    ctx.mockHttp.get.mockImplementation((url: string) => activeSessionGet(url).pipe(map((value) => ({
+      ...value,
+      execution_lane: 'stateless', control_socket: 'none', ws_url: null,
+      session_runtime_generation: runtimeGeneration, runtime_retirement_pending: false,
+    }))));
+    ctx.mockHttp.post.mockImplementation((url: string) => url.endsWith('/resume')
+      ? throwError(() => ({ status: 409, error: { detail: { code: 'session_not_ended' } } }))
+      : of({ accepted: true, turn_id: 1 }));
+    try {
+      await ctx.service.connect('stateless-external-resume');
+      fireSseOpen(ctx.sseInstances[0]);
+      fireSseMessage(ctx.sseInstances[0], {
+        method: 'session.ended', params: { session_runtime_generation: SESSION_RUNTIME_GENERATION },
+      }, '9:42');
+      runtimeGeneration = SESSION_RUNTIME_GENERATION_B;
+      expect(await ctx.service.sendMessage('queued on G2')).toBe(true);
+      await flushMicrotasks(40);
+      expect(ctx.service.threadStatus()).toBe('active');
+      expect(ctx.service.sessionReady()).toBe(true);
+      expect(ctx.wsInstances).toHaveLength(0);
+      expect(ctx.service.outbox()).toEqual([]);
+      expect(ctx.mockHttp.post.mock.calls.filter((c: any[]) => String(c[0]).endsWith('/input'))).toHaveLength(1);
+    } finally { ctx.service.disconnect(); }
+  });
+
+  it.each(['navigation', 'end'])('external Resume: %s invalidates an in-flight successor read', async (action) => {
+    const ctx = await externalResumeFixture();
+    const meta = new Subject<any>();
+    ctx.mockHttp.get.mockImplementation((url: string) => url.endsWith('/persistent/threads/external-races') ? meta : ctx.get(url));
+    try {
+      ctx.wake();
+      await flushMicrotasks();
+      if (action === 'navigation') ctx.service.disconnect();
+      else await ctx.service.endSession();
+      meta.next({ status: 'created', session_runtime_generation: SESSION_RUNTIME_GENERATION_B, runtime_retirement_pending: false });
+      meta.complete();
+      await flushMicrotasks(40);
+      expect(ctx.wsInstances).toHaveLength(1);
+      expect(ctx.service.sessionReady()).toBe(false);
+    } finally { ctx.service.disconnect(); }
+  });
+
+  it('external Resume: duplicate wake edges share a bounded read and can retry after timeout', async () => {
+    vi.useFakeTimers();
+    const ctx = await externalResumeFixture();
+    const meta = new Subject<any>();
+    ctx.mockHttp.get.mockImplementation((url: string) => url.endsWith('/persistent/threads/external-races') ? meta : ctx.get(url));
+    try {
+      const calls = () => ctx.mockHttp.get.mock.calls.filter((c: any[]) => String(c[0]).endsWith('/persistent/threads/external-races')).length;
+      const before = calls();
+      ctx.wake();
+      ctx.wake();
+      window.dispatchEvent(new Event('focus'));
+      await flushMicrotasks();
+      expect(calls()).toBe(before + 1);
+      await vi.advanceTimersByTimeAsync(15_000);
+      expect(ctx.service.threadStatus()).toBe('ended');
+      expect(meta.observed).toBe(false);
+      ctx.mockHttp.get.mockImplementation(ctx.get);
+      ctx.wake();
+      await flushMicrotasks(40);
+      expect(ctx.service.threadStatus()).toBe('created');
+      expect(ctx.service.sessionReady()).toBe(true);
+    } finally { ctx.service.disconnect(); vi.useRealTimers(); }
+  });
+
+  it.each([SESSION_RUNTIME_GENERATION, undefined, 'malformed'])('external Resume: fresh metadata with generation %s cannot reopen G1', async (generation) => {
+    const ctx = await externalResumeFixture();
+    ctx.state.generation = generation as string;
+    try {
+      ctx.wake();
+      await flushMicrotasks(40);
+      expect(ctx.service.threadStatus()).toBe('ended');
+      expect(ctx.service.sessionReady()).toBe(false);
+      expect(ctx.wsInstances).toHaveLength(1);
+    } finally { ctx.service.disconnect(); }
   });
 
   it('ignores same-G lifecycle noise after binding refusal and reconnects only for G2', async () => {

@@ -127,6 +127,7 @@ function createService(opts: {
     (globalThis as any).WebSocket = MockWebSocketCtor;
 
     const mockNotifications: any = {
+        isConnected: signal(false),
         lifecycleEvent: signal<{thread_id: string; state: string; reason?: string} | null>(null),
         cloudDiffStagedEvent: signal(null),
     };
