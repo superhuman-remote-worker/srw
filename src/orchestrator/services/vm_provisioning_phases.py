@@ -45,6 +45,17 @@ def _uuid(value: object) -> bool:
         return False
 
 
+def _registration_id(value: object) -> bool:
+    """Accept the prober's compact UUID without normalizing its CAS identity."""
+    if type(value) is not str:
+        return False
+    try:
+        parsed = UUID(value)
+        return value in {str(parsed), parsed.hex}
+    except (ValueError, TypeError, AttributeError):
+        return False
+
+
 class VMProvisioningPhaseStore:
     """Job-only phase observations; controller MAC validation belongs to caller.
 
@@ -74,7 +85,9 @@ class VMProvisioningPhaseStore:
         from shared.vm_resource_inventory import InventoryError
         from uuid import NAMESPACE_URL, uuid5
 
-        if not all(_uuid(value) for value in (thread_id, generation, vm_uid, registration)):
+        if not all(_uuid(value) for value in (thread_id, generation, vm_uid)):
+            return False
+        if not _registration_id(registration):
             return False
         if not isinstance(updates, Mapping) or updates.get("status") != "ready":
             return False

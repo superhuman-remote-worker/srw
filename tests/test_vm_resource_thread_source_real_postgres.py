@@ -476,13 +476,18 @@ async def _adopted_charged_thread(
     )
 
 
-async def _ready_charged_thread(db, monkeypatch):
+async def _ready_charged_thread(db, monkeypatch, *, compact_registration=True):
     (
         _, inventory, sample, demand, thread_id, runtime, generation,
         request_id, admitted, observations, _,
     ) = await _adopted_charged_thread(db, monkeypatch)
     vm_uid = observations["vm"]["object"]["metadata"]["uid"]
-    vmi_uid, launcher_uid, registration = (str(uuid4()) for _ in range(3))
+    vmi_uid, launcher_uid = (str(uuid4()) for _ in range(2))
+    # The live SSH readiness prober issues uuid4().hex, not a hyphenated UUID.
+    registration_uuid = uuid4()
+    registration = (
+        registration_uuid.hex if compact_registration else str(registration_uuid)
+    )
     node_uid, node_name = admitted["node_uid"], admitted["node_name"]
     observed = successor(sample)
     observed["vms"] = [{
@@ -535,10 +540,13 @@ async def _simulate_stale_thread_identity(db, thread_id, field, value):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("compact_registration", [True, False])
 async def test_typed_thread_adoption_and_probed_ready_bind_one_shared_charge(
-    db, monkeypatch,
+    db, monkeypatch, compact_registration,
 ):
-    prepared = await _ready_charged_thread(db, monkeypatch)
+    prepared = await _ready_charged_thread(
+        db, monkeypatch, compact_registration=compact_registration,
+    )
     thread_id = prepared["thread_id"]
     generation = prepared["generation"]
     request_id = prepared["request_id"]
@@ -549,6 +557,20 @@ async def test_typed_thread_adoption_and_probed_ready_bind_one_shared_charge(
     registration = prepared["registration"]
     updates = prepared["updates"]
     phases = VMProvisioningPhaseStore(db)
+    # A different registration must not publish Ready or bind the charge,
+    # even when it uses one of the accepted encodings.
+    wrong_registration = uuid4().hex if compact_registration else str(uuid4())
+    assert await phases.publish_thread_ready(
+        str(thread_id), str(generation), wrong_registration, vm_uid,
+        {**updates, "ssh_registration_id": wrong_registration},
+    ) is False
+    other_encoding = (
+        str(UUID(registration)) if compact_registration else UUID(registration).hex
+    )
+    assert await phases.publish_thread_ready(
+        str(thread_id), str(generation), other_encoding, vm_uid,
+        {**updates, "ssh_registration_id": other_encoding},
+    ) is False
     # The thread/agent/attach tuple and exact installed launcher must still
     # match when the final probe attempts its Ready transaction.
     for field, current in (
