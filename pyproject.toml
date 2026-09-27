@@ -582,3 +582,18 @@ forbidden_modules = [
   "agent.agent",
   "langgraph",
 ]
+
+[[tool.importlinter.contracts]]
+name = "Session input owner does not import the persistent runtime, application factories or the loop"
+type = "forbidden"
+source_modules = ["agent.api.session_input"]
+forbidden_modules = [
+  "agent.api.persistent_app",
+  "agent.api.dual_app",
+  "agent.api.app",
+  "agent.api.turn_executor",
+  "agent.persistent_graph",
+  "agent.graph",
+  "agent.agent",
+  "langgraph",
+]
