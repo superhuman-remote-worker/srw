@@ -4768,7 +4768,16 @@ async def _attach_session_inner(
                 raise ProtectedCloudUnavailable(
                     "protected-cloud mount authority changed during setup"
                 )
-    except BaseException:
+    except BaseException as exc:
+        if not isinstance(exc, asyncio.CancelledError):
+            # Cleanup can replace this error or wait indefinitely for proof.
+            # Retain only its class; messages/tracebacks can carry credentials.
+            logger.warning(
+                "Session attach failed before cleanup "
+                "(thread=%s stage=session_setup type=%s)",
+                thread_id,
+                type(exc).__name__,
+            )
         await _cleanup_failed_event_journal_attach(
             thread_id, restore_thread_id=prior_thread_id
         )

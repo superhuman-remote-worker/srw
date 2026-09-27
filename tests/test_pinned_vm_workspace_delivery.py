@@ -1,11 +1,14 @@
 """VM physical identity survives delivery, polling, and persistent SSH setup."""
 
+import asyncio
+import logging
 from copy import deepcopy
 from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+import pytest_asyncio
 from fastapi import HTTPException
 
 from agent.api import persistent_app, persistent_session
@@ -339,17 +342,13 @@ async def test_snapshot_rotation_before_first_attestation_is_refused(vm_delivery
     assert refused.value.status_code == 409
 
 
-@pytest.mark.asyncio
-async def test_vm_attach_setup_materializes_repository_bundle(
-    vm_delivery, monkeypatch, caplog
-):
-    """The setup wrapper consumes credentials carried inside the VM payload."""
+@pytest_asyncio.fixture
+async def vm_attach_setup(vm_delivery, monkeypatch):
     from shared.runtime.core.loader import AgentConfig
     from tests.test_managed_repository_authority import _authority, _runtime_payload
 
     payload = await _deliver(vm_delivery)
     credential = _runtime_payload(_authority(repo_name="thread-11111111"))
-    private_material = credential["private_key"]
     payload["git_remote_url"] = credential["clone_url"]
     payload["managed_repository_credentials"] = [credential]
     client = SimpleNamespace(
@@ -379,6 +378,16 @@ async def test_vm_attach_setup_materializes_repository_bundle(
     monkeypatch.setattr(persistent_app, "_session_runtime_generation", None)
     monkeypatch.setattr(persistent_app, "_session_runtime_attach_token", None)
     monkeypatch.setattr(persistent_app, "_pinned_runtime_generation_enabled", False)
+    return credential
+
+
+@pytest.mark.asyncio
+async def test_vm_attach_setup_materializes_repository_bundle(
+    vm_attach_setup, monkeypatch, caplog
+):
+    """The setup wrapper consumes credentials carried inside the VM payload."""
+    credential = vm_attach_setup
+    private_material = credential["private_key"]
     monkeypatch.setattr(RemoteBackend, "connect", lambda self: None)
     monkeypatch.setattr(RemoteBackend, "exists", lambda self, path: False)
     monkeypatch.setattr(RemoteBackend, "list_dir", lambda self, path: [])
@@ -432,3 +441,118 @@ async def test_vm_attach_setup_materializes_repository_bundle(
     assert "private_key" not in credential
     assert private_material not in caplog.text
     assert manager.call_args.kwargs["config"].git_remote_url == credential["clone_url"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cleanup_fails", [False, True])
+async def test_vm_setup_failure_is_logged_before_cleanup_settles(
+    vm_attach_setup, monkeypatch, caplog, cleanup_fails
+):
+    """The original failure stays observable even when cleanup replaces it."""
+    original = WorkspaceUnavailableError("https://user:secret-password@workspace")
+    cause = RuntimeError("-----BEGIN PRIVATE KEY----- secret-cause")
+    cleanup_failure = persistent_app.EventJournalUnavailable("secret-cleanup")
+    cleanup_entered = asyncio.Event()
+    cleanup_released = asyncio.Event()
+    cleanup_calls = 0
+
+    async def fail_workspace(self, **kwargs):
+        raise original from cause
+
+    async def cleanup(thread_id, **kwargs):
+        nonlocal cleanup_calls
+        cleanup_calls += 1
+        if cleanup_fails and cleanup_calls <= 2:
+            raise cleanup_failure
+        cleanup_entered.set()
+        await cleanup_released.wait()
+
+    monkeypatch.setattr(
+        persistent_session.PersistentSession, "_setup_workspace", fail_workspace
+    )
+    monkeypatch.setattr(persistent_app, "_cleanup_failed_event_journal_attach", cleanup)
+    monkeypatch.setattr(
+        persistent_app, "_EXACT_RETIREMENT_SETTLEMENT_RETRY_DELAYS", (0.0,)
+    )
+    caplog.set_level(logging.WARNING, logger=persistent_app.__name__)
+    task = asyncio.create_task(
+        persistent_app._attach_session(
+            THREAD,
+            pinned_status_identity_contract=1,
+            pinned_runtime_generation_contract=1,
+            session_runtime_generation=RUNTIME,
+            session_runtime_attach_token=ATTACH,
+        )
+    )
+    try:
+        await asyncio.wait_for(cleanup_entered.wait(), timeout=2)
+        records = [r for r in caplog.records if "stage=session_setup" in r.getMessage()]
+        assert len(records) == 1
+        record = records[0]
+        assert record.levelno == logging.WARNING
+        assert f"thread={THREAD}" in record.getMessage()
+        assert "type=WorkspaceUnavailableError" in record.getMessage()
+        assert record.args == (THREAD, "WorkspaceUnavailableError")
+        assert record.exc_info is None
+        assert record.exc_text is None
+        assert record.stack_info is None
+        for secret in (
+            str(original),
+            str(cause),
+            str(cleanup_failure),
+            vm_attach_setup["private_key"],
+        ):
+            assert secret not in repr(record.__dict__)
+            assert secret not in caplog.text
+        assert not task.done()
+        assert persistent_app._session is not None
+        assert persistent_app._thread_id == THREAD
+        assert persistent_app._session_runtime_generation == RUNTIME
+        assert persistent_app._session_runtime_attach_token == ATTACH
+        assert persistent_app._pool_heartbeat_status() == "session"
+        if cleanup_fails:
+            assert cleanup_calls == 3
+            assert "cleanup remains unproven" in caplog.text
+    finally:
+        cleanup_released.set()
+        expected = cleanup_failure if cleanup_fails else original
+        with pytest.raises(type(expected)) as raised:
+            await asyncio.wait_for(task, timeout=2)
+        assert raised.value is expected
+
+    assert sum("stage=session_setup" in r.getMessage() for r in caplog.records) == 1
+
+
+@pytest.mark.asyncio
+async def test_cancelled_vm_setup_keeps_cancellation_without_failure_warning(
+    vm_attach_setup, monkeypatch, caplog
+):
+    setup_entered = asyncio.Event()
+
+    async def blocked_workspace(self, **kwargs):
+        setup_entered.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(
+        persistent_session.PersistentSession, "_setup_workspace", blocked_workspace
+    )
+    monkeypatch.setattr(
+        persistent_app, "_cleanup_failed_event_journal_attach", AsyncMock()
+    )
+    task = asyncio.create_task(
+        persistent_app._attach_session(
+            THREAD,
+            pinned_status_identity_contract=1,
+            pinned_runtime_generation_contract=1,
+            session_runtime_generation=RUNTIME,
+            session_runtime_attach_token=ATTACH,
+        )
+    )
+    try:
+        await asyncio.wait_for(setup_entered.wait(), timeout=2)
+    finally:
+        task.cancel("test-cancellation")
+        with pytest.raises(asyncio.CancelledError) as cancelled:
+            await task
+    assert cancelled.value.args == ("test-cancellation",)
+    assert not any("stage=session_setup" in r.getMessage() for r in caplog.records)
