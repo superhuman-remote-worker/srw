@@ -348,6 +348,57 @@ class TestRunPersistentLoopSystemPrompt:
         assert _prompt_body(messages[0].content) == "attach-time prompt"
 
     @pytest.mark.asyncio
+    async def test_checkpoint_restore_keeps_its_summary_beside_the_prompt(self):
+        """A restore from a compaction checkpoint starts with the summary.
+
+        The summary is a SystemMessage too; mistaking it for the prompt slot
+        skipped the prompt insert and the per-turn refresh then overwrote the
+        summary with the prompt, so every restored session lost all history
+        before its kept tail (live on main-dev: 0 of 71 calls carried it).
+        """
+        summary = SystemMessage(content="[Summary of prior work]\nThe cat is Ash.")
+        tail = HumanMessage(content="What is my cat called?")
+        messages: List[BaseMessage] = [summary, tail]
+        seen: list[list[BaseMessage]] = []
+
+        call_count = 0
+
+        async def _input():
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                return "hi"
+            raise asyncio.CancelledError
+
+        llm = _make_streaming_llm(_make_llm_response())
+
+        async def _astream(sent, **kw):
+            seen.append(list(sent))
+            yield _make_llm_response()
+
+        llm.astream = _astream
+
+        await run_persistent_loop(
+            llm_with_tools=llm,
+            tools=[],
+            context_manager=AsyncMock(
+                ensure_within_limits=AsyncMock(side_effect=lambda m, *a, **kw: m)
+            ),
+            config=_make_config(),
+            system_prompt="attach-time prompt",
+            callbacks=_make_callbacks(get_user_input=_input),
+            messages=messages,
+            get_current_system_prompt=lambda: "rebuilt prompt",
+        )
+
+        assert _prompt_body(messages[0].content) == "rebuilt prompt"
+        assert messages[1] is summary
+        assert summary.content == "[Summary of prior work]\nThe cat is Ash."
+        assert seen, "the turn reached the model"
+        sent_text = [getattr(m, "content", "") for m in seen[0]]
+        assert "[Summary of prior work]\nThe cat is Ash." in sent_text
+
+    @pytest.mark.asyncio
     async def test_system_prompt_carries_current_date(self):
         """Every turn's system message states today's date and weekday.
 

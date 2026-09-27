@@ -33,6 +33,7 @@ from langchain_core.messages import (
 from agent.core.context import (
     ContextManager,
     extract_summary_text,
+    is_compaction_summary,
     repair_tool_call_arguments,
     repair_tool_pairing,
     scrub_history_tool_call_arguments,
@@ -67,6 +68,16 @@ from agent.services.image_content import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _holds_system_prompt(message: BaseMessage) -> bool:
+    """Whether ``message`` is the loop's system-prompt slot (``messages[0]``).
+
+    A compaction summary is a SystemMessage too, and is what a checkpoint
+    restore puts first; it must never be mistaken for (or overwritten as) the
+    prompt.
+    """
+    return isinstance(message, SystemMessage) and not is_compaction_summary(message)
 
 
 def _injection_anchor_index(messages: List[BaseMessage]) -> int:
@@ -1079,7 +1090,13 @@ async def run_persistent_loop(
     # Send system prompt as first message if not already present. Re-stamp the
     # date: a resumed session's prompt was built whenever the session was
     # created, which may be many days ago.
-    if not messages or not isinstance(messages[0], SystemMessage):
+    #
+    # A checkpoint restore starts with the compaction SUMMARY, which is also a
+    # SystemMessage. Treating it as the prompt slot skipped the prompt insert,
+    # and the per-turn refresh below then overwrote the summary with the prompt
+    # — every restored session silently lost all history before its kept tail
+    # (session_slash_commands_and_stateless_compact.md §6).
+    if not messages or not _holds_system_prompt(messages[0]):
         messages.insert(0, SystemMessage(content=with_current_date(system_prompt)))
 
     logger.info(
@@ -1174,7 +1191,7 @@ async def run_persistent_loop(
         current_prompt = (
             get_current_system_prompt() if get_current_system_prompt else None
         )
-        if not current_prompt and messages and isinstance(messages[0], SystemMessage):
+        if not current_prompt and messages and _holds_system_prompt(messages[0]):
             current_prompt = messages[0].content
         # Restored history can in principle carry list-shaped content; date
         # stamping is a nicety and must never take the session loop down.
@@ -1182,7 +1199,7 @@ async def run_persistent_loop(
             current_prompt = with_current_date(current_prompt)
             if (
                 messages
-                and isinstance(messages[0], SystemMessage)
+                and _holds_system_prompt(messages[0])
                 and messages[0].content != current_prompt
             ):
                 messages[0].content = current_prompt

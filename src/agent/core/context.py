@@ -54,6 +54,16 @@ from shared.runtime.core.message_markers import (
 logger = logging.getLogger(__name__)
 
 
+def is_compaction_summary(message: BaseMessage) -> bool:
+    """True for the ``[Summary of prior work]`` SystemMessage compaction writes."""
+    content = getattr(message, "content", None)
+    return (
+        isinstance(message, SystemMessage)
+        and isinstance(content, str)
+        and content.startswith("[Summary of prior work]")
+    )
+
+
 def extract_summary_text(messages: List[BaseMessage]) -> Optional[str]:
     """Return the most recent '[Summary of prior work]' summary content with the
     prefix stripped, or None when no summary is present.
