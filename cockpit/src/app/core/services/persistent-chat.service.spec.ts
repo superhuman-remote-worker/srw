@@ -11193,6 +11193,95 @@ describe('PersistentChatService — pending End visibility reconciliation', () =
     expectEnding();
   });
 
+  it('times out a hung initial metadata read and permits later lifecycle reconciliation', async () => {
+    const stalled = new Subject<any>();
+    let initialMeta = true;
+    ctx.mockHttp.get.mockImplementation((url: string) => {
+      if (metaUrl.test(url) && initialMeta) {
+        initialMeta = false;
+        return stalled;
+      }
+      return metaUrl.test(url)
+        ? activeSessionGet(url).pipe(map(body => ({ ...body, ...meta })))
+        : activeSessionGet(url);
+    });
+    let connectFinished = false;
+    const connection = ctx.service.connect('watched').then(() => { connectFinished = true; });
+    await flushMicrotasks();
+    expect(stalled.observed).toBe(true);
+    await vi.advanceTimersByTimeAsync(14_999);
+    expect(connectFinished).toBe(false);
+    expect(reads()).toBe(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(connectFinished).toBe(true);
+    expect(stalled.observed).toBe(false);
+    await connection;
+    fireSseOpen(ctx.sseInstances[0]);
+    await flushMicrotasks();
+    meta = { ...meta, ...pending };
+    await vi.advanceTimersByTimeAsync(5000);
+    expectEnding();
+  });
+
+  it('releases a hung pre-End metadata read before rereading without overlap', async () => {
+    await connected();
+    const stalled = new Subject<any>();
+    ctx.mockHttp.get.mockImplementationOnce(() => stalled);
+    await vi.advanceTimersByTimeAsync(5000);
+    const before = reads();
+    const failure = new Error('End response lost');
+    ctx.mockHttp.delete.mockReturnValue(throwError(() => failure));
+    let endFailure: unknown;
+    const ending = ctx.service.endSession().catch(err => { endFailure = err; });
+    meta = { ...meta, ...pending };
+    await vi.advanceTimersByTimeAsync(14_999);
+    expect(reads()).toBe(before);
+    expect(stalled.observed).toBe(true);
+    expect(endFailure).toBeUndefined();
+    expect(ctx.service.isConnected()).toBe(true);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(stalled.observed).toBe(false);
+    expect(reads()).toBe(before + 1);
+    expect(endFailure).toBe(failure);
+    await ending;
+    expectEnding();
+    meta = { status: 'ended', ended_at: '2026-09-27T10:00:00Z' };
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(ctx.service.threadStatus()).toBe('ended');
+    expect(ctx.sseInstances[0].close).not.toHaveBeenCalled();
+  });
+
+  it.each(['pending', 'ended'])('preserves End failure after a timed-out reread and later discovers %s', async outcome => {
+    await connected();
+    const stalled = new Subject<any>();
+    ctx.mockHttp.get.mockImplementationOnce(() => stalled);
+    const failure = new Error('End response lost');
+    ctx.mockHttp.delete.mockReturnValue(throwError(() => failure));
+    let endFailure: unknown;
+    const ending = ctx.service.endSession().catch(err => { endFailure = err; });
+    await flushMicrotasks();
+    const before = reads();
+    await vi.advanceTimersByTimeAsync(14_999);
+    expect(reads()).toBe(before);
+    expect(stalled.observed).toBe(true);
+    expect(endFailure).toBeUndefined();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(stalled.observed).toBe(false);
+    expect(endFailure).toBe(failure);
+    await ending;
+    expect(ctx.service.threadStatus()).toBe('active');
+    expect(ctx.service.isConnected()).toBe(true);
+    expect(ctx.wsInstances[0].close).not.toHaveBeenCalled();
+    meta = outcome === 'pending'
+      ? { ...meta, ...pending }
+      : { status: 'ended', ended_at: '2026-09-27T10:00:00Z' };
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(reads()).toBe(before + 1);
+    expect(ctx.service.threadStatus()).toBe(outcome === 'pending' ? 'ending' : 'ended');
+    expect(ctx.service.isConnected()).toBe(false);
+    expect(ctx.sseInstances[0].close).not.toHaveBeenCalled();
+  });
+
   it.each(['navigate', 'disconnect', 'destroy'])('ignores pending reads and stops reconciliation on %s', async action => {
     await connected();
     const response = new Subject<any>();

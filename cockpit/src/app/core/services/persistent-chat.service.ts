@@ -138,6 +138,9 @@ const CONTROL_WS_WATCHDOG_TIMEOUT_MS = 45_000;
 // hours later. See `knowledge-base/knowledge/issues/persistent_chat_silent_disconnect.md`.
 const SSE_WATCHDOG_INTERVAL_MS = 5000;
 const SSE_WATCHDOG_TIMEOUT_MS = 45000;
+// A hung shared read must release its slot so later lifecycle observations
+// and an ambiguous End's fresh reread can proceed.
+const THREAD_META_RESPONSE_TIMEOUT_MS = 15_000;
 
 // After an interrupt POST we wait for the agent to emit `interrupt.ack` /
 // `turn.completed` over SSE to clear the "Stopping…" state. If that frame is
@@ -2830,7 +2833,9 @@ export class PersistentChatService {
   ): Promise<void> {
     try {
       const thread = await firstValueFrom(
-        this.http.get<any>(`${environment.apiUrl}/persistent/threads/${threadId}`),
+        this.http
+          .get<any>(`${environment.apiUrl}/persistent/threads/${threadId}`)
+          .pipe(timeout({ first: THREAD_META_RESPONSE_TIMEOUT_MS })),
       );
       if (!this._isCurrentThreadRequest(threadId, generation)) return;
       const retirementPending = thread.runtime_retirement_pending === true;
