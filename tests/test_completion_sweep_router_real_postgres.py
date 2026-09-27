@@ -725,20 +725,24 @@ async def test_stateless_owner_gap_loses_to_concurrent_queue_reactivation(pg):
 
 @pytest.mark.asyncio
 async def test_concurrent_routes_share_one_action_and_heartbeat_keeps_term_live(pg):
+    import time
+
     job_id = await _job(pg)
     command_id = await _command(pg, job_id)
     finalizer = _BlockingFinalizer()
+    # A live-term success proof needs room for real database and scheduling
+    # delays; expiry remains authoritative and has separate loss controls.
     first_router = CompletionSweepRouter(
         pg,
         finalizer,
         claimant_id="router-a",
-        action_lease_seconds=0.3,
+        action_lease_seconds=3,
     )
     second_router = CompletionSweepRouter(
         pg,
         finalizer,
         claimant_id="router-b",
-        action_lease_seconds=0.3,
+        action_lease_seconds=3,
     )
 
     first_task = asyncio.create_task(
@@ -765,7 +769,7 @@ async def test_concurrent_routes_share_one_action_and_heartbeat_keeps_term_live(
     )
     assert not await first_router._renew(stale_action)
 
-    renewal_deadline = asyncio.get_running_loop().time() + 2
+    renewal_deadline = asyncio.get_running_loop().time() + 10
     renewed_expiry = initial_expiry
     while renewed_expiry <= initial_expiry + timedelta(milliseconds=50):
         assert asyncio.get_running_loop().time() < renewal_deadline
@@ -784,6 +788,9 @@ async def test_concurrent_routes_share_one_action_and_heartbeat_keeps_term_live(
     assert competing.disposition == "busy"
     assert finalizer.calls == [(str(command_id), False)]
 
+    # Deliberately stall the event loop after the native busy response. This
+    # exceeded the old 300ms lease and correctly caused claim_lost under load.
+    time.sleep(0.35)
     finalizer.release.set()
     completed = await asyncio.wait_for(first_task, timeout=2)
     assert completed.disposition == "completed"
