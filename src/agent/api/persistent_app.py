@@ -16972,10 +16972,12 @@ async def _poll_workspace_ready(
                 "workspace_runtime_incarnation": ws.get(
                     "workspace_runtime_incarnation"
                 ),
-                # VM endpoints retain the historical AutoAddPolicy path; Slice
-                # 2 admits no stateless VM claimant with a pinned pod identity.
-                "workspace_ssh_host_key_fingerprint": None,
-                # Slice 1 has no trusted VM host-identity adapter.
+                # The VM controller and provisioner attest the same physical
+                # tuple consumed by exact pinned-session SSH setup.
+                "workspace_ssh_host_key_fingerprint": ws.get(
+                    "workspace_ssh_host_key_fingerprint"
+                ),
+                # VM physical attestation does not grant Canvas presentation.
                 "canvas_presentation_available": False,
                 "canvas_live_apps_available": False,
                 "canvas_shared_browser_available": False,

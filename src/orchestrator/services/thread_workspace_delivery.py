@@ -284,6 +284,60 @@ async def attest_pinned_thread_k8s_workspace(
     return attestation
 
 
+async def attest_pinned_thread_vm_workspace(
+    thread_id: str,
+    thread: Mapping[str, Any],
+    vm: Mapping[str, Any],
+    workspace_backend: str | None,
+    *,
+    dependencies: ThreadWorkspaceDeliveryDependencies,
+) -> WorkspaceRuntimeAttestation | None:
+    """Pair the delivered VM snapshot with fresh controller/owner authority."""
+
+    if thread.get("execution_lane") == "stateless" or workspace_backend != "vm":
+        return None
+    if not isinstance(vm, Mapping):
+        raise HTTPException(409, "VM workspace authority is malformed")
+    if vm.get("status") != "ready":
+        return None
+    try:
+        attestation = await dependencies.vm_provisioner.attest_workspace_runtime(
+            thread_id, entity_type="thread"
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="VM workspace runtime attestation is unavailable",
+        ) from exc
+    # The adapter attests its own fresh owner read. It must also match the
+    # snapshot used by this delivery, including the admitted host-key pin.
+    if (
+        vm.get("provision_generation") != attestation.workspace_generation
+        or vm.get("active_pod_uid") != attestation.runtime_incarnation
+        or vm.get("ssh_host_key_fingerprint") != attestation.ssh_host_key_fingerprint
+        or vm.get("ssh_host") != attestation.host
+        or str(vm.get("ssh_port")) != str(attestation.port)
+        or vm.get("vm_uid") != attestation.vm_uid
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="VM workspace authority changed during attach",
+        )
+    refreshed = await dependencies.store.get_thread(thread_id)
+    if refreshed is None:
+        raise HTTPException(status_code=404, detail="Thread not found")
+    if (
+        refreshed.get("execution_lane") != thread.get("execution_lane")
+        or dependencies.thread_workspace_backend(refreshed) != workspace_backend
+        or thread_metadata_object(refreshed).get("vm") != vm
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="VM workspace authority changed during attach",
+        )
+    return attestation
+
+
 async def require_pinned_workspace_credential_owner(
     thread: dict[str, Any],
     presented_agent_id: str | None,
@@ -455,6 +509,9 @@ async def agent_get_thread_workspace_locked(
     _attest_pinned_thread_k8s_workspace = functools.partial(
         attest_pinned_thread_k8s_workspace, dependencies=dependencies
     )
+    _attest_pinned_thread_vm_workspace = functools.partial(
+        attest_pinned_thread_vm_workspace, dependencies=dependencies
+    )
     _require_pinned_workspace_credential_owner = functools.partial(
         require_pinned_workspace_credential_owner, dependencies=dependencies
     )
@@ -503,6 +560,8 @@ async def agent_get_thread_workspace_locked(
     authority_vm = vm
     authority_binding = binding
     workspace_backend = _thread_workspace_backend(thread)
+    if workspace_backend == "vm" and not isinstance(vm, dict):
+        raise HTTPException(409, "VM workspace authority is malformed")
     if thread.get("execution_lane") == "stateless" and workspace_backend == "sandbox":
         workspace_status = str(ws.get("status") or "")
         restore_marker_present = WORKSPACE_SNAPSHOT_RESTORE_REQUIRED_KEY in ws
@@ -691,6 +750,9 @@ async def agent_get_thread_workspace_locked(
                 pinned_k8s_attestation.runtime_incarnation
             ),
         }
+    pinned_vm_attestation = await _attest_pinned_thread_vm_workspace(
+        thread_id, thread, vm, workspace_backend
+    )
     workspace_generation: str | None = None
     workspace_runtime_incarnation: str | None = None
     workspace_ssh_host_key_fingerprint: str | None = None
@@ -779,6 +841,14 @@ async def agent_get_thread_workspace_locked(
         workspace_runtime_incarnation = pinned_k8s_attestation.runtime_incarnation
         workspace_ssh_host_key_fingerprint = (
             pinned_k8s_attestation.ssh_host_key_fingerprint
+        )
+    if pinned_vm_attestation is not None:
+        # VM provision generation and launcher Pod UID are the admitted
+        # physical pair; VM workspaces do not use the Canvas binding.
+        workspace_generation = pinned_vm_attestation.workspace_generation
+        workspace_runtime_incarnation = pinned_vm_attestation.runtime_incarnation
+        workspace_ssh_host_key_fingerprint = (
+            pinned_vm_attestation.ssh_host_key_fingerprint
         )
     if (
         entry_protected_marker == "on"
@@ -912,8 +982,6 @@ async def agent_get_thread_workspace_locked(
             status_code=403,
             detail="capability grants could not be verified for this session config",
         )
-    if workspace_backend == "vm" and not isinstance(vm, dict):
-        raise HTTPException(409, "VM workspace authority is malformed")
     if (
         thread.get("execution_lane") == "pinned"
         and thread.get("status") == "created"
@@ -1052,6 +1120,21 @@ async def agent_get_thread_workspace_locked(
                 status_code=409,
                 detail="Workspace authority changed during attach",
             )
+    if pinned_vm_attestation is not None:
+        latest = await postgres_db.get_thread(thread_id)
+        if latest is None:
+            raise HTTPException(status_code=404, detail="Thread not found")
+        confirmed = await _attest_pinned_thread_vm_workspace(
+            thread_id,
+            latest,
+            thread_metadata_object(latest).get("vm") or {},
+            _thread_workspace_backend(latest),
+        )
+        if confirmed != pinned_vm_attestation:
+            raise HTTPException(
+                status_code=409,
+                detail="VM workspace authority changed during attach",
+            )
     # Complete protected-reader and exact selected-mount validation before the
     # final lifecycle read. The endpoint holds ``thread_datasource_lock`` for
     # this whole function, so selection cannot change after this snapshot;
@@ -1127,6 +1210,13 @@ async def agent_get_thread_workspace_locked(
         final_ws != authority_ws
         or final_vm != authority_vm
         or final_binding != authority_binding
+        or (
+            pinned_vm_attestation is not None
+            and (
+                final_thread.get("execution_lane") != thread.get("execution_lane")
+                or _thread_workspace_backend(final_thread) != workspace_backend
+            )
+        )
     ):
         # Workspace U1 -> U2 is independent of the thread generation. Never
         # splice U1 coordinates/credentials into a response authorized by a
@@ -1252,5 +1342,6 @@ __all__ = [
     "agent_canvas_workspace_capabilities",
     "agent_get_thread_workspace_locked",
     "attest_pinned_thread_k8s_workspace",
+    "attest_pinned_thread_vm_workspace",
     "require_pinned_workspace_credential_owner",
 ]
