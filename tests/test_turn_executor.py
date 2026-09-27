@@ -3219,14 +3219,17 @@ class TestWriterLeaseFence:
 
 
 class TestCommitThenEffects:
-    def test_answered_by_transcript_accepts_a_turn_completed_frame(self):
-        # Carry-over from step 3: a final assistant message that carried a
-        # tool call has no zero-tool-call row; the turn.completed frame for
-        # that turn is the settled boundary.
-        assert "turn.completed" in te._ANSWERED_BY_TRANSCRIPT_SQL
-        assert "frame.payload ->> 'turn_id' = input.turn_number::text" in (
-            te._ANSWERED_BY_TRANSCRIPT_SQL
-        )
+    def test_answered_by_transcript_is_bound_to_the_inputs_own_turn(self):
+        # Only the oldest pending input's own turn answers it: the turn
+        # execution identity its settled reconcile mints (a final message
+        # that carried a tool call included; the stateless turn.completed
+        # frame follows that commit), or a final answer row of that exact
+        # turn. Behaviour on real PostgreSQL:
+        # tests/test_stateless_queued_input_real_postgres.py.
+        sql = te._ANSWERED_BY_TRANSCRIPT_SQL
+        assert "oldest.turn_execution_id IS NOT NULL" in sql
+        assert "answer.turn_number = oldest.turn_number" in sql
+        assert "later_input" not in sql
 
     @pytest.mark.asyncio
     async def test_hand_off_precedes_complete_and_the_push_is_not_awaited(

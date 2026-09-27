@@ -281,60 +281,63 @@ SELECT EXISTS (
 
 # Transcript-truth answered check (skip-if-answered's second leg). The
 # watermark leg catches a predecessor that persisted AND completed; this one
-# catches a predecessor whose turn ran to its final answer but whose
-# settlement never advanced ``consumed_seq`` (the loop died in the
-# turn-complete hook — e.g. the pre-fix compaction crash in
+# catches a predecessor whose turn reached its durable answer but whose
+# settlement never advanced ``consumed_seq`` (it died between the answer and
+# the watermark checkpoint, or in the turn-complete hook — e.g. the pre-fix
+# compaction crash in
 # knowledge-base/knowledge/issues/stateless_turn_settlement_crashes_after_midturn_compaction.md).
-# Without it, an operator unpark re-injects the already-answered human row
-# and the thread answers it twice. Returns the seq of the oldest pending
-# human row that is followed by a final assistant answer — content, no tool
-# calls (the loop ends a turn exactly there) — with no newer human input in
-# between; NULL when the oldest pending input is genuinely unanswered.
+# Without it, a successor or an operator unpark re-injects the already-answered
+# human row and the thread answers it twice.
+#
+# Only the OLDEST pending human row is examined, and only its own turn can
+# answer it. The stateless lane admits input while a turn runs: the queued row
+# takes the next turn number, and the running turn's answer lands after it, so
+# a later position in ``seq`` proves nothing
+# (knowledge-base/knowledge/issues/stateless_second_input_skipped_as_answered.md).
+# The input's turn number is its durable execution identity (fixed at
+# admission under the thread lock; the executor runs exactly that turn and the
+# loop stamps every row of it). The input is answered when either
+#   * its turn's authoritative final reconcile committed — that fenced
+#     transaction writes the turn's transcript and mints ``turn_execution_id``
+#     on this exact input row (the stateless ``turn.completed`` frame is
+#     published only after it), or
+#   * the loop's incremental writer already persisted a final answer of THIS
+#     turn: content, no tool calls (the loop ends a turn exactly there).
+# Returns that input's seq, or NULL when it is genuinely unanswered — the
+# watermark never advances past an input that did not run.
 _ANSWERED_BY_TRANSCRIPT_SQL = """
-SELECT input.seq
-  FROM thread_messages AS input
- WHERE input.thread_id = $1
-   AND input.role = 'human'
-   AND input.rewound_at IS NULL
-   AND input.seq > $2::bigint
-   AND input.seq <= $3::bigint
-   AND EXISTS (
-       SELECT 1
-         FROM thread_messages AS answer
-        WHERE answer.thread_id = input.thread_id
-          AND answer.role = 'ai'
-          AND answer.rewound_at IS NULL
-          AND answer.seq > input.seq
-          AND COALESCE(answer.content, '') <> ''
-          AND (
-              answer.tool_calls IS NULL
-              OR jsonb_typeof(answer.tool_calls) <> 'array'
-              OR jsonb_array_length(answer.tool_calls) = 0
-              -- A turn whose last assistant message carried a tool call
-              -- (answer text + write_file in one message) has no zero-tool
-              -- final row; its own turn.completed frame is the settled
-              -- boundary instead (stateless_turn_resilience.md step 3 → 4a).
-              OR EXISTS (
-                  SELECT 1
-                    FROM thread_events AS frame
-                   WHERE frame.thread_id = input.thread_id
-                     AND frame.kind = 'turn.completed'
-                     AND frame.payload ->> 'turn_id' = input.turn_number::text
-                     AND frame.created_at >= answer.created_at
+WITH oldest AS (
+    SELECT input.seq, input.turn_number, input.turn_execution_id
+      FROM thread_messages AS input
+     WHERE input.thread_id = $1
+       AND input.role = 'human'
+       AND input.rewound_at IS NULL
+       AND input.seq > $2::bigint
+       AND input.seq <= $3::bigint
+     ORDER BY input.seq ASC
+     LIMIT 1
+)
+SELECT oldest.seq
+  FROM oldest
+ WHERE oldest.turn_number IS NOT NULL
+   AND (
+       oldest.turn_execution_id IS NOT NULL
+       OR EXISTS (
+           SELECT 1
+             FROM thread_messages AS answer
+            WHERE answer.thread_id = $1
+              AND answer.role = 'ai'
+              AND answer.rewound_at IS NULL
+              AND answer.turn_number = oldest.turn_number
+              AND answer.seq > oldest.seq
+              AND COALESCE(answer.content, '') <> ''
+              AND (
+                  answer.tool_calls IS NULL
+                  OR jsonb_typeof(answer.tool_calls) <> 'array'
+                  OR jsonb_array_length(answer.tool_calls) = 0
               )
-          )
-          AND NOT EXISTS (
-              SELECT 1
-                FROM thread_messages AS later_input
-               WHERE later_input.thread_id = input.thread_id
-                 AND later_input.role = 'human'
-                 AND later_input.rewound_at IS NULL
-                 AND later_input.seq > input.seq
-                 AND later_input.seq < answer.seq
-          )
+       )
    )
- ORDER BY input.seq ASC
- LIMIT 1
 """
 
 # Shutdown classification (step 4a): a cancelled turn that crossed a tool
@@ -3493,12 +3496,12 @@ class StatelessTurnExecutor:
             self._mark_warm(claim)
             return
 
-        # (b) Skip-if-answered, transcript leg: the oldest pending input
-        # already has its final answer in thread_messages (a predecessor's
+        # (b) Skip-if-answered, transcript leg: the oldest pending input's
+        # own turn already reached its durable answer (a predecessor's
         # settlement died after the answer landed). Advance the watermark to
-        # that input instead of answering it again; complete_unit re-queues
-        # the unit when newer input is waiting behind it. A pending event
-        # delivery keeps the ordinary path (the claim must run it).
+        # exactly that input instead of answering it again; complete_unit
+        # re-queues the unit when newer input is waiting behind it. A pending
+        # event delivery keeps the ordinary path (the claim must run it).
         if (
             not watermarks_answered
             and claim.input_seq is not None
@@ -4588,7 +4591,7 @@ class StatelessTurnExecutor:
         return True
 
     async def _transcript_answered_seq(self, claim: ClaimedUnit) -> Optional[int]:
-        """Seq of the oldest pending input the transcript already answers, or None.
+        """Seq of the oldest pending input if its own turn already answered it.
 
         Read-only and fail-open to None: a query failure means "not proven
         answered", and the ordinary claim path decides. See
