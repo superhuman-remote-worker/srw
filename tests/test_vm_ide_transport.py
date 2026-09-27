@@ -417,3 +417,92 @@ async def test_direct_channel_websocket_upgrades_and_relays_frames():
             assert await asyncio.wait_for(channel.recv(), timeout=5) == "hello"
             await channel.send(b"\x00\x01")
             assert await asyncio.wait_for(channel.recv(), timeout=5) == b"\x00\x01"
+
+
+@pytest.mark.asyncio
+async def test_websocket_recv_keeps_all_frames_from_one_protocol_read():
+    from websockets.client import ClientProtocol
+    from websockets.frames import Frame, OP_BINARY, OP_CONT, OP_TEXT
+    from websockets.protocol import State
+    from websockets.uri import parse_uri
+
+    from orchestrator.services.vm_ide_transport import VMIDEWebSocket
+
+    protocol = ClientProtocol(parse_uri("ws://127.0.0.1:8080/vscode"), state=State.OPEN)
+    protocol.receive_data(
+        Frame(OP_TEXT, b"fir", fin=False).serialize(mask=False)
+        + Frame(OP_CONT, b"st").serialize(mask=False)
+        + Frame(OP_BINARY, b"\x00\x01").serialize(mask=False)
+    )
+    reader = SimpleNamespace(read=AsyncMock(side_effect=AssertionError("lost frame")))
+    channel = VMIDEWebSocket(reader, _Writer(), protocol)
+    assert await channel.recv() == "first"
+    assert await channel.recv() == b"\x00\x01"
+    reader.read.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_websocket_handshake_keeps_immediate_coalesced_server_frames():
+    from websockets.frames import Frame, OP_PING, OP_PONG, OP_TEXT
+    from websockets.server import ServerProtocol
+
+    from orchestrator.services.ide_proxy import IdeProxyTarget
+    from orchestrator.services.vm_ide_transport import VMIDETransport
+
+    class HandshakeReader:
+        def __init__(self, writer):
+            self.writer = writer
+            self.reads = 0
+            self.handshake_length = 0
+
+        async def read(self, amount):
+            self.reads += 1
+            if self.reads != 1:
+                raise AssertionError("server frames were lost during handshake")
+            self.handshake_length = len(self.writer.data)
+            server = ServerProtocol()
+            server.receive_data(self.writer.data)
+            (request,) = server.events_received()
+            server.send_response(server.accept(request))
+            return (
+                b"".join(server.data_to_send())
+                + Frame(OP_PING, b"probe").serialize(mask=False)
+                + Frame(OP_TEXT, b"welcome").serialize(mask=False)
+                + Frame(OP_TEXT, b"ready").serialize(mask=False)
+            )
+
+    proof = _proof()
+    target = IdeProxyTarget(
+        entity_id="job-1",
+        owner_kind="job",
+        backend="vm",
+        scope="vm",
+        host=proof.host,
+        port=proof.port,
+        identity=(
+            proof.workspace_generation,
+            proof.vm_uid,
+            proof.vmi_uid,
+            proof.launcher_pod_uid,
+            proof.rootdisk_pvc_uid,
+            proof.ssh_host_key_fingerprint,
+        ),
+    )
+    writer = _Writer()
+    reader = HandshakeReader(writer)
+    connection = SimpleNamespace(
+        open_connection=AsyncMock(return_value=(reader, writer))
+    )
+    provisioner = SimpleNamespace(
+        attest_workspace_runtime=AsyncMock(return_value=proof)
+    )
+    transport = VMIDETransport(
+        provisioner, pool=_Pool(connection), key_path="/private/key"
+    )
+    async with transport.open_websocket(target, path="/vscode") as channel:
+        pong = writer.data[reader.handshake_length :]
+        assert len(pong) >= 2 and pong[0] & 0x0F == OP_PONG
+        assert pong[1] & 0x80  # Client frames are masked.
+        assert await channel.recv() == "welcome"
+        assert await channel.recv() == "ready"
+    assert reader.reads == 1

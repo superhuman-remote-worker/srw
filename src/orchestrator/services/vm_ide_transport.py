@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+from collections import deque
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any
@@ -65,10 +66,17 @@ class VMIDEHTTPResponse:
 class VMIDEWebSocket:
     """Small SansIO WebSocket adapter over one authenticated SSH channel."""
 
-    def __init__(self, reader: Any, writer: Any, protocol: ClientProtocol) -> None:
+    def __init__(
+        self,
+        reader: Any,
+        writer: Any,
+        protocol: ClientProtocol,
+        initial_events: list[Any] | None = None,
+    ) -> None:
         self.reader = reader
         self.writer = writer
         self.protocol = protocol
+        self._events = deque(initial_events or ())
         self._fragment = bytearray()
         self._fragment_type: int | None = None
 
@@ -86,8 +94,10 @@ class VMIDEWebSocket:
 
     async def recv(self) -> str | bytes:
         while True:
-            events = self.protocol.events_received()
-            for event in events:
+            if not self._events:
+                self._events.extend(self.protocol.events_received())
+            while self._events:
+                event = self._events.popleft()
                 if not isinstance(event, Frame):
                     continue
                 if event.opcode in {OP_TEXT, OP_BINARY}:
@@ -390,15 +400,22 @@ class VMIDETransport:
                             if not data:
                                 raise VMIDEUnavailable("ide_ws_handshake_failed")
                             protocol.receive_data(data)
+                    handshake_events = protocol.events_received()
                     if not any(
                         isinstance(event, WSResponse) and event.status_code == 101
-                        for event in protocol.events_received()
+                        for event in handshake_events
                     ) or not self._target_matches(
                         await self._attest(target.entity_id, target.owner_kind),
                         target,
                     ):
                         raise VMIDEUnavailable("ide_ws_handshake_failed")
-                    channel = VMIDEWebSocket(reader, writer, protocol)
+                    channel = VMIDEWebSocket(
+                        reader,
+                        writer,
+                        protocol,
+                        initial_events=handshake_events,
+                    )
+                    await channel._flush()
                     try:
                         yield channel
                     finally:
