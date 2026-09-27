@@ -985,6 +985,33 @@ async def agent_get_thread_workspace_locked(
     if (
         thread.get("execution_lane") == "pinned"
         and thread.get("status") == "created"
+        and dependencies.vm_provisioner is not None
+        and vm.get("status") != "ready"
+    ):
+        from orchestrator.services.vm_thread_retained_resume import (
+            ensure_retained_thread_vm,
+        )
+
+        retained = await ensure_retained_thread_vm(
+            thread,
+            store=postgres_db,
+            provisioner=dependencies.vm_provisioner,
+        )
+        if retained is not None:
+            current = await postgres_db.get_thread(thread_id)
+            if not _thread_accepts_runtime(current):
+                raise HTTPException(409, "Retained VM runtime changed during admission")
+            await _require_pinned_workspace_credential_owner(
+                current,
+                presented_agent_id,
+                presented_runtime_generation,
+                presented_attach_token,
+            )
+            return initial_vm_wait_payload(current)
+
+    if (
+        thread.get("execution_lane") == "pinned"
+        and thread.get("status") == "created"
         and workspace_backend == "vm"
         and dependencies.vm_provisioner is not None
         and vm.get("status") != "ready"

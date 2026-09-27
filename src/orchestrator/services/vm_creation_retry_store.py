@@ -151,6 +151,11 @@ class VMCreationRetryStore:
             )
         ):
             raise VMCreationRetryConflict("thread_agent_changed")
+        if source.get("thread_retained_resume_id") is not None and not await conn.fetchval(
+            "SELECT public.valid_vm_thread_retained_resume_source(s) FROM vm_creation_retries s WHERE request_id=$1",
+            source["request_id"],
+        ):
+            raise VMCreationRetryConflict("thread_retained_resume_changed")
         if source["thread_wake_operation_id"] is not None:
             operation = await conn.fetchrow(
                 "SELECT * FROM vm_idle_operations WHERE id=$1 FOR SHARE",
@@ -2008,7 +2013,19 @@ class VMCreationRetryStore:
             raise VMCreationRetryConflict("creation_adoption_unproven")
         async with self.db.acquire() as conn:
             async with conn.transaction():
-                row, job = await self._effect_scope(conn, request_id)
+                retained = await conn.fetchval(
+                    "SELECT (to_jsonb(r)->>'thread_retained_resume_id') IS NOT NULL FROM vm_creation_retries r WHERE request_id=$1",
+                    UUID(request_id),
+                )
+                row, job = await self._effect_scope(conn, request_id, allow_terminal=bool(retained))
+                terminal_handoff = bool(retained and job["runtime_retirement_token"] is not None)
+                if retained and not terminal_handoff:
+                    job = await self._thread_scope(conn, row)
+                if terminal_handoff and not await conn.fetchval(
+                    "SELECT public.valid_thread_vm_creation_retirement_source(r,$2) FROM vm_creation_retries r WHERE request_id=$1",
+                    row["request_id"], row["state"] != "settled",
+                ):
+                    raise VMCreationRetryConflict("thread_retirement_source_changed")
                 permit = await self._check_carrier(
                     conn, row, carrier, values, allow_completed=True
                 )
@@ -2062,6 +2079,10 @@ class VMCreationRetryStore:
                     or str(row["observed_pvc_uid"]) != vm["pvc_uid"]
                 ):
                     raise VMCreationRetryConflict("creation_adoption_changed")
+                if terminal_handoff:
+                    from orchestrator.services.vm_thread_retained_resume import handoff_on_conn
+
+                    return await handoff_on_conn(self, conn, row, job, permit)
                 result = {"settled": True, "disposition": "adopted"}
                 context = _json(job["context"]) or {}
                 current = dict(context.get("vm") or {})

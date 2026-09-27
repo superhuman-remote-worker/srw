@@ -63,7 +63,7 @@ async def predecessor_snapshot(db, case):
         "vm_resource_thread_cleanup_stops",
     ):
         result[table] = await db.fetch(
-            f"SELECT to_jsonb(r)::text AS row FROM {table} r ORDER BY to_jsonb(r)::text"
+            f"SELECT (to_jsonb(r)-'thread_retained_resume_id')::text AS row FROM {table} r ORDER BY to_jsonb(r)::text"
         )
     result["cleanup"] = await db.fetch(
         "SELECT to_jsonb(r)::text AS row FROM vm_workspace_cleanup_admissions r "
@@ -816,7 +816,7 @@ async def test_raw_delete_requires_current_permanent_evidence_and_owner_wide_exc
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("head", ["0294", "0295"])
+@pytest.mark.parametrize("head", ["0294", "0295", "0296"])
 @pytest.mark.parametrize("ready", [True, False])
 async def test_forward_upgrade_preserves_populated_soft_end_tables(
     pg_dsn, monkeypatch, tmp_path, head, ready
@@ -871,7 +871,8 @@ async def test_forward_upgrade_preserves_populated_soft_end_tables(
         assert await predecessor_snapshot(store, case) == original
         assert (
             await pool.fetch(
-                "SELECT filename,checksum FROM schema_migrations WHERE filename NOT LIKE '0296%' ORDER BY filename"
+                "SELECT filename,checksum FROM schema_migrations WHERE filename=ANY($1::text[]) ORDER BY filename",
+                [row["filename"] for row in historical_checksums],
             )
             == historical_checksums
         )

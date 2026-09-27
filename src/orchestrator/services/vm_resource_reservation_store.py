@@ -774,15 +774,17 @@ class VMResourceReservationStore:
                 # when the frozen configuration permits golden/prepared disks.
                 if waiter["state"] not in {"waiting", "nonfit", "parked"} or not (
                     await conn.fetchval(
-                        "SELECT r.state='cancel_requested' AND r.origin='initial' "
-                        "AND r.expected_pvc_uid IS NULL AND r.observed_pvc_uid IS NULL "
+                        "SELECT r.state='cancel_requested' AND ("
+                        "(r.origin='initial' AND r.expected_pvc_uid IS NULL "
+                        "AND public.thread_vm_creation_cleanup_lineage(t,r,true) IS NOT NULL) "
+                        "OR public.valid_vm_thread_retained_resume_source(r)) "
+                        "AND r.observed_pvc_uid IS NULL "
                         "AND r.observed_vm_uid IS NULL AND r.thread_wake_operation_id IS NULL "
                         "AND r.creation_admission_id IS NULL AND r.creation_carrier_uid IS NULL "
                         "AND r.cancellation_disposition IS NULL "
                         "AND COALESCE(r.canonical_request->'workspace_storage','null'::jsonb)='null'::jsonb "
                         "AND NOT EXISTS(SELECT 1 FROM vm_creation_effects e WHERE e.request_id=r.request_id) "
                         "AND public.valid_thread_vm_creation_retirement_source(r,true) "
-                        "AND public.thread_vm_creation_cleanup_lineage(t,r,true) IS NOT NULL "
                         "FROM vm_creation_retries r JOIN threads t ON t.id=r.thread_id "
                         "WHERE r.request_id=$1", retry["request_id"],
                     )

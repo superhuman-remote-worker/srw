@@ -70,7 +70,7 @@ class PinnedRetirementOperations:
         purge_disk: bool,
         retirement: Mapping[str, Any],
     ) -> Any | None:
-        if purge_disk and retirement.get("context", {}).get("entry_status") == "ended":
+        if purge_disk:
             from orchestrator.services.vm_thread_retained_disk_purge import (
                 acquire_retained_disk_purge,
             )
@@ -1679,8 +1679,30 @@ class PinnedRetirementOperations:
             require_initial_agent_zero=require_initial_agent_zero,
         )
         thread_id = str(context.get("thread_id") or "")
+        if source.get("retained_resume_id") is not None:
+            from orchestrator.services.vm_thread_retained_resume import handoff_identity
+
+            captured = await handoff_identity(self.dependencies.store, retirement)
+            if captured is not None:
+                cleanup = await self._admit_vm_cleanup(
+                    thread_id, captured, purge_disk=bool(retirement.get("permanent")),
+                    retirement=retirement,
+                )
+                if cleanup is None:
+                    return False
+                disposition = completed_cleanup_outcome(cleanup)
+                if disposition is None:
+                    stopped = await self.dependencies.vm_provisioner.release_vm_captured(
+                        thread_id, captured, entity_type="thread",
+                        purge_disk=bool(retirement.get("permanent")), capture_snapshot=False,
+                        **vm_cleanup_kwargs(cleanup),
+                    )
+                    disposition = stopped.disposition
+                await self._complete_vm_cleanup(cleanup, disposition)
+                if disposition != "completed":
+                    return False
         if await self.dependencies.store.pinned_vm_creation_source_settled(thread_id, **identity):
-            return True
+            return await self._purge_cancelled_resume_disk(retirement)
         from orchestrator.services.vm_creation_retry_store import VMCreationRetryStore
 
         # Issued/unknown effects and source pins remain pending for the exact
@@ -1689,9 +1711,39 @@ class PinnedRetirementOperations:
         result = await VMCreationRetryStore(self.dependencies.store).settle_never_issued(
             request_id=str(source["request_id"]),
         )
-        return result.get("settled") is True and await self.dependencies.store.pinned_vm_creation_source_settled(
-            thread_id, **identity,
+        return (
+            result.get("settled") is True
+            and await self.dependencies.store.pinned_vm_creation_source_settled(thread_id, **identity)
+            and await self._purge_cancelled_resume_disk(retirement)
         )
+
+    async def _purge_cancelled_resume_disk(self, retirement):
+        source = retirement["context"].get("vm_creation_source") or {}
+        if not retirement.get("permanent") or not source.get("retained_resume_id"):
+            return True
+        from orchestrator.services.vm_thread_retained_resume import (
+            clear_terminal_vm_projection, terminal_disk_identity,
+        )
+
+        captured = await terminal_disk_identity(self.dependencies.store, retirement)
+        # An observed VM follows its own existing 0295 stop/purge above.
+        if captured is None:
+            return await clear_terminal_vm_projection(self.dependencies.store, retirement)
+        thread_id = retirement["context"]["thread_id"]
+        permit = await self._admit_vm_cleanup(
+            thread_id, captured, purge_disk=True, retirement=retirement,
+        )
+        if permit is None:
+            return False
+        disposition = completed_cleanup_outcome(permit)
+        if disposition is None:
+            result = await self.dependencies.vm_provisioner.release_vm_captured(
+                thread_id, captured, entity_type="thread", purge_disk=True,
+                capture_snapshot=False, **vm_cleanup_kwargs(permit),
+            )
+            disposition = result.disposition
+        await self._complete_vm_cleanup(permit, disposition)
+        return disposition == "completed" and await clear_terminal_vm_projection(self.dependencies.store, retirement)
 
     async def _recover_captured_sandbox_process_zero(
         self,

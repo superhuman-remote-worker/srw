@@ -812,7 +812,10 @@ async def _wait_for_owner_waiters(db, count):
     for _ in range(300):
         waiting = await db.fetchval(
             "SELECT count(*) FROM pg_stat_activity WHERE datname=current_database() "
-            "AND pid<>pg_backend_pid() AND wait_event_type='Lock' AND query ILIKE '%threads%'"
+            # Owner/PVC admission now queues some contenders on the shared
+            # advisory prefix before the same owner row. This database has only
+            # the two test producers; count both parts of that lock chain.
+            "AND pid<>pg_backend_pid() AND wait_event_type='Lock'"
         )
         if waiting >= count:
             return

@@ -3293,6 +3293,7 @@ class VMProvisioner:
         expected_attach_token: str | None = None,
         expected_vm_context: Mapping[str, Any] | None = None,
         wake_operation_id: str | None = None,
+        retained_resume_id: str | None = None,
         poll: bool = False,
         initial_creation: Mapping[str, Any] | None = None,
     ) -> bool | dict[str, Any]:
@@ -3304,7 +3305,7 @@ class VMProvisioner:
         Returns:
             True if the request was accepted, False otherwise.
         """
-        if wake_operation_id is not None and (
+        if (wake_operation_id is not None or retained_resume_id is not None) and (
             poll or preparation is not None or initialization is not None
         ):
             return False
@@ -3345,6 +3346,20 @@ class VMProvisioner:
         # request.  A stale route read, End, Resume, rebind, or DB failure is a
         # hard refusal with zero external calls.
         fresh_context = self._fresh_provision_ctx()
+        retained = None
+        if retained_resume_id is not None:
+            if self._db is None or wake_operation_id is not None:
+                return False
+            from orchestrator.services.vm_thread_retained_resume import operation_on_conn
+
+            async with self._db.acquire() as conn:
+                retained = await operation_on_conn(conn, retained_resume_id, thread_id)
+            if retained is None:
+                return False
+            fresh_context["provision_generation"] = str(retained["provision_generation"])
+            fresh_context["retained_resume_id"] = str(retained["id"])
+            fresh_context["rootdisk"] = None
+
         if wake_operation_id is not None:
             try:
                 wake_id = UUID(str(wake_operation_id))
@@ -3415,6 +3430,8 @@ class VMProvisioner:
             "VM_NETWORK_PROFILE_ENABLED", "false"
         ).lower() == "true":
             return False
+        if retained is not None and not resource_enforced:
+            return False
         creation_source = None
         if resource_enforced:
             # A claimed immutable source is the only route to a v3 effect. A
@@ -3462,7 +3479,15 @@ class VMProvisioner:
             try:
                 from shared.vm_network_profile import selected_profile
 
-                if wake_operation_id is not None:
+                if retained is not None:
+                    prior_request = retained["request"]
+                    if vm_image not in (None, prior_request.get("vm_image")) or (
+                        network_profile is not None and network_profile != prior_request.get("network_profile")
+                    ):
+                        return False
+                    vm_image = prior_request.get("vm_image")
+                    network_profile = prior_request.get("network_profile")
+                elif wake_operation_id is not None:
                     from orchestrator.services.vm_thread_network import (
                         document, profile_enabled,
                     )
@@ -3525,7 +3550,8 @@ class VMProvisioner:
                 frozen_request = resolved["request"]
                 frozen_config = resolved["controller_configuration"]
                 creation_source = {
-                    "request_id": fresh_context.get("idle_wake_request_id")
+                    "request_id": (str(retained["request_id"]) if retained is not None else None)
+                    or fresh_context.get("idle_wake_request_id")
                     or str(uuid4()),
                     "request": frozen_request,
                     "request_digest": canonical_request_digest(frozen_request),
@@ -3544,6 +3570,7 @@ class VMProvisioner:
                 expected_vm_context=expected_vm_context,
                 provision_context=fresh_context,
                 wake_operation_id=wake_operation_id,
+                **({"retained_resume_id": retained_resume_id} if retained_resume_id is not None else {}),
                 **({"creation_source": creation_source} if creation_source else {}),
                 **({"poll": True} if poll else {}),
                 **({"initial_creation": initial_creation} if initial_creation else {}),

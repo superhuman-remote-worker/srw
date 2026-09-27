@@ -145,6 +145,19 @@ async def ensure_session_workspace(
     # (reconnect) alone. Double-fire converges: restore sets vm.status=
     # 'restoring' immediately, which this condition excludes.
     vm_ctx = _thread_metadata(thread).get("vm") or {}
+    if pinned_authority is not None and vm_ctx.get("status") != "ready":
+        from orchestrator.services.vm_thread_retained_resume import (
+            ensure_retained_thread_vm,
+        )
+
+        retained = await ensure_retained_thread_vm(
+            thread,
+            store=db,
+            provisioner=getattr(suspension, "_vm_provisioner", None),
+        )
+        if retained is not None:
+            return EnsureResult(EnsureOutcome.PENDING, status="restoring")
+
     if vm_ctx.get("rootdisk") == "kept" and vm_ctx.get("status") in (
         "suspended",
         "deleted",

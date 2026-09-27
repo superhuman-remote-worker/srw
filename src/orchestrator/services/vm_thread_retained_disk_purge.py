@@ -56,6 +56,18 @@ async def acquire_retained_disk_purge(store, *, thread_id, identity, generation,
         )
         if thread is None:
             return CleanupPermit(allowed=False, reason="retained_disk_owner_missing")
+        early = thread["status"] != "ended"
+        operation = None
+        if early:
+            operation = await conn.fetchrow(
+                "SELECT op.* FROM vm_thread_retained_resumes op JOIN threads t ON t.id=op.thread_id "
+                "WHERE op.thread_id=$1 AND t.runtime_generation=$2 "
+                "AND public.valid_vm_thread_retained_early_end(t,op)",
+                owner,
+                generation,
+            )
+            if operation is None:
+                return None
         vm = _json(thread["metadata"]).get("vm") or {}
         source = await conn.fetchrow(
             "SELECT * FROM vm_creation_retries WHERE request_id::text=$1 "
@@ -81,9 +93,14 @@ async def acquire_retained_disk_purge(store, *, thread_id, identity, generation,
             )
         a = await conn.fetchrow(
             "SELECT * FROM vm_resource_thread_cleanup_authorities "
-            "WHERE request_id=$1 AND runtime_generation=$2 AND NOT purge_disk",
+            "WHERE request_id=$1 AND NOT purge_disk AND (runtime_generation=$2 OR cleanup_admission_id=$4 OR cleanup_admission_id IN ("
+            "SELECT terminal.compute_cleanup_admission_id FROM vm_thread_retained_resume_terminals terminal "
+            "JOIN vm_thread_retained_resumes op ON op.id=terminal.operation_id "
+            "WHERE op.thread_id=$3 AND terminal.runtime_generation=$2))",
             source["request_id"],
             generation,
+            owner,
+            operation["compute_cleanup_admission_id"] if operation else None,
         )
         if a is None or any(
             str(a[key]) != str(value)

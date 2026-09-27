@@ -436,7 +436,17 @@ async def test_old_end_with_incomplete_or_replaced_lineage_stays_held(
 ):
     case, physical = await old_settled_end(db, monkeypatch, ready=False)
     if fault == "resumed":
-        assert await db.resume_thread(str(case["thread_id"]))
+        with pytest.raises(RuntimeError, match="predecessor is unproven"):
+            await db.resume_thread(str(case["thread_id"]))
+        # An older process could already have reopened this unreconciled row.
+        # Current admission refuses it; the reconciler must also leave that
+        # historical successor untouched.
+        async with db.acquire() as conn, conn.transaction():
+            await conn.execute("SET LOCAL session_replication_role='replica'")
+            await conn.execute(
+                "UPDATE threads SET status='created',runtime_generation=gen_random_uuid() WHERE id=$1",
+                case["thread_id"],
+            )
     else:
         async with db.acquire() as conn, conn.transaction():
             await conn.execute("SET LOCAL session_replication_role='replica'")

@@ -22802,6 +22802,7 @@ class PostgresDB:
         expected_vm_context: Mapping[str, Any] | None,
         provision_context: Mapping[str, Any],
         wake_operation_id: str | None = None,
+        retained_resume_id: str | None = None,
         poll: bool = False,
         preparation_only: bool = False,
         expected_preparation_context: Mapping[str, Any] | None = None,
@@ -22834,6 +22835,7 @@ class PostgresDB:
                 UUID(str(wake_operation_id))
                 if wake_operation_id is not None else None
             )
+            parsed_resume = UUID(str(retained_resume_id)) if retained_resume_id is not None else None
             parsed_agent = (
                 UUID(str(expected_agent_id)) if expected_agent_id is not None else None
             )
@@ -22929,6 +22931,11 @@ class PostgresDB:
 
         async with self.acquire() as conn:
             async with conn.transaction():
+                from orchestrator.services.vm_thread_retained_resume import (
+                    lock_owner_on_conn, operation_on_conn,
+                )
+
+                await lock_owner_on_conn(conn, parsed_thread)
                 row = await conn.fetchrow(
                     "SELECT status,execution_lane,runtime_generation,"
                     "runtime_retirement_token,agent_id,runtime_attach_token,metadata,"
@@ -22954,6 +22961,23 @@ class PostgresDB:
                 )
                 if current_vm != expected_vm:
                     return False
+                retained = None
+                if parsed_resume is not None:
+                    retained = await operation_on_conn(conn, parsed_resume, parsed_thread)
+                    if (
+                        retained is None or parsed_agent is None or parsed_attach is None
+                        or retained["runtime_generation"] != parsed_runtime_generation
+                        or retained["request_id"] != parsed_request_id
+                        or str(retained["provision_generation"]) != provision_generation
+                        or parsed_wake is not None or poll or preparation_only
+                        or creation_source is None
+                        or request.get("vm_image") != retained["request"].get("vm_image")
+                        or request.get("network_profile") != retained["request"].get("network_profile")
+                        or request.get("preparation") is not None
+                        or request.get("initialization") is not None
+                        or (current_vm or {}).get("rootdisk_pvc_uid") != str(retained["pvc_uid"])
+                    ):
+                        return False
                 if initial_creation is not None:
                     # A workspace poll may start only a genuinely fresh VM
                     # after protected actor binding. Never reopen historical
@@ -23076,7 +23100,7 @@ class PostgresDB:
                     )
                 ):
                     return False
-                elif creation_source is not None:
+                elif creation_source is not None and retained is None:
                     from shared.vm_network_profile import selected_profile
 
                     if (
@@ -23233,17 +23257,20 @@ class PostgresDB:
                         "INSERT INTO vm_creation_retries "
                         "(request_id,owner_kind,thread_id,thread_runtime_generation,"
                         "thread_agent_id,thread_attach_token,thread_wake_operation_id,"
-                        "provision_generation,origin,request_digest,canonical_request,"
+                        + ("thread_retained_resume_id," if retained is not None else "")
+                        + "provision_generation,origin,request_digest,canonical_request,"
                         "controller_configuration_digest,controller_configuration,"
-                        "expected_pvc_uid) VALUES($1,'thread',$2,$3,$4,$5,$6,$7,'initial',"
-                        "$8,$9::jsonb,$10,$11::jsonb,$12) RETURNING *",
+                        "expected_pvc_uid) VALUES($1,'thread',$2,$3,$4,$5,$6,"
+                        + ("$13,$7,$14," if retained is not None else "$7,'initial',")
+                        + "$8,$9::jsonb,$10,$11::jsonb,$12) RETURNING *",
                         parsed_request_id, parsed_thread, parsed_runtime_generation,
                         parsed_agent, parsed_attach, parsed_wake,
                         UUID(provision_generation), creation_source["request_digest"],
                         json.dumps(request),
                         creation_source["controller_configuration_digest"],
                         json.dumps(configuration),
-                        open_idle["pvc_uid"] if open_idle is not None else None,
+                        retained["pvc_uid"] if retained is not None else (open_idle["pvc_uid"] if open_idle is not None else None),
+                        *((parsed_resume, "resume") if retained is not None else ()),
                     )
                     resource = await installed_job_resource_store(
                         conn, self, configuration,
@@ -39153,6 +39180,10 @@ class PostgresDB:
             self.acquire() if _connection is None else nullcontext(_connection)
         ) as conn:
             async with conn.transaction():
+                if _connection is None:
+                    from orchestrator.services.vm_thread_retained_resume import lock_owner_on_conn
+
+                    await lock_owner_on_conn(conn, parsed_thread_id)
                 row = await conn.fetchrow(
                     """
                     SELECT *
@@ -39975,7 +40006,7 @@ class PostgresDB:
                                 creation["owner_kind"] == "thread"
                                 and creation["thread_id"] == parsed_thread_id
                                 and creation["job_id"] is None
-                                and cleanup_protocol in {"exact", "initial_attach_abort_v1"}
+                                and cleanup_protocol in {"exact", "initial_attach_abort_v1", "retained_attach_abort_v1"}
                                 and str(creation["provision_generation"])
                                 == str(vm_context["provision_generation"])
                                 and creation["state"] in {
@@ -39993,7 +40024,14 @@ class PostgresDB:
                                 and configuration.get("version") == 3
                                 and canonical_configuration_digest(configuration)
                                 == creation["controller_configuration_digest"]
-                                and creation["observed_vm_uid"] is None
+                                and (
+                                    creation["observed_vm_uid"] is None
+                                    or creation.get("thread_retained_resume_id") is not None
+                                    and await conn.fetchval(
+                                        "SELECT public.valid_vm_thread_retained_resume_source(r) FROM vm_creation_retries r WHERE request_id=$1",
+                                        creation["request_id"],
+                                    )
+                                )
                             ):
                                 raise RuntimeError("thread VM creation source changed")
                             if vm_context.get("rootdisk_pvc_uid") is not None:
@@ -40013,6 +40051,8 @@ class PostgresDB:
                                 "thread_attach_token": str(creation["thread_attach_token"])
                                 if creation["thread_attach_token"] is not None else None,
                                 "captured_vm": vm_context,
+                                **({"retained_resume_id": str(creation["thread_retained_resume_id"])}
+                                   if creation.get("thread_retained_resume_id") is not None else {}),
                             }
                         else:
                             _canonical_uuid_text(vm_context.get("vm_uid"), label="VM UID")
@@ -43632,9 +43672,14 @@ class PostgresDB:
                 )
 
                 await lock_manifest_execution_catalog(conn)
+                from orchestrator.services.vm_thread_retained_resume import (
+                    lock_owner_on_conn, predecessor_on_conn, record_resume_on_conn,
+                )
+
+                await lock_owner_on_conn(conn, thread_id)
                 thread = await conn.fetchrow(
                     "SELECT id, status::text AS status, user_id, execution_lane, metadata, "
-                    "runtime_generation, runtime_retirement_token "
+                    "runtime_generation, runtime_retirement_token, ended_at "
                     "FROM threads WHERE id = $1::uuid FOR UPDATE",
                     thread_id,
                 )
@@ -43652,6 +43697,9 @@ class PostgresDB:
                     thread_id,
                 ):
                     return False
+                predecessor = (
+                    await predecessor_on_conn(conn, thread) if not stateless else None
+                )
                 resume_creation_mode: str | None = None
                 if stateless:
                     from shared.session_retirement import (
@@ -43862,10 +43910,12 @@ class PostgresDB:
                         WHERE id = $1::uuid AND status = 'ended'
                           AND user_id IS NOT NULL
                           AND runtime_retirement_token IS NULL
-                        RETURNING id
+                        RETURNING runtime_generation
                         """,
                         thread_id,
                     )
+                if row is not None and predecessor is not None:
+                    await record_resume_on_conn(conn, thread, predecessor, row)
                 if row is None and stateless:
                     raise RuntimeError(
                         "stateless resume lost lifecycle authority after queue revive"
