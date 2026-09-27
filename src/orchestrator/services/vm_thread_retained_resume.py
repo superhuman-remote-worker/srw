@@ -134,6 +134,8 @@ async def inherited_request_on_conn(conn, cleanup, vm):
     profile = request.get("network_profile")
     if profile is None:
         return request if vm.get("network_profile_evidence") is None else None
+    if not isinstance(vm.get("interface_mac"), str) or not vm["interface_mac"]:
+        return None
     if not reusable_profile_evidence(
         vm.get("network_profile_evidence"),
         profile,

@@ -399,7 +399,13 @@ async def test_native_queued_resume_end_proves_current_actor_and_can_resume_agai
 
 
 async def resumed_effects(
-    db, monkeypatch, *, stop_after="vm", adopt=False, observe_last=True
+    db,
+    monkeypatch,
+    *,
+    stop_after="vm",
+    adopt=False,
+    observe_last=True,
+    stop_before_effect=False,
 ):
     """Native source/grant/effect ledger; only signed Kubernetes observations modeled."""
     from orchestrator.services.vm_creation_retry_store import VMCreationRetryStore
@@ -549,13 +555,25 @@ async def resumed_effects(
             resource_version="3",
             secret=SECRET,
         )
-        assert (
-            await retry.begin_effect(
-                request_id=str(request_id),
-                claim_token=str(claim["claim_token"]),
-                carrier=carrier,
+        case["effect_args"] = {
+            "request_id": str(request_id),
+            "claim_token": str(claim["claim_token"]),
+            "carrier": carrier,
+        }
+        if stop_before_effect:
+            return (
+                case,
+                physical,
+                current,
+                source,
+                retry,
+                admitted,
+                observations,
+                carrier,
             )
-        )["actuation_allowed"] is True
+        granted = await retry.begin_effect(**case["effect_args"])
+        assert granted["actuation_allowed"] is True
+        case["effect_grant"] = granted
         object_metadata = {
             "uid": str(uuid4()),
             "name": values["object_name"],
@@ -677,8 +695,10 @@ async def resumed_effects(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("abort", [False, True, "detached"])
+@pytest.mark.parametrize("permanent", [False, True])
 async def test_observed_resume_vm_ended_before_adoption_hands_off_exact_new_charge(
-    db, monkeypatch
+    db, monkeypatch, abort, permanent
 ):
     (
         case,
@@ -690,8 +710,24 @@ async def test_observed_resume_vm_ended_before_adoption_hands_off_exact_new_char
         observations,
         carrier,
     ) = await resumed_effects(db, monkeypatch)
+    if abort:
+        from tests.test_pinned_vm_failed_initial_end_real_postgres import (
+            _abort_and_rebind_same_pod,
+        )
+
+        current = await _abort_and_rebind_same_pod(
+            db, current, rebind=abort != "detached"
+        )
+    original_source_identity = tuple(
+        source[key]
+        for key in (
+            "thread_runtime_generation",
+            "thread_agent_id",
+            "thread_attach_token",
+        )
+    )
     retirement = await db.begin_pinned_thread_retirement(
-        str(case["thread_id"]), permanent=False
+        str(case["thread_id"]), permanent=permanent
     )
     assert retirement["state"] == "pending", retirement
     assert retirement["context"]["vm"] is None
@@ -713,6 +749,17 @@ async def test_observed_resume_vm_ended_before_adoption_hands_off_exact_new_char
     )
     assert new["state"] == "settled" and new["ready_at"] is None
     assert (
+        tuple(
+            new[key]
+            for key in (
+                "thread_runtime_generation",
+                "thread_agent_id",
+                "thread_attach_token",
+            )
+        )
+        == original_source_identity
+    )
+    assert (
         await db.fetchval(
             "SELECT runtime_retirement_context FROM threads WHERE id=$1",
             case["thread_id"],
@@ -724,6 +771,9 @@ async def test_observed_resume_vm_ended_before_adoption_hands_off_exact_new_char
         source["request_id"],
     )
     assert authority is not None
+    assert authority["runtime_generation"] == current["runtime_generation"]
+    assert authority["agent_id"] == current["agent_id"]
+    assert authority["attach_token"] == current["runtime_attach_token"]
     assert authority["reservation_id"] == UUID(admitted["reservation_id"])
     assert str(authority["vm_uid"]) == observations["vm"]["object"]["metadata"]["uid"]
     assert authority["vm_uid"] != UUID(case["vm_uid"])
@@ -766,8 +816,8 @@ async def test_observed_resume_vm_ended_before_adoption_hands_off_exact_new_char
         return True
 
     cleanup.dependencies.session_router = SimpleNamespace(teardown_route=route_zero)
-    await cleanup.cleanup_pinned_thread_retirement(retirement, cleanup_agent_pod=False)
-    assert physical.stopped and physical.purged is False
+    assert await cleanup._settle_vm_creation_source(retirement)
+    assert physical.stopped and physical.purged is permanent
     assert (
         await db.fetchval(
             "SELECT state FROM vm_resource_reservations WHERE id=$1",
@@ -775,15 +825,69 @@ async def test_observed_resume_vm_ended_before_adoption_hands_off_exact_new_char
         )
         == "released"
     )
-    assert await db.acknowledge_pinned_thread_local_quiescence(
-        str(case["thread_id"]), **await _current_zero_arguments(db, current, retirement)
-    )
-    assert await db.settle_pinned_thread_retirement(
-        str(case["thread_id"]),
-        token=retirement["token"],
-        generation=retirement["generation"],
-    )
-    assert await db.resume_thread(str(case["thread_id"]))
+    if current["agent_id"] is not None:
+        assert await db.acknowledge_pinned_thread_local_quiescence(
+            str(case["thread_id"]),
+            **await _current_zero_arguments(db, current, retirement),
+        )
+    await cleanup.cleanup_pinned_thread_retirement(retirement, cleanup_agent_pod=False)
+    if permanent:
+        await db.delete_thread(
+            str(case["thread_id"]),
+            expected_runtime_generation=retirement["generation"],
+            expected_runtime_retirement_token=retirement["token"],
+        )
+        assert await db.get_thread(str(case["thread_id"])) is None
+    else:
+        assert await db.settle_pinned_thread_retirement(
+            str(case["thread_id"]),
+            token=retirement["token"],
+            generation=retirement["generation"],
+        )
+        import asyncpg
+
+        # Historical handoff must revalidate the captured source even when the
+        # source and cleanup generation happen to be equal. Roll back drift.
+        with pytest.raises(asyncpg.CheckViolationError, match="source unproven"):
+            async with db.acquire() as conn, conn.transaction():
+                await conn.execute("SET LOCAL session_replication_role='replica'")
+                await conn.execute(
+                    "UPDATE vm_resource_thread_cleanup_authorities SET retirement_context="
+                    "jsonb_set(retirement_context,'{vm_creation_source,thread_agent_id}',to_jsonb(gen_random_uuid()::text)) "
+                    "WHERE cleanup_admission_id=$1",
+                    authority["cleanup_admission_id"],
+                )
+                await conn.fetchval(
+                    "SELECT public.validate_vm_thread_retained_compute($1)",
+                    authority["cleanup_admission_id"],
+                )
+        assert await db.resume_thread(str(case["thread_id"]))
+        # The second ordinary Resume now uses the immutable observed-abort
+        # cleanup as history. Its early permanent End must purge that disk.
+        from tests.test_vm_thread_retained_disk_purge_real_postgres import RetainedDisk
+
+        disk = RetainedDisk(db, new_case)
+        disk.stopped = True
+        later_end = await db.begin_pinned_thread_retirement(
+            str(case["thread_id"]), permanent=True
+        )
+        assert later_end["state"] == "pending", later_end
+        assert await db.authorize_pinned_thread_retirement(
+            str(case["thread_id"]),
+            token=later_end["token"],
+            generation=later_end["generation"],
+            settle_status="ended",
+        )
+        await operations(db, disk).cleanup_pinned_thread_retirement(
+            later_end, cleanup_agent_pod=False
+        )
+        assert disk.purged
+        await db.delete_thread(
+            str(case["thread_id"]),
+            expected_runtime_generation=later_end["generation"],
+            expected_runtime_retirement_token=later_end["token"],
+        )
+        assert await db.get_thread(str(case["thread_id"])) is None
     await assert_predecessor_unchanged(db, case)
 
 
@@ -1263,3 +1367,696 @@ async def test_authenticated_resume_poll_commits_current_actor_and_no_credential
     assert source["expected_pvc_uid"] == UUID(case["pvc_uid"])
     assert await _poll(db, suspension._vm_provisioner, current) == payload
     await assert_predecessor_unchanged(db, case)
+
+
+async def race_on_owner(db, monkeypatch, thread_id, first, second):
+    """Force both serial orders using exact backend PIDs and real PostgreSQL blockers."""
+    import asyncio
+    from contextlib import asynccontextmanager
+    from contextvars import ContextVar
+
+    native_acquire = db.acquire
+    active = ContextVar("retained_resume_race_connection", default=None)
+
+    @asynccontextmanager
+    async def acquire():
+        if active.get() is not None:
+            yield active.get()
+        else:
+            async with native_acquire() as conn:
+                yield conn
+
+    monkeypatch.setattr(db, "acquire", acquire)
+    tasks = []
+    async with (
+        native_acquire() as first_conn,
+        native_acquire() as second_conn,
+        native_acquire() as barrier,
+        native_acquire() as monitor,
+    ):
+        first_pid = await first_conn.fetchval("SELECT pg_backend_pid()")
+        second_pid = await second_conn.fetchval("SELECT pg_backend_pid()")
+        barrier_pid = await barrier.fetchval("SELECT pg_backend_pid()")
+
+        async def run(conn, operation):
+            token = active.set(conn)
+            try:
+                return await operation()
+            finally:
+                active.reset(token)
+
+        async def blocked(pid, blockers):
+            async with asyncio.timeout(15):
+                while True:
+                    actual = set(
+                        await monitor.fetchval("SELECT pg_blocking_pids($1)", pid)
+                    )
+                    if actual & blockers:
+                        return
+                    for task in tasks:
+                        if task.done():
+                            task.result()
+                    await asyncio.sleep(0)
+
+        try:
+            async with barrier.transaction():
+                await barrier.fetchval(
+                    "SELECT id FROM threads WHERE id=$1 FOR UPDATE", thread_id
+                )
+                tasks.append(asyncio.create_task(run(first_conn, first)))
+                await blocked(first_pid, {barrier_pid})
+                tasks.append(asyncio.create_task(run(second_conn, second)))
+                await blocked(second_pid, {barrier_pid, first_pid})
+            return await asyncio.gather(*tasks)
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("first", ["resume", "purge"])
+async def test_0297_resume_and_permanent_purge_serialize_exact_owner(
+    db, monkeypatch, first
+):
+    from tests.test_vm_thread_retained_disk_purge_real_postgres import admit
+
+    case, physical = await settled(db, monkeypatch)
+    old = await db.get_thread(str(case["thread_id"]))
+
+    async def resume():
+        return await db.resume_thread(str(case["thread_id"]))
+
+    async def purge():
+        retirement = await db.begin_pinned_thread_retirement(
+            str(case["thread_id"]),
+            permanent=True,
+        )
+        if retirement["state"] != "pending":
+            return retirement
+        assert await db.authorize_pinned_thread_retirement(
+            str(case["thread_id"]),
+            token=retirement["token"],
+            generation=retirement["generation"],
+            settle_status="ended",
+        )
+        await admit(db, physical, retirement)
+        return retirement
+
+    actions = {"resume": resume, "purge": purge}
+    other = "purge" if first == "resume" else "resume"
+    results = dict(
+        zip(
+            (first, other),
+            await race_on_owner(
+                db, monkeypatch, case["thread_id"], actions[first], actions[other]
+            ),
+            strict=True,
+        )
+    )
+    assert results["resume"] is (first == "resume")
+    assert results["purge"]["state"] == "pending"
+    assert (results["purge"]["generation"] != str(old["runtime_generation"])) is (
+        first == "resume"
+    )
+    # Begin winning closes Resume. Resume winning makes the subsequent End own
+    # its new operation and qualify the no-source terminal proof before purge.
+    assert not await db.resume_thread(str(case["thread_id"]))
+    assert await db.fetchval("SELECT count(*) FROM vm_thread_retained_resumes") == (
+        first == "resume"
+    )
+    assert (
+        await db.fetchval(
+            "SELECT count(*) FROM vm_thread_retained_disk_purge_authorities"
+        )
+        == 1
+    )
+    assert await db.fetchval("SELECT count(*) FROM vm_creation_retries") == 1
+    assert await db.fetchval("SELECT count(*) FROM vm_creation_effects") == 3
+    assert not physical.purged
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("first", ["source", "end"])
+async def test_new_resume_source_and_end_serialize_exact_owner(db, monkeypatch, first):
+    case, _, current, suspension = await retained_resume(
+        db, monkeypatch, ready=True, marker=False, bind=True
+    )
+
+    async def source():
+        return await ensure_session_workspace(
+            str(case["thread_id"]),
+            db=db,
+            provisioner=None,
+            suspension=suspension,
+            expected_runtime_generation=str(current["runtime_generation"]),
+        )
+
+    async def end():
+        return await db.begin_pinned_thread_retirement(
+            str(case["thread_id"]), permanent=False
+        )
+
+    actions = {"source": source, "end": end}
+    other = "end" if first == "source" else "source"
+    results = dict(
+        zip(
+            (first, other),
+            await race_on_owner(
+                db, monkeypatch, case["thread_id"], actions[first], actions[other]
+            ),
+            strict=True,
+        )
+    )
+    assert results["end"]["state"] == "pending"
+    retirement = results["end"]
+    assert await db.authorize_pinned_thread_retirement(
+        str(case["thread_id"]),
+        token=retirement["token"],
+        generation=retirement["generation"],
+        settle_status="ended",
+    )
+    sources = await db.fetch(
+        "SELECT * FROM vm_creation_retries WHERE thread_retained_resume_id IS NOT NULL"
+    )
+    assert len(sources) == (first == "source")
+    assert all(row["state"] == "cancel_requested" for row in sources)
+    assert await db.fetchval("SELECT count(*) FROM vm_creation_effects") == 3
+    await assert_predecessor_unchanged(db, case)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("first", ["effect", "end"])
+async def test_new_resume_effect_and_end_serialize_with_unknown_issuance_hold(
+    db, monkeypatch, first
+):
+    from orchestrator.services.vm_creation_retry_store import VMCreationRetryConflict
+
+    case, physical, _, source, retry, admitted, _, _ = await resumed_effects(
+        db, monkeypatch, stop_before_effect=True
+    )
+
+    async def effect():
+        try:
+            return await retry.begin_effect(**case["effect_args"])
+        except VMCreationRetryConflict:
+            return {"actuation_allowed": False}
+
+    async def end():
+        return await db.begin_pinned_thread_retirement(
+            str(case["thread_id"]), permanent=True
+        )
+
+    actions = {"effect": effect, "end": end}
+    other = "end" if first == "effect" else "effect"
+    results = dict(
+        zip(
+            (first, other),
+            await race_on_owner(
+                db, monkeypatch, case["thread_id"], actions[first], actions[other]
+            ),
+            strict=True,
+        )
+    )
+    assert results["effect"]["actuation_allowed"] is (first == "effect")
+    retirement = results["end"]
+    assert retirement["state"] == "pending"
+    assert await db.authorize_pinned_thread_retirement(
+        str(case["thread_id"]),
+        token=retirement["token"],
+        generation=retirement["generation"],
+        settle_status="ended",
+    )
+    settled_result = await retry.settle_never_issued(
+        request_id=str(source["request_id"])
+    )
+    assert settled_result["settled"] is (first == "end")
+    assert await db.fetchval(
+        "SELECT state FROM vm_resource_reservations WHERE id=$1",
+        UUID(admitted["reservation_id"]),
+    ) == ("released" if first == "end" else "reserved")
+    assert await db.fetchval(
+        "SELECT count(*) FROM vm_creation_effects WHERE request_id=$1 AND state='issued'",
+        source["request_id"],
+    ) == (first == "effect")
+    if first == "effect":
+        assert not await operations(db, physical)._settle_vm_creation_source(retirement)
+        assert not physical.purged and len(physical.effects) == 1
+        assert (
+            await db.fetchval(
+                "SELECT count(*) FROM vm_thread_retained_disk_purge_authorities"
+            )
+            == 0
+        )
+    await assert_predecessor_unchanged(db, case)
+
+
+@pytest.mark.asyncio
+async def test_resumed_unused_grant_requires_winning_issuer_receipt(db, monkeypatch):
+    from orchestrator.services.vm_creation_retry_store import VMCreationRetryConflict
+
+    case, _, _, source, retry, admitted, _, carrier = await resumed_effects(
+        db, monkeypatch, stop_after="rootdisk", observe_last=False
+    )
+    retirement = await db.begin_pinned_thread_retirement(
+        str(case["thread_id"]), permanent=False
+    )
+    assert retirement["state"] == "pending"
+    assert await db.authorize_pinned_thread_retirement(
+        str(case["thread_id"]),
+        token=retirement["token"],
+        generation=retirement["generation"],
+        settle_status="ended",
+    )
+    proof = {
+        "request_id": str(source["request_id"]),
+        "effect_nonce": case["effect_grant"]["effect_nonce"],
+        "carrier": carrier,
+        "issuer_receipt": case["effect_grant"]["issuer_receipt"],
+        "reason": "resource_node_changed",
+    }
+    with pytest.raises(VMCreationRetryConflict):
+        await retry.record_not_attempted(**{**proof, "issuer_receipt": "f" * 64})
+    assert not (await retry.settle_never_issued(request_id=str(source["request_id"])))[
+        "settled"
+    ]
+    assert (
+        await db.fetchval(
+            "SELECT state FROM vm_resource_reservations WHERE id=$1",
+            UUID(admitted["reservation_id"]),
+        )
+        == "reserved"
+    )
+    assert (await retry.record_not_attempted(**proof))["recorded"]
+    assert (await retry.settle_never_issued(request_id=str(source["request_id"])))[
+        "settled"
+    ]
+    assert (
+        await db.fetchval(
+            "SELECT state FROM vm_resource_reservations WHERE id=$1",
+            UUID(admitted["reservation_id"]),
+        )
+        == "released"
+    )
+    await assert_predecessor_unchanged(db, case)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "fault", ["missing", "protocol", "actor", "attach", "pod", "successor", "ambiguous"]
+)
+async def test_observed_abort_bridge_refuses_unproved_edge(db, monkeypatch, fault):
+    from tests.test_pinned_vm_failed_initial_end_real_postgres import (
+        _abort_and_rebind_same_pod,
+    )
+
+    case, _, current, source, _, _, _, _ = await resumed_effects(db, monkeypatch)
+    current = await _abort_and_rebind_same_pod(db, current)
+    async with db.acquire() as conn, conn.transaction():
+        await conn.execute("SET LOCAL session_replication_role='replica'")
+        if fault == "missing":
+            await conn.execute(
+                "DELETE FROM thread_runtime_attach_abort_outcomes WHERE thread_id=$1",
+                case["thread_id"],
+            )
+        elif fault == "ambiguous":
+            await conn.execute(
+                "INSERT INTO thread_runtime_attach_abort_outcomes SELECT thread_id,runtime_generation,gen_random_uuid(),agent_id,agent_pod_uid,successor_generation,release_kind,quiescence_protocol,workspace_generation,workspace_runtime_incarnation,released_at FROM thread_runtime_attach_abort_outcomes WHERE thread_id=$1",
+                case["thread_id"],
+            )
+        else:
+            field, value = {
+                "protocol": ("quiescence_protocol", "local_runtime_zero_v1"),
+                "actor": ("agent_id", uuid4()),
+                "attach": ("runtime_attach_token", uuid4()),
+                "pod": ("agent_pod_uid", str(uuid4())),
+                "successor": ("successor_generation", uuid4()),
+            }[fault]
+            await conn.execute(
+                f"UPDATE thread_runtime_attach_abort_outcomes SET {field}=$2 WHERE thread_id=$1",
+                case["thread_id"],
+                value,
+            )
+    retirement = await db.begin_pinned_thread_retirement(
+        str(case["thread_id"]), permanent=False
+    )
+    assert retirement == {
+        "state": "malformed",
+        "reason": "physical_runtime_identity_malformed",
+    }
+    assert (
+        await db.fetchval(
+            "SELECT count(*) FROM vm_resource_thread_cleanup_authorities WHERE request_id=$1",
+            source["request_id"],
+        )
+        == 0
+    )
+    assert (
+        await db.fetchval(
+            "SELECT state FROM vm_creation_retries WHERE request_id=$1",
+            source["request_id"],
+        )
+        == "reconciling"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "fault",
+    [
+        None,
+        "missing",
+        "vm_uid",
+        "pvc_uid",
+        "vmi_uid",
+        "launcher_uid",
+        "interface_mac",
+        "missing_mac",
+        "configuration_digest",
+    ],
+)
+async def test_profiled_retained_source_requires_exact_saved_guest_identity(
+    db, monkeypatch, fault
+):
+    """Native profile source/Ready/End/Resume; the pinned SSH probe receipt is modeled."""
+    import sys
+    from tests import test_vm_resource_thread_source_real_postgres as source_fixture
+    from tests import test_vm_resource_thread_cleanup_real_postgres as end_fixture
+    from shared.vm_network_profile import NETWORK_PROFILE
+
+    image = "registry.example/qualified@sha256:" + "a" * 64
+    monkeypatch.setenv("VM_NETWORK_PROFILE_ENABLED", "true")
+    monkeypatch.setenv("VM_NETWORK_PROFILE_IMAGE_ALLOWLIST", image)
+    build = source_fixture.build_vm_creation_request
+    configuration = source_fixture.whole_launcher_configuration
+    ready = end_fixture._ready_charged_thread
+    native_settled = settled
+
+    def profiled_request(**kwargs):
+        return {
+            **build(**{**kwargs, "vm_image": image}),
+            "network_profile": NETWORK_PROFILE,
+        }
+
+    def profiled_configuration():
+        return {
+            **configuration(),
+            "network_profile_policy": {
+                "version": 1,
+                "image": image,
+                "profile": NETWORK_PROFILE,
+            },
+        }
+
+    async def profiled_ready(store, patch):
+        case = await ready(store, patch)
+        source = await store.fetchrow(
+            "SELECT observed_pvc_uid FROM vm_creation_retries WHERE request_id=$1",
+            case["request_id"],
+        )
+        receipt = {
+            "profile": NETWORK_PROFILE,
+            "provision_generation": str(case["generation"]),
+            "vm_uid": case["vm_uid"],
+            "pvc_uid": str(source["observed_pvc_uid"]),
+            "vmi_uid": case["vmi_uid"],
+            "launcher_uid": case["launcher_uid"],
+            "interface_mac": "02:00:00:00:00:41",
+            "guest_boot_id": str(uuid4()),
+            "cloud_init_instance_id": "profiled-first-boot",
+            "cloud_init_cached_instance_id": "profiled-first-boot",
+            "network_file_sha256": "a" * 64,
+            "name_only_dhcp": True,
+        }
+        case["updates"].update(
+            network_profile_evidence=receipt, interface_mac=receipt["interface_mac"]
+        )
+        return case
+
+    async def settled_with_fault(store, patch, **kwargs):
+        case, physical = await native_settled(store, patch, **kwargs)
+        if fault == "configuration_digest":
+            async with store.acquire() as conn, conn.transaction():
+                await conn.execute("SET LOCAL session_replication_role='replica'")
+                await conn.execute(
+                    "UPDATE vm_creation_retries SET controller_configuration_digest=$2 WHERE request_id=$1",
+                    case["request_id"],
+                    "sha256:" + "f" * 64,
+                )
+        elif fault:
+            vm = json.loads(
+                (await store.get_thread(str(case["thread_id"])))["metadata"]
+            )["vm"]
+            receipt = vm["network_profile_evidence"]
+            if fault == "missing_mac":
+                await store.merge_thread_vm_context(
+                    str(case["thread_id"]), {"interface_mac": None}
+                )
+            elif fault == "missing":
+                receipt = None
+            else:
+                receipt[fault] = str(uuid4())
+            await store.merge_thread_vm_context(
+                str(case["thread_id"]), {"network_profile_evidence": receipt}
+            )
+        return case, physical
+
+    monkeypatch.setattr(source_fixture, "build_vm_creation_request", profiled_request)
+    monkeypatch.setattr(
+        source_fixture, "whole_launcher_configuration", profiled_configuration
+    )
+    monkeypatch.setattr(end_fixture, "_ready_charged_thread", profiled_ready)
+    monkeypatch.setattr(sys.modules[__name__], "settled", settled_with_fault)
+    if fault:
+        with pytest.raises(RuntimeError, match="image/network lineage is unproven"):
+            await retained_resume(db, monkeypatch, ready=True, marker=False, bind=True)
+        assert await db.fetchval("SELECT count(*) FROM vm_thread_retained_resumes") == 0
+        assert await db.fetchval("SELECT count(*) FROM vm_creation_retries") == 1
+        return
+    case, _, current, suspension = await retained_resume(
+        db, monkeypatch, ready=True, marker=False, bind=True
+    )
+    monkeypatch.setenv("VM_NETWORK_PROFILE_ENABLED", "false")
+    monkeypatch.setenv("VM_NETWORK_PROFILE_IMAGE_ALLOWLIST", "")
+    monkeypatch.setenv("VM_IMAGE", "registry.example/current:latest")
+    await ensure_session_workspace(
+        str(case["thread_id"]),
+        db=db,
+        provisioner=None,
+        suspension=suspension,
+        expected_runtime_generation=str(current["runtime_generation"]),
+    )
+    source = await db.fetchrow(
+        "SELECT * FROM vm_creation_retries WHERE thread_retained_resume_id IS NOT NULL"
+    )
+    assert source is not None
+    request = json.loads(source["canonical_request"])
+    assert (
+        request["network_profile"] == NETWORK_PROFILE and request["vm_image"] == image
+    )
+    assert json.loads(source["controller_configuration"])["network_profile_policy"] == {
+        "version": 1,
+        "image": image,
+        "profile": NETWORK_PROFILE,
+    }
+    assert source["expected_pvc_uid"] == UUID(case["pvc_uid"])
+    await assert_predecessor_unchanged(db, case)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "missing_edge_after_begin",
+        "captured_edge",
+        "captured_source",
+        "captured_operation",
+    ],
+)
+async def test_observed_abort_handoff_revalidates_immutable_begin_capsule(
+    db, monkeypatch, fault
+):
+    import asyncpg
+    from orchestrator.services.vm_creation_retry_store import VMCreationRetryConflict
+    from tests.test_pinned_vm_failed_initial_end_real_postgres import (
+        _abort_and_rebind_same_pod,
+    )
+
+    case, _, current, source, retry, _, observations, carrier = await resumed_effects(
+        db, monkeypatch
+    )
+    await _abort_and_rebind_same_pod(db, current)
+    retirement = await db.begin_pinned_thread_retirement(
+        str(case["thread_id"]), permanent=False
+    )
+    assert retirement["state"] == "pending"
+    assert await db.authorize_pinned_thread_retirement(
+        str(case["thread_id"]),
+        token=retirement["token"],
+        generation=retirement["generation"],
+        settle_status="ended",
+    )
+    original = json.loads(
+        await db.fetchval(
+            "SELECT runtime_retirement_context FROM threads WHERE id=$1",
+            case["thread_id"],
+        )
+    )
+    changed = json.loads(json.dumps(original))
+    if fault == "captured_edge":
+        changed["vm_creation_source"]["abort_lineage"][0]["agent_pod_uid"] = str(
+            uuid4()
+        )
+    elif fault == "captured_source":
+        changed["vm_creation_source"]["thread_agent_id"] = str(uuid4())
+    elif fault == "captured_operation":
+        changed["vm_creation_source"]["retained_resume_id"] = str(uuid4())
+    if changed != original:
+        with pytest.raises(asyncpg.CheckViolationError):
+            await db.execute(
+                "UPDATE threads SET runtime_retirement_context=$2::jsonb WHERE id=$1",
+                case["thread_id"],
+                json.dumps(changed),
+            )
+    async with db.acquire() as conn, conn.transaction():
+        await conn.execute("SET LOCAL session_replication_role='replica'")
+        if fault == "missing_edge_after_begin":
+            await conn.execute(
+                "DELETE FROM thread_runtime_attach_abort_outcomes WHERE thread_id=$1",
+                case["thread_id"],
+            )
+        else:
+            await conn.execute(
+                "UPDATE threads SET runtime_retirement_context=$2::jsonb WHERE id=$1",
+                case["thread_id"],
+                json.dumps(changed),
+            )
+    assert not await db.fetchval(
+        "SELECT public.valid_thread_vm_creation_retirement_source(r,false) FROM vm_creation_retries r WHERE request_id=$1",
+        source["request_id"],
+    )
+    with pytest.raises(VMCreationRetryConflict):
+        await retry.settle_adopted(
+            request_id=str(source["request_id"]),
+            carrier=carrier,
+            observations=observations,
+        )
+    assert (
+        await db.fetchval(
+            "SELECT count(*) FROM vm_resource_thread_cleanup_authorities WHERE request_id=$1",
+            source["request_id"],
+        )
+        == 0
+    )
+    assert (
+        await db.fetchval(
+            "SELECT state FROM vm_resource_reservations WHERE request_id=$1",
+            source["request_id"],
+        )
+        == "reserved"
+    )
+
+
+@pytest.mark.asyncio
+async def test_old_creation_carrier_and_cleanup_child_cannot_act_after_new_resume(
+    db, monkeypatch
+):
+    from orchestrator.services.vm_creation_retry_store import (
+        VMCreationRetryConflict,
+        VMCreationRetryStore,
+    )
+    from orchestrator.services.vm_workspace_recovery_store import (
+        VMWorkspaceRecoveryStore,
+        cleanup_intent_digest,
+    )
+    from shared.vm_creation_issuance import seal_creation_carrier
+    from tests.test_vm_creation_actuation import SECRET
+
+    case, physical, _, new_source, _, admitted, _, _ = await resumed_effects(
+        db, monkeypatch, stop_before_effect=True
+    )
+    assert new_source["expected_pvc_uid"] == UUID(case["pvc_uid"])
+    assert (
+        await db.fetchval(
+            "SELECT state FROM vm_resource_reservations WHERE id=$1",
+            UUID(admitted["reservation_id"]),
+        )
+        == "reserved"
+    )
+    before = await predecessor_snapshot(db, case)
+    effects_before = await db.fetch(
+        "SELECT * FROM vm_creation_effects ORDER BY request_id,effect_number"
+    )
+    source = await db.fetchrow(
+        "SELECT * FROM vm_creation_retries WHERE request_id=$1", case["request_id"]
+    )
+    effect = await db.fetchrow(
+        "SELECT * FROM vm_creation_effects WHERE request_id=$1 AND effect_kind='vm'",
+        case["request_id"],
+    )
+    carrier = seal_creation_carrier(
+        json.loads(effect["carrier_intent"]),
+        namespace=effect["carrier_namespace"],
+        uid=str(effect["carrier_uid"]),
+        resource_version="3",
+        secret=SECRET,
+    )
+    with pytest.raises(VMCreationRetryConflict):
+        await VMCreationRetryStore(db).begin_effect(
+            request_id=str(case["request_id"]),
+            claim_token=str(uuid4()),
+            carrier=carrier,
+        )
+    store = VMWorkspaceRecoveryStore(db)
+    old_create = await db.fetchrow(
+        "SELECT * FROM vm_workspace_cleanup_admissions WHERE id=$1",
+        source["creation_admission_id"],
+    )
+    create_replay = await store.resume_cleanup_permit(
+        old_create["id"],
+        owner_kind="thread",
+        owner_id=case["thread_id"],
+        source=old_create["source"],
+        request_id=old_create["request_id"],
+        intent_digest=old_create["intent_digest"],
+    )
+    assert not create_replay.allowed and create_replay.completed_outcome == "adopted"
+    # A retained soft-End parent cannot authorize a destructive rootdisk child.
+    # An actual permanent-purge child cannot coexist with a legitimate Resume:
+    # its open parent excludes Resume, and its completed parent proves no disk.
+    old_parent = physical.effects[0]
+    child_id = uuid4()
+    child_args = dict(
+        owner_kind="thread",
+        owner_id=case["thread_id"],
+        pvc_uid=UUID(case["pvc_uid"]),
+        request_id=child_id,
+        source="controller_rootdisk_delete",
+        intent_digest=cleanup_intent_digest(
+            {"resource": "disk", "pvc_uid": case["pvc_uid"]}
+        ),
+    )
+    child = await store.acquire_cleanup_permit(
+        **child_args,
+        parent_cleanup=old_parent,
+        parent_provision_generation=str(case["generation"]),
+        expected_vm_uid=case["vm_uid"],
+        revalidate_completed=True,
+    )
+    assert not child.allowed
+    assert (
+        await db.fetchval(
+            "SELECT count(*) FROM vm_workspace_cleanup_admissions WHERE request_id=$1",
+            child_id,
+        )
+        == 0
+    )
+    assert await predecessor_snapshot(db, case) == before
+    assert (
+        await db.fetch(
+            "SELECT * FROM vm_creation_effects ORDER BY request_id,effect_number"
+        )
+        == effects_before
+    )
+    assert len(physical.effects) == 1 and not physical.purged

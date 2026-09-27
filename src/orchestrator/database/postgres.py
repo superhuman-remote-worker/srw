@@ -40051,8 +40051,14 @@ class PostgresDB:
                                 "thread_attach_token": str(creation["thread_attach_token"])
                                 if creation["thread_attach_token"] is not None else None,
                                 "captured_vm": vm_context,
-                                **({"retained_resume_id": str(creation["thread_retained_resume_id"])}
-                                   if creation.get("thread_retained_resume_id") is not None else {}),
+                                **({
+                                    "retained_resume_id": str(creation["thread_retained_resume_id"]),
+                                    "abort_lineage": json.loads(await conn.fetchval(
+                                        "SELECT public.vm_thread_retained_abort_path(op,$2::uuid)::text "
+                                        "FROM vm_thread_retained_resumes op WHERE id=$1",
+                                        creation["thread_retained_resume_id"], thread["runtime_generation"],
+                                    )),
+                                } if creation.get("thread_retained_resume_id") is not None else {}),
                             }
                         else:
                             _canonical_uuid_text(vm_context.get("vm_uid"), label="VM UID")

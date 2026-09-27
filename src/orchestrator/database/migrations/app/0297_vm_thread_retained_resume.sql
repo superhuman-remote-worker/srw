@@ -118,7 +118,7 @@ BEGIN
         RAISE EXCEPTION 'VM retained disk predecessor unproven' USING ERRCODE='23514';
     END IF;
     IF source.request_id IS NULL OR source.owner_kind IS DISTINCT FROM 'thread'
-       OR source.thread_id IS DISTINCT FROM a.thread_id OR (source.state IS DISTINCT FROM 'succeeded' AND NOT COALESCE(public.valid_vm_thread_retained_handoff(source),false))
+       OR source.thread_id IS DISTINCT FROM a.thread_id OR (source.state IS DISTINCT FROM 'succeeded' AND NOT COALESCE(public.valid_vm_thread_retained_cleanup_source(a,source),false))
        OR source.thread_wake_operation_id IS NOT NULL
        OR NOT (source.origin='initial' AND source.expected_pvc_uid IS NULL
            OR source.origin='resume' AND EXISTS (
@@ -128,8 +128,9 @@ BEGIN
                  AND op.runtime_generation=source.thread_runtime_generation
                  AND op.request_id=source.request_id AND op.provision_generation=source.provision_generation
                  AND prior.pvc_uid=source.expected_pvc_uid AND prior.pvc_uid=a.pvc_uid))
-       OR source.thread_runtime_generation IS DISTINCT FROM a.runtime_generation
-       OR source.thread_agent_id IS DISTINCT FROM a.agent_id OR source.thread_attach_token IS DISTINCT FROM a.attach_token
+       OR (NOT COALESCE(public.valid_vm_thread_retained_cleanup_source(a,source),false) AND (
+           source.thread_runtime_generation IS DISTINCT FROM a.runtime_generation
+           OR source.thread_agent_id IS DISTINCT FROM a.agent_id OR source.thread_attach_token IS DISTINCT FROM a.attach_token))
        OR source.provision_generation IS DISTINCT FROM a.provision_generation
        OR source.observed_vm_uid IS DISTINCT FROM a.vm_uid OR source.observed_pvc_uid IS DISTINCT FROM a.pvc_uid
        OR source.controller_configuration->>'version' IS DISTINCT FROM '3' THEN
@@ -359,27 +360,28 @@ BEGIN
 END;
 $$;
 
-CREATE FUNCTION public.valid_vm_thread_retained_runtime(op public.vm_thread_retained_resumes, owner_row public.threads)
-RETURNS boolean LANGUAGE plpgsql STABLE AS $$
+-- This is historical cleanup evidence only. It never transfers creation or
+-- effect authority to an abort successor. Compare every captured edge with the
+-- append-only native outcome and its protected physical Pod provenance.
+CREATE FUNCTION public.vm_thread_retained_abort_path(op public.vm_thread_retained_resumes, target_generation uuid)
+RETURNS jsonb LANGUAGE plpgsql STABLE AS $$
 DECLARE cursor_generation uuid := op.runtime_generation;
         visited uuid[] := ARRAY[]::uuid[];
         edge public.thread_runtime_attach_abort_outcomes%ROWTYPE;
         source public.vm_creation_retries%ROWTYPE;
+        path jsonb := '[]'::jsonb;
         edge_count integer;
         hops integer := 0;
 BEGIN
-    IF op.id IS NULL OR op.thread_id IS DISTINCT FROM owner_row.id OR owner_row.execution_lane IS DISTINCT FROM 'pinned' THEN
-        RETURN false;
-    END IF;
-    IF cursor_generation=owner_row.runtime_generation THEN RETURN true; END IF;
-    IF owner_row.status IS DISTINCT FROM 'created' THEN RETURN false; END IF;
+    IF op.id IS NULL OR target_generation IS NULL THEN RETURN NULL; END IF;
+    IF cursor_generation=target_generation THEN RETURN path; END IF;
     SELECT * INTO source FROM public.vm_creation_retries WHERE request_id=op.request_id;
     LOOP
-        IF hops>=4096 OR cursor_generation=ANY(visited) THEN RETURN false; END IF;
+        IF hops>=4096 OR cursor_generation=ANY(visited) THEN RETURN NULL; END IF;
         visited := array_append(visited,cursor_generation);
         SELECT count(*) INTO edge_count FROM (SELECT 1 FROM public.thread_runtime_attach_abort_outcomes o
             WHERE o.thread_id=op.thread_id AND o.runtime_generation=cursor_generation LIMIT 2) candidates;
-        IF edge_count<>1 THEN RETURN false; END IF;
+        IF edge_count<>1 THEN RETURN NULL; END IF;
         SELECT * INTO edge FROM public.thread_runtime_attach_abort_outcomes
             WHERE thread_id=op.thread_id AND runtime_generation=cursor_generation;
         IF edge.release_kind IS DISTINCT FROM 'process_zero'
@@ -387,15 +389,58 @@ BEGIN
            OR edge.workspace_generation IS NOT NULL OR edge.workspace_runtime_incarnation IS NOT NULL
            OR edge.agent_id IS NULL OR edge.runtime_attach_token IS NULL
            OR NULLIF(btrim(edge.agent_pod_uid),'') IS NULL
+           OR edge.successor_generation IS NULL OR edge.successor_generation=ANY(visited)
            OR (hops=0 AND source.request_id IS NOT NULL AND (
-               edge.agent_id IS DISTINCT FROM source.thread_agent_id OR edge.runtime_attach_token IS DISTINCT FROM source.thread_attach_token)) THEN
-            RETURN false;
+               edge.agent_id IS DISTINCT FROM source.thread_agent_id OR edge.runtime_attach_token IS DISTINCT FROM source.thread_attach_token))
+           OR NOT (EXISTS (SELECT 1 FROM public.thread_agent_warm_binding_protections p
+               WHERE p.thread_id=op.thread_id AND p.runtime_generation=edge.runtime_generation
+                 AND p.agent_id=edge.agent_id AND p.runtime_attach_token=edge.runtime_attach_token
+                 AND p.pod_uid=edge.agent_pod_uid AND p.bound_at IS NOT NULL
+                 AND p.evidence_protocol='exact_live_finalizer_v1')
+               OR EXISTS (SELECT 1 FROM public.thread_agent_pod_provision_intents p
+                   WHERE p.thread_id=op.thread_id AND p.runtime_generation=edge.runtime_generation
+                     AND p.pod_uid=edge.agent_pod_uid AND p.status='published'
+                     AND p.protection_protocol='finalizer_v1')) THEN
+            RETURN NULL;
         END IF;
+        path := path || jsonb_build_array(to_jsonb(edge));
         cursor_generation := edge.successor_generation;
         hops := hops+1;
-        IF cursor_generation=owner_row.runtime_generation THEN RETURN true; END IF;
+        IF cursor_generation=target_generation THEN RETURN path; END IF;
     END LOOP;
 END;
+$$;
+CREATE FUNCTION public.valid_vm_thread_retained_runtime(op public.vm_thread_retained_resumes, owner_row public.threads)
+RETURNS boolean LANGUAGE sql STABLE AS $$
+    SELECT op.id IS NOT NULL AND op.thread_id=owner_row.id AND owner_row.execution_lane='pinned'
+       AND (op.runtime_generation=owner_row.runtime_generation OR owner_row.status='created')
+       AND public.vm_thread_retained_abort_path(op,owner_row.runtime_generation) IS NOT NULL;
+$$;
+-- Both current retirement and historical cleanup validators verify this frozen
+-- capsule independently. No caller can nominate arbitrary JSON as a lineage.
+CREATE FUNCTION public.valid_vm_thread_retained_source_capture(source public.vm_creation_retries, context jsonb, target_generation uuid)
+RETURNS boolean LANGUAGE sql STABLE AS $$
+    SELECT public.valid_vm_thread_retained_resume_source(source)
+       AND context->'vm_creation_source'->>'request_id'=source.request_id::text
+       AND context->'vm_creation_source'->>'provision_generation'=source.provision_generation::text
+       AND context->'vm_creation_source'->>'thread_runtime_generation'=source.thread_runtime_generation::text
+       AND context->'vm_creation_source'->>'thread_agent_id'=source.thread_agent_id::text
+       AND context->'vm_creation_source'->>'thread_attach_token'=source.thread_attach_token::text
+       AND context->'vm_creation_source'->>'request_digest'=source.request_digest
+       AND context->'vm_creation_source'->>'controller_configuration_digest'=source.controller_configuration_digest
+       AND context->'vm_creation_source'->>'retained_resume_id'=source.thread_retained_resume_id::text
+       AND context->'vm_creation_source'->'captured_vm'->>'creation_request_id'=source.request_id::text
+       AND context->'vm_creation_source'->'captured_vm'->>'provision_generation'=source.provision_generation::text
+       AND COALESCE(context->'vm_creation_source'->'captured_vm'->'vm_uid','null'::jsonb)='null'::jsonb
+       AND (COALESCE(context->'vm_creation_source'->'captured_vm'->'rootdisk_pvc_uid','null'::jsonb)='null'::jsonb
+            OR context->'vm_creation_source'->'captured_vm'->>'rootdisk_pvc_uid'=source.observed_pvc_uid::text)
+       AND EXISTS (SELECT 1 FROM public.vm_thread_retained_resumes op
+           WHERE op.id=source.thread_retained_resume_id
+             AND context->'vm_creation_source'->'abort_lineage'=public.vm_thread_retained_abort_path(op,target_generation)
+             AND context->'vm_creation_source'->>'cleanup_protocol'=CASE WHEN op.runtime_generation=target_generation THEN 'exact' ELSE 'retained_attach_abort_v1' END
+             AND (op.runtime_generation<>target_generation OR (
+                 context->>'agent_id'=source.thread_agent_id::text
+                 AND context->>'runtime_attach_token'=source.thread_attach_token::text)));
 $$;
 ALTER FUNCTION public.thread_vm_creation_cleanup_lineage(public.threads,public.vm_creation_retries,boolean)
 RENAME TO thread_vm_initial_creation_cleanup_lineage;
@@ -406,7 +451,10 @@ BEGIN
     prior := public.thread_vm_initial_creation_cleanup_lineage(owner_row,retry,require_initial);
     IF prior IS NOT NULL THEN RETURN prior; END IF;
     IF NOT require_initial AND public.valid_vm_thread_retained_resume_source(retry)
-       AND retry.observed_vm_uid IS NULL AND NOT retry.boot_counted
+       AND retry.ready_at IS NULL AND (
+           (NOT retry.boot_counted AND retry.state IN ('queued','reconciling','attention','cancel_requested'))
+           OR (retry.observed_vm_uid IS NULL AND NOT retry.boot_counted AND retry.state='settled')
+           OR public.valid_vm_thread_retained_handoff(retry))
        AND EXISTS (SELECT 1 FROM public.vm_thread_retained_resumes op
            WHERE op.id=retry.thread_retained_resume_id AND op.runtime_generation<>owner_row.runtime_generation
              AND public.valid_vm_thread_retained_runtime(op,owner_row)) THEN
@@ -662,10 +710,11 @@ BEGIN
        OR owner_row.runtime_generation IS DISTINCT FROM d.runtime_generation
        OR (NOT early_end AND terminal.id IS NULL AND d.runtime_generation IS DISTINCT FROM a.runtime_generation)
        OR source.request_id IS NULL OR source.owner_kind IS DISTINCT FROM 'thread'
-       OR source.thread_id IS DISTINCT FROM a.thread_id OR (source.state IS DISTINCT FROM 'succeeded' AND NOT COALESCE(public.valid_vm_thread_retained_handoff(source),false))
+       OR source.thread_id IS DISTINCT FROM a.thread_id OR (source.state IS DISTINCT FROM 'succeeded' AND NOT COALESCE(public.valid_vm_thread_retained_cleanup_source(a,source),false))
        OR NOT (source.origin='initial' OR public.valid_vm_thread_retained_resume_source(source)) OR source.thread_wake_operation_id IS NOT NULL
-       OR source.thread_runtime_generation IS DISTINCT FROM a.runtime_generation
-       OR source.thread_agent_id IS DISTINCT FROM a.agent_id OR source.thread_attach_token IS DISTINCT FROM a.attach_token
+       OR (NOT COALESCE(public.valid_vm_thread_retained_cleanup_source(a,source),false) AND (
+           source.thread_runtime_generation IS DISTINCT FROM a.runtime_generation
+           OR source.thread_agent_id IS DISTINCT FROM a.agent_id OR source.thread_attach_token IS DISTINCT FROM a.attach_token))
        OR source.provision_generation IS DISTINCT FROM a.provision_generation
        OR source.observed_vm_uid IS DISTINCT FROM a.vm_uid OR source.observed_pvc_uid IS DISTINCT FROM a.pvc_uid
        OR source.controller_configuration->>'version' IS DISTINCT FROM '3'
@@ -777,6 +826,8 @@ CREATE OR REPLACE FUNCTION public.valid_thread_vm_creation_retirement_source(ret
           AND t.runtime_retirement_context->>'generation'=t.runtime_generation::text
           AND t.runtime_retirement_context->>'agent_id' IS NOT DISTINCT FROM t.agent_id::text
           AND t.runtime_retirement_context->>'runtime_attach_token' IS NOT DISTINCT FROM t.runtime_attach_token::text
+          AND (retry.thread_retained_resume_id IS NULL OR public.valid_vm_thread_retained_source_capture(
+              retry,t.runtime_retirement_context,t.runtime_generation))
           AND public.thread_vm_creation_cleanup_lineage(t,retry)=COALESCE(
               t.runtime_retirement_context->'vm_creation_source'->>'cleanup_protocol','exact')
           AND t.runtime_retirement_context->'vm_creation_source'->>'request_id'=retry.request_id::text
@@ -862,6 +913,21 @@ RETURNS boolean LANGUAGE sql STABLE AS $$
              AND root.evidence->>'pvc_uid'=source.observed_pvc_uid::text
              AND vm.evidence->>'cloud_init_uid'=secret.evidence->>'uid');
 $$;
+CREATE FUNCTION public.valid_vm_thread_retained_cleanup_source(a public.vm_resource_thread_cleanup_authorities, source public.vm_creation_retries)
+RETURNS boolean LANGUAGE sql STABLE AS $$
+    SELECT public.valid_vm_thread_retained_handoff(source)
+       AND a.thread_id=source.thread_id AND a.request_id=source.request_id
+       AND a.provision_generation=source.provision_generation
+       AND a.vm_uid=source.observed_vm_uid AND a.pvc_uid=source.observed_pvc_uid
+       AND a.vmi_uid IS NULL AND a.launcher_uid IS NULL
+       AND a.retirement_context->>'thread_id'=a.thread_id::text
+       AND a.retirement_context->>'generation'=a.runtime_generation::text
+       AND a.retirement_context->>'settle_status'='ended'
+       AND a.retirement_context->>'agent_id' IS NOT DISTINCT FROM a.agent_id::text
+       AND a.retirement_context->>'runtime_attach_token' IS NOT DISTINCT FROM a.attach_token::text
+       AND a.retirement_context->'vm'='null'::jsonb
+       AND public.valid_vm_thread_retained_source_capture(source,a.retirement_context,a.runtime_generation);
+$$;
 CREATE OR REPLACE FUNCTION public.validate_vm_thread_cleanup_authority(a public.vm_resource_thread_cleanup_authorities, allow_released boolean DEFAULT false)
 RETURNS boolean LANGUAGE plpgsql AS $$
 DECLARE
@@ -893,7 +959,7 @@ BEGIN
     -- Permanent endpoint cleanup deliberately removes metadata.vm after this
     -- authority's purge and debit. Its existing exact external receipt then
     -- authorizes reading the immutable Begin snapshot for final deletion.
-    IF allow_released AND a.purge_disk AND NOT (owner_row.metadata ? 'vm')
+    IF NOT terminal_handoff AND allow_released AND a.purge_disk AND NOT (owner_row.metadata ? 'vm')
        AND owner_row.runtime_retirement_external_cleanup IS NOT NULL
        AND owner_row.runtime_retirement_external_cleanup =
            public.pinned_retirement_external_cleanup_expected(owner_row.runtime_retirement_context,
@@ -907,9 +973,11 @@ BEGIN
        OR owner_row.runtime_generation IS DISTINCT FROM a.runtime_generation
        OR source.request_id IS NULL OR source.owner_kind IS DISTINCT FROM 'thread'
        OR source.thread_id IS DISTINCT FROM a.thread_id OR (source.state IS DISTINCT FROM 'succeeded' AND NOT terminal_handoff)
-       OR source.thread_runtime_generation IS DISTINCT FROM a.runtime_generation
-       OR source.thread_agent_id IS DISTINCT FROM a.agent_id
-       OR source.thread_attach_token IS DISTINCT FROM a.attach_token
+       OR (terminal_handoff AND NOT COALESCE(public.valid_vm_thread_retained_cleanup_source(a,source),false))
+       OR (NOT terminal_handoff AND (
+           source.thread_runtime_generation IS DISTINCT FROM a.runtime_generation
+           OR source.thread_agent_id IS DISTINCT FROM a.agent_id
+           OR source.thread_attach_token IS DISTINCT FROM a.attach_token))
        OR source.provision_generation IS DISTINCT FROM a.provision_generation
        OR source.observed_vm_uid IS DISTINCT FROM a.vm_uid
        OR source.observed_pvc_uid IS DISTINCT FROM a.pvc_uid
@@ -1056,6 +1124,66 @@ CREATE OR REPLACE FUNCTION public.valid_vm_creation_thread_disposition_identity(
        AND public.valid_thread_vm_creation_retirement_source(retry,require_captured)
        AND EXISTS (SELECT 1 FROM public.threads t WHERE t.id=retry.thread_id
            AND retry.cancellation_disposition->>'retirement_token'=t.runtime_retirement_token::text)) IS TRUE;
+$$;
+CREATE OR REPLACE FUNCTION public.vm_thread_creation_compute_delete_evidence(owner_row public.threads)
+RETURNS jsonb LANGUAGE plpgsql AS $$
+DECLARE evidence jsonb;
+        a public.vm_resource_thread_cleanup_authorities%ROWTYPE;
+        s public.vm_resource_thread_cleanup_stops%ROWTYPE;
+        charge public.vm_resource_reservations%ROWTYPE;
+BEGIN
+    evidence := public.vm_thread_creation_failed_initial_delete_evidence(owner_row);
+    IF evidence IS NOT NULL THEN RETURN evidence; END IF;
+    SELECT * INTO a FROM public.vm_resource_thread_cleanup_authorities
+        WHERE thread_id=owner_row.id AND runtime_generation=owner_row.runtime_generation
+          AND retirement_token=owner_row.runtime_retirement_token AND purge_disk;
+    IF NOT FOUND THEN RETURN NULL; END IF;
+    SELECT * INTO s FROM public.vm_resource_thread_cleanup_stops
+        WHERE cleanup_admission_id=a.cleanup_admission_id;
+    IF NOT FOUND THEN RETURN NULL; END IF;
+    SELECT * INTO charge FROM public.vm_resource_reservations WHERE id=a.reservation_id FOR UPDATE;
+    IF owner_row.runtime_retirement_permanent IS DISTINCT FROM true
+       OR charge.state IS DISTINCT FROM 'released'
+       OR charge.release_evidence IS DISTINCT FROM jsonb_build_object(
+           'kind','exact_cleanup_compute_absent','owner_kind','thread','thread_id',a.thread_id,
+           'cleanup_admission_id',a.cleanup_admission_id,'reservation_revision',a.reservation_revision,
+           'stop_evidence_digest','sha256:'||encode(sha256(convert_to(s.stop_evidence::text,'UTF8')),'hex'))
+       OR NOT EXISTS (SELECT 1 FROM public.thread_runtime_retirement_outcomes o
+           WHERE o.thread_id=owner_row.id AND o.runtime_generation=a.runtime_generation
+             AND o.retirement_token=a.retirement_token AND o.permanent AND o.outcome='deleted'
+             AND o.disposition='ended' AND o.agent_id IS NOT DISTINCT FROM a.agent_id
+             AND o.runtime_attach_token IS NOT DISTINCT FROM a.attach_token)
+       OR owner_row.runtime_retirement_external_cleanup IS NULL
+       OR owner_row.runtime_retirement_external_cleanup IS DISTINCT FROM
+           public.pinned_retirement_external_cleanup_expected(owner_row.runtime_retirement_context,
+               owner_row.runtime_generation,owner_row.runtime_retirement_token)
+       OR NOT public.pinned_retirement_external_resources_absent(owner_row.id,owner_row.metadata)
+       OR EXISTS (SELECT 1 FROM public.vm_creation_retries r
+           WHERE r.owner_kind='thread' AND r.thread_id=owner_row.id AND r.state<>'succeeded'
+             AND NOT EXISTS (SELECT 1 FROM public.vm_thread_retained_resume_terminals terminal
+                 WHERE terminal.operation_id=r.thread_retained_resume_id AND terminal.source_request_id=r.request_id
+                   AND terminal.source_terminal_evidence=public.vm_thread_retained_source_snapshot(r)))
+       OR EXISTS (SELECT 1 FROM public.vm_creation_effects e
+           JOIN public.vm_creation_retries r USING(request_id)
+           WHERE r.owner_kind='thread' AND r.thread_id=owner_row.id AND e.state='issued')
+       OR EXISTS (SELECT 1 FROM public.vm_resource_reservations v
+           JOIN public.vm_creation_retries r USING(request_id)
+           WHERE r.owner_kind='thread' AND r.thread_id=owner_row.id AND v.state<>'released')
+       OR EXISTS (SELECT 1 FROM public.vm_resource_waiters w
+           WHERE w.owner_kind='thread' AND w.thread_id=owner_row.id AND w.state NOT IN ('released','cancelled'))
+       OR EXISTS (SELECT 1 FROM public.vm_workspace_cleanup_admissions c
+           WHERE c.owner_kind='thread' AND c.owner_id=owner_row.id AND c.completed_at IS NULL) THEN
+        RETURN NULL;
+    END IF;
+    PERFORM public.validate_vm_thread_cleanup_stop(a,s,true);
+    RETURN jsonb_build_object('version',2,'kind','adopted_vm_cleanup',
+        'request_id',a.request_id,'cleanup_admission_id',a.cleanup_admission_id,
+        'reservation_id',a.reservation_id,'reservation_revision',a.reservation_revision,
+        'runtime_generation',a.runtime_generation,'retirement_token',a.retirement_token,
+        'local_quiescence',owner_row.runtime_retirement_local_quiescence,
+        'external_cleanup',owner_row.runtime_retirement_external_cleanup,
+        'stop_evidence',s.stop_evidence);
+END;
 $$;
 CREATE OR REPLACE FUNCTION public.vm_thread_creation_delete_evidence(owner_row public.threads)
 RETURNS jsonb LANGUAGE plpgsql AS $$

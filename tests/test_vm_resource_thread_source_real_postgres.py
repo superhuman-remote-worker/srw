@@ -305,6 +305,7 @@ async def _adopted_charged_thread(
 ):
     """Real typed CAS, shared admit, signed effects and optional adoption."""
     from tests.test_vm_creation_actuation import SECRET
+    from shared.vm_network_profile import NETWORK_DATA
 
     monkeypatch.setenv("VM_LIFECYCLE_HMAC_SECRET", SECRET.decode())
     policy, inventory, sample, demand = await environment(db)
@@ -453,8 +454,10 @@ async def _adopted_charged_thread(
                     }}, "spec": {"volumes": [
                         {"name": "rootdisk", "dataVolume": {
                             "name": "agent-vm-" + str(thread_id) + "-rootdisk"}},
-                        {"name": "cloud-init", "cloudInitNoCloud": {"secretRef": {
-                            "name": "agent-vm-" + str(thread_id) + "-cloudinit"}}},
+                        {"name": "cloud-init", "cloudInitNoCloud": {
+                            "secretRef": {"name": "agent-vm-" + str(thread_id) + "-cloudinit"},
+                            **({"networkData": NETWORK_DATA} if request.get("network_profile") is not None else {}),
+                        }},
                     ]}}},
                 },
             }
