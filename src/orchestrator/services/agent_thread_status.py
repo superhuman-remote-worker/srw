@@ -38,7 +38,10 @@ from uuid import UUID, uuid4
 
 from fastapi import HTTPException
 
-from orchestrator.schemas.agent_thread_status import AgentThreadStatusRequest
+from orchestrator.schemas.agent_thread_status import (
+    AgentRetirementActuatorRequest,
+    AgentThreadStatusRequest,
+)
 from orchestrator.services.deployment_gates import require_pinned_status_identity
 from orchestrator.services.officer_metadata import (
     officer_meta_enabled,
@@ -86,6 +89,26 @@ class AgentThreadStatusDependencies:
     suspend_thread_resources: Callable[..., Awaitable[Any]]
     #: B07 owns Officer conferences.
     conclude_conference_if_any: Callable[..., Awaitable[Any]]
+
+
+async def request_retirement_actuator(
+    thread_id: str, body: AgentRetirementActuatorRequest, *,
+    dependencies: AgentThreadStatusDependencies,
+) -> dict[str, Any]:
+    """Commit the complete authenticated End tuple without awaiting a stop."""
+    result = await dependencies.db.request_pinned_thread_retirement_actuator(
+        thread_id, agent_id=str(body.agent_id), pod_uid=body.pod_uid,
+        process_generation=body.process_generation,
+        runtime_generation=str(body.session_runtime_generation),
+        runtime_attach_token=str(body.session_runtime_attach_token),
+        retirement_token=str(body.session_runtime_retirement_token),
+        disposition=body.retirement_disposition, permanent=body.retirement_permanent,
+        workspace_generation=str(body.workspace_generation),
+        workspace_runtime_incarnation=str(body.workspace_runtime_incarnation),
+    )
+    if result is None:
+        raise HTTPException(status_code=409, detail={"code": "pinned_vm_actuator_request_refused"})
+    return result
 
 
 async def update_thread_status(

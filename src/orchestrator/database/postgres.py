@@ -44921,6 +44921,80 @@ class PostgresDB:
             )
         return [dict(row) for row in rows]
 
+    async def request_pinned_thread_retirement_actuator(
+        self, thread_id: str, *, agent_id: str, pod_uid: str,
+        process_generation: str, runtime_generation: str,
+        runtime_attach_token: str, retirement_token: str, disposition: str,
+        permanent: bool, workspace_generation: str,
+        workspace_runtime_incarnation: str,
+    ) -> dict[str, Any] | None:
+        """Commit an authenticated exact local drain, never a zero receipt."""
+        if disposition != "ended" or type(permanent) is not bool:
+            return None
+        marker = {
+            "kind": "vm_local_drain_complete_v1", "thread_id": str(thread_id),
+            "agent_id": str(agent_id), "pod_uid": str(pod_uid),
+            "process_generation": str(process_generation),
+            "runtime_generation": str(runtime_generation),
+            "runtime_attach_token": str(runtime_attach_token),
+            "retirement_token": str(retirement_token), "disposition": disposition,
+            "permanent": permanent, "workspace_generation": str(workspace_generation),
+            "workspace_runtime_incarnation": str(workspace_runtime_incarnation),
+        }
+        encoded = json.dumps(marker)
+        async with self.acquire() as conn, conn.transaction():
+            outcome = await conn.fetchval(
+                "SELECT 1 FROM thread_runtime_retirement_outcomes "
+                "WHERE thread_id=$1::uuid AND actuator_request=$2::jsonb",
+                thread_id, encoded,
+            )
+            if outcome:
+                return {"status": "settled_or_superseded", "actuator_request": marker}
+            owner = await conn.fetchrow(
+                "SELECT * FROM threads WHERE id=$1::uuid FOR UPDATE", thread_id,
+            )
+            if owner is None:
+                return None
+            # Lock the reciprocal process before the SQL guard rechecks it.
+            await conn.fetchrow(
+                "SELECT id FROM agents WHERE id=$1::uuid FOR SHARE", agent_id,
+            )
+            existing = owner["runtime_retirement_actuator_request"]
+            valid = await conn.fetchval(
+                "SELECT pinned_vm_actuator_request_valid(t,$2::jsonb,$3) "
+                "FROM threads t WHERE t.id=$1::uuid",
+                thread_id, encoded, existing is None,
+            )
+            if not valid:
+                return None
+            if existing is not None:
+                if isinstance(existing, str):
+                    existing = json.loads(existing)
+                if existing != marker:
+                    return None
+            else:
+                await conn.execute(
+                    "UPDATE threads SET runtime_retirement_actuator_request=$2::jsonb "
+                    "WHERE id=$1::uuid", thread_id, encoded,
+                )
+        return {"status": "actuator_requested", "actuator_request": marker}
+
+    async def current_pinned_vm_actuator_request(
+        self, thread_id: str, *, runtime_generation: str, retirement_token: str,
+        context: Mapping[str, Any], marker: Mapping[str, Any],
+    ) -> bool:
+        """Revalidate a worklist hint immediately before its first Pod effect."""
+        async with self.acquire() as conn:
+            return bool(await conn.fetchval(
+                "SELECT pinned_vm_actuator_request_valid(t,t.runtime_retirement_actuator_request) "
+                "FROM threads t WHERE id=$1::uuid AND runtime_generation=$2::uuid "
+                "AND runtime_retirement_token=$3::uuid "
+                "AND runtime_retirement_context=$4::jsonb "
+                "AND runtime_retirement_actuator_request=$5::jsonb",
+                thread_id, runtime_generation, retirement_token,
+                json.dumps(dict(context)), json.dumps(dict(marker)),
+            ))
+
     async def list_retryable_pinned_retirements(
         self,
         *,
@@ -44934,10 +45008,10 @@ class PostgresDB:
         Beginning retirement is intentionally not a best-effort flag: it is
         the durable admission closure for one exact generation.  If the
         orchestrator or agent dies after Begin, the marker must eventually be
-        actuated rather than wedging Resume forever.  We only nominate rows
-        after a generous grace and when the captured agent is absent/offline;
-        a live process retains ownership of its local quiescence and final
-        settlement call.
+        actuated rather than wedging Resume forever. An exact authenticated VM
+        local-drain marker permits immediate nomination, including a live actor.
+        Unmarked rows retain the generous grace and absent/offline requirement;
+        their local process still owns finalization and quiescence.
 
         That grace covers a live runtime still draining *before* its final
         settlement request. ``proven_grace_seconds`` (off by default) admits,
@@ -44964,6 +45038,7 @@ class PostgresDB:
                        t.runtime_retirement_started_at,
                        t.runtime_retirement_authorized_at,
                        t.runtime_retirement_context,
+                       t.runtime_retirement_actuator_request,
                        a.status::text AS agent_status,
                        t.runtime_retirement_started_at
                            > now() - make_interval(secs => $1::double precision)
@@ -44974,6 +45049,8 @@ class PostgresDB:
                    AND t.runtime_retirement_token IS NOT NULL
                    AND t.runtime_retirement_authorized_at IS NOT NULL
                    AND (
+                     pinned_vm_actuator_request_valid(t,t.runtime_retirement_actuator_request)
+                     OR ((
                        t.runtime_retirement_started_at
                            <= now() - make_interval(secs => $1::double precision)
                        OR (
@@ -45012,6 +45089,8 @@ class PostgresDB:
                        )
                    )
                    AND (t.agent_id IS NULL OR a.id IS NULL OR a.status = 'offline')
+                     )
+                   )
                    AND ($4::timestamptz IS NULL OR
                         (t.runtime_retirement_started_at,t.id) > ($4,$5::uuid))
                  ORDER BY t.runtime_retirement_started_at ASC, t.id ASC

@@ -19,7 +19,7 @@ from dataclasses import is_dataclass as _dc_is_dataclass
 from dataclasses import replace as _dc_replace
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Literal, Optional
 
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import BaseMessage
@@ -200,6 +200,13 @@ class PersistentSession:
     # generation/incarnation/SSH identity and terminal cleanup must produce the
     # tier-specific local zero-writer proof before settlement can be ACKed.
     pinned_runtime_identity_required: bool = False
+    # Exact terminal-owner checkpoints. These never constitute remote zero.
+    terminal_finalization_attempted: bool = False
+    terminal_memory_capture_attempted: bool = False
+    terminal_vm_shell_drained: bool = False
+    terminal_vm_drain_complete: bool = False
+    terminal_actuator_request: dict[str, Any] | None = None
+    terminal_actuator_request_accepted: bool = False
 
     # U5 session-parent delegation.  These are injected by persistent_app so
     # this state object never imports process-global owner/lease machinery.
@@ -3533,7 +3540,8 @@ class PersistentSession:
         *,
         preserve_shell: bool = False,
         preserve_workspace_daemons: bool = False,
-    ) -> None:
+        allow_vm_actuator_handoff: bool = False,
+    ) -> Literal["actuator_required"] | None:
         """Clean up agent-local resources and disconnect the backend transport.
 
         ``preserve_shell`` is the queue-claim/ownership handoff disposition:
@@ -3592,6 +3600,11 @@ class PersistentSession:
         strict_sandbox_cleanup = bool(
             strict_pinned_physical_cleanup and self.workspace_backend_tier == "sandbox"
         )
+        vm_actuator_handoff = bool(
+            allow_vm_actuator_handoff
+            and strict_pinned_physical_cleanup
+            and self.workspace_backend_tier in {"vm", "remote"}
+        )
         strict_terminal_cleanup = bool(
             self.shell_owner_token is not None or exact_pinned_terminal
         )
@@ -3618,6 +3631,13 @@ class PersistentSession:
             )
             if retire_shell_owner is not None:
                 retire_shell_owner()
+
+        if vm_actuator_handoff and (
+            backend_for_cleanup is None
+            or self.shell_manager is None
+            or not callable(getattr(backend_for_cleanup, "retire", None))
+        ):
+            raise WorkspaceUnavailableError("VM local drain lacks a strict shell/backend")
 
         # Belt for partial-attach and non-standard cleanup call sites. The
         # ordinary app teardown invokes this before its journal closes; this
@@ -3722,12 +3742,17 @@ class PersistentSession:
                         logger.warning(f"Cloud mount cleanup error: {exc}")
                         self.cloud_mount_manager = None
 
-        if self.shell_manager and not preserve_shell:
+        if (
+            self.shell_manager and not preserve_shell
+            and not (vm_actuator_handoff and self.terminal_vm_shell_drained)
+        ):
             try:
                 if strict_pinned_physical_cleanup:
                     self.shell_manager.cleanup(strict=True)
                 else:
                     self.shell_manager.cleanup()
+                if vm_actuator_handoff:
+                    self.terminal_vm_shell_drained = True
             except Exception as e:
                 if strict_terminal_cleanup:
                     # Stateless and protected terminal teardown are
@@ -3738,7 +3763,7 @@ class PersistentSession:
                     logger.error("Session shell retirement was not acknowledged: %s", e)
                 else:
                     logger.warning(f"Shell cleanup error: {e}")
-        elif self.shell_manager:
+        elif self.shell_manager and preserve_shell:
             logger.info(
                 "Preserving remote shell for session handoff: thread=%s",
                 self.thread_id,
@@ -3775,7 +3800,7 @@ class PersistentSession:
                 shell_retirement_error = WorkspaceUnavailableError(
                     "Sandbox workspace process-zero proof is unavailable"
                 )
-            else:
+            elif not vm_actuator_handoff:
                 # VM/remote process-zero belongs to the orchestrator actuator,
                 # which can prove the exact VM generation/UID after this live
                 # agent is absent. Never forge that stronger proof locally.
@@ -3807,6 +3832,7 @@ class PersistentSession:
             backend_for_cleanup is not None
             and resident_cleanup_error is None
             and local_handoff_error is None
+            and (not vm_actuator_handoff or browser_shutdown_error is None)
         ):
             backend = backend_for_cleanup
             if shell_retirement_error is not None:
@@ -3892,6 +3918,7 @@ class PersistentSession:
         if (
             exact_pinned_terminal
             and not self.local_quiescence_protocol
+            and not vm_actuator_handoff
             and shell_retirement_error is None
             and browser_shutdown_error is None
             and resident_cleanup_error is None
@@ -3924,3 +3951,6 @@ class PersistentSession:
             raise WorkspaceUnavailableError(
                 "Session backend retirement remains unacknowledged"
             ) from backend_retirement_error
+        if vm_actuator_handoff:
+            self.terminal_vm_drain_complete = True
+            return "actuator_required"

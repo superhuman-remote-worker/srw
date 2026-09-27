@@ -376,7 +376,8 @@ APP_INPUT_DELIVERY_CONSTRAINTS_NOT_VALID = (
     / "src/orchestrator/database/migrations/app/0213_input_delivery_constraints_not_valid.sql"
 )
 APP_CURRENT_MIGRATION_HEAD = (
-    ROOT / "src/orchestrator/database/migrations/app/0297_vm_thread_retained_resume.sql"
+    ROOT
+    / "src/orchestrator/database/migrations/app/0298_pinned_vm_retirement_actuator_request.sql"
 )
 AUDIT_EXPANSION = (
     ROOT

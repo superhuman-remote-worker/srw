@@ -109,6 +109,7 @@ def redact_thread_metadata(thread: dict[str, Any]) -> dict[str, Any]:
         "runtime_retirement_context",
         "runtime_retirement_stage_receipt",
         "runtime_retirement_local_quiescence",
+        "runtime_retirement_actuator_request",
         "runtime_retirement_external_cleanup",
     ):
         thread.pop(internal_key, None)

@@ -17,6 +17,23 @@ from uuid import UUID
 from pydantic import BaseModel, Field, model_validator
 
 
+class AgentRetirementActuatorRequest(BaseModel):
+    """Exact End handoff; carries no endpoint, disk authority or zero proof."""
+
+    agent_id: UUID
+    pod_uid: str = Field(min_length=1, max_length=256)
+    process_generation: str = Field(min_length=1, max_length=256)
+    session_runtime_generation: UUID
+    session_runtime_attach_token: UUID
+    session_runtime_retirement_token: UUID
+    retirement_disposition: Literal["ended"]
+    retirement_permanent: bool = Field(strict=True)
+    workspace_generation: UUID
+    workspace_runtime_incarnation: UUID
+
+    model_config = {"extra": "forbid"}
+
+
 class AgentThreadStatusRequest(BaseModel):
     status: str
     # Optional exact owner credential for pinned teardown. Stateless callers

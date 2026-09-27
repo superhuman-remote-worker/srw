@@ -524,7 +524,7 @@ _watchdog_tasks: list[asyncio.Task] = []
 # re-entrant caller (otherwise outer teardown and cancelled loop deadlock),
 # while every independent caller awaits the same authoritative cleanup result.
 _terminating: bool = False
-_termination_task: Optional[asyncio.Task[None]] = None
+_termination_task: Optional[asyncio.Task[str | None]] = None
 
 # Reference to the currently running persistent-loop task. Set by ws_chat when
 # it spawns the loop, cleared when _terminate_session runs. _terminate_session()
@@ -5261,7 +5261,7 @@ async def _terminate_session(
     mark_thread: bool = True,
     preserve_shell: Optional[bool] = None,
     preserve_workspace_daemons: bool = False,
-) -> None:
+) -> str | None:
     """Tear down the current session and return to idle.
 
     Called by:
@@ -5311,27 +5311,26 @@ async def _terminate_session(
             # re-entry. Every independent release/complete caller waits below.
             logger.debug("Terminate(%s) re-entered from the loop being joined", reason)
             return
-        await asyncio.shield(active)
-        return
+        return await asyncio.shield(active)
     if not _session:
         return
     termination_session = _session
     termination_identity = _attached_retirement_identity()
 
-    async def _run() -> None:
+    async def _run() -> str | None:
         global _terminating, _termination_task
         _terminating = True
         try:
             retry_attempt = 0
             while True:
                 try:
-                    await _terminate_session_inner(
+                    result = await _terminate_session_inner(
                         reason,
                         mark_thread=mark_thread,
                         preserve_shell=preserve_shell,
                         preserve_workspace_daemons=preserve_workspace_daemons,
                     )
-                    if reason in {
+                    if result != "actuator_requested" and reason in {
                         "boot_ws_timeout",
                         "thread_ended_oob",
                         "thread_retirement_authorized",
@@ -5340,7 +5339,7 @@ async def _terminate_session(
                         # cancels/joins them while this child remains shielded,
                         # so only the surviving exact owner can schedule exit.
                         _schedule_exit(delay=1.0)
-                    return
+                    return result
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
@@ -5383,7 +5382,7 @@ async def _terminate_session(
     )
     _termination_task = task
     try:
-        await asyncio.shield(task)
+        return await asyncio.shield(task)
     except asyncio.CancelledError:
         # Teardown continues as the single owner. Propagate caller
         # cancellation without publishing a false completion signal.
@@ -5391,6 +5390,62 @@ async def _terminate_session(
 
 
 _EXACT_RETIREMENT_SETTLEMENT_RETRY_DELAYS = (0.0, 0.25, 1.0, 3.0)
+
+
+async def _request_vm_retirement_actuator(
+    *, pinned_agent_id: str, retirement_permanent: bool,
+) -> str:
+    """Retry only the frozen drain handoff; acceptance leaves End pending."""
+    session = _session
+    identity = _attached_retirement_identity()
+    if (
+        not isinstance(session, PersistentSession)
+        or not session.terminal_vm_drain_complete
+        or identity is None
+        or _retirement_admission_identity != identity
+        or _retirement_admission_disposition != "ended"
+        or _retirement_admission_permanent is not retirement_permanent
+        or not _retirement_admission_token
+        or session.local_quiescence_protocol
+    ):
+        raise EventJournalUnavailable("VM actuator handoff lacks exact local drain")
+    if session.terminal_actuator_request_accepted:
+        return "actuator_requested"
+    if session.terminal_actuator_request is None:
+        session.terminal_actuator_request = {
+            "pinned_agent_id": pinned_agent_id,
+            "pod_uid": str(os.environ.get("POD_UID") or ""),
+            "process_generation": str(
+                getattr(_orchestrator_client, "dispatch_process_generation", "") or ""
+            ),
+            "session_runtime_generation": identity[1],
+            "session_runtime_attach_token": identity[2],
+            "session_runtime_retirement_token": _retirement_admission_token,
+            "retirement_disposition": "ended",
+            "retirement_permanent": retirement_permanent,
+            "workspace_generation": session.workspace_generation,
+            "workspace_runtime_incarnation": session.workspace_runtime_incarnation,
+        }
+    attempt = 0
+    while _session is session and _attached_retirement_identity() == identity:
+        try:
+            response = await _orchestrator_client.request_thread_retirement_actuator(
+                identity[0], **session.terminal_actuator_request,
+            )
+            if isinstance(response, dict) and response.get("status") in {
+                "actuator_requested", "settled_or_superseded",
+            }:
+                session.terminal_actuator_request_accepted = True
+                return "actuator_requested"
+        except Exception as exc:
+            logger.warning("VM actuator handoff response unavailable (thread=%s type=%s)",
+                           identity[0], type(exc).__name__)
+        delay = _EXACT_RETIREMENT_SETTLEMENT_RETRY_DELAYS[
+            min(attempt, len(_EXACT_RETIREMENT_SETTLEMENT_RETRY_DELAYS) - 1)
+        ]
+        attempt += 1
+        await asyncio.sleep(delay)
+    raise EventJournalUnavailable("VM actuator handoff identity changed")
 
 
 async def _settle_exact_retirement_after_quiescence(
@@ -5487,7 +5542,7 @@ async def _terminate_session_inner(
     mark_thread: bool = True,
     preserve_shell: Optional[bool] = None,
     preserve_workspace_daemons: bool = False,
-) -> None:
+) -> str | None:
     """Body of _terminate_session — only reached holding the _terminating guard."""
     global _session, _thread_id, _sessions_served, _loop_task
     global _loop_user_queue, _loop_interrupt_flag, _loop_interrupt_target_turn_id
@@ -5545,6 +5600,23 @@ async def _terminate_session_inner(
             raise EventJournalUnavailable(
                 f"cannot begin exact thread retirement before teardown: {thread_id}"
             )
+
+    vm_actuator_handoff = bool(
+        mark_thread
+        and not preserve_remote_shell
+        and not preserve_workspace_daemons
+        and _pinned_runtime_generation_enabled
+        and pinned_control_owner
+        and retirement_disposition == "ended"
+        and _retirement_admission_identity == _attached_retirement_identity()
+        and _retirement_admission_token
+        and _session.workspace_backend_tier in {"vm", "remote"}
+    )
+    if vm_actuator_handoff and _session.terminal_vm_drain_complete is True:
+        return await _request_vm_retirement_actuator(
+            pinned_agent_id=pinned_control_owner,
+            retirement_permanent=retirement_permanent,
+        )
 
     # Cancel in-flight loop_task FIRST. Out-of-band callers (heartbeat-intent
     # drain, thread-status watchdog) reach this without going through the
@@ -5623,13 +5695,15 @@ async def _terminate_session_inner(
     # _session.cleanup() tears down the stores; contained like the sibling
     # teardown steps — a memory failure must never skip cleanup.
     if (
-        not _stateless_mode()
+        getattr(_session, "terminal_memory_capture_attempted", False) is not True
+        and not _stateless_mode()
         and _session.memory_service is not None
         and not _session.final_memory_extracted
         and _session.messages
         and not (_session.shell_owner_token is not None and not mark_thread)
         and not _termination_admission_closed()
     ):
+        _session.terminal_memory_capture_attempted = True
         try:
             from agent.services.memory import CaptureEvent
 
@@ -5662,47 +5736,51 @@ async def _terminate_session_inner(
             exc_info=True,
         )
 
-    # Final cloud sync + drop secrets. No more background polling to stop:
-    # Phase 1 moved sync to turn boundaries via the coordinator. The last
-    # turn's background push must land first — never two concurrent walks of
-    # one mount, and never an aclose under an in-flight push.
-    if _session.workspace_sync:
-        try:
-            await _await_pending_cloud_push()
-            # Stateless bytes are committed only by the armed generation task
-            # above. A second raw push here would have no durable requirement
-            # or acknowledgement and, on lease-loss teardown, could overlap a
-            # successor's pull. Pinned teardown keeps its existing final
-            # push+pull byte-for-byte.
-            if not _stateless_mode():
-                await _session.workspace_sync.push_all()
-                await _session.workspace_sync.pull_all()
-        except Exception as e:
-            logger.warning(f"Final cloud sync failed (non-fatal): {e}")
-        if _background_push_owns(_session.workspace_sync):
-            # Step 4a: a handed-off push still transmits through this
-            # coordinator; its done-callback closes it. Closing here would
-            # yank the WebDAV client from under the off-slot transmit.
-            logger.info(
-                "cloud sync coordinator left open for the handed-off push (thread %s)",
-                thread_id,
-            )
-        else:
+    if getattr(_session, "terminal_finalization_attempted", False) is not True:
+        _session.terminal_finalization_attempted = True
+        # Final cloud sync + drop secrets. No more background polling to stop:
+        # Phase 1 moved sync to turn boundaries via the coordinator. The last
+        # turn's background push must land first — never two concurrent walks of
+        # one mount, and never an aclose under an in-flight push.
+        if _session.workspace_sync:
             try:
-                await _session.workspace_sync.aclose()
+                await _await_pending_cloud_push()
+                # Stateless bytes are committed only by the armed generation task
+                # above. A second raw push here would have no durable requirement
+                # or acknowledgement and, on lease-loss teardown, could overlap a
+                # successor's pull. Pinned teardown keeps its existing final
+                # push+pull byte-for-byte.
+                if not _stateless_mode():
+                    await _session.workspace_sync.push_all()
+                    await _session.workspace_sync.pull_all()
             except Exception as e:
-                logger.debug(f"Cloud sync aclose failed (non-fatal): {e}")
+                logger.warning(f"Final cloud sync failed (non-fatal): {e}")
+            if _background_push_owns(_session.workspace_sync):
+                # Step 4a: a handed-off push still transmits through this
+                # coordinator; its done-callback closes it. Closing here would
+                # yank the WebDAV client from under the off-slot transmit.
+                logger.info(
+                    "cloud sync coordinator left open for the handed-off push (thread %s)",
+                    thread_id,
+                )
+            else:
+                try:
+                    await _session.workspace_sync.aclose()
+                except Exception as e:
+                    logger.debug(f"Cloud sync aclose failed (non-fatal): {e}")
 
-    # Final git commit + push
-    if _session.workspace_manager:
-        git_mgr = getattr(_session.workspace_manager, "git_manager", None)
-        if git_mgr and git_mgr.is_active:
-            try:
-                if git_mgr.has_uncommitted_changes():
-                    git_mgr.commit(f"Session detach: thread {thread_id}")
-                git_mgr.push()
-            except Exception as e:
-                logger.warning(f"Final git push failed (non-fatal): {e}")
+        # Final git commit + push
+        if _session.workspace_manager:
+            git_mgr = getattr(_session.workspace_manager, "git_manager", None)
+            if git_mgr and git_mgr.is_active:
+                try:
+                    if git_mgr.has_uncommitted_changes():
+                        git_mgr.commit(f"Session detach: thread {thread_id}")
+                    if git_mgr.push() is False:
+                        logger.warning("Final git push was unsuccessful (non-fatal): %s",
+                                       getattr(git_mgr, "last_push_error", None))
+                except Exception as e:
+                    logger.warning(f"Final git push failed (non-fatal): {e}")
 
     # The journal owns a captured pool + thread identity. Drain it while both
     # the session and live subscribers still exist: terminal Canvas failures
@@ -5737,10 +5815,18 @@ async def _terminate_session_inner(
     # the remote shell. From here onward cleanup may mutate mount transports but
     # no new tool/shell command is admitted.
     _session.retire_shell_owner()
-    await _session.cleanup(
-        preserve_shell=preserve_remote_shell,
-        preserve_workspace_daemons=preserve_workspace_daemons,
-    )
+    cleanup_kwargs = {
+        "preserve_shell": preserve_remote_shell,
+        "preserve_workspace_daemons": preserve_workspace_daemons,
+    }
+    if vm_actuator_handoff:
+        cleanup_kwargs["allow_vm_actuator_handoff"] = True
+    cleanup_result = await _session.cleanup(**cleanup_kwargs)
+    if cleanup_result == "actuator_required":
+        return await _request_vm_retirement_actuator(
+            pinned_agent_id=pinned_control_owner,
+            retirement_permanent=retirement_permanent,
+        )
 
     if mark_thread and not await _settle_exact_retirement_after_quiescence(
         pinned_agent_id=pinned_control_owner,
@@ -6282,7 +6368,9 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
 
         thread_id = _thread_id
         try:
-            await _terminate_session("rest_detach")
+            result = await _terminate_session("rest_detach")
+            if result == "actuator_requested":
+                return JSONResponse({"status": "ending", "thread_id": thread_id}, status_code=202)
             return JSONResponse(
                 {
                     "status": "detached",
@@ -15969,20 +16057,7 @@ async def _handle_archive(ws: WebSocket) -> None:
                 "session retirement admission could not be closed"
             )
 
-        # 0. Final cloud sync. No background poll to stop after Phase 1.
-        # Await the last turn's background push first (same contract as
-        # _terminate_session): no concurrent walk, no aclose under a push.
-        if _session.workspace_sync:
-            try:
-                await _await_pending_cloud_push()
-                await _session.workspace_sync.push_all()
-                await _session.workspace_sync.pull_all()
-            except Exception as e:
-                logger.warning(f"Final cloud sync failed (non-fatal): {e}")
-            try:
-                await _session.workspace_sync.aclose()
-            except Exception as e:
-                logger.debug(f"Cloud sync aclose failed (non-fatal): {e}")
+        # Common termination owns the once-only final cloud/Git flush.
 
         # 1. Extract final memories on the pinned lane. Stateless turns already
         # own durable per-turn obligations; a full-history teardown pass would
@@ -16055,7 +16130,13 @@ async def _handle_archive(ws: WebSocket) -> None:
         # state, not a falsely ended one. The orchestrator journals the
         # authoritative terminal edge; this direct WS acknowledgement is only
         # a low-latency echo for the command issuer after settlement succeeds.
-        await _terminate_session("archive")
+        result = await _terminate_session("archive")
+        if result == "actuator_requested":
+            await _ws_send(ws, "session.ending", {
+                "thread_id": archived_thread_id,
+                "session_runtime_generation": archived_runtime_generation,
+            })
+            return
         terminal_params = {
             "thread_id": archived_thread_id,
             "session_runtime_generation": archived_runtime_generation,
@@ -16852,26 +16933,17 @@ async def _handle_idle_archive(ws: Optional[WebSocket] = None) -> None:
             except Exception as e:
                 logger.warning(f"Idle title generation failed: {e}")
 
-        # 2. Git commit + push. The caller immediately enters common teardown,
-        # which alone closes admission, drains controls, and performs the exact
-        # pinned-owner lifecycle CAS.
-        if _session.workspace_manager:
-            git_mgr = getattr(_session.workspace_manager, "git_manager", None)
-            if git_mgr and git_mgr.is_active:
-                try:
-                    if git_mgr.has_uncommitted_changes():
-                        git_mgr.commit(f"Idle timeout: thread {_thread_id}")
-                    git_mgr.push()
-                except Exception as e:
-                    logger.warning(f"Idle git push failed: {e}")
+        # Common termination owns the once-only final Git flush.
 
         # 3. Close durable admission/Resume, then settle the exact retirement
         # before reporting completion. The orchestrator's settlement owns the
         # durable ``session.ended`` journal edge. Publishing an agent-local
         # terminal frame earlier would make a failed settlement look ended and
         # could let Cockpit reopen Resume while cleanup is still in flight.
-        await _terminate_session("idle_timeout")
-
+        result = await _terminate_session("idle_timeout")
+        if result == "actuator_requested":
+            logger.info("Idle archive awaiting VM stop: thread=%s", idle_thread_id)
+            return
         logger.info(f"Idle archive complete: thread={idle_thread_id}")
     except Exception as e:
         logger.warning(f"Idle archive failed: {e}")

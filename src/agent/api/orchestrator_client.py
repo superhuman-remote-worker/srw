@@ -2301,6 +2301,67 @@ class OrchestratorClient:
             )
             return None
 
+    async def request_thread_retirement_actuator(
+        self, thread_id: str, *, pinned_agent_id: str, pod_uid: str,
+        process_generation: str, session_runtime_generation: str,
+        session_runtime_attach_token: str, session_runtime_retirement_token: str,
+        retirement_disposition: str, retirement_permanent: bool,
+        workspace_generation: str, workspace_runtime_incarnation: str,
+    ) -> dict[str, Any] | None:
+        """Publish/reconcile a frozen local-drain request, never an End ACK."""
+        coordinates = (
+            thread_id, pinned_agent_id, session_runtime_generation,
+            session_runtime_attach_token, session_runtime_retirement_token,
+            workspace_generation, workspace_runtime_incarnation,
+        )
+        if (
+            not self._client or not pod_uid or not process_generation.strip()
+            or retirement_disposition != "ended"
+            or type(retirement_permanent) is not bool
+            or any(_canonical_runtime_uuid(value) != value for value in coordinates)
+        ):
+            return None
+        body = {
+            "agent_id": pinned_agent_id, "pod_uid": pod_uid,
+            "process_generation": process_generation,
+            "session_runtime_generation": session_runtime_generation,
+            "session_runtime_attach_token": session_runtime_attach_token,
+            "session_runtime_retirement_token": session_runtime_retirement_token,
+            "retirement_disposition": retirement_disposition,
+            "retirement_permanent": retirement_permanent,
+            "workspace_generation": workspace_generation,
+            "workspace_runtime_incarnation": workspace_runtime_incarnation,
+        }
+        marker = {
+            "kind": "vm_local_drain_complete_v1", "thread_id": thread_id,
+            "agent_id": pinned_agent_id, "pod_uid": pod_uid,
+            "process_generation": process_generation,
+            "runtime_generation": session_runtime_generation,
+            "runtime_attach_token": session_runtime_attach_token,
+            "retirement_token": session_runtime_retirement_token,
+            "disposition": retirement_disposition, "permanent": retirement_permanent,
+            "workspace_generation": workspace_generation,
+            "workspace_runtime_incarnation": workspace_runtime_incarnation,
+        }
+        try:
+            response = await self._client.post(
+                f"{self.orchestrator_url}/api/agents/threads/{thread_id}/retirement-actuator",
+                json=body,
+            )
+            if response.status_code != 200:
+                return None
+            payload = response.json()
+        except Exception as exc:
+            logger.warning("VM retirement handoff unavailable: %s", type(exc).__name__)
+            return None
+        if (
+            not isinstance(payload, dict)
+            or payload.get("status") not in {"actuator_requested", "settled_or_superseded"}
+            or payload.get("actuator_request") != marker
+        ):
+            return None
+        return payload
+
     async def get_thread_retirement_outcome(
         self,
         thread_id: str,

@@ -15,7 +15,10 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
 
-from orchestrator.schemas.agent_thread_status import AgentThreadStatusRequest
+from orchestrator.schemas.agent_thread_status import (
+    AgentRetirementActuatorRequest,
+    AgentThreadStatusRequest,
+)
 from orchestrator.services import agent_thread_status
 
 # No `tags=`: the declarations this replaces carried none, and a tag would
@@ -29,6 +32,17 @@ def get_agent_thread_status_dependencies(
 ) -> agent_thread_status.AgentThreadStatusDependencies:
     """Resolve collaborators only from the application handling this request."""
     return request.app.state.agent_thread_status_dependencies_factory()
+
+
+@router.post("/api/agents/threads/{thread_id}/retirement-actuator")
+async def agent_request_retirement_actuator(
+    request: Request, thread_id: str, body: AgentRetirementActuatorRequest,
+) -> dict[str, Any]:
+    dependencies = get_agent_thread_status_dependencies(request)
+    await dependencies.require_internal(request)
+    return await agent_thread_status.request_retirement_actuator(
+        thread_id, body, dependencies=dependencies,
+    )
 
 
 @router.put("/api/agents/threads/{thread_id}/status")

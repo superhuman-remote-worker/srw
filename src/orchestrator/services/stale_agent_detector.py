@@ -44,8 +44,9 @@ __all__ = [
     "stale_agent_detector",
 ]
 
-# Durable pinned retirement is retried only after the exact local agent is
-# absent/offline and this grace has elapsed.  This is deliberately longer than
+# Unmarked pinned retirement is retried after the exact local agent is
+# absent/offline and this grace has elapsed. Exact VM local-drain handoffs
+# permit immediate actuation. This grace is deliberately longer than
 # ordinary local teardown: a live runtime owns memory/git/event-writer drain
 # after Begin and before its final settlement request.
 PINNED_RETIREMENT_RETRY_GRACE_SECONDS = max(
@@ -150,7 +151,7 @@ async def retire_orphaned_pinned_runtime(
 async def retry_pending_pinned_retirement(
     candidate: Mapping[str, Any], *, dependencies: StaleAgentDetectorDependencies
 ) -> bool:
-    """Retry one exact durable retirement after its local actor disappeared."""
+    """Retry exact durable retirement after actor loss or an accepted VM drain."""
 
     context = candidate.get("runtime_retirement_context") or {}
     if isinstance(context, str):
@@ -191,6 +192,14 @@ async def retry_pending_pinned_retirement(
     thread = await dependencies.store.get_thread(thread_id)
     if not isinstance(thread, Mapping):
         return False
+    marker = candidate.get("runtime_retirement_actuator_request")
+    if isinstance(marker, str):
+        try:
+            marker = json.loads(marker)
+        except (TypeError, ValueError):
+            return False
+    if marker is not None and not isinstance(marker, Mapping):
+        return False
     runtime_exposed = (
         dependencies.pinned_retirement_operations().retirement_context_runtime_exposed(
             {
@@ -227,7 +236,18 @@ async def retry_pending_pinned_retirement(
             )
         )
     ):
-        if candidate.get("nominated_before_grace"):
+        actuator_requested = False
+        if marker is not None:
+            # Recovery's first physical effect is Pod deletion, before its
+            # later lifecycle-lock reread. Revalidate the complete durable
+            # tuple immediately before entering that existing actuator.
+            actuator_requested = await dependencies.store.current_pinned_vm_actuator_request(
+                thread_id, runtime_generation=generation, retirement_token=token,
+                context=context, marker=marker,
+            )
+            if not actuator_requested:
+                return False
+        if candidate.get("nominated_before_grace") and not actuator_requested:
             # Nominated early for a proof it no longer shows exactly. Crash
             # recovery stays behind the full live-drain grace.
             return False
