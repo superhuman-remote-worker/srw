@@ -481,7 +481,7 @@ async def test_workspace_poll_preserves_generation(
     assert result["workspace_generation"] == WORKSPACE_GENERATION
     assert result["workspace_runtime_incarnation"] == WORKSPACE_RUNTIME_INCARNATION
     assert result["workspace_ssh_host_key_fingerprint"] == (
-        WORKSPACE_SSH_HOST_KEY_FINGERPRINT if expected_backend == "sandbox" else None
+        WORKSPACE_SSH_HOST_KEY_FINGERPRINT
     )
 
 
