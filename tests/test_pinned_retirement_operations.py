@@ -23,6 +23,8 @@ RUNTIME_GENERATION = "11111111-1111-4111-8111-111111111111"
 ATTACH_TOKEN = "22222222-2222-4222-8222-222222222222"
 RETIREMENT_TOKEN = "33333333-3333-4333-8333-333333333333"
 VM_GENERATION = "44444444-4444-4444-8444-444444444444"
+VM_UID = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee"
+ROOTDISK_UID = "ffffffff-ffff-4fff-8fff-ffffffffffff"
 CLAIM_ID = "66666666-6666-4666-8666-666666666666"
 CLAIM_ATTEMPT = "77777777-7777-4777-8777-777777777777"
 CLAIM_GENERATION = "88888888-8888-4888-8888-888888888888"
@@ -265,8 +267,8 @@ def _vm_retirement() -> dict[str, object]:
                 "provision_generation": VM_GENERATION,
                 "identity_provision_generation": VM_GENERATION,
                 "identity_authenticated": True,
-                "vm_uid": "vm-uid-a",
-                "rootdisk_pvc_uid": "rootdisk-uid-a",
+                "vm_uid": VM_UID,
+                "rootdisk_pvc_uid": ROOTDISK_UID,
                 "ssh_host": "vm.internal",
                 "ssh_port": 22,
                 "ssh_host_key_fingerprint": "SHA256:" + ("A" * 43),
@@ -289,8 +291,20 @@ def _current_vm_thread() -> dict[str, object]:
     }
 
 
+def _non_retained_vm_purge(monkeypatch):
+    """These legacy actuator tests have no retained Resume operation/source."""
+    from orchestrator.services import vm_thread_retained_disk_purge as retained
+
+    selector = AsyncMock(return_value=None)
+    monkeypatch.setattr(retained, "acquire_retained_disk_purge", selector)
+    return selector
+
+
 @pytest.mark.asyncio
-async def test_vm_recovery_stops_exact_pod_before_releasing_captured_vm() -> None:
+async def test_vm_recovery_stops_exact_pod_before_releasing_captured_vm(
+    monkeypatch,
+) -> None:
+    retained_selector = _non_retained_vm_purge(monkeypatch)
     events: list[str] = []
     store = MagicMock()
     store.get_thread = AsyncMock(
@@ -354,8 +368,8 @@ async def test_vm_recovery_stops_exact_pod_before_releasing_captured_vm() -> Non
     ]
     identity = VMTeardownIdentity(
         provision_generation=VM_GENERATION,
-        vm_uid="vm-uid-a",
-        rootdisk_pvc_uid="rootdisk-uid-a",
+        vm_uid=VM_UID,
+        rootdisk_pvc_uid=ROOTDISK_UID,
         ssh_host="vm.internal",
         ssh_port=22,
         ssh_host_key_fingerprint="SHA256:" + ("A" * 43),
@@ -379,7 +393,7 @@ async def test_vm_recovery_stops_exact_pod_before_releasing_captured_vm() -> Non
         expected_settle_status="ended",
         expected_quiescence_protocol="workspace_actuator_zero_v1",
         expected_workspace_generation=VM_GENERATION,
-        expected_workspace_runtime_incarnation="vm-uid-a",
+        expected_workspace_runtime_incarnation=VM_UID,
         quiescence_actor="orchestrator",
     )
 
@@ -397,7 +411,7 @@ async def test_vm_recovery_stops_exact_pod_before_releasing_captured_vm() -> Non
             "quiescence_protocol": "workspace_actuator_zero_v1",
             "quiescence_actor": "orchestrator",
             "workspace_generation": VM_GENERATION,
-            "workspace_runtime_incarnation": "vm-uid-a",
+            "workspace_runtime_incarnation": VM_UID,
         },
     }
     store.get_thread.side_effect = [completed, completed]
@@ -407,6 +421,13 @@ async def test_vm_recovery_stops_exact_pod_before_releasing_captured_vm() -> Non
     assert await operations.recover_captured_process_zero(_vm_retirement())
     vm_provisioner.release_vm_captured.assert_awaited_once()
     store.acknowledge_pinned_thread_local_quiescence.assert_awaited_once()
+    retained_selector.assert_awaited_once_with(
+        operations.dependencies.recovery_store,
+        thread_id=THREAD_ID,
+        identity=identity,
+        generation=RUNTIME_GENERATION,
+        token=RETIREMENT_TOKEN,
+    )
 
 
 @pytest.mark.asyncio
@@ -504,7 +525,10 @@ async def test_direct_vm_end_refuses_conflicting_alias_before_vm_effect() -> Non
 
 
 @pytest.mark.asyncio
-async def test_vm_recovery_hold_blocks_pinned_retirement_vm_release() -> None:
+async def test_vm_recovery_hold_blocks_pinned_retirement_vm_release(
+    monkeypatch,
+) -> None:
+    retained_selector = _non_retained_vm_purge(monkeypatch)
     store = MagicMock()
     store.get_thread = AsyncMock(
         side_effect=[_current_vm_thread(), _current_vm_thread()]
@@ -541,6 +565,15 @@ async def test_vm_recovery_hold_blocks_pinned_retirement_vm_release() -> None:
 
     assert not await operations.recover_captured_process_zero(_vm_retirement())
 
+    retained_selector.assert_awaited_once_with(
+        recovery_store,
+        thread_id=THREAD_ID,
+        identity=operations._captured_vm_recovery_identity(
+            _vm_retirement()["context"], permanent=True
+        ),
+        generation=RUNTIME_GENERATION,
+        token=RETIREMENT_TOKEN,
+    )
     recovery_store.acquire_cleanup_permit.assert_awaited_once()
     vm_provisioner.release_vm_captured.assert_not_awaited()
 
@@ -623,7 +656,7 @@ async def test_vm_recovery_accepts_explicit_null_redundant_alias() -> None:
         retirement["context"], permanent=True
     )
     assert identity is not None
-    assert identity.vm_uid == "vm-uid-a"
+    assert identity.vm_uid == VM_UID
 
 
 @pytest.mark.asyncio

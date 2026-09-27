@@ -996,7 +996,7 @@ def _lite_recovery_mocks(current):
 def _vm_retirement(*, backend="vm"):
     retirement, current = _lite_retirement(backend=backend, permanent=True)
     generation = "55555555-5555-4555-8555-555555555556"
-    vm_uid = "vm-incarnation-uid"
+    vm_uid = "66666666-6666-4666-8666-666666666667"
     retirement["context"]["vm"] = {
         "status": "ready",
         "provision_generation": generation,
@@ -1004,7 +1004,7 @@ def _vm_retirement(*, backend="vm"):
         "identity_authenticated": True,
         "vm_uid": vm_uid,
         "_runtime_incarnation": vm_uid,
-        "rootdisk_pvc_uid": "rootdisk-pvc-uid",
+        "rootdisk_pvc_uid": "77777777-7777-4777-8777-777777777778",
         "ssh_host": "192.0.2.44",
         "ssh_port": 22,
         "ssh_host_key_fingerprint": "SHA256:" + "A" * 43,
@@ -1075,13 +1075,19 @@ async def test_non_sandbox_recovery_uses_the_captured_vm_actuator(monkeypatch, b
     """Leader recovery must break the VM receipt/End retry dependency cycle."""
     import orchestrator.services.vm_workspace_recovery_store as recovery
     from orchestrator.services.vm_provisioner import VMTeardownResult
+    from orchestrator.services import vm_thread_retained_disk_purge as retained
+
+    # This legacy actuator fixture has no retained Resume operation/source.
+    retained_selector = AsyncMock(return_value=None)
+    monkeypatch.setattr(retained, "acquire_retained_disk_purge", retained_selector)
+    recovery_store = idle_recovery_store()
 
     # The retirement composition constructs the recovery store it hands the
     # operations (``controls.pinned_retirement_operations``).
     monkeypatch.setattr(
         vm_workspace_recovery_store_module,
         "VMWorkspaceRecoveryStore",
-        lambda db: idle_recovery_store(),
+        lambda db: recovery_store,
     )
     # This pinned-thread owner has no v3 Job creation/retry resource charge.
     monkeypatch.setattr(
@@ -1127,7 +1133,14 @@ async def test_non_sandbox_recovery_uses_the_captured_vm_actuator(monkeypatch, b
         == retirement["context"]["vm"]["provision_generation"]
     )
     assert call.args[1].vm_uid == retirement["context"]["vm"]["vm_uid"]
-    assert call.args[1].rootdisk_pvc_uid == "rootdisk-pvc-uid"
+    assert call.args[1].rootdisk_pvc_uid == "77777777-7777-4777-8777-777777777778"
+    retained_selector.assert_awaited_once_with(
+        recovery_store,
+        thread_id=retirement["context"]["thread_id"],
+        identity=call.args[1],
+        generation=retirement["generation"],
+        token=retirement["token"],
+    )
     parent_cleanup = call.kwargs["parent_cleanup"]
     assert parent_cleanup["intent"]["owner_id"] == call.args[0]
     assert parent_cleanup["intent"]["vm_uid"] == call.args[1].vm_uid
