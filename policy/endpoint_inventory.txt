@@ -126,6 +126,7 @@ POST   /api/agents/threads/{thread_id}/messages                                 
 POST   /api/agents/threads/{thread_id}/officer/notify                                   pat=refused         internal:require_internal
 POST   /api/agents/threads/{thread_id}/officer/wake                                     pat=refused         internal:require_internal
 POST   /api/agents/threads/{thread_id}/release-agent                                    pat=refused         internal:require_internal
+POST   /api/agents/threads/{thread_id}/retirement-actuator                              pat=refused         internal:require_internal
 GET    /api/agents/threads/{thread_id}/retirement-outcome                               pat=refused         internal:require_internal
 POST   /api/agents/threads/{thread_id}/rewind                                           pat=chat:write      gated:require_thread_owner
 PUT    /api/agents/threads/{thread_id}/status                                           pat=refused         internal:require_internal
