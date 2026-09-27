@@ -93,7 +93,7 @@ def _reset_agent_globals():
     mod._session_runtime_attach_token = None
     mod._orchestrator_client = None
     mod._subscribers.clear()
-    mod._loop_user_queue = None
+    mod._session_input._queue = None
 
 
 def _install_session(*, turn_count: int, headless_mode: str = "eager"):
@@ -113,7 +113,7 @@ def _install_session(*, turn_count: int, headless_mode: str = "eager"):
     client = AsyncMock()
     client.update_thread_status = AsyncMock(return_value=True)
     mod._orchestrator_client = client
-    mod._loop_user_queue = asyncio.Queue()
+    mod._session_input._queue = asyncio.Queue()
     return session, client
 
 
@@ -151,8 +151,8 @@ class TestPoliteModeFlip:
         await asyncio.sleep(0)
         client.update_thread_status.reset_mock()
 
-        mod._loop_user_queue.put_nowait("hi")
-        await mod._loop_get_user_input()
+        mod._session_input.queue.put_nowait("hi")
+        await mod._session_input.get_user_input()
         await asyncio.sleep(0)
 
         client.update_thread_status.assert_awaited_with(
@@ -166,9 +166,9 @@ class TestPoliteModeFlip:
         import agent.api.persistent_app as mod
 
         _, client = _install_session(turn_count=0, headless_mode="polite")
-        mod._loop_user_queue.put_nowait("hi")
+        mod._session_input.queue.put_nowait("hi")
 
-        await mod._loop_get_user_input()
+        await mod._session_input.get_user_input()
         await asyncio.sleep(0)
 
         client.update_thread_status.assert_not_called()
@@ -183,8 +183,8 @@ class TestPoliteModeFlip:
         await asyncio.sleep(0)
         client.update_thread_status.reset_mock()
 
-        mod._loop_user_queue.put_nowait("hi")
-        await mod._loop_get_user_input()
+        mod._session_input.queue.put_nowait("hi")
+        await mod._session_input.get_user_input()
         await asyncio.sleep(0)
 
         for call in client.update_thread_status.await_args_list:
@@ -196,9 +196,9 @@ class TestPoliteModeFlip:
         import agent.api.persistent_app as mod
 
         _, client = _install_session(turn_count=2, headless_mode="eager")
-        mod._loop_user_queue.put_nowait("hi")
+        mod._session_input.queue.put_nowait("hi")
 
-        await mod._loop_get_user_input()
+        await mod._session_input.get_user_input()
         await asyncio.sleep(0)
 
         client.update_thread_status.assert_awaited_with(
@@ -216,8 +216,8 @@ class TestPoliteModeFlip:
         # the downstream idle-timeout read works.
         del mod._session.config.headless
 
-        mod._loop_user_queue.put_nowait("hi")
-        await mod._loop_get_user_input()
+        mod._session_input.queue.put_nowait("hi")
+        await mod._session_input.get_user_input()
         await asyncio.sleep(0)
 
         # Eager fallback + no subscribers → should flip.

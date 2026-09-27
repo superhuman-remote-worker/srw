@@ -41,15 +41,18 @@ from agent.api import session_transport as _session_transport
 from agent.api._session_auth import SessionAuthBindings
 from agent.api.session_canvas_control import CanvasControlChannel
 from agent.api.session_contract import (
-    AcceptedInput,
-    DurableInputUnavailable,
     ProtectedCloudUnavailable,
-    SessionIdentityMismatch,
     SessionOperations,
     SessionRuntimeView,
     TerminationAdmissionClosed,
     WorkspaceNotReady,
     canonical_session_identity_fingerprint,
+)
+from agent.api.session_input import (
+    InputWaitPlan,
+    SessionInputPorts,
+    SessionInputRuntime,
+    SessionRuntimeIdentity,
 )
 from agent.api.session_http import (
     SessionHttpPorts,
@@ -503,11 +506,6 @@ _runtime_authorization_admission_open: bool = False
 # that existed only in the predecessor's RAM queue. The separate session
 # generation fences the durable thread binding. Reset on every attach.
 _input_runtime_generation: Optional[str] = None
-_queued_input_claims: set[tuple[str, int]] = set()
-# Serializes durable reclaim with local queue/priority publication. In
-# particular, a concurrent human B may not steal a just-deferred wake A between
-# A's generation CAS and its priority reclaim.
-_input_delivery_reclaim_lock = asyncio.Lock()
 _INPUT_CANCELLATION_ENABLED_ENV = "PERSISTENT_INPUT_CANCELLATION_ENABLED"
 
 
@@ -521,11 +519,6 @@ def _persistent_input_cancellation_enabled() -> bool:
         "on",
     }
 
-
-# True exactly while the persistent loop is parked in _loop_get_user_input's
-# queue wait — the only state where an out-of-band teardown (drain-suspend)
-# cannot kill user-visible work mid-turn.
-_awaiting_input: bool = False
 
 # Self-cleanup watchdogs (PR 2 — protect against the abandoned-pod failure modes
 # that the orchestrator reconciler can only catch with a 60s+ delay):
@@ -607,29 +600,30 @@ _canvas_control = CanvasControlChannel(
     fan_out_live=lambda frame: _fan_out_live_frame(frame),
 )
 
-# Loop-facing input primitives. Used to be closure-scoped inside ws_chat;
-# hoisted to module level so they survive WS reconnect. All three are reset
-# on session attach / cleared on _terminate_session.
-_loop_user_queue: Optional[asyncio.Queue] = None
-# Tri-state interrupt flag (phase 2): None = no interrupt pending,
-# "graceful" = stop after current tool call completes, "hard" = cancel the
-# in-flight LLM stream immediately and drop the partial AIMessage. Set by
-# the agent's POST /api/interrupt handler based on current _tool_inflight
-# state. Consumed by persistent_graph's check_interrupt callback at three
-# sites (pre-LLM, mid-astream, between tool calls). Legacy WS interrupt
-# path uses the same flag — sets "hard" when no tool is inflight.
-_loop_interrupt_flag: Optional[str] = None
-# Exact transcript turn the pending interrupt belongs to. A mode without a
-# matching target is invalid and is cleared rather than allowed to strike a
-# successor turn.
-_loop_interrupt_target_turn_id: Optional[int] = None
-# Hard-interrupt signal (phase 3). Set alongside _loop_interrupt_flag="hard"
-# so the loop can tear down a blocked LLM / auxiliary await (e.g. a hung
-# summarization read) immediately, instead of waiting for the cooperative
-# check_interrupt poll — which can't fire while the turn is parked in a
-# network read. Created in _attach_session, set in the interrupt handlers
-# when no tool is in flight, cleared whenever the flag is consumed.
-_hard_interrupt_event: Optional[asyncio.Event] = None
+# Input admission, delivery and interrupt state: the loop's input queue, the
+# claims published into it, the reclaim lock and protected-reclaim task, the
+# interrupt mode/target/hard-cancel event and the parked (awaiting-input)
+# window. One owner per process, like the Canvas channel. Attach, loop start
+# and teardown use its lifecycle operations; every dependency, including the
+# runtime identity, is read at call time.
+_session_input = SessionInputRuntime(
+    SessionInputPorts(
+        session=lambda: _session,
+        identity=lambda: _current_input_runtime_identity(),
+        stateless_mode=lambda: _stateless_mode(),
+        runtime_admission_closed=lambda: _runtime_admission_closed(),
+        protected_cloud_ready=lambda: _protected_cloud_runtime_ready(),
+        identity_fingerprint=lambda: _current_pinned_session_identity_fingerprint(),
+        cancellation_enabled=lambda: _persistent_input_cancellation_enabled(),
+        turn_open=lambda: _turn_event_open,
+        tool_inflight=lambda: _tool_inflight,
+        broadcast=lambda method, params: _broadcast(method, params),
+        track_side_task=lambda task: _track_session_side_task(task),
+        human_input_accepted=lambda content: _schedule_early_title(content),
+        begin_input_wait=lambda: _begin_loop_input_wait(),
+    ),
+    logger=logger,
+)
 
 # Serializes rewinds: two concurrent rewind frames on one session would race
 # the sweep/truncate pair. Second caller gets an error, not a queue.
@@ -647,7 +641,6 @@ _draft_title_value: Optional[str] = None
 # teardown before the event writer or claimant lease is released.
 _session_generation: int = 0
 _session_side_tasks: set[asyncio.Task[Any]] = set()
-_protected_input_reclaim_task: Optional[asyncio.Task[Any]] = None
 
 
 def _track_session_side_task(task: asyncio.Task[Any]) -> asyncio.Task[Any]:
@@ -1454,7 +1447,11 @@ def _turn_in_flight() -> bool:
     mid-turn without an explicit ``force``
     (knowledge-base/knowledge/issues/session_silent_failure_audit.md #11).
     """
-    return _loop_task is not None and not _loop_task.done() and not _awaiting_input
+    return (
+        _loop_task is not None
+        and not _loop_task.done()
+        and not _session_input.awaiting_input
+    )
 
 
 def _session_toolset_report() -> dict:
@@ -1578,11 +1575,7 @@ def activate_termination_admission_fence(source: str) -> bool:
         )
     # queue.get() otherwise has no reason to wake and notice the file/flag.
     # The sentinel is filtered by the loop and is never persisted.
-    if _awaiting_input and _loop_user_queue is not None:
-        try:
-            _loop_user_queue.put_nowait(_TERMINATION_QUEUE_SENTINEL)
-        except asyncio.QueueFull:  # pragma: no cover - production queue unbounded
-            pass
+    _session_input.wake_parked_wait(_TERMINATION_QUEUE_SENTINEL)
     return first
 
 
@@ -1600,7 +1593,7 @@ def _termination_quiescent() -> bool:
         if int(getattr(memory, "background_tasks_inflight", 0) or 0) > 0:
             return False
     task = _loop_task
-    return task is None or task.done() or _awaiting_input
+    return task is None or task.done() or _session_input.awaiting_input
 
 
 async def _wait_for_termination_quiescence(timeout_seconds: float) -> bool:
@@ -1653,7 +1646,7 @@ def _session_ready() -> bool:
     primitives are ready to accept a WS subscriber.
 
     Three-way check: ``_session.llm_with_tools`` is set near the end of
-    ``PersistentSession.setup()``, but ``_loop_user_queue`` is initialized
+    ``PersistentSession.setup()``, but the input queue is published
     later in ``_attach_session`` (after repo clone, cloud sync pull, message
     restore, and the ``thread_status='active'`` DB update). Anything that
     gates session readiness — the readiness probes (``/ready``,
@@ -1665,7 +1658,7 @@ def _session_ready() -> bool:
         not _runtime_admission_closed()
         and _session is not None
         and _session.llm_with_tools is not None
-        and _loop_user_queue is not None
+        and _session_input.queue is not None
         and _protected_cloud_runtime_ready()
     )
 
@@ -1693,7 +1686,7 @@ def _ensure_persistent_loop_started(
         if callable(_cb_setter):
             _cb_setter(_loop_compaction_progress)
         callbacks = PersistentLoopCallbacks(
-            get_user_input=_loop_get_user_input,
+            get_user_input=_session_input.get_user_input,
             on_token=_loop_on_token,
             on_thinking=_loop_on_thinking,
             on_tool_start=_loop_on_tool_start,
@@ -1704,7 +1697,7 @@ def _ensure_persistent_loop_started(
             on_turn_start=_loop_on_turn_start,
             on_turn_complete=_loop_on_turn_complete,
             on_error=_loop_on_error,
-            check_interrupt=_loop_check_interrupt,
+            check_interrupt=_session_input.check_interrupt,
             on_workspace_upgrade_needed=_loop_on_workspace_upgrade_needed,
             on_workspace_commit=_loop_on_workspace_commit,
             on_context_compacted=_loop_on_context_compacted,
@@ -1713,16 +1706,18 @@ def _ensure_persistent_loop_started(
             on_turn_settled=_loop_on_turn_settled,
             archive_llm_call=_loop_archive_llm_call,
             on_usage=_loop_on_usage,
-            hard_interrupt_event=_hard_interrupt_event,
+            hard_interrupt_event=_session_input.hard_interrupt_event,
             on_thinking_reset=_loop_on_thinking_reset,
             before_turn_authorization=_loop_before_turn_authorization,
             before_provider_admission=_loop_provider_admission_open,
             before_provider_execution=_loop_runtime_effect_authority_current,
-            admit_input_delivery=_loop_admit_input_delivery,
-            defer_input_delivery=_loop_defer_input_delivery,
-            cancel_input_delivery=_loop_cancel_input_delivery,
-            defer_and_requeue_input_delivery=(_loop_defer_and_requeue_input_delivery),
-            settle_input_delivery=_loop_settle_input_delivery,
+            admit_input_delivery=_session_input.admit_delivery,
+            defer_input_delivery=_session_input.defer_delivery,
+            cancel_input_delivery=_session_input.cancel_delivery,
+            defer_and_requeue_input_delivery=(
+                _session_input.defer_and_requeue_delivery
+            ),
+            settle_input_delivery=_session_input.settle_delivery,
         )
         # Tag the loop task — and the turn/aux tasks it spawns, which copy this
         # context at creation — with thread_id for log correlation.
@@ -1869,17 +1864,17 @@ async def _handle_heartbeat_intents(response: dict[str, Any]) -> None:
 def _session_parked() -> bool:
     """True when the persistent loop is parked waiting for user input.
 
-    Parked = blocked in _loop_get_user_input's queue wait with nothing
+    Parked = blocked in the input owner's queue wait with nothing
     queued and no tool call in flight. Anything else counts as an active
     turn and must not be torn down out-of-band.
     """
-    if not _awaiting_input or _tool_inflight:
+    if not _session_input.awaiting_input or _tool_inflight:
         return False
     if _runtime_admission_closed():
         # Queue contents remain durable/deferred for the replacement.  They do
         # not make the predecessor active once termination admission is closed.
         return True
-    queue = _loop_user_queue
+    queue = _session_input.queue
     return queue is None or queue.empty()
 
 
@@ -2220,7 +2215,7 @@ async def _thread_status_watchdog(poll_s: int) -> None:
 
     'awaiting_user' is the eager-mode transient idle state set by this same
     agent's loop on natural pause with no subscribers (Phase 5,
-    ``_loop_get_user_input``). It is NOT a terminal state — the orchestrator's
+    ``_begin_loop_input_wait``). It is NOT a terminal state — the orchestrator's
     attention-sleep watchdog owns the eventual ``awaiting_user → suspended``
     transition and we mustn't pre-empt it from here, or we kill the very
     untethered-survival behaviour Phase 1 + Phase 5 were built to enable.
@@ -3580,8 +3575,6 @@ async def _cleanup_failed_event_journal_attach(
     global _session, _thread_id, _event_writer
     global _events_epoch, _next_seq, _tool_inflight, _turn_event_open
     global _turn_tool_execution_identity, _turn_tool_execution_external_hook
-    global _loop_user_queue, _loop_interrupt_flag, _loop_interrupt_target_turn_id
-    global _hard_interrupt_event
     global _input_runtime_generation
     global _runtime_authorization_admission_open
     global _pinned_status_identity_enabled
@@ -3743,16 +3736,12 @@ async def _cleanup_failed_event_journal_attach(
     _turn_tool_execution_identity = None
     _turn_tool_execution_external_hook = None
     _turn_event_open = False
-    _loop_user_queue = None
-    _loop_interrupt_flag = None
-    _loop_interrupt_target_turn_id = None
-    _hard_interrupt_event = None
+    _session_input.teardown()
     _input_runtime_generation = None
     _runtime_authorization_admission_open = False
     _pinned_status_identity_enabled = False
     _clear_attached_runtime_identity()
     _clear_attached_runtime_actor()
-    _queued_input_claims.clear()
     _canvas_control.clear_all()
     _subscribers.clear()
     from agent.tools.registry import register_mcp_tools
@@ -5016,28 +5005,21 @@ async def _attach_session_inner(
     if not await _update_thread_status("active"):
         raise LeaseLostError("stateless attach lost lifecycle authority")
 
-    # Initialize headless loop primitives. These survive WS reconnect so that
-    # the loop can keep reading input / responding to interrupts across
-    # transport churn. Cleared in _terminate_session.
-    global _loop_user_queue, _loop_interrupt_flag, _loop_interrupt_target_turn_id
-    global _hard_interrupt_event, _input_runtime_generation
-    global _input_delivery_reclaim_lock
+    # Initialize headless loop input. It survives WS reconnect so that the
+    # loop can keep reading input / responding to interrupts across transport
+    # churn. Cleared in _terminate_session.
+    global _input_runtime_generation
     # Keep readiness closed until durable child recovery has completely
     # converged.  Publishing the queue earlier lets a concurrent status/input
     # request start the provider between two orphan reconciliations.
-    _loop_user_queue = None
-    _loop_interrupt_flag = None
-    _loop_interrupt_target_turn_id = None
-    _hard_interrupt_event = asyncio.Event()
+    _session_input.begin_attach()
     _input_runtime_generation = str(uuid4())
-    _input_delivery_reclaim_lock = asyncio.Lock()
-    _queued_input_claims.clear()
 
     # Child generations survive their parent process. Reconcile predecessors
     # under this exact authority before any provider can become ready;
     # recovered background evidence joins the durable-input reclaim below.
     await _session.recover_subagents()
-    _loop_user_queue = asyncio.Queue()
+    _session_input.open_queue()
 
     # Publish mount state only after the authoritative active CAS and queue
     # barrier.  An End racing message/repository restore must not observe a
@@ -5073,7 +5055,7 @@ async def _attach_session_inner(
     # setup has already completed.  The turn executor reads the stateless
     # inbox through input_seq/consumed_seq after this attach returns.
     if not _stateless_mode():
-        await _reclaim_pending_pinned_inputs()
+        await _session_input.reclaim_pending()
 
     # Start self-cleanup watchdogs (PR 2): exit on boot-WS timeout or
     # out-of-band thread.status='ended'. Cancelled by _terminate_session.
@@ -5094,7 +5076,7 @@ async def _attach_session_inner(
         and (_loop_task is None or _loop_task.done())
     ):
         _ensure_persistent_loop_started("officer_boot")
-        await _accept_user_input(
+        await _session_input.accept(
             "[wake: session started/restarted] You are the project officer "
             "coming back online after a start or restart. Reorient from your "
             "charter and knowledge base; recent orchestrator notices (if any) "
@@ -5497,8 +5479,6 @@ async def _terminate_session_inner(
 ) -> str | None:
     """Body of _terminate_session — only reached holding the _terminating guard."""
     global _session, _thread_id, _sessions_served, _loop_task
-    global _loop_user_queue, _loop_interrupt_flag, _loop_interrupt_target_turn_id
-    global _hard_interrupt_event
     global _events_epoch, _next_seq, _tool_inflight, _turn_event_open
     global _turn_tool_execution_identity, _turn_tool_execution_external_hook
     global _event_writer, _cloud_sync_retry_pending, _draft_title_value
@@ -5802,14 +5782,11 @@ async def _terminate_session_inner(
     _thread_id = None
     _clear_attached_runtime_actor()
 
-    # Clear headless input primitives + subscriber registry. The pump tasks
-    # owned by each subscriber are cancelled by their ws_chat finally blocks
+    # Clear headless input state + subscriber registry. The pump tasks owned by
+    # each subscriber are cancelled by their socket handlers' finally blocks
     # when those handlers notice the WS close; dropping the registry here
     # ensures stale entries don't accumulate across sessions.
-    _loop_user_queue = None
-    _loop_interrupt_flag = None
-    _loop_interrupt_target_turn_id = None
-    _hard_interrupt_event = None
+    _session_input.teardown()
     _input_runtime_generation = None
     _runtime_authorization_admission_open = False
     _pinned_status_identity_enabled = False
@@ -5817,7 +5794,6 @@ async def _terminate_session_inner(
         expected_generation=runtime_generation,
         expected_attach_token=runtime_attach_token,
     )
-    _queued_input_claims.clear()
     _draft_title_value = None
     _canvas_control.clear_all()
     _subscribers.clear()
@@ -6135,7 +6111,7 @@ def session_transport_bindings() -> SessionTransportBindings:
         retirement_admission_closed=lambda: _retirement_admission_closed(),
         protected_cloud_ready=lambda: _protected_cloud_runtime_ready(),
         session_ready=lambda: _session_ready(),
-        input_queue=lambda: _loop_user_queue,
+        input_queue=lambda: _session_input.queue,
         turn_open=lambda: _turn_event_open,
         tool_inflight=lambda: _tool_inflight,
     )
@@ -6143,9 +6119,9 @@ def session_transport_bindings() -> SessionTransportBindings:
         ensure_loop_started=lambda *args, **kwargs: _ensure_persistent_loop_started(
             *args, **kwargs
         ),
-        accept_input=lambda *args, **kwargs: _accept_user_input(*args, **kwargs),
-        signal_interrupt=lambda *args, **kwargs: _signal_interrupt_for_turn(
-            *args, **kwargs
+        accept_input=lambda *args, **kwargs: _session_input.accept(*args, **kwargs),
+        signal_interrupt=lambda *args, **kwargs: (
+            _session_input.signal_interrupt_for_turn(*args, **kwargs)
         ),
         resolve_permission=lambda *args, **kwargs: _resolve_pending_permission(
             *args, **kwargs
@@ -6539,16 +6515,6 @@ def create_persistent_app(config_path: str, thread_id: Optional[str] = None) -> 
     return app
 
 
-def _pinned_input_runtime_identity() -> tuple[str, str, str, str]:
-    agent_id = _registered_pinned_agent_id()
-    pod_uid = str(os.environ.get("POD_UID") or "").strip()
-    generation = str(_input_runtime_generation or "").strip()
-    attach_token = str(_session_runtime_attach_token or "").strip()
-    if agent_id is None or not pod_uid or not generation or not attach_token:
-        raise DurableInputUnavailable
-    return agent_id, pod_uid, generation, attach_token
-
-
 def _session_subagent_parent_authority():
     """Snapshot the exact current pinned life or stateless turn lease."""
 
@@ -6601,9 +6567,9 @@ def _session_subagent_parent_authority():
 async def _session_subagent_event_available(_message: str) -> None:
     """Low-latency wake after the terminal transaction queued role=event."""
 
-    if _stateless_mode() or _session is None or _loop_user_queue is None:
+    if _stateless_mode() or _session is None or _session_input.queue is None:
         return
-    await _reclaim_pending_pinned_inputs()
+    await _session_input.reclaim_pending()
 
 
 async def _loop_runtime_authority_current(
@@ -6678,7 +6644,7 @@ async def _loop_runtime_authority_current(
         return False
     try:
         agent_id, pod_uid, _process_generation, attach_token = (
-            _pinned_input_runtime_identity()
+            _session_input.pinned_identity()
         )
         session_generation = str(_session_runtime_generation or "").strip()
         if not session_generation:
@@ -6719,365 +6685,32 @@ async def _loop_runtime_settlement_authority_current() -> bool:
     return await _loop_runtime_authority_current(allow_retirement_settlement=True)
 
 
-async def _transition_claimed_input(
-    delivery_id: str,
-    claim_generation: int,
-    transition: str,
-    *,
-    turn_number: int | None = None,
-    reason: str | None = None,
-) -> bool:
-    if _session is None or _session.postgres_conn is None or _thread_id is None:
-        return False
-    try:
-        live_lease = _current_lease_var.get()
-        if live_lease is not None and live_lease.active:
-            executor_id = str(live_lease.executor_id or "").strip()
-            pod_uid = str(live_lease.pod_uid or "").strip()
-            if (
-                str(live_lease.unit_id or "") != str(_thread_id)
-                or not executor_id
-                or not pod_uid
-            ):
-                return False
-            return await _session.postgres_conn.transition_stateless_input_delivery(
-                thread_id=_thread_id,
-                delivery_id=delivery_id,
-                lease_token=int(live_lease.lease_token),
-                executor_id=executor_id,
-                pod_uid=pod_uid,
-                claim_generation=claim_generation,
-                transition=transition,
-                turn_number=turn_number,
-                reason=reason,
-            )
-        agent_id, pod_uid, runtime_generation, runtime_attach_token = (
-            _pinned_input_runtime_identity()
-        )
-        return await _session.postgres_conn.transition_pinned_input_delivery(
-            thread_id=_thread_id,
-            delivery_id=delivery_id,
-            agent_id=agent_id,
-            pod_uid=pod_uid,
-            runtime_generation=runtime_generation,
-            session_runtime_generation=str(_session_runtime_generation or ""),
-            runtime_attach_token=runtime_attach_token,
-            claim_generation=claim_generation,
-            transition=transition,
-            turn_number=turn_number,
-            reason=reason,
-        )
-    except Exception as exc:
-        logger.warning(
-            "Durable input %s transition failed (%s)",
-            transition,
-            type(exc).__name__,
-        )
-        return False
+def _current_input_runtime_identity() -> SessionRuntimeIdentity:
+    """The attached runtime identity, read now in one synchronous step."""
 
-
-async def _queue_claimed_input(row: dict[str, Any]) -> bool:
-    """Queue one exact durable claim once in this process generation."""
-
-    if _session is None or _session.postgres_conn is None or _thread_id is None:
-        return False
-    queue = _loop_user_queue
-    if queue is None:
-        return False
-    delivery_id = str(row["delivery_id"])
-    claim_generation = int(row["claim_generation"])
-    key = (delivery_id, claim_generation)
-    if key in _queued_input_claims:
-        return False
-    if not _protected_cloud_runtime_ready():
-        await _transition_claimed_input(
-            delivery_id,
-            claim_generation,
-            "deferred",
-            reason="protected_cloud_unavailable_before_queue",
-        )
-        _schedule_protected_input_reclaim()
-        return False
-    agent_id, pod_uid, runtime_generation, runtime_attach_token = (
-        _pinned_input_runtime_identity()
-    )
-    queued = await _session.postgres_conn.mark_pinned_input_delivery_queued(
+    return SessionRuntimeIdentity(
         thread_id=_thread_id,
-        delivery_id=delivery_id,
-        agent_id=agent_id,
-        pod_uid=pod_uid,
-        runtime_generation=runtime_generation,
-        session_runtime_generation=str(_session_runtime_generation or ""),
-        runtime_attach_token=runtime_attach_token,
-        claim_generation=claim_generation,
-    )
-    if not queued:
-        return False
-    # Another same-process request may have completed the identical DB CAS
-    # while this coroutine awaited it. Re-check at the no-await publication
-    # boundary so concurrent HTTP retries still produce one queue item.
-    if key in _queued_input_claims:
-        return False
-    if _runtime_admission_closed() or not _protected_cloud_runtime_ready():
-        await _transition_claimed_input(
-            delivery_id,
-            claim_generation,
-            "deferred",
-            reason=(
-                "runtime_terminating_before_queue"
-                if _runtime_admission_closed()
-                else "protected_cloud_unavailable_before_queue_publish"
-            ),
-        )
-        if not _runtime_admission_closed():
-            _schedule_protected_input_reclaim()
-        return False
-
-    # No await between local dedup publication and the unbounded put. A retry
-    # in this process observes the set; a process death loses the set and its
-    # new runtime generation reclaims the durable queued row.
-    _queued_input_claims.add(key)
-    queue_item = {
-        "content": str(row["content"]),
-        "id": str(row["message_id"]),
-        "role": str(row["role"]),
-        "source": str(row["source"]),
-        "delivery_id": delivery_id,
-        "claim_generation": claim_generation,
-    }
-    if row.get("supersedes_input_seq") is not None:
-        queue_item["supersedes_input_seq"] = int(row["supersedes_input_seq"])
-    queue.put_nowait(queue_item)
-    return True
-
-
-async def _reclaim_pending_pinned_inputs_locked() -> set[tuple[str, int]]:
-    """Replay pending input while holding ``_input_delivery_reclaim_lock``."""
-
-    if _session is None or _session.postgres_conn is None or _thread_id is None:
-        return set()
-    agent_id, pod_uid, runtime_generation, runtime_attach_token = (
-        _pinned_input_runtime_identity()
-    )
-    rows = await _session.postgres_conn.claim_pending_pinned_input_deliveries(
-        thread_id=_thread_id,
-        agent_id=agent_id,
-        pod_uid=pod_uid,
-        runtime_generation=runtime_generation,
-        session_runtime_generation=str(_session_runtime_generation or ""),
-        runtime_attach_token=runtime_attach_token,
-    )
-    queued: set[tuple[str, int]] = set()
-    for row in rows:
-        if await _queue_claimed_input(row):
-            queued.add((str(row["delivery_id"]), int(row["claim_generation"])))
-    if queued:
-        logger.info(
-            "Reclaimed %d durable persistent input(s) for thread %s",
-            len(queued),
-            _thread_id,
-        )
-    return queued
-
-
-async def _reclaim_pending_pinned_inputs() -> set[tuple[str, int]]:
-    """Attach-time or accept-time replay for persisted unadmitted input."""
-
-    async with _input_delivery_reclaim_lock:
-        return await _reclaim_pending_pinned_inputs_locked()
-
-
-def _schedule_protected_input_reclaim() -> None:
-    """Reclaim deferred input once this exact protected runtime heals."""
-
-    global _protected_input_reclaim_task
-    if _runtime_admission_closed() or _session is None or _thread_id is None:
-        return
-    current = _protected_input_reclaim_task
-    if current is not None and not current.done():
-        return
-    session = _session
-    thread_id = str(_thread_id)
-    generation = _session_generation
-
-    async def _wait_and_reclaim() -> None:
-        global _protected_input_reclaim_task
-        try:
-            while _session_identity_matches(session, thread_id, generation):
-                if _runtime_admission_closed():
-                    return
-                if _protected_cloud_runtime_ready():
-                    await _reclaim_pending_pinned_inputs()
-                    return
-                await asyncio.sleep(1.0)
-        finally:
-            if _protected_input_reclaim_task is asyncio.current_task():
-                _protected_input_reclaim_task = None
-
-    _protected_input_reclaim_task = _track_session_side_task(
-        asyncio.create_task(
-            _wait_and_reclaim(),
-            name=f"protected-input-reclaim-{thread_id[:12]}",
-        )
+        process_generation=_input_runtime_generation,
+        session_generation=_session_runtime_generation,
+        attach_token=_session_runtime_attach_token,
+        agent_id=_registered_pinned_agent_id(),
+        pod_uid=os.environ.get("POD_UID"),
+        lease=_current_lease_var.get(),
+        attach_generation=_session_generation,
     )
 
 
-async def _accept_user_input(
-    content: str,
-    *,
-    role: str = "human",
-    delivery_id: str | None = None,
-    expected_session_identity_fingerprint: str | None = None,
-) -> AcceptedInput:
-    """Persist an accepted user message, then enqueue it for the loop.
+def _schedule_early_title(content: str) -> None:
+    """Title the thread from an accepted opening prompt.
 
-    Returns the durable/local admission outcome. Persisting BEFORE the 200 closes the
-    swallowed-input gap (session_silent_failure_audit.md #1): the queue is
-    process memory, so without the row a mid-turn input vanished from the UI
-    on reload and died with the pod. The loop reuses the id when it consumes
-    the item, so its own persist is an upsert onto this row (final
-    turn_number), never a duplicate.
-
-    ``role`` controls only how the row is PERSISTED; the in-memory message stays
-    a ``HumanMessage`` regardless. That split is deliberate, and both halves are
-    load-bearing:
-
-    * ``role='event'`` keeps a system-injected notice (a worker job the session
-      created has finished) out of the human-bubble family, so the transcript
-      does not claim the user said it. It joins the shipped non-conversational
-      roles ``summary`` and ``error``, which the cockpit already branches on.
-    * Keeping the carrier a ``HumanMessage`` is what keeps ``_save_turn_ai_messages``
-      correct — it reconciles a turn by walking backwards until it hits one — and
-      avoids introducing a novel LangChain type into the graph. A synthetic
-      AIMessage+ToolMessage pair (the *transient* injection family) would be the
-      wrong shape: this is a one-time fact that must survive compaction.
+    The cockpit header fills in on submit rather than only after the
+    (possibly long) first turn ends. Fire-and-forget — must not block input
+    acceptance. _early_title_from_prompt self-guards on a placeholder title and
+    a low-signal prompt; the after-turn pass in _loop_on_turn_complete remains
+    the fallback. The input owner calls this only for human input.
     """
-    if _runtime_admission_closed():
-        raise TerminationAdmissionClosed
-    if not _protected_cloud_runtime_ready():
-        raise ProtectedCloudUnavailable
-    if (
-        expected_session_identity_fingerprint is not None
-        and _current_pinned_session_identity_fingerprint()
-        != expected_session_identity_fingerprint
-    ):
-        raise SessionIdentityMismatch
 
-    parsed_delivery_id = UUID(str(delivery_id)) if delivery_id else uuid4()
-    injected = role != "human"
-
-    if _session is None or _session.postgres_conn is None or _thread_id is None:
-        raise DurableInputUnavailable
-    try:
-        agent_id, pod_uid, runtime_generation, runtime_attach_token = (
-            _pinned_input_runtime_identity()
-        )
-        row = await asyncio.wait_for(
-            _session.postgres_conn.persist_pinned_input_delivery(
-                thread_id=_thread_id,
-                delivery_id=str(parsed_delivery_id),
-                role=role,
-                content=content,
-                source="officer_wake" if injected else "direct_human",
-                turn_number=_session.turn_count + 1,
-                agent_id=agent_id,
-                pod_uid=pod_uid,
-                runtime_generation=runtime_generation,
-                session_runtime_generation=str(_session_runtime_generation or ""),
-                runtime_attach_token=runtime_attach_token,
-            ),
-            timeout=5.0,
-        )
-    except Exception as exc:
-        logger.warning("Durable input persist/claim failed (%s)", type(exc).__name__)
-        raise DurableInputUnavailable from exc
-
-    state = str(row["state"])
-    claim_generation = int(row["claim_generation"])
-    duplicate = not bool(row.get("transcript_inserted"))
-    if state in {"admitted", "settled", "cancelled"}:
-        return AcceptedInput(
-            message_id=str(row["message_id"]),
-            delivery_id=str(parsed_delivery_id),
-            delivery_state=state,
-            claim_generation=claim_generation,
-            enqueued=False,
-            duplicate=True,
-        )
-
-    if not _protected_cloud_runtime_ready():
-        deferred = await _transition_claimed_input(
-            str(parsed_delivery_id),
-            claim_generation,
-            "deferred",
-            reason="protected_cloud_unavailable_after_persist",
-        )
-        if not deferred:
-            raise DurableInputUnavailable
-        _schedule_protected_input_reclaim()
-        return AcceptedInput(
-            message_id=str(row["message_id"]),
-            delivery_id=str(parsed_delivery_id),
-            delivery_state="deferred",
-            claim_generation=claim_generation,
-            enqueued=False,
-            duplicate=duplicate,
-            deferred=True,
-        )
-
-    if _runtime_admission_closed():
-        await _transition_claimed_input(
-            str(parsed_delivery_id),
-            claim_generation,
-            "deferred",
-            reason="runtime_terminating_after_persist",
-        )
-        return AcceptedInput(
-            message_id=str(row["message_id"]),
-            delivery_id=str(parsed_delivery_id),
-            delivery_state="deferred",
-            claim_generation=claim_generation,
-            enqueued=False,
-            duplicate=duplicate,
-            deferred=True,
-        )
-
-    key = (str(parsed_delivery_id), claim_generation)
-    already_queued = key in _queued_input_claims
-    # Claim the whole durable inbox in transcript order, including this row.
-    # That both preserves ordering and gives a same-process runtime a bounded
-    # way to recover inputs deferred by a transient authorization failure. A
-    # retry of this row observes the local claim set and cannot publish twice.
-    newly_queued = await _reclaim_pending_pinned_inputs()
-    queued_here = key in _queued_input_claims
-    enqueued = key in newly_queued and not already_queued
-    deferred = not queued_here and _runtime_admission_closed()
-    if injected and enqueued:
-        # Make the injection visible in a live cockpit. Nothing else would:
-        # /api/input broadcasts nothing and no frame carries user-message
-        # content (the cockpit builds a user turn from its own optimistic
-        # dispatch on send, or from a history reload). Without this the user
-        # watches a turn start and stream a reply with no visible prompt — the
-        # agent apparently talking to itself. Rides the normal _broadcast path,
-        # so it reaches WS subscribers and the thread_events log (hence SSE)
-        # alike.
-        _broadcast(
-            "session.event",
-            {
-                "content": str(row["content"]),
-                "id": str(row["message_id"]),
-                "role": role,
-            },
-        )
-    # Title the thread from the opening prompt(s) so the cockpit header fills in
-    # on submit rather than only after the (possibly long) first turn ends.
-    # Fire-and-forget — must not block input acceptance. _early_title_from_prompt
-    # self-guards on a placeholder title and a low-signal prompt; the after-turn
-    # pass in _loop_on_turn_complete remains the fallback.
-    #
-    # Injected input is excluded: a wake landing in a young session would
-    # retitle the whole thread after the job-completion text.
-    if not injected and _session is not None and _session.turn_count <= 2:
+    if _session is not None and _session.turn_count <= 2:
         title_session = _session
         title_thread_id = str(_thread_id or "")
         title_generation = _session_generation
@@ -7092,71 +6725,6 @@ async def _accept_user_input(
                 name=f"early-title-{title_thread_id[:12]}",
             )
         )
-    return AcceptedInput(
-        message_id=str(row["message_id"]),
-        delivery_id=str(parsed_delivery_id),
-        delivery_state="deferred" if deferred else "queued" if queued_here else state,
-        claim_generation=claim_generation,
-        enqueued=enqueued,
-        duplicate=duplicate,
-        deferred=deferred,
-    )
-
-
-def _clear_loop_interrupt(*, target_turn_id: int | None = None) -> bool:
-    """Clear one pending interrupt without crossing a turn boundary.
-
-    When ``target_turn_id`` is supplied, a newer turn's pending interrupt is
-    left untouched. Mode, target and the hard-event signal are one logical
-    value and are always cleared together.
-    """
-
-    global _loop_interrupt_flag, _loop_interrupt_target_turn_id
-    if target_turn_id is not None and _loop_interrupt_target_turn_id != int(
-        target_turn_id
-    ):
-        return False
-    had_interrupt = (
-        _loop_interrupt_flag is not None
-        or _loop_interrupt_target_turn_id is not None
-        or bool(_hard_interrupt_event and _hard_interrupt_event.is_set())
-    )
-    _loop_interrupt_flag = None
-    _loop_interrupt_target_turn_id = None
-    if _hard_interrupt_event is not None:
-        _hard_interrupt_event.clear()
-    return had_interrupt
-
-
-def _signal_interrupt_for_turn(
-    target_turn_id: int,
-    *,
-    force_graceful: bool = False,
-) -> Optional[str]:
-    """Synchronously signal RAM iff ``target_turn_id`` is still active.
-
-    The check and mutation have no await between them. That is the local half
-    of the exact-target fence: the database protects the lease generation,
-    while this function prevents a late request for turn N from interrupting
-    turn N+1 after an in-process transition.
-    """
-
-    global _loop_interrupt_flag, _loop_interrupt_target_turn_id
-    if (
-        _session is None
-        or not _turn_event_open
-        or int(_session.turn_count) != int(target_turn_id)
-    ):
-        return None
-    mode = "graceful" if (_tool_inflight or force_graceful) else "hard"
-    _loop_interrupt_flag = mode
-    _loop_interrupt_target_turn_id = int(target_turn_id)
-    # Hard interrupt with no tool in flight ⇒ the loop is parked in an LLM /
-    # auxiliary await; signal it to cancel that await immediately rather than
-    # waiting for the next cooperative check_interrupt poll.
-    if mode == "hard" and _hard_interrupt_event is not None:
-        _hard_interrupt_event.set()
-    return mode
 
 
 # --- Helpers ---
@@ -9272,7 +8840,7 @@ async def _drain_thread_interrupts(*, lease_token: int, target_turn_id: int) -> 
                 )
                 continue
 
-            mode = _signal_interrupt_for_turn(request.target_turn_id)
+            mode = _session_input.signal_interrupt_for_turn(request.target_turn_id)
             outcome = "applied" if mode is not None else "rejected"
             error_code = None if mode is not None else "target_turn_not_active"
             params: Dict[str, Any] = {
@@ -9972,9 +9540,9 @@ async def _current_canvas_for_control() -> dict[str, Any] | None:
 #
 # These used to be closures inside ws_chat. They've been hoisted so the loop
 # can outlive any single WebSocket connection: callbacks reference module
-# globals (_session, _loop_user_queue, _loop_interrupt_flag,
-# _orchestrator_client, _thread_id) and emit via
-# _broadcast() rather than writing to one ws.
+# globals (_session, _orchestrator_client, _thread_id) and emit via
+# _broadcast() rather than writing to one ws. The input and interrupt
+# callbacks are the input owner's (``_session_input``).
 # ---------------------------------------------------------------------------
 
 
@@ -10024,274 +9592,16 @@ def _loop_auxiliary_provider_admission_open() -> bool:
     return _officer_cfg() is None or _runtime_authorization_admission_open
 
 
-async def _loop_admit_input_delivery(
-    delivery_id: str, claim_generation: int, turn_number: int
-) -> bool | None:
-    """Cross the durable execution boundary immediately before model spend."""
+async def _begin_loop_input_wait() -> InputWaitPlan:
+    """The loop's turn-boundary step before it parks for the next input.
 
-    if not _runtime_input_admission_open():
-        if not _runtime_admission_closed():
-            _schedule_protected_input_reclaim()
-        return False
-    admitted = await _transition_claimed_input(
-        delivery_id,
-        claim_generation,
-        "admitted",
-        turn_number=turn_number,
-    )
-    # Close the in-process race as tightly as possible. If the sentinel became
-    # visible while the CAS awaited Postgres, roll the not-yet-used admission
-    # back to retryable before returning to the loop. No provider call exists
-    # between these two statements.
-    if admitted and not _runtime_input_admission_open():
-        deferred = await _transition_claimed_input(
-            delivery_id,
-            claim_generation,
-            "unadmit",
-            reason=(
-                "runtime_terminating_before_provider"
-                if _runtime_admission_closed()
-                else "protected_cloud_unavailable_before_provider"
-            ),
-        )
-        if deferred:
-            _queued_input_claims.discard((delivery_id, claim_generation))
-            if not _runtime_admission_closed():
-                _schedule_protected_input_reclaim()
-            return None
-        return False
-    return admitted
-
-
-async def _loop_defer_input_delivery(
-    delivery_id: str, claim_generation: int, reason: str
-) -> bool:
-    deferred = await _transition_claimed_input(
-        delivery_id,
-        claim_generation,
-        "deferred",
-        reason=reason,
-    )
-    if deferred:
-        _queued_input_claims.discard((delivery_id, claim_generation))
-        if not _runtime_admission_closed() and not _protected_cloud_runtime_ready():
-            _schedule_protected_input_reclaim()
-    return deferred
-
-
-async def _loop_cancel_input_delivery(
-    delivery_id: str,
-    claim_generation: int,
-    turn_number: int,
-    reason: str,
-) -> bool:
-    if not _persistent_input_cancellation_enabled():
-        logger.warning(
-            "Pinned input cancellation writer is disabled; halting before provider"
-        )
-        return False
-    cancelled = await _transition_claimed_input(
-        delivery_id,
-        claim_generation,
-        "cancelled",
-        turn_number=turn_number,
-        reason=reason,
-    )
-    if cancelled:
-        _queued_input_claims.discard((delivery_id, claim_generation))
-    return cancelled
-
-
-async def _loop_defer_and_requeue_input_delivery(
-    delivery_id: str,
-    claim_generation: int,
-    content: str,
-    role: str,
-    source: str,
-    reason: str,
-) -> dict[str, Any] | None:
-    """Atomically defer and priority-reclaim one stopped server wake.
-
-    The shared lock prevents concurrent input acceptance from reclaiming the
-    deferred row into the ordinary FIFO in the gap between its generation CAS
-    and priority publication. Claiming the exact stable identity mints a fresh
-    generation; the returned item stays in the graph's one-item priority slot.
+    Emits ``ready``, runs the natural-pause transition and an Officer's sleep
+    filing, and returns how long the wait may last. The input owner sets the
+    parked window only after this returns. On idle timeout the plan raises
+    IdleTimeoutError; the loop unwinds and ``_handle_idle_archive`` first
+    authorizes exact retirement before it emits the generation-tagged
+    diagnostic, so a failed Begin leaves the live UI and runtime usable.
     """
-
-    if source != "officer_wake" or role == "human":
-        return None
-    if (
-        _runtime_admission_closed()
-        or _session is None
-        or _session.postgres_conn is None
-        or _thread_id is None
-    ):
-        return None
-    async with _input_delivery_reclaim_lock:
-        try:
-            deferred = await _transition_claimed_input(
-                delivery_id,
-                claim_generation,
-                "deferred",
-                reason=reason,
-            )
-            if not deferred:
-                return None
-            _queued_input_claims.discard((delivery_id, claim_generation))
-            agent_id, pod_uid, runtime_generation, runtime_attach_token = (
-                _pinned_input_runtime_identity()
-            )
-            row = await asyncio.wait_for(
-                _session.postgres_conn.persist_pinned_input_delivery(
-                    thread_id=_thread_id,
-                    delivery_id=delivery_id,
-                    role=role,
-                    content=content,
-                    source=source,
-                    turn_number=_session.turn_count + 1,
-                    agent_id=agent_id,
-                    pod_uid=pod_uid,
-                    runtime_generation=runtime_generation,
-                    session_runtime_generation=str(_session_runtime_generation or ""),
-                    runtime_attach_token=runtime_attach_token,
-                ),
-                timeout=5.0,
-            )
-            next_generation = int(row["claim_generation"])
-            if str(row["state"]) not in {"owned", "queued"}:
-                return None
-            queued = await _session.postgres_conn.mark_pinned_input_delivery_queued(
-                thread_id=_thread_id,
-                delivery_id=delivery_id,
-                agent_id=agent_id,
-                pod_uid=pod_uid,
-                runtime_generation=runtime_generation,
-                session_runtime_generation=str(_session_runtime_generation or ""),
-                runtime_attach_token=runtime_attach_token,
-                claim_generation=next_generation,
-            )
-            if not queued:
-                return None
-            if _runtime_admission_closed():
-                await _transition_claimed_input(
-                    delivery_id,
-                    next_generation,
-                    "deferred",
-                    reason="runtime_terminating_before_priority_requeue",
-                )
-                return None
-        except Exception as exc:
-            logger.warning(
-                "Deferred wake priority reclaim failed (%s)", type(exc).__name__
-            )
-            return None
-
-        key = (delivery_id, next_generation)
-        if key in _queued_input_claims:
-            return None
-        _queued_input_claims.add(key)
-        return {
-            "content": str(row["content"]),
-            "id": str(row["message_id"]),
-            "role": str(row["role"]),
-            "source": source,
-            "delivery_id": delivery_id,
-            "claim_generation": next_generation,
-        }
-
-
-async def _loop_settle_input_delivery(delivery_id: str, claim_generation: int) -> bool:
-    settled = await _transition_claimed_input(
-        delivery_id,
-        claim_generation,
-        "settled",
-    )
-    if settled:
-        _queued_input_claims.discard((delivery_id, claim_generation))
-    return settled
-
-
-_PINNED_INPUT_POLL_SECONDS = 1.0
-
-
-async def _wait_for_persistent_input(
-    queue: asyncio.Queue,
-    *,
-    timeout: float | None = None,
-) -> Any:
-    """Wait while polling the durable pinned inbox for correctness.
-
-    Orchestrator-side input no longer needs a Pod-IP POST: it commits a stable
-    delivery and this exact reciprocal runtime claims it. LISTEN would only be
-    a latency optimization; the bounded poll means a lost notification, a pod
-    replacement, or an IP-reused foreign process cannot lose or consume work.
-    """
-
-    if _stateless_mode():
-        if timeout is None:
-            return await queue.get()
-        return await asyncio.wait_for(queue.get(), timeout=timeout)
-
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + timeout if timeout is not None else None
-    while True:
-        if _runtime_admission_closed():
-            # Leave every claimed/queued row for the successor. Normal
-            # teardown cancels this wait after preStop observes the park.
-            await asyncio.Future()
-        try:
-            await _reclaim_pending_pinned_inputs()
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.warning(
-                "Durable pinned input poll failed for thread %s; retrying",
-                _thread_id,
-                exc_info=True,
-            )
-        if not queue.empty():
-            return await queue.get()
-
-        remaining = None if deadline is None else deadline - loop.time()
-        if remaining is not None and remaining <= 0:
-            raise asyncio.TimeoutError
-        wait_for = _PINNED_INPUT_POLL_SECONDS
-        if remaining is not None:
-            wait_for = min(wait_for, remaining)
-        try:
-            return await asyncio.wait_for(queue.get(), timeout=wait_for)
-        except asyncio.TimeoutError:
-            if deadline is not None and loop.time() >= deadline:
-                raise
-
-
-async def _loop_get_user_input() -> str:
-    """Wait for the next user input. Honors session idle timeout.
-
-    On idle timeout, raises IdleTimeoutError. The loop unwinds and
-    ``_handle_idle_archive`` first authorizes exact retirement before it emits
-    the generation-tagged diagnostic; a failed Begin must leave the live UI and
-    runtime usable.
-    """
-    global _awaiting_input
-
-    queue = _loop_user_queue
-    if queue is None:
-        # _attach_session always initializes this. If we hit None here the
-        # session is being torn down — fail loudly so the loop unwinds.
-        raise RuntimeError("_loop_user_queue not initialized — session torn down?")
-
-    if _runtime_admission_closed():
-        # Do not consume already-durable queued work. The exact successor
-        # reclaims it from thread_input_deliveries; transcript restore excludes
-        # unadmitted rows because conversation context is not an inbox. This
-        # wait is cancelled by normal process shutdown after preStop observes
-        # the exact parked boundary.
-        _awaiting_input = True
-        try:
-            await asyncio.Future()
-        finally:
-            _awaiting_input = False
 
     _broadcast("ready", {})
 
@@ -10336,113 +9646,72 @@ async def _loop_get_user_input() -> str:
                 name="phase5-flip-awaiting-user",
             )
 
-    # Parked window for the drain-suspend gate (_session_parked): exactly the
-    # span where this coroutine is blocked on the queue. The finally also
-    # covers loop-task cancellation and the idle-timeout raise.
-    _awaiting_input = True
-    try:
-        if _session is None:
-            return await _wait_for_persistent_input(queue)
+    if _session is None:
+        return InputWaitPlan()
 
-        if officer_cfg is not None:
-            # Officer park (centurion.md §4). The primary wake is the
-            # orchestrator's Postgres-durable timer: consume the sleep tool's
-            # parked request and FILE the wake-up call; when no request was
-            # made (turn ended in plain text) file nothing — the officer
-            # watchdog files sleep_max on our behalf. The local wait is only
-            # a long, labeled backstop for the one failure external timers
-            # can't cover: timer path down while the API is up. Never raises
-            # IdleTimeoutError — an officer session never idle-archives.
-            sleep_req = None
-            if _session.tool_context is not None:
-                sleep_req = _session.tool_context.consume_officer_sleep()
-            if sleep_req is not None:
-                minutes = max(
-                    officer_cfg.sleep_min_minutes,
-                    min(
-                        int(sleep_req.get("minutes") or 0),
-                        officer_cfg.sleep_max_minutes,
-                    ),
-                )
-                asyncio.create_task(
-                    _file_officer_wake(minutes, sleep_req.get("reason") or ""),
-                    name="officer-file-wake",
-                )
-            try:
-                return await _wait_for_persistent_input(
-                    queue,
-                    timeout=officer_cfg.backstop_seconds,
-                )
-            except asyncio.TimeoutError:
-                logger.warning(
-                    "Officer backstop wake fired for thread %s — the "
-                    "orchestrator's durable timer never delivered",
-                    _thread_id,
-                )
-                return {
-                    "content": (
-                        "[backstop wake] The orchestrator's durable timer did "
-                        "not fire in time — its wake path may be degraded. "
-                        "Check the situation via your tools; if a conference "
-                        "hold is standing and no brief has arrived yet, go "
-                        "back to sleep."
-                    ),
-                    "role": "event",
-                }
+    if officer_cfg is not None:
+        # Officer park (centurion.md §4). The primary wake is the
+        # orchestrator's Postgres-durable timer: consume the sleep tool's
+        # parked request and FILE the wake-up call; when no request was
+        # made (turn ended in plain text) file nothing — the officer
+        # watchdog files sleep_max on our behalf. The local wait is only
+        # a long, labeled backstop for the one failure external timers
+        # can't cover: timer path down while the API is up. Never raises
+        # IdleTimeoutError — an officer session never idle-archives.
+        sleep_req = None
+        if _session.tool_context is not None:
+            sleep_req = _session.tool_context.consume_officer_sleep()
+        if sleep_req is not None:
+            minutes = max(
+                officer_cfg.sleep_min_minutes,
+                min(
+                    int(sleep_req.get("minutes") or 0),
+                    officer_cfg.sleep_max_minutes,
+                ),
+            )
+            asyncio.create_task(
+                _file_officer_wake(minutes, sleep_req.get("reason") or ""),
+                name="officer-file-wake",
+            )
 
-        idle_timeout_minutes = _session.config.interactive.idle_timeout_minutes
-        if idle_timeout_minutes and idle_timeout_minutes > 0:
-            idle_timeout_seconds = idle_timeout_minutes * 60
-            try:
-                return await _wait_for_persistent_input(
-                    queue,
-                    timeout=idle_timeout_seconds,
-                )
-            except asyncio.TimeoutError:
-                logger.info(
-                    "Idle timeout (%dmin) for thread %s",
-                    idle_timeout_minutes,
-                    _thread_id,
-                )
-                raise IdleTimeoutError(f"Idle timeout after {idle_timeout_seconds}s")
-        return await _wait_for_persistent_input(queue)
-    finally:
-        _awaiting_input = False
+        def _officer_backstop_wake() -> dict[str, str]:
+            logger.warning(
+                "Officer backstop wake fired for thread %s — the "
+                "orchestrator's durable timer never delivered",
+                _thread_id,
+            )
+            return {
+                "content": (
+                    "[backstop wake] The orchestrator's durable timer did "
+                    "not fire in time — its wake path may be degraded. "
+                    "Check the situation via your tools; if a conference "
+                    "hold is standing and no brief has arrived yet, go "
+                    "back to sleep."
+                ),
+                "role": "event",
+            }
 
-
-def _loop_check_interrupt() -> Optional[str]:
-    """One-shot read of the interrupt flag. Returns the mode or None.
-
-    Returns:
-        None when no interrupt is pending.
-        "hard" to cancel the in-flight LLM stream immediately and drop the
-            partial AIMessage (set when interrupt fires with no tool active).
-        "graceful" to stop after the current tool call completes (set when
-            interrupt fires with a tool mid-`ainvoke`).
-
-    Consumed by persistent_graph at three checkpoints. A `bool(result)`
-    check preserves the legacy "any interrupt → stop" semantics for sites
-    that don't yet branch on the mode.
-    """
-    mode = _loop_interrupt_flag
-    target_turn_id = _loop_interrupt_target_turn_id
-    if mode is None:
-        if target_turn_id is not None:
-            _clear_loop_interrupt()
-        return None
-    current_turn_id = int(_session.turn_count) if _session is not None else None
-    if target_turn_id is None or target_turn_id != current_turn_id:
-        logger.warning(
-            "Discarding unscoped/stale interrupt "
-            "(target_turn=%s current_turn=%s mode=%s)",
-            target_turn_id,
-            current_turn_id,
-            mode,
+        return InputWaitPlan(
+            timeout_seconds=officer_cfg.backstop_seconds,
+            on_timeout=_officer_backstop_wake,
         )
-        _clear_loop_interrupt()
-        return None
-    _clear_loop_interrupt(target_turn_id=target_turn_id)
-    return mode
+
+    idle_timeout_minutes = _session.config.interactive.idle_timeout_minutes
+    if idle_timeout_minutes and idle_timeout_minutes > 0:
+        idle_timeout_seconds = idle_timeout_minutes * 60
+
+        def _idle_timeout() -> None:
+            logger.info(
+                "Idle timeout (%dmin) for thread %s",
+                idle_timeout_minutes,
+                _thread_id,
+            )
+            raise IdleTimeoutError(f"Idle timeout after {idle_timeout_seconds}s")
+
+        return InputWaitPlan(
+            timeout_seconds=idle_timeout_seconds, on_timeout=_idle_timeout
+        )
+    return InputWaitPlan()
 
 
 async def _loop_on_token(token: str) -> None:
@@ -10500,7 +9769,7 @@ async def _loop_on_tool_execution_start(tool_name: str, tool_call_id: str) -> No
     del tool_name, tool_call_id
     if not await _loop_runtime_effect_authority_current():
         if not _protected_cloud_runtime_ready():
-            _schedule_protected_input_reclaim()
+            _session_input.schedule_protected_reclaim()
             raise WorkspaceUnavailableError(
                 "protected cloud became unavailable before tool execution"
             )
@@ -11094,8 +10363,8 @@ async def _wait_for_permission_resolution(
 
         read_task = asyncio.create_task(_read_status())
         interrupt_task = (
-            asyncio.create_task(_hard_interrupt_event.wait())
-            if _hard_interrupt_event is not None
+            asyncio.create_task(_session_input.hard_interrupt_event.wait())
+            if _session_input.hard_interrupt_event is not None
             else None
         )
         if interrupt_task is None:
@@ -11122,7 +10391,10 @@ async def _wait_for_permission_resolution(
             if current in terminal_statuses:
                 return str(current)
 
-            if _hard_interrupt_event is not None and _hard_interrupt_event.is_set():
+            if (
+                _session_input.hard_interrupt_event is not None
+                and _session_input.hard_interrupt_event.is_set()
+            ):
                 # Stop pressed. Leave the row pending — the user made no
                 # decision, so nothing may be recorded as one.
                 logger.info(
@@ -11140,17 +10412,17 @@ async def _wait_for_permission_resolution(
                 if remaining <= 0:
                     break
                 poll_seconds = min(_PERMISSION_POLL_SECONDS, remaining)
-                if _hard_interrupt_event is None:
+                if _session_input.hard_interrupt_event is None:
                     await asyncio.sleep(poll_seconds)
                 else:
                     try:
                         await asyncio.wait_for(
-                            _hard_interrupt_event.wait(),
+                            _session_input.hard_interrupt_event.wait(),
                             timeout=poll_seconds,
                         )
                     except asyncio.TimeoutError:
                         pass
-                    if _hard_interrupt_event.is_set():
+                    if _session_input.hard_interrupt_event.is_set():
                         logger.info(
                             "Permission wait interrupted (req=%s) — leaving pending",
                             request_id,
@@ -11179,7 +10451,10 @@ async def _wait_for_permission_resolution(
                     )
                     return "interrupted"
 
-                if _hard_interrupt_event is not None and _hard_interrupt_event.is_set():
+                if (
+                    _session_input.hard_interrupt_event is not None
+                    and _session_input.hard_interrupt_event.is_set()
+                ):
                     logger.info(
                         "Permission wait interrupted (req=%s) — leaving pending",
                         request_id,
@@ -11248,7 +10523,10 @@ async def _wait_for_permission_resolution(
                 # nobody beat us to it. This acquisition is released as soon
                 # as the boundary update and read complete.
 
-                if _hard_interrupt_event is not None and _hard_interrupt_event.is_set():
+                if (
+                    _session_input.hard_interrupt_event is not None
+                    and _session_input.hard_interrupt_event.is_set()
+                ):
                     logger.info(
                         "Permission wait interrupted (req=%s) — leaving pending",
                         request_id,
@@ -11497,7 +10775,7 @@ async def _loop_permission_check(
 
         # Phase 5: sudo gate hit untethered is the second natural-pause site.
         # Flip the thread so the attention-sleep watchdog can fire after the
-        # configured TTL. Idempotent against the _loop_get_user_input write.
+        # configured TTL. Idempotent against the _begin_loop_input_wait write.
         # Officer sessions never flip (centurion.md §4) — their pending gate
         # surfaces via the sitrep instead.
         if (
@@ -12364,7 +11642,7 @@ async def _loop_on_turn_start(turn_id: int) -> None:
             # and consumer could not be armed. The loop will run its normal
             # terminal callback for this failed turn.
             _turn_event_open = False
-            _clear_loop_interrupt(target_turn_id=turn_id)
+            _session_input.clear_interrupt(target_turn_id=turn_id)
             raise
     _broadcast("turn.started", {"turn_id": turn_id})
 
@@ -12410,7 +11688,7 @@ async def _loop_on_turn_start(turn_id: int) -> None:
             ):
                 _broadcast("workspace_sync.pulled", {"turn_id": turn_id})
 
-    # User-message persistence moved to accept time (_accept_user_input) plus
+    # User-message persistence moved to accept time (SessionInputRuntime.accept) plus
     # the loop's per-append upsert (persist_message). The content-based save
     # that lived here read the *most recent* content global for every queued
     # turn, so multiple queued inputs all persisted the last message's text
@@ -12546,7 +11824,7 @@ async def _loop_on_turn_complete(
     # a reattach during turn-end persistence never reopens an already-completed
     # assistant bubble merely because the broader loop is not parked yet.
     _turn_event_open = False
-    _clear_loop_interrupt(target_turn_id=turn_id)
+    _session_input.clear_interrupt(target_turn_id=turn_id)
     await _loop_on_turn_complete_body(
         turn_id,
         metrics,
@@ -12914,9 +12192,9 @@ async def _loop_on_error(message: str, turn_id: Optional[int] = None) -> None:
         else (int(_session.turn_count) if _session is not None else None)
     )
     if terminal_turn_id is None:
-        _clear_loop_interrupt()
+        _session_input.clear_interrupt()
     else:
-        _clear_loop_interrupt(target_turn_id=terminal_turn_id)
+        _session_input.clear_interrupt(target_turn_id=terminal_turn_id)
     payload: Dict[str, Any] = {"message": message}
     if turn_id is not None:
         payload["turn_id"] = turn_id
@@ -13771,7 +13049,7 @@ async def _handle_rewind(ws: WebSocket, data: Dict[str, Any]) -> None:
         #    the loop to park. _turn_event_open is the turn-in-flight signal.
         if _turn_event_open:
             active_turn_id = int(_session.turn_count)
-            if _signal_interrupt_for_turn(active_turn_id) is None:
+            if _session_input.signal_interrupt_for_turn(active_turn_id) is None:
                 await _err("Could not interrupt the running turn — try again")
                 return
             deadline = asyncio.get_event_loop().time() + 60.0
@@ -13792,12 +13070,7 @@ async def _handle_rewind(ws: WebSocket, data: Dict[str, Any]) -> None:
         # 3. Drain queued inputs: their rows sit past the sweep boundary and
         #    are about to be tombstoned; processing them post-rewind would
         #    resurrect the abandoned timeline.
-        if _loop_user_queue is not None:
-            while True:
-                try:
-                    _loop_user_queue.get_nowait()
-                except asyncio.QueueEmpty:
-                    break
+        _session_input.drain_queue()
 
         # 4. Workspace forward-restore — fallible, so it gates the sweep.
         abandoned_sha = None
@@ -16737,7 +16010,7 @@ async def _early_title_from_prompt(
     draft taken from the opening prompt — so it fills on submit instead of only
     after the (possibly long) first turn lands.
 
-    Primary *placeholder* path. Fire-and-forget from _accept_user_input; must
+    Primary *placeholder* path. Fire-and-forget from input acceptance; must
     never block input acceptance. The authoritative, grounded, schema-bound LLM
     title is minted later by _auto_title_after_first_turn, which replaces this
     draft. Low-signal prompts get no draft and are left to that pass.

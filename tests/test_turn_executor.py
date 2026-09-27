@@ -345,7 +345,7 @@ class Harness:
         pa._agent = SimpleNamespace(postgres_conn=self.db)
         pa._session = None
         pa._thread_id = None
-        pa._loop_user_queue = None
+        pa._session_input._queue = None
         pa._loop_task = None
         pa._turn_start_external_hook = None
         pa._turn_complete_external_hook = None
@@ -356,9 +356,9 @@ class Harness:
         pa._interrupt_owner_turn_id = None
         pa._tool_inflight = False
         pa._turn_tool_execution_identity = None
-        pa._loop_interrupt_flag = None
-        pa._loop_interrupt_target_turn_id = None
-        pa._hard_interrupt_event = asyncio.Event()
+        pa._session_input._interrupt_mode = None
+        pa._session_input._interrupt_target_turn_id = None
+        pa._session_input._hard_interrupt_event = asyncio.Event()
         pa._turn_event_open = False
         pa._pending_cloud_push_task = None
         pa._pending_cloud_push_staged = None
@@ -513,7 +513,7 @@ class Harness:
             pa._turn_tool_execution_external_hook = None
             harness.sessions.append(pa._session)
             pa._thread_id = kwargs.get("thread_id")
-            pa._loop_user_queue = asyncio.Queue()
+            pa._session_input._queue = asyncio.Queue()
 
         async def fake_terminate(
             reason,
@@ -539,12 +539,12 @@ class Harness:
             pa._loop_task = None
             pa._session = None
             pa._thread_id = None
-            pa._loop_user_queue = None
+            pa._session_input._queue = None
             pa._turn_tool_execution_identity = None
             pa._turn_tool_execution_external_hook = None
 
         def fake_ensure(source, client_id=None):
-            if pa._loop_user_queue is None:
+            if pa._session_input.queue is None:
                 return False
             if pa._loop_task is None or pa._loop_task.done():
                 pa._loop_task = asyncio.create_task(harness._fake_loop())
@@ -654,7 +654,7 @@ class Harness:
 
     async def _fake_loop(self):
         while True:
-            item = await pa._loop_user_queue.get()
+            item = await pa._session_input.queue.get()
             self.consumed.append(item)
             turn_id = int(pa._session.turn_count) + 1
             pa._session.turn_count = turn_id
@@ -664,19 +664,19 @@ class Harness:
             if start_hook is not None:
                 await start_hook(turn_id)
             if self.loop_behavior == "interrupt_checkpoint":
-                while pa._loop_interrupt_flag is None:
+                while pa._session_input.interrupt_mode is None:
                     await asyncio.sleep(0)
                 self.interrupt_order.append("signal")
                 self.interrupt_observations.append(
                     {
                         "turn_id": turn_id,
-                        "mode": pa._loop_interrupt_flag,
-                        "target_turn_id": pa._loop_interrupt_target_turn_id,
-                        "hard_event_set": pa._hard_interrupt_event.is_set(),
+                        "mode": pa._session_input.interrupt_mode,
+                        "target_turn_id": pa._session_input.interrupt_target_turn_id,
+                        "hard_event_set": pa._session_input.hard_interrupt_event.is_set(),
                     }
                 )
                 self.interrupt_observations[-1]["consumed_mode"] = (
-                    pa._loop_check_interrupt()
+                    pa._session_input.check_interrupt()
                 )
                 pa._turn_event_open = False
                 hook = pa._turn_complete_external_hook
@@ -730,7 +730,6 @@ class Harness:
 _PA_SAVED_ATTRS = (
     "_session",
     "_thread_id",
-    "_loop_user_queue",
     "_loop_task",
     "_turn_start_external_hook",
     "_turn_complete_external_hook",
@@ -743,9 +742,6 @@ _PA_SAVED_ATTRS = (
     "_orchestrator_client",
     "_tool_inflight",
     "_turn_tool_execution_identity",
-    "_loop_interrupt_flag",
-    "_loop_interrupt_target_turn_id",
-    "_hard_interrupt_event",
     "_turn_event_open",
     "_pending_cloud_push_task",
     "_pending_cloud_push_staged",
@@ -754,16 +750,29 @@ _PA_SAVED_ATTRS = (
     "_background_cloud_pushes",
 )
 
+# The input owner's state the harness rebinds per test.
+_INPUT_SAVED_ATTRS = (
+    "_queue",
+    "_interrupt_mode",
+    "_interrupt_target_turn_id",
+    "_hard_interrupt_event",
+)
+
 
 @pytest.fixture
 def harness(monkeypatch):
     saved = {name: getattr(pa, name) for name in _PA_SAVED_ATTRS}
+    saved_input = {
+        name: getattr(pa._session_input, name) for name in _INPUT_SAVED_ATTRS
+    }
     h = Harness(monkeypatch)
     try:
         yield h
     finally:
         for name, value in saved.items():
             setattr(pa, name, value)
+        for name, value in saved_input.items():
+            setattr(pa._session_input, name, value)
 
 
 async def _finish(h: Harness):
@@ -1214,7 +1223,7 @@ class TestBundleFailures:
         harness.bundle_error = ConnectionError("orchestrator down")
         pa._session = FakeSession(stateless_warm_reuse_safe=True)
         pa._thread_id = "previous-warm-thread"
-        pa._loop_user_queue = asyncio.Queue()
+        pa._session_input._queue = asyncio.Queue()
         pa._loop_task = asyncio.create_task(asyncio.sleep(3600))
         harness._fake_loop_tasks.append(pa._loop_task)
         claim = make_claim()
@@ -1501,18 +1510,20 @@ class TestShutdownCancellation:
             assert asyncio.get_running_loop().time() < deadline
             await asyncio.sleep(0.005)
 
-        original_signal = pa._signal_interrupt_for_turn
+        original_signal = pa._session_input.signal_interrupt_for_turn
 
         def _close_then_signal(turn_id, **kwargs):
             pa._turn_event_open = False
             return original_signal(turn_id, **kwargs)
 
-        with patch.object(pa, "_signal_interrupt_for_turn", _close_then_signal):
+        with patch.object(
+            pa._session_input, "signal_interrupt_for_turn", _close_then_signal
+        ):
             await harness.executor.stop(timeout=0)
         await _finish(harness)
 
         assert harness.executor._lease.lost.is_set()
-        assert pa._loop_interrupt_flag is None
+        assert pa._session_input.interrupt_mode is None
         assert not harness.calls["complete"]
         # A forced task cancellation may exact-release only after fake
         # termination has quiesced the physical owner; either disposition is
@@ -2059,7 +2070,7 @@ class TestShutdownCancellation:
             harness.executor._lease.update(claim.unit_id, claim.lease_token)
             pa._thread_id = str(claim.unit_id)
             pa._session = FakeSession()
-            pa._loop_user_queue = asyncio.Queue()
+            pa._session_input._queue = asyncio.Queue()
             if tool_effect:
                 pa._turn_tool_execution_identity = (
                     str(claim.unit_id),
@@ -2148,7 +2159,7 @@ class TestShutdownCancellation:
         claim = make_claim(token=41)
         pa._session = FakeSession(stateless_warm_reuse_safe=True)
         pa._thread_id = "prior-warm-thread"
-        pa._loop_user_queue = asyncio.Queue()
+        pa._session_input._queue = asyncio.Queue()
         pa._loop_task = asyncio.create_task(asyncio.sleep(3600))
         harness._fake_loop_tasks.append(pa._loop_task)
 
@@ -2387,7 +2398,7 @@ class TestLeaseLost:
         # complete_unit nor release_unit was called — the lease is gone.
         assert not harness.calls["release"]
         assert not harness.calls["complete"]
-        assert pa._loop_interrupt_flag in ("hard", "graceful")
+        assert pa._session_input.interrupt_mode in ("hard", "graceful")
         assert harness.calls["terminate"]
         assert harness.calls["terminate"][-1]["mark_thread"] is False
         assert harness.calls["terminate"][-1]["preserve_shell"] is True
@@ -2449,9 +2460,9 @@ class TestLeaseLost:
 
         assert harness.executor._abort_turn_politely(pa, target_turn_id=None) is False
         assert harness.executor._abort_turn_politely(pa, target_turn_id=2) is False
-        assert pa._loop_interrupt_flag is None
-        assert pa._loop_interrupt_target_turn_id is None
-        assert not pa._hard_interrupt_event.is_set()
+        assert pa._session_input.interrupt_mode is None
+        assert pa._session_input.interrupt_target_turn_id is None
+        assert not pa._session_input.hard_interrupt_event.is_set()
 
 
 # ---------------------------------------------------------------------------
@@ -3044,7 +3055,7 @@ class TestFencedPersistence:
         )
         token = current_lease.set(handle)
         try:
-            assert await pa._transition_claimed_input(
+            assert await pa._session_input.transition_claimed(
                 "0d8a40c3-8f0f-4f2b-acab-8a07660ecf5d",
                 3,
                 "admitted",

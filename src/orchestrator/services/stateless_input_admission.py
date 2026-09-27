@@ -41,7 +41,7 @@ async def admit_stateless_input(
     can never tear and a signal can never be lost.
 
     The message row is indistinguishable from the agent's accept-time persist
-    of a plain-text human message (``src/api/persistent_app._accept_user_input``
+    of a plain-text human message (``agent.api.session_input.SessionInputRuntime.accept``
     → ``src/database/postgres_db.save_thread_message``): same ``msg_`` id mint
     with the agent's own uuid5 row-id coercion, ``role='human'``,
     ``turn_number = total_turns + 1``, all other columns at their NULL

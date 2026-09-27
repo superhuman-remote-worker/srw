@@ -3620,7 +3620,7 @@ async def test_begun_retirement_closes_local_input_and_readiness_before_finaliza
         assert mod._runtime_input_admission_open() is False
         assert mod._session_ready() is False
         with pytest.raises(mod.TerminationAdmissionClosed):
-            await mod._accept_user_input("must not persist")
+            await mod._session_input.accept("must not persist")
 
     update.assert_awaited_once_with(
         "ending",
@@ -5499,10 +5499,10 @@ class TestTerminateSession:
         mod._loop_task = None  # nothing to cancel
         mod._thread_id = "t2"
         mod._subscribers["ghost"] = _asyncio.Queue()
-        mod._loop_user_queue = _asyncio.Queue()
-        mod._loop_interrupt_flag = "hard"
-        mod._loop_interrupt_target_turn_id = 4
-        mod._hard_interrupt_event = _asyncio.Event()
+        mod._session_input._queue = _asyncio.Queue()
+        mod._session_input._interrupt_mode = "hard"
+        mod._session_input._interrupt_target_turn_id = 4
+        mod._session_input._hard_interrupt_event = _asyncio.Event()
         mod._tool_inflight = True
         mod._events_epoch = 7
         mod._next_seq = 42
@@ -5518,10 +5518,10 @@ class TestTerminateSession:
             await mod._terminate_session("test")
 
         assert mod._subscribers == {}
-        assert mod._loop_user_queue is None
-        assert mod._loop_interrupt_flag is None
-        assert mod._loop_interrupt_target_turn_id is None
-        assert mod._hard_interrupt_event is None
+        assert mod._session_input.queue is None
+        assert mod._session_input.interrupt_mode is None
+        assert mod._session_input.interrupt_target_turn_id is None
+        assert mod._session_input.hard_interrupt_event is None
         assert mod._tool_inflight is False
         assert mod._events_epoch == 0
         assert mod._next_seq == 0
@@ -5678,7 +5678,7 @@ class TestAttachSessionCloudMount:
                 return None
 
             async def recover_subagents(self):
-                recovery_queue_states.append(mod._loop_user_queue)
+                recovery_queue_states.append(mod._session_input.queue)
 
         workspace_override = {
             "remote": {"host": "10.42.0.10"},
@@ -5715,7 +5715,7 @@ class TestAttachSessionCloudMount:
         ):
             try:
                 await mod._attach_session("thread-1")
-                queue_after_recovery = mod._loop_user_queue
+                queue_after_recovery = mod._session_input.queue
             finally:
                 mod._session = None
                 mod._thread_id = None
@@ -6113,7 +6113,7 @@ class TestHandlePersistentWebsocketReadiness:
         ws = self._validated_websocket()
         with (
             patch("agent.api.persistent_app._session", None),
-            patch("agent.api.persistent_app._loop_user_queue", None),
+            patch("agent.api.persistent_app._session_input._queue", None),
             patch("agent.api.persistent_app._loop_task", None),
             patch("agent.api.persistent_app._ws_connected_event", None),
         ):
@@ -6134,7 +6134,7 @@ class TestHandlePersistentWebsocketReadiness:
         session.llm_with_tools = None
         with (
             patch("agent.api.persistent_app._session", session),
-            patch("agent.api.persistent_app._loop_user_queue", None),
+            patch("agent.api.persistent_app._session_input._queue", None),
             patch("agent.api.persistent_app._loop_task", None),
             patch("agent.api.persistent_app._ws_connected_event", None),
             patch(
@@ -6162,7 +6162,7 @@ class TestHandlePersistentWebsocketReadiness:
         session.llm_with_tools = MagicMock()  # truthy
         with (
             patch("agent.api.persistent_app._session", session),
-            patch("agent.api.persistent_app._loop_user_queue", None),
+            patch("agent.api.persistent_app._session_input._queue", None),
             patch("agent.api.persistent_app._loop_task", None),
             patch("agent.api.persistent_app._ws_connected_event", None),
             patch(
@@ -6186,7 +6186,7 @@ class TestHandlePersistentWebsocketReadiness:
         session.llm_with_tools = None
         with (
             patch("agent.api.persistent_app._session", session),
-            patch("agent.api.persistent_app._loop_user_queue", None),
+            patch("agent.api.persistent_app._session_input._queue", None),
             patch("agent.api.persistent_app._loop_task", None),
             patch("agent.api.persistent_app._ws_connected_event", None),
             patch(
@@ -6215,7 +6215,7 @@ class TestHandlePersistentWebsocketReadiness:
         connected = asyncio.Event()
         with (
             patch("agent.api.persistent_app._session", session),
-            patch("agent.api.persistent_app._loop_user_queue", None),
+            patch("agent.api.persistent_app._session_input._queue", None),
             patch("agent.api.persistent_app._loop_task", None),
             patch("agent.api.persistent_app._ws_connected_event", connected),
             patch(
@@ -6261,7 +6261,7 @@ class TestHandlePersistentWebsocketReadiness:
         with (
             patch("agent.api.persistent_app._session", session),
             patch("agent.api.persistent_app._thread_id", "thread-1"),
-            patch("agent.api.persistent_app._loop_user_queue", asyncio.Queue()),
+            patch("agent.api.persistent_app._session_input._queue", asyncio.Queue()),
             patch("agent.api.persistent_app._session_ready", return_value=True),
             patch("agent.api.persistent_app._turn_event_open", True),
             patch(
@@ -6324,13 +6324,19 @@ class TestHandlePersistentWebsocketReadiness:
         with (
             patch("agent.api.persistent_app._session", session),
             patch("agent.api.persistent_app._thread_id", "thread-1"),
-            patch("agent.api.persistent_app._loop_user_queue", asyncio.Queue()),
+            patch("agent.api.persistent_app._session_input._queue", asyncio.Queue()),
             patch("agent.api.persistent_app._session_ready", return_value=True),
             patch("agent.api.persistent_app._turn_event_open", True),
             patch("agent.api.persistent_app._tool_inflight", False),
-            patch("agent.api.persistent_app._loop_interrupt_flag", None),
-            patch("agent.api.persistent_app._loop_interrupt_target_turn_id", None),
-            patch("agent.api.persistent_app._hard_interrupt_event", hard_event),
+            patch("agent.api.persistent_app._session_input._interrupt_mode", None),
+            patch(
+                "agent.api.persistent_app._session_input._interrupt_target_turn_id",
+                None,
+            ),
+            patch(
+                "agent.api.persistent_app._session_input._hard_interrupt_event",
+                hard_event,
+            ),
             patch(
                 "agent.api.persistent_app._pending_permission_requests",
                 AsyncMock(return_value=[]),
@@ -6355,8 +6361,8 @@ class TestHandlePersistentWebsocketReadiness:
                 "target_turn_id": 7,
                 "mode": "hard",
             }
-            assert pa._loop_interrupt_target_turn_id == 7
-            assert pa._loop_interrupt_flag == "hard"
+            assert pa._session_input.interrupt_target_turn_id == 7
+            assert pa._session_input.interrupt_mode == "hard"
             assert hard_event.is_set()
 
     @pytest.mark.asyncio
@@ -6548,7 +6554,7 @@ class TestSessionReadyHelper:
 
         with (
             patch("agent.api.persistent_app._session", None),
-            patch("agent.api.persistent_app._loop_user_queue", MagicMock()),
+            patch("agent.api.persistent_app._session_input._queue", MagicMock()),
         ):
             assert pa._session_ready() is False
 
@@ -6559,7 +6565,7 @@ class TestSessionReadyHelper:
         session.llm_with_tools = None
         with (
             patch("agent.api.persistent_app._session", session),
-            patch("agent.api.persistent_app._loop_user_queue", MagicMock()),
+            patch("agent.api.persistent_app._session_input._queue", MagicMock()),
         ):
             assert pa._session_ready() is False
 
@@ -6570,7 +6576,7 @@ class TestSessionReadyHelper:
         session.llm_with_tools = MagicMock()
         with (
             patch("agent.api.persistent_app._session", session),
-            patch("agent.api.persistent_app._loop_user_queue", None),
+            patch("agent.api.persistent_app._session_input._queue", None),
         ):
             assert pa._session_ready() is False
 
@@ -6583,7 +6589,7 @@ class TestSessionReadyHelper:
         session.protected_cloud_ready.return_value = True
         with (
             patch("agent.api.persistent_app._session", session),
-            patch("agent.api.persistent_app._loop_user_queue", MagicMock()),
+            patch("agent.api.persistent_app._session_input._queue", MagicMock()),
         ):
             assert pa._session_ready() is True
 
@@ -6599,33 +6605,33 @@ class TestLoopCheckInterrupt:
     def setup_method(self):
         import agent.api.persistent_app as mod
 
-        mod._loop_interrupt_flag = None
-        mod._loop_interrupt_target_turn_id = None
+        mod._session_input._interrupt_mode = None
+        mod._session_input._interrupt_target_turn_id = None
         mod._tool_inflight = False
-        mod._hard_interrupt_event = None
+        mod._session_input._hard_interrupt_event = None
         mod._session = SimpleNamespace(turn_count=7)
 
     def test_returns_none_when_flag_not_set(self):
         import agent.api.persistent_app as mod
 
-        assert mod._loop_check_interrupt() is None
+        assert mod._session_input.check_interrupt() is None
 
     def test_returns_hard_mode_once_then_resets(self):
         import agent.api.persistent_app as mod
 
-        mod._loop_interrupt_flag = "hard"
-        mod._loop_interrupt_target_turn_id = 7
-        assert mod._loop_check_interrupt() == "hard"
+        mod._session_input._interrupt_mode = "hard"
+        mod._session_input._interrupt_target_turn_id = 7
+        assert mod._session_input.check_interrupt() == "hard"
         # Subsequent reads see the reset.
-        assert mod._loop_check_interrupt() is None
+        assert mod._session_input.check_interrupt() is None
 
     def test_returns_graceful_mode_once_then_resets(self):
         import agent.api.persistent_app as mod
 
-        mod._loop_interrupt_flag = "graceful"
-        mod._loop_interrupt_target_turn_id = 7
-        assert mod._loop_check_interrupt() == "graceful"
-        assert mod._loop_check_interrupt() is None
+        mod._session_input._interrupt_mode = "graceful"
+        mod._session_input._interrupt_target_turn_id = 7
+        assert mod._session_input.check_interrupt() == "graceful"
+        assert mod._session_input.check_interrupt() is None
 
     def test_consuming_clears_hard_interrupt_event(self):
         """Consuming the flag resets the hard-interrupt event in lock-step so
@@ -6634,51 +6640,54 @@ class TestLoopCheckInterrupt:
 
         import agent.api.persistent_app as mod
 
-        mod._hard_interrupt_event = _asyncio.Event()
-        mod._hard_interrupt_event.set()
-        mod._loop_interrupt_flag = "hard"
-        mod._loop_interrupt_target_turn_id = 7
+        mod._session_input._hard_interrupt_event = _asyncio.Event()
+        mod._session_input.hard_interrupt_event.set()
+        mod._session_input._interrupt_mode = "hard"
+        mod._session_input._interrupt_target_turn_id = 7
 
-        assert mod._loop_check_interrupt() == "hard"
-        assert mod._hard_interrupt_event.is_set() is False
-        mod._hard_interrupt_event = None
+        assert mod._session_input.check_interrupt() == "hard"
+        assert mod._session_input.hard_interrupt_event.is_set() is False
+        mod._session_input._hard_interrupt_event = None
 
     def test_unscoped_interrupt_is_discarded_instead_of_striking_current_turn(self):
         import agent.api.persistent_app as mod
 
-        mod._loop_interrupt_flag = "hard"
-        mod._loop_interrupt_target_turn_id = None
+        mod._session_input._interrupt_mode = "hard"
+        mod._session_input._interrupt_target_turn_id = None
 
-        assert mod._loop_check_interrupt() is None
-        assert mod._loop_interrupt_flag is None
+        assert mod._session_input.check_interrupt() is None
+        assert mod._session_input.interrupt_mode is None
 
     def test_force_graceful_scoped_interrupt_never_sets_hard_event(self):
         import agent.api.persistent_app as mod
 
         mod._turn_event_open = True
         mod._tool_inflight = False
-        mod._hard_interrupt_event = asyncio.Event()
+        mod._session_input._hard_interrupt_event = asyncio.Event()
 
-        assert mod._signal_interrupt_for_turn(7, force_graceful=True) == "graceful"
-        assert mod._loop_interrupt_target_turn_id == 7
-        assert not mod._hard_interrupt_event.is_set()
+        assert (
+            mod._session_input.signal_interrupt_for_turn(7, force_graceful=True)
+            == "graceful"
+        )
+        assert mod._session_input.interrupt_target_turn_id == 7
+        assert not mod._session_input.hard_interrupt_event.is_set()
 
     @pytest.mark.asyncio
     async def test_late_interrupt_is_cleared_at_exact_turn_terminal_edge(self):
         import agent.api.persistent_app as mod
 
         mod._turn_event_open = True
-        mod._hard_interrupt_event = asyncio.Event()
-        assert mod._signal_interrupt_for_turn(7) == "hard"
+        mod._session_input._hard_interrupt_event = asyncio.Event()
+        assert mod._session_input.signal_interrupt_for_turn(7) == "hard"
 
         with patch.object(mod, "_loop_on_turn_complete_body", new=AsyncMock()):
             await mod._loop_on_turn_complete(7)
 
-        assert mod._loop_interrupt_flag is None
-        assert mod._loop_interrupt_target_turn_id is None
-        assert not mod._hard_interrupt_event.is_set()
+        assert mod._session_input.interrupt_mode is None
+        assert mod._session_input.interrupt_target_turn_id is None
+        assert not mod._session_input.hard_interrupt_event.is_set()
         mod._session.turn_count = 8
-        assert mod._loop_check_interrupt() is None
+        assert mod._session_input.check_interrupt() is None
 
 
 class TestHandleApiInterruptHardEvent:
@@ -6703,10 +6712,10 @@ class TestHandleApiInterruptHardEvent:
     def setup_method(self):
         import agent.api.persistent_app as mod
 
-        mod._loop_interrupt_flag = None
-        mod._loop_interrupt_target_turn_id = None
+        mod._session_input._interrupt_mode = None
+        mod._session_input._interrupt_target_turn_id = None
         mod._tool_inflight = False
-        mod._hard_interrupt_event = None
+        mod._session_input._hard_interrupt_event = None
 
     def teardown_method(self):
         import agent.api.persistent_app as mod
@@ -6714,9 +6723,9 @@ class TestHandleApiInterruptHardEvent:
         mod._session = None
         mod._tool_inflight = False
         mod._turn_event_open = False
-        mod._loop_interrupt_flag = None
-        mod._loop_interrupt_target_turn_id = None
-        mod._hard_interrupt_event = None
+        mod._session_input._interrupt_mode = None
+        mod._session_input._interrupt_target_turn_id = None
+        mod._session_input._hard_interrupt_event = None
 
     @pytest.mark.asyncio
     async def test_hard_mode_sets_event(self):
@@ -6727,7 +6736,7 @@ class TestHandleApiInterruptHardEvent:
         mod._session = SimpleNamespace(turn_count=7)
         mod._turn_event_open = True
         mod._tool_inflight = False  # no tool in flight ⇒ hard
-        mod._hard_interrupt_event = _asyncio.Event()
+        mod._session_input._hard_interrupt_event = _asyncio.Event()
 
         with patch.object(
             mod,
@@ -6736,9 +6745,9 @@ class TestHandleApiInterruptHardEvent:
         ):
             await _handle_api_interrupt(self._request())
 
-        assert mod._loop_interrupt_flag == "hard"
-        assert mod._loop_interrupt_target_turn_id == 7
-        assert mod._hard_interrupt_event.is_set() is True
+        assert mod._session_input.interrupt_mode == "hard"
+        assert mod._session_input.interrupt_target_turn_id == 7
+        assert mod._session_input.hard_interrupt_event.is_set() is True
 
     @pytest.mark.asyncio
     async def test_graceful_mode_leaves_event_unset(self):
@@ -6749,7 +6758,7 @@ class TestHandleApiInterruptHardEvent:
         mod._session = SimpleNamespace(turn_count=7)
         mod._turn_event_open = True
         mod._tool_inflight = True  # tool mid-ainvoke ⇒ graceful (never cancel)
-        mod._hard_interrupt_event = _asyncio.Event()
+        mod._session_input._hard_interrupt_event = _asyncio.Event()
 
         with patch.object(
             mod,
@@ -6758,9 +6767,9 @@ class TestHandleApiInterruptHardEvent:
         ):
             await _handle_api_interrupt(self._request())
 
-        assert mod._loop_interrupt_flag == "graceful"
-        assert mod._loop_interrupt_target_turn_id == 7
-        assert mod._hard_interrupt_event.is_set() is False
+        assert mod._session_input.interrupt_mode == "graceful"
+        assert mod._session_input.interrupt_target_turn_id == 7
+        assert mod._session_input.hard_interrupt_event.is_set() is False
 
     @pytest.mark.asyncio
     async def test_correlated_body_applies_only_to_exact_active_turn(self, monkeypatch):
@@ -6772,7 +6781,7 @@ class TestHandleApiInterruptHardEvent:
         mod._session = SimpleNamespace(turn_count=7)
         mod._turn_event_open = True
         mod._tool_inflight = False
-        mod._hard_interrupt_event = asyncio.Event()
+        mod._session_input._hard_interrupt_event = asyncio.Event()
         request = self._request(client_request_id="client-1", target_turn_id=7)
 
         with patch.object(
@@ -6790,9 +6799,9 @@ class TestHandleApiInterruptHardEvent:
             "applied": True,
             "mode": "hard",
         }
-        assert mod._loop_interrupt_flag == "hard"
-        assert mod._loop_interrupt_target_turn_id == 7
-        assert mod._hard_interrupt_event.is_set()
+        assert mod._session_input.interrupt_mode == "hard"
+        assert mod._session_input.interrupt_target_turn_id == 7
+        assert mod._session_input.hard_interrupt_event.is_set()
 
     @pytest.mark.asyncio
     async def test_correlated_stale_turn_rejects_before_ram_mutation(self, monkeypatch):
@@ -6803,8 +6812,8 @@ class TestHandleApiInterruptHardEvent:
         monkeypatch.delenv("STATELESS_EXECUTOR", raising=False)
         mod._session = SimpleNamespace(turn_count=8)
         mod._turn_event_open = True
-        mod._loop_interrupt_flag = None
-        mod._hard_interrupt_event = asyncio.Event()
+        mod._session_input._interrupt_mode = None
+        mod._session_input._hard_interrupt_event = asyncio.Event()
         request = self._request(client_request_id="client-1", target_turn_id=7)
 
         with patch.object(
@@ -6819,9 +6828,9 @@ class TestHandleApiInterruptHardEvent:
         assert payload["applied"] is False
         assert payload["error_code"] == "target_turn_not_active"
         assert payload["target_turn_id"] == 7
-        assert mod._loop_interrupt_flag is None
-        assert mod._loop_interrupt_target_turn_id is None
-        assert not mod._hard_interrupt_event.is_set()
+        assert mod._session_input.interrupt_mode is None
+        assert mod._session_input.interrupt_target_turn_id is None
+        assert not mod._session_input.hard_interrupt_event.is_set()
 
     @pytest.mark.asyncio
     async def test_bodyless_interrupt_while_idle_cannot_arm_next_turn(
@@ -6834,7 +6843,7 @@ class TestHandleApiInterruptHardEvent:
         monkeypatch.delenv("STATELESS_EXECUTOR", raising=False)
         mod._session = SimpleNamespace(turn_count=7)
         mod._turn_event_open = False
-        mod._hard_interrupt_event = asyncio.Event()
+        mod._session_input._hard_interrupt_event = asyncio.Event()
 
         with patch.object(
             mod,
@@ -6845,8 +6854,8 @@ class TestHandleApiInterruptHardEvent:
 
         assert response.status_code == 409
         assert json.loads(response.body)["error_code"] == "target_turn_not_active"
-        assert mod._loop_interrupt_flag is None
-        assert mod._loop_interrupt_target_turn_id is None
+        assert mod._session_input.interrupt_mode is None
+        assert mod._session_input.interrupt_target_turn_id is None
 
     @pytest.mark.asyncio
     async def test_correlated_body_requires_positive_integer_target(self, monkeypatch):
@@ -6874,7 +6883,7 @@ class TestHandleApiInterruptHardEvent:
 
         mod._session = SimpleNamespace(turn_count=7)
         mod._turn_event_open = True
-        mod._hard_interrupt_event = asyncio.Event()
+        mod._session_input._hard_interrupt_event = asyncio.Event()
 
         with patch.object(
             mod,
@@ -6888,9 +6897,9 @@ class TestHandleApiInterruptHardEvent:
             "error": "session_identity_mismatch",
             "retryable": True,
         }
-        assert mod._loop_interrupt_flag is None
-        assert mod._loop_interrupt_target_turn_id is None
-        assert not mod._hard_interrupt_event.is_set()
+        assert mod._session_input.interrupt_mode is None
+        assert mod._session_input.interrupt_target_turn_id is None
+        assert not mod._session_input.hard_interrupt_event.is_set()
 
 
 # ---------------------------------------------------------------------------

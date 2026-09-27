@@ -35,9 +35,7 @@ _PERSISTENT_GLOBALS = (
     "_drain_deferred_logged",
     "_session",
     "_thread_id",
-    "_awaiting_input",
     "_tool_inflight",
-    "_loop_user_queue",
     "_loop_task",
     "_orchestrator_client",
     "_session_runtime_generation",
@@ -60,13 +58,17 @@ class TestPersistentDrainHandler:
         from agent.api import persistent_app
 
         saved = {name: getattr(persistent_app, name) for name in _PERSISTENT_GLOBALS}
+        saved_input = (
+            persistent_app._session_input._awaiting_input,
+            persistent_app._session_input._queue,
+        )
         persistent_app._drain_intent_handled = False
         persistent_app._drain_deferred_logged = False
         persistent_app._session = None
         persistent_app._thread_id = None
-        persistent_app._awaiting_input = False
+        persistent_app._session_input._awaiting_input = False
         persistent_app._tool_inflight = False
-        persistent_app._loop_user_queue = None
+        persistent_app._session_input._queue = None
         persistent_app._orchestrator_client = None
         persistent_app._session_runtime_generation = None
         persistent_app._session_runtime_attach_token = None
@@ -79,6 +81,10 @@ class TestPersistentDrainHandler:
         yield
         for name, value in saved.items():
             setattr(persistent_app, name, value)
+        (
+            persistent_app._session_input._awaiting_input,
+            persistent_app._session_input._queue,
+        ) = saved_input
 
     def _attach_parked_session(self, persistent_app):
         """Simulate an attached session parked between turns."""
@@ -87,9 +93,9 @@ class TestPersistentDrainHandler:
         persistent_app._session.workspace_runtime_incarnation = None
         persistent_app._session.local_quiescence_protocol = "agent_runtime_zero_v1"
         persistent_app._thread_id = "tid-drain-1"
-        persistent_app._awaiting_input = True
+        persistent_app._session_input._awaiting_input = True
         persistent_app._tool_inflight = False
-        persistent_app._loop_user_queue = None
+        persistent_app._session_input._queue = None
         client = AsyncMock()
         client.suspend_thread = AsyncMock(return_value=True)
         persistent_app._orchestrator_client = client
@@ -330,7 +336,9 @@ class TestPersistentDrainHandler:
         from agent.api import persistent_app
 
         self._attach_parked_session(persistent_app)
-        persistent_app._awaiting_input = False  # loop not parked: mid-turn
+        persistent_app._session_input._awaiting_input = (
+            False  # loop not parked: mid-turn
+        )
 
         with (
             patch.object(
@@ -368,7 +376,7 @@ class TestPersistentDrainHandler:
         self._attach_parked_session(persistent_app)
         queue: asyncio.Queue = asyncio.Queue()
         queue.put_nowait("pending user message")
-        persistent_app._loop_user_queue = queue
+        persistent_app._session_input._queue = queue
 
         with patch.object(persistent_app, "_schedule_exit") as exit_:
             await persistent_app._handle_heartbeat_intents(
@@ -382,7 +390,7 @@ class TestPersistentDrainHandler:
         from agent.api import persistent_app
 
         client = self._attach_parked_session(persistent_app)
-        persistent_app._awaiting_input = False  # busy on the first tick
+        persistent_app._session_input._awaiting_input = False  # busy on the first tick
 
         with (
             patch.object(
@@ -400,7 +408,7 @@ class TestPersistentDrainHandler:
             )
             assert persistent_app._drain_intent_handled is False
 
-            persistent_app._awaiting_input = True  # loop parked
+            persistent_app._session_input._awaiting_input = True  # loop parked
             await persistent_app._handle_heartbeat_intents(
                 {"intents": {"should_drain": True}}
             )

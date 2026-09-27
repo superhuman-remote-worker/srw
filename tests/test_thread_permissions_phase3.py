@@ -318,14 +318,14 @@ class TestWaitForPermissionResolution:
         # (now closed) event loop, so awaiting it here raises and the wait
         # returns its conservative 'denied' default instead of the real
         # status. Own the precondition rather than inherit it.
-        mod._hard_interrupt_event = None
+        mod._session_input._hard_interrupt_event = None
 
     def teardown_method(self):
         import agent.api.persistent_app as mod
 
         mod._session = None
         mod._thread_id = None
-        mod._hard_interrupt_event = None
+        mod._session_input._hard_interrupt_event = None
 
     @pytest.mark.asyncio
     async def test_returns_immediately_if_already_approved(self):
@@ -439,7 +439,7 @@ class TestLoopPermissionCheckDBPath:
         mod._events_epoch = 0
         mod._next_seq = 0
         # Reaches _wait_for_permission_resolution — same cross-loop hazard.
-        mod._hard_interrupt_event = None
+        mod._session_input._hard_interrupt_event = None
 
     def teardown_method(self):
         import agent.api.persistent_app as mod
@@ -447,7 +447,7 @@ class TestLoopPermissionCheckDBPath:
         mod._session = None
         mod._thread_id = None
         mod._subscribers.clear()
-        mod._hard_interrupt_event = None
+        mod._session_input._hard_interrupt_event = None
 
     @pytest.mark.asyncio
     async def test_denies_when_insert_fails(self):

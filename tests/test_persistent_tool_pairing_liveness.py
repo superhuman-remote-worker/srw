@@ -289,17 +289,19 @@ async def test_mid_tool_drift_waits_for_pair_then_replacement_restore_is_valid()
         name: getattr(persistent_app, name)
         for name in (
             "_session",
-            "_awaiting_input",
             "_tool_inflight",
-            "_loop_user_queue",
             "_drain_intent_handled",
             "_drain_deferred_logged",
         )
     }
+    saved_input = (
+        persistent_app._session_input._awaiting_input,
+        persistent_app._session_input._queue,
+    )
     persistent_app._session = MagicMock()
-    persistent_app._awaiting_input = False
+    persistent_app._session_input._awaiting_input = False
     persistent_app._tool_inflight = False
-    persistent_app._loop_user_queue = None
+    persistent_app._session_input._queue = None
     persistent_app._drain_intent_handled = False
     persistent_app._drain_deferred_logged = False
     drain = AsyncMock()
@@ -311,7 +313,7 @@ async def test_mid_tool_drift_waits_for_pair_then_replacement_restore_is_valid()
         input_count += 1
         if input_count == 1:
             return "inspect safely"
-        persistent_app._awaiting_input = True
+        persistent_app._session_input._awaiting_input = True
         await persistent_app._handle_heartbeat_intents(
             {"intents": {"should_drain": True, "drain_reason": "image_drift"}}
         )
@@ -420,5 +422,9 @@ async def test_mid_tool_drift_waits_for_pair_then_replacement_restore_is_valid()
         assert replacement_call_ids == replacement_result_ids == {"call_drain"}
         assert durable == durable_snapshot
     finally:
+        (
+            persistent_app._session_input._awaiting_input,
+            persistent_app._session_input._queue,
+        ) = saved_input
         for name, value in saved.items():
             setattr(persistent_app, name, value)

@@ -29,6 +29,7 @@ from fastapi.testclient import TestClient
 from langchain_core.messages import AIMessage, HumanMessage
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
+from agent.api import session_contract
 from agent.services.workspace_undo import (
     WorkspaceUndoRetryable,
     WorkspaceUndoUnavailable,
@@ -247,6 +248,17 @@ def _make_session(*, thread_id: str = THREAD_ID, name: str = "session-A") -> Mag
     return session
 
 
+# Runtime names whose state or operation now lives on the input owner
+# (``persistent_app._session_input``, R3.3a), mapped to its attribute.
+_INPUT_OWNER_NAMES = {
+    "_loop_user_queue": "_queue",
+    "_loop_interrupt_flag": "_interrupt_mode",
+    "_loop_interrupt_target_turn_id": "_interrupt_target_turn_id",
+    "_hard_interrupt_event": "_hard_interrupt_event",
+    "_accept_user_input": "accept",
+}
+
+
 class _Runtime:
     """Test-owned view of the persistent runtime seams."""
 
@@ -255,11 +267,19 @@ class _Runtime:
         self._monkeypatch = monkeypatch
         self._signatures: dict[str, inspect.Signature] = {}
 
+    def _target(self, name: str):
+        moved = _INPUT_OWNER_NAMES.get(name)
+        if moved is not None:
+            return self.pa._session_input, moved
+        return self.pa, name
+
     def set(self, name: str, value) -> None:
-        self._monkeypatch.setattr(self.pa, name, value)
+        owner, attribute = self._target(name)
+        self._monkeypatch.setattr(owner, attribute, value)
 
     def patch(self, name: str, mock):
-        self._signatures[name] = inspect.signature(getattr(self.pa, name))
+        owner, attribute = self._target(name)
+        self._signatures[name] = inspect.signature(getattr(owner, attribute))
         self.set(name, mock)
         return mock
 
@@ -621,7 +641,7 @@ class TestStatelessExecutor:
         assert response.json() == STATELESS_REST_BODY
         rt.accept.assert_not_called()
         rt.resolve.assert_not_called()
-        assert rt.pa._loop_interrupt_flag is None
+        assert _interrupt_state(rt.pa) == (None, None)
 
     def test_ws_with_pinned_identity_gets_error_then_4409(
         self, client, ws_path, rt, pa, monkeypatch
@@ -1131,7 +1151,7 @@ class TestInput:
     def test_rest_rejections(
         self, client, rt, pa, name, status, body, retry_after, _ws_params
     ):
-        rt.accept.side_effect = getattr(pa, name)()
+        rt.accept.side_effect = getattr(session_contract, name)()
         response = client.post("/api/input", json=_input_body())
         assert response.status_code == status
         assert response.json() == body
@@ -1145,7 +1165,7 @@ class TestInput:
     def test_ws_rejections(
         self, client, ws_path, rt, pa, name, _status, _body, _retry_after, ws_params
     ):
-        rt.accept.side_effect = getattr(pa, name)()
+        rt.accept.side_effect = getattr(session_contract, name)()
         with _session_ws(client, ws_path) as ws:
             ws.send_json({"method": "message", "content": "hello"})
             if ws_params is None:
@@ -1328,7 +1348,8 @@ class TestInput:
 
 
 def _interrupt_state(pa) -> tuple:
-    return pa._loop_interrupt_flag, pa._loop_interrupt_target_turn_id
+    owner = pa._session_input
+    return owner.interrupt_mode, owner.interrupt_target_turn_id
 
 
 class TestInterrupt:

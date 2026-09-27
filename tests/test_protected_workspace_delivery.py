@@ -571,16 +571,19 @@ async def test_dedicated_attach_initial_engaging_polls_to_ready(monkeypatch):
         ("_session", None),
         ("_thread_id", None),
         ("_event_writer", None),
-        ("_loop_user_queue", None),
-        ("_loop_interrupt_flag", None),
-        ("_loop_interrupt_target_turn_id", None),
-        ("_hard_interrupt_event", None),
         ("_input_runtime_generation", None),
         ("_session_runtime_generation", None),
         ("_session_runtime_attach_token", None),
         ("_session_side_tasks", set()),
     ):
         monkeypatch.setattr(persistent_app, name, value)
+    for name in (
+        "_queue",
+        "_interrupt_mode",
+        "_interrupt_target_turn_id",
+        "_hard_interrupt_event",
+    ):
+        monkeypatch.setattr(persistent_app._session_input, name, None)
 
     with (
         patch.object(persistent_app, "PersistentSession", constructor),
@@ -592,7 +595,7 @@ async def test_dedicated_attach_initial_engaging_polls_to_ready(monkeypatch):
             "_update_thread_status",
             new=AsyncMock(return_value=True),
         ) as update_status,
-        patch.object(persistent_app, "_reclaim_pending_pinned_inputs", new=AsyncMock()),
+        patch.object(persistent_app._session_input, "reclaim_pending", new=AsyncMock()),
         patch.object(persistent_app, "_start_watchdogs"),
         patch.object(persistent_app, "_officer_cfg", return_value=None),
         patch.object(persistent_app, "_broadcast"),
@@ -651,7 +654,7 @@ def test_strict_pinned_input_identity_keeps_process_generation_separate(monkeypa
     )
     monkeypatch.setenv("POD_UID", "pod-uid")
 
-    assert persistent_app._pinned_input_runtime_identity() == (
+    assert persistent_app._session_input.pinned_identity() == (
         client.agent_id,
         "pod-uid",
         "ffffffff-ffff-4fff-8fff-ffffffffffff",

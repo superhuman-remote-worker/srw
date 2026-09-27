@@ -776,7 +776,7 @@ class TestInterruptModeSelection:
     def setup_method(self):
         import agent.api.persistent_app as mod
 
-        mod._loop_interrupt_flag = None
+        mod._session_input._interrupt_mode = None
         mod._tool_inflight = False
 
     def test_loop_on_tool_start_does_not_claim_execution_inflight(self):
@@ -1035,7 +1035,7 @@ class TestAgentRestInputEndpointsNoSession:
         import agent.api.persistent_app as mod
 
         mod._session = None
-        mod._loop_user_queue = None
+        mod._session_input._queue = None
 
     def test_api_input_503_without_session(self):
         from fastapi.testclient import TestClient
@@ -1078,7 +1078,7 @@ class TestAgentRestInputEndpointsNoSession:
         # Stand up a minimal session so we get past the 503 gate.
         mod._session = MagicMock()
         mod._session.protected_cloud_required = False
-        mod._loop_user_queue = _asyncio.Queue()
+        mod._session_input._queue = _asyncio.Queue()
         mod._retirement_admission_identity = None
         mod._termination_admission_fenced = False
 
@@ -1089,7 +1089,7 @@ class TestAgentRestInputEndpointsNoSession:
             assert resp.status_code == 400
         finally:
             mod._session = None
-            mod._loop_user_queue = None
+            mod._session_input._queue = None
 
     @pytest.mark.asyncio
     async def test_api_input_starts_loop_without_websocket(self):
@@ -1158,11 +1158,11 @@ class TestAgentRestInputEndpointsNoSession:
 
         mod._thread_id = "thread-rest"
         mod._loop_task = None
-        mod._loop_user_queue = asyncio.Queue()
-        mod._hard_interrupt_event = asyncio.Event()
+        mod._session_input._queue = asyncio.Queue()
+        mod._session_input._hard_interrupt_event = asyncio.Event()
         mod._input_runtime_generation = str(uuid4())
         mod._session_runtime_attach_token = str(uuid4())
-        mod._queued_input_claims.clear()
+        mod._session_input._queued_claims.clear()
         mod._session = SimpleNamespace(
             llm_with_tools=object(),
             tools=[],
@@ -1228,11 +1228,11 @@ class TestAgentRestInputEndpointsNoSession:
             mod._session = None
             mod._thread_id = None
             mod._loop_task = None
-            mod._loop_user_queue = None
-            mod._hard_interrupt_event = None
+            mod._session_input._queue = None
+            mod._session_input._hard_interrupt_event = None
             mod._input_runtime_generation = None
             mod._session_runtime_attach_token = None
-            mod._queued_input_claims.clear()
+            mod._session_input._queued_claims.clear()
 
 
 # ---------------------------------------------------------------------------

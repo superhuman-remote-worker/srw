@@ -100,14 +100,14 @@ def _restore_loop_primitives():
     global consumer runs next (e.g. `_wait_for_permission_resolution`)."""
 
     names = (
-        "_loop_user_queue",
-        "_loop_interrupt_flag",
+        "_queue",
+        "_interrupt_mode",
         "_hard_interrupt_event",
     )
-    saved = {name: getattr(papp, name) for name in names}
+    saved = {name: getattr(papp._session_input, name) for name in names}
     yield
     for name, value in saved.items():
-        setattr(papp, name, value)
+        setattr(papp._session_input, name, value)
 
 
 @pytest.mark.asyncio
@@ -1369,8 +1369,8 @@ async def test_none_agent_cloud_suppression_is_stateless_only(
         ) as build_sync,
         patch.object(papp, "_restore_session_messages", AsyncMock()),
         patch.object(
-            papp,
-            "_reclaim_pending_pinned_inputs",
+            papp._session_input,
+            "reclaim_pending",
             AsyncMock(return_value=set()),
         ) as reclaim_pinned,
         patch.object(

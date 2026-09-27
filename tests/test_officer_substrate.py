@@ -307,7 +307,7 @@ def _reset_agent_globals():
     mod._session_runtime_attach_token = None
     mod._orchestrator_client = None
     mod._subscribers.clear()
-    mod._loop_user_queue = None
+    mod._session_input._queue = None
 
 
 def _install_officer_session(*, officer_cfg, turn_count: int = 2):
@@ -326,7 +326,7 @@ def _install_officer_session(*, officer_cfg, turn_count: int = 2):
     client.update_thread_status = AsyncMock(return_value=True)
     client.file_officer_wake = AsyncMock(return_value=True)
     mod._orchestrator_client = client
-    mod._loop_user_queue = asyncio.Queue()
+    mod._session_input._queue = asyncio.Queue()
     return session, client
 
 
@@ -350,9 +350,9 @@ class TestOfficerInputWait:
         session.tool_context.consume_officer_sleep = MagicMock(
             return_value={"minutes": 500, "reason": "long haul"}
         )
-        await mod._loop_user_queue.put({"content": "hi", "role": "human"})
+        await mod._session_input.queue.put({"content": "hi", "role": "human"})
 
-        item = await mod._loop_get_user_input()
+        item = await mod._session_input.get_user_input()
 
         assert item["content"] == "hi"
         # Filing runs as a task — let it complete.
@@ -377,7 +377,7 @@ class TestOfficerInputWait:
         )
 
         try:
-            item = await mod._loop_get_user_input()
+            item = await mod._session_input.get_user_input()
         except IdleTimeoutError:  # pragma: no cover - the regression this pins
             pytest.fail("officer session must never raise IdleTimeoutError")
 
@@ -392,9 +392,9 @@ class TestOfficerInputWait:
             officer_cfg=OfficerConfig(enabled=True), turn_count=3
         )
         assert not mod._subscribers  # untethered — the flip condition
-        await mod._loop_user_queue.put({"content": "x", "role": "human"})
+        await mod._session_input.queue.put({"content": "x", "role": "human"})
 
-        await mod._loop_get_user_input()
+        await mod._session_input.get_user_input()
         await asyncio.sleep(0)
 
         client.update_thread_status.assert_not_awaited()
@@ -408,9 +408,9 @@ class TestOfficerInputWait:
         )
         session.tool_context = MagicMock()
         session.tool_context.consume_officer_sleep = MagicMock(return_value=None)
-        await mod._loop_user_queue.put({"content": "x", "role": "human"})
+        await mod._session_input.queue.put({"content": "x", "role": "human"})
 
-        await mod._loop_get_user_input()
+        await mod._session_input.get_user_input()
         await asyncio.sleep(0)
 
         # The watchdog files implicit sleep_max — the transport must not.

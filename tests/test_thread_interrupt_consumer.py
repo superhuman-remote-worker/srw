@@ -129,8 +129,8 @@ def stateless_owner(monkeypatch):
     monkeypatch.setattr(pa, "_session", session)
     monkeypatch.setattr(pa, "_thread_id", str(THREAD_ID))
     monkeypatch.setattr(pa, "_turn_event_open", True)
-    monkeypatch.setattr(pa, "_loop_interrupt_flag", None)
-    monkeypatch.setattr(pa, "_hard_interrupt_event", asyncio.Event())
+    monkeypatch.setattr(pa._session_input, "_interrupt_mode", None)
+    monkeypatch.setattr(pa._session_input, "_hard_interrupt_event", asyncio.Event())
     monkeypatch.setattr(pa, "_tool_inflight", False)
     handle = LeaseHandle()
     handle.update(str(THREAD_ID), 9)
@@ -171,7 +171,9 @@ async def test_signal_precedes_receipt_and_finalization(stateless_owner):
             "shared.thread_interrupts.fetch_interrupt_receipt",
             AsyncMock(return_value=None),
         ),
-        patch.object(pa, "_signal_interrupt_for_turn", side_effect=signal),
+        patch.object(
+            pa._session_input, "signal_interrupt_for_turn", side_effect=signal
+        ),
         patch.object(pa, "_broadcast_interrupt_durable", side_effect=journal) as write,
         patch.object(pa, "_finalize_durable_interrupt", side_effect=finalize) as finish,
     ):
@@ -225,7 +227,7 @@ async def test_receipt_recovery_never_resignals_or_rejournals(stateless_owner):
             "shared.thread_interrupts.fetch_interrupt_receipt",
             AsyncMock(return_value=_receipt()),
         ),
-        patch.object(pa, "_signal_interrupt_for_turn", signal),
+        patch.object(pa._session_input, "signal_interrupt_for_turn", signal),
         patch.object(pa, "_broadcast_interrupt_durable", journal),
         patch.object(pa, "_finalize_durable_interrupt", finalize),
     ):
@@ -287,7 +289,7 @@ async def test_stop_joins_slow_receipt_without_cancel_or_duplicate(
             "shared.thread_interrupts.fetch_interrupt_receipt",
             AsyncMock(return_value=None),
         ),
-        patch.object(pa, "_signal_interrupt_for_turn", signal),
+        patch.object(pa._session_input, "signal_interrupt_for_turn", signal),
         patch.object(pa, "_broadcast_interrupt_durable", journal),
         patch.object(pa, "_finalize_durable_interrupt", finalize),
     ):
@@ -437,7 +439,7 @@ async def test_terminal_edge_is_durably_rejected_without_ram_signal(
             == 1
         )
 
-    assert pa._loop_interrupt_flag is None
+    assert pa._session_input.interrupt_mode is None
     params = journal.await_args.args[1]
     assert params == {
         "request_id": str(REQUEST_ID),
@@ -492,7 +494,7 @@ async def test_stale_local_handle_never_reads_or_signals(stateless_owner):
     signal = MagicMock()
     with (
         patch("shared.thread_interrupts.fetch_next_interrupt_request", fetch),
-        patch.object(pa, "_signal_interrupt_for_turn", signal),
+        patch.object(pa._session_input, "signal_interrupt_for_turn", signal),
     ):
         with pytest.raises(pa.InterruptInboxBlocked):
             await pa._drain_thread_interrupts(lease_token=9, target_turn_id=4)
@@ -631,7 +633,7 @@ async def test_owner_crash_before_receipt_applies_stop_without_successor_signal(
         patch.object(pa, "_broadcast_interrupt_durable", side_effect=ack) as write,
         patch.object(pa, "_broadcast_event_durable", side_effect=boundary) as edge,
         patch.object(pa, "_finalize_durable_interrupt", side_effect=finalize) as finish,
-        patch.object(pa, "_signal_interrupt_for_turn") as signal,
+        patch.object(pa._session_input, "signal_interrupt_for_turn") as signal,
     ):
         assert await pa._reconcile_stale_thread_interrupts(lease_token=10) == (
             1,
@@ -706,7 +708,7 @@ async def test_owner_crash_after_receipt_finalizes_without_successor_signal(
         ) as edge,
         patch.object(pa, "_broadcast_interrupt_durable") as write,
         patch.object(pa, "_finalize_durable_interrupt", side_effect=finalize) as finish,
-        patch.object(pa, "_signal_interrupt_for_turn") as signal,
+        patch.object(pa._session_input, "signal_interrupt_for_turn") as signal,
     ):
         assert await pa._reconcile_stale_thread_interrupts(lease_token=10) == (
             1,
@@ -782,7 +784,7 @@ async def test_stale_recovery_emits_one_singular_boundary_per_exact_target(
         patch.object(
             pa, "_finalize_durable_interrupt", AsyncMock(return_value="applied")
         ),
-        patch.object(pa, "_signal_interrupt_for_turn") as signal,
+        patch.object(pa._session_input, "signal_interrupt_for_turn") as signal,
     ):
         assert await pa._reconcile_stale_thread_interrupts(lease_token=10) == (
             2,
@@ -849,7 +851,7 @@ async def test_terminal_applied_stale_row_settles_and_makes_progress_without_loo
         patch.object(pa, "_broadcast_event_durable", AsyncMock(return_value=(4, 1))),
         patch.object(pa, "_broadcast_interrupt_durable") as ack,
         patch.object(pa, "_finalize_durable_interrupt") as finalize,
-        patch.object(pa, "_signal_interrupt_for_turn") as signal,
+        patch.object(pa._session_input, "signal_interrupt_for_turn") as signal,
     ):
         assert await pa._reconcile_stale_thread_interrupts(lease_token=10) == (
             1,

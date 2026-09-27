@@ -170,11 +170,11 @@ def _wire_input_runtime(monkeypatch, tmp_path, db, *, turn_count: int = 5):
     )
     monkeypatch.setattr(persistent_app, "_termination_admission_fenced", False)
     monkeypatch.setattr(persistent_app, "_termination_fence_reason", None)
-    monkeypatch.setattr(persistent_app, "_awaiting_input", False)
+    monkeypatch.setattr(persistent_app._session_input, "_awaiting_input", False)
     monkeypatch.setattr(persistent_app, "_turn_event_open", False)
     monkeypatch.setattr(persistent_app, "_tool_inflight", False)
-    monkeypatch.setattr(persistent_app, "_loop_user_queue", queue)
-    monkeypatch.setattr(persistent_app, "_input_delivery_reclaim_lock", asyncio.Lock())
+    monkeypatch.setattr(persistent_app._session_input, "_queue", queue)
+    monkeypatch.setattr(persistent_app._session_input, "_reclaim_lock", asyncio.Lock())
     monkeypatch.setattr(persistent_app, "_thread_id", str(uuid4()))
     monkeypatch.setenv("POD_UID", "pod-uid-test")
     monkeypatch.setattr(
@@ -190,7 +190,7 @@ def _wire_input_runtime(monkeypatch, tmp_path, db, *, turn_count: int = 5):
     )
     monkeypatch.setattr(persistent_app, "_session_runtime_attach_token", str(uuid4()))
     monkeypatch.setattr(persistent_app, "_pinned_runtime_generation_enabled", False)
-    persistent_app._queued_input_claims.clear()
+    persistent_app._session_input._queued_claims.clear()
     monkeypatch.setattr(
         persistent_app,
         "_session",
@@ -466,10 +466,10 @@ async def test_retry_stable_event_is_enqueued_once_and_fence_rejects_new_wake(
     queue = _wire_input_runtime(monkeypatch, tmp_path, db)
     delivery_id = str(uuid4())
 
-    first = await persistent_app._accept_user_input(
+    first = await persistent_app._session_input.accept(
         "timer wake", role="event", delivery_id=delivery_id
     )
-    retry = await persistent_app._accept_user_input(
+    retry = await persistent_app._session_input.accept(
         "timer wake", role="event", delivery_id=delivery_id
     )
 
@@ -480,7 +480,7 @@ async def test_retry_stable_event_is_enqueued_once_and_fence_rejects_new_wake(
 
     assert persistent_app.activate_termination_admission_fence("test") is True
     with pytest.raises(persistent_app.TerminationAdmissionClosed):
-        await persistent_app._accept_user_input(
+        await persistent_app._session_input.accept(
             "must wait", role="event", delivery_id=str(uuid4())
         )
     assert queue.qsize() == 1
@@ -683,7 +683,7 @@ async def test_direct_input_fenced_after_persist_is_truthfully_deferred(
     )
     queue = _wire_input_runtime(monkeypatch, tmp_path, db)
 
-    accepted = await persistent_app._accept_user_input("please retain this")
+    accepted = await persistent_app._session_input.accept("please retain this")
 
     assert accepted.deferred is True
     assert accepted.enqueued is False
@@ -702,13 +702,13 @@ async def test_protected_mount_loss_rejects_before_persist_and_recovers(
     persistent_app._session.protected_cloud_ready = lambda: state["ready"]
 
     with pytest.raises(persistent_app.ProtectedCloudUnavailable):
-        await persistent_app._accept_user_input("do not persist yet")
+        await persistent_app._session_input.accept("do not persist yet")
     assert db.rows == []
     assert queue.empty()
     assert persistent_app._loop_provider_admission_open() is False
 
     state["ready"] = True
-    accepted = await persistent_app._accept_user_input("now it is safe")
+    accepted = await persistent_app._session_input.accept("now it is safe")
     assert accepted.enqueued is True
     assert len(db.rows) == 1
     assert queue.get_nowait()["content"] == "now it is safe"
@@ -753,12 +753,12 @@ async def test_partial_protected_mount_join_blocks_ready_input_provider_and_tool
     assert persistent_app._session_ready() is False
     assert persistent_app._loop_provider_admission_open() is False
     with pytest.raises(persistent_app.ProtectedCloudUnavailable):
-        await persistent_app._accept_user_input("must not cross a partial mount")
+        await persistent_app._session_input.accept("must not cross a partial mount")
     assert db.rows == []
     with pytest.raises(WorkspaceUnavailableError, match="protected cloud"):
         await persistent_app._loop_on_tool_execution_start("shell", "call-partial")
 
-    reclaim = persistent_app._protected_input_reclaim_task
+    reclaim = persistent_app._session_input.protected_reclaim_task
     if reclaim is not None:
         reclaim.cancel()
         await asyncio.gather(reclaim, return_exceptions=True)
@@ -775,7 +775,7 @@ async def test_protected_loss_after_persist_defers_then_reclaims_exactly_once(
     persistent_app._session.protected_cloud_ready = lambda: state["ready"]
     db.after_persist = lambda: state.update(ready=False)
 
-    accepted = await persistent_app._accept_user_input("retain once")
+    accepted = await persistent_app._session_input.accept("retain once")
     assert accepted.deferred is True
     assert accepted.enqueued is False
     assert len(db.rows) == 1
@@ -889,9 +889,9 @@ async def test_protected_loss_at_provider_admission_unadmits_and_defers(
             state["ready"] = False
         return True
 
-    monkeypatch.setattr(persistent_app, "_transition_claimed_input", transition)
+    monkeypatch.setattr(persistent_app._session_input, "transition_claimed", transition)
 
-    result = await persistent_app._loop_admit_input_delivery("delivery", 3, 7)
+    result = await persistent_app._session_input.admit_delivery("delivery", 3, 7)
 
     assert result is None
     assert transitions == ["admitted", "unadmit"]
@@ -1136,8 +1136,8 @@ async def test_websocket_post_persist_fence_acknowledges_and_successor_reclaims_
     db.after_persist = None
     persistent_app._termination_admission_fenced = False
     persistent_app._input_runtime_generation = str(uuid4())
-    persistent_app._queued_input_claims.clear()
-    reclaimed = await persistent_app._reclaim_pending_pinned_inputs()
+    persistent_app._session_input._queued_claims.clear()
+    reclaimed = await persistent_app._session_input.reclaim_pending()
     assert reclaimed == {(params["delivery_id"], 2)}
     item = queue.get_nowait()
     assert item["delivery_id"] == params["delivery_id"]
@@ -1197,23 +1197,25 @@ async def test_committed_insert_before_queue_is_reclaimed_by_new_process(
     db = _InsertOnceDB()
     queue = _wire_input_runtime(monkeypatch, tmp_path, db)
     delivery_id = str(uuid4())
-    original_queue = persistent_app._queue_claimed_input
+    original_queue = persistent_app._session_input.queue_claimed
 
     async def _die_after_commit(_row):
         raise RuntimeError("process died before queue publication")
 
-    monkeypatch.setattr(persistent_app, "_queue_claimed_input", _die_after_commit)
+    monkeypatch.setattr(
+        persistent_app._session_input, "queue_claimed", _die_after_commit
+    )
     with pytest.raises(RuntimeError, match="process died"):
-        await persistent_app._accept_user_input(
+        await persistent_app._session_input.accept(
             "persisted wake", role="event", delivery_id=delivery_id
         )
     assert len(db.rows) == 1
     assert queue.empty()
 
-    monkeypatch.setattr(persistent_app, "_queue_claimed_input", original_queue)
+    monkeypatch.setattr(persistent_app._session_input, "queue_claimed", original_queue)
     persistent_app._input_runtime_generation = str(uuid4())
-    persistent_app._queued_input_claims.clear()
-    assert await persistent_app._reclaim_pending_pinned_inputs() == {(delivery_id, 2)}
+    persistent_app._session_input._queued_claims.clear()
+    assert await persistent_app._session_input.reclaim_pending() == {(delivery_id, 2)}
     item = queue.get_nowait()
     assert item["delivery_id"] == delivery_id
     assert item["claim_generation"] == 2
@@ -1228,10 +1230,10 @@ async def test_cancelled_direct_human_delivery_is_terminal_and_not_reclaimed(
     queue = _wire_input_runtime(monkeypatch, tmp_path, db)
     monkeypatch.setenv("PERSISTENT_INPUT_CANCELLATION_ENABLED", "true")
 
-    accepted = await persistent_app._accept_user_input("stop this before provider")
+    accepted = await persistent_app._session_input.accept("stop this before provider")
     item = queue.get_nowait()
     assert item["source"] == "direct_human"
-    assert await persistent_app._loop_cancel_input_delivery(
+    assert await persistent_app._session_input.cancel_delivery(
         accepted.delivery_id,
         accepted.claim_generation,
         6,
@@ -1240,8 +1242,8 @@ async def test_cancelled_direct_human_delivery_is_terminal_and_not_reclaimed(
     assert db.deliveries[accepted.delivery_id]["state"] == "cancelled"
 
     persistent_app._input_runtime_generation = str(uuid4())
-    persistent_app._queued_input_claims.clear()
-    assert await persistent_app._reclaim_pending_pinned_inputs() == set()
+    persistent_app._session_input._queued_claims.clear()
+    assert await persistent_app._session_input.reclaim_pending() == set()
     assert queue.empty()
     assert len(db.rows) == 1
 
@@ -1251,10 +1253,12 @@ async def test_cancellation_writer_gate_defaults_off(monkeypatch, tmp_path):
     db = _InsertOnceDB()
     queue = _wire_input_runtime(monkeypatch, tmp_path, db)
     monkeypatch.delenv("PERSISTENT_INPUT_CANCELLATION_ENABLED", raising=False)
-    accepted = await persistent_app._accept_user_input("not written as cancelled yet")
+    accepted = await persistent_app._session_input.accept(
+        "not written as cancelled yet"
+    )
     queue.get_nowait()
 
-    assert not await persistent_app._loop_cancel_input_delivery(
+    assert not await persistent_app._session_input.cancel_delivery(
         accepted.delivery_id,
         accepted.claim_generation,
         6,
@@ -1270,29 +1274,29 @@ async def test_interrupted_event_defers_and_successor_reclaims_exactly_once(
     db = _InsertOnceDB()
     queue = _wire_input_runtime(monkeypatch, tmp_path, db)
     delivery_id = str(uuid4())
-    accepted = await persistent_app._accept_user_input(
+    accepted = await persistent_app._session_input.accept(
         "retry this wake",
         role="event",
         delivery_id=delivery_id,
     )
     first = queue.get_nowait()
     assert first["source"] == "officer_wake"
-    assert not await persistent_app._loop_cancel_input_delivery(
+    assert not await persistent_app._session_input.cancel_delivery(
         delivery_id,
         accepted.claim_generation,
         6,
         "human_stop_before_provider",
     )
-    assert await persistent_app._loop_defer_input_delivery(
+    assert await persistent_app._session_input.defer_delivery(
         delivery_id,
         accepted.claim_generation,
         "turn_interrupted_before_provider",
     )
 
     persistent_app._input_runtime_generation = str(uuid4())
-    persistent_app._queued_input_claims.clear()
-    assert await persistent_app._reclaim_pending_pinned_inputs() == {(delivery_id, 2)}
-    assert await persistent_app._reclaim_pending_pinned_inputs() == set()
+    persistent_app._session_input._queued_claims.clear()
+    assert await persistent_app._session_input.reclaim_pending() == {(delivery_id, 2)}
+    assert await persistent_app._session_input.reclaim_pending() == set()
     replay = queue.get_nowait()
     assert replay["delivery_id"] == delivery_id
     assert replay["claim_generation"] == 2
@@ -1307,14 +1311,14 @@ async def test_interrupted_event_priority_reclaim_uses_new_generation_not_fifo(
     db = _InsertOnceDB()
     queue = _wire_input_runtime(monkeypatch, tmp_path, db)
     delivery_id = str(uuid4())
-    accepted = await persistent_app._accept_user_input(
+    accepted = await persistent_app._session_input.accept(
         "priority wake",
         role="event",
         delivery_id=delivery_id,
     )
     queue.get_nowait()
 
-    replay = await persistent_app._loop_defer_and_requeue_input_delivery(
+    replay = await persistent_app._session_input.defer_and_requeue_delivery(
         delivery_id,
         accepted.claim_generation,
         "priority wake",
@@ -1327,7 +1331,7 @@ async def test_interrupted_event_priority_reclaim_uses_new_generation_not_fifo(
     assert replay["delivery_id"] == delivery_id
     assert replay["claim_generation"] == accepted.claim_generation + 1
     assert (delivery_id, accepted.claim_generation + 1) in (
-        persistent_app._queued_input_claims
+        persistent_app._session_input._queued_claims
     )
     assert queue.empty()
     assert len(db.rows) == 1
@@ -1351,7 +1355,7 @@ async def test_event_priority_reclaim_serializes_concurrent_human_accept(
     db = _BarrierDB()
     queue = _wire_input_runtime(monkeypatch, tmp_path, db)
     event_id = str(uuid4())
-    event = await persistent_app._accept_user_input(
+    event = await persistent_app._session_input.accept(
         "wake A",
         role="event",
         delivery_id=event_id,
@@ -1359,7 +1363,7 @@ async def test_event_priority_reclaim_serializes_concurrent_human_accept(
     queue.get_nowait()
 
     replay_task = asyncio.create_task(
-        persistent_app._loop_defer_and_requeue_input_delivery(
+        persistent_app._session_input.defer_and_requeue_delivery(
             event_id,
             event.claim_generation,
             "wake A",
@@ -1369,7 +1373,7 @@ async def test_event_priority_reclaim_serializes_concurrent_human_accept(
         )
     )
     await asyncio.wait_for(priority_claim_entered.wait(), timeout=1)
-    human_task = asyncio.create_task(persistent_app._accept_user_input("human B"))
+    human_task = asyncio.create_task(persistent_app._session_input.accept("human B"))
     await asyncio.sleep(0)
     release_priority_claim.set()
 
@@ -1391,10 +1395,10 @@ async def test_retry_before_and_after_admission_never_requeues(monkeypatch, tmp_
     db = _InsertOnceDB()
     queue = _wire_input_runtime(monkeypatch, tmp_path, db)
     delivery_id = str(uuid4())
-    first = await persistent_app._accept_user_input(
+    first = await persistent_app._session_input.accept(
         "wake", role="event", delivery_id=delivery_id
     )
-    before_admission = await persistent_app._accept_user_input(
+    before_admission = await persistent_app._session_input.accept(
         "wake", role="event", delivery_id=delivery_id
     )
     assert first.delivery_state == "queued"
@@ -1404,7 +1408,7 @@ async def test_retry_before_and_after_admission_never_requeues(monkeypatch, tmp_
     assert await db.transition_pinned_input_delivery(
         delivery_id=delivery_id, transition="admitted"
     )
-    after_admission = await persistent_app._accept_user_input(
+    after_admission = await persistent_app._session_input.accept(
         "wake", role="event", delivery_id=delivery_id
     )
     assert after_admission.delivery_state == "admitted"
@@ -1434,7 +1438,7 @@ async def test_concurrent_duplicate_delivery_attempts_publish_one_queue_item(
     delivery_id = str(uuid4())
     attempts = [
         asyncio.create_task(
-            persistent_app._accept_user_input(
+            persistent_app._session_input.accept(
                 "same wake", role="event", delivery_id=delivery_id
             )
         )
@@ -1651,8 +1655,8 @@ async def test_late_turn_n_interrupt_clears_before_durable_a_and_b_execute(monke
 
     async def _turn_complete(turn_id, metrics, *args, **kwargs):
         if turn_id == 1:
-            assert pa._signal_interrupt_for_turn(turn_id) == "hard"
-            assert pa._loop_interrupt_target_turn_id == 1
+            assert pa._session_input.signal_interrupt_for_turn(turn_id) == "hard"
+            assert pa._session_input.interrupt_target_turn_id == 1
         await pa._loop_on_turn_complete(
             turn_id,
             metrics,
@@ -1662,9 +1666,9 @@ async def test_late_turn_n_interrupt_clears_before_durable_a_and_b_execute(monke
             **kwargs,
         )
         if turn_id == 1:
-            assert pa._loop_interrupt_flag is None
-            assert pa._loop_interrupt_target_turn_id is None
-            assert not pa._hard_interrupt_event.is_set()
+            assert pa._session_input.interrupt_mode is None
+            assert pa._session_input.interrupt_target_turn_id is None
+            assert not pa._session_input.hard_interrupt_event.is_set()
 
     llm = MagicMock(reasoning=None)
     llm.astream = _stream
@@ -1690,7 +1694,7 @@ async def test_late_turn_n_interrupt_clears_before_durable_a_and_b_execute(monke
         ],
         on_turn_start=_turn_start,
         on_turn_complete=_turn_complete,
-        check_interrupt=pa._loop_check_interrupt,
+        check_interrupt=pa._session_input.check_interrupt,
         admit_input_delivery=_admit,
         settle_input_delivery=_settle,
         cancel_input_delivery=AsyncMock(return_value=True),
@@ -1700,9 +1704,9 @@ async def test_late_turn_n_interrupt_clears_before_durable_a_and_b_execute(monke
     monkeypatch.setattr(pa, "_session", session)
     monkeypatch.setattr(pa, "_turn_event_open", False)
     monkeypatch.setattr(pa, "_tool_inflight", False)
-    monkeypatch.setattr(pa, "_loop_interrupt_flag", None)
-    monkeypatch.setattr(pa, "_loop_interrupt_target_turn_id", None)
-    monkeypatch.setattr(pa, "_hard_interrupt_event", asyncio.Event())
+    monkeypatch.setattr(pa._session_input, "_interrupt_mode", None)
+    monkeypatch.setattr(pa._session_input, "_interrupt_target_turn_id", None)
+    monkeypatch.setattr(pa._session_input, "_hard_interrupt_event", asyncio.Event())
     monkeypatch.setattr(pa, "_loop_on_turn_complete_body", AsyncMock())
     await run_persistent_loop(
         llm_with_tools=llm,

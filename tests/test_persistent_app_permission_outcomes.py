@@ -241,7 +241,7 @@ class TestTetheredWaitDoesNotExpire:
         with (
             patch.object(pa, "_session", session),
             patch.object(pa, "_subscribers", {"c1": MagicMock()}),  # tethered
-            patch.object(pa, "_hard_interrupt_event", None),
+            patch.object(pa._session_input, "_hard_interrupt_event", None),
         ):
             status = await pa._wait_for_permission_resolution("req-1", timeout=0.01)
 
@@ -262,7 +262,7 @@ class TestTetheredWaitDoesNotExpire:
         with (
             patch.object(pa, "_session", session),
             patch.object(pa, "_subscribers", {}),  # untethered
-            patch.object(pa, "_hard_interrupt_event", None),
+            patch.object(pa._session_input, "_hard_interrupt_event", None),
         ):
             status = await pa._wait_for_permission_resolution("req-2", timeout=0.01)
 
@@ -285,7 +285,7 @@ class TestTetheredWaitDoesNotExpire:
         with (
             patch.object(pa, "_session", session),
             patch.object(pa, "_subscribers", {"c1": MagicMock()}),  # tethered
-            patch.object(pa, "_hard_interrupt_event", interrupt),
+            patch.object(pa._session_input, "_hard_interrupt_event", interrupt),
         ):
             status = await _asyncio.wait_for(
                 pa._wait_for_permission_resolution("req-3", timeout=30),
@@ -312,7 +312,7 @@ class TestStatelessDurablePresenceWait:
             patch.object(pa, "_stateless_mode", return_value=True),
             patch.object(pa, "_current_stateless_lease_token", return_value=9),
             patch.object(pa, "expire_permission_if_untethered", expiry),
-            patch.object(pa, "_hard_interrupt_event", None),
+            patch.object(pa._session_input, "_hard_interrupt_event", None),
         ):
             status = await pa._wait_for_permission_resolution("req-1", timeout=0.01)
 
@@ -339,7 +339,7 @@ class TestStatelessDurablePresenceWait:
             patch.object(pa, "_stateless_mode", return_value=True),
             patch.object(pa, "_current_stateless_lease_token", return_value=9),
             patch.object(pa, "expire_permission_if_untethered", expiry),
-            patch.object(pa, "_hard_interrupt_event", None),
+            patch.object(pa._session_input, "_hard_interrupt_event", None),
             patch.object(pa, "_PERMISSION_POLL_SECONDS", 0.005),
         ):
             waiter = asyncio.create_task(
@@ -376,7 +376,7 @@ class TestStatelessDurablePresenceWait:
             patch.object(pa, "_stateless_mode", return_value=True),
             patch.object(pa, "_current_stateless_lease_token", return_value=9),
             patch.object(pa, "expire_permission_if_untethered", expiry),
-            patch.object(pa, "_hard_interrupt_event", None),
+            patch.object(pa._session_input, "_hard_interrupt_event", None),
         ):
             status = await pa._wait_for_permission_resolution("req-2", timeout=0.01)
 
@@ -392,7 +392,7 @@ class TestStatelessDurablePresenceWait:
             patch.object(pa, "_thread_id", "00000000-0000-0000-0000-000000000001"),
             patch.object(pa, "_stateless_mode", return_value=True),
             patch.object(pa, "_current_stateless_lease_token", return_value=None),
-            patch.object(pa, "_hard_interrupt_event", None),
+            patch.object(pa._session_input, "_hard_interrupt_event", None),
         ):
             status = await pa._wait_for_permission_resolution("req-3", timeout=0.01)
 
@@ -424,7 +424,7 @@ class TestStatelessDurablePresenceWait:
             patch.object(pa, "_stateless_mode", return_value=True),
             patch.object(pa, "_current_stateless_lease_token", return_value=9),
             patch.object(pa, "expire_permission_if_untethered", _expire),
-            patch.object(pa, "_hard_interrupt_event", hard_interrupt),
+            patch.object(pa._session_input, "_hard_interrupt_event", hard_interrupt),
         ):
             waiter = asyncio.create_task(
                 pa._wait_for_permission_resolution("req-cas", timeout=0.01)
@@ -519,7 +519,7 @@ class TestStatelessPermissionPoolBudget:
             patch.object(pa, "_session", SimpleNamespace(postgres_conn=pool)),
             patch.object(pa, "_thread_id", thread_id),
             patch.object(pa, "_subscribers", {"c1": MagicMock()}),
-            patch.object(pa, "_hard_interrupt_event", None),
+            patch.object(pa._session_input, "_hard_interrupt_event", None),
             patch.object(pa, "_stateless_mode", return_value=True),
             patch.object(pa, "_current_stateless_lease_token", return_value=7),
             patch.object(pa, "_PERMISSION_POLL_SECONDS", 0.05),
@@ -588,7 +588,7 @@ class TestStatelessPermissionPoolBudget:
         with (
             patch.object(pa, "_session", SimpleNamespace(postgres_conn=pool)),
             patch.object(pa, "_thread_id", thread_id),
-            patch.object(pa, "_hard_interrupt_event", hard_interrupt),
+            patch.object(pa._session_input, "_hard_interrupt_event", hard_interrupt),
             patch.object(pa, "_drain_thread_controls", AsyncMock(return_value=0)),
             patch.object(pa, "_drain_thread_interrupts", AsyncMock(return_value=0)),
         ):

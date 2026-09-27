@@ -90,7 +90,7 @@ def _reset_agent_globals():
     mod._session_runtime_attach_token = None
     mod._orchestrator_client = None
     mod._subscribers.clear()
-    mod._loop_user_queue = None
+    mod._session_input._queue = None
 
 
 def _install_agent_session(*, turn_count: int = 0):
@@ -109,7 +109,7 @@ def _install_agent_session(*, turn_count: int = 0):
     client = AsyncMock()
     client.update_thread_status = AsyncMock(return_value=True)
     mod._orchestrator_client = client
-    mod._loop_user_queue = asyncio.Queue()
+    mod._session_input._queue = asyncio.Queue()
     return session, client
 
 
@@ -160,9 +160,9 @@ class TestLoopGetUserInputAwaitingUserFlip:
         import agent.api.persistent_app as mod
 
         _, client = _install_agent_session(turn_count=3)
-        mod._loop_user_queue.put_nowait("hi")  # unblock the get()
+        mod._session_input.queue.put_nowait("hi")  # unblock the get()
 
-        await mod._loop_get_user_input()
+        await mod._session_input.get_user_input()
 
         # Task is fire-and-forget — yield to event loop.
         await asyncio.sleep(0)
@@ -175,9 +175,9 @@ class TestLoopGetUserInputAwaitingUserFlip:
         import agent.api.persistent_app as mod
 
         _, client = _install_agent_session(turn_count=0)
-        mod._loop_user_queue.put_nowait("hi")
+        mod._session_input.queue.put_nowait("hi")
 
-        await mod._loop_get_user_input()
+        await mod._session_input.get_user_input()
         await asyncio.sleep(0)
 
         client.update_thread_status.assert_not_called()
@@ -191,8 +191,8 @@ class TestLoopGetUserInputAwaitingUserFlip:
         await asyncio.sleep(0)
         client.update_thread_status.reset_mock()
 
-        mod._loop_user_queue.put_nowait("hi")
-        await mod._loop_get_user_input()
+        mod._session_input.queue.put_nowait("hi")
+        await mod._session_input.get_user_input()
         await asyncio.sleep(0)
 
         # Only "active" from the subscribe wasn't called this time either;
@@ -207,7 +207,7 @@ class TestLoopGetUserInputAwaitingUserFlip:
 
         session, client = _install_agent_session(turn_count=3)
         session.postgres_conn = MagicMock()
-        mod._loop_user_queue.put_nowait("hi")
+        mod._session_input.queue.put_nowait("hi")
         monkeypatch.setenv("STATELESS_EXECUTOR", "1")
         durable_pause = AsyncMock(return_value=True)
         monkeypatch.setattr(mod, "mark_stateless_natural_pause", durable_pause)
@@ -216,7 +216,7 @@ class TestLoopGetUserInputAwaitingUserFlip:
         handle.update("thread-test-uuid", 17)
         context_token = mod._current_lease_var.set(handle)
         try:
-            await mod._loop_get_user_input()
+            await mod._session_input.get_user_input()
         finally:
             mod._current_lease_var.reset(context_token)
 

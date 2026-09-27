@@ -3596,7 +3596,7 @@ class TestToolExecutionLoop:
         with (
             patch.object(pa, "_session", session),
             patch.object(pa, "_tool_inflight", False),
-            patch.object(pa, "_schedule_protected_input_reclaim"),
+            patch.object(pa._session_input, "schedule_protected_reclaim"),
             patch.object(pa, "_broadcast"),
         ):
             with pytest.raises(WorkspaceUnavailableError, match="protected cloud"):

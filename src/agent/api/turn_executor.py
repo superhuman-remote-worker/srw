@@ -4092,7 +4092,7 @@ class StatelessTurnExecutor:
 
         # (h) Inject — the row already exists (accept-time persist is
         # orchestrator-side on this lane), so ONLY the queue put + loop
-        # arming from _accept_user_input are reproduced here; its persist is
+        # arming from input acceptance are reproduced here; its persist is
         # deliberately not. The id makes the loop's own turn-start persist an
         # idempotent upsert onto the same row.
         turn_done = asyncio.Event()
@@ -4166,7 +4166,7 @@ class StatelessTurnExecutor:
         if recovery_context is not None:
             recovery_context._stateless_subagent_recovery_active = is_subagent_recovery
         try:
-            await pa._loop_user_queue.put(queue_item)
+            await pa._session_input.publish_executor_input(queue_item)
 
             # (i) Wait for the full-turn settlement hook (event, not a poll),
             # the lease-lost signal, or the loop dying under us. PersistentApp
@@ -5095,7 +5095,7 @@ class StatelessTurnExecutor:
             )
             return False
         try:
-            mode = pa._signal_interrupt_for_turn(
+            mode = pa._session_input.signal_interrupt_for_turn(
                 target_turn_id,
                 force_graceful=force_graceful,
             )

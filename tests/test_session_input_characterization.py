@@ -43,14 +43,15 @@ from tests.test_stateless_input_delivery_real_postgres import (
 def _arrange_input_state(monkeypatch, *, queue_open: bool = True) -> None:
     """A freshly attached input runtime: queue, interrupt, claims and lock."""
 
-    monkeypatch.setattr(pa, "_loop_user_queue", asyncio.Queue() if queue_open else None)
-    monkeypatch.setattr(pa, "_loop_interrupt_flag", None)
-    monkeypatch.setattr(pa, "_loop_interrupt_target_turn_id", None)
-    monkeypatch.setattr(pa, "_hard_interrupt_event", asyncio.Event())
-    monkeypatch.setattr(pa, "_input_delivery_reclaim_lock", asyncio.Lock())
-    monkeypatch.setattr(pa, "_protected_input_reclaim_task", None)
-    monkeypatch.setattr(pa, "_awaiting_input", False)
-    monkeypatch.setattr(pa, "_queued_input_claims", set())
+    owner = pa._session_input
+    monkeypatch.setattr(owner, "_queue", asyncio.Queue() if queue_open else None)
+    monkeypatch.setattr(owner, "_interrupt_mode", None)
+    monkeypatch.setattr(owner, "_interrupt_target_turn_id", None)
+    monkeypatch.setattr(owner, "_hard_interrupt_event", asyncio.Event())
+    monkeypatch.setattr(owner, "_reclaim_lock", asyncio.Lock())
+    monkeypatch.setattr(owner, "_protected_reclaim_task", None)
+    monkeypatch.setattr(owner, "_awaiting_input", False)
+    monkeypatch.setattr(owner, "_queued_claims", set())
 
 
 def _restart_input_process(monkeypatch) -> str:
@@ -65,49 +66,57 @@ def _restart_input_process(monkeypatch) -> str:
 def _input_view() -> SimpleNamespace:
     """Read-only view of the runtime's input and interrupt state."""
 
+    owner = pa._session_input
     return SimpleNamespace(
-        queue=pa._loop_user_queue,
-        claims=frozenset(pa._queued_input_claims),
-        mode=pa._loop_interrupt_flag,
-        target=pa._loop_interrupt_target_turn_id,
-        hard_event=pa._hard_interrupt_event,
-        awaiting=pa._awaiting_input,
-        reclaim_lock=pa._input_delivery_reclaim_lock,
-        reclaim_task=pa._protected_input_reclaim_task,
+        queue=owner.queue,
+        claims=owner.queued_claims,
+        mode=owner.interrupt_mode,
+        target=owner.interrupt_target_turn_id,
+        hard_event=owner.hard_interrupt_event,
+        awaiting=owner.awaiting_input,
+        reclaim_lock=owner.reclaim_lock,
+        reclaim_task=owner.protected_reclaim_task,
     )
 
 
 def _note_queued_claim(key: tuple[str, int]) -> None:
     """Record a published claim the way queue publication does."""
 
-    pa._queued_input_claims.add(key)
+    pa._session_input._queued_claims.add(key)
 
 
 def _replace_reclaim(monkeypatch, fake) -> None:
     """Stand in for the durable reclaim the protected-heal task awaits."""
 
-    monkeypatch.setattr(pa, "_reclaim_pending_pinned_inputs", fake)
+    monkeypatch.setattr(pa._session_input, "reclaim_pending", fake)
 
 
 def _snapshot_input_state():
-    """Input state the module-global snapshot does not cover (none here)."""
+    """The owner object's state, which the module-global snapshot misses."""
 
-    return None
+    owner = pa._session_input
+    return dict(vars(owner)), set(owner._queued_claims)
 
 
 def _restore_input_state(snapshot) -> None:
-    del snapshot
+    attrs, claims = snapshot
+    owner = pa._session_input
+    vars(owner).clear()
+    vars(owner).update(attrs)
+    owner._queued_claims.clear()
+    owner._queued_claims.update(claims)
 
 
 def _runtime_ops() -> SimpleNamespace:
     """Runtime operations that are not transport or loop-callback ports."""
 
+    owner = pa._session_input
     return SimpleNamespace(
-        reclaim=pa._reclaim_pending_pinned_inputs,
-        queue_claimed=pa._queue_claimed_input,
-        schedule_protected_reclaim=pa._schedule_protected_input_reclaim,
-        transition=pa._transition_claimed_input,
-        clear_interrupt=pa._clear_loop_interrupt,
+        reclaim=owner.reclaim_pending,
+        queue_claimed=owner.queue_claimed,
+        schedule_protected_reclaim=owner.schedule_protected_reclaim,
+        transition=owner.transition_claimed,
+        clear_interrupt=owner.clear_interrupt,
     )
 
 

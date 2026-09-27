@@ -248,11 +248,11 @@ async def test_parked_pinned_loop_reclaims_durable_input(monkeypatch):
             )
         return {("delivery-a", 1)}
 
-    monkeypatch.setattr(mod, "_reclaim_pending_pinned_inputs", reclaim)
+    monkeypatch.setattr(mod._session_input, "reclaim_pending", reclaim)
     monkeypatch.setattr(mod, "_runtime_admission_closed", lambda: False)
     monkeypatch.setattr(mod, "_stateless_mode", lambda: False)
 
-    item = await mod._wait_for_persistent_input(queue, timeout=0.1)
+    item = await mod._session_input.wait_for_input(queue, timeout=0.1)
 
     assert item["delivery_id"] == "delivery-a"
     assert item["content"] == "durable successor wake"
