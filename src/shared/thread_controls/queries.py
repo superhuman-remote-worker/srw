@@ -308,6 +308,25 @@ def control_receipt_result(
         ):
             return "applied", None, None
 
+    # ``compact`` (stateless manual compaction) is receipted by the same
+    # ``context.compacted`` frame the transcript renders: a folded summary, or
+    # ``summary: null`` when there was nothing to fold. The checkpoint row it
+    # describes was written under the same lease before this receipt.
+    if verb == "compact":
+        request_payload = _json_object(request_payload)
+        summary = event_payload.get("summary")
+        if (
+            event_kind == "context.compacted"
+            and envelope_matches
+            and set(request_payload) <= {"focus", "boundary_message_id"}
+            and all(
+                isinstance(value, str) and value for value in request_payload.values()
+            )
+            and event_payload.get("trigger") == "manual"
+            and (summary is None or (isinstance(summary, str) and summary))
+        ):
+            return "applied", None, None
+
     error_code = str(event_payload.get("error_code") or "")
     if event_kind != "control.rejected" or not envelope_matches or not error_code:
         return None

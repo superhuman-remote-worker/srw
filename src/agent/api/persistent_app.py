@@ -8031,7 +8031,18 @@ def _describe_control_request(request: Any) -> tuple[str, str, Optional[str]]:
         return "narration.changed", "applied", None
     if request.verb == "workspace.undo" and request.payload == {}:
         return "files.restored", "applied", None
+    if request.verb == "compact" and _valid_compact_payload(request.payload):
+        return "context.compacted", "applied", None
     return "control.rejected", "rejected", "unsupported_control"
+
+
+def _valid_compact_payload(payload: Any) -> bool:
+    """``{focus?, boundary_message_id?}``, each a non-empty string when present."""
+    return (
+        isinstance(payload, dict)
+        and set(payload) <= {"focus", "boundary_message_id"}
+        and all(isinstance(value, str) and value for value in payload.values())
+    )
 
 
 async def _finalize_durable_control(
@@ -8418,6 +8429,13 @@ async def _drain_thread_controls(
                     raise ControlInboxBlocked(
                         f"workspace undo failed before acknowledgement: {request.id}"
                     ) from exc
+            elif outcome == "applied" and request.verb == "compact":
+                (
+                    event_kind,
+                    outcome,
+                    error_code,
+                    effect_params,
+                ) = await _apply_compact_control(request, lease_token=lease_token)
             params: Dict[str, Any] = {
                 "request_id": str(request.id),
                 "client_request_id": str(request.client_request_id),
@@ -8429,8 +8447,12 @@ async def _drain_thread_controls(
                 "narration.set",
             }:
                 params["mode"] = str(request.payload.get("mode") or "")
-            elif outcome == "applied" and request.verb == "workspace.undo":
-                params.update(effect_params)
+            elif outcome == "applied" and request.verb in {
+                "workspace.undo",
+                "compact",
+            }:
+                # The envelope above wins over any same-named effect key.
+                params = {**effect_params, **params}
             else:
                 params["error_code"] = error_code
 
@@ -12253,6 +12275,97 @@ async def _loop_on_workspace_upgrade_needed(freeze_data: Dict[str, Any]) -> None
     )
 
 
+#: ``(lease_token, context.compacted params)`` of the last resume-time
+#: compaction that persisted its checkpoint while a stateless claim was attached.
+#: A durable ``compact`` control drained under the SAME lease is already
+#: satisfied by it (attach restores before the control drain), so the drain
+#: restates that compaction instead of folding a second time.
+_resume_compaction_receipt: Optional[Tuple[int, Dict[str, Any]]] = None
+
+
+def _compaction_frame_params(
+    summary_text: Optional[str], before: int, after: int, trigger: str
+) -> Dict[str, Any]:
+    """The ``context.compacted`` params for the session's current turn."""
+    turn = _session.turn_count if _session else None
+    params: Dict[str, Any] = {
+        "before": before,
+        "after": after,
+        "trigger": trigger,
+        "summary": summary_text,
+        "turn": turn,
+    }
+    # Completion stats from the summarization engine (n_passes, duration_ms,
+    # before/after tokens) — extends context.compacted per
+    # knowledge-base/knowledge/features/context_summarization_rework.md.
+    ctx_mgr_stats = getattr(
+        getattr(_session, "context_manager", None),
+        "_last_summarization_stats",
+        None,
+    )
+    if isinstance(ctx_mgr_stats, dict):
+        params.update(ctx_mgr_stats)
+    return params
+
+
+async def _persist_compaction_checkpoint(
+    summary_text: str,
+    before: int,
+    after: int,
+    trigger: str,
+    *,
+    control_request_id: Optional[str] = None,
+) -> bool:
+    """Write the ``role='summary'`` restore checkpoint. Raises on failure.
+
+    Returns False only when there is nothing to write to (no summary, session
+    or thread). On the stateless lane the row is fenced by the current lease
+    (``save_thread_message``), so a lost lease raises ``LeaseLostError``.
+    """
+    if not (summary_text and _session and _session.postgres_conn and _thread_id):
+        return False
+    turn = _session.turn_count
+    # Type-guard: defensive against an unexpected turn_count type so an
+    # arithmetic glitch never kills the checkpoint. In production turn_count
+    # is always int (initialized to 0 in PersistentSession); the guard mainly
+    # protects test mocks where a bare MagicMock attribute slips through.
+    turn_int = turn if isinstance(turn, int) else 0
+    boundary_turn = max(turn_int - 1, 0)
+    # Resolve the message-granular boundary the summarizer just set (the id
+    # of the last message its summary covers) into a seq, so resume loads
+    # `summary + (seq > boundary_seq)` — the exact live tail — instead of the
+    # whole post-boundary turn(s). None ⇒ resume falls back to boundary_turn
+    # (e.g. resume-time compaction, whose restored messages carry fresh ids
+    # that don't resolve to a persisted row).
+    boundary_seq = None
+    ctx_mgr = getattr(_session, "context_manager", None)
+    boundary_id = getattr(ctx_mgr, "_last_compaction_boundary_id", None)
+    if boundary_id:
+        try:
+            boundary_seq = await _session.postgres_conn.get_seq_for_message_id(
+                _thread_id, boundary_id
+            )
+        except Exception as e:
+            logger.debug(f"boundary_seq lookup failed (non-fatal): {e}")
+    metrics: Dict[str, Any] = {
+        "before": before,
+        "after": after,
+        "trigger": trigger,
+        "boundary_turn": boundary_turn,
+        "boundary_seq": boundary_seq,
+    }
+    if control_request_id is not None:
+        metrics["control_request_id"] = control_request_id
+    await _session.postgres_conn.save_thread_message(
+        thread_id=_thread_id,
+        role="summary",
+        content=summary_text,
+        turn_number=turn,
+        metrics=metrics,
+    )
+    return True
+
+
 async def _record_compaction(
     summary_text: Optional[str],
     before: int,
@@ -12280,34 +12393,15 @@ async def _record_compaction(
     is safe for manual ``/compact`` and resume-time compaction (where all turns
     are already fully saved).
 
-    A non-None ``ws`` sends the live event over the control socket (manual
-    ``/compact``); the auto and resume paths pass ``ws=None`` to use the
-    broadcast/SSE channel.
+    A non-None ``ws`` sends the live event over that socket only; the manual
+    (pinned), auto and resume paths pass ``ws=None`` to use the broadcast/SSE
+    channel. The stateless manual path does not come through here: its
+    ``context.compacted`` is the durable control receipt
+    (``_apply_compact_control``).
     """
-    turn = _session.turn_count if _session else None
-    # Type-guard: defensive against an unexpected turn_count type so an
-    # arithmetic glitch never kills event emission. In production turn_count
-    # is always int (initialized to 0 in PersistentSession); the guard mainly
-    # protects test mocks where a bare MagicMock attribute slips through.
-    turn_int = turn if isinstance(turn, int) else 0
-    boundary_turn = max(turn_int - 1, 0)
-    params = {
-        "before": before,
-        "after": after,
-        "trigger": trigger,
-        "summary": summary_text,
-        "turn": turn,
-    }
-    # Completion stats from the summarization engine (n_passes, duration_ms,
-    # before/after tokens) — extends context.compacted per
-    # knowledge-base/knowledge/features/context_summarization_rework.md.
-    ctx_mgr_stats = getattr(
-        getattr(_session, "context_manager", None),
-        "_last_summarization_stats",
-        None,
-    )
-    if isinstance(ctx_mgr_stats, dict):
-        params.update(ctx_mgr_stats)
+    global _resume_compaction_receipt
+
+    params = _compaction_frame_params(summary_text, before, after, trigger)
     try:
         if ws is not None:
             await _ws_send(ws, "context.compacted", params)
@@ -12316,39 +12410,17 @@ async def _record_compaction(
     except Exception as e:
         logger.debug(f"Failed to emit context.compacted (non-fatal): {e}")
 
-    if summary_text and _session and _session.postgres_conn and _thread_id:
-        # Resolve the message-granular boundary the summarizer just set (the id
-        # of the last message its summary covers) into a seq, so resume loads
-        # `summary + (seq > boundary_seq)` — the exact live tail — instead of the
-        # whole post-boundary turn(s). None ⇒ resume falls back to boundary_turn
-        # (e.g. resume-time compaction, whose restored messages carry fresh ids
-        # that don't resolve to a persisted row).
-        boundary_seq = None
-        ctx_mgr = getattr(_session, "context_manager", None)
-        boundary_id = getattr(ctx_mgr, "_last_compaction_boundary_id", None)
-        if boundary_id:
-            try:
-                boundary_seq = await _session.postgres_conn.get_seq_for_message_id(
-                    _thread_id, boundary_id
-                )
-            except Exception as e:
-                logger.debug(f"boundary_seq lookup failed (non-fatal): {e}")
-        try:
-            await _session.postgres_conn.save_thread_message(
-                thread_id=_thread_id,
-                role="summary",
-                content=summary_text,
-                turn_number=turn,
-                metrics={
-                    "before": before,
-                    "after": after,
-                    "trigger": trigger,
-                    "boundary_turn": boundary_turn,
-                    "boundary_seq": boundary_seq,
-                },
-            )
-        except Exception as e:
-            logger.warning(f"Failed to persist compaction marker (non-fatal): {e}")
+    try:
+        persisted = await _persist_compaction_checkpoint(
+            summary_text or "", before, after, trigger
+        )
+    except Exception as e:
+        logger.warning(f"Failed to persist compaction marker (non-fatal): {e}")
+        return
+    if persisted and trigger == "resume":
+        lease_token = _current_stateless_lease_token()
+        if lease_token is not None:
+            _resume_compaction_receipt = (lease_token, dict(params))
 
 
 async def _loop_on_context_compacted(
@@ -13317,6 +13389,140 @@ async def _handle_rewind(ws: WebSocket, data: Dict[str, Any]) -> None:
         )
 
 
+class _ManualCompactionRefused(Exception):
+    """A manual compaction that cannot run, known before anything changed."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+#: How long a pinned ``/compact`` that arrives while a turn is running waits for
+#: the loop to park before refusing. The Cockpit already defers the command
+#: until the response ends; this absorbs the turn-end → ``ready`` window and a
+#: client that does not defer.
+_MANUAL_COMPACT_IDLE_WAIT_S = 30.0
+_MANUAL_COMPACT_IDLE_POLL_S = 0.25
+
+
+async def _await_turn_idle(timeout_s: float) -> bool:
+    """Wait until no turn is in flight. False when the deadline passed first."""
+    deadline = time.monotonic() + timeout_s
+    while _turn_in_flight():
+        if time.monotonic() >= deadline:
+            return False
+        await asyncio.sleep(_MANUAL_COMPACT_IDLE_POLL_S)
+    return True
+
+
+async def _compact_session_manually(
+    focus: str = "", boundary_message_id: Optional[str] = None
+) -> Tuple[str, Optional[str], int, int]:
+    """Run one manual compaction over the attached session's working context.
+
+    Shared by the pinned socket verb (``_handle_compact``) and the stateless
+    durable control (``_apply_compact_control``); the caller holds
+    ``_rewind_lock`` and guarantees no turn is running. Adopts the result into
+    ``_session.messages`` but persists and announces nothing — that differs per
+    lane. Returns ``(outcome, summary_text, before, after)`` with outcome
+    ``compacted`` | ``noop`` | ``failed`` (the summarizer produced nothing; the
+    conversation is intact). Raises ``_ManualCompactionRefused`` before any
+    change when the session is not ready, the runtime is terminating, or the
+    boundary message is no longer resident.
+    """
+    if not _session or not _session.context_manager:
+        raise _ManualCompactionRefused("session_not_ready", "Session not ready")
+
+    from agent.llm.response_guards import strip_removal_markers
+
+    ctx_mgr = _session.context_manager
+
+    # Manual compaction can run before the first loop start — make sure
+    # progress frames flow either way (idempotent setter; getattr for
+    # test doubles that stub the context manager).
+    _cb_setter = getattr(ctx_mgr, "set_progress_callback", None)
+    if callable(_cb_setter):
+        _cb_setter(_loop_compaction_progress)
+
+    # "Summarize up to here" (session rewind's sibling action): map the
+    # chosen message to keep_recent_override = the number of messages from
+    # it (inclusive) to the end, counted on the same basis
+    # summarize_and_compact uses (workspace injections excluded — they are
+    # filtered before keep_recent applies).
+    keep_recent_override = None
+    if boundary_message_id:
+        from shared.runtime.core.workspace_injection import (
+            is_workspace_injection_message,
+        )
+        from agent.database.postgres_db import _coerce_row_id
+
+        target_uuid = str(_coerce_row_id(boundary_message_id))
+        cut_index = None
+        for i, m in enumerate(_session.messages):
+            mid = getattr(m, "id", None)
+            if mid and str(_coerce_row_id(mid)) == target_uuid:
+                cut_index = i
+                break
+        if cut_index is None:
+            raise _ManualCompactionRefused(
+                "boundary_not_in_context",
+                "That message is no longer in working context — it may "
+                "already be summarized",
+            )
+        keep_recent_override = sum(
+            1
+            for m in _session.messages[cut_index:]
+            if not is_workspace_injection_message(m)
+        )
+
+    before_count = len(_session.messages)
+    runs_before = getattr(ctx_mgr, "compaction_runs", 0)
+    if _runtime_admission_closed():
+        raise _ManualCompactionRefused(
+            "runtime_terminating",
+            "Persistent runtime is terminating; retry on its replacement",
+        )
+    result = await ctx_mgr.summarize_and_compact(
+        messages=_session.messages,
+        auxiliary=_session.auxiliary_llm,
+        max_summary_length=getattr(
+            _session.config.context_management, "max_summary_length", 10000
+        ),
+        keep_recent_override=keep_recent_override,
+        trigger="manual",
+        focus=focus or None,
+    )
+    # summarize_and_compact returns a LangGraph reducer delta; this
+    # transport has no reducer, so strip the RemoveMessage markers before
+    # adopting. Leaking them into _session.messages made every later LLM
+    # call false-detect a compaction and re-persist the same summary row
+    # (the duplicate-banner bug, 2026-06-12).
+    _session.messages[:] = strip_removal_markers(result)
+    after_count = len(_session.messages)
+
+    runs_after = getattr(ctx_mgr, "compaction_runs", 0)
+    compacted_now = (
+        isinstance(runs_before, int)
+        and isinstance(runs_after, int)
+        and runs_after > runs_before
+    )
+    logger.info(
+        f"Manual compaction: {before_count} → {after_count} messages "
+        f"(summarized={compacted_now})"
+    )
+    if compacted_now:
+        return (
+            "compacted",
+            extract_summary_text(_session.messages),
+            before_count,
+            after_count,
+        )
+    if getattr(ctx_mgr, "last_compaction_failed", False) is True:
+        return "failed", None, before_count, after_count
+    return "noop", None, before_count, after_count
+
+
 async def _handle_compact(
     ws: WebSocket, focus: str = "", boundary_message_id: Optional[str] = None
 ) -> None:
@@ -13330,6 +13536,11 @@ async def _handle_compact(
     `/compact` (`boundary_message_id=None`) — any manual compaction racing a
     rewind hits the same hazard, not just the rewind sheet's "Summarize up
     to here".
+
+    Never runs beside a turn: the turn appends to the same list while the
+    summarizer is awaited, and adopting the result would drop those messages
+    from working memory. A request that arrives mid-turn waits (bounded) for
+    the loop to park.
     """
     if _runtime_admission_closed():
         await _ws_send(
@@ -13338,111 +13549,48 @@ async def _handle_compact(
             {"message": "Persistent runtime is terminating; retry on its replacement"},
         )
         return
+    if not await _await_turn_idle(_MANUAL_COMPACT_IDLE_WAIT_S):
+        await _ws_send(
+            ws,
+            "error",
+            {
+                "message": "A response is still running — send /compact again "
+                "when it finishes"
+            },
+        )
+        return
     if _rewind_lock.locked():
         await _ws_send(
             ws,
             "error",
-            {"message": "A rewind is in progress — try again when it finishes"},
+            {
+                "message": "A rewind or compaction is in progress — try again "
+                "when it finishes"
+            },
         )
         return
     async with _rewind_lock:
         try:
-            if not _session or not _session.context_manager:
-                await _ws_send(ws, "error", {"message": "Session not ready"})
+            try:
+                (
+                    outcome,
+                    summary_text,
+                    before_count,
+                    after_count,
+                ) = await _compact_session_manually(focus, boundary_message_id)
+            except _ManualCompactionRefused as refusal:
+                await _ws_send(ws, "error", {"message": refusal.message})
                 return
 
-            from agent.llm.response_guards import strip_removal_markers
-
-            ctx_mgr = _session.context_manager
-
-            # Manual compaction can run before the first loop start — make sure
-            # progress frames flow either way (idempotent setter; getattr for
-            # test doubles that stub the context manager).
-            _cb_setter = getattr(ctx_mgr, "set_progress_callback", None)
-            if callable(_cb_setter):
-                _cb_setter(_loop_compaction_progress)
-
-            # "Summarize up to here" (session rewind's sibling action): map the
-            # chosen message to keep_recent_override = the number of messages from
-            # it (inclusive) to the end, counted on the same basis
-            # summarize_and_compact uses (workspace injections excluded — they are
-            # filtered before keep_recent applies).
-            keep_recent_override = None
-            if boundary_message_id:
-                from shared.runtime.core.workspace_injection import (
-                    is_workspace_injection_message,
-                )
-                from agent.database.postgres_db import _coerce_row_id
-
-                target_uuid = str(_coerce_row_id(boundary_message_id))
-                cut_index = None
-                for i, m in enumerate(_session.messages):
-                    mid = getattr(m, "id", None)
-                    if mid and str(_coerce_row_id(mid)) == target_uuid:
-                        cut_index = i
-                        break
-                if cut_index is None:
-                    await _ws_send(
-                        ws,
-                        "error",
-                        {
-                            "message": "That message is no longer in working "
-                            "context — it may already be summarized"
-                        },
-                    )
-                    return
-                keep_recent_override = sum(
-                    1
-                    for m in _session.messages[cut_index:]
-                    if not is_workspace_injection_message(m)
-                )
-
-            before_count = len(_session.messages)
-            runs_before = getattr(ctx_mgr, "compaction_runs", 0)
-            if _runtime_admission_closed():
-                await _ws_send(
-                    ws,
-                    "error",
-                    {
-                        "message": "Persistent runtime is terminating; retry on "
-                        "its replacement"
-                    },
-                )
-                return
-            result = await ctx_mgr.summarize_and_compact(
-                messages=_session.messages,
-                auxiliary=_session.auxiliary_llm,
-                max_summary_length=getattr(
-                    _session.config.context_management, "max_summary_length", 10000
-                ),
-                keep_recent_override=keep_recent_override,
-                trigger="manual",
-                focus=focus or None,
-            )
-            # summarize_and_compact returns a LangGraph reducer delta; this
-            # transport has no reducer, so strip the RemoveMessage markers before
-            # adopting. Leaking them into _session.messages made every later LLM
-            # call false-detect a compaction and re-persist the same summary row
-            # (the duplicate-banner bug, 2026-06-12).
-            _session.messages[:] = strip_removal_markers(result)
-            after_count = len(_session.messages)
-
-            runs_after = getattr(ctx_mgr, "compaction_runs", 0)
-            compacted_now = (
-                isinstance(runs_before, int)
-                and isinstance(runs_after, int)
-                and runs_after > runs_before
-            )
-            if compacted_now:
+            if outcome == "compacted":
                 # A summary was actually produced: journal the completion
                 # (broadcast, not ws-only — SSE replay must be able to clear the
                 # progress UI after a reload) and persist the role='summary'
                 # checkpoint row.
-                summary_text = extract_summary_text(_session.messages)
                 await _record_compaction(
                     summary_text, before_count, after_count, trigger="manual", ws=None
                 )
-            else:
+            elif outcome == "noop":
                 # No-op (below thresholds / nothing to fold): transient notice to
                 # the requesting client only — no banner row, no journal entry.
                 # summary=None tells the cockpit to render a system line instead
@@ -13460,13 +13608,12 @@ async def _handle_compact(
                         "turn": turn if isinstance(turn, int) else None,
                     },
                 )
-            logger.info(
-                f"Manual compaction: {before_count} → {after_count} messages "
-                f"(summarized={compacted_now})"
-            )
+            # outcome == "failed": the engine already journaled
+            # compaction.failed ("conversation kept intact") — a second
+            # "nothing to compact" line would contradict it.
 
             # Commit + push workspace to Gitea on compaction (natural checkpoint boundary)
-            if _session.workspace_manager:
+            if _session and _session.workspace_manager:
                 git_mgr = getattr(_session.workspace_manager, "git_manager", None)
                 if git_mgr and git_mgr.is_active:
                     try:
@@ -13483,6 +13630,114 @@ async def _handle_compact(
         except Exception as e:
             logger.warning(f"Compaction failed: {e}")
             await _ws_send(ws, "error", {"message": f"Compaction failed: {e}"})
+
+
+async def _apply_compact_control(
+    request: Any, *, lease_token: Optional[int]
+) -> Tuple[str, str, Optional[str], Dict[str, Any]]:
+    """Run the stateless manual compaction a durable ``compact`` control asks for.
+
+    Returns ``(event_kind, outcome, error_code, receipt_params)`` for the
+    drain to journal as the durable receipt: ``context.compacted`` (a folded
+    summary, or ``summary: None`` when there was nothing to fold) or
+    ``control.rejected``. Raises ``ControlInboxBlocked`` only where the request
+    must stay pending for this or a successor claimant: a lost session or
+    lease, a terminating runtime, or a checkpoint that could not be written. A
+    summarizer failure is a durable rejection instead — a blocked control is
+    released as transient and requeued forever, starving the session's input.
+    (session_slash_commands_and_stateless_compact.md §3)
+    """
+    if lease_token is None:
+        # Admission keeps compact off the pinned inbox (it has a socket verb).
+        return "control.rejected", "rejected", "unsupported_control", {}
+    if _session is None or _session.postgres_conn is None or _thread_id is None:
+        raise ControlInboxBlocked(f"compaction lost its session: {request.id}")
+
+    request_id = str(request.id)
+    payload = request.payload if isinstance(request.payload, dict) else {}
+
+    # A checkpoint written for this exact request whose receipt never
+    # committed (crash between the two): answer from it, fold nothing twice.
+    try:
+        checkpoint = await _session.postgres_conn.get_latest_compaction_checkpoint(
+            _thread_id
+        )
+    except Exception as exc:
+        raise ControlInboxBlocked(
+            f"compaction checkpoint lookup failed: {request.id}"
+        ) from exc
+    if checkpoint and checkpoint.get("control_request_id") == request_id:
+        return (
+            "context.compacted",
+            "applied",
+            None,
+            {
+                "before": checkpoint.get("before"),
+                "after": checkpoint.get("after"),
+                "trigger": "manual",
+                "summary": checkpoint.get("summary") or None,
+                "turn": checkpoint.get("turn_number"),
+            },
+        )
+
+    # Attach restores before the drain; when that restore already compacted
+    # under this claim, the request is satisfied by it (same banner turn, so
+    # the Cockpit replaces rather than duplicates).
+    resumed = _resume_compaction_receipt
+    if resumed is not None and resumed[0] == lease_token:
+        params = dict(resumed[1])
+        params["trigger"] = "manual"
+        params["satisfied_by"] = "resume"
+        return "context.compacted", "applied", None, params
+
+    try:
+        async with _rewind_lock:
+            outcome, summary_text, before, after = await _compact_session_manually(
+                str(payload.get("focus") or ""),
+                payload.get("boundary_message_id") or None,
+            )
+            if outcome == "compacted":
+                try:
+                    await _persist_compaction_checkpoint(
+                        summary_text or "",
+                        before,
+                        after,
+                        "manual",
+                        control_request_id=request_id,
+                    )
+                except Exception as exc:
+                    raise ControlInboxBlocked(
+                        f"compaction checkpoint persist failed: {request.id}"
+                    ) from exc
+    except _ManualCompactionRefused as refusal:
+        if refusal.code == "boundary_not_in_context":
+            return "control.rejected", "rejected", refusal.code, {}
+        raise ControlInboxBlocked(
+            f"compaction cannot run yet ({refusal.code}): {request.id}"
+        ) from refusal
+    except (ControlInboxBlocked, asyncio.CancelledError):
+        raise
+    except LeaseLostError as exc:
+        raise ControlInboxBlocked(f"compaction lost its lease: {request.id}") from exc
+    except Exception:
+        logger.warning(
+            "Manual compaction failed for control %s", request.id, exc_info=True
+        )
+        return "control.rejected", "rejected", "compaction_failed", {}
+
+    if outcome == "failed":
+        return "control.rejected", "rejected", "compaction_failed", {}
+    return (
+        "context.compacted",
+        "applied",
+        None,
+        _compaction_frame_params(
+            summary_text if outcome == "compacted" else None,
+            before,
+            after,
+            "manual",
+        ),
+    )
 
 
 def _scrub_secret_values(fragment: Any) -> Any:

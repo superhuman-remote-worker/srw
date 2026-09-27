@@ -12,7 +12,7 @@ class ThreadControlRequest(BaseModel):
     """Strict public envelope for the durable control-inbox subset."""
 
     client_request_id: UUID
-    method: Literal["mode.set", "narration.set", "workspace.undo"]
+    method: Literal["mode.set", "narration.set", "workspace.undo", "compact"]
     session_runtime_generation: UUID | None = Field(
         None,
         description=(
@@ -31,6 +31,21 @@ class ThreadControlRequest(BaseModel):
         ]
         | None
     ) = None
+    focus: str | None = Field(
+        None,
+        max_length=4000,
+        description="compact only: optional focus for the summary (/compact <focus>).",
+    )
+    boundary_message_id: str | None = Field(
+        None,
+        min_length=1,
+        max_length=200,
+        description=(
+            "compact only: summarize everything before this transcript "
+            "message, keeping it and what follows (the rewind sheet's "
+            "'Summarize up to here')."
+        ),
+    )
 
     @model_validator(mode="after")
     def validate_method_mode_pair(self) -> "ThreadControlRequest":
@@ -42,12 +57,33 @@ class ThreadControlRequest(BaseModel):
             raise ValueError("narration.set requires a narration mode")
         if self.method == "workspace.undo" and self.mode is not None:
             raise ValueError("workspace.undo does not accept a mode")
+        if self.method == "compact" and self.mode is not None:
+            raise ValueError("compact does not accept a mode")
+        if self.method != "compact" and (
+            self.focus is not None or self.boundary_message_id is not None
+        ):
+            raise ValueError(
+                "focus and boundary_message_id are accepted only by compact"
+            )
         return self
 
     def control_payload(self) -> dict[str, Any]:
-        """Canonical payload used for idempotency and durable admission."""
+        """Canonical payload used for idempotency and durable admission.
 
-        return {} if self.method == "workspace.undo" else {"mode": self.mode}
+        ``compact`` carries only the keys that are present, so an empty focus
+        and an absent one are the same request.
+        """
+
+        if self.method == "workspace.undo":
+            return {}
+        if self.method == "compact":
+            payload: dict[str, Any] = {}
+            if self.focus and self.focus.strip():
+                payload["focus"] = self.focus.strip()
+            if self.boundary_message_id:
+                payload["boundary_message_id"] = self.boundary_message_id
+            return payload
+        return {"mode": self.mode}
 
 
 class ToolGroupPreviewRequest(BaseModel):

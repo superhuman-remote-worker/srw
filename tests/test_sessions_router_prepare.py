@@ -1603,12 +1603,13 @@ def test_connection_reports_stateless_ready_without_a_socket(monkeypatch):
         "pinned_runtime_generation_contract": 1,
         "session_runtime_generation": CONNECTION_GENERATION,
         # Declared per verb, never inferred from the lane: config edits ride
-        # the owner PATCH, the scalars + undo ride the control inbox, and the
-        # verbs with no stateless transport are ABSENT (not mapped to a
-        # socket that will never open).
+        # the owner PATCH, the scalars + undo + manual compaction ride the
+        # control inbox, and the verbs with no stateless transport are ABSENT
+        # (not mapped to a socket that will never open).
         "controls": {
             "config.update": "rest",
             "workspace.undo": "rest",
+            "compact": "rest",
             "mode.set": "rest",
             "narration.set": "rest",
         },
@@ -1679,9 +1680,14 @@ def test_stateless_controls_never_advertise_a_socket_verb():
     from orchestrator.routers.sessions import PINNED_CONTROLS, STATELESS_CONTROLS
 
     assert "websocket" not in STATELESS_CONTROLS.values()
-    for verb in ("compact", "archive", "rewind", "upgrade-to-workspace"):
+    for verb in ("archive", "rewind", "upgrade-to-workspace"):
         assert verb not in STATELESS_CONTROLS
         assert PINNED_CONTROLS[verb] == "websocket"
+    # Manual compaction exists on both lanes over different transports: the
+    # pinned socket verb, and the stateless control inbox (applied by the
+    # claimant's drain, session_slash_commands_and_stateless_compact.md §3).
+    assert PINNED_CONTROLS["compact"] == "websocket"
+    assert STATELESS_CONTROLS["compact"] == "rest"
     # Both lanes agree on the durable scalars.
     for verb in ("mode.set", "narration.set"):
         assert PINNED_CONTROLS[verb] == STATELESS_CONTROLS[verb] == "rest"

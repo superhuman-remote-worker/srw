@@ -2562,6 +2562,40 @@ class TestSetupTools:
         assert "set_skill_bundle" in loaded_names
         assert "set_automation_bundle" in loaded_names
 
+    def test_stateless_lane_never_offers_a_workspace_upgrade(self, monkeypatch):
+        """The upgrade accept is a socket verb the stateless lane cannot carry,
+        so a lite stateless session must not be handed the tool whose offer
+        card could never be accepted (the agent would wait on a human decision
+        that cannot arrive)."""
+        monkeypatch.setenv("STATELESS_EXECUTOR", "1")
+        session = _make_session(config=_make_config())
+        session.workspace_manager = MagicMock()
+        session.workspace_manager.backend.supports_shell = False
+
+        with (
+            patch(
+                "agent.api.persistent_session.get_all_tool_names",
+                return_value=["web_search", "request_workspace_upgrade"],
+            ),
+            patch(
+                "agent.api.persistent_session.load_tools", return_value=[]
+            ) as mock_load,
+            patch(
+                "agent.api.persistent_session.apply_description_overrides",
+                side_effect=lambda x: x,
+            ),
+            patch(
+                "agent.api.persistent_session.apply_instruction_enforcement",
+                side_effect=lambda x, y: x,
+            ),
+            patch("agent.api.persistent_session.ToolContext"),
+        ):
+            session._setup_tools(None)
+
+        loaded_names = mock_load.call_args_list[0].args[0]
+        assert "web_search" in loaded_names
+        assert "request_workspace_upgrade" not in loaded_names
+
     def test_workflows_can_be_disabled(self):
         """Automations & Loops opt-out removes workflow tools."""
         cfg = _make_config(extra={"_workflows_disabled": True})

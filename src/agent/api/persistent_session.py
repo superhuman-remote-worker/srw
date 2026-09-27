@@ -2587,6 +2587,16 @@ class PersistentSession:
             tool_names, getattr(self.workspace_manager, "backend", None)
         )
 
+        # Stateless lane: the upgrade's accept is a socket verb that lane has no
+        # transport for, so its offer card could never be accepted and the agent
+        # would wait on a human decision that cannot arrive. Stripped whichever
+        # source admitted it (config tool list or the lite-tier append above)
+        # (session_slash_commands_and_stateless_compact.md §2).
+        if os.environ.get("STATELESS_EXECUTOR", "").strip() == "1":
+            tool_names = [
+                name for name in tool_names if name != "request_workspace_upgrade"
+            ]
+
         # Background-officer capability ceiling
         # (knowledge-base/knowledge/features/officer_knowledge_plane.md §4, K3): a commissioned
         # background officer (officer.enabled is True — the runtime fact, not

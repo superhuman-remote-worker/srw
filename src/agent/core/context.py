@@ -1082,6 +1082,10 @@ class ContextManager:
         # heuristics that false-fire on stray RemoveMessage markers (the
         # duplicate-banner bug, 2026-06-12).
         self.compaction_runs: int = 0
+        # True when the last summarize_and_compact() call aborted because the
+        # summarizer produced nothing (aux LLM failure) — distinct from a
+        # no-op, which callers answering an explicit /compact must tell apart.
+        self.last_compaction_failed: bool = False
 
     def _note_compaction_success(self) -> None:
         """Bump the run counter and invalidate the provider-usage anchor.
@@ -2142,6 +2146,7 @@ class ContextManager:
         # sets it. A no-op / skipped compaction leaves it None so the transport
         # falls back to boundary_turn rather than recording a stale boundary_seq.
         self._last_compaction_boundary_id = None
+        self.last_compaction_failed = False
 
         # Filter out workspace injection messages BEFORE processing
         # They are transient and will be re-injected fresh after summarization
@@ -2380,6 +2385,7 @@ class ContextManager:
                 "Compaction aborted: summarization unavailable (aux LLM "
                 f"failure) — keeping {len(messages)} messages uncompacted"
             )
+            self.last_compaction_failed = True
             if oversized_count > 0:
                 return _substitution_only_result()
             return messages

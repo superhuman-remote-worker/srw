@@ -1490,3 +1490,191 @@ async def test_workspace_undo_payload_is_rechecked_inside_locked_admission():
 
     assert not _calls(conn, "fetchrow", "FROM run_queue")
     assert not [call for call in conn.calls if call[0] == "execute"]
+
+
+# ── Stateless manual compact (session_slash_commands_and_stateless_compact.md §3)
+
+
+def test_public_compact_envelope_canonicalizes_only_present_keys():
+    bare = ThreadControlRequest(client_request_id=CLIENT_REQUEST_ID, method="compact")
+    assert bare.control_payload() == {}
+    # An empty/whitespace focus is the same request as no focus at all.
+    blank = ThreadControlRequest(
+        client_request_id=CLIENT_REQUEST_ID, method="compact", focus="   "
+    )
+    assert blank.control_payload() == {}
+    full = ThreadControlRequest(
+        client_request_id=CLIENT_REQUEST_ID,
+        method="compact",
+        focus="  the pricing decisions ",
+        boundary_message_id="msg-42",
+    )
+    assert full.control_payload() == {
+        "focus": "the pricing decisions",
+        "boundary_message_id": "msg-42",
+    }
+
+    with pytest.raises(ValidationError, match="compact does not accept a mode"):
+        ThreadControlRequest(
+            client_request_id=CLIENT_REQUEST_ID, method="compact", mode="auto"
+        )
+    with pytest.raises(ValidationError, match="accepted only by compact"):
+        ThreadControlRequest(
+            client_request_id=CLIENT_REQUEST_ID,
+            method="mode.set",
+            mode="supervised",
+            focus="x",
+        )
+    with pytest.raises(ValidationError):
+        ThreadControlRequest(
+            client_request_id=CLIENT_REQUEST_ID, method="compact", focus="x" * 4001
+        )
+
+
+@pytest.mark.asyncio
+async def test_control_endpoint_admits_stateless_compact_payload():
+    thread = {
+        "id": THREAD_ID,
+        "user_id": OWNER_ID,
+        "project_id": PROJECT_ID,
+        "execution_lane": "stateless",
+        "metadata": {},
+    }
+    admitted = AdmittedControl(
+        id=REQUEST_ID,
+        request_seq=8,
+        client_request_id=CLIENT_REQUEST_ID,
+        verb="compact",
+        state="pending",
+        duplicate=False,
+    )
+    admit = AsyncMock(return_value=admitted)
+    grants = AsyncMock()
+    with (
+        patch.object(
+            thread_session,
+            "find_existing_thread_control",
+            AsyncMock(return_value=None),
+        ) as find_existing,
+        patch.object(thread_session, "require_stateless_workspace", MagicMock()),
+        patch.object(thread_session, "admit_thread_control", admit),
+        patch.object(thread_session, "log_security_event", AsyncMock()),
+    ):
+        response = await thread_session.submit_thread_control(
+            str(THREAD_ID),
+            ThreadControlRequest(
+                client_request_id=CLIENT_REQUEST_ID,
+                method="compact",
+                focus="open decisions",
+            ),
+            MagicMock(),
+            dependencies=_control_dependencies(
+                owner=AsyncMock(return_value=({"id": OWNER_ID}, thread)),
+                enforce=grants,
+            ),
+        )
+
+    assert response["method"] == "compact"
+    grants.assert_not_called()
+    assert find_existing.await_args.kwargs["payload"] == {"focus": "open decisions"}
+    assert admit.await_args.kwargs["verb"] == "compact"
+    assert admit.await_args.kwargs["payload"] == {"focus": "open decisions"}
+
+
+@pytest.mark.asyncio
+async def test_compact_admits_idle_stateless_session_on_any_tier():
+    # Unlike undo there is no sandbox restriction: a lite (virtual) session
+    # compacts its conversation just the same.
+    conn = _ControlConn(thread=_thread(), queue_state="done", baseline_input_seq=21)
+
+    result = await admit_thread_control(
+        _ControlDB(conn),
+        thread_id=THREAD_ID,
+        owner_user_id=OWNER_ID,
+        client_request_id=CLIENT_REQUEST_ID,
+        verb="compact",
+        payload={"focus": "open decisions"},
+        requested_by=str(OWNER_ID),
+    )
+
+    assert result.verb == "compact"
+    inserts = _calls(conn, "fetchval", "INSERT INTO thread_control_requests")
+    assert len(inserts) == 1
+    assert inserts[0][2][3:5] == ("compact", '{"focus":"open decisions"}')
+    # Admission wakes the queue for a control-only claim.
+    assert _calls(conn, "fetchval", "control_input_seq = GREATEST")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("queue_state", "input_seq", "consumed_seq", "message"),
+    [
+        ("leased", 21, 21, "completing a turn; retry compaction"),
+        ("queued", 22, 21, "pending input; retry compaction"),
+    ],
+)
+async def test_compact_never_races_or_overtakes_a_turn(
+    queue_state, input_seq, consumed_seq, message
+):
+    conn = _ControlConn(
+        thread=_thread(),
+        queue_state=queue_state,
+        input_seq=input_seq,
+        consumed_seq=consumed_seq,
+    )
+
+    with pytest.raises(ControlAdmissionNotReady, match=message):
+        await admit_thread_control(
+            _ControlDB(conn),
+            thread_id=THREAD_ID,
+            owner_user_id=OWNER_ID,
+            client_request_id=CLIENT_REQUEST_ID,
+            verb="compact",
+            payload={},
+            requested_by=str(OWNER_ID),
+        )
+
+    assert not [call for call in conn.calls if call[0] == "execute"]
+    assert not _calls(conn, "fetchval", "INSERT INTO thread_control_requests")
+
+
+@pytest.mark.asyncio
+async def test_compact_uses_the_socket_on_the_pinned_lane():
+    pinned = _ControlConn(
+        thread=_thread(execution_lane="pinned", agent_id=AGENT_ID),
+        reciprocal=1,
+    )
+    with pytest.raises(ControlAdmissionError, match="live session transport"):
+        await admit_thread_control(
+            _ControlDB(pinned),
+            thread_id=THREAD_ID,
+            owner_user_id=OWNER_ID,
+            client_request_id=CLIENT_REQUEST_ID,
+            verb="compact",
+            payload={},
+            requested_by=str(OWNER_ID),
+        )
+    assert not [call for call in pinned.calls if call[0] == "execute"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "payload",
+    [{"mode": "auto"}, {"focus": ""}, {"boundary_message_id": 7}],
+)
+async def test_compact_payload_is_rechecked_inside_locked_admission(payload):
+    conn = _ControlConn(thread=_thread(), queue_state="done")
+
+    with pytest.raises(ControlAdmissionError, match="compact accepts only"):
+        await admit_thread_control(
+            _ControlDB(conn),
+            thread_id=THREAD_ID,
+            owner_user_id=OWNER_ID,
+            client_request_id=CLIENT_REQUEST_ID,
+            verb="compact",
+            payload=payload,
+            requested_by=str(OWNER_ID),
+        )
+
+    assert not _calls(conn, "fetchrow", "FROM run_queue")
+    assert not [call for call in conn.calls if call[0] == "execute"]

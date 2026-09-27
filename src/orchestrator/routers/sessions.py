@@ -886,13 +886,16 @@ PINNED_CONTROLS: dict[str, ControlTransport] = {
 #: Queue-served sessions bind no agent, so nothing rides a socket. Config
 #: edits go through the owner PATCH (persisted at admission, applied by the
 #: next claim's attach — the same turn-boundary semantics the pane already
-#: documents); the scalar verbs and workspace undo ride the control inbox.
-#: ``compact`` / ``archive`` / ``rewind`` / ``upgrade-to-workspace`` have no
-#: stateless transport yet (stateless_agents.md §"Still open after S1/S2")
-#: and are deliberately ABSENT rather than mapped to something that drops them.
+#: documents); the scalar verbs, workspace undo and manual compaction ride the
+#: control inbox (compact: session_slash_commands_and_stateless_compact.md §3).
+#: ``archive`` / ``upgrade-to-workspace`` have no stateless transport (End is
+#: the owner DELETE; there is no stateless tier upgrade) and ``rewind`` is added
+#: per request below; absent verbs are deliberately ABSENT rather than mapped to
+#: something that drops them.
 STATELESS_CONTROLS: dict[str, ControlTransport] = {
     "config.update": "rest",
     "workspace.undo": "rest",
+    "compact": "rest",
     "mode.set": "rest",
     "narration.set": "rest",
 }

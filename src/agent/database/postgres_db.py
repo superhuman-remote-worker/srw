@@ -1451,6 +1451,13 @@ class PostgresDB:
             "boundary_turn": metrics.get("boundary_turn"),
             "boundary_seq": metrics.get("boundary_seq"),
             "turn_number": row["turn_number"],
+            "before": metrics.get("before"),
+            "after": metrics.get("after"),
+            "trigger": metrics.get("trigger"),
+            # Set only by a stateless manual compaction (the durable control it
+            # answered): lets a successor recognise a checkpoint whose journal
+            # receipt never committed instead of compacting a second time.
+            "control_request_id": metrics.get("control_request_id"),
         }
 
     async def get_seq_for_message_id(

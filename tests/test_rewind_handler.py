@@ -423,7 +423,9 @@ def test_compact_refuses_while_rewind_lock_held(monkeypatch):
 
     errors = [p for m, p in ws_sent if m == "error"]
     assert errors
-    assert "rewind is in progress" in errors[0]["message"].lower()
+    # The lock is shared by rewind and every manual compaction, so the refusal
+    # names both rather than assuming which one holds it.
+    assert "rewind or compaction is in progress" in errors[0]["message"].lower()
 
 
 def test_compact_boundary_maps_to_keep_recent(monkeypatch):
