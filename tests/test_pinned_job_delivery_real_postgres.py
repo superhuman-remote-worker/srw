@@ -431,7 +431,10 @@ async def _publish_fast_route(db, *, owner, agent_id, intent, process_generation
 
 
 @pytest.mark.asyncio
-async def test_two_connection_fast_report_precedes_late_post_confirmation(db, monkeypatch):
+@pytest.mark.parametrize("report_start_delay", [0, 0.15])
+async def test_two_connection_fast_report_precedes_late_post_confirmation(
+    db, monkeypatch, report_start_delay,
+):
     from shared.pinned_job_delivery import pinned_job_delivery_proof
 
     await _schema(db)
@@ -457,17 +460,28 @@ async def test_two_connection_fast_report_precedes_late_post_confirmation(db, mo
     route_id = UUID(json.loads(episode_before)["wait_key"])
     async with db.acquire() as blocker, blocker.transaction():
         await blocker.fetchrow("SELECT id FROM jobs WHERE id=$1 FOR UPDATE", owner)
-        report = asyncio.create_task(_publish_fast_route(
-            db, owner=owner, agent_id=agent_id, intent=intent,
-            process_generation=generation, pod_uid=pod_uid,
-            proof=proof, route_id=route_id,
-        ))
-        await asyncio.sleep(0.05)
+        blocker_pid = await blocker.fetchval("SELECT pg_backend_pid()")
+
+        async def publish_report():
+            # Exercise a slow task start or pool connection setup.
+            await asyncio.sleep(report_start_delay)
+            return await _publish_fast_route(
+                db, owner=owner, agent_id=agent_id, intent=intent,
+                process_generation=generation, pod_uid=pod_uid,
+                proof=proof, route_id=route_id,
+            )
+
+        report = asyncio.create_task(publish_report())
+        report_pid = await _wait_for_row_waiter(
+            db, "SELECT id FROM jobs WHERE id=$1 FOR UPDATE%", {blocker_pid},
+        )
         confirmation = asyncio.create_task(db.confirm_pinned_job_dispatch(
             str(owner), str(agent_id), pinned_delivery_id=str(intent["id"]),
             pinned_projection_digest=intent["projection_digest"],
         ))
-        await asyncio.sleep(0.05)
+        await _wait_for_row_waiter(
+            db, "SELECT * FROM jobs WHERE id=$1 FOR UPDATE%", {blocker_pid, report_pid},
+        )
         assert not report.done() and not confirmation.done()
     reported, confirmed = await asyncio.wait_for(
         asyncio.gather(report, confirmation), timeout=5,
@@ -527,16 +541,21 @@ async def test_two_connection_renewed_heartbeat_and_report_keep_original_marker(
     )
     async with db.acquire() as blocker, blocker.transaction():
         await blocker.fetchrow("SELECT id FROM jobs WHERE id=$1 FOR UPDATE", owner)
+        blocker_pid = await blocker.fetchval("SELECT pg_backend_pid()")
         report = asyncio.create_task(_publish_fast_route(
             db, owner=owner, agent_id=agent_id, intent=intent,
             process_generation=generation, pod_uid=pod_uid,
             proof=proof, route_id=route_id,
         ))
-        await asyncio.sleep(0.05)
+        report_pid = await _wait_for_row_waiter(
+            db, "SELECT id FROM jobs WHERE id=$1 FOR UPDATE%", {blocker_pid},
+        )
         heartbeat = asyncio.create_task(db.heartbeat(
             str(agent_id), "working", current_job_id=str(owner),
         ))
-        await asyncio.sleep(0.05)
+        await _wait_for_row_waiter(
+            db, "%UPDATE jobs%SET lease_expires_at%", {blocker_pid, report_pid},
+        )
         assert not heartbeat.done() and not report.done()
     beat, reported = await asyncio.wait_for(
         asyncio.gather(heartbeat, report), timeout=5,
@@ -574,7 +593,7 @@ async def test_two_connection_heartbeat_cannot_undo_pinned_nomination(db, monkey
             str(owner), episode_id=episode["episode_id"],
             revision=revision, identity=identity,
         ))
-        nominee_pid = await _wait_for_agent_row_waiter(
+        nominee_pid = await _wait_for_row_waiter(
             db,
             "SELECT * FROM agents WHERE id=$1 FOR UPDATE%",
             {blocker_pid},
@@ -582,7 +601,7 @@ async def test_two_connection_heartbeat_cannot_undo_pinned_nomination(db, monkey
         heartbeat = asyncio.create_task(db.heartbeat(
             str(agent_id), "working", current_job_id=str(owner),
         ))
-        await _wait_for_agent_row_waiter(
+        await _wait_for_row_waiter(
             db,
             "UPDATE agents SET%",
             {blocker_pid, nominee_pid},
@@ -637,17 +656,23 @@ async def test_two_connection_lease_recovery_loses_to_fast_route_report(db, monk
     )
     async with db.acquire() as blocker, blocker.transaction():
         await blocker.fetchrow("SELECT id FROM jobs WHERE id=$1 FOR UPDATE", owner)
+        blocker_pid = await blocker.fetchval("SELECT pg_backend_pid()")
         report = asyncio.create_task(_publish_fast_route(
             db, owner=owner, agent_id=agent_id, intent=intent,
             process_generation=generation, pod_uid=pod_uid,
             proof=proof, route_id=route_id,
         ))
-        await asyncio.sleep(0.05)
+        report_pid = await _wait_for_row_waiter(
+            db, "SELECT id FROM jobs WHERE id=$1 FOR UPDATE%", {blocker_pid},
+        )
         recovery = asyncio.create_task(db.recover_expired_lease_jobs(
             completion_commands_enabled=True,
         ))
-        await asyncio.sleep(0.05)
-        assert not report.done()
+        await _wait_for_row_waiter(
+            db, "%SELECT id, status::text AS status, execution_lane,%FROM jobs%FOR UPDATE%",
+            {blocker_pid, report_pid},
+        )
+        assert not report.done() and not recovery.done()
     reported, _ = await asyncio.wait_for(
         asyncio.gather(report, recovery), timeout=10,
     )
@@ -678,11 +703,14 @@ async def test_two_connection_resume_and_nomination_have_one_owner(
     store = VMIdleLifecycleStore(db)
     async with db.acquire() as blocker, blocker.transaction():
         await blocker.fetchrow("SELECT id FROM jobs WHERE id=$1 FOR UPDATE", owner)
+        blocker_pid = await blocker.fetchval("SELECT pg_backend_pid()")
         nomination = asyncio.create_task(store.admit_release(
             str(owner), episode_id=episode["episode_id"],
             revision=revision, identity=identity,
         ))
-        await asyncio.sleep(0.05)
+        nomination_pid = await _wait_for_row_waiter(
+            db, "SELECT * FROM jobs WHERE id=$1 FOR UPDATE%", {blocker_pid},
+        )
         if resume_kind == "in_process":
             resume = asyncio.create_task(db.resume_pinned_job_in_process(str(owner)))
         else:
@@ -691,7 +719,10 @@ async def test_two_connection_resume_and_nomination_have_one_owner(
                 expected_route_id=episode["wait_key"],
                 completion_commands_enabled=True,
             ))
-        await asyncio.sleep(0.05)
+        await _wait_for_row_waiter(
+            db, "SELECT id FROM jobs WHERE id=$1::uuid FOR UPDATE%",
+            {blocker_pid, nomination_pid},
+        )
         assert not nomination.done() and not resume.done()
     admitted, resumed = await asyncio.wait_for(
         asyncio.gather(nomination, resume), timeout=5,
@@ -818,7 +849,7 @@ async def _second_pinned_job(db):
     return other
 
 
-async def _wait_for_agent_row_waiter(db, query_pattern, blocking_pids):
+async def _wait_for_row_waiter(db, query_pattern, blocking_pids):
     """Prove a contender reached PostgreSQL's lock queue before the next starts."""
     async with asyncio.timeout(10):
         while True:
@@ -907,7 +938,7 @@ async def test_stale_cross_job_claim_waits_for_agent_first_nomination(
                 )
 
             nominee = asyncio.create_task(nominate())
-            nominee_pid = await _wait_for_agent_row_waiter(
+            nominee_pid = await _wait_for_row_waiter(
                 db,
                 "SELECT * FROM agents WHERE id=$1 FOR UPDATE%",
                 {blocker_pid},
@@ -915,7 +946,7 @@ async def test_stale_cross_job_claim_waits_for_agent_first_nomination(
             stale_claim = asyncio.create_task(
                 db.claim_job_for_agent(str(other), str(agent_id))
             )
-            await _wait_for_agent_row_waiter(
+            await _wait_for_row_waiter(
                 db,
                 "SELECT status,current_job_id FROM agents WHERE id=$1 FOR UPDATE%",
                 {blocker_pid, nominee_pid},
