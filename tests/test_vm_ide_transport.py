@@ -8,6 +8,11 @@ from unittest.mock import AsyncMock
 from uuid import uuid4
 
 import pytest
+from asyncssh import (
+    ChannelOpenError,
+    OPEN_ADMINISTRATIVELY_PROHIBITED,
+    OPEN_CONNECT_FAILED,
+)
 import websockets
 
 
@@ -63,6 +68,181 @@ class _Pool:
         yield self.connection
 
 
+def _health_response(status: str, *, code: int = 200) -> bytes:
+    body = ('{"status":"' + status + '","lastHeartbeat":0}').encode()
+    return (
+        f"HTTP/1.1 {code} {'OK' if code == 200 else 'Unavailable'}\r\n"
+        f"Content-Length: {len(body)}\r\n\r\n"
+    ).encode() + body
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("response", "expected"),
+    [
+        (_health_response("alive"), True),
+        (_health_response("expired"), True),
+        (_health_response("unknown"), False),
+        (_health_response("expired", code=503), False),
+        (b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nfalse", False),
+        (b'HTTP/1.1 200 OK\r\nContent-Length: 19\r\n\r\n{"status":"alive"}x', False),
+    ],
+)
+async def test_health_requires_200_with_known_code_server_status(response, expected):
+    from orchestrator.services.vm_ide_transport import _probe_code_server
+
+    connection = SimpleNamespace(
+        open_connection=AsyncMock(return_value=(_Reader(response), _Writer()))
+    )
+    assert await _probe_code_server(connection) is expected
+
+
+@pytest.mark.asyncio
+async def test_cold_start_waits_for_loopback_and_accepts_expired_idle_heartbeat():
+    from orchestrator.services.vm_ide_transport import VMIDETransport
+
+    proof = _proof()
+    connection = SimpleNamespace(
+        run=AsyncMock(return_value=SimpleNamespace(exit_status=0)),
+        open_connection=AsyncMock(
+            side_effect=[
+                ChannelOpenError(OPEN_CONNECT_FAILED, "Connection refused"),
+                (_Reader(_health_response("expired")), _Writer()),
+            ]
+        ),
+    )
+    provisioner = SimpleNamespace(
+        attest_workspace_runtime=AsyncMock(return_value=proof)
+    )
+    transport = VMIDETransport(
+        provisioner, pool=_Pool(connection), key_path="/private/guest-key"
+    )
+    assert (
+        await transport.start_and_probe(
+            "job-1",
+            owner_kind="job",
+            expected_generation=proof.workspace_generation,
+            expected_vm_uid=proof.vm_uid,
+        )
+        == proof
+    )
+    connection.run.assert_awaited_once()
+    assert connection.open_connection.await_count == 2
+    assert provisioner.attest_workspace_runtime.await_count >= 4
+
+
+@pytest.mark.asyncio
+async def test_cold_start_refusal_deadline_closes_as_service_unavailable(monkeypatch):
+    import orchestrator.services.vm_ide_transport as module
+
+    monkeypatch.setattr(module, "IDE_STARTUP_TIMEOUT_SECONDS", 0.03, raising=False)
+    monkeypatch.setattr(module, "IDE_STARTUP_RETRY_SECONDS", 0.01, raising=False)
+    proof = _proof()
+    connection = SimpleNamespace(
+        run=AsyncMock(return_value=SimpleNamespace(exit_status=0)),
+        open_connection=AsyncMock(
+            side_effect=ChannelOpenError(OPEN_CONNECT_FAILED, "Connection refused")
+        ),
+    )
+    transport = module.VMIDETransport(
+        SimpleNamespace(attest_workspace_runtime=AsyncMock(return_value=proof)),
+        pool=_Pool(connection),
+        key_path="/private/guest-key",
+    )
+    with pytest.raises(module.VMIDEUnavailable, match="ide_service_unavailable"):
+        await transport.start_and_probe(
+            "job-1",
+            owner_kind="job",
+            expected_generation=proof.workspace_generation,
+            expected_vm_uid=proof.vm_uid,
+        )
+    connection.run.assert_awaited_once()
+    assert connection.open_connection.await_count >= 2
+
+
+@pytest.mark.asyncio
+async def test_cold_start_refusal_stops_when_exact_runtime_changes():
+    from orchestrator.services.vm_ide_transport import VMIDETransport, VMIDEUnavailable
+
+    proof = _proof()
+    successor = replace(proof, launcher_pod_uid=str(uuid4()))
+    attest = AsyncMock(side_effect=[proof, proof, proof, successor])
+    connection = SimpleNamespace(
+        run=AsyncMock(return_value=SimpleNamespace(exit_status=0)),
+        open_connection=AsyncMock(
+            side_effect=ChannelOpenError(OPEN_CONNECT_FAILED, "Connection refused")
+        ),
+    )
+    transport = VMIDETransport(
+        SimpleNamespace(attest_workspace_runtime=attest),
+        pool=_Pool(connection),
+        key_path="/private/guest-key",
+    )
+    with pytest.raises(VMIDEUnavailable, match="ide_runtime_changed"):
+        await transport.start_and_probe(
+            "job-1",
+            owner_kind="job",
+            expected_generation=proof.workspace_generation,
+            expected_vm_uid=proof.vm_uid,
+        )
+    assert connection.open_connection.await_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "channel_error",
+    [
+        ChannelOpenError(OPEN_ADMINISTRATIVELY_PROHIBITED, "prohibited"),
+        PermissionError("denied"),
+    ],
+)
+async def test_cold_start_never_retries_hard_channel_error(channel_error):
+    from orchestrator.services.vm_ide_transport import VMIDETransport, VMIDEUnavailable
+
+    proof = _proof()
+    connection = SimpleNamespace(
+        run=AsyncMock(return_value=SimpleNamespace(exit_status=0)),
+        open_connection=AsyncMock(side_effect=channel_error),
+    )
+    transport = VMIDETransport(
+        SimpleNamespace(attest_workspace_runtime=AsyncMock(return_value=proof)),
+        pool=_Pool(connection),
+        key_path="/private/guest-key",
+    )
+    with pytest.raises(VMIDEUnavailable, match="ide_guest_transport_unavailable"):
+        await transport.start_and_probe(
+            "job-1",
+            owner_kind="job",
+            expected_generation=proof.workspace_generation,
+            expected_vm_uid=proof.vm_uid,
+        )
+    connection.open_connection.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_cold_start_cancellation_does_not_retry_or_turn_into_unavailable():
+    from orchestrator.services.vm_ide_transport import VMIDETransport
+
+    proof = _proof()
+    connection = SimpleNamespace(
+        run=AsyncMock(return_value=SimpleNamespace(exit_status=0)),
+        open_connection=AsyncMock(side_effect=asyncio.CancelledError),
+    )
+    transport = VMIDETransport(
+        SimpleNamespace(attest_workspace_runtime=AsyncMock(return_value=proof)),
+        pool=_Pool(connection),
+        key_path="/private/guest-key",
+    )
+    with pytest.raises(asyncio.CancelledError):
+        await transport.start_and_probe(
+            "job-1",
+            owner_kind="job",
+            expected_generation=proof.workspace_generation,
+            expected_vm_uid=proof.vm_uid,
+        )
+    connection.open_connection.assert_awaited_once()
+
+
 @pytest.mark.asyncio
 async def test_start_probes_guest_loopback_only_after_pinned_current_runtime():
     from orchestrator.services.vm_ide_transport import VMIDETransport
@@ -93,8 +273,7 @@ async def test_start_probes_guest_loopback_only_after_pinned_current_runtime():
 
     connection.open_connection.reset_mock()
     connection.open_connection.return_value = (
-        _Reader(b"HTTP/1.1 200 OK\r\nContent-Length: 18\r\n\r\n"
-                b'{"status":"alive"}'), _Writer(),
+        _Reader(_health_response("expired")), _Writer(),
     )
     connection.run.reset_mock()
     assert await transport.probe(

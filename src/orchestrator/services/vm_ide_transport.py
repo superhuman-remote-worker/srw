@@ -8,6 +8,7 @@ direct-tcpip channel reaches only the guest's loopback code-server port.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -26,10 +27,13 @@ from orchestrator.services.canvas_ssh import (
     CANVAS_LOOPBACK_HOST,
     PINNED_SSH_TRANSPORT_POOL,
     RemoteWorkspaceTarget,
+    asyncssh,
 )
 
 IDE_LOOPBACK_PORT = 8080
 IDE_START_COMMAND = "systemctl --user start srw-code-server-user.service"
+IDE_STARTUP_TIMEOUT_SECONDS = 10
+IDE_STARTUP_RETRY_SECONDS = 0.25
 
 
 class VMIDEUnavailable(RuntimeError):
@@ -190,8 +194,19 @@ async def _probe_code_server(connection: Any) -> bool:
                     break
                 elif event is h11.PAUSED:
                     return False
-        # code-server's local health endpoint has a precise small response.
-        return status == 200 and b'"status":"alive"' in body.replace(b" ", b"")
+        # code-server reports "expired" before a browser has sent a heartbeat.
+        # Both documented states prove the authenticated loopback service is up.
+        if status != 200:
+            return False
+        try:
+            health = json.loads(body)
+        except (ValueError, UnicodeDecodeError):
+            return False
+        return (
+            isinstance(health, dict)
+            and isinstance(health.get("status"), str)
+            and health["status"] in {"alive", "expired"}
+        )
     finally:
         writer.close()
         await writer.wait_closed()
@@ -418,8 +433,35 @@ class VMIDETransport:
                     # Older immutable images have no user unit.  Never fall
                     # back to sudo, a shell daemon, or an unproven endpoint.
                     raise VMIDEUnavailable("ide_guest_unit_unavailable")
-                if not await _probe_code_server(connection):
-                    raise VMIDEUnavailable("ide_service_unavailable")
+                # systemctl reports success when the user process is spawned,
+                # before code-server opens its loopback listener. Wait only for
+                # a connection-refused direct channel on this same pinned SSH
+                # transport. A malformed health response or other SSH failure
+                # is not evidence that more waiting will make it safe.
+                try:
+                    async with asyncio.timeout(IDE_STARTUP_TIMEOUT_SECONDS):
+                        while True:
+                            if await self._attest(owner_id, owner_kind) != initial:
+                                raise VMIDEUnavailable("ide_runtime_changed")
+                            try:
+                                healthy = await _probe_code_server(connection)
+                            except Exception as exc:
+                                channel_error = getattr(
+                                    asyncssh, "ChannelOpenError", None
+                                )
+                                if (
+                                    channel_error is None
+                                    or not isinstance(exc, channel_error)
+                                    or exc.code != asyncssh.OPEN_CONNECT_FAILED
+                                ):
+                                    raise
+                            else:
+                                if not healthy:
+                                    raise VMIDEUnavailable("ide_service_unavailable")
+                                break
+                            await asyncio.sleep(IDE_STARTUP_RETRY_SECONDS)
+                except TimeoutError as exc:
+                    raise VMIDEUnavailable("ide_service_unavailable") from exc
                 if await self._attest(owner_id, owner_kind) != initial:
                     raise VMIDEUnavailable("ide_runtime_changed")
         except VMIDEUnavailable:
