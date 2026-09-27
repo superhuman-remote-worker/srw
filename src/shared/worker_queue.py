@@ -1218,6 +1218,21 @@ async def hold_failed_container_worker_report(
         )
 
 
+async def hold_interrupted_container_worker(
+    db: Any, *, unit_id: UUID | str, lease_token: int
+) -> str:
+    """Restrict an interrupted node without reporting completion or stop proof."""
+    from shared.worker_execution_hold import hold_container_worker_attempt
+
+    async with _connection(db) as conn:
+        return await hold_container_worker_attempt(
+            conn,
+            job_id=unit_id,
+            lease_token=lease_token,
+            reason="node_execution_interrupted",
+        )
+
+
 async def rotate_worker_batch(
     db: Any,
     *,

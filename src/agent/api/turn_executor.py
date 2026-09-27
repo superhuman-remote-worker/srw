@@ -143,6 +143,7 @@ from shared.worker_queue import (
     complete_worker_batch,
     get_worker_completion_acceptance,
     hold_failed_container_worker_report,
+    hold_interrupted_container_worker,
     renew_worker_batch,
     release_worker_batch,
     rotate_worker_batch,
@@ -929,6 +930,7 @@ class StatelessTurnExecutor:
         self._worker_preempt_status: Optional[str] = None
         self._worker_terminal_report_generation: tuple[str, int] | None = None
         self._worker_container_report_uncertain = False
+        self._worker_node_interrupted = False
         self._worker_completion_accepted_generation: tuple[str, int] | None = None
         self._worker_workspace_recovery: WorkspaceRecoveryHandoff | None = None
         self._worker_workspace_recovery_code: WorkspaceRecoveryCode | None = None
@@ -1621,6 +1623,7 @@ class StatelessTurnExecutor:
         self._worker_preempt_status = None
         self._worker_terminal_report_generation = None
         self._worker_container_report_uncertain = False
+        self._worker_node_interrupted = False
         self._worker_completion_accepted_generation = None
         self._worker_workspace_recovery = None
         self._worker_workspace_recovery_code = None
@@ -1671,6 +1674,9 @@ class StatelessTurnExecutor:
             timing["outcome"] = f"quarantined:{self._worker_handoff_reason()}"
             return
         except SubagentLifecycleError as exc:
+            if self._worker_node_interrupted:
+                timing["outcome"] = await self._hold_interrupted_worker_node(claim)
+                return
             if await self._resolve_workspace_recovery(claim, error=exc):
                 timing["outcome"] = await self._handoff_workspace_recovery(claim=claim)
                 return
@@ -1704,6 +1710,9 @@ class StatelessTurnExecutor:
             timing["outcome"] = "released:child_lifecycle_failed"
             return
         except Exception as exc:
+            if self._worker_node_interrupted:
+                timing["outcome"] = await self._hold_interrupted_worker_node(claim)
+                return
             if self._worker_quarantined:
                 self.request_stop()
                 timing["outcome"] = f"quarantined:{self._worker_handoff_reason()}"
@@ -1991,6 +2000,9 @@ class StatelessTurnExecutor:
                 await self._join_worker_local_task(
                     asyncio.create_task(streaming_gen.aclose())
                 )
+
+        if self._worker_node_interrupted:
+            return await self._hold_interrupted_worker_node(claim)
 
         if await self._resolve_workspace_recovery(claim, final_state=final_state):
             return await self._handoff_workspace_recovery(claim=claim)
@@ -2763,6 +2775,13 @@ class StatelessTurnExecutor:
                         {next_state, lost_waiter, preempt_waiter},
                         return_when=asyncio.FIRST_COMPLETED,
                     )
+                    # A same-tick Pause must not discard already-observed
+                    # interruption evidence and publish an ordinary resumable
+                    # stop. Inspect only a completed local result; native hold
+                    # admission still gives Cancel/accepted successors priority.
+                    if next_state.done():
+                        with contextlib.suppress(asyncio.CancelledError, Exception):
+                            self._observe_worker_node_interruption(next_state.result())
                     # Ownership/control always wins a same-tick graph result.
                     if self._lease.lost.is_set():
                         next_state.cancel()
@@ -2784,7 +2803,16 @@ class StatelessTurnExecutor:
                             0.0, stream_started_at - agent_start_started_at
                         )
                     if isinstance(state, dict):
-                        final_state = state
+                        # This private stream field is emitted only for an
+                        # actual LangGraph NodeCancelledError. Latch before
+                        # generator-finally/quiescence can fail, and strip it
+                        # before any sibling completion path sees the state.
+                        self._observe_worker_node_interruption(state)
+                        final_state = {
+                            key: value
+                            for key, value in state.items()
+                            if key != "_worker_node_cancelled"
+                        }
                         error = state.get("error")
                         if isinstance(error, dict):
                             if error.get("type") == "workspace_unavailable":
@@ -2822,6 +2850,16 @@ class StatelessTurnExecutor:
                     waiter.cancel()
                     with contextlib.suppress(asyncio.CancelledError):
                         await waiter
+
+    def _observe_worker_node_interruption(self, state: Any) -> None:
+        if (
+            isinstance(state, dict)
+            and state.get("_worker_node_cancelled") is True
+            and self._completion_commands_enabled
+            and self._worker_workspace_backend == "sandbox"
+            and self._worker_workspace_provisioner == "k8s"
+        ):
+            self._worker_node_interrupted = True
 
     async def _worker_heartbeat_loop(self, claim: WorkerClaim) -> None:
         unit = claim.unit
@@ -3231,7 +3269,7 @@ class StatelessTurnExecutor:
     async def _cleanup_worker_runtime_locked(self, *, preserve_shell: bool) -> None:
         agent = _pa()._agent
         if agent is not None:
-            if self._worker_container_report_uncertain:
+            if self._worker_container_report_uncertain or self._worker_node_interrupted:
                 # This reduces outstanding local work; it never settles the
                 # durable barrier or proves a remote command stopped.
                 try:
@@ -3299,6 +3337,9 @@ class StatelessTurnExecutor:
         park_on_exhaustion: bool = True,
         timing: dict[str, Any] | None = None,
     ) -> None:
+        if self._worker_node_interrupted:
+            await self._hold_interrupted_worker_node(claim)
+            return
         if (
             reason == "terminal_report_failed"
             and await self._hold_unaccepted_container_report(claim)
@@ -3339,6 +3380,24 @@ class StatelessTurnExecutor:
             reason,
             state,
         )
+
+    async def _hold_interrupted_worker_node(self, claim: WorkerClaim) -> str:
+        try:
+            decision = await hold_interrupted_container_worker(
+                self._db, unit_id=claim.unit_id, lease_token=claim.lease_token
+            )
+            if decision in {"held", "superseded"}:
+                self._lease.mark_lost()
+        except Exception:
+            # No report or fallback release. Exact expiry classification owns
+            # an attempt whose restriction could not be committed here.
+            logger.exception("Interrupted worker node hold unavailable")
+        try:
+            await self._cleanup_worker_runtime(preserve_shell=True)
+        except Exception:
+            self.request_stop()
+            logger.exception("Interrupted worker node retirement remains unknown")
+        return "held:worker_execution_outcome_unknown"
 
     async def _hold_unaccepted_container_report(self, claim: WorkerClaim) -> bool:
         if not self._worker_container_report_uncertain:

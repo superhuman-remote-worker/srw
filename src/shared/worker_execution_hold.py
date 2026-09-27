@@ -50,7 +50,11 @@ async def hold_container_worker_attempt(
     *,
     job_id: UUID | str,
     lease_token: int,
-    reason: Literal["typed_report_unaccepted", "post_bundle_executor_loss"],
+    reason: Literal[
+        "typed_report_unaccepted",
+        "post_bundle_executor_loss",
+        "node_execution_interrupted",
+    ],
     grace_seconds: float | None = None,
 ) -> HoldDecision:
     """Atomically revoke one current container attempt without physical effects.
@@ -59,7 +63,11 @@ async def hold_container_worker_attempt(
     never falls through to generic requeue. Queue -> Job -> attempt ordering
     serializes with completion acceptance, claim, Resume and Cancel.
     """
-    if reason not in {"typed_report_unaccepted", "post_bundle_executor_loss"}:
+    if reason not in {
+        "typed_report_unaccepted",
+        "post_bundle_executor_loss",
+        "node_execution_interrupted",
+    }:
         raise ValueError("unknown worker hold reason")
     from shared.worker_queue import _CONTROL_CLAIM_ACTIVE_SQL
 

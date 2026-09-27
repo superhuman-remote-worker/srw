@@ -65,7 +65,18 @@ async def exact_claim(db):
 
 
 async def install_actual_stream(
-    db, pg_dsn, claim, monkeypatch, effects, *, die=False, explicit_goal=False
+    db,
+    pg_dsn,
+    claim,
+    monkeypatch,
+    effects,
+    *,
+    die=False,
+    explicit_goal=False,
+    effect_entered=None,
+    park_in_tool=False,
+    node_error=None,
+    stream_finally_error=None,
 ):
     executor, fixture_agent, client, _, _, _, release = worker._install(
         monkeypatch,
@@ -99,6 +110,12 @@ async def install_actual_stream(
 
     async def uncertain_tool(state):
         effects.append(claim.lease_token)
+        if effect_entered is not None:
+            effect_entered.set()
+        if park_in_tool:
+            await asyncio.Event().wait()
+        if node_error is not None:
+            raise node_error
         if die:
             raise asyncio.CancelledError(
                 "modeled process loss after remote tool admission"
@@ -120,7 +137,7 @@ async def install_actual_stream(
     stream_agent._workspace_manager = None
     stream_agent._defer_job_cleanup = True
     stream_agent._recover_subagent_orphans = AsyncMock()
-    stream_agent._quiesce_subagent_runtime = AsyncMock()
+    stream_agent._quiesce_subagent_runtime = AsyncMock(side_effect=stream_finally_error)
 
     async def process_job(*args, **kwargs):
         fixture_agent.process_calls.append((args, kwargs))
@@ -303,20 +320,27 @@ async def test_authorized_container_process_loss_cannot_publish_fresh_graph_clai
 ):
     monkeypatch.setenv("VM_WORKSPACE_RECOVERY_ENABLED", vm_recovery_flag)
     effects = []
-    claim = None
+    claim = serving = None
     previous_lease = current_lease.get()
     try:
         claim = await exact_claim(db)
+        entered = asyncio.Event()
         executor, client, graph, config, release = await install_actual_stream(
             db,
             pg_dsn,
             claim,
             monkeypatch,
             effects,
-            die=True,
+            effect_entered=entered,
+            park_in_tool=True,
         )
+        # A task cancellation models worker loss. Raising CancelledError from
+        # inside a node is a distinct LangGraph NodeCancelledError failure.
+        serving = asyncio.create_task(executor._serve_worker_claim(claim))
+        await asyncio.wait_for(entered.wait(), 5)
+        serving.cancel()
         with pytest.raises(asyncio.CancelledError):
-            await executor._serve_worker_claim(claim)
+            await serving
         client.report_completion.assert_not_awaited()
         release.assert_not_awaited()
         before = await graph.aget_state(config)
@@ -360,6 +384,9 @@ async def test_authorized_container_process_loss_cannot_publish_fresh_graph_clai
             "authorized container attempt was queued after loss with no no-replay hold"
         )
     finally:
+        if serving is not None and not serving.done():
+            serving.cancel()
+            await asyncio.gather(serving, return_exceptions=True)
         current_lease.set(previous_lease)
         await close_fenced_checkpointer_pool()
         if claim is not None:

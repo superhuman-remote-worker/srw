@@ -27,6 +27,7 @@ import aiosqlite
 from langchain_core.language_models import BaseChatModel
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.checkpoint.base import BaseCheckpointSaver
+from langgraph.errors import NodeCancelledError
 
 from shared.worker_errors import worker_error_cause
 from shared.runtime.core.loader import (
@@ -2500,11 +2501,21 @@ class UniversalAgent:
                 )
             else:
                 logger.error(f"Job {job_id} failed mid-stream: {e}", exc_info=True)
-            yield {
+            error_state = {
                 "job_id": job_id,
                 "error": error,
                 "should_stop": True,
             }
+            if getattr(self, "_defer_job_cleanup", False) and isinstance(
+                e, NodeCancelledError
+            ):
+                # LangGraph distinguishes a node raising CancelledError from
+                # cancellation of the serving task. Preserve that provenance
+                # locally: its unfinished checkpoint cannot prove safe replay
+                # or terminal completion. The worker consumes this field; it
+                # is never a checkpoint or completion-protocol write.
+                error_state["_worker_node_cancelled"] = True
+            yield error_state
         finally:
             # The worker driver does not report/rotate until it observes this
             # generator's StopAsyncIteration (and explicitly closes it on every
