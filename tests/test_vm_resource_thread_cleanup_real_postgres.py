@@ -140,6 +140,10 @@ def operations(db, provisioner):
         SimpleNamespace(
             store=db,
             vm_provisioner=provisioner,
+            # Permanent retirement also retires exited claim-less dedicated
+            # agent Pods it recorded (0301); a VM thread has none, so the
+            # step never reaches the provisioner. None fails loudly if it did.
+            agent_provisioner=None,
             recovery_store=VMWorkspaceRecoveryStore(db),
             logger=logging.getLogger(__name__),
         )
