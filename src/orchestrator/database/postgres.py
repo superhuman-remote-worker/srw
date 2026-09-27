@@ -41679,7 +41679,8 @@ class PostgresDB:
                            AS retirement_token,
                        queue.unit_kind,
                        queue.state AS queue_state,
-                       queue.lease_token
+                       queue.lease_token,
+                       queue.leased_by
                 FROM threads AS thread
                 LEFT JOIN run_queue AS queue ON queue.unit_id = thread.id
                 WHERE thread.id = $1::uuid
@@ -42131,6 +42132,45 @@ class PostgresDB:
             "AND thread.metadata#>'{_stateless_workspace_retirement_settled,terminal_token}'=to_jsonb(queue.lease_token))) "
             "AND ($2::timestamptz IS NULL OR (thread.ended_at,thread.id)>($2,$3::uuid)) "
             "ORDER BY thread.ended_at, thread.id LIMIT $1",
+            max(1, min(int(limit), 250)),
+            after[0] if after is not None else None,
+            after[1] if after is not None else None,
+        )
+        return [dict(row) for row in rows]
+
+    async def list_retryable_stateless_end_settlements(
+        self,
+        *,
+        limit: int = 25,
+        after: tuple[datetime, str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Nominate acknowledged non-initial End owners for full fenced replay.
+
+        Physical cleanup has its own retry owner, but cannot finish the
+        business End (including permanent owner deletion). These are hints;
+        the End funnel revalidates every proof under its lifecycle lock.
+        """
+        rows = await self.fetch(
+            "SELECT thread.* FROM threads AS thread JOIN run_queue AS queue "
+            "ON queue.unit_id=thread.id AND queue.unit_kind='session_turn' "
+            "AND queue.state='done' AND queue.leased_by IS NULL "
+            "CROSS JOIN LATERAL (SELECT COALESCE("
+            "thread.metadata->'_stateless_claim_retirement', "
+            "thread.metadata->'_stateless_workspace_retirement_settled') AS marker) AS retirement "
+            "WHERE thread.execution_lane='stateless' AND thread.status='ended' "
+            "AND NOT (retirement.marker ? 'initial_creation') "
+            "AND retirement.marker->'terminal_token'=to_jsonb(queue.lease_token) "
+            "AND queue.lease_token > 0 "
+            "AND jsonb_typeof(retirement.marker->'runtime_incarnation')='string' "
+            "AND ((thread.metadata->'_stateless_workspace_retirement_pending'='true'::jsonb "
+            "AND retirement.marker->'claimant_quiesced'='true'::jsonb "
+            "AND retirement.marker->'residents_retired'='true'::jsonb "
+            "AND retirement.marker->'remote_retired'='true'::jsonb) "
+            "OR (NOT (thread.metadata ? '_stateless_workspace_retirement_pending') "
+            "AND retirement.marker->'permanent'='true'::jsonb "
+            "AND retirement.marker->'cleanup_complete'='true'::jsonb)) "
+            "AND ($2::timestamptz IS NULL OR (thread.ended_at,thread.id)>($2,$3::uuid)) "
+            "ORDER BY thread.ended_at,thread.id LIMIT $1",
             max(1, min(int(limit), 250)),
             after[0] if after is not None else None,
             after[1] if after is not None else None,

@@ -1139,6 +1139,7 @@ async def end_thread_flow(
     include_officer_handoff: bool = False,
     expected_runtime_generation: str | None = None,
     expected_stateless_retirement_token: int | None = None,
+    expected_stateless_retirement_runtime: str | None = None,
     expected_agent_id: str | None = None,
     expected_attach_token: str | None = None,
     require_expected_agent_offline: bool = False,
@@ -1157,6 +1158,7 @@ async def end_thread_flow(
         include_officer_handoff=include_officer_handoff,
         expected_runtime_generation=expected_runtime_generation,
         expected_stateless_retirement_token=expected_stateless_retirement_token,
+        expected_stateless_retirement_runtime=expected_stateless_retirement_runtime,
         expected_agent_id=expected_agent_id,
         expected_attach_token=expected_attach_token,
         require_expected_agent_offline=require_expected_agent_offline,
@@ -1271,6 +1273,7 @@ async def _end_thread_flow_owned(
     include_officer_handoff: bool = False,
     expected_runtime_generation: str | None = None,
     expected_stateless_retirement_token: int | None = None,
+    expected_stateless_retirement_runtime: str | None = None,
     expected_agent_id: str | None = None,
     expected_attach_token: str | None = None,
     require_expected_agent_offline: bool = False,
@@ -2208,15 +2211,23 @@ async def _end_thread_flow_owned(
                 try:
                     from shared.session_retirement import (
                         stateless_retirement_authority,
+                        stateless_retirement_release_authorized,
                         stateless_settled_retirement_authority,
                     )
 
                     expected_marker = stateless_retirement_authority(
                         fresh_metadata
                     ) or stateless_settled_retirement_authority(fresh_metadata)
+                    if (
+                        expected_stateless_retirement_runtime is not None
+                        and "_stateless_workspace_retirement_pending" in fresh_metadata
+                    ):
+                        expected_marker = stateless_retirement_release_authorized(
+                            fresh_metadata
+                        )
                 except RuntimeError as exc:
                     raise HTTPException(
-                        409, "Initial retirement authority changed"
+                        409, "Stateless retirement authority changed"
                     ) from exc
                 if (
                     expected_marker is None
@@ -2226,9 +2237,26 @@ async def _end_thread_flow_owned(
                     or expected_marker["terminal_token"]
                     != expected_stateless_retirement_token
                     or expected_marker["permanent"] is not permanent
-                    or "initial_creation" not in expected_marker
+                    or (
+                        expected_stateless_retirement_runtime is None
+                        and "initial_creation" not in expected_marker
+                    )
+                    or (
+                        expected_stateless_retirement_runtime is not None
+                        and (
+                            "initial_creation" in expected_marker
+                            or expected_marker.get("runtime_incarnation")
+                            != expected_stateless_retirement_runtime
+                            or fresh_thread.get("status") != "ended"
+                            or fresh_authority.get("unit_kind") != "session_turn"
+                            or fresh_authority.get("queue_state") != "done"
+                            or fresh_authority.get("leased_by") is not None
+                            or fresh_authority.get("lease_token")
+                            != expected_stateless_retirement_token
+                        )
+                    )
                 ):
-                    raise HTTPException(409, "Initial retirement authority changed")
+                    raise HTTPException(409, "Stateless retirement authority changed")
             elif expected_runtime_generation is not None and (
                 str(fresh_thread.get("runtime_generation"))
                 != expected_runtime_generation

@@ -63,6 +63,10 @@ PINNED_RETIREMENT_PROVEN_RETRY_GRACE_SECONDS = max(
     0, int(os.environ.get("PINNED_RETIREMENT_PROVEN_RETRY_GRACE_SECONDS", "60"))
 )
 
+# This additional sweep may finish several acknowledged Ends, but never
+# monopolizes the detector while an external business effect remains held.
+STATELESS_END_SETTLEMENT_SWEEP_SECONDS = 5.0
+
 
 @dataclass(frozen=True, slots=True)
 class StaleAgentDetectorDependencies:
@@ -330,6 +334,63 @@ async def retry_initial_creation_retirement(
     return result.get("status") == ("deleted" if marker["permanent"] else "ended")
 
 
+async def retry_stateless_end_settlement(
+    candidate: Mapping[str, Any],
+    *,
+    dependencies: StaleAgentDetectorDependencies,
+) -> bool:
+    """Finish an acknowledged End through its normal exact-authority funnel."""
+    from shared.session_retirement import (
+        stateless_retirement_authority,
+        stateless_retirement_release_authorized,
+        stateless_settled_retirement_authority,
+    )
+
+    try:
+        marker = stateless_retirement_authority(candidate.get("metadata"))
+        if marker is not None:
+            marker = stateless_retirement_release_authorized(candidate.get("metadata"))
+        else:
+            marker = stateless_settled_retirement_authority(candidate.get("metadata"))
+            if marker is None or marker["permanent"] is not True:
+                return False
+    except RuntimeError:
+        return False
+    if (
+        "initial_creation" in marker
+        or not marker.get("runtime_incarnation")
+        or marker["terminal_token"] <= 0
+        or candidate.get("status") != "ended"
+        or candidate.get("execution_lane") != "stateless"
+    ):
+        return False
+    generation = str(candidate.get("runtime_generation") or "")
+    if not generation:
+        return False
+    thread_id = str(candidate.get("id") or "")
+    thread = await dependencies.store.get_thread(thread_id)
+    if thread is None:
+        return True
+    try:
+        result = await dependencies.thread_retirement_operations().end_thread_flow(
+            thread_id,
+            dict(thread),
+            permanent=marker["permanent"],
+            force=True,
+            expected_runtime_generation=generation,
+            expected_stateless_retirement_token=marker["terminal_token"],
+            expected_stateless_retirement_runtime=marker["runtime_incarnation"],
+        )
+    except HTTPException as exc:
+        if exc.status_code not in {409, 503}:
+            raise
+        logger.info(
+            "Stateless End settlement held for thread %s: %s", thread_id, exc.detail
+        )
+        return False
+    return result.get("status") == ("deleted" if marker["permanent"] else "ended")
+
+
 async def stale_agent_detector(
     shutdown_event: asyncio.Event, *, dependencies: StaleAgentDetectorDependencies
 ) -> None:
@@ -371,6 +432,8 @@ async def stale_agent_detector(
     # Restarting the detector safely resets this scheduling hint.
     initial_retirement_cursor: tuple[datetime, str] | None = None
     initial_retirement_batch_size = 25
+    stateless_settlement_cursor: tuple[datetime, str] | None = None
+    stateless_settlement_batch_size = 25
     pinned_retirement_cursor: tuple[datetime, str] | None = None
     vm_cleanup_resource_cursor: tuple[datetime, str] | None = None
     pinned_retirement_batch_size = 25
@@ -679,6 +742,40 @@ async def stale_agent_detector(
                 and len(initial_retirements) < initial_retirement_batch_size
             ):
                 initial_retirement_cursor = None
+
+            # A previously running stateless End may lose its request after
+            # shell/resident acknowledgements or after physical cleanup. The
+            # cleanup sweeper cannot perform its remaining business effects.
+            # Advance before replay, including on timeout, so a held oldest
+            # batch cannot starve later owners or unrelated detector steps.
+            try:
+                async with asyncio.timeout(STATELESS_END_SETTLEMENT_SWEEP_SECONDS):
+                    settlements = await _step(
+                        "pending_stateless_end_settlements",
+                        dependencies.store.list_retryable_stateless_end_settlements(
+                            limit=stateless_settlement_batch_size,
+                            after=stateless_settlement_cursor,
+                        ),
+                    )
+                    for candidate in settlements or []:
+                        if isinstance(candidate, Mapping):
+                            stateless_settlement_cursor = (
+                                candidate["ended_at"],
+                                str(candidate["id"]),
+                            )
+                            await _step(
+                                "retry_stateless_end_settlement",
+                                retry_stateless_end_settlement(
+                                    candidate, dependencies=dependencies
+                                ),
+                            )
+                    if (
+                        settlements is not None
+                        and len(settlements) < stateless_settlement_batch_size
+                    ):
+                        stateless_settlement_cursor = None
+            except TimeoutError:
+                logger.info("Stateless End settlement sweep deferred remaining work")
 
             # Static Docker containers survive owner termination.  Their
             # exact inventory lease plus the terminal job/thread row is the
