@@ -4094,6 +4094,7 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         tab.opener = null;
         tab.document.title = this.transloco.translate('jobs.lifecycle.wakingTab');
         tab.document.body.textContent = this.transloco.translate('jobs.lifecycle.wakingTab');
+        const applyLifecycle = this.chat.captureWorkspaceLifecycleUpdate(threadId);
         this.api.startThreadIdeSession(threadId).subscribe(result => {
             const leaseId = result?.access_lease_id;
             if (!result || !leaseId || result.status === 'unavailable') {
@@ -4119,9 +4120,7 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
                     return;
                 }
                 this.api.getThreadIdeStatus(threadId, leaseId).subscribe(status => {
-                    if (status?.workspace_lifecycle) {
-                        this.chat.workspaceLifecycle.set(status.workspace_lifecycle);
-                    }
+                    if (!applyLifecycle(status?.workspace_lifecycle)) return;
                     if (status?.status === 'active' && status.code_server_url) {
                         if (this.vmIdeOpenTimer) clearInterval(this.vmIdeOpenTimer);
                         this.vmIdeOpenTimer = null;
@@ -4253,9 +4252,10 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
 
     private fetchIdeStatus(threadId: string): void {
         this.idePollingAttempts++;
+        const applyLifecycle = this.chat.captureWorkspaceLifecycleUpdate(threadId);
         this.api.getThreadIdeStatus(threadId).subscribe(status => {
+            if (!applyLifecycle(status?.workspace_lifecycle)) return;
             this.ideStatus.set(status);
-            if (status?.workspace_lifecycle) this.chat.workspaceLifecycle.set(status.workspace_lifecycle);
             // Stop polling once active or after 30 attempts (5 min)
             if (status?.status === 'active' || this.idePollingAttempts >= 30) {
                 this.stopIdePolling();

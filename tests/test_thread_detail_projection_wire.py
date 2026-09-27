@@ -12,7 +12,10 @@ derived, and mounts projected.
 from __future__ import annotations
 
 import json
+from contextlib import asynccontextmanager
 from unittest.mock import AsyncMock
+
+import pytest
 
 from fastapi.testclient import TestClient
 
@@ -63,11 +66,14 @@ def _raw_row() -> dict:
     }
 
 
-def _client(store: _Store) -> TestClient:
+def _client(store: _Store, row: dict | None = None) -> TestClient:
     async def gate(request, gate_store, thread_id):
         del request
         assert gate_store is store and thread_id == THREAD_ID
-        return {"id": "owner-1", "is_admin": False}, _raw_row()
+        return {
+            "id": "owner-1",
+            "is_admin": False,
+        }, row if row is not None else _raw_row()
 
     app = mount_router(
         thread_session.router,
@@ -129,3 +135,37 @@ def test_detail_route_mints_a_missing_handle_and_projects_mounts() -> None:
             "backend_id": None,
         }
     ]
+
+
+@pytest.mark.parametrize("permanent", [False, True])
+@pytest.mark.parametrize("authorized", [False, True])
+def test_detail_preserves_raw_status_but_hides_ready_during_authorized_end(
+    permanent, authorized
+):
+    from .test_vm_idle_public import _thread_owner
+
+    row = {**_raw_row(), **_thread_owner(), "id": THREAD_ID, "ssh_handle": "s-owner"}
+    row.update(
+        runtime_retirement_token="retire",
+        runtime_retirement_authorized_at="2026-09-27T10:00:00Z" if authorized else None,
+        runtime_retirement_context={"settle_status": "ended"},
+        runtime_retirement_permanent=permanent,
+        workspace_idle_episode=None,
+    )
+
+    class Store(_Store):
+        @asynccontextmanager
+        async def acquire(self):
+            yield self
+
+        async def fetch(self, query, owner_kind, ids):
+            assert owner_kind == "thread" and [str(i) for i in ids] == [THREAD_ID]
+            return [row]
+
+    body = _client(Store(), row).get(f"/api/persistent/threads/{THREAD_ID}").json()
+    assert body["status"] == "active"
+    assert body["runtime_retirement_pending"] is authorized
+    assert body["retirement_disposition"] == ("ended" if authorized else None)
+    assert body["retirement_permanent"] is (authorized and permanent)
+    assert body["workspace_lifecycle"] == (None if authorized else {"state": "ready"})
+    assert "ended_at" not in body

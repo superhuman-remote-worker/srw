@@ -867,6 +867,10 @@ export class PersistentChatService {
       });
     });
     this.destroyRef.onDestroy(() => this._stopQueuePoll());
+    this.destroyRef.onDestroy(() => {
+      this.connectGeneration++;
+      this._stopSseWatchdog();
+    });
 
     // Invariant: "Stopping…" (isInterrupting) only makes sense while a turn
     // is actually streaming. Whenever streaming ends — turn completed, the
@@ -1205,6 +1209,25 @@ export class PersistentChatService {
       !this.retirementPermanent(),
   );
   readonly workspaceLifecycle = signal<WorkspaceLifecycleView | null>(null);
+
+  /** Bind an IDE response to this view, including same-thread Resume. A late
+   *  ready response cannot restore the idle view of a terminal retirement. */
+  captureWorkspaceLifecycleUpdate(
+    threadId: string,
+  ): (view: WorkspaceLifecycleView | null | undefined) => boolean {
+    const generation = this.connectGeneration;
+    return (view) => {
+      if (!this._isCurrentConnect(threadId, generation)) return false;
+      if (
+        this.threadStatus() === 'ended' ||
+        (this.threadStatus() === 'ending' && this.retirementDisposition() === 'ended')
+      ) {
+        return false;
+      }
+      if (view) this.workspaceLifecycle.set(view);
+      return true;
+    };
+  }
 
   // --- Session readiness (agent has finished init and is ready for messages) ---
   readonly sessionReady = signal(false);
@@ -2097,6 +2120,9 @@ export class PersistentChatService {
     }
     this.sessionRuntimeGeneration = null;
     this.sessionReady.set(false);
+    if (lifecycle === 'ended' || this.retirementDisposition() === 'ended') {
+      this.workspaceLifecycle.set(null);
+    }
     this.startupPhase.set(null);
     this.connectionState.set('disconnected');
     // Terminal observation is also a turn boundary. Preserve every buffered
@@ -2759,8 +2785,49 @@ export class PersistentChatService {
     }
   }
 
+  private threadMetaRequest: {
+    threadId: string;
+    generation: number;
+    lifecycleOnly: boolean;
+    promise: Promise<void>;
+  } | null = null;
+
+  /** Share an in-flight read within a view. An ambiguous End needs a fresh
+   *  read after any pre-End read finishes, never its earlier active snapshot. */
+  private async loadThreadMeta(
+    threadId: string,
+    generation = this.connectGeneration,
+    opts: { fresh?: boolean; lifecycleOnly?: boolean } = {},
+  ): Promise<void> {
+    if (!this._isCurrentThreadRequest(threadId, generation)) return;
+    const pending = this.threadMetaRequest;
+    if (pending?.threadId === threadId && pending.generation === generation) {
+      await pending.promise;
+      if (opts.fresh || (pending.lifecycleOnly && !opts.lifecycleOnly)) {
+        return this.loadThreadMeta(threadId, generation, { ...opts, fresh: false });
+      }
+      return;
+    }
+    const request = {
+      threadId,
+      generation,
+      lifecycleOnly: opts.lifecycleOnly === true,
+      promise: this._readThreadMeta(threadId, generation, opts.lifecycleOnly === true),
+    };
+    this.threadMetaRequest = request;
+    try {
+      await request.promise;
+    } finally {
+      if (this.threadMetaRequest === request) this.threadMetaRequest = null;
+    }
+  }
+
   /** Load thread metadata (title, model, turn count) from REST. */
-  private async loadThreadMeta(threadId: string, generation?: number): Promise<void> {
+  private async _readThreadMeta(
+    threadId: string,
+    generation: number,
+    lifecycleOnly: boolean,
+  ): Promise<void> {
     try {
       const thread = await firstValueFrom(
         this.http.get<any>(`${environment.apiUrl}/persistent/threads/${threadId}`),
@@ -2794,22 +2861,26 @@ export class PersistentChatService {
           return;
         }
       }
-      this.sessionTitle.set(thread.title || null);
-      const model = thread.metadata?.config_override?.llm?.model;
-      // `config_name` is an expert profile (normally `session_base`),
-      // not an LLM model.  Leave the display unknown until the resolved
-      // session-state snapshot supplies the effective model.
-      this.modelName.set(model || null);
-      const officer = thread.metadata?.config_override?.officer;
-      this.isOfficerThread.set(officer?.enabled === true || officer?.enabled === 'true');
-      const temperature = thread.metadata?.config_override?.llm?.temperature;
-      if (temperature != null) {
-        this.temperature.set(temperature);
+      // A periodic lifecycle read must not overwrite live model/turn state or
+      // fan out into review requests. Connect/recovery retain full hydration.
+      if (!lifecycleOnly) {
+        this.sessionTitle.set(thread.title || null);
+        const model = thread.metadata?.config_override?.llm?.model;
+        // `config_name` is an expert profile (normally `session_base`),
+        // not an LLM model.  Leave the display unknown until the resolved
+        // session-state snapshot supplies the effective model.
+        this.modelName.set(model || null);
+        const officer = thread.metadata?.config_override?.officer;
+        this.isOfficerThread.set(officer?.enabled === true || officer?.enabled === 'true');
+        const temperature = thread.metadata?.config_override?.llm?.temperature;
+        if (temperature != null) {
+          this.temperature.set(temperature);
+        }
+        this.turnCount.set(thread.total_turns || 0);
+        this.ncSessionFolder.set(thread.nc_session_folder || null);
+        this.cloudSessionUrl.set(thread.cloud_session_url || null);
+        this.sshHandle.set(thread.ssh_handle || null);
       }
-      this.turnCount.set(thread.total_turns || 0);
-      this.ncSessionFolder.set(thread.nc_session_folder || null);
-      this.cloudSessionUrl.set(thread.cloud_session_url || null);
-      this.sshHandle.set(thread.ssh_handle || null);
       this.threadStatus.set(effectiveStatus);
       this.endedAt.set(thread.ended_at || thread.last_activity || null);
       this.retirementDisposition.set(retirementDisposition);
@@ -2820,13 +2891,15 @@ export class PersistentChatService {
           : null,
       );
       this.workspaceLifecycle.set(thread.workspace_lifecycle ?? null);
-      this.threadMounts.set(Array.isArray(thread.mounts) ? thread.mounts : []);
-      this._protectedCloud.set(!!thread.metadata?.protected_cloud);
-      if (this._protectedCloud()) {
-        void this.refreshCloudDiffCount();
-        void this.resolveProtectedFolderLink();
-      } else {
-        this.protectedFolderLink.set(null);
+      if (!lifecycleOnly) {
+        this.threadMounts.set(Array.isArray(thread.mounts) ? thread.mounts : []);
+        this._protectedCloud.set(!!thread.metadata?.protected_cloud);
+        if (this._protectedCloud()) {
+          void this.refreshCloudDiffCount();
+          void this.resolveProtectedFolderLink();
+        } else {
+          this.protectedFolderLink.set(null);
+        }
       }
       if (retirementPending) {
         this._retireEndingControl(threadId, retirementDisposition);
@@ -3211,7 +3284,18 @@ export class PersistentChatService {
     if (this.agentLastEventAt <= 0) {
       this.agentLastEventAt = Date.now();
     }
+    const generation = this.connectGeneration;
     this.sseWatchdogTimer = setInterval(() => {
+      // End authorization has no journal frame. Reconcile a viewed live or
+      // ending thread on this existing 5 s clock, including a sibling tab's
+      // End. Settlement stops these reads while review SSE remains open.
+      if (
+        !this.intentionalClose &&
+        this._isCurrentConnect(threadId, generation) &&
+        this.threadStatus() !== 'ended' && this.threadStatus() !== 'suspended'
+      ) {
+        void this.loadThreadMeta(threadId, generation, { lifecycleOnly: true });
+      }
       // Piggyback the agent-quiet signal on this 5s tick (audit #8):
       // only meaningful while a turn is open — an idle agent being
       // quiet is expected.
@@ -4801,6 +4885,7 @@ export class PersistentChatService {
       this.disconnect();
       return 'done';
     }
+    const generation = this.connectGeneration;
     let outcome: unknown;
     try {
       const qs = force ? '?force=true' : '';
@@ -4810,6 +4895,7 @@ export class PersistentChatService {
         ),
       );
     } catch (err: unknown) {
+      if (!this._isCurrentConnect(threadId, generation)) throw err;
       if (this._isTurnInFlightEndError(err) && !force) {
         // Mid-turn guard (session_silent_failure_audit.md #11): the
         // orchestrator refuses to tear down a session whose agent is
@@ -4829,12 +4915,15 @@ export class PersistentChatService {
       if (this.executionLane() === 'stateless' && this._isRetryableEndFence(err)) {
         // The End may have begun durably (the row then projects a pending
         // retirement → `ending`) or not at all; the row says which.
-        await this.loadThreadMeta(threadId);
+        await this.loadThreadMeta(threadId, generation, { fresh: true });
         return 'retryable';
       }
+      // A pinned End can commit before its response is lost. Only a positive
+      // metadata observation retires controls; preserve the original failure.
+      await this.loadThreadMeta(threadId, generation, { fresh: true });
       throw err;
     }
-    if (this.threadId() !== threadId) return 'done';
+    if (!this._isCurrentConnect(threadId, generation)) return 'done';
     this.intentionalClose = false;
     const body = outcome as { status?: unknown; retirement_disposition?: unknown } | null;
     // The owner endpoint is asynchronous for a live pinned runtime: `ending`

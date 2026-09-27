@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
@@ -87,7 +88,9 @@ def test_owner_projection_covers_warm_release_wake_and_safe_holds():
     }
 
 
-@pytest.mark.parametrize("status", ["pending", "provisioning", "created", "ssh_pending"])
+@pytest.mark.parametrize(
+    "status", ["pending", "provisioning", "created", "ssh_pending"]
+)
 @pytest.mark.parametrize("owner_kind", ["job", "thread"])
 def test_initial_vm_provisioning_has_no_idle_lifecycle(status, owner_kind):
     row = _owner()
@@ -176,3 +179,90 @@ async def test_real_postgres_public_read_tracks_releasing_without_leaking_identi
     states = await read_vm_idle_states(db, owner_kind="job", owner_ids=[str(owner)])
     assert states[str(owner)] == {"state": "releasing"}
     assert identity["vm_uid"] not in str(states)
+
+
+def _thread_owner() -> dict:
+    row = _owner()
+    row.update(owner_kind="thread", status="active", execution_lane="pinned")
+    row["metadata"] = row.pop("context")
+    row["workspace_idle_episode"]["runtime_identity"]["owner_kind"] = "thread"
+    return row
+
+
+@pytest.mark.parametrize("permanent", [False, True])
+@pytest.mark.parametrize("phase", [None, "releasing", "suspended", "waking"])
+def test_authorized_terminal_retirement_hides_idle_projection(permanent, phase):
+    row = _thread_owner()
+    row.update(
+        runtime_retirement_token=str(uuid4()),
+        runtime_retirement_authorized_at=datetime.now(timezone.utc),
+        runtime_retirement_context=json.dumps({"settle_status": "ended"}),
+        runtime_retirement_permanent=permanent,
+        idle_phase=phase,
+    )
+    assert project_vm_idle_state(row) is None
+    assert row["status"] == "active"
+
+
+@pytest.mark.parametrize(
+    "retirement",
+    [
+        {
+            "runtime_retirement_token": "preflight",
+            "runtime_retirement_context": {"settle_status": "ended"},
+        },
+        {"runtime_retirement_token": None, "runtime_retirement_authorized_at": None},
+        {
+            "runtime_retirement_token": "suspend",
+            "runtime_retirement_authorized_at": "now",
+            "runtime_retirement_context": {"settle_status": "suspended"},
+        },
+    ],
+)
+@pytest.mark.parametrize("phase", ["releasing", "suspended", "waking", None])
+def test_preflight_aborted_and_suspended_retirement_preserve_idle(retirement, phase):
+    row = _thread_owner()
+    row.update(retirement, idle_phase=phase)
+    projected = project_vm_idle_state(row)
+    assert projected["state"] == (phase or "warm")
+
+
+def test_settled_thread_end_has_no_idle_projection():
+    row = _thread_owner()
+    row["status"] = "ended"
+    assert project_vm_idle_state(row) is None
+
+
+@pytest.mark.asyncio
+async def test_real_postgres_thread_read_hides_only_authorized_terminal_retirement(db):
+    row = _thread_owner()
+    await db.execute(
+        "INSERT INTO threads(id,status,execution_lane,metadata) VALUES($1,'active','pinned',$2::jsonb)",
+        row["id"],
+        json.dumps(row["metadata"]),
+    )
+
+    async def read():
+        return await read_vm_idle_states(
+            db, owner_kind="thread", owner_ids=[str(row["id"])]
+        )
+
+    assert (await read())[str(row["id"])] == {"state": "ready"}
+    await db.execute(
+        "UPDATE threads SET runtime_retirement_token=$2, "
+        "runtime_retirement_permanent=false,runtime_retirement_started_at=now(), "
+        "runtime_retirement_context=$3::jsonb WHERE id=$1",
+        row["id"],
+        uuid4(),
+        json.dumps({"settle_status": "ended"}),
+    )
+    assert (await read())[str(row["id"])] == {"state": "ready"}
+    await db.execute(
+        "UPDATE threads SET runtime_retirement_authorized_at=now() WHERE id=$1",
+        row["id"],
+    )
+    assert await read() == {}
+    assert (
+        await db.fetchval("SELECT status FROM threads WHERE id=$1", row["id"])
+        == "active"
+    )

@@ -45,6 +45,16 @@ def _object(value: Any) -> dict[str, Any]:
 def project_vm_idle_state(row: dict[str, Any]) -> dict[str, Any] | None:
     """Project one owner and its latest operation without private identity."""
     owner_kind = row["owner_kind"]
+    # Preflight is abortable and hidden; only authorized terminal retirement
+    # supersedes idle readiness. Suspended retirement keeps its idle view.
+    if (
+        owner_kind == "thread"
+        and row.get("runtime_retirement_token") is not None
+        and row.get("runtime_retirement_authorized_at") is not None
+        and _object(row.get("runtime_retirement_context")).get("settle_status")
+        == "ended"
+    ):
+        return None
     context = _object(row["context"] if owner_kind == "job" else row["metadata"])
     vm = _object(context.get("vm"))
     if not vm:
@@ -141,10 +151,16 @@ async def read_vm_idle_states(
     table, document = (
         ("jobs", "context") if owner_kind == "job" else ("threads", "metadata")
     )
+    retirement_fields = (
+        "owner.runtime_retirement_token,owner.runtime_retirement_authorized_at,"
+        "owner.runtime_retirement_context,"
+        if owner_kind == "thread"
+        else ""
+    )
     async with store.acquire() as conn:
         rows = await conn.fetch(
             f"SELECT owner.id,owner.status,owner.execution_lane,owner.{document},"
-            "owner.workspace_idle_episode,owner.workspace_idle_revision,"
+            f"{retirement_fields}owner.workspace_idle_episode,owner.workspace_idle_revision,"
             "op.phase AS idle_phase,op.episode_id AS idle_episode_id,"
             "op.reason AS idle_reason,op.retry_after AS idle_retry_after "
             f"FROM {table} owner LEFT JOIN LATERAL ("
