@@ -9,6 +9,7 @@ import {TranslocoService} from '@jsverse/transloco';
 import {of} from 'rxjs';
 import {beforeAll, describe, expect, it, vi} from 'vitest';
 import {environment} from '../../core/environment';
+import {WorkspaceLifecycleView} from '../../core/models/api.model';
 import {ApiService} from '../../core/services/api.service';
 import {CapabilitiesService} from '../../core/services/capabilities.service';
 import {PersistentChatService} from '../../core/services/persistent-chat.service';
@@ -33,6 +34,7 @@ class TestTranslocoPipe { transform(key: string): string { return key; } }
 // effects and capability service under test; unrelated child controls are shallow.
 function sessionState() {
   const state: Record<string, unknown> = {};
+  const workspaceLifecycle = signal<WorkspaceLifecycleView | null>(null);
   for (const key of ['isStartingSession', 'isDraftSession', 'isOfficerThread', 'isParked',
     'isResuming', 'isCreating', 'isAwaitingTurn', 'isStreaming', 'isInterrupting', 'isVmSession',
     'hasOlderTurns', 'cloudDiffPanelOpen', 'cloudSyncDegraded', 'protectedCloud',
@@ -43,14 +45,20 @@ function sessionState() {
     'outbox', 'outboxIds', 'draftDatasourceIds']) state[key] = signal([]);
   for (const key of ['compaction', 'rewindPrefill', 'rewindPreview', 'runningTool', 'pendingWorkspaceOffer',
     'currentUsage', 'queueState', 'verifiedProjectFolder', 'cloudSessionUrl', 'ncSessionFolder',
-    'cloudDiffProbe', 'cloudStagedAt', 'attachmentError', 'error', 'endedAt', 'draftDefaultsError',
-    'workspaceLifecycle']) state[key] = signal(null);
+    'cloudDiffProbe', 'cloudStagedAt', 'attachmentError', 'error', 'endedAt', 'draftDefaultsError']) state[key] = signal(null);
   return {...state, isConnected: signal(true), sessionReady: signal(true), threadId: signal('test-thread'),
     threadStatus: signal('active'), sessionTitle: signal('Test session'), connectionState: signal('connected'),
     modelName: signal('Test model'), permissionMode: signal('supervised'), narrationMode: signal('off'),
     startupPhase: signal('ready'), controlTransport: signal('websocket'), citationsByCid: signal(new Map()),
     awaitingElapsedMs: signal(0), reconnectAttempt: signal(0), agentSilenceSeconds: signal(0), cloudChangesCount: signal(0),
     sshHandle: signal('test-thread'), resetWindow: vi.fn(), refreshPendingRewindReceipt: vi.fn(),
+    workspaceLifecycle,
+    // These fixtures keep one current view; accept its IDE response and retain
+    // any lifecycle projection, including when the response omits that field.
+    captureWorkspaceLifecycleUpdate: (_threadId: string) => (view: WorkspaceLifecycleView | null | undefined) => {
+      if (view) workspaceLifecycle.set(view);
+      return true;
+    },
   };
 }
 
