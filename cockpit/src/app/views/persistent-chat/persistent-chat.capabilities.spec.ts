@@ -349,6 +349,79 @@ describe('header End on a pending stateless retirement', () => {
   });
 });
 
+describe('the slash menu completes the command word, never its argument', () => {
+  beforeAll(async () => {
+    HTMLElement.prototype.scrollTo = vi.fn();
+    await ɵresolveComponentResources(() => Promise.resolve(''));
+  });
+
+  const api = {
+    getThreadIdeStatus: () => of(null),
+    getMyCapabilities: () => of(null),
+    getSshHostKeys: () => of({hostname: 'ssh.example.test', host_keys: []}),
+  };
+
+  const enter = () => new KeyboardEvent('keydown', {key: 'Enter'});
+
+  it('closes once an argument starts, so Enter sends the whole command', async () => {
+    const chat = sessionState() as any;
+    chat.sendMessage = vi.fn(async () => true);
+    const fixture = await mountChat(chat, api, false);
+    try {
+      const view = fixture.componentInstance;
+      view.onInputChange('/comp');
+      expect(view.showSlashMenu()).toBe(true);
+
+      view.inputText = '/compact the pricing decisions';
+      view.onInputChange(view.inputText);
+      expect(view.showSlashMenu()).toBe(false);
+
+      view.onKeydown(enter());
+      expect(chat.sendMessage).toHaveBeenCalledWith('/compact the pricing decisions');
+    } finally {
+      fixture.destroy();
+      TestBed.resetTestingModule();
+    }
+  });
+
+  it('Enter on a command typed in full runs it instead of completing it again', async () => {
+    const chat = sessionState() as any;
+    chat.sendMessage = vi.fn(async () => true);
+    const fixture = await mountChat(chat, api, false);
+    try {
+      const view = fixture.componentInstance;
+      view.inputText = '/compact';
+      view.onInputChange(view.inputText);
+      expect(view.showSlashMenu()).toBe(true);
+
+      view.onKeydown(enter());
+      expect(view.showSlashMenu()).toBe(false);
+      expect(chat.sendMessage).toHaveBeenCalledWith('/compact');
+    } finally {
+      fixture.destroy();
+      TestBed.resetTestingModule();
+    }
+  });
+
+  it('Enter on a partial command still completes it', async () => {
+    const chat = sessionState() as any;
+    chat.sendMessage = vi.fn(async () => true);
+    const fixture = await mountChat(chat, api, false);
+    try {
+      const view = fixture.componentInstance;
+      view.inputText = '/comp';
+      view.onInputChange(view.inputText);
+
+      view.onKeydown(enter());
+      expect(view.inputText).toBe('/compact ');
+      expect(chat.sendMessage).not.toHaveBeenCalled();
+    } finally {
+      fixture.destroy();
+      TestBed.resetTestingModule();
+    }
+  });
+});
+
 describe('rewind affordances follow the declared controls', () => {
   beforeAll(async () => {
     HTMLElement.prototype.scrollTo = vi.fn();

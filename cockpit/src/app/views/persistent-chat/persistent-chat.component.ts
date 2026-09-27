@@ -3771,8 +3771,11 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     onInputChange(value: string): void {
         this.composerDraftRevision++;
         const trimmed = value.trimStart();
-        if (trimmed.startsWith('/')) {
-            const query = trimmed.split(/\s/)[0].toLowerCase();
+        // Offer completions only while the command word itself is being
+        // typed. Once an argument starts (`/compact the pricing`) the menu
+        // must close, or Enter "completes" the command and drops the argument.
+        if (trimmed.startsWith('/') && !/\s/.test(trimmed)) {
+            const query = trimmed.toLowerCase();
             this.slashQuery.set(query);
             this.showSlashMenu.set(this.filteredCommands().length > 0);
             this.slashSelectedIndex.set(0);
@@ -4044,12 +4047,22 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
                 return;
             }
             if (event.key === 'Tab' || (event.key === 'Enter' && !event.shiftKey)) {
-                event.preventDefault();
                 const selected = cmds[this.slashSelectedIndex()];
-                if (selected) {
-                    this.selectSlashCommand(selected);
+                // Enter on a command that is already typed in full runs it
+                // (falls through to the send below); otherwise complete it.
+                if (
+                    event.key === 'Enter' &&
+                    selected &&
+                    this.inputText.trim().toLowerCase() === selected.command
+                ) {
+                    this.showSlashMenu.set(false);
+                } else {
+                    event.preventDefault();
+                    if (selected) {
+                        this.selectSlashCommand(selected);
+                    }
+                    return;
                 }
-                return;
             }
             if (event.key === 'Escape') {
                 this.showSlashMenu.set(false);
