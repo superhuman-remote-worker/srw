@@ -86,7 +86,7 @@ def project_vm_idle_state(row: dict[str, Any]) -> dict[str, Any] | None:
     # Initial VM creation has no idle lifecycle yet. Reporting a hold here
     # would hide the IDE's restoring indicator behind a false idle warning.
     if (
-        vm.get("status") in {"pending", "provisioning"}
+        vm.get("status") in {"pending", "provisioning", "created", "ssh_pending"}
         and row.get("workspace_idle_episode") is None
         and row.get("workspace_idle_revision") == 0
         and phase is None
