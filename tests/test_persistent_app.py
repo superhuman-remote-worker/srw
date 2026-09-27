@@ -2380,6 +2380,55 @@ class TestAutoTitleAfterFirstTurn:
 
 class TestPollWorkspaceReady:
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("backend", ["vm", "sandbox"])
+    @pytest.mark.parametrize("identity", ["exact", "missing", "successor"])
+    async def test_ready_workspace_preserves_pinned_attach_authority(
+        self, monkeypatch, backend, identity
+    ):
+        """Polling must not discard the server contract before attach checks it."""
+        import agent.api.persistent_app as app
+
+        generation = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        monkeypatch.setattr(app, "_session_runtime_generation", generation)
+        monkeypatch.setattr(app, "_pinned_runtime_generation_enabled", True)
+        workspace = {
+            "workspace_provisioner": "k8s",
+            "pinned_status_identity_contract": 1,
+            "pinned_runtime_generation_contract": 1,
+            "session_runtime_generation": generation,
+        }
+        if backend == "vm":
+            workspace.update(vm_status="ready", vm_ssh_host="10.0.0.5")
+        else:
+            workspace.update(status="ready", pod_ip="10.0.0.5")
+        if identity == "missing":
+            workspace.pop("session_runtime_generation")
+        elif identity == "successor":
+            workspace["session_runtime_generation"] = (
+                "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+            )
+        client = AsyncMock()
+        client.get_thread_workspace.return_value = workspace
+
+        result = await app._poll_workspace_ready(
+            client, "tid", timeout=5, require_vm=backend == "vm"
+        )
+
+        if identity == "exact":
+            assert app._bind_attached_runtime_payload(
+                result, protected_required=False
+            ) == generation
+            assert app._pinned_status_identity_advertised(result)
+        else:
+            message = (
+                "contract omitted its generation"
+                if identity == "missing"
+                else "generation changed during attach"
+            )
+            with pytest.raises(app.WorkspaceNotReady, match=message):
+                app._bind_attached_runtime_payload(result, protected_required=False)
+
+    @pytest.mark.asyncio
     async def test_returns_none_when_workspace_not_found(self):
         """Returns None immediately when get_thread_workspace returns None."""
         client = AsyncMock()

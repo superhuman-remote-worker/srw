@@ -16955,6 +16955,15 @@ async def _poll_workspace_ready(
         if vm_status == "ready" and ws.get("vm_ssh_host"):
             return {
                 "backend": "vm",
+                # The attach verifier consumes the same server-issued runtime
+                # contract for both backends; normalization must preserve it.
+                "pinned_status_identity_contract": ws.get(
+                    "pinned_status_identity_contract"
+                ),
+                "pinned_runtime_generation_contract": ws.get(
+                    "pinned_runtime_generation_contract"
+                ),
+                "session_runtime_generation": ws.get("session_runtime_generation"),
                 # Server-derived provisioner authority must survive this
                 # normalization boundary. PersistentSession deliberately does
                 # not trust the provisioner from agent config.
