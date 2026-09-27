@@ -96,17 +96,20 @@ async def get_thread(
     store = dependencies.store
     user, thread = await dependencies.require_thread_owner(request, store, thread_id)
     result = redact_thread_metadata(dict(thread))
-    states = await read_vm_idle_states(
-        store, owner_kind="thread", owner_ids=[thread_id]
-    )
-    result["workspace_lifecycle"] = states.get(thread_id)
+    creations = {}
     if getattr(store, "supports_vm_creation_retry", False):
         from orchestrator.services.vm_creation_owner_view import thread_creation_views
 
-        result["vm_creation"] = (await thread_creation_views(
+        creations = await thread_creation_views(
             store, [thread_id], viewer_user_id=str(user["id"]),
             admin=user.get("is_admin") is True,
-        )).get(thread_id)
+        )
+        result["vm_creation"] = creations.get(thread_id)
+    states = await read_vm_idle_states(
+        store, owner_kind="thread", owner_ids=[thread_id],
+        current_thread_creations=creations,
+    )
+    result["workspace_lifecycle"] = states.get(thread_id)
     if not result.get("ssh_handle"):
         try:
             result["ssh_handle"] = await store.ensure_thread_ssh_handle(thread_id)

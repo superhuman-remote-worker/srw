@@ -239,15 +239,25 @@ async def get_thread_ide_status(
             gitea_url = f"{gitea_base}/{repo_path}"
 
     if _vm_thread(thread):
+        from orchestrator.services.vm_creation_owner_view import (
+            thread_creation_is_starting, thread_creation_views,
+        )
         from orchestrator.services.vm_idle_access import VMIdleAccessStore
         from orchestrator.services.vm_idle_lifecycle import VMIdleLifecycleStore
         from orchestrator.services.vm_idle_public import read_vm_idle_states
         from orchestrator.services.vm_ide_transport import VMIDEUnavailable, matches_admitted_runtime
 
+        creations = {}
+        if getattr(dependencies.store, "supports_vm_creation_retry", False):
+            creations = await thread_creation_views(
+                dependencies.store, [thread_id], viewer_user_id=str(user["id"]),
+                admin=user.get("is_admin") is True,
+            )
         states = await read_vm_idle_states(
             dependencies.store,
             owner_kind="thread",
             owner_ids=[thread_id],
+            current_thread_creations=creations,
         )
         lifecycle = {"workspace_lifecycle": states.get(thread_id)}
         active = await VMIdleLifecycleStore(dependencies.store).get_open_for_thread(
@@ -261,7 +271,9 @@ async def get_thread_ide_status(
                 "gitea_url": gitea_url,
             }
         vm = metadata.get("vm") or {}
-        if vm.get("status") in ("pending", "provisioning"):
+        if vm.get("status") in ("pending", "provisioning") or thread_creation_is_starting(
+            vm, creations.get(thread_id),
+        ):
             return {
                 **lifecycle,
                 "status": "restoring",

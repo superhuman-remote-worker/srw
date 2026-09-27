@@ -7,8 +7,28 @@ from uuid import UUID
 from orchestrator.services.vm_creation_progress import vm_creation_projection
 
 
+def thread_creation_is_starting(vm: dict, creation: dict | None) -> bool:
+    """Compose a current owner creation view with the same VM request.
+
+    This is presentation only. The caller supplies thread_creation_views output;
+    it does not prove readiness, grant access, or authorize a physical effect.
+    """
+    return bool(
+        creation
+        and vm.get("status") in {"pending", "provisioning", "created", "ssh_pending"}
+        and vm.get("creation_request_id")
+        and creation.get("request_id") == vm["creation_request_id"]
+        and creation.get("stage") in {"creation", "readiness"}
+        and creation.get("state") in {"queued", "resolving", "reconciling", "succeeded"}
+    )
+
+
 async def thread_creation_views(
-    db, thread_ids: list[str], *, viewer_user_id: str, admin: bool = False,
+    db,
+    thread_ids: list[str],
+    *,
+    viewer_user_id: str,
+    admin: bool = False,
 ) -> dict[str, dict]:
     """Read only exact authorized session sources, never installation capacity.
 
@@ -65,7 +85,9 @@ async def thread_creation_views(
                AND t.runtime_retirement_token IS NULL
                AND ($3::boolean OR t.user_id=$2::uuid)
             """,
-            ids, user, admin,
+            ids,
+            user,
+            admin,
         )
     result = {}
     for row in rows:

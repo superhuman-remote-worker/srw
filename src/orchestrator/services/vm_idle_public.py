@@ -11,6 +11,7 @@ from datetime import timedelta
 from typing import Any
 from uuid import UUID
 
+from orchestrator.services.vm_creation_owner_view import thread_creation_is_starting
 from shared.workspace_idle_policy import (
     DEFAULT_WARM_SECONDS,
     IdlePolicyError,
@@ -42,7 +43,11 @@ def _object(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
-def project_vm_idle_state(row: dict[str, Any]) -> dict[str, Any] | None:
+def project_vm_idle_state(
+    row: dict[str, Any],
+    *,
+    thread_creation: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
     """Project one owner and its latest operation without private identity."""
     owner_kind = row["owner_kind"]
     # Preflight is abortable and hidden; only authorized terminal retirement
@@ -103,6 +108,18 @@ def project_vm_idle_state(row: dict[str, Any]) -> dict[str, Any] | None:
     ):
         return None
 
+    # Ordinary Resume preserves the owner's idle revision. A matching current
+    # source can still be starting after an earlier episode ended; its creation
+    # view describes that progress without inventing an idle identity failure.
+    if (
+        owner_kind == "thread"
+        and row.get("runtime_retirement_token") is None
+        and row.get("workspace_idle_episode") is None
+        and phase is None
+        and thread_creation_is_starting(vm, thread_creation)
+    ):
+        return None
+
     if vm.get("status") != "ready":
         return {"state": "release_held", "reason_code": "identity_unverified"}
     if (
@@ -138,7 +155,11 @@ def project_vm_idle_state(row: dict[str, Any]) -> dict[str, Any] | None:
 
 
 async def read_vm_idle_states(
-    store: Any, *, owner_kind: str, owner_ids: list[str]
+    store: Any,
+    *,
+    owner_kind: str,
+    owner_ids: list[str],
+    current_thread_creations: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Read the latest owner state in one query after list/detail authorization."""
     if (
@@ -177,7 +198,10 @@ async def read_vm_idle_states(
         if "context" not in row and "metadata" not in row:
             # Narrow synthetic read stores may return rows for another query.
             continue
-        projected = project_vm_idle_state(row)
+        projected = project_vm_idle_state(
+            row,
+            thread_creation=(current_thread_creations or {}).get(str(row["id"])),
+        )
         if projected is not None:
             result[str(row["id"])] = projected
     return result

@@ -135,6 +135,78 @@ def test_nonready_vm_with_prior_idle_history_stays_held(status):
     }
 
 
+@pytest.mark.parametrize(
+    "status", ["pending", "provisioning", "created", "ssh_pending"]
+)
+@pytest.mark.parametrize("state", ["queued", "resolving", "reconciling", "succeeded"])
+def test_current_thread_creation_supersedes_only_empty_idle_history(status, state):
+    row = _thread_owner()
+    request_id = str(uuid4())
+    row.update(workspace_idle_episode=None, workspace_idle_revision=2, idle_phase=None)
+    row["metadata"]["vm"] = {"status": status, "creation_request_id": request_id}
+    creation = {
+        "request_id": request_id,
+        "state": state,
+        "stage": "readiness" if state == "succeeded" else "creation",
+    }
+    assert project_vm_idle_state(row, thread_creation=creation) is None
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "attention",
+        "cancel_requested",
+        "settled",
+        "wrong_request",
+        "missing_request",
+        "configuration",
+        "failed_vm",
+        "malformed_episode",
+        "idle_hold",
+        "job",
+        "retirement",
+    ],
+)
+def test_creation_progress_cannot_hide_other_idle_holds(fault):
+    row = _thread_owner()
+    request_id = str(uuid4())
+    row.update(workspace_idle_revision=2, idle_phase=None)
+    episode = row["workspace_idle_episode"]
+    row["workspace_idle_episode"] = None
+    row["metadata"]["vm"] = {"status": "ssh_pending", "creation_request_id": request_id}
+    creation = {"request_id": request_id, "state": "reconciling", "stage": "creation"}
+    if fault in {"attention", "cancel_requested", "settled"}:
+        creation["state"] = fault
+    elif fault == "wrong_request":
+        creation["request_id"] = str(uuid4())
+    elif fault == "missing_request":
+        del row["metadata"]["vm"]["creation_request_id"]
+        del creation["request_id"]
+    elif fault == "configuration":
+        creation["stage"] = "configuration"
+    elif fault == "failed_vm":
+        row["metadata"]["vm"]["status"] = "failed"
+    elif fault == "malformed_episode":
+        row["workspace_idle_episode"] = {}
+    elif fault == "idle_hold":
+        row.update(
+            workspace_idle_episode=episode,
+            idle_phase="wake_held",
+            idle_reason="resource_reservation_held",
+        )
+    elif fault == "job":
+        row.update(owner_kind="job", context=row.pop("metadata"))
+    elif fault == "retirement":
+        row["runtime_retirement_token"] = str(uuid4())
+    expected = (
+        {"state": "wake_held", "reason_code": "resource_reservation_held"}
+        if fault == "idle_hold"
+        else {"state": "release_held", "reason_code": "identity_unverified"}
+    )
+    assert project_vm_idle_state(row, thread_creation=creation) == expected
+
+
 @pytest.mark.parametrize("raw_episode", [{}, "{malformed json"])
 def test_nonready_vm_with_nonnull_idle_episode_stays_held(raw_episode):
     row = _owner()
