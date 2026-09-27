@@ -5503,7 +5503,6 @@ class TestTerminateSession:
         mod._loop_interrupt_flag = "hard"
         mod._loop_interrupt_target_turn_id = 4
         mod._hard_interrupt_event = _asyncio.Event()
-        mod._loop_last_user_content = ["something"]
         mod._tool_inflight = True
         mod._events_epoch = 7
         mod._next_seq = 42
@@ -5523,7 +5522,6 @@ class TestTerminateSession:
         assert mod._loop_interrupt_flag is None
         assert mod._loop_interrupt_target_turn_id is None
         assert mod._hard_interrupt_event is None
-        assert mod._loop_last_user_content == [""]
         assert mod._tool_inflight is False
         assert mod._events_epoch == 0
         assert mod._next_seq == 0

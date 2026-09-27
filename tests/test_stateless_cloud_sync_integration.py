@@ -102,7 +102,6 @@ def _restore_loop_primitives():
     names = (
         "_loop_user_queue",
         "_loop_interrupt_flag",
-        "_loop_last_user_content",
         "_hard_interrupt_event",
     )
     saved = {name: getattr(papp, name) for name in names}

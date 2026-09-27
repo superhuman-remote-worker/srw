@@ -174,7 +174,6 @@ def _wire_input_runtime(monkeypatch, tmp_path, db, *, turn_count: int = 5):
     monkeypatch.setattr(persistent_app, "_turn_event_open", False)
     monkeypatch.setattr(persistent_app, "_tool_inflight", False)
     monkeypatch.setattr(persistent_app, "_loop_user_queue", queue)
-    monkeypatch.setattr(persistent_app, "_loop_last_user_content", [""])
     monkeypatch.setattr(persistent_app, "_input_delivery_reclaim_lock", asyncio.Lock())
     monkeypatch.setattr(persistent_app, "_thread_id", str(uuid4()))
     monkeypatch.setenv("POD_UID", "pod-uid-test")

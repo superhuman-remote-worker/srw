@@ -1079,7 +1079,6 @@ class TestAgentRestInputEndpointsNoSession:
         mod._session = MagicMock()
         mod._session.protected_cloud_required = False
         mod._loop_user_queue = _asyncio.Queue()
-        mod._loop_last_user_content = [""]
         mod._retirement_admission_identity = None
         mod._termination_admission_fenced = False
 
@@ -1160,7 +1159,6 @@ class TestAgentRestInputEndpointsNoSession:
         mod._thread_id = "thread-rest"
         mod._loop_task = None
         mod._loop_user_queue = asyncio.Queue()
-        mod._loop_last_user_content = [""]
         mod._hard_interrupt_event = asyncio.Event()
         mod._input_runtime_generation = str(uuid4())
         mod._session_runtime_attach_token = str(uuid4())

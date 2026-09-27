@@ -630,7 +630,6 @@ _loop_interrupt_target_turn_id: Optional[int] = None
 # network read. Created in _attach_session, set in the interrupt handlers
 # when no tool is in flight, cleared whenever the flag is consumed.
 _hard_interrupt_event: Optional[asyncio.Event] = None
-_loop_last_user_content: List[str] = [""]
 
 # Serializes rewinds: two concurrent rewind frames on one session would race
 # the sweep/truncate pair. Second caller gets an error, not a queue.
@@ -3583,7 +3582,6 @@ async def _cleanup_failed_event_journal_attach(
     global _turn_tool_execution_identity, _turn_tool_execution_external_hook
     global _loop_user_queue, _loop_interrupt_flag, _loop_interrupt_target_turn_id
     global _hard_interrupt_event
-    global _loop_last_user_content
     global _input_runtime_generation
     global _runtime_authorization_admission_open
     global _pinned_status_identity_enabled
@@ -3749,7 +3747,6 @@ async def _cleanup_failed_event_journal_attach(
     _loop_interrupt_flag = None
     _loop_interrupt_target_turn_id = None
     _hard_interrupt_event = None
-    _loop_last_user_content = [""]
     _input_runtime_generation = None
     _runtime_authorization_admission_open = False
     _pinned_status_identity_enabled = False
@@ -5023,7 +5020,6 @@ async def _attach_session_inner(
     # the loop can keep reading input / responding to interrupts across
     # transport churn. Cleared in _terminate_session.
     global _loop_user_queue, _loop_interrupt_flag, _loop_interrupt_target_turn_id
-    global _loop_last_user_content
     global _hard_interrupt_event, _input_runtime_generation
     global _input_delivery_reclaim_lock
     # Keep readiness closed until durable child recovery has completely
@@ -5033,7 +5029,6 @@ async def _attach_session_inner(
     _loop_interrupt_flag = None
     _loop_interrupt_target_turn_id = None
     _hard_interrupt_event = asyncio.Event()
-    _loop_last_user_content = [""]
     _input_runtime_generation = str(uuid4())
     _input_delivery_reclaim_lock = asyncio.Lock()
     _queued_input_claims.clear()
@@ -5503,7 +5498,6 @@ async def _terminate_session_inner(
     """Body of _terminate_session — only reached holding the _terminating guard."""
     global _session, _thread_id, _sessions_served, _loop_task
     global _loop_user_queue, _loop_interrupt_flag, _loop_interrupt_target_turn_id
-    global _loop_last_user_content
     global _hard_interrupt_event
     global _events_epoch, _next_seq, _tool_inflight, _turn_event_open
     global _turn_tool_execution_identity, _turn_tool_execution_external_hook
@@ -5816,7 +5810,6 @@ async def _terminate_session_inner(
     _loop_interrupt_flag = None
     _loop_interrupt_target_turn_id = None
     _hard_interrupt_event = None
-    _loop_last_user_content = [""]
     _input_runtime_generation = None
     _runtime_authorization_admission_open = False
     _pinned_status_identity_enabled = False
@@ -6972,8 +6965,6 @@ async def _accept_user_input(
 
     parsed_delivery_id = UUID(str(delivery_id)) if delivery_id else uuid4()
     injected = role != "human"
-    if not injected:
-        _loop_last_user_content[0] = content
 
     if _session is None or _session.postgres_conn is None or _thread_id is None:
         raise DurableInputUnavailable
@@ -9982,7 +9973,7 @@ async def _current_canvas_for_control() -> dict[str, Any] | None:
 # These used to be closures inside ws_chat. They've been hoisted so the loop
 # can outlive any single WebSocket connection: callbacks reference module
 # globals (_session, _loop_user_queue, _loop_interrupt_flag,
-# _loop_last_user_content, _orchestrator_client, _thread_id) and emit via
+# _orchestrator_client, _thread_id) and emit via
 # _broadcast() rather than writing to one ws.
 # ---------------------------------------------------------------------------
 
@@ -13915,7 +13906,6 @@ async def _handle_rewind(ws: WebSocket, data: Dict[str, Any]) -> None:
                             not _session.messages and result["surviving_turn"] > 0
                         )
                 _session.turn_count = result["surviving_turn"]
-                _loop_last_user_content[0] = ""
 
                 # 6b. Narrow resweep: step 2's interrupt-wait can run for up
                 #     to 60s, long enough for the very turn being interrupted
