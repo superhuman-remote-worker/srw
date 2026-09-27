@@ -11115,6 +11115,226 @@ describe('PersistentChatService — queue state (parked / poll / retry)', () => 
   });
 });
 
+describe('PersistentChatComponent — pending VM IDE ownership', () => {
+  let originalEs: any;
+  let originalWs: any;
+  let ctx: ReturnType<typeof createService>;
+  let host: any;
+  let tab: any;
+  let post: Subject<any>;
+  let poll: Subject<any>;
+  const threadId = 'watched';
+  const leaseId = '11111111-1111-4111-8111-111111111111';
+  const readyUrl = `https://example.test/api/ide/${threadId}/proxy/_vm/${leaseId}/`;
+
+  beforeEach(async () => {
+    originalEs = globalThis.EventSource;
+    originalWs = globalThis.WebSocket;
+    vi.useFakeTimers();
+    ctx = createService();
+    ctx.mockHttp.get.mockImplementation(activeSessionGet);
+    await ctx.service.connect(threadId);
+    post = new Subject<any>();
+    poll = new Subject<any>();
+    tab = {
+      closed: false, opener: {}, document: {title: '', body: {textContent: ''}},
+      location: {href: ''}, close: vi.fn(() => { tab.closed = true; }),
+    };
+    vi.spyOn(window, 'open').mockReturnValue(tab);
+    // Execute the real component open, polling and destroy methods over the
+    // real service generation guard. Replace only HTTP/popup boundaries and
+    // initialize the fields normally supplied by the component constructor.
+    host = Object.assign(Object.create(PersistentChatComponent.prototype), {
+      chat: ctx.service,
+      api: {
+        startThreadIdeSession: vi.fn(() => post),
+        getThreadIdeStatus: vi.fn(() => poll),
+        closeThreadIdeLease: vi.fn(() => of(void 0)),
+      },
+      toast: {warning: vi.fn()}, transloco: {translate: (key: string) => key},
+      idePollingTimer: null, pendingVmIdeOpen: null, vmIdeOpenDestroyed: false, startupTickInterval: null,
+      compactionTimer: null, capabilitiesSub: null, recordingStateSub: null,
+      isRecording: signal(false),
+    });
+  });
+
+  afterEach(() => {
+    post.complete();
+    poll.complete();
+    host.ngOnDestroy();
+    ctx.service.disconnect();
+    TestBed.resetTestingModule();
+    vi.clearAllTimers();
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+    globalThis.EventSource = originalEs;
+    globalThis.WebSocket = originalWs;
+  });
+
+  function pending() {
+    host.openVmCodeServer();
+    post.next({status: 'restoring', access_lease_id: leaseId});
+    post.complete();
+  }
+
+  it('closes the exact pending lease when navigating away destroys the component', () => {
+    pending();
+    host.ngOnDestroy();
+    expect(host.api.closeThreadIdeLease).toHaveBeenCalledExactlyOnceWith(threadId, leaseId);
+    expect(tab.closed).toBe(true);
+  });
+
+  it.each(['restoring', 'active'])('closes a late %s POST lease after destruction without reviving the popup', async status => {
+    host.openVmCodeServer();
+    host.ngOnDestroy();
+    post.next({status, access_lease_id: leaseId, code_server_url: status === 'active' ? readyUrl : null});
+    post.complete();
+    await vi.advanceTimersByTimeAsync(3000);
+    expect.soft(host.api.closeThreadIdeLease).toHaveBeenCalledExactlyOnceWith(threadId, leaseId);
+    expect.soft(host.api.getThreadIdeStatus).not.toHaveBeenCalled();
+    expect.soft(tab.location.href).toBe('');
+    expect.soft(tab.closed).toBe(true);
+  });
+
+  it('discards a Ready poll already in flight when the component is destroyed', async () => {
+    pending();
+    await vi.advanceTimersByTimeAsync(3000);
+    expect(host.api.getThreadIdeStatus).toHaveBeenCalledWith(threadId, leaseId);
+    host.ngOnDestroy();
+    poll.next({status: 'active', access_lease_id: leaseId, code_server_url: readyUrl});
+    expect.soft(tab.location.href).toBe('');
+    expect.soft(host.api.closeThreadIdeLease).toHaveBeenCalledExactlyOnceWith(threadId, leaseId);
+  });
+
+  it('closes the original pending lease after a thread switch without touching its successor', async () => {
+    pending();
+    await ctx.service.connect('successor');
+    await vi.advanceTimersByTimeAsync(3000);
+    poll.next({status: 'active', access_lease_id: leaseId, code_server_url: readyUrl});
+    expect(tab.location.href).toBe('');
+    expect(host.api.closeThreadIdeLease).toHaveBeenCalledExactlyOnceWith(threadId, leaseId);
+  });
+
+  it('closes a late active POST lease after a thread switch without opening the old workspace', async () => {
+    host.openVmCodeServer();
+    await ctx.service.connect('successor');
+    post.next({status: 'active', access_lease_id: leaseId, code_server_url: readyUrl});
+    expect.soft(tab.location.href).toBe('');
+    expect.soft(host.api.closeThreadIdeLease).toHaveBeenCalledExactlyOnceWith(threadId, leaseId);
+  });
+
+  it.each(['post', 'poll'])('preserves the lease of an IDE popup already Ready through %s when navigating away', async readyVia => {
+    if (readyVia === 'post') {
+      host.openVmCodeServer();
+      post.next({status: 'active', access_lease_id: leaseId, code_server_url: readyUrl});
+    } else {
+      pending();
+      await vi.advanceTimersByTimeAsync(3000);
+      poll.next({status: 'active', access_lease_id: leaseId, code_server_url: readyUrl});
+    }
+    expect(tab.location.href).toBe(readyUrl);
+    host.ngOnDestroy();
+    expect(host.api.closeThreadIdeLease).not.toHaveBeenCalled();
+    expect(tab.closed).toBe(false);
+  });
+
+  it('already closes only the captured pending lease when the popup is closed', async () => {
+    pending();
+    tab.closed = true;
+    await vi.advanceTimersByTimeAsync(3000);
+    expect(host.api.closeThreadIdeLease).toHaveBeenCalledExactlyOnceWith(threadId, leaseId);
+  });
+
+  it('closes a known lease only once across popup close and repeated destruction', async () => {
+    pending();
+    tab.closed = true;
+    await vi.advanceTimersByTimeAsync(3000);
+    host.ngOnDestroy();
+    host.ngOnDestroy();
+    expect(host.api.closeThreadIdeLease).toHaveBeenCalledExactlyOnceWith(threadId, leaseId);
+  });
+
+  it('closes a late lease only once after repeated destruction', () => {
+    host.openVmCodeServer();
+    host.ngOnDestroy();
+    host.ngOnDestroy();
+    post.next({status: 'restoring', access_lease_id: leaseId});
+    host.ngOnDestroy();
+    expect(host.api.closeThreadIdeLease).toHaveBeenCalledExactlyOnceWith(threadId, leaseId);
+    expect(tab.close).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['restoring', 'active'])('keeps a replacement open independent of the prior late %s POST', async status => {
+    host.openVmCodeServer();
+    const replacementPost = new Subject<any>();
+    const replacementTab: any = {
+      closed: false, opener: {}, document: {title: '', body: {textContent: ''}},
+      location: {href: ''}, close: vi.fn(() => { replacementTab.closed = true; }),
+    };
+    const replacementLease = '22222222-2222-4222-8222-222222222222';
+    vi.mocked(window.open).mockReturnValue(replacementTab);
+    host.api.startThreadIdeSession.mockReturnValue(replacementPost);
+    host.openVmCodeServer();
+    replacementPost.next({status: 'restoring', access_lease_id: replacementLease});
+    replacementPost.complete();
+    post.next({status, access_lease_id: leaseId, code_server_url: readyUrl});
+    post.complete();
+
+    expect.soft(host.api.closeThreadIdeLease).toHaveBeenCalledExactlyOnceWith(threadId, leaseId);
+    expect.soft(tab.closed).toBe(true);
+    expect.soft(tab.location.href).toBe('');
+    await vi.advanceTimersByTimeAsync(3000);
+    expect(host.api.getThreadIdeStatus).toHaveBeenCalledExactlyOnceWith(threadId, replacementLease);
+    const replacementUrl = readyUrl.replace(leaseId, replacementLease);
+    poll.next({status: 'active', access_lease_id: replacementLease, code_server_url: replacementUrl});
+    expect(replacementTab.location.href).toBe(replacementUrl);
+    host.ngOnDestroy();
+    expect(replacementTab.closed).toBe(false);
+    expect(host.api.closeThreadIdeLease).toHaveBeenCalledExactlyOnceWith(threadId, leaseId);
+  });
+
+  it.each(['active', 'unavailable'])('ignores a replaced attempt’s late %s GET without affecting its replacement', async status => {
+    pending();
+    await vi.advanceTimersByTimeAsync(3000);
+    const replacementPost = new Subject<any>();
+    const replacementPoll = new Subject<any>();
+    const replacementLease = '22222222-2222-4222-8222-222222222222';
+    const replacementTab: any = {
+      closed: false, opener: {}, document: {title: '', body: {textContent: ''}},
+      location: {href: ''}, close: vi.fn(() => { replacementTab.closed = true; }),
+    };
+    vi.mocked(window.open).mockReturnValue(replacementTab);
+    host.api.startThreadIdeSession.mockReturnValue(replacementPost);
+    host.api.getThreadIdeStatus.mockReturnValue(replacementPoll);
+    host.openVmCodeServer();
+    replacementPost.next({status: 'restoring', access_lease_id: replacementLease});
+    replacementPost.complete();
+    poll.next({status, code_server_url: readyUrl, workspace_lifecycle: {state: 'ready'}});
+    poll.complete();
+    expect.soft(tab.closed).toBe(true);
+    expect.soft(tab.location.href).toBe('');
+    expect.soft(ctx.service.workspaceLifecycle()).not.toEqual({state: 'ready'});
+    expect.soft(host.api.closeThreadIdeLease).toHaveBeenCalledExactlyOnceWith(threadId, leaseId);
+    await vi.advanceTimersByTimeAsync(3000);
+    expect(host.api.getThreadIdeStatus).toHaveBeenLastCalledWith(threadId, replacementLease);
+    const replacementUrl = readyUrl.replace(leaseId, replacementLease);
+    replacementPoll.next({status: 'active', code_server_url: replacementUrl});
+    replacementPoll.complete();
+    expect(replacementTab.location.href).toBe(replacementUrl);
+    host.ngOnDestroy();
+    expect(replacementTab.closed).toBe(false);
+    expect(host.api.closeThreadIdeLease).toHaveBeenCalledExactlyOnceWith(threadId, leaseId);
+  });
+
+  it('already closes the pending lease at the existing five-minute polling timeout', async () => {
+    pending();
+    await vi.advanceTimersByTimeAsync(303_000);
+    expect(host.api.closeThreadIdeLease).toHaveBeenCalledExactlyOnceWith(threadId, leaseId);
+    expect(tab.closed).toBe(true);
+    expect(host.toast.warning).toHaveBeenCalledWith('jobs.lifecycle.wakeTimedOut');
+  });
+});
+
 describe('PersistentChatService — pending End visibility reconciliation', () => {
   async function flushMicrotasks() {
     for (let i = 0; i < 20; i++) await Promise.resolve();

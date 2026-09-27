@@ -110,6 +110,16 @@ interface Suggestion {
     de: string;
 }
 
+interface PendingVmIdeOpen {
+    threadId: string;
+    tab: Window;
+    leaseId: string | null;
+    timer: ReturnType<typeof setInterval> | null;
+    state: 'pending' | 'abandoned' | 'handedOff';
+    leaseCloseRequested: boolean;
+    applyLifecycle: ReturnType<PersistentChatService['captureWorkspaceLifecycleUpdate']>;
+}
+
 const SLASH_COMMANDS: SlashCommand[] = [
     {command: '/compact', descriptionKey: 'chat.slash.compact'},
     {command: '/done', descriptionKey: 'chat.slash.done'},
@@ -2898,7 +2908,8 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     readonly ideStatus = signal<IdeSessionStatus | null>(null);
     readonly lifecycleReasonKey = workspaceLifecycleReasonKey;
     private idePollingTimer: ReturnType<typeof setInterval> | null = null;
-    private vmIdeOpenTimer: ReturnType<typeof setInterval> | null = null;
+    private pendingVmIdeOpen: PendingVmIdeOpen | null = null;
+    private vmIdeOpenDestroyed = false;
     private idePollingAttempts = 0;
 
     private autoScroll = true;
@@ -2911,6 +2922,9 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         effect(() => {
             const connected = this.chat.isConnected();
             const threadId = this.chat.threadId();
+            if (this.pendingVmIdeOpen && this.pendingVmIdeOpen.threadId !== threadId) {
+                this.abandonVmIdeOpen(this.pendingVmIdeOpen);
+            }
             if (connected && threadId) {
                 this.startIdePolling(threadId);
             } else {
@@ -3343,7 +3357,8 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     ngOnDestroy(): void {
         // Don't disconnect — keep session alive across navigation
         this.stopIdePolling();
-        if (this.vmIdeOpenTimer) clearInterval(this.vmIdeOpenTimer);
+        this.vmIdeOpenDestroyed = true;
+        if (this.pendingVmIdeOpen) this.abandonVmIdeOpen(this.pendingVmIdeOpen);
         if (this.startupTickInterval) {
             clearInterval(this.startupTickInterval);
             this.startupTickInterval = null;
@@ -4085,7 +4100,7 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
 
     openVmCodeServer(): void {
         const threadId = this.chat.threadId();
-        if (!threadId) return;
+        if (!threadId || this.vmIdeOpenDestroyed) return;
         const tab = window.open('', '_blank');
         if (!tab) {
             this.toast.warning(this.transloco.translate('jobs.lifecycle.popupBlocked'));
@@ -4094,47 +4109,87 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
         tab.opener = null;
         tab.document.title = this.transloco.translate('jobs.lifecycle.wakingTab');
         tab.document.body.textContent = this.transloco.translate('jobs.lifecycle.wakingTab');
-        const applyLifecycle = this.chat.captureWorkspaceLifecycleUpdate(threadId);
+        if (this.pendingVmIdeOpen) this.abandonVmIdeOpen(this.pendingVmIdeOpen);
+        const attempt: PendingVmIdeOpen = {
+            threadId, tab, leaseId: null, timer: null, state: 'pending',
+            leaseCloseRequested: false,
+            applyLifecycle: this.chat.captureWorkspaceLifecycleUpdate(threadId),
+        };
+        this.pendingVmIdeOpen = attempt;
+        // Keep the response callback after abandonment: the server may already
+        // have admitted a lease whose exact ID we still need to close.
         this.api.startThreadIdeSession(threadId).subscribe(result => {
             const leaseId = result?.access_lease_id;
+            attempt.leaseId = leaseId ?? null;
+            if (!this.isCurrentVmIdeOpen(attempt, result)) {
+                this.abandonVmIdeOpen(attempt);
+                return;
+            }
             if (!result || !leaseId || result.status === 'unavailable') {
-                tab.close();
+                this.abandonVmIdeOpen(attempt);
                 this.toast.warning(this.transloco.translate('jobs.lifecycle.ideUnavailable'));
                 return;
             }
             if (result.status === 'active' && result.code_server_url) {
-                tab.location.href = result.code_server_url;
+                this.handOffVmIdeOpen(attempt, result.code_server_url);
                 return;
             }
-            if (this.vmIdeOpenTimer) clearInterval(this.vmIdeOpenTimer);
             let attempts = 0;
-            this.vmIdeOpenTimer = setInterval(() => {
-                if (tab.closed || ++attempts > 100) {
-                    if (this.vmIdeOpenTimer) clearInterval(this.vmIdeOpenTimer);
-                    this.vmIdeOpenTimer = null;
-                    if (!tab.closed) {
-                        tab.close();
-                        this.toast.warning(this.transloco.translate('jobs.lifecycle.wakeTimedOut'));
-                    }
-                    this.api.closeThreadIdeLease(threadId, leaseId).subscribe();
+            attempt.timer = setInterval(() => {
+                if (!this.isCurrentVmIdeOpen(attempt)) {
+                    this.abandonVmIdeOpen(attempt);
+                    return;
+                }
+                if (++attempts > 100) {
+                    this.abandonVmIdeOpen(attempt);
+                    this.toast.warning(this.transloco.translate('jobs.lifecycle.wakeTimedOut'));
                     return;
                 }
                 this.api.getThreadIdeStatus(threadId, leaseId).subscribe(status => {
-                    if (!applyLifecycle(status?.workspace_lifecycle)) return;
+                    if (!this.isCurrentVmIdeOpen(attempt, status)) {
+                        this.abandonVmIdeOpen(attempt);
+                        return;
+                    }
                     if (status?.status === 'active' && status.code_server_url) {
-                        if (this.vmIdeOpenTimer) clearInterval(this.vmIdeOpenTimer);
-                        this.vmIdeOpenTimer = null;
-                        tab.location.href = status.code_server_url;
+                        this.handOffVmIdeOpen(attempt, status.code_server_url);
                     } else if (!status || status.status === 'unavailable' || status.status === 'failed') {
-                        if (this.vmIdeOpenTimer) clearInterval(this.vmIdeOpenTimer);
-                        this.vmIdeOpenTimer = null;
-                        tab.close();
-                        this.api.closeThreadIdeLease(threadId, leaseId).subscribe();
+                        this.abandonVmIdeOpen(attempt);
                         this.toast.warning(this.transloco.translate('jobs.lifecycle.ideUnavailable'));
                     }
                 });
             }, 3000);
         });
+    }
+
+    private isCurrentVmIdeOpen(attempt: PendingVmIdeOpen, status?: IdeSessionStatus | null): boolean {
+        return attempt.state === 'pending' && !this.vmIdeOpenDestroyed
+            && this.pendingVmIdeOpen === attempt && !attempt.tab.closed
+            && attempt.applyLifecycle(status?.workspace_lifecycle);
+    }
+
+    private abandonVmIdeOpen(attempt: PendingVmIdeOpen): void {
+        if (attempt.state === 'handedOff') return;
+        if (attempt.state === 'pending') {
+            attempt.state = 'abandoned';
+            if (!attempt.tab.closed) attempt.tab.close();
+        }
+        if (attempt.timer) clearInterval(attempt.timer);
+        attempt.timer = null;
+        if (this.pendingVmIdeOpen === attempt) this.pendingVmIdeOpen = null;
+        if (attempt.leaseId && !attempt.leaseCloseRequested) {
+            attempt.leaseCloseRequested = true;
+            this.api.closeThreadIdeLease(attempt.threadId, attempt.leaseId).subscribe();
+        }
+    }
+
+    private handOffVmIdeOpen(attempt: PendingVmIdeOpen, url: string): void {
+        attempt.state = 'handedOff';
+        if (attempt.timer) clearInterval(attempt.timer);
+        attempt.timer = null;
+        this.pendingVmIdeOpen = null;
+        // The Ready popup now owns its transport and lease independently of
+        // the Session view. Navigation must not revoke that active IDE tab.
+        attempt.tab.location.href = url;
     }
 
     /**

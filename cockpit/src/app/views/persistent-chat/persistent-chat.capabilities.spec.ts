@@ -6,7 +6,7 @@ import {FormsModule} from '@angular/forms';
 import {By} from '@angular/platform-browser';
 import {Router} from '@angular/router';
 import {TranslocoService} from '@jsverse/transloco';
-import {of} from 'rxjs';
+import {of, Subject} from 'rxjs';
 import {beforeAll, describe, expect, it, vi} from 'vitest';
 import {environment} from '../../core/environment';
 import {WorkspaceLifecycleView} from '../../core/models/api.model';
@@ -87,6 +87,14 @@ async function mountChat(chat: ReturnType<typeof sessionState>, api: Record<stri
     schemas: [CUSTOM_ELEMENTS_SCHEMA],
   }});
   const fixture = TestBed.createComponent(PersistentChatComponent);
+  // JIT does not populate signal view queries. Resolve the actual rendered
+  // elements so after-render observers also work when a test switches threads.
+  for (const [query, selector] of [
+    ['messagesInner', '.messages-inner'], ['chatHeaderEl', '.chat-header'],
+    ['headerActionsEl', '.header-right'],
+  ]) Object.defineProperty(fixture.componentInstance, query, {
+    value: () => ({nativeElement: fixture.nativeElement.querySelector(selector)}),
+  });
   fixture.detectChanges();
   await fixture.whenStable();
   fixture.detectChanges();
@@ -139,6 +147,45 @@ describe('single-origin session capabilities', () => {
     } finally {
       TestBed.resetTestingModule();
       environment.externalClientsEnabled = previous;
+    }
+  });
+});
+
+describe('pending VM IDE ownership on the mounted component', () => {
+  beforeAll(async () => {
+    HTMLElement.prototype.scrollTo = vi.fn();
+    await ɵresolveComponentResources(() => Promise.resolve(''));
+  });
+
+  it('abandons the original pending lease immediately when the mounted view switches threads', async () => {
+    const chat = sessionState();
+    const admission = new Subject<any>();
+    const api = {
+      getThreadIdeStatus: () => of(null), getMyCapabilities: () => of(null),
+      getSshHostKeys: () => of({hostname: 'ssh.example.test', host_keys: []}),
+      startThreadIdeSession: () => admission,
+      closeThreadIdeLease: vi.fn(() => of(void 0)),
+    };
+    const tab: any = {
+      closed: false, opener: {}, document: {title: '', body: {textContent: ''}},
+      location: {href: ''}, close: vi.fn(() => { tab.closed = true; }),
+    };
+    const open = vi.spyOn(window, 'open').mockReturnValue(tab);
+    const fixture = await mountChat(chat, api, false);
+    try {
+      fixture.componentInstance.openVmCodeServer();
+      admission.next({status: 'restoring', access_lease_id: 'original-lease'});
+      admission.complete();
+      chat.threadId.set('successor');
+      fixture.detectChanges();
+      await fixture.whenStable();
+      expect(api.closeThreadIdeLease).toHaveBeenCalledExactlyOnceWith('test-thread', 'original-lease');
+      expect(tab.closed).toBe(true);
+    } finally {
+      admission.complete();
+      fixture.destroy();
+      TestBed.resetTestingModule();
+      open.mockRestore();
     }
   });
 });
