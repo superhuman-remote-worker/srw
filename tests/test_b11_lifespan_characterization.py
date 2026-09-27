@@ -448,6 +448,13 @@ def _lifespan_environment(
         return real_register(value)
 
     monkeypatch.setattr(model_registry, "register_catalog_lookup", _register)
+    # Task bodies are recorded rather than run in this characterization. Give
+    # the bridge a fresh, already-installed fake listener for startup's gate.
+    from orchestrator.services import notification_feed as notification_feed_module
+
+    fake_feed = notification_feed_module.NotificationFeedService()
+    fake_feed.lifecycle_bridge_ready.set()
+    monkeypatch.setattr(notification_feed_module, "notification_feed", fake_feed)
     monkeypatch.setattr(asyncio, "create_task", recorder.create_task)
     try:
         yield SimpleNamespace(
@@ -475,6 +482,7 @@ class _NoCapabilities:
 # (label, leader-gated, task name) in creation order.
 DEFAULT_CREATION = [
     ("run_as_leader", False, None),
+    ("NotificationFeedService.run_lifecycle_bridge", False, None),
     ("run_datasource_project_reconciler", False, None),
     ("stale_agent_detector", True, None),
     ("cleanup_expired_tokens", False, None),
@@ -569,6 +577,7 @@ DEFAULT_SHUTDOWN = [
     "workspace_metering_loop",
     "llm_usage_poll_loop",
     "usage_rollup_loop",
+    "NotificationFeedService.run_lifecycle_bridge",
 ]
 
 # Closure after every task is awaited, in order.

@@ -160,6 +160,8 @@ async def notification_sse_events(
             while True:
                 try:
                     event = await asyncio.wait_for(queue.get(), timeout=30)
+                    if event is None:
+                        break  # bridge lost its LISTEN authority; EventSource reconnects
                     yield f"data: {json.dumps(event)}\n\n"
                 except asyncio.TimeoutError:
                     yield ": keepalive\n\n"

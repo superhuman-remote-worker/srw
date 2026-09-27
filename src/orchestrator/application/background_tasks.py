@@ -141,6 +141,7 @@ BACKGROUND_TASK_SHUTDOWN_ORDER: tuple[str, ...] = (
     "infrastructure_usage_rollup",
     "infrastructure_metering_runtime",
     "audit_maintenance",
+    "session_lifecycle_bridge",
 )
 
 
@@ -212,6 +213,18 @@ async def start_background_tasks(
             on_acquired=metering_generation_callback,
         ),
     )
+    # Every HTTP replica must hear the owner-scoped lifecycle hint, regardless
+    # of which replica accepted Resume. Do not serve requests until this
+    # replica's dedicated PostgreSQL LISTEN connection is installed.
+    from orchestrator.services.notification_feed import notification_feed
+
+    tasks.start(
+        "session_lifecycle_bridge",
+        notification_feed.run_lifecycle_bridge(
+            resources.postgres_db, resources.shutdown_event
+        ),
+    )
+    await asyncio.wait_for(notification_feed.lifecycle_bridge_ready.wait(), timeout=10)
 
     async def _inventory_generation_coro(stop: asyncio.Event) -> None:
         generation = get_leader_generation()

@@ -32,16 +32,11 @@ logger = logging.getLogger(__name__)
 
 
 def emit(user_id: str, thread_id: str, state: str, **extra: Any) -> None:
-    """Broadcast a ``session.lifecycle`` event to the user's SSE feed.
+    """Broadcast locally and queue a generation-scoped cross-replica hint.
 
-    Safe to call from any async context — ``notification_feed.broadcast``
-    is non-blocking and silently drops events when no subscriber exists.
+    This remains synchronous and non-blocking for the startup callers.
     """
-    notification_feed.broadcast(
-        user_id,
-        "session.lifecycle",
-        {"thread_id": thread_id, "state": state, **extra},
-    )
+    notification_feed.publish_lifecycle(user_id, thread_id, state, **extra)
 
 
 async def wait_for_binding(thread_id: str, timeout_s: int, *, store: Any) -> bool:
