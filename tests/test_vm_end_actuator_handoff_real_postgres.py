@@ -42,7 +42,9 @@ async def _schema_applied(pg_dsn):
     if migration.exists():
         conn = await asyncpg.connect(pg_dsn)
         try:
-            if not await conn.fetchval("SELECT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid='threads'::regclass AND attname='runtime_retirement_actuator_request')"):
+            if not await conn.fetchval(
+                "SELECT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid='threads'::regclass AND attname='runtime_retirement_actuator_request')"
+            ):
                 await conn.execute(migration.read_text())
         finally:
             await conn.close()
@@ -53,57 +55,92 @@ async def db(_base_db):
     yield _base_db
 
 
-async def scenario(db, monkeypatch, *, permanent=False):
-    ids = await fixtures._seed(db, protected_agent_pod=True, workspace_claim=False)
+async def scenario(
+    db, monkeypatch, *, permanent=False, legacy_vm_incarnation=False, vm_updates=None
+):
+    pod_uid = str(uuid4())
+    ids = await fixtures._seed(
+        db, protected_agent_pod=True, workspace_claim=False, pod_uid=pod_uid
+    )
     ids["process_generation"] = str(uuid4())
-    ids["pod_uid"] = "old-pod"
+    ids["pod_uid"] = pod_uid
     vm_generation, vm_uid, disk_uid = (str(uuid4()) for _ in range(3))
+    launcher_uid, vmi_uid = str(uuid4()), str(uuid4())
     thread = await db.get_thread(ids["thread"])
     ids["generation"] = str(thread["runtime_generation"])
     vm = {
-        "status": "ready", "provision_generation": vm_generation,
+        "status": "ready",
+        "provision_generation": vm_generation,
         "identity_provision_generation": vm_generation,
-        "identity_authenticated": True, "vm_uid": vm_uid,
-        "_runtime_incarnation": vm_uid, "rootdisk_pvc_uid": disk_uid,
-        "ssh_host": "192.0.2.10", "ssh_port": 22,
+        "identity_authenticated": True,
+        "vm_uid": vm_uid,
+        "_runtime_incarnation": vm_uid,
+        "rootdisk_pvc_uid": disk_uid,
+        "active_pod_uid": launcher_uid,
+        "vmi_uid": vmi_uid,
+        "ssh_host": "192.0.2.10",
+        "ssh_port": 22,
     }
+    vm.update(vm_updates or {})
     metadata = fixtures._json(thread["metadata"])
     metadata["config_override"]["workspace"]["backend"] = "vm"
     metadata["config_override"]["officer"]["enabled"] = False
     metadata["vm"] = vm
-    await db.execute("UPDATE threads SET metadata=$2::jsonb WHERE id=$1::uuid",
-                     ids["thread"], json.dumps(metadata))
+    await db.execute(
+        "UPDATE threads SET metadata=$2::jsonb WHERE id=$1::uuid",
+        ids["thread"],
+        json.dumps(metadata),
+    )
     await db.execute(
         "UPDATE agents SET metadata=jsonb_build_object('dispatch_process_generation',$2::text) "
-        "WHERE id=$1::uuid", ids["agent"], ids["process_generation"],
+        "WHERE id=$1::uuid",
+        ids["agent"],
+        ids["process_generation"],
     )
-    retirement = await db.begin_pinned_thread_retirement(ids["thread"], permanent=permanent)
+    retirement = await db.begin_pinned_thread_retirement(
+        ids["thread"], permanent=permanent
+    )
     assert await db.authorize_pinned_thread_retirement(
-        ids["thread"], token=retirement["token"], generation=retirement["generation"],
+        ids["thread"],
+        token=retirement["token"],
+        generation=retirement["generation"],
         settle_status="ended",
     )
     request = {
-        "agent_id": ids["agent"], "pod_uid": ids["pod_uid"],
+        "agent_id": ids["agent"],
+        "pod_uid": ids["pod_uid"],
         "process_generation": ids["process_generation"],
         "runtime_generation": ids["generation"],
         "runtime_attach_token": ids["attach_token"],
         "retirement_token": retirement["token"],
-        "disposition": "ended", "permanent": permanent,
+        "disposition": "ended",
+        "permanent": permanent,
         "workspace_generation": vm_generation,
-        "workspace_runtime_incarnation": vm_uid,
+        "workspace_runtime_incarnation": vm_uid
+        if legacy_vm_incarnation
+        else launcher_uid,
     }
     events = []
     k8s = fixtures.StatefulPinnedK8sApi()
     pod_name = f"persistent-{ids['thread'][:12]}"
     k8s.install_old_pod(
-        namespace="agents-a", name=pod_name, uid=ids["pod_uid"],
-        labels={"srw/component": "persistent-agent", "srw/thread-id": ids["thread"],
-                "srw.io/runtime-generation": ids["generation"],
-                "srw.io/provision-attempt": ids["provision_attempt"]},
+        namespace="agents-a",
+        name=pod_name,
+        uid=ids["pod_uid"],
+        labels={
+            "srw/component": "persistent-agent",
+            "srw/thread-id": ids["thread"],
+            "srw.io/runtime-generation": ids["generation"],
+            "srw.io/provision-attempt": ids["provision_attempt"],
+        },
     )
     pod = k8s.pods[("agents-a", pod_name)]
-    pod.spec = NS(containers=[NS(name="agent")], init_containers=[],
-                  ephemeral_containers=[], volumes=[])
+    pod.spec = NS(
+        containers=[NS(name="agent")],
+        init_containers=[],
+        ephemeral_containers=[],
+        volumes=[],
+    )
     # The external Kubernetes boundary acknowledges terminal status only
     # after the native exact-UID delete. Finalizer removal then proves absence.
     native_delete = k8s.delete_namespaced_pod
@@ -124,10 +161,16 @@ async def scenario(db, monkeypatch, *, permanent=False):
     core, networking = MagicMock(), MagicMock()
     core.read_namespaced_service.side_effect = fixtures._K8sError(404)
     networking.read_namespaced_ingress.side_effect = fixtures._K8sError(404)
-    monkeypatch.setattr(main.app.state.resources, "session_router", SessionRouterService(
-        namespace="agents-a", ingress_host="unused.example", core_api=core,
-        networking_api=networking,
-    ))
+    monkeypatch.setattr(
+        main.app.state.resources,
+        "session_router",
+        SessionRouterService(
+            namespace="agents-a",
+            ingress_host="unused.example",
+            core_api=core,
+            networking_api=networking,
+        ),
+    )
 
     async def release_vm(thread_id, identity, **kwargs):
         assert ("agents-a", pod_name) not in k8s.pods
@@ -138,16 +181,23 @@ async def scenario(db, monkeypatch, *, permanent=False):
         assert current["status"] == "active"
         assert current["runtime_retirement_authorized_at"] is not None
         assert str(current["runtime_retirement_token"]) == retirement["token"]
-        assert identity.vm_uid == vm_uid and identity.provision_generation == vm_generation
+        assert (
+            identity.vm_uid == vm_uid and identity.provision_generation == vm_generation
+        )
         assert identity.rootdisk_pvc_uid == disk_uid
         assert kwargs["purge_disk"] is permanent
         events.append("vm-stop")
         assert await db.record_managed_repository_workspace_process_zero(
-            thread_id, owner_kind="thread", scope="vm", provisioner="vm",
+            thread_id,
+            owner_kind="thread",
+            scope="vm",
+            provisioner="vm",
             runtime_incarnation=vm_generation,
         )
         assert await db.merge_thread_vm_context_if_provision_generation(
-            thread_id, vm_generation, {"status": "deleted"},
+            thread_id,
+            vm_generation,
+            {"status": "deleted"},
         )
         return VMTeardownResult("completed", True)
 
@@ -158,12 +208,21 @@ async def scenario(db, monkeypatch, *, permanent=False):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("permanent", [False, True])
-async def test_live_actor_handoff_nominates_and_stops_exact_runtime(db, monkeypatch, permanent):
-    ids, retirement, request, events, _, _ = await scenario(db, monkeypatch, permanent=permanent)
+async def test_live_actor_handoff_nominates_and_stops_exact_runtime(
+    db, monkeypatch, permanent
+):
+    ids, retirement, request, events, _, _ = await scenario(
+        db, monkeypatch, permanent=permanent
+    )
     assert await db.list_retryable_pinned_retirements() == []
-    accepted = await db.request_pinned_thread_retirement_actuator(ids["thread"], **request)
+    accepted = await db.request_pinned_thread_retirement_actuator(
+        ids["thread"], **request
+    )
     assert accepted["status"] == "actuator_requested"
-    assert await db.request_pinned_thread_retirement_actuator(ids["thread"], **request) == accepted
+    assert (
+        await db.request_pinned_thread_retirement_actuator(ids["thread"], **request)
+        == accepted
+    )
     candidates = await db.list_retryable_pinned_retirements()
     assert len(candidates) == 1 and candidates[0]["nominated_before_grace"]
     assert candidates[0]["agent_status"] == "session"
@@ -176,51 +235,88 @@ async def test_live_actor_handoff_nominates_and_stops_exact_runtime(db, monkeypa
         return result
 
     monkeypatch.setattr(db, "gc_offline_agents", finish_pass)
-    await asyncio.wait_for(detector.stale_agent_detector(
-        stopped, dependencies=composition.stale_agent_detector_dependencies(main.app.state.resources),
-    ), timeout=15)
+    await asyncio.wait_for(
+        detector.stale_agent_detector(
+            stopped,
+            dependencies=composition.stale_agent_detector_dependencies(
+                main.app.state.resources
+            ),
+        ),
+        timeout=15,
+    )
     assert events == ["pod-stop", "vm-stop"]
 
     current = await db.get_thread(ids["thread"])
     assert current is None if permanent else current["status"] == "ended"
     assert await db.list_retryable_pinned_retirements() == []
-    outcome = await db.request_pinned_thread_retirement_actuator(ids["thread"], **request)
+    outcome = await db.request_pinned_thread_retirement_actuator(
+        ids["thread"], **request
+    )
     assert outcome["status"] == "settled_or_superseded"
     assert events == ["pod-stop", "vm-stop"]
 
 
 @pytest.mark.asyncio
-async def test_old_request_and_candidate_cannot_nominate_a_resumed_successor(db, monkeypatch):
+async def test_old_request_and_candidate_cannot_nominate_a_resumed_successor(
+    db, monkeypatch
+):
     from tests.test_pinned_vm_initial_binding_real_postgres import _bind_protected_agent
 
     ids, _, request, events, k8s, _ = await scenario(db, monkeypatch)
     assert await db.request_pinned_thread_retirement_actuator(ids["thread"], **request)
     candidate = (await db.list_retryable_pinned_retirements())[0]
-    dependencies = composition.stale_agent_detector_dependencies(main.app.state.resources)
-    assert await detector.retry_pending_pinned_retirement(candidate, dependencies=dependencies)
+    dependencies = composition.stale_agent_detector_dependencies(
+        main.app.state.resources
+    )
+    assert await detector.retry_pending_pinned_retirement(
+        candidate, dependencies=dependencies
+    )
     assert await db.resume_thread(ids["thread"])
     successor = await _bind_protected_agent(db, ids["thread"])
     assert str(successor["runtime_generation"]) != request["runtime_generation"]
     before = dict(successor)
-    outcome = await db.request_pinned_thread_retirement_actuator(ids["thread"], **request)
+    outcome = await db.request_pinned_thread_retirement_actuator(
+        ids["thread"], **request
+    )
     assert outcome["status"] == "settled_or_superseded"
-    assert not await detector.retry_pending_pinned_retirement(candidate, dependencies=dependencies)
+    assert not await detector.retry_pending_pinned_retirement(
+        candidate, dependencies=dependencies
+    )
     assert dict(await db.get_thread(ids["thread"])) == before
     assert await db.list_retryable_pinned_retirements() == []
     assert events == ["pod-stop", "vm-stop"]
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("field", [
-    "agent_id", "pod_uid", "process_generation", "runtime_generation",
-    "runtime_attach_token", "retirement_token", "disposition", "permanent",
-    "workspace_generation", "workspace_runtime_incarnation",
-])
+@pytest.mark.parametrize(
+    "field",
+    [
+        "agent_id",
+        "pod_uid",
+        "process_generation",
+        "runtime_generation",
+        "runtime_attach_token",
+        "retirement_token",
+        "disposition",
+        "permanent",
+        "workspace_generation",
+        "workspace_runtime_incarnation",
+    ],
+)
 async def test_mismatched_request_never_nominates_or_mutates(db, monkeypatch, field):
     ids, _, request, events, _, _ = await scenario(db, monkeypatch)
     changed = dict(request)
-    changed[field] = True if field == "permanent" else "suspended" if field == "disposition" else str(uuid4())
-    assert await db.request_pinned_thread_retirement_actuator(ids["thread"], **changed) is None
+    changed[field] = (
+        True
+        if field == "permanent"
+        else "suspended"
+        if field == "disposition"
+        else str(uuid4())
+    )
+    assert (
+        await db.request_pinned_thread_retirement_actuator(ids["thread"], **changed)
+        is None
+    )
     assert await db.list_retryable_pinned_retirements() == []
     current = await db.get_thread(ids["thread"])
     assert current["runtime_retirement_actuator_request"] is None
@@ -229,32 +325,84 @@ async def test_mismatched_request_never_nominates_or_mutates(db, monkeypatch, fi
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("incarnation", ["vm_uid", "vmi_uid"])
+async def test_new_marker_requires_launcher_not_another_vm_identity(
+    db, monkeypatch, incarnation
+):
+    ids, retirement, request, events, _, _ = await scenario(db, monkeypatch)
+    request["workspace_runtime_incarnation"] = retirement["context"]["vm"][incarnation]
+    assert (
+        await db.request_pinned_thread_retirement_actuator(ids["thread"], **request)
+        is None
+    )
+    assert await db.list_retryable_pinned_retirements() == []
+    assert events == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("launcher", [None, "", "not-a-uid", "A" * 36])
+@pytest.mark.parametrize("legacy_vm_incarnation", [False, True])
+async def test_missing_or_malformed_captured_launcher_cannot_admit_new_marker(
+    db, monkeypatch, launcher, legacy_vm_incarnation
+):
+    ids, _, request, events, _, _ = await scenario(
+        db,
+        monkeypatch,
+        legacy_vm_incarnation=legacy_vm_incarnation,
+        vm_updates={"active_pod_uid": launcher},
+    )
+    assert (
+        await db.request_pinned_thread_retirement_actuator(ids["thread"], **request)
+        is None
+    )
+    assert await db.list_retryable_pinned_retirements() == []
+    assert events == []
+
+
+@pytest.mark.asyncio
 async def test_marker_is_independently_guarded_and_not_a_zero_receipt(db, monkeypatch):
     ids, _, request, events, _, _ = await scenario(db, monkeypatch)
-    marker = {"kind": "vm_local_drain_complete_v1", "thread_id": ids["thread"], **request}
+    marker = {
+        "kind": "vm_local_drain_complete_v1",
+        "thread_id": ids["thread"],
+        **request,
+    }
     malformed = {**marker, "process_generation": "another-process"}
     with pytest.raises(asyncpg.CheckViolationError):
-        await db.execute("UPDATE threads SET runtime_retirement_actuator_request=$2::jsonb WHERE id=$1::uuid",
-                         ids["thread"], json.dumps(malformed))
+        await db.execute(
+            "UPDATE threads SET runtime_retirement_actuator_request=$2::jsonb WHERE id=$1::uuid",
+            ids["thread"],
+            json.dumps(malformed),
+        )
     assert await db.request_pinned_thread_retirement_actuator(ids["thread"], **request)
     for replacement in (None, malformed):
         with pytest.raises(asyncpg.CheckViolationError):
-            await db.execute("UPDATE threads SET runtime_retirement_actuator_request=$2::jsonb WHERE id=$1::uuid",
-                             ids["thread"], json.dumps(replacement) if replacement else None)
+            await db.execute(
+                "UPDATE threads SET runtime_retirement_actuator_request=$2::jsonb WHERE id=$1::uuid",
+                ids["thread"],
+                json.dumps(replacement) if replacement else None,
+            )
     with pytest.raises(asyncpg.CheckViolationError):
-        await db.execute("UPDATE threads SET runtime_retirement_permanent=true WHERE id=$1::uuid", ids["thread"])
+        await db.execute(
+            "UPDATE threads SET runtime_retirement_permanent=true WHERE id=$1::uuid",
+            ids["thread"],
+        )
     current = await db.get_thread(ids["thread"])
     assert current["runtime_retirement_stage_receipt"] is None
     assert current["runtime_retirement_local_quiescence"] is None
     assert not await db.settle_pinned_thread_retirement(
-        ids["thread"], token=request["retirement_token"], generation=request["runtime_generation"],
+        ids["thread"],
+        token=request["retirement_token"],
+        generation=request["runtime_generation"],
     )
     assert events == []
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("boundary", ["pod", "vm"])
-async def test_unknown_stop_preserves_pending_marker_and_retries_after_restart(db, monkeypatch, boundary):
+async def test_unknown_stop_preserves_pending_marker_and_retries_after_restart(
+    db, monkeypatch, boundary
+):
     ids, _, request, events, k8s, provider = await scenario(db, monkeypatch)
     assert await db.request_pinned_thread_retirement_actuator(ids["thread"], **request)
     if boundary == "pod":
@@ -273,14 +421,20 @@ async def test_unknown_stop_preserves_pending_marker_and_retries_after_restart(d
         provider.release_vm_captured = unknown
     candidate = (await db.list_retryable_pinned_retirements())[0]
     assert not await detector.retry_pending_pinned_retirement(
-        candidate, dependencies=composition.stale_agent_detector_dependencies(main.app.state.resources),
+        candidate,
+        dependencies=composition.stale_agent_detector_dependencies(
+            main.app.state.resources
+        ),
     )
     current = await db.get_thread(ids["thread"])
     assert current["runtime_retirement_actuator_request"] is not None
     assert current["runtime_retirement_local_quiescence"] is None
     assert current["runtime_retirement_stage_receipt"] is None
     assert current["runtime_retirement_external_cleanup"] is None
-    assert not await db.fetchval("SELECT 1 FROM thread_runtime_retirement_outcomes WHERE thread_id=$1::uuid", ids["thread"])
+    assert not await db.fetchval(
+        "SELECT 1 FROM thread_runtime_retirement_outcomes WHERE thread_id=$1::uuid",
+        ids["thread"],
+    )
     if boundary == "pod":
         k8s.delete_namespaced_pod = original
     else:
@@ -288,21 +442,32 @@ async def test_unknown_stop_preserves_pending_marker_and_retries_after_restart(d
     # Recompose all retirement operations: only durable work survives.
     candidate = (await db.list_retryable_pinned_retirements())[0]
     assert await detector.retry_pending_pinned_retirement(
-        candidate, dependencies=composition.stale_agent_detector_dependencies(main.app.state.resources),
+        candidate,
+        dependencies=composition.stale_agent_detector_dependencies(
+            main.app.state.resources
+        ),
     )
     assert events.count("vm-stop") == 1
 
 
 @pytest.mark.asyncio
-async def test_stale_candidate_refuses_before_pod_stop_after_process_changes(db, monkeypatch):
+async def test_stale_candidate_refuses_before_pod_stop_after_process_changes(
+    db, monkeypatch
+):
     ids, _, request, events, _, _ = await scenario(db, monkeypatch)
     assert await db.request_pinned_thread_retirement_actuator(ids["thread"], **request)
     candidate = (await db.list_retryable_pinned_retirements())[0]
-    await db.execute("UPDATE agents SET metadata=jsonb_set(metadata,'{dispatch_process_generation}',to_jsonb($2::text)) WHERE id=$1::uuid",
-                     ids["agent"], str(uuid4()))
+    await db.execute(
+        "UPDATE agents SET metadata=jsonb_set(metadata,'{dispatch_process_generation}',to_jsonb($2::text)) WHERE id=$1::uuid",
+        ids["agent"],
+        str(uuid4()),
+    )
     assert await db.list_retryable_pinned_retirements() == []
     assert not await detector.retry_pending_pinned_retirement(
-        candidate, dependencies=composition.stale_agent_detector_dependencies(main.app.state.resources),
+        candidate,
+        dependencies=composition.stale_agent_detector_dependencies(
+            main.app.state.resources
+        ),
     )
     assert events == []
 
@@ -312,24 +477,37 @@ async def test_internal_http_client_reconciles_lost_handoff_response(db, monkeyp
     ids, _, request, events, _, _ = await scenario(db, monkeypatch)
     api = FastAPI()
     api.include_router(router)
-    api.state.agent_thread_status_dependencies_factory = lambda: NS(db=db, require_internal=access.require_internal)
+    api.state.agent_thread_status_dependencies_factory = lambda: NS(
+        db=db, require_internal=access.require_internal
+    )
     monkeypatch.setattr(access, "_INTERNAL_KEY", "handoff-test-key")
     transport = httpx.ASGITransport(app=api)
-    client = OrchestratorClient(orchestrator_url="http://test", pod_ip="192.0.2.1",
-                                pod_port=8001, hostname="test", config_name="creator", pid=123)
+    client = OrchestratorClient(
+        orchestrator_url="http://test",
+        pod_ip="192.0.2.1",
+        pod_port=8001,
+        hostname="test",
+        config_name="creator",
+        pid=123,
+    )
     kwargs = {
-        "pinned_agent_id": request["agent_id"], "pod_uid": request["pod_uid"],
+        "pinned_agent_id": request["agent_id"],
+        "pod_uid": request["pod_uid"],
         "process_generation": request["process_generation"],
         "session_runtime_generation": request["runtime_generation"],
         "session_runtime_attach_token": request["runtime_attach_token"],
         "session_runtime_retirement_token": request["retirement_token"],
-        "retirement_disposition": "ended", "retirement_permanent": False,
+        "retirement_disposition": "ended",
+        "retirement_permanent": False,
         "workspace_generation": request["workspace_generation"],
         "workspace_runtime_incarnation": request["workspace_runtime_incarnation"],
     }
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as http:
         client._client = http
-        assert await client.request_thread_retirement_actuator(ids["thread"], **kwargs) is None
+        assert (
+            await client.request_thread_retirement_actuator(ids["thread"], **kwargs)
+            is None
+        )
         assert await db.list_retryable_pinned_retirements() == []
         http.headers["X-Internal-Key"] = "handoff-test-key"
         post = http.post
@@ -345,28 +523,45 @@ async def test_internal_http_client_reconciles_lost_handoff_response(db, monkeyp
             return result
 
         monkeypatch.setattr(http, "post", lose_once)
-        assert await client.request_thread_retirement_actuator(ids["thread"], **kwargs) is None
+        assert (
+            await client.request_thread_retirement_actuator(ids["thread"], **kwargs)
+            is None
+        )
         assert len(await db.list_retryable_pinned_retirements()) == 1
-        accepted = await client.request_thread_retirement_actuator(ids["thread"], **kwargs)
+        accepted = await client.request_thread_retirement_actuator(
+            ids["thread"], **kwargs
+        )
         assert accepted["status"] == "actuator_requested"
         assert events == []
 
 
 @pytest.mark.asyncio
-async def test_permanent_end_refuses_marker_upgrade_without_stranding_soft_end(db, monkeypatch):
+async def test_permanent_end_refuses_marker_upgrade_without_stranding_soft_end(
+    db, monkeypatch
+):
     ids, _, request, events, _, provider = await scenario(db, monkeypatch)
-    accepted = await db.request_pinned_thread_retirement_actuator(ids["thread"], **request)
+    accepted = await db.request_pinned_thread_retirement_actuator(
+        ids["thread"], **request
+    )
     operations = composition.thread_retirement_operations(main.app.state.resources)
     current = await db.get_thread(ids["thread"])
     with pytest.raises(HTTPException) as error:
-        await operations.end_thread_flow(ids["thread"], current, permanent=True, force=True)
+        await operations.end_thread_flow(
+            ids["thread"], current, permanent=True, force=True
+        )
     assert error.value.status_code == 409
     assert error.value.detail["reason"] == "retirement_mode_changed"
-    assert await db.request_pinned_thread_retirement_actuator(ids["thread"], **request) == accepted
+    assert (
+        await db.request_pinned_thread_retirement_actuator(ids["thread"], **request)
+        == accepted
+    )
     assert events == []
     candidate = (await db.list_retryable_pinned_retirements())[0]
     assert await detector.retry_pending_pinned_retirement(
-        candidate, dependencies=composition.stale_agent_detector_dependencies(main.app.state.resources),
+        candidate,
+        dependencies=composition.stale_agent_detector_dependencies(
+            main.app.state.resources
+        ),
     )
     ended = await db.get_thread(ids["thread"])
     assert ended["status"] == "ended"
@@ -378,7 +573,9 @@ async def test_permanent_end_refuses_marker_upgrade_without_stranding_soft_end(d
     assert permanent["state"] == "pending"
     assert permanent["token"] != request["retirement_token"]
     assert permanent["permanent"] is True
-    assert (await db.request_pinned_thread_retirement_actuator(ids["thread"], **request))["status"] == "settled_or_superseded"
+    assert (
+        await db.request_pinned_thread_retirement_actuator(ids["thread"], **request)
+    )["status"] == "settled_or_superseded"
     assert events == ["pod-stop", "vm-stop"]
 
 
@@ -392,36 +589,55 @@ async def test_acceptance_and_unknown_pod_keep_real_resource_charge(db, monkeypa
     prepared = await _ready_charged_thread(db, monkeypatch)
     thread_id = str(prepared["thread_id"])
     assert await VMProvisioningPhaseStore(db).publish_thread_ready(
-        thread_id, str(prepared["generation"]), prepared["registration"],
-        prepared["vm_uid"], prepared["updates"],
+        thread_id,
+        str(prepared["generation"]),
+        prepared["registration"],
+        prepared["vm_uid"],
+        prepared["updates"],
     )
     bound = await _bind_protected_agent(db, thread_id)
     metadata = fixtures._json(bound["metadata"])
     metadata["config_override"]["workspace"]["backend"] = "vm"
-    await db.execute("UPDATE threads SET metadata=$2::jsonb WHERE id=$1::uuid",
-                     thread_id, json.dumps(metadata))
+    await db.execute(
+        "UPDATE threads SET metadata=$2::jsonb WHERE id=$1::uuid",
+        thread_id,
+        json.dumps(metadata),
+    )
     process = str(uuid4())
     await db.execute(
         "UPDATE agents SET metadata=jsonb_build_object('dispatch_process_generation',$2::text) WHERE id=$1::uuid",
-        bound["agent_id"], process,
+        bound["agent_id"],
+        process,
     )
-    actor = await db.fetchrow("SELECT * FROM agents WHERE id=$1::uuid", bound["agent_id"])
+    actor = await db.fetchrow(
+        "SELECT * FROM agents WHERE id=$1::uuid", bound["agent_id"]
+    )
     retirement = await db.begin_pinned_thread_retirement(thread_id, permanent=False)
     assert retirement["state"] == "pending", retirement
     assert await db.authorize_pinned_thread_retirement(
-        thread_id, token=retirement["token"], generation=retirement["generation"], settle_status="ended",
+        thread_id,
+        token=retirement["token"],
+        generation=retirement["generation"],
+        settle_status="ended",
     )
     reservation_id = prepared["admitted"]["reservation_id"]
-    charge = dict(await db.fetchrow("SELECT * FROM vm_resource_reservations WHERE id=$1::uuid", reservation_id))
+    charge = dict(
+        await db.fetchrow(
+            "SELECT * FROM vm_resource_reservations WHERE id=$1::uuid", reservation_id
+        )
+    )
     assert charge["state"] != "released"
     request = {
-        "agent_id": str(bound["agent_id"]), "pod_uid": actor["pod_uid"],
+        "agent_id": str(bound["agent_id"]),
+        "pod_uid": actor["pod_uid"],
         "process_generation": process,
         "runtime_generation": str(bound["runtime_generation"]),
         "runtime_attach_token": str(bound["runtime_attach_token"]),
-        "retirement_token": retirement["token"], "disposition": "ended", "permanent": False,
+        "retirement_token": retirement["token"],
+        "disposition": "ended",
+        "permanent": False,
         "workspace_generation": str(prepared["generation"]),
-        "workspace_runtime_incarnation": prepared["vm_uid"],
+        "workspace_runtime_incarnation": prepared["launcher_uid"],
     }
     assert await db.request_pinned_thread_retirement_actuator(thread_id, **request)
     agent = AgentProvisioner()
@@ -430,14 +646,29 @@ async def test_acceptance_and_unknown_pod_keep_real_resource_charge(db, monkeypa
     agent._core_api.read_namespaced_pod.side_effect = fixtures._K8sError(503)
     vm_stop = AsyncMock(side_effect=AssertionError("unknown Pod cannot admit VM stop"))
     monkeypatch.setattr(agent_provider_module, "agent_provisioner", agent)
-    monkeypatch.setattr(vm_provider_module, "vm_provisioner", NS(lifecycle_available=True, release_vm_captured=vm_stop))
+    monkeypatch.setattr(
+        vm_provider_module,
+        "vm_provisioner",
+        NS(lifecycle_available=True, release_vm_captured=vm_stop),
+    )
     monkeypatch.setattr(main.app.state.resources, "postgres_db", db)
     candidate = (await db.list_retryable_pinned_retirements())[0]
     assert not await detector.retry_pending_pinned_retirement(
-        candidate, dependencies=composition.stale_agent_detector_dependencies(main.app.state.resources),
+        candidate,
+        dependencies=composition.stale_agent_detector_dependencies(
+            main.app.state.resources
+        ),
     )
     vm_stop.assert_not_called()
-    assert dict(await db.fetchrow("SELECT * FROM vm_resource_reservations WHERE id=$1::uuid", reservation_id)) == charge
+    assert (
+        dict(
+            await db.fetchrow(
+                "SELECT * FROM vm_resource_reservations WHERE id=$1::uuid",
+                reservation_id,
+            )
+        )
+        == charge
+    )
     current = await db.get_thread(thread_id)
     assert current["runtime_retirement_actuator_request"] is not None
     assert current["runtime_retirement_local_quiescence"] is None

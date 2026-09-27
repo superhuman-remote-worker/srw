@@ -12164,6 +12164,11 @@ DECLARE
     pod jsonb := context->'agent_pod';
     actor public.agents%ROWTYPE;
     expected jsonb;
+    workspace_incarnation text := vm->>'active_pod_uid';
+    legacy_durable_marker boolean := NOT require_actor
+        AND marker IS NOT NULL
+        AND marker = owner_row.runtime_retirement_actuator_request
+        AND marker->>'workspace_runtime_incarnation' = vm->>'vm_uid';
 BEGIN
     IF owner_row.execution_lane IS DISTINCT FROM 'pinned'
        OR owner_row.runtime_retirement_token IS NULL
@@ -12194,6 +12199,16 @@ BEGIN
        OR NULLIF(btrim(marker->>'process_generation'),'') IS NULL THEN
         RETURN false;
     END IF;
+    -- Delivery attests the launcher Pod UID, independently of the VM UID
+    -- used by the unchanged teardown/process-zero protocol. New requests must
+    -- carry that exact captured launcher; no alternate VM/VMI identity admits.
+    IF legacy_durable_marker THEN
+        -- 0298 could admit a VM-UID marker without a launcher field. Preserve
+        -- only continuation of that immutable, already stored full tuple.
+        workspace_incarnation := vm->>'vm_uid';
+    ELSIF COALESCE(workspace_incarnation,'') !~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' THEN
+        RETURN false;
+    END IF;
     expected := jsonb_build_object(
         'kind','vm_local_drain_complete_v1', 'thread_id',owner_row.id::text,
         'agent_id',owner_row.agent_id::text, 'pod_uid',pod->>'pod_uid',
@@ -12203,7 +12218,7 @@ BEGIN
         'retirement_token',owner_row.runtime_retirement_token::text,
         'disposition','ended', 'permanent',owner_row.runtime_retirement_permanent,
         'workspace_generation',vm->>'provision_generation',
-        'workspace_runtime_incarnation',vm->>'vm_uid'
+        'workspace_runtime_incarnation',workspace_incarnation
     );
     IF marker IS DISTINCT FROM expected THEN RETURN false; END IF;
     SELECT * INTO actor FROM public.agents WHERE id=owner_row.agent_id;

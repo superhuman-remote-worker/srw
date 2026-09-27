@@ -628,6 +628,7 @@ async def _seed(
     publish_agent_pod: bool = True,
     protected_agent_pod: bool = False,
     workspace_claim: bool = True,
+    pod_uid: str = "old-pod",
 ):
     ids = {key: str(uuid4()) for key in ("user", "project", "thread", "agent")}
     ids["attach_token"] = str(uuid4())
@@ -646,7 +647,7 @@ async def _seed(
         # new recycle protocol.
         metadata["agent_pod"] = {
             "pod_name": f"persistent-{ids['thread'][:12]}",
-            "pod_uid": "old-pod",
+            "pod_uid": pod_uid,
             "observed_build_sha": "old-build",
         }
     async with db.acquire() as conn:
@@ -715,7 +716,7 @@ async def _seed(
             expected_runtime_generation=generation,
             attempt_id=attempt,
             pod_name=f"persistent-{ids['thread'][:12]}",
-            pod_uid="old-pod",
+            pod_uid=pod_uid,
             namespace="agents-a",
         )
         async with db.acquire() as conn:
@@ -734,9 +735,10 @@ async def _seed(
             await conn.execute(
                 "INSERT INTO agents "
                 "(id,config_name,hostname,pod_ip,pod_uid,status,agent_mode,last_heartbeat) "
-                "VALUES ($1,'centurion',$2,'127.0.0.1','old-pod','session','persistent',now())",
+                "VALUES ($1,'centurion',$2,'127.0.0.1',$3,'session','persistent',now())",
                 UUID(ids["agent"]),
                 f"persistent-{ids['thread'][:12]}",
+                pod_uid,
             )
             async with conn.transaction():
                 if not protected_agent_pod:

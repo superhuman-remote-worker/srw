@@ -35,7 +35,11 @@ async def test_populated_0296_to_0298_preserves_pending_begin_and_old_outcome(
             "SELECT filename,checksum FROM schema_migrations ORDER BY filename"
         )
         await db.connect()
-        ids, retirement, request, events, _, _ = await scenario(db, monkeypatch)
+        # This test deliberately stops at published 0298, whose old marker
+        # contract used VM UID. 0299 compatibility is qualified separately.
+        ids, retirement, request, events, _, _ = await scenario(
+            db, monkeypatch, legacy_vm_incarnation=True
+        )
         _, historical_id = await _thread(db, lane="pinned", status="created")
         bound = await _bind_protected_agent(db, historical_id)
         historical = {

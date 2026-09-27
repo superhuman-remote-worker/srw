@@ -1,17 +1,25 @@
 """Charged VM local drain -> physical End -> retained Resume/permanent End."""
 
 import json
+from dataclasses import replace
 from types import SimpleNamespace as NS
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 from uuid import UUID, uuid4
 
 import pytest
+import httpx
+from fastapi import FastAPI
 
 from orchestrator import main
 from orchestrator.application import controls
 from orchestrator.services import agent_provisioner as agent_module
 from orchestrator.services import stale_agent_detector as detector
 from orchestrator.services import vm_provisioner as vm_module
+from orchestrator.services import thread_workspace_delivery as delivery
+from agent.api import persistent_app
+from agent.api.orchestrator_client import OrchestratorClient
+from orchestrator.routers.agent_thread_status import router
+from orchestrator.security import access
 from orchestrator.services.agent_provisioner import AgentProvisioner
 from orchestrator.services.session_provisioner import ensure_session_workspace
 from orchestrator.services.session_router import SessionRouterService
@@ -20,6 +28,10 @@ from orchestrator.services.workspace_suspension import WorkspaceSuspensionServic
 from tests import test_vm_resource_thread_source_real_postgres as sources
 from tests.test_persistent_recycler_real_postgres import StatefulPinnedK8sApi, _K8sError
 from tests.test_pinned_vm_initial_binding_real_postgres import _bind_protected_agent
+from tests.test_pinned_vm_workspace_delivery import (
+    FINGERPRINT,
+    vm_delivery as _vm_delivery,
+)
 from tests.test_vm_end_actuator_handoff_real_postgres import (
     _base_db,  # noqa: F401
     _base_schema,  # noqa: F401
@@ -35,6 +47,7 @@ from tests.test_vm_thread_retained_disk_purge_real_postgres import (
 
 db = _db
 pg_dsn = _pg_dsn
+vm_delivery = _vm_delivery
 
 
 async def charged_bound_ready(db, monkeypatch):
@@ -76,6 +89,7 @@ async def charged_bound_ready(db, monkeypatch):
     with monkeypatch.context() as creation:
         creation.setattr(sources, "seal_creation_carrier", actor_carrier)
         case = await sources._ready_charged_thread(source, creation)
+    case["updates"]["ssh_host_key_fingerprint"] = FINGERPRINT
     assert await VMProvisioningPhaseStore(db).publish_thread_ready(
         str(case["thread_id"]),
         str(case["generation"]),
@@ -98,9 +112,35 @@ async def charged_bound_ready(db, monkeypatch):
     return case, current
 
 
-async def end_by_handoff(db, monkeypatch):
+async def end_by_handoff(db, monkeypatch, vm_delivery):
     case, current = await charged_bound_ready(db, monkeypatch)
     thread_id = str(case["thread_id"])
+    # Exercise the real attestation and delivery boundary before Begin closes
+    # access. Only the signed controller observation is a physical-boundary fake.
+    vm_delivery.provisioner._db = db
+    vm_delivery.observed.update(
+        provision_generation=str(case["generation"]),
+        vm_uid=case["vm_uid"],
+        vmi_uid=case["vmi_uid"],
+        active_pod_uid=case["launcher_uid"],
+        rootdisk_pvc_uid=case["pvc_uid"],
+        pod_ip=case["updates"]["pod_ip"],
+    )
+    payload = await delivery.agent_get_thread_workspace_locked(
+        thread_id,
+        presented_agent_id=str(current["agent_id"]),
+        presented_runtime_generation=str(current["runtime_generation"]),
+        presented_attach_token=str(current["runtime_attach_token"]),
+        dependencies=replace(vm_delivery.dependencies, store=db),
+    )
+    workspace = await persistent_app._poll_workspace_ready(
+        NS(get_thread_workspace=AsyncMock(return_value=payload)),
+        thread_id,
+        timeout=1,
+        require_vm=True,
+    )
+    assert len({case["vm_uid"], case["vmi_uid"], case["launcher_uid"]}) == 3
+    assert workspace["workspace_runtime_incarnation"] == case["launcher_uid"]
     process = str(uuid4())
     await db.execute(
         "UPDATE agents SET metadata=jsonb_build_object('dispatch_process_generation',$2::text) WHERE id=$1",
@@ -117,6 +157,10 @@ async def end_by_handoff(db, monkeypatch):
         settle_status="ended",
     )
     pod = retirement["context"]["agent_pod"]
+    assert (
+        len({case["vm_uid"], case["vmi_uid"], case["launcher_uid"], pod["pod_uid"]})
+        == 4
+    )
     request = dict(
         agent_id=str(current["agent_id"]),
         pod_uid=pod["pod_uid"],
@@ -126,12 +170,59 @@ async def end_by_handoff(db, monkeypatch):
         retirement_token=retirement["token"],
         disposition="ended",
         permanent=False,
-        workspace_generation=str(case["generation"]),
-        workspace_runtime_incarnation=case["vm_uid"],
+        workspace_generation=workspace["workspace_generation"],
+        workspace_runtime_incarnation=workspace["workspace_runtime_incarnation"],
     )
     assert await db.list_retryable_pinned_retirements() == []
-    accepted = await db.request_pinned_thread_retirement_actuator(thread_id, **request)
+    api = FastAPI()
+    api.include_router(router)
+    api.state.agent_thread_status_dependencies_factory = lambda: NS(
+        db=db, require_internal=access.require_internal
+    )
+    monkeypatch.setattr(access, "_INTERNAL_KEY", "delivery-handoff-test-key")
+    client = OrchestratorClient(
+        orchestrator_url="http://test",
+        pod_ip="192.0.2.1",
+        pod_port=8001,
+        hostname="test",
+        config_name="creator",
+        pid=123,
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=api),
+        base_url="http://test",
+        headers={"X-Internal-Key": "delivery-handoff-test-key"},
+    ) as http:
+        client._client = http
+        accepted = await client.request_thread_retirement_actuator(
+            thread_id,
+            pinned_agent_id=request["agent_id"],
+            pod_uid=pod["pod_uid"],
+            process_generation=process,
+            session_runtime_generation=request["runtime_generation"],
+            session_runtime_attach_token=request["runtime_attach_token"],
+            session_runtime_retirement_token=retirement["token"],
+            retirement_disposition="ended",
+            retirement_permanent=False,
+            workspace_generation=workspace["workspace_generation"],
+            workspace_runtime_incarnation=workspace["workspace_runtime_incarnation"],
+        )
+    assert accepted is not None
     assert accepted["status"] == "actuator_requested"
+    assert (
+        accepted["actuator_request"]["workspace_runtime_incarnation"]
+        == case["launcher_uid"]
+    )
+    native_ack = db.acknowledge_pinned_thread_local_quiescence
+    zero_receipts = []
+
+    async def observe_zero(*args, **kwargs):
+        receipt = await native_ack(*args, **kwargs)
+        assert receipt is not None
+        zero_receipts.append(receipt)
+        return receipt
+
+    monkeypatch.setattr(db, "acknowledge_pinned_thread_local_quiescence", observe_zero)
     candidate = (await db.list_retryable_pinned_retirements())[0]
     assert (
         candidate["nominated_before_grace"] and candidate["agent_status"] != "offline"
@@ -193,6 +284,11 @@ async def end_by_handoff(db, monkeypatch):
         candidate, dependencies=dependencies
     )
     assert events == ["pod-stop", "vm-stop"]
+    assert len(zero_receipts) == 1
+    assert zero_receipts[0]["workspace_generation"] == str(case["generation"])
+    assert zero_receipts[0]["workspace_runtime_incarnation"] == case["vm_uid"]
+    assert zero_receipts[0]["quiescence_protocol"] == "workspace_actuator_zero_v1"
+    monkeypatch.setattr(db, "acknowledge_pinned_thread_local_quiescence", native_ack)
     physical.release_vm_captured = release
     assert physical.stopped and not physical.purged
     charge = await db.fetchrow(
@@ -275,10 +371,10 @@ async def resume_source(db, monkeypatch, case):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("followup", ["resume", "permanent"])
 async def test_charged_handoff_composes_with_retained_followup(
-    db, monkeypatch, followup
+    db, monkeypatch, followup, vm_delivery
 ):
     case, physical, request, candidate, dependencies = await end_by_handoff(
-        db, monkeypatch
+        db, monkeypatch, vm_delivery
     )
     thread_id = str(case["thread_id"])
     history = await predecessor_snapshot(db, case)
