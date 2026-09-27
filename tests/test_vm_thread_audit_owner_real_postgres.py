@@ -433,13 +433,16 @@ async def test_migration_backfills_live_identity_without_inventing_old_settlemen
             await store.fetchval("SELECT count(*) FROM vm_thread_creation_settlements")
             == 0
         )
-        assert (
+        migrated_source = dict(
             await store.fetchrow(
                 "SELECT * FROM vm_creation_retries WHERE request_id=$1",
                 original["request_id"],
             )
-            == source
         )
+        # 0297 adds a nullable Resume link without creating historical authority.
+        assert "thread_retained_resume_id" not in dict(source)
+        assert migrated_source.pop("thread_retained_resume_id") is None
+        assert migrated_source == dict(source)
         assert (
             await store.fetchrow(
                 "SELECT * FROM vm_resource_waiters WHERE request_id=$1",
