@@ -851,7 +851,9 @@ async def test_forward_upgrade_preserves_populated_soft_end_tables(
             case, old = await old_settled_end(store, monkeypatch, ready=ready)
             path = migrations / "0295_vm_thread_cleanup_resource_release.sql"
             (stage / path.name).write_text(path.read_text())
+            await store.close()
             await run_migrations(pool, stage)
+            await store.connect()
             assert [
                 r["state"]
                 for r in (
@@ -866,8 +868,14 @@ async def test_forward_upgrade_preserves_populated_soft_end_tables(
         historical_checksums = await pool.fetch(
             "SELECT filename,checksum FROM schema_migrations ORDER BY filename"
         )
+        # Model the restarted application, whose pool has not prepared owner
+        # queries before startup migrations. Keeping the old app pool across
+        # external ALTER TABLE reuses a SELECT * plan with the old row shape;
+        # asyncpg cannot re-prepare that statement inside Begin's transaction.
+        await store.close()
         await run_migrations(pool, migrations)
         await run_migrations(pool, migrations)
+        await store.connect()
         assert await predecessor_snapshot(store, case) == original
         assert (
             await pool.fetch(
