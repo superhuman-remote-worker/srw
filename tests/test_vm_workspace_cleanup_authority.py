@@ -208,7 +208,10 @@ def test_acquire_is_authenticated_and_revalidates_completed_replay(monkeypatch) 
     assert store.acquire_cleanup_permit.await_args.kwargs["revalidate_completed"]
 
 
-def test_acquire_forwards_authenticated_parent_and_captured_vm(monkeypatch) -> None:
+@pytest.mark.parametrize("owner_kind", ["job", "thread"])
+def test_acquire_forwards_authenticated_parent_and_captured_vm(
+    monkeypatch, owner_kind
+) -> None:
     store = SimpleNamespace(
         acquire_cleanup_permit=AsyncMock(
             return_value=SimpleNamespace(
@@ -221,11 +224,18 @@ def test_acquire_forwards_authenticated_parent_and_captured_vm(monkeypatch) -> N
         )
     )
     proof = {"admission_id": "original-parent", "intent_digest": "sha256:original"}
+    if owner_kind == "thread":
+        proof["intent"] = {
+            "source": "pinned_thread_retained_disk_purge",
+            "runtime_generation": "runtime-generation",
+            "retirement_token": "current-permanent-token",
+            "compute_cleanup_admission_id": "historical-compute-admission",
+        }
     generation = "00000000-0000-4000-8000-000000000924"
     request, _ = _signed(
         {
             "source": "controller_rootdisk_delete",
-            "owner_kind": "job",
+            "owner_kind": owner_kind,
             "owner_id": "00000000-0000-4000-8000-000000000922",
             "pvc_uid": "00000000-0000-4000-8000-000000000923",
             "dv_uid": "dv-uid",

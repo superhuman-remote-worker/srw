@@ -547,7 +547,7 @@ async def test_direct_sql_cannot_release_without_stop_or_mutate_authority(
         case["retirement"]["context"], permanent=False
     )
     permit = await ops._admit_vm_cleanup(
-        str(case["thread_id"]), identity, purge_disk=False
+        str(case["thread_id"]), identity, purge_disk=False, retirement=case["retirement"]
     )
     with pytest.raises(asyncpg.CheckViolationError):
         await db.execute(

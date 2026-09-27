@@ -640,3 +640,49 @@ async def test_vm_recovery_requires_rootdisk_uid_only_for_permanent_end() -> Non
     )
     assert soft_identity is not None
     assert soft_identity.rootdisk_pvc_uid is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("recognized", [True, False])
+async def test_retained_disk_refusal_never_falls_through_to_ordinary_cleanup(
+    monkeypatch, recognized
+):
+    from orchestrator.services import vm_thread_retained_disk_purge as retained
+    from orchestrator.services import pinned_retirement as retirement_module
+    from orchestrator.services.vm_workspace_recovery_store import CleanupPermit
+
+    operation = _operations()
+    current = {
+        "generation": "new-generation",
+        "token": "new-permanent-token",
+        "context": {"entry_status": "ended"},
+    }
+    identity = object()
+    ordinary = CleanupPermit(allowed=True)
+
+    async def retained_boundary(
+        store, *, thread_id, identity: object, generation, token
+    ):
+        assert thread_id == "owner"
+        assert generation == "new-generation" and token == "new-permanent-token"
+        return (
+            CleanupPermit(allowed=False, reason="predecessor_unproven")
+            if recognized
+            else None
+        )
+
+    async def ordinary_boundary(*args, **kwargs):
+        if recognized:
+            raise AssertionError(
+                "recognized retained-disk refusal reached ordinary cleanup"
+            )
+        return ordinary
+
+    monkeypatch.setattr(retained, "acquire_retained_disk_purge", retained_boundary)
+    monkeypatch.setattr(
+        retirement_module, "acquire_vm_cleanup_permit", ordinary_boundary
+    )
+    result = await operation._admit_vm_cleanup(
+        "owner", identity, purge_disk=True, retirement=current
+    )
+    assert result is (None if recognized else ordinary)

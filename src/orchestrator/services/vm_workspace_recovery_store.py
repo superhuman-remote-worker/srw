@@ -617,6 +617,20 @@ async def complete_vm_cleanup_permit(
     admission_id = getattr(permit, "admission_id", None)
     if admission_id is None:
         return
+    proof = getattr(permit, "parent_cleanup", None)
+    if (
+        isinstance(proof, Mapping)
+        and isinstance(proof.get("intent"), Mapping)
+        and proof["intent"].get("source") == "pinned_thread_retained_disk_purge"
+    ):
+        from orchestrator.services.vm_thread_retained_disk_purge import (
+            complete_retained_disk_purge,
+        )
+
+        await complete_retained_disk_purge(
+            recovery_store, permit, outcome=outcome, provisioner=provisioner
+        )
+        return
     if outcome != "completed":
         if await prepare_vm_cleanup_resource(recovery_store, permit) is not None:
             raise ResourceAdmissionError("resource_cleanup_stop_unproven")
@@ -624,8 +638,10 @@ async def complete_vm_cleanup_permit(
         return
     candidate = await prepare_vm_cleanup_resource(recovery_store, permit)
     if candidate is None:
-        if completed_cleanup_outcome(permit) != outcome:
-            await recovery_store.complete_cleanup_permit(admission_id, outcome=outcome)
+        # A caller's completed-outcome hint is not durable source authority.
+        # The store refuses retained-disk parents unless the bound dedicated
+        # path above validated their purge receipt; ordinary replay is a no-op.
+        await recovery_store.complete_cleanup_permit(admission_id, outcome=outcome)
         return
     if provisioner is None:
         raise ResourceAdmissionError("resource_cleanup_stop_unproven")
@@ -1661,6 +1677,19 @@ class VMWorkspaceRecoveryStore:
             ) is not None
         ):
             return CleanupPermit(allowed=False, reason="terminal_retention_unknown")
+        if (
+            parent_id is not None
+            and await conn.fetchval(
+                "SELECT source FROM vm_workspace_cleanup_admissions WHERE id=$1",
+                parent_id,
+            )
+            == "pinned_thread_retained_disk_purge"
+        ):
+            from orchestrator.services.vm_thread_retained_disk_purge import (
+                validate_retained_disk_parent,
+            )
+
+            await validate_retained_disk_parent(conn, parent_id)
         prior = await conn.fetchrow(
             "SELECT id,completed_at,pvc_uid,source,intent_digest,outcome,parent_admission_id "
             "FROM vm_workspace_cleanup_admissions "
@@ -1866,6 +1895,11 @@ class VMWorkspaceRecoveryStore:
                     "FROM vm_workspace_cleanup_admissions WHERE id=$1 FOR UPDATE",
                     admission_id,
                 )
+                if (
+                    row is not None
+                    and row.get("source") == "pinned_thread_retained_disk_purge"
+                ):
+                    raise ResourceAdmissionError("retained_disk_binding_required")
                 # VM create adoption/non-issuance is settled atomically with
                 # its retry ledger, never through generic cleanup completion.
                 if row is not None and row.get("source") == "controller_vm_create":
@@ -1927,6 +1961,51 @@ class VMWorkspaceRecoveryStore:
                 completed_outcome=row["outcome"],
                 creation_disposition=disposition,
             )
+        if row["parent_admission_id"] is not None:
+            async with self.db.acquire() as conn, conn.transaction():
+                if (
+                    await conn.fetchval(
+                        "SELECT source FROM vm_workspace_cleanup_admissions WHERE id=$1",
+                        row["parent_admission_id"],
+                    )
+                    == "pinned_thread_retained_disk_purge"
+                ):
+                    from orchestrator.services.vm_thread_retained_disk_purge import (
+                        validate_retained_disk_parent,
+                    )
+
+                    await validate_retained_disk_parent(
+                        conn, row["parent_admission_id"]
+                    )
+                    # The child may have completed while parent validation
+                    # waited for the owner. A durable completion acknowledges
+                    # its outcome; it must not authorize another disk effect.
+                    current = await conn.fetchrow(
+                        "SELECT * FROM vm_workspace_cleanup_admissions WHERE id=$1 FOR UPDATE",
+                        admission_id,
+                    )
+                    if current is None or any(
+                        current[key] != row[key]
+                        for key in (
+                            "owner_kind",
+                            "owner_id",
+                            "pvc_uid",
+                            "source",
+                            "request_id",
+                            "intent_digest",
+                            "parent_admission_id",
+                        )
+                    ):
+                        return CleanupPermit(
+                            allowed=False, reason="cleanup_reservation_changed"
+                        )
+                    if current["completed_at"] is not None:
+                        return CleanupPermit(
+                            allowed=False,
+                            admission_id=admission_id,
+                            reason="cleanup_request_already_completed",
+                            completed_outcome=current["outcome"],
+                        )
         if disposition is not None:
             # Older controllers must stop even if they ignore the new typed
             # disposition field. Only the dedicated actuator has consumer fences.

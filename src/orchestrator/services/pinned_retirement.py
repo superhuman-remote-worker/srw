@@ -63,8 +63,27 @@ class PinnedRetirementOperations:
     dependencies: PinnedRetirementDependencies
 
     async def _admit_vm_cleanup(
-        self, thread_id: str, identity: Any, *, purge_disk: bool
+        self,
+        thread_id: str,
+        identity: Any,
+        *,
+        purge_disk: bool,
+        retirement: Mapping[str, Any],
     ) -> Any | None:
+        if purge_disk and retirement.get("context", {}).get("entry_status") == "ended":
+            from orchestrator.services.vm_thread_retained_disk_purge import (
+                acquire_retained_disk_purge,
+            )
+
+            retained = await acquire_retained_disk_purge(
+                self.dependencies.recovery_store,
+                thread_id=thread_id,
+                identity=identity,
+                generation=retirement["generation"],
+                token=retirement["token"],
+            )
+            if retained is not None:
+                return retained if retained.allowed else None
         permit = await acquire_vm_cleanup_permit(
             self.dependencies.recovery_store,
             owner_kind="thread",
@@ -1870,6 +1889,7 @@ class PinnedRetirementOperations:
                     thread_id,
                     captured_vm_identity,
                     purge_disk=permanent,
+                    retirement=retirement,
                 )
                 if cleanup is None:
                     return False
@@ -2295,6 +2315,7 @@ class PinnedRetirementOperations:
                 thread_id,
                 vm_identity,
                 purge_disk=permanent,
+                retirement=retirement,
             )
             if cleanup is None:
                 raise RuntimeError("exact VM cleanup held for workspace recovery")
