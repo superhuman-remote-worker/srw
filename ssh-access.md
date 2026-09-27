@@ -1,9 +1,9 @@
 # SSH access to a session workspace
 
-Container-backed persistent sessions have a workspace you can reach over real
-`ssh`: run shell commands, `scp` files in and out, or point an editor at it.
-VM-backed Jobs and pinned sessions have a separate browser IDE path described
-below; the SSH gateway does not yet support their guest workspaces. This page
+Container-backed persistent sessions and VM-backed pinned sessions support real
+SSH and SFTP: run shell commands, transfer files, or connect an editor. VM-backed
+Jobs use the browser IDE described below; the SSH gateway addresses sessions by
+their SSH handles. This page
 covers registering a key, connecting with
 plain `ssh`, VS Code Remote-SSH and JetBrains Gateway, what the gateway deliberately
 refuses, how this interacts with the agent working in the same workspace, and how to
@@ -12,9 +12,9 @@ read the errors you'll actually hit.
 Two things here are counter-intuitive enough to cause support tickets if left
 unstated, so read at least these before anything else:
 
-- **Connecting needs a Personal Access Token, not just a registered key.** See
-  [Connect](#2-connect) below — this is easy to miss because the config block cockpit
-  gives you doesn't mention it.
+- **Connecting needs an attach token as well as a registered key.** The helper
+  normally obtains one using a Personal Access Token; an authenticated browser
+  can also obtain a short-lived token. See [Connect](#2-connect).
 - **JetBrains Gateway cannot use the config block at all**, and downloads a large IDE
   backend into your workspace the first time you attach. See
   [JetBrains Gateway](#3-jetbrains-gateway).
@@ -34,8 +34,16 @@ The VM image must include the stage-2 `srw-code-server-user.service` user unit
 and agent-host user lingering. The IDE starts only after authenticated access
 and runs on guest loopback. An older image without that unit cannot serve the
 VM IDE; rebuild and promote a supported image before relying on this action.
-The browser IDE is separate from this page's SSH gateway, which still refuses
-VM-tier SSH and SFTP connections.
+The browser IDE and SSH/SFTP use separate access leases. A VM SSH or SFTP
+connection must be admitted against the current authenticated guest identity;
+its own renewable lease closes when that connection ends. Each connection has
+a one-hour maximum lifetime. Ready VM access does not require enabling idle
+release or wake. Access to a sleeping VM requires the operator's wake policy.
+
+For same-cluster VMs, the gateway needs TCP port 22 egress to workspace Pods in
+addition to the container SSH port 30022. The chart supplies this rule when
+same-cluster VM support is enabled. The gateway checks the guest's pinned SSH
+host key before forwarding an authenticated client connection.
 
 ## 1. Register a key
 
@@ -74,11 +82,9 @@ shared account — doesn't go unnoticed.
 
 ### The credential: a PAT, exchanged for a short-lived attach token
 
-Registering a key proves *identity*. Actually opening a connection also needs a
-**Personal Access Token (PAT)**, because the connection is a browser-less client
-talking to an authenticated API, and the helper needs something to authenticate
-that first hop with. The plan's own config block doesn't mention this step, so it's
-easy to register a key, paste the config, and get an opaque failure — do this first:
+Registering a key proves *identity*. Opening a connection also needs a short-lived
+attach token. For reusable command-line access, the helper obtains that token
+using a **Personal Access Token (PAT)**. Configure the PAT before connecting:
 
 1. Go to **Settings → API Keys**, create a token with the **`chat:write`** scope
    (the default `jobs:read` + `chat:read` is not enough — an interactive shell is
@@ -99,7 +105,8 @@ never written to disk — you never see it, and there's nothing to copy.
 
 There is a second, different environment variable, `$SRW_SSH_TOKEN`, which is **not**
 your PAT — it's a way to hand the helper an *already-minted* attach token directly
-(for example one pasted from a debugging session), skipping the exchange entirely.
+(for example, obtained through the signed-in browser's authenticated
+`POST /api/ssh/attach-token`), skipping the PAT exchange entirely.
 Because that token expires in five minutes, **`$SRW_SSH_TOKEN` is useless in a config
 file or a script meant to be reused** — it works once, then mysteriously stops. Use
 `$SRW_TOKEN` (or the token file) for anything you intend to keep working.
@@ -262,10 +269,7 @@ requirements are different, though: the workspace needs `bash`, `tar`, and eithe
 
 ## 5. What does not work, and why
 
-The gateway refuses several things `ssh` can normally do. The first four rows below
-were reproduced live against a running gateway, not just read out of the source; the
-VM-tier row is a code-level fact only (this deployment had no VM-tier workspace to
-test against):
+The gateway supports workspace access with these forwarding and backend limits:
 
 | Feature | Behaviour | Why |
 |---|---|---|
@@ -273,7 +277,8 @@ test against):
 | SSH agent forwarding (`-A`) | Refused. `$SSH_AUTH_SOCK` is simply never set in the remote shell | Means **no `git push` using your local key** from inside the workspace — the agent socket never reaches it |
 | `ssh -J` (jump host / `ProxyJump`) | Cannot work at all | `ProxyJump` needs a `direct-tcpip` channel to an arbitrary destination host, and the gateway only permits a `direct-tcpip` destination of `127.0.0.1`/`localhost` — anything else is declined outright, with no dial attempted at all. (Confirmed live: a forward aimed at a real external address came back `connect failed: Connection refused`. That text is not evidence of an attempted-and-failed dial — it's asyncssh's fixed, generic literal for *any* declined channel-open request, emitted identically regardless of why. The gateway doesn't redirect the destination anywhere; it just says no.) |
 | `ssh -L` / `-D` to a service *inside* the workspace | Works | Same `direct-tcpip` path, but the destination you ask for already *is* loopback, so the permit check passes |
-| VM-tier workspaces | Refused with exit 77, `"this workspace is VM-tier - SSH access is not supported"` | Not implemented for that backend |
+| VM-backed pinned sessions | SSH and SFTP are supported when access to the current guest is admitted | Each connection holds its own bounded access lease |
+| VM-backed Jobs | Use the browser IDE | The SSH gateway resolves session handles |
 
 The refusal for a non-loopback `-L`/`-J` destination surfaces at **first use of the
 forward**, not at `ssh` startup — `-L` itself will appear to succeed silently; the
@@ -363,7 +368,7 @@ read them:
 |---|---|---|
 | **75** | Retry later — nothing else needs to change | workspace suspended, reclaimed while idle, shutting down, still restoring, a stale SSH binding, or **too many SSH connections to this workspace already** — close one and reconnect |
 | **69** | Gone — retrying alone won't help | workspace failed, deleted, this session ended, never had a workspace, is unreachable right now, or **the gateway itself is misconfigured** — report this to an administrator, since reconnecting can't fix it |
-| **77** | Denied | unknown/unauthorized handle, unregistered key, or a VM-tier workspace |
+| **77** | Denied | unknown/unauthorized handle, unregistered key, or VM access unsupported by the deployment |
 
 The attachment-cap and misconfiguration rows aren't tied to workspace state the way
 the others are — they come from the gateway's own resource limits and boot-time
