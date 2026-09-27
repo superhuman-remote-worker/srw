@@ -372,6 +372,7 @@ async def stale_agent_detector(
     initial_retirement_cursor: tuple[datetime, str] | None = None
     initial_retirement_batch_size = 25
     pinned_retirement_cursor: tuple[datetime, str] | None = None
+    vm_cleanup_resource_cursor: tuple[datetime, str] | None = None
     pinned_retirement_batch_size = 25
 
     while not shutdown_event.is_set():
@@ -594,6 +595,16 @@ async def stale_agent_detector(
             # replica finishes the immutable captured disposition.  Only
             # sufficiently old markers whose exact actor is absent/offline
             # are nominated; the shared advisory lock serializes replicas.
+            resource_cleanup = await _step(
+                "settled_vm_cleanup_resources",
+                dependencies.pinned_retirement_operations().reconcile_settled_vm_resources(
+                    limit=pinned_retirement_batch_size,
+                    after=vm_cleanup_resource_cursor,
+                ),
+            )
+            if isinstance(resource_cleanup, dict):
+                vm_cleanup_resource_cursor = resource_cleanup.get("after")
+
             pending_retirements = await _step(
                 "pending_pinned_retirements",
                 dependencies.store.list_retryable_pinned_retirements(

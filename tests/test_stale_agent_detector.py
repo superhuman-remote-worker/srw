@@ -101,6 +101,9 @@ def _pinned_operations(*, recover=None):
         )
     )
     return SimpleNamespace(
+        reconcile_settled_vm_resources=AsyncMock(
+            return_value={"after": None, "results": []}
+        ),
         retirement_context_runtime_exposed=real.retirement_context_runtime_exposed,
         retirement_has_exact_local_quiescence=(
             real.retirement_has_exact_local_quiescence

@@ -513,18 +513,18 @@ async def acquire_vm_cleanup_permit(
     else:
         permit = await recovery_store.acquire_cleanup_permit_on_conn(_conn, **arguments)
     bound = bind_vm_cleanup_permit(permit, request_id=request_id, intent=resource_intent)
-    if bound.allowed and owner_kind == "job" and source != "vm_idle_release":
+    if bound.allowed and owner_kind in {"job", "thread"} and source != "vm_idle_release":
         await prepare_vm_cleanup_resource(recovery_store, bound, _conn=_conn)
     return bound
 
 
 async def _vm_cleanup_resource_scope(conn, recovery_store, permit):
-    """Lock the genuine Job source before selecting its installed resource policy."""
+    """Lock the genuine owner/source before selecting its installed resource policy."""
     proof = getattr(permit, "parent_cleanup", None)
     if not isinstance(proof, Mapping) or not isinstance(proof.get("intent"), Mapping):
         return None
     intent = proof["intent"]
-    if intent.get("owner_kind") != "job" or intent.get("source") == "vm_idle_release":
+    if intent.get("owner_kind") not in {"job", "thread"} or intent.get("source") == "vm_idle_release":
         return None
     if (
         proof.get("admission_id") != str(permit.admission_id)
@@ -532,6 +532,12 @@ async def _vm_cleanup_resource_scope(conn, recovery_store, permit):
         or intent.get("purge_disk") not in {True, False}
     ):
         raise ResourceAdmissionError("resource_cleanup_identity_unproven")
+    if intent["owner_kind"] == "thread":
+        if intent.get("source") != "pinned_thread_retirement":
+            return None
+        from orchestrator.services.vm_resource_thread_cleanup import thread_cleanup_scope
+
+        return await thread_cleanup_scope(conn, recovery_store, permit, proof)
     try:
         owner_id = UUID(intent["owner_id"])
         generation = UUID(intent["provision_generation"])
@@ -584,6 +590,9 @@ async def _vm_cleanup_resource_scope(conn, recovery_store, permit):
 
 async def prepare_vm_cleanup_resource(recovery_store, permit, *, _conn=None):
     """Fence a charged ordinary cleanup before its external delete effect."""
+    proof = getattr(permit, "parent_cleanup", None)
+    if not isinstance(proof, Mapping) or not isinstance(proof.get("intent"), Mapping):
+        return None
     if _conn is not None:
         scope = await _vm_cleanup_resource_scope(_conn, recovery_store, permit)
         if scope is None:
@@ -628,6 +637,19 @@ async def complete_vm_cleanup_permit(
     async with recovery_store.db.acquire() as conn, conn.transaction():
         scope = await _vm_cleanup_resource_scope(conn, recovery_store, permit)
         if scope is None:
+            # A concurrent completion may have released this exact receipt
+            # while our probe ran. Missing source/policy is not replay proof.
+            if await conn.fetchval(
+                "SELECT EXISTS(SELECT 1 FROM vm_resource_thread_cleanup_authorities a "
+                "JOIN vm_resource_thread_cleanup_stops s USING(cleanup_admission_id) "
+                "JOIN vm_resource_reservations r ON r.id=a.reservation_id "
+                "WHERE a.cleanup_admission_id=$1 AND r.state='released') "
+                "OR EXISTS(SELECT 1 FROM vm_resource_cleanup_stop_receipts s "
+                "JOIN vm_resource_reservations r ON r.id=s.reservation_id "
+                "WHERE s.cleanup_admission_id=$1 AND r.state='released')",
+                admission_id,
+            ):
+                return
             raise ResourceAdmissionError("resource_cleanup_identity_unproven")
         resource, retry, job, cleanup, intent = scope
         await resource.release_cleanup_compute_on_conn(

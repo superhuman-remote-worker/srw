@@ -81,7 +81,23 @@ class PinnedRetirementOperations:
                 self.dependencies.recovery_store,
                 permit,
                 outcome=outcome,
+                provisioner=self.dependencies.vm_provisioner,
             )
+
+    async def reconcile_settled_vm_resources(
+        self, *, limit=25, after=None, timeout_seconds=5.0
+    ):
+        from orchestrator.services.vm_resource_thread_cleanup import (
+            reconcile_settled_thread_cleanup,
+        )
+
+        return await reconcile_settled_thread_cleanup(
+            self.dependencies.recovery_store,
+            self.dependencies.vm_provisioner,
+            limit=limit,
+            after=after,
+            timeout_seconds=timeout_seconds,
+        )
 
     async def begin_pinned_thread_retirement(
         self, thread_id: str, **kwargs: Any
@@ -1872,7 +1888,7 @@ class PinnedRetirementOperations:
                         )
                     )
                     disposition = vm_result.disposition
-                    await self._complete_vm_cleanup(cleanup, disposition)
+                await self._complete_vm_cleanup(cleanup, disposition)
                 if disposition != "completed":
                     self.dependencies.logger.warning(
                         "Pinned retirement VM process-zero remains retryable for "
@@ -2295,7 +2311,7 @@ class PinnedRetirementOperations:
                     **vm_cleanup_kwargs(cleanup),
                 )
                 disposition = vm_result.disposition
-                await self._complete_vm_cleanup(cleanup, disposition)
+            await self._complete_vm_cleanup(cleanup, disposition)
             if disposition != "completed":
                 raise RuntimeError("exact VM cleanup is retryable")
             completed_quiescence_protocol = "workspace_actuator_zero_v1"

@@ -1471,14 +1471,28 @@ class VMProvisioner:
     ) -> dict[str, Any] | None:
         """Probe an ordinary cleanup's exact compute absence outside SQL locks."""
 
+        owner_kind = candidate.get("owner_kind", "job")
+        if owner_kind not in {"job", "thread"}:
+            return None
+        owner_key = "owner_id" if owner_kind == "thread" else "job_id"
         try:
             fields = {
                 key: str(UUID(str(candidate[key])))
                 for key in (
-                    "job_id", "provision_generation", "vm_uid", "vmi_uid",
-                    "launcher_uid", "pvc_uid",
+                    owner_key,
+                    "provision_generation",
+                    "vm_uid",
+                    "pvc_uid",
                 )
             }
+            for key in ("vmi_uid", "launcher_uid"):
+                fields[key] = (
+                    None
+                    if owner_kind == "thread" and candidate.get(key) is None
+                    else str(UUID(str(candidate[key])))
+                )
+            if (fields["vmi_uid"] is None) != (fields["launcher_uid"] is None):
+                return None
             if any(fields[key] != candidate[key] for key in fields):
                 return None
         except (KeyError, TypeError, ValueError, AttributeError):
@@ -1486,12 +1500,12 @@ class VMProvisioner:
         if type(candidate.get("purge_disk")) is not bool:
             return None
         if (
-            await self._current_provision_generation("job", fields["job_id"])
+            await self._current_provision_generation(owner_kind, fields[owner_key])
             != fields["provision_generation"]
         ):
             return None
         probe = await self._probe_vm_teardown_identity(
-            fields["job_id"], fields["provision_generation"]
+            fields[owner_key], fields["provision_generation"]
         )
         if (
             probe.disposition != "absent"
@@ -1508,6 +1522,7 @@ class VMProvisioner:
             "version": 1,
             "kind": "vm_cleanup_physical_stop",
             **fields,
+            **({"owner_kind": "thread"} if owner_kind == "thread" else {}),
             "vm_absent": True,
             "vmi_absent": True,
             "launcher_absent": True,

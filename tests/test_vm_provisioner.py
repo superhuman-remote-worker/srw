@@ -2282,3 +2282,38 @@ class TestCreateVmDiskSize:
         )
         payload = prov._http_client.post.await_args.kwargs["json"]
         assert "disk_size" not in payload
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bound", [True, False])
+@pytest.mark.parametrize("purge_disk", [True, False])
+async def test_thread_cleanup_attestation_uses_thread_owner_and_whole_runtime_absence(
+    provisioner_with_nats, mock_nats_bridge, bound, purge_disk,
+):
+    from uuid import uuid4
+
+    candidate = {
+        "owner_kind": "thread", "owner_id": str(uuid4()),
+        "provision_generation": PROVISION_GENERATION, "vm_uid": str(uuid4()),
+        "pvc_uid": str(uuid4()), "vmi_uid": str(uuid4()) if bound else None,
+        "launcher_uid": str(uuid4()) if bound else None, "purge_disk": purge_disk,
+    }
+    reply = {
+        "_identity_authenticated": True, "status": "not_found",
+        "provision_generation": PROVISION_GENERATION,
+        "rootdisk_identity_known": True, "runtime_absence_known": True,
+        "vmi_absent": True, "launcher_absent": True,
+        "rootdisk_pvc_uid": None if purge_disk else candidate["pvc_uid"],
+    }
+    mock_nats_bridge.query_vm_status.side_effect = None
+    for missing in ("_identity_authenticated", "runtime_absence_known", "rootdisk_identity_known",
+                    "vmi_absent", "launcher_absent"):
+        mock_nats_bridge.query_vm_status.return_value = {**reply, missing: False}
+        assert await provisioner_with_nats.attest_vm_cleanup_stop(candidate) is None
+    mock_nats_bridge.query_vm_status.return_value = {**reply, "rootdisk_pvc_uid": str(uuid4())}
+    assert await provisioner_with_nats.attest_vm_cleanup_stop(candidate) is None
+    mock_nats_bridge.query_vm_status.return_value = reply
+    proof = await provisioner_with_nats.attest_vm_cleanup_stop(candidate)
+    assert proof["owner_kind"] == "thread" and proof["owner_id"] == candidate["owner_id"]
+    assert proof["vmi_uid"] == candidate["vmi_uid"]
+    assert proof["pvc_disposition"] == ("purged" if purge_disk else "retained")
