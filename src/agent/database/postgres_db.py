@@ -2231,14 +2231,20 @@ class PostgresDB:
         role: str,
         content: str,
         source: str,
-        turn_number: Optional[int],
         agent_id: str,
         pod_uid: str,
         runtime_generation: str,
         session_runtime_generation: str,
         runtime_attach_token: str,
+        turn_number: Optional[int] = None,
+        turn_number_hint: Optional[int] = None,
     ) -> Dict[str, Any]:
-        """Persist and claim one pinned input in a parent-first transaction."""
+        """Persist and claim one pinned input in a parent-first transaction.
+
+        ``turn_number_hint`` numbers only a row this call creates; a retry of
+        an admitted or settled identity resolves to its receipt whatever the
+        session's turn counter says now. ``turn_number`` asserts the turn.
+        """
 
         from shared.persistent_input_delivery import persist_input_delivery
 
@@ -2252,6 +2258,7 @@ class PostgresDB:
                     content=content,
                     source=source,
                     turn_number=turn_number,
+                    turn_number_hint=turn_number_hint,
                     agent_id=agent_id,
                     pod_uid=pod_uid,
                     runtime_generation=runtime_generation,

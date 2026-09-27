@@ -307,3 +307,22 @@ async def test_a_rerendered_wake_replays_the_stored_text(
     finally:
         parked.set()
         await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_an_asserted_turn_and_a_hint_are_never_combined():
+    from shared.persistent_input_delivery import persist_input_delivery
+
+    conn = AsyncMock()
+    with pytest.raises(ValueError, match="either"):
+        await persist_input_delivery(
+            conn,
+            thread_id=uuid4(),
+            delivery_id=uuid4(),
+            role="event",
+            content=WAKE,
+            source="officer_wake",
+            turn_number=2,
+            turn_number_hint=3,
+        )
+    conn.fetchrow.assert_not_called()

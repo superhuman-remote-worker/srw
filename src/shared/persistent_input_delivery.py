@@ -194,12 +194,19 @@ async def persist_input_delivery(
     runtime_attach_token: str | UUID | None = None,
     allow_stateless_subagent_event: bool = False,
     supersedes_input_seq: int | None = None,
+    turn_number_hint: int | None = None,
 ) -> dict[str, Any]:
     """Atomically persist one transcript row and optionally claim execution.
 
     With no runtime identity this is an orchestrator-side durable persist only.
     With all three identity fields it also establishes/recovers the exact
     process claim.  Partial identity is always rejected.
+
+    ``turn_number`` asserts the input's turn: a terminal receipt of another
+    turn is a conflict. ``turn_number_hint`` only numbers a transcript row this
+    call creates (a runtime's guess at its next turn); it never identifies an
+    existing row or receipt, so a retry that arrives after the session's turn
+    counter moved on still resolves to its receipt. Pass at most one.
     """
 
     delivery_uuid = UUID(str(delivery_id))
@@ -211,6 +218,8 @@ async def persist_input_delivery(
         and (not isinstance(supersedes_input_seq, int) or supersedes_input_seq <= 0)
     ):
         raise InputDeliveryConflict("superseded input sequence is invalid")
+    if turn_number is not None and turn_number_hint is not None:
+        raise ValueError("pass either an asserted turn number or a hint, not both")
     session_runtime_generation = session_runtime_generation or runtime_generation
     identity = (
         agent_id,
@@ -399,7 +408,11 @@ async def persist_input_delivery(
         thread_uuid,
     )
     effective_turn_number = (
-        int(existing_turn_number) if existing_turn_number is not None else turn_number
+        int(existing_turn_number)
+        if existing_turn_number is not None
+        else turn_number
+        if turn_number is not None
+        else turn_number_hint
     )
     if execution_lane == "stateless" and (
         isinstance(effective_turn_number, bool)

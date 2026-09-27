@@ -551,7 +551,9 @@ class SessionInputRuntime:
                     role=role,
                     content=content,
                     source="officer_wake" if injected else "direct_human",
-                    turn_number=session.turn_count + 1,
+                    # Numbers only a row this call creates; a retry of an
+                    # admitted/settled identity resolves to its receipt.
+                    turn_number_hint=session.turn_count + 1,
                     agent_id=agent_id,
                     pod_uid=pod_uid,
                     runtime_generation=runtime_generation,
@@ -794,7 +796,7 @@ class SessionInputRuntime:
                         role=role,
                         content=content,
                         source=source,
-                        turn_number=session.turn_count + 1,
+                        turn_number_hint=session.turn_count + 1,
                         agent_id=agent_id,
                         pod_uid=pod_uid,
                         runtime_generation=runtime_generation,
