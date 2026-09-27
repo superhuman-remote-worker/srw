@@ -2789,10 +2789,12 @@ export class PersistentChatComponent implements OnInit, AfterViewChecked, OnDest
     readonly showSlashMenu = signal(false);
     readonly slashSelectedIndex = signal(0);
     private readonly slashQuery = signal('');
+    // Only commands with a transport on this session are offered: the
+    // service answers from the /connection declaration, per command.
     readonly filteredCommands = computed(() =>
         SLASH_COMMANDS.filter(c =>
             c.command.startsWith(this.slashQuery()) &&
-            (c.command !== '/rewind' || this.chat.rewindModeAvailable('conversation'))));
+            this.chat.slashCommandAvailable(c.command)));
 
     // Empty-state suggestions (loaded once per mount; the whole set renders, nothing is picked)
     private readonly pickedSuggestions = signal<Suggestion[]>([]);

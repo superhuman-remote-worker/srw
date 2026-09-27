@@ -2120,7 +2120,16 @@
       "unavailable": "Diese Steuerung ist in dieser Sitzung nicht verfügbar.",
       "applyFailed": "Die Sitzungseinstellungen konnten nicht übernommen werden.",
       "applyTimeout": "Die Sitzung hat die Einstellungsänderung nicht bestätigt. Öffne die Einstellungen erneut, um den aktuellen Stand zu sehen.",
-      "appliedNextTurn": "Sitzungseinstellungen aktualisiert: {{summary}} — gilt ab der nächsten Antwort."
+      "appliedNextTurn": "Sitzungseinstellungen aktualisiert: {{summary}} — gilt ab der nächsten Antwort.",
+      "compactUnavailable": "Manuelles Komprimieren ist in dieser Sitzung nicht verfügbar. Der Kontext wird automatisch zusammengefasst, sobald die CTX-Anzeige 100 % erreicht.",
+      "compactDeferred": "Das Komprimieren startet nach der aktuellen Antwort.",
+      "compactFailed": "Komprimieren fehlgeschlagen — die Unterhaltung bleibt unverändert. Versuche es später erneut.",
+      "compactBoundaryGone": "Diese Nachricht ist nicht mehr im Arbeitskontext — sie wurde vielleicht schon zusammengefasst.",
+      "compactRejected": "Der Agent konnte diese Sitzung nicht komprimieren. Lade die Seite neu und versuche es erneut.",
+      "undoNothing": "Es gibt keine Dateiänderungen zum Rückgängigmachen.",
+      "undoUnsupported": "Rückgängig machen ist für den Workspace dieser Sitzung nicht verfügbar.",
+      "undoRejected": "Der Agent konnte die letzten Dateiänderungen nicht rückgängig machen.",
+      "upgradeUnavailable": "Workspace-Upgrades sind in dieser Sitzung nicht verfügbar."
     },
     "workspaceOffer": {
       "title": "Workspace-Upgrade angefordert",
@@ -3340,7 +3349,8 @@
       "tierUnreachable": {
         "downgrade": "Herunterstufen nicht möglich",
         "needsApproval": "Freigabe erforderlich",
-        "unsupported": "von dieser Stufe aus nicht verfügbar"
+        "unsupported": "von dieser Stufe aus nicht verfügbar",
+        "sessionUnsupported": "in dieser Sitzung nicht verfügbar"
       }
     },
     "autonomy": {

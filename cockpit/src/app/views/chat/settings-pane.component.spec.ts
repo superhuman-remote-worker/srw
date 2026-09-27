@@ -82,6 +82,7 @@ function createPane(options: {
     setMode: vi.fn(),
     setNarrationMode: vi.fn(),
     upgradeWorkspace: vi.fn(),
+    controlTransport: vi.fn(() => 'websocket'),
   };
   const api = {
     getPersistentThread: vi.fn().mockReturnValue(
@@ -192,6 +193,7 @@ function createPaneWithRealToolsGroup(toolGroups: SessionToolGroupsResponse) {
     setMode: vi.fn(),
     setNarrationMode: vi.fn(),
     upgradeWorkspace: vi.fn(),
+    controlTransport: vi.fn(() => 'websocket'),
   };
   const api = {
     getPersistentThread: vi.fn().mockReturnValue(
@@ -366,6 +368,7 @@ describe('SettingsPaneComponent locked-on categories, from the DOM', () => {
       setMode: vi.fn(),
       setNarrationMode: vi.fn(),
       upgradeWorkspace: vi.fn(),
+      controlTransport: vi.fn(() => 'websocket'),
     };
     const api = {
       getPersistentThread: vi.fn().mockReturnValue(
@@ -876,6 +879,21 @@ describe('SettingsPaneComponent workspace tier', () => {
     TestBed.resetTestingModule();
     const {component: admin} = createPane({grants: null});
     expect(admin.tierReachability()['vm']).toBe('ok');
+  });
+
+  it('a session with no upgrade transport reaches no tier, and says so', () => {
+    const {component, chat} = createPane({grants: null});
+    chat.controlTransport.mockReturnValue('unavailable');
+    // Re-read: the reachability computed depends on the tier signal, so
+    // nudge it the way a real thread-meta load would.
+    chat.workspaceTier.set('virtual');
+    expect(component.tierReachability()).toEqual({
+      sandbox: 'sessionUnsupported',
+      vm: 'sessionUnsupported',
+      none: 'downgrade',
+    });
+    component.onTierPicked('sandbox');
+    expect(component.pendingTier()).toBeNull();
   });
 
   it('vm tier offers no further upgrades (upgrade-only, no downgrades)', () => {

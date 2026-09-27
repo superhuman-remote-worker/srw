@@ -2120,7 +2120,16 @@
       "unavailable": "This control is not available in this session.",
       "applyFailed": "The session settings could not be applied.",
       "applyTimeout": "The session did not confirm the settings change. Reopen the settings to see what is in effect.",
-      "appliedNextTurn": "Session settings updated: {{summary}} — applies from the next response."
+      "appliedNextTurn": "Session settings updated: {{summary}} — applies from the next response.",
+      "compactUnavailable": "Manual compaction isn't available in this session. Context is summarized automatically when the CTX bar reaches 100%.",
+      "compactDeferred": "Compaction will run after the current response.",
+      "compactFailed": "Compaction failed — the conversation was kept intact. Try again later.",
+      "compactBoundaryGone": "That message is no longer in working context — it may already be summarized.",
+      "compactRejected": "The agent could not compact this session. Reload and try again.",
+      "undoNothing": "There are no file changes to undo.",
+      "undoUnsupported": "Undo isn't available for this session's workspace.",
+      "undoRejected": "The agent could not undo the last file changes.",
+      "upgradeUnavailable": "Workspace upgrades aren't available in this session."
     },
     "workspaceOffer": {
       "title": "Workspace upgrade requested",
@@ -3340,7 +3349,8 @@
       "tierUnreachable": {
         "downgrade": "can't move down a tier",
         "needsApproval": "needs approval",
-        "unsupported": "not available from this tier"
+        "unsupported": "not available from this tier",
+        "sessionUnsupported": "not available in this session"
       }
     },
     "narrationModes": {

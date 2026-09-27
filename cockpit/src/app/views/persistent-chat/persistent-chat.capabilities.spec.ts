@@ -52,6 +52,10 @@ function sessionState() {
     startupPhase: signal('ready'), controlTransport: signal('websocket'), citationsByCid: signal(new Map()),
     awaitingElapsedMs: signal(0), reconnectAttempt: signal(0), agentSilenceSeconds: signal(0), cloudChangesCount: signal(0),
     sshHandle: signal('test-thread'), resetWindow: vi.fn(), refreshPendingRewindReceipt: vi.fn(),
+    // The real service answers per command from /connection; here only
+    // /rewind is session-dependent, through the same signal the tests flip.
+    slashCommandAvailable: (command: string) =>
+      command !== '/rewind' || (state['rewindModeAvailable'] as () => boolean)(),
     workspaceLifecycle,
     // These fixtures keep one current view; accept its IDE response and retain
     // any lifecycle projection, including when the response omits that field.

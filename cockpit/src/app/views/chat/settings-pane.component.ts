@@ -309,6 +309,14 @@ export class SettingsPaneComponent {
             // `none`, or a tier this build does not know: nothing reachable,
             // so the row falls back to static text.
         }
+        // A session with no upgrade transport (the stateless lane) can move
+        // nowhere, whatever the ladder allows: say so in the option instead
+        // of refusing after the confirmation dialog.
+        if (this.chat.controlTransport('upgrade-to-workspace') !== 'websocket') {
+            for (const [tier, state] of Object.entries(map)) {
+                if (state === 'ok' || state === 'needsApproval') map[tier] = 'sessionUnsupported';
+            }
+        }
         return map;
     });
 

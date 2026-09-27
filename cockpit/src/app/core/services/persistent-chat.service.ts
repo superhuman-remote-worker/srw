@@ -285,13 +285,38 @@ export type NarrationMode = 'silent' | 'verbose' | 'auto';
 type DurableControl =
   | { method: 'mode.set'; mode: PermissionMode }
   | { method: 'narration.set'; mode: NarrationMode }
-  | { method: 'workspace.undo' };
+  | { method: 'workspace.undo' }
+  | { method: 'compact'; focus?: string; boundary_message_id?: string };
 
-type DurableScalarControl = Exclude<DurableControl, { method: 'workspace.undo' }>;
+type DurableScalarControl = Extract<DurableControl, { method: 'mode.set' | 'narration.set' }>;
 
 function isDurableScalarControl(control: DurableControl): control is DurableScalarControl {
-  return control.method !== 'workspace.undo';
+  return control.method === 'mode.set' || control.method === 'narration.set';
 }
+
+/** Slash commands whose availability follows a declared control verb. The
+ *  palette offers a command only when its verb has a transport on the current
+ *  session (session_slash_commands_and_stateless_compact.md §2). */
+const SLASH_COMMAND_VERBS: Record<string, readonly string[]> = {
+  '/compact': ['compact'],
+  '/undo': ['undo', 'workspace.undo'],
+  '/auto': ['mode.set'],
+  '/supervised': ['mode.set'],
+  '/autonomous': ['mode.set'],
+  '/silent': ['narration.set'],
+  '/verbose': ['narration.set'],
+  '/upgrade-workspace': ['upgrade-to-workspace'],
+};
+
+/** Owner rejection codes with a specific explanation (the fallback is the
+ *  generic `chat.control.ownerRejected`). */
+const CONTROL_REJECTION_KEYS: Record<string, string> = {
+  compaction_failed: 'chat.control.compactFailed',
+  boundary_not_in_context: 'chat.control.compactBoundaryGone',
+  workspace_undo_no_checkpoint: 'chat.control.undoNothing',
+  workspace_undo_checkpoint_missing: 'chat.control.undoNothing',
+  workspace_undo_unsupported: 'chat.control.undoUnsupported',
+};
 
 interface DurableControlOutboxItem {
   threadId: string;
@@ -842,6 +867,14 @@ export class PersistentChatService {
     // without Canvas ever depending on this service.
     effect(() => {
       this.threadTransport.setAgentTurnActive(this.isStreaming());
+    });
+
+    // A /compact (or "Summarize up to here") asked for mid-response runs once
+    // the session is idle again — see requestCompaction().
+    effect(() => {
+      const busy = this.isStreaming() || this.isAwaitingTurn();
+      if (busy) return;
+      untracked(() => this._flushDeferredCompaction());
     });
 
     // Stamp the start of an awaiting stretch and tick a 1 s clock while it
@@ -1677,6 +1710,13 @@ export class PersistentChatService {
   // ready state, not a failed WebSocket open; remember it so focus/SSE
   // recovery and user actions cannot restart the reconnect ladder.
   private controlSocket: 'unknown' | 'websocket' | 'none' = 'unknown';
+  /** A manual compaction held until the running response ends (one per
+   *  thread; see requestCompaction). Dropped on teardown and thread switch. */
+  private deferredCompaction: {
+    threadId: string;
+    focus: string;
+    boundaryMessageId?: string;
+  } | null = null;
   /** The `/connection` control declaration, stamped with the thread it
    *  describes so a stale map can never answer for the next session
    *  (singleton-state rule: stamp, don't just reset). null = not resolved
@@ -4177,7 +4217,94 @@ export class PersistentChatService {
   }
 
   summarizeAvailable(): boolean {
-    return this.controlTransport('compact') === 'websocket';
+    return this.controlTransport('compact') !== 'unavailable';
+  }
+
+  /** Whether the slash palette should offer `command` on this session.
+   *
+   *  Follows the `/connection` declaration, never the lane: a command is
+   *  offered only when one of its verbs has a transport here. `/done` is
+   *  always offered (a socketless session ends through the owner End path),
+   *  and `/rewind` keeps its own mode-aware gate. */
+  slashCommandAvailable(command: string): boolean {
+    const threadId = this.threadId();
+    if (!threadId || !this._controlPlaneAllowed(threadId)) return false;
+    if (command === '/done') return true;
+    if (command === '/rewind') return this.rewindModeAvailable('conversation');
+    const verbs = SLASH_COMMAND_VERBS[command];
+    if (!verbs) return true;
+    return verbs.some((verb) => this.controlTransport(verb) !== 'unavailable');
+  }
+
+  /** Ask for a manual compaction, now or after the current response.
+   *
+   *  Compaction rewrites the conversation the running turn works on, so it
+   *  never runs beside one (either lane): while a response streams or a sent
+   *  message waits for its turn, the request is held here — one per thread,
+   *  the latest focus wins — and dispatched when the session goes idle. */
+  requestCompaction(focus = '', boundaryMessageId?: string): void {
+    const threadId = this.threadId();
+    if (!threadId || !this._controlPlaneAllowed(threadId)) return;
+    if (this.controlTransport('compact') === 'unavailable') {
+      this.error.set(this.transloco.translate('chat.control.compactUnavailable'));
+      return;
+    }
+    if (this.isStreaming() || this.isAwaitingTurn()) {
+      const alreadyDeferred = this.deferredCompaction?.threadId === threadId;
+      this.deferredCompaction = { threadId, focus, boundaryMessageId };
+      if (!alreadyDeferred) {
+        this._systemMessage(this.transloco.translate('chat.control.compactDeferred'));
+      }
+      return;
+    }
+    this._dispatchCompaction(focus, boundaryMessageId);
+  }
+
+  private _dispatchCompaction(focus: string, boundaryMessageId?: string): void {
+    const transport = this.controlTransport('compact');
+    if (transport === 'rest') {
+      const control: DurableControl = { method: 'compact' };
+      if (focus.trim()) control.focus = focus.trim();
+      if (boundaryMessageId) control.boundary_message_id = boundaryMessageId;
+      this._sendDurableControl(control);
+      return;
+    }
+    // No local "Compacting context..." echo: the agent's
+    // compaction.started/progress frames drive the live progress block, and
+    // a no-op answers with a summary-less context.compacted (rendered as a
+    // system line).
+    const frame: Record<string, unknown> = { method: 'compact', focus };
+    if (boundaryMessageId) frame['boundary_message_id'] = boundaryMessageId;
+    this._sendControl(frame);
+  }
+
+  private _flushDeferredCompaction(): void {
+    const deferred = this.deferredCompaction;
+    if (!deferred) return;
+    this.deferredCompaction = null;
+    if (deferred.threadId !== this.threadId() || !this._controlPlaneAllowed(deferred.threadId)) {
+      return;
+    }
+    this._dispatchCompaction(deferred.focus, deferred.boundaryMessageId);
+  }
+
+  /** `/done` on a session without an `archive` socket: the owner End path the
+   *  End button uses, which works on both lanes (and asks before stopping a
+   *  busy stateless turn). Stays on the page, like the socket `/done`. */
+  private async _endFromSlashCommand(): Promise<void> {
+    try {
+      const outcome = await this.endSession();
+      if (outcome === 'retryable') {
+        this.error.set(this.transloco.translate('errors.sessions.endRetryable'));
+      }
+    } catch (err: unknown) {
+      const detail = (err as { error?: { detail?: unknown } })?.error?.detail;
+      this.error.set(
+        typeof detail === 'string'
+          ? this.sanitizeError(detail)
+          : this.transloco.translate('errors.sessions.endFailed'),
+      );
+    }
   }
 
   /** Drop every control frame queued for `threadId` and tell the user. Runs
@@ -4187,13 +4314,25 @@ export class PersistentChatService {
     const queued = this.controlOutbox.filter((item) => item.threadId === threadId);
     if (queued.length === 0) return;
     this.controlOutbox = this.controlOutbox.filter((item) => item.threadId !== threadId);
+    let failed = false;
     for (const item of queued) {
       let requestId: string | undefined;
+      let method: unknown;
       try {
-        requestId = JSON.parse(item.frame)?.request_id;
+        const parsed = JSON.parse(item.frame);
+        requestId = parsed?.request_id;
+        method = parsed?.method;
       } catch {
         requestId = undefined;
       }
+      if (method === 'archive') {
+        // A /done typed before /connection answered: it already said
+        // "Ending session...", so finish it on the End path instead of
+        // contradicting that line.
+        void this._endFromSlashCommand();
+        continue;
+      }
+      failed = true;
       if (requestId) {
         this._settlePendingConfigUpdate(requestId, {
           ok: false,
@@ -4203,7 +4342,7 @@ export class PersistentChatService {
         });
       }
     }
-    this.error.set(this.transloco.translate('chat.control.unavailable'));
+    if (failed) this.error.set(this.transloco.translate('chat.control.unavailable'));
   }
 
   private _settlePendingConfigUpdate(requestId: string, outcome: ConfigUpdateOutcome): boolean {
@@ -4472,16 +4611,16 @@ export class PersistentChatService {
    * the serving owner writes the acknowledgement through its journal
    * allocator and the normal SSE reducer applies it.
    */
-  private _sendDurableControl(control: DurableControl): void {
+  private _sendDurableControl(control: DurableControl): boolean {
     const threadId = this.threadId();
-    if (!threadId || !this._controlPlaneAllowed(threadId)) return;
+    if (!threadId || !this._controlPlaneAllowed(threadId)) return false;
     const runtimeGeneration = this.sessionRuntimeGeneration;
     if (!runtimeGeneration) {
       this._setDurableControlError(
         { method: control.method, ordinal: ++this.durableControlOrdinal },
         this.transloco.translate('chat.control.admissionFailed'),
       );
-      return;
+      return false;
     }
     const ordinal = ++this.durableControlOrdinal;
     // Keep an ambiguous/in-flight head exactly where it is, but collapse
@@ -4510,7 +4649,7 @@ export class PersistentChatService {
         { method: control.method, ordinal },
         this.transloco.translate('chat.control.backpressure'),
       );
-      return;
+      return false;
     }
     const item: DurableControlOutboxItem = {
       threadId,
@@ -4531,6 +4670,7 @@ export class PersistentChatService {
     });
     this.durableControlOutbox.push(item);
     this._flushDurableControlOutbox();
+    return true;
   }
 
   /** Single-flight FIFO drain. An ambiguous failure leaves the item at the
@@ -4929,6 +5069,7 @@ export class PersistentChatService {
     // transport down there is no turn.started to clear it — never leave
     // the composer stuck on "working" after a teardown.
     this.pendingTurnCount.set(0);
+    this.deferredCompaction = null;
     if (this.controlWsReconnectTimer) {
       clearTimeout(this.controlWsReconnectTimer);
       this.controlWsReconnectTimer = null;
@@ -6135,18 +6276,19 @@ export class PersistentChatService {
 
     switch (cmd) {
       case '/compact':
-        // No local "Compacting context..." echo: the agent's
-        // compaction.started/progress frames drive the live progress
-        // block, and a no-op answers with a summary-less
-        // context.compacted (rendered as a system line below).
-        this._sendControl({ method: 'compact', focus: arg });
+        this.requestCompaction(arg);
         return true;
       case '/done':
-        // _sendControl refuses (and says so) when this session has no
-        // socket transport for the verb — don't announce an end that was
-        // never dispatched.
-        if (this._sendControl({ method: 'archive' })) {
+        // The socket verb where one exists (it also syncs the cloud folder
+        // and titles the session); otherwise the owner End path. Announce
+        // only what was actually dispatched.
+        if (this.controlTransport('archive') === 'websocket') {
+          if (this._sendControl({ method: 'archive' })) {
+            this._systemMessage('Ending session...');
+          }
+        } else if (this.threadId() && this._controlPlaneAllowed(this.threadId()!)) {
           this._systemMessage('Ending session...');
+          void this._endFromSlashCommand();
         }
         return true;
       case '/auto':
@@ -6164,18 +6306,18 @@ export class PersistentChatService {
       case '/verbose':
         this.setNarrationMode('verbose');
         return true;
-      case '/undo':
-        if (this.controlSocket === 'none') {
-          this._sendDurableControl({ method: 'workspace.undo' });
-        } else {
-          // Pinned sessions retain the legacy direct-WS verb. The
-          // orchestrator deliberately refuses workspace.undo on the
-          // pinned REST lane because there is no lease-owned queue
-          // unit to fence the destructive operation against.
-          this._sendControl({ method: 'undo' });
-        }
-        this._systemMessage('Undoing last file changes...');
+      case '/undo': {
+        // Pinned sessions retain the legacy direct-WS verb. The
+        // orchestrator deliberately refuses workspace.undo on the pinned
+        // REST lane because there is no lease-owned queue unit to fence
+        // the destructive operation against.
+        const dispatched =
+          this.controlTransport('workspace.undo') === 'rest'
+            ? this._sendDurableControl({ method: 'workspace.undo' })
+            : this._sendControl({ method: 'undo' });
+        if (dispatched) this._systemMessage('Undoing last file changes...');
         return true;
+      }
       case '/upgrade-workspace': {
         const tier = arg.trim().toLowerCase() === 'vm' ? 'vm' : 'sandbox';
         this.upgradeWorkspace(tier);
@@ -6942,11 +7084,7 @@ export class PersistentChatService {
 
   /** "Summarize up to here" — manual compaction bounded at a message. */
   summarizeUpTo(messageId: string): void {
-    this._sendControl({
-      method: 'compact',
-      focus: '',
-      boundary_message_id: messageId,
-    });
+    this.requestCompaction('', messageId);
   }
 
   /** Arm the one-shot stuck-"Rewinding…" fallback (see rewind() and
@@ -6997,12 +7135,14 @@ export class PersistentChatService {
     if (this.controlTransport('upgrade-to-workspace') !== 'websocket') {
       // No transport on this session (queue-served sessions have none yet):
       // refuse before arming the in-progress state, and say so.
-      this.error.set(this.transloco.translate('chat.control.unavailable'));
+      this.error.set(this.transloco.translate('chat.control.upgradeUnavailable'));
       return;
     }
+    // _sendControl refuses (and says so) on a retired control plane; arm
+    // nothing for a frame that was never dispatched.
+    if (!this._sendControl({ method: 'upgrade-to-workspace', target_tier: tier })) return;
     this.pendingWorkspaceOffer.set(null);
     this.continueAfterUpgrade.set(opts.thenContinue === true);
-    this._sendControl({ method: 'upgrade-to-workspace', target_tier: tier });
     this.workspaceUpgradeInProgress.set({ tier });
     this._systemMessage(
       tier === 'vm'
@@ -7589,19 +7729,28 @@ export class PersistentChatService {
         const rejectedMethod =
           params['method'] === 'mode.set' ||
           params['method'] === 'narration.set' ||
-          params['method'] === 'workspace.undo'
+          params['method'] === 'workspace.undo' ||
+          params['method'] === 'compact'
             ? params['method']
             : null;
         const rejectedMarker = rejectedMethod
           ? this._takeDurableControlAck(params, rejectedMethod)
           : null;
         if (coveredBySnapshot) break;
+        const code = typeof params['error_code'] === 'string' ? params['error_code'] : '';
+        const messageKey =
+          CONTROL_REJECTION_KEYS[code] ??
+          (rejectedMethod === 'compact'
+            ? 'chat.control.compactRejected'
+            : rejectedMethod === 'workspace.undo'
+              ? 'chat.control.undoRejected'
+              : 'chat.control.ownerRejected');
         this._setDurableControlError(
           rejectedMarker ?? {
             method: rejectedMethod,
             ordinal: ++this.durableControlOrdinal,
           },
-          this.transloco.translate('chat.control.ownerRejected'),
+          this.transloco.translate(messageKey),
         );
         break;
       }
@@ -7757,6 +7906,8 @@ export class PersistentChatService {
       }
 
       case 'context.compacted': {
+        // A stateless /compact is receipted by this very frame.
+        this._clearDurableControlErrorAfter(this._takeDurableControlAck(params, 'compact'));
         // Compaction finished — clear the live progress block.
         this.compaction.set(null);
         const summary = (params['summary'] as string | null) ?? '';
@@ -7861,10 +8012,13 @@ export class PersistentChatService {
         // pointed at a nonexistent "upgrade button" / `/upgrade` command.
         const cmd = (params['command'] as string) || '';
         const cmdNote = cmd ? ` (\`${cmd}\` needs root)` : '';
+        const hint =
+          this.controlTransport('upgrade-to-workspace') === 'websocket'
+            ? 'Send /upgrade-workspace vm to move this session onto a VM with sudo ' +
+              '(your files carry over).'
+            : 'This session cannot be upgraded in place; start a VM session for root access.';
         this._systemMessage(
-          `VM upgrade needed: ${(params['reason'] as string) || 'sudo detected'}${cmdNote}. ` +
-            `Send /upgrade-workspace vm to move this session onto a VM with sudo ` +
-            `(your files carry over).`,
+          `VM upgrade needed: ${(params['reason'] as string) || 'sudo detected'}${cmdNote}. ${hint}`,
         );
         break;
       }

@@ -9376,7 +9376,13 @@ describe('PersistentChatService — workspace/VM upgrade notices (Q7/Q8)', () =>
   }
 
   it('vm_upgrade.needed points at the real /upgrade-workspace vm command, not a phantom button', async () => {
-    const { service, es } = await setup();
+    const ctx = createService();
+    // A pinned session: the upgrade verb has its socket transport.
+    ctx.mockHttp.get.mockImplementation(activeSessionGet);
+    await ctx.service.connect('thread-X');
+    fireSseOpen(ctx.sseInstances[0]);
+    const service = ctx.service;
+    const es = ctx.sseInstances[0];
     fireSseMessage(
       es,
       {
@@ -9391,6 +9397,20 @@ describe('PersistentChatService — workspace/VM upgrade notices (Q7/Q8)', () =>
     expect(lines.some((l) => l.includes('upgrade button'))).toBe(false);
     // The triggering command is surfaced for context.
     expect(lines.some((l) => l.includes('sudo apt-get install foo'))).toBe(true);
+  });
+
+  it('vm_upgrade.needed never suggests a command the session cannot carry', async () => {
+    // No socket, so no upgrade transport: pointing at /upgrade-workspace
+    // would only lead to a refusal.
+    const { service, es } = await setup();
+    fireSseMessage(
+      es,
+      { method: 'vm_upgrade.needed', params: { reason: 'sudo detected' } },
+      '1:1',
+    );
+    const lines = sysLines(service);
+    expect(lines.some((l) => l.startsWith('VM upgrade needed'))).toBe(true);
+    expect(lines.some((l) => l.includes('/upgrade-workspace'))).toBe(false);
   });
 
   it('workspace_upgrade.progress surfaces a live heartbeat during a slow provision', async () => {
@@ -11395,17 +11415,163 @@ describe('PersistentChatService — control transport is declared, never inferre
     const ctx = await socketlessSession();
 
     ctx.service.upgradeWorkspace('sandbox');
-    expect(ctx.service.error()).toBe('chat.control.unavailable');
+    expect(ctx.service.error()).toBe('chat.control.upgradeUnavailable');
     expect(ctx.service.workspaceUpgradeInProgress()).toBeNull();
     expect((ctx.service as any).controlOutbox).toEqual([]);
 
     ctx.service.error.set(null);
+    expect((ctx.service as any).handleSlashCommand('/compact')).toBe(true);
+    expect(ctx.service.error()).toBe('chat.control.compactUnavailable');
+    expect((ctx.service as any).controlOutbox).toEqual([]);
+    expect(ctx.mockHttp.post).not.toHaveBeenCalled();
+    expect(ctx.wsInstances).toHaveLength(0);
+  });
+
+  it('/done without an archive socket ends through the owner End path', async () => {
+    const ctx = await socketlessSession();
+    ctx.mockHttp.delete.mockReturnValue(of({ status: 'ended' }));
     const stamps = vi.spyOn(ctx.service as any, '_systemMessage');
+
     expect((ctx.service as any).handleSlashCommand('/done')).toBe(true);
-    expect(stamps).not.toHaveBeenCalledWith('Ending session...');
-    expect(ctx.service.error()).toBe('chat.control.unavailable');
+    await Promise.resolve();
+
+    expect(stamps).toHaveBeenCalledWith('Ending session...');
+    expect(ctx.mockHttp.delete).toHaveBeenCalledWith(
+      expect.stringContaining('/persistent/threads/socketless'),
+    );
+    expect(ctx.service.error()).toBeNull();
     expect((ctx.service as any).controlOutbox).toEqual([]);
     expect(ctx.wsInstances).toHaveLength(0);
+  });
+
+  it('the palette offers exactly the commands this session can carry', async () => {
+    const bare = await socketlessSession();
+    const offered = (ctx: typeof bare) =>
+      ['/compact', '/done', '/undo', '/rewind', '/auto', '/silent', '/upgrade-workspace'].filter(
+        (command) => ctx.service.slashCommandAvailable(command),
+      );
+    expect(offered(bare)).toEqual(['/done', '/undo', '/auto', '/silent']);
+
+    const withCompact = await socketlessSession({
+      ...declaredSocketless,
+      controls: { ...declaredSocketless.controls, compact: 'rest' },
+    });
+    expect(offered(withCompact)).toEqual(['/compact', '/done', '/undo', '/auto', '/silent']);
+  });
+
+  it('a declared stateless /compact rides the durable control inbox', async () => {
+    const ctx = await socketlessSession({
+      ...declaredSocketless,
+      controls: { ...declaredSocketless.controls, compact: 'rest' },
+    });
+    ctx.mockHttp.post.mockReturnValue(of({ state: 'pending' }));
+
+    expect(ctx.service.summarizeAvailable()).toBe(true);
+    expect((ctx.service as any).handleSlashCommand('/compact  the pricing  ')).toBe(true);
+
+    expect(ctx.mockHttp.post).toHaveBeenCalledWith(
+      expect.stringContaining('/persistent/threads/socketless/controls'),
+      expect.objectContaining({
+        method: 'compact',
+        focus: 'the pricing',
+        session_runtime_generation: declaredSocketless.session_runtime_generation,
+      }),
+    );
+    const body = ctx.mockHttp.post.mock.calls[0][1];
+    expect(body).not.toHaveProperty('boundary_message_id');
+    expect((ctx.service as any).controlOutbox).toEqual([]);
+    expect(ctx.wsInstances).toHaveLength(0);
+
+    // "Summarize up to here" carries its boundary on the same verb.
+    ctx.service.summarizeUpTo('msg-7');
+    expect(ctx.mockHttp.post.mock.calls.at(-1)?.[1]).toEqual(
+      expect.objectContaining({ method: 'compact', boundary_message_id: 'msg-7' }),
+    );
+  });
+
+  it('a /compact typed mid-response waits for the session to go idle', async () => {
+    const ctx = await socketlessSession({
+      ...declaredSocketless,
+      controls: { ...declaredSocketless.controls, compact: 'rest' },
+    });
+    ctx.mockHttp.post.mockReturnValue(of({ state: 'pending' }));
+    const stamps = vi.spyOn(ctx.service as any, '_systemMessage');
+    ctx.service.pendingTurnCount.set(1);
+    TestBed.tick();
+
+    (ctx.service as any).handleSlashCommand('/compact first');
+    (ctx.service as any).handleSlashCommand('/compact second');
+
+    expect(ctx.mockHttp.post).not.toHaveBeenCalled();
+    // Said once, however often it was asked.
+    expect(
+      stamps.mock.calls.filter(([line]) => line === 'chat.control.compactDeferred'),
+    ).toHaveLength(1);
+
+    ctx.service.pendingTurnCount.set(0);
+    TestBed.tick();
+
+    expect(ctx.mockHttp.post).toHaveBeenCalledTimes(1);
+    expect(ctx.mockHttp.post.mock.calls[0][1]).toEqual(
+      expect.objectContaining({ method: 'compact', focus: 'second' }),
+    );
+  });
+
+  it('an owner rejection of /compact says why, and its receipt clears the error', async () => {
+    const ctx = await socketlessSession({
+      ...declaredSocketless,
+      controls: { ...declaredSocketless.controls, compact: 'rest' },
+    });
+    ctx.mockHttp.post.mockReturnValue(of({ state: 'pending' }));
+    (ctx.service as any).handleSlashCommand('/compact');
+    const request = ctx.mockHttp.post.mock.calls[0][1];
+
+    fireSseMessage(
+      ctx.sseInstances[0],
+      {
+        method: 'control.rejected',
+        params: {
+          method: 'compact',
+          client_request_id: request.client_request_id,
+          error_code: 'compaction_failed',
+        },
+      },
+      '2:1',
+    );
+    expect(ctx.service.error()).toBe('chat.control.compactFailed');
+
+    (ctx.service as any).handleSlashCommand('/compact');
+    const retry = ctx.mockHttp.post.mock.calls[1][1];
+    fireSseMessage(
+      ctx.sseInstances[0],
+      {
+        method: 'context.compacted',
+        params: {
+          method: 'compact',
+          client_request_id: retry.client_request_id,
+          trigger: 'manual',
+          summary: 'folded',
+          turn: 2,
+          before: 40,
+          after: 6,
+        },
+      },
+      '2:2',
+    );
+    expect(ctx.service.error()).toBeNull();
+  });
+
+  it('/undo announces itself only when something was dispatched', async () => {
+    const ctx = await socketlessSession({
+      ...declaredSocketless,
+      session_runtime_generation: null,
+    });
+    const stamps = vi.spyOn(ctx.service as any, '_systemMessage');
+
+    // Without a runtime generation admission is refused locally.
+    expect((ctx.service as any).handleSlashCommand('/undo')).toBe(true);
+    expect(stamps).not.toHaveBeenCalledWith('Undoing last file changes...');
+    expect(ctx.service.error()).toBe('chat.control.admissionFailed');
   });
 
   it('frames queued before /connection resolved are failed once it declares no socket', async () => {

@@ -145,7 +145,8 @@ export type TierReachability =
   | 'ok'
   | 'downgrade'
   | 'needsApproval'
-  | 'unsupported';
+  | 'unsupported'
+  | 'sessionUnsupported';
 
 /** Deep-read a nested path from a config object. */
 export function readConfigPath(config: Record<string, unknown>, path: string): unknown {
