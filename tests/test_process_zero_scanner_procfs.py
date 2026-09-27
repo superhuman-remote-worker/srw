@@ -49,7 +49,7 @@ class Proc:
     # leader alone, reading exactly like the process.
     tasks: dict[int, bytes | BaseException] | None = None
     # Successive answers to listdir(/proc/P/task); the last one repeats.
-    listings: list[list[int]] | None = None
+    listings: list[list[int] | BaseException] | None = None
     # A listing taken just before a thread is created: returned by the first
     # listdir after each read of the leader's environment, so every scan
     # pass starts from a stale view of the group.
@@ -133,6 +133,8 @@ class Procfs:
             listing = proc.listings[0]
             if len(proc.listings) > 1:
                 proc.listings.pop(0)
+            if isinstance(listing, BaseException):
+                raise listing
             return [str(tid) for tid in listing]
         tasks = proc.tasks if proc.tasks is not None else {pid: proc.environ}
         return [str(tid) for tid in tasks]
@@ -382,6 +384,86 @@ class TestTaggedScanDeadLeaders:
         )
 
         assert code == 0
+
+    @pytest.mark.parametrize("terminate", [False, True], ids=["verify", "terminate"])
+    @pytest.mark.parametrize("failed_listing", [1, 2], ids=["initial", "stable"])
+    def test_task_directory_esrch_reinspects_an_exited_group(
+        self, terminate, failed_listing
+    ):
+        exited = Proc(
+            state="Z",
+            environ=_ESRCH,
+            listings=[[200]] * (failed_listing - 1) + [_ESRCH, [200]],
+        )
+
+        code, procfs = _tagged_scan({200: exited}, terminate=terminate)
+
+        assert code == 0
+        assert procfs.kills == []
+
+    @pytest.mark.parametrize("terminate", [False, True], ids=["verify", "terminate"])
+    @pytest.mark.parametrize("failed_listing", [1, 2], ids=["initial", "stable"])
+    def test_task_directory_esrch_still_finds_a_live_tagged_sibling(
+        self, monkeypatch, terminate, failed_listing
+    ):
+        half = Proc(state="Z", threads=2, environ=_ESRCH, tasks={200: _ESRCH})
+        procfs = Procfs({200: half, 300: Proc(environ=_UNTAGGED)})
+        listdir = procfs.listdir
+        observations = 0
+
+        def create_sibling_during_listing(path):
+            nonlocal observations
+            if path == "/proc/200/task":
+                observations += 1
+                if observations == failed_listing:
+                    half.tasks[201] = _TAGGED
+                    raise _ESRCH
+            return listdir(path)
+
+        monkeypatch.setattr(procfs, "listdir", create_sibling_during_listing)
+        command = _BACKEND._stateless_workspace_process_zero_shell(terminate=terminate)
+
+        code = procfs.run(command, "__SRW_PROCESS_ZERO_PY__")
+
+        assert code == (0 if terminate else 85)
+        assert procfs.kills == ([(200, signal.SIGTERM)] if terminate else [])
+        assert 300 in procfs.procs
+
+    @pytest.mark.parametrize("terminate", [False, True], ids=["verify", "terminate"])
+    def test_task_directory_esrch_that_never_settles_remains_ambiguous(self, terminate):
+        unknown = Proc(environ=_ESRCH, listings=[_ESRCH])
+
+        code, procfs = _tagged_scan({200: unknown}, terminate=terminate)
+
+        assert code == 86
+        assert procfs.kills == []
+
+    @pytest.mark.parametrize("terminate", [False, True], ids=["verify", "terminate"])
+    @pytest.mark.parametrize("failed_listing", [1, 2], ids=["initial", "stable"])
+    def test_task_directory_esrch_can_settle_as_a_gone_group(
+        self, monkeypatch, terminate, failed_listing
+    ):
+        procfs = Procfs({200: Proc(environ=_ESRCH), 300: Proc(environ=_UNTAGGED)})
+        listdir = procfs.listdir
+        observations = 0
+
+        def reap_during_listing(path):
+            nonlocal observations
+            if path == "/proc/200/task":
+                observations += 1
+                if observations == failed_listing:
+                    del procfs.procs[200]
+                    raise _ESRCH
+            return listdir(path)
+
+        monkeypatch.setattr(procfs, "listdir", reap_during_listing)
+        command = _BACKEND._stateless_workspace_process_zero_shell(terminate=terminate)
+
+        code = procfs.run(command, "__SRW_PROCESS_ZERO_PY__")
+
+        assert code == 0
+        assert procfs.kills == []
+        assert 300 in procfs.procs
 
     def test_verify_never_signals(self):
         procs = {

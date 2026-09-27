@@ -947,18 +947,27 @@ def environment(name):
     if values:
         return values.split(b"\\0")
     for _ in range(5):
-        listed = os.listdir(f"/proc/{{name}}/task")
-        for tid in listed:
-            try:
-                values = open(f"/proc/{{name}}/task/{{tid}}/environ", "rb").read()
-            except (FileNotFoundError, ProcessLookupError):
-                continue
-            if values:
-                return values.split(b"\\0")
+        try:
+            listed = os.listdir(f"/proc/{{name}}/task")
+            for tid in listed:
+                try:
+                    values = open(f"/proc/{{name}}/task/{{tid}}/environ", "rb").read()
+                except (FileNotFoundError, ProcessLookupError):
+                    continue
+                if values:
+                    return values.split(b"\\0")
+            relisted = os.listdir(f"/proc/{{name}}/task")
+        except ProcessLookupError:
+            # The task directory can open just before reaping and then
+            # readdir raises ESRCH. Repeat the complete observation: ESRCH
+            # alone proves neither absence nor that no live sibling exists.
+            # Persistent inability to inspect still returns UNSETTLED.
+            time.sleep(0.005)
+            continue
         # No listed task holds an mm with an environment. A thread created
         # meanwhile appears in a second listing; without one, no task of
         # the group carries a tag it can still act on.
-        if set(os.listdir(f"/proc/{{name}}/task")) <= set(listed):
+        if set(relisted) <= set(listed):
             return None
     return UNSETTLED
 
