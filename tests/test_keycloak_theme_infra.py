@@ -434,6 +434,30 @@ def test_local_kubernetes_dev_credentials_match_the_chart() -> None:
     )
 
 
+def test_local_kubernetes_dev_account_snippet_matches_the_chart() -> None:
+    """The guide's snippet for adding the accounts to an existing realm repeats
+    the passwords and roles; a drifted line creates an account the table lies
+    about."""
+    values = yaml.safe_load((ROOT / "helm/values.yaml").read_text())
+    chart = {
+        u["username"]: (u["password"], "admin user" if u["admin"] else "user")
+        for u in values["keycloak"]["devUsers"]["users"]
+    }
+    snippet = {
+        name: (password, roles)
+        for name, password, roles in re.findall(
+            r"^(dev-[a-z0-9-]+) (\S+) ([a-z ]+)$",
+            (ROOT / "docs/local-kubernetes.md").read_text(),
+            re.M,
+        )
+    }
+    assert snippet == chart, (
+        "Local Kubernetes dev-account snippet is out of sync with "
+        "keycloak.devUsers in helm/values.yaml.\n"
+        f"  snippet: {snippet}\n  chart:   {chart}"
+    )
+
+
 @pytest.mark.skipif(shutil.which("helm") is None, reason="helm binary not installed")
 def test_configmap_keys_have_no_slashes() -> None:
     """A real API server rejects a ConfigMap key containing '/'. Assert on the

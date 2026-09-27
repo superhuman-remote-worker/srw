@@ -265,6 +265,10 @@ helm install srw oci://ghcr.io/superhuman-remote-worker/charts/superhuman-remote
 **This mode is for evaluation only** — see
 [Secrets](#secrets) for production options.
 
+The first login is the initial administrator, `keycloak.bootstrapAdmin.username`
+(`test` when empty), with the password you supply as `KC_REALM_ADMIN_PASSWORD`;
+see [Secret schema](#secret-schema). No test accounts are created.
+
 After install, follow the printed `NOTES.txt` to back up the encryption key.
 
 ---
@@ -613,6 +617,11 @@ in an existing Keycloak database. Keep the same explicit value in offline or
 GitOps rendering, where Helm cannot read the existing ConfigMap. Create further
 administrators through SRW user management. Password reconciliation on pod
 restart continues to target the selected initial user.
+
+The chart creates no test accounts. `keycloak.devUsers` seeds six accounts
+whose passwords are published in this repository; it exists for local k3d
+development, defaults to `false`, and must never be enabled on a reachable
+deployment. See [Local Kubernetes with k3d](../docs/local-kubernetes.md#4-log-in).
 
 **Git, cloud, admin credentials:**
 - `GITEA_ADMIN_USER`, `GITEA_ADMIN_PASSWORD` (internal Gitea only)

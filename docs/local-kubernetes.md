@@ -196,7 +196,8 @@ single-origin mode and accept its certificate warning. Then use:
 The account is seeded by the local Keycloak configuration. Its email is
 pre-verified and it maps to the local Gitea administrator.
 
-The local overlay also enables published multi-user test accounts:
+The local values file also sets `keycloak.devUsers.enabled: true`, which adds
+published multi-user test accounts:
 
 | Username | Password | Roles |
 |---|---|---|
@@ -208,8 +209,38 @@ The local overlay also enables published multi-user test accounts:
 | `dev-user-4` | `srw-k3d-dev-usr4` | user |
 
 > [!WARNING]
-> Anyone who has read this repository knows these passwords. The chart default
-> keeps development users disabled; only the local overlay enables them.
+> Anyone who has read this repository knows these passwords.
+> `keycloak.devUsers.enabled` defaults to `false`, so an installation without the
+> local values file creates none of these accounts. Never enable it on a
+> reachable deployment.
+
+Keycloak creates these accounts only on its first start with an empty database.
+If your cluster's Keycloak database predates the setting, a Helm upgrade does
+not add them. Add them to the running realm instead:
+
+```bash
+kubectl --context k3d-srw --namespace srw exec -i deploy/srw-keycloak -c keycloak -- sh -s <<'EOF'
+kc() { /opt/keycloak/bin/kcadm.sh "$@" --config /tmp/kcadm.config; }
+kc config credentials --server "http://localhost:8080${KC_HTTP_RELATIVE_PATH}" \
+  --realm master --user "$KEYCLOAK_ADMIN" --password "$KEYCLOAK_ADMIN_PASSWORD"
+while read -r name password roles; do
+  kc create users -r srw -s username="$name" -s email="$name@localhost" \
+    -s emailVerified=true -s enabled=true -s firstName="$name" -s lastName=Dev
+  kc set-password -r srw --username "$name" --new-password "$password"
+  for role in $roles; do kc add-roles -r srw --uusername "$name" --rolename "$role"; done
+done <<'USERS'
+dev-admin-1 srw-k3d-dev-adm1 admin user
+dev-admin-2 srw-k3d-dev-adm2 admin user
+dev-user-1 srw-k3d-dev-usr1 user
+dev-user-2 srw-k3d-dev-usr2 user
+dev-user-3 srw-k3d-dev-usr3 user
+dev-user-4 srw-k3d-dev-usr4 user
+USERS
+EOF
+```
+
+Accounts that already exist report `User exists`; the command still sets their
+passwords and adds their roles.
 
 ## Local endpoints
 

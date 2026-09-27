@@ -108,7 +108,8 @@ secrets:
     # password on every pod restart by the chart's postStart hook. It must be at
     # least 16 characters or the realm password policy rejects the reset (and the
     # hook swallows the error), so the old 4-character "test" no longer works.
-    # The shared dev accounts live behind keycloak.devUsers — see README.
+    # The shared dev accounts live behind keycloak.devUsers — see
+    # docs/local-kubernetes.md.
     KEYCLOAK_ADMIN_USER: "admin"
     KEYCLOAK_ADMIN_PASSWORD: "dev_kc_admin"
     KC_ADMIN_USER: "admin"
@@ -458,7 +459,8 @@ logFormat: "text"
 #     enabled: false
 
 # Shared k3d test accounts — 2 admins + 4 regular users, fixed passwords
-# documented in README.md. Dev overlay only; the chart default is false.
+# documented in docs/local-kubernetes.md. Dev overlay only; the chart default
+# is false.
 keycloak:
   devUsers:
     enabled: true

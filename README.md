@@ -149,9 +149,15 @@ kubectl --context k3d-srw --namespace srw get pods --watch
 |---|---|---|
 | <https://localhost/> | `test` | `srw-k3d-dev-test` |
 
-The local values file contains published development credentials and must never
-be used on a reachable deployment. This source-based path installs the component
-images built from your checkout's history, not a release. Continue with the
+The local values file also enables six shared test accounts through
+`keycloak.devUsers.enabled`; their passwords are listed in
+[Log in](docs/local-kubernetes.md#4-log-in). The chart default is `false`, so a
+`helm install` without the local values file creates no test accounts. Because
+the local values file contains these published credentials, it must never be
+used on a reachable deployment.
+
+This source-based path installs the component images built from your checkout's
+history, not a release. Continue with the
 [local installation and smoke-test guide](docs/local-kubernetes.md). For an
 existing cluster, production topology, HA databases, upgrades, and the OCI
 chart, use the [Helm chart guide](helm/README.md).
