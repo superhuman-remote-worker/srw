@@ -845,10 +845,53 @@ def test_workspace_policy_admits_the_gateway(docs: list[dict]) -> None:
         ]
         assert admitted, f"{policy['metadata']['name']} does not admit the gateway"
         ports = {port["port"] for rule in admitted for port in rule["ports"]}
-        # 30022 only: VM-tier workspaces are refused upstream by
-        # ssh_gateway_targets (vm_unsupported), so port 22 would be an
-        # unused hole.
+        # This fixture uses VM mode off. VM mode is covered separately by
+        # the paired gateway-egress/workspace-ingress regression below.
         assert ports == {30022}
+
+
+@pytest.mark.parametrize(
+    ("setting", "expected_ports"),
+    [
+        ("vm.mode=off", {30022}),
+        ("vm.mode=same-cluster", {22, 30022}),
+        ("vmController.enabled=true", {22, 30022}),
+    ],
+)
+def test_gateway_workspace_ssh_policy_is_bidirectional(
+    setting: str,
+    expected_ports: set[int],
+) -> None:
+    """A real VM inner hop needs gateway egress as well as workspace ingress."""
+    documents = _render(
+        *ENABLE,
+        "--set",
+        setting,
+        "--set",
+        "vm.lifecycleAuthSecretName=vm-lifecycle-test",
+    )
+    gateway = _one(documents, "NetworkPolicy", "ssh-gateway")
+    workspace_rules = [
+        rule
+        for rule in gateway["spec"]["egress"]
+        if rule.get("to")
+        == [{"podSelector": {"matchLabels": {"srw.io/component": "agent-workspace"}}}]
+    ]
+    assert len(workspace_rules) == 1
+    assert {p["port"] for p in workspace_rules[0]["ports"]} == expected_ports
+    for policy in _find(documents, "NetworkPolicy", "workspace-policy"):
+        admitted = [
+            rule
+            for rule in policy["spec"]["ingress"]
+            if any(
+                source.get("podSelector", {})
+                .get("matchLabels", {})
+                .get("app.kubernetes.io/component")
+                == "ssh-gateway"
+                for source in rule.get("from", [])
+            )
+        ]
+        assert {p["port"] for rule in admitted for p in rule["ports"]} == expected_ports
 
 
 # ---------------------------------------------------------------------------
