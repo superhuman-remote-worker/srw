@@ -19,6 +19,130 @@ _TEST_RESOURCE_UID = "22222222-2222-4222-8222-222222222222"
 
 
 @pytest.mark.asyncio
+async def test_staged_ready_rejects_ssh_peer_with_wrong_pod_host_key():
+    """An authenticated key on another route cannot publish this Pod Ready."""
+
+    from datetime import datetime, timedelta, timezone
+
+    from orchestrator.services import container_provisioner as provider_module
+    from orchestrator.services.container_provisioner import ContainerProvisioner
+
+    owner = WorkspaceOwner.job(str(uuid4()))
+    pod_uid = str(uuid4())
+    receipt_id = str(uuid4())
+    fingerprint = "SHA256:" + "A" * 43
+    now = datetime.now(timezone.utc)
+    scheduled_at = now - timedelta(seconds=5)
+    ready_at = now - timedelta(seconds=2)
+    pod = SimpleNamespace(
+        metadata=SimpleNamespace(
+            uid=pod_uid,
+            creation_timestamp=scheduled_at - timedelta(seconds=1),
+            deletion_timestamp=None,
+        ),
+        spec=SimpleNamespace(node_name="node-1"),
+        status=SimpleNamespace(
+            phase="Running",
+            pod_ip="10.42.0.50",
+            conditions=[
+                SimpleNamespace(
+                    type="PodScheduled",
+                    status="True",
+                    last_transition_time=scheduled_at,
+                ),
+                SimpleNamespace(
+                    type="Ready", status="True", last_transition_time=ready_at
+                ),
+            ],
+            container_statuses=[
+                SimpleNamespace(
+                    name="workspace", ready=True, state=SimpleNamespace(waiting=None)
+                )
+            ],
+        ),
+    )
+    receipt = {
+        "id": receipt_id,
+        "claim_token": 1,
+        "runtime_incarnation": pod_uid,
+        "phase": "runtime_bound",
+        "settled_at": None,
+        "cancel_requested_at": None,
+        "startup_protocol_version": 1,
+        "startup_state": "starting",
+        "scheduled_at": scheduled_at,
+        "ready_budget_seconds": 120,
+        "pull_budget_seconds": None,
+        "ssh_budget_seconds": 30,
+        "startup_first_ready_at": ready_at,
+    }
+
+    class ObservationDB:
+        async def observe_container_startup(self, *args, **kwargs):
+            return True
+
+    provisioner = ContainerProvisioner()
+    provisioner._db = ObservationDB()
+    provisioner._core_api = MagicMock()
+    provisioner._core_api.read_namespaced_pod.return_value = pod
+    provisioner.get_current_workspace_creation_result = AsyncMock(return_value=receipt)
+    provisioner._require_workspace_pod_connection_identity = MagicMock()
+    provisioner._require_workspace_creation_reservation_annotation = MagicMock()
+    provisioner._trusted_pod_ssh_identity = AsyncMock(
+        return_value=(f"k8s-pod:{pod_uid}", fingerprint, pod_uid)
+    )
+
+    async def wrong_peer_probe(*args, **kwargs):
+        return (
+            (False, 1, "wrong host key")
+            if kwargs.get("expected_host_key_fingerprint")
+            else (True, 1, "")
+        )
+
+    with (
+        patch.object(
+            provider_module, "resolve_ssh_key_path", return_value="/run/test-key"
+        ),
+        patch.object(
+            provider_module,
+            "workspace_private_key_fingerprint",
+            return_value=fingerprint,
+        ),
+        patch.object(
+            provider_module,
+            "wait_for_agent_ssh",
+            new=AsyncMock(side_effect=wrong_peer_probe),
+        ) as probe,
+    ):
+        result = await provisioner._observe_container_startup_stage(
+            owner.pod_name,
+            owner=owner,
+            reservation=receipt,
+            expected_runtime_incarnation=pod_uid,
+            expected_creation_generation=None,
+            expected_network_tier=None,
+            expected_pvc_name=None,
+            expected_seed_configmap=None,
+            timeout=120,
+            pull_image=None,
+            observation_check=None,
+            authority_check=None,
+        )
+
+    assert result is None
+    provisioner._trusted_pod_ssh_identity.assert_awaited_once_with(
+        owner.pod_name,
+        pvc_name=None,
+        expected_owner=owner,
+        expected_runtime_incarnation=pod_uid,
+        expected_creation_generation=None,
+        expected_network_tier=None,
+        expected_seed_configmap=None,
+    )
+    assert probe.await_args.kwargs["expected_host_key_fingerprint"] == fingerprint
+
+
+@pytest.mark.asyncio
 async def test_bounded_kubernetes_call_joins_worker_after_repeated_cancellation():
     """No cancellation count may release authority around a live sync call."""
 

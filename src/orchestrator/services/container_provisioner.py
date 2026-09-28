@@ -15601,6 +15601,30 @@ class ContainerProvisioner:
                     "container startup reservation authority revoked"
                 )
 
+        if (
+            expected_pvc_name is _UNSPECIFIED_RESOURCE_BINDING
+            or expected_seed_configmap is _UNSPECIFIED_RESOURCE_BINDING
+        ):
+            raise WorkspaceRuntimeAuthorityError(
+                "container startup storage authority is incomplete"
+            )
+        await check_current()
+        (
+            _,
+            expected_host_key_fingerprint,
+            confirmed_uid,
+        ) = await self._trusted_pod_ssh_identity(
+            pod_name,
+            pvc_name=expected_pvc_name,
+            expected_owner=owner,
+            expected_runtime_incarnation=expected_runtime_incarnation,
+            expected_creation_generation=expected_creation_generation,
+            expected_network_tier=expected_network_tier,
+            expected_seed_configmap=expected_seed_configmap,
+        )
+        if confirmed_uid != expected_runtime_incarnation:
+            raise WorkspaceRuntimeAuthorityError("workspace Pod UID changed")
+        await check_current()
         remaining = (ssh_deadline - datetime.now(timezone.utc)).total_seconds()
         if remaining <= 0:
             await record(StartupAttention("ssh_deadline"))
@@ -15617,6 +15641,7 @@ class ContainerProvisioner:
             connect_timeout_s=self._ssh_auth_connect_timeout,
             interval_s=self._ssh_auth_poll_interval,
             key_path=key_path,
+            expected_host_key_fingerprint=expected_host_key_fingerprint,
             authority_check=check_current,
         )
         if not ready:
