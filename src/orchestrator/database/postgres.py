@@ -17028,8 +17028,7 @@ class PostgresDB:
         if owner_kind == "job":
             owner_table, owner_json = "jobs", "context"
             owner_guard = "j.status NOT IN ('completed','failed','cancelled')"
-            initial_guard = "TRUE"
-            cleanup_guard = "AND c.settled_at IS NULL"
+            initial_guard = "j.context #>> '{workspace_container,provisioner}'='k8s'"
         else:
             owner_table, owner_json = "threads", "metadata"
             owner_guard = (
@@ -17049,7 +17048,6 @@ class PostgresDB:
                 "'_stateless_workspace_retirement_pending','_stateless_claim_retirement',"
                 "'_stateless_claim_loss_hold','_stateless_claim_losses'])"
             )
-            cleanup_guard = ""
         query = (
             "SELECT r.owner_id,r.phase,r.result_kind,r.settled_at,"
             "r.cancel_requested_at,r.startup_protocol_version,r.startup_stage,"
@@ -17075,7 +17073,7 @@ class PostgresDB:
             "AND NOT EXISTS (SELECT 1 FROM "
             "managed_repository_workspace_cleanup_intents c "
             "WHERE c.owner_kind=$2 AND c.owner_id=j.id "
-            f"AND c.scope='workspace_container' {cleanup_guard})"
+            "AND c.scope='workspace_container' AND c.settled_at IS NULL)"
         )
         async with self.acquire() as conn:
             rows = await conn.fetch(query, ids, owner_kind)
