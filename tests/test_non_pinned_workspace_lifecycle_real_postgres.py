@@ -747,6 +747,105 @@ async def test_ide_restore_worklist_finds_settled_runtime_with_unfinished_work(d
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "owner_change",
+    (None, "wrong_uid", "wrong_token", "wrong_reservation"),
+)
+async def test_settled_ide_db_uuid_allows_only_exact_owner_restore_work_claim(
+    db, owner_change
+):
+    job_id, runtime = uuid4(), uuid4()
+    async with db.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO jobs (id, description, status, repo_name, context) "
+            "VALUES ($1, 'typed IDE receipt', 'completed', 'owned-repo', '{}'::jsonb)",
+            job_id,
+        )
+    admitted = await db.begin_managed_ide_restore_attempt(
+        str(job_id),
+        attempt_id=str(uuid4()),
+        proposed_context={
+            "status": "restoring",
+            "source": "gitea",
+            "snapshot_type": "gitea",
+            "restore_type": "k8s_container",
+            "started_at": "2026-09-28T00:00:00Z",
+        },
+        desired_manifest_digest="d" * 64,
+        claimant="ide-issuer:typed-receipt",
+    )
+    assert admitted["disposition"] == "accepted"
+    reservation = admitted["reservation"]
+    gate = dict(
+        owner_kind="job",
+        scope="ide",
+        reservation_generation=int(reservation["reservation_generation"]),
+        claimant="ide-issuer:typed-receipt",
+        claim_token=int(reservation["claim_token"]),
+    )
+    assert await db.mark_managed_repository_workspace_creation_started(
+        str(job_id), **gate
+    )
+    assert await db.begin_managed_repository_workspace_creation_effect(
+        str(job_id), **gate, resource_kind="pod"
+    )
+    assert await db.authorize_managed_repository_workspace_creation_runtime(
+        str(job_id), **gate, runtime_incarnation=str(runtime)
+    )
+    assert await db.merge_ide_session_context(
+        str(job_id),
+        {
+            "_runtime_incarnation": str(runtime),
+            "_creation_reservation_id": str(reservation["id"]),
+            "_creation_claim_token": str(reservation["claim_token"]),
+            "container_name": f"ide-{str(job_id)[:12]}",
+            "pod_ip": "10.42.0.31",
+        },
+    )
+    assert await db.settle_managed_repository_workspace_creation_reservation(
+        str(job_id), **gate, runtime_incarnation=str(runtime)
+    )
+
+    if owner_change is not None:
+        field, value = {
+            "wrong_uid": ("_runtime_incarnation", str(uuid4())),
+            "wrong_token": ("_creation_claim_token", "99999"),
+            "wrong_reservation": ("_creation_reservation_id", str(uuid4())),
+        }[owner_change]
+        async with db.acquire() as conn:
+            await _execute_pre_0195(
+                conn,
+                "UPDATE jobs SET context = jsonb_set(context, $2::text[], "
+                "to_jsonb($3::text)) WHERE id = $1",
+                job_id,
+                ["ide_session", field],
+                value,
+            )
+
+    provisioner = ContainerProvisioner()
+    provisioner._db = db
+    service = IdeSessionService()
+    service.connect(db, None, None, container_provisioner=provisioner)
+    receipt = await provisioner.get_current_ide_creation_result(str(job_id))
+    if owner_change is not None:
+        assert receipt is None
+        assert await service._current_ide_restore_runtime(str(job_id)) is None
+        return
+
+    assert receipt is not None
+    assert isinstance(receipt["runtime_incarnation"], UUID)
+    assert await service._current_ide_restore_runtime(str(job_id)) == (
+        str(runtime), "10.42.0.31"
+    )
+    claim = await service._claim_ide_restore_work(
+        str(job_id), runtime_incarnation=str(runtime)
+    )
+    assert claim is not None
+    assert claim[1]["id"] == reservation["id"]
+    assert claim[1]["runtime_incarnation"] == runtime
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("status", ("completed", "failed", "cancelled"))
 async def test_terminal_job_ide_restore_traverses_creation_and_work_gates(db, status):
     job_id, runtime = uuid4(), str(uuid4())

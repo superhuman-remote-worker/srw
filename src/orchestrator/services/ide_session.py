@@ -101,7 +101,10 @@ def _settled_ide_restore_runtime(
     ):
         return None
     runtime = _canonical_runtime(session.get(WORKSPACE_RUNTIME_INCARNATION_KEY))
-    receipt_runtime = _canonical_runtime(creation.get("runtime_incarnation"))
+    receipt_runtime_value = creation.get("runtime_incarnation")
+    if isinstance(receipt_runtime_value, UUID):
+        receipt_runtime_value = str(receipt_runtime_value)
+    receipt_runtime = _canonical_runtime(receipt_runtime_value)
     if runtime is None or runtime != receipt_runtime or runtime == retired_runtime:
         return None
     return runtime
