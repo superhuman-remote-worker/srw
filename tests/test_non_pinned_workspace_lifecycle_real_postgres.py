@@ -16,7 +16,11 @@ import pytest_asyncio
 from testcontainers.postgres import PostgresContainer
 
 from orchestrator.database.postgres import PostgresDB
-from orchestrator.services.container_provisioner import ContainerProvisioner
+from orchestrator.services.container_provisioner import (
+    ContainerProvisioner,
+    RuntimeDeletionOutcome,
+    WorkspaceRuntimeAttestation,
+)
 from orchestrator.services.ide_session import IdeSessionService
 from orchestrator.services.workspace_lifecycle import WorkspaceOwner
 from orchestrator.services.workspace_suspension import WorkspaceSuspensionService
@@ -945,6 +949,254 @@ async def test_settled_ide_db_uuid_allows_only_exact_owner_restore_work_claim(
     assert completed["ide_status"] == "active"
     assert completed["restore_work_completed_at"] is not None
     assert completed["restore_work_result_kind"] == "active"
+
+
+@pytest.mark.asyncio
+async def test_ide_context_runtime_merge_refuses_missing_wrong_or_replaced_owner(db):
+    job_id, runtime_a, _reservation = await _create_settled_restore_generation(
+        db,
+        owner_kind="job",
+        scope="ide",
+        runtime_updates={"container_name": "ide-current"},
+    )
+    runtime_b = str(uuid4())
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE jobs SET context = jsonb_set(context, '{unrelated}', "
+            "'{\"preserve\":true}'::jsonb) WHERE id = $1",
+            UUID(job_id),
+        )
+
+    merge = db.merge_ide_session_context_if_runtime
+    assert await merge(
+        job_id,
+        {"status": "restoring", "container_name": "ide-current"},
+        expected_runtime_incarnation=runtime_a,
+    )
+    assert not await merge(
+        job_id,
+        {"status": "failed"},
+        expected_runtime_incarnation=runtime_b,
+    )
+    assert not await merge(
+        job_id,
+        {"status": "failed"},
+        expected_runtime_incarnation="not-a-uid",
+    )
+    assert not await merge(
+        job_id,
+        {"status": []},
+        expected_runtime_incarnation=runtime_a,
+    )
+    assert not await merge(
+        job_id,
+        {"_runtime_incarnation": runtime_b, "status": "restoring"},
+        expected_runtime_incarnation=runtime_a,
+    )
+    async with db.acquire() as conn:
+        row = await conn.fetchval(
+            "SELECT context FROM jobs WHERE id = $1", UUID(job_id)
+        )
+    row = json.loads(row) if isinstance(row, str) else row
+    assert row["ide_session"]["status"] == "restoring"
+    assert row["ide_session"]["_runtime_incarnation"] == runtime_a
+    assert row["ide_session"]["container_name"] == "ide-current"
+    assert row["unrelated"] == {"preserve": True}
+
+    missing_id = uuid4()
+    async with db.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO jobs (id, description, status, context) "
+            "VALUES ($1, 'missing IDE runtime', 'paused', '{}'::jsonb)",
+            missing_id,
+        )
+    assert not await merge(
+        str(missing_id),
+        {"status": "failed"},
+        expected_runtime_incarnation=runtime_a,
+    )
+
+
+@pytest.mark.asyncio
+async def test_ide_context_runtime_merge_allows_stop_but_never_resurrects_it(db):
+    job_uuid = uuid4()
+    job_id, runtime, _reservation = await _create_settled_restore_generation(
+        db,
+        owner_kind="job",
+        scope="ide",
+        owner_id=job_uuid,
+        runtime_updates={"container_name": f"ide-{str(job_uuid)[:12]}"},
+    )
+    provisioner = ContainerProvisioner()
+    provisioner._db = db
+
+    async def delete_exact_runtime(_job_id, *, expected_runtime_incarnation):
+        assert _job_id == job_id
+        assert expected_runtime_incarnation == runtime
+        intent = await db.prepare_managed_repository_workspace_cleanup_intent(
+            job_id,
+            owner_kind="job",
+            scope="ide",
+            runtime_incarnation=runtime,
+            target_disposition="expired",
+            reclaim_shared_resources=False,
+            pod_uid=runtime,
+            resources_captured=True,
+        )
+        assert intent is not None
+        claimed = await db.claim_managed_repository_workspace_cleanup_intent(
+            str(intent["id"]), claimant="ide-stop:exact-runtime"
+        )
+        assert claimed is not None
+        assert await db.record_managed_repository_workspace_process_zero(
+            job_id,
+            owner_kind="job",
+            scope="ide",
+            provisioner="k8s",
+            runtime_incarnation=runtime,
+        )
+        assert await db.settle_managed_repository_workspace_cleanup_intent(
+            job_id,
+            owner_kind="job",
+            scope="ide",
+            runtime_incarnation=runtime,
+            intent_generation=int(claimed["intent_generation"]),
+            claimant=str(claimed["claimed_by"]),
+            claim_token=int(claimed["claim_token"]),
+        )
+        return RuntimeDeletionOutcome("current_deleted")
+
+    provisioner.delete_ide_pod_with_outcome = AsyncMock(
+        side_effect=delete_exact_runtime
+    )
+    service = IdeSessionService()
+    service.connect(db, None, None, container_provisioner=provisioner)
+    assert (await service.stop_session(job_id))["status"] == "stopped"
+
+    merge = db.merge_ide_session_context_if_runtime
+    for late_status in ("restoring", "failed", "cleanup_pending"):
+        assert not await merge(
+            job_id,
+            {"status": late_status},
+            expected_runtime_incarnation=runtime,
+        )
+    async with db.acquire() as conn:
+        settled = await conn.fetchrow(
+            "SELECT context #>> '{ide_session,status}' AS ide_status, "
+            "context #>> '{ide_session,stopped_at}' AS stopped_at "
+            "FROM jobs WHERE id = $1",
+            UUID(job_id),
+        )
+    assert settled["ide_status"] == "expired"
+    assert settled["stopped_at"] is not None
+
+
+@pytest.mark.asyncio
+async def test_real_ide_restore_tail_merges_exact_runtime_before_git(db):
+    """A real Postgres store must let the claimed B pass the inner restore gate."""
+
+    job_uuid = uuid4()
+    job_id, runtime, reservation = await _create_settled_restore_generation(
+        db,
+        owner_kind="job",
+        scope="ide",
+        owner_id=job_uuid,
+        runtime_updates={"container_name": f"ide-{str(job_uuid)[:12]}"},
+    )
+    provisioner = ContainerProvisioner()
+    provisioner._db = db
+    provisioner._k8s_available = True
+    provisioner.attest_ide_runtime = AsyncMock(
+        return_value=WorkspaceRuntimeAttestation(
+            backing_id=f"k8s-pod:test:{runtime}",
+            workspace_generation=runtime,
+            runtime_incarnation=runtime,
+            ssh_host_key_fingerprint=(
+                "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            ),
+            host="10.42.0.31",
+            pod_ip="10.42.0.31",
+        )
+    )
+    provisioner.ide_pod_live = AsyncMock(return_value=True)
+    service = IdeSessionService()
+    service.connect(db, None, None, container_provisioner=provisioner)
+    service._install_and_sync_managed_repository_over_ssh = AsyncMock(return_value=True)
+    service._wait_for_code_server = AsyncMock(return_value=True)
+
+    assert await service._restore_k8s_ide_container(
+        job_id,
+        {"repo_name": "owned-repo"},
+        "owned-repo",
+        "main",
+        restored=(runtime, "10.42.0.31"),
+    )
+    service._install_and_sync_managed_repository_over_ssh.assert_awaited_once()
+    async with db.acquire() as conn:
+        settled = await conn.fetchrow(
+            "SELECT j.context #>> '{ide_session,status}' AS ide_status, "
+            "j.context #>> '{ide_session,_runtime_incarnation}' AS owner_runtime, "
+            "r.restore_work_completed_at, r.restore_work_result_kind "
+            "FROM jobs j JOIN managed_repository_workspace_creation_reservations r "
+            "ON r.id = $2 WHERE j.id = $1",
+            UUID(job_id),
+            reservation["id"],
+        )
+    assert settled["owner_runtime"] == runtime
+    assert settled["ide_status"] == "active"
+    assert settled["restore_work_completed_at"] is not None
+    assert settled["restore_work_result_kind"] == "active"
+
+
+@pytest.mark.asyncio
+async def test_real_ide_snapshot_failure_keeps_exact_restore_retryable(db):
+    """A failed external snapshot cannot fabricate an active B projection."""
+
+    job_uuid = uuid4()
+    job_id, runtime, reservation = await _create_settled_restore_generation(
+        db,
+        owner_kind="job",
+        scope="ide",
+        owner_id=job_uuid,
+        runtime_updates={"container_name": f"ide-{str(job_uuid)[:12]}"},
+    )
+    provisioner = ContainerProvisioner()
+    provisioner._db = db
+    provisioner._k8s_available = True
+    provisioner.attest_ide_runtime = AsyncMock(
+        return_value=WorkspaceRuntimeAttestation(
+            backing_id=f"k8s-pod:test:{runtime}",
+            workspace_generation=runtime,
+            runtime_incarnation=runtime,
+            ssh_host_key_fingerprint=(
+                "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+            ),
+            host="10.42.0.31",
+            pod_ip="10.42.0.31",
+        )
+    )
+    service = IdeSessionService()
+    service.connect(db, None, None, container_provisioner=provisioner)
+
+    assert not await service._restore_snapshot_container(
+        job_id,
+        {"repo_name": "owned-repo"},
+        restored=(runtime, "10.42.0.31"),
+    )
+    async with db.acquire() as conn:
+        observed = await conn.fetchrow(
+            "SELECT j.context #>> '{ide_session,status}' AS ide_status, "
+            "j.context #>> '{ide_session,_runtime_incarnation}' AS owner_runtime, "
+            "r.restore_work_claimed_by, r.restore_work_completed_at "
+            "FROM jobs j JOIN managed_repository_workspace_creation_reservations r "
+            "ON r.id = $2 WHERE j.id = $1",
+            job_uuid,
+            reservation["id"],
+        )
+    assert observed["owner_runtime"] == runtime
+    assert observed["ide_status"] == "restoring"
+    assert observed["restore_work_claimed_by"] is None
+    assert observed["restore_work_completed_at"] is None
 
 
 @pytest.mark.asyncio
@@ -2439,10 +2691,11 @@ async def _create_settled_restore_generation(
     *,
     owner_kind: str,
     scope: str,
+    owner_id: UUID | None = None,
     runtime_updates: dict | None = None,
     state_updates: dict | None = None,
 ) -> tuple[str, str, dict]:
-    owner_id = uuid4()
+    owner_id = owner_id or uuid4()
     runtime_uid = uuid4()
     async with db.acquire() as conn:
         if owner_kind == "job":
@@ -4670,6 +4923,16 @@ async def test_atomic_a_retirement_b_publication_clears_a_attempt_lineage(
             "_creation_claim_token": str(second["claim_token"]),
             "container_name": f"ide-{str(job_id)[:12]}",
         },
+    )
+    assert not await db.merge_ide_session_context_if_runtime(
+        str(job_id),
+        {"status": "failed", "error": "late A callback"},
+        expected_runtime_incarnation=str(runtime_a),
+    )
+    assert await db.merge_ide_session_context_if_runtime(
+        str(job_id),
+        {"status": "restoring", "error": None},
+        expected_runtime_incarnation=str(runtime_b),
     )
     async with db.acquire() as conn:
         await conn.execute(

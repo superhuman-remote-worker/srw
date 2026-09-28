@@ -144,8 +144,9 @@ controller configuration, even when this Helm value is configured.
 ## Reading capacity
 
 In Cockpit, open **Admin → Capacity → VM capacity**. Each installed cluster has
-its own policy mode, inventory freshness, count backstop, waiting and teardown
-diagnostics, durable holds, and six-dimensional resource tables. Expand **Nodes**
+its own policy mode, inventory freshness, configured admission budgets, count
+backstop, waiting and teardown diagnostics, durable holds, and six-dimensional
+resource tables. Expand **Nodes**
 with a click or Enter/Space to inspect exact node accounting. A dash means
 unknown, including a missing count maximum or an unaccountable resource
 dimension; it must not be read as zero. When inventory accounting is unavailable,
@@ -155,6 +156,19 @@ Each installed cluster policy reports its mode and inventory freshness. The
 projection reads policy, inventory, waiters and reservations in one read-only
 database snapshot. `available` means that inventory can be accounted for; it
 does not promise that a particular VM can schedule.
+
+For an installed six-dimensional policy, `admission_budget` reports the
+installation limit across all owners, the limit for each owner separately, and
+the CPU reservation formula: `ceil(guest_vcpus × numerator / denominator) +
+launcher_overhead_millicores` per VM. Cockpit labels these as configured
+admission budgets. The policy mode indicates whether admission enforces them.
+The limits come from the validated installed policy and remain visible when
+inventory is stale or missing; a legacy policy without these limits reports
+`null`. CPU millicores are the operator's reserved cost, which can differ from
+KubeVirt's actual node CPU request. A CPU budget equals a guest-vCPU ceiling
+only when the installed CPU cost formula supports that interpretation. The
+budget rows and durable holds are distinct from physical node remaining
+capacity; none alone establishes that a particular VM fits.
 
 Resource vectors contain CPU millicores, memory bytes, ephemeral-storage bytes,
 and KVM, TUN and vhost-net device counts. Node totals distinguish allocatable

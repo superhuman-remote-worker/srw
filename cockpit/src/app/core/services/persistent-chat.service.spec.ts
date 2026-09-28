@@ -12172,6 +12172,69 @@ describe('PersistentChatService — pending End visibility reconciliation', () =
     expect(ctx.sseInstances[0].close).not.toHaveBeenCalled();
   });
 
+  it('leaves a viewed ending thread when its lifecycle GET confirms deletion', async () => {
+    await connected();
+    meta = { ...meta, ...pending, retirement_permanent: true };
+    await vi.advanceTimersByTimeAsync(5000);
+    expectEnding();
+
+    ctx.mockHttp.get.mockImplementation((url: string) =>
+      metaUrl.test(url)
+        ? throwError(() => ({ status: 404 }))
+        : activeSessionGet(url),
+    );
+    await vi.advanceTimersByTimeAsync(5000);
+
+    expect(ctx.service.deletedThreadId()).toBe('watched');
+    expect(ctx.sseInstances[0].close).toHaveBeenCalled();
+    const settledReads = reads();
+    await vi.advanceTimersByTimeAsync(15000);
+    expect(reads()).toBe(settledReads);
+  });
+
+  it.each([0, 401, 403, 503])('keeps an ending thread on metadata failure %s', async status => {
+    await connected();
+    meta = { ...meta, ...pending, retirement_permanent: true };
+    await vi.advanceTimersByTimeAsync(5000);
+    ctx.mockHttp.get.mockImplementation((url: string) =>
+      metaUrl.test(url)
+        ? throwError(() => ({ status }))
+        : activeSessionGet(url),
+    );
+
+    await vi.advanceTimersByTimeAsync(5000);
+    expect(ctx.service.threadStatus()).toBe('ending');
+    expect(ctx.service.deletedThreadId()).toBeNull();
+    expect(ctx.sseInstances[0].close).not.toHaveBeenCalled();
+  });
+
+  it.each(['navigate', 'resume'])('ignores an old 404 after %s', async action => {
+    await connected();
+    meta = { ...meta, ...pending, retirement_permanent: true };
+    await vi.advanceTimersByTimeAsync(5000);
+    const response = new Subject<any>();
+    ctx.mockHttp.get.mockImplementation((url: string) =>
+      metaUrl.test(url) ? response : activeSessionGet(url),
+    );
+    await vi.advanceTimersByTimeAsync(5000);
+    if (action === 'navigate') {
+      ctx.mockHttp.get.mockImplementation(activeSessionGet);
+      await ctx.service.connect('other');
+    } else {
+      fireSseMessage(ctx.sseInstances[0], {
+        method: 'session.ended',
+        params: { session_runtime_generation: SESSION_RUNTIME_GENERATION },
+      }, '1:1');
+      ctx.mockHttp.get.mockImplementation(activeSessionGet);
+      await ctx.service.resumeSession();
+    }
+
+    response.error({ status: 404 });
+    await flushMicrotasks();
+    expect(ctx.service.deletedThreadId()).toBeNull();
+    expect(ctx.service.threadStatus()).toBe('active');
+  });
+
   it('does not overlap metadata reads while an earlier read is pending', async () => {
     await connected();
     const response = new Subject<any>();

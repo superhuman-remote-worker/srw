@@ -490,6 +490,7 @@ async def test_ide_repository_key_refuses_raw_coordinate_before_loading_secret(
 @pytest.mark.asyncio
 async def test_ide_repository_key_rejects_reused_ip_host_key_before_stdin(
     service_factory,
+    caplog,
 ):
     """A same-IP successor with a different SSH key receives zero bytes."""
 
@@ -500,9 +501,12 @@ async def test_ide_repository_key_rejects_reused_ip_host_key_before_stdin(
     svc._run_secret_stdin_process = AsyncMock(return_value=True)
     attestation = svc._container_provisioner.attest_ide_runtime.return_value
 
-    with patch(
-        "orchestrator.services.ssh_helpers._scan_pinned_host_key",
-        new=AsyncMock(return_value=(None, b"SSH host key mismatch")),
+    with (
+        patch(
+            "orchestrator.services.ssh_helpers._scan_pinned_host_key",
+            new=AsyncMock(return_value=(None, b"SSH host key mismatch")),
+        ),
+        caplog.at_level("WARNING", logger="orchestrator.services.ide_session"),
     ):
         assert not await svc._install_and_sync_managed_repository_over_ssh(
             "job-reused-ip",
@@ -517,6 +521,9 @@ async def test_ide_repository_key_rejects_reused_ip_host_key_before_stdin(
 
     svc._run_secret_stdin_process.assert_not_awaited()
     assert bytes(secret) == b"\x00" * len(secret)
+    diagnostic = "\n".join(record.getMessage() for record in caplog.records)
+    assert "phase=host_key" in diagnostic
+    assert "SSH host key mismatch" not in diagnostic
 
 
 @pytest.mark.asyncio

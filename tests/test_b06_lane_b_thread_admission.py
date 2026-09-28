@@ -23,11 +23,13 @@ from orchestrator.database.postgres import (
     DatasourceMaterializationAuthorizationError,
     DatasourcePolicyConflictError,
 )
+from orchestrator.routers import thread_admission as admission_router
 from orchestrator.schemas.thread_admission import (
     ThreadCreateRequest,
     TrustedThreadSeed,
 )
 from orchestrator.services import thread_admission as ta
+from orchestrator.services.default_experts import ExpertSelection
 
 THREAD = "11111111-1111-4111-8111-111111111111"
 GENERATION = "22222222-2222-4222-8222-222222222222"
@@ -337,6 +339,93 @@ class TestDatasourceSelection:
 
 class TestCreationPlan:
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("entrypoint", ["preview", "create"])
+    async def test_projectless_background_officer_is_refused_before_insert(
+        self, monkeypatch, entrypoint
+    ):
+        deps = _deps()
+        monkeypatch.setattr(
+            admission_router, "get_thread_admission_dependencies", lambda _request: deps
+        )
+        body = ThreadCreateRequest(config_override={"officer": {"enabled": True}})
+
+        with pytest.raises(HTTPException) as exc:
+            if entrypoint == "preview":
+                await admission_router.preview_thread_creation(body, MagicMock())
+            else:
+                await admission_router.create_thread(body, MagicMock())
+
+        assert exc.value.status_code == 400
+        assert "exactly one project" in exc.value.detail
+        deps.store.create_thread.assert_not_awaited()
+        deps.provision_or_assign.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("source", ["account", "expert"])
+    async def test_inherited_background_officer_requires_one_project(
+        self, monkeypatch, source
+    ):
+        deps = _deps()
+        if source == "account":
+            deps.resolve_session_account_defaults.return_value = {
+                "workspace": {"backend": "sandbox"},
+                "officer": {"enabled": True},
+            }
+        else:
+            monkeypatch.setattr(
+                ta,
+                "resolve_root_expert",
+                AsyncMock(
+                    return_value=ExpertSelection(
+                        expert={
+                            "id": "expert-1",
+                            "config": {"officer": {"enabled": True}},
+                        },
+                        source="application",
+                    )
+                ),
+            )
+            deps.is_experts_db_enabled.return_value = True
+            deps.user_experts_enabled.return_value = True
+
+        with pytest.raises(HTTPException) as exc:
+            await _plan(ThreadCreateRequest(), deps)
+
+        assert exc.value.status_code == 400
+        assert "exactly one project" in exc.value.detail
+
+    @pytest.mark.asyncio
+    async def test_disabled_inherited_officer_stays_ordinary(self):
+        deps = _deps(
+            resolve_session_account_defaults=AsyncMock(
+                return_value={"officer": {"enabled": True}}
+            )
+        )
+        body = ThreadCreateRequest(config_override={"officer": {"enabled": False}})
+
+        plan = await _plan(body, deps)
+
+        assert plan.effective_project_ids == []
+        assert plan.officer_requested is False
+
+    @pytest.mark.asyncio
+    async def test_legacy_primary_does_not_hide_multiple_effective_projects(self):
+        body = ThreadCreateRequest(
+            project_id=PROJECT,
+            project_ids=[PROJECT, OTHER_PROJECT],
+            config_override={"officer": {"enabled": True}},
+        )
+        object.__setattr__(body, "_officer_post_config_snapshot", {})
+        deps = _deps()
+
+        with pytest.raises(HTTPException) as exc:
+            await _plan(body, deps)
+
+        assert exc.value.status_code == 400
+        assert "exactly one project" in exc.value.detail
+        deps.store.create_thread.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_scope_is_authorized_before_any_account_work(self):
         deps = _deps(
             authorize_thread_project_ids=AsyncMock(
@@ -476,10 +565,19 @@ class TestCreationPlan:
         deps.enforce_officer_auto_pull_release.assert_called_once_with(True)
 
     @pytest.mark.asyncio
-    async def test_auto_pull_is_materialized_off_for_an_ordinary_officer(self):
-        body = ThreadCreateRequest(config_override={"officer": {"enabled": True}})
-        plan = await _plan(body, _deps())
-        assert plan.config_override["officer"]["auto_pull"] is False
+    async def test_single_project_server_owned_commission_keeps_post_authority(self):
+        body = ThreadCreateRequest(
+            project_id=PROJECT, config_override={"officer": {"enabled": True}}
+        )
+        object.__setattr__(body, "_officer_post_config_snapshot", {})
+        deps = _deps()
+
+        plan = await _plan(body, deps)
+
+        assert plan.effective_project_ids == [PROJECT]
+        assert plan.officer_requested is True
+        assert plan.explicit_officer_commission is True
+        deps.can_manage_project_officer.assert_awaited_once_with(USER, PROJECT)
 
     @pytest.mark.asyncio
     async def test_a_conference_needs_exactly_one_project(self):

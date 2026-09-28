@@ -142,6 +142,8 @@ def _project(policy, observation, reservations, waiters, now):
         "nodes": None,
         "orphaned_held": None,
         "pending_external": None,
+        # Installed policy is authoritative even when inventory is unavailable.
+        "admission_budget": None,
         # The controller's count cap is not in the installed resource policy.
         # Never substitute a process default or reservation count for it.
         "count_backstop": {
@@ -159,6 +161,17 @@ def _project(policy, observation, reservations, waiters, now):
             policy["policy_digest"],
         ):
             raise ResourceAdmissionError("resource_policy_changed")
+        if settings.protocol == 2:
+            cost = parsed.host_cost.base
+            result["admission_budget"] = {
+                "installation": parsed.installation_budget.to_six_dict(),
+                "per_owner": parsed.owner_budget.to_six_dict(),
+                "cpu_cost": {
+                    "millicores_per_vcpu_numerator": cost.cpu_millicores_per_vcpu_numerator,
+                    "millicores_per_vcpu_denominator": cost.cpu_millicores_per_vcpu_denominator,
+                    "launcher_overhead_millicores": cost.launcher_cpu_overhead_millicores,
+                },
+            }
         if observation is None or observation["document"] is None:
             return result
         inventory = VMResourceInventoryStore(

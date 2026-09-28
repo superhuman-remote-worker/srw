@@ -915,10 +915,17 @@ class TestSessionCreateBoundary:
 
     @pytest.mark.asyncio
     async def test_hand_rolled_officer_requires_owner_not_only_capability(
-        self, session_create_env
+        self, session_create_env, monkeypatch
     ):
         main, db, _, grants = session_create_env
         db.get_user_role_in_project = AsyncMock(return_value="editor")
+        # Project attachment is allowed for this editor; commissioning an
+        # Officer must still reach and fail the separate owner-role gate.
+        monkeypatch.setattr(
+            thread_project_authorization_module,
+            "authorize_thread_project_ids",
+            AsyncMock(return_value=[SESSION_THREAD_ID]),
+        )
 
         with pytest.raises(fastapi_module.HTTPException) as exc:
             await services_thread_admission_module.create_thread(
@@ -1203,12 +1210,39 @@ class TestSessionCreateBoundary:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("class_source", ["account", "expert"])
-    async def test_resolved_pinned_only_class_is_materialized_before_admission(
-        self, session_create_env, monkeypatch, class_source
+    @pytest.mark.parametrize("class_kind", ["officer", "conference"])
+    async def test_resolved_pinned_only_class_obeys_project_admission(
+        self, session_create_env, monkeypatch, class_source, class_kind
     ):
         import asyncio
 
-        main, db, conn, _ = session_create_env
+        main, db, _, grants = session_create_env
+        inherited_class = (
+            {"enabled": True} if class_kind == "officer" else {"conference": True}
+        )
+        if class_kind == "conference":
+            # Keep a positive materialization case on a valid pinned class.
+            # Projectless background Officers are now rejected before creation.
+            monkeypatch.setattr(
+                thread_project_authorization_module,
+                "authorize_thread_project_ids",
+                AsyncMock(return_value=[SESSION_THREAD_ID]),
+            )
+            db.get_user_role_in_project = AsyncMock(return_value="owner")
+            db.get_officer_thread_for_project = AsyncMock(return_value=None)
+            monkeypatch.setattr(
+                officer_conference_module,
+                "find_open_conference_thread",
+                AsyncMock(return_value=None),
+            )
+            monkeypatch.setattr(
+                officer_conference_module, "hold_officer_for_conference", AsyncMock()
+            )
+            monkeypatch.setattr(
+                thread_mount_rows_module,
+                "build_thread_mount_rows",
+                AsyncMock(return_value=[]),
+            )
         monkeypatch.setattr(
             main.app.state.resources.settings, "stateless_session_enabled", True
         )
@@ -1230,7 +1264,7 @@ class TestSessionCreateBoundary:
             monkeypatch.setattr(
                 session_config_resolution,
                 "resolve_session_account_defaults",
-                AsyncMock(return_value={"officer": {"enabled": True}}),
+                AsyncMock(return_value={"officer": inherited_class}),
             )
         else:
             expert_id = str(uuid.uuid4())
@@ -1254,7 +1288,7 @@ class TestSessionCreateBoundary:
                         expert={
                             "id": expert_id,
                             "expert_type": "session",
-                            "config": {"officer": {"enabled": True}},
+                            "config": {"officer": inherited_class},
                             "prompts": {},
                         },
                         source="application",
@@ -1268,9 +1302,27 @@ class TestSessionCreateBoundary:
             "orchestrator.services.provision_or_assign.provision_or_assign",
             pinned_provision,
         ):
+            if class_kind == "officer":
+                with pytest.raises(fastapi_module.HTTPException) as exc:
+                    await services_thread_admission_module.create_thread(
+                        thread_admission_module.ThreadCreateRequest(
+                            title=f"{class_source} projectless officer"
+                        ),
+                        MagicMock(),
+                        dependencies=sessions_composition.thread_admission_dependencies(
+                            main.app.state.resources
+                        ),
+                    )
+                assert exc.value.status_code == 400
+                assert "exactly one project" in exc.value.detail
+                db.create_thread.assert_not_awaited()
+                grants.assert_not_awaited()
+                pinned_provision.assert_not_awaited()
+                return
             await services_thread_admission_module.create_thread(
                 thread_admission_module.ThreadCreateRequest(
-                    title=f"{class_source} officer"
+                    title=f"{class_source} conference",
+                    project_id=SESSION_THREAD_ID,
                 ),
                 MagicMock(),
                 dependencies=sessions_composition.thread_admission_dependencies(
@@ -1282,9 +1334,8 @@ class TestSessionCreateBoundary:
         assert db.create_thread.await_args.kwargs["execution_lane"] == "pinned"
         persisted = _persisted_thread_override(db)
         assert persisted["officer"] == {
-            "enabled": True,
-            "conference": False,
-            "auto_pull": False,
+            "enabled": False,
+            "conference": True,
         }
         pinned_provision.assert_awaited_once()
 

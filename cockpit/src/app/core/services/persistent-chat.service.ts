@@ -1248,6 +1248,8 @@ export class PersistentChatService {
 
   // --- Lifecycle state from the row (drives the resume card) ---
   readonly threadStatus = signal<ThreadStatus | null>(null);
+  /** Exact viewed thread confirmed absent after an observed `ending` state. */
+  readonly deletedThreadId = signal<string | null>(null);
   readonly endedAt = signal<string | null>(null);
   /** Safe public projection of the immutable retirement outcome. The browser
    *  never receives or stores the server's retirement token/context. */
@@ -2325,6 +2327,7 @@ export class PersistentChatService {
   ): Promise<void> {
     const previousThreadId = this.threadId();
     if (previousThreadId !== threadId) {
+      this.deletedThreadId.set(null);
       this.invalidBindingRuntime = null;
       this.bindingRecoveryRuntime = null;
     }
@@ -3017,7 +3020,16 @@ export class PersistentChatService {
         this._retireTerminalControl(threadId, runtimeGeneration);
       }
       return thread;
-    } catch {
+    } catch (err: any) {
+      // A permanent Delete can settle after its request returned a retryable
+      // 503 (or another tab issued it). Only this exact lifecycle GET's 404
+      // proves the viewed ending row is gone; other errors stay non-fatal.
+      if (err?.status === 404 && this._isCurrentThreadRequest(threadId, generation) &&
+          retirementVersion === this.retirementObservationVersion &&
+          this.threadStatus() === 'ending') {
+        this.disconnect();
+        this.deletedThreadId.set(threadId);
+      }
       // Non-fatal — UI will show fallback values
       return null;
     }

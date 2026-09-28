@@ -12464,6 +12464,83 @@ class PostgresDB:
 
         return result == "UPDATE 1"
 
+    async def merge_ide_session_context_if_runtime(
+        self,
+        job_id: str,
+        session_updates: Dict[str, Any],
+        *,
+        expected_runtime_incarnation: str,
+    ) -> bool:
+        """Merge one K8s IDE state only while its exact Pod UID still owns it.
+
+        Restore callbacks may not revive an IDE that Stop has moved into
+        cleanup, even while that stopped projection still retains its Pod UID.
+        Stop's own cleanup/expired writes remain valid after physical deletion.
+        The single UPDATE compares the owner and writes under one row lock.
+        """
+
+        try:
+            job_uuid = UUID(job_id)
+            runtime = _canonical_uuid_text(
+                expected_runtime_incarnation, label="IDE runtime incarnation"
+            )
+        except (TypeError, ValueError, RuntimeError):
+            return False
+        if not isinstance(session_updates, dict) or any(
+            key in session_updates
+            for key in (
+                "_runtime_incarnation",
+                "_creation_reservation_id",
+                "_creation_claim_token",
+                "_restore_attempt_id",
+            )
+        ):
+            return False
+        if session_updates.get("restore_type", "k8s_container") != "k8s_container":
+            return False
+
+        requested_status = session_updates.get("status")
+        if not isinstance(requested_status, str):
+            return False
+        allowed_current = {
+            "restoring": ("restoring", "failed"),
+            "failed": ("restoring", "failed"),
+            "cleanup_pending": (
+                "restoring",
+                "active",
+                "idle",
+                "failed",
+                "cleanup_pending",
+                "retiring_process_zero",
+            ),
+            "expired": (
+                "restoring",
+                "active",
+                "idle",
+                "failed",
+                "cleanup_pending",
+                "expired",
+            ),
+        }.get(requested_status)
+        if allowed_current is None:
+            return False
+
+        query = (
+            "UPDATE jobs SET context = jsonb_set("
+            "COALESCE(context, '{}'::jsonb), '{ide_session}', "
+            "COALESCE(context->'ide_session', '{}'::jsonb) || $1::jsonb), "
+            "updated_at = CURRENT_TIMESTAMP "
+            "WHERE id = $2 "
+            "AND context #>> '{ide_session,_runtime_incarnation}' = $3 "
+            "AND context #>> '{ide_session,restore_type}' = 'k8s_container' "
+            "AND context #>> '{ide_session,status}' = ANY($4::text[])"
+        )
+        async with self.acquire() as conn:
+            result = await conn.execute(
+                query, json.dumps(session_updates), job_uuid, runtime, allowed_current
+            )
+        return result == "UPDATE 1"
+
     async def merge_thread_ide_session_context(
         self,
         thread_id: str,

@@ -656,6 +656,16 @@ async def resolve_thread_creation_plan(
                 ),
             },
         )
+    # Agent attach requires one project for every enabled background Officer,
+    # including an Officer selected by an account or Expert default. Check the
+    # canonical authorized set: a legacy primary project_id can coexist with
+    # additional project_ids and must not make a multi-project Officer valid.
+    _officer_requested = materialized_session_class["enabled"]
+    if _officer_requested and len(effective_project_ids) != 1:
+        raise HTTPException(
+            status_code=400,
+            detail="A background Officer needs exactly one project.",
+        )
 
     # Conference embodiment (centurion.md §2/S9): validate the MATERIALIZED
     # effective class, not only the user's explicit fragment. An expert or
@@ -708,15 +718,12 @@ async def resolve_thread_creation_plan(
     # incarnation at a time. Refuse BEFORE provisioning — the atomic
     # registration claim after the INSERT below is the authority; this
     # early check just avoids creating a thread we would immediately
-    # have to stand down. Posts are project-scoped, so an officer class
-    # materialized onto a project-less session (account/expert default)
-    # has no post to claim and keeps its pre-post behavior: it creates,
-    # unregistered — every project-keyed officer read already ignores it.
-    _officer_requested = (config_override.get("officer") or {}).get("enabled") is True
+    # have to stand down. The project-count gate above excludes unbound and
+    # multi-project Officers before any post lookup or provisioning.
     _explicit_officer_commission = (
         request_body._officer_post_config_snapshot is not None
     )
-    if _officer_requested and primary_project_id:
+    if _officer_requested:
         if not await dependencies.can_manage_project_officer(user, primary_project_id):
             raise HTTPException(
                 status_code=403,

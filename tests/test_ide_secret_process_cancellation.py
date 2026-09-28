@@ -1,11 +1,124 @@
 """Real child processes must stop before an IDE key-operation owner exits."""
 
 import asyncio
+import logging
+import re
 import sys
+import tempfile
+from pathlib import Path
+from uuid import uuid4
 
 import pytest
 
 from orchestrator.services.ide_session import IdeSessionService
+from shared.runtime.core.managed_repository import (
+    managed_repository_agent_launch_command,
+    managed_repository_agent_zero_command,
+)
+
+
+@pytest.mark.asyncio
+async def test_failed_secret_process_reports_only_fixed_phase_and_exit_code(caplog):
+    secret_text = "stdin-private-key-canary"
+    command_text = (
+        "import sys; data=sys.stdin.buffer.read(); "
+        "sys.stdout.buffer.write(data+b' stdout-canary'); "
+        "sys.stderr.buffer.write(data+b' stderr-canary'); "
+        "raise SystemExit(86)"
+    )
+    command = [sys.executable, "-c", command_text, "argv-canary"]
+    secret = bytearray(secret_text.encode())
+    job_id = "11111111-1111-4111-8111-111111111111"
+
+    with caplog.at_level(logging.WARNING, logger="orchestrator.services.ide_session"):
+        assert not await IdeSessionService._run_secret_stdin_process(
+            command, secret, diagnostic_job_id=job_id
+        )
+
+    diagnostic = "\n".join(record.getMessage() for record in caplog.records)
+    assert f"job={job_id}" in diagnostic
+    assert "phase=child_exit" in diagnostic
+    assert "exit_code=86" in diagnostic
+    for forbidden in (
+        secret_text,
+        "stdout-canary",
+        "stderr-canary",
+        "argv-canary",
+        command_text,
+    ):
+        assert forbidden not in diagnostic
+    assert secret == bytearray(len(secret))
+
+
+@pytest.mark.asyncio
+async def test_generated_agent_failure_reports_code_without_exposing_command(caplog):
+    # Exercise the real generated shell rather than a fake child return code.
+    with tempfile.TemporaryDirectory(prefix="srw-git-diag-", dir="/tmp") as home:
+        authority_id = str(uuid4())
+        command = managed_repository_agent_launch_command(
+            home_path=home, authority_id=authority_id, generation=1
+        )
+        secret = bytearray(b"invalid-private-key-canary")
+        with caplog.at_level(
+            logging.WARNING, logger="orchestrator.services.ide_session"
+        ):
+            assert not await IdeSessionService._run_secret_stdin_process(
+                ["bash", "-c", command],
+                secret,
+                diagnostic_job_id="22222222-2222-4222-8222-222222222222",
+            )
+        diagnostic = "\n".join(record.getMessage() for record in caplog.records)
+        assert "phase=child_exit" in diagnostic
+        assert re.search(r"exit_code=\d+", diagnostic)
+        assert "invalid-private-key-canary" not in diagnostic
+        assert home not in diagnostic
+        assert command not in diagnostic
+        assert secret == bytearray(len(secret))
+        zero = await asyncio.create_subprocess_exec(
+            "bash",
+            "-c",
+            managed_repository_agent_zero_command(home_path=home),
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        assert await zero.wait() == 0
+        assert not list(Path(home, ".ssh", "srw-managed", "agents").glob("*.state"))
+
+
+@pytest.mark.asyncio
+async def test_secret_stdin_write_failure_is_not_misreported_as_spawn(
+    monkeypatch, caplog
+):
+    class BrokenStdin:
+        def write(self, _secret):
+            raise OSError("write-error-secret-canary")
+
+    class ExitedChild:
+        stdin = BrokenStdin()
+        returncode = 41
+
+    async def spawn(*_args, **_kwargs):
+        return ExitedChild()
+
+    monkeypatch.setattr(
+        "orchestrator.services.ide_session.create_owned_subprocess_exec", spawn
+    )
+    secret = bytearray(b"stdin-secret-canary")
+    with caplog.at_level(logging.WARNING, logger="orchestrator.services.ide_session"):
+        assert not await IdeSessionService._run_secret_stdin_process(
+            ["secret-command-canary"], secret
+        )
+
+    diagnostic = "\n".join(record.getMessage() for record in caplog.records)
+    assert "phase=child_io_error" in diagnostic
+    assert "phase=child_spawn_error" not in diagnostic
+    for forbidden in (
+        "write-error-secret-canary",
+        "stdin-secret-canary",
+        "secret-command-canary",
+    ):
+        assert forbidden not in diagnostic
+    assert secret == bytearray(len(secret))
 
 
 @pytest.mark.asyncio

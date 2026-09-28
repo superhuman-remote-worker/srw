@@ -3020,6 +3020,15 @@ export interface AdminVMClusterCapacity {
   }> | null;
   orphaned_held: {count: number; resources: VMResourceVector} | null;
   pending_external: VMResourceVector | null;
+  admission_budget: {
+    installation: VMResourceVector;
+    per_owner: VMResourceVector;
+    cpu_cost: {
+      millicores_per_vcpu_numerator: number;
+      millicores_per_vcpu_denominator: number;
+      launcher_overhead_millicores: number;
+    };
+  } | null;
   count_backstop: {maximum: number | null; observed: number | null; reason: string | null};
 }
 
