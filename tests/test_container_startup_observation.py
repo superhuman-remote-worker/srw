@@ -3,6 +3,7 @@
 from dataclasses import FrozenInstanceError
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
+from zoneinfo import ZoneInfo
 
 import pytest
 from kubernetes.client import (
@@ -214,3 +215,76 @@ def test_fractional_ssh_budget_is_supported_but_unaware_schedule_is_rejected():
     assert deadlines.latest_ssh_deadline_at == CREATED + timedelta(seconds=120.5)
     with pytest.raises(ValueError):
         scheduled_stage_deadlines(datetime(2026, 9, 28, 10, 0), budgets)
+
+
+def test_fall_back_fold_order_is_compared_by_utc_instant():
+    berlin = ZoneInfo("Europe/Berlin")
+    created = datetime(2026, 10, 25, 2, 50, tzinfo=berlin, fold=0)
+    transition = datetime(2026, 10, 25, 2, 55, tzinfo=berlin, fold=0)
+    now = datetime(2026, 10, 25, 2, 10, tzinfo=berlin, fold=1)
+
+    result = classify_exact_pod_schedule(
+        pod(
+            created=created,
+            node="node8",
+            condition=scheduled_condition("True", at=transition),
+        ),
+        UID,
+        now,
+    )
+    assert result == ScheduledAt(datetime(2026, 10, 25, 0, 55, tzinfo=timezone.utc))
+    assert result.scheduled_at.tzinfo is timezone.utc
+
+
+def test_fall_back_deadline_and_ssh_grace_follow_elapsed_time():
+    berlin = ZoneInfo("Europe/Berlin")
+    scheduled = datetime(2026, 10, 25, 2, 55, tzinfo=berlin, fold=0)
+    deadlines = scheduled_stage_deadlines(
+        scheduled, StageBudgets(ready_seconds=600, pull_seconds=None, ssh_seconds=30)
+    )
+    assert deadlines.readiness_deadline_at == datetime(
+        2026, 10, 25, 1, 5, tzinfo=timezone.utc
+    )
+    assert deadlines.latest_ssh_deadline_at == datetime(
+        2026, 10, 25, 1, 5, 30, tzinfo=timezone.utc
+    )
+    ready = datetime(2026, 10, 25, 2, 59, 50, tzinfo=berlin, fold=0)
+    now = datetime(2026, 10, 25, 2, 0, 5, tzinfo=berlin, fold=1)
+    assert deadlines.ssh_deadline_for_ready(ready, now=now) == datetime(
+        2026, 10, 25, 1, 0, 20, tzinfo=timezone.utc
+    )
+
+
+def test_spring_forward_deadline_uses_elapsed_time_across_offset_change():
+    berlin = ZoneInfo("Europe/Berlin")
+    scheduled = datetime(2026, 3, 29, 1, 55, tzinfo=berlin)
+    deadlines = scheduled_stage_deadlines(
+        scheduled, StageBudgets(ready_seconds=4200, pull_seconds=None, ssh_seconds=30)
+    )
+    assert deadlines.readiness_deadline_at == datetime(
+        2026, 3, 29, 2, 5, tzinfo=timezone.utc
+    )
+    assert deadlines.latest_ssh_deadline_at == datetime(
+        2026, 3, 29, 2, 5, 30, tzinfo=timezone.utc
+    )
+
+
+@pytest.mark.parametrize(
+    ("ready", "pull", "ssh"),
+    [
+        (1e-12, None, 30),
+        (120, 1e-12, 30),
+        (120, None, 1e-12),
+    ],
+)
+def test_positive_budget_below_one_microsecond_is_rejected(ready, pull, ssh):
+    with pytest.raises(ValueError):
+        StageBudgets(ready_seconds=ready, pull_seconds=pull, ssh_seconds=ssh)
+
+
+def test_one_microsecond_budget_remains_positive_in_effect():
+    deadlines = scheduled_stage_deadlines(
+        CREATED, StageBudgets(ready_seconds=1e-6, pull_seconds=None, ssh_seconds=1e-6)
+    )
+    assert deadlines.readiness_deadline_at == CREATED + timedelta(microseconds=1)
+    assert deadlines.latest_ssh_deadline_at == CREATED + timedelta(microseconds=2)

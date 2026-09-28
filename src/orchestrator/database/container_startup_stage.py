@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from math import isfinite
 from typing import Any, Literal, TypeAlias
 
@@ -37,7 +37,11 @@ def _finite_positive_seconds(value: Any) -> float:
         seconds = float(value)
     except OverflowError as exc:
         raise ValueError("startup budget is too large") from exc
-    if not isfinite(seconds) or seconds <= 0 or seconds > timedelta.max.total_seconds():
+    if (
+        not isfinite(seconds)
+        or seconds < 1e-6
+        or seconds > timedelta.max.total_seconds()
+    ):
         raise ValueError("startup budget must be a positive finite number")
     return seconds
 
@@ -77,17 +81,27 @@ class StageDeadlines:
     ) -> datetime | None:
         """No fresh SSH grace for a late/invalid Ready or an expired window."""
 
-        if (
-            not _aware(ready_at)
-            or not _aware(now)
-            or ready_at < self.scheduled_at
-            or ready_at > self.readiness_deadline_at
-            or ready_at > now
+        if not all(
+            _aware(value)
+            for value in (
+                ready_at,
+                now,
+                self.scheduled_at,
+                self.readiness_deadline_at,
+                self.latest_ssh_deadline_at,
+            )
         ):
+            return None
+        ready_at = ready_at.astimezone(timezone.utc)
+        now = now.astimezone(timezone.utc)
+        scheduled_at = self.scheduled_at.astimezone(timezone.utc)
+        readiness_deadline = self.readiness_deadline_at.astimezone(timezone.utc)
+        latest_ssh_deadline = self.latest_ssh_deadline_at.astimezone(timezone.utc)
+        if ready_at < scheduled_at or ready_at > readiness_deadline or ready_at > now:
             return None
         deadline = min(
             ready_at + timedelta(seconds=self.ssh_budget_seconds),
-            self.latest_ssh_deadline_at,
+            latest_ssh_deadline,
         )
         return deadline if now < deadline else None
 
@@ -99,6 +113,7 @@ def scheduled_stage_deadlines(
 
     if not _aware(scheduled_at) or not isinstance(budgets, StageBudgets):
         raise ValueError("trusted scheduled clock and budgets are required")
+    scheduled_at = scheduled_at.astimezone(timezone.utc)
     try:
         readiness_deadline = scheduled_at + timedelta(
             seconds=max(budgets.ready_seconds, budgets.pull_seconds or 0)
@@ -138,7 +153,11 @@ def classify_exact_pod_schedule(
     ):
         return Unknown()
     created = getattr(metadata, "creation_timestamp", None)
-    if not _aware(created) or created > now:
+    if not _aware(created):
+        return Unknown()
+    now_utc = now.astimezone(timezone.utc)
+    created_utc = created.astimezone(timezone.utc)
+    if created_utc > now_utc:
         return Unknown()
 
     spec = getattr(pod, "spec", None)
@@ -169,6 +188,8 @@ def classify_exact_pod_schedule(
         )
     if condition_status == "True" and node not in (None, ""):
         transition = getattr(condition, "last_transition_time", None)
-        if _aware(transition) and created <= transition <= now:
-            return ScheduledAt(transition)
+        if _aware(transition):
+            transition_utc = transition.astimezone(timezone.utc)
+            if created_utc <= transition_utc <= now_utc:
+                return ScheduledAt(transition_utc)
     return Unknown()
