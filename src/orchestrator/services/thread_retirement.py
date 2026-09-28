@@ -35,6 +35,7 @@ from orchestrator.services.managed_repository_authority import (
     revoke_and_delete_managed_repository,
 )
 from orchestrator.services.pinned_retirement import PinnedRetirementOperations
+from orchestrator.services.pinned_k8s_effect import PINNED_AUTHORITY_FINALIZER
 from orchestrator.services.session_provisioner import ensure_session_workspace
 from orchestrator.services.session_runtime_admission import thread_runtime_authority
 from orchestrator.services.stateless_workspace_gate import (
@@ -188,6 +189,121 @@ async def thread_turn_in_flight(
         return payload["turn_in_flight"]
     except Exception:
         return True
+
+
+async def _exact_stopped_pinned_agent_for_normal_end(
+    thread: Mapping[str, Any], *, dependencies: ThreadRetirementDependencies
+) -> bool:
+    """Admit normal End only for a DB-bound, protected, terminal exact Pod.
+
+    This proves the agent process stopped, not that workspace-local writers
+    stopped. The authorized retirement still needs its usual local-zero receipt.
+    An absent Pod alone never supplies this pre-authorization proof.
+    """
+
+    store = dependencies.store
+
+    async def target(row: Mapping[str, Any]) -> tuple[str, ...] | None:
+        thread_id = str(row.get("id") or "")
+        generation = str(row.get("runtime_generation") or "")
+        agent_id = str(row.get("agent_id") or "")
+        token = str(row.get("runtime_retirement_token") or "")
+        if not thread_id or not generation or not agent_id:
+            return None
+        if not token:
+            binding = await store.get_pinned_session_binding(
+                thread_id, expected_runtime_generation=generation
+            )
+            if (
+                binding is None
+                or binding.agent_id != agent_id
+                or binding.runtime_attach_token
+                != str(row.get("runtime_attach_token") or "")
+            ):
+                return None
+            return (
+                thread_id,
+                generation,
+                "",
+                agent_id,
+                binding.runtime_attach_token,
+                binding.agent_hostname,
+                binding.pod_namespace,
+                binding.pod_uid,
+            )
+
+        context = row.get("runtime_retirement_context") or {}
+        if isinstance(context, str):
+            try:
+                context = json.loads(context)
+            except (TypeError, ValueError):
+                return None
+        if not isinstance(context, Mapping):
+            return None
+        agent = context.get("agent")
+        pod = context.get("agent_pod")
+        if not isinstance(agent, Mapping) or not isinstance(pod, Mapping):
+            return None
+        attach_token = str(context.get("runtime_attach_token") or "")
+        name = str(agent.get("hostname") or "")
+        namespace = str(pod.get("namespace") or "")
+        pod_uid = str(agent.get("pod_uid") or "")
+        if not all((attach_token, name, namespace, pod_uid)) or not (
+            str(context.get("thread_id") or "") == thread_id
+            and str(context.get("generation") or "") == generation
+            and str(context.get("agent_id") or "") == agent_id
+            and str(agent.get("id") or "") == agent_id
+            and str(pod.get("pod_name") or "") == name
+            and str(pod.get("pod_uid") or "") == pod_uid
+            and str(pod.get("protection_protocol") or "") == "finalizer_v1"
+            and (
+                "runtime_attach_token" not in row
+                or str(row.get("runtime_attach_token") or "") == attach_token
+            )
+        ):
+            return None
+        current_agent = await store.get_agent(agent_id)
+        if not current_agent or not (
+            str(current_agent.get("thread_id") or "") == thread_id
+            and str(current_agent.get("hostname") or "") == name
+            and str(current_agent.get("pod_uid") or "") == pod_uid
+        ):
+            return None
+        return (
+            thread_id,
+            generation,
+            token,
+            agent_id,
+            attach_token,
+            name,
+            namespace,
+            pod_uid,
+        )
+
+    try:
+        expected = await target(thread)
+        if expected is None:
+            return False
+        _, _, _, _, _, name, namespace, pod_uid = expected
+        state, pod = await dependencies.agent_provisioner.observe_agent_pod_exact(
+            name, expected_pod_uid=pod_uid, namespace=namespace
+        )
+        if state != "exact_terminal" or pod is None:
+            return False
+        if str(getattr(getattr(pod, "status", None), "phase", "") or "") not in {
+            "Succeeded",
+            "Failed",
+        }:
+            # A Running Pod can briefly have terminated container statuses
+            # before a restart. Only a terminal Pod phase is non-restarting.
+            return False
+        finalizers = getattr(getattr(pod, "metadata", None), "finalizers", None) or []
+        if PINNED_AUTHORITY_FINALIZER not in finalizers:
+            return False
+        current = await store.get_thread(expected[0])
+        return bool(current is not None and await target(current) == expected)
+    except Exception:
+        return False
 
 
 def stateless_retirement_marker(thread: dict[str, Any]) -> dict[str, Any]:
@@ -1490,6 +1606,9 @@ async def _end_thread_flow_owned(
                 and thread.get("runtime_retirement_authorized_at") is not None
             )
             and await _thread_turn_in_flight(thread)
+            and not await _exact_stopped_pinned_agent_for_normal_end(
+                thread, dependencies=dependencies
+            )
         ):
             # Fast observational no-op for the common non-force refusal.  The
             # locked post-Begin probe below still catches a turn admitted in
@@ -1713,6 +1832,9 @@ async def _end_thread_flow_owned(
                 not already_authorized
                 and not force
                 and await _thread_turn_in_flight(probe_thread)
+                and not await _exact_stopped_pinned_agent_for_normal_end(
+                    probe_thread, dependencies=dependencies
+                )
             ):
                 abort_outcome = await _abort_hidden_preflight()
                 if abort_outcome == "authorized":
