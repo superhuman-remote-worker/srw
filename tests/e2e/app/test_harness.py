@@ -28,6 +28,74 @@ class FakeRunner(harness.CommandRunner):
         return self.responses.pop(0)
 
 
+@pytest.mark.parametrize("stage", ("archive", "import"))
+def test_image_transfer_timeout_keeps_partial_diagnostics_and_removes_archive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stage: str
+) -> None:
+    state_root = tmp_path / "state"
+    store = harness.StateStore(state_root)
+    ledger = store.initialize("20260928-032500-ab12cd34")
+    ledger["source_revision"] = "a" * 40
+    saved_refs: list[str] = []
+    monkeypatch.setattr(harness, "DEPENDENCY_IMAGES", ())
+
+    def timeout(argv, **kwargs):
+        assert kwargs["timeout"] == 1800
+        raise subprocess.TimeoutExpired(
+            argv,
+            1800,
+            output=b"copying layer sha256:123\nAuthorization: Bearer secret-value\n",
+            stderr=b"waiting for node import\xff\n",
+        )
+
+    monkeypatch.setattr(harness.subprocess, "run", timeout)
+    monkeypatch.setattr(
+        harness,
+        "docker_archive_config_ids",
+        lambda _: {
+            harness.canonical_containerd_tag(ref): "sha256:" + "b" * 64
+            for ref in saved_refs
+        },
+    )
+
+    class ImageRunner(harness.CommandRunner):
+        def run(self, argv, **kwargs):
+            if argv[:2] == ["docker", "version"]:
+                return harness.CommandResult(0, "linux/amd64\n")
+            if argv[:2] == ["docker", "build"]:
+                return harness.CommandResult(0)
+            if argv[:3] == ["docker", "image", "inspect"]:
+                return harness.CommandResult(
+                    0, f"sha256:{'b' * 64}|{ledger['run_id']}|{'a' * 40}\n"
+                )
+            if argv[:3] == ["docker", "image", "save"]:
+                archive = Path(argv[argv.index("--output") + 1])
+                archive.write_bytes(b"partial archive")
+                saved_refs.extend(argv[argv.index("--output") + 2 :])
+                if stage == "archive":
+                    return super().run(argv, **kwargs)
+                return harness.CommandResult(0, "archive saved\n")
+            if argv[:3] == ["k3d", "image", "import"]:
+                return super().run(argv, **kwargs)
+            raise AssertionError(f"unexpected test operation: {kwargs.get('label')}")
+
+    application = harness.ApplicationE2EHarness(state_root, ImageRunner())
+    with pytest.raises(harness.HarnessError, match="bounded timeout") as raised:
+        application.build_and_import_images(ledger)
+
+    run_dir = Path(ledger["run_dir"])
+    artifact = run_dir / "image-import-application.txt"
+    diagnostic = artifact.read_text()
+    assert "copying layer sha256:123" in diagnostic
+    assert "waiting for node import" in diagnostic
+    assert "bounded timeout" in diagnostic
+    assert "secret-value" not in diagnostic
+    assert "secret-value" not in str(raised.value)
+    assert "[REDACTED" in diagnostic
+    assert not (run_dir / ".image-import-application.tar").exists()
+    assert stat.S_IMODE(artifact.stat().st_mode) == 0o600
+
+
 def test_cluster_name_guard_never_accepts_shared_or_lookalike_names() -> None:
     assert (
         harness.validate_cluster_name("srw-e2e-20260824-123456-ab12cd34")

@@ -114,6 +114,14 @@ class HarnessError(RuntimeError):
     """An operator-safe harness failure."""
 
 
+class CommandTimeout(HarnessError):
+    """A bounded command failure with sanitized partial diagnostic output."""
+
+    def __init__(self, message: str, diagnostic: str):
+        super().__init__(message)
+        self.diagnostic = diagnostic
+
+
 class SafetyError(HarnessError):
     """A fail-closed ownership/origin violation."""
 
@@ -309,7 +317,18 @@ class CommandRunner:
             )
         except subprocess.TimeoutExpired as exc:
             operation = label or Path(argv[0]).name
-            raise HarnessError(f"{operation} exceeded its bounded timeout") from exc
+            # TimeoutExpired may carry bytes even with subprocess text=True.
+            # Keep argv/stdin out of the exception and its rendered traceback.
+            partial = "".join(
+                value.decode("utf-8", errors="replace")
+                if isinstance(value, bytes)
+                else value or ""
+                for value in (exc.stdout, exc.stderr)
+            )
+            raise CommandTimeout(
+                f"{operation} exceeded its bounded timeout",
+                bound_diagnostic(sanitize_diagnostic(partial)),
+            ) from None
         result = CommandResult(
             returncode=completed.returncode,
             stdout=completed.stdout,
@@ -2009,6 +2028,7 @@ class ApplicationE2EHarness:
                 raise SafetyError("refusing to overwrite a stale image archive")
             save_result = CommandResult(1)
             import_result = CommandResult(1)
+            timeout_output = ""
             try:
                 save_result = self.runner.run(
                     docker_image_save_command(image_refs, archive, platform),
@@ -2043,6 +2063,9 @@ class ApplicationE2EHarness:
                     raise HarnessError(
                         f"direct {label} image import failed with exit code {import_result.returncode}"
                     )
+            except CommandTimeout as exc:
+                timeout_output = f"\n{exc}\n{exc.diagnostic}"
+                raise
             finally:
                 import_output = bound_diagnostic(
                     sanitize_diagnostic(
@@ -2050,6 +2073,7 @@ class ApplicationE2EHarness:
                         + save_result.stderr
                         + import_result.stdout
                         + import_result.stderr
+                        + timeout_output
                     )
                 )
                 _atomic_private_write(
