@@ -4917,11 +4917,19 @@ BEGIN
     IF EXISTS (
         SELECT 1 FROM public.thread_agent_warm_binding_protections warm
          WHERE warm.agent_id = NEW.id
-           AND warm.status IN ('planned', 'protecting', 'protected', 'releasing')
-    ) AND (
-        NEW.thread_id IS NOT NULL
-        OR NEW.current_job_id IS NOT NULL
-        OR NEW.status::text <> 'draining'
+           AND warm.status IN ('planned', 'protecting', 'protected',
+                               'releasing', 'terminal_release')
+           AND (
+               NEW.thread_id IS NOT NULL
+               OR NEW.current_job_id IS NOT NULL
+               OR (warm.status = 'terminal_release' AND (
+                   NEW.status::text NOT IN ('draining', 'offline')
+                   OR NEW.hostname IS DISTINCT FROM warm.pod_name
+                   OR NEW.pod_uid IS DISTINCT FROM warm.pod_uid
+               ))
+               OR (warm.status <> 'terminal_release'
+                   AND NEW.status::text <> 'draining')
+           )
     ) THEN
         RAISE EXCEPTION 'warm Pod has unresolved protection authority'
             USING ERRCODE = '23514',
@@ -5003,7 +5011,8 @@ BEGIN
         SELECT 1 FROM public.thread_agent_warm_binding_protections warm
          WHERE warm.thread_id = NEW.thread_id
            AND warm.runtime_generation = NEW.runtime_generation
-           AND warm.status IN ('planned', 'protecting', 'protected', 'releasing')
+           AND warm.status IN ('planned', 'protecting', 'protected',
+                               'releasing', 'terminal_release')
     ) THEN
         RAISE EXCEPTION 'pinned Pod create races warm binding protection'
             USING ERRCODE = '23514',
@@ -5865,6 +5874,12 @@ BEGIN
     END IF;
 
     IF TG_OP = 'UPDATE' THEN
+        IF OLD.status = 'terminal_release' AND NEW.status = 'released'
+           AND NEW.release_outcome IS DISTINCT FROM 'exact_absent_v1' THEN
+            RAISE EXCEPTION 'terminal warm release requires absent Pod receipt'
+                USING ERRCODE = '23514',
+                      CONSTRAINT = 'thread_agent_warm_binding_authority';
+        END IF;
         IF NEW.protection_id IS DISTINCT FROM OLD.protection_id
            OR NEW.thread_id IS DISTINCT FROM OLD.thread_id
            OR NEW.runtime_generation IS DISTINCT FROM OLD.runtime_generation
@@ -5983,8 +5998,10 @@ BEGIN
                     AND NEW.abort_fence_resource_version IS NULL
                     AND NEW.abort_fence_value IS NULL
                     AND NEW.released_at IS NULL)
-                OR (OLD.status IN ('protected', 'bound')
-                    AND NEW.status = 'releasing'
+                OR (((OLD.status IN ('protected', 'bound')
+                    AND NEW.status = 'releasing')
+                    OR (OLD.status = 'bound'
+                    AND NEW.status = 'terminal_release'))
                     AND NEW.effect_token IS NOT DISTINCT FROM OLD.effect_token
                     AND NEW.effect_started_at
                         IS NOT DISTINCT FROM OLD.effect_started_at
@@ -6003,7 +6020,7 @@ BEGIN
                     AND NEW.abort_fence_resource_version IS NULL
                     AND NEW.abort_fence_value IS NULL
                     AND NEW.released_at IS NULL)
-                OR (OLD.status = 'releasing' AND NEW.status = 'released'
+                OR (OLD.status IN ('releasing', 'terminal_release') AND NEW.status = 'released'
                     AND NEW.effect_token IS NOT DISTINCT FROM OLD.effect_token
                     AND NEW.effect_started_at
                         IS NOT DISTINCT FROM OLD.effect_started_at
@@ -11487,6 +11504,84 @@ CREATE FUNCTION public.pinned_agent_intent_adoption_matches(candidate public.thr
            AND adoption.pod_uid = candidate.pod_uid
            AND candidate.protection_protocol = 'finalizer_v1'
     )
+$$;
+
+
+--
+-- Name: thread_agent_warm_binding_protections; Type: TABLE; Schema: public; Owner: -
+--
+
+CREATE TABLE public.thread_agent_warm_binding_protections (
+    protection_id uuid NOT NULL,
+    thread_id uuid NOT NULL,
+    runtime_generation uuid NOT NULL,
+    runtime_attach_token uuid NOT NULL,
+    agent_id uuid NOT NULL,
+    source character varying(24) NOT NULL,
+    provisioner character varying(16) NOT NULL,
+    namespace character varying(253) NOT NULL,
+    pod_name character varying(253) NOT NULL,
+    pod_uid text NOT NULL,
+    discovered_resource_version text NOT NULL,
+    status character varying(16) DEFAULT 'planned'::character varying NOT NULL,
+    lease_expires_at timestamp with time zone NOT NULL,
+    effect_token uuid,
+    effect_started_at timestamp with time zone,
+    effect_expires_at timestamp with time zone,
+    protection_resource_version text,
+    evidence_protocol character varying(48),
+    protected_at timestamp with time zone,
+    bound_at timestamp with time zone,
+    release_started_at timestamp with time zone,
+    release_outcome character varying(32),
+    abort_fence_protocol character varying(48),
+    abort_fence_resource_version text,
+    abort_fence_value text,
+    released_at timestamp with time zone,
+    created_at timestamp with time zone DEFAULT transaction_timestamp() NOT NULL,
+    CONSTRAINT thread_agent_warm_binding_pro_discovered_resource_version_check CHECK ((discovered_resource_version <> ''::text)),
+    CONSTRAINT thread_agent_warm_binding_protection_abort_fence_protocol_check CHECK (((abort_fence_protocol)::text = ANY ((ARRAY['unclaimed_plan_v1'::character varying, 'exact_rv_annotation_fence_v1'::character varying, 'exact_object_gone_v1'::character varying])::text[]))),
+    CONSTRAINT thread_agent_warm_binding_protections_check CHECK ((((pod_name)::text <> ''::text) AND (pod_uid <> ''::text))),
+    CONSTRAINT thread_agent_warm_binding_protections_check1 CHECK ((lease_expires_at > created_at)),
+    CONSTRAINT thread_agent_warm_binding_protections_check2 CHECK (((((status)::text = 'planned'::text) AND (effect_token IS NULL) AND (effect_started_at IS NULL) AND (effect_expires_at IS NULL) AND (protection_resource_version IS NULL) AND (evidence_protocol IS NULL) AND (protected_at IS NULL) AND (bound_at IS NULL) AND (release_started_at IS NULL) AND (abort_fence_protocol IS NULL) AND (abort_fence_resource_version IS NULL) AND (abort_fence_value IS NULL) AND (release_outcome IS NULL) AND (released_at IS NULL)) OR (((status)::text = 'protecting'::text) AND (effect_token IS NOT NULL) AND (effect_started_at IS NOT NULL) AND (effect_expires_at > effect_started_at) AND (effect_expires_at <= (effect_started_at + '00:03:00'::interval)) AND (protection_resource_version IS NULL) AND (evidence_protocol IS NULL) AND (protected_at IS NULL) AND (bound_at IS NULL) AND (release_started_at IS NULL) AND (abort_fence_protocol IS NULL) AND (abort_fence_resource_version IS NULL) AND (abort_fence_value IS NULL) AND (release_outcome IS NULL) AND (released_at IS NULL)) OR (((status)::text = 'protected'::text) AND (effect_token IS NOT NULL) AND (effect_started_at IS NOT NULL) AND (effect_expires_at IS NOT NULL) AND (NULLIF(protection_resource_version, ''::text) IS NOT NULL) AND ((evidence_protocol)::text = 'exact_live_finalizer_v1'::text) AND (protected_at IS NOT NULL) AND (bound_at IS NULL) AND (release_started_at IS NULL) AND (abort_fence_protocol IS NULL) AND (abort_fence_resource_version IS NULL) AND (abort_fence_value IS NULL) AND (release_outcome IS NULL) AND (released_at IS NULL)) OR (((status)::text = 'bound'::text) AND (effect_token IS NOT NULL) AND (effect_started_at IS NOT NULL) AND (effect_expires_at IS NOT NULL) AND (NULLIF(protection_resource_version, ''::text) IS NOT NULL) AND ((evidence_protocol)::text = 'exact_live_finalizer_v1'::text) AND (protected_at IS NOT NULL) AND (bound_at IS NOT NULL) AND (release_started_at IS NULL) AND (abort_fence_protocol IS NULL) AND (abort_fence_resource_version IS NULL) AND (abort_fence_value IS NULL) AND (release_outcome IS NULL) AND (released_at IS NULL)) OR (((status)::text = ANY (ARRAY[('releasing'::character varying)::text, ('terminal_release'::character varying)::text])) AND (effect_token IS NOT NULL) AND (effect_started_at IS NOT NULL) AND (effect_expires_at IS NOT NULL) AND (NULLIF(protection_resource_version, ''::text) IS NOT NULL) AND ((evidence_protocol)::text = 'exact_live_finalizer_v1'::text) AND (protected_at IS NOT NULL) AND (release_started_at IS NOT NULL) AND (abort_fence_protocol IS NULL) AND (abort_fence_resource_version IS NULL) AND (abort_fence_value IS NULL) AND (release_outcome IS NULL) AND (released_at IS NULL)) OR (((status)::text = 'released'::text) AND (effect_token IS NOT NULL) AND (effect_started_at IS NOT NULL) AND (effect_expires_at IS NOT NULL) AND (NULLIF(protection_resource_version, ''::text) IS NOT NULL) AND ((evidence_protocol)::text = 'exact_live_finalizer_v1'::text) AND (protected_at IS NOT NULL) AND (release_started_at IS NOT NULL) AND (abort_fence_protocol IS NULL) AND (abort_fence_resource_version IS NULL) AND (abort_fence_value IS NULL) AND (release_outcome IS NOT NULL) AND (released_at IS NOT NULL)) OR (((status)::text = 'aborted'::text) AND (protection_resource_version IS NULL) AND (evidence_protocol IS NULL) AND (protected_at IS NULL) AND (bound_at IS NULL) AND (release_started_at IS NULL) AND (((effect_token IS NULL) AND (effect_started_at IS NULL) AND (effect_expires_at IS NULL) AND ((abort_fence_protocol)::text = 'unclaimed_plan_v1'::text) AND (abort_fence_resource_version IS NULL) AND (abort_fence_value IS NULL)) OR ((effect_token IS NOT NULL) AND (effect_started_at IS NOT NULL) AND (effect_expires_at IS NOT NULL) AND ((((release_outcome)::text = 'exact_live_unprotected_v1'::text) AND ((abort_fence_protocol)::text = 'exact_rv_annotation_fence_v1'::text) AND (NULLIF(abort_fence_resource_version, ''::text) IS NOT NULL) AND (abort_fence_value = (((protection_id)::text || ':'::text) || (effect_token)::text))) OR (((release_outcome)::text = ANY (ARRAY[('exact_absent_v1'::character varying)::text, ('exact_replacement_v1'::character varying)::text])) AND ((abort_fence_protocol)::text = 'exact_object_gone_v1'::text) AND (abort_fence_resource_version IS NULL) AND (abort_fence_value IS NULL))))) AND (release_outcome IS NOT NULL) AND (released_at IS NOT NULL)))),
+    CONSTRAINT thread_agent_warm_binding_protections_namespace_check CHECK ((((length((namespace)::text) >= 1) AND (length((namespace)::text) <= 63)) AND ((namespace)::text ~ '^[a-z0-9]([-a-z0-9]*[a-z0-9])?$'::text))),
+    CONSTRAINT thread_agent_warm_binding_protections_provisioner_check CHECK (((provisioner)::text = ANY ((ARRAY['agent'::character varying, 'persistent'::character varying])::text[]))),
+    CONSTRAINT thread_agent_warm_binding_protections_release_outcome_check CHECK (((release_outcome)::text = ANY ((ARRAY['exact_live_unprotected_v1'::character varying, 'exact_absent_v1'::character varying, 'exact_replacement_v1'::character varying])::text[]))),
+    CONSTRAINT thread_agent_warm_binding_protections_source_check CHECK (((source)::text = ANY ((ARRAY['attach'::character varying, 'legacy_binding'::character varying])::text[]))),
+    CONSTRAINT thread_agent_warm_binding_protections_status_check CHECK (((status)::text = ANY ((ARRAY['planned'::character varying, 'protecting'::character varying, 'protected'::character varying, 'bound'::character varying, 'releasing'::character varying, 'terminal_release'::character varying, 'released'::character varying, 'aborted'::character varying])::text[])))
+);
+
+
+--
+-- Name: pinned_deleted_owner_warm_release_authorized(public.thread_agent_warm_binding_protections); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.pinned_deleted_owner_warm_release_authorized(warm public.thread_agent_warm_binding_protections) RETURNS boolean
+    LANGUAGE sql
+    AS $$
+    SELECT NOT EXISTS (
+               SELECT 1 FROM public.threads thread_row
+                WHERE thread_row.id = warm.thread_id
+           )
+       AND EXISTS (
+               SELECT 1 FROM public.thread_runtime_retirement_outcomes outcome
+                WHERE outcome.thread_id = warm.thread_id
+                  AND outcome.runtime_generation = warm.runtime_generation
+                  AND outcome.agent_id = warm.agent_id
+                  AND outcome.runtime_attach_token = warm.runtime_attach_token
+                  AND outcome.disposition = 'ended'
+                  AND outcome.permanent = true
+                  AND outcome.outcome = 'deleted'
+           )
+       AND NOT EXISTS (
+               SELECT 1 FROM public.agents actor
+                WHERE actor.id = warm.agent_id
+                  AND (actor.thread_id IS NOT NULL
+                       OR actor.current_job_id IS NOT NULL
+                       OR actor.status::text NOT IN ('draining', 'offline')
+                       OR actor.hostname IS DISTINCT FROM warm.pod_name
+                       OR actor.pod_uid IS DISTINCT FROM warm.pod_uid)
+           );
 $$;
 
 
@@ -18477,6 +18572,13 @@ BEGIN
                 USING ERRCODE = '23514',
                       CONSTRAINT = 'thread_agent_warm_binding_reciprocity';
         END IF;
+    ELSIF NEW.status = 'terminal_release' THEN
+        IF public.pinned_deleted_owner_warm_release_authorized(NEW)
+               IS NOT TRUE THEN
+            RAISE EXCEPTION 'terminal warm release lacks deleted-owner authority'
+                USING ERRCODE = '23514',
+                      CONSTRAINT = 'thread_agent_warm_binding_reciprocity';
+        END IF;
     ELSIF NEW.status IN ('released', 'aborted') THEN
         IF thread_row.id IS NOT NULL
            AND thread_row.agent_id IS NOT DISTINCT FROM NEW.agent_id THEN
@@ -24636,51 +24738,6 @@ CREATE TABLE public.thread_agent_pod_recycle_handoffs (
 
 
 --
--- Name: thread_agent_warm_binding_protections; Type: TABLE; Schema: public; Owner: -
---
-
-CREATE TABLE public.thread_agent_warm_binding_protections (
-    protection_id uuid NOT NULL,
-    thread_id uuid NOT NULL,
-    runtime_generation uuid NOT NULL,
-    runtime_attach_token uuid NOT NULL,
-    agent_id uuid NOT NULL,
-    source character varying(24) NOT NULL,
-    provisioner character varying(16) NOT NULL,
-    namespace character varying(253) NOT NULL,
-    pod_name character varying(253) NOT NULL,
-    pod_uid text NOT NULL,
-    discovered_resource_version text NOT NULL,
-    status character varying(16) DEFAULT 'planned'::character varying NOT NULL,
-    lease_expires_at timestamp with time zone NOT NULL,
-    effect_token uuid,
-    effect_started_at timestamp with time zone,
-    effect_expires_at timestamp with time zone,
-    protection_resource_version text,
-    evidence_protocol character varying(48),
-    protected_at timestamp with time zone,
-    bound_at timestamp with time zone,
-    release_started_at timestamp with time zone,
-    release_outcome character varying(32),
-    abort_fence_protocol character varying(48),
-    abort_fence_resource_version text,
-    abort_fence_value text,
-    released_at timestamp with time zone,
-    created_at timestamp with time zone DEFAULT transaction_timestamp() NOT NULL,
-    CONSTRAINT thread_agent_warm_binding_pro_discovered_resource_version_check CHECK ((discovered_resource_version <> ''::text)),
-    CONSTRAINT thread_agent_warm_binding_protection_abort_fence_protocol_check CHECK (((abort_fence_protocol)::text = ANY ((ARRAY['unclaimed_plan_v1'::character varying, 'exact_rv_annotation_fence_v1'::character varying, 'exact_object_gone_v1'::character varying])::text[]))),
-    CONSTRAINT thread_agent_warm_binding_protections_check CHECK ((((pod_name)::text <> ''::text) AND (pod_uid <> ''::text))),
-    CONSTRAINT thread_agent_warm_binding_protections_check1 CHECK ((lease_expires_at > created_at)),
-    CONSTRAINT thread_agent_warm_binding_protections_check2 CHECK (((((status)::text = 'planned'::text) AND (effect_token IS NULL) AND (effect_started_at IS NULL) AND (effect_expires_at IS NULL) AND (protection_resource_version IS NULL) AND (evidence_protocol IS NULL) AND (protected_at IS NULL) AND (bound_at IS NULL) AND (release_started_at IS NULL) AND (abort_fence_protocol IS NULL) AND (abort_fence_resource_version IS NULL) AND (abort_fence_value IS NULL) AND (release_outcome IS NULL) AND (released_at IS NULL)) OR (((status)::text = 'protecting'::text) AND (effect_token IS NOT NULL) AND (effect_started_at IS NOT NULL) AND (effect_expires_at > effect_started_at) AND (effect_expires_at <= (effect_started_at + '00:03:00'::interval)) AND (protection_resource_version IS NULL) AND (evidence_protocol IS NULL) AND (protected_at IS NULL) AND (bound_at IS NULL) AND (release_started_at IS NULL) AND (abort_fence_protocol IS NULL) AND (abort_fence_resource_version IS NULL) AND (abort_fence_value IS NULL) AND (release_outcome IS NULL) AND (released_at IS NULL)) OR (((status)::text = 'protected'::text) AND (effect_token IS NOT NULL) AND (effect_started_at IS NOT NULL) AND (effect_expires_at IS NOT NULL) AND (NULLIF(protection_resource_version, ''::text) IS NOT NULL) AND ((evidence_protocol)::text = 'exact_live_finalizer_v1'::text) AND (protected_at IS NOT NULL) AND (bound_at IS NULL) AND (release_started_at IS NULL) AND (abort_fence_protocol IS NULL) AND (abort_fence_resource_version IS NULL) AND (abort_fence_value IS NULL) AND (release_outcome IS NULL) AND (released_at IS NULL)) OR (((status)::text = 'bound'::text) AND (effect_token IS NOT NULL) AND (effect_started_at IS NOT NULL) AND (effect_expires_at IS NOT NULL) AND (NULLIF(protection_resource_version, ''::text) IS NOT NULL) AND ((evidence_protocol)::text = 'exact_live_finalizer_v1'::text) AND (protected_at IS NOT NULL) AND (bound_at IS NOT NULL) AND (release_started_at IS NULL) AND (abort_fence_protocol IS NULL) AND (abort_fence_resource_version IS NULL) AND (abort_fence_value IS NULL) AND (release_outcome IS NULL) AND (released_at IS NULL)) OR (((status)::text = 'releasing'::text) AND (effect_token IS NOT NULL) AND (effect_started_at IS NOT NULL) AND (effect_expires_at IS NOT NULL) AND (NULLIF(protection_resource_version, ''::text) IS NOT NULL) AND ((evidence_protocol)::text = 'exact_live_finalizer_v1'::text) AND (protected_at IS NOT NULL) AND (release_started_at IS NOT NULL) AND (abort_fence_protocol IS NULL) AND (abort_fence_resource_version IS NULL) AND (abort_fence_value IS NULL) AND (release_outcome IS NULL) AND (released_at IS NULL)) OR (((status)::text = 'released'::text) AND (effect_token IS NOT NULL) AND (effect_started_at IS NOT NULL) AND (effect_expires_at IS NOT NULL) AND (NULLIF(protection_resource_version, ''::text) IS NOT NULL) AND ((evidence_protocol)::text = 'exact_live_finalizer_v1'::text) AND (protected_at IS NOT NULL) AND (release_started_at IS NOT NULL) AND (abort_fence_protocol IS NULL) AND (abort_fence_resource_version IS NULL) AND (abort_fence_value IS NULL) AND (release_outcome IS NOT NULL) AND (released_at IS NOT NULL)) OR (((status)::text = 'aborted'::text) AND (protection_resource_version IS NULL) AND (evidence_protocol IS NULL) AND (protected_at IS NULL) AND (bound_at IS NULL) AND (release_started_at IS NULL) AND (((effect_token IS NULL) AND (effect_started_at IS NULL) AND (effect_expires_at IS NULL) AND ((abort_fence_protocol)::text = 'unclaimed_plan_v1'::text) AND (abort_fence_resource_version IS NULL) AND (abort_fence_value IS NULL)) OR ((effect_token IS NOT NULL) AND (effect_started_at IS NOT NULL) AND (effect_expires_at IS NOT NULL) AND ((((release_outcome)::text = 'exact_live_unprotected_v1'::text) AND ((abort_fence_protocol)::text = 'exact_rv_annotation_fence_v1'::text) AND (NULLIF(abort_fence_resource_version, ''::text) IS NOT NULL) AND (abort_fence_value = (((protection_id)::text || ':'::text) || (effect_token)::text))) OR (((release_outcome)::text = ANY ((ARRAY['exact_absent_v1'::character varying, 'exact_replacement_v1'::character varying])::text[])) AND ((abort_fence_protocol)::text = 'exact_object_gone_v1'::text) AND (abort_fence_resource_version IS NULL) AND (abort_fence_value IS NULL))))) AND (release_outcome IS NOT NULL) AND (released_at IS NOT NULL)))),
-    CONSTRAINT thread_agent_warm_binding_protections_namespace_check CHECK ((((length((namespace)::text) >= 1) AND (length((namespace)::text) <= 63)) AND ((namespace)::text ~ '^[a-z0-9]([-a-z0-9]*[a-z0-9])?$'::text))),
-    CONSTRAINT thread_agent_warm_binding_protections_provisioner_check CHECK (((provisioner)::text = ANY ((ARRAY['agent'::character varying, 'persistent'::character varying])::text[]))),
-    CONSTRAINT thread_agent_warm_binding_protections_release_outcome_check CHECK (((release_outcome)::text = ANY ((ARRAY['exact_live_unprotected_v1'::character varying, 'exact_absent_v1'::character varying, 'exact_replacement_v1'::character varying])::text[]))),
-    CONSTRAINT thread_agent_warm_binding_protections_source_check CHECK (((source)::text = ANY ((ARRAY['attach'::character varying, 'legacy_binding'::character varying])::text[]))),
-    CONSTRAINT thread_agent_warm_binding_protections_status_check CHECK (((status)::text = ANY ((ARRAY['planned'::character varying, 'protecting'::character varying, 'protected'::character varying, 'bound'::character varying, 'releasing'::character varying, 'released'::character varying, 'aborted'::character varying])::text[])))
-);
-
-
---
 -- Name: thread_client_presence; Type: TABLE; Schema: public; Owner: -
 --
 
@@ -30607,6 +30664,13 @@ CREATE UNIQUE INDEX idx_thread_agent_warm_binding_agent_active ON public.thread_
 
 
 --
+-- Name: idx_thread_agent_warm_binding_agent_active_v2; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX idx_thread_agent_warm_binding_agent_active_v2 ON public.thread_agent_warm_binding_protections USING btree (agent_id) WHERE ((status)::text = ANY ((ARRAY['planned'::character varying, 'protecting'::character varying, 'protected'::character varying, 'bound'::character varying, 'releasing'::character varying, 'terminal_release'::character varying])::text[]));
+
+
+--
 -- Name: idx_thread_agent_warm_binding_reconcile; Type: INDEX; Schema: public; Owner: -
 --
 
@@ -30614,10 +30678,24 @@ CREATE INDEX idx_thread_agent_warm_binding_reconcile ON public.thread_agent_warm
 
 
 --
+-- Name: idx_thread_agent_warm_binding_reconcile_v2; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE INDEX idx_thread_agent_warm_binding_reconcile_v2 ON public.thread_agent_warm_binding_protections USING btree (status, lease_expires_at, effect_expires_at) WHERE ((status)::text = ANY ((ARRAY['planned'::character varying, 'protecting'::character varying, 'protected'::character varying, 'releasing'::character varying, 'terminal_release'::character varying])::text[]));
+
+
+--
 -- Name: idx_thread_agent_warm_binding_thread_active; Type: INDEX; Schema: public; Owner: -
 --
 
 CREATE UNIQUE INDEX idx_thread_agent_warm_binding_thread_active ON public.thread_agent_warm_binding_protections USING btree (thread_id, runtime_generation) WHERE ((status)::text = ANY ((ARRAY['planned'::character varying, 'protecting'::character varying, 'protected'::character varying, 'bound'::character varying, 'releasing'::character varying])::text[]));
+
+
+--
+-- Name: idx_thread_agent_warm_binding_thread_active_v2; Type: INDEX; Schema: public; Owner: -
+--
+
+CREATE UNIQUE INDEX idx_thread_agent_warm_binding_thread_active_v2 ON public.thread_agent_warm_binding_protections USING btree (thread_id, runtime_generation) WHERE ((status)::text = ANY ((ARRAY['planned'::character varying, 'protecting'::character varying, 'protected'::character varying, 'bound'::character varying, 'releasing'::character varying, 'terminal_release'::character varying])::text[]));
 
 
 --
@@ -33592,7 +33670,7 @@ CREATE TRIGGER zzy_thread_agent_pod_recycle_successor_authority BEFORE INSERT ON
 -- Name: agents zzz_agents_pinned_warm_binding_authority; Type: TRIGGER; Schema: public; Owner: -
 --
 
-CREATE TRIGGER zzz_agents_pinned_warm_binding_authority BEFORE UPDATE ON public.agents FOR EACH ROW EXECUTE FUNCTION public.enforce_pinned_warm_agent_reservation();
+CREATE TRIGGER zzz_agents_pinned_warm_binding_authority BEFORE INSERT OR UPDATE ON public.agents FOR EACH ROW EXECUTE FUNCTION public.enforce_pinned_warm_agent_reservation();
 
 
 --
