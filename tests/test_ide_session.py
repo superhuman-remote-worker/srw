@@ -80,7 +80,10 @@ def browser_ide_transport_available(monkeypatch):
 @pytest.fixture
 def service_factory():
     from orchestrator.services.ide_session import IdeSessionService
-    from orchestrator.services.container_provisioner import WorkspaceRuntimeAttestation
+    from orchestrator.services.container_provisioner import (
+        ContainerProvisioner,
+        WorkspaceRuntimeAttestation,
+    )
 
     db = AsyncMock()
     db.merge_ide_session_context = AsyncMock()
@@ -100,7 +103,7 @@ def service_factory():
         }
     )
 
-    container_provisioner = AsyncMock()
+    container_provisioner = AsyncMock(spec_set=ContainerProvisioner)
     container_provisioner.is_available = True
     creation = {
         "id": IDE_RESERVATION,
