@@ -164,18 +164,20 @@ async def test_active_permanent_delete_persists_exact_warm_release_through_retry
             )
         assert denied.value.constraint_name == "agents_pinned_warm_binding_authority"
         await conn.execute(
-            "UPDATE agents SET last_heartbeat=now()-interval '1 day' "
-            "WHERE id=$1::uuid",
+            "UPDATE agents SET last_heartbeat=now()-interval '1 day' WHERE id=$1::uuid",
             UUID(ids["agent"]),
         )
     # Old replicas can run this global stale sweep without poisoning it;
     # offline is still an exact, unbound terminal actor, never a ready pool slot.
     assert await db.mark_stale_agents_offline(timeout_minutes=3)
     async with db.acquire() as conn:
-        assert await conn.fetchval(
-            "SELECT status::text FROM agents WHERE id=$1::uuid",
-            UUID(ids["agent"]),
-        ) == "offline"
+        assert (
+            await conn.fetchval(
+                "SELECT status::text FROM agents WHERE id=$1::uuid",
+                UUID(ids["agent"]),
+            )
+            == "offline"
+        )
     api.mark_terminal("agents-a", ids["pod_name"])
     assert pod.metadata.deletion_timestamp is None
     await reconcile_pinned_warm_binding_protections(
@@ -448,7 +450,9 @@ async def test_terminal_release_requires_absent_receipt_and_rechecks_deleted_own
 
 
 @pytest.mark.asyncio
-async def test_populated_0300_warm_binding_upgrades_and_validates(tmp_path, monkeypatch):
+async def test_populated_0300_warm_binding_upgrades_and_validates(
+    tmp_path, monkeypatch
+):
     migrations = (
         Path(__file__).resolve().parents[1] / "src/orchestrator/database/migrations/app"
     )
