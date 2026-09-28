@@ -7670,6 +7670,44 @@ class TestIdePodResourceAuthority:
         )
 
     @pytest.mark.asyncio
+    async def test_exact_admitted_ide_receipt_skips_second_reservation(self):
+        p = self._provisioner()
+        plan = await p._ide_creation_plan(
+            self.JOB_ID,
+            cpu="250m",
+            memory="512Mi",
+            cpu_limit="1000m",
+            memory_limit="2Gi",
+        )
+        receipt = {
+            "id": "33333333-3333-4333-8333-333333333333",
+            "owner_kind": "job",
+            "owner_id": self.JOB_ID,
+            "scope": "ide",
+            "operation_kind": "restore",
+            "reservation_generation": 1,
+            "claimed_by": "ide-issuer:one",
+            "claim_token": 1,
+            "desired_manifest_digest": plan["digest"],
+            "external_mutation_started_at": "2026-09-28T00:00:00Z",
+        }
+        p._create_ide_pod_reserved = AsyncMock(return_value=None)
+        with patch.object(
+            type(p._db),
+            "reserve_managed_repository_workspace_creation",
+            new=AsyncMock(side_effect=AssertionError("unexpected second reservation")),
+        ):
+            assert (
+                await p.create_ide_pod(
+                    self.JOB_ID, creation_reservation=receipt
+                )
+                is None
+            )
+        passed = p._create_ide_pod_reserved.await_args.kwargs
+        assert passed["_creation_reservation"] is receipt
+        assert passed["_creation_plan"]["digest"] == plan["digest"]
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize(
         ("incumbent_has_seed", "desired_has_seed"),
         [(True, False), (False, True), (True, True), (False, False)],

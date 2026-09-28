@@ -146,6 +146,22 @@ from orchestrator.services.ssh_handles import is_valid_handle, mint_ssh_handle
 
 logger = logging.getLogger(__name__)
 
+
+@asynccontextmanager
+async def _borrowed_creation_connection(conn: Any):
+    """Use a caller-owned transaction for a compound creation admission."""
+
+    yield conn
+
+
+@asynccontextmanager
+async def _borrowed_creation_transaction():
+    yield
+
+
+class _IdeRestoreAdmissionHeld(Exception):
+    """Roll back an uncommitted IDE projection when creation is held."""
+
 # A same-name Kubernetes fence must outlive every non-watch API request that
 # could still commit the original create.  The deployment's documented
 # apiserver request horizon is five minutes; keep an equal safety margin and
@@ -709,6 +725,35 @@ def _rotate_workspace_creation_claim_token(
     next_runtime["_creation_claim_token"] = str(next_claim_token)
     next_state = dict(state)
     next_state[state_key] = next_runtime
+    return next_state
+
+
+def _rotate_uidless_ide_restore_claim_token(
+    state: dict[str, Any],
+    *,
+    attempt_id: str,
+    reservation_id: str,
+    previous_claim_token: int,
+    next_claim_token: int,
+) -> dict[str, Any] | None:
+    """Rotate only the projected, exact UID-less IDE attempt receipt."""
+
+    ide = state.get("ide_session")
+    if (
+        not isinstance(ide, dict)
+        or ide.get("status") != "restoring"
+        or ide.get("restore_type") != "k8s_container"
+        or ide.get("_runtime_incarnation") is not None
+        or ide.get("_restore_attempt_id") != attempt_id
+        or ide.get("_creation_reservation_id") != reservation_id
+        or ide.get("_creation_claim_token") != str(previous_claim_token)
+    ):
+        return None
+    next_state = dict(state)
+    next_state["ide_session"] = {
+        **ide,
+        "_creation_claim_token": str(next_claim_token),
+    }
     return next_state
 
 
@@ -16262,6 +16307,190 @@ class PostgresDB:
             )
         )
 
+    @staticmethod
+    async def _settled_uidless_ide_restore_abort(
+        conn: Any, owner_id: UUID, state: dict[str, Any]
+    ) -> bool:
+        """Recognize only the exact prior zero-effect cancellation receipt."""
+
+        ide = state.get("ide_session")
+        if (
+            not isinstance(ide, dict)
+            or ide.get("status") != "expired"
+            or ide.get("restore_type") != "k8s_container"
+            or ide.get("_runtime_incarnation") is not None
+            or ide.get("container_id") is not None
+            or ide.get("container_name") is not None
+            or ide.get("pod_ip") is not None
+            or "_creation_reservation_id" in ide
+            or "_creation_claim_token" in ide
+        ):
+            return False
+        try:
+            attempt = UUID(str(ide.get("_restore_attempt_id")))
+        except (TypeError, ValueError):
+            return False
+        return bool(
+            await conn.fetchval(
+                "SELECT EXISTS (SELECT 1 FROM "
+                "managed_repository_workspace_creation_reservations r "
+                "WHERE r.owner_kind = 'job' AND r.owner_id = $1 "
+                "AND r.scope = 'ide' AND r.operation_kind = 'restore' "
+                "AND r.lifecycle_fingerprint->>'restore_attempt_id' = $2 "
+                "AND r.lifecycle_fingerprint->>'restore_source' = $3 "
+                "AND r.lifecycle_fingerprint->>'restore_snapshot_type' = $4 "
+                "AND r.phase = 'aborted' AND r.result_kind = 'aborted' "
+                "AND r.cancel_target_disposition = 'expired' "
+                "AND r.cancel_requested_at IS NOT NULL "
+                "AND r.cancel_cleanup_completed_at IS NOT NULL "
+                "AND r.cancel_projection_transaction_id IS NOT NULL "
+                "AND r.settled_at IS NOT NULL "
+                "AND r.external_mutation_started_at IS NULL "
+                "AND r.runtime_incarnation IS NULL AND r.pod_uid IS NULL)",
+                owner_id,
+                str(attempt),
+                str(ide.get("source") or ""),
+                str(ide.get("snapshot_type") or ""),
+            )
+        )
+
+    async def begin_managed_ide_restore_attempt(
+        self,
+        owner_id: str,
+        *,
+        attempt_id: str,
+        proposed_context: dict[str, Any],
+        desired_manifest_digest: str,
+        claimant: str,
+    ) -> dict[str, Any]:
+        """Commit the first IDE intent and its creation authority together."""
+
+        try:
+            owner_uuid = UUID(str(owner_id))
+            attempt_uuid = UUID(str(attempt_id))
+        except (TypeError, ValueError):
+            return {"disposition": "definitively_denied"}
+        if (
+            not isinstance(proposed_context, dict)
+            or proposed_context.get("status") != "restoring"
+            or proposed_context.get("restore_type") != "k8s_container"
+            or not isinstance(proposed_context.get("started_at"), str)
+            or any(
+                key in proposed_context
+                for key in (
+                    "_restore_attempt_id",
+                    "_creation_reservation_id",
+                    "_creation_claim_token",
+                    "_runtime_incarnation",
+                )
+            )
+            or re.fullmatch(r"[0-9a-f]{64}", desired_manifest_digest or "")
+            is None
+        ):
+            return {"disposition": "definitively_denied"}
+
+        try:
+            async with self.acquire() as conn:
+                async with conn.transaction():
+                    owner = await conn.fetchrow(
+                        "SELECT context, repo_name FROM jobs WHERE id = $1 FOR UPDATE",
+                        owner_uuid,
+                    )
+                    if owner is None:
+                        return {"disposition": "definitively_denied"}
+                    try:
+                        state = _strict_json_object(owner["context"], label="context")
+                    except RuntimeError:
+                        return {"disposition": "held"}
+                    if WORKER_EXECUTION_HOLD_KEY in state:
+                        return {
+                            "disposition": "held",
+                            "reason": "worker_execution_hold",
+                        }
+                    existing = state.get("ide_session")
+                    previous_closed = bool(
+                        existing not in (None, {})
+                        and await self._settled_uidless_ide_restore_abort(
+                            conn, owner_uuid, state
+                        )
+                    )
+                    if existing not in (None, {}) and not previous_closed:
+                        return {"disposition": "held"}
+                    source = proposed_context.get("source")
+                    snapshot = state.get("snapshot")
+                    if source == "gitea":
+                        source_valid = bool(
+                            proposed_context.get("snapshot_type") == "gitea"
+                            and isinstance(owner["repo_name"], str)
+                            and owner["repo_name"]
+                        )
+                    else:
+                        source_valid = bool(
+                            source == "snapshot"
+                            and proposed_context.get("snapshot_type") == "pod"
+                            and isinstance(snapshot, dict)
+                            and snapshot.get("status") == "available"
+                            and snapshot.get("source_type") == "pod"
+                        )
+                    if not source_valid:
+                        return {"disposition": "definitively_denied"}
+
+                    intent = dict(proposed_context)
+                    intent["_restore_attempt_id"] = str(attempt_uuid)
+                    if not previous_closed:
+                        # The terminal Job reservation guard needs a current
+                        # proposed intent on a genuinely empty first slot.
+                        state["ide_session"] = intent
+                        await conn.execute(
+                            "UPDATE jobs SET context = $2::jsonb WHERE id = $1",
+                            owner_uuid,
+                            json.dumps(state),
+                        )
+                    reservation = (
+                        await self.reserve_managed_repository_workspace_creation(
+                            owner_id,
+                            owner_kind="job",
+                            scope="ide",
+                            claimant=claimant,
+                            operation_kind="restore",
+                            desired_manifest_digest=desired_manifest_digest,
+                            _connection=conn,
+                        )
+                    )
+                    if reservation is None:
+                        raise _IdeRestoreAdmissionHeld
+                    reservation = await conn.fetchrow(
+                        "UPDATE managed_repository_workspace_creation_reservations "
+                        "SET lifecycle_fingerprint = lifecycle_fingerprint || "
+                        "jsonb_build_object('restore_attempt_id', $2::text, "
+                        "'restore_source', $4::text, "
+                        "'restore_snapshot_type', $5::text) "
+                        "WHERE id = $1 AND owner_kind = 'job' AND owner_id = $3 "
+                        "AND scope = 'ide' AND operation_kind = 'restore' "
+                        "RETURNING *",
+                        reservation["id"],
+                        str(attempt_uuid),
+                        owner_uuid,
+                        str(source),
+                        str(intent["snapshot_type"]),
+                    )
+                    if reservation is None:
+                        raise RuntimeError("IDE reservation lost during admission")
+                    intent["_creation_reservation_id"] = str(reservation["id"])
+                    intent["_creation_claim_token"] = str(reservation["claim_token"])
+                    state["ide_session"] = intent
+                    await conn.execute(
+                        "UPDATE jobs SET context = $2::jsonb WHERE id = $1",
+                        owner_uuid,
+                        json.dumps(state),
+                    )
+                    return {
+                        "disposition": "accepted",
+                        "reservation": dict(reservation),
+                    }
+        except _IdeRestoreAdmissionHeld:
+            return {"disposition": "held"}
+
     async def reserve_managed_repository_workspace_creation(
         self,
         owner_id: str,
@@ -16274,6 +16503,8 @@ class PostgresDB:
         desired_manifest_digest: str,
         expected_existing_reservation_id: str | None = None,
         expected_existing_claim_token: int | None = None,
+        expected_restore_attempt_id: str | None = None,
+        _connection: Any | None = None,
     ) -> dict[str, Any] | None:
         """Claim one durable creation generation before any Kubernetes effect.
 
@@ -16310,6 +16541,11 @@ class PostgresDB:
                 if expected_existing_reservation_id is not None
                 else None
             )
+            expected_attempt = (
+                UUID(str(expected_restore_attempt_id))
+                if expected_restore_attempt_id is not None
+                else None
+            )
         except (TypeError, ValueError):
             return None
         if (expected_existing is None) != (expected_existing_claim_token is None) or (
@@ -16320,10 +16556,22 @@ class PostgresDB:
             )
         ):
             return None
+        if expected_attempt is not None and expected_existing is None:
+            return None
         table = "jobs" if owner_kind == "job" else "threads"
         json_column = "context" if owner_kind == "job" else "metadata"
-        async with self.acquire() as conn:
-            async with conn.transaction():
+        connection_context = (
+            self.acquire()
+            if _connection is None
+            else _borrowed_creation_connection(_connection)
+        )
+        async with connection_context as conn:
+            transaction_context = (
+                conn.transaction()
+                if _connection is None
+                else _borrowed_creation_transaction()
+            )
+            async with transaction_context:
                 owner = await conn.fetchrow(
                     f"SELECT status::text AS owner_status, {json_column} AS state, "
                     + (
@@ -16443,7 +16691,16 @@ class PostgresDB:
                                 scope,
                             )
                         )
-                        if not uidless_settled_cleanup:
+                        uidless_ide_abort = bool(
+                            owner_kind == "job"
+                            and scope == "ide"
+                            and operation_kind == "restore"
+                            and runtime_status == "expired"
+                            and await self._settled_uidless_ide_restore_abort(
+                                conn, owner_uuid, owner_state
+                            )
+                        )
+                        if not (uidless_settled_cleanup or uidless_ide_abort):
                             return None
                 existing_runtime_retired = False
                 if existing_runtime is not None:
@@ -16504,6 +16761,34 @@ class PostgresDB:
                     or active["claim_token"] != expected_existing_claim_token
                 ):
                     return None
+                if expected_attempt is not None:
+                    ide = owner_state.get("ide_session")
+                    try:
+                        fingerprint = _strict_json_object(
+                            active["lifecycle_fingerprint"],
+                            label="IDE restore attempt fingerprint",
+                        )
+                    except (RuntimeError, TypeError, KeyError):
+                        return None
+                    if (
+                        not isinstance(ide, dict)
+                        or ide.get("status") != "restoring"
+                        or ide.get("restore_type") != "k8s_container"
+                        or ide.get("_restore_attempt_id") != str(expected_attempt)
+                        or ide.get("_creation_reservation_id")
+                        != str(active["id"])
+                        or ide.get("_creation_claim_token")
+                        != str(active["claim_token"])
+                        or fingerprint.get("restore_attempt_id")
+                        != str(expected_attempt)
+                        or ide.get("source") != fingerprint.get("restore_source")
+                        or ide.get("snapshot_type")
+                        != fingerprint.get("restore_snapshot_type")
+                        or not self._terminal_job_ide_restore_intent(
+                            owner_state, owner.get("repository_name")
+                        )
+                    ):
+                        return None
                 if active is not None and str(active.get("operation_kind") or "") != (
                     operation_kind
                 ):
@@ -16564,18 +16849,27 @@ class PostgresDB:
                     )
                     if reclaimed is None:
                         return None
-                    rotated_state = _rotate_workspace_creation_claim_token(
-                        owner_state,
-                        scope=scope,
-                        reservation_id=str(reclaimed["id"]),
-                        runtime_incarnation=(
-                            str(reclaimed["runtime_incarnation"])
-                            if reclaimed.get("runtime_incarnation") is not None
-                            else None
-                        ),
-                        previous_claim_token=int(active["claim_token"]),
-                        next_claim_token=int(reclaimed["claim_token"]),
-                    )
+                    if expected_attempt is not None and existing_runtime is None:
+                        rotated_state = _rotate_uidless_ide_restore_claim_token(
+                            owner_state,
+                            attempt_id=str(expected_attempt),
+                            reservation_id=str(reclaimed["id"]),
+                            previous_claim_token=int(active["claim_token"]),
+                            next_claim_token=int(reclaimed["claim_token"]),
+                        )
+                    else:
+                        rotated_state = _rotate_workspace_creation_claim_token(
+                            owner_state,
+                            scope=scope,
+                            reservation_id=str(reclaimed["id"]),
+                            runtime_incarnation=(
+                                str(reclaimed["runtime_incarnation"])
+                                if reclaimed.get("runtime_incarnation") is not None
+                                else None
+                            ),
+                            previous_claim_token=int(active["claim_token"]),
+                            next_claim_token=int(reclaimed["claim_token"]),
+                        )
                     if rotated_state is None:
                         raise RuntimeError(
                             "workspace creation claim rotation lost owner authority"
@@ -18392,6 +18686,150 @@ class PostgresDB:
                 )
         return result == "UPDATE 1"
 
+    async def cancel_managed_ide_restore_attempt(
+        self,
+        owner_id: str,
+        *,
+        attempt_id: str,
+        reservation_id: str,
+        claim_token: int,
+        claimant: str,
+    ) -> dict[str, Any] | None:
+        """Cancel only the currently projected IDE attempt under its owner lock.
+
+        A reserved, unstarted generation can publish expired with the native
+        0198 cancellation receipt in this transaction. A started generation
+        instead rotates its claim for the existing physical reconciler.
+        """
+
+        try:
+            owner_uuid = UUID(str(owner_id))
+            attempt_uuid = UUID(str(attempt_id))
+            reservation_uuid = UUID(str(reservation_id))
+        except (TypeError, ValueError):
+            return None
+        if (
+            type(claim_token) is not int
+            or claim_token <= 0
+            or not isinstance(claimant, str)
+            or not claimant
+            or len(claimant) > 160
+            or "\x00" in claimant
+        ):
+            return None
+        async with self.acquire() as conn:
+            async with conn.transaction():
+                owner = await conn.fetchrow(
+                    "SELECT context FROM jobs WHERE id = $1 FOR UPDATE", owner_uuid
+                )
+                if owner is None:
+                    return None
+                try:
+                    state = _strict_json_object(owner["context"], label="context")
+                except RuntimeError:
+                    return None
+                ide = state.get("ide_session")
+                if (
+                    not isinstance(ide, dict)
+                    or ide.get("status") != "restoring"
+                    or ide.get("restore_type") != "k8s_container"
+                    or ide.get("_restore_attempt_id") != str(attempt_uuid)
+                    or ide.get("_creation_reservation_id") != str(reservation_uuid)
+                    or ide.get("_creation_claim_token") != str(claim_token)
+                    or ide.get("_runtime_incarnation") is not None
+                ):
+                    return None
+                reservation = await conn.fetchrow(
+                    "SELECT * FROM managed_repository_workspace_creation_reservations "
+                    "WHERE owner_kind = 'job' AND owner_id = $1 AND scope = 'ide' "
+                    "AND id = $2 FOR UPDATE",
+                    owner_uuid,
+                    reservation_uuid,
+                )
+                if (
+                    reservation is None
+                    or reservation.get("settled_at") is not None
+                    or reservation.get("cancel_requested_at") is not None
+                    or reservation.get("operation_kind") != "restore"
+                    or reservation.get("phase") not in {"reserved", "mutating"}
+                    or int(reservation.get("claim_token") or 0) != claim_token
+                    or reservation.get("runtime_incarnation") is not None
+                    or reservation.get("pod_uid") is not None
+                ):
+                    return None
+                try:
+                    fingerprint = _strict_json_object(
+                        reservation["lifecycle_fingerprint"],
+                        label="lifecycle_fingerprint",
+                    )
+                except RuntimeError:
+                    return None
+                if (
+                    fingerprint.get("restore_attempt_id") != str(attempt_uuid)
+                    or fingerprint.get("restore_source") != ide.get("source")
+                    or fingerprint.get("restore_snapshot_type")
+                    != ide.get("snapshot_type")
+                ):
+                    return None
+                zero_effect = (
+                    reservation.get("phase") == "reserved"
+                    and reservation.get("external_mutation_started_at") is None
+                )
+                row = await conn.fetchrow(
+                    "UPDATE managed_repository_workspace_creation_reservations "
+                    "SET cancel_requested_at = now(), "
+                    "cancel_target_disposition = 'expired', "
+                    "cancel_resource_policy = 'preserve', "
+                    "cancel_snapshot_restore_required = false, "
+                    "settled_at = CASE WHEN $2 THEN now() ELSE settled_at END, "
+                    "phase = CASE WHEN $2 THEN 'aborted' ELSE phase END, "
+                    "result_kind = CASE WHEN $2 THEN 'aborted' ELSE result_kind END, "
+                    "cancel_cleanup_completed_at = CASE WHEN $2 THEN now() "
+                    "ELSE cancel_cleanup_completed_at END, "
+                    "claimed_by = CASE WHEN $2 THEN claimed_by ELSE $3 END, "
+                    "claim_token = CASE WHEN $2 THEN claim_token ELSE nextval("
+                    "'managed_repository_workspace_creation_claim_seq') END, "
+                    "expires_at = CASE WHEN $2 THEN expires_at ELSE now() + "
+                    "interval '5 minutes' END, "
+                    "attempts = CASE WHEN $2 THEN attempts ELSE attempts + 1 END, "
+                    "next_attempt_at = now() WHERE id = $1 "
+                    "AND settled_at IS NULL RETURNING *",
+                    reservation_uuid,
+                    zero_effect,
+                    claimant,
+                )
+                if row is None:
+                    return None
+                if zero_effect:
+                    next_ide = dict(ide)
+                    next_ide.pop("_creation_reservation_id", None)
+                    next_ide.pop("_creation_claim_token", None)
+                    next_ide.update(
+                        status="expired",
+                        pod_ip=None,
+                        code_server_url=None,
+                        stopped_at=datetime.now(timezone.utc).isoformat(),
+                    )
+                    state["ide_session"] = next_ide
+                else:
+                    state = _rotate_uidless_ide_restore_claim_token(
+                        state,
+                        attempt_id=str(attempt_uuid),
+                        reservation_id=str(reservation_uuid),
+                        previous_claim_token=claim_token,
+                        next_claim_token=int(row["claim_token"]),
+                    )
+                    if state is None:
+                        raise RuntimeError("IDE cancellation lost its owner claim")
+                updated = await conn.execute(
+                    "UPDATE jobs SET context = $2::jsonb WHERE id = $1",
+                    owner_uuid,
+                    json.dumps(state),
+                )
+                if updated != "UPDATE 1":
+                    raise RuntimeError("IDE cancellation lost its owner row")
+                return dict(row)
+
     async def request_managed_repository_workspace_creation_cancellation(
         self,
         owner_id: str,
@@ -18805,6 +19243,53 @@ class PostgresDB:
                 "managed_repository_workspace_creation_reservations "
                 "WHERE settled_at IS NULL AND reservation_generation > $1 "
                 "ORDER BY reservation_generation LIMIT $2",
+                after_generation,
+                limit,
+            )
+        return [dict(row) for row in rows]
+
+    async def list_pending_ide_restore_attempts(
+        self, *, limit: int = 25, after_generation: int = 0
+    ) -> list[dict[str, Any]]:
+        """Page only expired IDE restore claims named by their current owner."""
+
+        if (
+            type(limit) is not int
+            or not 1 <= limit <= 100
+            or type(after_generation) is not int
+            or after_generation < 0
+        ):
+            return []
+        async with self.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT r.*, now() AS database_now FROM "
+                "managed_repository_workspace_creation_reservations r "
+                "JOIN jobs j ON j.id = r.owner_id "
+                "WHERE r.owner_kind = 'job' AND r.scope = 'ide' "
+                "AND r.operation_kind = 'restore' "
+                "AND r.cancel_requested_at IS NULL "
+                "AND ((r.settled_at IS NULL AND r.expires_at <= now() "
+                "AND r.next_attempt_at <= now()) OR "
+                "(r.result_kind = 'settled' "
+                "AND r.runtime_incarnation IS NOT NULL "
+                "AND r.restore_work_completed_at IS NULL "
+                "AND r.restore_work_next_attempt_at <= now() "
+                "AND (r.restore_work_claim_expires_at IS NULL "
+                "OR r.restore_work_claim_expires_at <= now()))) "
+                "AND r.reservation_generation > $1 "
+                "AND j.context #>> '{ide_session,status}' = 'restoring' "
+                "AND j.context #>> '{ide_session,restore_type}' = 'k8s_container' "
+                "AND j.context #>> '{ide_session,_restore_attempt_id}' = "
+                "r.lifecycle_fingerprint->>'restore_attempt_id' "
+                "AND r.lifecycle_fingerprint ? 'restore_attempt_id' "
+                "AND j.context #>> '{ide_session,_creation_reservation_id}' = "
+                "r.id::text "
+                "AND j.context #>> '{ide_session,_creation_claim_token}' = "
+                "r.claim_token::text "
+                "AND (r.result_kind IS DISTINCT FROM 'settled' OR "
+                "j.context #>> '{ide_session,_runtime_incarnation}' = "
+                "r.runtime_incarnation::text) "
+                "ORDER BY r.reservation_generation LIMIT $2",
                 after_generation,
                 limit,
             )

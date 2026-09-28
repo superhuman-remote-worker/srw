@@ -3427,7 +3427,14 @@ BEGIN
                     MESSAGE = 'Local IDE process-zero authority is required';
             END IF;
         ELSIF destructive_transition AND runtime_id IS NULL
-           AND old_ide <> '{}'::JSONB THEN
+           AND old_ide <> '{}'::JSONB
+           AND NOT (
+               TG_OP = 'UPDATE'
+               AND source_kind = 'job'
+               AND public.managed_repo_uidless_ide_abort_authorized_now(
+                   source_id, old_state, new_state
+               )
+           ) THEN
             RAISE EXCEPTION USING
                 ERRCODE = '23514',
                 CONSTRAINT = 'managed_repository_ide_runtime_identity_required',
@@ -10664,6 +10671,48 @@ BEGIN
             new_runtime_state - '_creation_claim_token' - 'status'
         );
 END;
+$$;
+
+
+--
+-- Name: managed_repo_uidless_ide_abort_authorized_now(uuid, jsonb, jsonb); Type: FUNCTION; Schema: public; Owner: -
+--
+
+CREATE FUNCTION public.managed_repo_uidless_ide_abort_authorized_now(requested_owner_id uuid, old_state jsonb, new_state jsonb) RETURNS boolean
+    LANGUAGE sql
+    AS $$
+    SELECT old_state #>> '{ide_session,status}' = 'restoring'
+       AND old_state #>> '{ide_session,restore_type}' = 'k8s_container'
+       AND old_state #>> '{ide_session,_runtime_incarnation}' IS NULL
+       AND old_state #>> '{ide_session,container_id}' IS NULL
+       AND old_state #>> '{ide_session,_restore_attempt_id}' IS NOT NULL
+       AND EXISTS (
+           SELECT 1
+             FROM public.managed_repository_workspace_creation_reservations r
+            WHERE r.owner_kind = 'job'
+              AND r.owner_id = requested_owner_id
+              AND r.scope = 'ide'
+              AND r.operation_kind = 'restore'
+              AND r.id::TEXT = old_state #>> '{ide_session,_creation_reservation_id}'
+              AND r.claim_token::TEXT = old_state #>> '{ide_session,_creation_claim_token}'
+              AND r.lifecycle_fingerprint->>'restore_attempt_id' =
+                  old_state #>> '{ide_session,_restore_attempt_id}'
+              AND r.lifecycle_fingerprint->>'restore_source' =
+                  old_state #>> '{ide_session,source}'
+              AND r.lifecycle_fingerprint->>'restore_snapshot_type' =
+                  old_state #>> '{ide_session,snapshot_type}'
+              AND r.phase = 'aborted' AND r.result_kind = 'aborted'
+              AND r.cancel_target_disposition = 'expired'
+              AND r.cancel_requested_at IS NOT NULL
+              AND r.cancel_cleanup_completed_at IS NOT NULL
+              AND r.cancel_projection_transaction_id = txid_current()
+              AND r.settled_at IS NOT NULL
+              AND r.external_mutation_started_at IS NULL
+              AND r.runtime_incarnation IS NULL AND r.pod_uid IS NULL
+       )
+       AND public.managed_repo_cancelled_creation_projection_authorized_now(
+           'job', requested_owner_id, 'ide', old_state, new_state
+       );
 $$;
 
 

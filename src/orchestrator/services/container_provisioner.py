@@ -6665,6 +6665,38 @@ class ContainerProvisioner:
                 snapshot_restore_required=snapshot_restore_required,
             )
 
+    async def cancel_ide_restore_attempt(
+        self,
+        job_id: str,
+        *,
+        attempt_id: str,
+        reservation_id: str,
+        claim_token: int,
+    ) -> dict[str, Any] | None:
+        """Fence one UID-less IDE restore before attempting physical cleanup."""
+
+        if self._db is None:
+            return None
+        owner = WorkspaceOwner.job(job_id)
+        async with self._workspace_mutation_guard(owner, scope="ide") as owned:
+            if not owned:
+                return None
+            reservation = await self._db.cancel_managed_ide_restore_attempt(
+                job_id,
+                attempt_id=attempt_id,
+                reservation_id=reservation_id,
+                claim_token=claim_token,
+                claimant=f"ide-cancellation:{uuid4()}",
+            )
+            if not isinstance(reservation, dict):
+                return None
+            if reservation.get("settled_at") is not None:
+                return {**reservation, "reconciliation_outcome": "aborted"}
+            outcome = await self._reconcile_claimed_workspace_creation_reservation(
+                reservation, _mutation_guard_held=True
+            )
+            return {**reservation, "reconciliation_outcome": outcome}
+
     async def _request_workspace_creation_cancellation_guarded(
         self,
         owner: WorkspaceOwner,
@@ -11119,6 +11151,7 @@ class ContainerProvisioner:
         memory_limit: str = "2Gi",
         *,
         operation_id: str | None = None,
+        creation_reservation: dict[str, Any] | None = None,
     ) -> Optional[str]:
         """Create an IDE only under one durable owner/scope reservation."""
 
@@ -11151,16 +11184,31 @@ class ContainerProvisioner:
             cpu_limit=cpu_limit,
             memory_limit=memory_limit,
         )
-        reservation = await reserve(
-            self._db,
-            job_id,
-            owner_kind="job",
-            scope="ide",
-            claimant=claimant,
-            lease_seconds=1800,
-            operation_kind="restore",
-            desired_manifest_digest=str(creation_plan["digest"]),
-        )
+        if creation_reservation is None:
+            reservation = await reserve(
+                self._db,
+                job_id,
+                owner_kind="job",
+                scope="ide",
+                claimant=claimant,
+                lease_seconds=1800,
+                operation_kind="restore",
+                desired_manifest_digest=str(creation_plan["digest"]),
+            )
+        else:
+            reservation = creation_reservation
+            if (
+                reservation.get("owner_kind") != "job"
+                or str(reservation.get("owner_id")) != job_id
+                or reservation.get("scope") != "ide"
+                or reservation.get("operation_kind") != "restore"
+                or reservation.get("desired_manifest_digest")
+                != creation_plan["digest"]
+                or not isinstance(reservation.get("claimed_by"), str)
+                or type(reservation.get("claim_token")) is not int
+                or type(reservation.get("reservation_generation")) is not int
+            ):
+                return None
         if not isinstance(reservation, dict):
             return None
         owner = WorkspaceOwner.job(job_id)
@@ -11177,6 +11225,28 @@ class ContainerProvisioner:
                 _creation_plan=creation_plan,
             )
         if pod_ip is None:
+            fingerprint = reservation.get("lifecycle_fingerprint")
+            if isinstance(fingerprint, str):
+                try:
+                    fingerprint = json.loads(fingerprint)
+                except (TypeError, ValueError):
+                    fingerprint = None
+            attempt_id = (
+                fingerprint.get("restore_attempt_id")
+                if isinstance(fingerprint, dict)
+                else None
+            )
+            if attempt_id is not None:
+                # This first-create projection already names the reservation.
+                # Generic abort would close only the row and strand restoring;
+                # the exact cancellation closes both in the 0198 transaction.
+                await self.cancel_ide_restore_attempt(
+                    job_id,
+                    attempt_id=str(attempt_id),
+                    reservation_id=str(reservation["id"]),
+                    claim_token=int(reservation["claim_token"]),
+                )
+                return None
             if reservation.get("external_mutation_started_at") is None:
                 abort = getattr(
                     type(self._db),
