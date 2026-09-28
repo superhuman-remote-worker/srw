@@ -16062,6 +16062,70 @@ class PostgresDB:
             return None
         return raw_token
 
+    @staticmethod
+    def _terminal_job_ide_restore_intent(
+        state: dict[str, Any], repository_name: Any, *, allow_live: bool = False
+    ) -> bool:
+        """A terminal Job may create only its owner-requested, supported IDE."""
+
+        session = state.get("ide_session")
+        statuses = {"restoring", "expired", "failed"}
+        if allow_live:
+            statuses.update({"active", "idle"})
+        if not isinstance(session, dict) or session.get("status") not in statuses:
+            return False
+        if session.get("source") == "gitea":
+            return isinstance(repository_name, str) and bool(repository_name)
+        snapshot = state.get("snapshot")
+        return bool(
+            session.get("source") == "snapshot"
+            and session.get("snapshot_type") == "pod"
+            and isinstance(snapshot, dict)
+            and snapshot.get("status") == "available"
+            and snapshot.get("source_type") == "pod"
+        )
+
+    @classmethod
+    async def _terminal_job_ide_restore_current_intent(
+        cls, conn: Any, owner_id: UUID, scope: str
+    ) -> bool:
+        if scope != "ide":
+            return False
+        owner = await conn.fetchrow(
+            "SELECT context, repo_name FROM jobs WHERE id = $1", owner_id
+        )
+        if owner is None:
+            return False
+        try:
+            state = _strict_json_object(owner["context"], label="context")
+        except RuntimeError:
+            return False
+        return cls._terminal_job_ide_restore_intent(
+            state, owner["repo_name"], allow_live=True
+        )
+
+    @classmethod
+    async def _terminal_job_ide_restore_reservation(
+        cls, conn: Any, owner_id: UUID, scope: str, reservation_generation: int
+    ) -> bool:
+        """Keep every terminal-stage exception bound to the exact restore row."""
+
+        if not await cls._terminal_job_ide_restore_current_intent(
+            conn, owner_id, scope
+        ):
+            return False
+        return bool(
+            await conn.fetchval(
+                "SELECT EXISTS (SELECT 1 FROM "
+                "managed_repository_workspace_creation_reservations "
+                "WHERE owner_kind = 'job' AND owner_id = $1 "
+                "AND scope = 'ide' AND reservation_generation = $2 "
+                "AND operation_kind = 'restore')",
+                owner_id,
+                reservation_generation,
+            )
+        )
+
     async def reserve_managed_repository_workspace_creation(
         self,
         owner_id: str,
@@ -16128,9 +16192,9 @@ class PostgresDB:
                     f"SELECT status::text AS owner_status, {json_column} AS state, "
                     + (
                         "NULL::text AS execution_lane, "
-                        "NULL::uuid AS runtime_generation, "
+                        "NULL::uuid AS runtime_generation, repo_name AS repository_name, "
                         if owner_kind == "job"
-                        else "execution_lane, runtime_generation, "
+                        else "execution_lane, runtime_generation, NULL::text AS repository_name, "
                     )
                     + "now() AS database_now "
                     + f"FROM {table} WHERE id = $1 FOR UPDATE",
@@ -16147,16 +16211,25 @@ class PostgresDB:
                         return None
                     thread_runtime_generation = UUID(str(raw_generation))
                 owner_status = str(owner.get("owner_status") or "")
-                if (
-                    owner_kind == "job"
-                    and owner_status in {"completed", "failed", "cancelled"}
-                ) or (owner_kind == "thread" and owner_status == "ended"):
+                if owner_kind == "thread" and owner_status == "ended":
                     return None
                 try:
                     owner_state = _strict_json_object(
                         owner.get("state"), label=json_column
                     )
                 except RuntimeError:
+                    return None
+                if (
+                    owner_kind == "job"
+                    and owner_status in {"completed", "failed", "cancelled"}
+                    and not (
+                        scope == "ide"
+                        and operation_kind == "restore"
+                        and self._terminal_job_ide_restore_intent(
+                            owner_state, owner.get("repository_name")
+                        )
+                    )
+                ):
                     return None
                 if owner_kind == "job" and WORKER_EXECUTION_HOLD_KEY in owner_state:
                     return None
@@ -16487,6 +16560,12 @@ class PostgresDB:
                         owner_kind == "job"
                         and str(owner.get("owner_status") or "")
                         in {"completed", "failed", "cancelled"}
+                        and not (
+                            operation_kind == "restore"
+                            and await self._terminal_job_ide_restore_current_intent(
+                                conn, owner_uuid, scope
+                            )
+                        )
                     )
                     or (
                         owner_kind == "thread"
@@ -16580,6 +16659,9 @@ class PostgresDB:
                         owner_kind == "job"
                         and str(owner.get("owner_status") or "")
                         in {"completed", "failed", "cancelled"}
+                        and not await self._terminal_job_ide_restore_current_intent(
+                            conn, owner_uuid, scope
+                        )
                     )
                     or (
                         owner_kind == "thread"
@@ -16683,6 +16765,9 @@ class PostgresDB:
                         owner_kind == "job"
                         and str(owner.get("owner_status") or "")
                         in {"completed", "failed", "cancelled"}
+                        and not await self._terminal_job_ide_restore_current_intent(
+                            conn, owner_uuid, scope
+                        )
                     )
                     or (
                         owner_kind == "thread"
@@ -16828,6 +16913,9 @@ class PostgresDB:
                         owner_kind == "job"
                         and str(owner.get("owner_status") or "")
                         in {"completed", "failed", "cancelled"}
+                        and not await self._terminal_job_ide_restore_current_intent(
+                            conn, owner_uuid, scope
+                        )
                     )
                     or (
                         owner_kind == "thread"
@@ -16968,6 +17056,9 @@ class PostgresDB:
                         owner_kind == "job"
                         and str(owner.get("owner_status") or "")
                         in {"completed", "failed", "cancelled"}
+                        and not await self._terminal_job_ide_restore_current_intent(
+                            conn, owner_uuid, scope
+                        )
                     )
                     or (
                         owner_kind == "thread"
@@ -17303,6 +17394,9 @@ class PostgresDB:
                     or (
                         owner_kind == "job"
                         and str(owner_status) in {"completed", "failed", "cancelled"}
+                        and not await self._terminal_job_ide_restore_reservation(
+                            conn, owner_uuid, scope, reservation_generation
+                        )
                     )
                     or (owner_kind == "thread" and str(owner_status) == "ended")
                 ):
@@ -17372,6 +17466,9 @@ class PostgresDB:
                     or (
                         owner_kind == "job"
                         and str(owner_status) in {"completed", "failed", "cancelled"}
+                        and not await self._terminal_job_ide_restore_reservation(
+                            conn, owner_uuid, scope, reservation_generation
+                        )
                     )
                     or (owner_kind == "thread" and str(owner_status) == "ended")
                 ):
@@ -17453,6 +17550,9 @@ class PostgresDB:
                     or (
                         owner_kind == "job"
                         and str(owner_status) in {"completed", "failed", "cancelled"}
+                        and not await self._terminal_job_ide_restore_reservation(
+                            conn, owner_uuid, scope, reservation_generation
+                        )
                     )
                     or (owner_kind == "thread" and str(owner_status) == "ended")
                 ):
@@ -17659,6 +17759,9 @@ class PostgresDB:
                     or (
                         owner_kind == "job"
                         and str(owner_status) in {"completed", "failed", "cancelled"}
+                        and not await self._terminal_job_ide_restore_reservation(
+                            conn, owner_uuid, scope, reservation_generation
+                        )
                     )
                     or (owner_kind == "thread" and str(owner_status) == "ended")
                 ):
@@ -18021,6 +18124,9 @@ class PostgresDB:
                     owner_kind == "job"
                     and str(owner.get("owner_status") or "")
                     in {"completed", "failed", "cancelled"}
+                    and not await self._terminal_job_ide_restore_reservation(
+                        conn, owner_uuid, scope, reservation_generation
+                    )
                 ) or (
                     owner_kind == "thread"
                     and str(owner.get("owner_status") or "") == "ended"

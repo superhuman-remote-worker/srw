@@ -94,6 +94,228 @@ async def db(pg_dsn, _schema_applied):
         await store.close()
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ("completed", "failed", "cancelled"))
+async def test_terminal_job_ide_restore_traverses_creation_and_work_gates(db, status):
+    job_id, runtime = uuid4(), str(uuid4())
+    restoring = {
+        "ide_session": {
+            "status": "restoring",
+            "source": "gitea",
+            "snapshot_type": "gitea",
+            "started_at": "2026-09-28T00:00:00Z",
+        }
+    }
+    async with db.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO jobs (id, description, status, repo_name, context) "
+            "VALUES ($1, 'terminal IDE restore', $2, 'job-repo', $3::jsonb)",
+            job_id,
+            status,
+            json.dumps(restoring),
+        )
+
+    common = dict(owner_kind="job", scope="ide")
+    assert (
+        await db.reserve_managed_repository_workspace_creation(
+            str(job_id),
+            **common,
+            claimant="not-a-restore",
+            operation_kind="create",
+            desired_manifest_digest="0" * 64,
+        )
+        is None
+    )
+    assert (
+        await db.reserve_managed_repository_workspace_creation(
+            str(job_id),
+            owner_kind="job",
+            scope="workspace_container",
+            claimant="execution",
+            operation_kind="restore",
+            desired_manifest_digest="0" * 64,
+        )
+        is None
+    )
+    reservation = await db.reserve_managed_repository_workspace_creation(
+        str(job_id),
+        **common,
+        claimant="ide-restore",
+        operation_kind="restore",
+        desired_manifest_digest="0" * 64,
+    )
+    assert reservation is not None
+    generation = reservation["reservation_generation"]
+    token = reservation["claim_token"]
+    gate = dict(
+        **common,
+        reservation_generation=generation,
+        claimant="ide-restore",
+        claim_token=token,
+    )
+    assert (
+        await db.mark_managed_repository_workspace_creation_started(
+            str(job_id),
+            **gate,
+        )
+        is not None
+    )
+    assert await db.managed_repository_workspace_creation_claim_is_current(
+        str(job_id),
+        **gate,
+    )
+    assert (
+        await db.begin_managed_repository_workspace_creation_effect(
+            str(job_id),
+            **gate,
+            resource_kind="pod",
+        )
+        is not None
+    )
+    assert await db.authorize_managed_repository_workspace_creation_runtime(
+        str(job_id),
+        **gate,
+        runtime_incarnation=runtime,
+    )
+    restoring["ide_session"].update(
+        {
+            "restore_type": "k8s_container",
+            "_runtime_incarnation": runtime,
+            "_creation_reservation_id": str(reservation["id"]),
+            "_creation_claim_token": str(token),
+        }
+    )
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE jobs SET context = $2::jsonb WHERE id = $1",
+            job_id,
+            json.dumps(restoring),
+        )
+    assert await db.settle_managed_repository_workspace_creation_reservation(
+        str(job_id),
+        **gate,
+        runtime_incarnation=runtime,
+    )
+    assert (
+        await db.get_current_managed_repository_workspace_creation_result(
+            str(job_id),
+            **common,
+            operation_kind="restore",
+        )
+        is not None
+    )
+    claimed = await db.claim_current_managed_repository_workspace_restore_work(
+        str(job_id),
+        **common,
+        claimant="restore-work",
+    )
+    assert claimed is not None
+    work = dict(
+        **common,
+        reservation_id=str(reservation["id"]),
+        runtime_incarnation=runtime,
+        claimant="restore-work",
+        work_claim_token=int(claimed["restore_work_claim_token"]),
+    )
+    assert (
+        await db.renew_managed_repository_workspace_restore_work(
+            str(job_id),
+            **work,
+        )
+        is not None
+    )
+    assert await db.release_managed_repository_workspace_restore_work(
+        str(job_id),
+        **work,
+    )
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE managed_repository_workspace_creation_reservations "
+            "SET restore_work_next_attempt_at = now() - interval '1 second' "
+            "WHERE id = $1",
+            reservation["id"],
+        )
+    claimed = await db.claim_current_managed_repository_workspace_restore_work(
+        str(job_id),
+        **common,
+        claimant="restore-work",
+    )
+    assert claimed is not None
+    work["work_claim_token"] = int(claimed["restore_work_claim_token"])
+    assert await db.complete_managed_repository_workspace_restore_work(
+        str(job_id),
+        **work,
+        result_kind="active",
+        code_server_url="http://10.42.0.31:8080",
+        last_activity="2026-09-28T00:00:00+00:00",
+    )
+
+
+@pytest.mark.asyncio
+async def test_terminal_job_ide_restore_requires_current_supported_intent(db):
+    job_id = uuid4()
+    state = {
+        "ide_session": {
+            "status": "restoring",
+            "source": "snapshot",
+            "snapshot_type": "vm",
+        },
+        "snapshot": {"status": "available", "source_type": "vm"},
+    }
+    async with db.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO jobs (id, description, status, context) "
+            "VALUES ($1, 'IDE source guard', 'completed', $2::jsonb)",
+            job_id,
+            json.dumps(state),
+        )
+    reserve = dict(
+        owner_kind="job",
+        scope="ide",
+        claimant="source-guard",
+        operation_kind="restore",
+        desired_manifest_digest="0" * 64,
+    )
+    assert (
+        await db.reserve_managed_repository_workspace_creation(
+            str(job_id),
+            **reserve,
+        )
+        is None
+    )
+    state["ide_session"]["snapshot_type"] = "pod"
+    state["snapshot"]["source_type"] = "pod"
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE jobs SET context = $2::jsonb WHERE id = $1",
+            job_id,
+            json.dumps(state),
+        )
+    reservation = await db.reserve_managed_repository_workspace_creation(
+        str(job_id),
+        **reserve,
+    )
+    assert reservation is not None
+    state["ide_session"]["source"] = "unsupported"
+    async with db.acquire() as conn:
+        await conn.execute(
+            "UPDATE jobs SET context = $2::jsonb WHERE id = $1",
+            job_id,
+            json.dumps(state),
+        )
+    assert (
+        await db.mark_managed_repository_workspace_creation_started(
+            str(job_id),
+            owner_kind="job",
+            scope="ide",
+            reservation_generation=reservation["reservation_generation"],
+            claimant="source-guard",
+            claim_token=reservation["claim_token"],
+        )
+        is None
+    )
+
+
 async def _vm_process_zero(conn, owner_kind, owner, generation):
     await conn.execute(
         "INSERT INTO managed_repository_process_zero_receipts "
