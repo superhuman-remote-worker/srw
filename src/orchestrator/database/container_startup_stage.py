@@ -28,6 +28,11 @@ class ScheduledAt:
 
 
 @dataclass(frozen=True, slots=True)
+class BoundPodObserved:
+    """The caller attested the bound Pod identity without a usable stage clock."""
+
+
+@dataclass(frozen=True, slots=True)
 class ReadyObservedAt:
     """The first exact Kubernetes Ready transition for this Pod."""
 
