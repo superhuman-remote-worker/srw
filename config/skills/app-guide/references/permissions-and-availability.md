@@ -120,7 +120,10 @@ A running session's header **Settings** panel shows **Workspace** in its main
 over. Wait for provisioning to complete before checking the newly available
 tools. Virtual or Container can offer VM when allowed. None currently shows
 a fixed workspace value in this selector; start a new Container session when
-no upgrade action is offered.
+no upgrade action is offered. Some sessions cannot change workspace in place
+at all: their Workspace choices say **not available in this session** and
+`/upgrade-workspace` is refused. Start a new session with the needed workspace
+then.
 
 Workspace changes are upgrade-only: to move down to Virtual or None, start a
 new session. A workspace upgrade does not automatically enable a missing tool

@@ -78,9 +78,18 @@ deployment authorization.
 ## The chat view
 
 - **Composer**: attach files (documents, images, audio, video — drag-and-drop
-  and paste work too; on mobile you can take a photo), and use slash commands:
-  `/compact` (condense the conversation), `/done` (end the session), `/undo`,
-  `/auto`, `/supervised`, `/autonomous`, `/silent`, `/verbose`.
+  and paste work too; on mobile you can take a photo), and use slash commands.
+  Typing `/` opens a menu that lists only the commands this session supports:
+  `/compact` (condense the conversation), `/done` (end the session), `/undo`
+  (revert the last turn's file changes; needs a workspace with file history),
+  `/auto`, `/supervised`, `/autonomous`, `/silent`, `/verbose`, and `/rewind`
+  where the session offers it.
+  `/compact` takes optional focus text (`/compact keep the pricing decisions`).
+  Sent while the agent is still replying, it waits and runs after that reply.
+  Compaction also happens automatically when the **CTX** bar above the
+  composer reaches 100%, and the summary stays part of the conversation after
+  reloads and resumes. A "Nothing to compact" notice means there was not
+  enough older conversation to fold.
   Compaction is a context-window operation, not a durable-recording answer;
   questions about future recall or preserving a project decision require the
   focused **Memory and knowledge** guide.
@@ -118,7 +127,9 @@ deployment authorization.
 
 For a Virtual session that needs a browser or shell, choose **Container** in
 **Workspace** and confirm **Upgrade**. Existing files carry over; then check
-the needed tool category under **Tools**. Use the focused
+the needed tool category under **Tools**. If the Workspace choices say **not
+available in this session**, this session cannot change workspace in place:
+start a new session with the needed workspace instead. Use the focused
 `permissions-and-availability` guide for grants, other tiers, and locked
 controls, and `canvas-and-browser` for browser setup and shared login.
 
